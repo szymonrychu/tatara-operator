@@ -1,0 +1,6 @@
+/bin/
+/dist/
+/cover.out
+/cover.html
+.DS_Store
+*.test
