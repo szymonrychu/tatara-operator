@@ -10,6 +10,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	apiv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -56,6 +57,10 @@ func run(ctx context.Context) error {
 		return err
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return err
+	}
+	operatorMetrics := obs.NewOperatorMetrics(ctrlmetrics.Registry)
+	if err := addReconcilers(mgr, cfg, operatorMetrics); err != nil {
 		return err
 	}
 	logger.Info("starting manager",
