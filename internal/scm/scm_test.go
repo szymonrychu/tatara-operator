@@ -1,7 +1,6 @@
 package scm
 
 import (
-	"context"
 	"net/http"
 	"testing"
 
@@ -18,14 +17,8 @@ func TestProviders(t *testing.T) {
 	require.Equal(t, "gitlab", (&GitLab{}).Provider())
 }
 
-func TestM5MethodsNotImplemented(t *testing.T) {
-	ctx := context.Background()
-	for _, c := range []Client{&GitHub{}, &GitLab{}} {
-		_, err := c.OpenChange(ctx, "https://x/r", "tok", "src", "dst", "t", "b")
-		require.ErrorContains(t, err, "not implemented")
-		require.ErrorContains(t, c.Comment(ctx, "tok", "o/r#1", "b"), "not implemented")
-	}
-}
+// TestM5MethodsNotImplemented was removed in M5: OpenChange and Comment are
+// now fully implemented for both providers; the stub assertion is no longer valid.
 
 func TestWebhookEventZeroValue(t *testing.T) {
 	var e WebhookEvent

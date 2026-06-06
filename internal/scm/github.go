@@ -1,13 +1,18 @@
 package scm
 
 import (
+	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -88,6 +93,107 @@ func verifyGitHubSig(header string, payload []byte, secret string) error {
 	got := hex.EncodeToString(m.Sum(nil))
 	if !hmac.Equal([]byte(got), []byte(want)) {
 		return errors.New("github: signature mismatch")
+	}
+	return nil
+}
+
+func (c *GitHub) base() string {
+	if c.apiBase != "" {
+		return c.apiBase
+	}
+	return "https://api.github.com"
+}
+
+// OpenChange creates a pull request and returns its html_url.
+func (c *GitHub) OpenChange(ctx context.Context, repoURL, token, sourceBranch, targetBranch, title, body string) (string, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return "", err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls", owner, repo)
+	reqBody := map[string]string{"title": title, "head": sourceBranch, "base": targetBranch, "body": body}
+	var out struct {
+		HTMLURL string `json:"html_url"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, reqBody, &out); err != nil {
+		return "", err
+	}
+	return out.HTMLURL, nil
+}
+
+// Comment posts a comment on an issue or PR identified by owner/repo#number.
+func (c *GitHub) Comment(ctx context.Context, token, issueRef, body string) error {
+	owner, repo, number, err := ghIssueRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPost, path, token, map[string]string{"body": body}, nil)
+}
+
+func ghOwnerRepo(repoURL string) (string, string, error) {
+	u, err := url.Parse(repoURL)
+	if err != nil {
+		return "", "", fmt.Errorf("github: parse repo url %q: %w", repoURL, err)
+	}
+	p := strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
+	parts := strings.Split(p, "/")
+	if len(parts) < 2 || parts[len(parts)-1] == "" || parts[len(parts)-2] == "" {
+		return "", "", fmt.Errorf("github: cannot derive owner/repo from %q", repoURL)
+	}
+	return parts[len(parts)-2], parts[len(parts)-1], nil
+}
+
+func ghIssueRef(ref string) (string, string, int, error) {
+	at := strings.LastIndex(ref, "#")
+	if at < 0 {
+		return "", "", 0, fmt.Errorf("github: malformed issue ref %q", ref)
+	}
+	or, numStr := ref[:at], ref[at+1:]
+	oParts := strings.Split(or, "/")
+	if len(oParts) != 2 || oParts[0] == "" || oParts[1] == "" {
+		return "", "", 0, fmt.Errorf("github: malformed issue ref %q", ref)
+	}
+	n, err := strconv.Atoi(numStr)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("github: malformed issue number in %q: %w", ref, err)
+	}
+	return oParts[0], oParts[1], n, nil
+}
+
+func ghDo(ctx context.Context, base, method, path, token string, in, out any) error {
+	var rdr io.Reader
+	if in != nil {
+		b, err := json.Marshal(in)
+		if err != nil {
+			return fmt.Errorf("github: encode body: %w", err)
+		}
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
+	if err != nil {
+		return fmt.Errorf("github: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	if rdr != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("github: do request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(resp.Body)
+		return &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
+	}
+	if out == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("github: decode response: %w", err)
 	}
 	return nil
 }

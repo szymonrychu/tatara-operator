@@ -1,0 +1,104 @@
+package scm
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func newGitHub(t *testing.T, h http.HandlerFunc) *GitHub {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return &GitHub{apiBase: srv.URL}
+}
+
+func TestGitHubOpenChange(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/repos/o/r/pulls", r.URL.Path)
+		require.Equal(t, "Bearer ghtok", r.Header.Get("Authorization"))
+		require.Equal(t, "application/vnd.github+json", r.Header.Get("Accept"))
+		var in map[string]string
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&in))
+		require.Equal(t, "feature-x", in["head"])
+		require.Equal(t, "main", in["base"])
+		require.Equal(t, "Fix the bug", in["title"])
+		require.Equal(t, "body text", in["body"])
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"html_url": "https://github.com/o/r/pull/42"})
+	})
+
+	url, err := c.OpenChange(context.Background(), "https://github.com/o/r.git", "ghtok", "feature-x", "main", "Fix the bug", "body text")
+	require.NoError(t, err)
+	require.Equal(t, "https://github.com/o/r/pull/42", url)
+}
+
+func TestGitHubComment(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/repos/o/r/issues/7/comments", r.URL.Path)
+		require.Equal(t, "Bearer ghtok", r.Header.Get("Authorization"))
+		var in map[string]string
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&in))
+		require.Equal(t, "done", in["body"])
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	require.NoError(t, c.Comment(context.Background(), "ghtok", "o/r#7", "done"))
+}
+
+func TestGitHubOpenChangeErrorStatus(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"A pull request already exists"}`))
+	})
+	_, err := c.OpenChange(context.Background(), "https://github.com/o/r.git", "t", "h", "b", "title", "body")
+	require.Error(t, err)
+	var he *HTTPError
+	require.ErrorAs(t, err, &he)
+	require.Equal(t, 422, he.Status)
+}
+
+func TestGitHubParse(t *testing.T) {
+	tests := []struct {
+		name      string
+		repoURL   string
+		wantOwner string
+		wantRepo  string
+		wantErr   bool
+	}{
+		{"https-git", "https://github.com/o/r.git", "o", "r", false},
+		{"https-no-git", "https://github.com/o/r", "o", "r", false},
+		{"trailing-slash", "https://github.com/o/r/", "o", "r", false},
+		{"bad", "not a url with no path", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o, rp, err := ghOwnerRepo(tt.repoURL)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.wantOwner, o)
+			require.Equal(t, tt.wantRepo, rp)
+		})
+	}
+}
+
+func TestGitHubIssueNumber(t *testing.T) {
+	o, rp, n, err := ghIssueRef("o/r#123")
+	require.NoError(t, err)
+	require.Equal(t, "o", o)
+	require.Equal(t, "r", rp)
+	require.Equal(t, 123, n)
+
+	_, _, _, err = ghIssueRef("garbage")
+	require.Error(t, err)
+}

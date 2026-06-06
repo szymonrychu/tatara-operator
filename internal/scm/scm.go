@@ -2,7 +2,7 @@ package scm
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"net/http"
 )
 
@@ -27,31 +27,29 @@ type Client interface {
 	Comment(ctx context.Context, token, issueRef, body string) error
 }
 
-var errNotImplemented = errors.New("not implemented: M5")
+// HTTPError is returned when an SCM REST call responds 4xx/5xx.
+type HTTPError struct {
+	Status int
+	Body   string
+	Path   string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("scm: %s -> %d: %s", e.Path, e.Status, e.Body)
+}
 
 // GitHub implements Client for GitHub.
-type GitHub struct{}
+type GitHub struct {
+	apiBase string
+}
 
 // GitLab implements Client for GitLab.
-type GitLab struct{}
+type GitLab struct {
+	apiBase string
+}
 
 func (*GitHub) Provider() string { return "github" }
 func (*GitLab) Provider() string { return "gitlab" }
 
-// OpenChange is implemented in M5 (SCM write-back).
-func (*GitHub) OpenChange(context.Context, string, string, string, string, string, string) (string, error) {
-	return "", errNotImplemented
-}
-
-// Comment is implemented in M5 (SCM write-back).
-func (*GitHub) Comment(context.Context, string, string, string) error { return errNotImplemented }
-
-// OpenChange is implemented in M5 (SCM write-back).
-func (*GitLab) OpenChange(context.Context, string, string, string, string, string, string) (string, error) {
-	return "", errNotImplemented
-}
-
-// Comment is implemented in M5 (SCM write-back).
-func (*GitLab) Comment(context.Context, string, string, string) error { return errNotImplemented }
-
 // DetectAndVerify is implemented per provider in github.go and gitlab.go.
+// OpenChange and Comment are implemented per provider in github.go and gitlab.go.
