@@ -4,40 +4,87 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# imagePullSecrets are cluster-specific; the deploying helmfile supplies them.
+imagePullSecrets: []
+
 replicaCount: 1
 
-# Listener addresses (camelCase scalar -> kebab-case ConfigMap key -> envFrom).
+# Listener/config scalars. Each maps 1:1 to a SCREAMING_SNAKE ConfigMap key
+# via the envConfig helper and is consumed by the manager through envFrom (rule 6).
 httpAddr: ":8080"
 metricsAddr: ":9090"
-internalAddr: ":8081"
-
-# OIDC.
+healthAddr: ":8081"
+internalAddr: ":8082"
+# callbackUrl: full routable in-cluster base URL wrapper pods POST to.
+# M6 sets this to the internal Service DNS, e.g. http://tatara-operator-internal.tatara.svc:8082
+callbackUrl: ""
 oidcIssuer: ""
 oidcAudience: "tatara-operator"
-
-# Upstreams and identities.
-memoryBaseURL: ""
+memoryBaseUrl: ""
 ingesterImage: ""
 externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"
-
-# Secret-shaped scalars (rendered into the Secret).
-operatorOidcClientSecret: ""
-
-# Names of pre-existing secrets the operator references for spawned pods.
 anthropicSecretName: ""
 cliOidcSecretName: ""
-
+namespace: "tatara"
 logLevel: "info"
 
-resources:
-  requests:
-    cpu: 50m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 256Mi
+# Secret-backed scalars. Provided by a SOPS-encrypted values overlay at deploy
+# time. Set existingSecret to use an externally-managed Secret instead.
+existingSecret: ""
+operatorOidcClientSecret: ""
+
+service:
+  type: ClusterIP
+  httpPort: 8080
+  metricsPort: 9090
+
+serviceMonitor:
+  enabled: true
+  interval: "30s"
+  scrapeTimeout: "10s"
+
+ingress:
+  enabled: false
+  className: nginx
+  host: ""
+  path: "/"
+  clusterIssuer: letsencrypt-prod
+  tlsSecretName: ""
+
+# managedPodNetworkPolicy: egress-allowlist applied to spawned agent + ingest pods
+# (selected by tatara.dev/managed-by=tatara-operator).
+managedPodNetworkPolicy:
+  enabled: true
+  chatServiceName: tatara-chat
+
+rbac:
+  create: true
 
 serviceAccount:
   create: true
+  annotations: {}
   name: ""
+
+ingestServiceAccount:
+  create: true
+  name: "tatara-ingest"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
