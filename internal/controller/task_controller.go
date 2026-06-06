@@ -43,6 +43,10 @@ type TaskReconciler struct {
 	Metrics   *obs.OperatorMetrics
 	Session   agent.Session
 	PodConfig agent.PodConfig
+	// SCMFor returns a Writer for the given provider name ("github"|"gitlab").
+	// Nil in tests that do not exercise write-back; replaced with a fake in
+	// write-back tests.
+	SCMFor func(provider string) (Writer, error)
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=tasks,verbs=get;list;watch;create;update;patch;delete
@@ -71,6 +75,18 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	if isTerminal(task.Status.Phase) {
+		// M5 write-back: if the task succeeded and SCMFor is set, open PR/MR.
+		if task.Status.Phase == "Succeeded" && r.SCMFor != nil {
+			if cond := apimeta.FindStatusCondition(task.Status.Conditions, "WritebackPending"); cond != nil && cond.Status == metav1.ConditionTrue {
+				res, err := r.doWriteBack(ctx, &task)
+				if err != nil {
+					r.Metrics.ReconcileResult("Task", "error")
+					return ctrl.Result{}, err
+				}
+				r.Metrics.ReconcileResult("Task", "success")
+				return res, nil
+			}
+		}
 		return ctrl.Result{}, nil
 	}
 
