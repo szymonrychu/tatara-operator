@@ -13,8 +13,10 @@ Planned work not yet started. One line per item; link to plans for detail.
   push -> main-filtered incremental re-ingest. Work-item path is M5 stub.
   Plan: `docs/superpowers/plans/2026-06-06-tatara-operator-m2-webhook-push.md`.
 - [x] M3 REST API (operator, Part A) - OIDC-gated CRUD over Project/Repository/Task/Subtask, shared HTTP_ADDR listener with webhook server. Plan: `docs/superpowers/plans/2026-06-06-tatara-operator-m3-restapi-cli-tools.md`. Part B (tatara-cli MCP tools, Tasks 10-13) is a separate repo/release.
-- [ ] M4 Task reconciler + turn loop - wrapper Pod+Service, turn callbacks,
-  subtask iteration, concurrency gating.
+- [x] M4 - Task reconciler + turn loop (wrapper Pod/Service, plan turn,
+      subtask iteration, concurrency gate, callback server + poll backstop,
+      bounded pod-loss retry). SCM write-back deferred to M5 via the
+      WritebackPending condition hook.
 - [ ] M5 SCM write-back + work-item -> Task - scm interface (github+gitlab),
   branch/PR/MR/comment, work-item webhook -> Task.
 - [ ] M6 chart + deploy wiring - NetworkPolicy, metrics, Keycloak client,
