@@ -16,8 +16,8 @@ func TestGroupVersion(t *testing.T) {
 }
 
 func TestAddToScheme(t *testing.T) {
-	if v1alpha1.SchemeBuilder.GroupVersion.String() != "tatara.dev/v1alpha1" {
-		t.Fatalf("SchemeBuilder.GroupVersion = %q, want tatara.dev/v1alpha1", v1alpha1.SchemeBuilder.GroupVersion.String())
+	if v1alpha1.GroupVersion.String() != "tatara.dev/v1alpha1" {
+		t.Fatalf("GroupVersion = %q, want tatara.dev/v1alpha1", v1alpha1.GroupVersion.String())
 	}
 	if v1alpha1.AddToScheme == nil {
 		t.Fatal("AddToScheme is nil")

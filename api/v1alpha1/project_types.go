@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // AgentSpec configures the wrapper agent session a Task runs.
@@ -68,5 +69,8 @@ type ProjectList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&Project{}, &ProjectList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &Project{}, &ProjectList{})
+		return nil
+	})
 }

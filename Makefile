@@ -19,7 +19,7 @@ ENVTEST_K8S_VERSION ?= 1.33.0
 CHART_CRD_DIR := charts/tatara-operator/crds
 
 # Resolve helm binary via mise to avoid homebrew helm 4.x shadow.
-HELM_BIN := $(shell mise exec -- bash -c 'echo $$PATH' 2>/dev/null | tr ':' '\n' | grep -m1 'mise/installs/helm' || true)
+HELM_BIN := $(shell mise exec -- bash -c 'echo $$PATH' 2>/dev/null | tr ':' '\n' | grep -m1 'mise/installs/helm/' || true)
 ifdef HELM_BIN
 HELM_BIN := $(HELM_BIN)/helm
 else

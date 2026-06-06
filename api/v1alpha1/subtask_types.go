@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // SubtaskSpec defines the desired state of a Subtask. Created/updated by the
@@ -51,5 +52,8 @@ type SubtaskList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&Subtask{}, &SubtaskList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(GroupVersion, &Subtask{}, &SubtaskList{})
+		return nil
+	})
 }
