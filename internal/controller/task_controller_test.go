@@ -26,6 +26,7 @@ func newTaskReconciler(fs agent.Session) *TaskReconciler {
 		PodConfig: agent.PodConfig{
 			Namespace:           testNS,
 			CallbackURL:         "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},
@@ -466,5 +467,116 @@ func TestTaskReconcile_PodLostRecreatesThenFails(t *testing.T) {
 	tk := getTask(t, "t-lost")
 	if tk.Status.Phase != "Failed" {
 		t.Errorf("phase = %q, want Failed (pod lost, retries exhausted)", tk.Status.Phase)
+	}
+}
+
+// ----- P3: ResultSummary derived on termination -----
+
+func TestTaskReconcile_ResultSummaryDerivedFromSubtasks(t *testing.T) {
+	mkTaskProject(t, "p-rssum", 3)
+	mkTaskRepository(t, "r-rssum", "p-rssum")
+	mkTask(t, "t-rssum", "p-rssum", "r-rssum")
+	mkSubtask(t, "t-rssum-s1", "t-rssum", 1)
+
+	// Set the subtask Done with a result before termination.
+	st := getSubtask(t, "t-rssum-s1")
+	st.Status.Phase = "Done"
+	st.Status.Result = "implemented feature X"
+	if err := k8sClient.Status().Update(context.Background(), st); err != nil {
+		t.Fatalf("set subtask result: %v", err)
+	}
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-rssum"); err != nil { // spawn
+		t.Fatalf("spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-rssum")
+	if _, err := reconcileTask(t, r, "t-rssum"); err != nil { // plan turn
+		t.Fatalf("plan: %v", err)
+	}
+	// Plan callback with no further pending subtasks -> terminate Succeeded.
+	annotate(t, "t-rssum", map[string]string{annTurnComplete: "2026-06-07T09:00:00Z"})
+	if _, err := reconcileTask(t, r, "t-rssum"); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+
+	tk := getTask(t, "t-rssum")
+	if tk.Status.Phase != "Succeeded" {
+		t.Fatalf("phase = %q, want Succeeded", tk.Status.Phase)
+	}
+	if tk.Status.ResultSummary == "" {
+		t.Error("ResultSummary must be set when agent did not provide one")
+	}
+	if !contains(tk.Status.ResultSummary, "implemented feature X") {
+		t.Errorf("ResultSummary = %q, want last-subtask result", tk.Status.ResultSummary)
+	}
+}
+
+func TestTaskReconcile_ResultSummaryFallsBackToCount(t *testing.T) {
+	mkTaskProject(t, "p-rscount", 3)
+	mkTaskRepository(t, "r-rscount", "p-rscount")
+	mkTask(t, "t-rscount", "p-rscount", "r-rscount")
+	mkSubtask(t, "t-rscount-s1", "t-rscount", 1)
+
+	// Done subtask with no result text.
+	st := getSubtask(t, "t-rscount-s1")
+	st.Status.Phase = "Done"
+	if err := k8sClient.Status().Update(context.Background(), st); err != nil {
+		t.Fatalf("set subtask done: %v", err)
+	}
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-rscount"); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-rscount")
+	if _, err := reconcileTask(t, r, "t-rscount"); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	annotate(t, "t-rscount", map[string]string{annTurnComplete: "2026-06-07T09:05:00Z"})
+	if _, err := reconcileTask(t, r, "t-rscount"); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+
+	tk := getTask(t, "t-rscount")
+	if tk.Status.ResultSummary == "" {
+		t.Error("ResultSummary must be set (count fallback)")
+	}
+	if !contains(tk.Status.ResultSummary, "1") {
+		t.Errorf("ResultSummary = %q, want count mention", tk.Status.ResultSummary)
+	}
+}
+
+func TestTaskReconcile_ResultSummaryNotOverwrittenWhenSet(t *testing.T) {
+	mkTaskProject(t, "p-rsnoop", 3)
+	mkTaskRepository(t, "r-rsnoop", "p-rsnoop")
+	mkTask(t, "t-rsnoop", "p-rsnoop", "r-rsnoop")
+
+	// Agent already set ResultSummary via task_update.
+	tk := getTask(t, "t-rsnoop")
+	tk.Status.ResultSummary = "agent-provided summary"
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set result summary: %v", err)
+	}
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-rsnoop"); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-rsnoop")
+	if _, err := reconcileTask(t, r, "t-rsnoop"); err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	annotate(t, "t-rsnoop", map[string]string{annTurnComplete: "2026-06-07T09:10:00Z"})
+	if _, err := reconcileTask(t, r, "t-rsnoop"); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+
+	tk2 := getTask(t, "t-rsnoop")
+	if tk2.Status.ResultSummary != "agent-provided summary" {
+		t.Errorf("ResultSummary = %q, want agent-provided unchanged", tk2.Status.ResultSummary)
 	}
 }

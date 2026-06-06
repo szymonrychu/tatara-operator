@@ -266,7 +266,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	// No turn yet -> submit the plan turn (turn 0).
 	if current == "" {
-		id, err := r.Session.SubmitTurn(ctx, baseURL, planTurnText(task.Spec.Goal, taskBranch(task)), cbURL)
+		id, err := r.Session.SubmitTurn(ctx, baseURL, planTurnText(task.Spec.Goal, taskBranch(task), project.Name, task.Name), cbURL)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
 		}
@@ -311,7 +311,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		return r.terminate(ctx, task, "Succeeded", "NoPendingSubtasks", "all subtasks complete")
 	}
 
-	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task)), cbURL)
+	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task), task.Name), cbURL)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
 	}
@@ -384,6 +384,38 @@ func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, nam
 	return nil
 }
 
+// deriveResultSummary fills task.Status.ResultSummary from Done subtasks when
+// the agent has not explicitly set it. Called before write-back so PR/MR bodies
+// and issue comments are meaningful.
+func (r *TaskReconciler) deriveResultSummary(ctx context.Context, task *tatarav1alpha1.Task) {
+	if task.Status.ResultSummary != "" {
+		return
+	}
+	var subs tatarav1alpha1.SubtaskList
+	if err := r.List(ctx, &subs, client.InNamespace(task.Namespace)); err != nil {
+		return
+	}
+	done := 0
+	lastResult := ""
+	for i := range subs.Items {
+		st := &subs.Items[i]
+		if st.Spec.TaskRef != task.Name {
+			continue
+		}
+		if st.Status.Phase == "Done" {
+			done++
+			if st.Status.Result != "" {
+				lastResult = st.Status.Result
+			}
+		}
+	}
+	if lastResult != "" {
+		task.Status.ResultSummary = lastResult
+	} else if done > 0 {
+		task.Status.ResultSummary = fmt.Sprintf("Completed %d subtask(s).", done)
+	}
+}
+
 // terminate ends the Task: set phase, record turns, delete the wrapper
 // session + Pod + Service, and leave the M5 write-back hook marker.
 func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Task, phase, reason, msg string) (ctrl.Result, error) {
@@ -409,6 +441,9 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 		return ctrl.Result{}, fmt.Errorf("delete wrapper service: %w", err)
 	}
 
+	if phase == "Succeeded" {
+		r.deriveResultSummary(ctx, task)
+	}
 	task.Status.Phase = phase
 	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
 		Type: "Ready", Status: metav1.ConditionTrue, Reason: reason, Message: msg,

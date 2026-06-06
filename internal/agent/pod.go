@@ -19,6 +19,7 @@ const wrapperPort = 8080
 type PodConfig struct {
 	Namespace           string
 	CallbackURL         string // full routable in-cluster base URL, e.g. http://tatara-operator-internal.tatara.svc:8082
+	OIDCIssuer          string // OIDC issuer URL passed to the wrapper for token verification
 	AnthropicSecretName string
 	CLIOIDCSecretName   string
 }
@@ -69,6 +70,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
 		{Name: "DEFAULT_CALLBACK_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/turn-complete"},
+		// Task identity: lets the agent address MCP tools without repeating args.
+		{Name: "TATARA_TASK", Value: task.Name},
+		{Name: "TATARA_PROJECT", Value: project.Name},
+		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
+		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
+		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},
 		secretEnv("ANTHROPIC_API_KEY", cfg.AnthropicSecretName, "api-key"),
 		secretEnv("GIT_TOKEN", project.Spec.ScmSecretRef, "token"),
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),

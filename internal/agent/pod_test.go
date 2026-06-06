@@ -33,6 +33,7 @@ func sampleInputs() (*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatar
 	cfg := agent.PodConfig{
 		Namespace:           "tatara",
 		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082",
+		OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
@@ -85,6 +86,10 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"PERMISSION_MODE":      "bypassPermissions",
 		"TURN_TIMEOUT_SECONDS": "1800",
 		"DEFAULT_CALLBACK_URL": "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete",
+		"TATARA_TASK":          "task-7",
+		"TATARA_PROJECT":       "demo",
+		"OIDC_ISSUER":          "https://keycloak.tatara.svc/realms/master",
+		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)

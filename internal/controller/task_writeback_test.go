@@ -58,6 +58,7 @@ func newWriteBackReconciler(t *testing.T, fw *fakeWriter) *TaskReconciler {
 		PodConfig: agent.PodConfig{
 			Namespace:           testNS,
 			CallbackURL:         "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},

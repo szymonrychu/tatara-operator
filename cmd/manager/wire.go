@@ -71,6 +71,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 	return agent.PodConfig{
 		Namespace:           cfg.Namespace,
 		CallbackURL:         cfg.CallbackURL,
+		OIDCIssuer:          cfg.OIDCIssuer,
 		AnthropicSecretName: cfg.AnthropicSecretName,
 		CLIOIDCSecretName:   cfg.CLIOIDCSecretName,
 	}
