@@ -17,8 +17,10 @@ Planned work not yet started. One line per item; link to plans for detail.
       subtask iteration, concurrency gate, callback server + poll backstop,
       bounded pod-loss retry). SCM write-back deferred to M5 via the
       WritebackPending condition hook.
-- [ ] M5 SCM write-back + work-item -> Task - scm interface (github+gitlab),
-  branch/PR/MR/comment, work-item webhook -> Task.
+- [x] M5 SCM write-back + work-item -> Task - GitHub+GitLab OpenChange/Comment
+  via REST (httptest-faked); TaskReconciler write-back on Succeeded (envtest);
+  webhook work-item -> Task (httptest, signed payload, fake client);
+  scm.ByProvider wired into main. All tests green, lint clean.
 - [ ] M6 chart + deploy wiring - NetworkPolicy, metrics, Keycloak client,
   infra helmfile `tatara` release. Must create `tatara-ingest` ServiceAccount
   + ConfigMap-patch Role (see MEMORY.md 2026-06-06 M1 entry).

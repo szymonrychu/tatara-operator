@@ -235,7 +235,7 @@ func TestTaskWriteBackIdempotent(t *testing.T) {
 // permanentSCMError is a fake permanent error simulating scm.HTTPError{Status:422}.
 type permanentSCMError struct{ status int }
 
-func (e *permanentSCMError) Error() string { return fmt.Sprintf("scm: permanent %d", e.status) }
+func (e *permanentSCMError) Error() string     { return fmt.Sprintf("scm: permanent %d", e.status) }
 func (e *permanentSCMError) IsPermanent() bool { return e.status >= 400 && e.status < 500 }
 
 // TestTaskWriteBackAlreadyExists tests that a permanent 422 from OpenChange

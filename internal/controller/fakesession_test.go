@@ -63,4 +63,3 @@ func (f *fakeSession) lastSubmit() (submittedTurn, bool) {
 	}
 	return f.submits[len(f.submits)-1], true
 }
-
