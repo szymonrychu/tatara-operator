@@ -1,0 +1,41 @@
+package scm
+
+import (
+	"errors"
+	"net/http"
+	"net/url"
+	"strings"
+)
+
+// Select returns the Client for the provider indicated by request headers.
+func Select(h http.Header) (Client, error) {
+	switch {
+	case h.Get("X-GitHub-Event") != "":
+		return &GitHub{}, nil
+	case h.Get("X-Gitlab-Event") != "":
+		return &GitLab{}, nil
+	default:
+		return nil, errors.New("scm: unrecognized provider headers")
+	}
+}
+
+// SameRemote reports whether two git remote URLs refer to the same repository,
+// ignoring a trailing .git or /, and lowercasing the host.
+func SameRemote(a, b string) bool {
+	na, ok1 := normalizeRemote(a)
+	nb, ok2 := normalizeRemote(b)
+	if !ok1 || !ok2 {
+		return false
+	}
+	return na == nb
+}
+
+func normalizeRemote(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	path := strings.TrimSuffix(u.Path, "/")
+	path = strings.TrimSuffix(path, ".git")
+	return strings.ToLower(u.Host) + path, true
+}
