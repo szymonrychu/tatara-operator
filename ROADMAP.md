@@ -9,8 +9,9 @@ Planned work not yet started. One line per item; link to plans for detail.
 - [x] M1 Project + Repository + ingest - ProjectReconciler,
   RepositoryReconciler, ingest Job spawning, last-ingested-commit tracking.
   Plan: `docs/superpowers/plans/2026-06-06-tatara-operator-m1-project-repository-ingest.md`.
-- [ ] M2 webhook server (push) - HMAC verify, provider detection,
-  push -> main-filtered incremental re-ingest.
+- [x] M2 webhook server (push) - HMAC verify, provider detection,
+  push -> main-filtered incremental re-ingest. Work-item path is M5 stub.
+  Plan: `docs/superpowers/plans/2026-06-06-tatara-operator-m2-webhook-push.md`.
 - [ ] M3 REST API + tatara-cli MCP tools - OIDC-gated CRUD + tool group.
 - [ ] M4 Task reconciler + turn loop - wrapper Pod+Service, turn callbacks,
   subtask iteration, concurrency gating.

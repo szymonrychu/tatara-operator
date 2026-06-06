@@ -174,7 +174,7 @@ func objKey(ns, name string) client.ObjectKey {
 }
 
 func readBody(r *http.Request) ([]byte, error) {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	return io.ReadAll(io.LimitReader(r.Body, 5<<20))
 }
 
