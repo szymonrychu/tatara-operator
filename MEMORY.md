@@ -28,3 +28,26 @@ in spirit; prune only when a decision is reversed.
   because go.mod requires go 1.26.0 - local toolchain is 1.26.0 per rule 1.
 - 2026-06-06 Makefile HELM_BIN grep uses 'mise/installs/helm/' (trailing slash)
   to avoid matching 'helmfile' in the same mise PATH entries.
+- 2026-06-06 (M1) Ingest result SHA flows via a per-Repository ConfigMap
+  `<repo>-ingest-result` (key `sha`). The ingest Job patches it via the
+  in-cluster API after `git rev-parse HEAD`; the reconciler pre-creates it
+  (owner-ref Repository) and reads it on Job success. Chosen over pod-log
+  parsing (brittle) and Job annotations (Job cannot patch itself cleanly).
+  REQUIRES M6 chart to create ServiceAccount `tatara-ingest` + a Role granting
+  get/create/update/patch on ConfigMaps in ns `tatara`. Ingest container also
+  needs `kubectl` on PATH (the ingester image carries the Go toolchain; verify
+  kubectl presence in M6, else switch the patch step to a tiny `curl` against
+  the API or a dedicated sidecar).
+- 2026-06-06 (M1) Re-ingest trigger: full when status.lastIngestedCommit=="",
+  incremental (--since lastIngestedCommit) when annotation
+  tatara.dev/reingest-requested (RFC3339) is newer than status.lastIngestTime.
+  status.jobName is the single-flight guard. Conditions: Project `Ready`,
+  Repository `Ingested`.
+- 2026-06-06 (M1) Clone uses x-access-token:${SCM_TOKEN}@<host/path> in the
+  init container; works for both GitHub and GitLab HTTPS with the Secret key
+  `token`.
+- 2026-06-06 (M1) OperatorMetrics registered against ctrlmetrics.Registry
+  (controller-runtime's own prometheus registry) so they are served on the
+  existing /metrics endpoint without a second registry or server.
+- 2026-06-06 (M1) config.Config gained Namespace field (NAMESPACE env var,
+  default tatara); needed by ingestConfig to namespace the Job and result CM.

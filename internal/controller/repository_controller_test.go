@@ -161,10 +161,10 @@ func TestRepoReconcile_ConcurrencyGuard(t *testing.T) {
 func TestRepoReconcile_IncrementalUsesSince(t *testing.T) {
 	mkProject(t, "rp-inc", "rp-inc-scm")
 	mkSecret(t, "rp-inc-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
-	r := mkRepo(t, "inc", "rp-inc")
+	mkRepo(t, "inc", "rp-inc")
 
 	// simulate a prior successful ingest
-	r = getRepo(t, "inc")
+	r := getRepo(t, "inc")
 	r.Status.LastIngestedCommit = "oldsha99"
 	lastTime := metav1.NewTime(time.Now().Add(-1 * time.Hour))
 	r.Status.LastIngestTime = &lastTime
@@ -199,9 +199,9 @@ func TestRepoReconcile_IncrementalUsesSince(t *testing.T) {
 func TestRepoReconcile_NoReingestWhenAnnotationStale(t *testing.T) {
 	mkProject(t, "rp-stale", "rp-stale-scm")
 	mkSecret(t, "rp-stale-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
-	r := mkRepo(t, "stale", "rp-stale")
+	mkRepo(t, "stale", "rp-stale")
 
-	r = getRepo(t, "stale")
+	r := getRepo(t, "stale")
 	r.Status.LastIngestedCommit = "shaA"
 	nowTime := metav1.NewTime(time.Now())
 	r.Status.LastIngestTime = &nowTime
