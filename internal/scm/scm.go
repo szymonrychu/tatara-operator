@@ -55,10 +55,7 @@ func (*GitLab) OpenChange(context.Context, string, string, string, string, strin
 func (*GitLab) Comment(context.Context, string, string, string) error { return errNotImplemented }
 
 // DetectAndVerify is implemented per provider in github.go / gitlab.go.
-func (*GitHub) DetectAndVerify(http.Header, []byte, string) (WebhookEvent, error) {
-	return WebhookEvent{}, errNotImplemented
-}
-
+// GitLab placeholder remains until Task 3.
 func (*GitLab) DetectAndVerify(http.Header, []byte, string) (WebhookEvent, error) {
 	return WebhookEvent{}, errNotImplemented
 }
