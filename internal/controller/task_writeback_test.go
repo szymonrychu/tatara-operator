@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"testing"
 
@@ -18,6 +17,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 type fakeWriter struct {
@@ -232,18 +232,12 @@ func TestTaskWriteBackIdempotent(t *testing.T) {
 	require.Equal(t, 1, fw.openCalls, "OpenChange must not be called twice")
 }
 
-// permanentSCMError is a fake permanent error simulating scm.HTTPError{Status:422}.
-type permanentSCMError struct{ status int }
-
-func (e *permanentSCMError) Error() string     { return fmt.Sprintf("scm: permanent %d", e.status) }
-func (e *permanentSCMError) IsPermanent() bool { return e.status >= 400 && e.status < 500 }
-
-// TestTaskWriteBackAlreadyExists tests that a permanent 422 from OpenChange
-// clears WritebackPending and does not requeue infinitely.
+// TestTaskWriteBackAlreadyExists tests that a 4xx HTTPError from OpenChange
+// clears WritebackPending with a neutral reason and does not requeue.
 func TestTaskWriteBackAlreadyExists(t *testing.T) {
 	task := seedWritebackPending(t, "wb-task4", "wb-scm4", "wb-proj4", "wb-repo4")
 
-	fw := &fakeWriter{openErr: &permanentSCMError{status: 422}}
+	fw := &fakeWriter{openErr: &scm.HTTPError{Status: 422, Body: "already exists", Path: "/repos/o/r/pulls"}}
 	r := newWriteBackReconciler(t, fw)
 
 	res, err := reconcileWriteback(t, r, task.Name)
@@ -257,8 +251,30 @@ func TestTaskWriteBackAlreadyExists(t *testing.T) {
 		types.NamespacedName{Namespace: testNS, Name: task.Name},
 		&got,
 	))
-	// WritebackPending must be cleared even on permanent error.
+	// WritebackPending must be cleared with neutral reason, not an error reason.
 	cond := findCond(got.Status.Conditions, "WritebackPending")
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "WritebackSkipped", cond.Reason)
+	require.Contains(t, cond.Message, "422")
+}
+
+func TestProviderForRemote(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	tests := []struct {
+		remote string
+		want   string
+	}{
+		{"https://gitlab.com/org/repo.git", "gitlab"},
+		{"https://self-hosted.gitlab.example.com/org/repo.git", "gitlab"},
+		{"https://github.com/org/repo.git", "github"},
+		{"https://github.example.com/org/repo.git", "github"},
+		{"https://internal.example.com/org/repo.git", "github"}, // unknown -> defaults to github
+	}
+	for _, tc := range tests {
+		got := providerForRemote(ctx, tc.remote)
+		if got != tc.want {
+			t.Errorf("providerForRemote(%q) = %q, want %q", tc.remote, got, tc.want)
+		}
+	}
 }

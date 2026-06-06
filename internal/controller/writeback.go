@@ -52,7 +52,7 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		provider = task.Spec.Source.Provider
 	}
 	if provider == "" {
-		provider = providerForRemote(repo.Spec.URL)
+		provider = providerForRemote(ctx, repo.Spec.URL)
 	}
 
 	writer, err := r.SCMFor(provider)
@@ -77,13 +77,10 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		// Permanent 4xx: record failure and clear the condition (no infinite requeue).
 		var he *scm.HTTPError
 		if errors.As(err, &he) && he.Status >= 400 && he.Status < 500 {
-			r.clearWritebackPending(ctx, task, "OpenChangeFailed", fmt.Sprintf("open change: %v", err))
-			return ctrl.Result{}, nil
-		}
-		// Also accept any error that implements IsPermanent() bool.
-		type permanenter interface{ IsPermanent() bool }
-		if p, ok := err.(permanenter); ok && p.IsPermanent() {
-			r.clearWritebackPending(ctx, task, "OpenChangeFailed", fmt.Sprintf("open change permanent: %v", err))
+			// 4xx is permanent: PR/MR already exists or request is invalid.
+			// Clear the condition with a neutral reason; do not requeue.
+			r.clearWritebackPending(ctx, task, "WritebackSkipped",
+				fmt.Sprintf("PR/MR could not be opened or already exists: %d", he.Status))
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("writeback: open change: %w", err)
@@ -106,9 +103,15 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		"task", task.Name, "pr_url", prURL,
 		"has_source", task.Spec.Source != nil && task.Spec.Source.IssueRef != "")
 
-	// Comment on the originating work item (non-fatal).
+	// Comment on the originating work item (non-fatal). Keep this concise:
+	// the comment is already on the source issue so we omit the Source footer
+	// that writeBackBody appends; the PR/MR body carries the full text.
 	if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
-		commentBody := writeBackBody(task) + "\n\nPR/MR: " + prURL
+		resultSummary := task.Status.ResultSummary
+		if resultSummary == "" {
+			resultSummary = task.Spec.Goal
+		}
+		commentBody := "Done - opened PR/MR: " + prURL + "\n\n" + resultSummary
 		if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody); err != nil {
 			l.Error(err, "writeback: comment on work item (non-fatal)",
 				"issue_ref", task.Spec.Source.IssueRef)
@@ -133,16 +136,27 @@ func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatara
 	}
 }
 
-func providerForRemote(remote string) string {
-	if strings.Contains(strings.ToLower(remote), "gitlab") {
+// providerForRemote is a best-effort heuristic used only when
+// Task.spec.source.provider is unset. Prefer setting that field explicitly.
+func providerForRemote(ctx context.Context, remote string) string {
+	lower := strings.ToLower(remote)
+	if strings.Contains(lower, "gitlab") {
 		return "gitlab"
 	}
+	if strings.Contains(lower, "github") {
+		return "github"
+	}
+	log.FromContext(ctx).Info("writeback: provider unknown from remote URL, defaulting to github",
+		"remote", remote)
 	return "github"
 }
 
 // taskBranch returns the deterministic branch name for a Task's agent run.
-// Convention: tatara/task-<task-name>. The wrapper pod is told to push to
-// this branch via REPO_BRANCH env; M5 uses this same convention for write-back.
+// Convention: tatara/task-<task-name>. The branch is communicated to the agent
+// via the turn prompts (turnloop.go planTurnText/turnText); the operator opens
+// the PR/MR targeting this same branch. Operator and agent MUST agree on this
+// exact string. If the wrapper ever enforces branch pushing itself, it must use
+// this same value.
 func taskBranch(t *tatarav1alpha1.Task) string {
 	return "tatara/task-" + t.Name
 }

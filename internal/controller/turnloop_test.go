@@ -18,12 +18,23 @@ func sub(name string, order int, phase string) tatarav1alpha1.Subtask {
 }
 
 func TestPlanTurnText_MentionsDecompose(t *testing.T) {
-	txt := planTurnText("ship the feature")
+	txt := planTurnText("ship the feature", "tatara/task-abc")
 	if !strings.Contains(txt, "ship the feature") {
 		t.Errorf("plan turn missing goal: %q", txt)
 	}
 	if !strings.Contains(strings.ToLower(txt), "subtask") {
 		t.Errorf("plan turn missing subtask MCP instruction: %q", txt)
+	}
+}
+
+func TestPlanTurnText_ContainsBranchDirective(t *testing.T) {
+	const branch = "tatara/task-my-task"
+	txt := planTurnText("do the thing", branch)
+	if !strings.Contains(txt, branch) {
+		t.Errorf("plan turn missing branch directive %q: %q", branch, txt)
+	}
+	if !strings.Contains(txt, "NEVER commit or push to the default branch") {
+		t.Errorf("plan turn missing default-branch prohibition: %q", txt)
 	}
 }
 
@@ -50,8 +61,16 @@ func TestNextPendingSubtask_NoneLeft(t *testing.T) {
 }
 
 func TestTurnText_TitleAndDetail(t *testing.T) {
-	txt := turnText(sub("x", 1, "Pending"))
+	txt := turnText(sub("x", 1, "Pending"), "tatara/task-x")
 	if !strings.Contains(txt, "x-title") || !strings.Contains(txt, "x-detail") {
 		t.Errorf("turn text missing title/detail: %q", txt)
+	}
+}
+
+func TestTurnText_ContainsBranchReminder(t *testing.T) {
+	const branch = "tatara/task-my-task"
+	txt := turnText(sub("y", 2, "Pending"), branch)
+	if !strings.Contains(txt, branch) {
+		t.Errorf("turn text missing branch reminder %q: %q", branch, txt)
 	}
 }

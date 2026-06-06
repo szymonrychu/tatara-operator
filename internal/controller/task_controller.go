@@ -266,7 +266,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	// No turn yet -> submit the plan turn (turn 0).
 	if current == "" {
-		id, err := r.Session.SubmitTurn(ctx, baseURL, planTurnText(task.Spec.Goal), cbURL)
+		id, err := r.Session.SubmitTurn(ctx, baseURL, planTurnText(task.Spec.Goal, taskBranch(task)), cbURL)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
 		}
@@ -311,7 +311,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		return r.terminate(ctx, task, "Succeeded", "NoPendingSubtasks", "all subtasks complete")
 	}
 
-	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next), cbURL)
+	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task)), cbURL)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
 	}

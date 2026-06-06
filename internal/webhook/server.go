@@ -175,21 +175,11 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		return
 	}
 
-	isController := true
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "task-",
-			Namespace:    s.cfg.Namespace,
-			OwnerReferences: []metav1.OwnerReference{
-				{
-					APIVersion:         tatarav1.GroupVersion.String(),
-					Kind:               "Project",
-					Name:               proj.Name,
-					UID:                proj.UID,
-					Controller:         &isController,
-					BlockOwnerDeletion: &isController,
-				},
-			},
+			GenerateName:    "task-",
+			Namespace:       s.cfg.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
 		},
 		Spec: tatarav1.TaskSpec{
 			ProjectRef:    proj.Name,
