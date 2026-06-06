@@ -21,9 +21,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// ReingestAnnotation is the RFC3339 timestamp annotation the M2 webhook sets
-// to request an incremental re-ingest.
-const ReingestAnnotation = "tatara.dev/reingest-requested"
+// ReingestAnnotation aliases the canonical constant from api/v1alpha1 so
+// controller code keeps using the same short name internally.
+const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
 
 // RepositoryReconciler drives ingest Jobs for Repositories.
 type RepositoryReconciler struct {
