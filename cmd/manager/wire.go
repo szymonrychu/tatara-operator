@@ -7,6 +7,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/webhook"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
@@ -23,6 +24,17 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 		OIDCAudience:     memoryAudience,
 		Namespace:        cfg.Namespace,
 	}
+}
+
+// addWebhookServer constructs the SCM webhook server and registers it as a
+// manager Runnable so it shares the manager's lifecycle and graceful shutdown.
+func addWebhookServer(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics) error {
+	srv := webhook.NewServer(webhook.Config{
+		Client:    mgr.GetClient(),
+		Namespace: cfg.Namespace,
+		Metrics:   metrics,
+	})
+	return mgr.Add(webhook.NewRunnable(srv, cfg.HTTPAddr))
 }
 
 // addReconcilers constructs and registers the M1 reconcilers with mgr.

@@ -63,6 +63,9 @@ func run(ctx context.Context) error {
 	if err := addReconcilers(mgr, cfg, operatorMetrics); err != nil {
 		return err
 	}
+	if err := addWebhookServer(mgr, cfg, operatorMetrics); err != nil {
+		return err
+	}
 	logger.Info("starting manager",
 		slog.String("action", "manager_start"),
 		slog.String("version", version.String()),
