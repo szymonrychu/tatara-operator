@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "tatara-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 spec:
@@ -13,43 +14,54 @@ spec:
     metadata:
       labels:
         {{- include "tatara-operator.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include "tatara-operator.envConfig" . | sha256sum }}
     spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "tatara-operator.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
       securityContext:
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
-        - name: manager
+        - name: tatara-operator
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+            - name: internal
+              containerPort: 8082
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
           envFrom:
             - configMapRef:
                 name: {{ include "tatara-operator.fullname" . }}
             - secretRef:
-                name: {{ include "tatara-operator.fullname" . }}
-          ports:
-            - name: http
-              containerPort: 8080
-            - name: internal
-              containerPort: 8081
-            - name: metrics
-              containerPort: 9090
+                name: {{ default (include "tatara-operator.fullname" .) .Values.existingSecret }}
           livenessProbe:
             httpGet:
               path: /healthz
-              port: internal
+              port: health
             initialDelaySeconds: 10
             periodSeconds: 20
           readinessProbe:
             httpGet:
               path: /readyz
-              port: internal
+              port: health
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
