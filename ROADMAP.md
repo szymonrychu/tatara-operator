@@ -12,7 +12,7 @@ Planned work not yet started. One line per item; link to plans for detail.
 - [x] M2 webhook server (push) - HMAC verify, provider detection,
   push -> main-filtered incremental re-ingest. Work-item path is M5 stub.
   Plan: `docs/superpowers/plans/2026-06-06-tatara-operator-m2-webhook-push.md`.
-- [ ] M3 REST API + tatara-cli MCP tools - OIDC-gated CRUD + tool group.
+- [x] M3 REST API (operator, Part A) - OIDC-gated CRUD over Project/Repository/Task/Subtask, shared HTTP_ADDR listener with webhook server. Plan: `docs/superpowers/plans/2026-06-06-tatara-operator-m3-restapi-cli-tools.md`. Part B (tatara-cli MCP tools, Tasks 10-13) is a separate repo/release.
 - [ ] M4 Task reconciler + turn loop - wrapper Pod+Service, turn callbacks,
   subtask iteration, concurrency gating.
 - [ ] M5 SCM write-back + work-item -> Task - scm interface (github+gitlab),
