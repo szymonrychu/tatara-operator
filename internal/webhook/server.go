@@ -41,10 +41,17 @@ func NewServer(cfg Config) *Server {
 	return &Server{cfg: cfg, log: cfg.Logger}
 }
 
-// Handler returns the chi router mounting the webhook endpoint.
+// Mount registers the webhook route onto an existing chi router. Use this
+// when composing with other route groups on a shared listener.
+func (s *Server) Mount(r chi.Router) {
+	r.Post("/operator/webhooks/{project}", s.handle)
+}
+
+// Handler returns a standalone http.Handler with the webhook route. Kept for
+// backward-compatible use by NewRunnable in tests.
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
-	r.Post("/operator/webhooks/{project}", s.handle)
+	s.Mount(r)
 	return r
 }
 
@@ -191,9 +198,31 @@ func NewRunnable(srv *Server, addr string) *Runnable {
 
 // Start serves HTTP until ctx is cancelled, then gracefully shuts down.
 func (run *Runnable) Start(ctx context.Context) error {
+	return serveHTTP(ctx, run.addr, run.srv.Handler())
+}
+
+// HandlerRunnable serves an arbitrary http.Handler as a manager Runnable.
+// Use this when composing multiple route groups (e.g. webhook + REST API) on
+// a single shared listener.
+type HandlerRunnable struct {
+	handler http.Handler
+	addr    string
+}
+
+// NewHandlerRunnable wraps any http.Handler so it can be registered with mgr.Add.
+func NewHandlerRunnable(handler http.Handler, addr string) *HandlerRunnable {
+	return &HandlerRunnable{handler: handler, addr: addr}
+}
+
+// Start serves HTTP until ctx is cancelled, then gracefully shuts down.
+func (run *HandlerRunnable) Start(ctx context.Context) error {
+	return serveHTTP(ctx, run.addr, run.handler)
+}
+
+func serveHTTP(ctx context.Context, addr string, handler http.Handler) error {
 	httpSrv := &http.Server{
-		Addr:              run.addr,
-		Handler:           run.srv.Handler(),
+		Addr:              addr,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	errCh := make(chan error, 1)
