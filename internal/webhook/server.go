@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -104,7 +105,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case "push":
 		s.handlePush(ctx, w, providerName, projectName, ev)
 	case "issue", "mr":
-		s.handleWorkItem(w, providerName, proj, ev)
+		s.handleWorkItem(ctx, w, providerName, proj, ev)
 	default:
 		s.count(providerName, "other", "ignored")
 		w.WriteHeader(http.StatusAccepted)
@@ -145,18 +146,71 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func (s *Server) handleWorkItem(w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) {
 		s.count(provider, ev.Kind, "ignored")
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	// M2 stub: a labeled work item is accepted and logged, but Task creation
-	// is deliberately NOT performed here. M5 (work-item -> Task) completes this
-	// branch by creating a Task with goal=ev.Body and source from ev.
-	s.log.Info("webhook work item with trigger label (M2 stub, Task creation in M5)",
-		"provider", provider, "project", proj.Name, "kind", ev.Kind, "issue_ref", ev.IssueRef)
-	s.count(provider, ev.Kind, "accepted")
+
+	var repos tatarav1.RepositoryList
+	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
+		s.count(provider, ev.Kind, "error")
+		http.Error(w, "list repositories", http.StatusInternalServerError)
+		return
+	}
+	var repo *tatarav1.Repository
+	for i := range repos.Items {
+		r := &repos.Items[i]
+		if r.Spec.ProjectRef == proj.Name && scm.SameRemote(r.Spec.URL, ev.Repo) {
+			repo = r
+			break
+		}
+	}
+	if repo == nil {
+		s.log.InfoContext(ctx, "work item labeled but no matching repository",
+			"project", proj.Name, "remote", ev.Repo, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, "no_repo")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	isController := true
+	task := &tatarav1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "task-",
+			Namespace:    s.cfg.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         tatarav1.GroupVersion.String(),
+					Kind:               "Project",
+					Name:               proj.Name,
+					UID:                proj.UID,
+					Controller:         &isController,
+					BlockOwnerDeletion: &isController,
+				},
+			},
+		},
+		Spec: tatarav1.TaskSpec{
+			ProjectRef:    proj.Name,
+			RepositoryRef: repo.Name,
+			Goal:          ev.Body,
+			Source: &tatarav1.TaskSource{
+				Provider: provider,
+				IssueRef: ev.IssueRef,
+				URL:      ev.URL,
+			},
+		},
+	}
+	if err := s.cfg.Client.Create(ctx, task); err != nil {
+		s.count(provider, ev.Kind, "error")
+		http.Error(w, "create task", http.StatusInternalServerError)
+		return
+	}
+	s.log.InfoContext(ctx, "work item created task",
+		"project", proj.Name, "repository", repo.Name,
+		"task", task.Name, "issue_ref", ev.IssueRef)
+	s.count(provider, ev.Kind, "task_created")
 	w.WriteHeader(http.StatusAccepted)
 }
 

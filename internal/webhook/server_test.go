@@ -155,27 +155,9 @@ func TestPushNonDefaultBranchNoMutation(t *testing.T) {
 	require.Empty(t, got.Annotations[tatarav1.ReingestRequestedAnnotation])
 }
 
-func TestIssueWithTriggerLabelStubbed(t *testing.T) {
-	const secretVal = "whsec"
-	c := seedClient(t,
-		project("proj1", "proj1-scm", "tatara"),
-		secret("proj1-scm", secretVal),
-		repository("repo1", "proj1", "https://github.com/o/r.git", "main"),
-	)
-	h, reg := newServer(t, c)
-	body := []byte(`{"action":"opened","issue":{"number":7,"title":"t","body":"b","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	hdr := http.Header{}
-	hdr.Set("X-GitHub-Event", "issues")
-	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
-
-	w := post(t, h, "proj1", hdr, body)
-	require.Equal(t, http.StatusAccepted, w.Code)
-	// M2 stub: no Task created.
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Empty(t, tasks.Items)
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "result": "accepted"}))
-}
+// TestIssueWithTriggerLabelStubbed was the M2 stub test asserting NO Task is
+// created and result=accepted. Removed in M5: the handler now creates a Task
+// (result=task_created). See workitem_test.go for the replacement assertions.
 
 func TestUnknownProject404(t *testing.T) {
 	c := seedClient(t)
