@@ -177,10 +177,87 @@ func (r *RepositoryReconciler) ensureResultConfigMap(ctx context.Context, repo *
 	return nil
 }
 
-// handleFinishedJob is implemented in Task 5; for Task 4 it requeues so the
-// guard does not loop. Replaced wholesale by the Task 5 version.
+// handleFinishedJob applies a terminal ingest Job's outcome to the Repository
+// status: on success it reads the resolved HEAD SHA from the result ConfigMap
+// and records lastIngestedCommit/lastIngestTime/phase=Ingested; on failure it
+// records phase=Failed. It always clears status.jobName and observes the Job
+// duration.
 func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tataradevv1alpha1.Repository, job *batchv1.Job) (ctrl.Result, error) {
-	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	l := log.FromContext(ctx)
+
+	if job.Status.StartTime != nil && job.Status.CompletionTime != nil {
+		r.Metrics.ObserveIngestJobDuration(job.Status.CompletionTime.Sub(job.Status.StartTime.Time).Seconds())
+	}
+
+	if jobSucceeded(job) {
+		sha, err := r.readResultSHA(ctx, repo)
+		if err != nil {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("read ingest result sha: %w", err)
+		}
+		now := metav1.Now()
+		repo.Status.LastIngestedCommit = sha
+		repo.Status.LastIngestTime = &now
+		repo.Status.Phase = "Ingested"
+		repo.Status.JobName = ""
+		meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+			Type:               "Ingested",
+			Status:             metav1.ConditionTrue,
+			Reason:             "IngestSucceeded",
+			Message:            "ingested at " + sha,
+			ObservedGeneration: repo.Generation,
+		})
+		if err := r.Status().Update(ctx, repo); err != nil {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
+		}
+		l.Info("ingest succeeded",
+			"action", "ingest_succeeded", "resource_id", repo.Name, "sha", sha, "job", job.Name)
+		r.Metrics.ReconcileResult("Repository", "success")
+		return ctrl.Result{}, nil
+	}
+
+	repo.Status.Phase = "Failed"
+	repo.Status.JobName = ""
+	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+		Type:               "Ingested",
+		Status:             metav1.ConditionFalse,
+		Reason:             "IngestFailed",
+		Message:            "ingest job " + job.Name + " failed",
+		ObservedGeneration: repo.Generation,
+	})
+	if err := r.Status().Update(ctx, repo); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
+	}
+	l.Info("ingest failed",
+		"action", "ingest_failed", "resource_id", repo.Name, "job", job.Name)
+	r.Metrics.ReconcileResult("Repository", "error")
+	return ctrl.Result{}, nil
+}
+
+// jobSucceeded reports whether the Job has a Complete=True condition.
+func jobSucceeded(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// readResultSHA reads data["sha"] from the repo's result ConfigMap.
+func (r *RepositoryReconciler) readResultSHA(ctx context.Context, repo *tataradevv1alpha1.Repository) (string, error) {
+	var cm corev1.ConfigMap
+	key := types.NamespacedName{Namespace: repo.Namespace, Name: ingest.ResultConfigMapName(repo)}
+	if err := r.Get(ctx, key, &cm); err != nil {
+		return "", fmt.Errorf("get result configmap: %w", err)
+	}
+	sha := cm.Data["sha"]
+	if sha == "" {
+		return "", fmt.Errorf("result configmap %s has empty sha", cm.Name)
+	}
+	return sha, nil
 }
 
 // jobActive reports whether a Job has neither completed nor failed.
