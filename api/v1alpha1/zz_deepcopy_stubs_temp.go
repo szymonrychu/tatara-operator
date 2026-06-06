@@ -12,3 +12,13 @@ func (in *Repository) DeepCopyObject() runtime.Object     { return in.DeepCopy()
 func (in *Repository) DeepCopy() *Repository               { out := *in; return &out }
 func (in *RepositoryList) DeepCopyObject() runtime.Object { return in.DeepCopy() }
 func (in *RepositoryList) DeepCopy() *RepositoryList       { out := *in; return &out }
+
+func (in *Task) DeepCopyObject() runtime.Object     { return in.DeepCopy() }
+func (in *Task) DeepCopy() *Task                     { out := *in; return &out }
+func (in *TaskList) DeepCopyObject() runtime.Object { return in.DeepCopy() }
+func (in *TaskList) DeepCopy() *TaskList             { out := *in; return &out }
+
+func (in *Subtask) DeepCopyObject() runtime.Object     { return in.DeepCopy() }
+func (in *Subtask) DeepCopy() *Subtask                  { out := *in; return &out }
+func (in *SubtaskList) DeepCopyObject() runtime.Object { return in.DeepCopy() }
+func (in *SubtaskList) DeepCopy() *SubtaskList          { out := *in; return &out }
