@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"sync"
 
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -10,13 +11,13 @@ import (
 // Compile-time check: fakeSession satisfies agent.Session.
 var _ agent.Session = (*fakeSession)(nil)
 
-type submittedTurn struct { //nolint:unused // used by Task-6 reconciler tests
+type submittedTurn struct {
 	BaseURL, Text, CallbackURL, TurnID string
 }
 
 // fakeSession records SubmitTurn/GetTurn/DeleteSession calls and returns
 // scripted turn ids. It is safe for concurrent use by the reconciler.
-type fakeSession struct { //nolint:unused // used by Task-6 reconciler tests
+type fakeSession struct {
 	mu        sync.Mutex
 	submits   []submittedTurn
 	nextID    int
@@ -25,7 +26,7 @@ type fakeSession struct { //nolint:unused // used by Task-6 reconciler tests
 	submitErr error
 }
 
-func newFakeSession() *fakeSession { //nolint:unused // used by Task-6 reconciler tests
+func newFakeSession() *fakeSession {
 	return &fakeSession{getResult: map[string]agent.TurnResult{}}
 }
 
@@ -36,7 +37,7 @@ func (f *fakeSession) SubmitTurn(_ context.Context, baseURL, text, callbackURL s
 		return "", f.submitErr
 	}
 	f.nextID++
-	id := "turn-" + itoa(f.nextID)
+	id := "turn-" + strconv.Itoa(f.nextID)
 	f.submits = append(f.submits, submittedTurn{BaseURL: baseURL, Text: text, CallbackURL: callbackURL, TurnID: id})
 	return id, nil
 }
@@ -54,7 +55,7 @@ func (f *fakeSession) DeleteSession(_ context.Context, baseURL string) error {
 	return nil
 }
 
-func (f *fakeSession) lastSubmit() (submittedTurn, bool) { //nolint:unused // used by Task-6 reconciler tests
+func (f *fakeSession) lastSubmit() (submittedTurn, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.submits) == 0 {
@@ -63,14 +64,3 @@ func (f *fakeSession) lastSubmit() (submittedTurn, bool) { //nolint:unused // us
 	return f.submits[len(f.submits)-1], true
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b []byte
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
-}

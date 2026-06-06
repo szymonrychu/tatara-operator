@@ -25,7 +25,7 @@ func newTaskReconciler(fs agent.Session) *TaskReconciler {
 		Session: fs,
 		PodConfig: agent.PodConfig{
 			Namespace:           testNS,
-			InternalAddr:        "http://op-internal.tatara.svc:9090",
+			CallbackURL:         "http://op-internal.tatara.svc:8082",
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},
@@ -399,6 +399,51 @@ func TestTaskReconcile_MaxTurnsCap(t *testing.T) {
 	tk2 := getTask(t, "t-max")
 	if tk2.Status.Phase != "Succeeded" && tk2.Status.Phase != "Failed" {
 		t.Errorf("phase = %q, want terminal after maxTurns", tk2.Status.Phase)
+	}
+}
+
+// ----- Fix 2: per-turn timeout via reconciler -----
+
+func TestTaskReconcile_TurnTimeout(t *testing.T) {
+	mkTaskProject(t, "p-tt", 3)
+	mkTaskRepository(t, "r-tt", "p-tt")
+	mkTask(t, "t-tt", "p-tt", "r-tt")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+
+	// First reconcile: spawn pod.
+	if _, err := reconcileTask(t, r, "t-tt"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-tt")
+
+	// Second reconcile: submit plan turn.
+	if _, err := reconcileTask(t, r, "t-tt"); err != nil {
+		t.Fatalf("reconcile plan turn: %v", err)
+	}
+
+	// Backdate turn-started-at to simulate the deadline already having passed.
+	annotate(t, "t-tt", map[string]string{
+		annTurnStartedAt: "2000-01-01T00:00:00Z",
+	})
+
+	// Third reconcile: turn is in-flight (no annTurnComplete), deadline exceeded.
+	if _, err := reconcileTask(t, r, "t-tt"); err != nil {
+		t.Fatalf("reconcile timeout: %v", err)
+	}
+
+	tk := getTask(t, "t-tt")
+	if tk.Status.Phase != "Failed" {
+		t.Errorf("phase = %q, want Failed after turn timeout", tk.Status.Phase)
+	}
+	cond := findCond(tk.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "TurnTimeout" {
+		t.Errorf("expected Ready/TurnTimeout condition, got %+v", cond)
+	}
+	// Session.DeleteSession must have been called.
+	if len(fs.deleted) == 0 {
+		t.Error("expected DeleteSession call on turn timeout")
 	}
 }
 

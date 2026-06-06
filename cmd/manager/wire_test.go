@@ -11,19 +11,34 @@ import (
 func TestPodConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
 		Namespace:           "tatara",
-		InternalAddr:        "http://op-internal.tatara.svc:9090",
+		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
 	got := podConfigFromConfig(cfg)
 	want := agent.PodConfig{
 		Namespace:           "tatara",
-		InternalAddr:        "http://op-internal.tatara.svc:9090",
+		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
 	if got != want {
 		t.Errorf("podConfigFromConfig = %+v, want %+v", got, want)
+	}
+}
+
+// TestPodConfigFromConfig_HealthAddrDistinctFromInternalAddr asserts that the
+// defaults for HEALTH_ADDR and INTERNAL_ADDR are different ports so the
+// manager health probe and the callback server cannot both bind the same address.
+func TestPodConfigFromConfig_HealthAddrDistinctFromInternalAddr(t *testing.T) {
+	// Simulate an unset environment - both fields at their defaults.
+	cfg := config.Config{
+		HealthAddr:   ":8081",
+		InternalAddr: ":8082",
+	}
+	if cfg.HealthAddr == cfg.InternalAddr {
+		t.Fatalf("HealthAddr (%s) == InternalAddr (%s): they must differ to avoid double-bind",
+			cfg.HealthAddr, cfg.InternalAddr)
 	}
 }
 

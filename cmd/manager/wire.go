@@ -69,7 +69,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 	return agent.PodConfig{
 		Namespace:           cfg.Namespace,
-		InternalAddr:        cfg.InternalAddr,
+		CallbackURL:         cfg.CallbackURL,
 		AnthropicSecretName: cfg.AnthropicSecretName,
 		CLIOIDCSecretName:   cfg.CLIOIDCSecretName,
 	}
@@ -117,7 +117,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Session:   agent.NewHTTPSession(wrapperTokens.Token),
 		Namespace: cfg.Namespace,
 	}
-	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: normalizeAddr(cfg.InternalAddr)}); err != nil {
+	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return fmt.Errorf("add callback server: %w", err)
 	}
 	return nil
@@ -130,26 +130,4 @@ type callbackRunnable struct {
 
 func (c callbackRunnable) Start(ctx context.Context) error {
 	return c.srv.Start(ctx, c.addr)
-}
-
-// normalizeAddr converts INTERNAL_ADDR (which may be a full URL like
-// http://tatara-operator-internal.tatara.svc:9090 used as DEFAULT_CALLBACK_URL
-// base, or a raw listen address like :8081) into a net listen address (:port).
-// INTERNAL_ADDR is dual-purpose: the full URL drives the wrapper pod env;
-// the listen port is what the callback server binds to.
-func normalizeAddr(internalAddr string) string {
-	// If it starts with a scheme, strip everything before the last colon-group.
-	if len(internalAddr) > 0 && internalAddr[0] != ':' {
-		// Find the last colon to extract :port.
-		last := -1
-		for i := 0; i < len(internalAddr); i++ {
-			if internalAddr[i] == ':' {
-				last = i
-			}
-		}
-		if last >= 0 {
-			return internalAddr[last:]
-		}
-	}
-	return internalAddr
 }

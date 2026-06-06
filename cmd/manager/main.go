@@ -38,7 +38,7 @@ func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, e
 		Metrics: metricsserver.Options{
 			BindAddress: cfg.MetricsAddr,
 		},
-		HealthProbeBindAddress: cfg.InternalAddr,
+		HealthProbeBindAddress: cfg.HealthAddr,
 	})
 }
 

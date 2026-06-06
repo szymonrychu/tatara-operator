@@ -7,10 +7,23 @@ import (
 
 // Config holds the env-scalar configuration for the operator. Each field is
 // populated from an env var injected via the chart ConfigMap/Secret (rule 6).
+//
+// Four distinct listen addresses:
+//   - HealthAddr    (HEALTH_ADDR,   :8081) - manager health/readyz probe bind
+//   - InternalAddr  (INTERNAL_ADDR, :8082) - callback server bind (not exposed via ingress)
+//   - MetricsAddr   (METRICS_ADDR,  :9090) - Prometheus /metrics bind
+//   - HTTPAddr      (HTTP_ADDR,     :8080) - SCM webhook + REST API bind
+//
+// CallbackURL (CALLBACK_URL) is the full routable in-cluster base URL the
+// wrapper Pod POSTs to, e.g. http://tatara-operator-internal.tatara.svc:8082.
+// M6 MUST set this to the operator's callback Service DNS and expose
+// INTERNAL_ADDR on that Service.
 type Config struct {
 	HTTPAddr                 string
 	MetricsAddr              string
+	HealthAddr               string
 	InternalAddr             string
+	CallbackURL              string
 	OIDCIssuer               string
 	OIDCAudience             string
 	MemoryBaseURL            string
@@ -38,7 +51,9 @@ func Load() (Config, error) {
 	cfg := Config{
 		HTTPAddr:                 getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:              getDefault("METRICS_ADDR", ":9090"),
-		InternalAddr:             getDefault("INTERNAL_ADDR", ":8081"),
+		HealthAddr:               getDefault("HEALTH_ADDR", ":8081"),
+		InternalAddr:             getDefault("INTERNAL_ADDR", ":8082"),
+		CallbackURL:              os.Getenv("CALLBACK_URL"),
 		OIDCIssuer:               os.Getenv("OIDC_ISSUER"),
 		OIDCAudience:             os.Getenv("OIDC_AUDIENCE"),
 		MemoryBaseURL:            os.Getenv("MEMORY_BASE_URL"),

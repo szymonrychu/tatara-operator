@@ -10,7 +10,9 @@ func TestLoad(t *testing.T) {
 	env := map[string]string{
 		"HTTP_ADDR":                   ":8080",
 		"METRICS_ADDR":                ":9090",
-		"INTERNAL_ADDR":               ":8081",
+		"HEALTH_ADDR":                 ":8081",
+		"INTERNAL_ADDR":               ":8082",
+		"CALLBACK_URL":                "http://tatara-operator-internal.tatara.svc:8082",
 		"OIDC_ISSUER":                 "https://kc/realms/tatara",
 		"OIDC_AUDIENCE":               "tatara-operator",
 		"MEMORY_BASE_URL":             "http://tatara-memory:8080",
@@ -38,7 +40,9 @@ func TestLoad(t *testing.T) {
 	}{
 		{"HTTPAddr", cfg.HTTPAddr, ":8080"},
 		{"MetricsAddr", cfg.MetricsAddr, ":9090"},
-		{"InternalAddr", cfg.InternalAddr, ":8081"},
+		{"HealthAddr", cfg.HealthAddr, ":8081"},
+		{"InternalAddr", cfg.InternalAddr, ":8082"},
+		{"CallbackURL", cfg.CallbackURL, "http://tatara-operator-internal.tatara.svc:8082"},
 		{"OIDCIssuer", cfg.OIDCIssuer, "https://kc/realms/tatara"},
 		{"OIDCAudience", cfg.OIDCAudience, "tatara-operator"},
 		{"MemoryBaseURL", cfg.MemoryBaseURL, "http://tatara-memory:8080"},
@@ -64,5 +68,23 @@ func TestLoad_MissingRequired(t *testing.T) {
 	t.Setenv("OIDC_AUDIENCE", "")
 	if _, err := config.Load(); err == nil {
 		t.Fatal("expected error for missing required OIDC_ISSUER/OIDC_AUDIENCE")
+	}
+}
+
+// TestLoad_Defaults asserts that HealthAddr and InternalAddr have distinct
+// defaults so they cannot both bind the same port (which would cause
+// "address already in use" at startup).
+func TestLoad_Defaults(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	// Do not set HEALTH_ADDR or INTERNAL_ADDR so defaults apply.
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.HealthAddr == cfg.InternalAddr {
+		t.Fatalf("HealthAddr (%s) == InternalAddr (%s): they must be distinct to avoid double-bind",
+			cfg.HealthAddr, cfg.InternalAddr)
 	}
 }

@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -24,11 +26,13 @@ const (
 	capRequeue        = 15 * time.Second
 	pollRequeue       = 30 * time.Second
 	maxPodRecreations = 3
+	turnTimeoutGrace  = 60 * time.Second
 
 	annCurrentTurn    = "tatara.dev/current-turn"
 	annCurrentSubtask = "tatara.dev/current-subtask"
 	annTurnComplete   = "tatara.dev/turn-complete"
 	annPodRecreations = "tatara.dev/pod-recreations"
+	annTurnStartedAt  = "tatara.dev/turn-started-at"
 )
 
 // TaskReconciler spawns one wrapper session per Task and drives it turn by
@@ -202,7 +206,7 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 }
 
 func (r *TaskReconciler) podRecreations(task *tatarav1alpha1.Task) int {
-	n, _ := atoiSafe(task.Annotations[annPodRecreations])
+	n, _ := strconv.Atoi(task.Annotations[annPodRecreations])
 	return n
 }
 
@@ -214,23 +218,9 @@ func (r *TaskReconciler) bumpRecreations(ctx context.Context, task *tatarav1alph
 	if fresh.Annotations == nil {
 		fresh.Annotations = map[string]string{}
 	}
-	n, _ := atoiSafe(fresh.Annotations[annPodRecreations])
-	fresh.Annotations[annPodRecreations] = fmt.Sprintf("%d", n+1)
+	n, _ := strconv.Atoi(fresh.Annotations[annPodRecreations])
+	fresh.Annotations[annPodRecreations] = strconv.Itoa(n + 1)
 	return r.Update(ctx, fresh)
-}
-
-func atoiSafe(s string) (int, bool) {
-	n := 0
-	if s == "" {
-		return 0, false
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n, true
 }
 
 // podReady reports whether the wrapper Pod has the Ready condition true.
@@ -254,7 +244,7 @@ func (r *TaskReconciler) podReady(ctx context.Context, task *tatarav1alpha1.Task
 // Subtask per delivered turn-complete callback.
 func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	baseURL := agent.BaseURL(task, task.Namespace)
-	cbURL := r.PodConfig.InternalAddr + "/internal/turn-complete"
+	cbURL := strings.TrimSuffix(r.PodConfig.CallbackURL, "/") + "/internal/turn-complete"
 
 	current := task.Annotations[annCurrentTurn]
 
@@ -267,14 +257,18 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		return r.recordTurn(ctx, task, id, "")
 	}
 
-	// Turn in flight, no callback yet -> wait (backstop poll handled in Task 9).
+	// Turn in flight, no callback yet -> check for timeout, otherwise wait.
 	if task.Annotations[annTurnComplete] == "" {
+		if r.isTurnTimedOut(project, task) {
+			return r.terminate(ctx, task, "Failed", "TurnTimeout",
+				fmt.Sprintf("turn %s exceeded timeout", current))
+		}
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
 	// A callback arrived. Mark the executing Subtask Done (if any).
 	if prev := task.Annotations[annCurrentSubtask]; prev != "" {
-		if err := r.markSubtaskDone(ctx, prev, current); err != nil {
+		if err := r.markSubtaskDone(ctx, task.Namespace, prev, current); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -342,6 +336,7 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 	hadCallback := fresh.Annotations[annTurnComplete] != ""
 	fresh.Annotations[annCurrentTurn] = turnID
 	fresh.Annotations[annCurrentSubtask] = subtaskName
+	fresh.Annotations[annTurnStartedAt] = time.Now().UTC().Format(time.RFC3339)
 	delete(fresh.Annotations, annTurnComplete)
 	if err := r.Update(ctx, fresh); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
@@ -357,9 +352,9 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 
 // markSubtaskDone sets a Subtask Done, recording the turn id (its result is
 // written by the callback before this reconcile runs).
-func (r *TaskReconciler) markSubtaskDone(ctx context.Context, name, turnID string) error {
+func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, name, turnID string) error {
 	st := &tatarav1alpha1.Subtask{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: r.PodConfig.Namespace, Name: name}, st); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: taskNamespace, Name: name}, st); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -417,6 +412,26 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	}
 	r.updateInflightGauge(ctx)
 	return ctrl.Result{}, nil
+}
+
+// isTurnTimedOut reports whether the in-flight turn has exceeded
+// project.spec.agent.turnTimeoutSeconds + turnTimeoutGrace. It returns false
+// when the annotation is absent or unparseable (safe default: keep waiting).
+func (r *TaskReconciler) isTurnTimedOut(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
+	raw := task.Annotations[annTurnStartedAt]
+	if raw == "" {
+		return false
+	}
+	startedAt, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	timeout := project.Spec.Agent.TurnTimeoutSeconds
+	if timeout <= 0 {
+		timeout = 1800
+	}
+	deadline := startedAt.Add(time.Duration(timeout)*time.Second + turnTimeoutGrace)
+	return time.Now().After(deadline)
 }
 
 // updateInflightGauge sets operator_tasks_inflight to the count of active Tasks.

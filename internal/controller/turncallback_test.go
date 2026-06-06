@@ -106,3 +106,69 @@ func TestResolveTaskByTurn(t *testing.T) {
 	_ = types.NamespacedName{}
 	_ = time.Now
 }
+
+// ----- Fix 3: empty turnId -> 400, no Task mutated -----
+
+func TestTurnComplete_EmptyTurnID_Returns400(t *testing.T) {
+	cb := newCallbackServer()
+	body, _ := json.Marshal(map[string]any{"turnId": "", "state": "completed"})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for empty turnId", w.Code)
+	}
+}
+
+func TestTurnComplete_MissingTurnID_Returns400(t *testing.T) {
+	cb := newCallbackServer()
+	// Omit turnId entirely from the body.
+	body, _ := json.Marshal(map[string]any{"state": "completed"})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for missing turnId", w.Code)
+	}
+}
+
+func TestResolveTaskByTurn_SkipsEmptyAnnotation(t *testing.T) {
+	// Create a Task with no annCurrentTurn annotation (empty string).
+	mkTaskProject(t, "p-skip", 3)
+	mkTaskRepository(t, "r-skip", "p-skip")
+	mkTask(t, "t-skip-empty", "p-skip", "r-skip")
+	// t-skip-empty has no annCurrentTurn -> resolveTaskByTurn must NOT match it.
+
+	cb := newCallbackServer()
+	// Searching for empty string must return errTurnNotFound (not t-skip-empty).
+	_, err := cb.resolveTaskByTurn(context.Background(), "")
+	if err == nil {
+		t.Error("expected error resolving empty turnId: Tasks with empty annCurrentTurn must be skipped")
+	}
+}
+
+// ----- Fix 2: per-turn timeout in poll backstop -----
+
+func TestPollOnce_ExpiresTurnTimeout(t *testing.T) {
+	mkTaskProject(t, "p-timeout", 3)
+	mkTaskRepository(t, "r-timeout", "p-timeout")
+	mkTask(t, "t-timeout", "p-timeout", "r-timeout")
+	setTaskPhase(t, "t-timeout", "Running")
+	// Seed turn-started-at far in the past to simulate a timed-out turn.
+	annotate(t, "t-timeout", map[string]string{
+		annCurrentTurn:   "turn-stale",
+		annTurnStartedAt: "2000-01-01T00:00:00Z",
+	})
+
+	cb := newCallbackServer()
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-timeout")
+	if tk.Status.Phase != "Failed" {
+		t.Errorf("phase = %q, want Failed after turn timeout", tk.Status.Phase)
+	}
+	cond := findCond(tk.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "TurnTimeout" {
+		t.Errorf("expected Ready/TurnTimeout condition, got %+v", cond)
+	}
+}

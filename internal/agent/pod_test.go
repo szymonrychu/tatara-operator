@@ -32,7 +32,7 @@ func sampleInputs() (*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatar
 	}
 	cfg := agent.PodConfig{
 		Namespace:           "tatara",
-		InternalAddr:        "http://tatara-operator-internal.tatara.svc:9090",
+		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
@@ -84,7 +84,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"MODEL":                "claude-x",
 		"PERMISSION_MODE":      "bypassPermissions",
 		"TURN_TIMEOUT_SECONDS": "1800",
-		"DEFAULT_CALLBACK_URL": "http://tatara-operator-internal.tatara.svc:9090/internal/turn-complete",
+		"DEFAULT_CALLBACK_URL": "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)
@@ -116,6 +116,23 @@ func TestBuildPod_SecretEnv(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "tatara-cli-oidc", csec.Name)
 	require.Equal(t, "client-secret", csec.Key)
+}
+
+// TestBuildPod_CallbackURLFromConfig asserts that DEFAULT_CALLBACK_URL is
+// derived from PodConfig.CallbackURL (not a bind address) and that a trailing
+// slash in CallbackURL is stripped before appending the path.
+func TestBuildPod_CallbackURLFromConfig(t *testing.T) {
+	proj, repo, task, _ := sampleInputs()
+	cfg := agent.PodConfig{
+		Namespace:           "tatara",
+		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082/",
+		AnthropicSecretName: "anthropic",
+		CLIOIDCSecretName:   "tatara-cli-oidc",
+	}
+	c := agent.BuildPod(proj, repo, task, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "DEFAULT_CALLBACK_URL")
+	require.True(t, ok)
+	require.Equal(t, "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete", got)
 }
 
 func TestBuildPod_PortAndReadiness(t *testing.T) {
