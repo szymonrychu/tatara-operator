@@ -21,16 +21,19 @@ Planned work not yet started. One line per item; link to plans for detail.
   via REST (httptest-faked); TaskReconciler write-back on Succeeded (envtest);
   webhook work-item -> Task (httptest, signed payload, fake client);
   scm.ByProvider wired into main. All tests green, lint clean.
-- [x] M6 chart + deploy wiring (Tasks 1-9 done) - chart hardened: 4-port Deployment, dual-Service (main + internal callback), ConfigMap/Secret envFrom, RBAC (namespaced Role + CRD-reader ClusterRole), tatara-ingest SA+Role (M1 follow-up), managed-pod NetworkPolicy, ServiceMonitor, Ingress (cluster-agnostic). helm lint clean, 15 objects. Tasks 10-13 (chart publish, Keycloak client, infra helmfile release) are out-of-band. Plan: docs/superpowers/plans/2026-06-06-tatara-operator-m6-chart-deploy.md.
+- [x] M6 chart + deploy wiring - chart hardened: 4-port Deployment, dual-Service (main + internal callback), ConfigMap/Secret envFrom, RBAC (namespaced Role + CRD-reader ClusterRole), tatara-ingest SA+Role (M1 follow-up), managed-pod NetworkPolicy, ServiceMonitor, Ingress (cluster-agnostic). helm lint clean, 15 objects (14 plan + internal Service). Keycloak confidential client + audience mapper added to infra/terraform/keycloak/tatara_clients.tf. tatara-operator release added to infra helmfile tatara bucket (OCI chart 0.1.0) with common+default+sops values. All gated deploy steps listed below. Plan: docs/superpowers/plans/2026-06-06-tatara-operator-m6-chart-deploy.md.
 
-## Deploy follow-ons (out-of-band, before first real run)
+## Deploy follow-ons (gated - require human action in this order)
 
-- [ ] Set callbackUrl in infra values to http://tatara-operator-internal.tatara.svc:8082 (the internal Service DNS).
-- [ ] Add tatara.dev/managed-by=tatara-operator label to M1 ingest Job pod template (internal/ingest/job.go) and M4 agent Pod (internal/agent/pod.go) or the NetworkPolicy will not select them.
-- [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.1.0 before helmfile pins chart 0.1.0.
-- [ ] Build + push tatara-claude-code-wrapper and tatara-memory-repo-ingester images; operator cannot run agents or ingest until both are published.
-- [ ] Replicate ANTHROPIC_API_KEY into tatara namespace as Secret tatara-anthropic (not chart-rendered).
-- [ ] Create tatara-cli-oidc Secret in tatara namespace (wrapper's tatara-cli mints operator/memory/chat tokens).
-- [ ] Create per-Project SCM Secrets (keys: token, webhookSecret) in tatara namespace, one per Project (not chart-rendered).
-- [ ] Task 12: Add tatara-operator confidential Keycloak client + audience mapper in infra/terraform/keycloak/tatara_clients.tf.
-- [ ] Task 13: Add tatara-operator release to infra helmfile tatara bucket; run helmfile diff before apply.
+1. [ ] Add tatara.dev/managed-by=tatara-operator label to M1 ingest Job pod template (internal/ingest/job.go) and M4 agent Pod (internal/agent/pod.go) or the NetworkPolicy will not select them.
+2. [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.1.0 (operator image) to harbor.
+3. [ ] Build + push tatara-claude-code-wrapper image to harbor; operator cannot run agents until published.
+4. [ ] Build + push tatara-memory-repo-ingester image to harbor; operator cannot run ingest until published.
+5. [ ] `terraform -chdir=infra/terraform/keycloak apply` - creates the tatara-operator confidential client + audience mapper (3 resources). Gate: review `terraform plan` output first.
+6. [ ] Capture `terraform -chdir=infra/terraform/keycloak output -raw tatara_operator_client_secret` and populate the real value into `infra/helmfile/helmfiles/tatara/values/tatara-operator/default.secrets.yaml` via `sops-secret-helper` skill (placeholder currently reads REPLACE_WITH_KEYCLOAK_OUTPUT).
+7. [ ] Publish OCI chart: `helm package charts/tatara-operator -d /tmp && helm push /tmp/tatara-operator-0.1.0.tgz oci://harbor.szymonrichert.pl/charts` (from tatara-operator main, not a worktree).
+8. [ ] Replicate ANTHROPIC_API_KEY into tatara namespace as Secret tatara-anthropic (not chart-rendered; use reflector or sops-encrypted manifest).
+9. [ ] Create tatara-cli-oidc Secret in tatara namespace (keys: clientId, clientSecret for the tatara-cli public client; the wrapper's tatara-cli mints operator/memory/chat tokens via device flow).
+10. [ ] Create per-Project SCM Secrets (keys: token, webhookSecret) in tatara namespace, one per Project (not chart-rendered; see default.secrets.yaml comments).
+11. [ ] `helmfile -e default -f infra/helmfile/helmfiles/tatara/helmfile.yaml.gotmpl -l application=tatara-operator diff` - review diff (should show 15 objects + 4 CRDs as net-new). Gate: present to human before apply.
+12. [ ] `helmfile -e default -f infra/helmfile/helmfiles/tatara/helmfile.yaml.gotmpl -l application=tatara-operator apply` - ONLY after all above preconditions are satisfied and the human has reviewed the diff.
