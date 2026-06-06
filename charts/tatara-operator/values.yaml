@@ -1,0 +1,43 @@
+# Image. tag defaults to chart appVersion when empty.
+image:
+  repository: harbor.szymonrichert.pl/containers/tatara-operator
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# Listener addresses (camelCase scalar -> kebab-case ConfigMap key -> envFrom).
+httpAddr: ":8080"
+metricsAddr: ":9090"
+internalAddr: ":8081"
+
+# OIDC.
+oidcIssuer: ""
+oidcAudience: "tatara-operator"
+
+# Upstreams and identities.
+memoryBaseURL: ""
+ingesterImage: ""
+externalWebhookBase: ""
+operatorOidcClientId: "tatara-operator"
+
+# Secret-shaped scalars (rendered into the Secret).
+operatorOidcClientSecret: ""
+
+# Names of pre-existing secrets the operator references for spawned pods.
+anthropicSecretName: ""
+cliOidcSecretName: ""
+
+logLevel: "info"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+serviceAccount:
+  create: true
+  name: ""

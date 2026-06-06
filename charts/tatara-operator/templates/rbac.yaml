@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["tatara.dev"]
+    resources: ["projects", "repositories", "tasks", "subtasks"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["tatara.dev"]
+    resources: ["projects/status", "repositories/status", "tasks/status", "subtasks/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "tatara-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tatara-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
