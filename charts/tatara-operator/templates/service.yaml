@@ -2,16 +2,40 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "tatara-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 spec:
-  type: ClusterIP
-  selector:
-    {{- include "tatara-operator.selectorLabels" . | nindent 4 }}
+  type: {{ .Values.service.type }}
   ports:
     - name: http
-      port: 8080
+      port: {{ .Values.service.httpPort }}
       targetPort: http
+      protocol: TCP
     - name: metrics
-      port: 9090
+      port: {{ .Values.service.metricsPort }}
       targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "tatara-operator.selectorLabels" . | nindent 4 }}
+---
+# Separate ClusterIP Service for the internal turn-complete callback (INTERNAL_ADDR :8082).
+# Wrapper pods POST to this Service; it is NOT exposed via ingress.
+# CALLBACK_URL in the ConfigMap must point to this Service's in-cluster DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}-internal
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: internal
+spec:
+  type: ClusterIP
+  ports:
+    - name: internal
+      port: 8082
+      targetPort: internal
+      protocol: TCP
+  selector:
+    {{- include "tatara-operator.selectorLabels" . | nindent 4 }}
