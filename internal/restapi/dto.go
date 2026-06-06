@@ -137,9 +137,6 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 	return d
 }
 
-// keep compiler happy until Task 4 wires listRepositories
-var _ = toRepositoryDTO
-
 func toSubtaskDTO(st tatarav1alpha1.Subtask) SubtaskDTO {
 	return SubtaskDTO{
 		Name: st.Name, TaskRef: st.Spec.TaskRef, Title: st.Spec.Title,

@@ -66,3 +66,41 @@ func TestGetProject_NotFound(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/missing", nil))
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
+
+func repository(name, projectRef string) *tatarav1alpha1.Repository {
+	return &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: projectRef, URL: "https://git/" + name, DefaultBranch: "main", IngestEnabled: true},
+	}
+}
+
+func task(name, projectRef string) *tatarav1alpha1.Task {
+	return &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: projectRef, RepositoryRef: "repo", Goal: "g"},
+	}
+}
+
+func TestListRepositories_FilteredByProject(t *testing.T) {
+	r := buildRouter(t, repository("r1", "alpha"), repository("r2", "alpha"), repository("r3", "beta"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/alpha/repositories", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	var out []restapi.RepositoryDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.Len(t, out, 2)
+	for _, d := range out {
+		require.Equal(t, "alpha", d.ProjectRef)
+	}
+}
+
+func TestListTasks_FilteredByProject(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"), task("t2", "beta"))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/alpha/tasks", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	var out []restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.Len(t, out, 1)
+	require.Equal(t, "t1", out[0].Name)
+}

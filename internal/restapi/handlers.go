@@ -52,12 +52,41 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toProjectDTO(p))
 }
 
-func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) { notImplemented(w) }
-func (s *Server) listTasks(w http.ResponseWriter, r *http.Request)        { notImplemented(w) }
-func (s *Server) getTask(w http.ResponseWriter, r *http.Request)          { notImplemented(w) }
-func (s *Server) patchTask(w http.ResponseWriter, r *http.Request)        { notImplemented(w) }
-func (s *Server) listSubtasks(w http.ResponseWriter, r *http.Request)     { notImplemented(w) }
-func (s *Server) createSubtask(w http.ResponseWriter, r *http.Request)    { notImplemented(w) }
-func (s *Server) patchSubtask(w http.ResponseWriter, r *http.Request)     { notImplemented(w) }
+func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
+	proj := chi.URLParam(r, "p")
+	var list tatarav1alpha1.RepositoryList
+	if err := s.c.List(r.Context(), &list, client.InNamespace(s.ns)); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	out := make([]RepositoryDTO, 0)
+	for i := range list.Items {
+		if list.Items[i].Spec.ProjectRef == proj {
+			out = append(out, toRepositoryDTO(list.Items[i]))
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
+	proj := chi.URLParam(r, "p")
+	var list tatarav1alpha1.TaskList
+	if err := s.c.List(r.Context(), &list, client.InNamespace(s.ns)); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	out := make([]TaskDTO, 0)
+	for i := range list.Items {
+		if list.Items[i].Spec.ProjectRef == proj {
+			out = append(out, toTaskDTO(list.Items[i]))
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+func (s *Server) getTask(w http.ResponseWriter, r *http.Request)       { notImplemented(w) }
+func (s *Server) patchTask(w http.ResponseWriter, r *http.Request)     { notImplemented(w) }
+func (s *Server) listSubtasks(w http.ResponseWriter, r *http.Request)  { notImplemented(w) }
+func (s *Server) createSubtask(w http.ResponseWriter, r *http.Request) { notImplemented(w) }
+func (s *Server) patchSubtask(w http.ResponseWriter, r *http.Request)  { notImplemented(w) }
 
 func notImplemented(w http.ResponseWriter) { w.WriteHeader(http.StatusNotImplemented) }
