@@ -1,0 +1,204 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/ingest"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// ReingestAnnotation is the RFC3339 timestamp annotation the M2 webhook sets
+// to request an incremental re-ingest.
+const ReingestAnnotation = "tatara.dev/reingest-requested"
+
+// RepositoryReconciler drives ingest Jobs for Repositories.
+type RepositoryReconciler struct {
+	client.Client
+	Scheme       *runtime.Scheme
+	Metrics      *obs.OperatorMetrics
+	IngestConfig ingest.Config
+}
+
+// +kubebuilder:rbac:groups=tatara.dev,resources=repositories,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tatara.dev,resources=repositories/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
+
+// Reconcile launches and tracks the ingest Job for a Repository per the
+// re-ingest trigger contract.
+func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+
+	var repo tataradevv1alpha1.Repository
+	if err := r.Get(ctx, req.NamespacedName, &repo); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
+	}
+
+	if !repo.Spec.IngestEnabled {
+		return ctrl.Result{}, nil
+	}
+
+	// Concurrency guard: a named Job that still exists blocks new launches.
+	if repo.Status.JobName != "" {
+		var job batchv1.Job
+		err := r.Get(ctx, types.NamespacedName{Namespace: repo.Namespace, Name: repo.Status.JobName}, &job)
+		switch {
+		case err == nil && jobActive(&job):
+			l.Info("ingest job still active, requeueing",
+				"action", "ingest_guard", "resource_id", repo.Name, "job", repo.Status.JobName)
+			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+		case err == nil:
+			// terminal job handled by Task 5 result-apply path
+			return r.handleFinishedJob(ctx, &repo, &job)
+		case apierrors.IsNotFound(err):
+			// Job vanished (TTL/manual delete); clear and re-evaluate.
+			repo.Status.JobName = ""
+			if err := r.Status().Update(ctx, &repo); err != nil {
+				r.Metrics.ReconcileResult("Repository", "error")
+				return ctrl.Result{}, fmt.Errorf("clear stale jobName: %w", err)
+			}
+		default:
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("get ingest job: %w", err)
+		}
+	}
+
+	since, want := r.ingestDecision(&repo)
+	if !want {
+		r.Metrics.ReconcileResult("Repository", "success")
+		return ctrl.Result{}, nil
+	}
+
+	var project tataradevv1alpha1.Project
+	if err := r.Get(ctx, types.NamespacedName{Namespace: repo.Namespace, Name: repo.Spec.ProjectRef}, &project); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("get owning project %q: %w", repo.Spec.ProjectRef, err)
+	}
+
+	if err := r.ensureResultConfigMap(ctx, &repo); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("ensure result configmap: %w", err)
+	}
+
+	job := ingest.BuildJob(&project, &repo, since, r.IngestConfig)
+	if err := r.Create(ctx, job); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("create ingest job: %w", err)
+	}
+
+	repo.Status.JobName = job.Name
+	repo.Status.Phase = "Ingesting"
+	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+		Type:               "Ingested",
+		Status:             metav1.ConditionFalse,
+		Reason:             "IngestStarted",
+		Message:            "ingest job " + job.Name + " launched",
+		ObservedGeneration: repo.Generation,
+	})
+	if err := r.Status().Update(ctx, &repo); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
+	}
+
+	l.Info("launched ingest job",
+		"action", "ingest_start", "resource_id", repo.Name, "job", job.Name,
+		"incremental", since != "")
+	r.Metrics.ReconcileResult("Repository", "success")
+	return ctrl.Result{}, nil
+}
+
+// ingestDecision returns (sinceSHA, wantIngest). Full ingest (empty since)
+// when lastIngestedCommit is empty. Incremental (since=lastIngestedCommit)
+// when the reingest-requested annotation is newer than lastIngestTime.
+func (r *RepositoryReconciler) ingestDecision(repo *tataradevv1alpha1.Repository) (string, bool) {
+	if repo.Status.LastIngestedCommit == "" {
+		return "", true
+	}
+	raw := repo.Annotations[ReingestAnnotation]
+	if raw == "" {
+		return "", false
+	}
+	requested, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return "", false
+	}
+	// LastIngestTime is *metav1.Time; treat nil as zero time (always older).
+	var lastIngestTime time.Time
+	if repo.Status.LastIngestTime != nil {
+		lastIngestTime = repo.Status.LastIngestTime.Time
+	}
+	if requested.After(lastIngestTime) {
+		return repo.Status.LastIngestedCommit, true
+	}
+	return "", false
+}
+
+// ensureResultConfigMap creates the empty <repo>-ingest-result ConfigMap
+// (owner-ref Repository) if absent so the Job can patch it and the reconciler
+// can read it back.
+func (r *RepositoryReconciler) ensureResultConfigMap(ctx context.Context, repo *tataradevv1alpha1.Repository) error {
+	cm := &corev1.ConfigMap{}
+	cm.Name = ingest.ResultConfigMapName(repo)
+	cm.Namespace = repo.Namespace
+	if err := r.Get(ctx, types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}, cm); err == nil {
+		return nil
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get result configmap: %w", err)
+	}
+	cm = &corev1.ConfigMap{}
+	cm.Name = ingest.ResultConfigMapName(repo)
+	cm.Namespace = repo.Namespace
+	cm.Data = map[string]string{"sha": ""}
+	if err := controllerutil.SetControllerReference(repo, cm, r.Scheme); err != nil {
+		return fmt.Errorf("set ownerref on result configmap: %w", err)
+	}
+	if err := r.Create(ctx, cm); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create result configmap: %w", err)
+	}
+	return nil
+}
+
+// handleFinishedJob is implemented in Task 5; for Task 4 it requeues so the
+// guard does not loop. Replaced wholesale by the Task 5 version.
+func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tataradevv1alpha1.Repository, job *batchv1.Job) (ctrl.Result, error) {
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// jobActive reports whether a Job has neither completed nor failed.
+func jobActive(job *batchv1.Job) bool {
+	for _, c := range job.Status.Conditions {
+		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
+			return false
+		}
+	}
+	return true
+}
+
+// SetupWithManager registers the reconciler, watching Repositories and the
+// Jobs they own.
+func (r *RepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&tataradevv1alpha1.Repository{}).
+		Owns(&batchv1.Job{}).
+		Owns(&corev1.ConfigMap{}).
+		Complete(r)
+}
