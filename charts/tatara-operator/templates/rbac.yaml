@@ -1,25 +1,36 @@
+{{- if .Values.rbac.create }}
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: Role
 metadata:
-  name: {{ include "tatara-operator.fullname" . }}
+  name: {{ include "tatara-operator.fullname" . }}-manager
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 rules:
+  # CRDs reconciled by the manager (full CRUD on CRs + status subresource).
   - apiGroups: ["tatara.dev"]
     resources: ["projects", "repositories", "tasks", "subtasks"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["tatara.dev"]
     resources: ["projects/status", "repositories/status", "tasks/status", "subtasks/status"]
     verbs: ["get", "update", "patch"]
+  # ingest Jobs (batch).
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # agent Pods + Services (M4); ingest-result ConfigMaps (M1); events.
   - apiGroups: [""]
     resources: ["pods", "services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Project SCM Secrets (read only: token + webhookSecret).
+  - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  # NetworkPolicies: chart applies the managed-pod policy; operator may create
+  # per-Project policies at runtime.
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -28,16 +39,45 @@ rules:
     verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "tatara-operator.fullname" . }}-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tatara-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Cluster-scoped ClusterRole: read CRD resources (cluster-scoped by definition).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}-crd-reader
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "tatara-operator.fullname" . }}
+  name: {{ include "tatara-operator.fullname" . }}-crd-reader
   labels:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "tatara-operator.fullname" . }}
+  name: {{ include "tatara-operator.fullname" . }}-crd-reader
 subjects:
   - kind: ServiceAccount
     name: {{ include "tatara-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- end }}
