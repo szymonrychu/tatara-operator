@@ -2,18 +2,8 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "tatara-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 data:
-  HTTP_ADDR: {{ .Values.httpAddr | quote }}
-  METRICS_ADDR: {{ .Values.metricsAddr | quote }}
-  INTERNAL_ADDR: {{ .Values.internalAddr | quote }}
-  OIDC_ISSUER: {{ .Values.oidcIssuer | quote }}
-  OIDC_AUDIENCE: {{ .Values.oidcAudience | quote }}
-  MEMORY_BASE_URL: {{ .Values.memoryBaseURL | quote }}
-  INGESTER_IMAGE: {{ .Values.ingesterImage | quote }}
-  EXTERNAL_WEBHOOK_BASE: {{ .Values.externalWebhookBase | quote }}
-  OPERATOR_OIDC_CLIENT_ID: {{ .Values.operatorOidcClientId | quote }}
-  ANTHROPIC_SECRET_NAME: {{ .Values.anthropicSecretName | quote }}
-  CLI_OIDC_SECRET_NAME: {{ .Values.cliOidcSecretName | quote }}
-  LOG_LEVEL: {{ .Values.logLevel | quote }}
+  {{- include "tatara-operator.envConfig" . | nindent 2 }}
