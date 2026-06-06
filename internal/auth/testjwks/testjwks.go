@@ -26,8 +26,8 @@ type Server struct {
 	closeOnce sync.Once
 }
 
-// Start creates a new test JWKS server and registers cleanup on t.
-func Start(t *testing.T) *Server {
+// NewServer creates a new test JWKS server and registers cleanup on t.
+func NewServer(t *testing.T) *Server {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -62,12 +62,6 @@ func Start(t *testing.T) *Server {
 	return s
 }
 
-// NewServer is an alias for Start.
-func NewServer(t *testing.T) *Server {
-	t.Helper()
-	return Start(t)
-}
-
 // Close shuts down the test server. Idempotent.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
@@ -78,9 +72,6 @@ func (s *Server) Close() {
 // Issuer returns the base URL of the test server (acts as OIDC issuer).
 func (s *Server) Issuer() string { return s.issuer }
 
-// JWKSURL returns the JWKS endpoint URL.
-func (s *Server) JWKSURL() string { return s.issuer + "/jwks.json" }
-
 // Claims holds parameters for signing a test token.
 type Claims struct {
 	Issuer    string
@@ -90,36 +81,6 @@ type Claims struct {
 	IssuedAt  time.Time
 	ExpiresAt time.Time
 	Extra     map[string]any
-}
-
-// SignToken signs a JWT using a map of claim name -> value.
-// Standard claims default when absent: iss=server issuer, iat/nbf=now, exp=now+1h.
-func (s *Server) SignToken(claims map[string]interface{}) string {
-	s.t.Helper()
-	now := time.Now()
-
-	mc := jwt.MapClaims{}
-	for k, v := range claims {
-		mc[k] = v
-	}
-	if _, ok := mc["iss"]; !ok {
-		mc["iss"] = s.issuer
-	}
-	if _, ok := mc["iat"]; !ok {
-		mc["iat"] = now.Unix()
-	}
-	if _, ok := mc["nbf"]; !ok {
-		mc["nbf"] = now.Unix()
-	}
-	if _, ok := mc["exp"]; !ok {
-		mc["exp"] = now.Add(time.Hour).Unix()
-	}
-
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, mc)
-	tok.Header["kid"] = s.kid
-	signed, err := tok.SignedString(s.key)
-	require.NoError(s.t, err)
-	return signed
 }
 
 // SignTypedToken signs a JWT from a strongly-typed Claims struct.

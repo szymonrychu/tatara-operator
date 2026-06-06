@@ -5,9 +5,7 @@ import (
 	"log/slog"
 	"os"
 
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -27,10 +25,6 @@ func newScheme() *runtime.Scheme {
 	return s
 }
 
-func corePodGVK() schema.GroupVersionKind {
-	return corev1.SchemeGroupVersion.WithKind("Pod")
-}
-
 func utilRuntimeMust(err error) {
 	if err != nil {
 		panic(err)
@@ -47,11 +41,13 @@ func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, e
 	})
 }
 
-func run(ctx context.Context, logger *slog.Logger) error {
+func run(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
+	logger := obs.NewLogger(os.Stdout, obs.ParseLevel(cfg.LogLevel))
+	ctrl.SetLogger(slogToLogr(logger))
 	mgr, err := buildManager(cfg, newScheme())
 	if err != nil {
 		return err
@@ -62,7 +58,6 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		return err
 	}
-	// No reconcilers registered in M0; controllers land in M1-M4.
 	logger.Info("starting manager",
 		slog.String("action", "manager_start"),
 		slog.String("version", version.String()),
@@ -72,10 +67,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 }
 
 func main() {
-	logger := obs.NewLogger(os.Stdout, slog.LevelInfo)
-	ctrl.SetLogger(slogToLogr(logger))
-	if err := run(ctrl.SetupSignalHandler(), logger); err != nil {
-		logger.Error("manager exited with error", slog.String("error", err.Error()))
+	bootstrap := obs.NewLogger(os.Stdout, slog.LevelInfo)
+	ctrl.SetLogger(slogToLogr(bootstrap))
+	if err := run(ctrl.SetupSignalHandler()); err != nil {
+		bootstrap.Error("manager exited with error", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 }

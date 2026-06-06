@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	corev1 "k8s.io/api/core/v1"
 
 	apiv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
@@ -19,10 +19,7 @@ func TestNewScheme_RegistersAllKinds(t *testing.T) {
 
 func TestNewScheme_HasCoreTypes(t *testing.T) {
 	s := newScheme()
-	gvk := runtime.NewScheme()
-	_ = gvk
-	// core/v1 Pod must be registered so the manager client can read Secrets/Pods later.
-	if !s.Recognizes(corePodGVK()) {
+	if !s.Recognizes(corev1.SchemeGroupVersion.WithKind("Pod")) {
 		t.Fatal("scheme does not recognize core/v1 Pod")
 	}
 }
