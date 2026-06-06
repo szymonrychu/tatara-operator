@@ -1,0 +1,75 @@
+{{- if .Values.managedPodNetworkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}-managed-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+spec:
+  # Selects all agent + ingest pods. M1 ingest Job pod template and M4 agent Pod
+  # MUST carry this label (code change in internal/ingest/job.go and
+  # internal/agent/pod.go) or this policy will not apply to them.
+  podSelector:
+    matchLabels:
+      tatara.dev/managed-by: tatara-operator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Operator manager -> wrapper agent on the wrapper's HTTP port only.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "tatara-operator.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # tatara-memory service.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tatara-memory
+      ports:
+        - port: 8080
+          protocol: TCP
+    # tatara-chat service.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ .Values.managedPodNetworkPolicy.chatServiceName }}
+      ports:
+        - port: 8080
+          protocol: TCP
+    # Operator REST API (HTTP_ADDR :8080) and internal turn-complete callback
+    # (INTERNAL_ADDR :8082, via the tatara-operator-internal Service).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "tatara-operator.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8082
+          protocol: TCP
+    # SCM hosts (GitHub/GitLab) + Keycloak token endpoint: external HTTPS.
+    # CIDR tightening deferred (brittle IP ranges); broad 443 is the pragmatic
+    # allowlist, matching tatara-memory's existing 443 egress rule.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 443
+          protocol: TCP
+{{- end }}
