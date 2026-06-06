@@ -12,6 +12,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -107,6 +108,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Metrics:   metrics,
 		Session:   agent.NewHTTPSession(wrapperTokens.Token),
 		PodConfig: podConfigFromConfig(cfg),
+		SCMFor: func(provider string) (controller.Writer, error) {
+			return scm.ByProvider(provider)
+		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup TaskReconciler: %w", err)
 	}

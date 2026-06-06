@@ -2,6 +2,7 @@ package scm
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -28,6 +29,18 @@ func SameRemote(a, b string) bool {
 		return false
 	}
 	return na == nb
+}
+
+// ByProvider returns the real Client for a provider name ("github"|"gitlab").
+func ByProvider(name string) (Client, error) {
+	switch name {
+	case "github":
+		return &GitHub{}, nil
+	case "gitlab":
+		return &GitLab{}, nil
+	default:
+		return nil, fmt.Errorf("scm: unknown provider %q", name)
+	}
 }
 
 func normalizeRemote(raw string) (string, bool) {
