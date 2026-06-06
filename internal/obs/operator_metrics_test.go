@@ -1,7 +1,6 @@
 package obs
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -50,6 +49,60 @@ func TestIngestJobDuration(t *testing.T) {
 	}
 }
 
+func TestTurnDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.ObserveTurnDuration(30.0)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_turn_duration_seconds" {
+			found = true
+			if got := mf.GetMetric()[0].GetHistogram().GetSampleCount(); got != 1 {
+				t.Fatalf("sample count = %d, want 1", got)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_turn_duration_seconds not registered")
+	}
+}
+
+func TestWebhookEvent(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.WebhookEvent("github", "push", "accepted")
+	m.WebhookEvent("github", "push", "accepted")
+	m.WebhookEvent("gitlab", "push", "rejected")
+
+	got := testutil.ToFloat64(m.webhookEvents.WithLabelValues("github", "push", "accepted"))
+	if got != 2 {
+		t.Fatalf("github/push/accepted = %v, want 2", got)
+	}
+	got = testutil.ToFloat64(m.webhookEvents.WithLabelValues("gitlab", "push", "rejected"))
+	if got != 1 {
+		t.Fatalf("gitlab/push/rejected = %v, want 1", got)
+	}
+}
+
+func TestTasksInflight(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetTasksInflight(5)
+
+	got := testutil.ToFloat64(m.tasksInflight)
+	if got != 5 {
+		t.Fatalf("tasks_inflight = %v, want 5", got)
+	}
+}
+
 func TestOperatorMetricsNamesStable(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	_ = NewOperatorMetrics(reg)
@@ -57,6 +110,9 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 	want := map[string]bool{
 		"operator_reconcile_total":             false,
 		"operator_ingest_job_duration_seconds": false,
+		"operator_turn_duration_seconds":       false,
+		"operator_webhook_events_total":        false,
+		"operator_tasks_inflight":              false,
 	}
 	for _, mf := range mfs {
 		if _, ok := want[mf.GetName()]; ok {
@@ -68,5 +124,4 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 			t.Errorf("metric %q not registered", name)
 		}
 	}
-	_ = strings.TrimSpace
 }

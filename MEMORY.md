@@ -51,3 +51,5 @@ in spirit; prune only when a decision is reversed.
   existing /metrics endpoint without a second registry or server.
 - 2026-06-06 (M1) config.Config gained Namespace field (NAMESPACE env var,
   default tatara); needed by ingestConfig to namespace the Job and result CM.
+- 2026-06-06 (M1) On ingest Job failure, RepositoryReconciler sets phase=Failed and clears jobName but does NOT bump lastIngestTime; an incremental failure (annotation still newer than lastIngestTime) therefore relaunches on the next reconcile. In-Job retries are bounded by the Job's backoffLimit=2; there is no separate reconciler-level backoff. This is intended.
+- 2026-06-06 obs.Metrics (metrics.go) was dead code: created its own registry, never called in production. Consolidated all 5 platform metrics into OperatorMetrics (operator_metrics.go) on the injected registerer; deleted metrics.go and metrics_test.go.

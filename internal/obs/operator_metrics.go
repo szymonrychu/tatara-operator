@@ -8,6 +8,9 @@ import "github.com/prometheus/client_golang/prometheus"
 type OperatorMetrics struct {
 	reconcileTotal    *prometheus.CounterVec
 	ingestJobDuration prometheus.Histogram
+	turnDuration      prometheus.Histogram
+	webhookEvents     *prometheus.CounterVec
+	tasksInflight     prometheus.Gauge
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -23,13 +26,39 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help:    "Wall-clock duration of completed ingest Jobs.",
 			Buckets: prometheus.ExponentialBuckets(5, 2, 8),
 		}),
+		turnDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "operator_turn_duration_seconds",
+			Help:    "Wall-clock duration of agent turns.",
+			Buckets: prometheus.ExponentialBuckets(5, 2, 8),
+		}),
+		webhookEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_webhook_events_total",
+			Help: "Total webhook events by provider, kind and result.",
+		}, []string{"provider", "kind", "result"}),
+		tasksInflight: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "operator_tasks_inflight",
+			Help: "Number of Tasks currently running.",
+		}),
 	}
-	reg.MustRegister(m.reconcileTotal, m.ingestJobDuration)
-	// Pre-initialise label combinations so the counter vec appears in Gather
-	// even before any reconcile completes.
+	reg.MustRegister(
+		m.reconcileTotal,
+		m.ingestJobDuration,
+		m.turnDuration,
+		m.webhookEvents,
+		m.tasksInflight,
+	)
+	// Pre-initialise label combinations so the counter vecs appear in Gather
+	// even before any reconcile or webhook event completes.
 	for _, kind := range []string{"Project", "Repository"} {
 		for _, result := range []string{"success", "error"} {
 			m.reconcileTotal.WithLabelValues(kind, result)
+		}
+	}
+	for _, provider := range []string{"github", "gitlab"} {
+		for _, kind := range []string{"push"} {
+			for _, result := range []string{"accepted", "rejected"} {
+				m.webhookEvents.WithLabelValues(provider, kind, result)
+			}
 		}
 	}
 	return m
@@ -45,4 +74,20 @@ func (m *OperatorMetrics) ReconcileResult(kind, result string) {
 // Job took.
 func (m *OperatorMetrics) ObserveIngestJobDuration(seconds float64) {
 	m.ingestJobDuration.Observe(seconds)
+}
+
+// ObserveTurnDuration records the wall-clock seconds an agent turn took.
+func (m *OperatorMetrics) ObserveTurnDuration(seconds float64) {
+	m.turnDuration.Observe(seconds)
+}
+
+// WebhookEvent increments operator_webhook_events_total for the given
+// provider, kind and result.
+func (m *OperatorMetrics) WebhookEvent(provider, kind, result string) {
+	m.webhookEvents.WithLabelValues(provider, kind, result).Inc()
+}
+
+// SetTasksInflight sets the operator_tasks_inflight gauge to n.
+func (m *OperatorMetrics) SetTasksInflight(n float64) {
+	m.tasksInflight.Set(n)
 }
