@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 
+	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -24,6 +25,7 @@ func newScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	utilRuntimeMust(clientgoscheme.AddToScheme(s))
 	utilRuntimeMust(apiv1alpha1.AddToScheme(s))
+	utilRuntimeMust(cnpgv1.AddToScheme(s))
 	return s
 }
 
