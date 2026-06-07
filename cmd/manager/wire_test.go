@@ -51,8 +51,6 @@ func TestIngestConfigFromConfig(t *testing.T) {
 		Namespace:                "tatara",
 	}
 	got := ingestConfigFromConfig(cfg, "tatara-memory")
-	// MemoryBaseURL is no longer sourced from global config; it stays empty
-	// here and is set per-Project in N3 (project.Status.Memory.Endpoint).
 	want := ingest.Config{
 		IngesterImage:    "img:1",
 		OIDCIssuer:       "https://kc/realms/t",
