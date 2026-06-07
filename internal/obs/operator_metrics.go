@@ -6,11 +6,13 @@ import "github.com/prometheus/client_golang/prometheus"
 // tatara-operator. Construct one with NewOperatorMetrics and pass it to the
 // reconcilers.
 type OperatorMetrics struct {
-	reconcileTotal    *prometheus.CounterVec
-	ingestJobDuration prometheus.Histogram
-	turnDuration      prometheus.Histogram
-	webhookEvents     *prometheus.CounterVec
-	tasksInflight     prometheus.Gauge
+	reconcileTotal          *prometheus.CounterVec
+	ingestJobDuration       prometheus.Histogram
+	turnDuration            prometheus.Histogram
+	webhookEvents           *prometheus.CounterVec
+	tasksInflight           prometheus.Gauge
+	memoryProvisionDuration prometheus.Histogram
+	memoryStacks            *prometheus.GaugeVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -39,6 +41,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_tasks_inflight",
 			Help: "Number of Tasks currently running.",
 		}),
+		memoryProvisionDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "operator_memory_provision_duration_seconds",
+			Help:    "Wall-clock duration of a per-project memory stack reaching Ready.",
+			Buckets: prometheus.ExponentialBuckets(5, 2, 8),
+		}),
+		memoryStacks: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_memory_stacks",
+			Help: "Number of per-project memory stacks by phase.",
+		}, []string{"phase"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -46,6 +57,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.turnDuration,
 		m.webhookEvents,
 		m.tasksInflight,
+		m.memoryProvisionDuration,
+		m.memoryStacks,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -61,7 +74,21 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			}
 		}
 	}
+	for _, phase := range []string{"Provisioning", "Ready", "Failed"} {
+		m.memoryStacks.WithLabelValues(phase)
+	}
 	return m
+}
+
+// ObserveMemoryProvisionDuration records the wall-clock seconds a per-project
+// memory stack took to reach Ready.
+func (m *OperatorMetrics) ObserveMemoryProvisionDuration(seconds float64) {
+	m.memoryProvisionDuration.Observe(seconds)
+}
+
+// SetMemoryStacks sets the operator_memory_stacks gauge for the given phase.
+func (m *OperatorMetrics) SetMemoryStacks(phase string, n float64) {
+	m.memoryStacks.WithLabelValues(phase).Set(n)
 }
 
 // ReconcileResult increments operator_reconcile_total for the given kind and
