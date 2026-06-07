@@ -62,7 +62,7 @@ func secretEnv(name, secretName, key string) corev1.EnvVar {
 }
 
 // BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
-func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, cfg PodConfig) *corev1.Pod {
+func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
 	env := []corev1.EnvVar{
 		{Name: "REPO_URL", Value: repo.Spec.URL},
 		{Name: "REPO_BRANCH", Value: repo.Spec.DefaultBranch},
@@ -73,6 +73,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},
+		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
+		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
+		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},
 		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
 		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},
@@ -112,7 +115,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 // BuildService returns the ClusterIP Service fronting the wrapper Pod. Its name
 // equals the Pod name so the operator can address the wrapper at
 // http://<name>.<ns>.svc:8080.
-func BuildService(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, cfg PodConfig) *corev1.Service {
+func BuildService(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, memoryEndpoint string, cfg PodConfig) *corev1.Service {
+	_ = memoryEndpoint
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            PodName(task),

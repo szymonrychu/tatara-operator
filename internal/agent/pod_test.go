@@ -11,6 +11,8 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
+const testMemoryEndpoint = "http://mem-demo.tatara.svc:8080"
+
 func sampleInputs() (*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatarav1alpha1.Task, agent.PodConfig) {
 	proj := &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "tatara"},
@@ -60,7 +62,7 @@ func envSecretRef(c corev1.Container, name string) (*corev1.SecretKeySelector, b
 
 func TestBuildPod_NameAndImageAndOwner(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	pod := agent.BuildPod(proj, repo, task, cfg)
+	pod := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg)
 
 	require.Equal(t, agent.PodName(task), pod.Name)
 	require.Equal(t, "tatara", pod.Namespace)
@@ -77,7 +79,7 @@ func TestBuildPod_NameAndImageAndOwner(t *testing.T) {
 
 func TestBuildPod_PlainEnv(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
 
 	checks := map[string]string{
 		"REPO_URL":             "https://git/acme/repo1",
@@ -90,6 +92,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"TATARA_PROJECT":       "demo",
 		"OIDC_ISSUER":          "https://keycloak.tatara.svc/realms/master",
 		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
+		"TATARA_MEMORY_URL":    "http://mem-demo.tatara.svc:8080",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)
@@ -100,7 +103,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 
 func TestBuildPod_SecretEnv(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
 
 	ant, ok := envSecretRef(c, "ANTHROPIC_API_KEY")
 	require.True(t, ok)
@@ -134,7 +137,7 @@ func TestBuildPod_CallbackURLFromConfig(t *testing.T) {
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
-	c := agent.BuildPod(proj, repo, task, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
 	got, ok := envValue(c, "DEFAULT_CALLBACK_URL")
 	require.True(t, ok)
 	require.Equal(t, "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete", got)
@@ -142,7 +145,7 @@ func TestBuildPod_CallbackURLFromConfig(t *testing.T) {
 
 func TestBuildPod_PortAndReadiness(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
 	require.Len(t, c.Ports, 1)
 	require.Equal(t, int32(8080), c.Ports[0].ContainerPort)
 	require.NotNil(t, c.ReadinessProbe)
@@ -151,8 +154,8 @@ func TestBuildPod_PortAndReadiness(t *testing.T) {
 
 func TestBuildService_MatchesPod(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	svc := agent.BuildService(proj, repo, task, cfg)
-	pod := agent.BuildPod(proj, repo, task, cfg)
+	svc := agent.BuildService(proj, repo, task, testMemoryEndpoint, cfg)
+	pod := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg)
 
 	require.Equal(t, pod.Name, svc.Name) // service name == pod name
 	require.Equal(t, "tatara", svc.Namespace)
@@ -162,4 +165,13 @@ func TestBuildService_MatchesPod(t *testing.T) {
 
 	require.Len(t, svc.OwnerReferences, 1)
 	require.Equal(t, "Task", svc.OwnerReferences[0].Kind)
+}
+
+func TestBuildPod_MemoryEndpointEnv(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	const ep = "http://mem-other.tatara.svc:8080"
+	c := agent.BuildPod(proj, repo, task, ep, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "TATARA_MEMORY_URL")
+	require.True(t, ok, "TATARA_MEMORY_URL missing")
+	require.Equal(t, ep, got)
 }
