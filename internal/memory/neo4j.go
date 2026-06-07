@@ -38,6 +38,7 @@ func Neo4jStatefulSet(p *tatarav1alpha1.Project, cfg Config) *appsv1.StatefulSet
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
+					ImagePullSecrets: imagePullSecrets(cfg),
 					Containers: []corev1.Container{{
 						Name:  "neo4j",
 						Image: cfg.Neo4jImage,

@@ -36,6 +36,7 @@ type Config struct {
 	OperatorOIDCClientSecret string
 	AnthropicSecretName      string
 	CLIOIDCSecretName        string
+	ImagePullSecret          string
 	Namespace                string
 	LogLevel                 string
 }
@@ -69,6 +70,7 @@ func Load() (Config, error) {
 		OperatorOIDCClientSecret: os.Getenv("OPERATOR_OIDC_CLIENT_SECRET"),
 		AnthropicSecretName:      os.Getenv("ANTHROPIC_SECRET_NAME"),
 		CLIOIDCSecretName:        os.Getenv("CLI_OIDC_SECRET_NAME"),
+		ImagePullSecret:          os.Getenv("IMAGE_PULL_SECRET"),
 		Namespace:                getDefault("NAMESPACE", "tatara"),
 		LogLevel:                 getDefault("LOG_LEVEL", "info"),
 	}

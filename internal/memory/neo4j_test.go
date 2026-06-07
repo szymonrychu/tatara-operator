@@ -30,7 +30,7 @@ func TestNeo4jStatefulSet(t *testing.T) {
 	require.True(t, *ss.OwnerReferences[0].Controller)
 
 	c := ss.Spec.Template.Spec.Containers[0]
-	require.Equal(t, "neo4j:5-community", c.Image)
+	require.Equal(t, "neo4j:2026.04.0", c.Image)
 
 	// NEO4J_AUTH from the generated secret.
 	auth, ok := envByName(c.Env, "NEO4J_AUTH")
@@ -61,6 +61,19 @@ func TestNeo4jStatefulSet(t *testing.T) {
 		}
 	}
 	require.True(t, mounted)
+}
+
+func TestNeo4jStatefulSet_ImagePullSecrets(t *testing.T) {
+	p := testProject("acme")
+
+	// Set: imagePullSecrets present.
+	ss := memory.Neo4jStatefulSet(p, testCfg())
+	require.Len(t, ss.Spec.Template.Spec.ImagePullSecrets, 1)
+	require.Equal(t, "regcred", ss.Spec.Template.Spec.ImagePullSecrets[0].Name)
+
+	// Unset: imagePullSecrets absent.
+	ssNoIPS := memory.Neo4jStatefulSet(p, testCfgNoIPS())
+	require.Empty(t, ssNoIPS.Spec.Template.Spec.ImagePullSecrets)
 }
 
 func TestNeo4jStatefulSet_StorageOverride(t *testing.T) {

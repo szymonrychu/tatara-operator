@@ -13,11 +13,18 @@ func testCfg() memory.Config {
 		Namespace:        "tatara",
 		MemoryImage:      "harbor/tatara-memory:0.2.0",
 		LightragImage:    "ghcr.io/hkuds/lightrag:v1.4.16",
-		Neo4jImage:       "neo4j:5-community",
+		Neo4jImage:       "neo4j:2026.04.0",
 		OpenAISecretName: "tatara-openai",
 		OIDCIssuer:       "https://auth.example/realms/master",
 		OIDCAudience:     "tatara-memory",
+		ImagePullSecret:  "regcred",
 	}
+}
+
+func testCfgNoIPS() memory.Config {
+	cfg := testCfg()
+	cfg.ImagePullSecret = ""
+	return cfg
 }
 
 func TestPGCluster_DefaultsAndShape(t *testing.T) {
@@ -44,6 +51,19 @@ func TestPGCluster_DefaultsAndShape(t *testing.T) {
 	require.Equal(t, "tatara_memory", c.Spec.Bootstrap.InitDB.Owner)
 	require.Contains(t, c.Spec.Bootstrap.InitDB.PostInitApplicationSQL,
 		"CREATE EXTENSION IF NOT EXISTS vector")
+}
+
+func TestPGCluster_ImagePullSecrets(t *testing.T) {
+	p := testProject("acme")
+
+	// Set: imagePullSecrets present.
+	c := memory.PGCluster(p, testCfg())
+	require.Len(t, c.Spec.ImagePullSecrets, 1)
+	require.Equal(t, "regcred", c.Spec.ImagePullSecrets[0].Name)
+
+	// Unset: imagePullSecrets absent.
+	cNoIPS := memory.PGCluster(p, testCfgNoIPS())
+	require.Empty(t, cNoIPS.Spec.ImagePullSecrets)
 }
 
 func TestPGCluster_SpecOverrides(t *testing.T) {

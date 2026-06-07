@@ -30,6 +30,7 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		OpenAISecretName: cfg.OpenAISecretName,
 		OIDCIssuer:       cfg.OIDCIssuer,
 		OIDCAudience:     "tatara-memory",
+		ImagePullSecret:  cfg.ImagePullSecret,
 	}
 }
 

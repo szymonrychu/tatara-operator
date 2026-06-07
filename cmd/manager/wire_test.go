@@ -69,10 +69,11 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 		Namespace:        "tatara",
 		MemoryImage:      "harbor.example/tatara-memory:0.2.0",
 		LightragImage:    "harbor.example/lightrag:1.0.0",
-		Neo4jImage:       "neo4j:5-community",
+		Neo4jImage:       "neo4j:2026.04.0",
 		OpenAISecretName: "openai-shared",
 		OIDCIssuer:       "https://keycloak.example/realms/tatara",
 		OIDCAudience:     "tatara",
+		ImagePullSecret:  "regcred",
 	}
 	mc := memoryConfigFromConfig(cfg)
 	if mc.Namespace != "tatara" || mc.MemoryImage != cfg.MemoryImage ||
@@ -82,5 +83,8 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 	}
 	if mc.OIDCAudience != "tatara-memory" {
 		t.Fatalf("OIDCAudience = %q, want tatara-memory (the memory service audience)", mc.OIDCAudience)
+	}
+	if mc.ImagePullSecret != "regcred" {
+		t.Fatalf("ImagePullSecret = %q, want regcred", mc.ImagePullSecret)
 	}
 }

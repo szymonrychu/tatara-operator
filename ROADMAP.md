@@ -67,3 +67,11 @@ Planned work not yet started. One line per item; link to plans for detail.
 6. [ ] helmfile -e default -l application=tatara-operator apply.
 7. [ ] helm uninstall tatara-memory -n tatara (empty static stack; no data migration needed).
 8. [ ] Verify a Project provisions mem-<proj>-* and reaches status.memory.phase=Ready.
+
+## N5 deploy follow-ons - imagePullSecrets + neo4j tag fix (gated)
+
+1. [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.2.1.
+2. [ ] helm package + push tatara-operator-0.2.1.tgz to oci://harbor.szymonrichert.pl/charts.
+3. [ ] helmfile -e default -l application=tatara-operator diff (should show ConfigMap + Deployment image tag change).
+4. [ ] helmfile -e default -l application=tatara-operator apply.
+5. [ ] Verify neo4j pod reaches Running: `kubectl -n tatara get pod -l app.kubernetes.io/component=neo4j`.

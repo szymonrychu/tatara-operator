@@ -25,6 +25,7 @@ func TestLoad(t *testing.T) {
 		"OPERATOR_OIDC_CLIENT_SECRET": "shh",
 		"ANTHROPIC_SECRET_NAME":       "anthropic",
 		"CLI_OIDC_SECRET_NAME":        "cli-oidc",
+		"IMAGE_PULL_SECRET":           "regcred",
 		"LOG_LEVEL":                   "debug",
 	}
 	for k, v := range env {
@@ -58,6 +59,7 @@ func TestLoad(t *testing.T) {
 		{"OperatorOIDCClientSecret", cfg.OperatorOIDCClientSecret, "shh"},
 		{"AnthropicSecretName", cfg.AnthropicSecretName, "anthropic"},
 		{"CLIOIDCSecretName", cfg.CLIOIDCSecretName, "cli-oidc"},
+		{"ImagePullSecret", cfg.ImagePullSecret, "regcred"},
 		{"LogLevel", cfg.LogLevel, "debug"},
 	}
 	for _, tt := range tests {

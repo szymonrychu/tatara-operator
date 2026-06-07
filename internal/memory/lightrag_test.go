@@ -46,6 +46,19 @@ func TestLightragDeployment(t *testing.T) {
 	require.Equal(t, "password", env["NEO4J_PASSWORD"].ValueFrom.SecretKeyRef.Key)
 }
 
+func TestLightragDeployment_ImagePullSecrets(t *testing.T) {
+	p := testProject("acme")
+
+	// Set: imagePullSecrets present.
+	d := memory.LightragDeployment(p, testCfg())
+	require.Len(t, d.Spec.Template.Spec.ImagePullSecrets, 1)
+	require.Equal(t, "regcred", d.Spec.Template.Spec.ImagePullSecrets[0].Name)
+
+	// Unset: imagePullSecrets absent.
+	dNoIPS := memory.LightragDeployment(p, testCfgNoIPS())
+	require.Empty(t, dNoIPS.Spec.Template.Spec.ImagePullSecrets)
+}
+
 func TestLightragService(t *testing.T) {
 	p := testProject("acme")
 	svc := memory.LightragService(p, testCfg())

@@ -32,6 +32,10 @@ externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"
 anthropicSecretName: ""
 cliOidcSecretName: ""
+# imagePullSecret is cluster-specific (rule 14); set via infra helmfile values.
+# When non-empty, it is injected into every operator-spawned workload (neo4j
+# StatefulSet, lightrag Deployment, tatara-memory Deployment, cnpg Cluster).
+imagePullSecret: ""
 namespace: "tatara"
 logLevel: "info"
 

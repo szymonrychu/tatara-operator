@@ -80,6 +80,7 @@ EXTERNAL_WEBHOOK_BASE: {{ .Values.externalWebhookBase | quote }}
 OPERATOR_OIDC_CLIENT_ID: {{ .Values.operatorOidcClientId | quote }}
 ANTHROPIC_SECRET_NAME: {{ .Values.anthropicSecretName | quote }}
 CLI_OIDC_SECRET_NAME: {{ .Values.cliOidcSecretName | quote }}
+IMAGE_PULL_SECRET: {{ .Values.imagePullSecret | quote }}
 NAMESPACE: {{ .Values.namespace | quote }}
 LOG_LEVEL: {{ .Values.logLevel | quote }}
 {{- end -}}

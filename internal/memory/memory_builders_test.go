@@ -47,6 +47,19 @@ func TestMemoryDeployment(t *testing.T) {
 	require.Equal(t, "uri", dsn.ValueFrom.SecretKeyRef.Key)
 }
 
+func TestMemoryDeployment_ImagePullSecrets(t *testing.T) {
+	p := testProject("acme")
+
+	// Set: imagePullSecrets present.
+	d := memory.MemoryDeployment(p, testCfg())
+	require.Len(t, d.Spec.Template.Spec.ImagePullSecrets, 1)
+	require.Equal(t, "regcred", d.Spec.Template.Spec.ImagePullSecrets[0].Name)
+
+	// Unset: imagePullSecrets absent.
+	dNoIPS := memory.MemoryDeployment(p, testCfgNoIPS())
+	require.Empty(t, dNoIPS.Spec.Template.Spec.ImagePullSecrets)
+}
+
 func TestMemoryConfigMap(t *testing.T) {
 	p := testProject("acme")
 	cm := memory.MemoryConfigMap(p, testCfg())

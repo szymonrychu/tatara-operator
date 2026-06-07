@@ -6,6 +6,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// pgImagePullSecrets converts the operator ImagePullSecret config into the cnpg
+// LocalObjectReference slice expected by ClusterSpec.ImagePullSecrets. cnpg's
+// LocalObjectReference is a type alias for github.com/cloudnative-pg/machinery/pkg/api.LocalObjectReference
+// (not corev1.LocalObjectReference), so we build the slice here rather than
+// reusing the corev1-typed imagePullSecrets helper.
+func pgImagePullSecrets(cfg Config) []cnpgv1.LocalObjectReference {
+	if cfg.ImagePullSecret == "" {
+		return nil
+	}
+	return []cnpgv1.LocalObjectReference{{Name: cfg.ImagePullSecret}}
+}
+
 // PGCluster builds the per-Project cnpg Cluster. cnpg's controller derives the
 // mem-<proj>-pg-rw Service and the mem-<proj>-pg-app Secret (key "uri") that
 // lightrag and tatara-memory consume. The vector extension is installed via
@@ -26,7 +38,8 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 		},
 		ObjectMeta: objectMeta(p, cfg, n.PGCluster),
 		Spec: cnpgv1.ClusterSpec{
-			Instances: pgInstances(p),
+			Instances:        pgInstances(p),
+			ImagePullSecrets: pgImagePullSecrets(cfg),
 			StorageConfiguration: cnpgv1.StorageConfiguration{
 				Size: pgStorage(p),
 			},

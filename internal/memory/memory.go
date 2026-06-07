@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -31,6 +32,7 @@ type Config struct {
 	OpenAISecretName string
 	OIDCIssuer       string
 	OIDCAudience     string
+	ImagePullSecret  string
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.
@@ -99,6 +101,15 @@ func objectMeta(p *tatarav1alpha1.Project, cfg Config, name string) metav1.Objec
 		Labels:          labels(p.Name),
 		OwnerReferences: []metav1.OwnerReference{ownerRef(p)},
 	}
+}
+
+// imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
+// or nil when empty (omitted from the pod spec).
+func imagePullSecrets(cfg Config) []corev1.LocalObjectReference {
+	if cfg.ImagePullSecret == "" {
+		return nil
+	}
+	return []corev1.LocalObjectReference{{Name: cfg.ImagePullSecret}}
 }
 
 // pgInstances resolves the postgres instance count from spec, defaulting.
