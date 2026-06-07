@@ -25,7 +25,7 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 ## Per-project memory (N1-N4)
 
-- [x] N1 foundation - cnpg api dep + scheme, Project CRD memory fields, config image/secret fields, remove MEMORY_BASE_URL. Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n1-builders.md`.
+- [x] N1 complete - cnpg api dep + scheme, Project CRD memory fields, config image/secret fields, remove MEMORY_BASE_URL, internal/memory builder package (NamesFor, Endpoint, PGCluster, Neo4jPasswordSecret, Neo4jStatefulSet+Service, LightragDeployment+Service+PVC, MemoryDeployment+Service+ConfigMap+Secret). Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n1-builders.md`.
 - [ ] N2 provisioning reconcile - ProjectReconciler SSAs full per-project stack (PGCluster, neo4j StatefulSet, lightrag, tatara-memory), status.memory.phase/endpoint.
 - [ ] N3 ready-gating wiring - RepositoryReconciler + TaskReconciler gate on status.memory.Phase==Ready; ingest Job --base-url from status.memory.endpoint.
 - [ ] N4 RBAC + retire static tatara-memory - chart Role additions, helmfile tatara-memory release removed.
