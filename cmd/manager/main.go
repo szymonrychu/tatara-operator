@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -35,6 +36,12 @@ func utilRuntimeMust(err error) {
 func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, error) {
 	return ctrl.NewManager(ctrl.GetConfigOrDie(), manager.Options{
 		Scheme: scheme,
+		// The operator is namespace-scoped (all CRDs + spawned workloads live in
+		// cfg.Namespace), and the chart grants a namespaced Role. Scope the cache
+		// to that namespace so list/watch stays within the granted RBAC.
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{cfg.Namespace: {}},
+		},
 		Metrics: metricsserver.Options{
 			BindAddress: cfg.MetricsAddr,
 		},
