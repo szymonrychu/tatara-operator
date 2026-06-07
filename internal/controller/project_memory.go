@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -12,6 +13,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -146,4 +149,82 @@ func memoryPhase(readyInstances, wantInstances int, neo4jReady, lightragAvail, m
 		return "Ready"
 	}
 	return "Provisioning"
+}
+
+// memoryRequeue is how often the reconciler re-checks a Provisioning stack.
+const memoryRequeue = 10 * time.Second
+
+// reconcileMemory provisions the Project's memory stack and sets
+// project.Status.Memory + the MemoryReady condition (it does NOT persist;
+// the caller does one status update). It returns the requeue interval (set
+// while Provisioning) and a non-nil error only on a hard apply/health failure
+// (which is also recorded as phase=Failed + MemoryReady=False before
+// returning).
+func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1alpha1.Project) (time.Duration, error) {
+	start := time.Now()
+	p.Status.Memory = ensureMemoryStatus(p)
+	p.Status.Memory.Endpoint = memory.Endpoint(p.Name, r.MemoryConfig.Namespace)
+
+	pw, err := r.ensureNeo4jPassword(ctx, p)
+	if err != nil {
+		return 0, r.failMemory(p, "PasswordError", err)
+	}
+	if err := r.applyMemoryStack(ctx, p, pw); err != nil {
+		return 0, r.failMemory(p, "ApplyError", err)
+	}
+
+	readyInstances, neo4jReady, lightragAvail, memoryAvail, err := r.memoryStackHealth(ctx, p)
+	if err != nil {
+		return 0, r.failMemory(p, "HealthError", err)
+	}
+
+	phase := memoryPhase(readyInstances, effectivePGInstances(p), neo4jReady, lightragAvail, memoryAvail)
+	p.Status.Memory.Phase = phase
+
+	condStatus := metav1.ConditionFalse
+	reason := "Provisioning"
+	msg := "memory stack provisioning"
+	if phase == "Ready" {
+		condStatus = metav1.ConditionTrue
+		reason = "Ready"
+		msg = "memory stack ready at " + p.Status.Memory.Endpoint
+		r.Metrics.ObserveMemoryProvisionDuration(time.Since(start).Seconds())
+	}
+	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+		Type:               "MemoryReady",
+		Status:             condStatus,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: p.Generation,
+	})
+	r.Metrics.SetMemoryStacks(phase, 1)
+
+	if phase == "Ready" {
+		return 0, nil
+	}
+	return memoryRequeue, nil
+}
+
+// ensureMemoryStatus returns the existing status.memory or a fresh one.
+func ensureMemoryStatus(p *tataradevv1alpha1.Project) *tataradevv1alpha1.MemoryStatus {
+	if p.Status.Memory != nil {
+		return p.Status.Memory
+	}
+	return &tataradevv1alpha1.MemoryStatus{}
+}
+
+// failMemory records phase=Failed + MemoryReady=False on the Project status
+// and returns the wrapped error for the caller to surface.
+func (r *ProjectReconciler) failMemory(p *tataradevv1alpha1.Project, reason string, err error) error {
+	p.Status.Memory = ensureMemoryStatus(p)
+	p.Status.Memory.Phase = "Failed"
+	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
+		Type:               "MemoryReady",
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            err.Error(),
+		ObservedGeneration: p.Generation,
+	})
+	r.Metrics.SetMemoryStacks("Failed", 1)
+	return fmt.Errorf("reconcile memory: %w", err)
 }

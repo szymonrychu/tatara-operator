@@ -5,9 +5,11 @@ import (
 	"context"
 	"fmt"
 
+	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -63,18 +65,30 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		ObservedGeneration: project.Generation,
 	})
 
+	requeueAfter, memErr := r.reconcileMemory(ctx, &project)
+
 	if err := r.Status().Update(ctx, &project); err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, fmt.Errorf("update project status: %w", err)
 	}
 
+	if memErr != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, memErr
+	}
+
+	memPhase := ""
+	if project.Status.Memory != nil {
+		memPhase = project.Status.Memory.Phase
+	}
 	l.Info("reconciled project",
 		"action", "reconcile_project",
 		"resource_id", project.Name,
 		"ready", ready,
-		"reason", reason)
+		"reason", reason,
+		"memory_phase", memPhase)
 	r.Metrics.ReconcileResult("Project", "success")
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // validateSecret returns the condition (reason, message, ready) for the
@@ -101,10 +115,16 @@ func (r *ProjectReconciler) validateSecret(ctx context.Context, project *tatarad
 }
 
 // SetupWithManager registers the reconciler with the manager, watching
-// Projects.
+// Projects and the full per-project memory stack kinds.
 func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tataradevv1alpha1.Project{}).
 		Owns(&corev1.Secret{}).
+		Owns(&cnpgv1.Cluster{}).
+		Owns(&appsv1.StatefulSet{}).
+		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
+		Owns(&corev1.PersistentVolumeClaim{}).
+		Owns(&corev1.ConfigMap{}).
 		Complete(r)
 }

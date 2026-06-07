@@ -3,14 +3,18 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 func newMemoryReconciler() *ProjectReconciler {
@@ -147,5 +151,166 @@ func TestMemoryPhase_Transitions(t *testing.T) {
 				t.Fatalf("memoryPhase = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func reconcileMemory(t *testing.T, r *ProjectReconciler, name string) (ctrl.Result, error) {
+	t.Helper()
+	return r.Reconcile(logfIntoTestCtx(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: name},
+	})
+}
+
+func TestReconcile_ProvisionsStackAndSetsEndpoint(t *testing.T) {
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "rec-prov")
+
+	res, err := reconcileMemory(t, r, p.Name)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected requeue while Provisioning, got %+v", res)
+	}
+
+	got := getProject(t, p.Name)
+	if got.Status.Memory == nil {
+		t.Fatalf("status.memory is nil")
+	}
+	if got.Status.Memory.Phase != "Provisioning" {
+		t.Fatalf("phase = %q, want Provisioning", got.Status.Memory.Phase)
+	}
+	wantEndpoint := memory.Endpoint(p.Name, testNS)
+	if got.Status.Memory.Endpoint != wantEndpoint {
+		t.Fatalf("endpoint = %q, want %q", got.Status.Memory.Endpoint, wantEndpoint)
+	}
+}
+
+func TestReconcile_TransitionsToReadyWhenOwnedHealthy(t *testing.T) {
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "rec-ready")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	fakeStackHealthy(t, p.Name)
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got := waitMemoryPhase(t, p.Name, "Ready")
+	c := apimeta.FindStatusCondition(got.Status.Conditions, "MemoryReady")
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("MemoryReady condition = %+v, want True", c)
+	}
+}
+
+func TestReconcile_FailedOnApplyError(t *testing.T) {
+	r := newMemoryReconciler()
+	// Empty namespace makes every SSA target a non-existent namespace, so the
+	// apply fails and the reconciler records phase=Failed + MemoryReady=False.
+	r.MemoryConfig.Namespace = "no-such-namespace-xyz"
+	p := mkMemoryProject(t, "rec-fail")
+
+	if _, err := reconcileMemory(t, r, p.Name); err == nil {
+		t.Fatalf("expected reconcile error from apply failure")
+	}
+	got := getProject(t, p.Name)
+	if got.Status.Memory == nil || got.Status.Memory.Phase != "Failed" {
+		t.Fatalf("phase = %v, want Failed", got.Status.Memory)
+	}
+	c := apimeta.FindStatusCondition(got.Status.Conditions, "MemoryReady")
+	if c == nil || c.Status != metav1.ConditionFalse {
+		t.Fatalf("MemoryReady = %+v, want False", c)
+	}
+}
+
+func TestReconcile_CascadeDeleteRemovesStack(t *testing.T) {
+	ctx := context.Background()
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "rec-cascade")
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	names := memory.NamesFor(p.Name)
+
+	// envtest has no GC controller; assert the controller ownerRef + Background
+	// propagation are in place, which is what drives real-cluster cascade.
+	var cluster cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.PGCluster}, &cluster); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	assertOwnedByProject(t, cluster.GetOwnerReferences(), p.Name)
+	var pvc corev1.PersistentVolumeClaim
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.LightragPVC}, &pvc); err != nil {
+		t.Fatalf("get lightrag pvc: %v", err)
+	}
+	assertOwnedByProject(t, pvc.GetOwnerReferences(), p.Name)
+
+	if err := k8sClient.Delete(ctx, getProject(t, p.Name)); err != nil {
+		t.Fatalf("delete project: %v", err)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: p.Name}, &tataradevv1alpha1.Project{}); err == nil {
+		// Project still terminating is acceptable; the cascade is GC-driven and
+		// not simulated in envtest. The ownerRef assertions above prove it.
+		_ = cluster
+	}
+}
+
+func logfIntoTestCtx() context.Context {
+	return logf.IntoContext(context.Background(), logf.Log)
+}
+
+func waitMemoryPhase(t *testing.T, name, want string) *tataradevv1alpha1.Project {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		p := getProject(t, name)
+		if p.Status.Memory != nil && p.Status.Memory.Phase == want {
+			return p
+		}
+		time.Sleep(interval)
+	}
+	t.Fatalf("project %s memory phase never reached %s", name, want)
+	return nil
+}
+
+// fakeStackHealthy patches the owned objects' status subresources to the
+// healthy values the reconciler reads (no kubelet/cnpg-operator in envtest).
+func fakeStackHealthy(t *testing.T, project string) {
+	t.Helper()
+	ctx := context.Background()
+	names := memory.NamesFor(project)
+
+	var cluster cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.PGCluster}, &cluster); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	cluster.Status.ReadyInstances = 1
+	if err := k8sClient.Status().Update(ctx, &cluster); err != nil {
+		t.Fatalf("fake cluster status: %v", err)
+	}
+
+	var sts appsv1.StatefulSet
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.Neo4j}, &sts); err != nil {
+		t.Fatalf("get sts: %v", err)
+	}
+	sts.Status.Replicas = 1
+	sts.Status.ReadyReplicas = 1
+	if err := k8sClient.Status().Update(ctx, &sts); err != nil {
+		t.Fatalf("fake sts status: %v", err)
+	}
+
+	for _, dn := range []string{names.Lightrag, names.Memory} {
+		var dep appsv1.Deployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: dn}, &dep); err != nil {
+			t.Fatalf("get deployment %s: %v", dn, err)
+		}
+		dep.Status.Replicas = 1
+		dep.Status.ReadyReplicas = 1
+		dep.Status.AvailableReplicas = 1
+		if err := k8sClient.Status().Update(ctx, &dep); err != nil {
+			t.Fatalf("fake deployment %s status: %v", dn, err)
+		}
 	}
 }

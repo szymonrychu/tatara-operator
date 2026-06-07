@@ -7,6 +7,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/meta"
@@ -23,6 +24,15 @@ func newProjectReconciler() *ProjectReconciler {
 		Scheme:              k8sClient.Scheme(),
 		Metrics:             obs.NewOperatorMetrics(prometheus.NewRegistry()),
 		ExternalWebhookBase: "https://tatara.example/operator/webhooks",
+		MemoryConfig: memory.Config{
+			Namespace:        testNS,
+			MemoryImage:      "harbor.example/tatara-memory:test",
+			LightragImage:    "harbor.example/lightrag:test",
+			Neo4jImage:       "neo4j:5-community",
+			OpenAISecretName: "openai-shared",
+			OIDCIssuer:       "https://keycloak.example/realms/tatara",
+			OIDCAudience:     "tatara-memory",
+		},
 	}
 }
 
