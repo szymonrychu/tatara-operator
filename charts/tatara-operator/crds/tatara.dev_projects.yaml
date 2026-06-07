@@ -64,6 +64,20 @@ spec:
               maxConcurrentTasks:
                 default: 3
                 type: integer
+              memory:
+                description: |-
+                  MemorySpec configures the per-Project memory stack footprint. All fields
+                  are optional; defaults (pgInstances 1, pgStorage 10Gi, neo4jStorage 10Gi)
+                  are applied by the internal/memory builders, not by kubebuilder, so an
+                  empty (or absent) spec.memory still provisions a complete stack.
+                properties:
+                  neo4jStorage:
+                    type: string
+                  pgInstances:
+                    type: integer
+                  pgStorage:
+                    type: string
+                type: object
               scmSecretRef:
                 type: string
               triggerLabel:
@@ -134,6 +148,16 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              memory:
+                description: |-
+                  MemoryStatus reports the observed state of the per-Project memory stack.
+                  Endpoint is the canonical in-cluster URL every other component reads.
+                properties:
+                  endpoint:
+                    type: string
+                  phase:
+                    type: string
+                type: object
               webhookURL:
                 type: string
             type: object

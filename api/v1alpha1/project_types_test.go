@@ -1,6 +1,7 @@
 package v1alpha1_test
 
 import (
+	"reflect"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,6 +56,50 @@ func TestRepositoryFields(t *testing.T) {
 	}
 	if r.Status.Phase != "Ingested" {
 		t.Fatalf("Phase = %q, want Ingested", r.Status.Phase)
+	}
+}
+
+func TestProject_MemorySpecStatusDeepCopy(t *testing.T) {
+	p := &v1alpha1.Project{
+		Spec: v1alpha1.ProjectSpec{
+			Memory: &v1alpha1.MemorySpec{
+				PgInstances:  2,
+				PgStorage:    "20Gi",
+				Neo4jStorage: "5Gi",
+			},
+		},
+		Status: v1alpha1.ProjectStatus{
+			Memory: &v1alpha1.MemoryStatus{
+				Phase:    "Ready",
+				Endpoint: "http://mem-acme.tatara.svc:8080",
+			},
+		},
+	}
+	cp := p.DeepCopy()
+	if cp.Spec.Memory == p.Spec.Memory {
+		t.Fatal("spec.memory pointer not deep-copied")
+	}
+	if cp.Status.Memory == p.Status.Memory {
+		t.Fatal("status.memory pointer not deep-copied")
+	}
+	if !reflect.DeepEqual(cp.Spec.Memory, p.Spec.Memory) {
+		t.Fatalf("spec.memory mismatch: %+v vs %+v", cp.Spec.Memory, p.Spec.Memory)
+	}
+	if !reflect.DeepEqual(cp.Status.Memory, p.Status.Memory) {
+		t.Fatalf("status.memory mismatch: %+v vs %+v", cp.Status.Memory, p.Status.Memory)
+	}
+	// Mutating the copy must not affect the original.
+	cp.Spec.Memory.PgInstances = 9
+	if p.Spec.Memory.PgInstances == 9 {
+		t.Fatal("mutating copy mutated original (shallow copy)")
+	}
+}
+
+func TestProject_MemoryNilSafe(t *testing.T) {
+	p := &v1alpha1.Project{}
+	cp := p.DeepCopy()
+	if cp.Spec.Memory != nil || cp.Status.Memory != nil {
+		t.Fatal("nil memory must deep-copy to nil")
 	}
 }
 

@@ -5,6 +5,28 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// MemorySpec configures the per-Project memory stack footprint. All fields
+// are optional; defaults (pgInstances 1, pgStorage 10Gi, neo4jStorage 10Gi)
+// are applied by the internal/memory builders, not by kubebuilder, so an
+// empty (or absent) spec.memory still provisions a complete stack.
+type MemorySpec struct {
+	// +optional
+	PgInstances int `json:"pgInstances,omitempty"`
+	// +optional
+	PgStorage string `json:"pgStorage,omitempty"`
+	// +optional
+	Neo4jStorage string `json:"neo4jStorage,omitempty"`
+}
+
+// MemoryStatus reports the observed state of the per-Project memory stack.
+// Endpoint is the canonical in-cluster URL every other component reads.
+type MemoryStatus struct {
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+}
+
 // AgentSpec configures the wrapper agent session a Task runs.
 type AgentSpec struct {
 	// +optional
@@ -33,6 +55,8 @@ type ProjectSpec struct {
 	MaxConcurrentTasks int `json:"maxConcurrentTasks,omitempty"`
 	// +optional
 	Agent AgentSpec `json:"agent,omitempty"`
+	// +optional
+	Memory *MemorySpec `json:"memory,omitempty"`
 }
 
 // ProjectStatus defines the observed state of a Project.
@@ -43,6 +67,8 @@ type ProjectStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +optional
+	Memory *MemoryStatus `json:"memory,omitempty"`
 }
 
 // +kubebuilder:object:root=true
