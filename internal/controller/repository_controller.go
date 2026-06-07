@@ -94,12 +94,30 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get owning project %q: %w", repo.Spec.ProjectRef, err)
 	}
 
+	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
+		meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+			Type:               "MemoryNotReady",
+			Status:             metav1.ConditionTrue,
+			Reason:             "MemoryProvisioning",
+			Message:            "waiting for project " + project.Name + " memory stack to become Ready",
+			ObservedGeneration: repo.Generation,
+		})
+		if err := r.Status().Update(ctx, &repo); err != nil {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("set MemoryNotReady condition: %w", err)
+		}
+		l.Info("ingest gated: project memory not ready",
+			"action", "ingest_gate", "resource_id", repo.Name, "project", project.Name)
+		r.Metrics.ReconcileResult("Repository", "success")
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
 	if err := r.ensureResultConfigMap(ctx, &repo); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("ensure result configmap: %w", err)
 	}
 
-	job := ingest.BuildJob(&project, &repo, since, r.IngestConfig)
+	job := ingest.BuildJob(&project, &repo, since, project.Status.Memory.Endpoint, r.IngestConfig)
 	if err := r.Create(ctx, job); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("create ingest job: %w", err)

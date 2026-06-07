@@ -25,7 +25,6 @@ func newRepoReconciler() *RepositoryReconciler {
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 		IngestConfig: ingest.Config{
 			IngesterImage: "registry.example/ingester:1.2.3",
-			MemoryBaseURL: "http://tatara-memory.tatara.svc:8080",
 			OIDCIssuer:    "https://kc.example/realms/tatara",
 			OIDCClientID:  "tatara-operator",
 			OIDCAudience:  "tatara-memory",
@@ -106,6 +105,7 @@ func TestRepoReconcile_FullIngestLaunchesJob(t *testing.T) {
 	mkProject(t, "rp-full", "rp-full-scm")
 	mkSecret(t, "rp-full-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "full", "rp-full")
+	setProjectMemoryReady(t, "rp-full", "http://mem-rp-full.tatara.svc:8080")
 
 	if _, err := reconcileRepo(t, "full"); err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -139,6 +139,7 @@ func TestRepoReconcile_ConcurrencyGuard(t *testing.T) {
 	mkProject(t, "rp-guard", "rp-guard-scm")
 	mkSecret(t, "rp-guard-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "guard", "rp-guard")
+	setProjectMemoryReady(t, "rp-guard", "http://mem-rp-guard.tatara.svc:8080")
 
 	if _, err := reconcileRepo(t, "guard"); err != nil {
 		t.Fatalf("first reconcile: %v", err)
@@ -162,6 +163,7 @@ func TestRepoReconcile_IncrementalUsesSince(t *testing.T) {
 	mkProject(t, "rp-inc", "rp-inc-scm")
 	mkSecret(t, "rp-inc-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "inc", "rp-inc")
+	setProjectMemoryReady(t, "rp-inc", "http://mem-rp-inc.tatara.svc:8080")
 
 	// simulate a prior successful ingest
 	r := getRepo(t, "inc")
@@ -200,6 +202,7 @@ func TestRepoReconcile_NoReingestWhenAnnotationStale(t *testing.T) {
 	mkProject(t, "rp-stale", "rp-stale-scm")
 	mkSecret(t, "rp-stale-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "stale", "rp-stale")
+	setProjectMemoryReady(t, "rp-stale", "http://mem-rp-stale.tatara.svc:8080")
 
 	r := getRepo(t, "stale")
 	r.Status.LastIngestedCommit = "shaA"
@@ -239,4 +242,60 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+func setProjectMemoryReady(t *testing.T, name, endpoint string) {
+	t.Helper()
+	p := &tataradevv1alpha1.Project{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: name}, p); err != nil {
+		t.Fatalf("get project %s: %v", name, err)
+	}
+	p.Status.Memory = &tataradevv1alpha1.MemoryStatus{Phase: "Ready", Endpoint: endpoint}
+	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
+		t.Fatalf("set project %s memory ready: %v", name, err)
+	}
+}
+
+func TestRepoReconcile_GatesUntilMemoryReady(t *testing.T) {
+	mkProject(t, "rp-mem", "rp-mem-scm")
+	mkSecret(t, "rp-mem-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "memrepo", "rp-mem")
+
+	// Project memory is not Ready (no status.memory at all).
+	res, err := reconcileRepo(t, "memrepo")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("expected requeue while memory not ready")
+	}
+	if jobs := listIngestJobs(t, "memrepo"); len(jobs) != 0 {
+		t.Fatalf("memory not ready must not launch a job, got %d", len(jobs))
+	}
+	r := getRepo(t, "memrepo")
+	cond := findCond(r.Status.Conditions, "MemoryNotReady")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected MemoryNotReady=True condition, got %+v", cond)
+	}
+}
+
+func TestRepoReconcile_UsesProjectEndpointWhenReady(t *testing.T) {
+	mkProject(t, "rp-ep", "rp-ep-scm")
+	mkSecret(t, "rp-ep-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "eprepo", "rp-ep")
+	setProjectMemoryReady(t, "rp-ep", "http://mem-rp-ep.tatara.svc:8080")
+
+	if _, err := reconcileRepo(t, "eprepo"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	waitRepoJob(t, "eprepo")
+	jobs := listIngestJobs(t, "eprepo")
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want 1", len(jobs))
+	}
+	script := jobs[0].Spec.Template.Spec.Containers[0].Args[0]
+	if !contains(script, "--base-url http://mem-rp-ep.tatara.svc:8080") {
+		t.Errorf("ingest job must use the Project endpoint as base-url: %q", script)
+	}
 }

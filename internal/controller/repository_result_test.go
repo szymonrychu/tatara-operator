@@ -67,6 +67,7 @@ func TestRepoReconcile_JobSuccessAppliesSHA(t *testing.T) {
 	mkProject(t, "rp-ok", "rp-ok-scm")
 	mkSecret(t, "rp-ok-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "okrepo", "rp-ok")
+	setProjectMemoryReady(t, "rp-ok", "http://mem-rp-ok.tatara.svc:8080")
 
 	if _, err := reconcileRepo(t, "okrepo"); err != nil {
 		t.Fatalf("launch reconcile: %v", err)
@@ -103,6 +104,7 @@ func TestRepoReconcile_JobFailureSetsFailed(t *testing.T) {
 	mkProject(t, "rp-bad", "rp-bad-scm")
 	mkSecret(t, "rp-bad-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
 	mkRepo(t, "badrepo", "rp-bad")
+	setProjectMemoryReady(t, "rp-bad", "http://mem-rp-bad.tatara.svc:8080")
 
 	if _, err := reconcileRepo(t, "badrepo"); err != nil {
 		t.Fatalf("launch reconcile: %v", err)
