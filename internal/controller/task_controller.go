@@ -214,7 +214,7 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 		return false, fmt.Errorf("get wrapper pod: %w", err)
 	}
 
-	svc := agent.BuildService(project, repo, task, project.Status.Memory.Endpoint, r.PodConfig)
+	svc := agent.BuildService(project, repo, task, r.PodConfig)
 	existingSvc := &corev1.Service{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}, existingSvc)
 	if apierrors.IsNotFound(err) {

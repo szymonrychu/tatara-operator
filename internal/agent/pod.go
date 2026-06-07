@@ -115,8 +115,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 // BuildService returns the ClusterIP Service fronting the wrapper Pod. Its name
 // equals the Pod name so the operator can address the wrapper at
 // http://<name>.<ns>.svc:8080.
-func BuildService(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, memoryEndpoint string, cfg PodConfig) *corev1.Service {
-	_ = memoryEndpoint
+func BuildService(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, cfg PodConfig) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            PodName(task),

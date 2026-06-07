@@ -154,7 +154,7 @@ func TestBuildPod_PortAndReadiness(t *testing.T) {
 
 func TestBuildService_MatchesPod(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	svc := agent.BuildService(proj, repo, task, testMemoryEndpoint, cfg)
+	svc := agent.BuildService(proj, repo, task, cfg)
 	pod := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg)
 
 	require.Equal(t, pod.Name, svc.Name) // service name == pod name
