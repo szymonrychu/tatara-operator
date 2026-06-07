@@ -27,8 +27,8 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 - [x] N1 complete - cnpg api dep + scheme, Project CRD memory fields, config image/secret fields, remove MEMORY_BASE_URL, internal/memory builder package (NamesFor, Endpoint, PGCluster, Neo4jPasswordSecret, Neo4jStatefulSet+Service, LightragDeployment+Service+PVC, MemoryDeployment+Service+ConfigMap+Secret). Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n1-builders.md`.
 - [x] N2 provisioning reconcile - ProjectReconciler SSAs full per-project stack (PGCluster, neo4j StatefulSet, lightrag, tatara-memory), status.memory.phase/endpoint, MemoryReady condition, metrics, Owns() all stack kinds, memoryConfigFromConfig in wire.go. Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n2-provisioning.md`.
-- [ ] N3 ready-gating wiring - RepositoryReconciler + TaskReconciler gate on status.memory.Phase==Ready; ingest Job --base-url from status.memory.endpoint.
-- [ ] N4 RBAC + retire static tatara-memory - chart Role additions, helmfile tatara-memory release removed.
+- [x] N3 ready-gating wiring - RepositoryReconciler + TaskReconciler gate on status.memory.Phase==Ready; ingest Job --base-url + BASE_URL env from status.memory.endpoint; agent wrapper pod TATARA_MEMORY_URL from same; ingest.BuildJob baseURL param replaces removed MemoryBaseURL config field. Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n3-wiring.md`.
+- [ ] N4 RBAC + retire static tatara-memory - chart Role additions (cnpg/statefulsets/pvc/secrets create+update), helmfile tatara-memory release removed, infra operator values updated (memoryImage/lightragImage/neo4jImage/openaiSecretName, drop memoryBaseUrl), operator image bump + helmfile apply, helm uninstall tatara-memory (gated human step).
 
 ## Deploy follow-ons (gated - require human action in this order)
 
