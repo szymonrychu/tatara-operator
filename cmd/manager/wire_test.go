@@ -65,3 +65,24 @@ func TestIngestConfigFromConfig(t *testing.T) {
 		t.Errorf("ingestConfigFromConfig = %+v, want %+v", got, want)
 	}
 }
+
+func TestMemoryConfigFromConfig(t *testing.T) {
+	cfg := config.Config{
+		Namespace:        "tatara",
+		MemoryImage:      "harbor.example/tatara-memory:0.2.0",
+		LightragImage:    "harbor.example/lightrag:1.0.0",
+		Neo4jImage:       "neo4j:5-community",
+		OpenAISecretName: "openai-shared",
+		OIDCIssuer:       "https://keycloak.example/realms/tatara",
+		OIDCAudience:     "tatara",
+	}
+	mc := memoryConfigFromConfig(cfg)
+	if mc.Namespace != "tatara" || mc.MemoryImage != cfg.MemoryImage ||
+		mc.LightragImage != cfg.LightragImage || mc.Neo4jImage != cfg.Neo4jImage ||
+		mc.OpenAISecretName != cfg.OpenAISecretName || mc.OIDCIssuer != cfg.OIDCIssuer {
+		t.Fatalf("memoryConfigFromConfig mismatch: %+v", mc)
+	}
+	if mc.OIDCAudience != "tatara-memory" {
+		t.Fatalf("OIDCAudience = %q, want tatara-memory (the memory service audience)", mc.OIDCAudience)
+	}
+}

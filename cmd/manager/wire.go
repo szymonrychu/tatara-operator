@@ -10,12 +10,28 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
+	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
+
+// memoryConfigFromConfig maps operator config to the per-project memory stack
+// builder config. The audience is always the memory-service audience
+// (tatara-memory), not the operator's own API audience.
+func memoryConfigFromConfig(cfg config.Config) memory.Config {
+	return memory.Config{
+		Namespace:        cfg.Namespace,
+		MemoryImage:      cfg.MemoryImage,
+		LightragImage:    cfg.LightragImage,
+		Neo4jImage:       cfg.Neo4jImage,
+		OpenAISecretName: cfg.OpenAISecretName,
+		OIDCIssuer:       cfg.OIDCIssuer,
+		OIDCAudience:     "tatara-memory",
+	}
+}
 
 // ingestConfigFromConfig maps the operator config to the ingest Job builder
 // config. memoryAudience is the OIDC audience the ingester presents to
@@ -86,6 +102,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Scheme:              mgr.GetScheme(),
 		Metrics:             metrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
+		MemoryConfig:        memoryConfigFromConfig(cfg),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
