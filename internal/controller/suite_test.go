@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -44,6 +45,9 @@ func TestMain(m *testing.M) {
 
 		if err := tataradevv1alpha1.AddToScheme(scheme.Scheme); err != nil {
 			panic("add scheme: " + err.Error())
+		}
+		if err := cnpgv1.AddToScheme(scheme.Scheme); err != nil {
+			panic("add cnpg scheme: " + err.Error())
 		}
 
 		k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
