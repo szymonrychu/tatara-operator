@@ -26,7 +26,10 @@ type Config struct {
 	CallbackURL              string
 	OIDCIssuer               string
 	OIDCAudience             string
-	MemoryBaseURL            string
+	MemoryImage              string
+	LightragImage            string
+	Neo4jImage               string
+	OpenAISecretName         string
 	IngesterImage            string
 	ExternalWebhookBase      string
 	OperatorOIDCClientID     string
@@ -56,7 +59,10 @@ func Load() (Config, error) {
 		CallbackURL:              os.Getenv("CALLBACK_URL"),
 		OIDCIssuer:               os.Getenv("OIDC_ISSUER"),
 		OIDCAudience:             os.Getenv("OIDC_AUDIENCE"),
-		MemoryBaseURL:            os.Getenv("MEMORY_BASE_URL"),
+		MemoryImage:              os.Getenv("MEMORY_IMAGE"),
+		LightragImage:            os.Getenv("LIGHTRAG_IMAGE"),
+		Neo4jImage:               os.Getenv("NEO4J_IMAGE"),
+		OpenAISecretName:         os.Getenv("OPENAI_SECRET_NAME"),
 		IngesterImage:            os.Getenv("INGESTER_IMAGE"),
 		ExternalWebhookBase:      os.Getenv("EXTERNAL_WEBHOOK_BASE"),
 		OperatorOIDCClientID:     os.Getenv("OPERATOR_OIDC_CLIENT_ID"),

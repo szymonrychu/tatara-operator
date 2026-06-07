@@ -22,8 +22,9 @@ import (
 // tatara-memory.
 func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Config {
 	return ingest.Config{
-		IngesterImage:    cfg.IngesterImage,
-		MemoryBaseURL:    cfg.MemoryBaseURL,
+		IngesterImage: cfg.IngesterImage,
+		// MemoryBaseURL is set per-Project in N3 (project.Status.Memory.Endpoint);
+		// the global value was removed from operator config.
 		OIDCIssuer:       cfg.OIDCIssuer,
 		OIDCClientID:     cfg.OperatorOIDCClientID,
 		OIDCClientSecret: cfg.OperatorOIDCClientSecret,
