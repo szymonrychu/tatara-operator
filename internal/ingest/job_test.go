@@ -29,10 +29,11 @@ func testRepository() *tataradevv1alpha1.Repository {
 	return r
 }
 
+const testBaseURL = "http://mem-acme.tatara.svc:8080"
+
 func testConfig() Config {
 	return Config{
 		IngesterImage:    "registry.example/ingester:1.2.3",
-		MemoryBaseURL:    "http://tatara-memory.tatara.svc:8080",
 		OIDCIssuer:       "https://kc.example/realms/tatara",
 		OIDCClientID:     "tatara-operator",
 		OIDCClientSecret: "s3cr3t",
@@ -51,7 +52,7 @@ func envValue(c corev1.Container, key string) string {
 }
 
 func TestBuildJob_FullIngest(t *testing.T) {
-	job := BuildJob(testProject(), testRepository(), "", testConfig())
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 
 	if job.Namespace != "tatara" {
 		t.Errorf("namespace = %q, want tatara", job.Namespace)
@@ -100,7 +101,7 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	}
 
 	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
-	if !strings.Contains(cmd, "tatara-ingest --repo-root /workspace/repo --repo-name widgets --base-url http://tatara-memory.tatara.svc:8080") {
+	if !strings.Contains(cmd, "tatara-ingest --repo-root /workspace/repo --repo-name widgets --base-url http://mem-acme.tatara.svc:8080") {
 		t.Errorf("ingest cmd wrong: %q", cmd)
 	}
 	if strings.Contains(cmd, "--since") {
@@ -110,7 +111,7 @@ func TestBuildJob_FullIngest(t *testing.T) {
 		t.Errorf("ingest cmd must write result configmap: %q", cmd)
 	}
 
-	if v := envValue(main, "BASE_URL"); v != "http://tatara-memory.tatara.svc:8080" {
+	if v := envValue(main, "BASE_URL"); v != "http://mem-acme.tatara.svc:8080" {
 		t.Errorf("BASE_URL = %q", v)
 	}
 	if v := envValue(main, "OIDC_ISSUER"); v != "https://kc.example/realms/tatara" {
@@ -128,7 +129,7 @@ func TestBuildJob_FullIngest(t *testing.T) {
 }
 
 func TestBuildJob_IncrementalIngest(t *testing.T) {
-	job := BuildJob(testProject(), testRepository(), "abc1234", testConfig())
+	job := BuildJob(testProject(), testRepository(), "abc1234", testBaseURL, testConfig())
 	main := job.Spec.Template.Spec.Containers[0]
 	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
 	if !strings.Contains(cmd, "--since abc1234") {
@@ -137,7 +138,7 @@ func TestBuildJob_IncrementalIngest(t *testing.T) {
 }
 
 func TestBuildJob_SCMTokenFromSecret(t *testing.T) {
-	job := BuildJob(testProject(), testRepository(), "", testConfig())
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 	clone := job.Spec.Template.Spec.InitContainers[0]
 	var ref *corev1.EnvVarSource
 	for _, e := range clone.Env {
@@ -155,7 +156,7 @@ func TestBuildJob_SCMTokenFromSecret(t *testing.T) {
 }
 
 func TestBuildJob_SharedWorkspaceVolume(t *testing.T) {
-	job := BuildJob(testProject(), testRepository(), "", testConfig())
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 	ps := job.Spec.Template.Spec
 	var hasEmptyDir bool
 	for _, v := range ps.Volumes {
@@ -182,4 +183,17 @@ func TestBuildJob_SharedWorkspaceVolume(t *testing.T) {
 	}
 	_ = metav1.Now
 	_ = batchv1.Job{}
+}
+
+func TestBuildJob_BaseURLFromParameter(t *testing.T) {
+	const ep = "http://mem-other.tatara.svc:8080"
+	job := BuildJob(testProject(), testRepository(), "", ep, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
+	if !strings.Contains(cmd, "--base-url "+ep) {
+		t.Errorf("ingest cmd must carry parameter base-url %q: %q", ep, cmd)
+	}
+	if v := envValue(main, "BASE_URL"); v != ep {
+		t.Errorf("BASE_URL = %q, want %q", v, ep)
+	}
 }

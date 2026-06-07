@@ -15,7 +15,6 @@ import (
 // Config is the subset of operator configuration the Job builder needs.
 type Config struct {
 	IngesterImage    string
-	MemoryBaseURL    string
 	OIDCIssuer       string
 	OIDCClientID     string
 	OIDCClientSecret string
@@ -41,7 +40,7 @@ const (
 // Project SCM token in an init container into an emptyDir, runs tatara-ingest
 // in the main container, then writes the cloned HEAD SHA into the repo's
 // result ConfigMap via the in-cluster API.
-func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Repository, since string, cfg Config) *batchv1.Job {
+func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Repository, since, baseURL string, cfg Config) *batchv1.Job {
 	backoff := int32(2)
 	ttl := int32(3600)
 	controller := true
@@ -56,7 +55,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 
 	ingestArgs := fmt.Sprintf(
 		"tatara-ingest --repo-root %s --repo-name %s --base-url %s",
-		repoDir, repo.Name, cfg.MemoryBaseURL)
+		repoDir, repo.Name, baseURL)
 	if since != "" {
 		ingestArgs += " --since " + since
 	}
@@ -131,7 +130,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 						Command: []string{"/bin/sh", "-c"},
 						Args:    []string{mainScript},
 						Env: []corev1.EnvVar{
-							{Name: "BASE_URL", Value: cfg.MemoryBaseURL},
+							{Name: "BASE_URL", Value: baseURL},
 							{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 							{Name: "OIDC_CLIENT_ID", Value: cfg.OIDCClientID},
 							{Name: "OIDC_CLIENT_SECRET", Value: cfg.OIDCClientSecret},
