@@ -99,7 +99,12 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		memory.MemoryService(p, cfg),
 	}
 	for _, obj := range objs {
-		if err := r.Patch(ctx, obj, client.Apply,
+		// client.Apply (the Patch variant) is deprecated in favour of the typed
+		// r.Apply(ctx, applyconfig, ...) API introduced in controller-runtime
+		// v0.20+. Migration requires generated applyconfiguration types for every
+		// stack object and is tracked for N4. The Patch path is functionally
+		// identical and will not be removed before v0.30.
+		if err := r.Patch(ctx, obj, client.Apply, //nolint:staticcheck
 			client.FieldOwner(memoryFieldOwner), client.ForceOwnership); err != nil {
 			return fmt.Errorf("apply %T %s: %w", obj, obj.GetName(), err)
 		}
