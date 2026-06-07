@@ -161,10 +161,61 @@ func findCond(conds []metav1.Condition, typ string) *metav1.Condition {
 
 // ----- Task 6: concurrency gate + spawn -----
 
+func TestTaskReconcile_GatesUntilMemoryReady(t *testing.T) {
+	mkTaskProject(t, "p-memgate", 3)
+	mkTaskRepository(t, "r-memgate", "p-memgate")
+	mkTask(t, "t-memgate", "p-memgate", "r-memgate")
+	// Project memory not Ready -> requeue, no pod.
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	res, err := reconcileTask(t, r, "t-memgate")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("expected requeue while project memory not ready")
+	}
+	pod := &corev1.Pod{}
+	err = k8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-memgate"}, pod)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("memory not ready must not spawn a pod, got err=%v", err)
+	}
+}
+
+func TestTaskReconcile_PodCarriesMemoryEndpoint(t *testing.T) {
+	mkTaskProject(t, "p-memep", 3)
+	mkTaskRepository(t, "r-memep", "p-memep")
+	mkTask(t, "t-memep", "p-memep", "r-memep")
+	setProjectMemoryReady(t, "p-memep", "http://mem-p-memep.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-memep"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	pod := &corev1.Pod{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-memep"}, pod); err != nil {
+		t.Fatalf("expected wrapper pod: %v", err)
+	}
+	var got string
+	for _, e := range pod.Spec.Containers[0].Env {
+		if e.Name == "TATARA_MEMORY_URL" {
+			got = e.Value
+		}
+	}
+	if got != "http://mem-p-memep.tatara.svc:8080" {
+		t.Errorf("TATARA_MEMORY_URL = %q, want the project endpoint", got)
+	}
+}
+
 func TestTaskReconcile_SpawnsPodAndService(t *testing.T) {
 	mkTaskProject(t, "p-spawn", 3)
 	mkTaskRepository(t, "r-spawn", "p-spawn")
 	mkTask(t, "t-spawn", "p-spawn", "r-spawn")
+	setProjectMemoryReady(t, "p-spawn", "http://mem-p-spawn.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -198,6 +249,7 @@ func TestTaskReconcile_GatesAtCap(t *testing.T) {
 	mkTask(t, "t-running", "p-cap", "r-cap")
 	mkTask(t, "t-queued", "p-cap", "r-cap")
 	setTaskPhase(t, "t-running", "Running")
+	setProjectMemoryReady(t, "p-cap", "http://mem-p-cap.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -240,6 +292,7 @@ func TestTaskReconcile_PlanTurnSubmitted(t *testing.T) {
 	mkTaskProject(t, "p-plan", 3)
 	mkTaskRepository(t, "r-plan", "p-plan")
 	mkTask(t, "t-plan", "p-plan", "r-plan")
+	setProjectMemoryReady(t, "p-plan", "http://mem-p-plan.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -271,6 +324,7 @@ func TestTaskReconcile_AdvancesToNextSubtask(t *testing.T) {
 	mkTask(t, "t-adv", "p-adv", "r-adv")
 	mkSubtask(t, "t-adv-s1", "t-adv", 1)
 	mkSubtask(t, "t-adv-s2", "t-adv", 2)
+	setProjectMemoryReady(t, "p-adv", "http://mem-p-adv.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -329,6 +383,7 @@ func TestTaskReconcile_TerminatesWhenNoPending(t *testing.T) {
 	mkTaskProject(t, "p-end", 3)
 	mkTaskRepository(t, "r-end", "p-end")
 	mkTask(t, "t-end", "p-end", "r-end")
+	setProjectMemoryReady(t, "p-end", "http://mem-p-end.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -379,6 +434,7 @@ func TestTaskReconcile_MaxTurnsCap(t *testing.T) {
 	}
 	mkSubtask(t, "t-max-s1", "t-max", 1)
 	mkSubtask(t, "t-max-s2", "t-max", 2)
+	setProjectMemoryReady(t, "p-max", "http://mem-p-max.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -409,6 +465,7 @@ func TestTaskReconcile_TurnTimeout(t *testing.T) {
 	mkTaskProject(t, "p-tt", 3)
 	mkTaskRepository(t, "r-tt", "p-tt")
 	mkTask(t, "t-tt", "p-tt", "r-tt")
+	setProjectMemoryReady(t, "p-tt", "http://mem-p-tt.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -453,6 +510,7 @@ func TestTaskReconcile_PodLostRecreatesThenFails(t *testing.T) {
 	mkTaskRepository(t, "r-lost", "p-lost")
 	mkTask(t, "t-lost", "p-lost", "r-lost")
 	setTaskPhase(t, "t-lost", "Running")
+	setProjectMemoryReady(t, "p-lost", "http://mem-p-lost.tatara.svc:8080")
 	annotate(t, "t-lost", map[string]string{
 		annPodRecreations: "3",
 		annCurrentTurn:    "turn-1",
@@ -477,6 +535,7 @@ func TestTaskReconcile_ResultSummaryDerivedFromSubtasks(t *testing.T) {
 	mkTaskRepository(t, "r-rssum", "p-rssum")
 	mkTask(t, "t-rssum", "p-rssum", "r-rssum")
 	mkSubtask(t, "t-rssum-s1", "t-rssum", 1)
+	setProjectMemoryReady(t, "p-rssum", "http://mem-p-rssum.tatara.svc:8080")
 
 	// Set the subtask Done with a result before termination.
 	st := getSubtask(t, "t-rssum-s1")
@@ -518,6 +577,7 @@ func TestTaskReconcile_ResultSummaryFallsBackToCount(t *testing.T) {
 	mkTaskRepository(t, "r-rscount", "p-rscount")
 	mkTask(t, "t-rscount", "p-rscount", "r-rscount")
 	mkSubtask(t, "t-rscount-s1", "t-rscount", 1)
+	setProjectMemoryReady(t, "p-rscount", "http://mem-p-rscount.tatara.svc:8080")
 
 	// Done subtask with no result text.
 	st := getSubtask(t, "t-rscount-s1")
@@ -553,6 +613,7 @@ func TestTaskReconcile_ResultSummaryNotOverwrittenWhenSet(t *testing.T) {
 	mkTaskProject(t, "p-rsnoop", 3)
 	mkTaskRepository(t, "r-rsnoop", "p-rsnoop")
 	mkTask(t, "t-rsnoop", "p-rsnoop", "r-rsnoop")
+	setProjectMemoryReady(t, "p-rsnoop", "http://mem-p-rsnoop.tatara.svc:8080")
 
 	// Agent already set ResultSummary via task_update.
 	tk := getTask(t, "t-rsnoop")

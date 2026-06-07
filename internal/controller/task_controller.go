@@ -96,6 +96,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("get project: %w", err)
 	}
 
+	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
+		l.Info("task gated: project memory not ready",
+			"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
+		return ctrl.Result{RequeueAfter: capRequeue}, nil
+	}
+
 	// Concurrency gate: only applies to Tasks not yet active.
 	if !isActive(task.Status.Phase) {
 		atCap, err := r.atConcurrencyCap(ctx, &project, task.Name)
@@ -188,7 +194,7 @@ func (r *TaskReconciler) atConcurrencyCap(ctx context.Context, project *tatarav1
 // already-active Task it counts recreations; when the budget is exhausted it
 // returns exhausted=true so the caller fails the Task.
 func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task) (bool, error) {
-	pod := agent.BuildPod(project, repo, task, r.PodConfig)
+	pod := agent.BuildPod(project, repo, task, project.Status.Memory.Endpoint, r.PodConfig)
 	existing := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, existing)
 	switch {
@@ -208,7 +214,7 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 		return false, fmt.Errorf("get wrapper pod: %w", err)
 	}
 
-	svc := agent.BuildService(project, repo, task, r.PodConfig)
+	svc := agent.BuildService(project, repo, task, project.Status.Memory.Endpoint, r.PodConfig)
 	existingSvc := &corev1.Service{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}, existingSvc)
 	if apierrors.IsNotFound(err) {
