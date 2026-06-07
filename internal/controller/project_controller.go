@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,6 +26,7 @@ type ProjectReconciler struct {
 	Scheme              *runtime.Scheme
 	Metrics             *obs.OperatorMetrics
 	ExternalWebhookBase string
+	MemoryConfig        memory.Config
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
