@@ -84,7 +84,7 @@ func effectivePGInstances(p *tataradevv1alpha1.Project) int {
 // stack (owner-ref'd by the N1 builders). The neo4j password Secret is created
 // separately by ensureNeo4jPassword and is NOT applied here, so it is never
 // rotated.
-func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1alpha1.Project, neo4jPassword string) error {
+func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1alpha1.Project) error {
 	cfg := r.MemoryConfig
 	objs := []client.Object{
 		memory.PGCluster(p, cfg),
@@ -99,11 +99,11 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		memory.MemoryService(p, cfg),
 	}
 	for _, obj := range objs {
-		// client.Apply (the Patch variant) is deprecated in favour of the typed
-		// r.Apply(ctx, applyconfig, ...) API introduced in controller-runtime
-		// v0.20+. Migration requires generated applyconfiguration types for every
-		// stack object and is tracked for N4. The Patch path is functionally
-		// identical and will not be removed before v0.30.
+		// client.Apply (the Patch variant) is deprecated in controller-runtime
+		// v0.24.1 with no stated removal version. Migration to the typed
+		// r.Apply(ctx, applyconfig) API requires generated applyconfiguration
+		// types for all 10 stack objects (incl. cnpg Cluster) and is tracked
+		// for N4. The Patch path is functionally identical in the interim.
 		if err := r.Patch(ctx, obj, client.Apply, //nolint:staticcheck
 			client.FieldOwner(memoryFieldOwner), client.ForceOwnership); err != nil {
 			return fmt.Errorf("apply %T %s: %w", obj, obj.GetName(), err)
@@ -166,15 +166,14 @@ const memoryRequeue = 10 * time.Second
 // (which is also recorded as phase=Failed + MemoryReady=False before
 // returning).
 func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1alpha1.Project) (time.Duration, error) {
-	start := time.Now()
 	p.Status.Memory = ensureMemoryStatus(p)
+	prevPhase := p.Status.Memory.Phase
 	p.Status.Memory.Endpoint = memory.Endpoint(p.Name, r.MemoryConfig.Namespace)
 
-	pw, err := r.ensureNeo4jPassword(ctx, p)
-	if err != nil {
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
 		return 0, r.failMemory(p, "PasswordError", err)
 	}
-	if err := r.applyMemoryStack(ctx, p, pw); err != nil {
+	if err := r.applyMemoryStack(ctx, p); err != nil {
 		return 0, r.failMemory(p, "ApplyError", err)
 	}
 
@@ -193,7 +192,9 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		condStatus = metav1.ConditionTrue
 		reason = "Ready"
 		msg = "memory stack ready at " + p.Status.Memory.Endpoint
-		r.Metrics.ObserveMemoryProvisionDuration(time.Since(start).Seconds())
+		if prevPhase != "Ready" {
+			r.Metrics.ObserveMemoryProvisionDuration(time.Since(p.CreationTimestamp.Time).Seconds())
+		}
 	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               "MemoryReady",
@@ -202,7 +203,6 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		Message:            msg,
 		ObservedGeneration: p.Generation,
 	})
-	r.Metrics.SetMemoryStacks(phase, 1)
 
 	if phase == "Ready" {
 		return 0, nil
@@ -219,9 +219,10 @@ func ensureMemoryStatus(p *tataradevv1alpha1.Project) *tataradevv1alpha1.MemoryS
 }
 
 // failMemory records phase=Failed + MemoryReady=False on the Project status
-// and returns the wrapped error for the caller to surface.
+// and returns the wrapped error for the caller to surface. p.Status.Memory is
+// always non-nil when called from reconcileMemory (set at entry), so no
+// nil-guard is needed here.
 func (r *ProjectReconciler) failMemory(p *tataradevv1alpha1.Project, reason string, err error) error {
-	p.Status.Memory = ensureMemoryStatus(p)
 	p.Status.Memory.Phase = "Failed"
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               "MemoryReady",
@@ -230,6 +231,5 @@ func (r *ProjectReconciler) failMemory(p *tataradevv1alpha1.Project, reason stri
 		Message:            err.Error(),
 		ObservedGeneration: p.Generation,
 	})
-	r.Metrics.SetMemoryStacks("Failed", 1)
 	return fmt.Errorf("reconcile memory: %w", err)
 }

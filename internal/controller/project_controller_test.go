@@ -19,10 +19,16 @@ import (
 )
 
 func newProjectReconciler() *ProjectReconciler {
+	r, _ := newProjectReconcilerWithReg()
+	return r
+}
+
+func newProjectReconcilerWithReg() (*ProjectReconciler, *prometheus.Registry) {
+	reg := prometheus.NewRegistry()
 	return &ProjectReconciler{
 		Client:              k8sClient,
 		Scheme:              k8sClient.Scheme(),
-		Metrics:             obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:             obs.NewOperatorMetrics(reg),
 		ExternalWebhookBase: "https://tatara.example/operator/webhooks",
 		MemoryConfig: memory.Config{
 			Namespace:        testNS,
@@ -33,7 +39,7 @@ func newProjectReconciler() *ProjectReconciler {
 			OIDCIssuer:       "https://keycloak.example/realms/tatara",
 			OIDCAudience:     "tatara-memory",
 		},
-	}
+	}, reg
 }
 
 func reconcileProject(t *testing.T, name string) (ctrl.Result, error) {

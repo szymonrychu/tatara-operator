@@ -13,10 +13,10 @@ import (
 // PGVectorStorage.
 //
 // cnpg v1.29.1 field adaptations vs the plan (written for v1.27.x):
-// - Struct field names match exactly: Instances, StorageConfiguration.Size,
-//   Bootstrap.InitDB.{Database,Owner,PostInitApplicationSQL}. No changes needed.
-// - GroupVersion export: cnpgv1 exposes SchemeGroupVersion (not GroupVersion);
-//   TypeMeta.APIVersion uses cnpgv1.SchemeGroupVersion.String().
+//   - Struct field names match exactly: Instances, StorageConfiguration.Size,
+//     Bootstrap.InitDB.{Database,Owner,PostInitApplicationSQL}. No changes needed.
+//   - GroupVersion export: cnpgv1 exposes SchemeGroupVersion (not GroupVersion);
+//     TypeMeta.APIVersion uses cnpgv1.SchemeGroupVersion.String().
 func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 	n := NamesFor(p.Name)
 	return &cnpgv1.Cluster{

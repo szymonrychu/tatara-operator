@@ -77,6 +77,8 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, memErr
 	}
 
+	r.updateMemoryStackCounts(ctx)
+
 	memPhase := ""
 	if project.Status.Memory != nil {
 		memPhase = project.Status.Memory.Phase
@@ -89,6 +91,32 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		"memory_phase", memPhase)
 	r.Metrics.ReconcileResult("Project", "success")
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// updateMemoryStackCounts lists all Projects and sets the operator_memory_stacks
+// gauge to the current cluster-wide count per phase. Projects without
+// status.memory are not counted.
+func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
+	var list tataradevv1alpha1.ProjectList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	var provisioning, ready, failed int
+	for i := range list.Items {
+		mem := list.Items[i].Status.Memory
+		if mem == nil {
+			continue
+		}
+		switch mem.Phase {
+		case "Provisioning":
+			provisioning++
+		case "Ready":
+			ready++
+		case "Failed":
+			failed++
+		}
+	}
+	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed)
 }
 
 // validateSecret returns the condition (reason, message, ready) for the

@@ -86,10 +86,15 @@ func (m *OperatorMetrics) ObserveMemoryProvisionDuration(seconds float64) {
 	m.memoryProvisionDuration.Observe(seconds)
 }
 
-// SetMemoryStacks sets the operator_memory_stacks gauge for the given phase.
-func (m *OperatorMetrics) SetMemoryStacks(phase string, n float64) {
-	m.memoryStacks.WithLabelValues(phase).Set(n)
+// SetMemoryStackCounts sets the operator_memory_stacks gauge for all three
+// phases atomically to the given cluster-wide counts. Pass 0 for any phase
+// that has no stacks so stale values are cleared.
+func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed int) {
+	m.memoryStacks.WithLabelValues("Provisioning").Set(float64(provisioning))
+	m.memoryStacks.WithLabelValues("Ready").Set(float64(ready))
+	m.memoryStacks.WithLabelValues("Failed").Set(float64(failed))
 }
+
 
 // ReconcileResult increments operator_reconcile_total for the given kind and
 // result ("success" or "error").

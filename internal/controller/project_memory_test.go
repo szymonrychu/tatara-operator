@@ -6,6 +6,7 @@ import (
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
+	"github.com/prometheus/client_golang/prometheus"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	appsv1 "k8s.io/api/apps/v1"
@@ -18,7 +19,12 @@ import (
 )
 
 func newMemoryReconciler() *ProjectReconciler {
-	r := newProjectReconciler()
+	r, _ := newMemoryReconcilerWithReg()
+	return r
+}
+
+func newMemoryReconcilerWithReg() (*ProjectReconciler, *prometheus.Registry) {
+	r, reg := newProjectReconcilerWithReg()
 	r.MemoryConfig = memory.Config{
 		Namespace:        testNS,
 		MemoryImage:      "harbor.example/tatara-memory:test",
@@ -28,7 +34,29 @@ func newMemoryReconciler() *ProjectReconciler {
 		OIDCIssuer:       "https://keycloak.example/realms/tatara",
 		OIDCAudience:     "tatara-memory",
 	}
-	return r
+	return r, reg
+}
+
+// gatherMemoryStackCount reads operator_memory_stacks{phase=phase} from reg.
+func gatherMemoryStackCount(t *testing.T, reg *prometheus.Registry, phase string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_memory_stacks" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "phase" && lp.GetValue() == phase {
+					return m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func mkMemoryProject(t *testing.T, name string) *tataradevv1alpha1.Project {
@@ -80,11 +108,10 @@ func TestApplyMemoryStack_CreatesStackWithOwnerRefs(t *testing.T) {
 	r := newMemoryReconciler()
 	p := mkMemoryProject(t, "stack-create")
 
-	pw, err := r.ensureNeo4jPassword(ctx, p)
-	if err != nil {
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
 		t.Fatalf("password: %v", err)
 	}
-	if err := r.applyMemoryStack(ctx, p, pw); err != nil {
+	if err := r.applyMemoryStack(ctx, p); err != nil {
 		t.Fatalf("applyMemoryStack: %v", err)
 	}
 
@@ -112,7 +139,7 @@ func TestApplyMemoryStack_CreatesStackWithOwnerRefs(t *testing.T) {
 	assertOwnedByProject(t, sts.GetOwnerReferences(), p.Name)
 
 	// Idempotent: a second apply must not error.
-	if err := r.applyMemoryStack(ctx, p, pw); err != nil {
+	if err := r.applyMemoryStack(ctx, p); err != nil {
 		t.Fatalf("second applyMemoryStack: %v", err)
 	}
 }
@@ -273,6 +300,96 @@ func waitMemoryPhase(t *testing.T, name, want string) *tataradevv1alpha1.Project
 	}
 	t.Fatalf("project %s memory phase never reached %s", name, want)
 	return nil
+}
+
+func TestMemoryStackGauge_ClusterWideCounts(t *testing.T) {
+	// Two Projects reconciled by the same reconciler (shared gauge state).
+	// p1 stays Provisioning; p2 transitions to Ready via fakeStackHealthy.
+	// The gauge must reflect the full cluster-wide LIST, so we capture a
+	// baseline before creating the test Projects and assert deltas to avoid
+	// counting Projects from other tests in the shared test namespace.
+	r, reg := newMemoryReconcilerWithReg()
+
+	p1 := mkMemoryProject(t, "gauge-prov")
+	p2 := mkMemoryProject(t, "gauge-ready")
+
+	// First reconcile both: stacks applied, health returns Provisioning for both.
+	if _, err := r.Reconcile(logfIntoTestCtx(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: p1.Name}}); err != nil {
+		t.Fatalf("reconcile p1: %v", err)
+	}
+	if _, err := r.Reconcile(logfIntoTestCtx(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: p2.Name}}); err != nil {
+		t.Fatalf("reconcile p2: %v", err)
+	}
+	baselineProvisioning := gatherMemoryStackCount(t, reg, "Provisioning")
+	baselineReady := gatherMemoryStackCount(t, reg, "Ready")
+	// p1 and p2 are both Provisioning at this point; baseline includes them.
+	if baselineProvisioning < 2 {
+		t.Fatalf("Provisioning baseline = %v, want >=2 (p1+p2 at minimum)", baselineProvisioning)
+	}
+
+	// Transition p2 to Ready.
+	fakeStackHealthy(t, p2.Name)
+	if _, err := r.Reconcile(logfIntoTestCtx(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: p2.Name}}); err != nil {
+		t.Fatalf("second reconcile p2: %v", err)
+	}
+
+	provAfter := gatherMemoryStackCount(t, reg, "Provisioning")
+	readyAfter := gatherMemoryStackCount(t, reg, "Ready")
+	// p2 moved from Provisioning to Ready: delta must be exactly -1 / +1.
+	if got := baselineProvisioning - provAfter; got != 1 {
+		t.Fatalf("Provisioning delta = %v, want 1 (p2 left Provisioning)", got)
+	}
+	if got := readyAfter - baselineReady; got != 1 {
+		t.Fatalf("Ready delta = %v, want 1 (p2 entered Ready)", got)
+	}
+}
+
+func TestMemoryProvisionDuration_OnceOnTransition(t *testing.T) {
+	// ObserveMemoryProvisionDuration must fire exactly once, on the first
+	// transition into Ready, and never on steady-state Ready reconciles.
+	r, reg := newMemoryReconcilerWithReg()
+	p := mkMemoryProject(t, "dur-once")
+
+	// First reconcile: Provisioning - no observation.
+	if _, err := r.Reconcile(logfIntoTestCtx(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: p.Name}}); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	assertProvisionDurationCount(t, reg, 0)
+
+	// Transition to Ready.
+	fakeStackHealthy(t, p.Name)
+	if _, err := r.Reconcile(logfIntoTestCtx(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: p.Name}}); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	assertProvisionDurationCount(t, reg, 1)
+
+	// Third reconcile while still Ready: must NOT fire again.
+	if _, err := r.Reconcile(logfIntoTestCtx(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: p.Name}}); err != nil {
+		t.Fatalf("third reconcile: %v", err)
+	}
+	assertProvisionDurationCount(t, reg, 1)
+}
+
+// assertProvisionDurationCount asserts the operator_memory_provision_duration_seconds
+// histogram has exactly want samples recorded.
+func assertProvisionDurationCount(t *testing.T, reg *prometheus.Registry, want uint64) {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_memory_provision_duration_seconds" {
+			got := mf.GetMetric()[0].GetHistogram().GetSampleCount()
+			if got != want {
+				t.Fatalf("provision_duration sample count = %d, want %d", got, want)
+			}
+			return
+		}
+	}
+	if want != 0 {
+		t.Fatalf("operator_memory_provision_duration_seconds not found in registry")
+	}
 }
 
 // fakeStackHealthy patches the owned objects' status subresources to the
