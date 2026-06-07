@@ -20,7 +20,13 @@ internalAddr: ":8082"
 callbackUrl: ""
 oidcIssuer: ""
 oidcAudience: "tatara-operator"
-memoryBaseUrl: ""
+# Per-Project memory stack images + shared OpenAI secret (rule 6: scalar ->
+# SCREAMING_SNAKE ConfigMap key -> manager via envFrom). MEMORY_BASE_URL was
+# removed in N3 (replaced by per-Project status.memory.endpoint).
+memoryImage: ""
+lightragImage: ""
+neo4jImage: ""
+openaiSecretName: ""
 ingesterImage: ""
 externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"

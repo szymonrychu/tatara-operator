@@ -28,7 +28,16 @@ Planned work not yet started. One line per item; link to plans for detail.
 - [x] N1 complete - cnpg api dep + scheme, Project CRD memory fields, config image/secret fields, remove MEMORY_BASE_URL, internal/memory builder package (NamesFor, Endpoint, PGCluster, Neo4jPasswordSecret, Neo4jStatefulSet+Service, LightragDeployment+Service+PVC, MemoryDeployment+Service+ConfigMap+Secret). Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n1-builders.md`.
 - [x] N2 provisioning reconcile - ProjectReconciler SSAs full per-project stack (PGCluster, neo4j StatefulSet, lightrag, tatara-memory), status.memory.phase/endpoint, MemoryReady condition, metrics, Owns() all stack kinds, memoryConfigFromConfig in wire.go. Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n2-provisioning.md`.
 - [x] N3 ready-gating wiring - RepositoryReconciler + TaskReconciler gate on status.memory.Phase==Ready; ingest Job --base-url + BASE_URL env from status.memory.endpoint; agent wrapper pod TATARA_MEMORY_URL from same; ingest.BuildJob baseURL param replaces removed MemoryBaseURL config field. Plan: `docs/superpowers/plans/2026-06-07-per-project-memory-n3-wiring.md`.
-- [ ] N4 RBAC + retire static tatara-memory - chart Role additions (cnpg/statefulsets/pvc/secrets create+update), helmfile tatara-memory release removed, infra operator values updated (memoryImage/lightragImage/neo4jImage/openaiSecretName, drop memoryBaseUrl), operator image bump + helmfile apply, helm uninstall tatara-memory (gated human step).
+- [x] N4 retire static tatara-memory + chart RBAC/values + image bump + deploy -
+  operator chart Role gains postgresql.cnpg.io clusters(+/status), apps/deployments,
+  apps/statefulsets, core/persistentvolumeclaims CRUD; secrets verbs widened to
+  create/update/patch/delete (was read-only) for generated neo4j password + memory
+  config Secrets; ConfigMap drops MEMORY_BASE_URL, adds MEMORY_IMAGE/LIGHTRAG_IMAGE/
+  NEO4J_IMAGE/OPENAI_SECRET_NAME; Chart+appVersion 0.2.0; cnpg Cluster CRD provenance
+  header added. Infra removes the static tatara-memory release + values dir, bumps
+  operator image tag to 0.2.0, adds the image/secret values. Deploy + static-stack
+  uninstall are gated. apps/deployments was MISSING from prior RBAC; added here.
+  Plan: docs/superpowers/plans/2026-06-07-per-project-memory-n4-retire-deploy.md.
 
 ## Deploy follow-ons (gated - require human action in this order)
 
@@ -44,3 +53,17 @@ Planned work not yet started. One line per item; link to plans for detail.
 10. [ ] Create per-Project SCM Secrets (keys: token, webhookSecret) in tatara namespace, one per Project (not chart-rendered; see default.secrets.yaml comments).
 11. [ ] `helmfile -e default -f infra/helmfile/helmfiles/tatara/helmfile.yaml.gotmpl -l application=tatara-operator diff` - review diff (should show 15 objects + 4 CRDs as net-new). Gate: present to human before apply.
 12. [ ] `helmfile -e default -f infra/helmfile/helmfiles/tatara/helmfile.yaml.gotmpl -l application=tatara-operator apply` - ONLY after all above preconditions are satisfied and the human has reviewed the diff.
+
+## N4 deploy follow-ons (gated - require human action in this order)
+
+1. [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.2.0.
+2. [ ] Create shared Secret lightrag-openai (ns tatara, key LLM_BINDING_API_KEY)
+   via sops-secret-helper, reusing the key from the retiring tatara-memory sops
+   (recover from default.secrets.yaml BEFORE git rm, or from live cluster Secret).
+3. [ ] helm package + push tatara-operator-0.2.0.tgz to oci://harbor.szymonrichert.pl/charts.
+4. [ ] Confirm cnpg operator + lightrag-openai present in-cluster:
+   `kubectl get crd clusters.postgresql.cnpg.io && kubectl -n tatara get secret lightrag-openai`
+5. [ ] helmfile -e default -l application=tatara-operator diff (review; gate on human approval).
+6. [ ] helmfile -e default -l application=tatara-operator apply.
+7. [ ] helm uninstall tatara-memory -n tatara (empty static stack; no data migration needed).
+8. [ ] Verify a Project provisions mem-<proj>-* and reaches status.memory.phase=Ready.

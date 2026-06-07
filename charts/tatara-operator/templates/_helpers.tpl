@@ -71,7 +71,10 @@ INTERNAL_ADDR: {{ .Values.internalAddr | quote }}
 CALLBACK_URL: {{ .Values.callbackUrl | quote }}
 OIDC_ISSUER: {{ .Values.oidcIssuer | quote }}
 OIDC_AUDIENCE: {{ .Values.oidcAudience | quote }}
-MEMORY_BASE_URL: {{ .Values.memoryBaseUrl | quote }}
+MEMORY_IMAGE: {{ .Values.memoryImage | quote }}
+LIGHTRAG_IMAGE: {{ .Values.lightragImage | quote }}
+NEO4J_IMAGE: {{ .Values.neo4jImage | quote }}
+OPENAI_SECRET_NAME: {{ .Values.openaiSecretName | quote }}
 INGESTER_IMAGE: {{ .Values.ingesterImage | quote }}
 EXTERNAL_WEBHOOK_BASE: {{ .Values.externalWebhookBase | quote }}
 OPERATOR_OIDC_CLIENT_ID: {{ .Values.operatorOidcClientId | quote }}
