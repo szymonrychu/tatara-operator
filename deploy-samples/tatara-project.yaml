@@ -1,0 +1,42 @@
+apiVersion: tatara.dev/v1alpha1
+kind: Project
+metadata: {name: tatara, namespace: tatara}
+spec:
+  scmSecretRef: tatara-scm
+  triggerLabel: tatara
+  maxConcurrentTasks: 2
+  agent:
+    image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:0.1.0
+    model: claude-opus-4-8
+    permissionMode: bypassPermissions
+  memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata: {name: tatara-memory, namespace: tatara}
+spec: {projectRef: tatara, url: "https://github.com/szymonrychu/tatara-memory", defaultBranch: main}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata: {name: tatara-cli, namespace: tatara}
+spec: {projectRef: tatara, url: "https://github.com/szymonrychu/tatara-cli", defaultBranch: main}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata: {name: tatara-operator, namespace: tatara}
+spec: {projectRef: tatara, url: "https://github.com/szymonrychu/tatara-operator", defaultBranch: main}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata: {name: tatara-chat, namespace: tatara}
+spec: {projectRef: tatara, url: "https://github.com/szymonrychu/tatara-chat", defaultBranch: main}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata: {name: tatara-memory-repo-ingester, namespace: tatara}
+spec: {projectRef: tatara, url: "https://github.com/szymonrychu/tatara-memory-repo-ingester", defaultBranch: main}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata: {name: tatara-claude-code-wrapper, namespace: tatara}
+spec: {projectRef: tatara, url: "https://github.com/szymonrychu/tatara-claude-code-wrapper", defaultBranch: main}
