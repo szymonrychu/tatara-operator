@@ -27,6 +27,17 @@ func TestPlanTurnText_MentionsDecompose(t *testing.T) {
 	}
 }
 
+func TestPlanTurnText_AllowsDirectImplementation(t *testing.T) {
+	txt := planTurnText("fix a typo", "tatara/task-abc", "proj1", "task-abc")
+	low := strings.ToLower(txt)
+	if !strings.Contains(low, "implement it directly") {
+		t.Errorf("plan turn should let the agent implement small tasks directly: %q", txt)
+	}
+	if strings.Contains(txt, "Do not start implementation") {
+		t.Errorf("plan turn must not forbid implementation outright: %q", txt)
+	}
+}
+
 func TestPlanTurnText_ContainsBranchDirective(t *testing.T) {
 	const branch = "tatara/task-my-task"
 	txt := planTurnText("do the thing", branch, "my-project", "my-task")

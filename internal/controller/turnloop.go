@@ -13,15 +13,16 @@ import (
 func planTurnText(goal, branch, project, task string) string {
 	return fmt.Sprintf(
 		"You are working on Task `%s` in Project `%s`. "+
-			"Use the tatara MCP tools with task=`%s` (and project=`%s`) - "+
-			"e.g. record each planned subtask via subtask_create(task=`%s`, ...).\n\n"+
+			"Use the tatara MCP tools with task=`%s` (and project=`%s`).\n\n"+
 			"%s\n\n"+
-			"Decompose this objective into ordered Subtasks via the subtask MCP tool "+
-			"(subtask_create), one per concrete step. Do not start implementation in this turn.\n\n"+
-			"All work for this task MUST be committed and pushed to the git branch `%s` "+
-			"(create it from the default branch at the start). NEVER commit or push to the default branch directly. "+
-			"Push your branch before the task ends.",
-		task, project, task, project, task, goal, branch)
+			"If this objective is small enough to finish in one turn, implement it directly now - "+
+			"edit the files in the working tree. If it needs several steps, decompose it into ordered "+
+			"Subtasks via subtask_create(task=`%s`, ...), one per concrete step, which are executed in "+
+			"later turns.\n\n"+
+			"Your changes are committed and pushed to the git branch `%s` automatically at the end of each "+
+			"turn (the branch is created from the default branch for you). NEVER commit or push to the "+
+			"default branch directly.",
+		task, project, task, project, goal, task, branch)
 }
 
 // nextPendingSubtask returns the lowest-order Pending subtask, if any.
