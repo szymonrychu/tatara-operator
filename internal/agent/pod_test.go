@@ -100,6 +100,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"DEFAULT_CALLBACK_URL": "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete",
 		"TATARA_TASK":          "task-7",
 		"TATARA_PROJECT":       "demo",
+		"TASK_BRANCH":          "tatara/task-task-7",
 		"OIDC_ISSUER":          "https://keycloak.tatara.svc/realms/master",
 		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
 		"TATARA_MEMORY_URL":    "http://mem-demo.tatara.svc:8080",

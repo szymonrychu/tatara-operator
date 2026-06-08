@@ -72,6 +72,13 @@ func secretEnv(name, secretName, key string) corev1.EnvVar {
 }
 
 // BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
+// TaskBranch is the deterministic work branch for a Task's agent run, the
+// single source operator write-back, the turn prompts, and the wrapper all
+// agree on. Convention: tatara/task-<task-name>.
+func TaskBranch(t *tatarav1alpha1.Task) string {
+	return "tatara/task-" + t.Name
+}
+
 func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
 	env := []corev1.EnvVar{
 		{Name: "REPO_URL", Value: repo.Spec.URL},
@@ -83,6 +90,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},
+		// Work branch the wrapper checks out and pushes; the operator opens the
+		// PR from this same branch (see TaskBranch).
+		{Name: "TASK_BRANCH", Value: TaskBranch(task)},
 		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
 		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
 		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},

@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -158,7 +159,7 @@ func providerForRemote(ctx context.Context, remote string) string {
 // exact string. If the wrapper ever enforces branch pushing itself, it must use
 // this same value.
 func taskBranch(t *tatarav1alpha1.Task) string {
-	return "tatara/task-" + t.Name
+	return agent.TaskBranch(t)
 }
 
 func firstLine(s string) string {
