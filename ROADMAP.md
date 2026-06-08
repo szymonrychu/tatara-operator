@@ -48,9 +48,9 @@ Planned work not yet started. One line per item; link to plans for detail.
 5. [ ] `terraform -chdir=infra/terraform/keycloak apply` - creates the tatara-operator confidential client + audience mapper (3 resources). Gate: review `terraform plan` output first.
 6. [ ] Capture `terraform -chdir=infra/terraform/keycloak output -raw tatara_operator_client_secret` and populate the real value into `infra/helmfile/helmfiles/tatara/values/tatara-operator/default.secrets.yaml` via `sops-secret-helper` skill (placeholder currently reads REPLACE_WITH_KEYCLOAK_OUTPUT).
 7. [ ] Publish OCI chart: `helm package charts/tatara-operator -d /tmp && helm push /tmp/tatara-operator-0.1.0.tgz oci://harbor.szymonrichert.pl/charts` (from tatara-operator main, not a worktree).
-8. [ ] Provide the agent auth credential in tatara namespace as Secret tatara-anthropic, data key `oauth-token` (a long-lived `claude setup-token` token; not chart-rendered; use reflector or sops-encrypted manifest). Replaces the old `api-key`/ANTHROPIC_API_KEY (0.2.2).
-9. [ ] Create tatara-cli-oidc Secret in tatara namespace (keys: clientId, clientSecret for the tatara-cli public client; the wrapper's tatara-cli mints operator/memory/chat tokens via device flow).
-10. [ ] Create per-Project SCM Secrets (keys: token, webhookSecret) in tatara namespace, one per Project (not chart-rendered; see default.secrets.yaml comments).
+8. [x] tatara-anthropic (data key `oauth-token`) - chart-rendered from sops (0.2.3).
+9. [x] tatara-cli-oidc (keys: client-id, client-secret) - chart-rendered from sops (0.2.3).
+10. [x] tatara-scm (keys: token, webhookSecret) - chart-rendered from sops (0.2.3); single Project (multi-project deferred, rule 6).
 11. [ ] `helmfile -e default -f infra/helmfile/helmfiles/tatara/helmfile.yaml.gotmpl -l application=tatara-operator diff` - review diff (should show 15 objects + 4 CRDs as net-new). Gate: present to human before apply.
 12. [ ] `helmfile -e default -f infra/helmfile/helmfiles/tatara/helmfile.yaml.gotmpl -l application=tatara-operator apply` - ONLY after all above preconditions are satisfied and the human has reviewed the diff.
 

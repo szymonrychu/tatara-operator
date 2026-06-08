@@ -3,6 +3,17 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-08 (0.2.3) All four cluster-managed secrets (`tatara-anthropic`,
+  `tatara-cli-oidc`, `lightrag-openai`, `tatara-scm`) are now chart-rendered from
+  sops values (`templates/managed-secrets.yaml`), replacing manual `kubectl create
+  secret`. Each gated on its value(s); paired creds guarded with `and` so a
+  half-set pair never renders an empty credential. Names from existing
+  `*SecretName` values (+ new `scmSecretName`); data keys fixed by consumer code.
+  Chart-only change (no Go): chart `version` 0.2.3, `appVersion` stays 0.2.2, image
+  not rebuilt. Migration was delete-then-apply (manual secrets were not helm-owned,
+  so adoption would conflict). Deferred: multi-project SCM secrets - would need a
+  projects map (a list in `values.yaml`), which hard rule 6 forbids; one
+  `tatara-scm` is rendered for the single Project.
 - 2026-06-08 (0.2.2) Spawned agent auth switched from console API key to a
   long-lived Claude Code OAuth token: `pod.go` BuildPod now injects
   `CLAUDE_CODE_OAUTH_TOKEN` from Secret `<anthropicSecretName>` data key
