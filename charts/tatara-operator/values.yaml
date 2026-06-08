@@ -44,6 +44,17 @@ logLevel: "info"
 existingSecret: ""
 operatorOidcClientSecret: ""
 
+# Cluster-managed secrets rendered from SOPS values (empty = not rendered, use
+# an externally-managed Secret of the same name instead). Data keys are fixed
+# by consumer code; do not rename.
+scmSecretName: ""
+anthropicOauthToken: ""
+cliOidcClientId: ""
+cliOidcClientSecret: ""
+openaiApiKey: ""
+scmToken: ""
+scmWebhookSecret: ""
+
 service:
   type: ClusterIP
   httpPort: 8080
