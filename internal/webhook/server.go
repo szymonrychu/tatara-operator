@@ -175,6 +175,27 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		return
 	}
 
+	// Dedupe: creating an issue with the label fires both issues.opened and
+	// issues.labeled for the same issue. Skip if a non-terminal Task already
+	// exists for this issue ref (re-labeling after completion still re-triggers).
+	var existing tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &existing, client.InNamespace(s.cfg.Namespace)); err != nil {
+		s.count(provider, ev.Kind, "error")
+		http.Error(w, "list tasks", http.StatusInternalServerError)
+		return
+	}
+	for i := range existing.Items {
+		t := &existing.Items[i]
+		if t.Spec.Source != nil && t.Spec.Source.IssueRef == ev.IssueRef &&
+			t.Status.Phase != "Succeeded" && t.Status.Phase != "Failed" {
+			s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
+				"project", proj.Name, "issue_ref", ev.IssueRef, "task", t.Name)
+			s.count(provider, ev.Kind, "duplicate")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+	}
+
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName:    "task-",

@@ -47,6 +47,31 @@ func TestIssueWithTriggerLabelCreatesTask(t *testing.T) {
 	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "result": "task_created"}))
 }
 
+func TestDuplicateIssueEventDoesNotCreateSecondTask(t *testing.T) {
+	const secretVal = "whsec"
+	c := seedClient(t,
+		project("proj1wi", "proj1wi-scm", "tatara"),
+		secret("proj1wi-scm", secretVal),
+		repository("repo1wi", "proj1wi", "https://github.com/o/r.git", "main"),
+	)
+	h, reg := newServer(t, c)
+
+	body := []byte(`{"action":"opened","issue":{"number":7,"title":"Fix the bug","body":"please fix","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issues")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	// Creating an issue with the label fires both issues.opened and
+	// issues.labeled for the SAME issue. Only one Task should result.
+	require.Equal(t, http.StatusAccepted, post(t, h, "proj1wi", hdr, body).Code)
+	require.Equal(t, http.StatusAccepted, post(t, h, "proj1wi", hdr, body).Code)
+
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	require.Len(t, tasks.Items, 1, "duplicate issue event must not create a second task")
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "result": "duplicate"}))
+}
+
 func TestWorkItemNoLabelNoTask(t *testing.T) {
 	const secretVal = "whsec"
 	c := seedClient(t,
