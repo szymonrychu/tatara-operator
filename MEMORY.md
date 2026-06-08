@@ -3,6 +3,16 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-08 (0.2.2) Spawned agent auth switched from console API key to a
+  long-lived Claude Code OAuth token: `pod.go` BuildPod now injects
+  `CLAUDE_CODE_OAUTH_TOKEN` from Secret `<anthropicSecretName>` data key
+  `oauth-token` (was `ANTHROPIC_API_KEY`/`api-key`). Pure replace, not additive:
+  claude auth precedence puts `ANTHROPIC_API_KEY` above the OAuth token, so
+  injecting both would leave the OAuth token inert. Wrapper needs no change
+  (it passes os.Environ() straight to the claude child; OAuth login does not
+  trigger the API-key dialog claudejson.go seeds). The `tatara-anthropic`
+  Secret must carry `oauth-token` (from `claude setup-token`); the old `api-key`
+  key is no longer read. Drives subscription billing instead of console API.
 - 2026-06-06 Repo created at milestone M0 (scaffold). API group `tatara.dev`,
   version `v1alpha1`, kinds Project/Repository/Task/Subtask, all namespaced
   to `tatara`. Built on kubebuilder/controller-runtime (rejected plain

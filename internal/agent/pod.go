@@ -79,7 +79,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
 		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},
-		secretEnv("ANTHROPIC_API_KEY", cfg.AnthropicSecretName, "api-key"),
+		secretEnv("CLAUDE_CODE_OAUTH_TOKEN", cfg.AnthropicSecretName, "oauth-token"),
 		secretEnv("GIT_TOKEN", project.Spec.ScmSecretRef, "token"),
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),

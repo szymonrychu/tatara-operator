@@ -105,10 +105,10 @@ func TestBuildPod_SecretEnv(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
 
-	ant, ok := envSecretRef(c, "ANTHROPIC_API_KEY")
+	ant, ok := envSecretRef(c, "CLAUDE_CODE_OAUTH_TOKEN")
 	require.True(t, ok)
 	require.Equal(t, "anthropic", ant.Name)
-	require.Equal(t, "api-key", ant.Key)
+	require.Equal(t, "oauth-token", ant.Key)
 
 	git, ok := envSecretRef(c, "GIT_TOKEN")
 	require.True(t, ok)
