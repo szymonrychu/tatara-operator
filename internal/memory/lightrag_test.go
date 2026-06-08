@@ -40,6 +40,10 @@ func TestLightragDeployment(t *testing.T) {
 	// Secret wiring.
 	require.Equal(t, "tatara-openai", env["LLM_BINDING_API_KEY"].ValueFrom.SecretKeyRef.Name)
 	require.Equal(t, "LLM_BINDING_API_KEY", env["LLM_BINDING_API_KEY"].ValueFrom.SecretKeyRef.Key)
+	// LightRAG's processing pipeline reads the raw OPENAI_API_KEY env var; without
+	// it, entity extraction fails KeyError 'OPENAI_API_KEY' and docs never process.
+	require.Equal(t, "tatara-openai", env["OPENAI_API_KEY"].ValueFrom.SecretKeyRef.Name)
+	require.Equal(t, "LLM_BINDING_API_KEY", env["OPENAI_API_KEY"].ValueFrom.SecretKeyRef.Key)
 	require.Equal(t, "mem-acme-pg-app", env["POSTGRES_PASSWORD"].ValueFrom.SecretKeyRef.Name)
 	require.Equal(t, "password", env["POSTGRES_PASSWORD"].ValueFrom.SecretKeyRef.Key)
 	require.Equal(t, "mem-acme-neo4j", env["NEO4J_PASSWORD"].ValueFrom.SecretKeyRef.Name)

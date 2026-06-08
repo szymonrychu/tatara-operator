@@ -48,6 +48,9 @@ func lightragEnv(p *tatarav1alpha1.Project, cfg Config) []corev1.EnvVar {
 		lit("POSTGRES_DATABASE", "tatara_memory"),
 		lit("POSTGRES_USER", "tatara_memory"),
 		secretEnv("LLM_BINDING_API_KEY", cfg.OpenAISecretName, "LLM_BINDING_API_KEY"),
+		// LightRAG's openai LLM/embedding paths fall back to the raw OPENAI_API_KEY
+		// env var; without it document processing fails KeyError 'OPENAI_API_KEY'.
+		secretEnv("OPENAI_API_KEY", cfg.OpenAISecretName, "LLM_BINDING_API_KEY"),
 		secretEnv("POSTGRES_PASSWORD", n.PGAppSecret, "password"),
 		secretEnv("NEO4J_PASSWORD", n.Neo4jSecret, "password"),
 	}
