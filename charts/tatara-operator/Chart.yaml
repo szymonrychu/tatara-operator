@@ -2,5 +2,5 @@ apiVersion: v2
 name: tatara-operator
 description: Kubernetes operator orchestrating the tatara agentic-development loop (Project/Repository/Task/Subtask CRDs)
 type: application
-version: 0.2.6
-appVersion: "0.2.6"
+version: 0.2.7
+appVersion: "0.2.7"

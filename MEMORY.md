@@ -3,6 +3,13 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-08 (0.2.7) Agent created ZERO subtasks so nothing got implemented: the
+  plan-turn prompt (`turnloop.planTurnText`) said "Do not start implementation in
+  this turn", only `subtask_create`. Agents didn't decompose, so the loop ended
+  with no work and write-back had no diff. Relaxed the prompt: implement small
+  tasks directly in the plan turn (the wrapper auto-commits/pushes each turn),
+  decompose into Subtasks only for multi-step work. Pairs with wrapper 0.1.3
+  (excludes wrapper session config from the commit; bakes superpowers skills).
 - 2026-06-08 (0.2.6) Agent never produced a PR: the agent edits files but does
   not reliably branch/commit/push, so write-back hit `422 head invalid` (branch
   `tatara/task-*` never existed). Fix split across repos: wrapper now enforces
