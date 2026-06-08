@@ -3,6 +3,17 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-08 (0.2.5) lightrag `OPENAI_API_KEY` bug: `lightragEnv`
+  (`internal/memory/lightrag.go`) set `LLM_BINDING_API_KEY` but not
+  `OPENAI_API_KEY`. LightRAG's openai LLM/embedding paths fall back to the raw
+  `OPENAI_API_KEY` env, so its async processing pipeline failed
+  `KeyError 'OPENAI_API_KEY'` and every queued doc went `doc_status=failed`
+  (963 on the cluster) - chunks/entities/relations never materialized even though
+  `/documents/text` returned 200. Fix: source `OPENAI_API_KEY` from the same
+  openai Secret (key `LLM_BINDING_API_KEY`). Surfaced only once the upstream
+  chunk path drained end-to-end (memory 0.2.2/0.2.3 + ingester 0.2.2 kubectl
+  fixes) - the dogfood was the first real exercise of LightRAG doc processing;
+  earlier "index built" was schema/HNSW init, not document processing.
 - 2026-06-08 (0.2.4) imagePullSecrets bug: operator-spawned **ingest Jobs**
   (`internal/ingest/job.go`) and **agent wrapper Pods** (`internal/agent/pod.go`)
   set their container image from a private Harbor registry but had no
