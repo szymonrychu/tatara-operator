@@ -39,6 +39,19 @@ func testConfig() Config {
 		OIDCClientSecret: "s3cr3t",
 		OIDCAudience:     "tatara-memory",
 		Namespace:        "tatara",
+		ImagePullSecret:  "regcred",
+	}
+}
+
+func TestBuildJob_ImagePullSecrets(t *testing.T) {
+	ips := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig()).Spec.Template.Spec.ImagePullSecrets
+	if len(ips) != 1 || ips[0].Name != "regcred" {
+		t.Fatalf("expected imagePullSecrets [regcred], got %v", ips)
+	}
+	cfg := testConfig()
+	cfg.ImagePullSecret = ""
+	if got := BuildJob(testProject(), testRepository(), "", testBaseURL, cfg).Spec.Template.Spec.ImagePullSecrets; len(got) != 0 {
+		t.Fatalf("expected no imagePullSecrets when unset, got %v", got)
 	}
 }
 

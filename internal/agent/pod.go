@@ -22,6 +22,16 @@ type PodConfig struct {
 	OIDCIssuer          string // OIDC issuer URL passed to the wrapper for token verification
 	AnthropicSecretName string
 	CLIOIDCSecretName   string
+	ImagePullSecret     string
+}
+
+// imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
+// else nil, so the agent Pod can pull the wrapper image from a private registry.
+func imagePullSecrets(cfg PodConfig) []corev1.LocalObjectReference {
+	if cfg.ImagePullSecret == "" {
+		return nil
+	}
+	return []corev1.LocalObjectReference{{Name: cfg.ImagePullSecret}}
 }
 
 // PodName returns the deterministic wrapper Pod (and Service) name for a Task.
@@ -93,7 +103,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			OwnerReferences: []metav1.OwnerReference{ownerRef(task)},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
+			RestartPolicy:    corev1.RestartPolicyNever,
+			ImagePullSecrets: imagePullSecrets(cfg),
 			Containers: []corev1.Container{{
 				Name:  "wrapper",
 				Image: project.Spec.Agent.Image,

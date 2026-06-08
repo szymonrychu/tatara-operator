@@ -20,6 +20,16 @@ type Config struct {
 	OIDCClientSecret string
 	OIDCAudience     string
 	Namespace        string
+	ImagePullSecret  string
+}
+
+// imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
+// else nil, so the ingest Job can pull the ingester image from a private registry.
+func imagePullSecrets(cfg Config) []corev1.LocalObjectReference {
+	if cfg.ImagePullSecret == "" {
+		return nil
+	}
+	return []corev1.LocalObjectReference{{Name: cfg.ImagePullSecret}}
 }
 
 // ResultConfigMapName returns the name of the ConfigMap an ingest Job patches
@@ -102,6 +112,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 				Spec: corev1.PodSpec{
 					RestartPolicy:      corev1.RestartPolicyNever,
 					ServiceAccountName: "tatara-ingest",
+					ImagePullSecrets:   imagePullSecrets(cfg),
 					Volumes: []corev1.Volume{{
 						Name:         workspaceVolume,
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},

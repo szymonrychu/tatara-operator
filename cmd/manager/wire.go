@@ -45,6 +45,7 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 		OIDCClientSecret: cfg.OperatorOIDCClientSecret,
 		OIDCAudience:     memoryAudience,
 		Namespace:        cfg.Namespace,
+		ImagePullSecret:  cfg.ImagePullSecret,
 	}
 }
 
@@ -90,6 +91,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		OIDCIssuer:          cfg.OIDCIssuer,
 		AnthropicSecretName: cfg.AnthropicSecretName,
 		CLIOIDCSecretName:   cfg.CLIOIDCSecretName,
+		ImagePullSecret:     cfg.ImagePullSecret,
 	}
 }
 

@@ -38,8 +38,18 @@ func sampleInputs() (*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatar
 		OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
+		ImagePullSecret:     "regcred",
 	}
 	return proj, repo, task, cfg
+}
+
+func TestBuildPod_ImagePullSecrets(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	ips := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.ImagePullSecrets
+	require.Equal(t, []corev1.LocalObjectReference{{Name: "regcred"}}, ips)
+
+	cfg.ImagePullSecret = ""
+	require.Empty(t, agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.ImagePullSecrets)
 }
 
 func envValue(c corev1.Container, name string) (string, bool) {

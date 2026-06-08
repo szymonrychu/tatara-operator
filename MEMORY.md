@@ -3,6 +3,15 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-08 (0.2.4) imagePullSecrets bug: operator-spawned **ingest Jobs**
+  (`internal/ingest/job.go`) and **agent wrapper Pods** (`internal/agent/pod.go`)
+  set their container image from a private Harbor registry but had no
+  `imagePullSecrets`, so both failed `ErrImagePull` ("no basic auth credentials").
+  The 0.2.1 fix only covered the per-Project memory pods (`internal/memory`).
+  Fixed by mirroring the memory `imagePullSecrets(cfg)` helper in both packages,
+  fed from `IMAGE_PULL_SECRET` (regcred) via `wire.go`. Surfaced only on the first
+  real dogfood ingest (envtest never pulls images). Rule: every operator-spawned
+  workload that pulls a private image needs imagePullSecrets wired from config.
 - 2026-06-08 (0.2.3) All four cluster-managed secrets (`tatara-anthropic`,
   `tatara-cli-oidc`, `lightrag-openai`, `tatara-scm`) are now chart-rendered from
   sops values (`templates/managed-secrets.yaml`), replacing manual `kubectl create
