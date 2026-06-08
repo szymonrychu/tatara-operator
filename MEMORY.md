@@ -3,6 +3,16 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-08 (0.2.6) Agent never produced a PR: the agent edits files but does
+  not reliably branch/commit/push, so write-back hit `422 head invalid` (branch
+  `tatara/task-*` never existed). Fix split across repos: wrapper now enforces
+  the git workflow (checkout -b + commit/push per turn, 0.1.2); operator exports
+  `agent.TaskBranch` (single source of the `tatara/task-<name>` convention) and
+  passes it as `TASK_BRANCH` env to the agent pod. `controller.taskBranch` now
+  delegates to `agent.TaskBranch` so write-back, turn prompts, and the wrapper
+  agree on the exact branch. Also noted this run: the operator created TWO Tasks
+  for one issue (issue.opened-with-label + issue.labeled both fire) - dedupe by
+  issue ref is a TODO (see ROADMAP).
 - 2026-06-08 (0.2.5) lightrag `OPENAI_API_KEY` bug: `lightragEnv`
   (`internal/memory/lightrag.go`) set `LLM_BINDING_API_KEY` but not
   `OPENAI_API_KEY`. LightRAG's openai LLM/embedding paths fall back to the raw

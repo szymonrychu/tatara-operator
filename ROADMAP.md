@@ -2,6 +2,16 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+## Agent-loop follow-ups (found during 2026-06-08 dogfood)
+
+- [ ] Dedupe Task creation by issue ref: creating an issue with a label fires
+  both `issue.opened` (label already present) and `issue.labeled`, so the
+  webhook makes TWO Tasks (two agents, two PRs) for one issue. Key tasks by
+  `issue_ref` and no-op if one already exists.
+- [ ] Reconcile the staleness in `writeback.go` taskBranch comment: the branch is
+  now also communicated to the wrapper via `TASK_BRANCH` env (not only the turn
+  prompts), and the wrapper enforces the push.
+
 - [x] M0 scaffold - kubebuilder project, four CRD types + deepcopy, go.mod,
   internal/{obs,auth,config}, no-reconciler manager, Dockerfile, Makefile,
   chart skeleton with CRDs. Plan:
