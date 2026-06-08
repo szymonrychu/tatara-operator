@@ -6,7 +6,7 @@ spec:
   triggerLabel: tatara
   maxConcurrentTasks: 2
   agent:
-    image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:0.1.3
+    image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:0.1.4
     model: claude-opus-4-8
     permissionMode: bypassPermissions
   memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
