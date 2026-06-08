@@ -3,6 +3,12 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-09 (0.2.8) Dedupe Task creation by issue ref: creating an issue WITH
+  the label fires both `issues.opened` (label present) and `issues.labeled`, so
+  the webhook made TWO Tasks (two agents, two PRs) per issue. `handleWorkItem`
+  now skips creation if a non-terminal Task already exists for the issue ref;
+  re-labeling after completion still re-triggers. Fixes the dogfood "create an
+  issue with the label -> 2 agents" gotcha.
 - 2026-06-08 (0.2.7) Agent created ZERO subtasks so nothing got implemented: the
   plan-turn prompt (`turnloop.planTurnText`) said "Do not start implementation in
   this turn", only `subtask_create`. Agents didn't decompose, so the loop ended
