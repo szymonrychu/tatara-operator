@@ -76,7 +76,7 @@ func TestHandleWorkItemKind(t *testing.T) {
 		srv, c := newWebhookServer(t, proj, repo)
 		h := srv.Server.Handler()
 
-		body := []byte(`{"action":"labeled","sender":{"login":"alice"},"label":{"name":"tatara"},"issue":{"number":7,"title":"Fix","body":"please fix","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+		body := []byte(`{"action":"labeled","sender":{"login":"alice"},"label":{"name":"tatara"},"issue":{"number":7,"title":"Fix","body":"please fix","user":{"login":"alice"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 		hdr := http.Header{}
 		hdr.Set("X-GitHub-Event", "issues")
 		hdr.Set("X-Hub-Signature-256", ghSign("whsec", body))
@@ -99,7 +99,7 @@ func TestHandleWorkItemKind(t *testing.T) {
 		srv, c := newWebhookServer(t, proj, repo)
 		h := srv.Server.Handler()
 
-		body := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":9,"title":"PR","body":"body","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9","head":{"sha":"deadbeef","ref":"feature"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+		body := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":9,"title":"PR","body":"body","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9","head":{"sha":"deadbeef","ref":"feature"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 		hdr := http.Header{}
 		hdr.Set("X-GitHub-Event", "pull_request")
 		hdr.Set("X-Hub-Signature-256", ghSign("whsec", body))
@@ -122,7 +122,7 @@ func TestHandleWorkItemKind(t *testing.T) {
 		srv, c := newWebhookServer(t, proj, repo)
 		h := srv.Server.Handler()
 
-		body := []byte(`{"action":"opened","sender":{"login":"alice"},"pull_request":{"number":9,"title":"PR","body":"body","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9","head":{"sha":"deadbeef","ref":"feature"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+		body := []byte(`{"action":"opened","sender":{"login":"alice"},"pull_request":{"number":9,"title":"PR","body":"body","user":{"login":"alice"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9","head":{"sha":"deadbeef","ref":"feature"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 		hdr := http.Header{}
 		hdr.Set("X-GitHub-Event", "pull_request")
 		hdr.Set("X-Hub-Signature-256", ghSign("whsec", body))

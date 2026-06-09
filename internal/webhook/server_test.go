@@ -40,7 +40,9 @@ func newScheme(t *testing.T) *runtime.Scheme {
 }
 
 func seedClient(t *testing.T, objs ...client.Object) client.Client {
-	return fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build()
+	return fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{}, &tatarav1.Subtask{}).
+		Build()
 }
 
 func project(name, secretRef, trigger string) *tatarav1.Project {
