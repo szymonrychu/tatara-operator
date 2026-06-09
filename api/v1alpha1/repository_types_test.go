@@ -42,3 +42,20 @@ func TestRepository_DeepCopyCopiesLastScheduledReingest(t *testing.T) {
 		t.Error("deepcopy must allocate a new LastScheduledReingest pointer")
 	}
 }
+
+func TestRepositorySpec_SemanticIngestField(t *testing.T) {
+	r := &Repository{}
+	r.Spec.SemanticIngest = true
+	if !r.Spec.SemanticIngest {
+		t.Fatalf("SemanticIngest = %v, want true", r.Spec.SemanticIngest)
+	}
+}
+
+func TestRepository_DeepCopyCopiesSemanticIngest(t *testing.T) {
+	r := &Repository{}
+	r.Spec.SemanticIngest = true
+	cp := r.DeepCopy()
+	if !cp.Spec.SemanticIngest {
+		t.Errorf("deepcopy lost SemanticIngest: %v", cp.Spec.SemanticIngest)
+	}
+}
