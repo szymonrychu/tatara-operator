@@ -405,6 +405,26 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		return ctrl.Result{}, err
 	}
 	number := task.Spec.Source.Number
+
+	// Authorship gate (security boundary): hard-require the live PR/MR author to
+	// be the project bot before merging OR closing, regardless of MergePolicy.
+	// The agent must never act on a PR it does not own.
+	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
+		r.clearWritebackPending(ctx, task, "AuthorshipWithheld", "project has no scm.botLogin")
+		return ctrl.Result{}, nil
+	}
+	st, perr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+	if perr != nil {
+		return ctrl.Result{}, fmt.Errorf("writeback selfImprove: authorship gate: %w", perr)
+	}
+	if st.Author != proj.Spec.Scm.BotLogin {
+		l.Info("self-improve write-back withheld: PR not bot-authored",
+			"action", "scm_authorship_withheld", "resource_id", task.Name, "author", st.Author)
+		r.clearWritebackPending(ctx, task, "AuthorshipWithheld",
+			"PR/MR author is not the project bot login")
+		return ctrl.Result{}, nil
+	}
+
 	switch out.Action {
 	case "close":
 		err = writer.ClosePR(ctx, repo.Spec.URL, token, number, out.Reason)
@@ -430,6 +450,40 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 	l.Info("self-improve outcome applied", "action", "scm_pr_outcome", "resource_id", task.Name, "outcome", out.Action)
 	r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: "+out.Action)
 	return ctrl.Result{}, nil
+}
+
+// selfImproveBotAuthored reports whether the selfImprove PR/MR is actually
+// authored by the project's bot login, by consulting the live PR state. It is
+// the authoritative pre-spawn authorship gate: the agent must never be allowed
+// to push to / merge / close a PR it does not own.
+func (r *TaskReconciler) selfImproveBotAuthored(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (bool, error) {
+	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
+		return false, fmt.Errorf("authorship gate: project %q has no scm.botLogin", proj.Name)
+	}
+	if task.Spec.Source == nil {
+		return false, fmt.Errorf("authorship gate: selfImprove task %q has no source", task.Name)
+	}
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
+		return false, fmt.Errorf("authorship gate: get repository: %w", err)
+	}
+	provider := task.Spec.Source.Provider
+	if provider == "" {
+		provider = providerForRemote(ctx, repo.Spec.URL)
+	}
+	writer, err := r.SCMFor(provider)
+	if err != nil {
+		return false, fmt.Errorf("authorship gate: scm writer: %w", err)
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		return false, fmt.Errorf("authorship gate: scm token: %w", err)
+	}
+	st, err := writer.GetPRState(ctx, repo.Spec.URL, token, task.Spec.Source.Number)
+	if err != nil {
+		return false, fmt.Errorf("authorship gate: get pr state: %w", err)
+	}
+	return st.Author == proj.Spec.Scm.BotLogin, nil
 }
 
 // mergeAllowed enforces MergePolicy. autoMergeOnGreenCI merges only when CI is

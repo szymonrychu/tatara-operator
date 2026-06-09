@@ -709,7 +709,7 @@ func TestDoWriteBackKind(t *testing.T) {
 	})
 
 	t.Run("selfImprove/merge afterApproval", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{CIStatus: ""}}
+		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: ""}}
 		r := newFullFakeReconciler(t, fw)
 		task := seedWritebackKindTask(t, "wbk-si-merge", "wbk-proj-sim", "wbk-repo-sim", "wbk-scm-sim",
 			tatarav1alpha1.TaskSpec{
@@ -738,7 +738,7 @@ func TestDoWriteBackKind(t *testing.T) {
 	})
 
 	t.Run("selfImprove/merge autoMergeOnGreenCI success", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{CIStatus: "success"}}
+		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: "success"}}
 		r := newFullFakeReconciler(t, fw)
 		task := seedWritebackKindTask(t, "wbk-si-maci", "wbk-proj-maci", "wbk-repo-maci", "wbk-scm-maci",
 			tatarav1alpha1.TaskSpec{
@@ -764,7 +764,7 @@ func TestDoWriteBackKind(t *testing.T) {
 	})
 
 	t.Run("selfImprove/merge autoMergeOnGreenCI CI absent -> afterApproval", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{CIStatus: ""}}
+		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: ""}}
 		r := newFullFakeReconciler(t, fw)
 		task := seedWritebackKindTask(t, "wbk-si-noci", "wbk-proj-noci", "wbk-repo-noci", "wbk-scm-noci",
 			tatarav1alpha1.TaskSpec{
@@ -791,7 +791,7 @@ func TestDoWriteBackKind(t *testing.T) {
 	})
 
 	t.Run("selfImprove/close", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{}
+		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot"}}
 		r := newFullFakeReconciler(t, fw)
 		task := seedWritebackKindTask(t, "wbk-si-close", "wbk-proj-close", "wbk-repo-close", "wbk-scm-close",
 			tatarav1alpha1.TaskSpec{

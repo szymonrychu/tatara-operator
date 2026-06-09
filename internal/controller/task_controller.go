@@ -158,6 +158,27 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	// Authorship gate (security boundary): never spawn an agent for a
+	// selfImprove Task whose PR/MR is not actually authored by the bot. The
+	// webhook's AuthorLogin is only a hint; GetPRState is authoritative.
+	if task.Spec.Kind == "selfImprove" && !isActive(task.Status.Phase) && r.SCMFor != nil {
+		authored, gerr := r.selfImproveBotAuthored(ctx, &project, &task)
+		if gerr != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, gerr
+		}
+		if !authored {
+			res, terr := r.terminate(ctx, &task, "Failed", "NotBotAuthored",
+				"selfImprove PR/MR is not authored by the project bot login")
+			if terr != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, terr
+			}
+			r.Metrics.ReconcileResult("Task", "success")
+			return res, nil
+		}
+	}
+
 	var repo tatarav1alpha1.Repository
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		r.Metrics.ReconcileResult("Task", "error")
