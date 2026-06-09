@@ -472,7 +472,6 @@ type fullFakeSCMWriter struct {
 	scm.SCMWriter
 	// implement path
 	openCalls    int
-	openCallURL  string
 	openCallBody string
 	// review path
 	approveCalled        bool

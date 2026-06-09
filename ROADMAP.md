@@ -82,6 +82,12 @@ Planned work not yet started. One line per item; link to plans for detail.
 7. [ ] helm uninstall tatara-memory -n tatara (empty static stack; no data migration needed).
 8. [ ] Verify a Project provisions mem-<proj>-* and reaches status.memory.phase=Ready.
 
+## SCM projects + PR/MR reactions (operator core)
+
+- [x] Tasks 1-13 complete (0.3.0): SCMWriter interface (12 methods), GitHub REST v3 + Projects v2 GraphQL board ops, GitLab REST + label-driven board, DetectAndVerify extended fields, CRD (ScmSpec/BoardSpec, Task Kind/ApprovalRequired/ProposedIssue, ReviewVerdict/PROutcome, AwaitingApproval phase), webhook dispatch + Kind selection + prReactionScope gating + approval-label flip, approval gate + proposal-creation SCM egress, write-back branches on Kind (review/selfImprove/implement), REST POST /projects/{p}/issues + /tasks/{t}/review + /tasks/{t}/pr-outcome, metrics (action label + operator_scm_writes_total + operator_approval_gate_seconds). Plan: docs/superpowers/plans/2026-06-09-scm-projects-operator.md.
+- [ ] tatara-cli 3 new MCP tools (propose_issue/review_verdict/pr_outcome) - target tatara-cli repo.
+- [ ] Deploy 0.3.0: build + push operator image, helm package + push chart, helmfile apply.
+
 ## N5 deploy follow-ons - imagePullSecrets + neo4j tag fix (gated)
 
 1. [ ] Build + push harbor.szymonrichert.pl/containers/tatara-operator:0.2.1.
