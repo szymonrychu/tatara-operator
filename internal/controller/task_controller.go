@@ -215,7 +215,7 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 	}
 	pod := agent.BuildPod(project, repo, task, repos, project.Status.Memory.Endpoint, r.PodConfig)
 	existing := &corev1.Pod{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, existing)
+	err = r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		if isActive(task.Status.Phase) {
