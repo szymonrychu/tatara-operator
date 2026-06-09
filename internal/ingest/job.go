@@ -25,6 +25,26 @@ type Config struct {
 	SemanticModel    string
 }
 
+// semanticEnv returns the env vars that drive the ingester's Phase 2 semantic
+// extraction stage: the OpenAI key (sourced from the shared OpenAI Secret, same
+// secret/key pair lightrag uses) and the model. The key is omitted when no
+// OpenAI Secret is configured so the ingester falls back to AST-only ingest.
+func semanticEnv(cfg Config) []corev1.EnvVar {
+	env := []corev1.EnvVar{}
+	if cfg.OpenAISecretName != "" {
+		env = append(env, corev1.EnvVar{
+			Name: "OPENAI_API_KEY",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cfg.OpenAISecretName},
+					Key:                  "LLM_BINDING_API_KEY",
+				},
+			},
+		})
+	}
+	return env
+}
+
 // imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
 // else nil, so the ingest Job can pull the ingester image from a private registry.
 func imagePullSecrets(cfg Config) []corev1.LocalObjectReference {
@@ -147,13 +167,13 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 						Image:   cfg.IngesterImage,
 						Command: []string{"/bin/sh", "-c"},
 						Args:    []string{mainScript},
-						Env: []corev1.EnvVar{
+						Env: append([]corev1.EnvVar{
 							{Name: "BASE_URL", Value: baseURL},
 							{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 							{Name: "OIDC_CLIENT_ID", Value: cfg.OIDCClientID},
 							{Name: "OIDC_CLIENT_SECRET", Value: cfg.OIDCClientSecret},
 							{Name: "OIDC_AUDIENCE", Value: cfg.OIDCAudience},
-						},
+						}, semanticEnv(cfg)...),
 						VolumeMounts: []corev1.VolumeMount{{Name: workspaceVolume, MountPath: workspaceMount}},
 					}},
 				},

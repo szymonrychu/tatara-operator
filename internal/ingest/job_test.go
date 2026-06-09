@@ -40,6 +40,8 @@ func testConfig() Config {
 		OIDCAudience:     "tatara-memory",
 		Namespace:        "tatara",
 		ImagePullSecret:  "regcred",
+		OpenAISecretName: "tatara-openai",
+		SemanticModel:    "gpt-4o-mini",
 	}
 }
 
@@ -220,6 +222,40 @@ func TestBuildJob_FullHistoryClone(t *testing.T) {
 	}
 	if !strings.Contains(cloneCmd, "--branch main") {
 		t.Errorf("clone cmd missing branch: %q", cloneCmd)
+	}
+}
+
+func envSecretRef(c corev1.Container, key string) *corev1.SecretKeySelector {
+	for _, e := range c.Env {
+		if e.Name == key && e.ValueFrom != nil {
+			return e.ValueFrom.SecretKeyRef
+		}
+	}
+	return nil
+}
+
+func TestBuildJob_OpenAIKeyFromSecret(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	ref := envSecretRef(main, "OPENAI_API_KEY")
+	if ref == nil {
+		t.Fatal("ingest container must source OPENAI_API_KEY from a secret")
+	}
+	if ref.Name != "tatara-openai" || ref.Key != "LLM_BINDING_API_KEY" {
+		t.Errorf("OPENAI_API_KEY secretKeyRef = %s/%s, want tatara-openai/LLM_BINDING_API_KEY",
+			ref.Name, ref.Key)
+	}
+}
+
+func TestBuildJob_OpenAIKeyOmittedWhenSecretUnset(t *testing.T) {
+	cfg := testConfig()
+	cfg.OpenAISecretName = ""
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, cfg)
+	main := job.Spec.Template.Spec.Containers[0]
+	for _, e := range main.Env {
+		if e.Name == "OPENAI_API_KEY" {
+			t.Fatal("OPENAI_API_KEY must be omitted when OpenAISecretName is unset")
+		}
 	}
 }
 
