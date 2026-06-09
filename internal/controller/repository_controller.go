@@ -82,12 +82,6 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	since, want := r.ingestDecision(&repo)
-	if !want {
-		r.Metrics.ReconcileResult("Repository", "success")
-		return ctrl.Result{}, nil
-	}
-
 	var project tataradevv1alpha1.Project
 	if err := r.Get(ctx, types.NamespacedName{Namespace: repo.Namespace, Name: repo.Spec.ProjectRef}, &project); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
@@ -113,14 +107,26 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// Memory is Ready: clear the provisioning condition if it lingers from an
-	// earlier not-ready reconcile (persisted by the status update below).
-	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+	// earlier not-ready reconcile. Persist immediately when it flips, so it clears
+	// even on reconciles that launch no ingest (already-ingested repos).
+	if meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
 		Type:               "MemoryNotReady",
 		Status:             metav1.ConditionFalse,
 		Reason:             "MemoryReady",
 		Message:            "project memory stack is Ready",
 		ObservedGeneration: repo.Generation,
-	})
+	}) {
+		if err := r.Status().Update(ctx, &repo); err != nil {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("clear MemoryNotReady condition: %w", err)
+		}
+	}
+
+	since, want := r.ingestDecision(&repo)
+	if !want {
+		r.Metrics.ReconcileResult("Repository", "success")
+		return ctrl.Result{}, nil
+	}
 
 	if err := r.ensureResultConfigMap(ctx, &repo); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")

@@ -246,6 +246,38 @@ func TestRepoReconcile_NoReingestWhenAnnotationStale(t *testing.T) {
 	}
 }
 
+func TestRepoReconcile_ClearsMemoryNotReadyWithoutIngest(t *testing.T) {
+	mkProject(t, "rp-clr2", "rp-clr2-scm")
+	mkSecret(t, "rp-clr2-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "clr2", "rp-clr2")
+	setProjectMemoryReady(t, "rp-clr2", "http://mem-rp-clr2.tatara.svc:8080")
+
+	// Already-ingested repo carrying a lingering MemoryNotReady=True condition.
+	r := getRepo(t, "clr2")
+	r.Status.LastIngestedCommit = "shaX"
+	nowTime := metav1.NewTime(time.Now())
+	r.Status.LastIngestTime = &nowTime
+	r.Status.Phase = "Ingested"
+	r.Status.Conditions = append(r.Status.Conditions, metav1.Condition{
+		Type: "MemoryNotReady", Status: metav1.ConditionTrue, Reason: "MemoryProvisioning",
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := k8sClient.Status().Update(context.Background(), r); err != nil {
+		t.Fatalf("seed status: %v", err)
+	}
+
+	if _, err := reconcileRepo(t, "clr2"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if jobs := listIngestJobs(t, "clr2"); len(jobs) != 0 {
+		t.Fatalf("no ingest expected for an already-ingested repo, got %d jobs", len(jobs))
+	}
+	cond := findCond(getRepo(t, "clr2").Status.Conditions, "MemoryNotReady")
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected MemoryNotReady cleared to False on a no-ingest reconcile, got %+v", cond)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
 }
