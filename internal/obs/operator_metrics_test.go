@@ -77,17 +77,17 @@ func TestWebhookEvent(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.WebhookEvent("github", "push", "accepted")
-	m.WebhookEvent("github", "push", "accepted")
-	m.WebhookEvent("gitlab", "push", "rejected")
+	m.WebhookEvent("github", "push", "other", "accepted")
+	m.WebhookEvent("github", "push", "other", "accepted")
+	m.WebhookEvent("gitlab", "push", "other", "rejected")
 
-	got := testutil.ToFloat64(m.webhookEvents.WithLabelValues("github", "push", "accepted"))
+	got := testutil.ToFloat64(m.webhookEvents.WithLabelValues("github", "push", "other", "accepted"))
 	if got != 2 {
-		t.Fatalf("github/push/accepted = %v, want 2", got)
+		t.Fatalf("github/push/other/accepted = %v, want 2", got)
 	}
-	got = testutil.ToFloat64(m.webhookEvents.WithLabelValues("gitlab", "push", "rejected"))
+	got = testutil.ToFloat64(m.webhookEvents.WithLabelValues("gitlab", "push", "other", "rejected"))
 	if got != 1 {
-		t.Fatalf("gitlab/push/rejected = %v, want 1", got)
+		t.Fatalf("gitlab/push/other/rejected = %v, want 1", got)
 	}
 }
 
@@ -157,6 +157,46 @@ func TestMemoryStacksGauge_ZeroesStalePhase(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Provisioning")); got != 1 {
 		t.Fatalf("Provisioning stacks = %v, want 1", got)
+	}
+}
+
+func TestWebhookEventActionLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.WebhookEvent("github", "issue", "labeled", "ignored")
+	got := testutil.ToFloat64(m.webhookEvents.WithLabelValues("github", "issue", "labeled", "ignored"))
+	if got != 1 {
+		t.Fatalf("github/issue/labeled/ignored = %v, want 1", got)
+	}
+}
+
+func TestSCMWritesTotal(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SCMWrite("github", "merge", "ok")
+	m.SCMWrite("github", "merge", "ok")
+	got := testutil.ToFloat64(m.scmWritesTotal.WithLabelValues("github", "merge", "ok"))
+	if got != 2 {
+		t.Fatalf("github/merge/ok = %v, want 2", got)
+	}
+}
+
+func TestApprovalGateHistogram(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.ObserveApprovalGate(42.0)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_approval_gate_seconds" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("operator_approval_gate_seconds not registered")
 	}
 }
 

@@ -49,7 +49,7 @@ func TestGitLabComment(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
 	})
 
-	require.NoError(t, c.Comment(context.Background(), "gltok", "g/p!12", "done"))
+	require.NoError(t, c.Comment(context.Background(), "gltok", "g/p#12", "done"))
 }
 
 func TestGitLabOpenChangeErrorStatus(t *testing.T) {
@@ -89,12 +89,12 @@ func TestGitLabProjectPath(t *testing.T) {
 	}
 }
 
-func TestGitLabIssueRef(t *testing.T) {
-	path, iid, err := glIssueRef("g/sub/p!12")
+func TestGitLabHashRef(t *testing.T) {
+	path, iid, err := glHashRef("g/sub/p#12")
 	require.NoError(t, err)
 	require.Equal(t, "g/sub/p", path)
 	require.Equal(t, 12, iid)
 
-	_, _, err = glIssueRef("garbage")
+	_, _, err = glHashRef("garbage")
 	require.Error(t, err)
 }

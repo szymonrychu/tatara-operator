@@ -21,20 +21,37 @@ type ghLabel struct {
 }
 
 type ghWorkItem struct {
-	Number  int       `json:"number"`
-	Title   string    `json:"title"`
-	Body    string    `json:"body"`
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	User   struct {
+		Login string `json:"login"`
+	} `json:"user"`
 	Labels  []ghLabel `json:"labels"`
 	HTMLURL string    `json:"html_url"`
+	Head    struct {
+		SHA string `json:"sha"`
+		Ref string `json:"ref"`
+	} `json:"head"`
+	PullRequest *struct {
+		URL string `json:"url"`
+	} `json:"pull_request"`
 }
 
 type ghPayload struct {
+	Action     string `json:"action"`
 	Ref        string `json:"ref"`
 	After      string `json:"after"`
 	Repository struct {
 		CloneURL string `json:"clone_url"`
 		FullName string `json:"full_name"`
 	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Label struct {
+		Name string `json:"name"`
+	} `json:"label"`
 	Issue       *ghWorkItem `json:"issue"`
 	PullRequest *ghWorkItem `json:"pull_request"`
 }
@@ -53,15 +70,24 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	case "push":
 		return WebhookEvent{Kind: "push", Repo: p.Repository.CloneURL, Branch: strings.TrimPrefix(p.Ref, "refs/heads/")}, nil
 	case "issues":
-		return ghWorkItemEvent("issue", p.Repository.FullName, p.Repository.CloneURL, p.Issue), nil
+		return ghWorkItemEvent("issue", false, p, p.Issue), nil
+	case "issue_comment":
+		isPR := p.Issue != nil && p.Issue.PullRequest != nil
+		ev := ghWorkItemEvent("issue", isPR, p, p.Issue)
+		if isPR {
+			ev.Kind = "mr"
+		}
+		return ev, nil
 	case "pull_request":
-		return ghWorkItemEvent("mr", p.Repository.FullName, p.Repository.CloneURL, p.PullRequest), nil
+		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
+	case "pull_request_review":
+		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
 	}
 }
 
-func ghWorkItemEvent(kind, fullName, cloneURL string, wi *ghWorkItem) WebhookEvent {
+func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) WebhookEvent {
 	if wi == nil {
 		return WebhookEvent{Kind: "other"}
 	}
@@ -70,13 +96,21 @@ func ghWorkItemEvent(kind, fullName, cloneURL string, wi *ghWorkItem) WebhookEve
 		labels = append(labels, l.Name)
 	}
 	return WebhookEvent{
-		Kind:     kind,
-		Repo:     cloneURL,
-		Labels:   labels,
-		Title:    wi.Title,
-		Body:     wi.Body,
-		IssueRef: fmt.Sprintf("%s#%d", fullName, wi.Number),
-		URL:      wi.HTMLURL,
+		Kind:         kind,
+		Repo:         p.Repository.CloneURL,
+		Labels:       labels,
+		Title:        wi.Title,
+		Body:         wi.Body,
+		IssueRef:     fmt.Sprintf("%s#%d", p.Repository.FullName, wi.Number),
+		URL:          wi.HTMLURL,
+		AuthorLogin:  wi.User.Login,
+		ActorLogin:   p.Sender.Login,
+		Action:       p.Action,
+		Number:       wi.Number,
+		IsPR:         isPR,
+		HeadSHA:      wi.Head.SHA,
+		HeadBranch:   wi.Head.Ref,
+		ChangedLabel: p.Label.Name,
 	}
 }
 
@@ -196,4 +230,170 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 		return fmt.Errorf("github: decode response: %w", err)
 	}
 	return nil
+}
+
+// CreateIssue opens an issue and returns its ref + url.
+func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return IssueRef{}, err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues", owner, repo)
+	in := map[string]any{"title": req.Title, "body": req.Body}
+	if len(req.Labels) > 0 {
+		in["labels"] = req.Labels
+	}
+	var out struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
+		return IssueRef{}, err
+	}
+	return IssueRef{Ref: fmt.Sprintf("%s/%s#%d", owner, repo, out.Number), URL: out.HTMLURL}, nil
+}
+
+// AddLabel adds a single label to an issue/PR identified by owner/repo#number.
+func (c *GitHub) AddLabel(ctx context.Context, token, issueRef, label string) error {
+	owner, repo, number, err := ghIssueRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPost, path, token, map[string][]string{"labels": {label}}, nil)
+}
+
+// RemoveLabel removes a single label from an issue/PR.
+func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
+	owner, repo, number, err := ghIssueRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, label)
+	return ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
+}
+
+// GetPRState reads a PR plus its head check-runs, deriving CIStatus.
+func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return PRState{}, err
+	}
+	var pr struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Mergeable bool `json:"mergeable"`
+		Head      struct {
+			SHA string `json:"sha"`
+			Ref string `json:"ref"`
+		} `json:"head"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), token, nil, &pr); err != nil {
+		return PRState{}, err
+	}
+	st := PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, Mergeable: pr.Mergeable}
+	var checks struct {
+		CheckRuns []struct {
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, pr.Head.SHA), token, nil, &checks); err != nil {
+		return PRState{}, err
+	}
+	st.CIStatus = deriveGHCIStatus(checks.CheckRuns)
+	return st, nil
+}
+
+func deriveGHCIStatus(runs []struct {
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}) string {
+	if len(runs) == 0 {
+		return ""
+	}
+	failure, pending := false, false
+	for _, run := range runs {
+		if run.Status != "completed" {
+			pending = true
+			continue
+		}
+		if run.Conclusion != "success" && run.Conclusion != "neutral" && run.Conclusion != "skipped" {
+			failure = true
+		}
+	}
+	switch {
+	case failure:
+		return "failure"
+	case pending:
+		return "pending"
+	default:
+		return "success"
+	}
+}
+
+func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, event, body string, comments []map[string]any) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	in := map[string]any{"event": event}
+	if body != "" {
+		in["body"] = body
+	}
+	if comments != nil {
+		in["comments"] = comments
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPost, path, token, in, nil)
+}
+
+// Approve posts an APPROVE review.
+func (c *GitHub) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
+	return c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
+}
+
+// RequestChanges posts a REQUEST_CHANGES review.
+func (c *GitHub) RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error {
+	return c.review(ctx, repoURL, token, number, "REQUEST_CHANGES", body, nil)
+}
+
+// Suggest posts inline review comments with ```suggestion bodies.
+func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error {
+	comments := make([]map[string]any, 0, len(sugg))
+	for _, s := range sugg {
+		comments = append(comments, map[string]any{
+			"path": s.Path,
+			"line": s.Line,
+			"body": "```suggestion\n" + s.Body + "\n```",
+		})
+	}
+	return c.review(ctx, repoURL, token, number, "COMMENT", "", comments)
+}
+
+// Merge merges a PR with the given method (squash|merge|rebase).
+func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, nil)
+}
+
+// ClosePR closes a PR (state=closed) and posts a comment with the reason.
+func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int, body string) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
+	if err := ghDo(ctx, c.base(), http.MethodPatch, path, token, map[string]string{"state": "closed"}, nil); err != nil {
+		return err
+	}
+	if body == "" {
+		return nil
+	}
+	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }

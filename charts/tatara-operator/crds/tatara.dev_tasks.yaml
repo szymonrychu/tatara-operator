@@ -46,20 +46,56 @@ spec:
           spec:
             description: TaskSpec defines the desired state of a Task.
             properties:
+              approvalRequired:
+                type: boolean
               goal:
+                type: string
+              kind:
+                default: implement
+                enum:
+                - implement
+                - review
+                - selfImprove
                 type: string
               maxTurns:
                 type: integer
               projectRef:
                 type: string
+              proposedIssue:
+                description: ProposedIssueSpec is a tatara-proposed issue awaiting
+                  human approval.
+                properties:
+                  body:
+                    type: string
+                  kind:
+                    enum:
+                    - bug
+                    - improvement
+                    type: string
+                  repositoryRef:
+                    type: string
+                  title:
+                    type: string
+                required:
+                - body
+                - kind
+                - repositoryRef
+                - title
+                type: object
               repositoryRef:
                 type: string
               source:
                 description: TaskSource records the SCM work-item that originated
                   a webhook-born Task.
                 properties:
+                  authorLogin:
+                    type: string
+                  isPR:
+                    type: boolean
                   issueRef:
                     type: string
+                  number:
+                    type: integer
                   provider:
                     enum:
                     - github
@@ -138,9 +174,17 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              discoveredIssues:
+                items:
+                  type: string
+                type: array
+              gateEnteredAt:
+                format: date-time
+                type: string
               phase:
                 enum:
                 - Pending
+                - AwaitingApproval
                 - Planning
                 - Running
                 - Succeeded
@@ -148,10 +192,55 @@ spec:
                 type: string
               podName:
                 type: string
+              prOutcome:
+                description: PROutcome is the agent's outcome for a tatara-authored
+                  PR/MR.
+                properties:
+                  action:
+                    enum:
+                    - merge
+                    - close
+                    type: string
+                  reason:
+                    type: string
+                required:
+                - action
+                type: object
               prURL:
                 type: string
               resultSummary:
                 type: string
+              reviewVerdict:
+                description: ReviewVerdict is the agent's review decision for a human-authored
+                  PR/MR.
+                properties:
+                  body:
+                    type: string
+                  decision:
+                    enum:
+                    - approve
+                    - request_changes
+                    - comment
+                    type: string
+                  suggestions:
+                    items:
+                      description: Suggestion is one inline code suggestion on a PR/MR.
+                      properties:
+                        body:
+                          type: string
+                        line:
+                          type: integer
+                        path:
+                          type: string
+                      required:
+                      - body
+                      - line
+                      - path
+                      type: object
+                    type: array
+                required:
+                - decision
+                type: object
               turnsCompleted:
                 type: integer
             type: object

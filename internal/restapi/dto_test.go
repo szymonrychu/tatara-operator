@@ -45,6 +45,39 @@ func TestToTaskDTO_Source(t *testing.T) {
 	require.Equal(t, 2, d.Status.TurnsCompleted)
 }
 
+func TestToTaskDTO_NewFields(t *testing.T) {
+	task := tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t2"},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "demo", RepositoryRef: "repo", Goal: "fix",
+			Kind: "review", ApprovalRequired: true,
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#5", URL: "https://gh/5",
+				AuthorLogin: "alice", IsPR: true, Number: 5,
+			},
+		},
+		Status: tatarav1alpha1.TaskStatus{
+			Phase:            "AwaitingApproval",
+			DiscoveredIssues: []string{"https://gh/5"},
+			ReviewVerdict:    &tatarav1alpha1.ReviewVerdict{Decision: "approve", Body: "lgtm"},
+			PROutcome:        &tatarav1alpha1.PROutcome{Action: "merge", Reason: "green"},
+		},
+	}
+	d := toTaskDTO(task)
+	require.Equal(t, "review", d.Kind)
+	require.True(t, d.ApprovalRequired)
+	require.NotNil(t, d.Source)
+	require.Equal(t, "alice", d.Source.AuthorLogin)
+	require.True(t, d.Source.IsPR)
+	require.Equal(t, 5, d.Source.Number)
+	require.Equal(t, "AwaitingApproval", d.Status.Phase)
+	require.Equal(t, []string{"https://gh/5"}, d.Status.DiscoveredIssues)
+	require.NotNil(t, d.Status.ReviewVerdict)
+	require.Equal(t, "approve", d.Status.ReviewVerdict.Decision)
+	require.NotNil(t, d.Status.PROutcome)
+	require.Equal(t, "merge", d.Status.PROutcome.Action)
+}
+
 func TestToSubtaskDTO(t *testing.T) {
 	st := tatarav1alpha1.Subtask{
 		ObjectMeta: metav1.ObjectMeta{Name: "s1"},

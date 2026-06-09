@@ -13,6 +13,8 @@ type OperatorMetrics struct {
 	tasksInflight           prometheus.Gauge
 	memoryProvisionDuration prometheus.Histogram
 	memoryStacks            *prometheus.GaugeVec
+	scmWritesTotal          *prometheus.CounterVec
+	approvalGateSeconds     prometheus.Histogram
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -36,7 +38,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		webhookEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_webhook_events_total",
 			Help: "Total webhook events by provider, kind and result.",
-		}, []string{"provider", "kind", "result"}),
+		}, []string{"provider", "kind", "action", "result"}),
 		tasksInflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "operator_tasks_inflight",
 			Help: "Number of Tasks currently running.",
@@ -50,6 +52,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_stacks",
 			Help: "Number of per-project memory stacks by phase.",
 		}, []string{"phase"}),
+		scmWritesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_scm_writes_total",
+			Help: "Total SCM write operations by provider, verb, and result.",
+		}, []string{"provider", "verb", "result"}),
+		approvalGateSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "operator_approval_gate_seconds",
+			Help:    "Wall-clock seconds a Task spent in AwaitingApproval.",
+			Buckets: prometheus.ExponentialBuckets(60, 2, 10),
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -59,6 +70,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tasksInflight,
 		m.memoryProvisionDuration,
 		m.memoryStacks,
+		m.scmWritesTotal,
+		m.approvalGateSeconds,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -69,8 +82,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	for _, provider := range []string{"github", "gitlab"} {
 		for _, kind := range []string{"push"} {
-			for _, result := range []string{"accepted", "rejected"} {
-				m.webhookEvents.WithLabelValues(provider, kind, result)
+			for _, action := range []string{"other"} {
+				for _, result := range []string{"accepted", "rejected"} {
+					m.webhookEvents.WithLabelValues(provider, kind, action, result)
+				}
 			}
 		}
 	}
@@ -113,12 +128,23 @@ func (m *OperatorMetrics) ObserveTurnDuration(seconds float64) {
 }
 
 // WebhookEvent increments operator_webhook_events_total for the given
-// provider, kind and result.
-func (m *OperatorMetrics) WebhookEvent(provider, kind, result string) {
-	m.webhookEvents.WithLabelValues(provider, kind, result).Inc()
+// provider, kind, action and result.
+func (m *OperatorMetrics) WebhookEvent(provider, kind, action, result string) {
+	m.webhookEvents.WithLabelValues(provider, kind, action, result).Inc()
 }
 
 // SetTasksInflight sets the operator_tasks_inflight gauge to n.
 func (m *OperatorMetrics) SetTasksInflight(n float64) {
 	m.tasksInflight.Set(n)
+}
+
+// SCMWrite increments operator_scm_writes_total for the given provider, verb,
+// and result ("ok" or "error").
+func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
+	m.scmWritesTotal.WithLabelValues(provider, verb, result).Inc()
+}
+
+// ObserveApprovalGate records the seconds a Task spent in AwaitingApproval.
+func (m *OperatorMetrics) ObserveApprovalGate(seconds float64) {
+	m.approvalGateSeconds.Observe(seconds)
 }

@@ -31,8 +31,8 @@ func SameRemote(a, b string) bool {
 	return na == nb
 }
 
-// ByProvider returns the real Client for a provider name ("github"|"gitlab").
-func ByProvider(name string) (Client, error) {
+// ByProvider returns the real SCMWriter for a provider name ("github"|"gitlab").
+func ByProvider(name string) (SCMWriter, error) {
 	switch name {
 	case "github":
 		return &GitHub{}, nil

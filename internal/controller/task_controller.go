@@ -20,6 +20,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 const (
@@ -43,10 +44,10 @@ type TaskReconciler struct {
 	Metrics   *obs.OperatorMetrics
 	Session   agent.Session
 	PodConfig agent.PodConfig
-	// SCMFor returns a Writer for the given provider name ("github"|"gitlab").
+	// SCMFor returns an scm.SCMWriter for the given provider name ("github"|"gitlab").
 	// Nil in tests that do not exercise write-back; replaced with a fake in
 	// write-back tests.
-	SCMFor func(provider string) (Writer, error)
+	SCMFor func(provider string) (scm.SCMWriter, error)
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=tasks,verbs=get;list;watch;create;update;patch;delete
@@ -113,6 +114,68 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			l.Info("task gated at concurrency cap",
 				"action", "task_gate", "resource_id", task.Name, "project", project.Name)
 			return ctrl.Result{RequeueAfter: capRequeue}, nil
+		}
+	}
+
+	// Proposal creation: a Task with a ProposedIssue and no Source yet.
+	if task.Spec.Kind == "implement" && task.Spec.ProposedIssue != nil && task.Spec.Source == nil && r.SCMFor != nil {
+		res, err := r.createProposal(ctx, &project, &task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+	}
+
+	// Approval gate: hold until the ApprovalApproved condition is True.
+	if task.Spec.ApprovalRequired {
+		if cond := apimeta.FindStatusCondition(task.Status.Conditions, tatarav1alpha1.ConditionApprovalApproved); cond == nil || cond.Status != metav1.ConditionTrue {
+			if task.Status.Phase != "AwaitingApproval" {
+				task.Status.Phase = "AwaitingApproval"
+				if task.Status.GateEnteredAt == nil {
+					now := metav1.Now()
+					task.Status.GateEnteredAt = &now
+				}
+				if err := r.Status().Update(ctx, &task); err != nil {
+					r.Metrics.ReconcileResult("Task", "error")
+					return ctrl.Result{}, fmt.Errorf("set awaiting-approval phase: %w", err)
+				}
+			}
+			return ctrl.Result{RequeueAfter: capRequeue}, nil
+		}
+		// Approved: record the gate latency once and clear AwaitingApproval so
+		// the task resumes normal scheduling (the Planning block checks for phase=="").
+		if task.Status.GateEnteredAt != nil {
+			r.Metrics.ObserveApprovalGate(time.Since(task.Status.GateEnteredAt.Time).Seconds())
+		}
+		if task.Status.Phase == "AwaitingApproval" {
+			task.Status.Phase = ""
+			if err := r.Status().Update(ctx, &task); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, fmt.Errorf("clear awaiting-approval phase: %w", err)
+			}
+		}
+	}
+
+	// Authorship gate (security boundary): never spawn an agent for a
+	// selfImprove Task whose PR/MR is not actually authored by the bot. The
+	// webhook's AuthorLogin is only a hint; GetPRState is authoritative.
+	if task.Spec.Kind == "selfImprove" && !isActive(task.Status.Phase) && r.SCMFor != nil {
+		authored, gerr := r.selfImproveBotAuthored(ctx, &project, &task)
+		if gerr != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, gerr
+		}
+		if !authored {
+			res, terr := r.terminate(ctx, &task, "Failed", "NotBotAuthored",
+				"selfImprove PR/MR is not authored by the project bot login")
+			if terr != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, terr
+			}
+			r.Metrics.ReconcileResult("Task", "success")
+			return res, nil
 		}
 	}
 

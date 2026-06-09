@@ -48,29 +48,37 @@ type RepositoryDTO struct {
 }
 
 type taskSourceDTO struct {
-	Provider string `json:"provider,omitempty"`
-	IssueRef string `json:"issueRef,omitempty"`
-	URL      string `json:"url,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	IssueRef    string `json:"issueRef,omitempty"`
+	URL         string `json:"url,omitempty"`
+	AuthorLogin string `json:"authorLogin,omitempty"`
+	IsPR        bool   `json:"isPR,omitempty"`
+	Number      int    `json:"number,omitempty"`
 }
 
 type taskStatusDTO struct {
-	Phase          string             `json:"phase,omitempty"`
-	PodName        string             `json:"podName,omitempty"`
-	TurnsCompleted int                `json:"turnsCompleted,omitempty"`
-	PrURL          string             `json:"prURL,omitempty"`
-	ResultSummary  string             `json:"resultSummary,omitempty"`
-	Conditions     []metav1.Condition `json:"conditions,omitempty"`
+	Phase            string                        `json:"phase,omitempty"`
+	PodName          string                        `json:"podName,omitempty"`
+	TurnsCompleted   int                           `json:"turnsCompleted,omitempty"`
+	PrURL            string                        `json:"prURL,omitempty"`
+	ResultSummary    string                        `json:"resultSummary,omitempty"`
+	DiscoveredIssues []string                      `json:"discoveredIssues,omitempty"`
+	ReviewVerdict    *tatarav1alpha1.ReviewVerdict `json:"reviewVerdict,omitempty"`
+	PROutcome        *tatarav1alpha1.PROutcome     `json:"prOutcome,omitempty"`
+	Conditions       []metav1.Condition            `json:"conditions,omitempty"`
 }
 
 // TaskDTO is the stable JSON shape for a Task CRD.
 type TaskDTO struct {
-	Name          string         `json:"name"`
-	ProjectRef    string         `json:"projectRef,omitempty"`
-	RepositoryRef string         `json:"repositoryRef,omitempty"`
-	Goal          string         `json:"goal,omitempty"`
-	Source        *taskSourceDTO `json:"source,omitempty"`
-	MaxTurns      int            `json:"maxTurns,omitempty"`
-	Status        taskStatusDTO  `json:"status"`
+	Name             string         `json:"name"`
+	ProjectRef       string         `json:"projectRef,omitempty"`
+	RepositoryRef    string         `json:"repositoryRef,omitempty"`
+	Goal             string         `json:"goal,omitempty"`
+	Kind             string         `json:"kind,omitempty"`
+	ApprovalRequired bool           `json:"approvalRequired,omitempty"`
+	Source           *taskSourceDTO `json:"source,omitempty"`
+	MaxTurns         int            `json:"maxTurns,omitempty"`
+	Status           taskStatusDTO  `json:"status"`
 }
 
 type subtaskStatusDTO struct {
@@ -122,16 +130,21 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 	d := TaskDTO{
 		Name: task.Name, ProjectRef: task.Spec.ProjectRef, RepositoryRef: task.Spec.RepositoryRef,
 		Goal: task.Spec.Goal, MaxTurns: task.Spec.MaxTurns,
+		Kind: task.Spec.Kind, ApprovalRequired: task.Spec.ApprovalRequired,
 		Status: taskStatusDTO{
 			Phase: task.Status.Phase, PodName: task.Status.PodName,
 			TurnsCompleted: task.Status.TurnsCompleted, PrURL: task.Status.PrURL,
 			ResultSummary: task.Status.ResultSummary, Conditions: task.Status.Conditions,
+			DiscoveredIssues: task.Status.DiscoveredIssues,
+			ReviewVerdict:    task.Status.ReviewVerdict,
+			PROutcome:        task.Status.PROutcome,
 		},
 	}
 	if task.Spec.Source != nil {
 		d.Source = &taskSourceDTO{
 			Provider: task.Spec.Source.Provider, IssueRef: task.Spec.Source.IssueRef,
-			URL: task.Spec.Source.URL,
+			URL: task.Spec.Source.URL, AuthorLogin: task.Spec.Source.AuthorLogin,
+			IsPR: task.Spec.Source.IsPR, Number: task.Spec.Source.Number,
 		}
 	}
 	return d

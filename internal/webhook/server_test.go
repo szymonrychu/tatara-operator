@@ -40,7 +40,9 @@ func newScheme(t *testing.T) *runtime.Scheme {
 }
 
 func seedClient(t *testing.T, objs ...client.Object) client.Client {
-	return fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).Build()
+	return fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{}, &tatarav1.Subtask{}).
+		Build()
 }
 
 func project(name, secretRef, trigger string) *tatarav1.Project {
@@ -132,7 +134,7 @@ func TestPushSetsReingestAnnotation(t *testing.T) {
 	_, err := time.Parse(time.RFC3339, ts)
 	require.NoError(t, err)
 
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "push", "result": "accepted"}))
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "push", "action": "", "result": "accepted"}))
 }
 
 func TestPushNonDefaultBranchNoMutation(t *testing.T) {
@@ -168,7 +170,7 @@ func TestUnknownProject404(t *testing.T) {
 	hdr.Set("X-Hub-Signature-256", ghSign("whatever", body))
 	w := post(t, h, "ghost", hdr, body)
 	require.Equal(t, http.StatusNotFound, w.Code)
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "other", "result": "unknown_project"}))
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "other", "action": "other", "result": "unknown_project"}))
 }
 
 func TestBadSignature401NoMutation(t *testing.T) {
@@ -188,5 +190,5 @@ func TestBadSignature401NoMutation(t *testing.T) {
 	var got tatarav1.Repository
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "repo1"}, &got))
 	require.Empty(t, got.Annotations[tatarav1.ReingestRequestedAnnotation])
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "other", "result": "bad_signature"}))
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "other", "action": "other", "result": "bad_signature"}))
 }

@@ -207,6 +207,144 @@ func (s *Server) createSubtask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, toSubtaskDTO(*st))
 }
 
+// --- Task 11: POST /projects/{p}/issues, /tasks/{t}/review, /tasks/{t}/pr-outcome ---
+
+type proposeIssueReq struct {
+	RepositoryRef string `json:"repositoryRef"`
+	Title         string `json:"title"`
+	Body          string `json:"body"`
+	Kind          string `json:"kind"`
+}
+
+func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
+	var req proposeIssueReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Title == "" || req.Body == "" || req.Kind == "" || req.RepositoryRef == "" {
+		writeError(w, http.StatusBadRequest, "repositoryRef, title, body, kind required")
+		return
+	}
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "task-",
+			Namespace:    s.ns,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(&proj, tatarav1alpha1.GroupVersion.WithKind("Project")),
+			},
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:       projName,
+			RepositoryRef:    req.RepositoryRef,
+			Goal:             req.Title,
+			Kind:             "implement",
+			ApprovalRequired: true,
+			ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
+				RepositoryRef: req.RepositoryRef, Title: req.Title, Body: req.Body, Kind: req.Kind,
+			},
+		},
+	}
+	if err := s.c.Create(r.Context(), task); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	task.Status.Phase = "AwaitingApproval"
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type: tatarav1alpha1.ConditionApprovalApproved, Status: metav1.ConditionFalse,
+		Reason: "Proposed", Message: "issue proposed via REST; awaiting human approval",
+		LastTransitionTime: metav1.NewTime(time.Now()),
+	})
+	if err := s.c.Status().Update(r.Context(), task); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toTaskDTO(*task))
+}
+
+type reviewVerdictReq struct {
+	Decision    string                      `json:"decision"`
+	Body        string                      `json:"body,omitempty"`
+	Suggestions []tatarav1alpha1.Suggestion `json:"suggestions,omitempty"`
+}
+
+func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
+	var req reviewVerdictReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Decision == "" {
+		writeError(w, http.StatusBadRequest, "decision required")
+		return
+	}
+	switch req.Decision {
+	case "approve", "request_changes", "comment":
+	default:
+		writeError(w, http.StatusBadRequest, "decision must be one of approve, request_changes, comment")
+		return
+	}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Kind != "review" {
+		writeError(w, http.StatusConflict, "review verdict only applies to a review task")
+		return
+	}
+	t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
+type prOutcomeReq struct {
+	Action string `json:"action"`
+	Reason string `json:"reason,omitempty"`
+}
+
+func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
+	var req prOutcomeReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, "action required")
+		return
+	}
+	switch req.Action {
+	case "merge", "close":
+	default:
+		writeError(w, http.StatusBadRequest, "action must be one of merge, close")
+		return
+	}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Kind != "selfImprove" {
+		writeError(w, http.StatusConflict, "pr outcome only applies to a selfImprove task")
+		return
+	}
+	t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 // --- Task 7: PATCH /subtasks/{s} ---
 
 type subtaskPatchReq struct {

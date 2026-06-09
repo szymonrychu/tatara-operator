@@ -17,8 +17,8 @@ func glHeader(event, token string) http.Header {
 func TestGitLabDetectAndVerify(t *testing.T) {
 	const secret = "glt0ken"
 	pushBody := []byte(`{"ref":"refs/heads/main","project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"}}`)
-	issueBody := []byte(`{"object_kind":"issue","project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":12,"title":"An issue","description":"desc","url":"https://gitlab.com/g/p/-/issues/12"},"labels":[{"title":"tatara"},{"title":"ops"}]}`)
-	mrBody := []byte(`{"object_kind":"merge_request","project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":34,"title":"An MR","description":"mr desc","url":"https://gitlab.com/g/p/-/merge_requests/34"},"labels":[{"title":"tatara"}]}`)
+	issueBody := []byte(`{"object_kind":"issue","user":{"username":"alice"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":12,"title":"An issue","description":"desc","url":"https://gitlab.com/g/p/-/issues/12"},"labels":[{"title":"tatara"},{"title":"ops"}]}`)
+	mrBody := []byte(`{"object_kind":"merge_request","user":{"username":"bob"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":34,"title":"An MR","description":"mr desc","url":"https://gitlab.com/g/p/-/merge_requests/34"},"labels":[{"title":"tatara"}]}`)
 
 	tests := []struct {
 		name  string
@@ -27,8 +27,8 @@ func TestGitLabDetectAndVerify(t *testing.T) {
 		want  WebhookEvent
 	}{
 		{"push", "Push Hook", pushBody, WebhookEvent{Kind: "push", Repo: "https://gitlab.com/g/p.git", Branch: "main"}},
-		{"issue", "Issue Hook", issueBody, WebhookEvent{Kind: "issue", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara", "ops"}, Title: "An issue", Body: "desc", IssueRef: "g/p!12", URL: "https://gitlab.com/g/p/-/issues/12"}},
-		{"mr", "Merge Request Hook", mrBody, WebhookEvent{Kind: "mr", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara"}, Title: "An MR", Body: "mr desc", IssueRef: "g/p!34", URL: "https://gitlab.com/g/p/-/merge_requests/34"}},
+		{"issue", "Issue Hook", issueBody, WebhookEvent{Kind: "issue", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara", "ops"}, Title: "An issue", Body: "desc", IssueRef: "g/p#12", URL: "https://gitlab.com/g/p/-/issues/12", AuthorLogin: "alice", ActorLogin: "alice", Action: "other", Number: 12}},
+		{"mr", "Merge Request Hook", mrBody, WebhookEvent{Kind: "mr", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara"}, Title: "An MR", Body: "mr desc", IssueRef: "g/p!34", URL: "https://gitlab.com/g/p/-/merge_requests/34", AuthorLogin: "bob", ActorLogin: "bob", IsPR: true, Action: "other", Number: 34}},
 		{"other", "Pipeline Hook", []byte(`{}`), WebhookEvent{Kind: "other"}},
 	}
 	c := &GitLab{}
@@ -39,6 +39,34 @@ func TestGitLabDetectAndVerify(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestGitLabNoteHook(t *testing.T) {
+	const secret = "glt0ken"
+	c := &GitLab{}
+	t.Run("issue comment derives iid from nested issue", func(t *testing.T) {
+		// object_attributes.iid here is the note id (99), NOT the issue iid (12).
+		body := []byte(`{"object_kind":"note","user":{"username":"alice"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":99,"description":"a comment","url":"https://gitlab.com/g/p/-/issues/12#note_99"},"issue":{"iid":12},"labels":[{"title":"tatara"}]}`)
+		ev, err := c.DetectAndVerify(glHeader("Note Hook", secret), body, secret)
+		require.NoError(t, err)
+		require.Equal(t, "issue", ev.Kind)
+		require.False(t, ev.IsPR)
+		require.Equal(t, 12, ev.Number)
+		require.Equal(t, "g/p#12", ev.IssueRef)
+		require.Equal(t, "created", ev.Action)
+		require.Equal(t, "alice", ev.ActorLogin)
+	})
+	t.Run("MR comment derives iid from nested merge_request", func(t *testing.T) {
+		body := []byte(`{"object_kind":"note","user":{"username":"bob"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":77,"description":"mr comment","url":"https://gitlab.com/g/p/-/merge_requests/34#note_77"},"merge_request":{"iid":34,"source_branch":"feat"},"labels":[{"title":"tatara"}]}`)
+		ev, err := c.DetectAndVerify(glHeader("Note Hook", secret), body, secret)
+		require.NoError(t, err)
+		require.Equal(t, "mr", ev.Kind)
+		require.True(t, ev.IsPR)
+		require.Equal(t, 34, ev.Number)
+		require.Equal(t, "g/p!34", ev.IssueRef)
+		require.Equal(t, "feat", ev.HeadBranch)
+		require.Equal(t, "bob", ev.ActorLogin)
+	})
 }
 
 func TestGitLabBadToken(t *testing.T) {

@@ -78,6 +78,51 @@ spec:
                   pgStorage:
                     type: string
                 type: object
+              scm:
+                description: ScmSpec binds a Project to one SCM provider and its board/merge
+                  policy.
+                properties:
+                  approvalLabel:
+                    default: tatara/awaiting-approval
+                    type: string
+                  board:
+                    description: BoardSpec configures the project board tatara participates
+                      in.
+                    properties:
+                      githubProjectNumber:
+                        type: integer
+                      gitlabBoardId:
+                        type: integer
+                      statusField:
+                        default: Status
+                        type: string
+                    type: object
+                  botLogin:
+                    type: string
+                  mergePolicy:
+                    default: afterApproval
+                    enum:
+                    - afterApproval
+                    - autoMergeOnGreenCI
+                    type: string
+                  owner:
+                    type: string
+                  prReactionScope:
+                    default: labeledOrMentioned
+                    enum:
+                    - labeledOrMentioned
+                    - all
+                    type: string
+                  provider:
+                    enum:
+                    - github
+                    - gitlab
+                    type: string
+                required:
+                - botLogin
+                - owner
+                - provider
+                type: object
               scmSecretRef:
                 type: string
               triggerLabel:
