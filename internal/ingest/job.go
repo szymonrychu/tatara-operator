@@ -21,6 +21,8 @@ type Config struct {
 	OIDCAudience     string
 	Namespace        string
 	ImagePullSecret  string
+	OpenAISecretName string
+	SemanticModel    string
 }
 
 // imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,

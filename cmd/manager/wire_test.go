@@ -49,6 +49,8 @@ func TestIngestConfigFromConfig(t *testing.T) {
 		OperatorOIDCClientID:     "tatara-operator",
 		OperatorOIDCClientSecret: "secret",
 		Namespace:                "tatara",
+		OpenAISecretName:         "tatara-openai",
+		SemanticModel:            "gpt-4o-mini",
 	}
 	got := ingestConfigFromConfig(cfg, "tatara-memory")
 	want := ingest.Config{
@@ -58,6 +60,8 @@ func TestIngestConfigFromConfig(t *testing.T) {
 		OIDCClientSecret: "secret",
 		OIDCAudience:     "tatara-memory",
 		Namespace:        "tatara",
+		OpenAISecretName: "tatara-openai",
+		SemanticModel:    "gpt-4o-mini",
 	}
 	if got != want {
 		t.Errorf("ingestConfigFromConfig = %+v, want %+v", got, want)
