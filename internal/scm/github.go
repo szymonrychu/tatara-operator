@@ -198,16 +198,45 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 	return nil
 }
 
-// SCMWriter stubs -- replaced by real implementations in subsequent tasks.
+// CreateIssue opens an issue and returns its ref + url.
+func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return IssueRef{}, err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues", owner, repo)
+	in := map[string]any{"title": req.Title, "body": req.Body}
+	if len(req.Labels) > 0 {
+		in["labels"] = req.Labels
+	}
+	var out struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
+		return IssueRef{}, err
+	}
+	return IssueRef{Ref: fmt.Sprintf("%s/%s#%d", owner, repo, out.Number), URL: out.HTMLURL}, nil
+}
 
-func (c *GitHub) CreateIssue(_ context.Context, _, _ string, _ IssueReq) (IssueRef, error) {
-	return IssueRef{}, fmt.Errorf("github: CreateIssue: not implemented")
+// AddLabel adds a single label to an issue/PR identified by owner/repo#number.
+func (c *GitHub) AddLabel(ctx context.Context, token, issueRef, label string) error {
+	owner, repo, number, err := ghIssueRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPost, path, token, map[string][]string{"labels": {label}}, nil)
 }
-func (c *GitHub) AddLabel(_ context.Context, _, _, _ string) error {
-	return fmt.Errorf("github: AddLabel: not implemented")
-}
-func (c *GitHub) RemoveLabel(_ context.Context, _, _, _ string) error {
-	return fmt.Errorf("github: RemoveLabel: not implemented")
+
+// RemoveLabel removes a single label from an issue/PR.
+func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
+	owner, repo, number, err := ghIssueRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, label)
+	return ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
 }
 func (c *GitHub) GetPRState(_ context.Context, _, _ string, _ int) (PRState, error) {
 	return PRState{}, fmt.Errorf("github: GetPRState: not implemented")
