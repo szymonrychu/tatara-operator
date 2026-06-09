@@ -41,7 +41,6 @@ func ResultConfigMapName(repo *tataradevv1alpha1.Repository) string {
 const (
 	workspaceVolume = "workspace"
 	workspaceMount  = "/workspace"
-	repoDir         = "/workspace/repo"
 )
 
 // BuildJob returns the *batchv1.Job that ingests repo for project. When since
@@ -55,12 +54,18 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 	ttl := int32(3600)
 	controller := true
 
+	// Clone into a directory that mirrors the repo namespace (owner/.../repo),
+	// not a flat "/workspace/repo", so concurrent clones never collide.
+	repoDir := workspaceMount + "/" + namespacePath(repo.Spec.URL)
+
 	// Use git credential helper to inject SCM_TOKEN without embedding it in
 	// the URL string. The full URL appears literally in the command so tests
 	// can assert on it; the token is supplied via SecretKeyRef env var.
+	// Full-history clone (no --depth): the incremental diff needs <since> in
+	// history, and a shallow clone exits 128 when <since> is absent.
 	cloneCmd := fmt.Sprintf(
 		`set -e; git -c "credential.helper=!f() { echo username=x-access-token; echo password=${SCM_TOKEN}; }; f" `+
-			`clone --depth 1 --branch %s %s %s`,
+			`clone --branch %s %s %s`,
 		repo.Spec.DefaultBranch, repo.Spec.URL, repoDir)
 
 	ingestArgs := fmt.Sprintf(

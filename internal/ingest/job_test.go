@@ -114,7 +114,7 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	}
 
 	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
-	if !strings.Contains(cmd, "tatara-ingest --repo-root /workspace/repo --repo-name widgets --base-url http://mem-acme.tatara.svc:8080") {
+	if !strings.Contains(cmd, "tatara-ingest --repo-root /workspace/acme/widgets --repo-name widgets --base-url http://mem-acme.tatara.svc:8080") {
 		t.Errorf("ingest cmd wrong: %q", cmd)
 	}
 	if strings.Contains(cmd, "--since") {
@@ -208,5 +208,39 @@ func TestBuildJob_BaseURLFromParameter(t *testing.T) {
 	}
 	if v := envValue(main, "BASE_URL"); v != ep {
 		t.Errorf("BASE_URL = %q, want %q", v, ep)
+	}
+}
+
+func TestBuildJob_FullHistoryClone(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	clone := job.Spec.Template.Spec.InitContainers[0]
+	cloneCmd := strings.Join(clone.Command, " ") + " " + strings.Join(clone.Args, " ")
+	if strings.Contains(cloneCmd, "--depth") {
+		t.Errorf("clone must be full history (no --depth): %q", cloneCmd)
+	}
+	if !strings.Contains(cloneCmd, "--branch main") {
+		t.Errorf("clone cmd missing branch: %q", cloneCmd)
+	}
+}
+
+func TestBuildJob_NamespaceCloneDir(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+
+	// widgets repo URL is https://github.com/acme/widgets.git -> acme/widgets
+	const wantDir = "/workspace/acme/widgets"
+
+	clone := job.Spec.Template.Spec.InitContainers[0]
+	cloneCmd := strings.Join(clone.Command, " ") + " " + strings.Join(clone.Args, " ")
+	if !strings.Contains(cloneCmd, wantDir) {
+		t.Errorf("clone must target namespace dir %q: %q", wantDir, cloneCmd)
+	}
+
+	main := job.Spec.Template.Spec.Containers[0]
+	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
+	if !strings.Contains(cmd, "--repo-root "+wantDir) {
+		t.Errorf("ingest cmd must use namespace repo-root %q: %q", wantDir, cmd)
+	}
+	if !strings.Contains(cmd, "git -C "+wantDir+" rev-parse HEAD") {
+		t.Errorf("HEAD resolution must run in namespace dir %q: %q", wantDir, cmd)
 	}
 }
