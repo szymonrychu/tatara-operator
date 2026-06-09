@@ -50,4 +50,7 @@ func (s *Server) routes(r chi.Router) {
 	r.Get("/tasks/{t}/subtasks", s.listSubtasks)
 	r.Post("/tasks/{t}/subtasks", s.createSubtask)
 	r.Patch("/subtasks/{s}", s.patchSubtask)
+	r.Post("/projects/{p}/issues", s.proposeIssue)
+	r.Post("/tasks/{t}/review", s.reviewVerdict)
+	r.Post("/tasks/{t}/pr-outcome", s.prOutcome)
 }
