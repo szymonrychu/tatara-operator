@@ -3,6 +3,7 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-09 (0.2.9) Cross-repo agent tasks: BuildPod gains a repos param and sets TATARA_REPOS (JSON array, primary first) so the wrapper clones all Project repos into /workspace/<name>; planTurnText gains the multi-repo workspace layout instruction; doWriteBack loops over all Project repos and attempts OpenChange per repo (4xx/no-branch repos are skipped), collects all PR URLs, and comments the issue with all links; primary PR URL remains in task.Status.PrURL. fakeWriterPerRepo added to writeback tests. Boy-scout: gofmt trailing blank line in operator_metrics.go.
 - 2026-06-09 (0.2.8) Dedupe Task creation by issue ref: creating an issue WITH
   the label fires both `issues.opened` (label present) and `issues.labeled`, so
   the webhook made TWO Tasks (two agents, two PRs) per issue. `handleWorkItem`

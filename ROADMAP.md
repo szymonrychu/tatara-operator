@@ -7,6 +7,11 @@ Planned work not yet started. One line per item; link to plans for detail.
 - [x] Dedupe Task creation by issue ref (shipped 0.2.8): `handleWorkItem` skips
   creation when a non-terminal Task already exists for the issue ref; re-labeling
   after completion still re-triggers.
+- [x] Cross-repo agent tasks (shipped 0.2.9, O1-O3): BuildPod sets TATARA_REPOS
+  (all Project repos, primary first); planTurnText tells the agent about
+  /workspace/<name> layout; doWriteBack loops all Project repos and opens one PR
+  per changed repo; issue comment carries all PR links.
+  Plan: `docs/superpowers/plans/2026-06-09-cross-repo-agent-tasks.md`.
 - [ ] Reconcile the staleness in `writeback.go` taskBranch comment: the branch is
   now also communicated to the wrapper via `TASK_BRANCH` env (not only the turn
   prompts), and the wrapper enforces the push.
