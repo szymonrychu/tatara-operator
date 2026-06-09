@@ -62,6 +62,13 @@ spec:
                 minLength: 9
                 pattern: ^(\S+\s+){4}\S+$
                 type: string
+              semanticIngest:
+                default: true
+                description: |-
+                  SemanticIngest enables Phase 2 LLM semantic extraction for this
+                  repository's ingest Job. Defaults true; set false to run AST-only
+                  ingest and avoid per-changed-file LLM cost.
+                type: boolean
               url:
                 type: string
             required:

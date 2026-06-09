@@ -59,3 +59,13 @@ func TestRepository_DeepCopyCopiesSemanticIngest(t *testing.T) {
 		t.Errorf("deepcopy lost SemanticIngest: %v", cp.Spec.SemanticIngest)
 	}
 }
+
+func TestRepository_DeepCopyIndependentSemanticIngest(t *testing.T) {
+	r := &Repository{}
+	r.Spec.SemanticIngest = true
+	cp := r.DeepCopy()
+	cp.Spec.SemanticIngest = false
+	if !r.Spec.SemanticIngest {
+		t.Fatal("mutating the copy's SemanticIngest changed the original; deepcopy must be a value copy")
+	}
+}
