@@ -18,12 +18,9 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
-// Writer opens changes and comments on the originating work item. Implemented
-// by the per-provider scm clients; faked in tests.
-type Writer interface {
-	OpenChange(ctx context.Context, repoURL, token, sourceBranch, targetBranch, title, body string) (string, error)
-	Comment(ctx context.Context, token, issueRef, body string) error
-}
+// Writer is the SCM egress contract the reconciler uses. It is the full
+// scm.SCMWriter; SCMFor returns it and tests fake it.
+type Writer = scm.SCMWriter
 
 // doWriteBack opens a PR/MR for each Project repo that has the task branch,
 // comments the primary issue with all PR links, and records them on the Task
@@ -37,6 +34,15 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 	if task.Status.PrURL != "" {
 		r.clearWritebackPending(ctx, task, "AlreadyWritten", "pr/mr url already set")
 		return ctrl.Result{}, nil
+	}
+
+	switch task.Spec.Kind {
+	case "review":
+		return r.writeBackReview(ctx, task)
+	case "selfImprove":
+		return r.writeBackSelfImprove(ctx, task)
+	default:
+		// implement (unchanged path below)
 	}
 
 	var proj tatarav1alpha1.Project
@@ -215,7 +221,7 @@ func writeBackBody(t *tatarav1alpha1.Task) string {
 	if t.Spec.Source != nil && t.Spec.Source.URL != "" {
 		b += "\n\nSource: " + t.Spec.Source.URL
 	}
-	return b
+	return b + "\n\n" + tataraAuthoredMarker
 }
 
 const tataraAuthoredMarker = "<!-- tatara-authored -->"
@@ -307,6 +313,156 @@ func boardRefFromSpec(s *tatarav1alpha1.ScmSpec) scm.BoardRef {
 		b.StatusField = s.Board.StatusField
 	}
 	return b
+}
+
+// scmContext resolves project, primary repo, writer, token, and provider for a Task.
+func (r *TaskReconciler) scmContext(ctx context.Context, task *tatarav1alpha1.Task) (tatarav1alpha1.Project, tatarav1alpha1.Repository, scm.SCMWriter, string, string, error) {
+	var proj tatarav1alpha1.Project
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil {
+		return proj, tatarav1alpha1.Repository{}, nil, "", "", fmt.Errorf("writeback: get project: %w", err)
+	}
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
+		return proj, repo, nil, "", "", fmt.Errorf("writeback: get repository: %w", err)
+	}
+	provider := ""
+	if task.Spec.Source != nil {
+		provider = task.Spec.Source.Provider
+	}
+	if provider == "" {
+		provider = providerForRemote(ctx, repo.Spec.URL)
+	}
+	writer, err := r.SCMFor(provider)
+	if err != nil {
+		return proj, repo, nil, "", provider, fmt.Errorf("writeback: scm writer: %w", err)
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		return proj, repo, writer, "", provider, fmt.Errorf("writeback: scm token: %w", err)
+	}
+	return proj, repo, writer, token, provider, nil
+}
+
+func (r *TaskReconciler) recordSCM(provider, verb string, err error) {
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	r.Metrics.SCMWrite(provider, verb, result)
+}
+
+// writeBackReview reads Status.ReviewVerdict and posts exactly one verb set.
+// Never calls OpenChange.
+func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+	v := task.Status.ReviewVerdict
+	if v == nil || task.Spec.Source == nil {
+		r.clearWritebackPending(ctx, task, "NoVerdict", "review task without a verdict")
+		return ctrl.Result{}, nil
+	}
+	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	_ = proj
+	number := task.Spec.Source.Number
+	switch v.Decision {
+	case "approve":
+		err = writer.Approve(ctx, repo.Spec.URL, token, number, v.Body)
+		r.recordSCM(provider, "approve", err)
+	case "request_changes":
+		err = writer.RequestChanges(ctx, repo.Spec.URL, token, number, v.Body)
+		r.recordSCM(provider, "request_changes", err)
+		if err == nil && len(v.Suggestions) > 0 {
+			serr := writer.Suggest(ctx, repo.Spec.URL, token, number, toSCMSuggestions(v.Suggestions))
+			r.recordSCM(provider, "suggest", serr)
+		}
+	case "comment":
+		err = writer.Comment(ctx, token, task.Spec.Source.IssueRef, v.Body)
+		r.recordSCM(provider, "comment", err)
+	default:
+		err = fmt.Errorf("unknown review decision %q", v.Decision)
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("writeback review: %w", err)
+	}
+	l.Info("review verdict posted", "action", "scm_review", "resource_id", task.Name, "decision", v.Decision)
+	r.clearWritebackPending(ctx, task, "Reviewed", "review verdict posted: "+v.Decision)
+	return ctrl.Result{}, nil
+}
+
+// writeBackSelfImprove reads Status.PROutcome and merges or closes the PR per policy.
+// Never calls OpenChange.
+func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+	out := task.Status.PROutcome
+	if out == nil || task.Spec.Source == nil {
+		r.clearWritebackPending(ctx, task, "NoOutcome", "selfImprove task without an outcome")
+		return ctrl.Result{}, nil
+	}
+	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	number := task.Spec.Source.Number
+	switch out.Action {
+	case "close":
+		err = writer.ClosePR(ctx, repo.Spec.URL, token, number, out.Reason)
+		r.recordSCM(provider, "close", err)
+	case "merge":
+		ok, merr := r.mergeAllowed(ctx, &proj, repo, writer, token, number)
+		if merr != nil {
+			return ctrl.Result{}, merr
+		}
+		if !ok {
+			l.Info("self-improve merge withheld: policy not satisfied", "action", "scm_merge_withheld", "resource_id", task.Name)
+			r.clearWritebackPending(ctx, task, "MergeWithheld", "merge policy not satisfied")
+			return ctrl.Result{}, nil
+		}
+		err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
+		r.recordSCM(provider, "merge", err)
+	default:
+		err = fmt.Errorf("unknown pr outcome %q", out.Action)
+	}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("writeback selfImprove: %w", err)
+	}
+	l.Info("self-improve outcome applied", "action", "scm_pr_outcome", "resource_id", task.Name, "outcome", out.Action)
+	r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: "+out.Action)
+	return ctrl.Result{}, nil
+}
+
+// mergeAllowed enforces MergePolicy. autoMergeOnGreenCI merges only when CI is
+// present and green; CI absent falls back to afterApproval (trusts pr_outcome=merge
+// as the agent's relay of an approving signal).
+func (r *TaskReconciler) mergeAllowed(ctx context.Context, proj *tatarav1alpha1.Project, repo tatarav1alpha1.Repository, writer scm.SCMWriter, token string, number int) (bool, error) {
+	policy := "afterApproval"
+	if proj.Spec.Scm != nil && proj.Spec.Scm.MergePolicy != "" {
+		policy = proj.Spec.Scm.MergePolicy
+	}
+	if policy == "autoMergeOnGreenCI" {
+		st, err := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+		if err != nil {
+			return false, fmt.Errorf("merge policy: get pr state: %w", err)
+		}
+		if st.CIStatus == "success" {
+			return true, nil
+		}
+		if st.CIStatus != "" {
+			return false, nil // CI present but not green
+		}
+		// CI absent -> fall back to afterApproval below.
+	}
+	// afterApproval: trust pr_outcome=merge as the agent's relay of an approving signal.
+	return true, nil
+}
+
+func toSCMSuggestions(in []tatarav1alpha1.Suggestion) []scm.Suggestion {
+	out := make([]scm.Suggestion, 0, len(in))
+	for _, s := range in {
+		out = append(out, scm.Suggestion{Path: s.Path, Line: s.Line, Body: s.Body})
+	}
+	return out
 }
 
 func (r *TaskReconciler) scmToken(ctx context.Context, ns, ref string) (string, error) {

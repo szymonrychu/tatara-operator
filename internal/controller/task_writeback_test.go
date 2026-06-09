@@ -467,6 +467,375 @@ func TestWriteback_SkipsRepoWith422(t *testing.T) {
 	require.NotContains(t, fw.commentArgs[0], "r2")
 }
 
+// fullFakeSCMWriter records calls to all SCMWriter methods used by review/selfImprove/implement paths.
+type fullFakeSCMWriter struct {
+	scm.SCMWriter
+	// implement path
+	openCalls    int
+	openCallURL  string
+	openCallBody string
+	// review path
+	approveCalled        bool
+	approveNumber        int
+	approveBody          string
+	requestChangesCalled bool
+	requestChangesNumber int
+	requestChangesBody   string
+	suggestCalled        bool
+	suggestSuggs         []scm.Suggestion
+	commentCalled        bool
+	commentIssueRef      string
+	commentBody          string
+	// selfImprove path
+	mergeCalled   bool
+	mergeNumber   int
+	mergeMethod   string
+	closePRCalled bool
+	closePRNumber int
+	// GetPRState
+	prState    scm.PRState
+	prStateErr error
+}
+
+func (f *fullFakeSCMWriter) OpenChange(_ context.Context, _, _, _, _, title, body string) (string, error) {
+	f.openCalls++
+	f.openCallBody = body
+	return "https://example/pr/99", nil
+}
+func (f *fullFakeSCMWriter) Comment(_ context.Context, _, issueRef, body string) error {
+	f.commentCalled = true
+	f.commentIssueRef = issueRef
+	f.commentBody = body
+	return nil
+}
+func (f *fullFakeSCMWriter) Approve(_ context.Context, _, _ string, number int, body string) error {
+	f.approveCalled = true
+	f.approveNumber = number
+	f.approveBody = body
+	return nil
+}
+func (f *fullFakeSCMWriter) RequestChanges(_ context.Context, _, _ string, number int, body string) error {
+	f.requestChangesCalled = true
+	f.requestChangesNumber = number
+	f.requestChangesBody = body
+	return nil
+}
+func (f *fullFakeSCMWriter) Suggest(_ context.Context, _, _ string, _ int, sugg []scm.Suggestion) error {
+	f.suggestCalled = true
+	f.suggestSuggs = sugg
+	return nil
+}
+func (f *fullFakeSCMWriter) Merge(_ context.Context, _, _ string, number int, method string) error {
+	f.mergeCalled = true
+	f.mergeNumber = number
+	f.mergeMethod = method
+	return nil
+}
+func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, _ string) error {
+	f.closePRCalled = true
+	f.closePRNumber = number
+	return nil
+}
+func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	return f.prState, f.prStateErr
+}
+
+// seedWritebackKindTask creates the minimal project+repo+secret+task for write-back Kind tests.
+// scmSpec may be nil for implement tasks; provided for selfImprove policy tests.
+func seedWritebackKindTask(t *testing.T, name, project, repo, scmSecret string, spec tatarav1alpha1.TaskSpec, scmSpec *tatarav1alpha1.ScmSpec) *tatarav1alpha1.Task {
+	t.Helper()
+	ctx := context.Background()
+
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: scmSecret, Namespace: testNS},
+		Data:       map[string][]byte{"token": []byte("pat"), "webhookSecret": []byte("w")},
+	}
+	if err := k8sClient.Create(ctx, sec); err != nil {
+		t.Fatalf("create secret %s: %v", scmSecret, err)
+	}
+	projSpec := tatarav1alpha1.ProjectSpec{
+		ScmSecretRef: scmSecret,
+		TriggerLabel: "tatara",
+		Agent: tatarav1alpha1.AgentSpec{
+			Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
+			MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,
+		},
+	}
+	if scmSpec != nil {
+		projSpec.Scm = scmSpec
+	}
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: project, Namespace: testNS},
+		Spec:       projSpec,
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project %s: %v", project, err)
+	}
+	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc"}
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("set project memory ready: %v", err)
+	}
+
+	r := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: repo, Namespace: testNS},
+		Spec: tatarav1alpha1.RepositorySpec{
+			ProjectRef:       project,
+			URL:              "https://github.com/o/r.git",
+			DefaultBranch:    "main",
+			ReingestSchedule: "0 6 * * *",
+		},
+	}
+	if err := k8sClient.Create(ctx, r); err != nil {
+		t.Fatalf("create repo %s: %v", repo, err)
+	}
+
+	spec.ProjectRef = project
+	spec.RepositoryRef = repo
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec:       spec,
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task %s: %v", name, err)
+	}
+
+	// Seed WritebackPending so doWriteBack is entered.
+	task.Status.Phase = "Succeeded"
+	task.Status.ResultSummary = "done"
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type: "WritebackPending", Status: metav1.ConditionTrue, Reason: "AwaitingM5",
+	})
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed writeback status: %v", err)
+	}
+	var fresh tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, &fresh); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	return &fresh
+}
+
+func newFullFakeReconciler(t *testing.T, fw *fullFakeSCMWriter) *TaskReconciler {
+	t.Helper()
+	return &TaskReconciler{
+		Client:  k8sClient,
+		Scheme:  k8sClient.Scheme(),
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Session: newFakeSession(),
+		PodConfig: agent.PodConfig{
+			Namespace:           testNS,
+			CallbackURL:         "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "tatara-cli-oidc",
+		},
+		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
+	}
+}
+
+func TestDoWriteBackKind(t *testing.T) {
+	t.Run("review/approve", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-rev-approve", "wbk-proj-ra", "wbk-repo-ra", "wbk-scm-ra",
+			tatarav1alpha1.TaskSpec{
+				Goal: "review a PR",
+				Kind: "review",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#9", IsPR: true, Number: 9,
+				},
+			}, nil)
+		task.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: "approve", Body: "lgtm"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.approveCalled, "Approve must be called")
+		require.Equal(t, 9, fw.approveNumber)
+		require.Equal(t, "lgtm", fw.approveBody)
+		require.Zero(t, fw.openCalls, "OpenChange must NOT be called for review kind")
+	})
+
+	t.Run("review/request_changes with suggestions", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-rev-rc", "wbk-proj-rc", "wbk-repo-rc", "wbk-scm-rc",
+			tatarav1alpha1.TaskSpec{
+				Goal: "review a PR",
+				Kind: "review",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#10", IsPR: true, Number: 10,
+				},
+			}, nil)
+		task.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{
+			Decision:    "request_changes",
+			Body:        "nope",
+			Suggestions: []tatarav1alpha1.Suggestion{{Path: "a.go", Line: 5, Body: "x := 1"}},
+		}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.requestChangesCalled, "RequestChanges must be called")
+		require.Equal(t, 10, fw.requestChangesNumber)
+		require.True(t, fw.suggestCalled, "Suggest must be called when suggestions present")
+		require.Len(t, fw.suggestSuggs, 1)
+		require.Equal(t, "a.go", fw.suggestSuggs[0].Path)
+		require.Zero(t, fw.openCalls, "OpenChange must NOT be called for review kind")
+	})
+
+	t.Run("review/comment", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-rev-cmt", "wbk-proj-cmt", "wbk-repo-cmt", "wbk-scm-cmt",
+			tatarav1alpha1.TaskSpec{
+				Goal: "comment on a PR",
+				Kind: "review",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#11", IsPR: true, Number: 11,
+				},
+			}, nil)
+		task.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: "comment", Body: "nice work"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.commentCalled, "Comment must be called for decision=comment")
+		require.Equal(t, "o/r#11", fw.commentIssueRef)
+		require.Equal(t, "nice work", fw.commentBody)
+		require.Zero(t, fw.openCalls, "OpenChange must NOT be called")
+	})
+
+	t.Run("selfImprove/merge afterApproval", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{prState: scm.PRState{CIStatus: ""}}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-si-merge", "wbk-proj-sim", "wbk-repo-sim", "wbk-scm-sim",
+			tatarav1alpha1.TaskSpec{
+				Goal: "self-improve",
+				Kind: "selfImprove",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#12", IsPR: true, Number: 12,
+				},
+			},
+			&tatarav1alpha1.ScmSpec{
+				Provider:    "github",
+				Owner:       "o",
+				BotLogin:    "tatara-bot",
+				MergePolicy: "afterApproval",
+			})
+		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge", Reason: "approved"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.mergeCalled, "Merge must be called for afterApproval pr_outcome=merge")
+		require.False(t, fw.closePRCalled, "ClosePR must NOT be called")
+		require.Equal(t, 12, fw.mergeNumber)
+		require.Equal(t, "squash", fw.mergeMethod)
+	})
+
+	t.Run("selfImprove/merge autoMergeOnGreenCI success", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{prState: scm.PRState{CIStatus: "success"}}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-si-maci", "wbk-proj-maci", "wbk-repo-maci", "wbk-scm-maci",
+			tatarav1alpha1.TaskSpec{
+				Goal: "self-improve CI",
+				Kind: "selfImprove",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#13", IsPR: true, Number: 13,
+				},
+			},
+			&tatarav1alpha1.ScmSpec{
+				Provider:    "github",
+				Owner:       "o",
+				BotLogin:    "tatara-bot",
+				MergePolicy: "autoMergeOnGreenCI",
+			})
+		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.mergeCalled, "Merge must be called when CI=success")
+	})
+
+	t.Run("selfImprove/merge autoMergeOnGreenCI CI absent -> afterApproval", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{prState: scm.PRState{CIStatus: ""}}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-si-noci", "wbk-proj-noci", "wbk-repo-noci", "wbk-scm-noci",
+			tatarav1alpha1.TaskSpec{
+				Goal: "self-improve no CI",
+				Kind: "selfImprove",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#14", IsPR: true, Number: 14,
+				},
+			},
+			&tatarav1alpha1.ScmSpec{
+				Provider:    "github",
+				Owner:       "o",
+				BotLogin:    "tatara-bot",
+				MergePolicy: "autoMergeOnGreenCI",
+			})
+		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		// CI absent -> falls back to afterApproval which trusts pr_outcome=merge -> merges.
+		require.True(t, fw.mergeCalled, "CI absent falls back to afterApproval which trusts pr_outcome=merge")
+	})
+
+	t.Run("selfImprove/close", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-si-close", "wbk-proj-close", "wbk-repo-close", "wbk-scm-close",
+			tatarav1alpha1.TaskSpec{
+				Goal: "self-improve close",
+				Kind: "selfImprove",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#15", IsPR: true, Number: 15,
+				},
+			},
+			&tatarav1alpha1.ScmSpec{
+				Provider: "github", Owner: "o", BotLogin: "tatara-bot", MergePolicy: "afterApproval",
+			})
+		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "close", Reason: "rejecting"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.closePRCalled, "ClosePR must be called")
+		require.Equal(t, 15, fw.closePRNumber)
+		require.False(t, fw.mergeCalled, "Merge must NOT be called")
+	})
+
+	t.Run("implement body carries marker", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-impl-marker", "wbk-proj-impl", "wbk-repo-impl", "wbk-scm-impl",
+			tatarav1alpha1.TaskSpec{
+				Goal: "fix bug",
+				Kind: "implement",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "github", IssueRef: "o/r#16", IsPR: false, Number: 0,
+				},
+			}, nil)
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.GreaterOrEqual(t, fw.openCalls, 1, "OpenChange must be called for implement kind")
+		require.Contains(t, fw.openCallBody, "<!-- tatara-authored -->", "implement body must carry marker")
+	})
+}
+
 func TestProviderForRemote(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	tests := []struct {
