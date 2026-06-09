@@ -40,6 +40,8 @@ func testConfig() Config {
 		OIDCAudience:     "tatara-memory",
 		Namespace:        "tatara",
 		ImagePullSecret:  "regcred",
+		OpenAISecretName: "tatara-openai",
+		SemanticModel:    "gpt-4o-mini",
 	}
 }
 
@@ -220,6 +222,68 @@ func TestBuildJob_FullHistoryClone(t *testing.T) {
 	}
 	if !strings.Contains(cloneCmd, "--branch main") {
 		t.Errorf("clone cmd missing branch: %q", cloneCmd)
+	}
+}
+
+func envSecretRef(c corev1.Container, key string) *corev1.SecretKeySelector {
+	for _, e := range c.Env {
+		if e.Name == key && e.ValueFrom != nil {
+			return e.ValueFrom.SecretKeyRef
+		}
+	}
+	return nil
+}
+
+func TestBuildJob_OpenAIKeyFromSecret(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	ref := envSecretRef(main, "OPENAI_API_KEY")
+	if ref == nil {
+		t.Fatal("ingest container must source OPENAI_API_KEY from a secret")
+	}
+	if ref.Name != "tatara-openai" || ref.Key != "LLM_BINDING_API_KEY" {
+		t.Errorf("OPENAI_API_KEY secretKeyRef = %s/%s, want tatara-openai/LLM_BINDING_API_KEY",
+			ref.Name, ref.Key)
+	}
+}
+
+func TestBuildJob_OpenAIKeyOmittedWhenSecretUnset(t *testing.T) {
+	cfg := testConfig()
+	cfg.OpenAISecretName = ""
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, cfg)
+	main := job.Spec.Template.Spec.Containers[0]
+	for _, e := range main.Env {
+		if e.Name == "OPENAI_API_KEY" {
+			t.Fatal("OPENAI_API_KEY must be omitted when OpenAISecretName is unset")
+		}
+	}
+}
+
+func TestBuildJob_SemanticModelEnv(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_MODEL"); v != "gpt-4o-mini" {
+		t.Errorf("SEMANTIC_MODEL = %q, want gpt-4o-mini", v)
+	}
+}
+
+func TestBuildJob_SemanticIngestEnv_True(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.SemanticIngest = true
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_INGEST"); v != "true" {
+		t.Errorf("SEMANTIC_INGEST = %q, want true", v)
+	}
+}
+
+func TestBuildJob_SemanticIngestEnv_False(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.SemanticIngest = false
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_INGEST"); v != "false" {
+		t.Errorf("SEMANTIC_INGEST = %q, want false", v)
 	}
 }
 

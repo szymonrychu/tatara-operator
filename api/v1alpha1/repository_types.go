@@ -15,6 +15,12 @@ type RepositorySpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	IngestEnabled bool `json:"ingestEnabled,omitempty"`
+	// SemanticIngest enables Phase 2 LLM semantic extraction for this
+	// repository's ingest Job. Defaults true; set false to run AST-only
+	// ingest and avoid per-changed-file LLM cost.
+	// +kubebuilder:default=true
+	// +optional
+	SemanticIngest bool `json:"semanticIngest,omitempty"`
 	// ReingestSchedule is a standard 5-field cron expression (e.g. "0 6 * * *")
 	// that triggers a periodic catch-up re-ingest in addition to push webhooks.
 	// +kubebuilder:validation:Required

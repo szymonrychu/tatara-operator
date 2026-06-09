@@ -46,6 +46,8 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 		OIDCAudience:     memoryAudience,
 		Namespace:        cfg.Namespace,
 		ImagePullSecret:  cfg.ImagePullSecret,
+		OpenAISecretName: cfg.OpenAISecretName,
+		SemanticModel:    cfg.SemanticModel,
 	}
 }
 
