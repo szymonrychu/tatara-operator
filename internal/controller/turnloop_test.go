@@ -105,3 +105,14 @@ func TestTurnText_ContainsTaskReminder(t *testing.T) {
 		t.Errorf("turn text missing task reminder: %q", txt)
 	}
 }
+
+func TestPlanTurnText_MentionsAllReposCloned(t *testing.T) {
+	txt := planTurnText("do x", "tatara/task-abc", "proj1", "task-abc")
+	low := strings.ToLower(txt)
+	if !strings.Contains(low, "/workspace/") {
+		t.Errorf("plan turn missing /workspace/ path: %q", txt)
+	}
+	if !strings.Contains(low, "each repo you") {
+		t.Errorf("plan turn missing 'each repo you' instruction: %q", txt)
+	}
+}

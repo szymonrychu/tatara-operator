@@ -15,6 +15,9 @@ func planTurnText(goal, branch, project, task string) string {
 		"You are working on Task `%s` in Project `%s`. "+
 			"Use the tatara MCP tools with task=`%s` (and project=`%s`).\n\n"+
 			"%s\n\n"+
+			"All Project repos are cloned under `/workspace/<name>` (primary: this task's repo). "+
+			"Make changes in whatever repos the issue requires; each repo you change is committed and "+
+			"pushed to `%s` and gets its own PR.\n\n"+
 			"If this objective is small enough to finish in one turn, implement it directly now - "+
 			"edit the files in the working tree. If it needs several steps, decompose it into ordered "+
 			"Subtasks via subtask_create(task=`%s`, ...), one per concrete step, which are executed in "+
@@ -22,7 +25,7 @@ func planTurnText(goal, branch, project, task string) string {
 			"Your changes are committed and pushed to the git branch `%s` automatically at the end of each "+
 			"turn (the branch is created from the default branch for you). NEVER commit or push to the "+
 			"default branch directly.",
-		task, project, task, project, goal, task, branch)
+		task, project, task, project, goal, branch, task, branch)
 }
 
 // nextPendingSubtask returns the lowest-order Pending subtask, if any.
