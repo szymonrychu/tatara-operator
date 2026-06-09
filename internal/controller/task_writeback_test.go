@@ -102,9 +102,10 @@ func seedWritebackPending(t *testing.T, name, scmSecret, project, repo string) *
 	r := &tatarav1alpha1.Repository{
 		ObjectMeta: metav1.ObjectMeta{Name: repo, Namespace: testNS},
 		Spec: tatarav1alpha1.RepositorySpec{
-			ProjectRef:    project,
-			URL:           "https://github.com/o/r.git",
-			DefaultBranch: "main",
+			ProjectRef:       project,
+			URL:              "https://github.com/o/r.git",
+			DefaultBranch:    "main",
+			ReingestSchedule: "0 6 * * *",
 		},
 	}
 	if err := k8sClient.Create(ctx, r); err != nil {
@@ -188,7 +189,7 @@ func TestTaskWriteBackNoCommentWhenNoSource(t *testing.T) {
 	}))
 	require.NoError(t, k8sClient.Create(ctx, &tatarav1alpha1.Repository{
 		ObjectMeta: metav1.ObjectMeta{Name: "wb-repo2", Namespace: testNS},
-		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: "wb-proj2", URL: "https://github.com/o/r2.git", DefaultBranch: "main"},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: "wb-proj2", URL: "https://github.com/o/r2.git", DefaultBranch: "main", ReingestSchedule: "0 6 * * *"},
 	}))
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "wb-task2", Namespace: testNS},
@@ -333,7 +334,7 @@ func seedWritebackPendingMultiRepo(t *testing.T, name, scmSecret, project, prima
 
 	r1 := &tatarav1alpha1.Repository{
 		ObjectMeta: metav1.ObjectMeta{Name: primaryRepo, Namespace: testNS},
-		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: "https://github.com/o/r1.git", DefaultBranch: "main"},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: "https://github.com/o/r1.git", DefaultBranch: "main", ReingestSchedule: "0 6 * * *"},
 	}
 	if err := k8sClient.Create(ctx, r1); err != nil {
 		t.Fatalf("create primary repository %s: %v", primaryRepo, err)
@@ -341,7 +342,7 @@ func seedWritebackPendingMultiRepo(t *testing.T, name, scmSecret, project, prima
 
 	r2 := &tatarav1alpha1.Repository{
 		ObjectMeta: metav1.ObjectMeta{Name: secondaryRepo, Namespace: testNS},
-		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: "https://github.com/o/r2.git", DefaultBranch: "main"},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: "https://github.com/o/r2.git", DefaultBranch: "main", ReingestSchedule: "0 6 * * *"},
 	}
 	if err := k8sClient.Create(ctx, r2); err != nil {
 		t.Fatalf("create secondary repository %s: %v", secondaryRepo, err)

@@ -61,6 +61,7 @@ func mkRepo(t *testing.T, name, projectRef string) *tataradevv1alpha1.Repository
 	r.Spec.URL = "https://github.com/acme/" + name + ".git"
 	r.Spec.DefaultBranch = "main"
 	r.Spec.IngestEnabled = true
+	r.Spec.ReingestSchedule = "0 6 * * *"
 	if err := k8sClient.Create(context.Background(), r); err != nil {
 		t.Fatalf("create repo %s: %v", name, err)
 	}
