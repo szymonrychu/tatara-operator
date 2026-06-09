@@ -186,3 +186,39 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 	}
 	return nil
 }
+
+// SCMWriter stubs -- replaced by real implementations in subsequent tasks.
+
+func (c *GitLab) CreateIssue(_ context.Context, _, _ string, _ IssueReq) (IssueRef, error) {
+	return IssueRef{}, fmt.Errorf("gitlab: CreateIssue: not implemented")
+}
+func (c *GitLab) AddLabel(_ context.Context, _, _, _ string) error {
+	return fmt.Errorf("gitlab: AddLabel: not implemented")
+}
+func (c *GitLab) RemoveLabel(_ context.Context, _, _, _ string) error {
+	return fmt.Errorf("gitlab: RemoveLabel: not implemented")
+}
+func (c *GitLab) GetPRState(_ context.Context, _, _ string, _ int) (PRState, error) {
+	return PRState{}, fmt.Errorf("gitlab: GetPRState: not implemented")
+}
+func (c *GitLab) Approve(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("gitlab: Approve: not implemented")
+}
+func (c *GitLab) RequestChanges(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("gitlab: RequestChanges: not implemented")
+}
+func (c *GitLab) Suggest(_ context.Context, _, _ string, _ int, _ []Suggestion) error {
+	return fmt.Errorf("gitlab: Suggest: not implemented")
+}
+func (c *GitLab) Merge(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("gitlab: Merge: not implemented")
+}
+func (c *GitLab) ClosePR(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("gitlab: ClosePR: not implemented")
+}
+func (c *GitLab) AddBoardItem(_ context.Context, _ string, _ BoardRef, _ string) error {
+	return fmt.Errorf("gitlab: AddBoardItem: not implemented")
+}
+func (c *GitLab) SetBoardColumn(_ context.Context, _ string, _ BoardRef, _, _ string) error {
+	return fmt.Errorf("gitlab: SetBoardColumn: not implemented")
+}

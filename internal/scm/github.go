@@ -197,3 +197,39 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 	}
 	return nil
 }
+
+// SCMWriter stubs -- replaced by real implementations in subsequent tasks.
+
+func (c *GitHub) CreateIssue(_ context.Context, _, _ string, _ IssueReq) (IssueRef, error) {
+	return IssueRef{}, fmt.Errorf("github: CreateIssue: not implemented")
+}
+func (c *GitHub) AddLabel(_ context.Context, _, _, _ string) error {
+	return fmt.Errorf("github: AddLabel: not implemented")
+}
+func (c *GitHub) RemoveLabel(_ context.Context, _, _, _ string) error {
+	return fmt.Errorf("github: RemoveLabel: not implemented")
+}
+func (c *GitHub) GetPRState(_ context.Context, _, _ string, _ int) (PRState, error) {
+	return PRState{}, fmt.Errorf("github: GetPRState: not implemented")
+}
+func (c *GitHub) Approve(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("github: Approve: not implemented")
+}
+func (c *GitHub) RequestChanges(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("github: RequestChanges: not implemented")
+}
+func (c *GitHub) Suggest(_ context.Context, _, _ string, _ int, _ []Suggestion) error {
+	return fmt.Errorf("github: Suggest: not implemented")
+}
+func (c *GitHub) Merge(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("github: Merge: not implemented")
+}
+func (c *GitHub) ClosePR(_ context.Context, _, _ string, _ int, _ string) error {
+	return fmt.Errorf("github: ClosePR: not implemented")
+}
+func (c *GitHub) AddBoardItem(_ context.Context, _ string, _ BoardRef, _ string) error {
+	return fmt.Errorf("github: AddBoardItem: not implemented")
+}
+func (c *GitHub) SetBoardColumn(_ context.Context, _ string, _ BoardRef, _, _ string) error {
+	return fmt.Errorf("github: SetBoardColumn: not implemented")
+}
