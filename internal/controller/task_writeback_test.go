@@ -21,6 +21,7 @@ import (
 )
 
 type fakeWriter struct {
+	scm.SCMWriter
 	mu          sync.Mutex
 	openCalls   int
 	commentArgs []string // issueRef|body
@@ -62,7 +63,7 @@ func newWriteBackReconciler(t *testing.T, fw *fakeWriter) *TaskReconciler {
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},
-		SCMFor: func(string) (Writer, error) { return fw, nil },
+		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
 	}
 }
 
@@ -282,6 +283,7 @@ func TestTaskWriteBackAlreadyExists(t *testing.T) {
 // fakeWriterPerRepo returns a configurable PR URL per repoURL, and an HTTPError
 // for repos in the 422 set.
 type fakeWriterPerRepo struct {
+	scm.SCMWriter
 	mu          sync.Mutex
 	openCalls   int
 	commentArgs []string
@@ -398,7 +400,7 @@ func TestWriteback_OpensPRPerRepoWithBranch(t *testing.T) {
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},
-		SCMFor: func(string) (Writer, error) { return fw, nil },
+		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
 	}
 	task := seedWritebackPendingMultiRepo(t, "wb-mr-task1", "wb-mr-scm1", "wb-mr-proj1", "wb-mr-repo1", "wb-mr-repo2")
 
@@ -443,7 +445,7 @@ func TestWriteback_SkipsRepoWith422(t *testing.T) {
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},
-		SCMFor: func(string) (Writer, error) { return fw, nil },
+		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
 	}
 	task := seedWritebackPendingMultiRepo(t, "wb-mr-task2", "wb-mr-scm2", "wb-mr-proj2", "wb-mr-repo3", "wb-mr-repo4")
 

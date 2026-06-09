@@ -218,6 +218,97 @@ func writeBackBody(t *tatarav1alpha1.Task) string {
 	return b
 }
 
+const tataraAuthoredMarker = "<!-- tatara-authored -->"
+
+// createProposal opens the proposed issue with the approval label, places it
+// on the board in the "Proposed" column, records the Source + DiscoveredIssues,
+// and stays in AwaitingApproval. It is the only SCM egress for proposals.
+func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+	if proj.Spec.Scm == nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: project %q has no scm spec", proj.Name)
+	}
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProposedIssue.RepositoryRef}, &repo); err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: get repository: %w", err)
+	}
+	writer, err := r.SCMFor(proj.Spec.Scm.Provider)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: scm writer: %w", err)
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: scm token: %w", err)
+	}
+	label := proj.Spec.Scm.ApprovalLabel
+	if label == "" {
+		label = "tatara/awaiting-approval"
+	}
+	body := task.Spec.ProposedIssue.Body + "\n\n" + tataraAuthoredMarker
+	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
+		Title:  task.Spec.ProposedIssue.Title,
+		Body:   body,
+		Labels: []string{label},
+	})
+	if err != nil {
+		r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "error")
+		return ctrl.Result{}, fmt.Errorf("proposal: create issue: %w", err)
+	}
+	r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "ok")
+	if proj.Spec.Scm.Board != nil {
+		board := boardRefFromSpec(proj.Spec.Scm)
+		if err := writer.AddBoardItem(ctx, token, board, ref.URL); err != nil {
+			l.Error(err, "proposal: add board item (non-fatal)")
+			r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_add", "error")
+		} else {
+			r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_add", "ok")
+			if err := writer.SetBoardColumn(ctx, token, board, ref.URL, "Proposed"); err != nil {
+				l.Error(err, "proposal: set board column (non-fatal)")
+				r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_column", "error")
+			} else {
+				r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_column", "ok")
+			}
+		}
+	}
+	task.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider:    proj.Spec.Scm.Provider,
+		IssueRef:    ref.Ref,
+		URL:         ref.URL,
+		Number:      0,
+		IsPR:        false,
+		AuthorLogin: proj.Spec.Scm.BotLogin,
+	}
+	if err := r.Update(ctx, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: record source: %w", err)
+	}
+	task.Status.Phase = "AwaitingApproval"
+	task.Status.DiscoveredIssues = append(task.Status.DiscoveredIssues, ref.URL)
+	now := metav1.Now()
+	task.Status.GateEnteredAt = &now
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type:    tatarav1alpha1.ConditionApprovalApproved,
+		Status:  metav1.ConditionFalse,
+		Reason:  "AwaitingHuman",
+		Message: "issue opened with approval label; awaiting removal",
+	})
+	if err := r.Status().Update(ctx, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: record status: %w", err)
+	}
+	l.Info("proposal issue opened", "action", "scm_propose_issue",
+		"resource_id", task.Name, "project", proj.Name, "issue_ref", ref.Ref)
+	return ctrl.Result{RequeueAfter: capRequeue}, nil
+}
+
+func boardRefFromSpec(s *tatarav1alpha1.ScmSpec) scm.BoardRef {
+	b := scm.BoardRef{Provider: s.Provider, Owner: s.Owner}
+	if s.Board != nil {
+		b.GitHubProjectNumber = s.Board.GitHubProjectNumber
+		b.GitLabBoardID = s.Board.GitLabBoardID
+		b.StatusField = s.Board.StatusField
+	}
+	return b
+}
+
 func (r *TaskReconciler) scmToken(ctx context.Context, ns, ref string) (string, error) {
 	var sec corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: ref}, &sec); err != nil {

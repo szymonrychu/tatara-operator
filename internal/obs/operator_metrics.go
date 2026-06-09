@@ -13,6 +13,8 @@ type OperatorMetrics struct {
 	tasksInflight           prometheus.Gauge
 	memoryProvisionDuration prometheus.Histogram
 	memoryStacks            *prometheus.GaugeVec
+	scmWritesTotal          *prometheus.CounterVec
+	approvalGateSeconds     prometheus.Histogram
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -50,6 +52,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_stacks",
 			Help: "Number of per-project memory stacks by phase.",
 		}, []string{"phase"}),
+		scmWritesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_scm_writes_total",
+			Help: "Total SCM write operations by provider, verb, and result.",
+		}, []string{"provider", "verb", "result"}),
+		approvalGateSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "operator_approval_gate_seconds",
+			Help:    "Wall-clock seconds a Task spent in AwaitingApproval.",
+			Buckets: prometheus.ExponentialBuckets(60, 2, 10),
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -59,6 +70,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tasksInflight,
 		m.memoryProvisionDuration,
 		m.memoryStacks,
+		m.scmWritesTotal,
+		m.approvalGateSeconds,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -123,4 +136,15 @@ func (m *OperatorMetrics) WebhookEvent(provider, kind, action, result string) {
 // SetTasksInflight sets the operator_tasks_inflight gauge to n.
 func (m *OperatorMetrics) SetTasksInflight(n float64) {
 	m.tasksInflight.Set(n)
+}
+
+// SCMWrite increments operator_scm_writes_total for the given provider, verb,
+// and result ("ok" or "error").
+func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
+	m.scmWritesTotal.WithLabelValues(provider, verb, result).Inc()
+}
+
+// ObserveApprovalGate records the seconds a Task spent in AwaitingApproval.
+func (m *OperatorMetrics) ObserveApprovalGate(seconds float64) {
+	m.approvalGateSeconds.Observe(seconds)
 }

@@ -9,11 +9,15 @@ import (
 func TestByProvider(t *testing.T) {
 	gh, err := ByProvider("github")
 	require.NoError(t, err)
-	require.Equal(t, "github", gh.Provider())
+	ghClient, ok := gh.(Client)
+	require.True(t, ok, "github SCMWriter must also implement Client")
+	require.Equal(t, "github", ghClient.Provider())
 
 	gl, err := ByProvider("gitlab")
 	require.NoError(t, err)
-	require.Equal(t, "gitlab", gl.Provider())
+	glClient, ok := gl.(Client)
+	require.True(t, ok, "gitlab SCMWriter must also implement Client")
+	require.Equal(t, "gitlab", glClient.Provider())
 
 	_, err = ByProvider("bitbucket")
 	require.Error(t, err)

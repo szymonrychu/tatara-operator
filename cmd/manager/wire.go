@@ -131,7 +131,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Metrics:   metrics,
 		Session:   agent.NewHTTPSession(wrapperTokens.Token),
 		PodConfig: podConfigFromConfig(cfg),
-		SCMFor: func(provider string) (controller.Writer, error) {
+		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
 	}).SetupWithManager(mgr); err != nil {
