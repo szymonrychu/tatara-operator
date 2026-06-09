@@ -187,38 +187,225 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 	return nil
 }
 
-// SCMWriter stubs -- replaced by real implementations in subsequent tasks.
+// CreateIssue opens an issue and returns its ref + url.
+func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error) {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return IssueRef{}, err
+	}
+	in := map[string]string{"title": req.Title, "description": req.Body}
+	if len(req.Labels) > 0 {
+		in["labels"] = strings.Join(req.Labels, ",")
+	}
+	var out struct {
+		IID    int    `json:"iid"`
+		WebURL string `json:"web_url"`
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/issues"
+	if err := glDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
+		return IssueRef{}, err
+	}
+	return IssueRef{Ref: fmt.Sprintf("%s#%d", proj, out.IID), URL: out.WebURL}, nil
+}
 
-func (c *GitLab) CreateIssue(_ context.Context, _, _ string, _ IssueReq) (IssueRef, error) {
-	return IssueRef{}, fmt.Errorf("gitlab: CreateIssue: not implemented")
+// AddLabel adds a label to an issue identified by group/proj#iid.
+func (c *GitLab) AddLabel(ctx context.Context, token, issueRef, label string) error {
+	proj, iid, err := glHashRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
+	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"add_labels": label}, nil)
 }
-func (c *GitLab) AddLabel(_ context.Context, _, _, _ string) error {
-	return fmt.Errorf("gitlab: AddLabel: not implemented")
+
+// RemoveLabel removes a label from an issue identified by group/proj#iid.
+func (c *GitLab) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
+	proj, iid, err := glHashRef(issueRef)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
+	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"remove_labels": label}, nil)
 }
-func (c *GitLab) RemoveLabel(_ context.Context, _, _, _ string) error {
-	return fmt.Errorf("gitlab: RemoveLabel: not implemented")
+
+// GetPRState reads an MR and its head pipeline status.
+func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return PRState{}, err
+	}
+	var mr struct {
+		Author struct {
+			Username string `json:"username"`
+		} `json:"author"`
+		SHA          string `json:"sha"`
+		SourceBranch string `json:"source_branch"`
+		MergeStatus  string `json:"merge_status"`
+		HeadPipeline struct {
+			Status string `json:"status"`
+		} `json:"head_pipeline"`
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	if err := glDo(ctx, c.base(), http.MethodGet, path, token, nil, &mr); err != nil {
+		return PRState{}, err
+	}
+	return PRState{
+		Author:     mr.Author.Username,
+		HeadSHA:    mr.SHA,
+		HeadBranch: mr.SourceBranch,
+		Mergeable:  mr.MergeStatus == "can_be_merged",
+		CIStatus:   glCIStatus(mr.HeadPipeline.Status),
+	}, nil
 }
-func (c *GitLab) GetPRState(_ context.Context, _, _ string, _ int) (PRState, error) {
-	return PRState{}, fmt.Errorf("gitlab: GetPRState: not implemented")
+
+func glCIStatus(s string) string {
+	switch s {
+	case "":
+		return ""
+	case "success":
+		return "success"
+	case "failed", "canceled":
+		return "failure"
+	default:
+		return "pending"
+	}
 }
-func (c *GitLab) Approve(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("gitlab: Approve: not implemented")
+
+// Approve approves an MR.
+func (c *GitLab) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/approve"
+	if err := glDo(ctx, c.base(), http.MethodPost, path, token, nil, nil); err != nil {
+		return err
+	}
+	if body == "" {
+		return nil
+	}
+	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
-func (c *GitLab) RequestChanges(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("gitlab: RequestChanges: not implemented")
+
+// RequestChanges unapproves, awards thumbsdown, and posts a note.
+func (c *GitLab) RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	base := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	if err := glDo(ctx, c.base(), http.MethodPost, base+"/unapprove", token, nil, nil); err != nil {
+		return err
+	}
+	if err := glDo(ctx, c.base(), http.MethodPost, base+"/award_emoji", token, map[string]string{"name": "thumbsdown"}, nil); err != nil {
+		return err
+	}
+	if body == "" {
+		body = "Requesting changes."
+	}
+	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
-func (c *GitLab) Suggest(_ context.Context, _, _ string, _ int, _ []Suggestion) error {
-	return fmt.Errorf("gitlab: Suggest: not implemented")
+
+// Suggest posts inline ```suggestion notes on the MR.
+func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	for _, s := range sugg {
+		note := fmt.Sprintf("`%s:%d`\n```suggestion\n%s\n```", s.Path, s.Line, s.Body)
+		if err := c.mrNote(ctx, c.base(), proj, number, token, note); err != nil {
+			return err
+		}
+	}
+	return nil
 }
-func (c *GitLab) Merge(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("gitlab: Merge: not implemented")
+
+// Merge merges an MR.
+func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	in := map[string]bool{"squash": method == "squash"}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/merge"
+	return glDo(ctx, c.base(), http.MethodPut, path, token, in, nil)
 }
-func (c *GitLab) ClosePR(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("gitlab: ClosePR: not implemented")
+
+// ClosePR closes an MR (state_event=close) and posts the reason as a note.
+func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int, body string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	if err := glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"state_event": "close"}, nil); err != nil {
+		return err
+	}
+	if body == "" {
+		return nil
+	}
+	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
-func (c *GitLab) AddBoardItem(_ context.Context, _ string, _ BoardRef, _ string) error {
-	return fmt.Errorf("gitlab: AddBoardItem: not implemented")
+
+func (c *GitLab) mrNote(ctx context.Context, base, proj string, number int, token, body string) error {
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/notes"
+	return glDo(ctx, base, http.MethodPost, path, token, map[string]string{"body": body}, nil)
 }
-func (c *GitLab) SetBoardColumn(_ context.Context, _ string, _ BoardRef, _, _ string) error {
-	return fmt.Errorf("gitlab: SetBoardColumn: not implemented")
+
+// glHashRef parses group/proj#iid into project path + iid (issue refs use '#').
+func glHashRef(ref string) (string, int, error) {
+	at := strings.LastIndex(ref, "#")
+	if at < 0 {
+		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+	}
+	proj, iidStr := ref[:at], ref[at+1:]
+	if proj == "" {
+		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+	}
+	iid, err := strconv.Atoi(iidStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("gitlab: malformed iid in %q: %w", ref, err)
+	}
+	return proj, iid, nil
+}
+
+// glIssueURLRef parses a GitLab issue web URL (.../g/p/-/issues/4) into a
+// project path + iid for board label updates.
+func glIssueURLRef(itemURL string) (string, int, error) {
+	u, err := url.Parse(itemURL)
+	if err != nil {
+		return "", 0, fmt.Errorf("gitlab: parse item url %q: %w", itemURL, err)
+	}
+	p := strings.Trim(u.Path, "/")
+	idx := strings.Index(p, "/-/issues/")
+	if idx < 0 {
+		return "", 0, fmt.Errorf("gitlab: not an issue url %q", itemURL)
+	}
+	proj := p[:idx]
+	iid, err := strconv.Atoi(p[idx+len("/-/issues/"):])
+	if err != nil {
+		return "", 0, fmt.Errorf("gitlab: bad iid in %q: %w", itemURL, err)
+	}
+	return proj, iid, nil
+}
+
+// AddBoardItem ensures the issue carries the board's default list label so it
+// appears on the GitLab issue board. No-op semantics beyond the label.
+func (c *GitLab) AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error {
+	return c.setBoardLabel(ctx, token, itemURL, "Open")
+}
+
+// SetBoardColumn swaps the issue's board::<col> scoped label.
+func (c *GitLab) SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error {
+	return c.setBoardLabel(ctx, token, itemURL, column)
+}
+
+func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column string) error {
+	proj, iid, err := glIssueURLRef(itemURL)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
+	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"add_labels": "board::" + column}, nil)
 }
