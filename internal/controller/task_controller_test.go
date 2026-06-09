@@ -64,6 +64,7 @@ func mkTaskRepository(t *testing.T, name, projectRef string) {
 	r.Spec.ProjectRef = projectRef
 	r.Spec.URL = "https://git/acme/" + name
 	r.Spec.DefaultBranch = "main"
+	r.Spec.ReingestSchedule = "0 6 * * *"
 	if err := k8sClient.Create(context.Background(), r); err != nil {
 		t.Fatalf("create repository: %v", err)
 	}

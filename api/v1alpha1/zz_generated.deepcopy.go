@@ -244,6 +244,10 @@ func (in *RepositoryStatus) DeepCopyInto(out *RepositoryStatus) {
 		in, out := &in.LastIngestTime, &out.LastIngestTime
 		*out = (*in).DeepCopy()
 	}
+	if in.LastScheduledReingest != nil {
+		in, out := &in.LastScheduledReingest, &out.LastScheduledReingest
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))
