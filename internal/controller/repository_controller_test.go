@@ -135,6 +135,21 @@ func TestRepoReconcile_FullIngestLaunchesJob(t *testing.T) {
 	}
 }
 
+func TestRepoReconcile_ClearsMemoryNotReadyWhenReady(t *testing.T) {
+	mkProject(t, "rp-clr", "rp-clr-scm")
+	mkSecret(t, "rp-clr-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "clr", "rp-clr")
+	setProjectMemoryReady(t, "rp-clr", "http://mem-rp-clr.tatara.svc:8080")
+
+	if _, err := reconcileRepo(t, "clr"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	cond := findCond(getRepo(t, "clr").Status.Conditions, "MemoryNotReady")
+	if cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("expected MemoryNotReady=False once memory is Ready, got %+v", cond)
+	}
+}
+
 func TestRepoReconcile_ConcurrencyGuard(t *testing.T) {
 	mkProject(t, "rp-guard", "rp-guard-scm")
 	mkSecret(t, "rp-guard-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
