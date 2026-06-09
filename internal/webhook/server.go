@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -62,14 +63,14 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	body, err := readBody(r)
 	if err != nil {
-		s.count("unknown", "other", "bad_request")
+		s.count("unknown", "other", "other", "bad_request")
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
 
 	provider, err := scm.Select(r.Header)
 	if err != nil {
-		s.count("unknown", "other", "bad_request")
+		s.count("unknown", "other", "other", "bad_request")
 		http.Error(w, "unrecognized provider", http.StatusBadRequest)
 		return
 	}
@@ -78,25 +79,25 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	var proj tatarav1.Project
 	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, projectName), &proj); err != nil {
 		if apierrors.IsNotFound(err) {
-			s.count(providerName, "other", "unknown_project")
+			s.count(providerName, "other", "other", "unknown_project")
 			http.Error(w, "unknown project", http.StatusNotFound)
 			return
 		}
-		s.count(providerName, "other", "error")
+		s.count(providerName, "other", "other", "error")
 		http.Error(w, "lookup project", http.StatusInternalServerError)
 		return
 	}
 
 	webhookSecret, err := s.webhookSecret(ctx, proj.Spec.ScmSecretRef)
 	if err != nil {
-		s.count(providerName, "other", "error")
+		s.count(providerName, "other", "other", "error")
 		http.Error(w, "secret", http.StatusInternalServerError)
 		return
 	}
 
 	ev, err := provider.DetectAndVerify(r.Header, body, webhookSecret)
 	if err != nil {
-		s.count(providerName, "other", "bad_signature")
+		s.count(providerName, "other", "other", "bad_signature")
 		http.Error(w, "verification failed", http.StatusUnauthorized)
 		return
 	}
@@ -107,7 +108,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case "issue", "mr":
 		s.handleWorkItem(ctx, w, providerName, proj, ev)
 	default:
-		s.count(providerName, "other", "ignored")
+		s.count(providerName, "other", ev.Action, "ignored")
 		w.WriteHeader(http.StatusAccepted)
 	}
 }
@@ -115,7 +116,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider, projectName string, ev scm.WebhookEvent) {
 	var repos tatarav1.RepositoryList
 	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
-		s.count(provider, "push", "error")
+		s.count(provider, "push", ev.Action, "error")
 		http.Error(w, "list repositories", http.StatusInternalServerError)
 		return
 	}
@@ -132,30 +133,61 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 		}
 		repo.Annotations[tatarav1.ReingestRequestedAnnotation] = time.Now().UTC().Format(time.RFC3339)
 		if err := s.cfg.Client.Update(ctx, repo); err != nil {
-			s.count(provider, "push", "error")
+			s.count(provider, "push", ev.Action, "error")
 			http.Error(w, "annotate repository", http.StatusInternalServerError)
 			return
 		}
 		s.log.InfoContext(ctx, "webhook push re-ingest requested",
 			"provider", provider, "project", projectName, "repository", repo.Name, "branch", ev.Branch)
-		s.count(provider, "push", "accepted")
+		s.count(provider, "push", ev.Action, "accepted")
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	s.count(provider, "push", "ignored")
+	s.count(provider, "push", ev.Action, "ignored")
 	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
-	if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) {
-		s.count(provider, ev.Kind, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+	// Approval flip: unlabeling the approval label from a bot-authored issue
+	// signals human approval; set ApprovalApproved=True on the matching Task.
+	if ev.Action == "unlabeled" && ev.ChangedLabel == approvalLabel(proj) && proj.Spec.Scm != nil && ev.AuthorLogin == proj.Spec.Scm.BotLogin {
+		s.flipApproval(ctx, w, provider, proj, ev)
 		return
+	}
+
+	// Determine Task Kind and gating based on PR/issue and author.
+	bot := ""
+	scope := "labeledOrMentioned"
+	if proj.Spec.Scm != nil {
+		bot = proj.Spec.Scm.BotLogin
+		if proj.Spec.Scm.PRReactionScope != "" {
+			scope = proj.Spec.Scm.PRReactionScope
+		}
+	}
+
+	kind := "implement"
+	if ev.IsPR {
+		if ev.AuthorLogin == bot && bot != "" {
+			kind = "selfImprove"
+		} else {
+			kind = "review"
+		}
+		if scope == "labeledOrMentioned" && !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && !mentionsBot(ev.Body, bot) {
+			s.count(provider, ev.Kind, ev.Action, "ignored")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+	} else {
+		if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) {
+			s.count(provider, ev.Kind, ev.Action, "ignored")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 	}
 
 	var repos tatarav1.RepositoryList
 	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
-		s.count(provider, ev.Kind, "error")
+		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "list repositories", http.StatusInternalServerError)
 		return
 	}
@@ -170,7 +202,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	if repo == nil {
 		s.log.InfoContext(ctx, "work item labeled but no matching repository",
 			"project", proj.Name, "remote", ev.Repo, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, "no_repo")
+		s.count(provider, ev.Kind, ev.Action, "no_repo")
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -180,7 +212,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// exists for this issue ref (re-labeling after completion still re-triggers).
 	var existing tatarav1.TaskList
 	if err := s.cfg.Client.List(ctx, &existing, client.InNamespace(s.cfg.Namespace)); err != nil {
-		s.count(provider, ev.Kind, "error")
+		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "list tasks", http.StatusInternalServerError)
 		return
 	}
@@ -190,7 +222,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			t.Status.Phase != "Succeeded" && t.Status.Phase != "Failed" {
 			s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
 				"project", proj.Name, "issue_ref", ev.IssueRef, "task", t.Name)
-			s.count(provider, ev.Kind, "duplicate")
+			s.count(provider, ev.Kind, ev.Action, "duplicate")
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
@@ -206,23 +238,90 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			ProjectRef:    proj.Name,
 			RepositoryRef: repo.Name,
 			Goal:          ev.Body,
+			Kind:          kind,
 			Source: &tatarav1.TaskSource{
-				Provider: provider,
-				IssueRef: ev.IssueRef,
-				URL:      ev.URL,
+				Provider:    provider,
+				IssueRef:    ev.IssueRef,
+				URL:         ev.URL,
+				AuthorLogin: ev.AuthorLogin,
+				IsPR:        ev.IsPR,
+				Number:      ev.Number,
 			},
 		},
 	}
 	if err := s.cfg.Client.Create(ctx, task); err != nil {
-		s.count(provider, ev.Kind, "error")
+		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
 	s.log.InfoContext(ctx, "work item created task",
 		"project", proj.Name, "repository", repo.Name,
-		"task", task.Name, "issue_ref", ev.IssueRef)
-	s.count(provider, ev.Kind, "task_created")
+		"task", task.Name, "issue_ref", ev.IssueRef, "kind", kind)
+	s.count(provider, ev.Kind, ev.Action, "task_created")
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// flipApproval finds the Task whose Source.IssueRef matches ev.IssueRef and
+// sets the ApprovalApproved condition to True.
+func (s *Server) flipApproval(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "list tasks", http.StatusInternalServerError)
+		return
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.Source == nil || t.Spec.Source.IssueRef != ev.IssueRef {
+			continue
+		}
+		// Set ApprovalApproved=True.
+		now := metav1.Now()
+		found := false
+		for j, c := range t.Status.Conditions {
+			if c.Type == tatarav1.ConditionApprovalApproved {
+				t.Status.Conditions[j].Status = "True"
+				t.Status.Conditions[j].Reason = "HumanApproved"
+				t.Status.Conditions[j].Message = "approval label removed by human"
+				t.Status.Conditions[j].LastTransitionTime = now
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Status.Conditions = append(t.Status.Conditions, metav1.Condition{
+				Type:               tatarav1.ConditionApprovalApproved,
+				Status:             "True",
+				Reason:             "HumanApproved",
+				Message:            "approval label removed by human",
+				LastTransitionTime: now,
+			})
+		}
+		if err := s.cfg.Client.Status().Update(ctx, t); err != nil {
+			s.count(provider, ev.Kind, ev.Action, "error")
+			http.Error(w, "flip approval", http.StatusInternalServerError)
+			return
+		}
+		s.log.InfoContext(ctx, "approval label removed; task approval flipped",
+			"project", proj.Name, "task", t.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "approval_flipped")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	// No matching task found; ignore.
+	s.count(provider, ev.Kind, ev.Action, "ignored")
+	w.WriteHeader(http.StatusAccepted)
+}
+
+func approvalLabel(p tatarav1.Project) string {
+	if p.Spec.Scm != nil && p.Spec.Scm.ApprovalLabel != "" {
+		return p.Spec.Scm.ApprovalLabel
+	}
+	return "tatara/awaiting-approval"
+}
+
+func mentionsBot(body, bot string) bool {
+	return bot != "" && strings.Contains(body, "@"+bot)
 }
 
 func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) {
@@ -237,8 +336,8 @@ func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) 
 	return string(v), nil
 }
 
-func (s *Server) count(provider, kind, result string) {
-	s.cfg.Metrics.WebhookEvent(provider, kind, result)
+func (s *Server) count(provider, kind, action, result string) {
+	s.cfg.Metrics.WebhookEvent(provider, kind, action, result)
 }
 
 func objKey(ns, name string) client.ObjectKey {

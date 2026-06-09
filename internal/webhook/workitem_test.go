@@ -44,7 +44,7 @@ func TestIssueWithTriggerLabelCreatesTask(t *testing.T) {
 	require.Equal(t, "Project", tk.OwnerReferences[0].Kind)
 	require.Equal(t, "proj1wi", tk.OwnerReferences[0].Name)
 
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "result": "task_created"}))
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "action": "opened", "result": "task_created"}))
 }
 
 func TestDuplicateIssueEventDoesNotCreateSecondTask(t *testing.T) {
@@ -69,7 +69,7 @@ func TestDuplicateIssueEventDoesNotCreateSecondTask(t *testing.T) {
 	var tasks tatarav1.TaskList
 	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
 	require.Len(t, tasks.Items, 1, "duplicate issue event must not create a second task")
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "result": "duplicate"}))
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "action": "opened", "result": "duplicate"}))
 }
 
 func TestWorkItemNoLabelNoTask(t *testing.T) {
@@ -110,5 +110,5 @@ func TestWorkItemLabeledButNoRepoMatch(t *testing.T) {
 	var tasks tatarav1.TaskList
 	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
 	require.Empty(t, tasks.Items)
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "result": "no_repo"}))
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "action": "opened", "result": "no_repo"}))
 }

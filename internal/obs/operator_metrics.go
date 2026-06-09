@@ -36,7 +36,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		webhookEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_webhook_events_total",
 			Help: "Total webhook events by provider, kind and result.",
-		}, []string{"provider", "kind", "result"}),
+		}, []string{"provider", "kind", "action", "result"}),
 		tasksInflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "operator_tasks_inflight",
 			Help: "Number of Tasks currently running.",
@@ -69,8 +69,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	for _, provider := range []string{"github", "gitlab"} {
 		for _, kind := range []string{"push"} {
-			for _, result := range []string{"accepted", "rejected"} {
-				m.webhookEvents.WithLabelValues(provider, kind, result)
+			for _, action := range []string{"other"} {
+				for _, result := range []string{"accepted", "rejected"} {
+					m.webhookEvents.WithLabelValues(provider, kind, action, result)
+				}
 			}
 		}
 	}
@@ -113,9 +115,9 @@ func (m *OperatorMetrics) ObserveTurnDuration(seconds float64) {
 }
 
 // WebhookEvent increments operator_webhook_events_total for the given
-// provider, kind and result.
-func (m *OperatorMetrics) WebhookEvent(provider, kind, result string) {
-	m.webhookEvents.WithLabelValues(provider, kind, result).Inc()
+// provider, kind, action and result.
+func (m *OperatorMetrics) WebhookEvent(provider, kind, action, result string) {
+	m.webhookEvents.WithLabelValues(provider, kind, action, result).Inc()
 }
 
 // SetTasksInflight sets the operator_tasks_inflight gauge to n.

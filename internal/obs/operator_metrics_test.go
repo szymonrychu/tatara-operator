@@ -77,17 +77,17 @@ func TestWebhookEvent(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.WebhookEvent("github", "push", "accepted")
-	m.WebhookEvent("github", "push", "accepted")
-	m.WebhookEvent("gitlab", "push", "rejected")
+	m.WebhookEvent("github", "push", "other", "accepted")
+	m.WebhookEvent("github", "push", "other", "accepted")
+	m.WebhookEvent("gitlab", "push", "other", "rejected")
 
-	got := testutil.ToFloat64(m.webhookEvents.WithLabelValues("github", "push", "accepted"))
+	got := testutil.ToFloat64(m.webhookEvents.WithLabelValues("github", "push", "other", "accepted"))
 	if got != 2 {
-		t.Fatalf("github/push/accepted = %v, want 2", got)
+		t.Fatalf("github/push/other/accepted = %v, want 2", got)
 	}
-	got = testutil.ToFloat64(m.webhookEvents.WithLabelValues("gitlab", "push", "rejected"))
+	got = testutil.ToFloat64(m.webhookEvents.WithLabelValues("gitlab", "push", "other", "rejected"))
 	if got != 1 {
-		t.Fatalf("gitlab/push/rejected = %v, want 1", got)
+		t.Fatalf("gitlab/push/other/rejected = %v, want 1", got)
 	}
 }
 
