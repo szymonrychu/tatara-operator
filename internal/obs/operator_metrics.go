@@ -95,7 +95,6 @@ func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed int) 
 	m.memoryStacks.WithLabelValues("Failed").Set(float64(failed))
 }
 
-
 // ReconcileResult increments operator_reconcile_total for the given kind and
 // result ("success" or "error").
 func (m *OperatorMetrics) ReconcileResult(kind, result string) {

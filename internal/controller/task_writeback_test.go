@@ -260,6 +260,192 @@ func TestTaskWriteBackAlreadyExists(t *testing.T) {
 	require.Contains(t, cond.Message, "422")
 }
 
+// fakeWriterPerRepo returns a configurable PR URL per repoURL, and an HTTPError
+// for repos in the 422 set.
+type fakeWriterPerRepo struct {
+	mu          sync.Mutex
+	openCalls   int
+	commentArgs []string
+	prURLs      map[string]string // repoURL -> pr URL
+	errRepos    map[string]bool   // repoURL -> return 422
+}
+
+func (f *fakeWriterPerRepo) OpenChange(_ context.Context, repoURL, _, _, _, _, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.openCalls++
+	if f.errRepos[repoURL] {
+		return "", &scm.HTTPError{Status: 422, Body: "branch not found", Path: "/pulls"}
+	}
+	url, ok := f.prURLs[repoURL]
+	if !ok {
+		url = "https://example/pr/" + repoURL
+	}
+	return url, nil
+}
+
+func (f *fakeWriterPerRepo) Comment(_ context.Context, _, issueRef, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.commentArgs = append(f.commentArgs, issueRef+"|"+body)
+	return nil
+}
+
+// seedWritebackPendingMultiRepo creates a project with two repos (r1=primary, r2=secondary)
+// plus the task seeded in WritebackPending state.
+func seedWritebackPendingMultiRepo(t *testing.T, name, scmSecret, project, primaryRepo, secondaryRepo string) *tatarav1alpha1.Task {
+	t.Helper()
+	ctx := context.Background()
+
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: scmSecret, Namespace: testNS},
+		Data:       map[string][]byte{"token": []byte("pat"), "webhookSecret": []byte("w")},
+	}
+	if err := k8sClient.Create(ctx, sec); err != nil {
+		t.Fatalf("create secret %s: %v", scmSecret, err)
+	}
+
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: project, Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{ScmSecretRef: scmSecret, TriggerLabel: "tatara"},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project %s: %v", project, err)
+	}
+
+	r1 := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: primaryRepo, Namespace: testNS},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: "https://github.com/o/r1.git", DefaultBranch: "main"},
+	}
+	if err := k8sClient.Create(ctx, r1); err != nil {
+		t.Fatalf("create primary repository %s: %v", primaryRepo, err)
+	}
+
+	r2 := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: secondaryRepo, Namespace: testNS},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: "https://github.com/o/r2.git", DefaultBranch: "main"},
+	}
+	if err := k8sClient.Create(ctx, r2); err != nil {
+		t.Fatalf("create secondary repository %s: %v", secondaryRepo, err)
+	}
+
+	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r1#9", URL: "https://github.com/o/r1/issues/9"}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    project,
+			RepositoryRef: primaryRepo,
+			Goal:          "Cross-repo fix",
+			Source:        src,
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task %s: %v", name, err)
+	}
+
+	task.Status.Phase = "Succeeded"
+	task.Status.ResultSummary = "fixed both repos"
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type:   "WritebackPending",
+		Status: metav1.ConditionTrue,
+		Reason: "AwaitingM5",
+	})
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed writeback pending status on %s: %v", name, err)
+	}
+	var fresh tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, &fresh); err != nil {
+		t.Fatalf("reload task %s: %v", name, err)
+	}
+	return &fresh
+}
+
+func TestWriteback_OpensPRPerRepoWithBranch(t *testing.T) {
+	fw := &fakeWriterPerRepo{
+		prURLs: map[string]string{
+			"https://github.com/o/r1.git": "https://github.com/o/r1/pull/10",
+			"https://github.com/o/r2.git": "https://github.com/o/r2/pull/11",
+		},
+	}
+	r := &TaskReconciler{
+		Client:  k8sClient,
+		Scheme:  k8sClient.Scheme(),
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Session: newFakeSession(),
+		PodConfig: agent.PodConfig{
+			Namespace:           testNS,
+			CallbackURL:         "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "tatara-cli-oidc",
+		},
+		SCMFor: func(string) (Writer, error) { return fw, nil },
+	}
+	task := seedWritebackPendingMultiRepo(t, "wb-mr-task1", "wb-mr-scm1", "wb-mr-proj1", "wb-mr-repo1", "wb-mr-repo2")
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+
+	// WritebackPending must be cleared.
+	cond := findCond(got.Status.Conditions, "WritebackPending")
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+
+	// Both PRs were opened.
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	require.Equal(t, 2, fw.openCalls)
+	// Issue was commented with both PR links.
+	require.Len(t, fw.commentArgs, 1)
+	require.Contains(t, fw.commentArgs[0], "o/r1#9|")
+	require.Contains(t, fw.commentArgs[0], "https://github.com/o/r1/pull/10")
+	require.Contains(t, fw.commentArgs[0], "https://github.com/o/r2/pull/11")
+	// PrURL on status contains at least the primary PR.
+	require.Contains(t, got.Status.PrURL, "https://github.com/o/r1/pull/10")
+}
+
+func TestWriteback_SkipsRepoWith422(t *testing.T) {
+	fw := &fakeWriterPerRepo{
+		prURLs:   map[string]string{"https://github.com/o/r1.git": "https://github.com/o/r1/pull/20"},
+		errRepos: map[string]bool{"https://github.com/o/r2.git": true},
+	}
+	r := &TaskReconciler{
+		Client:  k8sClient,
+		Scheme:  k8sClient.Scheme(),
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Session: newFakeSession(),
+		PodConfig: agent.PodConfig{
+			Namespace:           testNS,
+			CallbackURL:         "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "tatara-cli-oidc",
+		},
+		SCMFor: func(string) (Writer, error) { return fw, nil },
+	}
+	task := seedWritebackPendingMultiRepo(t, "wb-mr-task2", "wb-mr-scm2", "wb-mr-proj2", "wb-mr-repo3", "wb-mr-repo4")
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	cond := findCond(got.Status.Conditions, "WritebackPending")
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	require.Equal(t, 2, fw.openCalls) // called for both repos
+	// Only one PR URL in comment (r2 was 422-skipped)
+	require.Len(t, fw.commentArgs, 1)
+	require.Contains(t, fw.commentArgs[0], "https://github.com/o/r1/pull/20")
+	require.NotContains(t, fw.commentArgs[0], "r2")
+}
+
 func TestProviderForRemote(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	tests := []struct {

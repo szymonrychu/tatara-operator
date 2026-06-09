@@ -25,10 +25,11 @@ type Writer interface {
 	Comment(ctx context.Context, token, issueRef, body string) error
 }
 
-// doWriteBack opens a PR/MR for the task and optionally comments on the source
-// issue. It is called when WritebackPending is True and prURL is not yet set.
-// Permanent SCM errors (4xx) are recorded without requeue; transient errors are
-// returned for requeue.
+// doWriteBack opens a PR/MR for each Project repo that has the task branch,
+// comments the primary issue with all PR links, and records them on the Task
+// status. It is called when WritebackPending is True and prURL is not yet set.
+// Permanent SCM errors (4xx) per repo are logged and skipped; transient errors
+// are returned for requeue.
 func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
@@ -43,8 +44,8 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return ctrl.Result{}, fmt.Errorf("writeback: get project: %w", err)
 	}
 
-	var repo tatarav1alpha1.Repository
-	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
+	var primaryRepo tatarav1alpha1.Repository
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &primaryRepo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("writeback: get repository: %w", err)
 	}
 
@@ -53,7 +54,7 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		provider = task.Spec.Source.Provider
 	}
 	if provider == "" {
-		provider = providerForRemote(ctx, repo.Spec.URL)
+		provider = providerForRemote(ctx, primaryRepo.Spec.URL)
 	}
 
 	writer, err := r.SCMFor(provider)
@@ -68,55 +69,76 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return ctrl.Result{}, fmt.Errorf("writeback: scm token: %w", err)
 	}
 
+	// Gather all Project repos; primary first, then the rest.
+	allRepos, err := r.projectRepos(ctx, &proj)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("writeback: list project repos: %w", err)
+	}
+	// Build an ordered list with the primary first.
+	ordered := make([]tatarav1alpha1.Repository, 0, len(allRepos))
+	ordered = append(ordered, primaryRepo)
+	for i := range allRepos {
+		if allRepos[i].Name != primaryRepo.Name {
+			ordered = append(ordered, allRepos[i])
+		}
+	}
+
 	sourceBranch := taskBranch(task)
 	title := firstLine(task.Spec.Goal)
 	body := writeBackBody(task)
 
-	prURL, err := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
-	if err != nil {
-		l.Error(err, "writeback: open change", "task", task.Name)
-		// Permanent 4xx: record failure and clear the condition (no infinite requeue).
-		var he *scm.HTTPError
-		if errors.As(err, &he) && he.Status >= 400 && he.Status < 500 {
-			// 4xx is permanent: PR/MR already exists or request is invalid.
-			// Clear the condition with a neutral reason; do not requeue.
-			r.clearWritebackPending(ctx, task, "WritebackSkipped",
-				fmt.Sprintf("PR/MR could not be opened or already exists: %d", he.Status))
-			return ctrl.Result{}, nil
+	var prURLs []string
+	var lastSkipStatus int
+	for _, repo := range ordered {
+		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
+		if openErr != nil {
+			var he *scm.HTTPError
+			if errors.As(openErr, &he) && he.Status >= 400 && he.Status < 500 {
+				// 4xx permanent: branch missing or no diff - skip this repo.
+				l.Info("writeback: skipping repo (4xx)", "repo", repo.Name, "status", he.Status)
+				lastSkipStatus = he.Status
+				continue
+			}
+			return ctrl.Result{}, fmt.Errorf("writeback: open change for %s: %w", repo.Name, openErr)
 		}
-		return ctrl.Result{}, fmt.Errorf("writeback: open change: %w", err)
+		l.Info("writeback: pr/mr opened", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
+		prURLs = append(prURLs, prURL)
 	}
 
-	// Record prURL and clear the condition atomically via Status().Update.
-	task.Status.PrURL = prURL
+	if len(prURLs) == 0 {
+		// No repo had the branch - treat as skipped (mirrors old single-repo 4xx behavior).
+		msg := "PR/MR could not be opened or already exists"
+		if lastSkipStatus != 0 {
+			msg = fmt.Sprintf("PR/MR could not be opened or already exists: %d", lastSkipStatus)
+		}
+		r.clearWritebackPending(ctx, task, "WritebackSkipped", msg)
+		return ctrl.Result{}, nil
+	}
+
+	// Record primary PR URL (first in list) and all URLs in the condition message.
+	task.Status.PrURL = prURLs[0]
 	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
 		Type:               "WritebackPending",
 		Status:             metav1.ConditionFalse,
 		Reason:             "Written",
-		Message:            "pr/mr opened: " + prURL,
+		Message:            "pr/mr opened: " + strings.Join(prURLs, " "),
 		ObservedGeneration: task.Generation,
 	})
 	if err := r.Status().Update(ctx, task); err != nil {
 		return ctrl.Result{}, fmt.Errorf("writeback: update prURL: %w", err)
 	}
 
-	l.Info("writeback: pr/mr opened",
-		"task", task.Name, "pr_url", prURL,
-		"has_source", task.Spec.Source != nil && task.Spec.Source.IssueRef != "")
-
-	// Comment on the originating work item (non-fatal). Keep this concise:
-	// the comment is already on the source issue so we omit the Source footer
-	// that writeBackBody appends; the PR/MR body carries the full text.
+	// Comment on the originating issue with all PR links (non-fatal).
 	if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 		resultSummary := task.Status.ResultSummary
 		if resultSummary == "" {
 			resultSummary = task.Spec.Goal
 		}
-		commentBody := "Done - opened PR/MR: " + prURL + "\n\n" + resultSummary
+		commentBody := "Done - opened PR/MR:\n" + strings.Join(prURLs, "\n") + "\n\n" + resultSummary
 		if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody); err != nil {
 			l.Error(err, "writeback: comment on work item (non-fatal)",
 				"issue_ref", task.Spec.Source.IssueRef)
-			// Non-fatal: PR exists; continue.
+			// Non-fatal: PRs exist; continue.
 		}
 	}
 
@@ -154,10 +176,8 @@ func providerForRemote(ctx context.Context, remote string) string {
 
 // taskBranch returns the deterministic branch name for a Task's agent run.
 // Convention: tatara/task-<task-name>. The branch is communicated to the agent
-// via the turn prompts (turnloop.go planTurnText/turnText); the operator opens
-// the PR/MR targeting this same branch. Operator and agent MUST agree on this
-// exact string. If the wrapper ever enforces branch pushing itself, it must use
-// this same value.
+// via the turn prompts (turnloop.go planTurnText/turnText) and TASK_BRANCH env;
+// the operator opens the PR/MR targeting this same branch.
 func taskBranch(t *tatarav1alpha1.Task) string {
 	return agent.TaskBranch(t)
 }
