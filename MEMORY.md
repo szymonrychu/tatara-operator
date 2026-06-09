@@ -3,6 +3,7 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-09 (0.2.12) B2 fix: `MemoryNotReady` was only cleared on the ingest path (after the `if !want` early-return), so already-ingested repos kept the stale condition. Reordered the memory gate + clear before `ingestDecision`, persisting the flip immediately. Also: the agent's headless CLI auth fails `unauthorized_client` because `tatara-cli-oidc/client-secret` (sops `cliOidcClientSecret`) is STALE vs the live tatara-operator Keycloak client; the operator's own `OPERATOR_OIDC_CLIENT_SECRET` works - user must re-sync the sops value (NOT a code bug).
 - 2026-06-09 (0.2.11) Agent-native tatara tools (operator half): inject
   `TATARA_OPERATOR_URL` (config `OPERATOR_URL`, default
   `http://tatara-operator.tatara.svc:8080`) onto the agent pod so the CLI's
