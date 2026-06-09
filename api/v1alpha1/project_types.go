@@ -44,6 +44,38 @@ type AgentSpec struct {
 	TurnTimeoutSeconds int `json:"turnTimeoutSeconds,omitempty"`
 }
 
+// BoardSpec configures the project board tatara participates in.
+type BoardSpec struct {
+	// +optional
+	GitHubProjectNumber int `json:"githubProjectNumber,omitempty"`
+	// +optional
+	GitLabBoardID int `json:"gitlabBoardId,omitempty"`
+	// +kubebuilder:default="Status"
+	// +optional
+	StatusField string `json:"statusField,omitempty"`
+}
+
+// ScmSpec binds a Project to one SCM provider and its board/merge policy.
+type ScmSpec struct {
+	// +kubebuilder:validation:Enum=github;gitlab
+	Provider string `json:"provider"`
+	Owner    string `json:"owner"`
+	BotLogin string `json:"botLogin"`
+	// +optional
+	Board *BoardSpec `json:"board,omitempty"`
+	// +kubebuilder:validation:Enum=afterApproval;autoMergeOnGreenCI
+	// +kubebuilder:default="afterApproval"
+	// +optional
+	MergePolicy string `json:"mergePolicy,omitempty"`
+	// +kubebuilder:validation:Enum=labeledOrMentioned;all
+	// +kubebuilder:default="labeledOrMentioned"
+	// +optional
+	PRReactionScope string `json:"prReactionScope,omitempty"`
+	// +kubebuilder:default="tatara/awaiting-approval"
+	// +optional
+	ApprovalLabel string `json:"approvalLabel,omitempty"`
+}
+
 // ProjectSpec defines the desired state of a Project.
 type ProjectSpec struct {
 	ScmSecretRef string `json:"scmSecretRef"`
@@ -57,6 +89,8 @@ type ProjectSpec struct {
 	Agent AgentSpec `json:"agent,omitempty"`
 	// +optional
 	Memory *MemorySpec `json:"memory,omitempty"`
+	// +optional
+	Scm *ScmSpec `json:"scm,omitempty"`
 }
 
 // ProjectStatus defines the observed state of a Project.

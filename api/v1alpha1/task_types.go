@@ -5,6 +5,43 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// ConditionApprovalApproved is set True once a human removes the approval label.
+const ConditionApprovalApproved = "ApprovalApproved"
+
+// ProposedIssueSpec is a tatara-proposed issue awaiting human approval.
+type ProposedIssueSpec struct {
+	RepositoryRef string `json:"repositoryRef"`
+	Title         string `json:"title"`
+	Body          string `json:"body"`
+	// +kubebuilder:validation:Enum=bug;improvement
+	Kind string `json:"kind"`
+}
+
+// Suggestion is one inline code suggestion on a PR/MR.
+type Suggestion struct {
+	Path string `json:"path"`
+	Line int    `json:"line"`
+	Body string `json:"body"`
+}
+
+// ReviewVerdict is the agent's review decision for a human-authored PR/MR.
+type ReviewVerdict struct {
+	// +kubebuilder:validation:Enum=approve;request_changes;comment
+	Decision string `json:"decision"`
+	// +optional
+	Body string `json:"body,omitempty"`
+	// +optional
+	Suggestions []Suggestion `json:"suggestions,omitempty"`
+}
+
+// PROutcome is the agent's outcome for a tatara-authored PR/MR.
+type PROutcome struct {
+	// +kubebuilder:validation:Enum=merge;close
+	Action string `json:"action"`
+	// +optional
+	Reason string `json:"reason,omitempty"`
+}
+
 // TaskSource records the SCM work-item that originated a webhook-born Task.
 type TaskSource struct {
 	// +kubebuilder:validation:Enum=github;gitlab
@@ -12,6 +49,12 @@ type TaskSource struct {
 	IssueRef string `json:"issueRef"`
 	// +optional
 	URL string `json:"url,omitempty"`
+	// +optional
+	AuthorLogin string `json:"authorLogin,omitempty"`
+	// +optional
+	IsPR bool `json:"isPR,omitempty"`
+	// +optional
+	Number int `json:"number,omitempty"`
 }
 
 // TaskSpec defines the desired state of a Task.
@@ -23,11 +66,19 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
+	// +kubebuilder:validation:Enum=implement;review;selfImprove
+	// +kubebuilder:default="implement"
+	// +optional
+	Kind string `json:"kind,omitempty"`
+	// +optional
+	ApprovalRequired bool `json:"approvalRequired,omitempty"`
+	// +optional
+	ProposedIssue *ProposedIssueSpec `json:"proposedIssue,omitempty"`
 }
 
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
-	// +kubebuilder:validation:Enum=Pending;Planning;Running;Succeeded;Failed
+	// +kubebuilder:validation:Enum=Pending;AwaitingApproval;Planning;Running;Succeeded;Failed
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional
@@ -42,6 +93,14 @@ type TaskStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +optional
+	DiscoveredIssues []string `json:"discoveredIssues,omitempty"`
+	// +optional
+	ReviewVerdict *ReviewVerdict `json:"reviewVerdict,omitempty"`
+	// +optional
+	PROutcome *PROutcome `json:"prOutcome,omitempty"`
+	// +optional
+	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true
