@@ -31,6 +31,7 @@ type PodConfig struct {
 	AnthropicSecretName string
 	CLIOIDCSecretName   string
 	ImagePullSecret     string
+	OperatorURL         string // operator REST base URL for the agent's task_*/subtask_* MCP tools
 }
 
 // imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
@@ -106,6 +107,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
 		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
 		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},
+		// Operator REST URL: the agent's tatara-cli task_*/subtask_* MCP tools reach
+		// the operator API at TATARA_OPERATOR_URL.
+		{Name: "TATARA_OPERATOR_URL", Value: cfg.OperatorURL},
 		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
 		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},

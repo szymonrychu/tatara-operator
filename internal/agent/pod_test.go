@@ -40,6 +40,7 @@ func sampleInputs() (*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatar
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 		ImagePullSecret:     "regcred",
+		OperatorURL:         "http://tatara-operator.tatara.svc:8080",
 	}
 	return proj, repo, task, cfg
 }
@@ -105,6 +106,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"OIDC_ISSUER":          "https://keycloak.tatara.svc/realms/master",
 		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
 		"TATARA_MEMORY_URL":    "http://mem-demo.tatara.svc:8080",
+		"TATARA_OPERATOR_URL":  "http://tatara-operator.tatara.svc:8080",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)

@@ -26,6 +26,7 @@ type Config struct {
 	CallbackURL              string
 	OIDCIssuer               string
 	OIDCAudience             string
+	OperatorURL              string
 	MemoryImage              string
 	LightragImage            string
 	Neo4jImage               string
@@ -60,6 +61,7 @@ func Load() (Config, error) {
 		CallbackURL:              os.Getenv("CALLBACK_URL"),
 		OIDCIssuer:               os.Getenv("OIDC_ISSUER"),
 		OIDCAudience:             os.Getenv("OIDC_AUDIENCE"),
+		OperatorURL:              getDefault("OPERATOR_URL", "http://tatara-operator.tatara.svc:8080"),
 		MemoryImage:              os.Getenv("MEMORY_IMAGE"),
 		LightragImage:            os.Getenv("LIGHTRAG_IMAGE"),
 		Neo4jImage:               os.Getenv("NEO4J_IMAGE"),

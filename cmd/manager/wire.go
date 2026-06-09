@@ -92,6 +92,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		AnthropicSecretName: cfg.AnthropicSecretName,
 		CLIOIDCSecretName:   cfg.CLIOIDCSecretName,
 		ImagePullSecret:     cfg.ImagePullSecret,
+		OperatorURL:         cfg.OperatorURL,
 	}
 }
 
