@@ -15,6 +15,12 @@ type RepositorySpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	IngestEnabled bool `json:"ingestEnabled,omitempty"`
+	// ReingestSchedule is a standard 5-field cron expression (e.g. "0 6 * * *")
+	// that triggers a periodic catch-up re-ingest in addition to push webhooks.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=9
+	// +kubebuilder:validation:Pattern=`^(\S+\s+){4}\S+$`
+	ReingestSchedule string `json:"reingestSchedule"`
 }
 
 // RepositoryStatus defines the observed state of a Repository.
@@ -26,6 +32,10 @@ type RepositoryStatus struct {
 	LastIngestedCommit string `json:"lastIngestedCommit,omitempty"`
 	// +optional
 	LastIngestTime *metav1.Time `json:"lastIngestTime,omitempty"`
+	// LastScheduledReingest is the last time the cron schedule stamped a
+	// reingest-requested annotation; used as the base for the next fire.
+	// +optional
+	LastScheduledReingest *metav1.Time `json:"lastScheduledReingest,omitempty"`
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 	// +optional

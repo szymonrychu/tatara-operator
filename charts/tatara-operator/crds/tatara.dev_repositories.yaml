@@ -55,10 +55,18 @@ spec:
                 type: boolean
               projectRef:
                 type: string
+              reingestSchedule:
+                description: |-
+                  ReingestSchedule is a standard 5-field cron expression (e.g. "0 6 * * *")
+                  that triggers a periodic catch-up re-ingest in addition to push webhooks.
+                minLength: 9
+                pattern: ^(\S+\s+){4}\S+$
+                type: string
               url:
                 type: string
             required:
             - projectRef
+            - reingestSchedule
             - url
             type: object
           status:
@@ -129,6 +137,12 @@ spec:
                 format: date-time
                 type: string
               lastIngestedCommit:
+                type: string
+              lastScheduledReingest:
+                description: |-
+                  LastScheduledReingest is the last time the cron schedule stamped a
+                  reingest-requested annotation; used as the base for the next fire.
+                format: date-time
                 type: string
               phase:
                 enum:
