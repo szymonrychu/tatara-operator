@@ -3,6 +3,16 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-09 (0.2.11) Agent-native tatara tools (operator half): inject
+  `TATARA_OPERATOR_URL` (config `OPERATOR_URL`, default
+  `http://tatara-operator.tatara.svc:8080`) onto the agent pod so the CLI's
+  `task_*`/`subtask_*` MCP tools have an endpoint - previously only
+  `TATARA_MEMORY_URL` was set. Also clear the stale `MemoryNotReady` condition on
+  Repositories once `project.status.memory.phase == Ready` (it lingered from
+  provisioning and misled - the agent self-audit flagged it). Pairs with
+  tatara-cli headless client-credentials auth + wrapper `tatara mcp-config` at
+  boot. Note: the operator subagent died mid-O1 (socket error); O1 was finished +
+  O2 done by the integrator.
 - 2026-06-09 (0.2.10) Report/question tasks were invisible: a task with no code
   change pushes no branch, so write-back opened no PR and returned WITHOUT
   commenting - the agent's answer (`status.ResultSummary`) never reached the
