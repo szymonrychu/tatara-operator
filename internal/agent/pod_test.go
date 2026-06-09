@@ -1,6 +1,7 @@
 package agent_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -45,11 +46,11 @@ func sampleInputs() (*tatarav1alpha1.Project, *tatarav1alpha1.Repository, *tatar
 
 func TestBuildPod_ImagePullSecrets(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	ips := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.ImagePullSecrets
+	ips := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.ImagePullSecrets
 	require.Equal(t, []corev1.LocalObjectReference{{Name: "regcred"}}, ips)
 
 	cfg.ImagePullSecret = ""
-	require.Empty(t, agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.ImagePullSecrets)
+	require.Empty(t, agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.ImagePullSecrets)
 }
 
 func envValue(c corev1.Container, name string) (string, bool) {
@@ -72,7 +73,7 @@ func envSecretRef(c corev1.Container, name string) (*corev1.SecretKeySelector, b
 
 func TestBuildPod_NameAndImageAndOwner(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	pod := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg)
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
 
 	require.Equal(t, agent.PodName(task), pod.Name)
 	require.Equal(t, "tatara", pod.Namespace)
@@ -89,7 +90,7 @@ func TestBuildPod_NameAndImageAndOwner(t *testing.T) {
 
 func TestBuildPod_PlainEnv(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
 
 	checks := map[string]string{
 		"REPO_URL":             "https://git/acme/repo1",
@@ -114,7 +115,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 
 func TestBuildPod_SecretEnv(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
 
 	ant, ok := envSecretRef(c, "CLAUDE_CODE_OAUTH_TOKEN")
 	require.True(t, ok)
@@ -148,7 +149,7 @@ func TestBuildPod_CallbackURLFromConfig(t *testing.T) {
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
-	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
 	got, ok := envValue(c, "DEFAULT_CALLBACK_URL")
 	require.True(t, ok)
 	require.Equal(t, "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete", got)
@@ -156,7 +157,7 @@ func TestBuildPod_CallbackURLFromConfig(t *testing.T) {
 
 func TestBuildPod_PortAndReadiness(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
 	require.Len(t, c.Ports, 1)
 	require.Equal(t, int32(8080), c.Ports[0].ContainerPort)
 	require.NotNil(t, c.ReadinessProbe)
@@ -166,7 +167,7 @@ func TestBuildPod_PortAndReadiness(t *testing.T) {
 func TestBuildService_MatchesPod(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	svc := agent.BuildService(proj, repo, task, cfg)
-	pod := agent.BuildPod(proj, repo, task, testMemoryEndpoint, cfg)
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
 
 	require.Equal(t, pod.Name, svc.Name) // service name == pod name
 	require.Equal(t, "tatara", svc.Namespace)
@@ -181,8 +182,24 @@ func TestBuildService_MatchesPod(t *testing.T) {
 func TestBuildPod_MemoryEndpointEnv(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	const ep = "http://mem-other.tatara.svc:8080"
-	c := agent.BuildPod(proj, repo, task, ep, cfg).Spec.Containers[0]
+	c := agent.BuildPod(proj, repo, task, nil, ep, cfg).Spec.Containers[0]
 	got, ok := envValue(c, "TATARA_MEMORY_URL")
 	require.True(t, ok, "TATARA_MEMORY_URL missing")
 	require.Equal(t, ep, got)
+}
+
+func TestBuildPod_SetsTataraRepos(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	repos := []tatarav1alpha1.Repository{
+		{ObjectMeta: metav1.ObjectMeta{Name: "repo1"}, Spec: tatarav1alpha1.RepositorySpec{URL: "https://git/acme/repo1", DefaultBranch: "main"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "repo2"}, Spec: tatarav1alpha1.RepositorySpec{URL: "https://git/acme/repo2", DefaultBranch: "dev"}},
+	}
+	c := agent.BuildPod(proj, repo, task, repos, testMemoryEndpoint, cfg).Spec.Containers[0]
+	v, ok := envValue(c, "TATARA_REPOS")
+	require.True(t, ok)
+	var got []map[string]string
+	require.NoError(t, json.Unmarshal([]byte(v), &got))
+	require.Equal(t, "repo1", got[0]["name"]) // primary (the task's repo) first
+	require.Equal(t, "https://git/acme/repo2", got[1]["url"])
+	require.Equal(t, "dev", got[1]["branch"])
 }

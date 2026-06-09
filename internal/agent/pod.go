@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,13 @@ import (
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
 const wrapperPort = 8080
+
+// repoEntry is the JSON shape of one entry in TATARA_REPOS.
+type repoEntry struct {
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Branch string `json:"branch"`
+}
 
 // PodConfig holds the operator-level inputs the Pod/Service builders need that
 // do not come from the CRDs.
@@ -71,7 +79,6 @@ func secretEnv(name, secretName, key string) corev1.EnvVar {
 	}
 }
 
-// BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
 // TaskBranch is the deterministic work branch for a Task's agent run, the
 // single source operator write-back, the turn prompts, and the wrapper all
 // agree on. Convention: tatara/task-<task-name>.
@@ -79,7 +86,10 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 	return "tatara/task-" + t.Name
 }
 
-func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
+// BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
+// repos is the full list of Project Repositories; the task's own repo is placed
+// first in TATARA_REPOS. Pass nil when there is only one repo (env is omitted).
+func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, repos []tatarav1alpha1.Repository, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
 	env := []corev1.EnvVar{
 		{Name: "REPO_URL", Value: repo.Spec.URL},
 		{Name: "REPO_BRANCH", Value: repo.Spec.DefaultBranch},
@@ -103,6 +113,22 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("GIT_TOKEN", project.Spec.ScmSecretRef, "token"),
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
+	}
+
+	if len(repos) > 0 {
+		// Primary repo first, then the rest.
+		entries := []repoEntry{{Name: repo.Name, URL: repo.Spec.URL, Branch: repo.Spec.DefaultBranch}}
+		for i := range repos {
+			if repos[i].Name != repo.Name {
+				entries = append(entries, repoEntry{
+					Name:   repos[i].Name,
+					URL:    repos[i].Spec.URL,
+					Branch: repos[i].Spec.DefaultBranch,
+				})
+			}
+		}
+		buf, _ := json.Marshal(entries)
+		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
 
 	return &corev1.Pod{

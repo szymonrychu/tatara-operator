@@ -190,11 +190,30 @@ func (r *TaskReconciler) atConcurrencyCap(ctx context.Context, project *tatarav1
 	return active >= max, nil
 }
 
+// projectRepos returns all Repositories belonging to a Project.
+func (r *TaskReconciler) projectRepos(ctx context.Context, project *tatarav1alpha1.Project) ([]tatarav1alpha1.Repository, error) {
+	var list tatarav1alpha1.RepositoryList
+	if err := r.List(ctx, &list, client.InNamespace(project.Namespace)); err != nil {
+		return nil, fmt.Errorf("list repositories: %w", err)
+	}
+	var out []tatarav1alpha1.Repository
+	for i := range list.Items {
+		if list.Items[i].Spec.ProjectRef == project.Name {
+			out = append(out, list.Items[i])
+		}
+	}
+	return out, nil
+}
+
 // ensurePodAndService creates the wrapper Pod+Service if absent. For an
 // already-active Task it counts recreations; when the budget is exhausted it
 // returns exhausted=true so the caller fails the Task.
 func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task) (bool, error) {
-	pod := agent.BuildPod(project, repo, task, project.Status.Memory.Endpoint, r.PodConfig)
+	repos, err := r.projectRepos(ctx, project)
+	if err != nil {
+		return false, err
+	}
+	pod := agent.BuildPod(project, repo, task, repos, project.Status.Memory.Endpoint, r.PodConfig)
 	existing := &corev1.Pod{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, existing)
 	switch {
