@@ -284,9 +284,19 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decision required")
 		return
 	}
+	switch req.Decision {
+	case "approve", "request_changes", "comment":
+	default:
+		writeError(w, http.StatusBadRequest, "decision must be one of approve, request_changes, comment")
+		return
+	}
 	var t tatarav1alpha1.Task
 	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
 		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Kind != "review" {
+		writeError(w, http.StatusConflict, "review verdict only applies to a review task")
 		return
 	}
 	t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
@@ -312,9 +322,19 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "action required")
 		return
 	}
+	switch req.Action {
+	case "merge", "close":
+	default:
+		writeError(w, http.StatusBadRequest, "action must be one of merge, close")
+		return
+	}
 	var t tatarav1alpha1.Task
 	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
 		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Kind != "selfImprove" {
+		writeError(w, http.StatusConflict, "pr outcome only applies to a selfImprove task")
 		return
 	}
 	t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}

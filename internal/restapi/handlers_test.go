@@ -140,6 +140,13 @@ func TestPatchTask_NotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func taskWithKind(name, projectRef, kind string) *tatarav1alpha1.Task {
+	return &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: projectRef, RepositoryRef: "repo", Goal: "g", Kind: kind},
+	}
+}
+
 func subtask(name, taskRef string, order int) *tatarav1alpha1.Subtask {
 	return &tatarav1alpha1.Subtask{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
@@ -259,7 +266,7 @@ func TestProposeIssue_ProjectNotFound(t *testing.T) {
 }
 
 func TestReviewVerdict(t *testing.T) {
-	r := buildRouter(t, task("t1", "alpha"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	body := strings.NewReader(`{"decision":"approve","body":"lgtm","suggestions":[{"path":"a.go","line":12,"body":"x"}]}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
 	req.Header.Set("Content-Type", "application/json")
@@ -275,12 +282,30 @@ func TestReviewVerdict(t *testing.T) {
 }
 
 func TestReviewVerdict_MissingDecision(t *testing.T) {
-	r := buildRouter(t, task("t1", "alpha"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	body := strings.NewReader(`{"body":"lgtm"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestReviewVerdict_InvalidDecision(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"decision":"reject"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestReviewVerdict_WrongKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
+	body := strings.NewReader(`{"decision":"approve"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
 }
 
 func TestReviewVerdict_TaskNotFound(t *testing.T) {
@@ -293,7 +318,7 @@ func TestReviewVerdict_TaskNotFound(t *testing.T) {
 }
 
 func TestPROutcome(t *testing.T) {
-	r := buildRouter(t, task("t1", "alpha"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
 	body := strings.NewReader(`{"action":"merge","reason":"green"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
 	req.Header.Set("Content-Type", "application/json")
@@ -308,12 +333,30 @@ func TestPROutcome(t *testing.T) {
 }
 
 func TestPROutcome_MissingAction(t *testing.T) {
-	r := buildRouter(t, task("t1", "alpha"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
 	body := strings.NewReader(`{"reason":"x"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestPROutcome_InvalidAction(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
+	body := strings.NewReader(`{"action":"rebase"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestPROutcome_WrongKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"action":"merge"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
 }
 
 func TestPROutcome_TaskNotFound(t *testing.T) {
