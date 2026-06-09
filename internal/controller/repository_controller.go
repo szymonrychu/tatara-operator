@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -24,6 +25,10 @@ import (
 // ReingestAnnotation aliases the canonical constant from api/v1alpha1 so
 // controller code keeps using the same short name internally.
 const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
+
+// maxScheduleRequeue bounds the cron requeue so clock skew or long sleeps still
+// re-evaluate the schedule reasonably soon.
+const maxScheduleRequeue = 6 * time.Hour
 
 // RepositoryReconciler drives ingest Jobs for Repositories.
 type RepositoryReconciler struct {
@@ -124,8 +129,13 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	since, want := r.ingestDecision(&repo)
 	if !want {
+		res, err := r.scheduleNextReingest(ctx, &repo)
+		if err != nil {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, err
+		}
 		r.Metrics.ReconcileResult("Repository", "success")
-		return ctrl.Result{}, nil
+		return res, nil
 	}
 
 	if err := r.ensureResultConfigMap(ctx, &repo); err != nil {
@@ -184,6 +194,83 @@ func (r *RepositoryReconciler) ingestDecision(repo *tataradevv1alpha1.Repository
 		return repo.Status.LastIngestedCommit, true
 	}
 	return "", false
+}
+
+// scheduleNextReingest applies the per-Repository cron schedule for an
+// already-ingested repo. It parses spec.reingestSchedule and computes the next
+// fire from base = lastScheduledReingest | lastIngestTime | creationTimestamp.
+// When the fire is due (and strictly after lastIngestTime, so an in-flight
+// ingest from another trigger is not double-stamped), it stamps the existing
+// reingest-requested annotation and records lastScheduledReingest; the
+// annotation change re-triggers reconcile, which launches the Job via the
+// existing path. Otherwise it requeues at the next fire (clamped). A bad cron
+// expression is logged at ERROR and skipped (no requeue, no error).
+func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *tataradevv1alpha1.Repository) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+
+	// Only schedule once a repo has been ingested at least once; a first full
+	// ingest is driven by ingestDecision, not the cron.
+	if repo.Status.LastIngestedCommit == "" || repo.Spec.ReingestSchedule == "" {
+		return ctrl.Result{}, nil
+	}
+
+	schedule, err := cron.ParseStandard(repo.Spec.ReingestSchedule)
+	if err != nil {
+		l.Error(err, "invalid reingestSchedule, skipping cron",
+			"action", "ingest_schedule_invalid", "resource_id", repo.Name,
+			"schedule", repo.Spec.ReingestSchedule)
+		return ctrl.Result{}, nil
+	}
+
+	var lastIngestTime time.Time
+	if repo.Status.LastIngestTime != nil {
+		lastIngestTime = repo.Status.LastIngestTime.Time
+	}
+
+	base := repo.CreationTimestamp.Time
+	if repo.Status.LastIngestTime != nil {
+		base = repo.Status.LastIngestTime.Time
+	}
+	if repo.Status.LastScheduledReingest != nil {
+		base = repo.Status.LastScheduledReingest.Time
+	}
+
+	now := time.Now()
+	next := schedule.Next(base)
+
+	if now.Before(next) {
+		requeue := next.Sub(now)
+		if requeue > maxScheduleRequeue {
+			requeue = maxScheduleRequeue
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
+	}
+
+	// Due. Guard against firing while an ingest from another trigger is still
+	// in flight or just finished: only stamp when now is strictly after the
+	// last successful ingest.
+	if !now.After(lastIngestTime) {
+		return ctrl.Result{RequeueAfter: maxScheduleRequeue}, nil
+	}
+
+	if repo.Annotations == nil {
+		repo.Annotations = map[string]string{}
+	}
+	repo.Annotations[ReingestAnnotation] = now.UTC().Format(time.RFC3339)
+	if err := r.Update(ctx, repo); err != nil {
+		return ctrl.Result{}, fmt.Errorf("stamp scheduled reingest annotation: %w", err)
+	}
+
+	scheduled := metav1.NewTime(now)
+	repo.Status.LastScheduledReingest = &scheduled
+	if err := r.Status().Update(ctx, repo); err != nil {
+		return ctrl.Result{}, fmt.Errorf("update lastScheduledReingest: %w", err)
+	}
+
+	l.Info("scheduled re-ingest requested",
+		"action", "ingest_schedule_fire", "resource_id", repo.Name,
+		"schedule", repo.Spec.ReingestSchedule)
+	return ctrl.Result{}, nil
 }
 
 // ensureResultConfigMap creates the empty <repo>-ingest-result ConfigMap

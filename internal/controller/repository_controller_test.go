@@ -347,3 +347,139 @@ func TestRepoReconcile_UsesProjectEndpointWhenReady(t *testing.T) {
 		t.Errorf("ingest job must use the Project endpoint as base-url: %q", script)
 	}
 }
+
+func setRepoIngested(t *testing.T, name, sha string, lastIngest time.Time) {
+	t.Helper()
+	r := getRepo(t, name)
+	r.Status.LastIngestedCommit = sha
+	lt := metav1.NewTime(lastIngest)
+	r.Status.LastIngestTime = &lt
+	r.Status.Phase = "Ingested"
+	if err := k8sClient.Status().Update(context.Background(), r); err != nil {
+		t.Fatalf("seed ingested status for %s: %v", name, err)
+	}
+}
+
+func TestRepoReconcile_ScheduleStampsAnnotationWhenDue(t *testing.T) {
+	mkProject(t, "rp-sch1", "rp-sch1-scm")
+	mkSecret(t, "rp-sch1-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "sch1", "rp-sch1")
+	setProjectMemoryReady(t, "rp-sch1", "http://mem-rp-sch1.tatara.svc:8080")
+
+	// Schedule fires every minute; last ingest was an hour ago, so it is due now.
+	r := getRepo(t, "sch1")
+	r.Spec.ReingestSchedule = "* * * * *"
+	if err := k8sClient.Update(context.Background(), r); err != nil {
+		t.Fatalf("set schedule: %v", err)
+	}
+	setRepoIngested(t, "sch1", "shaSch1", time.Now().Add(-1*time.Hour))
+
+	if _, err := reconcileRepo(t, "sch1"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getRepo(t, "sch1")
+	if got.Annotations[ReingestAnnotation] == "" {
+		t.Fatal("due schedule must stamp the reingest-requested annotation")
+	}
+	if got.Status.LastScheduledReingest == nil {
+		t.Fatal("due schedule must set status.lastScheduledReingest")
+	}
+	// No Job yet: the annotation re-triggers reconcile via the watch; this
+	// reconcile pass only stamps.
+	if jobs := listIngestJobs(t, "sch1"); len(jobs) != 0 {
+		t.Fatalf("schedule stamp pass must not itself launch a job, got %d", len(jobs))
+	}
+}
+
+func TestRepoReconcile_ScheduleRequeuesWhenNotDue(t *testing.T) {
+	mkProject(t, "rp-sch2", "rp-sch2-scm")
+	mkSecret(t, "rp-sch2-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "sch2", "rp-sch2")
+	setProjectMemoryReady(t, "rp-sch2", "http://mem-rp-sch2.tatara.svc:8080")
+
+	// Far-future daily schedule + a fresh ingest => not due; expect a requeue.
+	r := getRepo(t, "sch2")
+	r.Spec.ReingestSchedule = "0 6 * * *"
+	if err := k8sClient.Update(context.Background(), r); err != nil {
+		t.Fatalf("set schedule: %v", err)
+	}
+	setRepoIngested(t, "sch2", "shaSch2", time.Now())
+
+	res, err := reconcileRepo(t, "sch2")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("not-due schedule must set RequeueAfter, got %v", res.RequeueAfter)
+	}
+	if res.RequeueAfter > 6*time.Hour {
+		t.Errorf("RequeueAfter must be clamped to 6h, got %v", res.RequeueAfter)
+	}
+	if getRepo(t, "sch2").Annotations[ReingestAnnotation] != "" {
+		t.Error("not-due schedule must not stamp the annotation")
+	}
+	if getRepo(t, "sch2").Status.LastScheduledReingest != nil {
+		t.Error("not-due schedule must not set lastScheduledReingest")
+	}
+}
+
+func TestRepoReconcile_ScheduleBadCronSkips(t *testing.T) {
+	mkProject(t, "rp-sch3", "rp-sch3-scm")
+	mkSecret(t, "rp-sch3-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "sch3", "rp-sch3")
+	setProjectMemoryReady(t, "rp-sch3", "http://mem-rp-sch3.tatara.svc:8080")
+
+	// A syntactically-shaped but semantically invalid cron (bad minute field).
+	r := getRepo(t, "sch3")
+	r.Spec.ReingestSchedule = "99 6 * * *"
+	if err := k8sClient.Update(context.Background(), r); err != nil {
+		t.Fatalf("set schedule: %v", err)
+	}
+	setRepoIngested(t, "sch3", "shaSch3", time.Now().Add(-1*time.Hour))
+
+	res, err := reconcileRepo(t, "sch3")
+	if err != nil {
+		t.Fatalf("bad cron must not error the reconcile: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("bad cron must skip scheduling (no requeue), got %v", res.RequeueAfter)
+	}
+	if getRepo(t, "sch3").Annotations[ReingestAnnotation] != "" {
+		t.Error("bad cron must not stamp the annotation")
+	}
+}
+
+func TestRepoReconcile_ScheduleNoDoubleFireWithinInterval(t *testing.T) {
+	mkProject(t, "rp-sch4", "rp-sch4-scm")
+	mkSecret(t, "rp-sch4-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "sch4", "rp-sch4")
+	setProjectMemoryReady(t, "rp-sch4", "http://mem-rp-sch4.tatara.svc:8080")
+
+	r := getRepo(t, "sch4")
+	r.Spec.ReingestSchedule = "0 6 * * *"
+	if err := k8sClient.Update(context.Background(), r); err != nil {
+		t.Fatalf("set schedule: %v", err)
+	}
+	setRepoIngested(t, "sch4", "shaSch4", time.Now().Add(-25*time.Hour))
+
+	// lastScheduledReingest is recent => next fire is in the future => not due,
+	// even though lastIngestTime is old. Guards against double-fire.
+	r = getRepo(t, "sch4")
+	just := metav1.NewTime(time.Now().Add(-1 * time.Minute))
+	r.Status.LastScheduledReingest = &just
+	if err := k8sClient.Status().Update(context.Background(), r); err != nil {
+		t.Fatalf("seed lastScheduledReingest: %v", err)
+	}
+
+	res, err := reconcileRepo(t, "sch4")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if getRepo(t, "sch4").Annotations[ReingestAnnotation] != "" {
+		t.Error("recent lastScheduledReingest must prevent a second stamp this interval")
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("expected a requeue to the next fire, got %v", res.RequeueAfter)
+	}
+}
