@@ -19,6 +19,7 @@ func TestLoad(t *testing.T) {
 		"LIGHTRAG_IMAGE":              "ghcr.io/hkuds/lightrag:v1.4.16",
 		"NEO4J_IMAGE":                 "neo4j:5-community",
 		"OPENAI_SECRET_NAME":          "tatara-openai",
+		"SEMANTIC_MODEL":              "gpt-4o-mini",
 		"INGESTER_IMAGE":              "harbor/ingester:1",
 		"EXTERNAL_WEBHOOK_BASE":       "https://ops.example",
 		"OPERATOR_OIDC_CLIENT_ID":     "tatara-operator",
@@ -53,6 +54,7 @@ func TestLoad(t *testing.T) {
 		{"LightragImage", cfg.LightragImage, "ghcr.io/hkuds/lightrag:v1.4.16"},
 		{"Neo4jImage", cfg.Neo4jImage, "neo4j:5-community"},
 		{"OpenAISecretName", cfg.OpenAISecretName, "tatara-openai"},
+		{"SemanticModel", cfg.SemanticModel, "gpt-4o-mini"},
 		{"IngesterImage", cfg.IngesterImage, "harbor/ingester:1"},
 		{"ExternalWebhookBase", cfg.ExternalWebhookBase, "https://ops.example"},
 		{"OperatorOIDCClientID", cfg.OperatorOIDCClientID, "tatara-operator"},
@@ -82,6 +84,20 @@ func TestLoad_MissingRequired(t *testing.T) {
 // TestLoad_Defaults asserts that HealthAddr and InternalAddr have distinct
 // defaults so they cannot both bind the same port (which would cause
 // "address already in use" at startup).
+func TestLoad_SemanticModelDefault(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("SEMANTIC_MODEL", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.SemanticModel != "gpt-4o-mini" {
+		t.Fatalf("SemanticModel default = %q, want gpt-4o-mini", cfg.SemanticModel)
+	}
+}
+
 func TestLoad_Defaults(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")

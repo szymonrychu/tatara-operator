@@ -31,6 +31,7 @@ type Config struct {
 	LightragImage            string
 	Neo4jImage               string
 	OpenAISecretName         string
+	SemanticModel            string
 	IngesterImage            string
 	ExternalWebhookBase      string
 	OperatorOIDCClientID     string
@@ -66,6 +67,7 @@ func Load() (Config, error) {
 		LightragImage:            os.Getenv("LIGHTRAG_IMAGE"),
 		Neo4jImage:               os.Getenv("NEO4J_IMAGE"),
 		OpenAISecretName:         os.Getenv("OPENAI_SECRET_NAME"),
+		SemanticModel:            getDefault("SEMANTIC_MODEL", "gpt-4o-mini"),
 		IngesterImage:            os.Getenv("INGESTER_IMAGE"),
 		ExternalWebhookBase:      os.Getenv("EXTERNAL_WEBHOOK_BASE"),
 		OperatorOIDCClientID:     os.Getenv("OPERATOR_OIDC_CLIENT_ID"),
