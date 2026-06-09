@@ -26,15 +26,26 @@ type ghWorkItem struct {
 	Body    string    `json:"body"`
 	Labels  []ghLabel `json:"labels"`
 	HTMLURL string    `json:"html_url"`
+	Head    struct {
+		SHA string `json:"sha"`
+		Ref string `json:"ref"`
+	} `json:"head"`
 }
 
 type ghPayload struct {
+	Action     string `json:"action"`
 	Ref        string `json:"ref"`
 	After      string `json:"after"`
 	Repository struct {
 		CloneURL string `json:"clone_url"`
 		FullName string `json:"full_name"`
 	} `json:"repository"`
+	Sender struct {
+		Login string `json:"login"`
+	} `json:"sender"`
+	Label struct {
+		Name string `json:"name"`
+	} `json:"label"`
 	Issue       *ghWorkItem `json:"issue"`
 	PullRequest *ghWorkItem `json:"pull_request"`
 }
@@ -53,15 +64,24 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	case "push":
 		return WebhookEvent{Kind: "push", Repo: p.Repository.CloneURL, Branch: strings.TrimPrefix(p.Ref, "refs/heads/")}, nil
 	case "issues":
-		return ghWorkItemEvent("issue", p.Repository.FullName, p.Repository.CloneURL, p.Issue), nil
+		return ghWorkItemEvent("issue", false, p, p.Issue), nil
+	case "issue_comment":
+		ev := ghWorkItemEvent("issue", false, p, p.Issue)
+		ev.IsPR = p.Issue != nil && p.Issue.Head.Ref != ""
+		if ev.IsPR {
+			ev.Kind = "mr"
+		}
+		return ev, nil
 	case "pull_request":
-		return ghWorkItemEvent("mr", p.Repository.FullName, p.Repository.CloneURL, p.PullRequest), nil
+		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
+	case "pull_request_review":
+		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
 	}
 }
 
-func ghWorkItemEvent(kind, fullName, cloneURL string, wi *ghWorkItem) WebhookEvent {
+func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) WebhookEvent {
 	if wi == nil {
 		return WebhookEvent{Kind: "other"}
 	}
@@ -70,13 +90,20 @@ func ghWorkItemEvent(kind, fullName, cloneURL string, wi *ghWorkItem) WebhookEve
 		labels = append(labels, l.Name)
 	}
 	return WebhookEvent{
-		Kind:     kind,
-		Repo:     cloneURL,
-		Labels:   labels,
-		Title:    wi.Title,
-		Body:     wi.Body,
-		IssueRef: fmt.Sprintf("%s#%d", fullName, wi.Number),
-		URL:      wi.HTMLURL,
+		Kind:         kind,
+		Repo:         p.Repository.CloneURL,
+		Labels:       labels,
+		Title:        wi.Title,
+		Body:         wi.Body,
+		IssueRef:     fmt.Sprintf("%s#%d", p.Repository.FullName, wi.Number),
+		URL:          wi.HTMLURL,
+		AuthorLogin:  p.Sender.Login,
+		Action:       p.Action,
+		Number:       wi.Number,
+		IsPR:         isPR,
+		HeadSHA:      wi.Head.SHA,
+		HeadBranch:   wi.Head.Ref,
+		ChangedLabel: p.Label.Name,
 	}
 }
 

@@ -2,6 +2,9 @@ package scm
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -221,6 +224,42 @@ func TestGitHubReviewVerbs(t *testing.T) {
 		}
 		if !paths["POST /repos/o/r/issues/5/comments"] {
 			t.Fatalf("missing comment; got %+v", paths)
+		}
+	})
+}
+
+func ghSign(payload []byte, secret string) string {
+	m := hmac.New(sha256.New, []byte(secret))
+	m.Write(payload)
+	return "sha256=" + hex.EncodeToString(m.Sum(nil))
+}
+
+func TestGitHubDetectAndVerifyFields(t *testing.T) {
+	const secret = "s3cr3t"
+	t.Run("issue labeled", func(t *testing.T) {
+		payload := []byte(`{"action":"labeled","sender":{"login":"alice"},"label":{"name":"tatara/awaiting-approval"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"issue":{"number":7,"title":"T","body":"B","html_url":"https://gh/o/r/issues/7","labels":[{"name":"tatara"}]}}`)
+		h := http.Header{}
+		h.Set("X-GitHub-Event", "issues")
+		h.Set("X-Hub-Signature-256", ghSign(payload, secret))
+		ev, err := (&GitHub{}).DetectAndVerify(h, payload, secret)
+		if err != nil {
+			t.Fatalf("DetectAndVerify: %v", err)
+		}
+		if ev.Kind != "issue" || ev.Action != "labeled" || ev.AuthorLogin != "alice" || ev.Number != 7 || ev.IsPR || ev.ChangedLabel != "tatara/awaiting-approval" {
+			t.Fatalf("event = %+v", ev)
+		}
+	})
+	t.Run("pull_request opened", func(t *testing.T) {
+		payload := []byte(`{"action":"opened","sender":{"login":"bob"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"pull_request":{"number":9,"title":"PR","body":"body","html_url":"https://gh/o/r/pull/9","head":{"sha":"deadbeef","ref":"feature"}}}`)
+		h := http.Header{}
+		h.Set("X-GitHub-Event", "pull_request")
+		h.Set("X-Hub-Signature-256", ghSign(payload, secret))
+		ev, err := (&GitHub{}).DetectAndVerify(h, payload, secret)
+		if err != nil {
+			t.Fatalf("DetectAndVerify: %v", err)
+		}
+		if ev.Kind != "mr" || !ev.IsPR || ev.AuthorLogin != "bob" || ev.Number != 9 || ev.HeadSHA != "deadbeef" || ev.HeadBranch != "feature" || ev.Action != "opened" {
+			t.Fatalf("event = %+v", ev)
 		}
 	})
 }

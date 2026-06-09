@@ -21,16 +21,30 @@ type glLabel struct {
 type glPayload struct {
 	ObjectKind string `json:"object_kind"`
 	Ref        string `json:"ref"`
-	Project    struct {
+	User       struct {
+		Username string `json:"username"`
+	} `json:"user"`
+	Project struct {
 		GitHTTPURL        string `json:"git_http_url"`
 		PathWithNamespace string `json:"path_with_namespace"`
 	} `json:"project"`
 	ObjectAttributes struct {
-		IID         int    `json:"iid"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		URL         string `json:"url"`
+		IID          int    `json:"iid"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		URL          string `json:"url"`
+		Action       string `json:"action"`
+		SourceBranch string `json:"source_branch"`
+		LastCommit   struct {
+			ID string `json:"id"`
+		} `json:"last_commit"`
 	} `json:"object_attributes"`
+	Changes struct {
+		Labels struct {
+			Previous []glLabel `json:"previous"`
+			Current  []glLabel `json:"current"`
+		} `json:"labels"`
+	} `json:"changes"`
 	Labels []glLabel `json:"labels"`
 }
 
@@ -51,9 +65,11 @@ func (*GitLab) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	case "Push Hook":
 		return WebhookEvent{Kind: "push", Repo: p.Project.GitHTTPURL, Branch: trimGitLabRef(p.Ref)}, nil
 	case "Issue Hook":
-		return glWorkItemEvent("issue", p), nil
+		return glWorkItemEvent("issue", false, p), nil
 	case "Merge Request Hook":
-		return glWorkItemEvent("mr", p), nil
+		return glWorkItemEvent("mr", true, p), nil
+	case "Note Hook":
+		return glWorkItemEvent("issue", false, p), nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
 	}
@@ -67,20 +83,71 @@ func trimGitLabRef(ref string) string {
 	return ref
 }
 
-func glWorkItemEvent(kind string, p glPayload) WebhookEvent {
+func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 	labels := make([]string, 0, len(p.Labels))
 	for _, l := range p.Labels {
 		labels = append(labels, l.Title)
 	}
-	return WebhookEvent{
-		Kind:     kind,
-		Repo:     p.Project.GitHTTPURL,
-		Labels:   labels,
-		Title:    p.ObjectAttributes.Title,
-		Body:     p.ObjectAttributes.Description,
-		IssueRef: fmt.Sprintf("%s!%d", p.Project.PathWithNamespace, p.ObjectAttributes.IID),
-		URL:      p.ObjectAttributes.URL,
+	sep := "!"
+	if kind == "issue" {
+		sep = "#"
 	}
+	action, changed := glActionAndLabel(p)
+	return WebhookEvent{
+		Kind:         kind,
+		Repo:         p.Project.GitHTTPURL,
+		Labels:       labels,
+		Title:        p.ObjectAttributes.Title,
+		Body:         p.ObjectAttributes.Description,
+		IssueRef:     fmt.Sprintf("%s%s%d", p.Project.PathWithNamespace, sep, p.ObjectAttributes.IID),
+		URL:          p.ObjectAttributes.URL,
+		AuthorLogin:  p.User.Username,
+		Action:       action,
+		Number:       p.ObjectAttributes.IID,
+		IsPR:         isPR,
+		HeadSHA:      p.ObjectAttributes.LastCommit.ID,
+		HeadBranch:   p.ObjectAttributes.SourceBranch,
+		ChangedLabel: changed,
+	}
+}
+
+// glActionAndLabel normalizes the GitLab action and derives labeled/unlabeled
+// plus the single changed label from object_attributes.action + changes.labels.
+func glActionAndLabel(p glPayload) (string, string) {
+	prev := labelSet(p.Changes.Labels.Previous)
+	cur := labelSet(p.Changes.Labels.Current)
+	for name := range cur {
+		if !prev[name] {
+			return "labeled", name
+		}
+	}
+	for name := range prev {
+		if !cur[name] {
+			return "unlabeled", name
+		}
+	}
+	switch p.ObjectAttributes.Action {
+	case "open", "reopen":
+		return "opened", ""
+	case "close":
+		return "closed", ""
+	case "update":
+		return "synchronize", ""
+	case "approved":
+		return "submitted", ""
+	case "":
+		return "other", ""
+	default:
+		return p.ObjectAttributes.Action, ""
+	}
+}
+
+func labelSet(ls []glLabel) map[string]bool {
+	out := make(map[string]bool, len(ls))
+	for _, l := range ls {
+		out[l.Title] = true
+	}
+	return out
 }
 
 func (c *GitLab) base() string {
@@ -112,9 +179,9 @@ func (c *GitLab) OpenChange(ctx context.Context, repoURL, token, sourceBranch, t
 	return out.WebURL, nil
 }
 
-// Comment posts a note on an issue identified by group/proj!iid.
+// Comment posts a note on an issue identified by group/proj#iid.
 func (c *GitLab) Comment(ctx context.Context, token, issueRef, body string) error {
-	proj, iid, err := glIssueRef(issueRef)
+	proj, iid, err := glHashRef(issueRef)
 	if err != nil {
 		return err
 	}
@@ -132,22 +199,6 @@ func glProjectPath(repoURL string) (string, error) {
 		return "", fmt.Errorf("gitlab: cannot derive project path from %q", repoURL)
 	}
 	return p, nil
-}
-
-func glIssueRef(ref string) (string, int, error) {
-	at := strings.LastIndex(ref, "!")
-	if at < 0 {
-		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
-	}
-	proj, iidStr := ref[:at], ref[at+1:]
-	if proj == "" {
-		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
-	}
-	iid, err := strconv.Atoi(iidStr)
-	if err != nil {
-		return "", 0, fmt.Errorf("gitlab: malformed iid in %q: %w", ref, err)
-	}
-	return proj, iid, nil
 }
 
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {

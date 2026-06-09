@@ -27,8 +27,8 @@ func TestGitLabDetectAndVerify(t *testing.T) {
 		want  WebhookEvent
 	}{
 		{"push", "Push Hook", pushBody, WebhookEvent{Kind: "push", Repo: "https://gitlab.com/g/p.git", Branch: "main"}},
-		{"issue", "Issue Hook", issueBody, WebhookEvent{Kind: "issue", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara", "ops"}, Title: "An issue", Body: "desc", IssueRef: "g/p!12", URL: "https://gitlab.com/g/p/-/issues/12"}},
-		{"mr", "Merge Request Hook", mrBody, WebhookEvent{Kind: "mr", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara"}, Title: "An MR", Body: "mr desc", IssueRef: "g/p!34", URL: "https://gitlab.com/g/p/-/merge_requests/34"}},
+		{"issue", "Issue Hook", issueBody, WebhookEvent{Kind: "issue", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara", "ops"}, Title: "An issue", Body: "desc", IssueRef: "g/p#12", URL: "https://gitlab.com/g/p/-/issues/12", Action: "other", Number: 12}},
+		{"mr", "Merge Request Hook", mrBody, WebhookEvent{Kind: "mr", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara"}, Title: "An MR", Body: "mr desc", IssueRef: "g/p!34", URL: "https://gitlab.com/g/p/-/merge_requests/34", IsPR: true, Action: "other", Number: 34}},
 		{"other", "Pipeline Hook", []byte(`{}`), WebhookEvent{Kind: "other"}},
 	}
 	c := &GitLab{}

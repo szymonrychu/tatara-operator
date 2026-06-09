@@ -170,3 +170,33 @@ func TestGitLabCapabilities(t *testing.T) {
 		}
 	})
 }
+
+func TestGitLabDetectAndVerifyFields(t *testing.T) {
+	const secret = "tok"
+	t.Run("issue unlabeled", func(t *testing.T) {
+		payload := []byte(`{"object_kind":"issue","user":{"username":"alice"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":7,"title":"T","description":"D","url":"https://gl/g/p/-/issues/7","action":"update"},"changes":{"labels":{"previous":[{"title":"tatara/awaiting-approval"}],"current":[]}},"labels":[]}`)
+		h := http.Header{}
+		h.Set("X-Gitlab-Event", "Issue Hook")
+		h.Set("X-Gitlab-Token", secret)
+		ev, err := (&GitLab{}).DetectAndVerify(h, payload, secret)
+		if err != nil {
+			t.Fatalf("DetectAndVerify: %v", err)
+		}
+		if ev.Kind != "issue" || ev.AuthorLogin != "alice" || ev.Number != 7 || ev.Action != "unlabeled" || ev.ChangedLabel != "tatara/awaiting-approval" {
+			t.Fatalf("event = %+v", ev)
+		}
+	})
+	t.Run("merge request opened", func(t *testing.T) {
+		payload := []byte(`{"object_kind":"merge_request","user":{"username":"bob"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":9,"title":"MR","description":"D","url":"https://gl/g/p/-/merge_requests/9","action":"open","source_branch":"feat","last_commit":{"id":"sha9"}},"labels":[]}`)
+		h := http.Header{}
+		h.Set("X-Gitlab-Event", "Merge Request Hook")
+		h.Set("X-Gitlab-Token", secret)
+		ev, err := (&GitLab{}).DetectAndVerify(h, payload, secret)
+		if err != nil {
+			t.Fatalf("DetectAndVerify: %v", err)
+		}
+		if ev.Kind != "mr" || !ev.IsPR || ev.AuthorLogin != "bob" || ev.Number != 9 || ev.Action != "opened" || ev.HeadSHA != "sha9" || ev.HeadBranch != "feat" {
+			t.Fatalf("event = %+v", ev)
+		}
+	})
+}
