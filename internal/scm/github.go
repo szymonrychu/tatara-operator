@@ -363,9 +363,3 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 	}
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }
-func (c *GitHub) AddBoardItem(_ context.Context, _ string, _ BoardRef, _ string) error {
-	return fmt.Errorf("github: AddBoardItem: not implemented")
-}
-func (c *GitHub) SetBoardColumn(_ context.Context, _ string, _ BoardRef, _, _ string) error {
-	return fmt.Errorf("github: SetBoardColumn: not implemented")
-}

@@ -102,7 +102,8 @@ func (e *HTTPError) Error() string {
 
 // GitHub implements Client for GitHub.
 type GitHub struct {
-	apiBase string
+	apiBase     string
+	graphQLBase string
 }
 
 // GitLab implements Client for GitLab.
