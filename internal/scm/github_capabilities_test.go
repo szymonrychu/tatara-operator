@@ -81,3 +81,146 @@ func TestGitHubIssueAuthor(t *testing.T) {
 		}
 	})
 }
+
+func TestGitHubGetPRState(t *testing.T) {
+	cases := []struct {
+		name   string
+		runs   []map[string]string // status,conclusion
+		wantCI string
+	}{
+		{"no runs", nil, ""},
+		{"in progress", []map[string]string{{"status": "in_progress", "conclusion": ""}}, "pending"},
+		{"all success", []map[string]string{{"status": "completed", "conclusion": "success"}}, "success"},
+		{"one failure", []map[string]string{{"status": "completed", "conclusion": "success"}, {"status": "completed", "conclusion": "failure"}}, "failure"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/repos/o/r/pulls/5":
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"user":      map[string]any{"login": "alice"},
+						"mergeable": true,
+						"head":      map[string]any{"sha": "abc", "ref": "feature"},
+					})
+				case "/repos/o/r/commits/abc/check-runs":
+					runs := make([]map[string]any, 0, len(tc.runs))
+					for _, run := range tc.runs {
+						runs = append(runs, map[string]any{"status": run["status"], "conclusion": run["conclusion"]})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": runs})
+				default:
+					t.Fatalf("unexpected path %q", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+			c := &GitHub{apiBase: srv.URL}
+			st, err := c.GetPRState(context.Background(), "https://github.com/o/r", "tok", 5)
+			if err != nil {
+				t.Fatalf("GetPRState: %v", err)
+			}
+			if st.Author != "alice" || st.HeadSHA != "abc" || st.HeadBranch != "feature" || !st.Mergeable {
+				t.Fatalf("state = %+v", st)
+			}
+			if st.CIStatus != tc.wantCI {
+				t.Fatalf("CIStatus = %q, want %q", st.CIStatus, tc.wantCI)
+			}
+		})
+	}
+}
+
+func TestGitHubReviewVerbs(t *testing.T) {
+	t.Run("Approve", func(t *testing.T) {
+		var gotPath string
+		var body map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			b, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(b, &body)
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		if err := c.Approve(context.Background(), "https://github.com/o/r", "tok", 5, "lgtm"); err != nil {
+			t.Fatalf("Approve: %v", err)
+		}
+		if gotPath != "/repos/o/r/pulls/5/reviews" || body["event"] != "APPROVE" || body["body"] != "lgtm" {
+			t.Fatalf("path=%q body=%+v", gotPath, body)
+		}
+	})
+	t.Run("RequestChanges", func(t *testing.T) {
+		var body map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(b, &body)
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		if err := c.RequestChanges(context.Background(), "https://github.com/o/r", "tok", 5, "nope"); err != nil {
+			t.Fatalf("RequestChanges: %v", err)
+		}
+		if body["event"] != "REQUEST_CHANGES" {
+			t.Fatalf("event = %v", body["event"])
+		}
+	})
+	t.Run("Suggest", func(t *testing.T) {
+		var body map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(b, &body)
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		err := c.Suggest(context.Background(), "https://github.com/o/r", "tok", 5, []Suggestion{{Path: "a.go", Line: 12, Body: "x := 1"}})
+		if err != nil {
+			t.Fatalf("Suggest: %v", err)
+		}
+		if body["event"] != "COMMENT" {
+			t.Fatalf("event = %v", body["event"])
+		}
+		comments, _ := body["comments"].([]any)
+		if len(comments) != 1 {
+			t.Fatalf("comments = %+v", body["comments"])
+		}
+		first, _ := comments[0].(map[string]any)
+		if first["path"] != "a.go" || first["line"].(float64) != 12 {
+			t.Fatalf("comment = %+v", first)
+		}
+		if cbody, _ := first["body"].(string); cbody != "```suggestion\nx := 1\n```" {
+			t.Fatalf("comment body = %q", cbody)
+		}
+	})
+	t.Run("Merge", func(t *testing.T) {
+		var gotPath, gotMethod string
+		var body map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath, gotMethod = r.URL.Path, r.Method
+			b, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(b, &body)
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		if err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash"); err != nil {
+			t.Fatalf("Merge: %v", err)
+		}
+		if gotPath != "/repos/o/r/pulls/5/merge" || gotMethod != http.MethodPut || body["merge_method"] != "squash" {
+			t.Fatalf("path=%q method=%q body=%+v", gotPath, gotMethod, body)
+		}
+	})
+	t.Run("ClosePR", func(t *testing.T) {
+		paths := map[string]bool{}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths[r.Method+" "+r.URL.Path] = true
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		if err := c.ClosePR(context.Background(), "https://github.com/o/r", "tok", 5, "rejecting"); err != nil {
+			t.Fatalf("ClosePR: %v", err)
+		}
+		if !paths["PATCH /repos/o/r/pulls/5"] {
+			t.Fatalf("missing PATCH; got %+v", paths)
+		}
+		if !paths["POST /repos/o/r/issues/5/comments"] {
+			t.Fatalf("missing comment; got %+v", paths)
+		}
+	})
+}

@@ -238,23 +238,130 @@ func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string)
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, label)
 	return ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
 }
-func (c *GitHub) GetPRState(_ context.Context, _, _ string, _ int) (PRState, error) {
-	return PRState{}, fmt.Errorf("github: GetPRState: not implemented")
+
+// GetPRState reads a PR plus its head check-runs, deriving CIStatus.
+func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return PRState{}, err
+	}
+	var pr struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Mergeable bool `json:"mergeable"`
+		Head      struct {
+			SHA string `json:"sha"`
+			Ref string `json:"ref"`
+		} `json:"head"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), token, nil, &pr); err != nil {
+		return PRState{}, err
+	}
+	st := PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, Mergeable: pr.Mergeable}
+	var checks struct {
+		CheckRuns []struct {
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, pr.Head.SHA), token, nil, &checks); err != nil {
+		return PRState{}, err
+	}
+	st.CIStatus = deriveGHCIStatus(checks.CheckRuns)
+	return st, nil
 }
-func (c *GitHub) Approve(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("github: Approve: not implemented")
+
+func deriveGHCIStatus(runs []struct {
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}) string {
+	if len(runs) == 0 {
+		return ""
+	}
+	failure, pending := false, false
+	for _, run := range runs {
+		if run.Status != "completed" {
+			pending = true
+			continue
+		}
+		if run.Conclusion != "success" && run.Conclusion != "neutral" && run.Conclusion != "skipped" {
+			failure = true
+		}
+	}
+	switch {
+	case failure:
+		return "failure"
+	case pending:
+		return "pending"
+	default:
+		return "success"
+	}
 }
-func (c *GitHub) RequestChanges(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("github: RequestChanges: not implemented")
+
+func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, event, body string, comments []map[string]any) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	in := map[string]any{"event": event}
+	if body != "" {
+		in["body"] = body
+	}
+	if comments != nil {
+		in["comments"] = comments
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPost, path, token, in, nil)
 }
-func (c *GitHub) Suggest(_ context.Context, _, _ string, _ int, _ []Suggestion) error {
-	return fmt.Errorf("github: Suggest: not implemented")
+
+// Approve posts an APPROVE review.
+func (c *GitHub) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
+	return c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
 }
-func (c *GitHub) Merge(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("github: Merge: not implemented")
+
+// RequestChanges posts a REQUEST_CHANGES review.
+func (c *GitHub) RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error {
+	return c.review(ctx, repoURL, token, number, "REQUEST_CHANGES", body, nil)
 }
-func (c *GitHub) ClosePR(_ context.Context, _, _ string, _ int, _ string) error {
-	return fmt.Errorf("github: ClosePR: not implemented")
+
+// Suggest posts inline review comments with ```suggestion bodies.
+func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error {
+	comments := make([]map[string]any, 0, len(sugg))
+	for _, s := range sugg {
+		comments = append(comments, map[string]any{
+			"path": s.Path,
+			"line": s.Line,
+			"body": "```suggestion\n" + s.Body + "\n```",
+		})
+	}
+	return c.review(ctx, repoURL, token, number, "COMMENT", "", comments)
+}
+
+// Merge merges a PR with the given method (squash|merge|rebase).
+func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", owner, repo, number)
+	return ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, nil)
+}
+
+// ClosePR closes a PR (state=closed) and posts a comment with the reason.
+func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int, body string) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
+	if err := ghDo(ctx, c.base(), http.MethodPatch, path, token, map[string]string{"state": "closed"}, nil); err != nil {
+		return err
+	}
+	if body == "" {
+		return nil
+	}
+	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }
 func (c *GitHub) AddBoardItem(_ context.Context, _ string, _ BoardRef, _ string) error {
 	return fmt.Errorf("github: AddBoardItem: not implemented")
