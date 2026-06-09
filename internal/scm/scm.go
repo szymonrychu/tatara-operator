@@ -16,7 +16,8 @@ type WebhookEvent struct {
 	Body         string
 	IssueRef     string // owner/repo#123 (github) or group/proj!iid (gitlab)
 	URL          string
-	AuthorLogin  string // login of the issue/PR/MR author (board identity)
+	AuthorLogin  string // login of the issue/PR/MR author (the resource author)
+	ActorLogin   string // login of the user who triggered the event (the sender)
 	Action       string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
 	Number       int    // issue/PR/MR number (github) or iid (gitlab)
 	IsPR         bool   // true for mr/pull_request events

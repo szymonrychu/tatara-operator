@@ -23,8 +23,8 @@ func TestValueTypesZero(t *testing.T) {
 	if b.GitHubProjectNumber != 3 || b.StatusField != "Status" {
 		t.Fatalf("BoardRef fields not wired: %+v", b)
 	}
-	ev := WebhookEvent{AuthorLogin: "bot", Action: "labeled", Number: 7, IsPR: true, HeadSHA: "deadbeef", HeadBranch: "feat", ChangedLabel: "tatara/awaiting-approval"}
-	if ev.AuthorLogin != "bot" || !ev.IsPR || ev.ChangedLabel == "" {
+	ev := WebhookEvent{AuthorLogin: "bot", ActorLogin: "alice", Action: "labeled", Number: 7, IsPR: true, HeadSHA: "deadbeef", HeadBranch: "feat", ChangedLabel: "tatara/awaiting-approval"}
+	if ev.AuthorLogin != "bot" || ev.ActorLogin != "alice" || !ev.IsPR || ev.ChangedLabel == "" {
 		t.Fatalf("WebhookEvent new fields not wired: %+v", ev)
 	}
 }

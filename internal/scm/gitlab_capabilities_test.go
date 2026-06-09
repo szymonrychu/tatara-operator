@@ -182,7 +182,7 @@ func TestGitLabDetectAndVerifyFields(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DetectAndVerify: %v", err)
 		}
-		if ev.Kind != "issue" || ev.AuthorLogin != "alice" || ev.Number != 7 || ev.Action != "unlabeled" || ev.ChangedLabel != "tatara/awaiting-approval" {
+		if ev.Kind != "issue" || ev.AuthorLogin != "alice" || ev.ActorLogin != "alice" || ev.Number != 7 || ev.Action != "unlabeled" || ev.ChangedLabel != "tatara/awaiting-approval" {
 			t.Fatalf("event = %+v", ev)
 		}
 	})
@@ -195,7 +195,7 @@ func TestGitLabDetectAndVerifyFields(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DetectAndVerify: %v", err)
 		}
-		if ev.Kind != "mr" || !ev.IsPR || ev.AuthorLogin != "bob" || ev.Number != 9 || ev.Action != "opened" || ev.HeadSHA != "sha9" || ev.HeadBranch != "feat" {
+		if ev.Kind != "mr" || !ev.IsPR || ev.AuthorLogin != "bob" || ev.ActorLogin != "bob" || ev.Number != 9 || ev.Action != "opened" || ev.HeadSHA != "sha9" || ev.HeadBranch != "feat" {
 			t.Fatalf("event = %+v", ev)
 		}
 	})

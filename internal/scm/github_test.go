@@ -26,8 +26,8 @@ func ghHeader(event, secret string, body []byte) http.Header {
 func TestGitHubDetectAndVerify(t *testing.T) {
 	const secret = "s3cr3t"
 	pushBody := []byte(`{"ref":"refs/heads/main","after":"abc123","repository":{"clone_url":"https://github.com/o/r.git"}}`)
-	issueBody := []byte(`{"action":"opened","issue":{"number":7,"title":"Fix bug","body":"do it","labels":[{"name":"tatara"},{"name":"bug"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	prBody := []byte(`{"action":"opened","pull_request":{"number":9,"title":"PR title","body":"pr body","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	issueBody := []byte(`{"action":"opened","sender":{"login":"alice"},"issue":{"number":7,"title":"Fix bug","body":"do it","user":{"login":"author1"},"labels":[{"name":"tatara"},{"name":"bug"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	prBody := []byte(`{"action":"opened","sender":{"login":"alice"},"pull_request":{"number":9,"title":"PR title","body":"pr body","user":{"login":"author2"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 
 	tests := []struct {
 		name  string
@@ -36,8 +36,8 @@ func TestGitHubDetectAndVerify(t *testing.T) {
 		want  WebhookEvent
 	}{
 		{"push", "push", pushBody, WebhookEvent{Kind: "push", Repo: "https://github.com/o/r.git", Branch: "main"}},
-		{"issue", "issues", issueBody, WebhookEvent{Kind: "issue", Repo: "https://github.com/o/r.git", Labels: []string{"tatara", "bug"}, Title: "Fix bug", Body: "do it", IssueRef: "o/r#7", URL: "https://github.com/o/r/issues/7", Action: "opened", Number: 7}},
-		{"pr", "pull_request", prBody, WebhookEvent{Kind: "mr", Repo: "https://github.com/o/r.git", Labels: []string{"tatara"}, Title: "PR title", Body: "pr body", IssueRef: "o/r#9", URL: "https://github.com/o/r/pull/9", Action: "opened", Number: 9, IsPR: true}},
+		{"issue", "issues", issueBody, WebhookEvent{Kind: "issue", Repo: "https://github.com/o/r.git", Labels: []string{"tatara", "bug"}, Title: "Fix bug", Body: "do it", IssueRef: "o/r#7", URL: "https://github.com/o/r/issues/7", AuthorLogin: "author1", ActorLogin: "alice", Action: "opened", Number: 7}},
+		{"pr", "pull_request", prBody, WebhookEvent{Kind: "mr", Repo: "https://github.com/o/r.git", Labels: []string{"tatara"}, Title: "PR title", Body: "pr body", IssueRef: "o/r#9", URL: "https://github.com/o/r/pull/9", AuthorLogin: "author2", ActorLogin: "alice", Action: "opened", Number: 9, IsPR: true}},
 		{"other", "ping", []byte(`{}`), WebhookEvent{Kind: "other"}},
 	}
 	c := &GitHub{}
@@ -48,6 +48,29 @@ func TestGitHubDetectAndVerify(t *testing.T) {
 			require.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestGitHubIssueCommentPRDetection(t *testing.T) {
+	const secret = "s3cr3t"
+	c := &GitHub{}
+	t.Run("comment on a PR routes to mr with IsPR true", func(t *testing.T) {
+		body := []byte(`{"action":"created","sender":{"login":"alice"},"issue":{"number":9,"title":"PR title","body":"x","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9","pull_request":{"url":"https://api.github.com/repos/o/r/pulls/9"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+		ev, err := c.DetectAndVerify(ghHeader("issue_comment", secret, body), body, secret)
+		require.NoError(t, err)
+		require.Equal(t, "mr", ev.Kind)
+		require.True(t, ev.IsPR)
+		require.Equal(t, "tatara-bot", ev.AuthorLogin)
+		require.Equal(t, "alice", ev.ActorLogin)
+	})
+	t.Run("comment on a plain issue stays issue with IsPR false", func(t *testing.T) {
+		body := []byte(`{"action":"created","sender":{"login":"alice"},"issue":{"number":7,"title":"An issue","body":"x","user":{"login":"author1"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+		ev, err := c.DetectAndVerify(ghHeader("issue_comment", secret, body), body, secret)
+		require.NoError(t, err)
+		require.Equal(t, "issue", ev.Kind)
+		require.False(t, ev.IsPR)
+		require.Equal(t, "author1", ev.AuthorLogin)
+		require.Equal(t, "alice", ev.ActorLogin)
+	})
 }
 
 func TestGitHubBadSignature(t *testing.T) {

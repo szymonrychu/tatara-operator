@@ -39,6 +39,13 @@ type glPayload struct {
 			ID string `json:"id"`
 		} `json:"last_commit"`
 	} `json:"object_attributes"`
+	Issue struct {
+		IID int `json:"iid"`
+	} `json:"issue"`
+	MergeRequest struct {
+		IID          int    `json:"iid"`
+		SourceBranch string `json:"source_branch"`
+	} `json:"merge_request"`
 	Changes struct {
 		Labels struct {
 			Previous []glLabel `json:"previous"`
@@ -69,7 +76,7 @@ func (*GitLab) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	case "Merge Request Hook":
 		return glWorkItemEvent("mr", true, p), nil
 	case "Note Hook":
-		return glWorkItemEvent("issue", false, p), nil
+		return glNoteEvent(p), nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
 	}
@@ -93,6 +100,10 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 		sep = "#"
 	}
 	action, changed := glActionAndLabel(p)
+	// GitLab webhook payloads carry the event actor (p.User) but not a
+	// distinct resource-author field on the issue/MR object, so AuthorLogin
+	// falls back to the actor. This is only a hint; the authoritative
+	// authorship gate lives in the controller (which calls GetPRState).
 	return WebhookEvent{
 		Kind:         kind,
 		Repo:         p.Project.GitHTTPURL,
@@ -102,12 +113,49 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 		IssueRef:     fmt.Sprintf("%s%s%d", p.Project.PathWithNamespace, sep, p.ObjectAttributes.IID),
 		URL:          p.ObjectAttributes.URL,
 		AuthorLogin:  p.User.Username,
+		ActorLogin:   p.User.Username,
 		Action:       action,
 		Number:       p.ObjectAttributes.IID,
 		IsPR:         isPR,
 		HeadSHA:      p.ObjectAttributes.LastCommit.ID,
 		HeadBranch:   p.ObjectAttributes.SourceBranch,
 		ChangedLabel: changed,
+	}
+}
+
+// glNoteEvent builds a WebhookEvent for a Note Hook (comment). The note's own
+// object_attributes.iid is the note id, not the work item; the work item iid
+// comes from whichever nested object (issue or merge_request) is populated.
+func glNoteEvent(p glPayload) WebhookEvent {
+	labels := make([]string, 0, len(p.Labels))
+	for _, l := range p.Labels {
+		labels = append(labels, l.Title)
+	}
+	kind, sep, isPR := "issue", "#", false
+	number := p.Issue.IID
+	headBranch := ""
+	if p.MergeRequest.IID != 0 {
+		kind, sep, isPR = "mr", "!", true
+		number = p.MergeRequest.IID
+		headBranch = p.MergeRequest.SourceBranch
+	}
+	// GitLab Note payloads carry the comment author (p.User) but not a
+	// distinct work-item author; AuthorLogin falls back to the actor. The
+	// authoritative authorship gate lives in the controller (GetPRState).
+	return WebhookEvent{
+		Kind:        kind,
+		Repo:        p.Project.GitHTTPURL,
+		Labels:      labels,
+		Title:       p.ObjectAttributes.Title,
+		Body:        p.ObjectAttributes.Description,
+		IssueRef:    fmt.Sprintf("%s%s%d", p.Project.PathWithNamespace, sep, number),
+		URL:         p.ObjectAttributes.URL,
+		AuthorLogin: p.User.Username,
+		ActorLogin:  p.User.Username,
+		Action:      "created",
+		Number:      number,
+		IsPR:        isPR,
+		HeadBranch:  headBranch,
 	}
 }
 

@@ -83,26 +83,40 @@ func (c *GitHub) SetBoardColumn(ctx context.Context, token string, board BoardRe
 	if field == "" {
 		field = "Status"
 	}
+	type projectV2 struct {
+		ID    string `json:"id"`
+		Field struct {
+			ID      string `json:"id"`
+			Options []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"options"`
+		} `json:"field"`
+	}
 	var proj struct {
+		User struct {
+			ProjectV2 projectV2 `json:"projectV2"`
+		} `json:"user"`
 		Organization struct {
-			ProjectV2 struct {
-				ID    string `json:"id"`
-				Field struct {
-					ID      string `json:"id"`
-					Options []struct {
-						ID   string `json:"id"`
-						Name string `json:"name"`
-					} `json:"options"`
-				} `json:"field"`
-			} `json:"projectV2"`
+			ProjectV2 projectV2 `json:"projectV2"`
 		} `json:"organization"`
 	}
-	pq := fmt.Sprintf(`query { organization(login:%q) { projectV2(number:%d) { id field(name:%q) { ... on ProjectV2SingleSelectField { id options { id name } } } } } }`, board.Owner, board.GitHubProjectNumber, field)
+	// The board owner may be a user or an organization; query both aliased
+	// roots and pick whichever resolves non-null.
+	fieldSel := fmt.Sprintf(`projectV2(number:%d) { id field(name:%q) { ... on ProjectV2SingleSelectField { id options { id name } } } }`, board.GitHubProjectNumber, field)
+	pq := fmt.Sprintf(`query { user(login:%q) { %s } organization(login:%q) { %s } }`, board.Owner, fieldSel, board.Owner, fieldSel)
 	if err := c.ghGraphQL(ctx, token, pq, nil, &proj); err != nil {
 		return err
 	}
+	pv := proj.Organization.ProjectV2
+	if proj.User.ProjectV2.ID != "" {
+		pv = proj.User.ProjectV2
+	}
+	if pv.ID == "" {
+		return fmt.Errorf("github: project %d not found for owner %q", board.GitHubProjectNumber, board.Owner)
+	}
 	optionID := ""
-	for _, o := range proj.Organization.ProjectV2.Field.Options {
+	for _, o := range pv.Field.Options {
 		if o.Name == column {
 			optionID = o.ID
 			break
@@ -111,31 +125,42 @@ func (c *GitHub) SetBoardColumn(ctx context.Context, token string, board BoardRe
 	if optionID == "" {
 		return fmt.Errorf("github: board column %q not found in field %q", column, field)
 	}
-	itemID, err := c.ghProjectItemID(ctx, token, itemURL, proj.Organization.ProjectV2.ID)
+	itemID, err := c.ghProjectItemID(ctx, token, itemURL, pv.ID)
 	if err != nil {
 		return err
 	}
 	mq := fmt.Sprintf(`mutation { updateProjectV2ItemFieldValue(input:{projectId:%q, itemId:%q, fieldId:%q, value:{singleSelectOptionId:%q}}) { clientMutationId } }`,
-		proj.Organization.ProjectV2.ID, itemID, proj.Organization.ProjectV2.Field.ID, optionID)
+		pv.ID, itemID, pv.Field.ID, optionID)
 	return c.ghGraphQL(ctx, token, mq, nil, nil)
 }
 
 func (c *GitHub) ghProjectID(ctx context.Context, token string, board BoardRef) (string, error) {
 	var out struct {
+		User struct {
+			ProjectV2 struct {
+				ID string `json:"id"`
+			} `json:"projectV2"`
+		} `json:"user"`
 		Organization struct {
 			ProjectV2 struct {
 				ID string `json:"id"`
 			} `json:"projectV2"`
 		} `json:"organization"`
 	}
-	q := fmt.Sprintf(`query { organization(login:%q) { projectV2(number:%d) { id } } }`, board.Owner, board.GitHubProjectNumber)
+	// The board owner may be a user or an organization; query both aliased
+	// roots and pick whichever resolves non-null.
+	q := fmt.Sprintf(`query { user(login:%q) { projectV2(number:%d) { id } } organization(login:%q) { projectV2(number:%d) { id } } }`,
+		board.Owner, board.GitHubProjectNumber, board.Owner, board.GitHubProjectNumber)
 	if err := c.ghGraphQL(ctx, token, q, nil, &out); err != nil {
 		return "", err
 	}
-	if out.Organization.ProjectV2.ID == "" {
-		return "", fmt.Errorf("github: project %d not found for org %q", board.GitHubProjectNumber, board.Owner)
+	if out.User.ProjectV2.ID != "" {
+		return out.User.ProjectV2.ID, nil
 	}
-	return out.Organization.ProjectV2.ID, nil
+	if out.Organization.ProjectV2.ID != "" {
+		return out.Organization.ProjectV2.ID, nil
+	}
+	return "", fmt.Errorf("github: project %d not found for owner %q", board.GitHubProjectNumber, board.Owner)
 }
 
 func (c *GitHub) ghResourceID(ctx context.Context, token, itemURL string) (string, error) {

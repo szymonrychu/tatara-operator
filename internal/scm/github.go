@@ -21,15 +21,21 @@ type ghLabel struct {
 }
 
 type ghWorkItem struct {
-	Number  int       `json:"number"`
-	Title   string    `json:"title"`
-	Body    string    `json:"body"`
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	User   struct {
+		Login string `json:"login"`
+	} `json:"user"`
 	Labels  []ghLabel `json:"labels"`
 	HTMLURL string    `json:"html_url"`
 	Head    struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"`
 	} `json:"head"`
+	PullRequest *struct {
+		URL string `json:"url"`
+	} `json:"pull_request"`
 }
 
 type ghPayload struct {
@@ -66,9 +72,9 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	case "issues":
 		return ghWorkItemEvent("issue", false, p, p.Issue), nil
 	case "issue_comment":
-		ev := ghWorkItemEvent("issue", false, p, p.Issue)
-		ev.IsPR = p.Issue != nil && p.Issue.Head.Ref != ""
-		if ev.IsPR {
+		isPR := p.Issue != nil && p.Issue.PullRequest != nil
+		ev := ghWorkItemEvent("issue", isPR, p, p.Issue)
+		if isPR {
 			ev.Kind = "mr"
 		}
 		return ev, nil
@@ -97,7 +103,8 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 		Body:         wi.Body,
 		IssueRef:     fmt.Sprintf("%s#%d", p.Repository.FullName, wi.Number),
 		URL:          wi.HTMLURL,
-		AuthorLogin:  p.Sender.Login,
+		AuthorLogin:  wi.User.Login,
+		ActorLogin:   p.Sender.Login,
 		Action:       p.Action,
 		Number:       wi.Number,
 		IsPR:         isPR,
