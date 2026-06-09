@@ -106,8 +106,20 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 	}
 
 	if len(prURLs) == 0 {
-		// No repo had the branch - treat as skipped (mirrors old single-repo 4xx behavior).
-		msg := "PR/MR could not be opened or already exists"
+		// No repo had the branch / no code change: still post the agent's result
+		// to the issue, so report/question/verify tasks surface their answer
+		// (otherwise the work is invisible - no PR and no comment).
+		if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
+			summary := task.Status.ResultSummary
+			if summary == "" {
+				summary = task.Spec.Goal
+			}
+			if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, summary); err != nil {
+				l.Error(err, "writeback: comment result on work item (non-fatal)",
+					"issue_ref", task.Spec.Source.IssueRef)
+			}
+		}
+		msg := "no PR opened; result commented on the issue"
 		if lastSkipStatus != 0 {
 			msg = fmt.Sprintf("PR/MR could not be opened or already exists: %d", lastSkipStatus)
 		}

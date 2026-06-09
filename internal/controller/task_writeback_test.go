@@ -215,6 +215,24 @@ func TestTaskWriteBackNoCommentWhenNoSource(t *testing.T) {
 	require.Empty(t, fw.commentArgs)
 }
 
+func TestWriteback_CommentsResultWhenNoPR(t *testing.T) {
+	// Report/question task: no repo has the branch (all 422), so no PR opens,
+	// but the agent's result must still be posted to the issue.
+	fw := &fakeWriter{openErr: &scm.HTTPError{Status: 422, Body: "no diff", Path: "/pulls"}}
+	r := newWriteBackReconciler(t, fw)
+	task := seedWritebackPending(t, "wb-nopr", "wb-scm-nopr", "wb-proj-nopr", "wb-repo-nopr")
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	require.GreaterOrEqual(t, fw.openCalls, 1)
+	require.Len(t, fw.commentArgs, 1, "report-only task must still comment its result on the issue")
+	require.Contains(t, fw.commentArgs[0], "o/r#7|")
+	require.Contains(t, fw.commentArgs[0], "did the thing") // ResultSummary from the seed
+}
+
 func TestTaskWriteBackIdempotent(t *testing.T) {
 	fw := &fakeWriter{prURL: "https://github.com/o/r/pull/7"}
 	r := newWriteBackReconciler(t, fw)
