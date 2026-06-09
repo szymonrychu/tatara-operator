@@ -4,6 +4,7 @@ package ingest
 
 import (
 	"fmt"
+	"strconv"
 
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -27,10 +28,18 @@ type Config struct {
 
 // semanticEnv returns the env vars that drive the ingester's Phase 2 semantic
 // extraction stage: the OpenAI key (sourced from the shared OpenAI Secret, same
-// secret/key pair lightrag uses) and the model. The key is omitted when no
-// OpenAI Secret is configured so the ingester falls back to AST-only ingest.
-func semanticEnv(cfg Config) []corev1.EnvVar {
-	env := []corev1.EnvVar{}
+// secret/key pair lightrag uses), the model, and the per-Repository opt-out.
+// The key is omitted when no OpenAI Secret is configured so the ingester falls
+// back to AST-only ingest. SEMANTIC_MODEL defaults to gpt-4o-mini.
+func semanticEnv(repo *tataradevv1alpha1.Repository, cfg Config) []corev1.EnvVar {
+	model := cfg.SemanticModel
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	env := []corev1.EnvVar{
+		{Name: "SEMANTIC_MODEL", Value: model},
+		{Name: "SEMANTIC_INGEST", Value: strconv.FormatBool(repo.Spec.SemanticIngest)},
+	}
 	if cfg.OpenAISecretName != "" {
 		env = append(env, corev1.EnvVar{
 			Name: "OPENAI_API_KEY",
@@ -173,7 +182,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 							{Name: "OIDC_CLIENT_ID", Value: cfg.OIDCClientID},
 							{Name: "OIDC_CLIENT_SECRET", Value: cfg.OIDCClientSecret},
 							{Name: "OIDC_AUDIENCE", Value: cfg.OIDCAudience},
-						}, semanticEnv(cfg)...),
+						}, semanticEnv(repo, cfg)...),
 						VolumeMounts: []corev1.VolumeMount{{Name: workspaceVolume, MountPath: workspaceMount}},
 					}},
 				},

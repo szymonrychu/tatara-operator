@@ -259,6 +259,34 @@ func TestBuildJob_OpenAIKeyOmittedWhenSecretUnset(t *testing.T) {
 	}
 }
 
+func TestBuildJob_SemanticModelEnv(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_MODEL"); v != "gpt-4o-mini" {
+		t.Errorf("SEMANTIC_MODEL = %q, want gpt-4o-mini", v)
+	}
+}
+
+func TestBuildJob_SemanticIngestEnv_True(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.SemanticIngest = true
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_INGEST"); v != "true" {
+		t.Errorf("SEMANTIC_INGEST = %q, want true", v)
+	}
+}
+
+func TestBuildJob_SemanticIngestEnv_False(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.SemanticIngest = false
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_INGEST"); v != "false" {
+		t.Errorf("SEMANTIC_INGEST = %q, want false", v)
+	}
+}
+
 func TestBuildJob_NamespaceCloneDir(t *testing.T) {
 	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 
