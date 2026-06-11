@@ -20,6 +20,7 @@ type glMR struct {
 
 type glIssueItem struct {
 	IID       int       `json:"iid"`
+	Title     string    `json:"title"`
 	Labels    []string  `json:"labels"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -53,7 +54,7 @@ func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	out := make([]IssueRef, 0, len(raw))
 	for _, i := range raw {
 		out = append(out, IssueRef{
-			Repo: proj, Number: i.IID, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false,
+			Repo: proj, Number: i.IID, Title: i.Title, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false,
 		})
 	}
 	return out, nil
@@ -67,14 +68,14 @@ func (c *GitLab) ListBoardItems(_ context.Context, _ BoardRef) ([]BoardItem, err
 }
 
 // CloseIssue posts a note then PUTs the issue state_event=close.
-func (c *GitLab) CloseIssue(ctx context.Context, repo string, number int, comment string) error {
+func (c *GitLab) CloseIssue(ctx context.Context, token, repo string, number int, comment string) error {
 	proj := repo
 	if comment != "" {
 		npath := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number) + "/notes"
-		if err := glDo(ctx, c.base(), http.MethodPost, npath, c.token, map[string]string{"body": comment}, nil); err != nil {
+		if err := glDo(ctx, c.base(), http.MethodPost, npath, token, map[string]string{"body": comment}, nil); err != nil {
 			return err
 		}
 	}
 	ipath := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number)
-	return glDo(ctx, c.base(), http.MethodPut, ipath, c.token, map[string]string{"state_event": "close"}, nil)
+	return glDo(ctx, c.base(), http.MethodPut, ipath, token, map[string]string{"state_event": "close"}, nil)
 }

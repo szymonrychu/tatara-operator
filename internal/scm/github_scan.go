@@ -21,6 +21,7 @@ type ghPR struct {
 
 type ghIssueItem struct {
 	Number      int       `json:"number"`
+	Title       string    `json:"title"`
 	Labels      []ghLabel `json:"labels"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	PullRequest *struct {
@@ -66,7 +67,7 @@ func (c *GitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	out := make([]IssueRef, 0, len(raw))
 	for _, i := range raw {
 		out = append(out, IssueRef{
-			Repo: slug, Number: i.Number, Labels: ghLabelNames(i.Labels),
+			Repo: slug, Number: i.Number, Title: i.Title, Labels: ghLabelNames(i.Labels),
 			UpdatedAt: i.UpdatedAt, IsPR: i.PullRequest != nil,
 		})
 	}
@@ -131,19 +132,19 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 }
 
 // CloseIssue posts a comment then PATCHes the issue state to closed.
-func (c *GitHub) CloseIssue(ctx context.Context, repo string, number int, comment string) error {
+func (c *GitHub) CloseIssue(ctx context.Context, token, repo string, number int, comment string) error {
 	owner, name, err := ghOwnerRepoFromSlug(repo)
 	if err != nil {
 		return err
 	}
 	if comment != "" {
 		cpath := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, name, number)
-		if err := ghDo(ctx, c.base(), http.MethodPost, cpath, c.token, map[string]string{"body": comment}, nil); err != nil {
+		if err := ghDo(ctx, c.base(), http.MethodPost, cpath, token, map[string]string{"body": comment}, nil); err != nil {
 			return fmt.Errorf("github: close issue comment: %w", err)
 		}
 	}
 	ipath := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, name, number)
-	return ghDo(ctx, c.base(), http.MethodPatch, ipath, c.token, map[string]string{"state": "closed"}, nil)
+	return ghDo(ctx, c.base(), http.MethodPatch, ipath, token, map[string]string{"state": "closed"}, nil)
 }
 
 func ghOwnerRepoFromSlug(slug string) (string, string, error) {

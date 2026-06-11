@@ -18,7 +18,7 @@ type fakeIssueWriter struct {
 	closeCalls []string // repo|comment
 }
 
-func (f *fakeIssueWriter) CloseIssue(_ context.Context, repo string, _ int, comment string) error {
+func (f *fakeIssueWriter) CloseIssue(_ context.Context, _, repo string, _ int, comment string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.closeCalls = append(f.closeCalls, repo+"|"+comment)

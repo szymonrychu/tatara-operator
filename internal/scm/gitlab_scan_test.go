@@ -56,7 +56,7 @@ func TestGitLabCloseIssue(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := &GitLab{apiBase: srv.URL, token: "tok"}
-	if err := c.CloseIssue(context.Background(), "g/p", 7, "closing"); err != nil {
+	if err := c.CloseIssue(context.Background(), "tok", "g/p", 7, "closing"); err != nil {
 		t.Fatalf("CloseIssue: %v", err)
 	}
 	noteKey := "POST " + "/projects/" + "g%2Fp" + "/issues/7/notes"

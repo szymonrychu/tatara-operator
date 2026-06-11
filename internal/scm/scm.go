@@ -54,6 +54,7 @@ type PRRef struct {
 type IssueRef struct {
 	Repo      string    `json:"repo"`
 	Number    int       `json:"number"`
+	Title     string    `json:"title,omitempty"`
 	Labels    []string  `json:"labels,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 	IsPR      bool      `json:"isPr"` // GitHub /issues returns PRs; filter these out
@@ -107,7 +108,7 @@ type SCMWriter interface {
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
-	CloseIssue(ctx context.Context, repo string, number int, comment string) error
+	CloseIssue(ctx context.Context, token, repo string, number int, comment string) error
 }
 
 // SCMReader lists open work for the cron scan loop; *GitHub and *GitLab satisfy it.

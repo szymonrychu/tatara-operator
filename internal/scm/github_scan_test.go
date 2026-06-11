@@ -68,7 +68,7 @@ func TestGitHubCloseIssue(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := &GitHub{apiBase: srv.URL}
-	if err := c.CloseIssue(context.Background(), "o/r", 7, "closing: out of scope"); err != nil {
+	if err := c.CloseIssue(context.Background(), "tok", "o/r", 7, "closing: out of scope"); err != nil {
 		t.Fatalf("CloseIssue: %v", err)
 	}
 	if _, ok := paths["POST /repos/o/r/issues/7/comments"]; !ok {
