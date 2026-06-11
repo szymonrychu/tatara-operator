@@ -56,6 +56,8 @@ spec:
                 - implement
                 - review
                 - selfImprove
+                - triageIssue
+                - brainstorm
                 type: string
               maxTurns:
                 type: integer
@@ -181,6 +183,20 @@ spec:
               gateEnteredAt:
                 format: date-time
                 type: string
+              issueOutcome:
+                description: IssueOutcome is the agent's outcome for an issue-triage
+                  task.
+                properties:
+                  action:
+                    enum:
+                    - implement
+                    - close
+                    type: string
+                  comment:
+                    type: string
+                required:
+                - action
+                type: object
               phase:
                 enum:
                 - Pending

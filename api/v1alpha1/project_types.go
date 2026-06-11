@@ -55,6 +55,40 @@ type BoardSpec struct {
 	StatusField string `json:"statusField,omitempty"`
 }
 
+// CronActivity schedules one Project scan activity (mrScan or issueScan).
+type CronActivity struct {
+	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables this activity.
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+	// +kubebuilder:default=1
+	// +optional
+	MaxPerCycle int `json:"maxPerCycle,omitempty"`
+}
+
+// BrainstormActivity schedules the opt-in self-driven issue-proposal scan.
+type BrainstormActivity struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+	// +kubebuilder:default=1
+	// +optional
+	MaxPerCycle int `json:"maxPerCycle,omitempty"`
+	// +kubebuilder:validation:items:Enum=docs;memory;internet
+	// +optional
+	Sources []string `json:"sources,omitempty"`
+}
+
+// ScmCron groups the three cron-driven scan activities.
+type ScmCron struct {
+	// +optional
+	MRScan CronActivity `json:"mrScan,omitempty"`
+	// +optional
+	IssueScan CronActivity `json:"issueScan,omitempty"`
+	// +optional
+	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
+}
+
 // ScmSpec binds a Project to one SCM provider and its board/merge policy.
 type ScmSpec struct {
 	// +kubebuilder:validation:Enum=github;gitlab
@@ -74,6 +108,10 @@ type ScmSpec struct {
 	// +kubebuilder:default="tatara/awaiting-approval"
 	// +optional
 	ApprovalLabel string `json:"approvalLabel,omitempty"`
+	// +optional
+	PriorityLabel string `json:"priorityLabel,omitempty"`
+	// +optional
+	Cron *ScmCron `json:"cron,omitempty"`
 }
 
 // ProjectSpec defines the desired state of a Project.
@@ -103,6 +141,12 @@ type ProjectStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	Memory *MemoryStatus `json:"memory,omitempty"`
+	// +optional
+	LastMRScan *metav1.Time `json:"lastMRScan,omitempty"`
+	// +optional
+	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
+	// +optional
+	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
 }
 
 // +kubebuilder:object:root=true
