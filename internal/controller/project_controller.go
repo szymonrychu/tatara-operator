@@ -9,6 +9,7 @@ import (
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,9 @@ type ProjectReconciler struct {
 	Metrics             *obs.OperatorMetrics
 	ExternalWebhookBase string
 	MemoryConfig        memory.Config
+	// ReaderFor returns a token-bound scm.SCMReader for a provider name and token.
+	// Nil in tests that do not exercise scanning; wired in wire.go at runtime.
+	ReaderFor func(provider, token string) (scm.SCMReader, error)
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete

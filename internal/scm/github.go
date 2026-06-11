@@ -165,6 +165,9 @@ func (c *GitHub) Comment(ctx context.Context, token, issueRef, body string) erro
 	return ghDo(ctx, c.base(), http.MethodPost, path, token, map[string]string{"body": body}, nil)
 }
 
+// OwnerRepo parses a GitHub clone/repo URL into owner and repo name.
+func OwnerRepo(repoURL string) (string, string, error) { return ghOwnerRepo(repoURL) }
+
 func ghOwnerRepo(repoURL string) (string, string, error) {
 	u, err := url.Parse(repoURL)
 	if err != nil {
