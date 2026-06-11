@@ -17,6 +17,26 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
+// gaugeValue reads a gauge metric value from a Prometheus registry by name+labels.
+func gaugeValue(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if labelsMatch(m.GetLabel(), labels) {
+				return m.GetGauge().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
 func newTaskReconciler(fs agent.Session) *TaskReconciler {
 	return &TaskReconciler{
 		Client:  k8sClient,
@@ -640,5 +660,68 @@ func TestTaskReconcile_ResultSummaryNotOverwrittenWhenSet(t *testing.T) {
 	tk2 := getTask(t, "t-rsnoop")
 	if tk2.Status.ResultSummary != "agent-provided summary" {
 		t.Errorf("ResultSummary = %q, want agent-provided unchanged", tk2.Status.ResultSummary)
+	}
+}
+
+// TestUpdateInflightGauge_PerKind verifies that updateInflightGauge emits
+// tatara_tasks_inflight{kind} for each active kind and zeroes missing kinds.
+func TestUpdateInflightGauge_PerKind(t *testing.T) {
+	ctx := context.Background()
+	mkTaskProject(t, "p-inflight", 5)
+	mkSecret(t, "p-inflight-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkTaskRepository(t, "r-inflight", "p-inflight")
+	setProjectMemoryReady(t, "p-inflight", "http://mem-inflight.tatara.svc:8080")
+
+	// Create one Planning task per kind.
+	kindNames := map[string]string{"review": "t-inflight-review", "selfImprove": "t-inflight-si"}
+	for i, kind := range []string{"review", "selfImprove"} {
+		name := kindNames[kind]
+		task := &tatarav1alpha1.Task{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+			Spec: tatarav1alpha1.TaskSpec{
+				ProjectRef:    "p-inflight",
+				RepositoryRef: "r-inflight",
+				Goal:          "goal",
+				Kind:          kind,
+			},
+		}
+		if err := k8sClient.Create(ctx, task); err != nil {
+			t.Fatalf("create task %d: %v", i, err)
+		}
+		task.Status.Phase = "Planning"
+		if err := k8sClient.Status().Update(ctx, task); err != nil {
+			t.Fatalf("set phase %d: %v", i, err)
+		}
+	}
+
+	reg := prometheus.NewRegistry()
+	r := &TaskReconciler{
+		Client:  k8sClient,
+		Scheme:  k8sClient.Scheme(),
+		Metrics: obs.NewOperatorMetrics(reg),
+		Session: newFakeSession(),
+		PodConfig: agent.PodConfig{
+			Namespace:           testNS,
+			CallbackURL:         "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "tatara-cli-oidc",
+		},
+	}
+	r.updateInflightGauge(ctx)
+
+	// Each active kind must have gauge value 1.
+	reviewCount := gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "review"})
+	if reviewCount != 1 {
+		t.Errorf("tatara_tasks_inflight{kind=review} = %v, want 1", reviewCount)
+	}
+	siCount := gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "selfImprove"})
+	if siCount != 1 {
+		t.Errorf("tatara_tasks_inflight{kind=selfImprove} = %v, want 1", siCount)
+	}
+	// An inactive kind must not appear as non-zero.
+	implCount := gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "implement"})
+	if implCount != 0 {
+		t.Errorf("tatara_tasks_inflight{kind=implement} = %v, want 0", implCount)
 	}
 }
