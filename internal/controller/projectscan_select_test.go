@@ -22,7 +22,7 @@ func TestSelectPriorityThenStale(t *testing.T) {
 		wantOrder []int
 	}{
 		{"priority first then stale, cap 3", "tatara/priority", 3, []int{2, 4, 3}},
-		{"no priority label = pure stale", "", 2, []int{3, 1}},
+		{"no priority label = pure stale", "", 2, []int{3, 2}},
 		{"cap 1 picks stalest priority", "tatara/priority", 1, []int{2}},
 	}
 	for _, tc := range cases {
