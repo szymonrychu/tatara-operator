@@ -28,8 +28,6 @@ type Writer = scm.SCMWriter
 // Permanent SCM errors (4xx) per repo are logged and skipped; transient errors
 // are returned for requeue.
 func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
-	l := log.FromContext(ctx)
-
 	// Idempotency guard: already done.
 	if task.Status.PrURL != "" {
 		r.clearWritebackPending(ctx, task, "AlreadyWritten", "pr/mr url already set")
@@ -44,8 +42,18 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 	case "triageIssue":
 		return r.writeBackIssue(ctx, task)
 	default:
-		// implement / brainstorm (proposal path handled pre-spawn) - unchanged below
+		// implement / brainstorm (proposal path handled pre-spawn)
 	}
+
+	return r.writeBackOpenChange(ctx, task)
+}
+
+// writeBackOpenChange opens a PR/MR for each Project repo that has the task
+// branch, comments the primary issue with all PR links, and records them on
+// the Task status. Shared by the default (implement/brainstorm) path and the
+// triageIssue-implement path.
+func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
 
 	var proj tatarav1alpha1.Project
 	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil {
@@ -481,9 +489,10 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 	}
 	if out.Action == "implement" {
 		r.Metrics.IssueOutcome("implement")
-		l.Info("issue outcome implement (PR is the artifact)", "action", "scm_issue_outcome", "resource_id", task.Name, "outcome", "implement")
-		r.clearWritebackPending(ctx, task, "IssueImplement", "implement decision recorded; PR is the artifact")
-		return ctrl.Result{}, nil
+		l.Info("issue outcome implement: opening PR from agent branch", "action", "scm_issue_outcome", "resource_id", task.Name, "outcome", "implement")
+		// Route through the shared OpenChange path so the agent's pushed branch
+		// becomes a tatara-authored PR re-entering the author-gated review/merge path.
+		return r.writeBackOpenChange(ctx, task)
 	}
 	// close
 	_, repo, writer, _, provider, err := r.scmContext(ctx, task)
