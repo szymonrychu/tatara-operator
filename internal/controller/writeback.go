@@ -28,8 +28,6 @@ type Writer = scm.SCMWriter
 // Permanent SCM errors (4xx) per repo are logged and skipped; transient errors
 // are returned for requeue.
 func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
-	l := log.FromContext(ctx)
-
 	// Idempotency guard: already done.
 	if task.Status.PrURL != "" {
 		r.clearWritebackPending(ctx, task, "AlreadyWritten", "pr/mr url already set")
@@ -41,9 +39,21 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return r.writeBackReview(ctx, task)
 	case "selfImprove":
 		return r.writeBackSelfImprove(ctx, task)
+	case "triageIssue":
+		return r.writeBackIssue(ctx, task)
 	default:
-		// implement (unchanged path below)
+		// implement / brainstorm (proposal path handled pre-spawn)
 	}
+
+	return r.writeBackOpenChange(ctx, task)
+}
+
+// writeBackOpenChange opens a PR/MR for each Project repo that has the task
+// branch, comments the primary issue with all PR links, and records them on
+// the Task status. Shared by the default (implement/brainstorm) path and the
+// triageIssue-implement path.
+func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
 
 	var proj tatarav1alpha1.Project
 	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil {
@@ -450,6 +460,69 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 	l.Info("self-improve outcome applied", "action", "scm_pr_outcome", "resource_id", task.Name, "outcome", out.Action)
 	r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: "+out.Action)
 	return ctrl.Result{}, nil
+}
+
+// writeBackIssue applies a triageIssue Task's IssueOutcome: close calls
+// CloseIssue with the agent's comment; implement records the marker only (the
+// PR opened during the agent run is the artifact, re-entering the author-gated
+// path). Never calls OpenChange.
+func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+	out := task.Status.IssueOutcome
+	if out == nil || task.Spec.Source == nil {
+		r.clearWritebackPending(ctx, task, "NoOutcome", "triageIssue task without an outcome")
+		return ctrl.Result{}, nil
+	}
+	// Safety gate: triageIssue must never close a PR.
+	if task.Spec.Source.IsPR {
+		l.Error(fmt.Errorf("triageIssue source is a PR"), "writeback issue: refusing to close a PR",
+			"action", "scm_issue_refused_pr", "resource_id", task.Name, "number", task.Spec.Source.Number)
+		r.clearWritebackPending(ctx, task, "IssueRefusedPR", "triageIssue source is a PR; CloseIssue withheld")
+		return ctrl.Result{}, nil
+	}
+	// Re-assert kind (defence-in-depth).
+	if task.Spec.Kind != "triageIssue" {
+		l.Error(fmt.Errorf("unexpected kind %q in writeBackIssue", task.Spec.Kind), "writeback issue: wrong kind",
+			"action", "scm_issue_wrong_kind", "resource_id", task.Name)
+		r.clearWritebackPending(ctx, task, "IssueWrongKind", "writeBackIssue called for non-triageIssue task")
+		return ctrl.Result{}, nil
+	}
+	if out.Action == "implement" {
+		r.Metrics.IssueOutcome("implement")
+		l.Info("issue outcome implement: opening PR from agent branch", "action", "scm_issue_outcome", "resource_id", task.Name, "outcome", "implement")
+		// Route through the shared OpenChange path so the agent's pushed branch
+		// becomes a tatara-authored PR re-entering the author-gated review/merge path.
+		return r.writeBackOpenChange(ctx, task)
+	}
+	// close
+	_, repo, writer, _, provider, err := r.scmContext(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	repoSlug, _, perr := repoSlugFromURL(repo.Spec.URL, provider)
+	if perr != nil {
+		return ctrl.Result{}, perr
+	}
+	if cerr := writer.CloseIssue(ctx, repoSlug, task.Spec.Source.Number, out.Comment); cerr != nil {
+		r.recordSCM(provider, "close_issue", cerr)
+		return ctrl.Result{}, fmt.Errorf("writeback issue close: %w", cerr)
+	}
+	r.recordSCM(provider, "close_issue", nil)
+	r.Metrics.IssueOutcome("close")
+	l.Info("issue closed", "action", "scm_issue_outcome", "resource_id", task.Name, "outcome", "close", "number", task.Spec.Source.Number)
+	r.clearWritebackPending(ctx, task, "IssueClosed", "issue closed with comment")
+	return ctrl.Result{}, nil
+}
+
+// repoSlugFromURL derives the provider-correct repo slug (owner/name for
+// GitHub, group/proj path for GitLab) that CloseIssue expects.
+func repoSlugFromURL(repoURL, provider string) (string, string, error) {
+	if provider == "gitlab" {
+		proj, err := scm.GitLabProjectPath(repoURL)
+		return proj, "", err
+	}
+	owner, name, err := scm.OwnerRepo(repoURL)
+	return owner + "/" + name, "", err
 }
 
 // selfImproveBotAuthored reports whether the selfImprove PR/MR is actually

@@ -249,6 +249,9 @@ func glProjectPath(repoURL string) (string, error) {
 	return p, nil
 }
 
+// GitLabProjectPath parses a GitLab repo URL into its project path.
+func GitLabProjectPath(repoURL string) (string, error) { return glProjectPath(repoURL) }
+
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {
 	var rdr io.Reader
 	if in != nil {
@@ -287,10 +290,10 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 }
 
 // CreateIssue opens an issue and returns its ref + url.
-func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error) {
+func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (CreatedIssue, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
-		return IssueRef{}, err
+		return CreatedIssue{}, err
 	}
 	in := map[string]string{"title": req.Title, "description": req.Body}
 	if len(req.Labels) > 0 {
@@ -302,9 +305,9 @@ func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/issues"
 	if err := glDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
-		return IssueRef{}, err
+		return CreatedIssue{}, err
 	}
-	return IssueRef{Ref: fmt.Sprintf("%s#%d", proj, out.IID), URL: out.WebURL}, nil
+	return CreatedIssue{Ref: fmt.Sprintf("%s#%d", proj, out.IID), URL: out.WebURL}, nil
 }
 
 // AddLabel adds a label to an issue identified by group/proj#iid.

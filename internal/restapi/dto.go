@@ -65,6 +65,7 @@ type taskStatusDTO struct {
 	DiscoveredIssues []string                      `json:"discoveredIssues,omitempty"`
 	ReviewVerdict    *tatarav1alpha1.ReviewVerdict `json:"reviewVerdict,omitempty"`
 	PROutcome        *tatarav1alpha1.PROutcome     `json:"prOutcome,omitempty"`
+	IssueOutcome     *tatarav1alpha1.IssueOutcome  `json:"issueOutcome,omitempty"`
 	Conditions       []metav1.Condition            `json:"conditions,omitempty"`
 }
 
@@ -138,6 +139,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			DiscoveredIssues: task.Status.DiscoveredIssues,
 			ReviewVerdict:    task.Status.ReviewVerdict,
 			PROutcome:        task.Status.PROutcome,
+			IssueOutcome:     task.Status.IssueOutcome,
 		},
 	}
 	if task.Spec.Source != nil {

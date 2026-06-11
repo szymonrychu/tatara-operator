@@ -491,6 +491,9 @@ type fullFakeSCMWriter struct {
 	mergeMethod   string
 	closePRCalled bool
 	closePRNumber int
+	// triageIssue path
+	closeIssueCalled bool
+	closeIssueNumber int
 	// GetPRState
 	prState    scm.PRState
 	prStateErr error
@@ -537,6 +540,11 @@ func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, 
 }
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr
+}
+func (f *fullFakeSCMWriter) CloseIssue(_ context.Context, _ string, number int, _ string) error {
+	f.closeIssueCalled = true
+	f.closeIssueNumber = number
+	return nil
 }
 
 // seedWritebackKindTask creates the minimal project+repo+secret+task for write-back Kind tests.
@@ -833,6 +841,78 @@ func TestDoWriteBackKind(t *testing.T) {
 		require.GreaterOrEqual(t, fw.openCalls, 1, "OpenChange must be called for implement kind")
 		require.Contains(t, fw.openCallBody, "<!-- tatara-authored -->", "implement body must carry marker")
 	})
+}
+
+func TestWriteBackIssue_IsPRRefused(t *testing.T) {
+	// CloseIssue must NOT be called when the source is a PR.
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	task := seedWritebackKindTask(t, "wbi-ispr", "wbi-proj-ispr", "wbi-repo-ispr", "wbi-scm-ispr",
+		tatarav1alpha1.TaskSpec{
+			Goal: "triage issue that is actually a PR",
+			Kind: "triageIssue",
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#20", IsPR: true, Number: 20,
+			},
+		}, nil)
+	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "close", Comment: "out of scope"}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.False(t, fw.closeIssueCalled, "CloseIssue must NOT be called when source.IsPR is true")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	cond := findCond(got.Status.Conditions, "WritebackPending")
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "IssueRefusedPR", cond.Reason)
+}
+
+func TestWriteBackIssue_CloseIssue(t *testing.T) {
+	// CloseIssue must be called for a real issue (IsPR=false) with action=close.
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	task := seedWritebackKindTask(t, "wbi-close", "wbi-proj-close", "wbi-repo-close", "wbi-scm-close",
+		tatarav1alpha1.TaskSpec{
+			Goal: "triage issue",
+			Kind: "triageIssue",
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#21", IsPR: false, Number: 21,
+			},
+		}, nil)
+	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "close", Comment: "out of scope"}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.True(t, fw.closeIssueCalled, "CloseIssue must be called for IsPR=false, action=close")
+	require.Equal(t, 21, fw.closeIssueNumber)
+}
+
+func TestWriteBackIssue_ImplementCallsOpenChange(t *testing.T) {
+	// action=implement must call OpenChange so the pushed branch becomes a PR.
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	task := seedWritebackKindTask(t, "wbi-impl", "wbi-proj-impl2", "wbi-repo-impl2", "wbi-scm-impl2",
+		tatarav1alpha1.TaskSpec{
+			Goal: "triage issue implement",
+			Kind: "triageIssue",
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#22", IsPR: false, Number: 22,
+			},
+		}, nil)
+	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.GreaterOrEqual(t, fw.openCalls, 1, "OpenChange must be called for triageIssue action=implement")
+	require.False(t, fw.closeIssueCalled, "CloseIssue must NOT be called for implement")
 }
 
 func TestProviderForRemote(t *testing.T) {

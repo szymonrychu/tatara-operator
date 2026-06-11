@@ -15,6 +15,11 @@ type OperatorMetrics struct {
 	memoryStacks            *prometheus.GaugeVec
 	scmWritesTotal          *prometheus.CounterVec
 	approvalGateSeconds     prometheus.Histogram
+	scanItemsTotal          *prometheus.CounterVec
+	scanTasksCreatedTotal   *prometheus.CounterVec
+	scanDurationSeconds     *prometheus.HistogramVec
+	issueOutcomeTotal       *prometheus.CounterVec
+	tasksInflightKind       *prometheus.GaugeVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -61,6 +66,27 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help:    "Wall-clock seconds a Task spent in AwaitingApproval.",
 			Buckets: prometheus.ExponentialBuckets(60, 2, 10),
 		}),
+		scanItemsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_scan_items_total",
+			Help: "Total scan candidates by activity and outcome.",
+		}, []string{"activity", "outcome"}),
+		scanTasksCreatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_scan_tasks_created_total",
+			Help: "Tasks created by scan activity and Task kind.",
+		}, []string{"activity", "kind"}),
+		scanDurationSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "tatara_scan_duration_seconds",
+			Help:    "Wall-clock duration of one scan activity.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
+		}, []string{"activity"}),
+		issueOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_issue_outcome_total",
+			Help: "Issue-triage outcomes by action.",
+		}, []string{"action"}),
+		tasksInflightKind: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_tasks_inflight",
+			Help: "In-flight Tasks by kind.",
+		}, []string{"kind"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -72,6 +98,11 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryStacks,
 		m.scmWritesTotal,
 		m.approvalGateSeconds,
+		m.scanItemsTotal,
+		m.scanTasksCreatedTotal,
+		m.scanDurationSeconds,
+		m.issueOutcomeTotal,
+		m.tasksInflightKind,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -92,7 +123,40 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, phase := range []string{"Provisioning", "Ready", "Failed"} {
 		m.memoryStacks.WithLabelValues(phase)
 	}
+	for _, activity := range []string{"mrScan", "issueScan", "brainstorm"} {
+		for _, outcome := range []string{"scanned", "picked", "skipped_dedup", "skipped_cap"} {
+			m.scanItemsTotal.WithLabelValues(activity, outcome)
+		}
+	}
+	for _, action := range []string{"implement", "close"} {
+		m.issueOutcomeTotal.WithLabelValues(action)
+	}
 	return m
+}
+
+// ScanItem increments tatara_scan_items_total for an activity + outcome.
+func (m *OperatorMetrics) ScanItem(activity, outcome string) {
+	m.scanItemsTotal.WithLabelValues(activity, outcome).Inc()
+}
+
+// ScanTaskCreated increments tatara_scan_tasks_created_total for an activity + kind.
+func (m *OperatorMetrics) ScanTaskCreated(activity, kind string) {
+	m.scanTasksCreatedTotal.WithLabelValues(activity, kind).Inc()
+}
+
+// ObserveScanDuration records the seconds one scan activity took.
+func (m *OperatorMetrics) ObserveScanDuration(activity string, seconds float64) {
+	m.scanDurationSeconds.WithLabelValues(activity).Observe(seconds)
+}
+
+// IssueOutcome increments tatara_issue_outcome_total for an action.
+func (m *OperatorMetrics) IssueOutcome(action string) {
+	m.issueOutcomeTotal.WithLabelValues(action).Inc()
+}
+
+// SetTasksInflightKind sets tatara_tasks_inflight for one Task kind.
+func (m *OperatorMetrics) SetTasksInflightKind(kind string, n float64) {
+	m.tasksInflightKind.WithLabelValues(kind).Set(n)
 }
 
 // ObserveMemoryProvisionDuration records the wall-clock seconds a per-project

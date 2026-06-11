@@ -573,19 +573,33 @@ func (r *TaskReconciler) isTurnTimedOut(project *tatarav1alpha1.Project, task *t
 	return time.Now().After(deadline)
 }
 
-// updateInflightGauge sets operator_tasks_inflight to the count of active Tasks.
+// updateInflightGauge sets operator_tasks_inflight (aggregate) and
+// tatara_tasks_inflight{kind} (per-kind) to the count of active Tasks.
 func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(r.PodConfig.Namespace)); err != nil {
 		return
 	}
 	n := 0
+	byKind := map[string]int{}
 	for i := range list.Items {
 		if isActive(list.Items[i].Status.Phase) {
 			n++
+			byKind[list.Items[i].Spec.Kind]++
 		}
 	}
 	r.Metrics.SetTasksInflight(float64(n))
+	// Emit per-kind gauge for all known kinds, zeroing kinds with no in-flight tasks.
+	for _, kind := range []string{"implement", "review", "selfImprove", "triageIssue", "brainstorm"} {
+		r.Metrics.SetTasksInflightKind(kind, float64(byKind[kind]))
+	}
+	// Also emit any kinds seen in the list that are not in the known set.
+	for kind, count := range byKind {
+		if kind == "implement" || kind == "review" || kind == "selfImprove" || kind == "triageIssue" || kind == "brainstorm" {
+			continue
+		}
+		r.Metrics.SetTasksInflightKind(kind, float64(count))
+	}
 }
 
 // SetupWithManager registers the Task reconciler, watching Tasks and the

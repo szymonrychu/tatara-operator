@@ -42,6 +42,14 @@ type PROutcome struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// IssueOutcome is the agent's outcome for an issue-triage task.
+type IssueOutcome struct {
+	// +kubebuilder:validation:Enum=implement;close
+	Action string `json:"action"`
+	// +optional
+	Comment string `json:"comment,omitempty"` // required when Action==close
+}
+
 // TaskSource records the SCM work-item that originated a webhook-born Task.
 type TaskSource struct {
 	// +kubebuilder:validation:Enum=github;gitlab
@@ -66,7 +74,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`
@@ -99,6 +107,8 @@ type TaskStatus struct {
 	ReviewVerdict *ReviewVerdict `json:"reviewVerdict,omitempty"`
 	// +optional
 	PROutcome *PROutcome `json:"prOutcome,omitempty"`
+	// +optional
+	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
 	// +optional
 	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
 }

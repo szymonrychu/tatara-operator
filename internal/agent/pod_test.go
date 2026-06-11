@@ -205,3 +205,35 @@ func TestBuildPod_SetsTataraRepos(t *testing.T) {
 	require.Equal(t, "https://git/acme/repo2", got[1]["url"])
 	require.Equal(t, "dev", got[1]["branch"])
 }
+
+func TestBuildPodEgressLabel(t *testing.T) {
+	cases := []struct {
+		name    string
+		sources string
+		want    bool
+	}{
+		{"internet present", "docs,memory,internet", true},
+		{"internet absent", "docs,memory", false},
+		{"no annotation", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &tatarav1alpha1.Task{}
+			task.Name = "bs"
+			task.Spec.Kind = "brainstorm"
+			if tc.sources != "" {
+				task.Annotations = map[string]string{"tatara.dev/brainstorm-sources": tc.sources}
+			}
+			proj := &tatarav1alpha1.Project{}
+			repo := &tatarav1alpha1.Repository{}
+			pod := agent.BuildPod(proj, repo, task, nil, "http://mem", agent.PodConfig{Namespace: "tatara"})
+			_, has := pod.Labels["tatara.io/egress"]
+			if has != tc.want {
+				t.Fatalf("egress label present=%v, want %v (labels=%+v)", has, tc.want, pod.Labels)
+			}
+			if tc.want && pod.Labels["tatara.io/egress"] != "internet" {
+				t.Fatalf("egress label value = %q, want internet", pod.Labels["tatara.io/egress"])
+			}
+		})
+	}
+}

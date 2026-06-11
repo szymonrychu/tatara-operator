@@ -29,9 +29,9 @@ type fakeSCMWriter struct {
 	addedBoardItem bool
 }
 
-func (f *fakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.IssueRef, error) {
+func (f *fakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
 	f.createdLabels = req.Labels
-	return scm.IssueRef{Ref: "o/r#1", URL: "https://gh/o/r/issues/1"}, nil
+	return scm.CreatedIssue{Ref: "o/r#1", URL: "https://gh/o/r/issues/1"}, nil
 }
 
 func (f *fakeSCMWriter) AddBoardItem(_ context.Context, _ string, _ scm.BoardRef, _ string) error {

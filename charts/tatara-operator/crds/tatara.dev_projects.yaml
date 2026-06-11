@@ -99,6 +99,54 @@ spec:
                     type: object
                   botLogin:
                     type: string
+                  cron:
+                    description: ScmCron groups the three cron-driven scan activities.
+                    properties:
+                      brainstorm:
+                        description: BrainstormActivity schedules the opt-in self-driven
+                          issue-proposal scan.
+                        properties:
+                          enabled:
+                            type: boolean
+                          maxPerCycle:
+                            default: 1
+                            type: integer
+                          schedule:
+                            type: string
+                          sources:
+                            items:
+                              enum:
+                              - docs
+                              - memory
+                              - internet
+                              type: string
+                            type: array
+                        type: object
+                      issueScan:
+                        description: CronActivity schedules one Project scan activity
+                          (mrScan or issueScan).
+                        properties:
+                          maxPerCycle:
+                            default: 1
+                            type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables this activity.
+                            type: string
+                        type: object
+                      mrScan:
+                        description: CronActivity schedules one Project scan activity
+                          (mrScan or issueScan).
+                        properties:
+                          maxPerCycle:
+                            default: 1
+                            type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables this activity.
+                            type: string
+                        type: object
+                    type: object
                   mergePolicy:
                     default: afterApproval
                     enum:
@@ -112,6 +160,8 @@ spec:
                     enum:
                     - labeledOrMentioned
                     - all
+                    type: string
+                  priorityLabel:
                     type: string
                   provider:
                     enum:
@@ -193,6 +243,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              lastBrainstorm:
+                format: date-time
+                type: string
+              lastIssueScan:
+                format: date-time
+                type: string
+              lastMRScan:
+                format: date-time
+                type: string
               memory:
                 description: |-
                   MemoryStatus reports the observed state of the per-Project memory stack.

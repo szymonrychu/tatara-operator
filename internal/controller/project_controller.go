@@ -4,11 +4,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +31,9 @@ type ProjectReconciler struct {
 	Metrics             *obs.OperatorMetrics
 	ExternalWebhookBase string
 	MemoryConfig        memory.Config
+	// ReaderFor returns a token-bound scm.SCMReader for a provider name and token.
+	// Nil in tests that do not exercise scanning; wired in wire.go at runtime.
+	ReaderFor func(provider, token string) (scm.SCMReader, error)
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -79,6 +84,13 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.updateMemoryStackCounts(ctx)
 
+	scanRequeue, scanErr := r.runScans(ctx, &project)
+	if scanErr != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, scanErr
+	}
+	requeueAfter = soonestRequeue(requeueAfter, scanRequeue)
+
 	memPhase := ""
 	if project.Status.Memory != nil {
 		memPhase = project.Status.Memory.Phase
@@ -91,6 +103,21 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		"memory_phase", memPhase)
 	r.Metrics.ReconcileResult("Project", "success")
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// soonestRequeue returns the smaller positive duration; 0 means "no requeue"
+// and loses to any positive value.
+func soonestRequeue(a, b time.Duration) time.Duration {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 // updateMemoryStackCounts lists all Projects and sets the operator_memory_stacks

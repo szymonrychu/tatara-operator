@@ -107,6 +107,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Metrics:             metrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup ProjectReconciler: %w", err)
 	}

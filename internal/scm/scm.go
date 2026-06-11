@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // WebhookEvent is the provider-agnostic parse of an inbound SCM webhook.
@@ -33,10 +34,37 @@ type IssueReq struct {
 	Labels []string
 }
 
-// IssueRef identifies a created issue.
-type IssueRef struct {
+// CreatedIssue identifies a created issue (internal return type, not a wire type).
+type CreatedIssue struct {
 	Ref string // owner/repo#n (github) or group/proj#iid (gitlab)
 	URL string // html/web url
+}
+
+// PRRef is one open PR/MR listed for cron MR-triage.
+type PRRef struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	Author    string    `json:"author"`
+	HeadSHA   string    `json:"headSha"`
+	Labels    []string  `json:"labels,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// IssueRef is one open issue listed for cron issue-triage.
+type IssueRef struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	Labels    []string  `json:"labels,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	IsPR      bool      `json:"isPr"` // GitHub /issues returns PRs; filter these out
+}
+
+// BoardItem is one project-board item listed for cron issue-triage.
+type BoardItem struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"` // 0 for draft/non-issue items -> skipped
+	Column    string    `json:"column"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // PRState is the inspected state of a PR/MR.
@@ -68,7 +96,7 @@ type BoardRef struct {
 type SCMWriter interface {
 	OpenChange(ctx context.Context, repoURL, token, sourceBranch, targetBranch, title, body string) (string, error)
 	Comment(ctx context.Context, token, issueRef, body string) error
-	CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error)
+	CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (CreatedIssue, error)
 	AddLabel(ctx context.Context, token, issueRef, label string) error
 	RemoveLabel(ctx context.Context, token, issueRef, label string) error
 	GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error)
@@ -79,6 +107,14 @@ type SCMWriter interface {
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
+	CloseIssue(ctx context.Context, repo string, number int, comment string) error
+}
+
+// SCMReader lists open work for the cron scan loop; *GitHub and *GitLab satisfy it.
+type SCMReader interface {
+	ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error)
+	ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error)
+	ListBoardItems(ctx context.Context, board BoardRef) ([]BoardItem, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;
@@ -105,11 +141,13 @@ func (e *HTTPError) Error() string {
 type GitHub struct {
 	apiBase     string
 	graphQLBase string
+	token       string // bound for reader calls; empty for writer/webhook use
 }
 
 // GitLab implements Client for GitLab.
 type GitLab struct {
 	apiBase string
+	token   string // bound for reader calls; empty for writer/webhook use
 }
 
 func (*GitHub) Provider() string { return "github" }

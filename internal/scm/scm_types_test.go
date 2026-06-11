@@ -7,9 +7,9 @@ func TestValueTypesZero(t *testing.T) {
 	if r.Title != "t" || r.Labels[0] != "x" {
 		t.Fatalf("IssueReq fields not wired: %+v", r)
 	}
-	ref := IssueRef{Ref: "o/r#1", URL: "https://x/1"}
+	ref := CreatedIssue{Ref: "o/r#1", URL: "https://x/1"}
 	if ref.Ref != "o/r#1" || ref.URL == "" {
-		t.Fatalf("IssueRef fields not wired: %+v", ref)
+		t.Fatalf("CreatedIssue fields not wired: %+v", ref)
 	}
 	st := PRState{Author: "a", HeadSHA: "sha", HeadBranch: "br", Mergeable: true, CIStatus: "success"}
 	if !st.Mergeable || st.CIStatus != "success" {
@@ -32,4 +32,31 @@ func TestValueTypesZero(t *testing.T) {
 func TestProvidersSatisfySCMWriter(t *testing.T) {
 	var _ SCMWriter = (*GitHub)(nil)
 	var _ SCMWriter = (*GitLab)(nil)
+}
+
+func TestProvidersSatisfySCMReader(t *testing.T) {
+	var _ SCMReader = (*GitHub)(nil)
+	var _ SCMReader = (*GitLab)(nil)
+}
+
+func TestProvidersSatisfyCloseIssue(t *testing.T) {
+	var w SCMWriter = (*GitHub)(nil)
+	_ = w
+	var w2 SCMWriter = (*GitLab)(nil)
+	_ = w2
+}
+
+func TestScanWireTypesZero(t *testing.T) {
+	pr := PRRef{Repo: "o/r", Number: 5, Author: "bot", HeadSHA: "abc", Labels: []string{"p"}}
+	if pr.Repo != "o/r" || pr.Number != 5 || pr.Author != "bot" || pr.HeadSHA != "abc" || pr.Labels[0] != "p" {
+		t.Fatalf("PRRef fields not wired: %+v", pr)
+	}
+	iss := IssueRef{Repo: "o/r", Number: 7, Labels: []string{"p"}, IsPR: true}
+	if iss.Repo != "o/r" || iss.Number != 7 || !iss.IsPR {
+		t.Fatalf("IssueRef fields not wired: %+v", iss)
+	}
+	bi := BoardItem{Repo: "o/r", Number: 9, Column: "Todo"}
+	if bi.Repo != "o/r" || bi.Number != 9 || bi.Column != "Todo" {
+		t.Fatalf("BoardItem fields not wired: %+v", bi)
+	}
 }
