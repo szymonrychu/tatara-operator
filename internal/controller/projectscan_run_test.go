@@ -9,6 +9,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 type fakeReader struct {
@@ -133,6 +134,20 @@ func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
 		t.Fatalf("bad cron must create no tasks")
 	}
 	_ = res
+}
+
+func TestReconcileRequeuesFromScan(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 0 1 1 *", MaxPerCycle: 1}} // yearly: never due now
+	proj, _ := seedScanProject(t, "requeue-proj", cron)
+	r := newScanReconciler(&fakeReader{})
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "requeue-proj"}})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter <= 0 || res.RequeueAfter > maxScheduleRequeue {
+		t.Fatalf("RequeueAfter = %v, want (0, %v]", res.RequeueAfter, maxScheduleRequeue)
+	}
+	_ = proj
 }
 
 func TestRunScans_DedupSkipsInFlight(t *testing.T) {

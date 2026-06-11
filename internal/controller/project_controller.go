@@ -4,6 +4,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -83,6 +84,13 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.updateMemoryStackCounts(ctx)
 
+	scanRequeue, scanErr := r.runScans(ctx, &project)
+	if scanErr != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, scanErr
+	}
+	requeueAfter = soonestRequeue(requeueAfter, scanRequeue)
+
 	memPhase := ""
 	if project.Status.Memory != nil {
 		memPhase = project.Status.Memory.Phase
@@ -95,6 +103,21 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		"memory_phase", memPhase)
 	r.Metrics.ReconcileResult("Project", "success")
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// soonestRequeue returns the smaller positive duration; 0 means "no requeue"
+// and loses to any positive value.
+func soonestRequeue(a, b time.Duration) time.Duration {
+	switch {
+	case a == 0:
+		return b
+	case b == 0:
+		return a
+	case a < b:
+		return a
+	default:
+		return b
+	}
 }
 
 // updateMemoryStackCounts lists all Projects and sets the operator_memory_stacks
