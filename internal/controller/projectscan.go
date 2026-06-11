@@ -117,8 +117,8 @@ func hasLabel(labels []string, want string) bool {
 
 // selectCandidates partitions into priority-labelled and rest, sorts each
 // least-recently-updated first, concatenates priority++rest, and caps at n.
-// When priorityLabel is empty, items with no labels sort before items with any
-// labels (stale-first within each group), so unlabeled items are preferred.
+// When priorityLabel is empty, selection is pure stale-first over all
+// candidates (labels ignored), per design section 7.
 func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 	if n < 1 {
 		n = 1
@@ -145,18 +145,9 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 		return out
 	}
 
-	// No priority label: prefer unlabeled items (stale-first), then labeled (stale-first).
-	var unlabeled, labeled []candidate
-	for _, c := range in {
-		if len(c.labels) == 0 {
-			unlabeled = append(unlabeled, c)
-		} else {
-			labeled = append(labeled, c)
-		}
-	}
-	staleFirst(unlabeled)
-	staleFirst(labeled)
-	out := append(unlabeled, labeled...)
+	// No priority label: pure stale-first over the whole slice (labels ignored).
+	out := append([]candidate(nil), in...)
+	staleFirst(out)
 	if len(out) > n {
 		out = out[:n]
 	}
@@ -400,13 +391,21 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	for range cands {
 		r.Metrics.ScanItem("mrScan", "scanned")
 	}
-	picked := selectCandidates(cands, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
-	created := 0
-	for _, c := range picked {
+	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
+	var eligible []candidate
+	for _, c := range cands {
 		if isDeduped(c, existing) {
 			r.Metrics.ScanItem("mrScan", "skipped_dedup")
-			continue
+		} else {
+			eligible = append(eligible, c)
 		}
+	}
+	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
+	for i := 0; i < len(eligible)-len(selected); i++ {
+		r.Metrics.ScanItem("mrScan", "skipped_cap")
+	}
+	created := 0
+	for _, c := range selected {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			continue
@@ -468,13 +467,21 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	for range cands {
 		r.Metrics.ScanItem("issueScan", "scanned")
 	}
-	picked := selectCandidates(cands, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
-	created := 0
-	for _, c := range picked {
+	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
+	var eligible []candidate
+	for _, c := range cands {
 		if isDeduped(c, existing) {
 			r.Metrics.ScanItem("issueScan", "skipped_dedup")
-			continue
+		} else {
+			eligible = append(eligible, c)
 		}
+	}
+	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
+	for i := 0; i < len(eligible)-len(selected); i++ {
+		r.Metrics.ScanItem("issueScan", "skipped_cap")
+	}
+	created := 0
+	for _, c := range selected {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			continue

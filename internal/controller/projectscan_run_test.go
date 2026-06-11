@@ -6,7 +6,10 @@ import (
 	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -148,6 +151,103 @@ func TestReconcileRequeuesFromScan(t *testing.T) {
 		t.Fatalf("RequeueAfter = %v, want (0, %v]", res.RequeueAfter, maxScheduleRequeue)
 	}
 	_ = proj
+}
+
+// counterValue reads a counter value by label from a Prometheus registry.
+func counterValue(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if labelsMatch(m.GetLabel(), labels) {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
+	got := map[string]string{}
+	for _, p := range pairs {
+		got[p.GetName()] = p.GetValue()
+	}
+	for k, v := range want {
+		if got[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// TestRunScans_DedupBeforeCap verifies that dedup is applied before the cap so
+// a capped stalest-already-in-flight item does not consume the single slot and
+// starve the next eligible item.
+func TestRunScans_DedupBeforeCap(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 1}}
+	proj, repo := seedScanProject(t, "dedupbefore-proj", cron)
+	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	proj.Status.LastIssueScan = &past
+	_ = k8sClient.Status().Update(context.Background(), proj)
+
+	// Issue #10 is the stalest (updatedAt 100s). Pre-create a Running triageIssue task for it.
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 10}, "issueScan", "triageIssue")
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "dedupbefore-proj", RepositoryRef: repo.Name, Goal: "g", Kind: "triageIssue"}
+	if err := k8sClient.Create(context.Background(), pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	pre.Status.Phase = "Running"
+	_ = k8sClient.Status().Update(context.Background(), pre)
+
+	// Two issues: #10 (stalest, deduped) and #11 (newer, eligible).
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/r", Number: 10, UpdatedAt: time.Unix(100, 0)}, // stalest - deduped
+		{Repo: "o/r", Number: 11, UpdatedAt: time.Unix(200, 0)}, // second - should be picked
+	}}
+
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if _, err := r.runScans(context.Background(), proj); err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+
+	// Exactly 1 new task must be created (for #11, not #10).
+	tasks := listScanTasks(t, "dedupbefore-proj")
+	newTasks := 0
+	for _, tk := range tasks {
+		if tk.Name != pre.Name {
+			newTasks++
+			if tk.Spec.Source == nil || tk.Spec.Source.Number != 11 {
+				t.Fatalf("expected new task for #11, got source=%+v", tk.Spec.Source)
+			}
+		}
+	}
+	if newTasks != 1 {
+		t.Fatalf("want exactly 1 new task for #11, got %d new tasks (total %d)", newTasks, len(tasks))
+	}
+
+	// skipped_dedup must be incremented for #10.
+	dedupCount := counterValue(t, reg, "tatara_scan_items_total", map[string]string{"activity": "issueScan", "outcome": "skipped_dedup"})
+	if dedupCount < 1 {
+		t.Fatalf("skipped_dedup counter = %v, want >= 1", dedupCount)
+	}
+
+	// skipped_cap must be 0 (eligible=1 item after dedup, cap=1 -> no truncation).
+	capCount := counterValue(t, reg, "tatara_scan_items_total", map[string]string{"activity": "issueScan", "outcome": "skipped_cap"})
+	if capCount != 0 {
+		t.Fatalf("skipped_cap counter = %v, want 0", capCount)
+	}
 }
 
 func TestRunScans_DedupSkipsInFlight(t *testing.T) {
