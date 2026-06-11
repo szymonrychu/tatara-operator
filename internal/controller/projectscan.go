@@ -8,6 +8,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 // activityNextFire parses a 5-field cron and returns the next fire after base.
@@ -150,6 +151,46 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 	out := append(unlabeled, labeled...)
 	if len(out) > n {
 		out = out[:n]
+	}
+	return out
+}
+
+func candidatesFromPRs(prs []scm.PRRef) []candidate {
+	out := make([]candidate, 0, len(prs))
+	for _, p := range prs {
+		out = append(out, candidate{
+			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
+			labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
+		})
+	}
+	return out
+}
+
+// candidatesFromIssues drops rows GitHub reported as PRs (IsPR) so issueScan
+// never triages a PR as an issue.
+func candidatesFromIssues(iss []scm.IssueRef) []candidate {
+	out := make([]candidate, 0, len(iss))
+	for _, i := range iss {
+		if i.IsPR {
+			continue
+		}
+		out = append(out, candidate{
+			repo: i.Repo, number: i.Number, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+		})
+	}
+	return out
+}
+
+// candidatesFromBoard maps board items (issues only; Number 0 = draft, skipped)
+// to candidates; deduping against per-repo issues happens in the caller via
+// (repo, number).
+func candidatesFromBoard(items []scm.BoardItem) []candidate {
+	out := make([]candidate, 0, len(items))
+	for _, b := range items {
+		if b.Number == 0 {
+			continue
+		}
+		out = append(out, candidate{repo: b.Repo, number: b.Number, updatedAt: b.UpdatedAt, isPR: false})
 	}
 	return out
 }
