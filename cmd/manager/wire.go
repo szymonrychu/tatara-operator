@@ -137,6 +137,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup TaskReconciler: %w", err)
 	}

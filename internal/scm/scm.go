@@ -54,6 +54,7 @@ type PRRef struct {
 type IssueRef struct {
 	Repo      string    `json:"repo"`
 	Number    int       `json:"number"`
+	Title     string    `json:"title,omitempty"`
 	Labels    []string  `json:"labels,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 	IsPR      bool      `json:"isPr"` // GitHub /issues returns PRs; filter these out

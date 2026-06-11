@@ -48,6 +48,10 @@ type TaskReconciler struct {
 	// Nil in tests that do not exercise write-back; replaced with a fake in
 	// write-back tests.
 	SCMFor func(provider string) (scm.SCMWriter, error)
+	// ReaderFor returns a token-bound scm.SCMReader for title-level duplicate
+	// detection in createProposal. Nil in tests that do not exercise reading;
+	// wired in wire.go at runtime. When nil the title check is skipped gracefully.
+	ReaderFor func(provider, token string) (scm.SCMReader, error)
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=tasks,verbs=get;list;watch;create;update;patch;delete

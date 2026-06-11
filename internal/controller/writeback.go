@@ -252,11 +252,30 @@ const tataraAuthoredMarker = "<!-- tatara-authored -->"
 // createProposal opens the proposed issue with the approval label, places it
 // on the board in the "Proposed" column, records the Source + DiscoveredIssues,
 // and stays in AwaitingApproval. It is the only SCM egress for proposals.
+//
+// Duplicate-prevention layers (Fix 4):
+//
+//	(A) Source-set idempotency guard: if task.Spec.Source.URL is already set the
+//	    issue was created on a prior reconcile; skip straight to AwaitingApproval.
+//	(B) RetryOnConflict wraps both the Spec.Source r.Update and the status update
+//	    so they reliably land even when the API server races with another reconcile.
+//	(C) Title-level idempotency: before calling CreateIssue, list open issues via
+//	    the reader and skip creation if an open issue with the same title exists;
+//	    set Source to the existing issue and proceed to AwaitingApproval.
 func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 	if proj.Spec.Scm == nil {
 		return ctrl.Result{}, fmt.Errorf("proposal: project %q has no scm spec", proj.Name)
 	}
+
+	// (A) Idempotency guard: Source already recorded means CreateIssue already ran.
+	if task.Spec.Source != nil && task.Spec.Source.URL != "" {
+		l.Info("proposal skipped: source already set",
+			"action", "scm_propose_skip_source_set", "resource_id", task.Name,
+			"issue_url", task.Spec.Source.URL)
+		return r.advanceToAwaitingApproval(ctx, task, task.Spec.Source.URL)
+	}
+
 	var repo tatarav1alpha1.Repository
 	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProposedIssue.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("proposal: get repository: %w", err)
@@ -269,13 +288,32 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("proposal: scm token: %w", err)
 	}
+
+	// (C) Title-level idempotency: skip CreateIssue if an open issue with the
+	// same title already exists. Matching on exact title among tatara-authored
+	// issues is safe because the title is deterministic (brainstorm generates it).
+	// Body/marker check is skipped: if a human opened an issue with the exact
+	// same title it is still safer to track it than to create a duplicate.
+	proposalTitle := task.Spec.ProposedIssue.Title
+	if r.ReaderFor != nil {
+		if existing, found, rerr := r.findOpenIssueByTitle(ctx, proj, repo.Spec.URL, token, proposalTitle); rerr != nil {
+			l.Error(rerr, "proposal: list open issues for dedup check (non-fatal, proceeding with create)")
+		} else if found {
+			l.Info("proposal skipped: duplicate exists",
+				"action", "scm_propose_skip_duplicate",
+				"resource_id", task.Name,
+				"existing_number", existing.Number)
+			return r.recordExistingProposal(ctx, proj, task, existing)
+		}
+	}
+
 	label := proj.Spec.Scm.ApprovalLabel
 	if label == "" {
 		label = "tatara/awaiting-approval"
 	}
 	body := task.Spec.ProposedIssue.Body + "\n\n" + tataraAuthoredMarker
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
-		Title:  task.Spec.ProposedIssue.Title,
+		Title:  proposalTitle,
 		Body:   body,
 		Labels: []string{label},
 	})
@@ -284,6 +322,7 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		return ctrl.Result{}, fmt.Errorf("proposal: create issue: %w", err)
 	}
 	r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "ok")
+
 	if proj.Spec.Scm.Board != nil {
 		board := boardRefFromSpec(proj.Spec.Scm)
 		if err := writer.AddBoardItem(ctx, token, board, ref.URL); err != nil {
@@ -299,7 +338,8 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 			}
 		}
 	}
-	task.Spec.Source = &tatarav1alpha1.TaskSource{
+
+	src := &tatarav1alpha1.TaskSource{
 		Provider:    proj.Spec.Scm.Provider,
 		IssueRef:    ref.Ref,
 		URL:         ref.URL,
@@ -307,25 +347,127 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		IsPR:        false,
 		AuthorLogin: proj.Spec.Scm.BotLogin,
 	}
-	if err := r.Update(ctx, task); err != nil {
+
+	// (B) RetryOnConflict: record Spec.Source; re-Get the task inside the closure
+	// so the write lands even when another reconcile has bumped the resource version.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
+			return gerr
+		}
+		fresh.Spec.Source = src
+		return r.Update(ctx, fresh)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("proposal: record source: %w", err)
 	}
-	task.Status.Phase = "AwaitingApproval"
-	task.Status.DiscoveredIssues = append(task.Status.DiscoveredIssues, ref.URL)
-	now := metav1.Now()
-	task.Status.GateEnteredAt = &now
-	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-		Type:    tatarav1alpha1.ConditionApprovalApproved,
-		Status:  metav1.ConditionFalse,
-		Reason:  "AwaitingHuman",
-		Message: "issue opened with approval label; awaiting removal",
-	})
-	if err := r.Status().Update(ctx, task); err != nil {
-		return ctrl.Result{}, fmt.Errorf("proposal: record status: %w", err)
-	}
+
 	l.Info("proposal issue opened", "action", "scm_propose_issue",
 		"resource_id", task.Name, "project", proj.Name, "issue_ref", ref.Ref)
+
+	return r.advanceToAwaitingApproval(ctx, task, ref.URL)
+}
+
+// advanceToAwaitingApproval sets phase=AwaitingApproval, appends to
+// DiscoveredIssues, sets ApprovalApproved=False, and clears WritebackPending.
+// Uses RetryOnConflict on the status update.
+func (r *TaskReconciler) advanceToAwaitingApproval(ctx context.Context, task *tatarav1alpha1.Task, issueURL string) (ctrl.Result, error) {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
+			return gerr
+		}
+		fresh.Status.Phase = "AwaitingApproval"
+		// Append issueURL only if not already present.
+		alreadyPresent := false
+		for _, u := range fresh.Status.DiscoveredIssues {
+			if u == issueURL {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			fresh.Status.DiscoveredIssues = append(fresh.Status.DiscoveredIssues, issueURL)
+		}
+		now := metav1.Now()
+		if fresh.Status.GateEnteredAt == nil {
+			fresh.Status.GateEnteredAt = &now
+		}
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:    tatarav1alpha1.ConditionApprovalApproved,
+			Status:  metav1.ConditionFalse,
+			Reason:  "AwaitingHuman",
+			Message: "issue opened with approval label; awaiting removal",
+		})
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "WritebackPending",
+			Status:             metav1.ConditionFalse,
+			Reason:             "ProposalPending",
+			Message:            "proposal issue created; awaiting approval",
+			ObservedGeneration: fresh.Generation,
+		})
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: record status: %w", err)
+	}
 	return ctrl.Result{RequeueAfter: capRequeue}, nil
+}
+
+// recordExistingProposal wires the task to an existing open issue that matches
+// the proposal title, skipping CreateIssue. Used by the (C) title-dedup path.
+func (r *TaskReconciler) recordExistingProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, existing scm.IssueRef) (ctrl.Result, error) {
+	issueURL := fmt.Sprintf("https://github.com/%s/issues/%d", existing.Repo, existing.Number)
+	if proj.Spec.Scm.Provider == "gitlab" {
+		issueURL = fmt.Sprintf("https://gitlab.com/%s/-/issues/%d", existing.Repo, existing.Number)
+	}
+	issueRef := fmt.Sprintf("%s#%d", existing.Repo, existing.Number)
+
+	src := &tatarav1alpha1.TaskSource{
+		Provider:    proj.Spec.Scm.Provider,
+		IssueRef:    issueRef,
+		URL:         issueURL,
+		Number:      existing.Number,
+		IsPR:        false,
+		AuthorLogin: proj.Spec.Scm.BotLogin,
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
+			return gerr
+		}
+		fresh.Spec.Source = src
+		return r.Update(ctx, fresh)
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("proposal: record existing source: %w", err)
+	}
+
+	return r.advanceToAwaitingApproval(ctx, task, issueURL)
+}
+
+// findOpenIssueByTitle lists open issues for the repo and returns the first
+// one whose Title matches proposalTitle exactly. Returns (zero, false, nil)
+// when no match is found, (zero, false, err) on list failure.
+func (r *TaskReconciler) findOpenIssueByTitle(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token, proposalTitle string) (scm.IssueRef, bool, error) {
+	reader, err := r.ReaderFor(proj.Spec.Scm.Provider, token)
+	if err != nil {
+		return scm.IssueRef{}, false, fmt.Errorf("proposal: reader for %s: %w", proj.Spec.Scm.Provider, err)
+	}
+	owner, repo, err := scm.OwnerRepo(repoURL)
+	if err != nil {
+		// GitLab path: try project path.
+		owner = proj.Spec.Scm.Owner
+		repo = ""
+	}
+	issues, err := reader.ListOpenIssues(ctx, owner, repo)
+	if err != nil {
+		return scm.IssueRef{}, false, fmt.Errorf("proposal: list open issues: %w", err)
+	}
+	for _, iss := range issues {
+		if !iss.IsPR && iss.Title == proposalTitle {
+			return iss, true, nil
+		}
+	}
+	return scm.IssueRef{}, false, nil
 }
 
 func boardRefFromSpec(s *tatarav1alpha1.ScmSpec) scm.BoardRef {
