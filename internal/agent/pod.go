@@ -135,11 +135,16 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
 
+	labels := podLabels(task)
+	if task.Spec.Kind == "brainstorm" && hasInternetSource(task.Annotations["tatara.dev/brainstorm-sources"]) {
+		labels["tatara.io/egress"] = "internet"
+	}
+
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            PodName(task),
 			Namespace:       cfg.Namespace,
-			Labels:          podLabels(task),
+			Labels:          labels,
 			OwnerReferences: []metav1.OwnerReference{ownerRef(task)},
 		},
 		Spec: corev1.PodSpec{
@@ -187,4 +192,15 @@ func BuildService(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposito
 // BaseURL returns the in-cluster wrapper address for a Task's Service.
 func BaseURL(task *tatarav1alpha1.Task, namespace string) string {
 	return "http://" + PodName(task) + "." + namespace + ".svc:" + strconv.Itoa(wrapperPort)
+}
+
+// hasInternetSource reports whether the comma-joined brainstorm sources list
+// includes "internet", gating the egress NetworkPolicy pod label.
+func hasInternetSource(csv string) bool {
+	for _, s := range strings.Split(csv, ",") {
+		if strings.TrimSpace(s) == "internet" {
+			return true
+		}
+	}
+	return false
 }
