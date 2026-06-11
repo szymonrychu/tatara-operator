@@ -43,6 +43,18 @@ func ByProvider(name string) (SCMWriter, error) {
 	}
 }
 
+// ReaderByProvider returns a token-bound SCMReader for a provider name.
+func ReaderByProvider(name, token string) (SCMReader, error) {
+	switch name {
+	case "github":
+		return &GitHub{token: token}, nil
+	case "gitlab":
+		return &GitLab{token: token}, nil
+	default:
+		return nil, fmt.Errorf("scm: unknown provider %q", name)
+	}
+}
+
 func normalizeRemote(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {
