@@ -249,6 +249,9 @@ func glProjectPath(repoURL string) (string, error) {
 	return p, nil
 }
 
+// GitLabProjectPath parses a GitLab repo URL into its project path.
+func GitLabProjectPath(repoURL string) (string, error) { return glProjectPath(repoURL) }
+
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {
 	var rdr io.Reader
 	if in != nil {
