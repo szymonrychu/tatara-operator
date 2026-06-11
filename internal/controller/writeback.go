@@ -41,8 +41,13 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return r.writeBackSelfImprove(ctx, task)
 	case "triageIssue":
 		return r.writeBackIssue(ctx, task)
+	case "brainstorm":
+		// Brainstorm proposals are created via propose_issue which spawns child
+		// Tasks. The brainstorm Task itself never opens a PR.
+		r.clearWritebackPending(ctx, task, "BrainstormProposed", "brainstorm proposals created via propose_issue; no PR to open")
+		return ctrl.Result{}, nil
 	default:
-		// implement / brainstorm (proposal path handled pre-spawn)
+		// implement and other future kinds that open a change.
 	}
 
 	return r.writeBackOpenChange(ctx, task)
