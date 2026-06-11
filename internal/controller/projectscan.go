@@ -6,8 +6,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
+
+// activityNextFire parses a 5-field cron and returns the next fire after base.
+// ok=false when the schedule is empty (disabled) or malformed (caller logs).
+func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
+	if schedule == "" {
+		return time.Time{}, false
+	}
+	parsed, err := cron.ParseStandard(schedule)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed.Next(base), true
+}
 
 const (
 	labelSourceRepo   = "tatara.io/source-repo"
