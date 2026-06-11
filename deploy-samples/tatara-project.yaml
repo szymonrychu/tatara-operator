@@ -6,10 +6,31 @@ spec:
   triggerLabel: tatara
   maxConcurrentTasks: 2
   agent:
-    image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:0.1.8
+    image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:0.1.12
     model: claude-opus-4-8
     permissionMode: bypassPermissions
   memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
+  # PAT-based activation (no bot account / no Project board). botLogin == the PAT
+  # owner, so mrScan routes the owner's own PRs to selfImprove and others' to
+  # review. No `board` -> issueScan covers per-repo issues only (the Repository CRs
+  # below). mergePolicy/prReactionScope/approvalLabel default.
+  scm:
+    provider: github
+    owner: szymonrychu
+    botLogin: szymonrychu
+    priorityLabel: tatara/priority
+    cron:
+      mrScan:
+        schedule: "0 * * * *"
+        maxPerCycle: 1
+      issueScan:
+        schedule: "0 * * * *"
+        maxPerCycle: 1
+      brainstorm:
+        enabled: true
+        schedule: "0 6 * * *"
+        maxPerCycle: 1
+        sources: [docs, memory, internet]
 ---
 apiVersion: tatara.dev/v1alpha1
 kind: Repository

@@ -1,0 +1,46 @@
+# Cluster-side egress allow for the autonomous-cron brainstorm feature.
+# NOT chart-templated (rule 14). Applied with `kubectl apply -f`. Keys on the
+# operator-stamped pod label `tatara.io/egress: internet` (contract lock section
+# 3), which the operator adds to brainstorm pods only when `internet` is in
+# spec.scm.cron.brainstorm.sources.
+#
+# ADDITIVE ONLY. This grants the labelled brainstorm pod outbound DNS + 443 to the
+# internet (WebSearch/WebFetch), on top of whatever the existing
+# tatara-operator-managed-pods policy already allows (NetworkPolicies union). There
+# is deliberately NO namespace-wide default-deny-egress here: chat/memory/cnpg/neo4j
+# pods are currently selected by no egress policy (open egress); a default-deny would
+# newly restrict and could break them. Hardening the namespace is a separate task
+# that must first audit every pod's required egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tatara-egress-internet
+  namespace: tatara
+  labels:
+    app.kubernetes.io/part-of: tatara
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  podSelector:
+    matchLabels:
+      tatara.io/egress: internet
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Outbound HTTPS to the internet (WebSearch/WebFetch + Anthropic API).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
