@@ -200,6 +200,38 @@ func TestApprovalGateHistogram(t *testing.T) {
 	}
 }
 
+func TestScanMetricsRegistered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.ScanItem("mrScan", "picked")
+	m.ScanTaskCreated("mrScan", "review")
+	m.ObserveScanDuration("mrScan", 0.5)
+	m.IssueOutcome("close")
+	m.SetTasksInflightKind("triageIssue", 2)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	want := map[string]bool{
+		"tatara_scan_items_total":         false,
+		"tatara_scan_tasks_created_total": false,
+		"tatara_scan_duration_seconds":    false,
+		"tatara_issue_outcome_total":      false,
+		"tatara_tasks_inflight":           false,
+	}
+	for _, mf := range mfs {
+		if _, ok := want[mf.GetName()]; ok {
+			want[mf.GetName()] = true
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Fatalf("metric %q not registered/gathered", name)
+		}
+	}
+}
+
 func TestOperatorMetricsNamesStable(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	_ = NewOperatorMetrics(reg)
