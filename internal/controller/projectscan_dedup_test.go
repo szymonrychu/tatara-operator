@@ -60,8 +60,8 @@ func TestDedupIssue(t *testing.T) {
 		mkCronTask("o/r", 6, "triageIssue", "", "Planning"), // non-terminal -> skip #6
 		terminal, // terminal -> skip unless newer activity
 	}
-	older := candidate{repo: "o/r", number: 7, updatedAt: created.Time.Add(-time.Hour)}
-	newer := candidate{repo: "o/r", number: 7, updatedAt: created.Time.Add(time.Hour)}
+	older := candidate{repo: "o/r", number: 7, updatedAt: created.Add(-time.Hour)}
+	newer := candidate{repo: "o/r", number: 7, updatedAt: created.Add(time.Hour)}
 	if !isDeduped(candidate{repo: "o/r", number: 6}, existing) {
 		t.Fatalf("in-flight issue #6 should be deduped")
 	}
