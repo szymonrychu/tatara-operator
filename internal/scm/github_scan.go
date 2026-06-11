@@ -131,19 +131,19 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 }
 
 // CloseIssue posts a comment then PATCHes the issue state to closed.
-func (c *GitHub) CloseIssue(ctx context.Context, repo string, number int, comment string) error {
+func (c *GitHub) CloseIssue(ctx context.Context, token, repo string, number int, comment string) error {
 	owner, name, err := ghOwnerRepoFromSlug(repo)
 	if err != nil {
 		return err
 	}
 	if comment != "" {
 		cpath := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, name, number)
-		if err := ghDo(ctx, c.base(), http.MethodPost, cpath, c.token, map[string]string{"body": comment}, nil); err != nil {
+		if err := ghDo(ctx, c.base(), http.MethodPost, cpath, token, map[string]string{"body": comment}, nil); err != nil {
 			return fmt.Errorf("github: close issue comment: %w", err)
 		}
 	}
 	ipath := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, name, number)
-	return ghDo(ctx, c.base(), http.MethodPatch, ipath, c.token, map[string]string{"state": "closed"}, nil)
+	return ghDo(ctx, c.base(), http.MethodPatch, ipath, token, map[string]string{"state": "closed"}, nil)
 }
 
 func ghOwnerRepoFromSlug(slug string) (string, string, error) {

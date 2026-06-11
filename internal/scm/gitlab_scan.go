@@ -67,14 +67,14 @@ func (c *GitLab) ListBoardItems(_ context.Context, _ BoardRef) ([]BoardItem, err
 }
 
 // CloseIssue posts a note then PUTs the issue state_event=close.
-func (c *GitLab) CloseIssue(ctx context.Context, repo string, number int, comment string) error {
+func (c *GitLab) CloseIssue(ctx context.Context, token, repo string, number int, comment string) error {
 	proj := repo
 	if comment != "" {
 		npath := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number) + "/notes"
-		if err := glDo(ctx, c.base(), http.MethodPost, npath, c.token, map[string]string{"body": comment}, nil); err != nil {
+		if err := glDo(ctx, c.base(), http.MethodPost, npath, token, map[string]string{"body": comment}, nil); err != nil {
 			return err
 		}
 	}
 	ipath := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number)
-	return glDo(ctx, c.base(), http.MethodPut, ipath, c.token, map[string]string{"state_event": "close"}, nil)
+	return glDo(ctx, c.base(), http.MethodPut, ipath, token, map[string]string{"state_event": "close"}, nil)
 }

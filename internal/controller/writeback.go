@@ -495,7 +495,7 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 		return r.writeBackOpenChange(ctx, task)
 	}
 	// close
-	_, repo, writer, _, provider, err := r.scmContext(ctx, task)
+	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -503,7 +503,7 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 	if perr != nil {
 		return ctrl.Result{}, perr
 	}
-	if cerr := writer.CloseIssue(ctx, repoSlug, task.Spec.Source.Number, out.Comment); cerr != nil {
+	if cerr := writer.CloseIssue(ctx, token, repoSlug, task.Spec.Source.Number, out.Comment); cerr != nil {
 		r.recordSCM(provider, "close_issue", cerr)
 		return ctrl.Result{}, fmt.Errorf("writeback issue close: %w", cerr)
 	}

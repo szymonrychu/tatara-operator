@@ -541,7 +541,7 @@ func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, 
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr
 }
-func (f *fullFakeSCMWriter) CloseIssue(_ context.Context, _ string, number int, _ string) error {
+func (f *fullFakeSCMWriter) CloseIssue(_ context.Context, _, _ string, number int, _ string) error {
 	f.closeIssueCalled = true
 	f.closeIssueNumber = number
 	return nil
