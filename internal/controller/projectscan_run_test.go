@@ -125,6 +125,32 @@ func TestRunScans_IssueScanCap(t *testing.T) {
 	}
 }
 
+// TestRunScans_RequeueAfterPositiveAfterFire verifies that after a due activity
+// fires, runScans returns a RequeueAfter > 0 (the next-fire of the post-stamp
+// schedule), not 0, so the activity continues to be scheduled.
+func TestRunScans_RequeueAfterPositiveAfterFire(t *testing.T) {
+	// Hourly schedule; last ran 2h ago -> due now; next fire ~1h from now.
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerCycle: 1}}
+	proj, _ := seedScanProject(t, "requeue-fire-proj", cron)
+	past := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	proj.Status.LastIssueScan = &past
+	_ = k8sClient.Status().Update(context.Background(), proj)
+
+	reader := &fakeReader{issues: []scm.IssueRef{}} // no issues, just checks requeue
+	r := newScanReconciler(reader)
+	requeue, err := r.runScans(context.Background(), proj)
+	if err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+	if requeue <= 0 {
+		t.Fatalf("RequeueAfter = %v after a due issueScan fire, want > 0", requeue)
+	}
+	// Sanity: should be roughly 1 hour, definitely <= maxScheduleRequeue.
+	if requeue > maxScheduleRequeue {
+		t.Fatalf("RequeueAfter = %v exceeds maxScheduleRequeue %v", requeue, maxScheduleRequeue)
+	}
+}
+
 func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "not a cron", MaxPerCycle: 1}}
 	proj, _ := seedScanProject(t, "badcron-proj", cron)

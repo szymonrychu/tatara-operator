@@ -565,10 +565,16 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 
 	// mrScan
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
-		consider(next)
 		if due {
 			r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
 			r.stampScan(ctx, proj, "mrScan")
+			// Recompute next-fire from now so the post-stamp schedule produces a
+			// positive RequeueAfter (the pre-fire next is in the past).
+			if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
+				consider(next2)
+			}
+		} else {
+			consider(next)
 		}
 	} else if cronSpec.MRScan.Schedule != "" {
 		l.Error(fmt.Errorf("invalid cron %q", cronSpec.MRScan.Schedule), "scan: invalid mrScan cron, disabling",
@@ -577,10 +583,14 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 
 	// issueScan
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
-		consider(next)
 		if due {
 			r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
 			r.stampScan(ctx, proj, "issueScan")
+			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
+				consider(next2)
+			}
+		} else {
+			consider(next)
 		}
 	} else if cronSpec.IssueScan.Schedule != "" {
 		l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
@@ -590,10 +600,14 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// brainstorm (opt-in)
 	if cronSpec.Brainstorm.Enabled {
 		if _, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
-			consider(next)
 			if due {
 				r.brainstorm(ctx, proj, repos, cronSpec.Brainstorm)
 				r.stampScan(ctx, proj, "brainstorm")
+				if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
+				consider(next)
 			}
 		} else if cronSpec.Brainstorm.Schedule != "" {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Brainstorm.Schedule), "scan: invalid brainstorm cron, disabling",
