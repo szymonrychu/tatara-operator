@@ -34,6 +34,18 @@ func TestProvidersSatisfySCMWriter(t *testing.T) {
 	var _ SCMWriter = (*GitLab)(nil)
 }
 
+func TestProvidersSatisfySCMReader(t *testing.T) {
+	var _ SCMReader = (*GitHub)(nil)
+	var _ SCMReader = (*GitLab)(nil)
+}
+
+func TestProvidersSatisfyCloseIssue(t *testing.T) {
+	var w SCMWriter = (*GitHub)(nil)
+	_ = w
+	var w2 SCMWriter = (*GitLab)(nil)
+	_ = w2
+}
+
 func TestScanWireTypesZero(t *testing.T) {
 	pr := PRRef{Repo: "o/r", Number: 5, Author: "bot", HeadSHA: "abc", Labels: []string{"p"}}
 	if pr.Repo != "o/r" || pr.Number != 5 || pr.Author != "bot" || pr.HeadSHA != "abc" || pr.Labels[0] != "p" {

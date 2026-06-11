@@ -107,6 +107,14 @@ type SCMWriter interface {
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
+	CloseIssue(ctx context.Context, repo string, number int, comment string) error
+}
+
+// SCMReader lists open work for the cron scan loop; *GitHub and *GitLab satisfy it.
+type SCMReader interface {
+	ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error)
+	ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error)
+	ListBoardItems(ctx context.Context, board BoardRef) ([]BoardItem, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;
@@ -133,11 +141,13 @@ func (e *HTTPError) Error() string {
 type GitHub struct {
 	apiBase     string
 	graphQLBase string
+	token       string // bound for reader calls; empty for writer/webhook use
 }
 
 // GitLab implements Client for GitLab.
 type GitLab struct {
 	apiBase string
+	token   string // bound for reader calls; empty for writer/webhook use
 }
 
 func (*GitHub) Provider() string { return "github" }
