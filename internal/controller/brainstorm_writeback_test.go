@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/stretchr/testify/require"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"

@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -350,24 +351,27 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 }
 
 // stampScan records the per-activity Last*Scan and persists status.
+// RetryOnConflict handles racing reconcile updates so the stamp always lands.
 func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string) {
 	now := metav1.Now()
-	fresh := &tatarav1alpha1.Project{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
-		return
-	}
-	switch activity {
-	case "mrScan":
-		fresh.Status.LastMRScan = &now
-		proj.Status.LastMRScan = &now
-	case "issueScan":
-		fresh.Status.LastIssueScan = &now
-		proj.Status.LastIssueScan = &now
-	case "brainstorm":
-		fresh.Status.LastBrainstorm = &now
-		proj.Status.LastBrainstorm = &now
-	}
-	_ = r.Status().Update(ctx, fresh)
+	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Project{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
+			return err
+		}
+		switch activity {
+		case "mrScan":
+			fresh.Status.LastMRScan = &now
+			proj.Status.LastMRScan = &now
+		case "issueScan":
+			fresh.Status.LastIssueScan = &now
+			proj.Status.LastIssueScan = &now
+		case "brainstorm":
+			fresh.Status.LastBrainstorm = &now
+			proj.Status.LastBrainstorm = &now
+		}
+		return r.Status().Update(ctx, fresh)
+	})
 }
 
 // mrScan lists open PRs across repos, selects, dedups, and creates Tasks routed

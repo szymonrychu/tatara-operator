@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -179,15 +180,22 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 }
 
 // clearWritebackPending sets WritebackPending=False and updates status.
+// RetryOnConflict handles concurrent reconcile updates so the clear always lands.
 func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatarav1alpha1.Task, reason, msg string) {
-	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-		Type:               "WritebackPending",
-		Status:             metav1.ConditionFalse,
-		Reason:             reason,
-		Message:            msg,
-		ObservedGeneration: task.Generation,
-	})
-	if err := r.Status().Update(ctx, task); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "WritebackPending",
+			Status:             metav1.ConditionFalse,
+			Reason:             reason,
+			Message:            msg,
+			ObservedGeneration: fresh.Generation,
+		})
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
 		log.FromContext(ctx).Error(err, "writeback: clear WritebackPending", "task", task.Name)
 	}
 }
