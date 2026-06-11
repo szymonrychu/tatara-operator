@@ -105,7 +105,7 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 		field = "Status"
 	}
 	sel := fmt.Sprintf(
-		`projectV2(number:%d){ items(first:100){ nodes { updatedAt fieldValueByName(name:%q){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } ... on PullRequest { number repository { nameWithOwner } } } } } }`,
+		`projectV2(number:%d){ items(first:100){ nodes { updatedAt fieldValueByName(name:%q){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } }`,
 		board.GitHubProjectNumber, field,
 	)
 	q := fmt.Sprintf(`query { user(login:%q){ %s } organization(login:%q){ %s } }`, board.Owner, sel, board.Owner, sel)

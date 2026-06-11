@@ -465,6 +465,20 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 		r.clearWritebackPending(ctx, task, "NoOutcome", "triageIssue task without an outcome")
 		return ctrl.Result{}, nil
 	}
+	// Safety gate: triageIssue must never close a PR.
+	if task.Spec.Source.IsPR {
+		l.Error(fmt.Errorf("triageIssue source is a PR"), "writeback issue: refusing to close a PR",
+			"action", "scm_issue_refused_pr", "resource_id", task.Name, "number", task.Spec.Source.Number)
+		r.clearWritebackPending(ctx, task, "IssueRefusedPR", "triageIssue source is a PR; CloseIssue withheld")
+		return ctrl.Result{}, nil
+	}
+	// Re-assert kind (defence-in-depth).
+	if task.Spec.Kind != "triageIssue" {
+		l.Error(fmt.Errorf("unexpected kind %q in writeBackIssue", task.Spec.Kind), "writeback issue: wrong kind",
+			"action", "scm_issue_wrong_kind", "resource_id", task.Name)
+		r.clearWritebackPending(ctx, task, "IssueWrongKind", "writeBackIssue called for non-triageIssue task")
+		return ctrl.Result{}, nil
+	}
 	if out.Action == "implement" {
 		r.Metrics.IssueOutcome("implement")
 		l.Info("issue outcome implement (PR is the artifact)", "action", "scm_issue_outcome", "resource_id", task.Name, "outcome", "implement")
