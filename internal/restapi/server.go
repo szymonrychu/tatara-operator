@@ -53,4 +53,5 @@ func (s *Server) routes(r chi.Router) {
 	r.Post("/projects/{p}/issues", s.proposeIssue)
 	r.Post("/tasks/{t}/review", s.reviewVerdict)
 	r.Post("/tasks/{t}/pr-outcome", s.prOutcome)
+	r.Post("/tasks/{t}/issue-outcome", s.issueOutcome)
 }

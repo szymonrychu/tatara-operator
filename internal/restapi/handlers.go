@@ -345,6 +345,48 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
+type issueOutcomeReq struct {
+	Action  string `json:"action"`
+	Comment string `json:"comment,omitempty"`
+}
+
+func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
+	var req issueOutcomeReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, "action required")
+		return
+	}
+	switch req.Action {
+	case "implement", "close":
+	default:
+		writeError(w, http.StatusBadRequest, "action must be one of implement, close")
+		return
+	}
+	if req.Action == "close" && req.Comment == "" {
+		writeError(w, http.StatusBadRequest, "comment required when action is close")
+		return
+	}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Kind != "triageIssue" {
+		writeError(w, http.StatusConflict, "issue outcome only applies to a triageIssue task")
+		return
+	}
+	t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 // --- Task 7: PATCH /subtasks/{s} ---
 
 type subtaskPatchReq struct {

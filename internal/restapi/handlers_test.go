@@ -367,3 +367,72 @@ func TestPROutcome_TaskNotFound(t *testing.T) {
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
+
+func TestIssueOutcome(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"action":"close","comment":"out of scope"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.IssueOutcome)
+	require.Equal(t, "close", out.Status.IssueOutcome.Action)
+	require.Equal(t, "out of scope", out.Status.IssueOutcome.Comment)
+}
+
+func TestIssueOutcome_Implement(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"action":"implement"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestIssueOutcome_MissingAction(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"comment":"x"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestIssueOutcome_InvalidAction(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"action":"merge"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestIssueOutcome_CloseRequiresComment(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"action":"close"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestIssueOutcome_WrongKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"action":"implement"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestIssueOutcome_TaskNotFound(t *testing.T) {
+	r := buildRouter(t)
+	body := strings.NewReader(`{"action":"implement"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/missing/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
