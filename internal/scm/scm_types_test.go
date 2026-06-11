@@ -33,3 +33,18 @@ func TestProvidersSatisfySCMWriter(t *testing.T) {
 	var _ SCMWriter = (*GitHub)(nil)
 	var _ SCMWriter = (*GitLab)(nil)
 }
+
+func TestScanWireTypesZero(t *testing.T) {
+	pr := PRRef{Repo: "o/r", Number: 5, Author: "bot", HeadSHA: "abc", Labels: []string{"p"}}
+	if pr.Repo != "o/r" || pr.Number != 5 || pr.Author != "bot" || pr.HeadSHA != "abc" || pr.Labels[0] != "p" {
+		t.Fatalf("PRRef fields not wired: %+v", pr)
+	}
+	iss := IssueRef{Repo: "o/r", Number: 7, Labels: []string{"p"}, IsPR: true}
+	if iss.Repo != "o/r" || iss.Number != 7 || !iss.IsPR {
+		t.Fatalf("IssueRef fields not wired: %+v", iss)
+	}
+	bi := BoardItem{Repo: "o/r", Number: 9, Column: "Todo"}
+	if bi.Repo != "o/r" || bi.Number != 9 || bi.Column != "Todo" {
+		t.Fatalf("BoardItem fields not wired: %+v", bi)
+	}
+}

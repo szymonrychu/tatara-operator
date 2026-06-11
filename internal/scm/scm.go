@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // WebhookEvent is the provider-agnostic parse of an inbound SCM webhook.
@@ -37,6 +38,33 @@ type IssueReq struct {
 type CreatedIssue struct {
 	Ref string // owner/repo#n (github) or group/proj#iid (gitlab)
 	URL string // html/web url
+}
+
+// PRRef is one open PR/MR listed for cron MR-triage.
+type PRRef struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	Author    string    `json:"author"`
+	HeadSHA   string    `json:"headSha"`
+	Labels    []string  `json:"labels,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// IssueRef is one open issue listed for cron issue-triage.
+type IssueRef struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"`
+	Labels    []string  `json:"labels,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	IsPR      bool      `json:"isPr"` // GitHub /issues returns PRs; filter these out
+}
+
+// BoardItem is one project-board item listed for cron issue-triage.
+type BoardItem struct {
+	Repo      string    `json:"repo"`
+	Number    int       `json:"number"` // 0 for draft/non-issue items -> skipped
+	Column    string    `json:"column"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // PRState is the inspected state of a PR/MR.
