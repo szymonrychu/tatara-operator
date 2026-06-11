@@ -20,9 +20,9 @@ type ghPR struct {
 }
 
 type ghIssueItem struct {
-	Number    int       `json:"number"`
-	Labels    []ghLabel `json:"labels"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Number      int       `json:"number"`
+	Labels      []ghLabel `json:"labels"`
+	UpdatedAt   time.Time `json:"updated_at"`
 	PullRequest *struct {
 		URL string `json:"url"`
 	} `json:"pull_request"`
@@ -81,7 +81,7 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 			Name string `json:"name"`
 		} `json:"fieldValueByName"`
 		Content struct {
-			Number     int    `json:"number"`
+			Number     int `json:"number"`
 			Repository struct {
 				NameWithOwner string `json:"nameWithOwner"`
 			} `json:"repository"`

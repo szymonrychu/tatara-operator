@@ -15,8 +15,8 @@ func TestGitHubListOpenPRs(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{
 			{"number": 5, "user": map[string]any{"login": "alice"},
-				"head": map[string]any{"sha": "abc"},
-				"labels": []map[string]any{{"name": "tatara/priority"}},
+				"head":       map[string]any{"sha": "abc"},
+				"labels":     []map[string]any{{"name": "tatara/priority"}},
 				"updated_at": "2026-06-10T12:00:00Z"},
 		})
 	}))
@@ -88,7 +88,7 @@ func TestGitHubListBoardItems(t *testing.T) {
 						"items": map[string]any{"nodes": []map[string]any{
 							{"updatedAt": "2026-06-10T12:00:00Z",
 								"fieldValueByName": map[string]any{"name": "Todo"},
-								"content": map[string]any{"number": 9, "repository": map[string]any{"nameWithOwner": "o/r"}}},
+								"content":          map[string]any{"number": 9, "repository": map[string]any{"nameWithOwner": "o/r"}}},
 						}},
 					},
 				},
