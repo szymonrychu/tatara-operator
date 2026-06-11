@@ -7,9 +7,9 @@ func TestValueTypesZero(t *testing.T) {
 	if r.Title != "t" || r.Labels[0] != "x" {
 		t.Fatalf("IssueReq fields not wired: %+v", r)
 	}
-	ref := IssueRef{Ref: "o/r#1", URL: "https://x/1"}
+	ref := CreatedIssue{Ref: "o/r#1", URL: "https://x/1"}
 	if ref.Ref != "o/r#1" || ref.URL == "" {
-		t.Fatalf("IssueRef fields not wired: %+v", ref)
+		t.Fatalf("CreatedIssue fields not wired: %+v", ref)
 	}
 	st := PRState{Author: "a", HeadSHA: "sha", HeadBranch: "br", Mergeable: true, CIStatus: "success"}
 	if !st.Mergeable || st.CIStatus != "success" {

@@ -233,10 +233,10 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 }
 
 // CreateIssue opens an issue and returns its ref + url.
-func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error) {
+func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (CreatedIssue, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
-		return IssueRef{}, err
+		return CreatedIssue{}, err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/issues", owner, repo)
 	in := map[string]any{"title": req.Title, "body": req.Body}
@@ -248,9 +248,9 @@ func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 		HTMLURL string `json:"html_url"`
 	}
 	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
-		return IssueRef{}, err
+		return CreatedIssue{}, err
 	}
-	return IssueRef{Ref: fmt.Sprintf("%s/%s#%d", owner, repo, out.Number), URL: out.HTMLURL}, nil
+	return CreatedIssue{Ref: fmt.Sprintf("%s/%s#%d", owner, repo, out.Number), URL: out.HTMLURL}, nil
 }
 
 // AddLabel adds a single label to an issue/PR identified by owner/repo#number.

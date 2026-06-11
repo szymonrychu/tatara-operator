@@ -33,8 +33,8 @@ type IssueReq struct {
 	Labels []string
 }
 
-// IssueRef identifies a created issue.
-type IssueRef struct {
+// CreatedIssue identifies a created issue (internal return type, not a wire type).
+type CreatedIssue struct {
 	Ref string // owner/repo#n (github) or group/proj#iid (gitlab)
 	URL string // html/web url
 }
@@ -68,7 +68,7 @@ type BoardRef struct {
 type SCMWriter interface {
 	OpenChange(ctx context.Context, repoURL, token, sourceBranch, targetBranch, title, body string) (string, error)
 	Comment(ctx context.Context, token, issueRef, body string) error
-	CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (IssueRef, error)
+	CreateIssue(ctx context.Context, repoURL, token string, req IssueReq) (CreatedIssue, error)
 	AddLabel(ctx context.Context, token, issueRef, label string) error
 	RemoveLabel(ctx context.Context, token, issueRef, label string) error
 	GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error)
