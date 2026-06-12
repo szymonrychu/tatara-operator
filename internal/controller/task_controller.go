@@ -219,13 +219,28 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 		return r.terminate(ctx, task, "Failed", "PodLost", "wrapper pod lost; recreation budget exhausted")
 	}
 
-	// Set Planning on first spawn.
+	// Set Planning on first spawn. RetryOnConflict: lifecycle handlers write
+	// status (the iteration counter) immediately before this, and the cached
+	// client can lag the API server, so a plain Update races. Absorbing the
+	// conflict here (instead of erroring the reconcile) is essential: a
+	// reconcile-level error would re-enter the handler at Phase=="" and
+	// re-run its iteration increment, spinning the count to the backstop.
 	if task.Status.Phase == "" {
-		task.Status.Phase = "Planning"
-		task.Status.PodName = agent.PodName(task)
-		if err := r.Status().Update(ctx, task); err != nil {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			if fresh.Status.Phase != "" {
+				return nil // already advanced by a prior attempt
+			}
+			fresh.Status.Phase = "Planning"
+			fresh.Status.PodName = agent.PodName(task)
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("set planning phase: %w", err)
 		}
+		task.Status.Phase = "Planning"
 		r.updateInflightGauge(ctx)
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
