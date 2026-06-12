@@ -400,3 +400,19 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 	}
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }
+
+// GetCommitCIStatus returns the CI status for the given commit sha by reading
+// its check-runs. Returns "" (none) | "pending" | "success" | "failure".
+func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error) {
+	var checks struct {
+		CheckRuns []struct {
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, sha)
+	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &checks); err != nil {
+		return "", err
+	}
+	return deriveGHCIStatus(checks.CheckRuns), nil
+}

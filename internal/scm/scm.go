@@ -119,6 +119,9 @@ type SCMReader interface {
 	ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error)
 	ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error)
 	ListBoardItems(ctx context.Context, board BoardRef) ([]BoardItem, error)
+	// GetCommitCIStatus returns the CI status for a commit sha.
+	// Returns "" (none) | "pending" | "success" | "failure".
+	GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;

@@ -511,3 +511,37 @@ func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column strin
 	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"add_labels": "board::" + column}, nil)
 }
+
+// GetCommitCIStatus returns the CI status for a commit sha by reading its
+// statuses. owner is the project path (group/project). Returns "" (none) |
+// "pending" | "success" | "failure".
+func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha string) (string, error) {
+	var statuses []struct {
+		Status string `json:"status"`
+	}
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + sha + "/statuses"
+	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &statuses); err != nil {
+		return "", err
+	}
+	if len(statuses) == 0 {
+		return "", nil
+	}
+	// Aggregate: failure > pending > success.
+	failure, pending := false, false
+	for _, s := range statuses {
+		switch glCIStatus(s.Status) {
+		case "failure":
+			failure = true
+		case "pending":
+			pending = true
+		}
+	}
+	switch {
+	case failure:
+		return "failure", nil
+	case pending:
+		return "pending", nil
+	default:
+		return "success", nil
+	}
+}

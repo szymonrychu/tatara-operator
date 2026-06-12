@@ -31,6 +31,9 @@ func (f *fakeReader) ListOpenIssues(context.Context, string, string) ([]scm.Issu
 func (f *fakeReader) ListBoardItems(context.Context, scm.BoardRef) ([]scm.BoardItem, error) {
 	return f.board, nil
 }
+func (f *fakeReader) GetCommitCIStatus(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
 
 func seedScanProject(t *testing.T, name string, cron *tatarav1alpha1.ScmCron) (*tatarav1alpha1.Project, *tatarav1alpha1.Repository) {
 	t.Helper()
