@@ -75,3 +75,24 @@ jobs:
       - uses: azure/setup-kubectl@v4
       - name: build and push image
         run: bash .github/ci/kaniko-build.sh "${{ github.event.repository.name }}"
+
+  chart:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: tatara-operator
+    needs: [image]
+    env:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v4
+      - name: package and push chart
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          VERSION="$(git describe --tags --always --dirty)"
+          NAME="$(basename "$(ls -d charts/*/)")"
+          helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
+          helm package "charts/$NAME" --version "0.0.0-${SHORT_SHA}" --app-version "${VERSION}"
+          helm push "${NAME}-0.0.0-${SHORT_SHA}.tgz" oci://harbor.szymonrichert.pl/charts
