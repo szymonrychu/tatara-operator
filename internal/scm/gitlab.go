@@ -283,7 +283,7 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
 		return fmt.Errorf("gitlab: decode response: %w", err)
 	}
 	return nil
@@ -423,15 +423,21 @@ func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int,
 	return nil
 }
 
-// Merge merges an MR.
-func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+// Merge merges an MR. Returns the merge commit SHA on success.
+func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 	in := map[string]bool{"squash": method == "squash"}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/merge"
-	return glDo(ctx, c.base(), http.MethodPut, path, token, in, nil)
+	var resp struct {
+		MergeCommitSHA string `json:"merge_commit_sha"`
+	}
+	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
+		return "", err
+	}
+	return resp.MergeCommitSHA, nil
 }
 
 // ClosePR closes an MR (state_event=close) and posts the reason as a note.
@@ -510,4 +516,38 @@ func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column strin
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"add_labels": "board::" + column}, nil)
+}
+
+// GetCommitCIStatus returns the CI status for a commit sha by reading its
+// statuses. owner is the project path (group/project). Returns "" (none) |
+// "pending" | "success" | "failure".
+func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha string) (string, error) {
+	var statuses []struct {
+		Status string `json:"status"`
+	}
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + sha + "/statuses"
+	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &statuses); err != nil {
+		return "", err
+	}
+	if len(statuses) == 0 {
+		return "", nil
+	}
+	// Aggregate: failure > pending > success.
+	failure, pending := false, false
+	for _, s := range statuses {
+		switch glCIStatus(s.Status) {
+		case "failure":
+			failure = true
+		case "pending":
+			pending = true
+		}
+	}
+	switch {
+	case failure:
+		return "failure", nil
+	case pending:
+		return "pending", nil
+	default:
+		return "success", nil
+	}
 }

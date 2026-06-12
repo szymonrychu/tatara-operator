@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -59,6 +60,13 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 // the Task status. Shared by the default (implement/brainstorm) path and the
 // triageIssue-implement path.
 func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	// Idempotency guard: if PrURL is already set this function ran successfully on
+	// a previous reconcile. Clear WritebackPending and return without re-opening.
+	if task.Status.PrURL != "" {
+		r.clearWritebackPending(ctx, task, "AlreadyWritten", "pr/mr url already set")
+		return ctrl.Result{}, nil
+	}
+
 	l := log.FromContext(ctx)
 
 	var proj tatarav1alpha1.Project
@@ -107,11 +115,22 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 
 	sourceBranch := taskBranch(task)
 	title := firstLine(task.Spec.Goal)
-	body := writeBackBody(task)
+	baseBody := writeBackBody(task)
 
 	var prURLs []string
 	var lastSkipStatus int
 	for _, repo := range ordered {
+		body := baseBody
+		// Append "Closes #N" for the primary repo of an issue-linked lifecycle task
+		// so the MR auto-closes the issue on merge.  Never emit this on secondary
+		// repos (cross-repo leak) or for non-lifecycle / PR-entry tasks.
+		if repo.Name == primaryRepo.Name &&
+			task.Spec.Kind == "issueLifecycle" &&
+			task.Spec.Source != nil &&
+			!task.Spec.Source.IsPR &&
+			task.Spec.Source.Number > 0 {
+			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
+		}
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
 		if openErr != nil {
 			var he *scm.HTTPError
@@ -604,8 +623,20 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 			r.clearWritebackPending(ctx, task, "MergeWithheld", "merge policy not satisfied")
 			return ctrl.Result{}, nil
 		}
-		err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
+		_, err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
 		r.recordSCM(provider, "merge", err)
+		// 405 or body contains "conflict" -> merge conflict on an in-flight task.
+		// Do NOT return the error: that would trigger controller-runtime backoff loop.
+		// Instead clear WritebackPending and let the task be re-triaged.
+		if err != nil {
+			var he *scm.HTTPError
+			if errors.As(err, &he) && (he.Status == 405 || strings.Contains(strings.ToLower(he.Body), "conflict")) {
+				l.Info("self-improve merge conflict (405); clearing writeback pending",
+					"action", "scm_selfimprove_conflict", "resource_id", task.Name)
+				r.clearWritebackPending(ctx, task, "MergeConflict", "merge conflict; left for re-triage")
+				return ctrl.Result{}, nil
+			}
+		}
 	default:
 		err = fmt.Errorf("unknown pr outcome %q", out.Action)
 	}

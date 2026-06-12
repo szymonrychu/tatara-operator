@@ -44,6 +44,15 @@ type AgentSpec struct {
 	// +kubebuilder:default=1800
 	// +optional
 	TurnTimeoutSeconds int `json:"turnTimeoutSeconds,omitempty"`
+	// +kubebuilder:default=200000
+	// +optional
+	ContextWindowTokens int `json:"contextWindowTokens,omitempty"`
+	// +kubebuilder:default=50
+	// +optional
+	HandoverThresholdPercent int `json:"handoverThresholdPercent,omitempty"`
+	// +kubebuilder:default=10
+	// +optional
+	MaxLifecycleIterations int `json:"maxLifecycleIterations,omitempty"`
 }
 
 // BoardSpec configures the project board tatara participates in.
@@ -115,6 +124,12 @@ type ScmSpec struct {
 	PriorityLabel string `json:"priorityLabel,omitempty"`
 	// +optional
 	Cron *ScmCron `json:"cron,omitempty"`
+	// +kubebuilder:default=60
+	// +optional
+	BabysitDeadlineMinutes int `json:"babysitDeadlineMinutes,omitempty"`
+	// +kubebuilder:default=60
+	// +optional
+	ConversationIdleMinutes int `json:"conversationIdleMinutes,omitempty"`
 }
 
 // ProjectSpec defines the desired state of a Project.

@@ -70,7 +70,7 @@ func singleTask(t *testing.T, c client.Client, projectName string) tatarav1.Task
 }
 
 func TestHandleWorkItemKind(t *testing.T) {
-	t.Run("issue with trigger label -> implement task, ApprovalRequired=false", func(t *testing.T) {
+	t.Run("issue with trigger label -> issueLifecycle task entering at Implement, ApprovalRequired=false", func(t *testing.T) {
 		proj := newProjectWithScm(t, "tatara-bot", "labeledOrMentioned")
 		repo := newRepo(t, proj.Name, "https://github.com/o/r.git")
 		srv, c := newWebhookServer(t, proj, repo)
@@ -85,7 +85,11 @@ func TestHandleWorkItemKind(t *testing.T) {
 		require.Equal(t, http.StatusAccepted, w.Code)
 
 		tk := singleTask(t, c, proj.Name)
-		require.Equal(t, "implement", tk.Spec.Kind)
+		// kind switch: was "implement", now "issueLifecycle" (migration note: in-flight
+		// "implement" tasks created before this deploy still complete via old writeback arm)
+		require.Equal(t, "issueLifecycle", tk.Spec.Kind)
+		// Entry state is now carried by the create-time annotation (FIX 3).
+		require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"])
 		require.False(t, tk.Spec.ApprovalRequired)
 		require.NotNil(t, tk.Spec.Source)
 		require.Equal(t, "alice", tk.Spec.Source.AuthorLogin)
@@ -93,7 +97,7 @@ func TestHandleWorkItemKind(t *testing.T) {
 		require.Equal(t, 7, tk.Spec.Source.Number)
 	})
 
-	t.Run("PR opened by botLogin -> selfImprove task", func(t *testing.T) {
+	t.Run("PR opened by botLogin -> issueLifecycle MRCI task", func(t *testing.T) {
 		proj := newProjectWithScm(t, "tatara-bot", "labeledOrMentioned")
 		repo := newRepo(t, proj.Name, "https://github.com/o/r.git")
 		srv, c := newWebhookServer(t, proj, repo)
@@ -108,7 +112,12 @@ func TestHandleWorkItemKind(t *testing.T) {
 		require.Equal(t, http.StatusAccepted, w.Code)
 
 		tk := singleTask(t, c, proj.Name)
-		require.Equal(t, "selfImprove", tk.Spec.Kind)
+		// kind switch: was "selfImprove", now "issueLifecycle" (migration note: in-flight
+		// "selfImprove" tasks created before this deploy still complete via old writeback arm)
+		require.Equal(t, "issueLifecycle", tk.Spec.Kind)
+		// Entry state is now carried by the create-time annotation, not a post-create
+		// Status().Update (FIX 3). reconcileLifecycle initializes LifecycleState from it.
+		require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"])
 		require.False(t, tk.Spec.ApprovalRequired)
 		require.NotNil(t, tk.Spec.Source)
 		require.Equal(t, "tatara-bot", tk.Spec.Source.AuthorLogin)

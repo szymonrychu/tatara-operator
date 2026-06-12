@@ -44,10 +44,10 @@ type PROutcome struct {
 
 // IssueOutcome is the agent's outcome for an issue-triage task.
 type IssueOutcome struct {
-	// +kubebuilder:validation:Enum=implement;close
+	// +kubebuilder:validation:Enum=implement;close;discuss
 	Action string `json:"action"`
 	// +optional
-	Comment string `json:"comment,omitempty"` // required when Action==close
+	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
 }
 
 // TaskSource records the SCM work-item that originated a webhook-born Task.
@@ -74,7 +74,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`
@@ -111,6 +111,35 @@ type TaskStatus struct {
 	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
 	// +optional
 	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
+
+	// Lifecycle fields (issueLifecycle kind only; empty on all other kinds).
+
+	// +kubebuilder:validation:Enum=Triage;Conversation;Implement;MRCI;Merge;MainCI;Done;Stopped;Parked
+	// +optional
+	LifecycleState string `json:"lifecycleState,omitempty"`
+	// +optional
+	LastActivityAt *metav1.Time `json:"lastActivityAt,omitempty"`
+	// +optional
+	DeadlineAt *metav1.Time `json:"deadlineAt,omitempty"`
+	// +optional
+	HeadBranch string `json:"headBranch,omitempty"`
+	// +optional
+	PRNumber int `json:"prNumber,omitempty"`
+	// +optional
+	MergeCommitSHA string `json:"mergeCommitSHA,omitempty"`
+	// +optional
+	CumulativeTokens int64 `json:"cumulativeTokens,omitempty"`
+	// +optional
+	LastTurnInputTokens int64 `json:"lastTurnInputTokens,omitempty"`
+	// +optional
+	LifecycleIterations int `json:"lifecycleIterations,omitempty"`
+	// +optional
+	Handover string `json:"handover,omitempty"`
+	// ImplementContext is an optional re-entry prompt injected at the start of
+	// the next Implement agent turn (e.g. CI failure details, conflict notice).
+	// Cleared after the turn is submitted so a later fresh entry is clean.
+	// +optional
+	ImplementContext string `json:"implementContext,omitempty"`
 }
 
 // +kubebuilder:object:root=true

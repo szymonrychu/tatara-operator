@@ -21,6 +21,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// linkedIssueNumber is a package-local alias for scm.LinkedIssueNumber so
+// the mrScan call sites remain readable without a long qualifier.
+func linkedIssueNumber(body string) (int, bool) {
+	return scm.LinkedIssueNumber(body)
+}
+
+// isLifecycleTerminal reports whether a lifecycle state counts as terminal for
+// dedup purposes (Done/Stopped/Parked free the (repo,number) key on newer activity).
+func isLifecycleTerminal(state string) bool {
+	switch state {
+	case "Done", "Stopped", "Parked":
+		return true
+	}
+	return false
+}
+
 // activityNextFire parses a 5-field cron and returns the next fire after base.
 // ok=false when the schedule is empty (disabled) or malformed (caller logs).
 func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
@@ -34,12 +50,13 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 	return parsed.Next(base), true
 }
 
+// label key aliases for readability within this package.
 const (
-	labelSourceRepo   = "tatara.io/source-repo"
-	labelSourceNumber = "tatara.io/source-number"
-	labelSourceKind   = "tatara.io/source-kind"
-	labelHeadSHA      = "tatara.io/head-sha"
-	labelActivity     = "tatara.io/activity"
+	labelSourceRepo   = tatarav1alpha1.LabelSourceRepo
+	labelSourceNumber = tatarav1alpha1.LabelSourceNumber
+	labelSourceKind   = tatarav1alpha1.LabelSourceKind
+	labelHeadSHA      = tatarav1alpha1.LabelHeadSHA
+	labelActivity     = tatarav1alpha1.LabelActivity
 )
 
 // sanitizeRepoLabel makes a repo slug DNS-label-safe by replacing '/' with '.'.
@@ -65,6 +82,8 @@ func scanTaskLabels(c candidate, activity, kind string) map[string]string {
 // isDeduped reports whether a candidate already has a Task that should suppress
 // a re-pick, per the dedup rules:
 //   - any non-terminal Task for (repo, number) -> skip
+//   - issueLifecycle: Done/Stopped/Parked lifecycle states count as terminal for
+//     dedup purposes (they free the key on newer activity, like Phase Succeeded)
 //   - PR: a terminal Task at the same head-sha -> skip (already handled revision)
 //   - issue: a terminal Task whose creation is at/after the candidate updatedAt -> skip
 func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
@@ -75,7 +94,11 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		if !isTerminal(t.Status.Phase) {
+		// A lifecycle Task with a non-terminal lifecycle state is in-flight even
+		// if the phase hasn't advanced yet. Treat lifecycle terminals as equivalent
+		// to Phase Succeeded/Failed for dedup.
+		lifecycleTerminal := t.Status.LifecycleState != "" && isLifecycleTerminal(t.Status.LifecycleState)
+		if !isTerminal(t.Status.Phase) && !lifecycleTerminal {
 			return true
 		}
 		if c.isPR {
@@ -94,12 +117,13 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 
 // candidate is one scannable work item (PR, issue, or board item) normalized
 // for selection + dedup. number/repo identify it; labels drive priority;
-// updatedAt drives stale-first ordering.
+// updatedAt drives stale-first ordering. body is used for PR "Closes #N" parsing.
 type candidate struct {
 	repo      string
 	number    int
 	author    string
 	headSHA   string
+	body      string
 	labels    []string
 	updatedAt time.Time
 	isPR      bool
@@ -206,7 +230,7 @@ func candidatesFromPRs(prs []scm.PRRef) []candidate {
 	for _, p := range prs {
 		out = append(out, candidate{
 			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
-			labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
+			body: p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
 		})
 	}
 	return out
@@ -245,25 +269,35 @@ const annBrainstormSources = "tatara.dev/brainstorm-sources"
 
 // createScanTask creates one cron Task for a candidate with the dedup labels,
 // a TaskSource pointing at the work item, and an owner-ref to the Project.
-func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, c candidate, activity, kind, goal string) (*tatarav1alpha1.Task, error) {
+//
+// labelCand drives the dedup labels (source-repo, source-number). srcCand
+// drives the TaskSource (provider, issueRef, number, isPR, authorLogin). For
+// most callers they are the same candidate. For bot-PR MRCI entries they
+// differ: labelCand carries the linked-issue number (dedup key) while srcCand
+// carries the PR identity (number, IsPR=true).
+//
+// extraAnnotations, if non-nil, is set on the Task at create time
+// (e.g. tatara.dev/lifecycle-entry for issueLifecycle tasks).
+func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, labelCand, srcCand candidate, activity, kind, goal string, extraAnnotations map[string]string) (*tatarav1alpha1.Task, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
 	src := &tatarav1alpha1.TaskSource{
 		Provider: provider,
-		IssueRef: fmt.Sprintf("%s#%d", c.repo, c.number),
-		Number:   c.number,
-		IsPR:     c.isPR,
+		IssueRef: fmt.Sprintf("%s#%d", srcCand.repo, srcCand.number),
+		Number:   srcCand.number,
+		IsPR:     srcCand.isPR,
 	}
-	if c.author != "" {
-		src.AuthorLogin = c.author
+	if srcCand.author != "" {
+		src.AuthorLogin = srcCand.author
 	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "scan-",
 			Namespace:    proj.Namespace,
-			Labels:       scanTaskLabels(c, activity, kind),
+			Labels:       scanTaskLabels(labelCand, activity, kind),
+			Annotations:  extraAnnotations,
 		},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
@@ -421,10 +455,14 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 }
 
 // mrScan lists open PRs across repos, selects, dedups, and creates Tasks routed
-// by authoritative author -> review (human) | selfImprove (bot).
+// by authoritative author -> review (human) | issueLifecycle/MRCI (bot).
 func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
+	bot := ""
+	if proj.Spec.Scm != nil {
+		bot = proj.Spec.Scm.BotLogin
+	}
 	var cands []candidate
 	for i := range repos {
 		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
@@ -450,8 +488,11 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			eligible = append(eligible, c)
 		}
 	}
+	// kind switch for bot PRs: was "selfImprove", now "issueLifecycle" (MRCI entry);
+	// migration note: in-flight "selfImprove" tasks created before this deploy still complete
+	// via old writeback arm.
 	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
-		func(slug string) int { return laneOccupancy(existing, slug, "review", "selfImprove") })
+		func(slug string) int { return laneOccupancy(existing, slug, "issueLifecycle", "review") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("mrScan", "skipped_cap")
 	}
@@ -461,14 +502,34 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		if !ok {
 			continue
 		}
-		kind := "review"
-		if c.author == proj.Spec.Scm.BotLogin {
-			kind = "selfImprove"
-		}
-		goal := fmt.Sprintf("Triage %s PR %s#%d", kind, c.repo, c.number)
-		if _, err := r.createScanTask(ctx, proj, &repo, c, "mrScan", kind, goal); err != nil {
-			l.Error(err, "scan: create mrScan task", "resource_id", proj.Name, "repo", repo.Name)
-			continue
+		if c.author == bot && bot != "" {
+			// Bot PR -> issueLifecycle entering at MRCI. Dedup key is the linked issue
+			// number from "Closes #N" if present, else the PR number.
+			dedupNumber := c.number
+			if issueNum, linked := linkedIssueNumber(c.body); linked {
+				dedupNumber = issueNum
+			}
+			// labelCand carries the dedup key (issue number when present).
+			labelCand := candidate{
+				repo: c.repo, number: dedupNumber, headSHA: c.headSHA,
+				labels: c.labels, updatedAt: c.updatedAt, isPR: c.isPR,
+			}
+			// srcCand carries the actual PR identity (PR number, IsPR=true).
+			srcCand := candidate{
+				repo: c.repo, number: c.number, author: c.author, isPR: true,
+			}
+			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
+			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			if _, err := r.createScanTask(ctx, proj, &repo, labelCand, srcCand, "mrScan", "issueLifecycle", goal, ann); err != nil {
+				l.Error(err, "scan: create mrScan issueLifecycle task", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
+		} else {
+			goal := fmt.Sprintf("Triage review PR %s#%d", c.repo, c.number)
+			if _, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, nil); err != nil {
+				l.Error(err, "scan: create mrScan task", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
 		}
 		r.Metrics.ScanItem("mrScan", "picked")
 		created++
@@ -528,8 +589,10 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			eligible = append(eligible, c)
 		}
 	}
+	// kind switch: was "triageIssue", now "issueLifecycle"; migration note: in-flight
+	// "triageIssue" tasks created before this deploy still complete via old writeback arm.
 	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
-		func(slug string) int { return laneOccupancy(existing, slug, "triageIssue") })
+		func(slug string) int { return laneOccupancy(existing, slug, "issueLifecycle") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("issueScan", "skipped_cap")
 	}
@@ -540,7 +603,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			continue
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
-		if _, err := r.createScanTask(ctx, proj, &repo, c, "issueScan", "triageIssue", goal); err != nil {
+		if _, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil); err != nil {
 			l.Error(err, "scan: create issueScan task", "resource_id", proj.Name, "repo", repo.Name)
 			continue
 		}

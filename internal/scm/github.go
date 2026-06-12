@@ -229,7 +229,7 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
 		return fmt.Errorf("github: decode response: %w", err)
 	}
 	return nil
@@ -376,13 +376,20 @@ func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int,
 }
 
 // Merge merges a PR with the given method (squash|merge|rebase).
-func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+// Returns the merge commit SHA on success.
+func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", owner, repo, number)
-	return ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, nil)
+	var resp struct {
+		SHA string `json:"sha"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, &resp); err != nil {
+		return "", err
+	}
+	return resp.SHA, nil
 }
 
 // ClosePR closes a PR (state=closed) and posts a comment with the reason.
@@ -399,4 +406,67 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 		return nil
 	}
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
+}
+
+// GetCommitCIStatus returns the CI status for the given commit sha by reading
+// both check-runs and the legacy combined-status API and folding the results:
+//   - failure if either source reports failure
+//   - pending if either source reports pending (and neither reports failure)
+//   - success if all present signals report success
+//   - "" if neither source has any data
+//
+// Returns "" (none) | "pending" | "success" | "failure".
+func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error) {
+	var checks struct {
+		CheckRuns []struct {
+			Status     string `json:"status"`
+			Conclusion string `json:"conclusion"`
+		} `json:"check_runs"`
+	}
+	checkPath := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, sha)
+	if err := ghDo(ctx, c.base(), http.MethodGet, checkPath, c.token, nil, &checks); err != nil {
+		return "", err
+	}
+	checkStatus := deriveGHCIStatus(checks.CheckRuns)
+
+	// Also read the legacy combined-status endpoint so CI systems that report via
+	// Commit Statuses (not Check Runs) are visible.
+	var combined struct {
+		State      string `json:"state"`
+		TotalCount int    `json:"total_count"`
+	}
+	statusPath := fmt.Sprintf("/repos/%s/%s/commits/%s/status", owner, repo, sha)
+	if err := ghDo(ctx, c.base(), http.MethodGet, statusPath, c.token, nil, &combined); err != nil {
+		return "", err
+	}
+	// combined.State is always present (even "pending" when TotalCount==0).
+	// Treat TotalCount==0 as "no data" (same as "" from check-runs).
+	combinedStatus := ""
+	if combined.TotalCount > 0 {
+		switch combined.State {
+		case "success":
+			combinedStatus = "success"
+		case "pending":
+			combinedStatus = "pending"
+		case "failure", "error":
+			combinedStatus = "failure"
+		}
+	}
+
+	return foldCIStatuses(checkStatus, combinedStatus), nil
+}
+
+// foldCIStatuses merges two CI status strings with the precedence rule:
+// failure > pending > success > "" (none).
+func foldCIStatuses(a, b string) string {
+	if a == "failure" || b == "failure" {
+		return "failure"
+	}
+	if a == "pending" || b == "pending" {
+		return "pending"
+	}
+	if a == "success" || b == "success" {
+		return "success"
+	}
+	return ""
 }

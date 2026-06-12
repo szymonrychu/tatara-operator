@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -47,6 +49,7 @@ type PRRef struct {
 	Author    string    `json:"author"`
 	HeadSHA   string    `json:"headSha"`
 	Labels    []string  `json:"labels,omitempty"`
+	Body      string    `json:"body,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
@@ -104,7 +107,7 @@ type SCMWriter interface {
 	Approve(ctx context.Context, repoURL, token string, number int, body string) error
 	RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error
 	Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error
-	Merge(ctx context.Context, repoURL, token string, number int, method string) error
+	Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error)
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
@@ -116,6 +119,9 @@ type SCMReader interface {
 	ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error)
 	ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error)
 	ListBoardItems(ctx context.Context, board BoardRef) ([]BoardItem, error)
+	// GetCommitCIStatus returns the CI status for a commit sha.
+	// Returns "" (none) | "pending" | "success" | "failure".
+	GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;
@@ -156,3 +162,21 @@ func (*GitLab) Provider() string { return "gitlab" }
 
 // DetectAndVerify is implemented per provider in github.go and gitlab.go.
 // OpenChange and Comment are implemented per provider in github.go and gitlab.go.
+
+// reClosesIssue matches "Closes #N" (case-insensitive) in a PR body.
+var reClosesIssue = regexp.MustCompile(`(?i)closes\s+#(\d+)`)
+
+// LinkedIssueNumber parses the first "Closes #N" reference from a PR body.
+// Returns (n, true) on match, (0, false) otherwise. Shared by the webhook
+// binder and the cron mrScan so their dedup keys are consistent.
+func LinkedIssueNumber(body string) (int, bool) {
+	m := reClosesIssue.FindStringSubmatch(body)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}

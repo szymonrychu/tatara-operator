@@ -105,7 +105,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable.
-func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics) error {
+func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics) error {
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
@@ -134,11 +134,12 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Audience:     "tatara-claude-code-wrapper",
 	})
 	if err := (&controller.TaskReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		Metrics:   metrics,
-		Session:   agent.NewHTTPSession(wrapperTokens.Token),
-		PodConfig: podConfigFromConfig(cfg),
+		Client:           mgr.GetClient(),
+		Scheme:           mgr.GetScheme(),
+		Metrics:          metrics,
+		LifecycleMetrics: lifecycleMetrics,
+		Session:          agent.NewHTTPSession(wrapperTokens.Token),
+		PodConfig:        podConfigFromConfig(cfg),
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},

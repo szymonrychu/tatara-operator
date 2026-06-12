@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -173,10 +174,14 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
-	kind := "implement"
+	// kind switch: issue with triggerLabel -> issueLifecycle (was "implement");
+	// bot PR -> issueLifecycle (was "selfImprove"); migration note: in-flight
+	// "implement"/"selfImprove" tasks created before this deploy still complete
+	// via the old writeback arms.
+	kind := "issueLifecycle"
 	if ev.IsPR {
 		if ev.AuthorLogin == bot && bot != "" {
-			kind = "selfImprove"
+			kind = "issueLifecycle"
 		} else {
 			kind = "review"
 		}
@@ -236,10 +241,49 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
+	// Determine the lifecycle entry state for issueLifecycle tasks. This is set
+	// as a create-time annotation so reconcileLifecycle can initialize
+	// LifecycleState atomically from it, without a separate post-create
+	// Status().Update that may be lost.
+	ann := map[string]string{}
+	// Dedup labels: set for issueLifecycle tasks so the webhook-born Task uses
+	// the same dedup key as a cron mrScan/issueScan Task for the same work item,
+	// preventing duplicate lifecycle Tasks.
+	var labels map[string]string
+	if kind == "issueLifecycle" {
+		if ev.IsPR {
+			ann[tatarav1.LifecycleEntryAnnotation] = "MRCI"
+			// Bot-PR dedup key: linked issue number from "Closes #N" when present,
+			// else the PR number - mirroring mrScan's key exactly.
+			dedupNumber := ev.Number
+			if issueNum, linked := scm.LinkedIssueNumber(ev.Body); linked {
+				dedupNumber = issueNum
+			}
+			repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+			labels = map[string]string{
+				tatarav1.LabelSourceRepo:   repoSlug,
+				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
+				tatarav1.LabelSourceKind:   kind,
+				tatarav1.LabelActivity:     "webhook",
+			}
+		} else {
+			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
+			repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+			labels = map[string]string{
+				tatarav1.LabelSourceRepo:   repoSlug,
+				tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
+				tatarav1.LabelSourceKind:   kind,
+				tatarav1.LabelActivity:     "webhook",
+			}
+		}
+	}
+
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName:    "task-",
 			Namespace:       s.cfg.Namespace,
+			Annotations:     ann,
+			Labels:          labels,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -262,6 +306,9 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
+	// NOTE: No post-create Status().Update for lifecycle state. The entry state is
+	// carried by the LifecycleEntryAnnotation and consumed by reconcileLifecycle on
+	// the first reconcile.
 	s.log.InfoContext(ctx, "work item created task",
 		"project", proj.Name, "repository", repo.Name,
 		"task", task.Name, "issue_ref", ev.IssueRef, "kind", kind)

@@ -69,7 +69,8 @@ func run(ctx context.Context) error {
 		return err
 	}
 	operatorMetrics := obs.NewOperatorMetrics(ctrlmetrics.Registry)
-	if err := addReconcilers(mgr, cfg, operatorMetrics); err != nil {
+	lifecycleMetrics := obs.NewLifecycleMetrics(ctrlmetrics.Registry)
+	if err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics); err != nil {
 		return err
 	}
 	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics); err != nil {

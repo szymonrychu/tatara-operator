@@ -103,6 +103,51 @@ func TestProject_MemoryNilSafe(t *testing.T) {
 	}
 }
 
+// TestProjectLifecycleConfigFields asserts the new lifecycle config fields
+// exist on AgentSpec and ScmSpec and round-trip correctly through DeepCopy.
+func TestProjectLifecycleConfigFields(t *testing.T) {
+	p := &v1alpha1.Project{
+		Spec: v1alpha1.ProjectSpec{
+			ScmSecretRef: "scm",
+			Agent: v1alpha1.AgentSpec{
+				ContextWindowTokens:      200000,
+				HandoverThresholdPercent: 50,
+				MaxLifecycleIterations:   10,
+			},
+			Scm: &v1alpha1.ScmSpec{
+				Provider:                "github",
+				Owner:                   "acme",
+				BotLogin:                "bot",
+				BabysitDeadlineMinutes:  60,
+				ConversationIdleMinutes: 60,
+			},
+		},
+	}
+
+	cp := p.DeepCopy()
+
+	if cp.Spec.Agent.ContextWindowTokens != 200000 {
+		t.Errorf("ContextWindowTokens = %d, want 200000", cp.Spec.Agent.ContextWindowTokens)
+	}
+	if cp.Spec.Agent.HandoverThresholdPercent != 50 {
+		t.Errorf("HandoverThresholdPercent = %d, want 50", cp.Spec.Agent.HandoverThresholdPercent)
+	}
+	if cp.Spec.Agent.MaxLifecycleIterations != 10 {
+		t.Errorf("MaxLifecycleIterations = %d, want 10", cp.Spec.Agent.MaxLifecycleIterations)
+	}
+	if cp.Spec.Scm.BabysitDeadlineMinutes != 60 {
+		t.Errorf("BabysitDeadlineMinutes = %d, want 60", cp.Spec.Scm.BabysitDeadlineMinutes)
+	}
+	if cp.Spec.Scm.ConversationIdleMinutes != 60 {
+		t.Errorf("ConversationIdleMinutes = %d, want 60", cp.Spec.Scm.ConversationIdleMinutes)
+	}
+	// Mutation safety
+	cp.Spec.Agent.ContextWindowTokens = 999
+	if p.Spec.Agent.ContextWindowTokens == 999 {
+		t.Error("mutating copy mutated original")
+	}
+}
+
 func TestProjectRegisteredInScheme(t *testing.T) {
 	s := runtime.NewScheme()
 	if err := v1alpha1.AddToScheme(s); err != nil {
