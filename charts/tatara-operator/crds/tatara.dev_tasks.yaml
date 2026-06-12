@@ -201,6 +201,12 @@ spec:
                 items:
                   type: string
                 type: array
+              followupIssueURL:
+                description: |-
+                  FollowupIssueURL is the URL of the follow-up issue opened when
+                  ChangeSummary.RemainingScope is non-empty. Used as an idempotency guard to
+                  prevent opening a second follow-up issue on re-entry.
+                type: string
               gateEnteredAt:
                 format: date-time
                 type: string

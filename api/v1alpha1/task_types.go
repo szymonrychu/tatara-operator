@@ -124,6 +124,11 @@ type TaskStatus struct {
 	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
 	// +optional
 	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
+	// FollowupIssueURL is the URL of the follow-up issue opened when
+	// ChangeSummary.RemainingScope is non-empty. Used as an idempotency guard to
+	// prevent opening a second follow-up issue on re-entry.
+	// +optional
+	FollowupIssueURL string `json:"followupIssueURL,omitempty"`
 	// +optional
 	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
 
