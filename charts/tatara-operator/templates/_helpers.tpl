@@ -83,4 +83,9 @@ CLI_OIDC_SECRET_NAME: {{ .Values.cliOidcSecretName | quote }}
 IMAGE_PULL_SECRET: {{ .Values.imagePullSecret | quote }}
 NAMESPACE: {{ .Values.namespace | quote }}
 LOG_LEVEL: {{ .Values.logLevel | quote }}
+INGRESS_HOST: {{ .Values.ingressHost | quote }}
+INGRESS_CLASS_NAME: {{ .Values.ingressClassName | quote }}
+MEMORY_PATH_PREFIX: {{ .Values.memoryPathPrefix | quote }}
+CHAT_PATH_PREFIX: {{ .Values.chatPathPrefix | quote }}
+CHAT_IMAGE: {{ .Values.chatImage | quote }}
 {{- end -}}

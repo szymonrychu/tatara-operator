@@ -38,6 +38,11 @@ cliOidcSecretName: ""
 imagePullSecret: ""
 namespace: "tatara"
 logLevel: "info"
+ingressHost: ""
+ingressClassName: "nginx"
+memoryPathPrefix: "/api/v1/memory"
+chatPathPrefix: "/api/v1/chat"
+chatImage: ""
 
 # Secret-backed scalars. Provided by a SOPS-encrypted values overlay at deploy
 # time. Set existingSecret to use an externally-managed Secret instead.
