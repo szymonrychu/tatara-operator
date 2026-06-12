@@ -100,10 +100,10 @@ func TestIssueScanDedupLifecycleTerminals(t *testing.T) {
 	}
 
 	cases := []struct {
-		name           string
-		cand           candidate
-		existing       []tatarav1alpha1.Task
-		wantDeduped    bool
+		name        string
+		cand        candidate
+		existing    []tatarav1alpha1.Task
+		wantDeduped bool
 	}{
 		{
 			name: "non-terminal lifecycle state (Triage) suppresses",
