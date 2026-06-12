@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -114,11 +115,22 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 
 	sourceBranch := taskBranch(task)
 	title := firstLine(task.Spec.Goal)
-	body := writeBackBody(task)
+	baseBody := writeBackBody(task)
 
 	var prURLs []string
 	var lastSkipStatus int
 	for _, repo := range ordered {
+		body := baseBody
+		// Append "Closes #N" for the primary repo of an issue-linked lifecycle task
+		// so the MR auto-closes the issue on merge.  Never emit this on secondary
+		// repos (cross-repo leak) or for non-lifecycle / PR-entry tasks.
+		if repo.Name == primaryRepo.Name &&
+			task.Spec.Kind == "issueLifecycle" &&
+			task.Spec.Source != nil &&
+			!task.Spec.Source.IsPR &&
+			task.Spec.Source.Number > 0 {
+			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
+		}
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
 		if openErr != nil {
 			var he *scm.HTTPError

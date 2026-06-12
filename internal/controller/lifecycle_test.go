@@ -13,6 +13,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -26,8 +27,10 @@ type lifecycleFakeSCMWriter struct {
 	mu           sync.Mutex
 	closeCalls   []struct{ repo, comment string }
 	commentCalls []struct{ issueRef, body string }
-	openCalls    []struct{ sourceBranch string }
-	openPRURL    string
+	openCalls    []struct {
+		repoURL, sourceBranch, body string
+	}
+	openPRURL string
 }
 
 func (f *lifecycleFakeSCMWriter) CloseIssue(_ context.Context, _, repo string, _ int, comment string) error {
@@ -44,10 +47,12 @@ func (f *lifecycleFakeSCMWriter) Comment(_ context.Context, _, issueRef, body st
 	return nil
 }
 
-func (f *lifecycleFakeSCMWriter) OpenChange(_ context.Context, _, _, sourceBranch, _, _, _ string) (string, error) {
+func (f *lifecycleFakeSCMWriter) OpenChange(_ context.Context, repoURL, _, sourceBranch, _, _, body string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.openCalls = append(f.openCalls, struct{ sourceBranch string }{sourceBranch})
+	f.openCalls = append(f.openCalls, struct {
+		repoURL, sourceBranch, body string
+	}{repoURL, sourceBranch, body})
 	url := f.openPRURL
 	if url == "" {
 		url = "https://github.com/o/r/pull/42"
@@ -1116,6 +1121,249 @@ func TestLifecycleImplement_ContextInPromptWhenPodReady(t *testing.T) {
 	}
 	if !strings.Contains(sub.Text, "CI failed: build timed out") {
 		t.Errorf("submitted turn text missing context detail; text=%q", sub.Text)
+	}
+}
+
+// ----- Task 7: Closes #N on lifecycle MR body (primary repo only) -----
+
+// seedLifecycleTaskWithSecondaryRepo creates the same objects as seedLifecycleTask
+// plus a second Repository in the same project. Returns the task and secondary repo name.
+func seedLifecycleTaskWithSecondaryRepo(t *testing.T, name, proj, primaryRepo, secondaryRepo, scmSecret string, source *tatarav1alpha1.TaskSource) *tatarav1alpha1.Task {
+	t.Helper()
+	task := seedLifecycleTask(t, name, proj, primaryRepo, scmSecret, source)
+	// Add a second repo to the same project.
+	r2 := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: secondaryRepo, Namespace: testNS},
+		Spec: tatarav1alpha1.RepositorySpec{
+			ProjectRef: proj, URL: "https://github.com/o/r2.git",
+			DefaultBranch: "main", ReingestSchedule: "0 6 * * *",
+		},
+	}
+	if err := k8sClient.Create(context.Background(), r2); err != nil {
+		t.Fatalf("create secondary repo %s: %v", secondaryRepo, err)
+	}
+	return task
+}
+
+// TestLifecycleImplement_ClosesIssueInPrimaryRepoMRBody verifies that an
+// issue-linked lifecycle task's MR body for the PRIMARY repo contains
+// "Closes #<issueNumber>".
+func TestLifecycleImplement_ClosesIssueInPrimaryRepoMRBody(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-closes-primary"
+	proj := "lc-cp-proj"
+	primaryRepo := "lc-cp-repo"
+	sec := "lc-cp-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#50",
+		URL: "https://github.com/o/r/issues/50", Number: 50,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, primaryRepo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.openCalls) == 0 {
+		t.Fatal("expected OpenChange to be called")
+	}
+	primaryBody := fw.openCalls[0].body
+	wantCloses := "Closes #50"
+	if !strings.Contains(primaryBody, wantCloses) {
+		t.Errorf("primary repo MR body = %q, want to contain %q", primaryBody, wantCloses)
+	}
+}
+
+// TestLifecycleImplement_ClosesIssueNotInSecondaryRepoMRBody verifies that the
+// "Closes #N" line does NOT appear in secondary-repo MR bodies.
+func TestLifecycleImplement_ClosesIssueNotInSecondaryRepoMRBody(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-closes-secondary"
+	proj := "lc-cs-proj"
+	primaryRepo := "lc-cs-repo1"
+	secondaryRepo := "lc-cs-repo2"
+	sec := "lc-cs-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#51",
+		URL: "https://github.com/o/r/issues/51", Number: 51,
+		IsPR: false,
+	}
+	task := seedLifecycleTaskWithSecondaryRepo(t, name, proj, primaryRepo, secondaryRepo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.openCalls) < 2 {
+		t.Fatalf("expected 2 OpenChange calls (primary+secondary), got %d", len(fw.openCalls))
+	}
+	// Primary repo must have Closes #51.
+	if !strings.Contains(fw.openCalls[0].body, "Closes #51") {
+		t.Errorf("primary repo MR body = %q, must contain 'Closes #51'", fw.openCalls[0].body)
+	}
+	// Secondary repo must NOT have Closes #51.
+	if strings.Contains(fw.openCalls[1].body, "Closes #51") {
+		t.Errorf("secondary repo MR body = %q, must NOT contain 'Closes #51'", fw.openCalls[1].body)
+	}
+}
+
+// TestLifecycleImplement_NoPREntryLifecycleTaskDoesNotClose verifies that a
+// lifecycle Task entered from a PR (Source.IsPR=true) does NOT emit Closes #N.
+func TestLifecycleImplement_NoPREntryLifecycleTaskDoesNotClose(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-closes-pr-entry"
+	proj := "lc-cpe-proj"
+	repo := "lc-cpe-repo"
+	sec := "lc-cpe-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#52",
+		URL: "https://github.com/o/r/pull/52", Number: 52,
+		IsPR: true,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.openCalls) == 0 {
+		t.Fatal("expected OpenChange to be called")
+	}
+	if strings.Contains(fw.openCalls[0].body, "Closes #") {
+		t.Errorf("PR-entry lifecycle task MR body = %q, must NOT contain 'Closes #'", fw.openCalls[0].body)
+	}
+}
+
+// TestLifecycleImplement_LegacyImplementTaskDoesNotClose verifies that a
+// generic (non-lifecycle) implement Task's MR body does NOT contain Closes #N.
+func TestLifecycleImplement_LegacyImplementTaskDoesNotClose(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	// Use the existing writeBackOpenChange test infrastructure.
+	mkSecret(t, "lc-legacy-sec", map[string][]byte{"token": []byte("tok"), "webhookSecret": []byte("w")})
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-legacy-proj", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "lc-legacy-sec",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o"},
+			Agent: tatarav1alpha1.AgentSpec{
+				Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
+				MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("set memory ready: %v", err)
+	}
+	r2 := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-legacy-repo", Namespace: testNS},
+		Spec: tatarav1alpha1.RepositorySpec{
+			ProjectRef:    "lc-legacy-proj",
+			URL:           "https://github.com/o/r.git",
+			DefaultBranch: "main", ReingestSchedule: "0 6 * * *",
+		},
+	}
+	if err := k8sClient.Create(ctx, r2); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-legacy-task", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    "lc-legacy-proj",
+			RepositoryRef: "lc-legacy-repo",
+			Goal:          "improve the login flow",
+			Kind:          "implement", // NOT issueLifecycle
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#53",
+				URL: "https://github.com/o/r/issues/53", Number: 53, IsPR: false,
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	// Seed WritebackPending=True to trigger doWriteBack -> writeBackOpenChange.
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type: "WritebackPending", Status: metav1.ConditionTrue,
+		Reason: "AgentDone", ObservedGeneration: task.Generation,
+	})
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed legacy task: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "lc-legacy-task"}}
+	_, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.openCalls) == 0 {
+		t.Fatal("expected OpenChange to be called for legacy implement task")
+	}
+	if strings.Contains(fw.openCalls[0].body, "Closes #") {
+		t.Errorf("legacy implement MR body = %q, must NOT contain 'Closes #'", fw.openCalls[0].body)
 	}
 }
 
