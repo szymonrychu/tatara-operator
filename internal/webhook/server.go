@@ -150,6 +150,15 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 }
 
 func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	// issue_comment created: find a live lifecycle Task for the issue and react.
+	// This is intercepted before the trigger-label gate so bot comments on issues
+	// without the triggerLabel still pass through correctly (they are ignored by
+	// the bot-author gate below).
+	if ev.Action == "created" && !ev.IsPR {
+		s.handleIssueComment(ctx, w, provider, proj, ev)
+		return
+	}
+
 	// Approval flip: a human (not the bot) removing the approval label from a
 	// bot-authored proposal issue signals human approval. The actual proposal
 	// match (ProposedIssue set, source author is the bot, approval required) is
@@ -162,6 +171,25 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		(provider != "github" || ev.AuthorLogin == proj.Spec.Scm.BotLogin) {
 		s.flipApproval(ctx, w, provider, proj, ev)
 		return
+	}
+
+	// triggerLabel on a Conversation task -> jump to Implement without spawning
+	// a new task. Checked before the dedup loop so we never create a duplicate.
+	if ev.Action == "labeled" && !ev.IsPR && ev.ChangedLabel == proj.Spec.TriggerLabel {
+		if task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef); found &&
+			task.Status.LifecycleState == "Conversation" {
+			task.Status.LifecycleState = "Implement"
+			if err := s.cfg.Client.Status().Update(ctx, task); err != nil {
+				s.count(provider, ev.Kind, ev.Action, "error")
+				http.Error(w, "update task", http.StatusInternalServerError)
+				return
+			}
+			s.log.InfoContext(ctx, "triggerLabel on Conversation task: set Implement",
+				"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
+			s.count(provider, ev.Kind, ev.Action, "accepted")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 	}
 
 	// Determine Task Kind and gating based on PR/issue and author.
@@ -314,6 +342,91 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		"task", task.Name, "issue_ref", ev.IssueRef, "kind", kind)
 	s.count(provider, ev.Kind, ev.Action, "task_created")
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleIssueComment reacts to an issue_comment (action=created) webhook.
+// It finds the live lifecycle Task for the issue and, if the commenter is not
+// the bot, resets LastActivityAt/DeadlineAt and sets state to Triage (so the
+// reconciler re-spawns the agent with the updated thread). Bot comments are
+// ignored to prevent self-trigger loops.
+func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+
+	// ActorLogin is the sender of the event (comment author for issue_comment).
+	if botLogin != "" && ev.ActorLogin == botLogin {
+		s.log.InfoContext(ctx, "issue_comment: bot-authored comment ignored",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef)
+	if !found {
+		s.log.InfoContext(ctx, "issue_comment: no live lifecycle task found",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	now := metav1.Now()
+	idleMinutes := 60
+	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
+		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
+	}
+	deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+
+	task.Status.LastActivityAt = &now
+	task.Status.DeadlineAt = &deadline
+	// Conversation or Stopped -> re-activate to Triage so the reconciler re-spawns.
+	if task.Status.LifecycleState == "Conversation" || task.Status.LifecycleState == "Stopped" {
+		task.Status.LifecycleState = "Triage"
+	}
+
+	if err := s.cfg.Client.Status().Update(ctx, task); err != nil {
+		s.log.ErrorContext(ctx, "issue_comment: update task status", "error", err, "task", task.Name)
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "update task", http.StatusInternalServerError)
+		return
+	}
+	s.log.InfoContext(ctx, "issue_comment: lifecycle task updated",
+		"project", proj.Name, "task", task.Name,
+		"issue_ref", ev.IssueRef, "new_state", task.Status.LifecycleState)
+	s.count(provider, ev.Kind, ev.Action, "accepted")
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// findLifecycleTask finds a non-terminal issueLifecycle Task for the given
+// issue ref within the project. Returns (task, true) when found.
+func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+		return nil, false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.Kind != "issueLifecycle" || t.Spec.ProjectRef != projectName {
+			continue
+		}
+		if t.Spec.Source == nil || t.Spec.Source.IssueRef != issueRef {
+			continue
+		}
+		// Skip terminal lifecycle states (Done/Stopped/Parked) and terminal phases
+		// (Succeeded/Failed). Stopped is resumable so we include it.
+		switch t.Status.LifecycleState {
+		case "Done", "Parked":
+			continue
+		}
+		if t.Status.Phase == "Succeeded" || t.Status.Phase == "Failed" {
+			continue
+		}
+		return t, true
+	}
+	return nil, false
 }
 
 // flipApproval finds the Task whose Source.IssueRef matches ev.IssueRef and
