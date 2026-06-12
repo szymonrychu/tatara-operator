@@ -569,3 +569,153 @@ func TestLifecycleTriage_FailedTransitionsToParked(t *testing.T) {
 		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
 	}
 }
+
+// ----- Task 6: Implement state handler -----
+
+func TestLifecycleImplement_SucceededOpensMRAndEntersMRCI(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-impl-ok"
+	proj := "lc-ip-ok"
+	repo := "lc-ir-ok"
+	sec := "lc-is-ok"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#10", URL: "https://github.com/o/r/issues/10",
+		Number: 10,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	// Seed: Implement agent run completed successfully.
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed implement succeeded: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/42"}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.openCalls) == 0 {
+		t.Fatal("OpenChange must be called for Implement succeeded")
+	}
+	wantBranch := taskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS}})
+	if fw.openCalls[0].sourceBranch != wantBranch {
+		t.Errorf("OpenChange sourceBranch = %q, want %q", fw.openCalls[0].sourceBranch, wantBranch)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get task after: %v", err)
+	}
+	if got.Status.LifecycleState != "MRCI" {
+		t.Errorf("LifecycleState = %q, want MRCI", got.Status.LifecycleState)
+	}
+	if got.Status.PrURL != "https://github.com/o/r/pull/42" {
+		t.Errorf("PrURL = %q, want https://github.com/o/r/pull/42", got.Status.PrURL)
+	}
+	if got.Status.PRNumber != 42 {
+		t.Errorf("PRNumber = %d, want 42", got.Status.PRNumber)
+	}
+	if got.Status.HeadBranch == "" {
+		t.Error("HeadBranch must be set")
+	}
+	if got.Status.LifecycleIterations != 1 {
+		t.Errorf("LifecycleIterations = %d, want 1", got.Status.LifecycleIterations)
+	}
+}
+
+// noChangeSCMWriter returns 422 for OpenChange, simulating no-diff / branch absent.
+type noChangeSCMWriter struct{ scm.SCMWriter }
+
+func (n *noChangeSCMWriter) OpenChange(_ context.Context, _, _, _, _, _, _ string) (string, error) {
+	return "", &scm.HTTPError{Status: 422, Body: "no diff", Path: "/pulls"}
+}
+
+func (n *noChangeSCMWriter) Comment(_ context.Context, _, _, _ string) error { return nil }
+
+func TestLifecycleImplement_NoPRTransitionsToParked(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-impl-nopr"
+	proj := "lc-ip-nopr"
+	repo := "lc-ir-nopr"
+	sec := "lc-is-nopr"
+	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#11", Number: 11}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+	// Override SCMFor to return a writer that returns 422.
+	r.SCMFor = func(string) (scm.SCMWriter, error) {
+		return &noChangeSCMWriter{}, nil
+	}
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get task after: %v", err)
+	}
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked (no-change)", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleImplement_FailedTransitionsToParked(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-impl-fail"
+	proj := "lc-ip-fail"
+	repo := "lc-ir-fail"
+	sec := "lc-is-fail"
+	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#12", Number: 12}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Failed"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	r := newLifecycleReconciler(t, nil)
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get task after: %v", err)
+	}
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked (implement-failed)", got.Status.LifecycleState)
+	}
+}

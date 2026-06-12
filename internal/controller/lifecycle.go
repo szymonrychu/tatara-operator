@@ -5,6 +5,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -164,9 +166,13 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return res, nil
 
 	case "Implement":
-		// M0b Task 6: handled in separate commit.
+		res, err := r.handleImplement(ctx, &project, task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
 		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+		return res, nil
 
 	case "Conversation", "MRCI", "Merge", "MainCI":
 		// M1/M2: poll states - stub requeue
@@ -318,4 +324,92 @@ func (r *TaskReconciler) triagePostComment(_ context.Context, _ *tatarav1alpha1.
 	log.FromContext(ctx).Info("lifecycle triage: discuss comment posted",
 		"action", "scm_issue_discuss", "resource_id", task.Name)
 	return nil
+}
+
+// handleImplement drives the Implement agent-run state. On a finished run it
+// calls writeBackOpenChange to open the MR, then transitions to MRCI.
+func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	if isTerminal(task.Status.Phase) {
+		return r.finishImplement(ctx, task)
+	}
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
+		return ctrl.Result{}, fmt.Errorf("implement: get repo: %w", err)
+	}
+	planText := planTurnText(task.Spec.Goal, taskBranch(task), project.Name, task.Name)
+	return r.driveAgentRun(ctx, project, &repo, task, planText)
+}
+
+// finishImplement opens the MR after the Implement run completes.
+func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+
+	if task.Status.Phase == "Failed" {
+		l.Info("implement agent run failed; parking task",
+			"action", "lifecycle_implement_failed", "resource_id", task.Name)
+		if err := r.setLifecycleState(ctx, task, "Parked", "implement-failed"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.resetAgentRun(ctx, task)
+	}
+
+	// Phase == Succeeded: open MR via the shared writeBackOpenChange path.
+	// writeBackOpenChange sets task.Status.PrURL when a PR was opened.
+	if _, err := r.writeBackOpenChange(ctx, task); err != nil {
+		return ctrl.Result{}, fmt.Errorf("implement: open change: %w", err)
+	}
+
+	// Re-read task to pick up PrURL written by writeBackOpenChange.
+	fresh := &tatarav1alpha1.Task{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+		return ctrl.Result{}, fmt.Errorf("implement: re-get task: %w", err)
+	}
+
+	if fresh.Status.PrURL == "" {
+		// No PR opened (no diff / branch absent) -> park.
+		l.Info("implement: no PR opened; parking", "action", "lifecycle_implement_no_change", "resource_id", task.Name)
+		if err := r.setLifecycleState(ctx, fresh, "Parked", "no-change"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
+	}
+
+	// Record head branch and PR number.
+	prNumber := parsePRNumber(fresh.Status.PrURL)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		t2 := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), t2); err != nil {
+			return err
+		}
+		t2.Status.HeadBranch = taskBranch(task)
+		t2.Status.PRNumber = prNumber
+		t2.Status.LifecycleIterations++
+		return r.Status().Update(ctx, t2)
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("implement: record pr fields: %w", err)
+	}
+
+	// Re-get for setLifecycleState.
+	fresh2 := &tatarav1alpha1.Task{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
+		return ctrl.Result{}, fmt.Errorf("implement: get for state transition: %w", err)
+	}
+	if err := r.setLifecycleState(ctx, fresh2, "MRCI", "implement-done"); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, r.resetAgentRun(ctx, fresh2)
+}
+
+// parsePRNumber extracts the trailing integer from a PR/MR URL
+// (e.g. https://github.com/o/r/pull/42 -> 42).
+func parsePRNumber(prURL string) int {
+	if prURL == "" {
+		return 0
+	}
+	parts := strings.Split(strings.TrimRight(prURL, "/"), "/")
+	if len(parts) == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(parts[len(parts)-1])
+	return n
 }
