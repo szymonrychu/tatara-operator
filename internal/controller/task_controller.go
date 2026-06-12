@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -29,11 +30,12 @@ const (
 	maxPodRecreations = 3
 	turnTimeoutGrace  = 60 * time.Second
 
-	annCurrentTurn    = "tatara.dev/current-turn"
-	annCurrentSubtask = "tatara.dev/current-subtask"
-	annTurnComplete   = "tatara.dev/turn-complete"
-	annPodRecreations = "tatara.dev/pod-recreations"
-	annTurnStartedAt  = "tatara.dev/turn-started-at"
+	annCurrentTurn           = "tatara.dev/current-turn"
+	annCurrentSubtask        = "tatara.dev/current-subtask"
+	annTurnComplete          = "tatara.dev/turn-complete"
+	annPodRecreations        = "tatara.dev/pod-recreations"
+	annTurnStartedAt         = "tatara.dev/turn-started-at"
+	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
 )
 
 // TaskReconciler spawns one wrapper session per Task and drives it turn by
@@ -366,7 +368,27 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
 		}
-		return r.recordTurn(ctx, task, id, "")
+		res, err := r.recordTurn(ctx, task, id, "")
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		// Clear pending-handover-resume annotation now that turn-0 has been submitted.
+		if task.Annotations[annPendingHandoverResume] != "" {
+			if cerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				fresh := &tatarav1alpha1.Task{}
+				if err2 := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err2 != nil {
+					return err2
+				}
+				if fresh.Annotations == nil {
+					return nil
+				}
+				delete(fresh.Annotations, annPendingHandoverResume)
+				return r.Update(ctx, fresh)
+			}); cerr != nil {
+				return ctrl.Result{}, fmt.Errorf("clear pending-handover-resume: %w", cerr)
+			}
+		}
+		return res, nil
 	}
 
 	// Turn in flight, no callback yet -> check for timeout, otherwise wait.

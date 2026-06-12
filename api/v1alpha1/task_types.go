@@ -50,6 +50,19 @@ type IssueOutcome struct {
 	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
 }
 
+// ChangeSummary holds the scope report submitted by the agent at the end of an
+// Implement run via the change_summary MCP tool.
+type ChangeSummary struct {
+	// +optional
+	PRTitle string `json:"prTitle,omitempty"`
+	// +optional
+	PRBody string `json:"prBody,omitempty"`
+	// +optional
+	DeliveredScope string `json:"deliveredScope,omitempty"`
+	// +optional
+	RemainingScope string `json:"remainingScope,omitempty"`
+}
+
 // TaskSource records the SCM work-item that originated a webhook-born Task.
 type TaskSource struct {
 	// +kubebuilder:validation:Enum=github;gitlab
@@ -109,6 +122,13 @@ type TaskStatus struct {
 	PROutcome *PROutcome `json:"prOutcome,omitempty"`
 	// +optional
 	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
+	// +optional
+	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
+	// FollowupIssueURL is the URL of the follow-up issue opened when
+	// ChangeSummary.RemainingScope is non-empty. Used as an idempotency guard to
+	// prevent opening a second follow-up issue on re-entry.
+	// +optional
+	FollowupIssueURL string `json:"followupIssueURL,omitempty"`
 	// +optional
 	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
 

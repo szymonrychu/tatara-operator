@@ -30,9 +30,11 @@ type lifecycleFakeSCMWriter struct {
 	closeCalls   []struct{ repo, comment string }
 	commentCalls []struct{ issueRef, body string }
 	openCalls    []struct {
-		repoURL, sourceBranch, body string
+		repoURL, sourceBranch, title, body string
 	}
-	openPRURL string
+	openPRURL      string
+	createIssues   []struct{ url, title, body string }
+	createIssueURL string
 }
 
 func (f *lifecycleFakeSCMWriter) CloseIssue(_ context.Context, _, repo string, _ int, comment string) error {
@@ -49,17 +51,28 @@ func (f *lifecycleFakeSCMWriter) Comment(_ context.Context, _, issueRef, body st
 	return nil
 }
 
-func (f *lifecycleFakeSCMWriter) OpenChange(_ context.Context, repoURL, _, sourceBranch, _, _, body string) (string, error) {
+func (f *lifecycleFakeSCMWriter) OpenChange(_ context.Context, repoURL, _, sourceBranch, _, title, body string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.openCalls = append(f.openCalls, struct {
-		repoURL, sourceBranch, body string
-	}{repoURL, sourceBranch, body})
+		repoURL, sourceBranch, title, body string
+	}{repoURL, sourceBranch, title, body})
 	url := f.openPRURL
 	if url == "" {
 		url = "https://github.com/o/r/pull/42"
 	}
 	return url, nil
+}
+
+func (f *lifecycleFakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	url := f.createIssueURL
+	if url == "" {
+		url = "https://github.com/o/r/issues/99"
+	}
+	f.createIssues = append(f.createIssues, struct{ url, title, body string }{url, req.Title, req.Body})
+	return scm.CreatedIssue{Ref: "o/r#99", URL: url}, nil
 }
 
 // newLifecycleReconciler builds a TaskReconciler wired with the given SCM writer.
@@ -1935,6 +1948,9 @@ func (f *fakeReaderMainCI) ListBoardItems(_ context.Context, _ scm.BoardRef) ([]
 }
 func (f *fakeReaderMainCI) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
 	return f.ciStatus, f.ciErr
+}
+func (f *fakeReaderMainCI) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return nil, nil
 }
 
 func seedMainCITask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMainCI, deadlineOffset time.Duration) (*TaskReconciler, string) {

@@ -77,6 +77,9 @@ func (f *fakeProposalReader) ListBoardItems(_ context.Context, _ scm.BoardRef) (
 func (f *fakeProposalReader) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
 	return "", nil
 }
+func (f *fakeProposalReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return nil, nil
+}
 
 // seedProposalTask creates the minimum objects for createProposal: a secret,
 // project with scm spec + scmSecretRef, a repository, and a Task with

@@ -33,12 +33,23 @@ type CallbackServer struct {
 }
 
 type turnCompletePayload struct {
-	TurnID          string  `json:"turnId"`
-	State           string  `json:"state"`
-	FinalText       string  `json:"finalText"`
-	StopReason      string  `json:"stopReason"`
-	Error           string  `json:"error"`
-	DurationSeconds float64 `json:"durationSeconds"`
+	TurnID          string          `json:"turnId"`
+	State           string          `json:"state"`
+	FinalText       string          `json:"finalText"`
+	StopReason      string          `json:"stopReason"`
+	Error           string          `json:"error"`
+	DurationSeconds float64         `json:"durationSeconds"`
+	Usage           json.RawMessage `json:"usage,omitempty"`
+}
+
+// turnUsage mirrors the usage object the wrapper posts in the turn-complete
+// payload. Fields match the wrapper's turn.Record.Usage JSON (confirmed from
+// tatara-claude-code-wrapper/internal/turn/turn.go).
+type turnUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 }
 
 // Handler returns the http.Handler for POST /internal/turn-complete.
@@ -65,6 +76,13 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 	}
 	s.Metrics.ObserveTurnDuration(p.DurationSeconds)
 
+	if len(p.Usage) > 0 {
+		if err := s.recordUsage(r.Context(), p.TurnID, p.Usage); err != nil {
+			l.Error(err, "record turn usage (non-fatal)", "turn_id", p.TurnID)
+			// non-fatal: continue to record the result
+		}
+	}
+
 	if err := s.recordResult(r.Context(), agent.TurnResult{
 		State: p.State, FinalText: p.FinalText, StopReason: p.StopReason, Err: p.Error,
 	}, p.TurnID); err != nil {
@@ -81,6 +99,33 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 }
 
 var errTurnNotFound = errors.New("no task with that current turn")
+
+// recordUsage parses a raw usage JSON blob and persists LastTurnInputTokens /
+// CumulativeTokens on the matching Task via RetryOnConflict.
+// Absent or unparseable usage is silently tolerated (no-op).
+func (s *CallbackServer) recordUsage(ctx context.Context, turnID string, raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	var u turnUsage
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return nil // tolerate malformed usage
+	}
+	task, err := s.resolveTaskByTurn(ctx, turnID)
+	if err != nil {
+		return err
+	}
+	inputTotal := u.InputTokens + u.CacheReadInputTokens
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: task.Name}, fresh); err != nil {
+			return fmt.Errorf("reload task for usage: %w", err)
+		}
+		fresh.Status.LastTurnInputTokens = inputTotal
+		fresh.Status.CumulativeTokens += u.OutputTokens
+		return s.Client.Status().Update(ctx, fresh)
+	})
+}
 
 // recordResult writes finalText onto the executing Subtask (if any) and bumps
 // the Task's turn-complete annotation to requeue its reconcile.

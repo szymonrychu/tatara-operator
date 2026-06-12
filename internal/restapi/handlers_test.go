@@ -436,3 +436,54 @@ func TestIssueOutcome_TaskNotFound(t *testing.T) {
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
+
+// --- M4 Task 2: POST /tasks/{t}/change-summary ---
+
+func TestChangeSummary_WritesAllFields(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"Implements login flow","deliveredScope":"login endpoint","remainingScope":"logout endpoint"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ChangeSummary)
+	require.Equal(t, "feat: add login", out.Status.ChangeSummary.PRTitle)
+	require.Equal(t, "Implements login flow", out.Status.ChangeSummary.PRBody)
+	require.Equal(t, "login endpoint", out.Status.ChangeSummary.DeliveredScope)
+	require.Equal(t, "logout endpoint", out.Status.ChangeSummary.RemainingScope)
+}
+
+func TestChangeSummary_WritesWithoutRemainingScope(t *testing.T) {
+	r := buildRouter(t, task("t2", "alpha"))
+	body := strings.NewReader(`{"prTitle":"fix: close bug","prBody":"Fixes bug","deliveredScope":"bug fixed"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t2/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ChangeSummary)
+	require.Equal(t, "bug fixed", out.Status.ChangeSummary.DeliveredScope)
+	require.Equal(t, "", out.Status.ChangeSummary.RemainingScope)
+}
+
+func TestChangeSummary_TaskNotFound(t *testing.T) {
+	r := buildRouter(t)
+	body := strings.NewReader(`{"prTitle":"x","prBody":"y","deliveredScope":"z"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/missing/change-summary", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestChangeSummary_InvalidBody(t *testing.T) {
+	r := buildRouter(t, task("t3", "alpha"))
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t3/change-summary", strings.NewReader(`not-json`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}

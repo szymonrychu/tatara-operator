@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -65,6 +66,35 @@ func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 // Returns nil to satisfy the SCMReader interface without a second source of truth.
 func (c *GitLab) ListBoardItems(_ context.Context, _ BoardRef) ([]BoardItem, error) {
 	return nil, nil
+}
+
+// glNote is the JSON shape of a GitLab issue note.
+type glNote struct {
+	Author struct {
+		Username string `json:"username"`
+	} `json:"author"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+	System    bool      `json:"system"`
+}
+
+// ListIssueComments returns non-system notes on issue number, oldest-first.
+// For GitLab owner carries the full project path (group/sub/project); repo is unused.
+func (c *GitLab) ListIssueComments(ctx context.Context, owner, _ string, number int) ([]IssueComment, error) {
+	var raw []glNote
+	path := "/projects/" + url.PathEscape(owner) + "/issues/" + strconv.Itoa(number) + "/notes"
+	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]IssueComment, 0, len(raw))
+	for _, n := range raw {
+		if n.System {
+			continue
+		}
+		out = append(out, IssueComment{Author: n.Author.Username, Body: n.Body, CreatedAt: n.CreatedAt})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
 }
 
 // CloseIssue posts a note then PUTs the issue state_event=close.

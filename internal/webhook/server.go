@@ -16,6 +16,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -150,6 +151,15 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 }
 
 func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	// issue_comment created: find a live lifecycle Task for the issue and react.
+	// This is intercepted before the trigger-label gate so bot comments on issues
+	// without the triggerLabel still pass through correctly (they are ignored by
+	// the bot-author gate below).
+	if ev.Action == "created" && !ev.IsPR {
+		s.handleIssueComment(ctx, w, provider, proj, ev)
+		return
+	}
+
 	// Approval flip: a human (not the bot) removing the approval label from a
 	// bot-authored proposal issue signals human approval. The actual proposal
 	// match (ProposedIssue set, source author is the bot, approval required) is
@@ -162,6 +172,36 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		(provider != "github" || ev.AuthorLogin == proj.Spec.Scm.BotLogin) {
 		s.flipApproval(ctx, w, provider, proj, ev)
 		return
+	}
+
+	// triggerLabel on a Conversation task -> jump to Implement without spawning
+	// a new task. Checked before the dedup loop so we never create a duplicate.
+	// Also clears DeadlineAt so MRCI gets a fresh babysit deadline (not the stale
+	// conversation idle deadline). Wrapped in RetryOnConflict to avoid clobbering
+	// a concurrent lifecycle reconcile.
+	if ev.Action == "labeled" && !ev.IsPR && ev.ChangedLabel == proj.Spec.TriggerLabel {
+		if task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef); found &&
+			task.Status.LifecycleState == "Conversation" {
+			updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				fresh := &tatarav1.Task{}
+				if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+					return err
+				}
+				fresh.Status.LifecycleState = "Implement"
+				fresh.Status.DeadlineAt = nil // clear stale conversation deadline
+				return s.cfg.Client.Status().Update(ctx, fresh)
+			})
+			if updateErr != nil {
+				s.count(provider, ev.Kind, ev.Action, "error")
+				http.Error(w, "update task", http.StatusInternalServerError)
+				return
+			}
+			s.log.InfoContext(ctx, "triggerLabel on Conversation task: set Implement",
+				"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
+			s.count(provider, ev.Kind, ev.Action, "accepted")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 	}
 
 	// Determine Task Kind and gating based on PR/issue and author.
@@ -314,6 +354,175 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		"task", task.Name, "issue_ref", ev.IssueRef, "kind", kind)
 	s.count(provider, ev.Kind, ev.Action, "task_created")
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleIssueComment reacts to an issue_comment (action=created) webhook.
+// It finds the live lifecycle Task for the issue and, if the commenter is not
+// the bot, resets LastActivityAt/DeadlineAt and sets state to Triage (so the
+// reconciler re-spawns the agent with the updated thread). Bot comments are
+// ignored to prevent self-trigger loops.
+func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+
+	// ActorLogin is the sender of the event (comment author for issue_comment).
+	if botLogin != "" && ev.ActorLogin == botLogin {
+		s.log.InfoContext(ctx, "issue_comment: bot-authored comment ignored",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef)
+	if !found {
+		// Per spec: "new comment under an older issue -> start from triage".
+		// Only for issues (IsPR=false) from human authors; PR comments are ignored.
+		if !ev.IsPR {
+			s.createLifecycleTaskAtTriage(ctx, w, provider, proj, ev)
+			return
+		}
+		s.log.InfoContext(ctx, "issue_comment: no live lifecycle task found (PR comment ignored)",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	idleMinutes := 60
+	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
+		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
+	}
+
+	// Wrap in RetryOnConflict to avoid clobbering a concurrent lifecycle reconcile
+	// that may be advancing LifecycleState at the same time (FIX 3).
+	if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+		fresh.Status.LastActivityAt = &now
+		fresh.Status.DeadlineAt = &deadline
+		// Conversation or Stopped -> re-activate to Triage so the reconciler re-spawns.
+		if fresh.Status.LifecycleState == "Conversation" || fresh.Status.LifecycleState == "Stopped" {
+			fresh.Status.LifecycleState = "Triage"
+		}
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	}); updateErr != nil {
+		s.log.ErrorContext(ctx, "issue_comment: update task status", "error", updateErr, "task", task.Name)
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "update task", http.StatusInternalServerError)
+		return
+	}
+	s.log.InfoContext(ctx, "issue_comment: lifecycle task updated",
+		"project", proj.Name, "task", task.Name,
+		"issue_ref", ev.IssueRef)
+	s.count(provider, ev.Kind, ev.Action, "accepted")
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// createLifecycleTaskAtTriage creates a new issueLifecycle Task at Triage for an
+// issue_comment on an issue with no existing live task. Uses the same dedup labels
+// and lifecycle-entry annotation as issueScan so the two paths share the same key.
+func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	// Find the matching Repository for the event's repo URL.
+	var repos tatarav1.RepositoryList
+	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "list repositories", http.StatusInternalServerError)
+		return
+	}
+	var repo *tatarav1.Repository
+	for i := range repos.Items {
+		r := &repos.Items[i]
+		if r.Spec.ProjectRef == proj.Name && scm.SameRemote(r.Spec.URL, ev.Repo) {
+			repo = r
+			break
+		}
+	}
+	if repo == nil {
+		s.log.InfoContext(ctx, "issue_comment: no matching repository for untracked issue",
+			"project", proj.Name, "remote", ev.Repo, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	// Dedup labels matching the issueScan convention.
+	repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+	labels := map[string]string{
+		tatarav1.LabelSourceRepo:   repoSlug,
+		tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
+		tatarav1.LabelSourceKind:   "issueLifecycle",
+		tatarav1.LabelActivity:     "webhook",
+	}
+	ann := map[string]string{tatarav1.LifecycleEntryAnnotation: "Triage"}
+
+	task := &tatarav1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName:    "task-",
+			Namespace:       s.cfg.Namespace,
+			Annotations:     ann,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
+		},
+		Spec: tatarav1.TaskSpec{
+			ProjectRef:    proj.Name,
+			RepositoryRef: repo.Name,
+			Goal:          ev.Body,
+			Kind:          "issueLifecycle",
+			Source: &tatarav1.TaskSource{
+				Provider:    provider,
+				IssueRef:    ev.IssueRef,
+				URL:         ev.URL,
+				AuthorLogin: ev.AuthorLogin,
+				IsPR:        false,
+				Number:      ev.Number,
+			},
+		},
+	}
+	if err := s.cfg.Client.Create(ctx, task); err != nil {
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "create task", http.StatusInternalServerError)
+		return
+	}
+	s.log.InfoContext(ctx, "issue_comment: created lifecycle task at Triage for untracked issue",
+		"project", proj.Name, "repository", repo.Name, "task", task.Name, "issue_ref", ev.IssueRef)
+	s.count(provider, ev.Kind, ev.Action, "task_created")
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// findLifecycleTask finds a non-terminal issueLifecycle Task for the given
+// issue ref within the project. Returns (task, true) when found.
+func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+		return nil, false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.Kind != "issueLifecycle" || t.Spec.ProjectRef != projectName {
+			continue
+		}
+		if t.Spec.Source == nil || t.Spec.Source.IssueRef != issueRef {
+			continue
+		}
+		// Skip terminal lifecycle states (Done/Stopped/Parked) and terminal phases
+		// (Succeeded/Failed). Stopped is resumable so we include it.
+		switch t.Status.LifecycleState {
+		case "Done", "Parked":
+			continue
+		}
+		if t.Status.Phase == "Succeeded" || t.Status.Phase == "Failed" {
+			continue
+		}
+		return t, true
+	}
+	return nil, false
 }
 
 // flipApproval finds the Task whose Source.IssueRef matches ev.IssueRef and

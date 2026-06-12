@@ -117,6 +117,21 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	title := firstLine(task.Spec.Goal)
 	baseBody := writeBackBody(task)
 
+	// M4: when the agent submitted a change_summary, use PRTitle + PRBody +
+	// Delivered block as the MR title/body instead of the M1 defaults.
+	if cs := task.Status.ChangeSummary; cs != nil {
+		if cs.PRTitle != "" {
+			title = cs.PRTitle
+		}
+		deliveredBody := cs.PRBody
+		if cs.DeliveredScope != "" {
+			deliveredBody += "\n\n## Delivered\n" + cs.DeliveredScope
+		}
+		// Preserve the tatara-authored marker so downstream merge-gate logic works.
+		deliveredBody += "\n\n" + tataraAuthoredMarker
+		baseBody = deliveredBody
+	}
+
 	var prURLs []string
 	var lastSkipStatus int
 	for _, repo := range ordered {
