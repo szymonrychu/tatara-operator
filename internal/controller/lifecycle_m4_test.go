@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -333,17 +332,3 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 	}
 }
 
-// seedLifecycleTaskWithGoal creates a lifecycle task with custom Goal.
-// This is a thin convenience wrapper around seedLifecycleTask.
-func seedLifecycleTaskWithGoal(t *testing.T, name, proj, repo, sec, goal string, source *tatarav1alpha1.TaskSource) *tatarav1alpha1.Task {
-	t.Helper()
-	task := seedLifecycleTask(t, name, proj, repo, sec, source)
-	task.Spec.Goal = goal
-	if err := k8sClient.Update(context.Background(), task); err != nil {
-		t.Fatalf("update goal: %v", err)
-	}
-	return &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
-		Spec:       task.Spec,
-	}
-}

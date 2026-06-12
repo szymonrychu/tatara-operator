@@ -674,6 +674,17 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
 	}
 
+	// M4: open a follow-up issue when RemainingScope is set and not already done.
+	if err := r.maybeOpenFollowupIssue(ctx, fresh); err != nil {
+		// Non-fatal: log and continue so the lifecycle does not stall.
+		l.Error(err, "implement: open follow-up issue (non-fatal)", "resource_id", task.Name)
+	}
+
+	// Re-read after follow-up so subsequent writes use the latest resourceVersion.
+	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+		return ctrl.Result{}, fmt.Errorf("implement: re-get after followup: %w", err)
+	}
+
 	// Record head branch, PR number, and transition to MRCI in one RetryOnConflict
 	// block to minimise conflict surface (was two separate round-trips).
 	prNumber := parsePRNumber(fresh.Status.PrURL)
@@ -708,6 +719,70 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, fmt.Errorf("implement: get for reset: %w", err)
 	}
 	return ctrl.Result{}, r.resetAgentRun(ctx, fresh2)
+}
+
+// maybeOpenFollowupIssue creates a follow-up issue when ChangeSummary.RemainingScope
+// is non-empty and Status.FollowupIssueURL is not yet set (idempotency guard).
+// It appends the new issue URL to Status.DiscoveredIssues and records it in
+// Status.FollowupIssueURL so re-entry does not open a duplicate.
+// Non-fatal: if CreateIssue fails the caller logs and continues.
+func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatarav1alpha1.Task) error {
+	cs := task.Status.ChangeSummary
+	if cs == nil || cs.RemainingScope == "" {
+		return nil
+	}
+	// Idempotency guard: already opened.
+	if task.Status.FollowupIssueURL != "" {
+		return nil
+	}
+
+	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	if err != nil {
+		return fmt.Errorf("followup: scm context: %w", err)
+	}
+
+	issueTitle := "Follow-up: " + firstLine(task.Spec.Goal) + " (remaining scope)"
+	prURL := task.Status.PrURL
+	issueBody := cs.RemainingScope + "\n\nOpened as a follow-up to: " + prURL + "\n\n" + tataraAuthoredMarker
+
+	created, cerr := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
+		Title: issueTitle,
+		Body:  issueBody,
+	})
+	if cerr != nil {
+		return fmt.Errorf("followup: create issue: %w", cerr)
+	}
+
+	log.FromContext(ctx).Info("lifecycle implement: follow-up issue opened",
+		"action", "scm_followup_issue",
+		"resource_id", task.Name,
+		"issue_url", created.URL,
+	)
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		// Append to DiscoveredIssues only if not already present.
+		alreadyPresent := false
+		for _, u := range fresh.Status.DiscoveredIssues {
+			if u == created.URL {
+				alreadyPresent = true
+				break
+			}
+		}
+		if !alreadyPresent {
+			fresh.Status.DiscoveredIssues = append(fresh.Status.DiscoveredIssues, created.URL)
+		}
+		fresh.Status.FollowupIssueURL = created.URL
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.DiscoveredIssues = fresh.Status.DiscoveredIssues
+		task.Status.FollowupIssueURL = fresh.Status.FollowupIssueURL
+		return nil
+	})
 }
 
 // parsePRNumber extracts the trailing integer from a PR/MR URL
