@@ -89,19 +89,19 @@ spec:
               - { key: .dockerconfigjson, path: config.json }
 EOF
 
-# Wait for the pod, stream kaniko logs to completion, then read the Job result.
-for _ in $(seq 1 60); do
-  if kubectl -n "$NS" get pod -l job-name="$JOB" -o name 2>/dev/null | grep -q .; then break; fi
-  sleep 2
-done
-kubectl -n "$NS" logs -f "job/${JOB}" || true
+# Wait for the pod to start, stream kaniko logs, then poll the Job to a terminal
+# state. A real build (pull bases + compile + push) takes minutes, so the poll
+# window matches the Job's activeDeadlineSeconds (1500s) rather than a short cap.
+kubectl -n "$NS" wait --for=condition=Ready pod -l "job-name=$JOB" --timeout=300s >/dev/null 2>&1 || true
+kubectl -n "$NS" logs -f "job/${JOB}" 2>/dev/null || true
 
-for _ in $(seq 1 30); do
+deadline=$((SECONDS + 1500))
+while [[ "$SECONDS" -lt "$deadline" ]]; do
   succeeded="$(kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)"
   failed="$(kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.failed}' 2>/dev/null || true)"
   if [[ "$succeeded" == "1" ]]; then echo "kaniko: build pushed"; exit 0; fi
   if [[ -n "$failed" && "$failed" != "0" ]]; then echo "kaniko: build failed"; exit 1; fi
-  sleep 2
+  sleep 5
 done
 echo "kaniko: timed out waiting for Job result"
 exit 1
