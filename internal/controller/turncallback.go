@@ -32,6 +32,12 @@ type CallbackServer struct {
 	Namespace string
 }
 
+// maxCallbackBody caps the turn-complete request body, mirroring the webhook
+// server's 5 MiB limit. The callback is not exposed via ingress but is
+// reachable in-cluster, so this is defense-in-depth against an OOM from a
+// misbehaving wrapper POSTing a huge payload.
+const maxCallbackBody = 5 << 20
+
 type turnCompletePayload struct {
 	TurnID          string  `json:"turnId"`
 	State           string  `json:"state"`
@@ -54,8 +60,14 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxCallbackBody)
 	var p turnCompletePayload
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
@@ -239,7 +251,7 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 // Start runs the callback HTTP server and the poll backstop until ctx is done.
 // It implements sigs.k8s.io/controller-runtime/pkg/manager.Runnable.
 func (s *CallbackServer) Start(ctx context.Context, addr string) error {
-	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 1 << 20}
 	go func() {
 		t := time.NewTicker(pollRequeue)
 		defer t.Stop()

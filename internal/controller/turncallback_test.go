@@ -147,6 +147,23 @@ func TestResolveTaskByTurn_SkipsEmptyAnnotation(t *testing.T) {
 	}
 }
 
+// ----- Body size limit: oversized payload -> 413, no OOM -----
+
+func TestTurnComplete_OversizedBody_Returns413(t *testing.T) {
+	cb := newCallbackServer()
+	// Build a body larger than maxCallbackBody by stuffing finalText.
+	huge := bytes.Repeat([]byte("a"), maxCallbackBody+1024)
+	body, _ := json.Marshal(map[string]any{
+		"turnId": "turn-big", "state": "completed", "finalText": string(huge),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want 413 for oversized body", w.Code)
+	}
+}
+
 // ----- Fix 2: per-turn timeout in poll backstop -----
 
 func TestPollOnce_ExpiresTurnTimeout(t *testing.T) {
