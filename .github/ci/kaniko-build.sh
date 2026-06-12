@@ -55,6 +55,15 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      # Keep image builds off control-plane nodes: kaniko IO starves etcd
+      # fsync and crashes the local apiserver (2026-06-12 NotReady incident).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
       imagePullSecrets:
         - name: regcred
       containers:
