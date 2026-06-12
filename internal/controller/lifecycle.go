@@ -482,8 +482,34 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 
 // handleConversation manages the idle wait state. No pod is ever spawned here.
 // If the deadline has passed the task transitions to Stopped (idle-stop, resumable).
+// If DeadlineAt is nil (safety net for tasks whose deadline was never set), set it
+// once and requeue so the normal deadline path runs on the next reconcile.
 // Otherwise it requeues until the deadline.
 func (r *TaskReconciler) handleConversation(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	if task.Status.DeadlineAt == nil {
+		// Safety net: set deadline once rather than returning false from
+		// deadlinePassed forever and requeuing without bound.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			if fresh.Status.DeadlineAt != nil {
+				task.Status.DeadlineAt = fresh.Status.DeadlineAt
+				return nil
+			}
+			dl := metav1.NewTime(time.Now().Add(60 * time.Minute))
+			fresh.Status.DeadlineAt = &dl
+			if err := r.Status().Update(ctx, fresh); err != nil {
+				return err
+			}
+			task.Status.DeadlineAt = fresh.Status.DeadlineAt
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("conversation: set nil deadline: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
 	if deadlinePassed(task) {
 		if err := r.setLifecycleState(ctx, task, "Stopped", "idle"); err != nil {
 			return ctrl.Result{}, err
@@ -689,8 +715,9 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, fmt.Errorf("implement: re-get after followup: %w", err)
 	}
 
-	// Record head branch, PR number, and transition to MRCI in one RetryOnConflict
-	// block to minimise conflict surface (was two separate round-trips).
+	// Record head branch, PR number, clear any stale deadline (e.g. from a prior
+	// Conversation idle deadline), and transition to MRCI in one RetryOnConflict
+	// block to minimise conflict surface.
 	prNumber := parsePRNumber(fresh.Status.PrURL)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		t2 := &tatarav1alpha1.Task{}
@@ -699,6 +726,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		}
 		t2.Status.HeadBranch = taskBranch(task)
 		t2.Status.PRNumber = prNumber
+		t2.Status.DeadlineAt = nil // clear stale Conversation/Implement deadline; MRCI sets its own via ensureDeadline
 		t2.Status.LifecycleState = "MRCI"
 		return r.Status().Update(ctx, t2)
 	}); err != nil {
