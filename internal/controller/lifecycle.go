@@ -328,11 +328,10 @@ func (r *TaskReconciler) triageCloseIssue(ctx context.Context, project *tatarav1
 }
 
 // triagePostComment posts the discuss comment to the source issue.
-func (r *TaskReconciler) triagePostComment(_ context.Context, _ *tatarav1alpha1.Project, task *tatarav1alpha1.Task, comment string) error {
+func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha1.Project, task *tatarav1alpha1.Task, comment string) error {
 	if task.Spec.Source == nil {
 		return nil
 	}
-	ctx := context.Background()
 	_, _, writer, token, _, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("triage discuss: %w", err)
