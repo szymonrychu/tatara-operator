@@ -98,6 +98,9 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		memory.MemoryDeployment(p, cfg),
 		memory.MemoryService(p, cfg),
 	}
+	if ing := memory.Ingress(p, cfg); ing != nil {
+		objs = append(objs, ing)
+	}
 	for _, obj := range objs {
 		// client.Apply (the Patch variant) is deprecated in controller-runtime
 		// v0.24.1 with no stated removal version. Migration to the typed
@@ -169,6 +172,7 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 	p.Status.Memory = ensureMemoryStatus(p)
 	prevPhase := p.Status.Memory.Phase
 	p.Status.Memory.Endpoint = memory.Endpoint(p.Name, r.MemoryConfig.Namespace)
+	p.Status.Memory.ExternalEndpoint = memory.ExternalMemoryURL(p.Name, r.MemoryConfig)
 
 	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
 		return 0, r.failMemory(p, "PasswordError", err)

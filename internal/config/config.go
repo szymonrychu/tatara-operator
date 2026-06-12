@@ -41,6 +41,11 @@ type Config struct {
 	ImagePullSecret          string
 	Namespace                string
 	LogLevel                 string
+	IngressHost              string
+	IngressClassName         string
+	MemoryPathPrefix         string
+	ChatPathPrefix           string
+	ChatImage                string
 }
 
 func getDefault(key, def string) string {
@@ -77,6 +82,11 @@ func Load() (Config, error) {
 		ImagePullSecret:          os.Getenv("IMAGE_PULL_SECRET"),
 		Namespace:                getDefault("NAMESPACE", "tatara"),
 		LogLevel:                 getDefault("LOG_LEVEL", "info"),
+		IngressHost:              os.Getenv("INGRESS_HOST"),
+		IngressClassName:         getDefault("INGRESS_CLASS_NAME", "nginx"),
+		MemoryPathPrefix:         getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
+		ChatPathPrefix:           getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
+		ChatImage:                os.Getenv("CHAT_IMAGE"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

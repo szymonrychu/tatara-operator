@@ -31,6 +31,11 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		OIDCIssuer:       cfg.OIDCIssuer,
 		OIDCAudience:     "tatara-memory",
 		ImagePullSecret:  cfg.ImagePullSecret,
+		IngressHost:      cfg.IngressHost,
+		IngressClassName: cfg.IngressClassName,
+		MemoryPathPrefix: cfg.MemoryPathPrefix,
+		ChatPathPrefix:   cfg.ChatPathPrefix,
+		ChatImage:        cfg.ChatImage,
 	}
 }
 

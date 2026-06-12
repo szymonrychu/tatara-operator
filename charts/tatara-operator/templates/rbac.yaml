@@ -41,6 +41,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Per-project Ingress (external exposure of memory + chat paths).
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Project SCM Secrets (read: token + webhookSecret) + per-Project generated
   # memory Secrets (create/update: neo4j password, memory config Secret).
   - apiGroups: [""]

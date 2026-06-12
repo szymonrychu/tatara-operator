@@ -25,6 +25,8 @@ type MemoryStatus struct {
 	Phase string `json:"phase,omitempty"`
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
+	// +optional
+	ExternalEndpoint string `json:"externalEndpoint,omitempty"`
 }
 
 // AgentSpec configures the wrapper agent session a Task runs.

@@ -259,6 +259,8 @@ spec:
                 properties:
                   endpoint:
                     type: string
+                  externalEndpoint:
+                    type: string
                   phase:
                     type: string
                 type: object
