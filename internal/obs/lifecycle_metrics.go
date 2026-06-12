@@ -92,6 +92,11 @@ func (m *LifecycleMetrics) RecordHandover() {
 	m.handoverTotal.Inc()
 }
 
+// HandoverTotal returns the handover counter for use in test assertions.
+func (m *LifecycleMetrics) HandoverTotal() prometheus.Counter {
+	return m.handoverTotal
+}
+
 // RecordGiveup increments tatara_lifecycle_giveup_total{reason}.
 func (m *LifecycleMetrics) RecordGiveup(reason string) {
 	m.giveupTotal.WithLabelValues(reason).Inc()

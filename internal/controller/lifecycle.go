@@ -891,6 +891,9 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
+		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "mrci-failure"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -921,6 +924,91 @@ func (r *TaskReconciler) setImplementContext(ctx context.Context, task *tatarav1
 		task.Status.ImplementContext = msg
 		return nil
 	})
+}
+
+// maybeMarkHandoverResume checks whether the last implement run consumed enough
+// context to warrant a handover on the NEXT fresh run. When the threshold is
+// reached it:
+//   - ensures Status.Handover is set (uses the agent-submitted doc if present,
+//     otherwise builds one from ResultSummary + ImplementContext + head branch)
+//   - stamps tatara.dev/pending-handover-resume=true on the Task annotations
+//   - calls LifecycleMetrics.RecordHandover()
+//
+// Called after EACH failure->Implement transition (MRCI failure, Merge 405,
+// MainCI failure). A ContextWindowTokens<=0 is treated as "no guard" to avoid
+// div-by-zero.
+func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
+	ctxWin := project.Spec.Agent.ContextWindowTokens
+	if ctxWin <= 0 {
+		return nil
+	}
+	threshold := project.Spec.Agent.HandoverThresholdPercent
+	if threshold <= 0 {
+		threshold = 50
+	}
+	pct := task.Status.LastTurnInputTokens * 100 / int64(ctxWin)
+	if pct < int64(threshold) {
+		return nil
+	}
+
+	// Build handover doc when Status.Handover is empty.
+	handover := task.Status.Handover
+	if handover == "" {
+		parts := []string{}
+		if task.Status.ResultSummary != "" {
+			parts = append(parts, "## Prior work summary\n"+task.Status.ResultSummary)
+		}
+		if task.Status.ImplementContext != "" {
+			parts = append(parts, "## Re-entry context\n"+task.Status.ImplementContext)
+		}
+		if task.Status.HeadBranch != "" {
+			parts = append(parts, "Prior work is on branch `"+task.Status.HeadBranch+"`; read its diff.")
+		}
+		if len(parts) > 0 {
+			handover = strings.Join(parts, "\n\n")
+		} else {
+			handover = "Resume from prior implement run."
+		}
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[annPendingHandoverResume] = "true"
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.ResourceVersion = fresh.ResourceVersion
+		return nil
+	}); err != nil {
+		return fmt.Errorf("maybeMarkHandoverResume: set annotation: %w", err)
+	}
+
+	// Persist Handover on status.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.Handover = handover
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.Handover = handover
+		return nil
+	}); err != nil {
+		return fmt.Errorf("maybeMarkHandoverResume: set handover status: %w", err)
+	}
+
+	if r.LifecycleMetrics != nil {
+		r.LifecycleMetrics.RecordHandover()
+	}
+	return nil
 }
 
 // handleMerge attempts to merge the PR. Handles 405-conflict as a re-implement
@@ -1006,6 +1094,9 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 				return ctrl.Result{}, err
 			}
 			if err := r.clearDeadline(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
 				return ctrl.Result{}, err
 			}
 			if err := r.setLifecycleState(ctx, task, "Implement", "merge-conflict"); err != nil {
@@ -1123,6 +1214,9 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 			return ctrl.Result{}, err
 		}
 		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "mainci-failure"); err != nil {
