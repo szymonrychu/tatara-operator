@@ -118,6 +118,20 @@ spec:
           status:
             description: TaskStatus defines the observed state of a Task.
             properties:
+              changeSummary:
+                description: |-
+                  ChangeSummary holds the scope report submitted by the agent at the end of an
+                  Implement run via the change_summary MCP tool.
+                properties:
+                  deliveredScope:
+                    type: string
+                  prBody:
+                    type: string
+                  prTitle:
+                    type: string
+                  remainingScope:
+                    type: string
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

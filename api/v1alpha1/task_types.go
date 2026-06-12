@@ -50,6 +50,19 @@ type IssueOutcome struct {
 	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
 }
 
+// ChangeSummary holds the scope report submitted by the agent at the end of an
+// Implement run via the change_summary MCP tool.
+type ChangeSummary struct {
+	// +optional
+	PRTitle string `json:"prTitle,omitempty"`
+	// +optional
+	PRBody string `json:"prBody,omitempty"`
+	// +optional
+	DeliveredScope string `json:"deliveredScope,omitempty"`
+	// +optional
+	RemainingScope string `json:"remainingScope,omitempty"`
+}
+
 // TaskSource records the SCM work-item that originated a webhook-born Task.
 type TaskSource struct {
 	// +kubebuilder:validation:Enum=github;gitlab
@@ -109,6 +122,8 @@ type TaskStatus struct {
 	PROutcome *PROutcome `json:"prOutcome,omitempty"`
 	// +optional
 	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
+	// +optional
+	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
 	// +optional
 	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
 

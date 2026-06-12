@@ -387,6 +387,40 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
+// --- M4 Task 2: POST /tasks/{t}/change-summary ---
+
+type changeSummaryReq struct {
+	PRTitle        string `json:"prTitle,omitempty"`
+	PRBody         string `json:"prBody,omitempty"`
+	DeliveredScope string `json:"deliveredScope,omitempty"`
+	RemainingScope string `json:"remainingScope,omitempty"`
+}
+
+func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
+	var req changeSummaryReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	var t tatarav1alpha1.Task
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        req.PRTitle,
+		PRBody:         req.PRBody,
+		DeliveredScope: req.DeliveredScope,
+		RemainingScope: req.RemainingScope,
+	}
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 // --- Task 7: PATCH /subtasks/{s} ---
 
 type subtaskPatchReq struct {
