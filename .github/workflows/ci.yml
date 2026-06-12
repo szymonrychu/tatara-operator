@@ -8,7 +8,7 @@ on:
 
 jobs:
   secscan:
-    runs-on: szymonrychu-tatara
+    runs-on: tatara-operator
     steps:
       - uses: actions/checkout@v4
       - name: gitleaks
@@ -18,7 +18,7 @@ jobs:
           ./gitleaks detect --source . --no-git --redact --verbose
 
   lint:
-    runs-on: szymonrychu-tatara
+    runs-on: tatara-operator
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -36,7 +36,7 @@ jobs:
           make lint
 
   test:
-    runs-on: szymonrychu-tatara
+    runs-on: tatara-operator
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -47,7 +47,7 @@ jobs:
         run: make test
 
   build:
-    runs-on: szymonrychu-tatara
+    runs-on: tatara-operator
     needs: [secscan, lint, test]
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
 
   image:
     if: ${{ github.event_name == 'push' }}
-    runs-on: szymonrychu-tatara
+    runs-on: tatara-operator
     needs: [secscan, lint, test, build]
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

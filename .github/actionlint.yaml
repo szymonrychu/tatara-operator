@@ -1,4 +1,4 @@
 self-hosted-runner:
-  # Self-hosted ARC runner scale set (infra: helmfiles/coding/arc-runner-szymonrychu).
+  # Per-repo self-hosted ARC runner scale set (infra: helmfiles/coding/helmfile.yaml.gotmpl).
   labels:
-    - szymonrychu-tatara
+    - tatara-operator
