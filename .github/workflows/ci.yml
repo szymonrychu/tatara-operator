@@ -29,13 +29,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
       - name: gofmt
         run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; echo 'gofmt -s required'; exit 1; }
-      - name: golangci-lint
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
-          GOBIN_DIR="$(go env GOPATH)/bin"
-          export PATH="$GOBIN_DIR:$PATH"
-          make lint
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
 
   test:
     runs-on: tatara-operator
