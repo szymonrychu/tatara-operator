@@ -194,6 +194,12 @@ spec:
                 type: string
               headBranch:
                 type: string
+              implementContext:
+                description: |-
+                  ImplementContext is an optional re-entry prompt injected at the start of
+                  the next Implement agent turn (e.g. CI failure details, conflict notice).
+                  Cleared after the turn is submitted so a later fresh entry is clean.
+                type: string
               issueOutcome:
                 description: IssueOutcome is the agent's outcome for an issue-triage
                   task.

@@ -12,6 +12,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -951,6 +952,170 @@ func TestReconcileLifecycle_NoAnnotationDefaultsTriage(t *testing.T) {
 	}
 	if got.Status.LifecycleState != "Triage" {
 		t.Errorf("LifecycleState = %q, want Triage (default when no annotation)", got.Status.LifecycleState)
+	}
+}
+
+// ----- Task 2: Implement re-entry context prompt + field clear -----
+
+// TestLifecycleImplementPlanText_PlainWhenContextEmpty verifies that when
+// ImplementContext is empty the prompt is the plain planTurnText output.
+func TestLifecycleImplementPlanText_PlainWhenContextEmpty(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-plain", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "proj", RepositoryRef: "repo",
+			Goal: "fix the bug", Kind: "issueLifecycle",
+		},
+		Status: tatarav1alpha1.TaskStatus{ImplementContext: ""},
+	}
+	got := implementPrompt(task)
+	want := planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)
+	if got != want {
+		t.Errorf("implementPrompt with empty context:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// TestLifecycleImplementPlanText_IncludesContextBlockWhenSet verifies that
+// when ImplementContext is non-empty the prompt contains both the base plan
+// text and a "## Re-entry context" block with the context value.
+func TestLifecycleImplementPlanText_IncludesContextBlockWhenSet(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-reentry", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "proj", RepositoryRef: "repo",
+			Goal: "fix the bug", Kind: "issueLifecycle",
+		},
+		Status: tatarav1alpha1.TaskStatus{ImplementContext: "CI failed: test_login timed out"},
+	}
+	got := implementPrompt(task)
+	if !strings.Contains(got, planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)) {
+		t.Error("implementPrompt with context must include the base plan text")
+	}
+	if !strings.Contains(got, "## Re-entry context") {
+		t.Errorf("implementPrompt with context must contain '## Re-entry context'; got: %q", got)
+	}
+	if !strings.Contains(got, "CI failed: test_login timed out") {
+		t.Errorf("implementPrompt with context must contain the context detail; got: %q", got)
+	}
+}
+
+// TestLifecycleImplement_ContextClearedAfterRunStarts verifies that after
+// handleImplement spawns the first pod and sets Phase=Planning, ImplementContext
+// is cleared on the persisted Task so a later fresh entry is not re-prompted
+// with the old context.
+func TestLifecycleImplement_ContextClearedAfterRunStarts(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-impl-ctx-clear"
+	proj := "lc-icc-proj"
+	repo := "lc-icc-repo"
+	sec := "lc-icc-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#30", URL: "https://github.com/o/r/issues/30",
+		Number: 30,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	// State: ready to spawn a fresh implement run; ImplementContext is set (re-entry).
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = ""
+	task.Status.ImplementContext = "CI failed: test_auth timed out"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed implement re-entry: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	// First reconcile: ensurePodAndService creates pod, sets Phase=Planning, requeues.
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle (spawn): %v", err)
+	}
+
+	// After the spawn reconcile, ImplementContext must be cleared on the persisted task.
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get task after spawn: %v", err)
+	}
+	if got.Status.ImplementContext != "" {
+		t.Errorf("ImplementContext = %q after spawn, want empty (must be cleared when run starts)", got.Status.ImplementContext)
+	}
+}
+
+// TestLifecycleImplement_ContextInPromptWhenPodReady verifies that when a
+// task with ImplementContext set reaches the driveTurns step (pod ready, no
+// current turn), the submitted turn text contains the re-entry context block.
+func TestLifecycleImplement_ContextInPromptWhenPodReady(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-impl-ctx-prompt"
+	proj := "lc-icp-proj"
+	repo := "lc-icp-repo"
+	sec := "lc-icp-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#31", URL: "https://github.com/o/r/issues/31",
+		Number: 31,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+
+	// State: pod exists and is ready, Phase=Planning, ImplementContext set.
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Planning"
+	task.Status.PodName = agent.PodName(task)
+	task.Status.ImplementContext = "CI failed: build timed out"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Create a ready pod so podReady returns true.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.PodName(task),
+			Namespace: testNS,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "wrapper", Image: "wrapper:1"}},
+		},
+	}
+	if err := k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue,
+	}}
+	if err := k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("set pod ready: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	sess := newFakeSession()
+	r := newLifecycleReconciler(t, fw)
+	r.Session = sess
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	sub, ok := sess.lastSubmit()
+	if !ok {
+		t.Fatal("expected a SubmitTurn call; none recorded")
+	}
+	if !strings.Contains(sub.Text, "## Re-entry context") {
+		t.Errorf("submitted turn text missing re-entry context block; text=%q", sub.Text)
+	}
+	if !strings.Contains(sub.Text, "CI failed: build timed out") {
+		t.Errorf("submitted turn text missing context detail; text=%q", sub.Text)
 	}
 }
 

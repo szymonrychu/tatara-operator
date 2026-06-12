@@ -344,6 +344,17 @@ func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha
 	return nil
 }
 
+// implementPrompt builds the turn-0 prompt for the Implement state. When
+// Status.ImplementContext is set it appends a "## Re-entry context" block so
+// the agent knows why it is being re-entered (CI failure, conflict, etc.).
+func implementPrompt(task *tatarav1alpha1.Task) string {
+	base := planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)
+	if task.Status.ImplementContext == "" {
+		return base
+	}
+	return base + "\n\n## Re-entry context\n" + task.Status.ImplementContext
+}
+
 // handleImplement drives the Implement agent-run state. On a finished run it
 // calls writeBackOpenChange to open the MR, then transitions to MRCI.
 func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
@@ -354,7 +365,30 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("implement: get repo: %w", err)
 	}
-	planText := planTurnText(task.Spec.Goal, taskBranch(task), project.Name, task.Name)
+	// Build the prompt before clearing so the re-entry context block is included.
+	planText := implementPrompt(task)
+	savedCtx := task.Status.ImplementContext
+	// Zero on the in-memory task struct. For Phase=="" the Planning-phase
+	// Status().Update inside driveAgentRun persists the zero value, avoiding a
+	// separate round-trip. For Phase=="Planning" (pod already ready) driveAgentRun
+	// does not do a pre-submit status update, so we do an explicit RetryOnConflict
+	// clear now to ensure the next reconcile cannot re-inject the stale context.
+	task.Status.ImplementContext = ""
+	if task.Status.Phase != "" && savedCtx != "" {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			if fresh.Status.ImplementContext == "" {
+				return nil // already cleared
+			}
+			fresh.Status.ImplementContext = ""
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("implement: clear ImplementContext: %w", err)
+		}
+	}
 	return r.driveAgentRun(ctx, project, &repo, task, planText)
 }
 

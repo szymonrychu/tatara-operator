@@ -135,6 +135,11 @@ type TaskStatus struct {
 	LifecycleIterations int `json:"lifecycleIterations,omitempty"`
 	// +optional
 	Handover string `json:"handover,omitempty"`
+	// ImplementContext is an optional re-entry prompt injected at the start of
+	// the next Implement agent turn (e.g. CI failure details, conflict notice).
+	// Cleared after the turn is submitted so a later fresh entry is clean.
+	// +optional
+	ImplementContext string `json:"implementContext,omitempty"`
 }
 
 // +kubebuilder:object:root=true
