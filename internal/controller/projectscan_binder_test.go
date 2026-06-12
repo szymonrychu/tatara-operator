@@ -204,15 +204,25 @@ func TestMRScanBotPRCreatesIssueLifecycleMRCI(t *testing.T) {
 		t.Fatalf("no task found for human PR #10")
 	}
 
-	// Bot PR -> issueLifecycle with MRCI entry
+	// Bot PR -> issueLifecycle with MRCI entry annotation; Spec.Source carries PR identity.
 	if botTask.Spec.Kind != "issueLifecycle" {
 		t.Errorf("bot PR task Kind = %q, want issueLifecycle", botTask.Spec.Kind)
 	}
-	if botTask.Status.LifecycleState != "MRCI" {
-		t.Errorf("bot PR task LifecycleState = %q, want MRCI", botTask.Status.LifecycleState)
+	// Entry state is now carried by the create-time annotation (FIX 3+5).
+	if botTask.Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "MRCI" {
+		t.Errorf("bot PR task lifecycle-entry annotation = %q, want MRCI", botTask.Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
 	}
-	if botTask.Status.PRNumber != 9 {
-		t.Errorf("bot PR task PRNumber = %d, want 9", botTask.Status.PRNumber)
+	// PR number is in Spec.Source (set at create time), not Status.PRNumber.
+	if botTask.Spec.Source == nil || botTask.Spec.Source.Number != 9 {
+		t.Errorf("bot PR task Spec.Source.Number = %d, want 9", func() int {
+			if botTask.Spec.Source == nil {
+				return 0
+			}
+			return botTask.Spec.Source.Number
+		}())
+	}
+	if botTask.Spec.Source == nil || !botTask.Spec.Source.IsPR {
+		t.Errorf("bot PR task Spec.Source.IsPR must be true")
 	}
 
 	// Human PR -> review (unchanged)
@@ -248,8 +258,13 @@ func TestMRScanBotPRClosesIssueKeyedOnLinkedIssue(t *testing.T) {
 	if tk.Labels[labelSourceNumber] != "17" {
 		t.Errorf("source-number label = %q, want 17 (linked issue)", tk.Labels[labelSourceNumber])
 	}
-	if tk.Status.PRNumber != 42 {
-		t.Errorf("PRNumber = %d, want 42 (the actual PR)", tk.Status.PRNumber)
+	// PR number is in Spec.Source.Number (set at create time, not via Status).
+	if tk.Spec.Source == nil || tk.Spec.Source.Number != 42 {
+		n := 0
+		if tk.Spec.Source != nil {
+			n = tk.Spec.Source.Number
+		}
+		t.Errorf("Spec.Source.Number = %d, want 42 (the actual PR)", n)
 	}
 }
 

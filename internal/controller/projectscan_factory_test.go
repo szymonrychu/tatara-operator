@@ -36,7 +36,7 @@ func TestCreateScanTask(t *testing.T) {
 
 	r := newScanReconciler(nil)
 	c := candidate{repo: "o/r", number: 5, headSHA: "abc", isPR: true}
-	created, err := r.createScanTask(ctx, proj, repo, c, "mrScan", "review", "review PR o/r#5")
+	created, err := r.createScanTask(ctx, proj, repo, c, c, "mrScan", "review", "review PR o/r#5", nil)
 	if err != nil {
 		t.Fatalf("createScanTask: %v", err)
 	}

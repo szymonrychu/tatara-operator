@@ -280,25 +280,35 @@ const annBrainstormSources = "tatara.dev/brainstorm-sources"
 
 // createScanTask creates one cron Task for a candidate with the dedup labels,
 // a TaskSource pointing at the work item, and an owner-ref to the Project.
-func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, c candidate, activity, kind, goal string) (*tatarav1alpha1.Task, error) {
+//
+// labelCand drives the dedup labels (source-repo, source-number). srcCand
+// drives the TaskSource (provider, issueRef, number, isPR, authorLogin). For
+// most callers they are the same candidate. For bot-PR MRCI entries they
+// differ: labelCand carries the linked-issue number (dedup key) while srcCand
+// carries the PR identity (number, IsPR=true).
+//
+// extraAnnotations, if non-nil, is set on the Task at create time
+// (e.g. tatara.dev/lifecycle-entry for issueLifecycle tasks).
+func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, labelCand, srcCand candidate, activity, kind, goal string, extraAnnotations map[string]string) (*tatarav1alpha1.Task, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
 	src := &tatarav1alpha1.TaskSource{
 		Provider: provider,
-		IssueRef: fmt.Sprintf("%s#%d", c.repo, c.number),
-		Number:   c.number,
-		IsPR:     c.isPR,
+		IssueRef: fmt.Sprintf("%s#%d", srcCand.repo, srcCand.number),
+		Number:   srcCand.number,
+		IsPR:     srcCand.isPR,
 	}
-	if c.author != "" {
-		src.AuthorLogin = c.author
+	if srcCand.author != "" {
+		src.AuthorLogin = srcCand.author
 	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "scan-",
 			Namespace:    proj.Namespace,
-			Labels:       scanTaskLabels(c, activity, kind),
+			Labels:       scanTaskLabels(labelCand, activity, kind),
+			Annotations:  extraAnnotations,
 		},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
@@ -510,22 +520,24 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if issueNum, linked := linkedIssueNumber(c.body); linked {
 				dedupNumber = issueNum
 			}
-			dedupCand := candidate{
+			// labelCand carries the dedup key (issue number when present).
+			labelCand := candidate{
 				repo: c.repo, number: dedupNumber, headSHA: c.headSHA,
 				labels: c.labels, updatedAt: c.updatedAt, isPR: c.isPR,
 			}
+			// srcCand carries the actual PR identity (PR number, IsPR=true).
+			srcCand := candidate{
+				repo: c.repo, number: c.number, author: c.author, isPR: true,
+			}
 			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
-			task, err := r.createScanTask(ctx, proj, &repo, dedupCand, "mrScan", "issueLifecycle", goal)
-			if err != nil {
+			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			if _, err := r.createScanTask(ctx, proj, &repo, labelCand, srcCand, "mrScan", "issueLifecycle", goal, ann); err != nil {
 				l.Error(err, "scan: create mrScan issueLifecycle task", "resource_id", proj.Name, "repo", repo.Name)
 				continue
 			}
-			if setErr := r.setMRCIStatus(ctx, task, c.number); setErr != nil {
-				l.Error(setErr, "scan: set MRCI status", "resource_id", proj.Name, "task", task.Name)
-			}
 		} else {
 			goal := fmt.Sprintf("Triage review PR %s#%d", c.repo, c.number)
-			if _, err := r.createScanTask(ctx, proj, &repo, c, "mrScan", "review", goal); err != nil {
+			if _, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, nil); err != nil {
 				l.Error(err, "scan: create mrScan task", "resource_id", proj.Name, "repo", repo.Name)
 				continue
 			}
@@ -537,13 +549,6 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
 	return len(selected) < len(eligible)
-}
-
-// setMRCIStatus sets LifecycleState=MRCI and PRNumber on the given task's status.
-func (r *ProjectReconciler) setMRCIStatus(ctx context.Context, task *tatarav1alpha1.Task, prNumber int) error {
-	task.Status.LifecycleState = "MRCI"
-	task.Status.PRNumber = prNumber
-	return r.Status().Update(ctx, task)
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
@@ -609,7 +614,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			continue
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
-		if _, err := r.createScanTask(ctx, proj, &repo, c, "issueScan", "issueLifecycle", goal); err != nil {
+		if _, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil); err != nil {
 			l.Error(err, "scan: create issueScan task", "resource_id", proj.Name, "repo", repo.Name)
 			continue
 		}

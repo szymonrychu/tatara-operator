@@ -806,6 +806,154 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 	}
 }
 
+// ----- FIX 3+5: reconcileLifecycle initializes LifecycleState from lifecycle-entry annotation -----
+
+// TestReconcileLifecycle_AnnotationEntryImplement asserts that when LifecycleState
+// is empty but the tatara.dev/lifecycle-entry annotation is "Implement", the first
+// reconcile sets LifecycleState=Implement (not the default Triage).
+func TestReconcileLifecycle_AnnotationEntryImplement(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	mkSecret(t, "lc-annimpl-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-annimpl-proj", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{ScmSecretRef: "lc-annimpl-scm"},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("set memory ready: %v", err)
+	}
+	repo := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-annimpl-repo", Namespace: testNS},
+		Spec: tatarav1alpha1.RepositorySpec{
+			ProjectRef: "lc-annimpl-proj", URL: "https://github.com/o/r.git",
+			DefaultBranch: "main", ReingestSchedule: "0 6 * * *",
+		},
+	}
+	if err := k8sClient.Create(ctx, repo); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+
+	// Task with lifecycle-entry=Implement annotation, empty LifecycleState.
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "lc-annimpl-task",
+			Namespace:   testNS,
+			Annotations: map[string]string{"tatara.dev/lifecycle-entry": "Implement"},
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "lc-annimpl-proj", RepositoryRef: "lc-annimpl-repo",
+			Goal: "issue #3", Kind: "issueLifecycle",
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	reg := prometheus.NewRegistry()
+	r := &TaskReconciler{
+		Client:           k8sClient,
+		Scheme:           k8sClient.Scheme(),
+		Metrics:          obs.NewOperatorMetrics(reg),
+		LifecycleMetrics: obs.NewLifecycleMetrics(reg),
+		Session:          newFakeSession(),
+		PodConfig: agent.PodConfig{
+			Namespace: testNS, CallbackURL: "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
+			AnthropicSecretName: "anthropic", CLIOIDCSecretName: "tatara-cli-oidc",
+		},
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: "lc-annimpl-task"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "lc-annimpl-task"}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status.LifecycleState != "Implement" {
+		t.Errorf("LifecycleState = %q, want Implement (from annotation); default would be Triage", got.Status.LifecycleState)
+	}
+}
+
+// TestReconcileLifecycle_NoAnnotationDefaultsTriage asserts that without the
+// lifecycle-entry annotation, LifecycleState is still initialized to Triage.
+func TestReconcileLifecycle_NoAnnotationDefaultsTriage(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	mkSecret(t, "lc-noann-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-noann-proj", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{ScmSecretRef: "lc-noann-scm"},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
+		t.Fatalf("set memory ready: %v", err)
+	}
+	repo := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-noann-repo", Namespace: testNS},
+		Spec: tatarav1alpha1.RepositorySpec{
+			ProjectRef: "lc-noann-proj", URL: "https://github.com/o/r.git",
+			DefaultBranch: "main", ReingestSchedule: "0 6 * * *",
+		},
+	}
+	if err := k8sClient.Create(ctx, repo); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "lc-noann-task", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "lc-noann-proj", RepositoryRef: "lc-noann-repo",
+			Goal: "issue #4", Kind: "issueLifecycle",
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	reg := prometheus.NewRegistry()
+	r := &TaskReconciler{
+		Client:           k8sClient,
+		Scheme:           k8sClient.Scheme(),
+		Metrics:          obs.NewOperatorMetrics(reg),
+		LifecycleMetrics: obs.NewLifecycleMetrics(reg),
+		Session:          newFakeSession(),
+		PodConfig: agent.PodConfig{
+			Namespace: testNS, CallbackURL: "http://op-internal.tatara.svc:8082",
+			OIDCIssuer:          "https://keycloak.tatara.svc/realms/master",
+			AnthropicSecretName: "anthropic", CLIOIDCSecretName: "tatara-cli-oidc",
+		},
+	}
+
+	_, err := r.Reconcile(ctx, ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: "lc-noann-task"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "lc-noann-task"}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status.LifecycleState != "Triage" {
+		t.Errorf("LifecycleState = %q, want Triage (default when no annotation)", got.Status.LifecycleState)
+	}
+}
+
 // ----- FIX 2: idempotent writeBackOpenChange + atomic implement-finish -----
 
 // TestLifecycleImplement_IdempotentOnRetry verifies that calling the implement-finish

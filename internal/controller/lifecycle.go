@@ -162,8 +162,13 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 
 	switch task.Status.LifecycleState {
 	case "":
-		// First reconcile: initialize to Triage.
-		if err := r.setLifecycleState(ctx, task, "Triage", "initial"); err != nil {
+		// First reconcile: initialize from the lifecycle-entry annotation set at
+		// create time by the binder/mrScan; default to Triage when absent.
+		entry := task.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+		if entry == "" {
+			entry = "Triage"
+		}
+		if err := r.setLifecycleState(ctx, task, entry, "initial"); err != nil {
 			r.Metrics.ReconcileResult("Task", "error")
 			return ctrl.Result{}, err
 		}

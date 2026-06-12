@@ -240,10 +240,24 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
+	// Determine the lifecycle entry state for issueLifecycle tasks. This is set
+	// as a create-time annotation so reconcileLifecycle can initialize
+	// LifecycleState atomically from it, without a separate post-create
+	// Status().Update that may be lost.
+	ann := map[string]string{}
+	if kind == "issueLifecycle" {
+		if ev.IsPR {
+			ann[tatarav1.LifecycleEntryAnnotation] = "MRCI"
+		} else {
+			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
+		}
+	}
+
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName:    "task-",
 			Namespace:       s.cfg.Namespace,
+			Annotations:     ann,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -266,21 +280,9 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
-	// For issueLifecycle tasks, set the initial lifecycle state on status.
-	if kind == "issueLifecycle" {
-		if ev.IsPR {
-			// Bot PR enters at MRCI.
-			task.Status.LifecycleState = "MRCI"
-			task.Status.PRNumber = ev.Number
-		} else {
-			// Trigger-labeled issue enters at Implement (per spec: skip dialogue).
-			task.Status.LifecycleState = "Implement"
-		}
-		if err := s.cfg.Client.Status().Update(ctx, task); err != nil {
-			s.log.WarnContext(ctx, "webhook: set lifecycle state failed (non-fatal)",
-				"project", proj.Name, "task", task.Name, "err", err)
-		}
-	}
+	// NOTE: No post-create Status().Update for lifecycle state. The entry state is
+	// carried by the LifecycleEntryAnnotation and consumed by reconcileLifecycle on
+	// the first reconcile.
 	s.log.InfoContext(ctx, "work item created task",
 		"project", proj.Name, "repository", repo.Name,
 		"task", task.Name, "issue_ref", ev.IssueRef, "kind", kind)

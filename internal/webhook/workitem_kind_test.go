@@ -88,7 +88,8 @@ func TestHandleWorkItemKind(t *testing.T) {
 		// kind switch: was "implement", now "issueLifecycle" (migration note: in-flight
 		// "implement" tasks created before this deploy still complete via old writeback arm)
 		require.Equal(t, "issueLifecycle", tk.Spec.Kind)
-		require.Equal(t, "Implement", tk.Status.LifecycleState)
+		// Entry state is now carried by the create-time annotation (FIX 3).
+		require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"])
 		require.False(t, tk.Spec.ApprovalRequired)
 		require.NotNil(t, tk.Spec.Source)
 		require.Equal(t, "alice", tk.Spec.Source.AuthorLogin)
@@ -114,8 +115,9 @@ func TestHandleWorkItemKind(t *testing.T) {
 		// kind switch: was "selfImprove", now "issueLifecycle" (migration note: in-flight
 		// "selfImprove" tasks created before this deploy still complete via old writeback arm)
 		require.Equal(t, "issueLifecycle", tk.Spec.Kind)
-		require.Equal(t, "MRCI", tk.Status.LifecycleState)
-		require.Equal(t, 9, tk.Status.PRNumber)
+		// Entry state is now carried by the create-time annotation, not a post-create
+		// Status().Update (FIX 3). reconcileLifecycle initializes LifecycleState from it.
+		require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"])
 		require.False(t, tk.Spec.ApprovalRequired)
 		require.NotNil(t, tk.Spec.Source)
 		require.Equal(t, "tatara-bot", tk.Spec.Source.AuthorLogin)

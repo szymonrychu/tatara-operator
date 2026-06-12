@@ -54,7 +54,8 @@ func TestLabeledIssueWebhookCreatesIssueLifecycleImplement(t *testing.T) {
 	require.Len(t, matching, 1)
 	tk := matching[0]
 	require.Equal(t, "issueLifecycle", tk.Spec.Kind, "labeled issue must create issueLifecycle kind")
-	require.Equal(t, "Implement", tk.Status.LifecycleState, "trigger-labeled issue must enter at Implement")
+	// Entry state is now carried by the lifecycle-entry annotation (FIX 3+5).
+	require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"], "trigger-labeled issue must have lifecycle-entry=Implement annotation")
 }
 
 // TestBotPRWebhookCreatesIssueLifecycleMRCI asserts that a webhook for a
@@ -100,8 +101,106 @@ func TestBotPRWebhookCreatesIssueLifecycleMRCI(t *testing.T) {
 	require.Len(t, matching, 1)
 	tk := matching[0]
 	require.Equal(t, "issueLifecycle", tk.Spec.Kind, "bot PR must create issueLifecycle kind")
-	require.Equal(t, "MRCI", tk.Status.LifecycleState, "bot PR must enter at MRCI")
-	require.Equal(t, 9, tk.Status.PRNumber, "PRNumber must be set from PR number")
+	// Entry state is now carried by the lifecycle-entry annotation (FIX 3+5).
+	require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"], "bot PR must have lifecycle-entry=MRCI annotation")
+	require.Equal(t, 9, tk.Spec.Source.Number, "Spec.Source.Number must be PR number")
+}
+
+// ----- FIX 3 + FIX 5: atomic lifecycle entry via create-time annotation -----
+
+// TestLabeledIssueWebhook_EntryAnnotationImplement asserts that a trigger-labeled
+// issue creates a Task whose tatara.dev/lifecycle-entry annotation is "Implement",
+// so reconcileLifecycle can initialize LifecycleState atomically from the annotation
+// without a post-create status update.
+func TestLabeledIssueWebhook_EntryAnnotationImplement(t *testing.T) {
+	const secretVal = "whsec"
+	proj := newProjectWithScm(t, "tatara-bot", "labeledOrMentioned")
+	proj.Name = "lc-ann-issue-proj"
+	proj.Namespace = ns
+	proj.Spec.ScmSecretRef = "lc-ann-issue-scm"
+	proj.Spec.TriggerLabel = "tatara"
+
+	c := seedClient(t,
+		proj,
+		&tatarav1.Repository{
+			ObjectMeta: metav1.ObjectMeta{Name: "lc-ann-issue-repo", Namespace: ns},
+			Spec:       tatarav1.RepositorySpec{ProjectRef: "lc-ann-issue-proj", URL: "https://github.com/o/r.git", DefaultBranch: "main"},
+		},
+		secret("lc-ann-issue-scm", secretVal),
+	)
+	h, _ := newServer(t, c)
+
+	body := []byte(`{"action":"labeled","sender":{"login":"alice"},"label":{"name":"tatara"},"issue":{"number":3,"title":"Fix","body":"please fix","user":{"login":"alice"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/3"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issues")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "lc-ann-issue-proj", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	var matching []tatarav1.Task
+	for _, tk := range tasks.Items {
+		if tk.Spec.ProjectRef == "lc-ann-issue-proj" {
+			matching = append(matching, tk)
+		}
+	}
+	require.Len(t, matching, 1)
+	tk := matching[0]
+	require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"],
+		"trigger-labeled issue task must have lifecycle-entry=Implement annotation at create time")
+	// Spec.Source must be set at create time (atomic with the Task object).
+	require.NotNil(t, tk.Spec.Source)
+	require.Equal(t, 3, tk.Spec.Source.Number)
+}
+
+// TestBotPRWebhook_EntryAnnotationMRCIAndSpecSource asserts that a bot-PR webhook
+// creates a Task with lifecycle-entry=MRCI annotation AND Spec.Source populated
+// with PR number, IsPR=true, and URL - all set atomically at create time, not via
+// a post-create status update.
+func TestBotPRWebhook_EntryAnnotationMRCIAndSpecSource(t *testing.T) {
+	const secretVal = "whsec"
+	proj := newProjectWithScm(t, "tatara-bot", "labeledOrMentioned")
+	proj.Name = "lc-ann-botpr-proj"
+	proj.Namespace = ns
+	proj.Spec.ScmSecretRef = "lc-ann-botpr-scm"
+	proj.Spec.TriggerLabel = "tatara"
+
+	c := seedClient(t,
+		proj,
+		&tatarav1.Repository{
+			ObjectMeta: metav1.ObjectMeta{Name: "lc-ann-botpr-repo", Namespace: ns},
+			Spec:       tatarav1.RepositorySpec{ProjectRef: "lc-ann-botpr-proj", URL: "https://github.com/o/r.git", DefaultBranch: "main"},
+		},
+		secret("lc-ann-botpr-scm", secretVal),
+	)
+	h, _ := newServer(t, c)
+
+	body := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":15,"title":"PR","body":"Closes #7\ndescription","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/15","head":{"sha":"deadbeef","ref":"feature"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "pull_request")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "lc-ann-botpr-proj", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	var matching []tatarav1.Task
+	for _, tk := range tasks.Items {
+		if tk.Spec.ProjectRef == "lc-ann-botpr-proj" {
+			matching = append(matching, tk)
+		}
+	}
+	require.Len(t, matching, 1)
+	tk := matching[0]
+	require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"],
+		"bot-PR task must have lifecycle-entry=MRCI annotation at create time")
+	require.NotNil(t, tk.Spec.Source, "Spec.Source must be set at create time")
+	require.Equal(t, 15, tk.Spec.Source.Number, "Spec.Source.Number must be PR number")
+	require.True(t, tk.Spec.Source.IsPR, "Spec.Source.IsPR must be true for bot PR")
+	require.Equal(t, "https://github.com/o/r/pull/15", tk.Spec.Source.URL)
 }
 
 // TestHumanPRWebhookStillCreatesReview asserts that human-authored PRs still
