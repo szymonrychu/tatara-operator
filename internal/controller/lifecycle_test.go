@@ -1008,10 +1008,10 @@ func TestLifecycleImplementPlanText_IncludesContextBlockWhenSet(t *testing.T) {
 	}
 }
 
-// TestLifecycleImplement_ContextClearedAfterRunStarts verifies that after
-// handleImplement spawns the first pod and sets Phase=Planning, ImplementContext
-// is cleared on the persisted Task so a later fresh entry is not re-prompted
-// with the old context.
+// TestLifecycleImplement_ContextClearedAfterRunStarts verifies that ImplementContext
+// is preserved through the spawn reconcile (Phase="" -> Planning) and is only
+// cleared in finishImplement once the run completes. The old assertion (cleared on
+// spawn) tested the bug; this replacement tests the correct behaviour.
 func TestLifecycleImplement_ContextClearedAfterRunStarts(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-impl-ctx-clear"
@@ -1034,7 +1034,7 @@ func TestLifecycleImplement_ContextClearedAfterRunStarts(t *testing.T) {
 	fw := &lifecycleFakeSCMWriter{}
 	r := newLifecycleReconciler(t, fw)
 
-	// First reconcile: ensurePodAndService creates pod, sets Phase=Planning, requeues.
+	// Spawn reconcile: pod created, Phase -> Planning.
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
 		tk := &tatarav1alpha1.Task{}
 		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
@@ -1046,13 +1046,16 @@ func TestLifecycleImplement_ContextClearedAfterRunStarts(t *testing.T) {
 		t.Fatalf("reconcileLifecycle (spawn): %v", err)
 	}
 
-	// After the spawn reconcile, ImplementContext must be cleared on the persisted task.
+	// After spawn, ImplementContext must still be set (not cleared yet).
 	got := &tatarav1alpha1.Task{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after spawn: %v", err)
 	}
-	if got.Status.ImplementContext != "" {
-		t.Errorf("ImplementContext = %q after spawn, want empty (must be cleared when run starts)", got.Status.ImplementContext)
+	if got.Status.ImplementContext == "" {
+		t.Errorf("ImplementContext cleared on spawn (Phase=Planning); must persist until finishImplement")
+	}
+	if got.Status.Phase != "Planning" {
+		t.Errorf("Phase = %q, want Planning after spawn", got.Status.Phase)
 	}
 }
 

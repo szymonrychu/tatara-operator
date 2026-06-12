@@ -96,12 +96,26 @@ func (r *TaskReconciler) clearDeadline(ctx context.Context, task *tatarav1alpha1
 }
 
 // parkWithComment posts a comment on the PR/issue and transitions to Parked.
+// For issue-linked tasks it comments on the issue (IssueRef). For bot-PR-entry
+// tasks with no issue ref, it falls back to the PR ref derived from lifecyclePR.
 func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alpha1.Task, writer scm.SCMWriter, token, reason, msg string) error {
 	l := log.FromContext(ctx)
-	// Post comment on PR/issue (non-fatal if it fails).
-	if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
-		if cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg); cerr != nil {
-			l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
+	if task.Spec.Source != nil {
+		commentRef := task.Spec.Source.IssueRef
+		// For bot-PR-entry tasks the binder sets IssueRef to "owner/repo#N" (the PR
+		// ref). In the rare case it is empty, fall back to URL from lifecyclePR so
+		// the park is never silent.
+		if commentRef == "" && task.Spec.Source.IsPR {
+			_, prURL := lifecyclePR(task)
+			if prURL == "" {
+				prURL = task.Spec.Source.URL
+			}
+			commentRef = prURL
+		}
+		if commentRef != "" {
+			if cerr := writer.Comment(ctx, token, commentRef, msg); cerr != nil {
+				l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
+			}
 		}
 	}
 	return r.setLifecycleState(ctx, task, "Parked", reason)
@@ -487,8 +501,6 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 			// Backstop: too many attempts. Post comment and park.
 			_, _, writer, token, _, scmErr := r.scmContext(ctx, task)
 			if scmErr == nil && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
-				number, _ := lifecyclePR(task)
-				_ = number
 				msg := "max lifecycle iterations reached; leaving for a human"
 				_ = writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
 			}
@@ -526,36 +538,45 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("implement: get repo: %w", err)
 	}
-	// Build the prompt before clearing so the re-entry context block is included.
+	// Build the prompt using the current ImplementContext (may contain re-entry
+	// instructions). Do NOT clear it here - it must persist until the pod is ready
+	// and driveTurns submits the turn-0 prompt. Clearing happens in finishImplement,
+	// after the run has completed and the context has been used.
 	planText := implementPrompt(task)
-	savedCtx := task.Status.ImplementContext
-	// Zero on the in-memory task struct. For Phase=="" the Planning-phase
-	// Status().Update inside driveAgentRun persists the zero value, avoiding a
-	// separate round-trip. For Phase=="Planning" (pod already ready) driveAgentRun
-	// does not do a pre-submit status update, so we do an explicit RetryOnConflict
-	// clear now to ensure the next reconcile cannot re-inject the stale context.
-	task.Status.ImplementContext = ""
-	if task.Status.Phase != "" && savedCtx != "" {
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
-			if fresh.Status.ImplementContext == "" {
-				return nil // already cleared
-			}
-			fresh.Status.ImplementContext = ""
-			return r.Status().Update(ctx, fresh)
-		}); err != nil {
-			return ctrl.Result{}, fmt.Errorf("implement: clear ImplementContext: %w", err)
-		}
-	}
 	return r.driveAgentRun(ctx, project, &repo, task, planText)
 }
 
 // finishImplement opens the MR after the Implement run completes.
 func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
+
+	// Clear ImplementContext: by the time finishImplement runs the turn-0 prompt
+	// has already been submitted (or the run failed), so the context is stale.
+	// Each re-entry overwrites it fresh, so clearing here is safe.
+	// After the write, refresh the in-memory task so subsequent status updates use
+	// the current resourceVersion and do not conflict.
+	if task.Status.ImplementContext != "" {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			if fresh.Status.ImplementContext == "" {
+				task.ResourceVersion = fresh.ResourceVersion
+				task.Status = fresh.Status
+				return nil
+			}
+			fresh.Status.ImplementContext = ""
+			if err := r.Status().Update(ctx, fresh); err != nil {
+				return err
+			}
+			task.ResourceVersion = fresh.ResourceVersion
+			task.Status = fresh.Status
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("implement: clear ImplementContext: %w", err)
+		}
+	}
 
 	if task.Status.Phase == "Failed" {
 		l.Info("implement agent run failed; parking task",
@@ -647,6 +668,17 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 	}
 
 	number, _ := lifecyclePR(task)
+
+	// Guard: PR number 0 means no PR was opened; calling GetPRState(0) is invalid.
+	if number == 0 {
+		l.Info("mrci: PR number is 0; parking task",
+			"action", "lifecycle_mrci_no_pr", "resource_id", task.Name)
+		msg := "lifecycle: no PR number available for MRCI; parking."
+		if err := r.parkWithComment(ctx, task, writer, token, "no-pr-number", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
 
 	// Authorship gate: PR must be bot-authored.
 	st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
@@ -760,6 +792,21 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 
 	number, _ := lifecyclePR(task)
 
+	// Idempotency: if the PR is already merged (MergeCommitSHA already set on the
+	// task), skip straight to MainCI without calling Merge again. This handles the
+	// case where setLifecycleState("MainCI") failed after a successful Merge on a
+	// prior reconcile, which would otherwise re-merge -> 405 -> bogus conflict path.
+	if task.Status.MergeCommitSHA != "" {
+		// PR was merged in a prior reconcile; advance to MainCI directly.
+		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "MainCI", "already-merged"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Set DeadlineAt on first entry.
 	if err := r.ensureDeadline(ctx, task, project); err != nil {
 		return ctrl.Result{}, fmt.Errorf("merge: ensure deadline: %w", err)
@@ -845,8 +892,7 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 // handleMainCI polls the default-branch CI for the merge commit SHA,
 // closes the issue on green, and re-enters Implement on failure.
 func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
-	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
-	_ = proj
+	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("mainci: %w", err)
 	}
@@ -869,6 +915,12 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 
 	// Get the CI status for the merge commit.
 	sha := task.Status.MergeCommitSHA
+	// Guard: an empty SHA means the Merge state wrote the SHA but the status update
+	// was lost. Requeue to allow Merge to re-run and populate the SHA rather than
+	// polling "" until the deadline parks the task.
+	if sha == "" {
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
 	if r.ReaderFor == nil {
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
@@ -876,11 +928,22 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 	if rerr != nil {
 		return ctrl.Result{}, fmt.Errorf("mainci: reader: %w", rerr)
 	}
-	owner, repoName, perr := scm.OwnerRepo(repo.Spec.URL)
-	if perr != nil {
-		return ctrl.Result{}, fmt.Errorf("mainci: parse repo url: %w", perr)
+	// Derive the commit-status target provider-aware: GitLab needs the full project
+	// path (group/sub/project), GitHub needs owner/repo separately.
+	var ciOwner, ciRepo string
+	if provider == "gitlab" {
+		ciOwner, err = scm.GitLabProjectPath(repo.Spec.URL)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("mainci: parse gitlab project path: %w", err)
+		}
+		ciRepo = ""
+	} else {
+		ciOwner, ciRepo, err = scm.OwnerRepo(repo.Spec.URL)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("mainci: parse repo url: %w", err)
+		}
 	}
-	ciStatus, cerr := reader.GetCommitCIStatus(ctx, owner, repoName, sha)
+	ciStatus, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha)
 	if cerr != nil {
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
@@ -916,6 +979,9 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 	case "failure":
 		ctxMsg := fmt.Sprintf("Default-branch pipeline failed after merge (SHA %s). Re-implement the fix and push.", sha)
 		if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "mainci-failure"); err != nil {
