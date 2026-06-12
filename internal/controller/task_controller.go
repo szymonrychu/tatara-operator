@@ -40,10 +40,11 @@ const (
 // turn over the Task's Subtasks.
 type TaskReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	Metrics   *obs.OperatorMetrics
-	Session   agent.Session
-	PodConfig agent.PodConfig
+	Scheme           *runtime.Scheme
+	Metrics          *obs.OperatorMetrics
+	LifecycleMetrics *obs.LifecycleMetrics
+	Session          agent.Session
+	PodConfig        agent.PodConfig
 	// SCMFor returns an scm.SCMWriter for the given provider name ("github"|"gitlab").
 	// Nil in tests that do not exercise write-back; replaced with a fake in
 	// write-back tests.
@@ -77,6 +78,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		r.Metrics.ReconcileResult("Task", "error")
 		return ctrl.Result{}, fmt.Errorf("get task: %w", err)
+	}
+
+	if task.Spec.Kind == "issueLifecycle" {
+		return r.reconcileLifecycle(ctx, &task)
 	}
 
 	if isTerminal(task.Status.Phase) {
@@ -594,12 +599,13 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	}
 	r.Metrics.SetTasksInflight(float64(n))
 	// Emit per-kind gauge for all known kinds, zeroing kinds with no in-flight tasks.
-	for _, kind := range []string{"implement", "review", "selfImprove", "triageIssue", "brainstorm"} {
+	for _, kind := range []string{"implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle"} {
 		r.Metrics.SetTasksInflightKind(kind, float64(byKind[kind]))
 	}
 	// Also emit any kinds seen in the list that are not in the known set.
 	for kind, count := range byKind {
-		if kind == "implement" || kind == "review" || kind == "selfImprove" || kind == "triageIssue" || kind == "brainstorm" {
+		switch kind {
+		case "implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle":
 			continue
 		}
 		r.Metrics.SetTasksInflightKind(kind, float64(count))
