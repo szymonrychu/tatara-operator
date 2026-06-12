@@ -122,29 +122,45 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 	names := memory.NamesFor(p.Name)
 	ns := r.MemoryConfig.Namespace
 
+	// A NotFound read means the object was SSA-applied moments ago and is not
+	// yet visible in the informer cache (or has not been created yet). That is
+	// not-yet-ready, not a failure: leave the count at zero so memoryPhase
+	// reports Provisioning. Only a genuine (non-NotFound) read error is returned.
 	var cluster cnpgv1.Cluster
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.PGCluster}, &cluster); e != nil {
-		return 0, 0, 0, 0, fmt.Errorf("get cnpg cluster: %w", e)
+		if !apierrors.IsNotFound(e) {
+			return 0, 0, 0, 0, fmt.Errorf("get cnpg cluster: %w", e)
+		}
+	} else {
+		readyInstances = cluster.Status.ReadyInstances
 	}
-	readyInstances = cluster.Status.ReadyInstances
 
 	var sts appsv1.StatefulSet
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.Neo4j}, &sts); e != nil {
-		return 0, 0, 0, 0, fmt.Errorf("get neo4j statefulset: %w", e)
+		if !apierrors.IsNotFound(e) {
+			return 0, 0, 0, 0, fmt.Errorf("get neo4j statefulset: %w", e)
+		}
+	} else {
+		neo4jReady = sts.Status.ReadyReplicas
 	}
-	neo4jReady = sts.Status.ReadyReplicas
 
 	var lightrag appsv1.Deployment
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.Lightrag}, &lightrag); e != nil {
-		return 0, 0, 0, 0, fmt.Errorf("get lightrag deployment: %w", e)
+		if !apierrors.IsNotFound(e) {
+			return 0, 0, 0, 0, fmt.Errorf("get lightrag deployment: %w", e)
+		}
+	} else {
+		lightragAvail = lightrag.Status.AvailableReplicas
 	}
-	lightragAvail = lightrag.Status.AvailableReplicas
 
 	var mem appsv1.Deployment
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.Memory}, &mem); e != nil {
-		return 0, 0, 0, 0, fmt.Errorf("get memory deployment: %w", e)
+		if !apierrors.IsNotFound(e) {
+			return 0, 0, 0, 0, fmt.Errorf("get memory deployment: %w", e)
+		}
+	} else {
+		memoryAvail = mem.Status.AvailableReplicas
 	}
-	memoryAvail = mem.Status.AvailableReplicas
 
 	return readyInstances, neo4jReady, lightragAvail, memoryAvail, nil
 }
@@ -165,9 +181,10 @@ const memoryRequeue = 10 * time.Second
 // reconcileMemory provisions the Project's memory stack and sets
 // project.Status.Memory + the MemoryReady condition (it does NOT persist;
 // the caller does one status update). It returns the requeue interval (set
-// while Provisioning) and a non-nil error only on a hard apply/health failure
-// (which is also recorded as phase=Failed + MemoryReady=False before
-// returning).
+// while Provisioning) and a non-nil error on a hard apply/password failure
+// (recorded as phase=Failed + MemoryReady=False) or a transient health read
+// error (which leaves the phase unchanged and requeues with backoff rather
+// than flapping to Failed).
 func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1alpha1.Project) (time.Duration, error) {
 	p.Status.Memory = ensureMemoryStatus(p)
 	prevPhase := p.Status.Memory.Phase
@@ -183,7 +200,15 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 
 	readyInstances, neo4jReady, lightragAvail, memoryAvail, err := r.memoryStackHealth(ctx, p)
 	if err != nil {
-		return 0, r.failMemory(p, "HealthError", err)
+		// A non-NotFound read is a transient API/cache blip, not a real failure
+		// (NotFound is already handled as not-yet-ready inside memoryStackHealth).
+		// Leave the phase and MemoryReady condition as they are so a healthy
+		// stack does not flap to Failed on a 30s blip, and requeue with backoff.
+		// Failed is reserved for genuine apply/password errors.
+		if p.Status.Memory.Phase == "" {
+			p.Status.Memory.Phase = "Provisioning"
+		}
+		return 0, fmt.Errorf("reconcile memory health: %w", err)
 	}
 
 	phase := memoryPhase(readyInstances, effectivePGInstances(p), neo4jReady, lightragAvail, memoryAvail)
