@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,6 +152,51 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 	staleFirst(out)
 	if len(out) > n {
 		out = out[:n]
+	}
+	return out
+}
+
+// laneOccupancy counts this Project's scan Tasks for repoSlug that still occupy
+// the repo's lane: Kind in kinds, phase not terminal and not AwaitingApproval
+// (an awaiting-approval proposal frees the lane for the next item).
+func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...string) int {
+	label := sanitizeRepoLabel(repoSlug)
+	n := 0
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceRepo] != label || !slices.Contains(kinds, t.Spec.Kind) {
+			continue
+		}
+		switch t.Status.Phase {
+		case "Succeeded", "Failed", "AwaitingApproval":
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// selectPerRepo groups eligible candidates by repo and picks, per repo, the best
+// (priority-then-stale) items up to maxPerRepo minus that repo's lane occupancy.
+func selectPerRepo(eligible []candidate, priorityLabel string, maxPerRepo int, occ func(repoSlug string) int) []candidate {
+	if maxPerRepo < 1 {
+		maxPerRepo = 1
+	}
+	byRepo := map[string][]candidate{}
+	var order []string
+	for _, c := range eligible {
+		if _, ok := byRepo[c.repo]; !ok {
+			order = append(order, c.repo)
+		}
+		byRepo[c.repo] = append(byRepo[c.repo], c)
+	}
+	var out []candidate
+	for _, slug := range order {
+		n := maxPerRepo - occ(slug)
+		if n < 1 {
+			continue
+		}
+		out = append(out, selectCandidates(byRepo[slug], priorityLabel, n)...)
 	}
 	return out
 }
