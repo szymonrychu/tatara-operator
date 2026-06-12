@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # Self-hosted ARC runner scale set (infra: helmfiles/coding/arc-runner-szymonrychu).
+  labels:
+    - szymonrychu-tatara

@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  secscan:
+    runs-on: szymonrychu-tatara
+    steps:
+      - uses: actions/checkout@v4
+      - name: gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks detect --source . --no-git --redact --verbose
+
+  lint:
+    runs-on: szymonrychu-tatara
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; echo 'gofmt -s required'; exit 1; }
+      - name: golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.1.6
+          GOBIN_DIR="$(go env GOPATH)/bin"
+          export PATH="$GOBIN_DIR:$PATH"
+          make lint
+
+  test:
+    runs-on: szymonrychu-tatara
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: test
+        run: make test
+
+  build:
+    runs-on: szymonrychu-tatara
+    needs: [secscan, lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build
+        run: make build
+
+  image:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: szymonrychu-tatara
+    needs: [secscan, lint, test, build]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-kubectl@v4
+      - name: build and push image
+        run: bash .github/ci/kaniko-build.sh "${{ github.event.repository.name }}"
