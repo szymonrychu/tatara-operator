@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Dispatch a one-shot kaniko Job that builds this repo's image and pushes it to
-# harbor. Runs on the ARC runner (in-cluster); uses the runner's mounted
-# ServiceAccount for kubectl. Streams kaniko logs and propagates the Job result.
-# Harbor push auth and the private-repo clone token are passed in via the
-# workflow's GitHub secrets and materialized as short-lived in-namespace secrets.
+# harbor. Runs on the ARC runner (in-cluster, namespace arc-runners) and uses the
+# runner's mounted ServiceAccount (tatara-ci-dispatcher) to manage the Job and its
+# short-lived clone/docker-config secrets. The dispatcher SA may create/delete
+# secrets but NOT read them (no secrets:get) so a build cannot read the ARC GitHub
+# App key that also lives in arc-runners. Harbor push auth and the private-repo
+# clone token come from the workflow's GitHub secrets. Streams kaniko logs and
+# propagates the Job result.
 set -euo pipefail
 
 REPO="${1:?repo name required}"          # e.g. tatara-operator
-NS="tatara-ci"
+NS="arc-runners"
 SHORT_SHA="${GITHUB_SHA:0:7}"
 VERSION="$(git describe --tags --always --dirty)"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -22,21 +25,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Transient clone-token secret (kaniko git-context auth for the private repo).
+# Idempotency: clear leftovers from a prior run of the same commit (create, not
+# apply, so the SA needs no secrets:get).
+kubectl -n "$NS" delete job "$JOB" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+kubectl -n "$NS" delete secret "$CLONE_SECRET" "$DOCKERCFG_SECRET" --ignore-not-found >/dev/null 2>&1 || true
+
+# Short-lived clone-token secret (kaniko git-context auth for the private repo).
 kubectl -n "$NS" create secret generic "$CLONE_SECRET" \
   --from-literal=username=x-access-token \
-  --from-literal=token="${GITHUB_TOKEN:?GITHUB_TOKEN required}" \
-  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  --from-literal=token="${GITHUB_TOKEN:?GITHUB_TOKEN required}" >/dev/null
 
-# Transient harbor docker-config secret (kaniko push auth), from workflow secrets.
+# Short-lived harbor docker-config secret (kaniko push auth), from workflow secrets.
 kubectl -n "$NS" create secret docker-registry "$DOCKERCFG_SECRET" \
   --docker-server=harbor.szymonrichert.pl \
   --docker-username="${HARBOR_USERNAME:?HARBOR_USERNAME required}" \
-  --docker-password="${HARBOR_PASSWORD:?HARBOR_PASSWORD required}" \
-  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  --docker-password="${HARBOR_PASSWORD:?HARBOR_PASSWORD required}" >/dev/null
 
-# Render and apply the kaniko Job.
-cat <<EOF | kubectl apply -f -
+# Create the kaniko Job.
+kubectl create -f - <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
