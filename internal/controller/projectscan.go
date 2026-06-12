@@ -79,6 +79,36 @@ func scanTaskLabels(c candidate, activity, kind string) map[string]string {
 	return l
 }
 
+// findConvTaskToReactivate returns the first Conversation or Stopped lifecycle
+// Task for the candidate whose LastActivityAt is strictly older than the
+// candidate's updatedAt (meaning a new comment arrived that we missed). When
+// such a task exists the caller should reactivate it to Triage rather than
+// creating a duplicate Task. Returns nil when no reactivation is warranted.
+func findConvTaskToReactivate(c candidate, existing []tatarav1alpha1.Task) *tatarav1alpha1.Task {
+	if c.isPR {
+		return nil
+	}
+	repoLabel := sanitizeRepoLabel(c.repo)
+	numLabel := strconv.Itoa(c.number)
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+			continue
+		}
+		state := t.Status.LifecycleState
+		if state != "Conversation" && state != "Stopped" {
+			continue
+		}
+		if t.Status.LastActivityAt == nil {
+			continue
+		}
+		if c.updatedAt.After(t.Status.LastActivityAt.Time) {
+			return t
+		}
+	}
+	return nil
+}
+
 // isDeduped reports whether a candidate already has a Task that should suppress
 // a re-pick, per the dedup rules:
 //   - any non-terminal Task for (repo, number) -> skip
@@ -580,6 +610,39 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	for range cands {
 		r.Metrics.ScanItem("issueScan", "scanned")
 	}
+	// Reactivation pass: when an issue was updated after the bound lifecycle
+	// Task's LastActivityAt (missed webhook), reset the Task to Triage instead
+	// of creating a duplicate. This runs before dedup so the reactivated task
+	// absorbs the candidate and the dedup check below skips it normally.
+	for _, c := range cands {
+		task := findConvTaskToReactivate(c, existing)
+		if task == nil {
+			continue
+		}
+		now := metav1.Now()
+		idleMinutes := 60
+		if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
+			idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
+		}
+		deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			if fetchErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); fetchErr != nil {
+				return fetchErr
+			}
+			task.Status.LifecycleState = "Triage"
+			task.Status.LastActivityAt = &now
+			task.Status.DeadlineAt = &deadline
+			return r.Status().Update(ctx, task)
+		})
+		if err != nil {
+			l.Error(err, "issueScan: reactivate conversation task", "action", "reactivate_conv", "resource_id", task.Name)
+			continue
+		}
+		l.Info("issueScan: reactivated conversation task", "action", "reactivate_conv", "resource_id", task.Name,
+			"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+		r.Metrics.ScanItem("issueScan", "reactivated")
+	}
+
 	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
 	var eligible []candidate
 	for _, c := range cands {

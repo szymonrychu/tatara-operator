@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	triageCommentCap       = 20    // max comments included in triage prompt
+	triageCommentCap        = 20   // max comments included in triage prompt
 	triageCommentCharBudget = 8000 // max chars of comment thread
 )
 
