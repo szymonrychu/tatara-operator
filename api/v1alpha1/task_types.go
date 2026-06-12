@@ -44,10 +44,10 @@ type PROutcome struct {
 
 // IssueOutcome is the agent's outcome for an issue-triage task.
 type IssueOutcome struct {
-	// +kubebuilder:validation:Enum=implement;close
+	// +kubebuilder:validation:Enum=implement;close;discuss
 	Action string `json:"action"`
 	// +optional
-	Comment string `json:"comment,omitempty"` // required when Action==close
+	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
 }
 
 // TaskSource records the SCM work-item that originated a webhook-born Task.

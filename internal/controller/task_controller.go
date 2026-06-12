@@ -194,44 +194,8 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
 	}
 
-	exhausted, err := r.ensurePodAndService(ctx, &project, &repo, &task)
-	if err != nil {
-		r.Metrics.ReconcileResult("Task", "error")
-		return ctrl.Result{}, err
-	}
-	if exhausted {
-		res, err := r.terminate(ctx, &task, "Failed", "PodLost", "wrapper pod lost; recreation budget exhausted")
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-	}
-
-	// Set Planning on first spawn.
-	if task.Status.Phase == "" {
-		task.Status.Phase = "Planning"
-		task.Status.PodName = agent.PodName(&task)
-		if err := r.Status().Update(ctx, &task); err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, fmt.Errorf("set planning phase: %w", err)
-		}
-		r.updateInflightGauge(ctx)
-		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{RequeueAfter: pollRequeue}, nil
-	}
-
-	ready, err := r.podReady(ctx, &task)
-	if err != nil {
-		r.Metrics.ReconcileResult("Task", "error")
-		return ctrl.Result{}, err
-	}
-	if !ready {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
-
-	res, err := r.driveTurns(ctx, &project, &task)
+	planText := planTurnText(task.Spec.Goal, taskBranch(&task), project.Name, task.Name)
+	res, err := r.driveAgentRun(ctx, &project, &repo, &task, planText)
 	if err != nil {
 		r.Metrics.ReconcileResult("Task", "error")
 		return ctrl.Result{}, err
@@ -239,6 +203,40 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	r.updateInflightGauge(ctx)
 	r.Metrics.ReconcileResult("Task", "success")
 	return res, nil
+}
+
+// driveAgentRun is the shared agent-spawn + drive-turns sequence. It handles
+// ensurePodAndService, the Planning phase transition, pod readiness wait, and
+// driveTurns. Used by the generic Reconcile and by lifecycle state handlers.
+func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, planText string) (ctrl.Result, error) {
+	exhausted, err := r.ensurePodAndService(ctx, project, repo, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if exhausted {
+		return r.terminate(ctx, task, "Failed", "PodLost", "wrapper pod lost; recreation budget exhausted")
+	}
+
+	// Set Planning on first spawn.
+	if task.Status.Phase == "" {
+		task.Status.Phase = "Planning"
+		task.Status.PodName = agent.PodName(task)
+		if err := r.Status().Update(ctx, task); err != nil {
+			return ctrl.Result{}, fmt.Errorf("set planning phase: %w", err)
+		}
+		r.updateInflightGauge(ctx)
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
+
+	ready, err := r.podReady(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	return r.driveTurns(ctx, project, task, planText)
 }
 
 // atConcurrencyCap reports whether the Project already has maxConcurrentTasks
@@ -354,8 +352,9 @@ func (r *TaskReconciler) podReady(ctx context.Context, task *tatarav1alpha1.Task
 }
 
 // driveTurns runs the callback-driven turn loop: plan turn first, then one
-// Subtask per delivered turn-complete callback.
-func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+// Subtask per delivered turn-complete callback. planText is the turn-0 prompt;
+// callers supply it so lifecycle states can inject their own prompts.
+func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, planText string) (ctrl.Result, error) {
 	baseURL := agent.BaseURL(task, task.Namespace)
 	cbURL := strings.TrimSuffix(r.PodConfig.CallbackURL, "/") + "/internal/turn-complete"
 
@@ -363,7 +362,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	// No turn yet -> submit the plan turn (turn 0).
 	if current == "" {
-		id, err := r.Session.SubmitTurn(ctx, baseURL, planTurnText(task.Spec.Goal, taskBranch(task), project.Name, task.Name), cbURL)
+		id, err := r.Session.SubmitTurn(ctx, baseURL, planText, cbURL)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
 		}
