@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -21,7 +22,90 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
+
+const babysitDefaultDeadlineMinutes = 60
+
+// lifecyclePR returns the PR number and URL for a lifecycle task. When the task
+// was opened via an issue (issue path), finishImplement writes PrNumber/PrURL;
+// when entered directly from a bot PR (IsPR=true), the Source fields carry them.
+func lifecyclePR(task *tatarav1alpha1.Task) (number int, url string) {
+	if task.Status.PRNumber != 0 {
+		return task.Status.PRNumber, task.Status.PrURL
+	}
+	if task.Spec.Source != nil && task.Spec.Source.IsPR {
+		return task.Spec.Source.Number, task.Spec.Source.URL
+	}
+	return 0, ""
+}
+
+// deadlinePassed reports whether the task's DeadlineAt has been reached.
+func deadlinePassed(task *tatarav1alpha1.Task) bool {
+	if task.Status.DeadlineAt == nil {
+		return false
+	}
+	return time.Now().After(task.Status.DeadlineAt.Time)
+}
+
+// ensureDeadline sets DeadlineAt on first entry to a poll state when unset.
+func (r *TaskReconciler) ensureDeadline(ctx context.Context, task *tatarav1alpha1.Task, project *tatarav1alpha1.Project) error {
+	if task.Status.DeadlineAt != nil {
+		return nil
+	}
+	minutes := babysitDefaultDeadlineMinutes
+	if project.Spec.Scm != nil && project.Spec.Scm.BabysitDeadlineMinutes > 0 {
+		minutes = project.Spec.Scm.BabysitDeadlineMinutes
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Status.DeadlineAt != nil {
+			task.Status.DeadlineAt = fresh.Status.DeadlineAt
+			return nil
+		}
+		dl := metav1.NewTime(time.Now().Add(time.Duration(minutes) * time.Minute))
+		fresh.Status.DeadlineAt = &dl
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.DeadlineAt = fresh.Status.DeadlineAt
+		return nil
+	})
+}
+
+// clearDeadline clears DeadlineAt on transition out of a poll state.
+func (r *TaskReconciler) clearDeadline(ctx context.Context, task *tatarav1alpha1.Task) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Status.DeadlineAt == nil {
+			return nil
+		}
+		fresh.Status.DeadlineAt = nil
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.DeadlineAt = nil
+		return nil
+	})
+}
+
+// parkWithComment posts a comment on the PR/issue and transitions to Parked.
+func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alpha1.Task, writer scm.SCMWriter, token, reason, msg string) error {
+	l := log.FromContext(ctx)
+	// Post comment on PR/issue (non-fatal if it fails).
+	if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
+		if cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg); cerr != nil {
+			l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
+		}
+	}
+	return r.setLifecycleState(ctx, task, "Parked", reason)
+}
 
 // setLifecycleState updates task.Status.LifecycleState to `to`, retrying on
 // conflict (same pattern as clearWritebackPending). It logs the transition at
@@ -52,6 +136,11 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 
 	if r.LifecycleMetrics != nil {
 		r.LifecycleMetrics.RecordTransition(from, to)
+		// Track live task counts per state via delta adjustments on the gauge.
+		if from != "" {
+			r.LifecycleMetrics.AddLifecycleState(from, -1)
+		}
+		r.LifecycleMetrics.AddLifecycleState(to, 1)
 	}
 
 	task.Status.LifecycleState = to
@@ -193,10 +282,36 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		r.Metrics.ReconcileResult("Task", "success")
 		return res, nil
 
-	case "Conversation", "MRCI", "Merge", "MainCI":
-		// M1/M2: poll states - stub requeue
+	case "Conversation":
 		r.Metrics.ReconcileResult("Task", "success")
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+
+	case "MRCI":
+		res, err := r.handleMRCI(ctx, &project, task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+
+	case "Merge":
+		res, err := r.handleMerge(ctx, &project, task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+
+	case "MainCI":
+		res, err := r.handleMainCI(ctx, &project, task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
 
 	case "Done", "Stopped", "Parked":
 		r.Metrics.ReconcileResult("Task", "success")
@@ -361,6 +476,52 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 	if isTerminal(task.Status.Phase) {
 		return r.finishImplement(ctx, task)
 	}
+
+	// Fresh-spawn path: Phase == "". Apply backstop + increment iterations.
+	if task.Status.Phase == "" {
+		maxIter := 10
+		if project.Spec.Agent.MaxLifecycleIterations > 0 {
+			maxIter = project.Spec.Agent.MaxLifecycleIterations
+		}
+		if task.Status.LifecycleIterations >= maxIter {
+			// Backstop: too many attempts. Post comment and park.
+			_, _, writer, token, _, scmErr := r.scmContext(ctx, task)
+			if scmErr == nil && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
+				number, _ := lifecyclePR(task)
+				_ = number
+				msg := "max lifecycle iterations reached; leaving for a human"
+				_ = writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
+			}
+			if err := r.setLifecycleState(ctx, task, "Parked", "maxIterations"); err != nil {
+				return ctrl.Result{}, err
+			}
+			if r.LifecycleMetrics != nil {
+				r.LifecycleMetrics.RecordGiveup("maxIterations")
+			}
+			return ctrl.Result{}, nil
+		}
+		// Increment LifecycleIterations on fresh spawn, then re-read task so
+		// driveAgentRun has the current resourceVersion.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			fresh.Status.LifecycleIterations++
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("implement: increment iterations: %w", err)
+		}
+		// Re-read after increment so driveAgentRun uses the latest resourceVersion.
+		refreshed := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), refreshed); err != nil {
+			return ctrl.Result{}, fmt.Errorf("implement: re-get after iteration increment: %w", err)
+		}
+		// Copy mutable pointers back so callers see the new values.
+		task.ResourceVersion = refreshed.ResourceVersion
+		task.Status = refreshed.Status
+	}
+
 	var repo tatarav1alpha1.Repository
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("implement: get repo: %w", err)
@@ -436,7 +597,6 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		}
 		t2.Status.HeadBranch = taskBranch(task)
 		t2.Status.PRNumber = prNumber
-		t2.Status.LifecycleIterations++
 		t2.Status.LifecycleState = "MRCI"
 		return r.Status().Update(ctx, t2)
 	}); err != nil {
@@ -453,6 +613,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 	if r.LifecycleMetrics != nil {
 		r.LifecycleMetrics.RecordTransition("Implement", "MRCI")
 	}
+	task.Status.LifecycleState = "MRCI"
 
 	// Re-get for resetAgentRun.
 	fresh2 := &tatarav1alpha1.Task{}
@@ -474,4 +635,295 @@ func parsePRNumber(prURL string) int {
 	}
 	n, _ := strconv.Atoi(parts[len(parts)-1])
 	return n
+}
+
+// handleMRCI polls the MR CI status, enforces the authorship gate, and
+// transitions to Merge (green), Implement (failure), or Parked (deadline/not-bot).
+func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("mrci: %w", err)
+	}
+
+	number, _ := lifecyclePR(task)
+
+	// Authorship gate: PR must be bot-authored.
+	st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+	if serr != nil {
+		return ctrl.Result{}, fmt.Errorf("mrci: get pr state: %w", serr)
+	}
+	botLogin := ""
+	if project.Spec.Scm != nil {
+		botLogin = project.Spec.Scm.BotLogin
+	}
+	if botLogin != "" && st.Author != botLogin {
+		l.Info("mrci: PR not bot-authored; parking",
+			"action", "lifecycle_mrci_not_bot", "resource_id", task.Name, "author", st.Author)
+		msg := fmt.Sprintf("lifecycle: PR #%d is not authored by the bot (%s); parking.", number, botLogin)
+		if err := r.parkWithComment(ctx, task, writer, token, "not-bot-authored", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("not-bot-authored")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Set DeadlineAt on first entry.
+	if err := r.ensureDeadline(ctx, task, project); err != nil {
+		return ctrl.Result{}, fmt.Errorf("mrci: ensure deadline: %w", err)
+	}
+
+	// Deadline check (do after authorship so a non-bot PR parks immediately).
+	if deadlinePassed(task) {
+		msg := fmt.Sprintf("lifecycle: MRCI deadline reached for PR #%d; parking.", number)
+		if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("deadline")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	switch st.CIStatus {
+	case "pending":
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+
+	case "success":
+		if r.LifecycleMetrics != nil && task.Status.DeadlineAt != nil {
+			minutes := babysitDefaultDeadlineMinutes
+			if project.Spec.Scm != nil && project.Spec.Scm.BabysitDeadlineMinutes > 0 {
+				minutes = project.Spec.Scm.BabysitDeadlineMinutes
+			}
+			elapsed := time.Duration(minutes)*time.Minute - time.Until(task.Status.DeadlineAt.Time)
+			if elapsed > 0 {
+				r.LifecycleMetrics.ObserveMRCIWait(elapsed.Seconds())
+			}
+		}
+		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "Merge", "mrci-success"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+
+	case "failure":
+		ctx2 := fmt.Sprintf("MR pipeline failed for PR #%d. Fix the failures and push.", number)
+		if err := r.setImplementContext(ctx, task, ctx2); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "Implement", "mrci-failure"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+
+	default: // "" - no CI configured
+		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "Merge", "mrci-no-ci"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+}
+
+// setImplementContext persists ImplementContext on the task via RetryOnConflict.
+func (r *TaskReconciler) setImplementContext(ctx context.Context, task *tatarav1alpha1.Task, msg string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ImplementContext = msg
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.ImplementContext = msg
+		return nil
+	})
+}
+
+// handleMerge attempts to merge the PR. Handles 405-conflict as a re-implement
+// signal (MUST NOT return the error to avoid controller-runtime backoff loop).
+func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("merge: %w", err)
+	}
+
+	number, _ := lifecyclePR(task)
+
+	// Set DeadlineAt on first entry.
+	if err := r.ensureDeadline(ctx, task, project); err != nil {
+		return ctrl.Result{}, fmt.Errorf("merge: ensure deadline: %w", err)
+	}
+
+	// Check mergeAllowed policy.
+	allowed, merr := r.mergeAllowed(ctx, project, repo, writer, token, number)
+	if merr != nil {
+		return ctrl.Result{}, merr
+	}
+	if !allowed {
+		if deadlinePassed(task) {
+			msg := fmt.Sprintf("lifecycle: merge deadline reached for PR #%d; parking.", number)
+			if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+			if r.LifecycleMetrics != nil {
+				r.LifecycleMetrics.RecordGiveup("deadline")
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
+
+	// Attempt merge.
+	sha, mergeErr := writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
+	if mergeErr == nil {
+		// Success: record SHA and advance.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			fresh.Status.MergeCommitSHA = sha
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("merge: record sha: %w", err)
+		}
+		task.Status.MergeCommitSHA = sha
+		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "MainCI", "merged"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 405 or body contains "conflict" -> re-implement with resolve instruction.
+	var he *scm.HTTPError
+	if errors.As(mergeErr, &he) {
+		if he.Status == 405 || strings.Contains(strings.ToLower(he.Body), "conflict") {
+			branch := task.Status.HeadBranch
+			ctxMsg := fmt.Sprintf("Merge conflict on branch `%s`. Rebase the default branch into it, resolve conflicts, and push.", branch)
+			if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.clearDeadline(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.setLifecycleState(ctx, task, "Implement", "merge-conflict"); err != nil {
+				return ctrl.Result{}, err
+			}
+			// MUST return nil error - not returning the error prevents controller-runtime backoff loop.
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Transient error: requeue or deadline park.
+	if deadlinePassed(task) {
+		msg := fmt.Sprintf("lifecycle: merge deadline reached (error: %v) for PR #%d; parking.", mergeErr, number)
+		if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("deadline")
+		}
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{RequeueAfter: pollRequeue}, nil
+}
+
+// handleMainCI polls the default-branch CI for the merge commit SHA,
+// closes the issue on green, and re-enters Implement on failure.
+func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
+	_ = proj
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("mainci: %w", err)
+	}
+
+	// Set DeadlineAt on first entry.
+	if err := r.ensureDeadline(ctx, task, project); err != nil {
+		return ctrl.Result{}, fmt.Errorf("mainci: ensure deadline: %w", err)
+	}
+
+	if deadlinePassed(task) {
+		msg := "lifecycle: MainCI deadline reached; parking."
+		if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("deadline")
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Get the CI status for the merge commit.
+	sha := task.Status.MergeCommitSHA
+	if r.ReaderFor == nil {
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
+	reader, rerr := r.ReaderFor(provider, token)
+	if rerr != nil {
+		return ctrl.Result{}, fmt.Errorf("mainci: reader: %w", rerr)
+	}
+	owner, repoName, perr := scm.OwnerRepo(repo.Spec.URL)
+	if perr != nil {
+		return ctrl.Result{}, fmt.Errorf("mainci: parse repo url: %w", perr)
+	}
+	ciStatus, cerr := reader.GetCommitCIStatus(ctx, owner, repoName, sha)
+	if cerr != nil {
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
+
+	switch ciStatus {
+	case "pending", "":
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+
+	case "success":
+		// Close the originating issue (idempotent: swallow 404 / already-closed).
+		if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" && !task.Spec.Source.IsPR {
+			repoSlug, _, slugErr := repoSlugFromURL(repo.Spec.URL, provider)
+			if slugErr == nil {
+				closeErr := writer.CloseIssue(ctx, token, repoSlug, task.Spec.Source.Number, "")
+				if closeErr != nil {
+					var closeHE *scm.HTTPError
+					if !errors.As(closeErr, &closeHE) || (closeHE.Status != 404 && closeHE.Status != 422) {
+						return ctrl.Result{}, fmt.Errorf("mainci: close issue: %w", closeErr)
+					}
+					// 404/422: already closed; continue.
+				}
+			}
+		}
+		if err := r.setLifecycleState(ctx, task, "Done", "mainci-success"); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			elapsed := time.Since(task.CreationTimestamp.Time)
+			r.LifecycleMetrics.ObserveLifecycle(elapsed.Seconds())
+		}
+		return ctrl.Result{}, nil
+
+	case "failure":
+		ctxMsg := fmt.Sprintf("Default-branch pipeline failed after merge (SHA %s). Re-implement the fix and push.", sha)
+		if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "Implement", "mainci-failure"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+
+	default:
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
 }

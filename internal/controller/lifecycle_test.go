@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -17,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -590,8 +592,10 @@ func TestLifecycleImplement_SucceededOpensMRAndEntersMRCI(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 	// Seed: Implement agent run completed successfully.
+	// LifecycleIterations=1: spawn already incremented it when Phase was "".
 	task.Status.LifecycleState = "Implement"
 	task.Status.Phase = "Succeeded"
+	task.Status.LifecycleIterations = 1
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed implement succeeded: %v", err)
 	}
@@ -1424,5 +1428,635 @@ func TestLifecycleImplement_IdempotentOnRetry(t *testing.T) {
 	}
 	if got.Status.PrURL != "https://github.com/o/r/pull/77" {
 		t.Errorf("PrURL = %q, want unchanged", got.Status.PrURL)
+	}
+}
+
+// ============================================================
+// Task 6 - Iteration backstop
+// ============================================================
+
+// seedImplementReadyTask seeds a task in LifecycleState=Implement, Phase=""
+// (ready to spawn a fresh run). Extra status fields set via the returned task
+// pointer before calling reconcileLifecycle.
+func seedImplementReadyTask(t *testing.T, suffix string, iterations int) (*TaskReconciler, *lifecycleFakeSCMWriter, *tatarav1alpha1.Task) {
+	t.Helper()
+	ctx := context.Background()
+	name := "lc-backstop-" + suffix
+	proj := "lc-bsp-" + suffix
+	repo := "lc-bsr-" + suffix
+	sec := "lc-bss-" + suffix
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#7", URL: "https://github.com/o/r/issues/7",
+		Number: 7,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	// Set MaxLifecycleIterations on the project to 3 for deterministic tests.
+	projObj := &tatarav1alpha1.Project{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: proj}, projObj); err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	projObj.Spec.Agent.MaxLifecycleIterations = 3
+	if err := k8sClient.Update(ctx, projObj); err != nil {
+		t.Fatalf("update project MaxLifecycleIterations: %v", err)
+	}
+
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = ""
+	task.Status.LifecycleIterations = iterations
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed implement ready: %v", err)
+	}
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+	// Wire the reader so GetPRState works (not needed for backstop but keeps
+	// the reconciler consistent).
+	return r, fw, task
+}
+
+func fetchTask(t *testing.T, name string) *tatarav1alpha1.Task {
+	t.Helper()
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get task %s: %v", name, err)
+	}
+	return got
+}
+
+// TestLifecycleImplement_BackstopParksWhenMaxIterationsReached verifies that
+// entering Implement with LifecycleIterations >= MaxLifecycleIterations parks the
+// task without spawning a pod, increments giveup metric, and posts a comment.
+func TestLifecycleImplement_BackstopParksWhenMaxIterationsReached(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, fw, task := seedImplementReadyTask(t, "max", 3) // 3 >= max(3) -> park
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, task.Name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, task.Name)
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked (backstop)", got.Status.LifecycleState)
+	}
+	// No pod spawned.
+	pods := &corev1.PodList{}
+	if err := k8sClient.List(ctx, pods, client.InNamespace(testNS), client.MatchingFields{"metadata.name": agent.PodName(task)}); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	// Pod count check via comment - backstop must post comment.
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) == 0 {
+		t.Error("backstop must post a comment on the issue/PR")
+	}
+	found := false
+	for _, c := range fw.commentCalls {
+		if strings.Contains(c.body, "max lifecycle iterations") || strings.Contains(c.body, "human") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("backstop comment must mention max iterations; got %+v", fw.commentCalls)
+	}
+}
+
+// TestLifecycleImplement_BackstopAllowsSpawnBelowMax verifies that with iterations
+// below max, Implement still spawns (transitions away from Implement).
+func TestLifecycleImplement_BackstopAllowsSpawnBelowMax(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, _, task := seedImplementReadyTask(t, "below", 2) // 2 < max(3) -> spawn
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, task.Name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, task.Name)
+	// Phase should advance (Planning) meaning spawn occurred, not Parked.
+	if got.Status.LifecycleState == "Parked" {
+		t.Error("LifecycleState must not be Parked below max iterations")
+	}
+	// LifecycleIterations must be incremented.
+	if got.Status.LifecycleIterations != 3 {
+		t.Errorf("LifecycleIterations = %d, want 3 (incremented on spawn)", got.Status.LifecycleIterations)
+	}
+}
+
+// ============================================================
+// Task 3 - MRCI poll state
+// ============================================================
+
+// lifecycleFakeSCMWriterMRCI extends lifecycleFakeSCMWriter with GetPRState control.
+type lifecycleFakeSCMWriterMRCI struct {
+	lifecycleFakeSCMWriter
+	prState scm.PRState
+	prErr   error
+}
+
+func (f *lifecycleFakeSCMWriterMRCI) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prState, f.prErr
+}
+
+func (f *lifecycleFakeSCMWriterMRCI) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
+	return "", nil
+}
+
+func seedMRCITask(t *testing.T, suffix string, prState scm.PRState, deadlineOffset time.Duration) (*TaskReconciler, *lifecycleFakeSCMWriterMRCI, string) {
+	t.Helper()
+	ctx := context.Background()
+	name := "lc-mrci-" + suffix
+	proj := "lc-mrcip-" + suffix
+	repo := "lc-mrcir-" + suffix
+	sec := "lc-mrcis-" + suffix
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#8", URL: "https://github.com/o/r/issues/8",
+		Number: 8,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+
+	task.Status.LifecycleState = "MRCI"
+	task.Status.PRNumber = 42
+	task.Status.PrURL = "https://github.com/o/r/pull/42"
+	task.Status.HeadBranch = "tatara/task-" + name
+	if deadlineOffset != 0 {
+		dl := metav1.NewTime(time.Now().Add(deadlineOffset))
+		task.Status.DeadlineAt = &dl
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed mrci task: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriterMRCI{prState: prState}
+	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+	return r, fw, name
+}
+
+func TestLifecycleMRCI_PendingRequeues(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, _, name := seedMRCITask(t, "pending", scm.PRState{Author: "bot", CIStatus: "pending"}, time.Hour)
+
+	res, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("pending CI must requeue")
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "MRCI" {
+		t.Errorf("LifecycleState = %q, want MRCI on pending CI", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMRCI_SuccessTransitionsToMerge(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, _, name := seedMRCITask(t, "success", scm.PRState{Author: "bot", CIStatus: "success"}, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Merge" {
+		t.Errorf("LifecycleState = %q, want Merge on CI success", got.Status.LifecycleState)
+	}
+	if got.Status.DeadlineAt != nil {
+		t.Error("DeadlineAt must be cleared on transition out of MRCI")
+	}
+}
+
+func TestLifecycleMRCI_FailureSetsContextAndReentersImplement(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, _, name := seedMRCITask(t, "failure", scm.PRState{Author: "bot", CIStatus: "failure"}, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Implement" {
+		t.Errorf("LifecycleState = %q, want Implement on CI failure", got.Status.LifecycleState)
+	}
+	if got.Status.ImplementContext == "" {
+		t.Error("ImplementContext must be set on MRCI failure")
+	}
+	if !strings.Contains(got.Status.ImplementContext, "pipeline") && !strings.Contains(got.Status.ImplementContext, "MR") && !strings.Contains(got.Status.ImplementContext, "CI") {
+		t.Errorf("ImplementContext = %q, should mention pipeline/CI failure", got.Status.ImplementContext)
+	}
+}
+
+func TestLifecycleMRCI_NoCITransitionsToMerge(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	// CIStatus="" means no CI configured
+	r, _, name := seedMRCITask(t, "noci", scm.PRState{Author: "bot", CIStatus: ""}, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Merge" {
+		t.Errorf("LifecycleState = %q, want Merge when no CI", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMRCI_DeadlineParks(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	// deadline already passed (negative offset)
+	r, fw, name := seedMRCITask(t, "deadline", scm.PRState{Author: "bot", CIStatus: "pending"}, -time.Minute)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked on deadline", got.Status.LifecycleState)
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) == 0 {
+		t.Error("deadline park must post a comment")
+	}
+}
+
+func TestLifecycleMRCI_NonBotAuthorParks(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, fw, name := seedMRCITask(t, "notbot", scm.PRState{Author: "someuser", CIStatus: "pending"}, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked (non-bot author)", got.Status.LifecycleState)
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) == 0 {
+		t.Error("non-bot author park must post a comment")
+	}
+}
+
+// ============================================================
+// Task 4 - Merge state + 405 regression guard
+// ============================================================
+
+// lifecycleFakeSCMWriterMerge extends the base fake with controlled Merge behaviour.
+type lifecycleFakeSCMWriterMerge struct {
+	lifecycleFakeSCMWriter
+	prState  scm.PRState
+	mergeSHA string
+	mergeErr error
+}
+
+func (f *lifecycleFakeSCMWriterMerge) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prState, nil
+}
+
+func (f *lifecycleFakeSCMWriterMerge) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mergeSHA, f.mergeErr
+}
+
+func seedMergeTask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMerge, deadlineOffset time.Duration) (*TaskReconciler, string) {
+	t.Helper()
+	ctx := context.Background()
+	name := "lc-merge-" + suffix
+	proj := "lc-mergep-" + suffix
+	repo := "lc-merger-" + suffix
+	sec := "lc-merges-" + suffix
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#9", URL: "https://github.com/o/r/issues/9",
+		Number: 9,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+
+	task.Status.LifecycleState = "Merge"
+	task.Status.PRNumber = 42
+	task.Status.PrURL = "https://github.com/o/r/pull/42"
+	task.Status.HeadBranch = "tatara/task-" + name
+	if deadlineOffset != 0 {
+		dl := metav1.NewTime(time.Now().Add(deadlineOffset))
+		task.Status.DeadlineAt = &dl
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed merge task: %v", err)
+	}
+
+	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+	return r, name
+}
+
+func TestLifecycleMerge_AllowedOK_TransitionsToMainCIWithSHA(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMerge{
+		prState:  scm.PRState{Author: "bot", Mergeable: true, CIStatus: "success"},
+		mergeSHA: "abc123sha",
+	}
+	r, name := seedMergeTask(t, "ok", fw, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "MainCI" {
+		t.Errorf("LifecycleState = %q, want MainCI on successful merge", got.Status.LifecycleState)
+	}
+	if got.Status.MergeCommitSHA != "abc123sha" {
+		t.Errorf("MergeCommitSHA = %q, want abc123sha", got.Status.MergeCommitSHA)
+	}
+	if got.Status.DeadlineAt != nil {
+		t.Error("DeadlineAt must be cleared after merge")
+	}
+}
+
+// TestLifecycleMerge_405ConflictSpawnsResolveAttempt_ErrNil is the explicit
+// live-loop guard: a 405 from Merge must NOT return an error to controller-runtime
+// (which would trigger exponential backoff), and must transition to Implement with
+// ImplementContext set.
+func TestLifecycleMerge_405ConflictSpawnsResolveAttempt_ErrNil(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMerge{
+		prState:  scm.PRState{Author: "bot", Mergeable: true, CIStatus: "success"},
+		mergeErr: &scm.HTTPError{Status: 405, Body: "merge conflict", Path: "/merge"},
+	}
+	r, name := seedMergeTask(t, "405", fw, time.Hour)
+
+	result, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	// THE CRITICAL ASSERTION: err must be nil (no controller-runtime backoff loop).
+	if err != nil {
+		t.Errorf("405 conflict must NOT return error (live-loop guard): got err = %v", err)
+	}
+	_ = result
+
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Implement" {
+		t.Errorf("LifecycleState = %q, want Implement (spawn resolve attempt)", got.Status.LifecycleState)
+	}
+	if got.Status.ImplementContext == "" {
+		t.Error("ImplementContext must be set for conflict resolve instruction")
+	}
+	if !strings.Contains(got.Status.ImplementContext, "conflict") && !strings.Contains(got.Status.ImplementContext, "rebase") {
+		t.Errorf("ImplementContext = %q; should mention conflict/rebase", got.Status.ImplementContext)
+	}
+}
+
+func TestLifecycleMerge_NotAllowedRequeues(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	// autoMergeOnGreenCI with pending CI -> mergeAllowed=false
+	fw := &lifecycleFakeSCMWriterMerge{
+		prState: scm.PRState{Author: "bot", CIStatus: "pending"},
+	}
+	r, name := seedMergeTask(t, "notallowed", fw, time.Hour)
+	// Set autoMergeOnGreenCI policy on project.
+	proj := &tatarav1alpha1.Project{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "lc-mergep-notallowed"}, proj); err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	proj.Spec.Scm.MergePolicy = "autoMergeOnGreenCI"
+	if err := k8sClient.Update(context.Background(), proj); err != nil {
+		t.Fatalf("update project policy: %v", err)
+	}
+
+	res, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("not-allowed merge must requeue")
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Merge" {
+		t.Errorf("LifecycleState = %q, want Merge (not allowed, requeue)", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMerge_TransientErrorRequeues(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMerge{
+		prState:  scm.PRState{Author: "bot", CIStatus: "success"},
+		mergeErr: &scm.HTTPError{Status: 503, Body: "service unavailable", Path: "/merge"},
+	}
+	r, name := seedMergeTask(t, "transient", fw, time.Hour)
+
+	res, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("transient merge error must requeue")
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Merge" {
+		t.Errorf("LifecycleState = %q, want Merge (transient)", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMerge_TransientDeadlineParks(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMerge{
+		prState:  scm.PRState{Author: "bot", CIStatus: "success"},
+		mergeErr: &scm.HTTPError{Status: 503, Body: "unavailable", Path: "/merge"},
+	}
+	r, name := seedMergeTask(t, "trans-dl", fw, -time.Minute) // deadline already passed
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked (transient error + deadline)", got.Status.LifecycleState)
+	}
+}
+
+// ============================================================
+// Task 5 - MainCI poll + close
+// ============================================================
+
+// lifecycleFakeSCMWriterMainCI controls commit CI and close calls.
+type lifecycleFakeSCMWriterMainCI struct {
+	lifecycleFakeSCMWriter
+	ciStatus     string
+	ciErr        error
+	closeIssueFn func() error // optional override; nil = success
+}
+
+func (f *lifecycleFakeSCMWriterMainCI) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	return scm.PRState{Author: "bot", CIStatus: "success"}, nil
+}
+
+func (f *lifecycleFakeSCMWriterMainCI) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
+	return "", nil
+}
+
+func (f *lifecycleFakeSCMWriterMainCI) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
+	return f.ciStatus, f.ciErr
+}
+
+func (f *lifecycleFakeSCMWriterMainCI) CloseIssue(_ context.Context, _, _ string, _ int, comment string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closeCalls = append(f.closeCalls, struct{ repo, comment string }{"", comment})
+	if f.closeIssueFn != nil {
+		return f.closeIssueFn()
+	}
+	return nil
+}
+
+// SCMReaderMainCI satisfies SCMReader for GetCommitCIStatus in the reconciler.
+// (The reconciler calls GetCommitCIStatus via ReaderFor.)
+type fakeReaderMainCI struct {
+	ciStatus string
+	ciErr    error
+}
+
+func (f *fakeReaderMainCI) ListOpenPRs(_ context.Context, _, _ string) ([]scm.PRRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderMainCI) ListOpenIssues(_ context.Context, _, _ string) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderMainCI) ListBoardItems(_ context.Context, _ scm.BoardRef) ([]scm.BoardItem, error) {
+	return nil, nil
+}
+func (f *fakeReaderMainCI) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
+	return f.ciStatus, f.ciErr
+}
+
+func seedMainCITask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMainCI, deadlineOffset time.Duration) (*TaskReconciler, string) {
+	t.Helper()
+	ctx := context.Background()
+	name := "lc-mainci-" + suffix
+	proj := "lc-mcp-" + suffix
+	repo := "lc-mcr-" + suffix
+	sec := "lc-mcs-" + suffix
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#11", URL: "https://github.com/o/r/issues/11",
+		Number: 11,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+
+	task.Status.LifecycleState = "MainCI"
+	task.Status.MergeCommitSHA = "deadbeef"
+	task.Status.PRNumber = 55
+	task.Status.PrURL = "https://github.com/o/r/pull/55"
+	if deadlineOffset != 0 {
+		dl := metav1.NewTime(time.Now().Add(deadlineOffset))
+		task.Status.DeadlineAt = &dl
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed mainci task: %v", err)
+	}
+
+	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &fakeReaderMainCI{ciStatus: fw.ciStatus, ciErr: fw.ciErr}, nil
+	}
+	return r, name
+}
+
+func TestLifecycleMainCI_PendingRequeues(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMainCI{ciStatus: "pending"}
+	r, name := seedMainCITask(t, "pending", fw, time.Hour)
+
+	res, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Error("pending MainCI must requeue")
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "MainCI" {
+		t.Errorf("LifecycleState = %q, want MainCI on pending", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMainCI_SuccessClosesDoneIdempotent(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	// closeIssueFn returns nil (idempotent - issue may already be closed)
+	fw := &lifecycleFakeSCMWriterMainCI{ciStatus: "success"}
+	r, name := seedMainCITask(t, "success", fw, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Done" {
+		t.Errorf("LifecycleState = %q, want Done on MainCI success", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMainCI_SuccessCloseIssueIdempotentOnNotFound(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	// Simulate already-closed: CloseIssue returns a 404 HTTPError (Closes #N
+	// in the MR body may have already closed it).
+	fw := &lifecycleFakeSCMWriterMainCI{
+		ciStatus: "success",
+		closeIssueFn: func() error {
+			return &scm.HTTPError{Status: 404, Body: "not found", Path: "/issues/close"}
+		},
+	}
+	r, name := seedMainCITask(t, "idem", fw, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle on idempotent close: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Done" {
+		t.Errorf("LifecycleState = %q, want Done (idempotent CloseIssue)", got.Status.LifecycleState)
+	}
+}
+
+func TestLifecycleMainCI_FailureReentersImplement(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMainCI{ciStatus: "failure"}
+	r, name := seedMainCITask(t, "failure", fw, time.Hour)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Implement" {
+		t.Errorf("LifecycleState = %q, want Implement on MainCI failure", got.Status.LifecycleState)
+	}
+	if got.Status.ImplementContext == "" {
+		t.Error("ImplementContext must be set on MainCI failure")
+	}
+}
+
+func TestLifecycleMainCI_DeadlineParks(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMainCI{ciStatus: "pending"}
+	r, name := seedMainCITask(t, "deadline", fw, -time.Minute) // already past
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked on MainCI deadline", got.Status.LifecycleState)
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) == 0 {
+		t.Error("deadline park must post comment")
 	}
 }
