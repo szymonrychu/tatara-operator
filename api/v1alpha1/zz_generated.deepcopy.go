@@ -360,6 +360,10 @@ func (in *RepositoryStatus) DeepCopyInto(out *RepositoryStatus) {
 		in, out := &in.LastScheduledReingest, &out.LastScheduledReingest
 		*out = (*in).DeepCopy()
 	}
+	if in.LastIngestFailureTime != nil {
+		in, out := &in.LastIngestFailureTime, &out.LastIngestFailureTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

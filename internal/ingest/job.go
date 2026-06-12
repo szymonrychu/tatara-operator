@@ -82,7 +82,7 @@ const (
 // result ConfigMap via the in-cluster API.
 func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Repository, since, baseURL string, cfg Config) *batchv1.Job {
 	backoff := int32(2)
-	ttl := int32(3600)
+	ttl := int32(600)
 	controller := true
 
 	// Clone into a directory that mirrors the repo namespace (owner/.../repo),

@@ -3,6 +3,7 @@
 Past decisions and their context. One line per entry, dated. Append-only
 in spirit; prune only when a decision is reversed.
 
+- 2026-06-12 (0.4.2) Ingest Job hardening: TTL lowered 3600->600s (self-GC 10m after finish); operator exponential backoff (30s base, 2x per failure, 30m cap) prevents re-creation flood - previously a failing Job was re-created on every reconcile with no gate, causing a 449-pod/144-job incident; IngestFailureCount + LastIngestFailureTime added to RepositoryStatus for state tracking.
 - 2026-06-09 (0.2.12) B2 fix: `MemoryNotReady` was only cleared on the ingest path (after the `if !want` early-return), so already-ingested repos kept the stale condition. Reordered the memory gate + clear before `ingestDecision`, persisting the flip immediately. Also: the agent's headless CLI auth fails `unauthorized_client` because `tatara-cli-oidc/client-secret` (sops `cliOidcClientSecret`) is STALE vs the live tatara-operator Keycloak client; the operator's own `OPERATOR_OIDC_CLIENT_SECRET` works - user must re-sync the sops value (NOT a code bug).
 - 2026-06-09 (0.2.11) Agent-native tatara tools (operator half): inject
   `TATARA_OPERATOR_URL` (config `OPERATOR_URL`, default

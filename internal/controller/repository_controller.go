@@ -30,6 +30,30 @@ const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
 // re-evaluate the schedule reasonably soon.
 const maxScheduleRequeue = 6 * time.Hour
 
+// ingestBackoff constants for exponential back-off between failed Job re-creations.
+const (
+	baseIngestBackoff = 30 * time.Second
+	maxIngestBackoff  = 30 * time.Minute
+)
+
+// ingestBackoff returns the back-off duration for the given consecutive failure
+// count: base * 2^(failures-1), capped at maxIngestBackoff.
+func ingestBackoff(failures int) time.Duration {
+	if failures <= 0 {
+		return baseIngestBackoff
+	}
+	// Cap the shift to avoid int overflow (30 shifts exceeds 30m anyway).
+	shift := failures - 1
+	if shift > 30 {
+		shift = 30
+	}
+	d := baseIngestBackoff * (1 << uint(shift))
+	if d > maxIngestBackoff || d < 0 {
+		return maxIngestBackoff
+	}
+	return d
+}
+
 // RepositoryReconciler drives ingest Jobs for Repositories.
 type RepositoryReconciler struct {
 	client.Client
@@ -137,6 +161,44 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		r.Metrics.ReconcileResult("Repository", "success")
 		return res, nil
 	}
+
+	// Exponential back-off gate: if there have been recent failures and the
+	// back-off window has not yet elapsed, hold off and requeue.
+	if repo.Status.IngestFailureCount > 0 && repo.Status.LastIngestFailureTime != nil {
+		backoff := ingestBackoff(repo.Status.IngestFailureCount)
+		retryAt := repo.Status.LastIngestFailureTime.Add(backoff)
+		if time.Now().Before(retryAt) {
+			remaining := time.Until(retryAt)
+			meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+				Type:   "IngestBackoff",
+				Status: metav1.ConditionTrue,
+				Reason: "IngestFailing",
+				Message: fmt.Sprintf("ingest has failed %d time(s); next retry in %s",
+					repo.Status.IngestFailureCount, remaining.Round(time.Second)),
+				ObservedGeneration: repo.Generation,
+			})
+			if err := r.Status().Update(ctx, &repo); err != nil {
+				r.Metrics.ReconcileResult("Repository", "error")
+				return ctrl.Result{}, fmt.Errorf("set IngestBackoff condition: %w", err)
+			}
+			l.Info("ingest backoff active",
+				"action", "ingest_backoff",
+				"resource_id", repo.Name,
+				"failure_count", repo.Status.IngestFailureCount,
+				"retry_after", retryAt.Format(time.RFC3339))
+			r.Metrics.ReconcileResult("Repository", "success")
+			return ctrl.Result{RequeueAfter: remaining}, nil
+		}
+	}
+
+	// Clear any lingering IngestBackoff condition before launching.
+	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+		Type:               "IngestBackoff",
+		Status:             metav1.ConditionFalse,
+		Reason:             "IngestRetrying",
+		Message:            "backoff elapsed, launching ingest job",
+		ObservedGeneration: repo.Generation,
+	})
 
 	if err := r.ensureResultConfigMap(ctx, &repo); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
@@ -321,6 +383,8 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 		repo.Status.LastIngestTime = &now
 		repo.Status.Phase = "Ingested"
 		repo.Status.JobName = ""
+		repo.Status.IngestFailureCount = 0
+		repo.Status.LastIngestFailureTime = nil
 		meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
 			Type:               "Ingested",
 			Status:             metav1.ConditionTrue,
@@ -340,6 +404,9 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 
 	repo.Status.Phase = "Failed"
 	repo.Status.JobName = ""
+	repo.Status.IngestFailureCount++
+	failTime := metav1.NewTime(time.Now())
+	repo.Status.LastIngestFailureTime = &failTime
 	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
 		Type:               "Ingested",
 		Status:             metav1.ConditionFalse,
@@ -352,7 +419,8 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 		return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
 	}
 	l.Info("ingest failed",
-		"action", "ingest_failed", "resource_id", repo.Name, "job", job.Name)
+		"action", "ingest_failed", "resource_id", repo.Name, "job", job.Name,
+		"failure_count", repo.Status.IngestFailureCount)
 	r.Metrics.ReconcileResult("Repository", "error")
 	return ctrl.Result{}, nil
 }

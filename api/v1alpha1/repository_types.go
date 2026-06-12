@@ -42,6 +42,14 @@ type RepositoryStatus struct {
 	// reingest-requested annotation; used as the base for the next fire.
 	// +optional
 	LastScheduledReingest *metav1.Time `json:"lastScheduledReingest,omitempty"`
+	// IngestFailureCount tracks consecutive ingest Job failures for exponential
+	// backoff between re-creations.
+	// +optional
+	IngestFailureCount int `json:"ingestFailureCount,omitempty"`
+	// LastIngestFailureTime is the timestamp of the most recent ingest Job
+	// failure; used alongside IngestFailureCount to compute backoff.
+	// +optional
+	LastIngestFailureTime *metav1.Time `json:"lastIngestFailureTime,omitempty"`
 	// +optional
 	JobName string `json:"jobName,omitempty"`
 	// +optional

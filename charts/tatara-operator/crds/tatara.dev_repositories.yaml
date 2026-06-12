@@ -138,7 +138,18 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              ingestFailureCount:
+                description: |-
+                  IngestFailureCount tracks consecutive ingest Job failures for exponential
+                  backoff between re-creations.
+                type: integer
               jobName:
+                type: string
+              lastIngestFailureTime:
+                description: |-
+                  LastIngestFailureTime is the timestamp of the most recent ingest Job
+                  failure; used alongside IngestFailureCount to compute backoff.
+                format: date-time
                 type: string
               lastIngestTime:
                 format: date-time
