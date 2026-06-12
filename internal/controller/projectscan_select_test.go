@@ -4,8 +4,63 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
+
+func TestLaneOccupancy(t *testing.T) {
+	mk := func(repo, kind, phase string) tatarav1alpha1.Task {
+		return tatarav1alpha1.Task{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel(repo)}},
+			Spec:       tatarav1alpha1.TaskSpec{Kind: kind},
+			Status:     tatarav1alpha1.TaskStatus{Phase: phase},
+		}
+	}
+	existing := []tatarav1alpha1.Task{
+		mk("o/a", "triageIssue", "Running"),          // occupies a/issue lane
+		mk("o/a", "triageIssue", "AwaitingApproval"), // does NOT occupy
+		mk("o/a", "triageIssue", "Succeeded"),        // terminal, no
+		mk("o/b", "review", "Planning"),              // occupies b/mr lane
+		mk("o/a", "selfImprove", "Running"),          // wrong kind for issue lane
+	}
+	require.Equal(t, 1, laneOccupancy(existing, "o/a", "triageIssue"))
+	require.Equal(t, 1, laneOccupancy(existing, "o/b", "review", "selfImprove"))
+	require.Equal(t, 0, laneOccupancy(existing, "o/c", "triageIssue"))
+}
+
+func TestSelectPerRepo(t *testing.T) {
+	c := func(repo string, n int, age time.Duration) candidate {
+		return candidate{repo: repo, number: n, updatedAt: time.Now().Add(-age)}
+	}
+	eligible := []candidate{
+		c("o/a", 1, 3*time.Hour), c("o/a", 2, 1*time.Hour), // a: two items
+		c("o/b", 3, 2*time.Hour), // b: one item
+	}
+
+	// a lane already has 1 active -> a gets 0; b has 0 -> b gets its 1.
+	occ := func(slug string) int {
+		if slug == "o/a" {
+			return 1
+		}
+		return 0
+	}
+	got := selectPerRepo(eligible, "", 1, occ)
+	require.Len(t, got, 1)
+	require.Equal(t, "o/b", got[0].repo)
+
+	// empty lanes, maxPerRepo 1 -> one per repo, stale-first within repo.
+	got2 := selectPerRepo(eligible, "", 1, func(string) int { return 0 })
+	require.Len(t, got2, 2)
+	require.ElementsMatch(t, []string{"o/a", "o/b"}, []string{got2[0].repo, got2[1].repo})
+	for _, g := range got2 {
+		if g.repo == "o/a" {
+			require.Equal(t, 1, g.number) // a#1 is older -> stale-first
+		}
+	}
+}
 
 func TestSelectPriorityThenStale(t *testing.T) {
 	base := time.Date(2026, 6, 10, 0, 0, 0, 0, time.UTC)

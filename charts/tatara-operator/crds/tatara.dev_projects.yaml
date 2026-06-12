@@ -126,8 +126,10 @@ spec:
                         description: CronActivity schedules one Project scan activity
                           (mrScan or issueScan).
                         properties:
-                          maxPerCycle:
+                          maxPerRepo:
                             default: 1
+                            description: MaxPerRepo caps the number of in-progress
+                              Tasks per repo (one lane per repo).
                             type: integer
                           schedule:
                             description: Schedule is a 5-field cron (robfig ParseStandard).
@@ -138,8 +140,10 @@ spec:
                         description: CronActivity schedules one Project scan activity
                           (mrScan or issueScan).
                         properties:
-                          maxPerCycle:
+                          maxPerRepo:
                             default: 1
+                            description: MaxPerRepo caps the number of in-progress
+                              Tasks per repo (one lane per repo).
                             type: integer
                           schedule:
                             description: Schedule is a 5-field cron (robfig ParseStandard).

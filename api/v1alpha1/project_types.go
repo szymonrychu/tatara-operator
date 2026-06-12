@@ -62,9 +62,10 @@ type CronActivity struct {
 	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables this activity.
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
+	// MaxPerRepo caps the number of in-progress Tasks per repo (one lane per repo).
 	// +kubebuilder:default=1
 	// +optional
-	MaxPerCycle int `json:"maxPerCycle,omitempty"`
+	MaxPerRepo int `json:"maxPerRepo,omitempty"`
 }
 
 // BrainstormActivity schedules the opt-in self-driven issue-proposal scan.

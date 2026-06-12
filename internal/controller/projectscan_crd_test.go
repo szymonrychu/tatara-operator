@@ -20,8 +20,8 @@ func TestProjectCronFieldsRoundTrip(t *testing.T) {
 		Provider: "github", Owner: "o", BotLogin: "bot",
 		PriorityLabel: "tatara/priority",
 		Cron: &tataradevv1alpha1.ScmCron{
-			MRScan:    tataradevv1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerCycle: 2},
-			IssueScan: tataradevv1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerCycle: 1},
+			MRScan:    tataradevv1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2},
+			IssueScan: tataradevv1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1},
 			Brainstorm: tataradevv1alpha1.BrainstormActivity{
 				Enabled: true, Schedule: "0 6 * * *", MaxPerCycle: 1,
 				Sources: []string{"docs", "memory", "internet"},
@@ -35,7 +35,7 @@ func TestProjectCronFieldsRoundTrip(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "cron-proj"}, got); err != nil {
 		t.Fatalf("get project: %v", err)
 	}
-	if got.Spec.Scm.PriorityLabel != "tatara/priority" || got.Spec.Scm.Cron.MRScan.MaxPerCycle != 2 {
+	if got.Spec.Scm.PriorityLabel != "tatara/priority" || got.Spec.Scm.Cron.MRScan.MaxPerRepo != 2 {
 		t.Fatalf("cron fields not persisted: %+v", got.Spec.Scm)
 	}
 	if !got.Spec.Scm.Cron.Brainstorm.Enabled || got.Spec.Scm.Cron.Brainstorm.Sources[2] != "internet" {

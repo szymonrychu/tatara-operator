@@ -69,8 +69,115 @@ func listScanTasks(t *testing.T, project string) []tatarav1alpha1.Task {
 	return out
 }
 
+func mkScanRepo(t *testing.T, project, name, url string) tatarav1alpha1.Repository {
+	t.Helper()
+	rp := &tatarav1alpha1.Repository{}
+	rp.Name = name
+	rp.Namespace = testNS
+	rp.Spec = tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: url, DefaultBranch: "main", ReingestSchedule: "0 6 * * *"}
+	if err := k8sClient.Create(context.Background(), rp); err != nil {
+		t.Fatalf("create repo %s: %v", name, err)
+	}
+	return *rp
+}
+
+func TestIssueScan_PerRepoTopUp(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
+	proj, _ := seedScanProject(t, "fanout-iss", cron)
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, "fanout-iss", "fanout-iss-a", "https://github.com/o/a.git"),
+		mkScanRepo(t, "fanout-iss", "fanout-iss-b", "https://github.com/o/b.git"),
+	}
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/a", Number: 1, UpdatedAt: time.Unix(100, 0)},
+		{Repo: "o/a", Number: 2, UpdatedAt: time.Unix(200, 0)},
+		{Repo: "o/b", Number: 3, UpdatedAt: time.Unix(100, 0)},
+		{Repo: "o/b", Number: 4, UpdatedAt: time.Unix(200, 0)},
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	backlog := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	if !backlog {
+		t.Fatalf("want backlog=true (2 of 4 issues remain after per-repo top-up)")
+	}
+	tasks := listScanTasks(t, "fanout-iss")
+	bySlug := map[string]int{}
+	for i := range tasks {
+		bySlug[tasks[i].Labels[labelSourceRepo]]++
+	}
+	if len(tasks) != 2 || bySlug[sanitizeRepoLabel("o/a")] != 1 || bySlug[sanitizeRepoLabel("o/b")] != 1 {
+		t.Fatalf("want 1 task per repo (o/a, o/b), got %d tasks: %v", len(tasks), bySlug)
+	}
+}
+
+func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
+	proj, _ := seedScanProject(t, "fanout-hold", cron)
+	repoA := mkScanRepo(t, "fanout-hold", "fanout-hold-a", "https://github.com/o/a.git")
+
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/a", number: 1}, "issueScan", "triageIssue")
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "fanout-hold", RepositoryRef: repoA.Name, Goal: "g", Kind: "triageIssue"}
+	if err := k8sClient.Create(context.Background(), pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	pre.Status.Phase = "Running"
+	_ = k8sClient.Status().Update(context.Background(), pre)
+
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/a", Number: 1, UpdatedAt: time.Unix(100, 0)}, // in-flight (deduped)
+		{Repo: "o/a", Number: 2, UpdatedAt: time.Unix(200, 0)}, // blocked by the held lane
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	backlog := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan)
+	if !backlog {
+		t.Fatalf("want backlog=true (#2 blocked by the Running #1 lane)")
+	}
+	if tasks := listScanTasks(t, "fanout-hold"); len(tasks) != 1 {
+		t.Fatalf("want only the pre-existing task (lane held by Running #1), got %d", len(tasks))
+	}
+}
+
+func TestMRScan_PerRepoTopUp(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
+	proj, _ := seedScanProject(t, "fanout-mr", cron)
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, "fanout-mr", "fanout-mr-a", "https://github.com/o/a.git"),
+		mkScanRepo(t, "fanout-mr", "fanout-mr-b", "https://github.com/o/b.git"),
+	}
+	reader := &fakeReader{prs: []scm.PRRef{
+		{Repo: "o/a", Number: 1, Author: "tatara-bot", UpdatedAt: time.Unix(100, 0)}, // o/a stalest -> selfImprove
+		{Repo: "o/a", Number: 2, Author: "human", UpdatedAt: time.Unix(200, 0)},
+		{Repo: "o/b", Number: 3, Author: "human", UpdatedAt: time.Unix(100, 0)}, // o/b stalest -> review
+		{Repo: "o/b", Number: 4, Author: "tatara-bot", UpdatedAt: time.Unix(200, 0)},
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
+	if !backlog {
+		t.Fatalf("want backlog=true (2 of 4 PRs remain after per-repo top-up)")
+	}
+	tasks := listScanTasks(t, "fanout-mr")
+	bySlug := map[string]int{}
+	for i := range tasks {
+		bySlug[tasks[i].Labels[labelSourceRepo]]++
+		if k := tasks[i].Spec.Kind; k != "review" && k != "selfImprove" {
+			t.Fatalf("unexpected kind %q", k)
+		}
+	}
+	if len(tasks) != 2 || bySlug[sanitizeRepoLabel("o/a")] != 1 || bySlug[sanitizeRepoLabel("o/b")] != 1 {
+		t.Fatalf("want 1 mr task per repo (o/a, o/b), got %d tasks: %v", len(tasks), bySlug)
+	}
+}
+
 func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 2}}
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 2}}
 	proj, _ := seedScanProject(t, "mrscan-proj", cron)
 	// Backdate LastMRScan so the * * * * * schedule fires immediately.
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
@@ -103,7 +210,7 @@ func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
 }
 
 func TestRunScans_IssueScanCap(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "issuescan-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastIssueScan = &past
@@ -130,7 +237,7 @@ func TestRunScans_IssueScanCap(t *testing.T) {
 // schedule), not 0, so the activity continues to be scheduled.
 func TestRunScans_RequeueAfterPositiveAfterFire(t *testing.T) {
 	// Hourly schedule; last ran 2h ago -> due now; next fire ~1h from now.
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "requeue-fire-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Hour))
 	proj.Status.LastIssueScan = &past
@@ -152,7 +259,7 @@ func TestRunScans_RequeueAfterPositiveAfterFire(t *testing.T) {
 }
 
 func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "not a cron", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "not a cron", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "badcron-proj", cron)
 	r := newScanReconciler(&fakeReader{})
 	res, err := r.runScans(context.Background(), proj)
@@ -166,7 +273,7 @@ func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
 }
 
 func TestReconcileRequeuesFromScan(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 0 1 1 *", MaxPerCycle: 1}} // yearly: never due now
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 0 1 1 *", MaxPerRepo: 1}} // yearly: never due now
 	proj, _ := seedScanProject(t, "requeue-proj", cron)
 	r := newScanReconciler(&fakeReader{})
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "requeue-proj"}})
@@ -212,17 +319,18 @@ func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
 	return true
 }
 
-// TestRunScans_DedupBeforeCap verifies that dedup is applied before the cap so
-// a capped stalest-already-in-flight item does not consume the single slot and
-// starve the next eligible item.
+// TestRunScans_DedupBeforeCap verifies that a stalest item already in flight as
+// an AwaitingApproval proposal is deduped (not recreated) AND does not occupy the
+// repo lane, so the next eligible item is still picked.
 func TestRunScans_DedupBeforeCap(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 1}}
 	proj, repo := seedScanProject(t, "dedupbefore-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastIssueScan = &past
 	_ = k8sClient.Status().Update(context.Background(), proj)
 
-	// Issue #10 is the stalest (updatedAt 100s). Pre-create a Running triageIssue task for it.
+	// Issue #10 is the stalest (updatedAt 100s). Pre-create an AwaitingApproval
+	// triageIssue task for it (a proposal awaiting approval -> does not hold the lane).
 	pre := &tatarav1alpha1.Task{}
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
@@ -231,7 +339,7 @@ func TestRunScans_DedupBeforeCap(t *testing.T) {
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
-	pre.Status.Phase = "Running"
+	pre.Status.Phase = "AwaitingApproval"
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	// Two issues: #10 (stalest, deduped) and #11 (newer, eligible).
@@ -277,7 +385,7 @@ func TestRunScans_DedupBeforeCap(t *testing.T) {
 }
 
 func TestRunScans_DedupSkipsInFlight(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 5}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 5}}
 	proj, repo := seedScanProject(t, "dedup-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastIssueScan = &past

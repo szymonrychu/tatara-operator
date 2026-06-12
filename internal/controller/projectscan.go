@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -151,6 +152,51 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 	staleFirst(out)
 	if len(out) > n {
 		out = out[:n]
+	}
+	return out
+}
+
+// laneOccupancy counts this Project's scan Tasks for repoSlug that still occupy
+// the repo's lane: Kind in kinds, phase not terminal and not AwaitingApproval
+// (an awaiting-approval proposal frees the lane for the next item).
+func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...string) int {
+	label := sanitizeRepoLabel(repoSlug)
+	n := 0
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceRepo] != label || !slices.Contains(kinds, t.Spec.Kind) {
+			continue
+		}
+		switch t.Status.Phase {
+		case "Succeeded", "Failed", "AwaitingApproval":
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// selectPerRepo groups eligible candidates by repo and picks, per repo, the best
+// (priority-then-stale) items up to maxPerRepo minus that repo's lane occupancy.
+func selectPerRepo(eligible []candidate, priorityLabel string, maxPerRepo int, occ func(repoSlug string) int) []candidate {
+	if maxPerRepo < 1 {
+		maxPerRepo = 1
+	}
+	byRepo := map[string][]candidate{}
+	var order []string
+	for _, c := range eligible {
+		if _, ok := byRepo[c.repo]; !ok {
+			order = append(order, c.repo)
+		}
+		byRepo[c.repo] = append(byRepo[c.repo], c)
+	}
+	var out []candidate
+	for _, slug := range order {
+		n := maxPerRepo - occ(slug)
+		if n < 1 {
+			continue
+		}
+		out = append(out, selectCandidates(byRepo[slug], priorityLabel, n)...)
 	}
 	return out
 }
@@ -376,7 +422,7 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 
 // mrScan lists open PRs across repos, selects, dedups, and creates Tasks routed
 // by authoritative author -> review (human) | selfImprove (bot).
-func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) {
+func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	var cands []candidate
@@ -404,7 +450,8 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			eligible = append(eligible, c)
 		}
 	}
-	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
+	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
+		func(slug string) int { return laneOccupancy(existing, slug, "review", "selfImprove") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("mrScan", "skipped_cap")
 	}
@@ -429,10 +476,11 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
+	return len(selected) < len(eligible)
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
-func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) {
+func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	seen := map[string]bool{}
@@ -480,7 +528,8 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			eligible = append(eligible, c)
 		}
 	}
-	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
+	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
+		func(slug string) int { return laneOccupancy(existing, slug, "triageIssue") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("issueScan", "skipped_cap")
 	}
@@ -501,6 +550,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
+	return len(selected) < len(eligible)
 }
 
 // brainstorm creates up to MaxPerCycle generative Tasks (no list).
@@ -570,12 +620,15 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// mrScan
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
 		if due {
-			r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
+			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
 			r.stampScan(ctx, proj, "mrScan")
 			// Recompute next-fire from now so the post-stamp schedule produces a
 			// positive RequeueAfter (the pre-fire next is in the past).
 			if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
 				consider(next2)
+			}
+			if backlog {
+				consider(now.Add(backlogRequeue))
 			}
 		} else {
 			consider(next)
@@ -588,10 +641,13 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// issueScan
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
-			r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
+			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
 			r.stampScan(ctx, proj, "issueScan")
 			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
 				consider(next2)
+			}
+			if backlog {
+				consider(now.Add(backlogRequeue))
 			}
 		} else {
 			consider(next)
