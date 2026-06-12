@@ -539,15 +539,19 @@ func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha
 	return nil
 }
 
-// implementPrompt builds the turn-0 prompt for the Implement state. When
-// Status.ImplementContext is set it appends a "## Re-entry context" block so
-// the agent knows why it is being re-entered (CI failure, conflict, etc.).
+// implementPrompt builds the turn-0 prompt for the Implement state.
+//   - When Status.ImplementContext is set, appends a "## Re-entry context" block.
+//   - When the pending-handover-resume annotation is set, prepends a
+//     "## Resume from handover" block so the agent resumes with full context.
 func implementPrompt(task *tatarav1alpha1.Task) string {
 	base := planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)
-	if task.Status.ImplementContext == "" {
-		return base
+	if task.Status.ImplementContext != "" {
+		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
 	}
-	return base + "\n\n## Re-entry context\n" + task.Status.ImplementContext
+	if task.Annotations[annPendingHandoverResume] == "true" && task.Status.Handover != "" {
+		base += "\n\n## Resume from handover\n" + task.Status.Handover
+	}
+	return base
 }
 
 // handleImplement drives the Implement agent-run state. On a finished run it
