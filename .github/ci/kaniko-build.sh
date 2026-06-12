@@ -2,6 +2,8 @@
 # Dispatch a one-shot kaniko Job that builds this repo's image and pushes it to
 # harbor. Runs on the ARC runner (in-cluster); uses the runner's mounted
 # ServiceAccount for kubectl. Streams kaniko logs and propagates the Job result.
+# Harbor push auth and the private-repo clone token are passed in via the
+# workflow's GitHub secrets and materialized as short-lived in-namespace secrets.
 set -euo pipefail
 
 REPO="${1:?repo name required}"          # e.g. tatara-operator
@@ -11,18 +13,26 @@ VERSION="$(git describe --tags --always --dirty)"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 JOB="kaniko-${REPO}-${SHORT_SHA}"
 CLONE_SECRET="clone-${REPO}-${SHORT_SHA}"
+DOCKERCFG_SECRET="dockercfg-${REPO}-${SHORT_SHA}"
 
 # shellcheck disable=SC2329  # invoked via the trap below
 cleanup() {
-  kubectl -n "$NS" delete secret "$CLONE_SECRET" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl -n "$NS" delete secret "$CLONE_SECRET" "$DOCKERCFG_SECRET" \
+    --ignore-not-found >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 # Transient clone-token secret (kaniko git-context auth for the private repo).
-# Token never printed; created via stdin apply.
 kubectl -n "$NS" create secret generic "$CLONE_SECRET" \
   --from-literal=username=x-access-token \
   --from-literal=token="${GITHUB_TOKEN:?GITHUB_TOKEN required}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# Transient harbor docker-config secret (kaniko push auth), from workflow secrets.
+kubectl -n "$NS" create secret docker-registry "$DOCKERCFG_SECRET" \
+  --docker-server=harbor.szymonrichert.pl \
+  --docker-username="${HARBOR_USERNAME:?HARBOR_USERNAME required}" \
+  --docker-password="${HARBOR_PASSWORD:?HARBOR_PASSWORD required}" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # Render and apply the kaniko Job.
@@ -68,7 +78,7 @@ spec:
       volumes:
         - name: docker-config
           secret:
-            secretName: harbor-push-dockercfg
+            secretName: ${DOCKERCFG_SECRET}
             items:
               - { key: .dockerconfigjson, path: config.json }
 EOF
