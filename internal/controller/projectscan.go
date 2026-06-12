@@ -478,7 +478,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
-func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) {
+func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	seen := map[string]bool{}
@@ -526,7 +526,8 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			eligible = append(eligible, c)
 		}
 	}
-	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo)
+	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
+		func(slug string) int { return laneOccupancy(existing, slug, "triageIssue") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("issueScan", "skipped_cap")
 	}
@@ -547,6 +548,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
+	return len(selected) < len(eligible)
 }
 
 // brainstorm creates up to MaxPerCycle generative Tasks (no list).
@@ -634,10 +636,13 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// issueScan
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
-			r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
+			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
 			r.stampScan(ctx, proj, "issueScan")
 			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
 				consider(next2)
+			}
+			if backlog {
+				consider(now.Add(backlogRequeue))
 			}
 		} else {
 			consider(next)

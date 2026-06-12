@@ -30,6 +30,10 @@ const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
 // re-evaluate the schedule reasonably soon.
 const maxScheduleRequeue = 6 * time.Hour
 
+// backlogRequeue is the short requeue used while a scan still has open items with
+// no Task (lanes full), so freed lanes refill without waiting for the next cron fire.
+const backlogRequeue = 60 * time.Second
+
 // ingestBackoff constants for exponential back-off between failed Job re-creations.
 const (
 	baseIngestBackoff = 30 * time.Second

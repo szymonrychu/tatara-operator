@@ -69,6 +69,48 @@ func listScanTasks(t *testing.T, project string) []tatarav1alpha1.Task {
 	return out
 }
 
+func mkScanRepo(t *testing.T, project, name, url string) tatarav1alpha1.Repository {
+	t.Helper()
+	rp := &tatarav1alpha1.Repository{}
+	rp.Name = name
+	rp.Namespace = testNS
+	rp.Spec = tatarav1alpha1.RepositorySpec{ProjectRef: project, URL: url, DefaultBranch: "main", ReingestSchedule: "0 6 * * *"}
+	if err := k8sClient.Create(context.Background(), rp); err != nil {
+		t.Fatalf("create repo %s: %v", name, err)
+	}
+	return *rp
+}
+
+func TestIssueScan_PerRepoTopUp(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
+	proj, _ := seedScanProject(t, "fanout-iss", cron)
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, "fanout-iss", "fanout-iss-a", "https://github.com/o/a.git"),
+		mkScanRepo(t, "fanout-iss", "fanout-iss-b", "https://github.com/o/b.git"),
+	}
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/a", Number: 1, UpdatedAt: time.Unix(100, 0)},
+		{Repo: "o/a", Number: 2, UpdatedAt: time.Unix(200, 0)},
+		{Repo: "o/b", Number: 3, UpdatedAt: time.Unix(100, 0)},
+		{Repo: "o/b", Number: 4, UpdatedAt: time.Unix(200, 0)},
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	backlog := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	if !backlog {
+		t.Fatalf("want backlog=true (2 of 4 issues remain after per-repo top-up)")
+	}
+	tasks := listScanTasks(t, "fanout-iss")
+	bySlug := map[string]int{}
+	for i := range tasks {
+		bySlug[tasks[i].Labels[labelSourceRepo]]++
+	}
+	if len(tasks) != 2 || bySlug[sanitizeRepoLabel("o/a")] != 1 || bySlug[sanitizeRepoLabel("o/b")] != 1 {
+		t.Fatalf("want 1 task per repo (o/a, o/b), got %d tasks: %v", len(tasks), bySlug)
+	}
+}
+
 func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 2}}
 	proj, _ := seedScanProject(t, "mrscan-proj", cron)
