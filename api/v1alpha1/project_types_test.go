@@ -110,15 +110,15 @@ func TestProjectLifecycleConfigFields(t *testing.T) {
 		Spec: v1alpha1.ProjectSpec{
 			ScmSecretRef: "scm",
 			Agent: v1alpha1.AgentSpec{
-				ContextWindowTokens:     200000,
+				ContextWindowTokens:      200000,
 				HandoverThresholdPercent: 50,
-				MaxLifecycleIterations:  10,
+				MaxLifecycleIterations:   10,
 			},
 			Scm: &v1alpha1.ScmSpec{
-				Provider:               "github",
-				Owner:                  "acme",
-				BotLogin:               "bot",
-				BabysitDeadlineMinutes: 60,
+				Provider:                "github",
+				Owner:                   "acme",
+				BotLogin:                "bot",
+				BabysitDeadlineMinutes:  60,
 				ConversationIdleMinutes: 60,
 			},
 		},

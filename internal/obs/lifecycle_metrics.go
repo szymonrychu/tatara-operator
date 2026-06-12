@@ -10,13 +10,13 @@ import (
 // issueLifecycle state machine. Separate from OperatorMetrics to keep the
 // lifecycle concerns isolated and testable with a fresh registry.
 type LifecycleMetrics struct {
-	lifecycleState      *prometheus.GaugeVec
-	transitionTotal     *prometheus.CounterVec
-	handoverTotal       prometheus.Counter
-	giveupTotal         *prometheus.CounterVec
-	idleStopTotal       prometheus.Counter
-	mrciWaitSeconds     prometheus.Histogram
-	lifecycleSeconds    prometheus.Histogram
+	lifecycleState   *prometheus.GaugeVec
+	transitionTotal  *prometheus.CounterVec
+	handoverTotal    prometheus.Counter
+	giveupTotal      *prometheus.CounterVec
+	idleStopTotal    prometheus.Counter
+	mrciWaitSeconds  prometheus.Histogram
+	lifecycleSeconds prometheus.Histogram
 }
 
 // NewLifecycleMetrics registers the lifecycle collectors on reg and returns the
