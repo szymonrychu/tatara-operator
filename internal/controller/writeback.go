@@ -623,7 +623,7 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 			r.clearWritebackPending(ctx, task, "MergeWithheld", "merge policy not satisfied")
 			return ctrl.Result{}, nil
 		}
-		err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
+		_, err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
 		r.recordSCM(provider, "merge", err)
 	default:
 		err = fmt.Errorf("unknown pr outcome %q", out.Action)
