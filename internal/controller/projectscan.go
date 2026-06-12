@@ -422,7 +422,7 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 
 // mrScan lists open PRs across repos, selects, dedups, and creates Tasks routed
 // by authoritative author -> review (human) | selfImprove (bot).
-func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) {
+func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	var cands []candidate
@@ -450,7 +450,8 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			eligible = append(eligible, c)
 		}
 	}
-	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo)
+	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
+		func(slug string) int { return laneOccupancy(existing, slug, "review", "selfImprove") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("mrScan", "skipped_cap")
 	}
@@ -475,6 +476,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
+	return len(selected) < len(eligible)
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
@@ -618,12 +620,15 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// mrScan
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
 		if due {
-			r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
+			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
 			r.stampScan(ctx, proj, "mrScan")
 			// Recompute next-fire from now so the post-stamp schedule produces a
 			// positive RequeueAfter (the pre-fire next is in the past).
 			if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
 				consider(next2)
+			}
+			if backlog {
+				consider(now.Add(backlogRequeue))
 			}
 		} else {
 			consider(next)
