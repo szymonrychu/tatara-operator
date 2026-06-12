@@ -87,7 +87,7 @@ func TestGitLabCapabilities(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := &GitLab{apiBase: srv.URL}
-		if err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash"); err != nil {
+		if _, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash"); err != nil {
 			t.Fatalf("Merge: %v", err)
 		}
 		if gotPath != "/projects/"+url.PathEscape("g/p")+"/merge_requests/5/merge" || gotMethod != http.MethodPut {

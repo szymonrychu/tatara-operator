@@ -107,7 +107,7 @@ type SCMWriter interface {
 	Approve(ctx context.Context, repoURL, token string, number int, body string) error
 	RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error
 	Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error
-	Merge(ctx context.Context, repoURL, token string, number int, method string) error
+	Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error)
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error

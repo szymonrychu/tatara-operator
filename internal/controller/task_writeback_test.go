@@ -527,11 +527,11 @@ func (f *fullFakeSCMWriter) Suggest(_ context.Context, _, _ string, _ int, sugg 
 	f.suggestSuggs = sugg
 	return nil
 }
-func (f *fullFakeSCMWriter) Merge(_ context.Context, _, _ string, number int, method string) error {
+func (f *fullFakeSCMWriter) Merge(_ context.Context, _, _ string, number int, method string) (string, error) {
 	f.mergeCalled = true
 	f.mergeNumber = number
 	f.mergeMethod = method
-	return nil
+	return "", nil
 }
 func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, _ string) error {
 	f.closePRCalled = true

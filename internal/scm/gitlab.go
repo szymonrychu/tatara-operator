@@ -283,7 +283,7 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
 		return fmt.Errorf("gitlab: decode response: %w", err)
 	}
 	return nil
@@ -423,15 +423,21 @@ func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int,
 	return nil
 }
 
-// Merge merges an MR.
-func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+// Merge merges an MR. Returns the merge commit SHA on success.
+func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 	in := map[string]bool{"squash": method == "squash"}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/merge"
-	return glDo(ctx, c.base(), http.MethodPut, path, token, in, nil)
+	var resp struct {
+		MergeCommitSHA string `json:"merge_commit_sha"`
+	}
+	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
+		return "", err
+	}
+	return resp.MergeCommitSHA, nil
 }
 
 // ClosePR closes an MR (state_event=close) and posts the reason as a note.

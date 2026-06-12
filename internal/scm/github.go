@@ -229,7 +229,7 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
 		return fmt.Errorf("github: decode response: %w", err)
 	}
 	return nil
@@ -376,13 +376,20 @@ func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int,
 }
 
 // Merge merges a PR with the given method (squash|merge|rebase).
-func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) error {
+// Returns the merge commit SHA on success.
+func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", owner, repo, number)
-	return ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, nil)
+	var resp struct {
+		SHA string `json:"sha"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, &resp); err != nil {
+		return "", err
+	}
+	return resp.SHA, nil
 }
 
 // ClosePR closes a PR (state=closed) and posts a comment with the reason.
