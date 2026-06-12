@@ -297,8 +297,13 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return res, nil
 
 	case "Conversation":
+		res, err := r.handleConversation(ctx, task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
 		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+		return res, nil
 
 	case "MRCI":
 		res, err := r.handleMRCI(ctx, &project, task)
@@ -349,7 +354,52 @@ func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alph
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("triage: get repo: %w", err)
 	}
-	return r.driveAgentRun(ctx, project, &repo, task, lifecycleTriageText(task))
+	prompt := r.buildTriagePromptFor(ctx, project, task)
+	return r.driveAgentRun(ctx, project, &repo, task, prompt)
+}
+
+// buildTriagePromptFor fetches issue comments via ReaderFor (if wired) and
+// builds the full triage turn-0 prompt with the comment thread included.
+// On any error it falls back to the plain lifecycleTriageText gracefully.
+func (r *TaskReconciler) buildTriagePromptFor(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) string {
+	l := log.FromContext(ctx)
+	if r.ReaderFor == nil || task.Spec.Source == nil {
+		return lifecycleTriageText(task)
+	}
+	provider := task.Spec.Source.Provider
+	if provider == "" && project.Spec.Scm != nil {
+		provider = project.Spec.Scm.Provider
+	}
+	token, err := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef)
+	if err != nil {
+		l.Info("triage: could not fetch token for comment thread (non-fatal)", "resource_id", task.Name)
+		return lifecycleTriageText(task)
+	}
+	reader, err := r.ReaderFor(provider, token)
+	if err != nil {
+		l.Info("triage: could not get reader for comment thread (non-fatal)", "resource_id", task.Name)
+		return lifecycleTriageText(task)
+	}
+	owner, repoName, parseErr := scm.OwnerRepo(r.repoURLForTask(ctx, task))
+	if parseErr != nil {
+		return lifecycleTriageText(task)
+	}
+	comments, err := reader.ListIssueComments(ctx, owner, repoName, task.Spec.Source.Number)
+	if err != nil {
+		l.Info("triage: ListIssueComments failed (non-fatal)", "resource_id", task.Name, "err", err.Error())
+		return lifecycleTriageText(task)
+	}
+	return buildTriagePrompt(task, comments)
+}
+
+// repoURLForTask fetches the Repository URL for the task's RepositoryRef.
+// Returns "" on error (caller falls back gracefully).
+func (r *TaskReconciler) repoURLForTask(ctx context.Context, task *tatarav1alpha1.Task) string {
+	var repo tatarav1alpha1.Repository
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
+		return ""
+	}
+	return repo.Spec.URL
 }
 
 // finishTriage consumes Status.IssueOutcome after a completed Triage agent run.
@@ -428,6 +478,22 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 	}
 
 	return ctrl.Result{}, r.resetAgentRun(ctx, task)
+}
+
+// handleConversation manages the idle wait state. No pod is ever spawned here.
+// If the deadline has passed the task transitions to Stopped (idle-stop, resumable).
+// Otherwise it requeues until the deadline.
+func (r *TaskReconciler) handleConversation(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	if deadlinePassed(task) {
+		if err := r.setLifecycleState(ctx, task, "Stopped", "idle"); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordIdleStop()
+		}
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{RequeueAfter: pollRequeue}, nil
 }
 
 // triageCloseIssue calls CloseIssue for the task's source issue.

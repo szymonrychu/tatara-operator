@@ -3,8 +3,15 @@ package controller
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
+)
+
+const (
+	triageCommentCap       = 20    // max comments included in triage prompt
+	triageCommentCharBudget = 8000 // max chars of comment thread
 )
 
 // planTurnText is the turn-0 prompt: the goal plus the instruction to
@@ -68,6 +75,34 @@ func lifecycleTriageText(task *tatarav1alpha1.Task) string {
 			"   - action=close      (out of scope / duplicate / not actionable; supply reason as `comment`)\n\n"+
 			"You MUST call issue_outcome before finishing. Do not open PRs or make code changes in this turn.",
 		issueRef, issueURL, task.Spec.Goal)
+}
+
+// buildTriagePrompt constructs the turn-0 prompt for the Triage state. When
+// comments are non-nil it appends a "## Conversation thread" block (capped to
+// the most-recent triageCommentCap comments and triageCommentCharBudget chars)
+// so a fresh pod has full context. When comments is empty the prompt equals
+// lifecycleTriageText(task).
+func buildTriagePrompt(task *tatarav1alpha1.Task, comments []scm.IssueComment) string {
+	base := lifecycleTriageText(task)
+	if len(comments) == 0 {
+		return base
+	}
+	// Cap to most-recent N comments.
+	if len(comments) > triageCommentCap {
+		comments = comments[len(comments)-triageCommentCap:]
+	}
+	var sb strings.Builder
+	sb.WriteString("\n\n## Conversation thread\n")
+	for _, c := range comments {
+		line := fmt.Sprintf("**%s**: %s\n", c.Author, c.Body)
+		sb.WriteString(line)
+	}
+	thread := sb.String()
+	// Apply char budget: truncate from the front (oldest) if over budget.
+	if len(thread) > triageCommentCharBudget {
+		thread = thread[len(thread)-triageCommentCharBudget:]
+	}
+	return base + thread
 }
 
 // turnText is the prompt for executing one Subtask.
