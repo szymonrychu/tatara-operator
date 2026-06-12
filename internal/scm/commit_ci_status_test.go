@@ -31,19 +31,26 @@ func TestGitHubGetCommitCIStatus(t *testing.T) {
 		}, "success"},
 	}
 	for _, tc := range cases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/repos/o/r/commits/deadbeef/check-runs" {
-					t.Fatalf("unexpected path %q", r.URL.Path)
+				switch r.URL.Path {
+				case "/repos/o/r/commits/deadbeef/check-runs":
+					runs := make([]map[string]any, 0, len(tc.runs))
+					for _, run := range tc.runs {
+						runs = append(runs, map[string]any{
+							"status":     run["status"],
+							"conclusion": run["conclusion"],
+						})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": runs})
+				case "/repos/o/r/commits/deadbeef/status":
+					// Combined-status: return no statuses so check-runs dominate.
+					_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+				default:
+					t.Errorf("unexpected path %q", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
 				}
-				runs := make([]map[string]any, 0, len(tc.runs))
-				for _, run := range tc.runs {
-					runs = append(runs, map[string]any{
-						"status":     run["status"],
-						"conclusion": run["conclusion"],
-					})
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": runs})
 			}))
 			defer srv.Close()
 			c := &GitHub{apiBase: srv.URL}
@@ -58,9 +65,10 @@ func TestGitHubGetCommitCIStatus(t *testing.T) {
 	}
 }
 
-// TestGitHubGetCommitCIStatus_Error verifies that a non-2xx response is surfaced as an error.
+// TestGitHubGetCommitCIStatus_Error verifies that a non-2xx check-runs response is surfaced as an error.
 func TestGitHubGetCommitCIStatus_Error(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Return 404 for all paths to trigger an error on the check-runs call.
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
@@ -129,3 +137,96 @@ func TestGitLabGetCommitCIStatus_Error(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// TestGitHubGetCommitCIStatus_CombinedStatusFolded verifies that GitHub's
+// GetCommitCIStatus folds the legacy combined-status API with check-runs:
+//   - combined-status=success + no check-runs -> "success"
+//   - combined-status=pending + no check-runs -> "pending"
+//   - combined-status=failure + no check-runs -> "failure"
+//   - combined-status=success + check-run failure -> "failure" (check-run wins)
+//   - no check-runs + no combined state -> "" (none)
+func TestGitHubGetCommitCIStatus_CombinedStatusFolded(t *testing.T) {
+	cases := []struct {
+		name          string
+		checkRuns     []map[string]string // nil = no check-runs
+		combinedState string              // "" = no combined status
+		wantCI        string
+	}{
+		{
+			name:          "combined success, no check-runs -> success",
+			combinedState: "success",
+			wantCI:        "success",
+		},
+		{
+			name:          "combined pending, no check-runs -> pending",
+			combinedState: "pending",
+			wantCI:        "pending",
+		},
+		{
+			name:          "combined failure, no check-runs -> failure",
+			combinedState: "failure",
+			wantCI:        "failure",
+		},
+		{
+			name:          "no check-runs, no combined -> empty",
+			combinedState: "",
+			wantCI:        "",
+		},
+		{
+			name:          "check-run success, combined success -> success",
+			checkRuns:     []map[string]string{{"status": "completed", "conclusion": "success"}},
+			combinedState: "success",
+			wantCI:        "success",
+		},
+		{
+			name:          "check-run failure, combined success -> failure (check-run wins)",
+			checkRuns:     []map[string]string{{"status": "completed", "conclusion": "failure"}},
+			combinedState: "success",
+			wantCI:        "failure",
+		},
+		{
+			name:          "check-run success, combined failure -> failure (combined wins)",
+			checkRuns:     []map[string]string{{"status": "completed", "conclusion": "success"}},
+			combinedState: "failure",
+			wantCI:        "failure",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				checkRunsPath := "/repos/o/r/commits/deadbeef/check-runs"
+				statusPath := "/repos/o/r/commits/deadbeef/status"
+				switch r.URL.Path {
+				case checkRunsPath:
+					runs := make([]map[string]any, 0, len(tc.checkRuns))
+					for _, run := range tc.checkRuns {
+						runs = append(runs, map[string]any{
+							"status":     run["status"],
+							"conclusion": run["conclusion"],
+						})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": runs})
+				case statusPath:
+					if tc.combinedState == "" {
+						_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+					} else {
+						_ = json.NewEncoder(w).Encode(map[string]any{"state": tc.combinedState, "total_count": 1})
+					}
+				default:
+					t.Errorf("unexpected path %q", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer srv.Close()
+			c := &GitHub{apiBase: srv.URL}
+			got, err := c.GetCommitCIStatus(context.Background(), "o", "r", "deadbeef")
+			if err != nil {
+				t.Fatalf("GetCommitCIStatus: %v", err)
+			}
+			if got != tc.wantCI {
+				t.Fatalf("GetCommitCIStatus = %q, want %q", got, tc.wantCI)
+			}
+		})
+	}
+}

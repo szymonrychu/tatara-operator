@@ -409,7 +409,13 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 }
 
 // GetCommitCIStatus returns the CI status for the given commit sha by reading
-// its check-runs. Returns "" (none) | "pending" | "success" | "failure".
+// both check-runs and the legacy combined-status API and folding the results:
+//   - failure if either source reports failure
+//   - pending if either source reports pending (and neither reports failure)
+//   - success if all present signals report success
+//   - "" if neither source has any data
+//
+// Returns "" (none) | "pending" | "success" | "failure".
 func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error) {
 	var checks struct {
 		CheckRuns []struct {
@@ -417,9 +423,50 @@ func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string)
 			Conclusion string `json:"conclusion"`
 		} `json:"check_runs"`
 	}
-	path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, sha)
-	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &checks); err != nil {
+	checkPath := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, sha)
+	if err := ghDo(ctx, c.base(), http.MethodGet, checkPath, c.token, nil, &checks); err != nil {
 		return "", err
 	}
-	return deriveGHCIStatus(checks.CheckRuns), nil
+	checkStatus := deriveGHCIStatus(checks.CheckRuns)
+
+	// Also read the legacy combined-status endpoint so CI systems that report via
+	// Commit Statuses (not Check Runs) are visible.
+	var combined struct {
+		State      string `json:"state"`
+		TotalCount int    `json:"total_count"`
+	}
+	statusPath := fmt.Sprintf("/repos/%s/%s/commits/%s/status", owner, repo, sha)
+	if err := ghDo(ctx, c.base(), http.MethodGet, statusPath, c.token, nil, &combined); err != nil {
+		return "", err
+	}
+	// combined.State is always present (even "pending" when TotalCount==0).
+	// Treat TotalCount==0 as "no data" (same as "" from check-runs).
+	combinedStatus := ""
+	if combined.TotalCount > 0 {
+		switch combined.State {
+		case "success":
+			combinedStatus = "success"
+		case "pending":
+			combinedStatus = "pending"
+		case "failure", "error":
+			combinedStatus = "failure"
+		}
+	}
+
+	return foldCIStatuses(checkStatus, combinedStatus), nil
+}
+
+// foldCIStatuses merges two CI status strings with the precedence rule:
+// failure > pending > success > "" (none).
+func foldCIStatuses(a, b string) string {
+	if a == "failure" || b == "failure" {
+		return "failure"
+	}
+	if a == "pending" || b == "pending" {
+		return "pending"
+	}
+	if a == "success" || b == "success" {
+		return "success"
+	}
+	return ""
 }
