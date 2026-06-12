@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"time"
 )
 
@@ -145,6 +146,30 @@ func (c *GitHub) CloseIssue(ctx context.Context, token, repo string, number int,
 	}
 	ipath := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, name, number)
 	return ghDo(ctx, c.base(), http.MethodPatch, ipath, token, map[string]string{"state": "closed"}, nil)
+}
+
+// ghIssueComment is the JSON shape of a GitHub issue comment.
+type ghIssueComment struct {
+	User struct {
+		Login string `json:"login"`
+	} `json:"user"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ListIssueComments returns the comments on issue number, oldest-first.
+func (c *GitHub) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	var raw []ghIssueComment
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, number)
+	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]IssueComment, 0, len(raw))
+	for _, c := range raw {
+		out = append(out, IssueComment{Author: c.User.Login, Body: c.Body, CreatedAt: c.CreatedAt})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
 }
 
 func ghOwnerRepoFromSlug(slug string) (string, string, error) {

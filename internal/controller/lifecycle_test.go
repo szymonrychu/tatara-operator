@@ -1936,6 +1936,9 @@ func (f *fakeReaderMainCI) ListBoardItems(_ context.Context, _ scm.BoardRef) ([]
 func (f *fakeReaderMainCI) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
 	return f.ciStatus, f.ciErr
 }
+func (f *fakeReaderMainCI) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return nil, nil
+}
 
 func seedMainCITask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMainCI, deadlineOffset time.Duration) (*TaskReconciler, string) {
 	t.Helper()
