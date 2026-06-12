@@ -404,7 +404,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			eligible = append(eligible, c)
 		}
 	}
-	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
+	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo)
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("mrScan", "skipped_cap")
 	}
@@ -480,7 +480,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			eligible = append(eligible, c)
 		}
 	}
-	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerCycle)
+	selected := selectCandidates(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo)
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("issueScan", "skipped_cap")
 	}

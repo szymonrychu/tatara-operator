@@ -70,7 +70,7 @@ func listScanTasks(t *testing.T, project string) []tatarav1alpha1.Task {
 }
 
 func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 2}}
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 2}}
 	proj, _ := seedScanProject(t, "mrscan-proj", cron)
 	// Backdate LastMRScan so the * * * * * schedule fires immediately.
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
@@ -103,7 +103,7 @@ func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
 }
 
 func TestRunScans_IssueScanCap(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "issuescan-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastIssueScan = &past
@@ -130,7 +130,7 @@ func TestRunScans_IssueScanCap(t *testing.T) {
 // schedule), not 0, so the activity continues to be scheduled.
 func TestRunScans_RequeueAfterPositiveAfterFire(t *testing.T) {
 	// Hourly schedule; last ran 2h ago -> due now; next fire ~1h from now.
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "requeue-fire-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Hour))
 	proj.Status.LastIssueScan = &past
@@ -152,7 +152,7 @@ func TestRunScans_RequeueAfterPositiveAfterFire(t *testing.T) {
 }
 
 func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "not a cron", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "not a cron", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "badcron-proj", cron)
 	r := newScanReconciler(&fakeReader{})
 	res, err := r.runScans(context.Background(), proj)
@@ -166,7 +166,7 @@ func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
 }
 
 func TestReconcileRequeuesFromScan(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 0 1 1 *", MaxPerCycle: 1}} // yearly: never due now
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 0 1 1 *", MaxPerRepo: 1}} // yearly: never due now
 	proj, _ := seedScanProject(t, "requeue-proj", cron)
 	r := newScanReconciler(&fakeReader{})
 	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "requeue-proj"}})
@@ -216,7 +216,7 @@ func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
 // a capped stalest-already-in-flight item does not consume the single slot and
 // starve the next eligible item.
 func TestRunScans_DedupBeforeCap(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 1}}
 	proj, repo := seedScanProject(t, "dedupbefore-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastIssueScan = &past
@@ -277,7 +277,7 @@ func TestRunScans_DedupBeforeCap(t *testing.T) {
 }
 
 func TestRunScans_DedupSkipsInFlight(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerCycle: 5}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 5}}
 	proj, repo := seedScanProject(t, "dedup-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastIssueScan = &past
