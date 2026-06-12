@@ -25,6 +25,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends make
       - name: gofmt
         run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; echo 'gofmt -s required'; exit 1; }
       - name: golangci-lint
@@ -43,6 +45,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends make
       - name: test
         run: make test
 
@@ -55,6 +59,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends make
       - name: build
         run: make build
 
