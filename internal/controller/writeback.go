@@ -59,6 +59,13 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 // the Task status. Shared by the default (implement/brainstorm) path and the
 // triageIssue-implement path.
 func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	// Idempotency guard: if PrURL is already set this function ran successfully on
+	// a previous reconcile. Clear WritebackPending and return without re-opening.
+	if task.Status.PrURL != "" {
+		r.clearWritebackPending(ctx, task, "AlreadyWritten", "pr/mr url already set")
+		return ctrl.Result{}, nil
+	}
+
 	l := log.FromContext(ctx)
 
 	var proj tatarav1alpha1.Project

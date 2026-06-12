@@ -388,7 +388,8 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
 	}
 
-	// Record head branch and PR number.
+	// Record head branch, PR number, and transition to MRCI in one RetryOnConflict
+	// block to minimise conflict surface (was two separate round-trips).
 	prNumber := parsePRNumber(fresh.Status.PrURL)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		t2 := &tatarav1alpha1.Task{}
@@ -398,18 +399,27 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		t2.Status.HeadBranch = taskBranch(task)
 		t2.Status.PRNumber = prNumber
 		t2.Status.LifecycleIterations++
+		t2.Status.LifecycleState = "MRCI"
 		return r.Status().Update(ctx, t2)
 	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("implement: record pr fields: %w", err)
+		return ctrl.Result{}, fmt.Errorf("implement: record pr fields + MRCI transition: %w", err)
 	}
 
-	// Re-get for setLifecycleState.
+	l.Info("lifecycle transition",
+		"action", "lifecycle_transition",
+		"resource_id", task.Name,
+		"from", "Implement",
+		"to", "MRCI",
+		"reason", "implement-done",
+	)
+	if r.LifecycleMetrics != nil {
+		r.LifecycleMetrics.RecordTransition("Implement", "MRCI")
+	}
+
+	// Re-get for resetAgentRun.
 	fresh2 := &tatarav1alpha1.Task{}
 	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
-		return ctrl.Result{}, fmt.Errorf("implement: get for state transition: %w", err)
-	}
-	if err := r.setLifecycleState(ctx, fresh2, "MRCI", "implement-done"); err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("implement: get for reset: %w", err)
 	}
 	return ctrl.Result{}, r.resetAgentRun(ctx, fresh2)
 }

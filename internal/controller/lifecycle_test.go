@@ -805,3 +805,63 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 		t.Errorf("LifecycleState = %q, want Implement; concurrency cap must not block finishTriage", got.Status.LifecycleState)
 	}
 }
+
+// ----- FIX 2: idempotent writeBackOpenChange + atomic implement-finish -----
+
+// TestLifecycleImplement_IdempotentOnRetry verifies that calling the implement-finish
+// path twice (Phase Succeeded, PrURL already set from a previous reconcile) opens
+// the PR exactly once and still ends in LifecycleState=MRCI.
+func TestLifecycleImplement_IdempotentOnRetry(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-impl-idem"
+	proj := "lc-ip-idem"
+	repo := "lc-ir-idem"
+	sec := "lc-is-idem"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#20", URL: "https://github.com/o/r/issues/20",
+		Number: 20,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+
+	// Simulate: first reconcile opened the PR and set PrURL, but then errored
+	// before finishing the state transition. So: Phase=Succeeded, PrURL already set,
+	// LifecycleState still Implement.
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.PrURL = "https://github.com/o/r/pull/77"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/77"}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle (retry): %v", err)
+	}
+
+	fw.mu.Lock()
+	openCount := len(fw.openCalls)
+	fw.mu.Unlock()
+	if openCount != 0 {
+		t.Errorf("OpenChange called %d times on retry; want 0 (PR already open)", openCount)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get task after: %v", err)
+	}
+	if got.Status.LifecycleState != "MRCI" {
+		t.Errorf("LifecycleState = %q, want MRCI after idempotent retry", got.Status.LifecycleState)
+	}
+	if got.Status.PrURL != "https://github.com/o/r/pull/77" {
+		t.Errorf("PrURL = %q, want unchanged", got.Status.PrURL)
+	}
+}
