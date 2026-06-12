@@ -45,6 +45,16 @@ func testConfig() Config {
 	}
 }
 
+func TestBuildJob_TTLSecondsAfterFinished(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	if job.Spec.TTLSecondsAfterFinished == nil {
+		t.Fatal("TTLSecondsAfterFinished must be set")
+	}
+	if got := *job.Spec.TTLSecondsAfterFinished; got != 600 {
+		t.Errorf("TTLSecondsAfterFinished = %d, want 600", got)
+	}
+}
+
 func TestBuildJob_ImagePullSecrets(t *testing.T) {
 	ips := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig()).Spec.Template.Spec.ImagePullSecrets
 	if len(ips) != 1 || ips[0].Name != "regcred" {
