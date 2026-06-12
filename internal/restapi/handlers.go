@@ -421,6 +421,38 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
+// --- M3: POST /tasks/{t}/handover ---
+
+const handoverMaxBytes = 16 * 1024 // 16 KB cap
+
+type handoverReq struct {
+	Handover string `json:"handover"`
+}
+
+func (s *Server) handover(w http.ResponseWriter, r *http.Request) {
+	var req handoverReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	// Cap at 16KB.
+	if len(req.Handover) > handoverMaxBytes {
+		req.Handover = req.Handover[:handoverMaxBytes]
+	}
+	var t tatarav1alpha1.Task
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	t.Status.Handover = req.Handover
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 // --- Task 7: PATCH /subtasks/{s} ---
 
 type subtaskPatchReq struct {

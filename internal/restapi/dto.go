@@ -67,6 +67,7 @@ type taskStatusDTO struct {
 	PROutcome        *tatarav1alpha1.PROutcome     `json:"prOutcome,omitempty"`
 	IssueOutcome     *tatarav1alpha1.IssueOutcome  `json:"issueOutcome,omitempty"`
 	ChangeSummary    *tatarav1alpha1.ChangeSummary `json:"changeSummary,omitempty"`
+	Handover         string                        `json:"handover,omitempty"`
 	Conditions       []metav1.Condition            `json:"conditions,omitempty"`
 }
 
@@ -142,6 +143,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			PROutcome:        task.Status.PROutcome,
 			IssueOutcome:     task.Status.IssueOutcome,
 			ChangeSummary:    task.Status.ChangeSummary,
+			Handover:         task.Status.Handover,
 		},
 	}
 	if task.Spec.Source != nil {
