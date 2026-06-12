@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -245,11 +246,35 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// LifecycleState atomically from it, without a separate post-create
 	// Status().Update that may be lost.
 	ann := map[string]string{}
+	// Dedup labels: set for issueLifecycle tasks so the webhook-born Task uses
+	// the same dedup key as a cron mrScan/issueScan Task for the same work item,
+	// preventing duplicate lifecycle Tasks.
+	var labels map[string]string
 	if kind == "issueLifecycle" {
 		if ev.IsPR {
 			ann[tatarav1.LifecycleEntryAnnotation] = "MRCI"
+			// Bot-PR dedup key: linked issue number from "Closes #N" when present,
+			// else the PR number - mirroring mrScan's key exactly.
+			dedupNumber := ev.Number
+			if issueNum, linked := scm.LinkedIssueNumber(ev.Body); linked {
+				dedupNumber = issueNum
+			}
+			repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+			labels = map[string]string{
+				tatarav1.LabelSourceRepo:   repoSlug,
+				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
+				tatarav1.LabelSourceKind:   kind,
+				tatarav1.LabelActivity:     "webhook",
+			}
 		} else {
 			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
+			repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+			labels = map[string]string{
+				tatarav1.LabelSourceRepo:   repoSlug,
+				tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
+				tatarav1.LabelSourceKind:   kind,
+				tatarav1.LabelActivity:     "webhook",
+			}
 		}
 	}
 
@@ -258,6 +283,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			GenerateName:    "task-",
 			Namespace:       s.cfg.Namespace,
 			Annotations:     ann,
+			Labels:          labels,
 			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
 		},
 		Spec: tatarav1.TaskSpec{

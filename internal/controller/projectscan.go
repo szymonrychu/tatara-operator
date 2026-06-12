@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -22,21 +21,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// reClosesIssue matches "Closes #N" (case-insensitive) in a PR body.
-var reClosesIssue = regexp.MustCompile(`(?i)closes\s+#(\d+)`)
-
-// linkedIssueNumber parses the first "Closes #N" reference from a PR body.
-// Returns (n, true) on match, (0, false) otherwise.
+// linkedIssueNumber is a package-local alias for scm.LinkedIssueNumber so
+// the mrScan call sites remain readable without a long qualifier.
 func linkedIssueNumber(body string) (int, bool) {
-	m := reClosesIssue.FindStringSubmatch(body)
-	if m == nil {
-		return 0, false
-	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil {
-		return 0, false
-	}
-	return n, true
+	return scm.LinkedIssueNumber(body)
 }
 
 // isLifecycleTerminal reports whether a lifecycle state counts as terminal for
@@ -62,12 +50,13 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 	return parsed.Next(base), true
 }
 
+// label key aliases for readability within this package.
 const (
-	labelSourceRepo   = "tatara.io/source-repo"
-	labelSourceNumber = "tatara.io/source-number"
-	labelSourceKind   = "tatara.io/source-kind"
-	labelHeadSHA      = "tatara.io/head-sha"
-	labelActivity     = "tatara.io/activity"
+	labelSourceRepo   = tatarav1alpha1.LabelSourceRepo
+	labelSourceNumber = tatarav1alpha1.LabelSourceNumber
+	labelSourceKind   = tatarav1alpha1.LabelSourceKind
+	labelHeadSHA      = tatarav1alpha1.LabelHeadSHA
+	labelActivity     = tatarav1alpha1.LabelActivity
 )
 
 // sanitizeRepoLabel makes a repo slug DNS-label-safe by replacing '/' with '.'.

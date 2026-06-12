@@ -203,6 +203,53 @@ func TestBotPRWebhook_EntryAnnotationMRCIAndSpecSource(t *testing.T) {
 	require.Equal(t, "https://github.com/o/r/pull/15", tk.Spec.Source.URL)
 }
 
+// ----- FIX 4: bot-PR webhook dedup key uses linked issue number -----
+
+// TestBotPRWebhook_DedupKeyLinkedIssue asserts that when a bot-PR webhook body
+// contains "Closes #7", the created Task's tatara.io/source-number dedup label
+// is "7" (the linked issue number), matching what mrScan would produce for the
+// same PR body, preventing duplicate lifecycle Tasks.
+func TestBotPRWebhook_DedupKeyLinkedIssue(t *testing.T) {
+	const secretVal = "whsec"
+	proj := newProjectWithScm(t, "tatara-bot", "labeledOrMentioned")
+	proj.Name = "lc-dedup-proj"
+	proj.Namespace = ns
+	proj.Spec.ScmSecretRef = "lc-dedup-scm"
+	proj.Spec.TriggerLabel = "tatara"
+
+	c := seedClient(t,
+		proj,
+		&tatarav1.Repository{
+			ObjectMeta: metav1.ObjectMeta{Name: "lc-dedup-repo", Namespace: ns},
+			Spec:       tatarav1.RepositorySpec{ProjectRef: "lc-dedup-proj", URL: "https://github.com/o/r.git", DefaultBranch: "main"},
+		},
+		secret("lc-dedup-scm", secretVal),
+	)
+	h, _ := newServer(t, c)
+
+	// Bot-authored PR body includes "Closes #7"
+	body := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":21,"title":"PR","body":"Closes #7\nsome description","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/21","head":{"sha":"abc","ref":"feature"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "pull_request")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "lc-dedup-proj", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	var matching []tatarav1.Task
+	for _, tk := range tasks.Items {
+		if tk.Spec.ProjectRef == "lc-dedup-proj" {
+			matching = append(matching, tk)
+		}
+	}
+	require.Len(t, matching, 1)
+	tk := matching[0]
+	require.Equal(t, "7", tk.Labels["tatara.io/source-number"],
+		"bot-PR with Closes #7 must have source-number=7 (linked issue), matching mrScan's dedup key")
+}
+
 // TestHumanPRWebhookStillCreatesReview asserts that human-authored PRs still
 // create Kind=review (unchanged behavior).
 func TestHumanPRWebhookStillCreatesReview(t *testing.T) {

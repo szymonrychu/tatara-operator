@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -157,3 +159,21 @@ func (*GitLab) Provider() string { return "gitlab" }
 
 // DetectAndVerify is implemented per provider in github.go and gitlab.go.
 // OpenChange and Comment are implemented per provider in github.go and gitlab.go.
+
+// reClosesIssue matches "Closes #N" (case-insensitive) in a PR body.
+var reClosesIssue = regexp.MustCompile(`(?i)closes\s+#(\d+)`)
+
+// LinkedIssueNumber parses the first "Closes #N" reference from a PR body.
+// Returns (n, true) on match, (0, false) otherwise. Shared by the webhook
+// binder and the cron mrScan so their dedup keys are consistent.
+func LinkedIssueNumber(body string) (int, bool) {
+	m := reClosesIssue.FindStringSubmatch(body)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
