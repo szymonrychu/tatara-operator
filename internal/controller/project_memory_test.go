@@ -154,6 +154,62 @@ func assertOwnedByProject(t *testing.T, refs []metav1.OwnerReference, project st
 	t.Fatalf("no controller ownerRef to Project %q in %+v", project, refs)
 }
 
+func TestMemoryStackHealth_MissingObjectsAreNotReadyNotError(t *testing.T) {
+	// Objects that have not been applied (or are not yet visible in the informer
+	// cache right after an SSA apply) read as NotFound. That must surface as
+	// not-yet-ready (zero counts) and NOT as a hard error, so the phase does not
+	// flap to Failed during normal provisioning.
+	ctx := context.Background()
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "health-missing")
+
+	ready, neo4j, lightrag, mem, err := r.memoryStackHealth(ctx, p)
+	if err != nil {
+		t.Fatalf("memoryStackHealth on a never-applied stack returned error: %v", err)
+	}
+	if ready != 0 || neo4j != 0 || lightrag != 0 || mem != 0 {
+		t.Fatalf("expected all-zero readiness, got %d/%d/%d/%d", ready, neo4j, lightrag, mem)
+	}
+	if got := memoryPhase(ready, effectivePGInstances(p), neo4j, lightrag, mem); got != "Provisioning" {
+		t.Fatalf("memoryPhase = %q, want Provisioning", got)
+	}
+}
+
+func TestReconcile_PartialStackStaysProvisioningNotFailed(t *testing.T) {
+	// A stack where only some objects are healthy (e.g. cnpg ready but neo4j not
+	// yet visible) must read as Provisioning, never Failed.
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "rec-partial")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+
+	// Make only cnpg ready; neo4j/lightrag/memory stay at zero.
+	ctx := context.Background()
+	names := memory.NamesFor(p.Name)
+	var cluster cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.PGCluster}, &cluster); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	cluster.Status.ReadyInstances = 1
+	if err := k8sClient.Status().Update(ctx, &cluster); err != nil {
+		t.Fatalf("fake cluster status: %v", err)
+	}
+
+	res, err := reconcileMemory(t, r, p.Name)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if res.RequeueAfter == 0 {
+		t.Fatalf("expected requeue while Provisioning, got %+v", res)
+	}
+	got := getProject(t, p.Name)
+	if got.Status.Memory == nil || got.Status.Memory.Phase != "Provisioning" {
+		t.Fatalf("phase = %v, want Provisioning", got.Status.Memory)
+	}
+}
+
 func TestMemoryPhase_Transitions(t *testing.T) {
 	cases := []struct {
 		name           string
