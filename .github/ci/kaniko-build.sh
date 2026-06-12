@@ -55,15 +55,16 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      # Keep image builds off control-plane nodes: kaniko IO starves etcd
-      # fsync and crashes the local apiserver (2026-06-12 NotReady incident).
+      # Run image builds ON control-plane (mirrors helmfile arc-runners):
+      # nas carries the media stack and build IO saturated its disks
+      # (2026-06-12). arc-runners LimitRange caps kaniko ephemeral usage.
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
               - matchExpressions:
                   - key: node-role.kubernetes.io/control-plane
-                    operator: DoesNotExist
+                    operator: Exists
       imagePullSecrets:
         - name: regcred
       containers:
