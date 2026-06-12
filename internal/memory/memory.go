@@ -33,6 +33,11 @@ type Config struct {
 	OIDCIssuer       string
 	OIDCAudience     string
 	ImagePullSecret  string
+	IngressHost      string
+	IngressClassName string
+	MemoryPathPrefix string
+	ChatPathPrefix   string
+	ChatImage        string
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.
