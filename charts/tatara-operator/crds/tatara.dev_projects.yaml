@@ -47,8 +47,17 @@ spec:
                 description: AgentSpec configures the wrapper agent session a Task
                   runs.
                 properties:
+                  contextWindowTokens:
+                    default: 200000
+                    type: integer
+                  handoverThresholdPercent:
+                    default: 50
+                    type: integer
                   image:
                     type: string
+                  maxLifecycleIterations:
+                    default: 10
+                    type: integer
                   maxTurnsPerTask:
                     default: 50
                     type: integer
@@ -85,6 +94,9 @@ spec:
                   approvalLabel:
                     default: tatara/awaiting-approval
                     type: string
+                  babysitDeadlineMinutes:
+                    default: 60
+                    type: integer
                   board:
                     description: BoardSpec configures the project board tatara participates
                       in.
@@ -99,6 +111,9 @@ spec:
                     type: object
                   botLogin:
                     type: string
+                  conversationIdleMinutes:
+                    default: 60
+                    type: integer
                   cron:
                     description: ScmCron groups the three cron-driven scan activities.
                     properties:
