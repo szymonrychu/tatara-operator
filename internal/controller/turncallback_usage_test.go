@@ -27,9 +27,9 @@ func TestTurnComplete_WithUsage(t *testing.T) {
 		"state":     "completed",
 		"finalText": "done",
 		"usage": map[string]any{
-			"input_tokens":              1000,
-			"output_tokens":             200,
-			"cache_read_input_tokens":   500,
+			"input_tokens":                1000,
+			"output_tokens":               200,
+			"cache_read_input_tokens":     500,
 			"cache_creation_input_tokens": 0,
 		},
 	})

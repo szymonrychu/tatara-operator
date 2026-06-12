@@ -331,4 +331,3 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 		t.Errorf("CreateIssue called %d times; want 0 for empty RemainingScope", len(fw.createIssues))
 	}
 }
-
