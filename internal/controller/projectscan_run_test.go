@@ -116,11 +116,12 @@ func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	proj, _ := seedScanProject(t, "fanout-hold", cron)
 	repoA := mkScanRepo(t, "fanout-hold", "fanout-hold-a", "https://github.com/o/a.git")
 
+	// issueLifecycle (not triageIssue) holds the lane for the new binder.
 	pre := &tatarav1alpha1.Task{}
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
-	pre.Labels = scanTaskLabels(candidate{repo: "o/a", number: 1}, "issueScan", "triageIssue")
-	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "fanout-hold", RepositoryRef: repoA.Name, Goal: "g", Kind: "triageIssue"}
+	pre.Labels = scanTaskLabels(candidate{repo: "o/a", number: 1}, "issueScan", "issueLifecycle")
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "fanout-hold", RepositoryRef: repoA.Name, Goal: "g", Kind: "issueLifecycle"}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
@@ -151,7 +152,7 @@ func TestMRScan_PerRepoTopUp(t *testing.T) {
 		mkScanRepo(t, "fanout-mr", "fanout-mr-b", "https://github.com/o/b.git"),
 	}
 	reader := &fakeReader{prs: []scm.PRRef{
-		{Repo: "o/a", Number: 1, Author: "tatara-bot", UpdatedAt: time.Unix(100, 0)}, // o/a stalest -> selfImprove
+		{Repo: "o/a", Number: 1, Author: "tatara-bot", UpdatedAt: time.Unix(100, 0)}, // o/a stalest -> issueLifecycle/MRCI
 		{Repo: "o/a", Number: 2, Author: "human", UpdatedAt: time.Unix(200, 0)},
 		{Repo: "o/b", Number: 3, Author: "human", UpdatedAt: time.Unix(100, 0)}, // o/b stalest -> review
 		{Repo: "o/b", Number: 4, Author: "tatara-bot", UpdatedAt: time.Unix(200, 0)},
@@ -167,7 +168,7 @@ func TestMRScan_PerRepoTopUp(t *testing.T) {
 	bySlug := map[string]int{}
 	for i := range tasks {
 		bySlug[tasks[i].Labels[labelSourceRepo]]++
-		if k := tasks[i].Spec.Kind; k != "review" && k != "selfImprove" {
+		if k := tasks[i].Spec.Kind; k != "review" && k != "issueLifecycle" {
 			t.Fatalf("unexpected kind %q", k)
 		}
 	}
@@ -199,8 +200,8 @@ func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
 	for _, tk := range tasks {
 		kinds[tk.Spec.Kind] = true
 	}
-	if !kinds["selfImprove"] || !kinds["review"] {
-		t.Fatalf("want review+selfImprove kinds, got %+v", kinds)
+	if !kinds["issueLifecycle"] || !kinds["review"] {
+		t.Fatalf("want review+issueLifecycle kinds, got %+v", kinds)
 	}
 	got := &tatarav1alpha1.Project{}
 	_ = k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "mrscan-proj"}, got)
@@ -227,8 +228,8 @@ func TestRunScans_IssueScanCap(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("cap=1 should create 1 task, got %d", len(tasks))
 	}
-	if tasks[0].Spec.Kind != "triageIssue" {
-		t.Fatalf("kind = %q, want triageIssue", tasks[0].Spec.Kind)
+	if tasks[0].Spec.Kind != "issueLifecycle" {
+		t.Fatalf("kind = %q, want issueLifecycle", tasks[0].Spec.Kind)
 	}
 }
 

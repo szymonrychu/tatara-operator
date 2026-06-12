@@ -47,6 +47,7 @@ type PRRef struct {
 	Author    string    `json:"author"`
 	HeadSHA   string    `json:"headSha"`
 	Labels    []string  `json:"labels,omitempty"`
+	Body      string    `json:"body,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 

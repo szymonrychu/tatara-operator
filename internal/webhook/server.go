@@ -173,10 +173,14 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
-	kind := "implement"
+	// kind switch: issue with triggerLabel -> issueLifecycle (was "implement");
+	// bot PR -> issueLifecycle (was "selfImprove"); migration note: in-flight
+	// "implement"/"selfImprove" tasks created before this deploy still complete
+	// via the old writeback arms.
+	kind := "issueLifecycle"
 	if ev.IsPR {
 		if ev.AuthorLogin == bot && bot != "" {
-			kind = "selfImprove"
+			kind = "issueLifecycle"
 		} else {
 			kind = "review"
 		}
@@ -261,6 +265,21 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
+	}
+	// For issueLifecycle tasks, set the initial lifecycle state on status.
+	if kind == "issueLifecycle" {
+		if ev.IsPR {
+			// Bot PR enters at MRCI.
+			task.Status.LifecycleState = "MRCI"
+			task.Status.PRNumber = ev.Number
+		} else {
+			// Trigger-labeled issue enters at Implement (per spec: skip dialogue).
+			task.Status.LifecycleState = "Implement"
+		}
+		if err := s.cfg.Client.Status().Update(ctx, task); err != nil {
+			s.log.WarnContext(ctx, "webhook: set lifecycle state failed (non-fatal)",
+				"project", proj.Name, "task", task.Name, "err", err)
+		}
 	}
 	s.log.InfoContext(ctx, "work item created task",
 		"project", proj.Name, "repository", repo.Name,

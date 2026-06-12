@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -20,6 +21,33 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// reClosesIssue matches "Closes #N" (case-insensitive) in a PR body.
+var reClosesIssue = regexp.MustCompile(`(?i)closes\s+#(\d+)`)
+
+// linkedIssueNumber parses the first "Closes #N" reference from a PR body.
+// Returns (n, true) on match, (0, false) otherwise.
+func linkedIssueNumber(body string) (int, bool) {
+	m := reClosesIssue.FindStringSubmatch(body)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// isLifecycleTerminal reports whether a lifecycle state counts as terminal for
+// dedup purposes (Done/Stopped/Parked free the (repo,number) key on newer activity).
+func isLifecycleTerminal(state string) bool {
+	switch state {
+	case "Done", "Stopped", "Parked":
+		return true
+	}
+	return false
+}
 
 // activityNextFire parses a 5-field cron and returns the next fire after base.
 // ok=false when the schedule is empty (disabled) or malformed (caller logs).
@@ -65,6 +93,8 @@ func scanTaskLabels(c candidate, activity, kind string) map[string]string {
 // isDeduped reports whether a candidate already has a Task that should suppress
 // a re-pick, per the dedup rules:
 //   - any non-terminal Task for (repo, number) -> skip
+//   - issueLifecycle: Done/Stopped/Parked lifecycle states count as terminal for
+//     dedup purposes (they free the key on newer activity, like Phase Succeeded)
 //   - PR: a terminal Task at the same head-sha -> skip (already handled revision)
 //   - issue: a terminal Task whose creation is at/after the candidate updatedAt -> skip
 func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
@@ -75,7 +105,11 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		if !isTerminal(t.Status.Phase) {
+		// A lifecycle Task with a non-terminal lifecycle state is in-flight even
+		// if the phase hasn't advanced yet. Treat lifecycle terminals as equivalent
+		// to Phase Succeeded/Failed for dedup.
+		lifecycleTerminal := t.Status.LifecycleState != "" && isLifecycleTerminal(t.Status.LifecycleState)
+		if !isTerminal(t.Status.Phase) && !lifecycleTerminal {
 			return true
 		}
 		if c.isPR {
@@ -94,12 +128,13 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 
 // candidate is one scannable work item (PR, issue, or board item) normalized
 // for selection + dedup. number/repo identify it; labels drive priority;
-// updatedAt drives stale-first ordering.
+// updatedAt drives stale-first ordering. body is used for PR "Closes #N" parsing.
 type candidate struct {
 	repo      string
 	number    int
 	author    string
 	headSHA   string
+	body      string
 	labels    []string
 	updatedAt time.Time
 	isPR      bool
@@ -206,7 +241,7 @@ func candidatesFromPRs(prs []scm.PRRef) []candidate {
 	for _, p := range prs {
 		out = append(out, candidate{
 			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
-			labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
+			body: p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
 		})
 	}
 	return out
@@ -421,10 +456,14 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 }
 
 // mrScan lists open PRs across repos, selects, dedups, and creates Tasks routed
-// by authoritative author -> review (human) | selfImprove (bot).
+// by authoritative author -> review (human) | issueLifecycle/MRCI (bot).
 func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
+	bot := ""
+	if proj.Spec.Scm != nil {
+		bot = proj.Spec.Scm.BotLogin
+	}
 	var cands []candidate
 	for i := range repos {
 		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
@@ -450,8 +489,11 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			eligible = append(eligible, c)
 		}
 	}
+	// kind switch for bot PRs: was "selfImprove", now "issueLifecycle" (MRCI entry);
+	// migration note: in-flight "selfImprove" tasks created before this deploy still complete
+	// via old writeback arm.
 	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
-		func(slug string) int { return laneOccupancy(existing, slug, "review", "selfImprove") })
+		func(slug string) int { return laneOccupancy(existing, slug, "issueLifecycle", "review") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("mrScan", "skipped_cap")
 	}
@@ -461,14 +503,32 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		if !ok {
 			continue
 		}
-		kind := "review"
-		if c.author == proj.Spec.Scm.BotLogin {
-			kind = "selfImprove"
-		}
-		goal := fmt.Sprintf("Triage %s PR %s#%d", kind, c.repo, c.number)
-		if _, err := r.createScanTask(ctx, proj, &repo, c, "mrScan", kind, goal); err != nil {
-			l.Error(err, "scan: create mrScan task", "resource_id", proj.Name, "repo", repo.Name)
-			continue
+		if c.author == bot && bot != "" {
+			// Bot PR -> issueLifecycle entering at MRCI. Dedup key is the linked issue
+			// number from "Closes #N" if present, else the PR number.
+			dedupNumber := c.number
+			if issueNum, linked := linkedIssueNumber(c.body); linked {
+				dedupNumber = issueNum
+			}
+			dedupCand := candidate{
+				repo: c.repo, number: dedupNumber, headSHA: c.headSHA,
+				labels: c.labels, updatedAt: c.updatedAt, isPR: c.isPR,
+			}
+			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
+			task, err := r.createScanTask(ctx, proj, &repo, dedupCand, "mrScan", "issueLifecycle", goal)
+			if err != nil {
+				l.Error(err, "scan: create mrScan issueLifecycle task", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
+			if setErr := r.setMRCIStatus(ctx, task, c.number); setErr != nil {
+				l.Error(setErr, "scan: set MRCI status", "resource_id", proj.Name, "task", task.Name)
+			}
+		} else {
+			goal := fmt.Sprintf("Triage review PR %s#%d", c.repo, c.number)
+			if _, err := r.createScanTask(ctx, proj, &repo, c, "mrScan", "review", goal); err != nil {
+				l.Error(err, "scan: create mrScan task", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
 		}
 		r.Metrics.ScanItem("mrScan", "picked")
 		created++
@@ -477,6 +537,13 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
 	return len(selected) < len(eligible)
+}
+
+// setMRCIStatus sets LifecycleState=MRCI and PRNumber on the given task's status.
+func (r *ProjectReconciler) setMRCIStatus(ctx context.Context, task *tatarav1alpha1.Task, prNumber int) error {
+	task.Status.LifecycleState = "MRCI"
+	task.Status.PRNumber = prNumber
+	return r.Status().Update(ctx, task)
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
@@ -528,8 +595,10 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			eligible = append(eligible, c)
 		}
 	}
+	// kind switch: was "triageIssue", now "issueLifecycle"; migration note: in-flight
+	// "triageIssue" tasks created before this deploy still complete via old writeback arm.
 	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
-		func(slug string) int { return laneOccupancy(existing, slug, "triageIssue") })
+		func(slug string) int { return laneOccupancy(existing, slug, "issueLifecycle") })
 	for i := 0; i < len(eligible)-len(selected); i++ {
 		r.Metrics.ScanItem("issueScan", "skipped_cap")
 	}
@@ -540,7 +609,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			continue
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
-		if _, err := r.createScanTask(ctx, proj, &repo, c, "issueScan", "triageIssue", goal); err != nil {
+		if _, err := r.createScanTask(ctx, proj, &repo, c, "issueScan", "issueLifecycle", goal); err != nil {
 			l.Error(err, "scan: create issueScan task", "resource_id", proj.Name, "repo", repo.Name)
 			continue
 		}
