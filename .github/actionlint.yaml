@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # Per-repo self-hosted ARC runner scale set (infra: helmfiles/coding/helmfile.yaml.gotmpl).
+  labels:
+    - tatara-operator

@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  secscan:
+    runs-on: tatara-operator
+    steps:
+      - uses: actions/checkout@v4
+      - name: gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz" \
+            | tar -xzf - gitleaks
+          ./gitleaks detect --source . --no-git --redact --verbose
+
+  lint:
+    runs-on: tatara-operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+      - name: gofmt
+        run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; echo 'gofmt -s required'; exit 1; }
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
+
+  test:
+    runs-on: tatara-operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+      - name: test
+        run: make test
+
+  build:
+    runs-on: tatara-operator
+    needs: [secscan, lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+      - name: build
+        run: make build
+
+  image:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: tatara-operator
+    needs: [secscan, lint, test, build]
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-kubectl@v4
+      - name: build and push image
+        run: bash .github/ci/kaniko-build.sh "${{ github.event.repository.name }}"
