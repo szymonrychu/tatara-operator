@@ -21,6 +21,8 @@ type OperatorMetrics struct {
 	issueOutcomeTotal       *prometheus.CounterVec
 	tasksInflightKind       *prometheus.GaugeVec
 	agentBootRaceRequeue    prometheus.Counter
+	openProposals           *prometheus.GaugeVec
+	approvalBackstopFlips   prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -92,6 +94,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_agent_boot_race_requeue_total",
 			Help: "Times a turn submit hit a still-booting wrapper and was requeued instead of erroring.",
 		}),
+		openProposals: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_open_proposals",
+			Help: "Open, unapproved agent-proposed issues per repo.",
+		}, []string{"repo"}),
+		approvalBackstopFlips: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_approval_backstop_flips_total",
+			Help: "Approvals recovered by the backstop after a missed webhook.",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -109,6 +119,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.issueOutcomeTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
+		m.openProposals,
+		m.approvalBackstopFlips,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -224,3 +236,11 @@ func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
 func (m *OperatorMetrics) ObserveApprovalGate(seconds float64) {
 	m.approvalGateSeconds.Observe(seconds)
 }
+
+// SetOpenProposals sets operator_open_proposals for a repo slug.
+func (m *OperatorMetrics) SetOpenProposals(repo string, n float64) {
+	m.openProposals.WithLabelValues(repo).Set(n)
+}
+
+// ApprovalBackstopFlip increments operator_approval_backstop_flips_total.
+func (m *OperatorMetrics) ApprovalBackstopFlip() { m.approvalBackstopFlips.Inc() }

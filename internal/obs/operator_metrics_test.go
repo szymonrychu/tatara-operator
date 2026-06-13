@@ -244,6 +244,25 @@ func TestScanMetricsRegistered(t *testing.T) {
 	}
 }
 
+func TestOpenProposalsGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetOpenProposals("o/r", 2)
+	if got := testutil.ToFloat64(m.openProposals.WithLabelValues("o/r")); got != 2 {
+		t.Fatalf("openProposals{o/r} = %v, want 2", got)
+	}
+}
+
+func TestApprovalBackstopFlips(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.ApprovalBackstopFlip()
+	m.ApprovalBackstopFlip()
+	if got := testutil.ToFloat64(m.approvalBackstopFlips); got != 2 {
+		t.Fatalf("approvalBackstopFlips = %v, want 2", got)
+	}
+}
+
 func TestOperatorMetricsNamesStable(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	_ = NewOperatorMetrics(reg)
