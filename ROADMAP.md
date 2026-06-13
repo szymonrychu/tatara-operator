@@ -4,6 +4,12 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 ## Agent-loop follow-ups (found during 2026-06-08 dogfood)
 
+- [x] Phase-label dedup + orphan-recovery (presence+state, Option A) - four phase
+  labels (brainstorming/approved/implementation/declined) as state-of-truth;
+  dedup+backstop key on label presence + task state (not label-added-time);
+  webhook reactivates Parked tasks. Merged+deployed 306f596 (set-image). Plan:
+  `../tatara/docs/superpowers/plans/2026-06-13-tatara-phase-label-dedup.md`.
+  Optional cleanup: proposalBacklog doc comment still says "idea label".
 - [x] 3-label issue lifecycle (tatara-idea/approved/rejected), conversation-driven
   approval, retire label-toggle approval (branch feat/label-lifecycle; awaiting
   deploy + one-time label migration). Plan:
