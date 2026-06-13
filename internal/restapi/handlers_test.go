@@ -560,6 +560,19 @@ func TestPostComment_NoSourceConflict(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code)
 }
 
+func TestPostComment_WrongKindRejected(t *testing.T) {
+	tk := taskWithKind("tc4", "alpha", "review")
+	tk.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "owner/repo#9"}
+	r := buildRouter(t, tk)
+	body := strings.NewReader(`{"body":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/tc4/comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "issueLifecycle")
+}
+
 func TestPostComment_TaskNotFound(t *testing.T) {
 	r := buildRouter(t)
 	body := strings.NewReader(`{"body":"hello"}`)

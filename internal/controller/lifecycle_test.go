@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -26,10 +27,11 @@ import (
 
 type lifecycleFakeSCMWriter struct {
 	scm.SCMWriter
-	mu           sync.Mutex
-	closeCalls   []struct{ repo, comment string }
-	commentCalls []struct{ issueRef, body string }
-	openCalls    []struct {
+	mu            sync.Mutex
+	failOnComment string
+	closeCalls    []struct{ repo, comment string }
+	commentCalls  []struct{ issueRef, body string }
+	openCalls     []struct {
 		repoURL, sourceBranch, title, body string
 	}
 	openPRURL      string
@@ -47,6 +49,9 @@ func (f *lifecycleFakeSCMWriter) CloseIssue(_ context.Context, _, repo string, _
 func (f *lifecycleFakeSCMWriter) Comment(_ context.Context, _, issueRef, body string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failOnComment != "" && body == f.failOnComment {
+		return fmt.Errorf("simulated comment failure")
+	}
 	f.commentCalls = append(f.commentCalls, struct{ issueRef, body string }{issueRef, body})
 	return nil
 }
@@ -2137,5 +2142,49 @@ func TestReconcileLifecycle_DrainsPendingComments(t *testing.T) {
 	}
 	if len(reloaded.Status.PendingComments) != 0 {
 		t.Fatalf("PendingComments not cleared: %#v", reloaded.Status.PendingComments)
+	}
+}
+
+func TestReconcileLifecycle_DrainPartialFailureKeepsRemaining(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "owner/repo#8",
+		URL: "https://github.com/owner/repo/issues/8", Number: 8,
+	}
+	task := seedLifecycleTask(t,
+		"lc-drain-fail-task", "lc-drain-fail-proj", "lc-drain-fail-repo", "lc-drain-fail-scm", src)
+
+	task.Status.PendingComments = []string{"ok1", "BOOM", "ok2"}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set PendingComments: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{failOnComment: "BOOM"}
+	r := newLifecycleReconciler(t, fw)
+
+	// The drain must return an error (so the reconcile requeues) once a comment
+	// fails to post.
+	if _, err := r.reconcileLifecycle(ctx, task); err == nil {
+		t.Fatal("reconcileLifecycle: expected error on comment post failure")
+	}
+
+	// Only the comment before the failure is delivered; BOOM is never recorded.
+	got := fw.commentBodies("owner/repo#8")
+	if len(got) != 1 || got[0] != "ok1" {
+		t.Fatalf("posted comments = %#v, want [ok1]", got)
+	}
+
+	// The delivered comment is dequeued; the failed one and everything after it
+	// remain so a retry does not re-post ok1.
+	var reloaded tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "lc-drain-fail-task"}, &reloaded); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	want := []string{"BOOM", "ok2"}
+	if len(reloaded.Status.PendingComments) != len(want) ||
+		reloaded.Status.PendingComments[0] != want[0] ||
+		reloaded.Status.PendingComments[1] != want[1] {
+		t.Fatalf("PendingComments = %#v, want %#v", reloaded.Status.PendingComments, want)
 	}
 }

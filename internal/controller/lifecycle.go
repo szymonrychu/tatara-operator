@@ -268,25 +268,49 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 	}
 
 	// Drain agent-queued free-form comments (from the comment MCP tool) to the
-	// linked issue before anything else, then clear and requeue.
-	if len(task.Status.PendingComments) > 0 && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
-		_, _, writer, token, _, err := r.scmContext(ctx, task)
+	// linked issue before anything else, then clear and requeue. Comments are
+	// posted in order; each posted comment is dequeued under RetryOnConflict
+	// (preserving any concurrently-appended comment) BEFORE returning, so a
+	// post failure can never re-post an already-delivered comment.
+	if pending := task.Status.PendingComments; len(pending) > 0 && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
+		_, _, writer, token, provider, err := r.scmContext(ctx, task)
 		if err != nil {
 			r.Metrics.ReconcileResult("Task", "error")
 			return ctrl.Result{}, fmt.Errorf("lifecycle drain comments: %w", err)
 		}
-		for _, c := range task.Status.PendingComments {
-			if cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, c); cerr != nil {
-				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, fmt.Errorf("lifecycle drain comment: %w", cerr)
+		posted := 0
+		var postErr error
+		for _, c := range pending {
+			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, c)
+			r.recordSCM(provider, "comment", cerr)
+			if cerr != nil {
+				postErr = cerr
+				break
 			}
+			posted++
 			l.Info("lifecycle: agent comment posted",
 				"action", "scm_agent_comment", "resource_id", task.Name)
 		}
-		task.Status.PendingComments = nil
-		if err := r.Status().Update(ctx, task); err != nil {
+		if posted > 0 {
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				var fresh tatarav1alpha1.Task
+				if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), &fresh); gerr != nil {
+					return gerr
+				}
+				if len(fresh.Status.PendingComments) >= posted {
+					fresh.Status.PendingComments = fresh.Status.PendingComments[posted:]
+				} else {
+					fresh.Status.PendingComments = nil
+				}
+				return r.Status().Update(ctx, &fresh)
+			}); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, fmt.Errorf("lifecycle clear comments: %w", err)
+			}
+		}
+		if postErr != nil {
 			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, fmt.Errorf("lifecycle clear comments: %w", err)
+			return ctrl.Result{}, fmt.Errorf("lifecycle drain comment: %w", postErr)
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}

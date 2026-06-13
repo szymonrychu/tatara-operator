@@ -514,4 +514,3 @@ func TestLifecycleTriageText_NamesFollowupSkill(t *testing.T) {
 		t.Fatalf("triage prompt does not invoke tatara-research-followup skill:\n%s", got)
 	}
 }
-
