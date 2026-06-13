@@ -157,9 +157,10 @@ func TestIssueScanDedupLifecycleTerminals(t *testing.T) {
 		},
 	}
 
+	managed := managedPhaseLabels(nil)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := isDeduped(tc.cand, tc.existing)
+			got := isDeduped(tc.cand, tc.existing, managed)
 			if got != tc.wantDeduped {
 				t.Fatalf("isDeduped = %v, want %v", got, tc.wantDeduped)
 			}

@@ -43,9 +43,10 @@ func TestDedupPR(t *testing.T) {
 		{"terminal new sha eligible", candidate{repo: "o/r", number: 2, headSHA: "sha9", isPR: true}, false},
 		{"unseen pr eligible", candidate{repo: "o/r", number: 3, headSHA: "shaY", isPR: true}, false},
 	}
+	managed := managedPhaseLabels(nil)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isDeduped(tc.cand, existing); got != tc.want {
+			if got := isDeduped(tc.cand, existing, managed); got != tc.want {
 				t.Fatalf("isDeduped = %v, want %v", got, tc.want)
 			}
 		})
@@ -60,15 +61,90 @@ func TestDedupIssue(t *testing.T) {
 		mkCronTask("o/r", 6, "triageIssue", "", "Planning"), // non-terminal -> skip #6
 		terminal, // terminal -> skip unless newer activity
 	}
+	managed := managedPhaseLabels(nil)
 	older := candidate{repo: "o/r", number: 7, updatedAt: created.Add(-time.Hour)}
 	newer := candidate{repo: "o/r", number: 7, updatedAt: created.Add(time.Hour)}
-	if !isDeduped(candidate{repo: "o/r", number: 6}, existing) {
+	if !isDeduped(candidate{repo: "o/r", number: 6}, existing, managed) {
 		t.Fatalf("in-flight issue #6 should be deduped")
 	}
-	if !isDeduped(older, existing) {
+	if !isDeduped(older, existing, managed) {
 		t.Fatalf("terminal issue with no new activity should be deduped")
 	}
-	if isDeduped(newer, existing) {
+	if isDeduped(newer, existing, managed) {
 		t.Fatalf("terminal issue with newer activity should be eligible")
+	}
+}
+
+func TestDedupTerminalTaskWithActiveLabelIsDeduped(t *testing.T) {
+	created := metav1.Now()
+	terminal := mkCronTask("o/r", 5, "issueLifecycle", "", "Succeeded")
+	terminal.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{terminal}
+	managed := managedPhaseLabels(nil)
+	// issue has tatara-implementation label -> managed label present -> deduped
+	c := candidate{repo: "o/r", number: 5, labels: []string{"tatara-implementation"}, updatedAt: created.Add(time.Hour)}
+	if !isDeduped(c, existing, managed) {
+		t.Fatalf("terminal task + active managed label should be deduped (orphan; backstop handles)")
+	}
+}
+
+func TestDedupTerminalTaskNoLabelNewActivityEligible(t *testing.T) {
+	created := metav1.Now()
+	terminal := mkCronTask("o/r", 5, "issueLifecycle", "", "Succeeded")
+	terminal.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{terminal}
+	managed := managedPhaseLabels(nil)
+	// no managed label, new activity -> eligible for fresh triage
+	c := candidate{repo: "o/r", number: 5, labels: []string{}, updatedAt: created.Add(time.Hour)}
+	if isDeduped(c, existing, managed) {
+		t.Fatalf("terminal task + no managed label + new activity should be eligible")
+	}
+}
+
+func TestDedupTerminalTaskNoLabelNoNewActivityDeduped(t *testing.T) {
+	created := metav1.Now()
+	terminal := mkCronTask("o/r", 5, "issueLifecycle", "", "Succeeded")
+	terminal.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{terminal}
+	managed := managedPhaseLabels(nil)
+	// no managed label, updatedAt == creation -> deduped
+	c := candidate{repo: "o/r", number: 5, labels: []string{}, updatedAt: created.Time}
+	if !isDeduped(c, existing, managed) {
+		t.Fatalf("terminal task + no managed label + no new activity should be deduped")
+	}
+}
+
+func TestDedupNonTerminalTaskAlwaysDeduped(t *testing.T) {
+	existing := []tatarav1alpha1.Task{mkCronTask("o/r", 5, "issueLifecycle", "", "Planning")}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 5, labels: []string{"tatara-implementation"}, updatedAt: time.Now()}
+	if !isDeduped(c, existing, managed) {
+		t.Fatalf("non-terminal task should always be deduped")
+	}
+}
+
+func TestDedupDeclinedLabelIsDeduped(t *testing.T) {
+	created := metav1.Now()
+	terminal := mkCronTask("o/r", 5, "issueLifecycle", "", "Succeeded")
+	terminal.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{terminal}
+	managed := managedPhaseLabels(nil)
+	// declined is in managedPhaseLabels -> suppressed
+	c := candidate{repo: "o/r", number: 5, labels: []string{"tatara-declined"}, updatedAt: created.Add(time.Hour)}
+	if !isDeduped(c, existing, managed) {
+		t.Fatalf("terminal task + tatara-declined label should be deduped")
+	}
+}
+
+func TestDedupPRHeadShaUnchanged(t *testing.T) {
+	created := metav1.Now()
+	terminal := mkCronTask("o/r", 5, "review", "sha1", "Succeeded")
+	terminal.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{terminal}
+	managed := managedPhaseLabels(nil)
+	// PR same headSHA -> deduped
+	c := candidate{repo: "o/r", number: 5, headSHA: "sha1", isPR: true, updatedAt: created.Add(time.Hour)}
+	if !isDeduped(c, existing, managed) {
+		t.Fatalf("PR terminal task at same headSHA should be deduped")
 	}
 }

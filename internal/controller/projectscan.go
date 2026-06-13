@@ -110,13 +110,15 @@ func findConvTaskToReactivate(c candidate, existing []tatarav1alpha1.Task) *tata
 }
 
 // isDeduped reports whether a candidate already has a Task that should suppress
-// a re-pick, per the dedup rules:
-//   - any non-terminal Task for (repo, number) -> skip
-//   - issueLifecycle: Done/Stopped/Parked lifecycle states count as terminal for
-//     dedup purposes (they free the key on newer activity, like Phase Succeeded)
-//   - PR: a terminal Task at the same head-sha -> skip (already handled revision)
-//   - issue: a terminal Task whose creation is at/after the candidate updatedAt -> skip
-func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
+// a re-pick. Phase labels are the issue's state-of-truth (Option A):
+//   - any non-terminal Task for (repo,number) -> skip (fast path)
+//   - PR: a terminal Task at the same head-sha -> skip
+//   - issue: a managed phase label present on the OPEN issue -> skip (active =>
+//     handled by the live Task above; terminal+label => orphan the backstop
+//     resumes; declined => no action). No managed label -> legacy/untracked, fall
+//     back to activity-vs-creation so a stale terminal Task is not re-triaged
+//     unless the issue saw new activity.
+func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string) bool {
 	repoLabel := sanitizeRepoLabel(c.repo)
 	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
@@ -124,9 +126,6 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		// A lifecycle Task with a non-terminal lifecycle state is in-flight even
-		// if the phase hasn't advanced yet. Treat lifecycle terminals as equivalent
-		// to Phase Succeeded/Failed for dedup.
 		lifecycleTerminal := t.Status.LifecycleState != "" && isLifecycleTerminal(t.Status.LifecycleState)
 		if !isTerminal(t.Status.Phase) && !lifecycleTerminal {
 			return true
@@ -137,7 +136,10 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 			}
 			continue
 		}
-		// issue: terminal Task suppresses unless the issue saw newer activity.
+		// issue: phase label is state-of-truth.
+		if hasAnyLabel(c.labels, managed) {
+			return true
+		}
 		if !c.updatedAt.After(t.CreationTimestamp.Time) {
 			return true
 		}
@@ -165,6 +167,15 @@ func hasLabel(labels []string, want string) bool {
 	}
 	for _, l := range labels {
 		if l == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyLabel(labels, want []string) bool {
+	for _, w := range want {
+		if hasLabel(labels, w) {
 			return true
 		}
 	}
@@ -553,9 +564,10 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		r.Metrics.ScanItem("mrScan", "scanned")
 	}
 	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
+	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing) {
+		if isDeduped(c, existing, managed) {
 			r.Metrics.ScanItem("mrScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
@@ -693,9 +705,10 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	}
 
 	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
+	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing) {
+		if isDeduped(c, existing, managed) {
 			r.Metrics.ScanItem("issueScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
