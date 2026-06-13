@@ -133,3 +133,22 @@ func TestHasHumanComment(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, got)
 }
+
+// TestSetLifecycleLabel_UnknownLabels_RemovesUnconditionally verifies the
+// read-failure fallback: when the current label set cannot be read (the issue
+// is not in the open list, e.g. just-closed, or the reader returns nothing),
+// the desired label is added and BOTH other managed labels are removed
+// best-effort, preserving the "exactly one managed label" contract.
+func TestSetLifecycleLabel_UnknownLabels_RemovesUnconditionally(t *testing.T) {
+	_, task, w := seedLabelTask(t, "unknown", []string{"tatara-idea"})
+	var proj tatarav1alpha1.Project
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
+	// commentReader.ListOpenIssues returns nil -> issue never matched -> known=false.
+	r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		SCMFor:    func(string) (scm.SCMWriter, error) { return w, nil },
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return &commentReader{}, nil }}
+	require.NoError(t, r.setLifecycleLabel(context.Background(), &proj, task, "tatara-approved"))
+	require.Equal(t, []string{"tatara-approved"}, w.added)
+	require.ElementsMatch(t, []string{"tatara-idea", "tatara-rejected"}, w.removed)
+}

@@ -46,7 +46,14 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	}
 	issueRef := task.Spec.Source.IssueRef
 
+	// known reports whether we read the issue's current label set. When we could
+	// not (nil reader, list error, or issue not in the open list e.g. just-closed),
+	// current is empty but we must NOT skip the removals - otherwise the
+	// "exactly one managed label" contract silently breaks. In that case we
+	// add + remove unconditionally; AddLabel is idempotent and RemoveLabel is
+	// best-effort (tolerates the label being absent).
 	current := map[string]bool{}
+	known := false
 	if r.ReaderFor != nil {
 		if reader, rerr := r.ReaderFor(provider, token); rerr == nil {
 			if owner, name, oerr := scm.OwnerRepo(repo.Spec.URL); oerr == nil {
@@ -56,6 +63,7 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 							for _, lb := range iss.Labels {
 								current[lb] = true
 							}
+							known = true
 							break
 						}
 					}
@@ -64,7 +72,7 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		}
 	}
 
-	if !current[desired] {
+	if !known || !current[desired] {
 		if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
 			r.recordSCM(provider, "add_label", aerr)
 			return fmt.Errorf("set label add %q: %w", desired, aerr)
@@ -72,7 +80,7 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		r.recordSCM(provider, "add_label", nil)
 	}
 	for _, lb := range managed {
-		if lb == desired || !current[lb] {
+		if lb == desired || (known && !current[lb]) {
 			continue
 		}
 		if rerr := writer.RemoveLabel(ctx, token, issueRef, lb); rerr != nil {
