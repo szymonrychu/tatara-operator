@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -366,6 +367,10 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		// Per spec: "new comment under an older issue -> start from triage".
 		// Only for issues (IsPR=false) from human authors; PR comments are ignored.
 		if !ev.IsPR {
+			if parked, ok := s.findReactivatableTask(ctx, proj.Name, ev.IssueRef); ok {
+				s.reactivateTask(ctx, w, provider, proj, ev, parked)
+				return
+			}
 			s.createLifecycleTaskAtTriage(ctx, w, provider, proj, ev)
 			return
 		}
@@ -508,6 +513,91 @@ func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef st
 		return t, true
 	}
 	return nil, false
+}
+
+// findReactivatableTask returns an owning issueLifecycle Task for issueRef that
+// went terminal but is resumable (LifecycleState == "Parked"). Done tasks are
+// NOT reactivated (their work is complete). Returns (task, true) when found.
+func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+		return nil, false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.Kind != "issueLifecycle" || t.Spec.ProjectRef != projectName {
+			continue
+		}
+		if t.Spec.Source == nil || t.Spec.Source.IssueRef != issueRef {
+			continue
+		}
+		if t.Status.LifecycleState == "Parked" {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// reactivateTask resumes a Parked owning Task: it clears the agent-run state
+// (Phase, turn annotations) and the wrapper pod/service, sets LifecycleState
+// back to Triage, and stamps LastActivityAt/DeadlineAt so the reconciler
+// re-triages the issue with the new comment.
+func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent, task *tatarav1.Task) {
+	// Best-effort delete the wrapper pod + service.
+	pod := &corev1.Pod{}
+	pod.Name = agent.PodName(task)
+	pod.Namespace = s.cfg.Namespace
+	if err := s.cfg.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		s.log.ErrorContext(ctx, "reactivate: delete pod (non-fatal)", "error", err, "task", task.Name)
+	}
+	svc := &corev1.Service{}
+	svc.Name = agent.PodName(task)
+	svc.Namespace = s.cfg.Namespace
+	if err := s.cfg.Client.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		s.log.ErrorContext(ctx, "reactivate: delete service (non-fatal)", "error", err, "task", task.Name)
+	}
+
+	idleMinutes := 60
+	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
+		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
+	}
+	if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+		fresh.Status.LifecycleState = "Triage"
+		fresh.Status.Phase = ""
+		fresh.Status.LastActivityAt = &now
+		fresh.Status.DeadlineAt = &deadline
+		if err := s.cfg.Client.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		// Clear turn annotations (metadata update, separate from status).
+		fresh2 := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
+			return err
+		}
+		if fresh2.Annotations != nil {
+			delete(fresh2.Annotations, tatarav1.AnnCurrentTurn)
+			delete(fresh2.Annotations, tatarav1.AnnCurrentSubtask)
+			delete(fresh2.Annotations, tatarav1.AnnTurnComplete)
+			delete(fresh2.Annotations, tatarav1.AnnTurnStartedAt)
+			delete(fresh2.Annotations, tatarav1.AnnPodRecreations)
+		}
+		return s.cfg.Client.Update(ctx, fresh2)
+	}); updateErr != nil {
+		s.log.ErrorContext(ctx, "reactivate: update task", "error", updateErr, "task", task.Name)
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "reactivate task", http.StatusInternalServerError)
+		return
+	}
+	s.log.InfoContext(ctx, "issue_comment: reactivated parked lifecycle task",
+		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
+	s.count(provider, ev.Kind, ev.Action, "accepted")
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func mentionsBot(body, bot string) bool {
