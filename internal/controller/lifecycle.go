@@ -359,13 +359,13 @@ func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alph
 	return r.driveAgentRun(ctx, project, &repo, task, prompt)
 }
 
-// buildTriagePromptFor fetches issue comments via ReaderFor (if wired) and
-// builds the full triage turn-0 prompt with the comment thread included.
-// On any error it falls back to the plain lifecycleTriageText gracefully.
+// buildTriagePromptFor fetches issue content and comments via ReaderFor (if wired) and
+// builds the full triage turn-0 prompt with real title, body, and comment thread included.
+// On any error it falls back gracefully with empty title/body.
 func (r *TaskReconciler) buildTriagePromptFor(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) string {
 	l := log.FromContext(ctx)
 	if r.ReaderFor == nil || task.Spec.Source == nil {
-		return lifecycleTriageText(task)
+		return lifecycleTriageText(task, "", "")
 	}
 	provider := task.Spec.Source.Provider
 	if provider == "" && project.Spec.Scm != nil {
@@ -374,23 +374,27 @@ func (r *TaskReconciler) buildTriagePromptFor(ctx context.Context, project *tata
 	token, err := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef)
 	if err != nil {
 		l.Info("triage: could not fetch token for comment thread (non-fatal)", "resource_id", task.Name)
-		return lifecycleTriageText(task)
+		return lifecycleTriageText(task, "", "")
 	}
 	reader, err := r.ReaderFor(provider, token)
 	if err != nil {
 		l.Info("triage: could not get reader for comment thread (non-fatal)", "resource_id", task.Name)
-		return lifecycleTriageText(task)
+		return lifecycleTriageText(task, "", "")
 	}
 	owner, repoName, parseErr := scm.OwnerRepo(r.repoURLForTask(ctx, task))
 	if parseErr != nil {
-		return lifecycleTriageText(task)
+		return lifecycleTriageText(task, "", "")
+	}
+	content, err := reader.GetIssue(ctx, owner, repoName, task.Spec.Source.Number)
+	if err != nil {
+		l.Info("triage: GetIssue failed (non-fatal)", "resource_id", task.Name, "err", err.Error())
 	}
 	comments, err := reader.ListIssueComments(ctx, owner, repoName, task.Spec.Source.Number)
 	if err != nil {
 		l.Info("triage: ListIssueComments failed (non-fatal)", "resource_id", task.Name, "err", err.Error())
-		return lifecycleTriageText(task)
+		comments = nil
 	}
-	return buildTriagePrompt(task, comments)
+	return buildTriagePrompt(task, content.Title, content.Body, comments)
 }
 
 // repoURLForTask fetches the Repository URL for the task's RepositoryRef.

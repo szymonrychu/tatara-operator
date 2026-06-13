@@ -39,6 +39,35 @@ func (f *fakeReaderComments) GetCommitCIStatus(_ context.Context, _, _, _ string
 func (f *fakeReaderComments) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
 	return f.comments, f.err
 }
+func (f *fakeReaderComments) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
+	return scm.IssueContent{}, nil
+}
+
+// fakeReaderWithIssue is a fake SCMReader that returns scripted issue content and comments.
+type fakeReaderWithIssue struct {
+	title    string
+	body     string
+	comments []scm.IssueComment
+}
+
+func (f *fakeReaderWithIssue) ListOpenPRs(_ context.Context, _, _ string) ([]scm.PRRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderWithIssue) ListOpenIssues(_ context.Context, _, _ string) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderWithIssue) ListBoardItems(_ context.Context, _ scm.BoardRef) ([]scm.BoardItem, error) {
+	return nil, nil
+}
+func (f *fakeReaderWithIssue) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeReaderWithIssue) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return f.comments, nil
+}
+func (f *fakeReaderWithIssue) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
+	return scm.IssueContent{Title: f.title, Body: f.body}, nil
+}
 
 // TestBuildTriagePrompt_NoComments verifies the prompt equals the plain
 // lifecycleTriageText when there are no prior comments.
@@ -56,10 +85,20 @@ func TestBuildTriagePrompt_NoComments(t *testing.T) {
 			},
 		},
 	}
-	got := buildTriagePrompt(task, nil)
-	want := lifecycleTriageText(task)
+	got := buildTriagePrompt(task, "My Issue Title", "My Issue Body", nil)
+	want := lifecycleTriageText(task, "My Issue Title", "My Issue Body")
 	if got != want {
 		t.Errorf("buildTriagePrompt with no comments:\ngot:  %q\nwant: %q", got, want)
+	}
+	// Title and body must appear; goal must not appear as issue body.
+	if !strings.Contains(got, "My Issue Title") {
+		t.Errorf("prompt must contain real issue title; got: %q", got)
+	}
+	if !strings.Contains(got, "My Issue Body") {
+		t.Errorf("prompt must contain real issue body; got: %q", got)
+	}
+	if strings.Contains(got, "Issue body:\nFix the login bug") {
+		t.Errorf("prompt must NOT use task Goal as issue body; got: %q", got)
 	}
 }
 
@@ -86,14 +125,24 @@ func TestBuildTriagePrompt_WithComments(t *testing.T) {
 			},
 		},
 	}
-	got := buildTriagePrompt(task, comments)
+	got := buildTriagePrompt(task, "Fix Title", "Fix Body", comments)
 
 	// Must contain the base triage instructions.
-	base := lifecycleTriageText(task)
+	base := lifecycleTriageText(task, "Fix Title", "Fix Body")
 	if !strings.Contains(got, "issue_outcome") {
 		t.Errorf("buildTriagePrompt must contain base triage instructions; got: %q", got)
 	}
 	_ = base
+	// Real title and body must appear; goal must not appear as issue body.
+	if !strings.Contains(got, "Fix Title") {
+		t.Errorf("prompt must contain real issue title; got: %q", got)
+	}
+	if !strings.Contains(got, "Fix Body") {
+		t.Errorf("prompt must contain real issue body; got: %q", got)
+	}
+	if strings.Contains(got, "Issue body:\nFix the login bug") {
+		t.Errorf("prompt must NOT use task Goal as issue body; got: %q", got)
+	}
 
 	// Must contain a thread section.
 	if !strings.Contains(got, "## Conversation thread") {
@@ -133,7 +182,7 @@ func TestBuildTriagePrompt_CapLength(t *testing.T) {
 			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#1", Number: 1},
 		},
 	}
-	got := buildTriagePrompt(task, comments)
+	got := buildTriagePrompt(task, "cap title", "cap body", comments)
 	// Should NOT contain the first 5 comments (oldest ones were dropped).
 	for i := 0; i < 5; i++ {
 		oldest := comments[i].Body
@@ -380,5 +429,77 @@ func TestConversation_AfterDeadline_TransitionsToStopped(t *testing.T) {
 	podErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, pod)
 	if podErr == nil {
 		t.Error("pod must NOT be created when transitioning to Stopped")
+	}
+}
+
+// TestTriagePrompt_ContainsRealTitleAndBody verifies that the triage prompt
+// produced by buildTriagePromptFor contains the real issue title and body
+// fetched via GetIssue, and does NOT contain the task's Goal as the issue body.
+func TestTriagePrompt_ContainsRealTitleAndBody(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-triage-realtitle"
+	proj := "lc-trt-proj"
+	repo := "lc-trt-repo"
+	sec := "lc-trt-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#55",
+		URL: "https://github.com/o/r/issues/55", Number: 55,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+
+	task.Status.LifecycleState = "Triage"
+	task.Status.Phase = "Planning"
+	task.Status.PodName = agent.PodName(task)
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: agent.PodName(task), Namespace: testNS},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "wrapper", Image: "wrapper:1"}}},
+	}
+	if err := k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	if err := k8sClient.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("set pod ready: %v", err)
+	}
+
+	sess := newFakeSession()
+	r := newLifecycleReconciler(t, &lifecycleFakeSCMWriter{})
+	r.Session = sess
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &fakeReaderWithIssue{
+			title: "Real Title",
+			body:  "Real Body",
+		}, nil
+	}
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	sub, ok := sess.lastSubmit()
+	if !ok {
+		t.Fatal("expected a SubmitTurn call; none recorded")
+	}
+	if !strings.Contains(sub.Text, "Real Title") {
+		t.Errorf("prompt must contain real issue title; text=%q", sub.Text)
+	}
+	if !strings.Contains(sub.Text, "Real Body") {
+		t.Errorf("prompt must contain real issue body; text=%q", sub.Text)
+	}
+	// Goal must NOT appear as the issue body.
+	goal := task.Spec.Goal
+	if strings.Contains(sub.Text, "Issue body:\n"+goal) {
+		t.Errorf("prompt must NOT use task Goal as issue body; goal=%q text=%q", goal, sub.Text)
 	}
 }

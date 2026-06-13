@@ -49,6 +49,31 @@ func TestGitLabListOpenIssues(t *testing.T) {
 	}
 }
 
+func TestGitLabGetIssue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/issues/21" {
+			t.Fatalf("unexpected path: %q", glTestPath(r))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"iid":         21,
+			"title":       "gl title",
+			"description": "gl body",
+		})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	content, err := c.GetIssue(context.Background(), "g/p", "", 21)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if content.Title != "gl title" {
+		t.Errorf("Title = %q, want %q", content.Title, "gl title")
+	}
+	if content.Body != "gl body" {
+		t.Errorf("Body = %q, want %q", content.Body, "gl body")
+	}
+}
+
 func TestGitLabCloseIssue(t *testing.T) {
 	paths := map[string]bool{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
