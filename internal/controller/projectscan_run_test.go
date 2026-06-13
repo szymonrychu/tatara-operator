@@ -536,16 +536,16 @@ func TestBrainstorm_UnderCap_CreatesOnePerRepo(t *testing.T) {
 	}
 }
 
-// TestBrainstorm_AtCap_SkipsRepo: repo with >= maxOpenProposals open approval-label issues -> no brainstorm task.
+// TestBrainstorm_AtCap_SkipsRepo: repo with >= maxOpenProposals open idea-label issues -> no brainstorm task.
 func TestBrainstorm_AtCap_SkipsRepo(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "bs-atcap", []string{"o/c"}, 3)
-	// 3 open issues with the approval label -> at cap
+	// 3 open issues with the idea label (default "tatara-idea") -> at cap
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/c": {
-				{Repo: "o/c", Number: 1, Labels: []string{"tatara/awaiting-approval"}, IsPR: false},
-				{Repo: "o/c", Number: 2, Labels: []string{"tatara/awaiting-approval"}, IsPR: false},
-				{Repo: "o/c", Number: 3, Labels: []string{"tatara/awaiting-approval"}, IsPR: false},
+				{Repo: "o/c", Number: 1, Labels: []string{"tatara-idea"}, IsPR: false},
+				{Repo: "o/c", Number: 2, Labels: []string{"tatara-idea"}, IsPR: false},
+				{Repo: "o/c", Number: 3, Labels: []string{"tatara-idea"}, IsPR: false},
 			},
 		},
 	}

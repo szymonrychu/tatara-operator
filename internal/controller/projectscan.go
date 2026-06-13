@@ -698,10 +698,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	if maxProp < 1 {
 		maxProp = 3
 	}
-	approvalLabel := ""
-	if proj.Spec.Scm != nil {
-		approvalLabel = proj.Spec.Scm.ApprovalLabel
-	}
+	ideaLabel, _, _ := lifecycleLabels(proj.Spec.Scm)
 	created := 0
 	for i := range repos {
 		repo := repos[i]
@@ -713,7 +710,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			r.Metrics.ScanItem("brainstorm", "skipped_inflight")
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, &repo, approvalLabel, existing)
+		backlog, err := r.proposalBacklog(ctx, reader, &repo, ideaLabel, existing)
 		if err != nil {
 			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
 			continue
@@ -756,21 +753,11 @@ func brainstormInFlight(existing []tatarav1alpha1.Task, repoName string) bool {
 	return false
 }
 
-// proposalBacklog counts open, unapproved agent proposals for repo. When
-// approvalLabel is set it counts open non-PR issues bearing that label (live
-// ListOpenIssues). When empty it falls back to counting AwaitingApproval
-// proposal Tasks for the repo.
-func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, approvalLabel string, existing []tatarav1alpha1.Task) (int, error) {
-	if approvalLabel == "" {
-		n := 0
-		for i := range existing {
-			t := existing[i]
-			if t.Spec.RepositoryRef == repo.Name && t.Spec.ProposedIssue != nil && t.Status.Phase == "AwaitingApproval" {
-				n++
-			}
-		}
-		return n, nil
-	}
+// proposalBacklog counts open, undecided ideas for repo: open non-PR issues
+// bearing the idea label (live ListOpenIssues). This subsumes tatara-originated
+// proposals and any human-filed issue parked as an idea, providing conservative
+// brainstorm backpressure.
+func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, ideaLabel string, _ []tatarav1alpha1.Task) (int, error) {
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
 	if err != nil {
 		return 0, err
@@ -781,7 +768,7 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 	}
 	n := 0
 	for _, iss := range issues {
-		if !iss.IsPR && hasLabel(iss.Labels, approvalLabel) {
+		if !iss.IsPR && hasLabel(iss.Labels, ideaLabel) {
 			n++
 		}
 	}
