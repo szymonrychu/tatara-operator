@@ -116,3 +116,11 @@ func TestPlanTurnText_MentionsAllReposCloned(t *testing.T) {
 		t.Errorf("plan turn missing 'each repo you' instruction: %q", txt)
 	}
 }
+
+func TestLifecycleTriageText_ApprovalInstructions(t *testing.T) {
+	task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r#1", URL: "u"}}}
+	got := lifecycleTriageText(task, "T", "B")
+	if !strings.Contains(got, "human") || !strings.Contains(got, "approval comment") {
+		t.Fatalf("triage prompt missing conversation-approval guidance:\n%s", got)
+	}
+}
