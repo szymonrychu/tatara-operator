@@ -73,6 +73,14 @@ spec:
               maxConcurrentTasks:
                 default: 3
                 type: integer
+              maxOpenTasks:
+                default: 3
+                description: |-
+                  MaxOpenTasks is the hard ceiling on non-terminal Tasks the operator will
+                  autonomously create for this Project (cron scans + brainstorm). At the cap,
+                  scan/brainstorm creation is skipped until open Tasks finish. The reactive
+                  webhook path is exempt (human-initiated).
+                type: integer
               memory:
                 description: |-
                   MemorySpec configures the per-Project memory stack footprint. All fields

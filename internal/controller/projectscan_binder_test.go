@@ -24,10 +24,11 @@ func TestIssueScanCreatesIssueLifecycleKind(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
+	b := 99
 	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-issue-kind-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-issue-kind", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
-	}, nil, cron.IssueScan)
+	}, nil, cron.IssueScan, &b)
 
 	tasks := listScanTasks(t, "binder-issue-kind")
 	if len(tasks) == 0 {
@@ -72,8 +73,9 @@ func TestIssueScanLaneOccupancyCountsIssueLifecycle(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
+	b2 := 99
 	backlog := r.issueScan(context.Background(), proj, reader,
-		[]tatarav1alpha1.Repository{*repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan)
+		[]tatarav1alpha1.Repository{*repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
 	if !backlog {
 		t.Fatalf("want backlog=true (#2 blocked by the Running issueLifecycle #1 lane)")
 	}
@@ -181,7 +183,8 @@ func TestMRScanBotPRCreatesIssueLifecycleMRCI(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-mr-bot-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-mr-bot", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
+	b3 := 99
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b3)
 
 	tasks := listScanTasks(t, "binder-mr-bot")
 	if len(tasks) != 2 {
@@ -247,7 +250,8 @@ func TestMRScanBotPRClosesIssueKeyedOnLinkedIssue(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-mr-closes-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-mr-closes", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
+	b4 := 99
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b4)
 
 	tasks := listScanTasks(t, "binder-mr-closes")
 	if len(tasks) != 1 {
@@ -284,7 +288,8 @@ func TestMRScanBotPRNoClosesKeyedOnPRNumber(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-mr-noclose-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-mr-noclose", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
+	b5 := 99
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b5)
 
 	tasks := listScanTasks(t, "binder-mr-noclose")
 	if len(tasks) != 1 {

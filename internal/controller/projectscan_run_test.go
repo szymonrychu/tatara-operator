@@ -108,7 +108,8 @@ func TestIssueScan_PerRepoTopUp(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	backlog := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	b := 99
+	backlog := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
 	if !backlog {
 		t.Fatalf("want backlog=true (2 of 4 issues remain after per-repo top-up)")
 	}
@@ -146,7 +147,8 @@ func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	backlog := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan)
+	b2 := 99
+	backlog := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
 	if !backlog {
 		t.Fatalf("want backlog=true (#2 blocked by the Running #1 lane)")
 	}
@@ -171,7 +173,8 @@ func TestMRScan_PerRepoTopUp(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
+	b3 := 99
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b3)
 	if !backlog {
 		t.Fatalf("want backlog=true (2 of 4 PRs remain after per-repo top-up)")
 	}
@@ -519,7 +522,8 @@ func TestBrainstorm_UnderCap_CreatesOnePerRepo(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	bbs := 99
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs)
 
 	tasks := listBrainstormTasks(t, "bs-undercap")
 	if len(tasks) != 2 {
@@ -553,7 +557,8 @@ func TestBrainstorm_AtCap_SkipsRepo(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	bbs2 := 99
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs2)
 
 	tasks := listBrainstormTasks(t, "bs-atcap")
 	if len(tasks) != 0 {
@@ -589,7 +594,8 @@ func TestBrainstorm_InFlight_SkipsRepo(t *testing.T) {
 
 	existing := []tatarav1alpha1.Task{*pre}
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	r.brainstorm(context.Background(), proj, reader, repos, existing, act)
+	bbs3 := 99
+	r.brainstorm(context.Background(), proj, reader, repos, existing, act, &bbs3)
 
 	tasks := listBrainstormTasks(t, "bs-inflight")
 	if len(tasks) != 1 {
@@ -611,7 +617,8 @@ func TestBrainstorm_ListErrorIsolatesRepo(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	bbs4 := 99
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs4)
 
 	tasks := listBrainstormTasks(t, "bs-isolate")
 	// Only repo f should get a task; repo e errored and was skipped.
