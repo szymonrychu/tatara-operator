@@ -75,6 +75,9 @@ func (f *lifecycleFakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req
 	return scm.CreatedIssue{Ref: "o/r#99", URL: url}, nil
 }
 
+func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
+func (f *lifecycleFakeSCMWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
+
 // newLifecycleReconciler builds a TaskReconciler wired with the given SCM writer.
 func newLifecycleReconciler(t *testing.T, fw *lifecycleFakeSCMWriter) *TaskReconciler {
 	t.Helper()
