@@ -441,6 +441,31 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 
 	switch action {
 	case "close":
+		if hasUnmergedChange(task) {
+			// Invariant: never close an issue that has an unmerged code change.
+			// A human-comment re-triage of an issue whose MR is open/conflicting
+			// can yield a "close" outcome; closing here would orphan the unmerged
+			// change. Keep the issue open (idea) and await the change being
+			// merged-green or abandoned.
+			l.Info("triage close withheld: unmerged change exists; keeping issue open",
+				"action", "lifecycle_close_withheld", "resource_id", task.Name,
+				"pr_url", task.Status.PrURL, "head_branch", task.Status.HeadBranch)
+			if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+				return ctrl.Result{}, err
+			}
+			note := comment
+			if note != "" {
+				note += "\n\n"
+			}
+			note += "tatara: not closing - this issue has an unmerged change that must be merged (with green main CI) or abandoned first."
+			if err := r.triagePostComment(ctx, project, task, note); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.enterConversation(ctx, project, task, "close-withheld-unmerged"); err != nil {
+				return ctrl.Result{}, err
+			}
+			break
+		}
 		if err := r.setLifecycleLabel(ctx, project, task, rejected); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -591,9 +616,25 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, task *tatarav1a
 	return ctrl.Result{RequeueAfter: pollRequeue}, nil
 }
 
-// triageCloseIssue calls CloseIssue for the task's source issue.
+// hasUnmergedChange reports whether the task produced a code artifact (a pushed
+// branch or an opened PR/MR). An issue with an unmerged change must NOT be
+// closed by an agent-driven outcome; only handleMainCI (merge recorded + main
+// CI green) may close such an issue.
+func hasUnmergedChange(task *tatarav1alpha1.Task) bool {
+	return task.Status.PrURL != "" || task.Status.HeadBranch != ""
+}
+
+// triageCloseIssue calls CloseIssue for the task's source issue. It refuses to
+// close when an unmerged change exists (defence-in-depth for the invariant that
+// only a merged-and-green lifecycle may close an issue).
 func (r *TaskReconciler) triageCloseIssue(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, comment string) error {
 	if task.Spec.Source == nil {
+		return nil
+	}
+	if hasUnmergedChange(task) {
+		log.FromContext(ctx).Info("triage close withheld: issue has an unmerged change",
+			"action", "scm_close_withheld", "resource_id", task.Name,
+			"number", task.Spec.Source.Number, "pr_url", task.Status.PrURL, "head_branch", task.Status.HeadBranch)
 		return nil
 	}
 	_, repo, writer, token, provider, err := r.scmContext(ctx, task)

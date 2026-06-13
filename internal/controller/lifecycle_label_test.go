@@ -24,7 +24,10 @@ func (errGetIssueReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.Is
 // finishTriage also calls Comment (discuss) and CloseIssue (close); add no-op
 // overrides so the embedded nil SCMWriter is never dereferenced.
 func (w *labelWriter) Comment(_ context.Context, _, _, _ string) error { return nil }
-func (w *labelWriter) CloseIssue(_ context.Context, _, _ string, _ int, _ string) error {
+func (w *labelWriter) CloseIssue(_ context.Context, _, _ string, number int, _ string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = append(w.closed, number)
 	return nil
 }
 

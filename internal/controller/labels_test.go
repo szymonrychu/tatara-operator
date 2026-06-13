@@ -20,6 +20,7 @@ type labelWriter struct {
 	mu      sync.Mutex
 	added   []string
 	removed []string
+	closed  []int
 }
 
 func (w *labelWriter) AddLabel(_ context.Context, _, _, label string) error {

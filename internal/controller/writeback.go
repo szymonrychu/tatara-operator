@@ -721,6 +721,15 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 		return r.writeBackOpenChange(ctx, task)
 	}
 	// close
+	// Invariant: never close an issue that has an unmerged code change. Only the
+	// merged-and-green lifecycle (handleMainCI) may close such an issue.
+	if hasUnmergedChange(task) {
+		l.Info("issue close withheld: triageIssue has an unmerged change",
+			"action", "scm_close_withheld", "resource_id", task.Name, "number", task.Spec.Source.Number,
+			"pr_url", task.Status.PrURL, "head_branch", task.Status.HeadBranch)
+		r.clearWritebackPending(ctx, task, "CloseWithheldUnmerged", "issue has an unmerged change; close withheld")
+		return ctrl.Result{}, nil
+	}
 	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, err
