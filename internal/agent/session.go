@@ -4,7 +4,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 )
 
 // TurnResult is the outcome of one wrapper turn, as reported by the wrapper's
@@ -29,4 +31,39 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string {
 	return fmt.Sprintf("wrapper http %d: %s", e.Status, e.Body)
+}
+
+// UnreachableError wraps a transport-level failure reaching the wrapper: the
+// HTTP request never produced a response. It typically means the wrapper pod
+// is still booting its turn server even though the pod is Ready and the
+// Service has endpoints. Callers treat it as a transient retry, not a hard
+// failure that should trigger reconcile backoff.
+type UnreachableError struct {
+	Err error
+}
+
+func (e *UnreachableError) Error() string {
+	if e.Err == nil {
+		return "agent unreachable"
+	}
+	return "agent unreachable: " + e.Err.Error()
+}
+
+func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// isUnreachable reports whether err from http.Client.Do is a transport-level
+// failure to reach the wrapper (dial refused/reset, no route, DNS not found):
+// the pod is still booting its turn server. Timeouts and context cancellation
+// are deliberately NOT boot-races - a hung or shutting-down server must keep
+// erroring (and backing off) rather than requeue on a fixed short interval
+// forever.
+func isUnreachable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return false
+	}
+	return true
 }

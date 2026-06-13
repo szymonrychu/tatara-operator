@@ -49,6 +49,9 @@ func (s *httpSession) do(ctx context.Context, method, url string, body any, out 
 	}
 	resp, err := s.hc.Do(req)
 	if err != nil {
+		if isUnreachable(err) {
+			return &UnreachableError{Err: err}
+		}
 		return fmt.Errorf("agent: do request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()

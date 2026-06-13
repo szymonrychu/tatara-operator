@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
@@ -38,10 +40,16 @@ func gaugeValue(t *testing.T, reg *prometheus.Registry, name string, labels map[
 }
 
 func newTaskReconciler(fs agent.Session) *TaskReconciler {
+	r, _ := newTaskReconcilerReg(fs)
+	return r
+}
+
+func newTaskReconcilerReg(fs agent.Session) (*TaskReconciler, *prometheus.Registry) {
+	reg := prometheus.NewRegistry()
 	return &TaskReconciler{
 		Client:  k8sClient,
 		Scheme:  k8sClient.Scheme(),
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics: obs.NewOperatorMetrics(reg),
 		Session: fs,
 		PodConfig: agent.PodConfig{
 			Namespace:           testNS,
@@ -50,7 +58,7 @@ func newTaskReconciler(fs agent.Session) *TaskReconciler {
 			AnthropicSecretName: "anthropic",
 			CLIOIDCSecretName:   "tatara-cli-oidc",
 		},
-	}
+	}, reg
 }
 
 func reconcileTask(t *testing.T, r *TaskReconciler, name string) (ctrl.Result, error) {
@@ -336,6 +344,146 @@ func TestTaskReconcile_PlanTurnSubmitted(t *testing.T) {
 	tk := getTask(t, "t-plan")
 	if tk.Annotations[annCurrentTurn] != sub.TurnID {
 		t.Errorf("current-turn = %q, want %q", tk.Annotations[annCurrentTurn], sub.TurnID)
+	}
+}
+
+func TestTaskReconcile_AgentUnreachable_RequeuesWithoutError(t *testing.T) {
+	mkTaskProject(t, "p-unreach", 3)
+	mkTaskRepository(t, "r-unreach", "p-unreach")
+	mkTask(t, "t-unreach", "p-unreach", "r-unreach")
+	setProjectMemoryReady(t, "p-unreach", "http://mem-p-unreach.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r, reg := newTaskReconcilerReg(fs)
+	if _, err := reconcileTask(t, r, "t-unreach"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-unreach")
+	// Turn server still booting: transport-level failure, not an HTTP error.
+	fs.submitErr = &agent.UnreachableError{Err: errors.New("dial tcp: connect: connection refused")}
+
+	res, err := reconcileTask(t, r, "t-unreach")
+	if err != nil {
+		t.Fatalf("agent-unreachable must not error the reconcile (would trigger exponential backoff): %v", err)
+	}
+	if res.RequeueAfter != agentBootRequeue {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, agentBootRequeue)
+	}
+	if _, ok := fs.lastSubmit(); ok {
+		t.Error("no turn should be recorded when the submit fails")
+	}
+	if tk := getTask(t, "t-unreach"); tk.Annotations[annCurrentTurn] != "" {
+		t.Errorf("current-turn annotation should be empty, got %q", tk.Annotations[annCurrentTurn])
+	}
+	if got := counterValue(t, reg, "operator_agent_boot_race_requeue_total", nil); got != 1 {
+		t.Errorf("operator_agent_boot_race_requeue_total = %v, want 1", got)
+	}
+}
+
+func TestTaskReconcile_AgentUnreachable_StampStableAcrossRequeues(t *testing.T) {
+	mkTaskProject(t, "p-unrstable", 3)
+	mkTaskRepository(t, "r-unrstable", "p-unrstable")
+	mkTask(t, "t-unrstable", "p-unrstable", "r-unrstable")
+	setProjectMemoryReady(t, "p-unrstable", "http://mem-p-unrstable.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-unrstable"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-unrstable")
+	fs.submitErr = &agent.UnreachableError{Err: errors.New("connection refused")}
+
+	if _, err := reconcileTask(t, r, "t-unrstable"); err != nil { // boot-race 1: stamps
+		t.Fatalf("boot-race 1: %v", err)
+	}
+	first := getTask(t, "t-unrstable").Annotations[annAgentUnreachableSince]
+	if first == "" {
+		t.Fatal("expected marker stamped on first boot-race")
+	}
+	if _, err := reconcileTask(t, r, "t-unrstable"); err != nil { // boot-race 2: within deadline
+		t.Fatalf("boot-race 2: %v", err)
+	}
+	if second := getTask(t, "t-unrstable").Annotations[annAgentUnreachableSince]; second != first {
+		t.Errorf("marker re-stamped within deadline: was %q now %q (would reset the boot deadline every requeue)", first, second)
+	}
+}
+
+func TestTaskReconcile_AgentUnreachable_TerminatesAfterDeadline(t *testing.T) {
+	mkTaskProject(t, "p-unrdead", 3)
+	mkTaskRepository(t, "r-unrdead", "p-unrdead")
+	mkTask(t, "t-unrdead", "p-unrdead", "r-unrdead")
+	setProjectMemoryReady(t, "p-unrdead", "http://mem-p-unrdead.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-unrdead"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-unrdead")
+	fs.submitErr = &agent.UnreachableError{Err: errors.New("connection refused")}
+	// Agent has been unreachable longer than the boot deadline.
+	annotate(t, "t-unrdead", map[string]string{
+		annAgentUnreachableSince: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
+	})
+
+	if _, err := reconcileTask(t, r, "t-unrdead"); err != nil {
+		t.Fatalf("terminate path must not error: %v", err)
+	}
+	if tk := getTask(t, "t-unrdead"); tk.Status.Phase != "Failed" {
+		t.Errorf("phase = %q, want Failed (a never-reachable pod must terminate, not loop forever)", tk.Status.Phase)
+	}
+}
+
+func TestTaskReconcile_AgentUnreachable_ClearsMarkerOnSuccess(t *testing.T) {
+	mkTaskProject(t, "p-unrclr", 3)
+	mkTaskRepository(t, "r-unrclr", "p-unrclr")
+	mkTask(t, "t-unrclr", "p-unrclr", "r-unrclr")
+	setProjectMemoryReady(t, "p-unrclr", "http://mem-p-unrclr.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-unrclr"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-unrclr")
+	fs.submitErr = &agent.UnreachableError{Err: errors.New("connection refused")}
+	if _, err := reconcileTask(t, r, "t-unrclr"); err != nil { // boot-race: stamps marker
+		t.Fatalf("boot-race reconcile: %v", err)
+	}
+	if tk := getTask(t, "t-unrclr"); tk.Annotations[annAgentUnreachableSince] == "" {
+		t.Fatal("expected unreachable marker stamped after first boot-race")
+	}
+	fs.submitErr = nil // agent now reachable
+	if _, err := reconcileTask(t, r, "t-unrclr"); err != nil {
+		t.Fatalf("recovered reconcile: %v", err)
+	}
+	if _, ok := fs.lastSubmit(); !ok {
+		t.Error("expected a successful submit after recovery")
+	}
+	if tk := getTask(t, "t-unrclr"); tk.Annotations[annAgentUnreachableSince] != "" {
+		t.Errorf("unreachable marker must clear on success, got %q", tk.Annotations[annAgentUnreachableSince])
+	}
+}
+
+func TestTaskReconcile_SubmitHTTPError_StillErrors(t *testing.T) {
+	mkTaskProject(t, "p-httperr", 3)
+	mkTaskRepository(t, "r-httperr", "p-httperr")
+	mkTask(t, "t-httperr", "p-httperr", "r-httperr")
+	setProjectMemoryReady(t, "p-httperr", "http://mem-p-httperr.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-httperr"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-httperr")
+	// A real HTTP rejection from the wrapper must keep erroring (not be masked
+	// as a boot-race requeue).
+	fs.submitErr = &agent.HTTPError{Status: 500, Body: "boom"}
+
+	if _, err := reconcileTask(t, r, "t-httperr"); err == nil {
+		t.Fatal("a real HTTP error from submit must still error the reconcile")
 	}
 }
 

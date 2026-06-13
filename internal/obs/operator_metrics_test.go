@@ -25,6 +25,18 @@ func TestReconcileTotal(t *testing.T) {
 	}
 }
 
+func TestAgentBootRaceRequeue(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AgentBootRaceRequeue()
+	m.AgentBootRaceRequeue()
+
+	if got := testutil.ToFloat64(m.agentBootRaceRequeue); got != 2 {
+		t.Fatalf("operator_agent_boot_race_requeue_total = %v, want 2", got)
+	}
+}
+
 func TestIngestJobDuration(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
