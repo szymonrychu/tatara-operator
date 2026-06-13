@@ -7,7 +7,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -156,7 +155,7 @@ func doReconcileApproval(t *testing.T, r *TaskReconciler, name string) ctrl.Resu
 }
 
 func TestApprovalGate(t *testing.T) {
-	t.Run("proposal creates Source + holds AwaitingApproval", func(t *testing.T) {
+	t.Run("proposal creates Source + completes Task (Succeeded)", func(t *testing.T) {
 		fw := &fakeSCMWriter{}
 		r := newApprovalReconciler(t, fw)
 		task := seedApprovalTask(t, "ap-task1", "ap-proj1", "ap-repo1", "ap-scm1")
@@ -167,8 +166,8 @@ func TestApprovalGate(t *testing.T) {
 		require.NoError(t, k8sClient.Get(context.Background(),
 			types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
 
-		// CreateIssue was called with the approval label.
-		require.Equal(t, []string{"tatara/awaiting-approval"}, fw.createdLabels)
+		// CreateIssue was called with the idea label (not the old approval label).
+		require.Equal(t, []string{"tatara-idea"}, fw.createdLabels)
 		// Board item was added and column was set.
 		require.True(t, fw.addedBoardItem)
 		require.Equal(t, "Proposed", fw.boardColumn)
@@ -178,43 +177,34 @@ func TestApprovalGate(t *testing.T) {
 		require.False(t, got.Spec.Source.IsPR)
 		// DiscoveredIssues has the URL.
 		require.Contains(t, got.Status.DiscoveredIssues, "https://gh/o/r/issues/1")
-		// Phase is AwaitingApproval.
-		require.Equal(t, "AwaitingApproval", got.Status.Phase)
-		// No pod was created for this task (proposal holds execution).
+		// Phase is Succeeded - idea issue flows through normal lifecycle, no parking.
+		require.Equal(t, "Succeeded", got.Status.Phase)
+		// No pod was created for this task (proposal task does not spawn an agent run).
 		podName := agent.PodName(&got)
 		var pod corev1.Pod
 		err := k8sClient.Get(context.Background(),
 			types.NamespacedName{Namespace: testNS, Name: podName}, &pod)
-		require.True(t, err != nil, "pod should not exist for approval-gated task, but got no error")
+		require.True(t, err != nil, "pod should not exist for proposal task, but got no error")
 	})
 
-	t.Run("gate releases on ApprovalApproved=True", func(t *testing.T) {
+	t.Run("proposal task stays Succeeded on second reconcile", func(t *testing.T) {
 		fw := &fakeSCMWriter{}
 		r := newApprovalReconciler(t, fw)
 		task := seedApprovalTask(t, "ap-task2", "ap-proj2", "ap-repo2", "ap-scm2")
 
-		// First reconcile: triggers proposal creation, stays AwaitingApproval.
+		// First reconcile: creates issue, completes the Task (Succeeded).
 		doReconcileApproval(t, r, task.Name)
 
 		var got tatarav1alpha1.Task
 		require.NoError(t, k8sClient.Get(context.Background(),
 			types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
-		require.Equal(t, "AwaitingApproval", got.Status.Phase)
+		require.Equal(t, "Succeeded", got.Status.Phase)
 
-		// Simulate human approval: set ApprovalApproved=True.
-		apimeta.SetStatusCondition(&got.Status.Conditions, metav1.Condition{
-			Type:   tatarav1alpha1.ConditionApprovalApproved,
-			Status: metav1.ConditionTrue,
-			Reason: "HumanApproved",
-		})
-		require.NoError(t, k8sClient.Status().Update(context.Background(), &got))
-
-		// Second reconcile: gate released; reconciler should proceed past AwaitingApproval.
+		// Second reconcile: task is already Succeeded; reconciler must be a no-op.
 		doReconcileApproval(t, r, task.Name)
 
 		require.NoError(t, k8sClient.Get(context.Background(),
 			types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
-		// Phase must have advanced past AwaitingApproval.
-		require.NotEqual(t, "AwaitingApproval", got.Status.Phase)
+		require.Equal(t, "Succeeded", got.Status.Phase)
 	})
 }

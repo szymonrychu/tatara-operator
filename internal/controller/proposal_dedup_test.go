@@ -189,10 +189,10 @@ func TestCreateProposal_SourceAlreadySet(t *testing.T) {
 	// CreateIssue must NOT have been called.
 	require.Zero(t, fw.calls(), "CreateIssue must not be called when Source.URL is already set")
 
-	// Task status should be AwaitingApproval.
+	// Task must be completed (Succeeded) - the idea issue flows through the normal lifecycle.
 	var got tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
-	require.Equal(t, "AwaitingApproval", got.Status.Phase, "phase must be AwaitingApproval")
+	require.Equal(t, "Succeeded", got.Status.Phase, "phase must be Succeeded after source-set guard")
 
 	// WritebackPending must be False.
 	cond := findCond(got.Status.Conditions, "WritebackPending")
@@ -290,8 +290,8 @@ func TestCreateProposal_TitleDuplicateSkipsCreate(t *testing.T) {
 	require.NotNil(t, got.Spec.Source, "Spec.Source must be set to the existing issue")
 	require.Equal(t, 42, got.Spec.Source.Number, "Source.Number must match the existing issue")
 
-	// Phase must be AwaitingApproval.
-	require.Equal(t, "AwaitingApproval", got.Status.Phase)
+	// Phase must be Succeeded.
+	require.Equal(t, "Succeeded", got.Status.Phase)
 
 	// WritebackPending must be False.
 	cond := findCond(got.Status.Conditions, "WritebackPending")
@@ -345,8 +345,8 @@ func TestCreateProposal_TitleNoMatchProceedsNormally(t *testing.T) {
 
 // --- verify fix 3 still intact: createProposal routes through Phase transition ---
 
-// TestCreateProposal_SetsAwaitingApproval verifies the happy path: a fresh Task
-// with ProposedIssue gets CreateIssue called once and transitions to AwaitingApproval.
+// TestCreateProposal_HappyPath verifies the happy path: a fresh Task
+// with ProposedIssue gets CreateIssue called once and completes the Task (Succeeded).
 func TestCreateProposal_HappyPath(t *testing.T) {
 	fw := &fakeProposalWriter{}
 	r := newProposalReconciler(t, fw, nil)
@@ -365,10 +365,11 @@ func TestCreateProposal_HappyPath(t *testing.T) {
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
 	require.NotNil(t, got.Spec.Source, "Spec.Source must be set on happy path")
 	require.Equal(t, "https://github.com/o/r/issues/99", got.Spec.Source.URL)
-	require.Equal(t, "AwaitingApproval", got.Status.Phase)
+	require.Equal(t, "Succeeded", got.Status.Phase)
 
-	// ApprovalApproved condition must be False.
-	cond := apimeta.FindStatusCondition(got.Status.Conditions, tatarav1alpha1.ConditionApprovalApproved)
+	// WritebackPending must be False with reason BrainstormProposed.
+	cond := apimeta.FindStatusCondition(got.Status.Conditions, "WritebackPending")
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "BrainstormProposed", cond.Reason)
 }
