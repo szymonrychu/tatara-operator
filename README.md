@@ -16,21 +16,33 @@ operator-native Pod/Job spawning).
 
 ## Status
 
-Milestone M0 (scaffold). API types, shared `internal/{obs,auth,config}`
-packages, a no-reconciler manager, Dockerfile, Makefile, and a chart
-skeleton carrying the CRDs. Reconciler, webhook, REST, and agent logic
-land in M1-M6.
+Shipping 0.4.2. All milestones (M0-M6) and the per-project-memory line
+(N1-N4) are complete. The manager reconciles Project/Repository/Task/
+Subtask, provisions a per-project `tatara-memory` stack (CNPG Postgres,
+Neo4j, LightRAG, memory service), ingests repositories and tracks the
+last-ingested commit, serves an OIDC-gated REST API and HMAC-verified
+GitHub/GitLab webhooks on a shared listener, turns labelled issues into
+Tasks, runs the agent turn loop in `tatara-claude-code-wrapper` Pods, and
+writes results back to the SCM as one PR per changed repo plus an issue
+comment. Remaining work is the gated deploy steps tracked in `ROADMAP.md`.
 
 ## Layout
 
 ```
-cmd/manager/main.go               # controller-runtime manager entrypoint
-api/v1alpha1/                      # Project/Repository/Task/Subtask types
-internal/controller/              # reconcilers (M1+)
-internal/obs/                     # JSON slog + Prometheus registry
-internal/auth/                    # OIDC verifier + client-credentials token source
-internal/config/                  # env-scalar config
-charts/tatara-operator/           # cluster-agnostic Helm chart + CRDs
+cmd/manager/                       # controller-runtime manager entrypoint + wiring
+api/v1alpha1/                      # Project/Repository/Task/Subtask types + deepcopy
+internal/controller/               # Project/Repository/Task reconcilers, turn loop, write-back
+internal/agent/                    # agent wrapper Pod/Service + turn session/callback
+internal/ingest/                   # repo-ingest Job builder
+internal/memory/                   # per-project memory stack builders (CNPG/Neo4j/LightRAG/memory)
+internal/scm/                      # GitHub/GitLab clients + repo scan + provider registry
+internal/restapi/                  # OIDC-gated CRUD REST API
+internal/webhook/                  # HMAC-verified push + work-item webhook server
+internal/auth/                     # OIDC verifier + client-credentials token source
+internal/config/                   # env-scalar config
+internal/obs/                      # JSON slog + Prometheus metrics
+internal/version/                  # build-stamped version info
+charts/tatara-operator/            # cluster-agnostic Helm chart + CRDs
 ```
 
 ## Development
