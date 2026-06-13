@@ -13,7 +13,6 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -775,115 +774,6 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 	return n, nil
 }
 
-// approvalBackstop recovers proposals approved on the SCM (approval label
-// removed) whose ApprovalApproved condition was never flipped (missed webhook).
-func (r *ProjectReconciler) approvalBackstop(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task) {
-	l := log.FromContext(ctx)
-	if proj.Spec.Scm == nil || proj.Spec.Scm.ApprovalLabel == "" {
-		return
-	}
-	approvalLabel := proj.Spec.Scm.ApprovalLabel
-	for i := range existing {
-		t := existing[i]
-		if t.Spec.ProposedIssue == nil || t.Status.Phase != "AwaitingApproval" || t.Spec.Source == nil {
-			continue
-		}
-		// Mirror the webhook's authoritative flip guard (server.go flipApproval):
-		// only a bot-authored proposal that requires approval may be flipped.
-		if !t.Spec.ApprovalRequired || proj.Spec.Scm.BotLogin == "" || t.Spec.Source.AuthorLogin != proj.Spec.Scm.BotLogin {
-			continue
-		}
-		if apimeta.IsStatusConditionTrue(t.Status.Conditions, tatarav1alpha1.ConditionApprovalApproved) {
-			continue
-		}
-		if implRunningForIssue(existing, t.Spec.Source.IssueRef, t.Name) {
-			continue
-		}
-		repo := repoByName(repos, t.Spec.RepositoryRef)
-		if repo == nil {
-			continue
-		}
-		owner, name, err := scm.OwnerRepo(repo.Spec.URL)
-		if err != nil {
-			continue
-		}
-		issues, err := reader.ListOpenIssues(ctx, owner, name)
-		if err != nil {
-			l.Info("approvalBackstop: list issues failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
-			continue
-		}
-		open, labelPresent := issueState(issues, t.Spec.Source.IssueRef, approvalLabel)
-		if !open || labelPresent {
-			continue // closed (webhook path), or still awaiting approval
-		}
-		// Approved on SCM but condition not set: flip it (RetryOnConflict).
-		if err := r.flipApprovalApproved(ctx, &t); err != nil {
-			l.Error(err, "approvalBackstop: flip approval", "resource_id", t.Name)
-			continue
-		}
-		r.Metrics.ApprovalBackstopFlip()
-		l.Info("approvalBackstop: recovered missed approval", "action", "approval_backstop", "resource_id", t.Name, "issue", t.Spec.Source.IssueRef)
-	}
-}
-
-// implRunningForIssue reports whether some active (non-terminal, non-AwaitingApproval)
-// Task other than self references issueRef.
-func implRunningForIssue(existing []tatarav1alpha1.Task, issueRef, self string) bool {
-	for i := range existing {
-		t := existing[i]
-		if t.Name == self || t.Spec.Source == nil || t.Spec.Source.IssueRef != issueRef {
-			continue
-		}
-		if !isTerminal(t.Status.Phase) && t.Status.Phase != "AwaitingApproval" {
-			return true
-		}
-	}
-	return false
-}
-
-// issueState returns (open, hasApprovalLabel) for the issue identified by
-// issueRef ("owner/repo#number") among the open issues; open=false if the ref
-// is not in the open list. Matches on IssueRef (not Number) because the
-// proposal-creation path records Source.Number=0 and the real number only
-// lives in Source.IssueRef.
-func issueState(issues []scm.IssueRef, issueRef, approvalLabel string) (bool, bool) {
-	for _, iss := range issues {
-		if fmt.Sprintf("%s#%d", iss.Repo, iss.Number) == issueRef {
-			return true, hasLabel(iss.Labels, approvalLabel)
-		}
-	}
-	return false, false
-}
-
-// repoByName returns a pointer to the Repository with the given name, or nil.
-func repoByName(repos []tatarav1alpha1.Repository, name string) *tatarav1alpha1.Repository {
-	for i := range repos {
-		if repos[i].Name == name {
-			return &repos[i]
-		}
-	}
-	return nil
-}
-
-// flipApprovalApproved sets the ApprovalApproved condition to True on a Task,
-// retrying on conflict.
-func (r *ProjectReconciler) flipApprovalApproved(ctx context.Context, task *tatarav1alpha1.Task) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
-		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-			Type:               tatarav1alpha1.ConditionApprovalApproved,
-			Status:             metav1.ConditionTrue,
-			Reason:             "ApprovalBackstop",
-			Message:            "approval label removed on SCM; recovered by backstop",
-			ObservedGeneration: fresh.Generation,
-		})
-		return r.Status().Update(ctx, fresh)
-	})
-}
-
 // runScans runs each due activity and returns the soonest next-fire as a
 // requeue duration. Cron parsing/SCM/create failures are logged and skipped per
 // activity so one bad activity never blocks the others or crashes the reconciler.
@@ -961,9 +851,6 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
 			"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "issueScan")
 	}
-
-	// approvalBackstop: unconditional - cheap, self-gating
-	r.approvalBackstop(ctx, proj, reader, repos, existing)
 
 	// brainstorm (opt-in)
 	if cronSpec.Brainstorm.Enabled {
