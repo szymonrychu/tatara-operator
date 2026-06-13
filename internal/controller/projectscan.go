@@ -793,6 +793,11 @@ func (r *ProjectReconciler) approvalBackstop(ctx context.Context, proj *tatarav1
 		if t.Spec.ProposedIssue == nil || t.Status.Phase != "AwaitingApproval" || t.Spec.Source == nil {
 			continue
 		}
+		// Mirror the webhook's authoritative flip guard (server.go flipApproval):
+		// only a bot-authored proposal that requires approval may be flipped.
+		if !t.Spec.ApprovalRequired || proj.Spec.Scm.BotLogin == "" || t.Spec.Source.AuthorLogin != proj.Spec.Scm.BotLogin {
+			continue
+		}
 		if apimeta.IsStatusConditionTrue(t.Status.Conditions, tatarav1alpha1.ConditionApprovalApproved) {
 			continue
 		}
@@ -812,7 +817,7 @@ func (r *ProjectReconciler) approvalBackstop(ctx context.Context, proj *tatarav1
 			l.Info("approvalBackstop: list issues failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
 			continue
 		}
-		open, labelPresent := issueState(issues, t.Spec.Source.Number, approvalLabel)
+		open, labelPresent := issueState(issues, t.Spec.Source.IssueRef, approvalLabel)
 		if !open || labelPresent {
 			continue // closed (webhook path), or still awaiting approval
 		}
@@ -841,11 +846,14 @@ func implRunningForIssue(existing []tatarav1alpha1.Task, issueRef, self string) 
 	return false
 }
 
-// issueState returns (open, hasApprovalLabel) for number among the open issues
-// (open=false if number is not in the open list).
-func issueState(issues []scm.IssueRef, number int, approvalLabel string) (bool, bool) {
+// issueState returns (open, hasApprovalLabel) for the issue identified by
+// issueRef ("owner/repo#number") among the open issues; open=false if the ref
+// is not in the open list. Matches on IssueRef (not Number) because the
+// proposal-creation path records Source.Number=0 and the real number only
+// lives in Source.IssueRef.
+func issueState(issues []scm.IssueRef, issueRef, approvalLabel string) (bool, bool) {
 	for _, iss := range issues {
-		if iss.Number == number {
+		if fmt.Sprintf("%s#%d", iss.Repo, iss.Number) == issueRef {
 			return true, hasLabel(iss.Labels, approvalLabel)
 		}
 	}

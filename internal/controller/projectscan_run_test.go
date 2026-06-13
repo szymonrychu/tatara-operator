@@ -475,12 +475,10 @@ func seedBrainstormProject(t *testing.T, name string, repoSlugs []string, maxOpe
 	}
 	var repos []tatarav1alpha1.Repository
 	for _, slug := range repoSlugs {
-		parts := strings.SplitN(slug, "/", 2)
 		repoName := name + "-" + strings.ReplaceAll(slug, "/", "-")
 		rp := &tatarav1alpha1.Repository{}
 		rp.Name = repoName
 		rp.Namespace = testNS
-		_ = parts
 		rp.Spec = tatarav1alpha1.RepositorySpec{
 			ProjectRef:       name,
 			URL:              "https://github.com/" + slug + ".git",
@@ -637,17 +635,20 @@ func TestBrainstorm_ListErrorIsolatesRepo(t *testing.T) {
 
 // mkAwaitingApprovalTask creates an AwaitingApproval proposal Task bound to a
 // project and repo, with a TaskSource.Number so the backstop can look it up.
-func mkAwaitingApprovalTask(t *testing.T, project, repoName, issueRef string, issueNumber int) *tatarav1alpha1.Task {
+func mkAwaitingApprovalTask(t *testing.T, project, repoName, issueRef string) *tatarav1alpha1.Task {
 	t.Helper()
 	task := &tatarav1alpha1.Task{}
 	task.GenerateName = "proposal-"
 	task.Namespace = testNS
 	task.Labels = map[string]string{labelActivity: "issueScan"}
+	// Mirror production createProposal: Number is 0 (the real number lives only
+	// in IssueRef), bot-authored, approval-required.
 	task.Spec = tatarav1alpha1.TaskSpec{
-		ProjectRef:    project,
-		RepositoryRef: repoName,
-		Goal:          "proposal",
-		Kind:          "brainstorm",
+		ProjectRef:       project,
+		RepositoryRef:    repoName,
+		Goal:             "proposal",
+		Kind:             "brainstorm",
+		ApprovalRequired: true,
 		ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
 			RepositoryRef: repoName,
 			Title:         "test proposal",
@@ -655,9 +656,10 @@ func mkAwaitingApprovalTask(t *testing.T, project, repoName, issueRef string, is
 			Kind:          "improvement",
 		},
 		Source: &tatarav1alpha1.TaskSource{
-			Provider: "github",
-			IssueRef: issueRef,
-			Number:   issueNumber,
+			Provider:    "github",
+			IssueRef:    issueRef,
+			Number:      0,
+			AuthorLogin: "tatara-bot",
 		},
 	}
 	if err := k8sClient.Create(context.Background(), task); err != nil {
@@ -674,7 +676,7 @@ func mkAwaitingApprovalTask(t *testing.T, project, repoName, issueRef string, is
 // without approval label -> ApprovalApproved condition flipped True.
 func TestApprovalBackstop_FlipsStuckApproved(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "backstop-flip", []string{"o/g"}, 3)
-	task := mkAwaitingApprovalTask(t, "backstop-flip", repos[0].Name, "o/g#10", 10)
+	task := mkAwaitingApprovalTask(t, "backstop-flip", repos[0].Name, "o/g#10")
 
 	// Issue 10 is open but approval label is absent -> approved on SCM but webhook missed.
 	reader := &perRepoFakeReader{
@@ -706,7 +708,7 @@ func TestApprovalBackstop_FlipsStuckApproved(t *testing.T) {
 // TestApprovalBackstop_NotApproved_NoOp: approval label still present -> no flip.
 func TestApprovalBackstop_NotApproved_NoOp(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "backstop-noop", []string{"o/h"}, 3)
-	task := mkAwaitingApprovalTask(t, "backstop-noop", repos[0].Name, "o/h#20", 20)
+	task := mkAwaitingApprovalTask(t, "backstop-noop", repos[0].Name, "o/h#20")
 
 	// Label still present -> not yet approved.
 	reader := &perRepoFakeReader{
@@ -734,7 +736,7 @@ func TestApprovalBackstop_NotApproved_NoOp(t *testing.T) {
 // TestApprovalBackstop_ImplRunning_NoOp: implementation already running -> no flip.
 func TestApprovalBackstop_ImplRunning_NoOp(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "backstop-impl", []string{"o/i"}, 3)
-	task := mkAwaitingApprovalTask(t, "backstop-impl", repos[0].Name, "o/i#30", 30)
+	task := mkAwaitingApprovalTask(t, "backstop-impl", repos[0].Name, "o/i#30")
 
 	// Pre-create a running implementation Task for the same issue.
 	implTask := &tatarav1alpha1.Task{}
