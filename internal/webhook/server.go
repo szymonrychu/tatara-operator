@@ -14,7 +14,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -157,20 +156,6 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// the bot-author gate below).
 	if ev.Action == "created" && !ev.IsPR {
 		s.handleIssueComment(ctx, w, provider, proj, ev)
-		return
-	}
-
-	// Approval flip: a human (not the bot) removing the approval label from a
-	// bot-authored proposal issue signals human approval. The actual proposal
-	// match (ProposedIssue set, source author is the bot, approval required) is
-	// re-checked per Task in flipApproval; here we only gate the entry on the
-	// event shape. On GitHub the issue author (AuthorLogin) is reliable, so we
-	// also require it to be the bot; GitLab cannot distinguish author from actor
-	// in the payload, so the Task-side check is authoritative there.
-	if ev.Action == "unlabeled" && ev.ChangedLabel == approvalLabel(proj) && proj.Spec.Scm != nil &&
-		ev.ActorLogin != proj.Spec.Scm.BotLogin &&
-		(provider != "github" || ev.AuthorLogin == proj.Spec.Scm.BotLogin) {
-		s.flipApproval(ctx, w, provider, proj, ev)
 		return
 	}
 
@@ -523,55 +508,6 @@ func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef st
 		return t, true
 	}
 	return nil, false
-}
-
-// flipApproval finds the Task whose Source.IssueRef matches ev.IssueRef and
-// sets the ApprovalApproved condition to True.
-func (s *Server) flipApproval(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
-	var tasks tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "list tasks", http.StatusInternalServerError)
-		return
-	}
-	bot := proj.Spec.Scm.BotLogin
-	for i := range tasks.Items {
-		t := &tasks.Items[i]
-		if t.Spec.Source == nil || t.Spec.Source.IssueRef != ev.IssueRef {
-			continue
-		}
-		// Only a genuine tatara proposal may be flipped: it must carry a
-		// ProposedIssue, be bot-authored, and require approval.
-		if t.Spec.ProposedIssue == nil || !t.Spec.ApprovalRequired || t.Spec.Source.AuthorLogin != bot {
-			continue
-		}
-		apimeta.SetStatusCondition(&t.Status.Conditions, metav1.Condition{
-			Type:    tatarav1.ConditionApprovalApproved,
-			Status:  metav1.ConditionTrue,
-			Reason:  "HumanApproved",
-			Message: "approval label removed by human",
-		})
-		if err := s.cfg.Client.Status().Update(ctx, t); err != nil {
-			s.count(provider, ev.Kind, ev.Action, "error")
-			http.Error(w, "flip approval", http.StatusInternalServerError)
-			return
-		}
-		s.log.InfoContext(ctx, "approval label removed; task approval flipped",
-			"project", proj.Name, "task", t.Name, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "approval_flipped")
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	// No matching task found; ignore.
-	s.count(provider, ev.Kind, ev.Action, "ignored")
-	w.WriteHeader(http.StatusAccepted)
-}
-
-func approvalLabel(p tatarav1.Project) string {
-	if p.Spec.Scm != nil && p.Spec.Scm.ApprovalLabel != "" {
-		return p.Spec.Scm.ApprovalLabel
-	}
-	return "tatara/awaiting-approval"
 }
 
 func mentionsBot(body, bot string) bool {
