@@ -122,9 +122,25 @@ type ScmSpec struct {
 	// +kubebuilder:default="labeledOrMentioned"
 	// +optional
 	PRReactionScope string `json:"prReactionScope,omitempty"`
+	// ApprovalLabel is DEPRECATED and no longer used: approval is now driven by
+	// the conversation (the triage agent reads the thread) and projected onto the
+	// idea/approved/rejected labels below. Kept only for migration tooling.
 	// +kubebuilder:default="tatara/awaiting-approval"
 	// +optional
 	ApprovalLabel string `json:"approvalLabel,omitempty"`
+	// IdeaLabel marks an issue tatara originated or updated but that is not yet
+	// ready for implementation.
+	// +kubebuilder:default="tatara-idea"
+	// +optional
+	IdeaLabel string `json:"ideaLabel,omitempty"`
+	// ApprovedLabel marks an issue approved for implementation.
+	// +kubebuilder:default="tatara-approved"
+	// +optional
+	ApprovedLabel string `json:"approvedLabel,omitempty"`
+	// RejectedLabel marks an issue tatara closed (redundant, duplicate, not actionable).
+	// +kubebuilder:default="tatara-rejected"
+	// +optional
+	RejectedLabel string `json:"rejectedLabel,omitempty"`
 	// +optional
 	PriorityLabel string `json:"priorityLabel,omitempty"`
 	// +optional

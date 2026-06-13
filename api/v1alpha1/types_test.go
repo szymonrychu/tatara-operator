@@ -15,6 +15,13 @@ func TestScmSpecFields(t *testing.T) {
 	}
 }
 
+func TestScmSpecLabelFields(t *testing.T) {
+	s := ScmSpec{IdeaLabel: "tatara-idea", ApprovedLabel: "tatara-approved", RejectedLabel: "tatara-rejected"}
+	if s.IdeaLabel != "tatara-idea" || s.ApprovedLabel != "tatara-approved" || s.RejectedLabel != "tatara-rejected" {
+		t.Fatalf("label fields not set: %+v", s)
+	}
+}
+
 func TestTaskNewFields(t *testing.T) {
 	ts := TaskSpec{
 		Kind: "review", ApprovalRequired: true,
