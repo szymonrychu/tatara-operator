@@ -88,4 +88,5 @@ INGRESS_CLASS_NAME: {{ .Values.ingressClassName | quote }}
 MEMORY_PATH_PREFIX: {{ .Values.memoryPathPrefix | quote }}
 CHAT_PATH_PREFIX: {{ .Values.chatPathPrefix | quote }}
 CHAT_IMAGE: {{ .Values.chatImage | quote }}
+LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 {{- end -}}
