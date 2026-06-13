@@ -255,16 +255,8 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	task.Status.Phase = "AwaitingApproval"
-	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-		Type: tatarav1alpha1.ConditionApprovalApproved, Status: metav1.ConditionFalse,
-		Reason: "Proposed", Message: "issue proposed via REST; awaiting human approval",
-		LastTransitionTime: metav1.NewTime(time.Now()),
-	})
-	if err := s.c.Status().Update(r.Context(), task); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	// The proposal Task starts Pending; the controller opens the idea-labelled
+	// issue and completes the Task (Succeeded). No AwaitingApproval parking.
 	writeJSON(w, http.StatusCreated, toTaskDTO(*task))
 }
 
