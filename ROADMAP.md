@@ -4,6 +4,10 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 ## Agent-loop follow-ups (found during 2026-06-08 dogfood)
 
+- [x] 3-label issue lifecycle (tatara-idea/approved/rejected), conversation-driven
+  approval, retire label-toggle approval (branch feat/label-lifecycle; awaiting
+  deploy + one-time label migration). Plan:
+  `../tatara/docs/superpowers/plans/2026-06-13-tatara-label-lifecycle.md`.
 - [x] Dedupe Task creation by issue ref (shipped 0.2.8): `handleWorkItem` skips
   creation when a non-terminal Task already exists for the issue ref; re-labeling
   after completion still re-triggers.
