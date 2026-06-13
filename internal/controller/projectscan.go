@@ -230,6 +230,39 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 	return n
 }
 
+// taskOpen reports whether a Task counts as non-terminal ("open") for the
+// MaxOpenTasks cap. Terminal = Succeeded/Failed phase, or a terminal lifecycle
+// state (Done/Stopped/Parked) for issueLifecycle Tasks.
+func taskOpen(t *tatarav1alpha1.Task) bool {
+	if isTerminal(t.Status.Phase) {
+		return false
+	}
+	switch t.Status.LifecycleState {
+	case "Done", "Stopped", "Parked":
+		return false
+	}
+	return true
+}
+
+// openTaskCount counts non-terminal Tasks in the snapshot.
+func openTaskCount(existing []tatarav1alpha1.Task) int {
+	n := 0
+	for i := range existing {
+		if taskOpen(&existing[i]) {
+			n++
+		}
+	}
+	return n
+}
+
+// maxOpenTasks returns the Project's open-task cap (default 3).
+func maxOpenTasks(proj *tatarav1alpha1.Project) int {
+	if proj.Spec.MaxOpenTasks > 0 {
+		return proj.Spec.MaxOpenTasks
+	}
+	return 3
+}
+
 // selectPerRepo groups eligible candidates by repo and picks, per repo, the best
 // (priority-then-stale) items up to maxPerRepo minus that repo's lane occupancy.
 func selectPerRepo(eligible []candidate, priorityLabel string, maxPerRepo int, occ func(repoSlug string) int) []candidate {
@@ -494,7 +527,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 
 // mrScan lists open PRs across repos, selects, dedups, and creates Tasks routed
 // by authoritative author -> review (human) | issueLifecycle/MRCI (bot).
-func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
+// budget is the shared open-task creation budget; mrScan decrements it on each
+// successful create and stops creating when budget reaches zero.
+func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity, budget *int) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	bot := ""
@@ -536,6 +571,9 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	}
 	created := 0
 	for _, c := range selected {
+		if *budget <= 0 {
+			break
+		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			continue
@@ -571,6 +609,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 		r.Metrics.ScanItem("mrScan", "picked")
 		created++
+		*budget--
 	}
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
@@ -579,7 +618,9 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
-func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
+// budget is the shared open-task creation budget; issueScan decrements it on each
+// successful create and stops creating when budget reaches zero.
+func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity, budget *int) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	seen := map[string]bool{}
@@ -669,6 +710,9 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	}
 	created := 0
 	for _, c := range selected {
+		if *budget <= 0 {
+			break
+		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			continue
@@ -680,6 +724,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		}
 		r.Metrics.ScanItem("issueScan", "picked")
 		created++
+		*budget--
 	}
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
@@ -690,7 +735,9 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 // brainstorm runs one brainstorm cycle: per-repo, backpressured by live open
 // proposal count. Replaces the old MaxPerCycle body; MaxPerCycle field is
 // retained for API compat but unused.
-func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
+// budget is the shared open-task creation budget; brainstorm decrements it on
+// each successful create and stops creating when budget reaches zero.
+func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity, budget *int) {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	maxProp := act.MaxOpenProposals
@@ -719,6 +766,9 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			r.Metrics.ScanItem("brainstorm", "skipped_cap")
 			continue
 		}
+		if *budget <= 0 {
+			break
+		}
 		goal := "Propose a single, well-defined issue for repo " + slug
 		if _, err := r.createBrainstormTask(ctx, proj, &repo, goal, act.Sources); err != nil {
 			l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", repo.Name)
@@ -726,6 +776,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		}
 		r.Metrics.ScanItem("brainstorm", "picked")
 		created++
+		*budget--
 	}
 	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
@@ -812,10 +863,20 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		return 0, err
 	}
 
+	// Compute creation budget: how many more open Tasks the operator may create.
+	budget := maxOpenTasks(proj) - openTaskCount(existing)
+	if budget < 0 {
+		budget = 0
+	}
+	if budget == 0 {
+		l.Info("scan: at open-task cap; skipping autonomous creation",
+			"action", "scan_open_cap", "resource_id", proj.Name, "cap", maxOpenTasks(proj))
+	}
+
 	// mrScan
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
 		if due {
-			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
+			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan, &budget)
 			r.stampScan(ctx, proj, "mrScan")
 			// Recompute next-fire from now so the post-stamp schedule produces a
 			// positive RequeueAfter (the pre-fire next is in the past).
@@ -836,7 +897,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// issueScan
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
-			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
+			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
 			r.stampScan(ctx, proj, "issueScan")
 			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
 				consider(next2)
@@ -856,7 +917,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if cronSpec.Brainstorm.Enabled {
 		if _, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
 			if due {
-				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
+				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, &budget)
 				r.stampScan(ctx, proj, "brainstorm")
 				if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
 					consider(next2)

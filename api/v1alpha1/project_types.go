@@ -162,6 +162,13 @@ type ProjectSpec struct {
 	// +kubebuilder:default=3
 	// +optional
 	MaxConcurrentTasks int `json:"maxConcurrentTasks,omitempty"`
+	// MaxOpenTasks is the hard ceiling on non-terminal Tasks the operator will
+	// autonomously create for this Project (cron scans + brainstorm). At the cap,
+	// scan/brainstorm creation is skipped until open Tasks finish. The reactive
+	// webhook path is exempt (human-initiated).
+	// +kubebuilder:default=3
+	// +optional
+	MaxOpenTasks int `json:"maxOpenTasks,omitempty"`
 	// +optional
 	Agent AgentSpec `json:"agent,omitempty"`
 	// +optional
