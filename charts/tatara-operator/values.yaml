@@ -43,6 +43,10 @@ ingressClassName: "nginx"
 memoryPathPrefix: "/api/v1/memory"
 chatPathPrefix: "/api/v1/chat"
 chatImage: ""
+# Leader election guards against two managers reconciling concurrently during a
+# rolling-update surge (replicaCount: 1, maxSurge rounds up to 1). Keep on; set
+# false only for single-process local/envtest runs.
+leaderElection: true
 
 # Secret-backed scalars. Provided by a SOPS-encrypted values overlay at deploy
 # time. Set existingSecret to use an externally-managed Secret instead.

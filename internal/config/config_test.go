@@ -98,6 +98,34 @@ func TestLoad_SemanticModelDefault(t *testing.T) {
 	}
 }
 
+func TestLoad_LeaderElectionDefaultsOn(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("LEADER_ELECTION", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.LeaderElection {
+		t.Fatal("LeaderElection default = false, want true")
+	}
+}
+
+func TestLoad_LeaderElectionDisabled(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("LEADER_ELECTION", "false")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LeaderElection {
+		t.Fatal("LeaderElection = true with LEADER_ELECTION=false, want false")
+	}
+}
+
 func TestLoad_Defaults(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")

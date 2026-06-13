@@ -35,8 +35,11 @@ func utilRuntimeMust(err error) {
 	}
 }
 
-func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, error) {
-	return ctrl.NewManager(ctrl.GetConfigOrDie(), manager.Options{
+// managerOptions builds the controller-runtime manager options. Split out from
+// buildManager so the leader-election wiring is unit-testable without a live
+// API server.
+func managerOptions(cfg config.Config, scheme *runtime.Scheme) manager.Options {
+	return manager.Options{
 		Scheme: scheme,
 		// The operator is namespace-scoped (all CRDs + spawned workloads live in
 		// cfg.Namespace), and the chart grants a namespaced Role. Scope the cache
@@ -48,7 +51,17 @@ func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, e
 			BindAddress: cfg.MetricsAddr,
 		},
 		HealthProbeBindAddress: cfg.HealthAddr,
-	})
+		// Guard against two managers reconciling concurrently during a
+		// rolling-update surge (replicaCount: 1, maxSurge rounds up to 1).
+		// The lease lives in the same namespace the cache/RBAC are scoped to.
+		LeaderElection:          cfg.LeaderElection,
+		LeaderElectionID:        "tatara-operator-leader",
+		LeaderElectionNamespace: cfg.Namespace,
+	}
+}
+
+func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, error) {
+	return ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions(cfg, scheme))
 }
 
 func run(ctx context.Context) error {

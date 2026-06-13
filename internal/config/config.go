@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
 
 // Config holds the env-scalar configuration for the operator. Each field is
@@ -46,6 +47,10 @@ type Config struct {
 	MemoryPathPrefix         string
 	ChatPathPrefix           string
 	ChatImage                string
+	// LeaderElection guards against two managers reconciling concurrently
+	// during a rolling-update surge. Defaults on; set LEADER_ELECTION=false
+	// for envtest/local single-process runs.
+	LeaderElection bool
 }
 
 func getDefault(key, def string) string {
@@ -53,6 +58,18 @@ func getDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getBoolDefault(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 // Load reads the operator configuration from the environment, applying
@@ -87,6 +104,7 @@ func Load() (Config, error) {
 		MemoryPathPrefix:         getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
 		ChatPathPrefix:           getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
+		LeaderElection:           getBoolDefault("LEADER_ELECTION", true),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

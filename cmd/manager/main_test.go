@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	apiv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/config"
 )
 
 func TestNewScheme_RegistersAllKinds(t *testing.T) {
@@ -23,6 +24,26 @@ func TestNewScheme_HasCoreTypes(t *testing.T) {
 	s := newScheme()
 	if !s.Recognizes(corev1.SchemeGroupVersion.WithKind("Pod")) {
 		t.Fatal("scheme does not recognize core/v1 Pod")
+	}
+}
+
+func TestManagerOptions_LeaderElection(t *testing.T) {
+	opts := managerOptions(config.Config{Namespace: "tatara", LeaderElection: true}, newScheme())
+	if !opts.LeaderElection {
+		t.Fatal("managerOptions did not enable leader election")
+	}
+	if opts.LeaderElectionID != "tatara-operator-leader" {
+		t.Fatalf("LeaderElectionID = %q, want tatara-operator-leader", opts.LeaderElectionID)
+	}
+	if opts.LeaderElectionNamespace != "tatara" {
+		t.Fatalf("LeaderElectionNamespace = %q, want tatara", opts.LeaderElectionNamespace)
+	}
+}
+
+func TestManagerOptions_LeaderElectionDisabled(t *testing.T) {
+	opts := managerOptions(config.Config{Namespace: "tatara", LeaderElection: false}, newScheme())
+	if opts.LeaderElection {
+		t.Fatal("managerOptions enabled leader election when config flag was false")
 	}
 }
 
