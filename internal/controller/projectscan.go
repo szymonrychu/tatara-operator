@@ -839,6 +839,93 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 	return n, nil
 }
 
+// hasNonTerminalTaskForIssue reports whether any open (non-terminal) Task exists
+// for (slug, number) in the snapshot.
+func hasNonTerminalTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
+	repoLabel := sanitizeRepoLabel(slug)
+	numLabel := strconv.Itoa(number)
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+			continue
+		}
+		if taskOpen(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// recoverOrphans starts the correct lifecycle Task for each OPEN issue that
+// carries an active phase label but has no live Task (a missed/never-started or
+// stalled handler). It RE-LISTS existing Tasks so it sees Tasks mrScan/issueScan
+// created earlier this cycle (an open bot MR becomes a live MRCI Task -> not an
+// orphan). Bounded by the shared open-task budget.
+func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, budget *int) {
+	if *budget <= 0 {
+		return
+	}
+	l := log.FromContext(ctx)
+	existing, err := r.existingScanTasks(ctx, proj)
+	if err != nil {
+		l.Error(err, "backstop: list tasks", "action", "backstop_list_error", "resource_id", proj.Name)
+		return
+	}
+	brainstorming, approved, implementation, _ := lifecycleLabels(proj.Spec.Scm)
+	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
+	for i := range repos {
+		owner, name, oerr := scm.OwnerRepo(repos[i].Spec.URL)
+		if oerr != nil {
+			continue
+		}
+		issues, lerr := reader.ListOpenIssues(ctx, owner, name)
+		if lerr != nil {
+			l.Error(lerr, "backstop: ListOpenIssues", "action", "backstop_list_error", "resource_id", proj.Name, "repo", repos[i].Name)
+			continue
+		}
+		slug := owner + "/" + name
+		for _, iss := range issues {
+			if iss.IsPR {
+				continue
+			}
+			var entry, goal string
+			switch {
+			case hasLabel(iss.Labels, implementation):
+				entry = "Implement"
+				goal = fmt.Sprintf("Resume implementation for %s#%d (phase label present, no live task)", slug, iss.Number)
+			case hasLabel(iss.Labels, approved):
+				entry = "Implement"
+				goal = fmt.Sprintf("Implement approved issue %s#%d", slug, iss.Number)
+			case hasLabel(iss.Labels, brainstorming) || hasLabel(iss.Labels, legacyIdea):
+				entry = "Triage"
+				goal = fmt.Sprintf("Triage issue %s#%d", slug, iss.Number)
+			default:
+				continue
+			}
+			if hasNonTerminalTaskForIssue(existing, slug, iss.Number) {
+				continue
+			}
+			if *budget <= 0 {
+				return
+			}
+			repo, ok := r.matchRepoForSlug(repos, slug)
+			if !ok {
+				continue
+			}
+			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt}
+			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: entry}
+			if _, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann); cerr != nil {
+				l.Error(cerr, "backstop: create recovery task", "action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
+			l.Info("backstop: recovered orphaned issue", "action", "backstop_recover",
+				"resource_id", proj.Name, "issue", fmt.Sprintf("%s#%d", slug, iss.Number), "entry", entry)
+			r.Metrics.ScanItem("backstop", "recovered")
+			*budget--
+		}
+	}
+}
+
 // runScans runs each due activity and returns the soonest next-fire as a
 // requeue duration. Cron parsing/SCM/create failures are logged and skipped per
 // activity so one bad activity never blocks the others or crashes the reconciler.
@@ -913,6 +1000,9 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		if due {
 			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
 			r.stampScan(ctx, proj, "issueScan")
+			if budget > 0 {
+				r.recoverOrphans(ctx, proj, reader, repos, &budget)
+			}
 			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
 				consider(next2)
 			}
