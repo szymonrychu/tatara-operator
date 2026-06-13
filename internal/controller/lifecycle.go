@@ -228,6 +228,31 @@ func needsSpawn(lifecycleState, phase string) bool {
 	return false
 }
 
+// ensurePhaseLabel sets the desired managed phase label on the task's source
+// issue (no-op for PR sources or missing source). phase is one of
+// "brainstorming"|"approved"|"implementation"|"declined"; it resolves the
+// configured label name and delegates to setLifecycleLabel (idempotent).
+func (r *TaskReconciler) ensurePhaseLabel(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, phase string) error {
+	if task.Spec.Source == nil || task.Spec.Source.IsPR || task.Spec.Source.IssueRef == "" {
+		return nil
+	}
+	brainstorming, approved, implementation, declined := lifecycleLabels(project.Spec.Scm)
+	var desired string
+	switch phase {
+	case "brainstorming":
+		desired = brainstorming
+	case "approved":
+		desired = approved
+	case "implementation":
+		desired = implementation
+	case "declined":
+		desired = declined
+	default:
+		return nil
+	}
+	return r.setLifecycleLabel(ctx, project, task, desired)
+}
+
 // reconcileLifecycle is the dispatch function for issueLifecycle Tasks. It
 // applies the memory-ready and concurrency gates ONLY on the spawn path (i.e.
 // when about to start a new agent run). Terminal-phase outcome consumption,
@@ -275,6 +300,12 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		if err := r.setLifecycleState(ctx, task, entry, "initial"); err != nil {
 			r.Metrics.ReconcileResult("Task", "error")
 			return ctrl.Result{}, err
+		}
+		if entry == "Triage" {
+			if err := r.ensurePhaseLabel(ctx, &project, task, "brainstorming"); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, err
+			}
 		}
 		r.Metrics.ReconcileResult("Task", "success")
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
@@ -351,6 +382,13 @@ func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alph
 		return r.finishTriage(ctx, project, task)
 	}
 	// Run in progress (or not yet started) -> drive another step.
+	// Idempotent: ensure the brainstorming label is set (covers reactivation where
+	// the task re-enters Triage without going through the case "" initializer).
+	if !isTerminal(task.Status.Phase) {
+		if err := r.ensurePhaseLabel(ctx, project, task, "brainstorming"); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	var repo tatarav1alpha1.Repository
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("triage: get repo: %w", err)
@@ -738,6 +776,10 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 		// Copy mutable pointers back so callers see the new values.
 		task.ResourceVersion = refreshed.ResourceVersion
 		task.Status = refreshed.Status
+		// Idempotent: set implementation label on fresh Implement spawn.
+		if err := r.ensurePhaseLabel(ctx, project, task, "implementation"); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	var repo tatarav1alpha1.Repository
