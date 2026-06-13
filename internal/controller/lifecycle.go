@@ -429,21 +429,21 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		comment = outcome.Comment
 	}
 
-	// Clear IssueOutcome before acting so stale outcome is never re-consumed.
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
-		fresh.Status.IssueOutcome = nil
-		return r.Status().Update(ctx, fresh)
-	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("triage: clear IssueOutcome: %w", err)
-	}
-	task.Status.IssueOutcome = nil
+	// IssueOutcome is cleared only AFTER the action arm commits a state
+	// transition (see clearIssueOutcome calls below). Clearing before acting
+	// would, on any mid-arm SCM error, strand the task with a nil outcome and
+	// silently default a close/discuss to implement on the next reconcile.
+	// Accepted tradeoff: if the post-SCM status transition (RetryOnConflict)
+	// exhausts its retries after the comment/close already landed, the next
+	// reconcile re-runs the arm and may post a duplicate triage comment. That
+	// is rare and cosmetic, and preferred over the wrong-implement downgrade.
+	idea, approved, rejected := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
 	case "close":
+		if err := r.setLifecycleLabel(ctx, project, task, rejected); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.triageCloseIssue(ctx, project, task, comment); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -452,37 +452,101 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 
 	case "discuss":
+		if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.triagePostComment(ctx, project, task, comment); err != nil {
 			return ctrl.Result{}, err
 		}
-		idleMinutes := 60
-		if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
-			idleMinutes = project.Spec.Scm.ConversationIdleMinutes
-		}
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
-			now := metav1.Now()
-			deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
-			fresh.Status.DeadlineAt = &deadline
-			fresh.Status.LastActivityAt = &now
-			return r.Status().Update(ctx, fresh)
-		}); err != nil {
-			return ctrl.Result{}, fmt.Errorf("triage: set deadline: %w", err)
-		}
-		if err := r.setLifecycleState(ctx, task, "Conversation", "triage-discuss"); err != nil {
+		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err
 		}
 
 	default: // "implement" and anything else
+		// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
+		// human has engaged. Authorship is detected via the tatara-authored marker
+		// in the issue body - reliable and egress-verified, unlike Source.AuthorLogin
+		// which is empty for cron-scanned issues and untrusted on the webhook path.
+		authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
+		if aerr != nil {
+			l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
+				"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
+			authored = true
+		}
+		if authored {
+			human, herr := r.hasHumanComment(ctx, project, task)
+			if herr != nil {
+				l.Info("triage: hasHumanComment failed; parking as idea (fail closed)",
+					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
+				human = false
+			}
+			if !human {
+				if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := r.clearIssueOutcome(ctx, task); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, r.resetAgentRun(ctx, task)
+			}
+		}
+		if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 
+	if err := r.clearIssueOutcome(ctx, task); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, r.resetAgentRun(ctx, task)
+}
+
+// clearIssueOutcome nils Status.IssueOutcome (RetryOnConflict). Called only
+// after the triage action arm has committed its state transition, so a mid-arm
+// error retries the same outcome rather than defaulting to implement.
+func (r *TaskReconciler) clearIssueOutcome(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.IssueOutcome = nil
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return fmt.Errorf("triage: clear IssueOutcome: %w", err)
+	}
+	task.Status.IssueOutcome = nil
+	return nil
+}
+
+// enterConversation sets the conversation idle deadline + LastActivityAt and
+// transitions the task to Conversation with the given reason. Shared by the
+// discuss and bot-await-approval triage outcomes.
+func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, reason string) error {
+	idleMinutes := 60
+	if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
+		idleMinutes = project.Spec.Scm.ConversationIdleMinutes
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+		fresh.Status.DeadlineAt = &deadline
+		fresh.Status.LastActivityAt = &now
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return fmt.Errorf("enter conversation: set deadline: %w", err)
+	}
+	return r.setLifecycleState(ctx, task, "Conversation", reason)
 }
 
 // handleConversation manages the idle wait state. No pod is ever spawned here.

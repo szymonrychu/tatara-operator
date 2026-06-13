@@ -233,18 +233,11 @@ func TestProposeIssue(t *testing.T) {
 	var out restapi.TaskDTO
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
 	require.Equal(t, "implement", out.Kind)
-	require.True(t, out.ApprovalRequired)
+	require.False(t, out.ApprovalRequired)
 	require.Equal(t, "alpha", out.ProjectRef)
 	require.Equal(t, "repo-a", out.RepositoryRef)
-	require.Equal(t, "AwaitingApproval", out.Status.Phase)
+	require.Empty(t, out.Status.Phase) // starts Pending; controller completes it to Succeeded
 	require.NotEmpty(t, out.Name)
-	found := false
-	for _, c := range out.Status.Conditions {
-		if c.Type == "ApprovalApproved" && c.Status == metav1.ConditionFalse {
-			found = true
-		}
-	}
-	require.True(t, found, "ApprovalApproved=False condition not set")
 }
 
 func TestProposeIssue_MissingFields(t *testing.T) {

@@ -307,7 +307,7 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		l.Info("proposal skipped: source already set",
 			"action", "scm_propose_skip_source_set", "resource_id", task.Name,
 			"issue_url", task.Spec.Source.URL)
-		return r.advanceToAwaitingApproval(ctx, task, task.Spec.Source.URL)
+		return r.completeProposal(ctx, task, task.Spec.Source.URL)
 	}
 
 	var repo tatarav1alpha1.Repository
@@ -341,10 +341,8 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		}
 	}
 
-	label := proj.Spec.Scm.ApprovalLabel
-	if label == "" {
-		label = "tatara/awaiting-approval"
-	}
+	idea, _, _ := lifecycleLabels(proj.Spec.Scm)
+	label := idea
 	body := task.Spec.ProposedIssue.Body + "\n\n" + tataraAuthoredMarker
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 		Title:  proposalTitle,
@@ -398,52 +396,41 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	l.Info("proposal issue opened", "action", "scm_propose_issue",
 		"resource_id", task.Name, "project", proj.Name, "issue_ref", ref.Ref)
 
-	return r.advanceToAwaitingApproval(ctx, task, ref.URL)
+	return r.completeProposal(ctx, task, ref.URL)
 }
 
-// advanceToAwaitingApproval sets phase=AwaitingApproval, appends to
-// DiscoveredIssues, sets ApprovalApproved=False, and clears WritebackPending.
-// Uses RetryOnConflict on the status update.
-func (r *TaskReconciler) advanceToAwaitingApproval(ctx context.Context, task *tatarav1alpha1.Task, issueURL string) (ctrl.Result, error) {
+// completeProposal marks the brainstorm proposal Task Succeeded after the idea
+// issue has been opened. The issue (now carrying the idea label) flows through
+// the normal issue lifecycle from here; there is no AwaitingApproval parking.
+func (r *TaskReconciler) completeProposal(ctx context.Context, task *tatarav1alpha1.Task, issueURL string) (ctrl.Result, error) {
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
 			return gerr
 		}
-		fresh.Status.Phase = "AwaitingApproval"
-		// Append issueURL only if not already present.
-		alreadyPresent := false
+		fresh.Status.Phase = "Succeeded"
+		present := false
 		for _, u := range fresh.Status.DiscoveredIssues {
 			if u == issueURL {
-				alreadyPresent = true
+				present = true
 				break
 			}
 		}
-		if !alreadyPresent {
+		if !present {
 			fresh.Status.DiscoveredIssues = append(fresh.Status.DiscoveredIssues, issueURL)
 		}
-		now := metav1.Now()
-		if fresh.Status.GateEnteredAt == nil {
-			fresh.Status.GateEnteredAt = &now
-		}
-		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-			Type:    tatarav1alpha1.ConditionApprovalApproved,
-			Status:  metav1.ConditionFalse,
-			Reason:  "AwaitingHuman",
-			Message: "issue opened with approval label; awaiting removal",
-		})
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               "WritebackPending",
 			Status:             metav1.ConditionFalse,
-			Reason:             "ProposalPending",
-			Message:            "proposal issue created; awaiting approval",
+			Reason:             "BrainstormProposed",
+			Message:            "proposal issue opened with idea label",
 			ObservedGeneration: fresh.Generation,
 		})
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("proposal: record status: %w", err)
+		return ctrl.Result{}, fmt.Errorf("proposal: complete: %w", err)
 	}
-	return ctrl.Result{RequeueAfter: capRequeue}, nil
+	return ctrl.Result{}, nil
 }
 
 // recordExistingProposal wires the task to an existing open issue that matches
@@ -475,7 +462,7 @@ func (r *TaskReconciler) recordExistingProposal(ctx context.Context, proj *tatar
 		return ctrl.Result{}, fmt.Errorf("proposal: record existing source: %w", err)
 	}
 
-	return r.advanceToAwaitingApproval(ctx, task, issueURL)
+	return r.completeProposal(ctx, task, issueURL)
 }
 
 // findOpenIssueByTitle lists open issues for the repo and returns the first

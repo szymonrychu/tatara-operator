@@ -73,13 +73,15 @@ func lifecycleTriageText(task *tatarav1alpha1.Task, title, body string) string {
 			"Issue title: %s\n"+
 			"Issue body:\n%s\n\n"+
 			"Your job:\n"+
-			"1. Read the issue carefully.\n"+
-			"2. Use tatara MCP tools (memory, code search, docs) to understand the codebase and "+
-			"determine whether this issue should be implemented, needs more discussion, or should be closed.\n"+
-			"3. Call the `issue_outcome` MCP tool with one of:\n"+
-			"   - action=implement  (ready to work on)\n"+
-			"   - action=discuss    (needs clarification; supply your questions as `comment`)\n"+
-			"   - action=close      (out of scope / duplicate / not actionable; supply reason as `comment`)\n\n"+
+			"1. Read the issue AND the full conversation thread carefully.\n"+
+			"2. Use tatara MCP tools (memory, code search, docs) to understand the codebase.\n"+
+			"3. Decide the outcome by interpreting the human's intent in the thread:\n"+
+			"   - A human approval / go-ahead -> action=implement.\n"+
+			"   - A human decline, or duplicate / out-of-scope / not-actionable -> action=close (supply the reason as `comment`).\n"+
+			"   - Still under discussion or needing the human -> action=discuss (supply your questions as `comment`).\n"+
+			"4. IMPORTANT: if THIS issue was opened by tatara itself (a tatara idea), emit action=implement "+
+			"ONLY if a human has posted an approval comment in the thread; otherwise emit action=discuss and wait.\n"+
+			"5. Call the `issue_outcome` MCP tool with your chosen action.\n\n"+
 			"You MUST call issue_outcome before finishing. Do not open PRs or make code changes in this turn.",
 		issueRef, issueURL, title, body)
 }

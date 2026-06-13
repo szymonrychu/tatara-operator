@@ -93,6 +93,14 @@ spec:
                 properties:
                   approvalLabel:
                     default: tatara/awaiting-approval
+                    description: |-
+                      ApprovalLabel is DEPRECATED and no longer used: approval is now driven by
+                      the conversation (the triage agent reads the thread) and projected onto the
+                      idea/approved/rejected labels below. Kept only for migration tooling.
+                    type: string
+                  approvedLabel:
+                    default: tatara-approved
+                    description: ApprovedLabel marks an issue approved for implementation.
                     type: string
                   babysitDeadlineMinutes:
                     default: 60
@@ -172,6 +180,12 @@ spec:
                             type: string
                         type: object
                     type: object
+                  ideaLabel:
+                    default: tatara-idea
+                    description: |-
+                      IdeaLabel marks an issue tatara originated or updated but that is not yet
+                      ready for implementation.
+                    type: string
                   mergePolicy:
                     default: afterApproval
                     enum:
@@ -192,6 +206,11 @@ spec:
                     enum:
                     - github
                     - gitlab
+                    type: string
+                  rejectedLabel:
+                    default: tatara-rejected
+                    description: RejectedLabel marks an issue tatara closed (redundant,
+                      duplicate, not actionable).
                     type: string
                 required:
                 - botLogin

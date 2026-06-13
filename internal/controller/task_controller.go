@@ -143,36 +143,6 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return res, nil
 	}
 
-	// Approval gate: hold until the ApprovalApproved condition is True.
-	if task.Spec.ApprovalRequired {
-		if cond := apimeta.FindStatusCondition(task.Status.Conditions, tatarav1alpha1.ConditionApprovalApproved); cond == nil || cond.Status != metav1.ConditionTrue {
-			if task.Status.Phase != "AwaitingApproval" {
-				task.Status.Phase = "AwaitingApproval"
-				if task.Status.GateEnteredAt == nil {
-					now := metav1.Now()
-					task.Status.GateEnteredAt = &now
-				}
-				if err := r.Status().Update(ctx, &task); err != nil {
-					r.Metrics.ReconcileResult("Task", "error")
-					return ctrl.Result{}, fmt.Errorf("set awaiting-approval phase: %w", err)
-				}
-			}
-			return ctrl.Result{RequeueAfter: capRequeue}, nil
-		}
-		// Approved: record the gate latency once and clear AwaitingApproval so
-		// the task resumes normal scheduling (the Planning block checks for phase=="").
-		if task.Status.GateEnteredAt != nil {
-			r.Metrics.ObserveApprovalGate(time.Since(task.Status.GateEnteredAt.Time).Seconds())
-		}
-		if task.Status.Phase == "AwaitingApproval" {
-			task.Status.Phase = ""
-			if err := r.Status().Update(ctx, &task); err != nil {
-				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, fmt.Errorf("clear awaiting-approval phase: %w", err)
-			}
-		}
-	}
-
 	// Authorship gate (security boundary): never spawn an agent for a
 	// selfImprove Task whose PR/MR is not actually authored by the bot. The
 	// webhook's AuthorLogin is only a hint; GetPRState is authoritative.
