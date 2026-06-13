@@ -245,7 +245,7 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 			RepositoryRef:    req.RepositoryRef,
 			Goal:             req.Title,
 			Kind:             "implement",
-			ApprovalRequired: true,
+			ApprovalRequired: false,
 			ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
 				RepositoryRef: req.RepositoryRef, Title: req.Title, Body: req.Body, Kind: req.Kind,
 			},
