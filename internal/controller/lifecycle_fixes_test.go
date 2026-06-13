@@ -677,3 +677,44 @@ func TestLifecycleMainCI_EmptyMergeCommitSHARequeues(t *testing.T) {
 		t.Error("MainCI with empty MergeCommitSHA must not park immediately")
 	}
 }
+
+// ============================================================
+// FIX 9 - MainCI failure must reset the merged-change state so
+//          the re-implement opens and merges a NEW MR instead of
+//          looping forever on the stale merged PR / failing SHA.
+//          Repro: szymonrychu/tatara-chat#19 / PR #20 (chart job
+//          skipped on the PR, failed on main post-merge).
+// ============================================================
+
+// TestLifecycleMainCI_FailureClearsMergedChangeState verifies that when MainCI
+// re-enters Implement on a post-merge failure, MergeCommitSHA, PrURL and PRNumber
+// are cleared. Without this, writeBackOpenChange short-circuits on the stale PrURL
+// ("AlreadyWritten") so no new MR is opened, and handleMerge's "already-merged"
+// guard (MergeCommitSHA set) skips the merge - bouncing the task between MRCI,
+// Merge and MainCI on the stale failing SHA until maxLifecycleIterations parks it.
+func TestLifecycleMainCI_FailureClearsMergedChangeState(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMainCI{ciStatus: "failure"}
+	r, name := seedMainCITask(t, "fail-reset", fw, time.Hour)
+
+	// seedMainCITask sets MergeCommitSHA="deadbeef", PRNumber=55,
+	// PrURL=".../pull/55" - the merged-change state that must be cleared.
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Implement" {
+		t.Fatalf("LifecycleState = %q, want Implement on MainCI failure", got.Status.LifecycleState)
+	}
+	if got.Status.MergeCommitSHA != "" {
+		t.Errorf("MergeCommitSHA = %q, want cleared so the next Merge actually merges the new MR", got.Status.MergeCommitSHA)
+	}
+	if got.Status.PrURL != "" {
+		t.Errorf("PrURL = %q, want cleared so writeBackOpenChange opens a NEW MR", got.Status.PrURL)
+	}
+	if got.Status.PRNumber != 0 {
+		t.Errorf("PRNumber = %d, want 0 so MRCI polls the new MR, not the merged one", got.Status.PRNumber)
+	}
+}

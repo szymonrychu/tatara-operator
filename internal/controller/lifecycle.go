@@ -1068,6 +1068,38 @@ func (r *TaskReconciler) setImplementContext(ctx context.Context, task *tatarav1
 	})
 }
 
+// clearMergedChangeState resets the per-MR write-back fields (MergeCommitSHA,
+// PrURL, PRNumber) when the lifecycle re-enters Implement AFTER a PR was already
+// merged - i.e. only from the MainCI failure route. The merged PR is closed, so
+// the fix must land as a brand new MR; leaving these fields set traps the task in
+// a non-converging loop:
+//   - PrURL set -> writeBackOpenChange short-circuits ("AlreadyWritten") and never
+//     opens the new MR, so finishImplement re-enters MRCI against the stale PR.
+//   - MergeCommitSHA set -> handleMerge's "already-merged" idempotency guard skips
+//     the merge and bounces straight to MainCI, re-checking the stale failing SHA.
+//
+// Clearing them lets the next Implement->MRCI->Merge cycle open and merge a real
+// new change. NOT called on the MRCI-failure or Merge-conflict routes: there the
+// PR is still open (MergeCommitSHA is unset) and the fix is pushed to the same PR.
+func (r *TaskReconciler) clearMergedChangeState(ctx context.Context, task *tatarav1alpha1.Task) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.MergeCommitSHA = ""
+		fresh.Status.PrURL = ""
+		fresh.Status.PRNumber = 0
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.MergeCommitSHA = ""
+		task.Status.PrURL = ""
+		task.Status.PRNumber = 0
+		return nil
+	})
+}
+
 // maybeMarkHandoverResume checks whether the last implement run consumed enough
 // context to warrant a handover on the NEXT fresh run. When the threshold is
 // reached it:
@@ -1351,8 +1383,15 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 		return ctrl.Result{}, nil
 
 	case "failure":
-		ctxMsg := fmt.Sprintf("Default-branch pipeline failed after merge (SHA %s). Re-implement the fix and push.", sha)
+		ctxMsg := fmt.Sprintf("Default-branch pipeline failed after merge (SHA %s). The previous MR is already merged; open a NEW MR with the fix and push.", sha)
 		if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
+			return ctrl.Result{}, err
+		}
+		// The merged PR is closed: clear MergeCommitSHA/PrURL/PRNumber so the next
+		// Implement->MRCI->Merge cycle opens and merges a fresh MR instead of
+		// short-circuiting on the stale merged PR (writeback AlreadyWritten guard)
+		// and stale SHA (handleMerge already-merged guard).
+		if err := r.clearMergedChangeState(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.clearDeadline(ctx, task); err != nil {
