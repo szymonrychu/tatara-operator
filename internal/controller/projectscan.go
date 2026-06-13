@@ -679,22 +679,44 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	return len(selected) < len(eligible)
 }
 
-// brainstorm creates up to MaxPerCycle generative Tasks (no list).
-func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository, act tatarav1alpha1.BrainstormActivity) {
+// brainstorm runs one brainstorm cycle: per-repo, backpressured by live open
+// proposal count. Replaces the old MaxPerCycle body; MaxPerCycle field is
+// retained for API compat but unused.
+func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
 	l := log.FromContext(ctx)
 	start := time.Now()
-	if len(repos) == 0 {
-		return
+	maxProp := act.MaxOpenProposals
+	if maxProp < 1 {
+		maxProp = 3
 	}
-	n := act.MaxPerCycle
-	if n < 1 {
-		n = 1
+	approvalLabel := ""
+	if proj.Spec.Scm != nil {
+		approvalLabel = proj.Spec.Scm.ApprovalLabel
 	}
 	created := 0
-	for i := 0; i < n; i++ {
-		goal := "Brainstorm new issues for project " + proj.Name
-		if _, err := r.createBrainstormTask(ctx, proj, &repos[0], goal, act.Sources); err != nil {
-			l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name)
+	for i := range repos {
+		repo := repos[i]
+		slug := repoSlug(&repo)
+		if slug == "" {
+			continue
+		}
+		if brainstormInFlight(existing, repo.Name) {
+			r.Metrics.ScanItem("brainstorm", "skipped_inflight")
+			continue
+		}
+		backlog, err := r.proposalBacklog(ctx, reader, &repo, approvalLabel, existing)
+		if err != nil {
+			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
+			continue
+		}
+		r.Metrics.SetOpenProposals(slug, float64(backlog))
+		if backlog >= maxProp {
+			r.Metrics.ScanItem("brainstorm", "skipped_cap")
+			continue
+		}
+		goal := "Propose a single, well-defined issue for repo " + slug
+		if _, err := r.createBrainstormTask(ctx, proj, &repo, goal, act.Sources); err != nil {
+			l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", repo.Name)
 			continue
 		}
 		r.Metrics.ScanItem("brainstorm", "picked")
@@ -703,6 +725,58 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
 		"picked", created, "duration_ms", time.Since(start).Milliseconds())
+}
+
+// repoSlug returns "owner/name" for a Repository URL, or "" on error.
+func repoSlug(repo *tatarav1alpha1.Repository) string {
+	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
+	if err != nil {
+		return ""
+	}
+	return owner + "/" + name
+}
+
+// brainstormInFlight reports whether a non-terminal brainstorm Task targets repoName.
+func brainstormInFlight(existing []tatarav1alpha1.Task, repoName string) bool {
+	for i := range existing {
+		t := existing[i]
+		if t.Labels[labelActivity] == "brainstorm" && t.Spec.RepositoryRef == repoName && !isTerminal(t.Status.Phase) {
+			return true
+		}
+	}
+	return false
+}
+
+// proposalBacklog counts open, unapproved agent proposals for repo. When
+// approvalLabel is set it counts open non-PR issues bearing that label (live
+// ListOpenIssues). When empty it falls back to counting AwaitingApproval
+// proposal Tasks for the repo.
+func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, approvalLabel string, existing []tatarav1alpha1.Task) (int, error) {
+	if approvalLabel == "" {
+		n := 0
+		for i := range existing {
+			t := existing[i]
+			if t.Spec.RepositoryRef == repo.Name && t.Spec.ProposedIssue != nil && t.Status.Phase == "AwaitingApproval" {
+				n++
+			}
+		}
+		return n, nil
+	}
+	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
+	if err != nil {
+		return 0, err
+	}
+	issues, err := reader.ListOpenIssues(ctx, owner, name)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, iss := range issues {
+		if !iss.IsPR && hasLabel(iss.Labels, approvalLabel) {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // runScans runs each due activity and returns the soonest next-fire as a
@@ -787,7 +861,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if cronSpec.Brainstorm.Enabled {
 		if _, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
 			if due {
-				r.brainstorm(ctx, proj, repos, cronSpec.Brainstorm)
+				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
 				r.stampScan(ctx, proj, "brainstorm")
 				if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
 					consider(next2)
