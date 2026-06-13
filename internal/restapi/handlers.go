@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -251,6 +252,11 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	agent.StampPodName(task, projName, provider, req.RepositoryRef)
 	if err := s.c.Create(r.Context(), task); err != nil {
 		writeClientErr(w, err)
 		return
