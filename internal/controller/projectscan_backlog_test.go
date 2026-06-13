@@ -29,7 +29,7 @@ func TestProposalBacklog_CountsIdeaLabel(t *testing.T) {
 		{Repo: "o/r", Number: 4, Labels: []string{"tatara-idea"}},
 	}}
 	r := &ProjectReconciler{Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
-	n, err := r.proposalBacklog(context.Background(), rdr, repo, "tatara-idea", nil)
+	n, err := r.proposalBacklog(context.Background(), rdr, repo, "tatara-idea", nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, 2, n)
 }

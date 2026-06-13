@@ -80,7 +80,7 @@ func TestFinishTriage_Close_Rejected(t *testing.T) {
 	markSucceededWithOutcome(t, task.Name, "close")
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
-	require.Equal(t, []string{"tatara-rejected"}, w.added)
+	require.Equal(t, []string{"tatara-declined"}, w.added)
 	require.Equal(t, "Done", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
@@ -91,7 +91,7 @@ func TestFinishTriage_Discuss_Idea(t *testing.T) {
 	markSucceededWithOutcome(t, task.Name, "discuss")
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
-	require.Equal(t, []string{"tatara-idea"}, w.added)
+	require.Equal(t, []string{"tatara-brainstorming"}, w.added)
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
@@ -106,7 +106,7 @@ func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testin
 	markSucceededWithOutcome(t, task.Name, "implement")
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
-	require.Equal(t, []string{"tatara-idea"}, w.added)
+	require.Equal(t, []string{"tatara-brainstorming"}, w.added)
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
@@ -133,6 +133,6 @@ func TestFinishTriage_AuthorshipCheckError_FailsClosed_ParksIdea(t *testing.T) {
 	markSucceededWithOutcome(t, task.Name, "implement")
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
-	require.Equal(t, []string{"tatara-idea"}, w.added)
+	require.Equal(t, []string{"tatara-brainstorming"}, w.added)
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }

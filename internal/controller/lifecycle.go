@@ -437,7 +437,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 	// exhausts its retries after the comment/close already landed, the next
 	// reconcile re-runs the arm and may post a duplicate triage comment. That
 	// is rare and cosmetic, and preferred over the wrong-implement downgrade.
-	idea, approved, rejected := lifecycleLabels(project.Spec.Scm)
+	brainstorming, approved, _, declined := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
 	case "close":
@@ -445,12 +445,12 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 			// Invariant: never close an issue that has an unmerged code change.
 			// A human-comment re-triage of an issue whose MR is open/conflicting
 			// can yield a "close" outcome; closing here would orphan the unmerged
-			// change. Keep the issue open (idea) and await the change being
+			// change. Keep the issue open (brainstorming) and await the change being
 			// merged-green or abandoned.
 			l.Info("triage close withheld: unmerged change exists; keeping issue open",
 				"action", "lifecycle_close_withheld", "resource_id", task.Name,
 				"pr_url", task.Status.PrURL, "head_branch", task.Status.HeadBranch)
-			if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+			if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 				return ctrl.Result{}, err
 			}
 			note := comment
@@ -466,7 +466,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 			}
 			break
 		}
-		if err := r.setLifecycleLabel(ctx, project, task, rejected); err != nil {
+		if err := r.setLifecycleLabel(ctx, project, task, declined); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.triageCloseIssue(ctx, project, task, comment); err != nil {
@@ -477,7 +477,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 
 	case "discuss":
-		if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+		if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.triagePostComment(ctx, project, task, comment); err != nil {
@@ -501,12 +501,12 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if authored {
 			human, herr := r.hasHumanComment(ctx, project, task)
 			if herr != nil {
-				l.Info("triage: hasHumanComment failed; parking as idea (fail closed)",
+				l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
 					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
 				human = false
 			}
 			if !human {
-				if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+				if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 					return ctrl.Result{}, err
 				}
 				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {

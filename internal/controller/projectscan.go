@@ -744,7 +744,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	if maxProp < 1 {
 		maxProp = 3
 	}
-	ideaLabel, _, _ := lifecycleLabels(proj.Spec.Scm)
+	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
 	created := 0
 	for i := range repos {
 		repo := repos[i]
@@ -756,7 +756,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			r.Metrics.ScanItem("brainstorm", "skipped_inflight")
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, &repo, ideaLabel, existing)
+		backlog, err := r.proposalBacklog(ctx, reader, &repo, brainstormingLabel, proj.Spec.Scm, existing)
 		if err != nil {
 			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
 			continue
@@ -807,7 +807,7 @@ func brainstormInFlight(existing []tatarav1alpha1.Task, repoName string) bool {
 // bearing the idea label (live ListOpenIssues). This subsumes tatara-originated
 // proposals and any human-filed issue parked as an idea, providing conservative
 // brainstorm backpressure.
-func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, ideaLabel string, _ []tatarav1alpha1.Task) (int, error) {
+func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, brainstormingLabel string, scmSpec *tatarav1alpha1.ScmSpec, _ []tatarav1alpha1.Task) (int, error) {
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
 	if err != nil {
 		return 0, err
@@ -816,9 +816,10 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 	if err != nil {
 		return 0, err
 	}
+	legacyIdea, _ := legacyLabels(scmSpec)
 	n := 0
 	for _, iss := range issues {
-		if !iss.IsPR && hasLabel(iss.Labels, ideaLabel) {
+		if !iss.IsPR && (hasLabel(iss.Labels, brainstormingLabel) || hasLabel(iss.Labels, legacyIdea)) {
 			n++
 		}
 	}

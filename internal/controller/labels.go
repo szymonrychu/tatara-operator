@@ -10,18 +10,37 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// lifecycleLabels returns the three managed labels for the project, applying the
-// tatara-idea/tatara-approved/tatara-rejected defaults when a field is empty.
-func lifecycleLabels(s *tatarav1alpha1.ScmSpec) (idea, approved, rejected string) {
-	idea, approved, rejected = "tatara-idea", "tatara-approved", "tatara-rejected"
+// lifecycleLabels returns the four managed phase labels (brainstorming/approved/
+// implementation/declined), applying defaults when a field is empty.
+func lifecycleLabels(s *tatarav1alpha1.ScmSpec) (brainstorming, approved, implementation, declined string) {
+	brainstorming, approved, implementation, declined =
+		"tatara-brainstorming", "tatara-approved", "tatara-implementation", "tatara-declined"
+	if s == nil {
+		return
+	}
+	if s.BrainstormingLabel != "" {
+		brainstorming = s.BrainstormingLabel
+	}
+	if s.ApprovedLabel != "" {
+		approved = s.ApprovedLabel
+	}
+	if s.ImplementationLabel != "" {
+		implementation = s.ImplementationLabel
+	}
+	if s.DeclinedLabel != "" {
+		declined = s.DeclinedLabel
+	}
+	return
+}
+
+// legacyLabels returns the deprecated idea/rejected labels (lazy migration).
+func legacyLabels(s *tatarav1alpha1.ScmSpec) (idea, rejected string) {
+	idea, rejected = "tatara-idea", "tatara-rejected"
 	if s == nil {
 		return
 	}
 	if s.IdeaLabel != "" {
 		idea = s.IdeaLabel
-	}
-	if s.ApprovedLabel != "" {
-		approved = s.ApprovedLabel
 	}
 	if s.RejectedLabel != "" {
 		rejected = s.RejectedLabel
@@ -29,18 +48,35 @@ func lifecycleLabels(s *tatarav1alpha1.ScmSpec) (idea, approved, rejected string
 	return
 }
 
-// setLifecycleLabel ensures exactly `desired` of the three managed labels is
+// managedPhaseLabels returns every label the operator owns (new + legacy), so
+// setLifecycleLabel removes all-but-desired and dedup recognizes legacy issues.
+func managedPhaseLabels(s *tatarav1alpha1.ScmSpec) []string {
+	b, a, i, d := lifecycleLabels(s)
+	idea, rej := legacyLabels(s)
+	return []string{b, a, i, d, idea, rej}
+}
+
+// activePhaseLabels returns the labels meaning "in flight" (brainstorming,
+// approved, implementation, + legacy idea). An OPEN issue bearing any of these
+// with only-terminal Tasks is an orphan the backstop resumes.
+func activePhaseLabels(s *tatarav1alpha1.ScmSpec) []string {
+	b, a, i, _ := lifecycleLabels(s)
+	idea, _ := legacyLabels(s)
+	return []string{b, a, i, idea}
+}
+
+// setLifecycleLabel ensures exactly `desired` of the managed phase labels is
 // present on the task's source issue: it adds `desired` if absent and removes
-// the other two managed labels if present. It never touches any non-managed
-// label. Idempotent. AddLabel failures are returned (caller requeues);
-// RemoveLabel failures are logged and tolerated.
+// all other managed labels (4 phase labels: brainstorming/approved/
+// implementation/declined, plus 2 legacy labels: idea/rejected) if present.
+// It never touches any non-managed label. Idempotent. AddLabel failures are
+// returned (caller requeues); RemoveLabel failures are logged and tolerated.
 func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, desired string) error {
 	if task.Spec.Source == nil || task.Spec.Source.IssueRef == "" {
 		return nil
 	}
 	l := log.FromContext(ctx)
-	idea, approved, rejected := lifecycleLabels(proj.Spec.Scm)
-	managed := []string{idea, approved, rejected}
+	managed := managedPhaseLabels(proj.Spec.Scm)
 	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("set label: %w", err)

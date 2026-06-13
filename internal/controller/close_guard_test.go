@@ -29,7 +29,7 @@ func TestFinishTriage_Close_WithUnmergedChange_NotClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, w.closed, "issue must NOT be closed while an unmerged change exists")
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
-	require.Equal(t, []string{"tatara-idea"}, w.added, "label idea, not rejected")
+	require.Equal(t, []string{"tatara-brainstorming"}, w.added, "label brainstorming, not declined")
 }
 
 // A "close" outcome on an issue with NO code artifact is a legitimate triage
@@ -44,5 +44,5 @@ func TestFinishTriage_Close_NoChange_Closed(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []int{7}, w.closed, "pure triage reject closes the issue")
 	require.Equal(t, "Done", getTaskByName(t, task.Name).Status.LifecycleState)
-	require.Contains(t, w.added, "tatara-rejected")
+	require.Contains(t, w.added, "tatara-declined")
 }

@@ -379,8 +379,8 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		}
 	}
 
-	idea, _, _ := lifecycleLabels(proj.Spec.Scm)
-	label := idea
+	brainstorming, _, _, _ := lifecycleLabels(proj.Spec.Scm)
+	label := brainstorming
 	body := task.Spec.ProposedIssue.Body + "\n\n" + tataraAuthoredMarker
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 		Title:  proposalTitle,
