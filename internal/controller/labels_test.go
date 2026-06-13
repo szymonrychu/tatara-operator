@@ -105,10 +105,15 @@ func TestSetLifecycleLabel_NeverTouchesTriggerOrPriority(t *testing.T) {
 type commentReader struct {
 	fakeProposalReader
 	comments []scm.IssueComment
+	body     string // issue body returned by GetIssue (carries tataraAuthoredMarker when set)
 }
 
 func (r *commentReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
 	return r.comments, nil
+}
+
+func (r *commentReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
+	return scm.IssueContent{Body: r.body}, nil
 }
 
 func newReconcilerWithReader(rdr scm.SCMReader) *TaskReconciler {

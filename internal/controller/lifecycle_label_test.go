@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +12,13 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+// errGetIssueReader fails GetIssue so the authorship check errors (fail-closed test).
+type errGetIssueReader struct{ fakeProposalReader }
+
+func (errGetIssueReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
+	return scm.IssueContent{}, fmt.Errorf("get issue boom")
+}
 
 // labelWriter (defined in labels_test.go) overrides only AddLabel/RemoveLabel.
 // finishTriage also calls Comment (discuss) and CloseIssue (close); add no-op
@@ -84,12 +92,13 @@ func TestFinishTriage_Discuss_Idea(t *testing.T) {
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
-func TestFinishTriage_BotAuthoredImplement_NoHumanComment_ParksIdea(t *testing.T) {
-	_, task, w := seedLabelTask(t, "bot-noh", nil)
-	got := getTaskByName(t, task.Name)
-	got.Spec.Source.AuthorLogin = "tatara-bot"
-	require.NoError(t, k8sClient.Update(context.Background(), got))
-	r := reconcilerFor(w, &commentReader{comments: []scm.IssueComment{{Author: "tatara-bot", Body: "my idea"}}})
+// Authorship is detected via the tataraAuthoredMarker in the issue body, NOT
+// Source.AuthorLogin (which issueScan leaves empty). seedLabelTask sets
+// AuthorLogin="human", so these tests prove the guard fires on the cron path
+// purely from the marker.
+func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testing.T) {
+	_, task, w := seedLabelTask(t, "auth-noh", nil)
+	r := reconcilerFor(w, &commentReader{body: "an idea\n\n" + tataraAuthoredMarker})
 	proj := projOf(t, task)
 	markSucceededWithOutcome(t, task.Name, "implement")
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
@@ -98,16 +107,29 @@ func TestFinishTriage_BotAuthoredImplement_NoHumanComment_ParksIdea(t *testing.T
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
-func TestFinishTriage_BotAuthoredImplement_WithHumanComment_Approved(t *testing.T) {
-	_, task, w := seedLabelTask(t, "bot-h", nil)
-	got := getTaskByName(t, task.Name)
-	got.Spec.Source.AuthorLogin = "tatara-bot"
-	require.NoError(t, k8sClient.Update(context.Background(), got))
-	r := reconcilerFor(w, &commentReader{comments: []scm.IssueComment{{Author: "szymon", Body: "approved, go"}}})
+func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testing.T) {
+	_, task, w := seedLabelTask(t, "auth-h", nil)
+	r := reconcilerFor(w, &commentReader{
+		body:     "an idea\n\n" + tataraAuthoredMarker,
+		comments: []scm.IssueComment{{Author: "szymon", Body: "approved, go"}},
+	})
 	proj := projOf(t, task)
 	markSucceededWithOutcome(t, task.Name, "implement")
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-approved"}, w.added)
 	require.Equal(t, "Implement", getTaskByName(t, task.Name).Status.LifecycleState)
+}
+
+// Fail-closed: when the authorship check errors, treat the issue as tatara-authored
+// and park it (never auto-approve on an unknown).
+func TestFinishTriage_AuthorshipCheckError_FailsClosed_ParksIdea(t *testing.T) {
+	_, task, w := seedLabelTask(t, "auth-err", nil)
+	r := reconcilerFor(w, &errGetIssueReader{})
+	proj := projOf(t, task)
+	markSucceededWithOutcome(t, task.Name, "implement")
+	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
+	require.NoError(t, err)
+	require.Equal(t, []string{"tatara-idea"}, w.added)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }

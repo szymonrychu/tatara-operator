@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -134,4 +135,37 @@ func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alph
 		}
 	}
 	return false, nil
+}
+
+// tataraAuthoredIssue reports whether the task's source issue was opened by
+// tatara, detected by the tataraAuthoredMarker in the issue body. This is the
+// reliable, egress-verified authorship signal for the self-approve guard:
+// Source.AuthorLogin is empty for cron-scanned issues and comes from the
+// untrusted webhook payload otherwise. Returns the error so the caller can fail
+// closed (treat as authored -> require a human approval comment).
+func (r *TaskReconciler) tataraAuthoredIssue(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (bool, error) {
+	if r.ReaderFor == nil || task.Spec.Source == nil {
+		return false, nil
+	}
+	provider := task.Spec.Source.Provider
+	if provider == "" && proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		return false, err
+	}
+	reader, err := r.ReaderFor(provider, token)
+	if err != nil {
+		return false, err
+	}
+	owner, name, err := scm.OwnerRepo(r.repoURLForTask(ctx, task))
+	if err != nil {
+		return false, err
+	}
+	content, err := reader.GetIssue(ctx, owner, name, task.Spec.Source.Number)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(content.Body, tataraAuthoredMarker), nil
 }

@@ -429,19 +429,10 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		comment = outcome.Comment
 	}
 
-	// Clear IssueOutcome before acting so stale outcome is never re-consumed.
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
-		fresh.Status.IssueOutcome = nil
-		return r.Status().Update(ctx, fresh)
-	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("triage: clear IssueOutcome: %w", err)
-	}
-	task.Status.IssueOutcome = nil
-
+	// IssueOutcome is cleared only AFTER the action arm commits a state
+	// transition (see clearIssueOutcome calls below). Clearing before acting
+	// would, on any mid-arm SCM error, strand the task with a nil outcome and
+	// silently default a close/discuss to implement on the next reconcile.
 	idea, approved, rejected := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
@@ -468,10 +459,17 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 
 	default: // "implement" and anything else
-		// Bot-authored self-approve guard: tatara never approves its own idea
-		// before a human has engaged. A human-filed issue may self-approve.
-		if task.Spec.Source != nil && project.Spec.Scm != nil &&
-			project.Spec.Scm.BotLogin != "" && task.Spec.Source.AuthorLogin == project.Spec.Scm.BotLogin {
+		// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
+		// human has engaged. Authorship is detected via the tatara-authored marker
+		// in the issue body - reliable and egress-verified, unlike Source.AuthorLogin
+		// which is empty for cron-scanned issues and untrusted on the webhook path.
+		authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
+		if aerr != nil {
+			l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
+				"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
+			authored = true
+		}
+		if authored {
 			human, herr := r.hasHumanComment(ctx, project, task)
 			if herr != nil {
 				l.Info("triage: hasHumanComment failed; parking as idea (fail closed)",
@@ -485,6 +483,9 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
 					return ctrl.Result{}, err
 				}
+				if err := r.clearIssueOutcome(ctx, task); err != nil {
+					return ctrl.Result{}, err
+				}
 				return ctrl.Result{}, r.resetAgentRun(ctx, task)
 			}
 		}
@@ -496,7 +497,28 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 	}
 
+	if err := r.clearIssueOutcome(ctx, task); err != nil {
+		return ctrl.Result{}, err
+	}
 	return ctrl.Result{}, r.resetAgentRun(ctx, task)
+}
+
+// clearIssueOutcome nils Status.IssueOutcome (RetryOnConflict). Called only
+// after the triage action arm has committed its state transition, so a mid-arm
+// error retries the same outcome rather than defaulting to implement.
+func (r *TaskReconciler) clearIssueOutcome(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.IssueOutcome = nil
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return fmt.Errorf("triage: clear IssueOutcome: %w", err)
+	}
+	task.Status.IssueOutcome = nil
+	return nil
 }
 
 // enterConversation sets the conversation idle deadline + LastActivityAt and
