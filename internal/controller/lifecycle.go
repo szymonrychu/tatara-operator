@@ -433,6 +433,10 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 	// transition (see clearIssueOutcome calls below). Clearing before acting
 	// would, on any mid-arm SCM error, strand the task with a nil outcome and
 	// silently default a close/discuss to implement on the next reconcile.
+	// Accepted tradeoff: if the post-SCM status transition (RetryOnConflict)
+	// exhausts its retries after the comment/close already landed, the next
+	// reconcile re-runs the arm and may post a duplicate triage comment. That
+	// is rare and cosmetic, and preferred over the wrong-implement downgrade.
 	idea, approved, rejected := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
