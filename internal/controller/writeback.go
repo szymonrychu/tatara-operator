@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -296,6 +297,43 @@ const tataraAuthoredMarker = "<!-- tatara-authored -->"
 //	(C) Title-level idempotency: before calling CreateIssue, list open issues via
 //	    the reader and skip creation if an open issue with the same title exists;
 //	    set Source to the existing issue and proceed to AwaitingApproval.
+//
+// resolveRepository finds the Repository CR for a ProposedIssue.RepositoryRef.
+// The brainstorm agent may pass either the CR name ("tatara-cli") or the SCM
+// slug ("owner/tatara-cli"); both resolve here. Slug match is by the owner/repo
+// of each Project Repository's URL. Without this, an agent that passes the slug
+// makes createProposal 404 ("Repository not found"), the proposal never opens an
+// issue, and the issue-count backpressure never trips.
+func (r *TaskReconciler) resolveRepository(ctx context.Context, namespace, projectRef, ref string) (tatarav1alpha1.Repository, error) {
+	var repo tatarav1alpha1.Repository
+	// A bare CR name has no slash; a slug ("owner/repo") would be rejected by the
+	// API server as an invalid name, so only attempt a direct Get for bare names.
+	if !strings.Contains(ref, "/") {
+		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref}, &repo); err == nil {
+			return repo, nil
+		} else if !apierrors.IsNotFound(err) {
+			return repo, err
+		}
+	}
+	var list tatarav1alpha1.RepositoryList
+	if err := r.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return repo, err
+	}
+	for i := range list.Items {
+		it := list.Items[i]
+		if it.Spec.ProjectRef != projectRef {
+			continue
+		}
+		if it.Name == ref {
+			return it, nil
+		}
+		if owner, name, oerr := scm.OwnerRepo(it.Spec.URL); oerr == nil && owner+"/"+name == ref {
+			return it, nil
+		}
+	}
+	return repo, fmt.Errorf("no Repository matches %q (tried CR name and owner/repo slug)", ref)
+}
+
 func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 	if proj.Spec.Scm == nil {
@@ -310,8 +348,8 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		return r.completeProposal(ctx, task, task.Spec.Source.URL)
 	}
 
-	var repo tatarav1alpha1.Repository
-	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProposedIssue.RepositoryRef}, &repo); err != nil {
+	repo, err := r.resolveRepository(ctx, task.Namespace, proj.Name, task.Spec.ProposedIssue.RepositoryRef)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("proposal: get repository: %w", err)
 	}
 	writer, err := r.SCMFor(proj.Spec.Scm.Provider)
