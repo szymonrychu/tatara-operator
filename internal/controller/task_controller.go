@@ -495,17 +495,24 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		}
 		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
 	}
+	// Persist the in-flight turn id BEFORE any other fallible write. The turn is
+	// already running on the agent; if a status write below failed first, the
+	// reconcile would return an error without recording annCurrentTurn, re-enter
+	// the callback branch on the next requeue, and submit a duplicate turn -
+	// orphaning this one. recordTurn also flips the Task to Running.
+	res, err := r.recordTurn(ctx, task, id, next.Name)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// Cosmetic: mark the executing Subtask Running. The turn is already durably
+	// recorded, so a failure here only costs a requeue, never a lost turn.
 	if next.Status.Phase != "Running" {
 		next.Status.Phase = "Running"
 		if err := r.Status().Update(ctx, next); err != nil {
 			return ctrl.Result{}, fmt.Errorf("set subtask running: %w", err)
 		}
 	}
-	task.Status.Phase = "Running"
-	if err := r.Status().Update(ctx, task); err != nil {
-		return ctrl.Result{}, fmt.Errorf("set task running: %w", err)
-	}
-	return r.recordTurn(ctx, task, id, next.Name)
+	return res, nil
 }
 
 // turnCap returns the maximum turns allowed for this Task.
@@ -520,7 +527,10 @@ func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
 }
 
 // recordTurn writes the in-flight turn id + executing subtask onto the Task,
-// clears the turn-complete marker, and bumps turnsCompleted when a turn closed.
+// clears the turn-complete marker, bumps turnsCompleted when a turn closed, and
+// flips the Task to Running on a subtask turn. The annotation write lands first
+// so the in-flight turn is durably recorded before the status write, which may
+// fail independently without orphaning the turn.
 func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Task, turnID, subtaskName string) (ctrl.Result, error) {
 	fresh := &tatarav1alpha1.Task{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
@@ -540,8 +550,15 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 	}
 	if hadCallback {
 		fresh.Status.TurnsCompleted++
+	}
+	// A subtask turn (subtaskName set) flips the Task to Running; the plan turn
+	// (subtaskName empty) leaves the phase untouched (Planning).
+	if subtaskName != "" {
+		fresh.Status.Phase = "Running"
+	}
+	if hadCallback || subtaskName != "" {
 		if err := r.Status().Update(ctx, fresh); err != nil {
-			return ctrl.Result{}, fmt.Errorf("record turns completed: %w", err)
+			return ctrl.Result{}, fmt.Errorf("record turn status: %w", err)
 		}
 	}
 	return ctrl.Result{RequeueAfter: pollRequeue}, nil

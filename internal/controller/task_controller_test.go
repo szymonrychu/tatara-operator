@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -543,6 +545,90 @@ func TestTaskReconcile_AdvancesToNextSubtask(t *testing.T) {
 	s2Turn, _ := fs.lastSubmit()
 	if !contains(s2Turn.Text, "t-adv-s2-title") {
 		t.Errorf("s2 turn text = %q", s2Turn.Text)
+	}
+}
+
+// failingStatusClient wraps a client.Client and, once armed, fails every
+// Status().Update call. Used to prove a status write that fails after a
+// successful SubmitTurn does not orphan the in-flight turn.
+type failingStatusClient struct {
+	client.Client
+	armed bool
+}
+
+func (c *failingStatusClient) Status() client.SubResourceWriter {
+	return &failingStatusWriter{SubResourceWriter: c.Client.Status(), c: c}
+}
+
+type failingStatusWriter struct {
+	client.SubResourceWriter
+	c *failingStatusClient
+}
+
+func (w *failingStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if w.c.armed {
+		return fmt.Errorf("injected status update failure")
+	}
+	return w.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+// TestTaskReconcile_StatusWriteFailureDoesNotOrphanTurn pins the ordering fix:
+// once SubmitTurn succeeds the turn is running on the agent, so the turn id must
+// be persisted before any other fallible write. A status write that fails first
+// would return an error without recording annCurrentTurn, re-enter the callback
+// branch on requeue, and submit a duplicate turn - orphaning the first.
+func TestTaskReconcile_StatusWriteFailureDoesNotOrphanTurn(t *testing.T) {
+	mkTaskProject(t, "p-orphan", 3)
+	mkTaskRepository(t, "r-orphan", "p-orphan")
+	mkTask(t, "t-orphan", "p-orphan", "r-orphan")
+	mkSubtask(t, "t-orphan-s1", "t-orphan", 1)
+	setProjectMemoryReady(t, "p-orphan", "http://mem-p-orphan.tatara.svc:8080")
+
+	fs := newFakeSession()
+	fc := &failingStatusClient{Client: k8sClient}
+	r := newTaskReconciler(fs)
+	r.Client = fc
+
+	if _, err := reconcileTask(t, r, "t-orphan"); err != nil { // spawn
+		t.Fatalf("spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-orphan")
+	if _, err := reconcileTask(t, r, "t-orphan"); err != nil { // plan turn
+		t.Fatalf("plan: %v", err)
+	}
+	// Plan-turn callback: the next reconcile submits the s1 subtask turn.
+	annotate(t, "t-orphan", map[string]string{annTurnComplete: "2026-06-06T12:00:00Z"})
+
+	// Arm the fault: every status write during the s1 submit reconcile fails.
+	fc.armed = true
+	if _, err := reconcileTask(t, r, "t-orphan"); err == nil {
+		t.Fatal("expected the injected status write failure to surface as a reconcile error")
+	}
+	fc.armed = false
+
+	s1Turn, ok := fs.lastSubmit()
+	if !ok {
+		t.Fatal("expected the s1 subtask turn to have been submitted")
+	}
+	// Despite the failed status write the in-flight turn id is durably recorded
+	// and the callback marker is cleared.
+	tk := getTask(t, "t-orphan")
+	if tk.Annotations[annCurrentTurn] != s1Turn.TurnID {
+		t.Fatalf("current-turn = %q, want %q: a failed status write orphaned the in-flight turn",
+			tk.Annotations[annCurrentTurn], s1Turn.TurnID)
+	}
+	if tk.Annotations[annTurnComplete] != "" {
+		t.Errorf("turn-complete marker should be cleared, got %q", tk.Annotations[annTurnComplete])
+	}
+
+	// Next reconcile (no fault): the controller sees the recorded turn and waits
+	// for its callback instead of submitting a duplicate.
+	if _, err := reconcileTask(t, r, "t-orphan"); err != nil {
+		t.Fatalf("wait reconcile: %v", err)
+	}
+	if after, _ := fs.lastSubmit(); after.TurnID != s1Turn.TurnID {
+		t.Errorf("a duplicate turn was submitted (%q != %q); the in-flight turn was orphaned",
+			after.TurnID, s1Turn.TurnID)
 	}
 }
 
