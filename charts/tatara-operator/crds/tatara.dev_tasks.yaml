@@ -257,6 +257,14 @@ spec:
                 type: string
               mergeCommitSHA:
                 type: string
+              pendingComments:
+                description: |-
+                  PendingComments are free-form comments queued by the agent via the
+                  comment MCP tool, posted to the task's linked issue on the next
+                  reconcile and then cleared. Does not change the lifecycle state.
+                items:
+                  type: string
+                type: array
               phase:
                 enum:
                 - Pending

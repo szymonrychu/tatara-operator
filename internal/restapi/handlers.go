@@ -11,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -379,6 +380,56 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 	}
 	t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
 	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
+// --- POST /tasks/{t}/comment ---
+
+type issueCommentReq struct {
+	Body string `json:"body"`
+}
+
+func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
+	var req issueCommentReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Body == "" {
+		writeError(w, http.StatusBadRequest, "body required")
+		return
+	}
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	// Only issueLifecycle Tasks have the reconcile drain that posts queued
+	// comments; queuing on any other kind would leak forever.
+	if t.Spec.Kind != "issueLifecycle" {
+		writeError(w, http.StatusConflict, "comment only applies to an issueLifecycle task")
+		return
+	}
+	if t.Spec.Source == nil || t.Spec.Source.IssueRef == "" {
+		writeError(w, http.StatusConflict, "comment requires a task linked to an issue")
+		return
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.Task
+		if gerr := s.c.Get(r.Context(), key, &fresh); gerr != nil {
+			return gerr
+		}
+		fresh.Status.PendingComments = append(fresh.Status.PendingComments, req.Body)
+		if uerr := s.c.Status().Update(r.Context(), &fresh); uerr != nil {
+			return uerr
+		}
+		t = fresh
+		return nil
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}

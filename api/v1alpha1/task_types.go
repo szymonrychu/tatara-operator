@@ -160,6 +160,11 @@ type TaskStatus struct {
 	// Cleared after the turn is submitted so a later fresh entry is clean.
 	// +optional
 	ImplementContext string `json:"implementContext,omitempty"`
+	// PendingComments are free-form comments queued by the agent via the
+	// comment MCP tool, posted to the task's linked issue on the next
+	// reconcile and then cleared. Does not change the lifecycle state.
+	// +optional
+	PendingComments []string `json:"pendingComments,omitempty"`
 }
 
 // +kubebuilder:object:root=true

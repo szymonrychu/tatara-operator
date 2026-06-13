@@ -72,6 +72,7 @@ func lifecycleTriageText(task *tatarav1alpha1.Task, title, body string) string {
 		"You are the tatara lifecycle agent performing Triage for issue %s (%s).\n\n"+
 			"Issue title: %s\n"+
 			"Issue body:\n%s\n\n"+
+			"Invoke the `tatara-research-followup` skill, which defines how to research the gap, post design comments via the comment tool, and decide the outcome.\n\n"+
 			"Your job:\n"+
 			"1. Read the issue AND the full conversation thread carefully.\n"+
 			"2. Use tatara MCP tools (memory, code search, docs) to understand the codebase.\n"+
