@@ -111,13 +111,15 @@ func findConvTaskToReactivate(c candidate, existing []tatarav1alpha1.Task) *tata
 }
 
 // isDeduped reports whether a candidate already has a Task that should suppress
-// a re-pick, per the dedup rules:
-//   - any non-terminal Task for (repo, number) -> skip
-//   - issueLifecycle: Done/Stopped/Parked lifecycle states count as terminal for
-//     dedup purposes (they free the key on newer activity, like Phase Succeeded)
-//   - PR: a terminal Task at the same head-sha -> skip (already handled revision)
-//   - issue: a terminal Task whose creation is at/after the candidate updatedAt -> skip
-func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
+// a re-pick. Phase labels are the issue's state-of-truth (Option A):
+//   - any non-terminal Task for (repo,number) -> skip (fast path)
+//   - PR: a terminal Task at the same head-sha -> skip
+//   - issue: a managed phase label present on the OPEN issue -> skip (active =>
+//     handled by the live Task above; terminal+label => orphan the backstop
+//     resumes; declined => no action). No managed label -> legacy/untracked, fall
+//     back to activity-vs-creation so a stale terminal Task is not re-triaged
+//     unless the issue saw new activity.
+func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string) bool {
 	repoLabel := sanitizeRepoLabel(c.repo)
 	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
@@ -125,9 +127,6 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		// A lifecycle Task with a non-terminal lifecycle state is in-flight even
-		// if the phase hasn't advanced yet. Treat lifecycle terminals as equivalent
-		// to Phase Succeeded/Failed for dedup.
 		lifecycleTerminal := t.Status.LifecycleState != "" && isLifecycleTerminal(t.Status.LifecycleState)
 		if !isTerminal(t.Status.Phase) && !lifecycleTerminal {
 			return true
@@ -138,7 +137,10 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task) bool {
 			}
 			continue
 		}
-		// issue: terminal Task suppresses unless the issue saw newer activity.
+		// issue: phase label is state-of-truth.
+		if hasAnyLabel(c.labels, managed) {
+			return true
+		}
 		if !c.updatedAt.After(t.CreationTimestamp.Time) {
 			return true
 		}
@@ -166,6 +168,15 @@ func hasLabel(labels []string, want string) bool {
 	}
 	for _, l := range labels {
 		if l == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyLabel(labels, want []string) bool {
+	for _, w := range want {
+		if hasLabel(labels, w) {
 			return true
 		}
 	}
@@ -560,9 +571,10 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		r.Metrics.ScanItem("mrScan", "scanned")
 	}
 	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
+	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing) {
+		if isDeduped(c, existing, managed) {
 			r.Metrics.ScanItem("mrScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
@@ -700,9 +712,10 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	}
 
 	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
+	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing) {
+		if isDeduped(c, existing, managed) {
 			r.Metrics.ScanItem("issueScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
@@ -751,7 +764,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	if maxProp < 1 {
 		maxProp = 3
 	}
-	ideaLabel, _, _ := lifecycleLabels(proj.Spec.Scm)
+	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
 	created := 0
 	for i := range repos {
 		repo := repos[i]
@@ -763,7 +776,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			r.Metrics.ScanItem("brainstorm", "skipped_inflight")
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, &repo, ideaLabel, existing)
+		backlog, err := r.proposalBacklog(ctx, reader, &repo, brainstormingLabel, proj.Spec.Scm, existing)
 		if err != nil {
 			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
 			continue
@@ -814,7 +827,7 @@ func brainstormInFlight(existing []tatarav1alpha1.Task, repoName string) bool {
 // bearing the idea label (live ListOpenIssues). This subsumes tatara-originated
 // proposals and any human-filed issue parked as an idea, providing conservative
 // brainstorm backpressure.
-func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, ideaLabel string, _ []tatarav1alpha1.Task) (int, error) {
+func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, brainstormingLabel string, scmSpec *tatarav1alpha1.ScmSpec, _ []tatarav1alpha1.Task) (int, error) {
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
 	if err != nil {
 		return 0, err
@@ -823,13 +836,101 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 	if err != nil {
 		return 0, err
 	}
+	legacyIdea, _ := legacyLabels(scmSpec)
 	n := 0
 	for _, iss := range issues {
-		if !iss.IsPR && hasLabel(iss.Labels, ideaLabel) {
+		if !iss.IsPR && (hasLabel(iss.Labels, brainstormingLabel) || hasLabel(iss.Labels, legacyIdea)) {
 			n++
 		}
 	}
 	return n, nil
+}
+
+// hasNonTerminalTaskForIssue reports whether any open (non-terminal) Task exists
+// for (slug, number) in the snapshot.
+func hasNonTerminalTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
+	repoLabel := sanitizeRepoLabel(slug)
+	numLabel := strconv.Itoa(number)
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+			continue
+		}
+		if taskOpen(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// recoverOrphans starts the correct lifecycle Task for each OPEN issue that
+// carries an active phase label but has no live Task (a missed/never-started or
+// stalled handler). It RE-LISTS existing Tasks so it sees Tasks mrScan/issueScan
+// created earlier this cycle (an open bot MR becomes a live MRCI Task -> not an
+// orphan). Bounded by the shared open-task budget.
+func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, budget *int) {
+	if *budget <= 0 {
+		return
+	}
+	l := log.FromContext(ctx)
+	existing, err := r.existingScanTasks(ctx, proj)
+	if err != nil {
+		l.Error(err, "backstop: list tasks", "action", "backstop_list_error", "resource_id", proj.Name)
+		return
+	}
+	brainstorming, approved, implementation, _ := lifecycleLabels(proj.Spec.Scm)
+	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
+	for i := range repos {
+		owner, name, oerr := scm.OwnerRepo(repos[i].Spec.URL)
+		if oerr != nil {
+			continue
+		}
+		issues, lerr := reader.ListOpenIssues(ctx, owner, name)
+		if lerr != nil {
+			l.Error(lerr, "backstop: ListOpenIssues", "action", "backstop_list_error", "resource_id", proj.Name, "repo", repos[i].Name)
+			continue
+		}
+		slug := owner + "/" + name
+		for _, iss := range issues {
+			if iss.IsPR {
+				continue
+			}
+			var entry, goal string
+			switch {
+			case hasLabel(iss.Labels, implementation):
+				entry = "Implement"
+				goal = fmt.Sprintf("Resume implementation for %s#%d (phase label present, no live task)", slug, iss.Number)
+			case hasLabel(iss.Labels, approved):
+				entry = "Implement"
+				goal = fmt.Sprintf("Implement approved issue %s#%d", slug, iss.Number)
+			case hasLabel(iss.Labels, brainstorming) || hasLabel(iss.Labels, legacyIdea):
+				entry = "Triage"
+				goal = fmt.Sprintf("Triage issue %s#%d", slug, iss.Number)
+			default:
+				continue
+			}
+			if hasNonTerminalTaskForIssue(existing, slug, iss.Number) {
+				continue
+			}
+			if *budget <= 0 {
+				return
+			}
+			repo, ok := r.matchRepoForSlug(repos, slug)
+			if !ok {
+				continue
+			}
+			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt}
+			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: entry}
+			if _, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann); cerr != nil {
+				l.Error(cerr, "backstop: create recovery task", "action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
+			l.Info("backstop: recovered orphaned issue", "action", "backstop_recover",
+				"resource_id", proj.Name, "issue", fmt.Sprintf("%s#%d", slug, iss.Number), "entry", entry)
+			r.Metrics.ScanItem("backstop", "recovered")
+			*budget--
+		}
+	}
 }
 
 // runScans runs each due activity and returns the soonest next-fire as a
@@ -906,6 +1007,9 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		if due {
 			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
 			r.stampScan(ctx, proj, "issueScan")
+			if budget > 0 {
+				r.recoverOrphans(ctx, proj, reader, repos, &budget)
+			}
 			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
 				consider(next2)
 			}

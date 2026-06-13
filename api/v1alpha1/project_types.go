@@ -128,8 +128,7 @@ type ScmSpec struct {
 	// +kubebuilder:default="tatara/awaiting-approval"
 	// +optional
 	ApprovalLabel string `json:"approvalLabel,omitempty"`
-	// IdeaLabel marks an issue tatara originated or updated but that is not yet
-	// ready for implementation.
+	// IdeaLabel is DEPRECATED (legacy alias for BrainstormingLabel); kept for lazy migration.
 	// +kubebuilder:default="tatara-idea"
 	// +optional
 	IdeaLabel string `json:"ideaLabel,omitempty"`
@@ -137,10 +136,22 @@ type ScmSpec struct {
 	// +kubebuilder:default="tatara-approved"
 	// +optional
 	ApprovedLabel string `json:"approvedLabel,omitempty"`
-	// RejectedLabel marks an issue tatara closed (redundant, duplicate, not actionable).
+	// RejectedLabel is DEPRECATED (legacy alias for DeclinedLabel); kept for lazy migration.
 	// +kubebuilder:default="tatara-rejected"
 	// +optional
 	RejectedLabel string `json:"rejectedLabel,omitempty"`
+	// BrainstormingLabel marks an issue tatara is triaging / discussing (pre-approval).
+	// +kubebuilder:default="tatara-brainstorming"
+	// +optional
+	BrainstormingLabel string `json:"brainstormingLabel,omitempty"`
+	// ImplementationLabel marks an issue whose implementation is in flight.
+	// +kubebuilder:default="tatara-implementation"
+	// +optional
+	ImplementationLabel string `json:"implementationLabel,omitempty"`
+	// DeclinedLabel marks an issue declined before implementation (triage reject).
+	// +kubebuilder:default="tatara-declined"
+	// +optional
+	DeclinedLabel string `json:"declinedLabel,omitempty"`
 	// +optional
 	PriorityLabel string `json:"priorityLabel,omitempty"`
 	// +optional

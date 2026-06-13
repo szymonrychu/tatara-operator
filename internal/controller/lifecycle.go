@@ -228,6 +228,31 @@ func needsSpawn(lifecycleState, phase string) bool {
 	return false
 }
 
+// ensurePhaseLabel sets the desired managed phase label on the task's source
+// issue (no-op for PR sources or missing source). phase is one of
+// "brainstorming"|"approved"|"implementation"|"declined"; it resolves the
+// configured label name and delegates to setLifecycleLabel (idempotent).
+func (r *TaskReconciler) ensurePhaseLabel(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, phase string) error {
+	if task.Spec.Source == nil || task.Spec.Source.IsPR || task.Spec.Source.IssueRef == "" {
+		return nil
+	}
+	brainstorming, approved, implementation, declined := lifecycleLabels(project.Spec.Scm)
+	var desired string
+	switch phase {
+	case "brainstorming":
+		desired = brainstorming
+	case "approved":
+		desired = approved
+	case "implementation":
+		desired = implementation
+	case "declined":
+		desired = declined
+	default:
+		return nil
+	}
+	return r.setLifecycleLabel(ctx, project, task, desired)
+}
+
 // reconcileLifecycle is the dispatch function for issueLifecycle Tasks. It
 // applies the memory-ready and concurrency gates ONLY on the spawn path (i.e.
 // when about to start a new agent run). Terminal-phase outcome consumption,
@@ -275,6 +300,12 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		if err := r.setLifecycleState(ctx, task, entry, "initial"); err != nil {
 			r.Metrics.ReconcileResult("Task", "error")
 			return ctrl.Result{}, err
+		}
+		if entry == "Triage" {
+			if err := r.ensurePhaseLabel(ctx, &project, task, "brainstorming"); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, err
+			}
 		}
 		r.Metrics.ReconcileResult("Task", "success")
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
@@ -351,6 +382,13 @@ func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alph
 		return r.finishTriage(ctx, project, task)
 	}
 	// Run in progress (or not yet started) -> drive another step.
+	// Idempotent: ensure the brainstorming label is set (covers reactivation where
+	// the task re-enters Triage without going through the case "" initializer).
+	if !isTerminal(task.Status.Phase) {
+		if err := r.ensurePhaseLabel(ctx, project, task, "brainstorming"); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	var repo tatarav1alpha1.Repository
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("triage: get repo: %w", err)
@@ -437,7 +475,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 	// exhausts its retries after the comment/close already landed, the next
 	// reconcile re-runs the arm and may post a duplicate triage comment. That
 	// is rare and cosmetic, and preferred over the wrong-implement downgrade.
-	idea, approved, rejected := lifecycleLabels(project.Spec.Scm)
+	brainstorming, approved, _, declined := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
 	case "close":
@@ -445,12 +483,12 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 			// Invariant: never close an issue that has an unmerged code change.
 			// A human-comment re-triage of an issue whose MR is open/conflicting
 			// can yield a "close" outcome; closing here would orphan the unmerged
-			// change. Keep the issue open (idea) and await the change being
+			// change. Keep the issue open (brainstorming) and await the change being
 			// merged-green or abandoned.
 			l.Info("triage close withheld: unmerged change exists; keeping issue open",
 				"action", "lifecycle_close_withheld", "resource_id", task.Name,
 				"pr_url", task.Status.PrURL, "head_branch", task.Status.HeadBranch)
-			if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+			if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 				return ctrl.Result{}, err
 			}
 			note := comment
@@ -466,7 +504,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 			}
 			break
 		}
-		if err := r.setLifecycleLabel(ctx, project, task, rejected); err != nil {
+		if err := r.setLifecycleLabel(ctx, project, task, declined); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.triageCloseIssue(ctx, project, task, comment); err != nil {
@@ -477,7 +515,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 
 	case "discuss":
-		if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+		if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.triagePostComment(ctx, project, task, comment); err != nil {
@@ -501,12 +539,12 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if authored {
 			human, herr := r.hasHumanComment(ctx, project, task)
 			if herr != nil {
-				l.Info("triage: hasHumanComment failed; parking as idea (fail closed)",
+				l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
 					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
 				human = false
 			}
 			if !human {
-				if err := r.setLifecycleLabel(ctx, project, task, idea); err != nil {
+				if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 					return ctrl.Result{}, err
 				}
 				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
@@ -738,6 +776,10 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 		// Copy mutable pointers back so callers see the new values.
 		task.ResourceVersion = refreshed.ResourceVersion
 		task.Status = refreshed.Status
+		// Idempotent: set implementation label on fresh Implement spawn.
+		if err := r.ensurePhaseLabel(ctx, project, task, "implementation"); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	var repo tatarav1alpha1.Repository

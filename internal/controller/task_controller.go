@@ -33,11 +33,11 @@ const (
 	maxPodRecreations = 3
 	turnTimeoutGrace  = 60 * time.Second
 
-	annCurrentTurn           = "tatara.dev/current-turn"
-	annCurrentSubtask        = "tatara.dev/current-subtask"
-	annTurnComplete          = "tatara.dev/turn-complete"
-	annPodRecreations        = "tatara.dev/pod-recreations"
-	annTurnStartedAt         = "tatara.dev/turn-started-at"
+	annCurrentTurn           = tatarav1alpha1.AnnCurrentTurn
+	annCurrentSubtask        = tatarav1alpha1.AnnCurrentSubtask
+	annTurnComplete          = tatarav1alpha1.AnnTurnComplete
+	annPodRecreations        = tatarav1alpha1.AnnPodRecreations
+	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
 	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
 	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
 )

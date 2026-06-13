@@ -127,6 +127,11 @@ spec:
                     type: object
                   botLogin:
                     type: string
+                  brainstormingLabel:
+                    default: tatara-brainstorming
+                    description: BrainstormingLabel marks an issue tatara is triaging
+                      / discussing (pre-approval).
+                    type: string
                   conversationIdleMinutes:
                     default: 60
                     type: integer
@@ -188,11 +193,20 @@ spec:
                             type: string
                         type: object
                     type: object
+                  declinedLabel:
+                    default: tatara-declined
+                    description: DeclinedLabel marks an issue declined before implementation
+                      (triage reject).
+                    type: string
                   ideaLabel:
                     default: tatara-idea
-                    description: |-
-                      IdeaLabel marks an issue tatara originated or updated but that is not yet
-                      ready for implementation.
+                    description: IdeaLabel is DEPRECATED (legacy alias for BrainstormingLabel);
+                      kept for lazy migration.
+                    type: string
+                  implementationLabel:
+                    default: tatara-implementation
+                    description: ImplementationLabel marks an issue whose implementation
+                      is in flight.
                     type: string
                   mergePolicy:
                     default: afterApproval
@@ -217,8 +231,8 @@ spec:
                     type: string
                   rejectedLabel:
                     default: tatara-rejected
-                    description: RejectedLabel marks an issue tatara closed (redundant,
-                      duplicate, not actionable).
+                    description: RejectedLabel is DEPRECATED (legacy alias for DeclinedLabel);
+                      kept for lazy migration.
                     type: string
                 required:
                 - botLogin

@@ -76,6 +76,45 @@ func seedLabelTask(t *testing.T, suffix string, currentLabels []string) (*TaskRe
 	return r, &fresh, w
 }
 
+func sliceContains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLifecycleLabelsFourDefaults(t *testing.T) {
+	b, a, i, d := lifecycleLabels(nil)
+	if b != "tatara-brainstorming" || a != "tatara-approved" || i != "tatara-implementation" || d != "tatara-declined" {
+		t.Fatalf("defaults: got %q %q %q %q", b, a, i, d)
+	}
+	s := &tatarav1alpha1.ScmSpec{BrainstormingLabel: "bs", ApprovedLabel: "ap", ImplementationLabel: "im", DeclinedLabel: "dc"}
+	b, a, i, d = lifecycleLabels(s)
+	if b != "bs" || a != "ap" || i != "im" || d != "dc" {
+		t.Fatalf("overrides: got %q %q %q %q", b, a, i, d)
+	}
+}
+
+func TestManagedAndActivePhaseLabelsIncludeLegacy(t *testing.T) {
+	managed := managedPhaseLabels(nil)
+	for _, want := range []string{"tatara-brainstorming", "tatara-approved", "tatara-implementation", "tatara-declined", "tatara-idea", "tatara-rejected"} {
+		if !sliceContains(managed, want) {
+			t.Fatalf("managedPhaseLabels missing %q: %v", want, managed)
+		}
+	}
+	active := activePhaseLabels(nil)
+	for _, want := range []string{"tatara-brainstorming", "tatara-approved", "tatara-implementation", "tatara-idea"} {
+		if !sliceContains(active, want) {
+			t.Fatalf("activePhaseLabels missing %q: %v", want, active)
+		}
+	}
+	if sliceContains(active, "tatara-declined") || sliceContains(active, "tatara-rejected") {
+		t.Fatalf("activePhaseLabels must NOT include terminal labels: %v", active)
+	}
+}
+
 func TestSetLifecycleLabel_AddsDesiredRemovesOthers(t *testing.T) {
 	r, task, w := seedLabelTask(t, "addrm", []string{"tatara-idea", "unrelated"})
 	var proj tatarav1alpha1.Project
@@ -156,5 +195,5 @@ func TestSetLifecycleLabel_UnknownLabels_RemovesUnconditionally(t *testing.T) {
 		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return &commentReader{}, nil }}
 	require.NoError(t, r.setLifecycleLabel(context.Background(), &proj, task, "tatara-approved"))
 	require.Equal(t, []string{"tatara-approved"}, w.added)
-	require.ElementsMatch(t, []string{"tatara-idea", "tatara-rejected"}, w.removed)
+	require.ElementsMatch(t, []string{"tatara-brainstorming", "tatara-implementation", "tatara-declined", "tatara-idea", "tatara-rejected"}, w.removed)
 }
