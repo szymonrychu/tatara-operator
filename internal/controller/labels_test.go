@@ -101,3 +101,35 @@ func TestSetLifecycleLabel_NeverTouchesTriggerOrPriority(t *testing.T) {
 	require.Equal(t, []string{"tatara-rejected"}, w.added)
 	require.Equal(t, []string{"tatara-idea"}, w.removed)
 }
+
+type commentReader struct {
+	fakeProposalReader
+	comments []scm.IssueComment
+}
+
+func (r *commentReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return r.comments, nil
+}
+
+func newReconcilerWithReader(rdr scm.SCMReader) *TaskReconciler {
+	return &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		SCMFor:    func(string) (scm.SCMWriter, error) { return &labelWriter{}, nil },
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return rdr, nil }}
+}
+
+func TestHasHumanComment(t *testing.T) {
+	_, task, _ := seedLabelTask(t, "humancmt", nil)
+	var proj tatarav1alpha1.Project
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
+
+	r1 := newReconcilerWithReader(&commentReader{comments: []scm.IssueComment{{Author: "tatara-bot", Body: "proposal"}}})
+	got, err := r1.hasHumanComment(context.Background(), &proj, task)
+	require.NoError(t, err)
+	require.False(t, got)
+
+	r2 := newReconcilerWithReader(&commentReader{comments: []scm.IssueComment{{Author: "tatara-bot", Body: "x"}, {Author: "szymon", Body: "looks good, go"}}})
+	got, err = r2.hasHumanComment(context.Background(), &proj, task)
+	require.NoError(t, err)
+	require.True(t, got)
+}

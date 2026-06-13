@@ -87,3 +87,43 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		"resource_id", task.Name, "issue_ref", issueRef, "label", desired)
 	return nil
 }
+
+// hasHumanComment reports whether the task's source issue has at least one
+// comment authored by a non-bot login. Used to gate self-approval of
+// bot-authored issues: tatara never self-approves its own idea before a human
+// has engaged. Returns the underlying error so the caller can fail closed.
+func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (bool, error) {
+	if r.ReaderFor == nil || task.Spec.Source == nil {
+		return false, nil
+	}
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	provider := task.Spec.Source.Provider
+	if provider == "" && proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		return false, err
+	}
+	reader, err := r.ReaderFor(provider, token)
+	if err != nil {
+		return false, err
+	}
+	owner, name, err := scm.OwnerRepo(r.repoURLForTask(ctx, task))
+	if err != nil {
+		return false, err
+	}
+	comments, err := reader.ListIssueComments(ctx, owner, name, task.Spec.Source.Number)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range comments {
+		if c.Author != "" && c.Author != botLogin {
+			return true, nil
+		}
+	}
+	return false, nil
+}
