@@ -86,6 +86,11 @@ type BrainstormActivity struct {
 	// +kubebuilder:default=1
 	// +optional
 	MaxPerCycle int `json:"maxPerCycle,omitempty"`
+	// MaxOpenProposals caps open, unapproved agent proposals per repo; at or
+	// above this the repo is skipped. Default 3.
+	// +kubebuilder:default=3
+	// +optional
+	MaxOpenProposals int `json:"maxOpenProposals,omitempty"`
 	// +kubebuilder:validation:items:Enum=docs;memory;internet
 	// +optional
 	Sources []string `json:"sources,omitempty"`

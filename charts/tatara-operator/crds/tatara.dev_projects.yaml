@@ -123,6 +123,12 @@ spec:
                         properties:
                           enabled:
                             type: boolean
+                          maxOpenProposals:
+                            default: 3
+                            description: |-
+                              MaxOpenProposals caps open, unapproved agent proposals per repo; at or
+                              above this the repo is skipped. Default 3.
+                            type: integer
                           maxPerCycle:
                             default: 1
                             type: integer

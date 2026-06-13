@@ -160,3 +160,10 @@ func TestProjectRegisteredInScheme(t *testing.T) {
 		t.Fatal("Repository kind not recognized by scheme")
 	}
 }
+
+func TestBrainstormActivity_MaxOpenProposalsField(t *testing.T) {
+	b := v1alpha1.BrainstormActivity{MaxOpenProposals: 3}
+	if b.MaxOpenProposals != 3 {
+		t.Fatalf("MaxOpenProposals = %d, want 3", b.MaxOpenProposals)
+	}
+}

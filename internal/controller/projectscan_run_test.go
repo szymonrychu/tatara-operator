@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -420,5 +422,362 @@ func TestRunScans_DedupSkipsInFlight(t *testing.T) {
 	// only the pre-existing one; no new task for #10
 	if n := len(listScanTasks(t, "dedup-proj")); n != 1 {
 		t.Fatalf("dedup failed: want 1 task, got %d", n)
+	}
+}
+
+// perRepoFakeReader allows scripting per-repo issues and errors for brainstorm
+// and backstop tests. It falls through to the base fakeReader for PRs/board.
+type perRepoFakeReader struct {
+	fakeReader
+	// issuesByRepo maps "owner/repo" -> issues to return.
+	issuesByRepo map[string][]scm.IssueRef
+	// errRepos is the set of "owner/repo" slugs that return an error.
+	errRepos map[string]bool
+}
+
+func (f *perRepoFakeReader) ListOpenIssues(_ context.Context, owner, repo string) ([]scm.IssueRef, error) {
+	slug := owner + "/" + repo
+	if f.errRepos[slug] {
+		return nil, fmt.Errorf("fake error for %s", slug)
+	}
+	if iss, ok := f.issuesByRepo[slug]; ok {
+		return iss, nil
+	}
+	return nil, nil
+}
+
+// seedBrainstormProject creates a Project with ApprovalLabel set and a brainstorm
+// cron, plus the requested repositories (by slug "owner/repo").
+func seedBrainstormProject(t *testing.T, name string, repoSlugs []string, maxOpenProposals int) (*tatarav1alpha1.Project, []tatarav1alpha1.Repository) {
+	t.Helper()
+	ctx := context.Background()
+	mkSecret(t, name+"-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+	cron := &tatarav1alpha1.ScmCron{
+		Brainstorm: tatarav1alpha1.BrainstormActivity{
+			Enabled:          true,
+			Schedule:         "0 * * * *",
+			MaxOpenProposals: maxOpenProposals,
+		},
+	}
+	proj := &tatarav1alpha1.Project{}
+	proj.Name = name
+	proj.Namespace = testNS
+	proj.Spec.ScmSecretRef = name + "-scm"
+	proj.Spec.Scm = &tatarav1alpha1.ScmSpec{
+		Provider:      "github",
+		Owner:         "o",
+		BotLogin:      "tatara-bot",
+		ApprovalLabel: "tatara/awaiting-approval",
+		Cron:          cron,
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	var repos []tatarav1alpha1.Repository
+	for _, slug := range repoSlugs {
+		repoName := name + "-" + strings.ReplaceAll(slug, "/", "-")
+		rp := &tatarav1alpha1.Repository{}
+		rp.Name = repoName
+		rp.Namespace = testNS
+		rp.Spec = tatarav1alpha1.RepositorySpec{
+			ProjectRef:       name,
+			URL:              "https://github.com/" + slug + ".git",
+			DefaultBranch:    "main",
+			ReingestSchedule: "0 6 * * *",
+		}
+		if err := k8sClient.Create(ctx, rp); err != nil {
+			t.Fatalf("create repo %s: %v", slug, err)
+		}
+		repos = append(repos, *rp)
+	}
+	return proj, repos
+}
+
+// listBrainstormTasks returns brainstorm tasks for the given project.
+func listBrainstormTasks(t *testing.T, project string) []tatarav1alpha1.Task {
+	t.Helper()
+	tasks := listScanTasks(t, project)
+	var out []tatarav1alpha1.Task
+	for _, tk := range tasks {
+		if tk.Labels[labelActivity] == "brainstorm" {
+			out = append(out, tk)
+		}
+	}
+	return out
+}
+
+// TestBrainstorm_UnderCap_CreatesOnePerRepo: 2 repos, 0 proposals each -> 2 brainstorm tasks.
+func TestBrainstorm_UnderCap_CreatesOnePerRepo(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-undercap", []string{"o/a", "o/b"}, 3)
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/a": {},
+			"o/b": {},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+
+	tasks := listBrainstormTasks(t, "bs-undercap")
+	if len(tasks) != 2 {
+		t.Fatalf("want 2 brainstorm tasks (one per repo), got %d", len(tasks))
+	}
+	repoRefs := map[string]bool{}
+	for _, tk := range tasks {
+		repoRefs[tk.Spec.RepositoryRef] = true
+	}
+	for _, rp := range repos {
+		if !repoRefs[rp.Name] {
+			t.Fatalf("no brainstorm task for repo %s", rp.Name)
+		}
+	}
+}
+
+// TestBrainstorm_AtCap_SkipsRepo: repo with >= maxOpenProposals open approval-label issues -> no brainstorm task.
+func TestBrainstorm_AtCap_SkipsRepo(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-atcap", []string{"o/c"}, 3)
+	// 3 open issues with the approval label -> at cap
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/c": {
+				{Repo: "o/c", Number: 1, Labels: []string{"tatara/awaiting-approval"}, IsPR: false},
+				{Repo: "o/c", Number: 2, Labels: []string{"tatara/awaiting-approval"}, IsPR: false},
+				{Repo: "o/c", Number: 3, Labels: []string{"tatara/awaiting-approval"}, IsPR: false},
+			},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+
+	tasks := listBrainstormTasks(t, "bs-atcap")
+	if len(tasks) != 0 {
+		t.Fatalf("want 0 brainstorm tasks (at cap), got %d", len(tasks))
+	}
+}
+
+// TestBrainstorm_InFlight_SkipsRepo: pre-existing non-terminal brainstorm Task -> no new task.
+func TestBrainstorm_InFlight_SkipsRepo(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-inflight", []string{"o/d"}, 3)
+	// pre-create a Planning brainstorm Task for this repo
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "brainstorm-"
+	pre.Namespace = testNS
+	pre.Labels = map[string]string{labelActivity: "brainstorm"}
+	pre.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef:    "bs-inflight",
+		RepositoryRef: repos[0].Name,
+		Goal:          "g",
+		Kind:          "brainstorm",
+	}
+	if err := k8sClient.Create(context.Background(), pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	pre.Status.Phase = "Planning"
+	_ = k8sClient.Status().Update(context.Background(), pre)
+
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{"o/d": {}},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	existing := []tatarav1alpha1.Task{*pre}
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
+	r.brainstorm(context.Background(), proj, reader, repos, existing, act)
+
+	tasks := listBrainstormTasks(t, "bs-inflight")
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 task (pre-existing only, in-flight guard), got %d", len(tasks))
+	}
+}
+
+// TestBrainstorm_ListErrorIsolatesRepo: reader error for repo A does not block repo B.
+func TestBrainstorm_ListErrorIsolatesRepo(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-isolate", []string{"o/e", "o/f"}, 3)
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/e": {}, // will error (errRepos)
+			"o/f": {},
+		},
+		errRepos: map[string]bool{"o/e": true},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+
+	tasks := listBrainstormTasks(t, "bs-isolate")
+	// Only repo f should get a task; repo e errored and was skipped.
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 brainstorm task (for repo f only), got %d", len(tasks))
+	}
+	// Find repo for o/f
+	var repoF *tatarav1alpha1.Repository
+	for i := range repos {
+		if strings.Contains(repos[i].Spec.URL, "o/f") {
+			repoF = &repos[i]
+		}
+	}
+	if repoF == nil {
+		t.Fatal("could not find repo for o/f")
+	}
+	if tasks[0].Spec.RepositoryRef != repoF.Name {
+		t.Fatalf("task RepositoryRef = %q, want %q", tasks[0].Spec.RepositoryRef, repoF.Name)
+	}
+}
+
+// mkAwaitingApprovalTask creates an AwaitingApproval proposal Task bound to a
+// project and repo, with a TaskSource.Number so the backstop can look it up.
+func mkAwaitingApprovalTask(t *testing.T, project, repoName, issueRef string) *tatarav1alpha1.Task {
+	t.Helper()
+	task := &tatarav1alpha1.Task{}
+	task.GenerateName = "proposal-"
+	task.Namespace = testNS
+	task.Labels = map[string]string{labelActivity: "issueScan"}
+	// Mirror production createProposal: Number is 0 (the real number lives only
+	// in IssueRef), bot-authored, approval-required.
+	task.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef:       project,
+		RepositoryRef:    repoName,
+		Goal:             "proposal",
+		Kind:             "brainstorm",
+		ApprovalRequired: true,
+		ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
+			RepositoryRef: repoName,
+			Title:         "test proposal",
+			Body:          "body",
+			Kind:          "improvement",
+		},
+		Source: &tatarav1alpha1.TaskSource{
+			Provider:    "github",
+			IssueRef:    issueRef,
+			Number:      0,
+			AuthorLogin: "tatara-bot",
+		},
+	}
+	if err := k8sClient.Create(context.Background(), task); err != nil {
+		t.Fatalf("create proposal task: %v", err)
+	}
+	task.Status.Phase = "AwaitingApproval"
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("set AwaitingApproval: %v", err)
+	}
+	return task
+}
+
+// TestApprovalBackstop_FlipsStuckApproved: AwaitingApproval task, issue open
+// without approval label -> ApprovalApproved condition flipped True.
+func TestApprovalBackstop_FlipsStuckApproved(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "backstop-flip", []string{"o/g"}, 3)
+	task := mkAwaitingApprovalTask(t, "backstop-flip", repos[0].Name, "o/g#10")
+
+	// Issue 10 is open but approval label is absent -> approved on SCM but webhook missed.
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/g": {{Repo: "o/g", Number: 10, Labels: []string{}, IsPR: false}},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	existing := []tatarav1alpha1.Task{*task}
+	r.approvalBackstop(context.Background(), proj, reader, repos, existing)
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	var found bool
+	for _, c := range got.Status.Conditions {
+		if c.Type == tatarav1alpha1.ConditionApprovalApproved && c.Status == "True" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ApprovalApproved condition not set True; conditions: %+v", got.Status.Conditions)
+	}
+}
+
+// TestApprovalBackstop_NotApproved_NoOp: approval label still present -> no flip.
+func TestApprovalBackstop_NotApproved_NoOp(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "backstop-noop", []string{"o/h"}, 3)
+	task := mkAwaitingApprovalTask(t, "backstop-noop", repos[0].Name, "o/h#20")
+
+	// Label still present -> not yet approved.
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/h": {{Repo: "o/h", Number: 20, Labels: []string{"tatara/awaiting-approval"}, IsPR: false}},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	existing := []tatarav1alpha1.Task{*task}
+	r.approvalBackstop(context.Background(), proj, reader, repos, existing)
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	for _, c := range got.Status.Conditions {
+		if c.Type == tatarav1alpha1.ConditionApprovalApproved && c.Status == "True" {
+			t.Fatalf("ApprovalApproved should NOT be set when label still present")
+		}
+	}
+}
+
+// TestApprovalBackstop_ImplRunning_NoOp: implementation already running -> no flip.
+func TestApprovalBackstop_ImplRunning_NoOp(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "backstop-impl", []string{"o/i"}, 3)
+	task := mkAwaitingApprovalTask(t, "backstop-impl", repos[0].Name, "o/i#30")
+
+	// Pre-create a running implementation Task for the same issue.
+	implTask := &tatarav1alpha1.Task{}
+	implTask.GenerateName = "impl-"
+	implTask.Namespace = testNS
+	implTask.Labels = map[string]string{labelActivity: "issueScan"}
+	implTask.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef:    "backstop-impl",
+		RepositoryRef: repos[0].Name,
+		Goal:          "implement o/i#30",
+		Kind:          "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{
+			Provider: "github",
+			IssueRef: "o/i#30",
+			Number:   30,
+		},
+	}
+	if err := k8sClient.Create(context.Background(), implTask); err != nil {
+		t.Fatalf("create impl task: %v", err)
+	}
+	implTask.Status.Phase = "Running"
+	_ = k8sClient.Status().Update(context.Background(), implTask)
+
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/i": {{Repo: "o/i", Number: 30, Labels: []string{}, IsPR: false}},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	existing := []tatarav1alpha1.Task{*task, *implTask}
+	r.approvalBackstop(context.Background(), proj, reader, repos, existing)
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	for _, c := range got.Status.Conditions {
+		if c.Type == tatarav1alpha1.ConditionApprovalApproved && c.Status == "True" {
+			t.Fatalf("ApprovalApproved should NOT be set when impl already running")
+		}
 	}
 }
