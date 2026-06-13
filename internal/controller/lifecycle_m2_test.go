@@ -503,3 +503,15 @@ func TestTriagePrompt_ContainsRealTitleAndBody(t *testing.T) {
 		t.Errorf("prompt must NOT use task Goal as issue body; goal=%q text=%q", goal, sub.Text)
 	}
 }
+
+// ----- C4: Triage prompt names the follow-up skill -----
+
+func TestLifecycleTriageText_NamesFollowupSkill(t *testing.T) {
+	task := &tatarav1alpha1.Task{}
+	task.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "o/r#1", URL: "http://x"}
+	got := lifecycleTriageText(task, "T", "B")
+	if !strings.Contains(got, "tatara-research-followup") {
+		t.Fatalf("triage prompt does not invoke tatara-research-followup skill:\n%s", got)
+	}
+}
+
