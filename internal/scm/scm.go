@@ -121,6 +121,12 @@ type IssueComment struct {
 	CreatedAt time.Time
 }
 
+// IssueContent holds the title and body of an issue fetched from the SCM.
+type IssueContent struct {
+	Title string
+	Body  string
+}
+
 // SCMReader lists open work for the cron scan loop; *GitHub and *GitLab satisfy it.
 type SCMReader interface {
 	ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error)
@@ -132,6 +138,9 @@ type SCMReader interface {
 	// ListIssueComments returns the human comments on an issue, oldest-first.
 	// For GitLab owner carries the full project path; repo is unused.
 	ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error)
+	// GetIssue returns the title and body of an issue.
+	// For GitLab owner carries the full project path; repo is unused.
+	GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;

@@ -78,6 +78,20 @@ type glNote struct {
 	System    bool      `json:"system"`
 }
 
+// GetIssue returns the title and body of an issue.
+// For GitLab owner carries the full project path; repo is unused.
+func (c *GitLab) GetIssue(ctx context.Context, owner, _ string, number int) (IssueContent, error) {
+	var raw struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	}
+	path := "/projects/" + url.PathEscape(owner) + "/issues/" + strconv.Itoa(number)
+	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+		return IssueContent{}, err
+	}
+	return IssueContent{Title: raw.Title, Body: raw.Description}, nil
+}
+
 // ListIssueComments returns non-system notes on issue number, oldest-first.
 // For GitLab owner carries the full project path (group/sub/project); repo is unused.
 func (c *GitLab) ListIssueComments(ctx context.Context, owner, _ string, number int) ([]IssueComment, error) {

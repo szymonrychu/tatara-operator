@@ -55,15 +55,22 @@ func nextPendingSubtask(subs []tatarav1alpha1.Subtask) (*tatarav1alpha1.Subtask,
 // reads the issue body, consults docs/code/memory via tatara MCP tools, and
 // decides by calling the issue_outcome MCP tool with action close (with a
 // comment), discuss (with questions as the comment), or implement.
-func lifecycleTriageText(task *tatarav1alpha1.Task) string {
+func lifecycleTriageText(task *tatarav1alpha1.Task, title, body string) string {
 	issueRef := ""
 	issueURL := ""
 	if task.Spec.Source != nil {
 		issueRef = task.Spec.Source.IssueRef
 		issueURL = task.Spec.Source.URL
 	}
+	if title == "" {
+		title = "(title unavailable)"
+	}
+	if body == "" {
+		body = "(body unavailable)"
+	}
 	return fmt.Sprintf(
 		"You are the tatara lifecycle agent performing Triage for issue %s (%s).\n\n"+
+			"Issue title: %s\n"+
 			"Issue body:\n%s\n\n"+
 			"Your job:\n"+
 			"1. Read the issue carefully.\n"+
@@ -74,16 +81,16 @@ func lifecycleTriageText(task *tatarav1alpha1.Task) string {
 			"   - action=discuss    (needs clarification; supply your questions as `comment`)\n"+
 			"   - action=close      (out of scope / duplicate / not actionable; supply reason as `comment`)\n\n"+
 			"You MUST call issue_outcome before finishing. Do not open PRs or make code changes in this turn.",
-		issueRef, issueURL, task.Spec.Goal)
+		issueRef, issueURL, title, body)
 }
 
 // buildTriagePrompt constructs the turn-0 prompt for the Triage state. When
 // comments are non-nil it appends a "## Conversation thread" block (capped to
 // the most-recent triageCommentCap comments and triageCommentCharBudget chars)
 // so a fresh pod has full context. When comments is empty the prompt equals
-// lifecycleTriageText(task).
-func buildTriagePrompt(task *tatarav1alpha1.Task, comments []scm.IssueComment) string {
-	base := lifecycleTriageText(task)
+// lifecycleTriageText(task, title, body).
+func buildTriagePrompt(task *tatarav1alpha1.Task, title, body string, comments []scm.IssueComment) string {
+	base := lifecycleTriageText(task, title, body)
 	if len(comments) == 0 {
 		return base
 	}

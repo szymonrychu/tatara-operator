@@ -23,6 +23,7 @@ type ghPR struct {
 type ghIssueItem struct {
 	Number      int       `json:"number"`
 	Title       string    `json:"title"`
+	Body        string    `json:"body"`
 	Labels      []ghLabel `json:"labels"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	PullRequest *struct {
@@ -170,6 +171,16 @@ func (c *GitHub) ListIssueComments(ctx context.Context, owner, repo string, numb
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// GetIssue returns the title and body of an issue.
+func (c *GitHub) GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error) {
+	var raw ghIssueItem
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number)
+	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+		return IssueContent{}, err
+	}
+	return IssueContent{Title: raw.Title, Body: raw.Body}, nil
 }
 
 func ghOwnerRepoFromSlug(slug string) (string, string, error) {

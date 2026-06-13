@@ -235,6 +235,9 @@ func (f *fakeReaderCapture) GetCommitCIStatus(_ context.Context, owner, repo, sh
 func (f *fakeReaderCapture) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
 	return nil, nil
 }
+func (f *fakeReaderCapture) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
+	return scm.IssueContent{}, nil
+}
 
 // seedGitLabMainCITask seeds a MainCI task backed by a GitLab nested-path repo.
 func seedGitLabMainCITask(t *testing.T, suffix string, reader *fakeReaderCapture) (*TaskReconciler, string) {

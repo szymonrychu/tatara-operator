@@ -152,6 +152,31 @@ func TestGitHubListBoardItemsNoPRNodes(t *testing.T) {
 	}
 }
 
+func TestGitHubGetIssue(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/21" {
+			t.Fatalf("unexpected path: %q", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"number": 21,
+			"title":  "the title",
+			"body":   "the body",
+		})
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	content, err := c.GetIssue(context.Background(), "o", "r", 21)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if content.Title != "the title" {
+		t.Errorf("Title = %q, want %q", content.Title, "the title")
+	}
+	if content.Body != "the body" {
+		t.Errorf("Body = %q, want %q", content.Body, "the body")
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
 		func() bool {
