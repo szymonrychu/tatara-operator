@@ -392,6 +392,29 @@ func TestIssueOutcome_Implement(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestIssueOutcome_DiscussLifecycle(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"discuss","comment":"need details: which repo?"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.IssueOutcome)
+	require.Equal(t, "discuss", out.Status.IssueOutcome.Action)
+}
+
+func TestIssueOutcome_DiscussRequiresComment(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"discuss"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestIssueOutcome_MissingAction(t *testing.T) {
 	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
 	body := strings.NewReader(`{"comment":"x"}`)

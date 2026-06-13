@@ -361,13 +361,13 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Action {
-	case "implement", "close":
+	case "implement", "close", "discuss":
 	default:
-		writeError(w, http.StatusBadRequest, "action must be one of implement, close")
+		writeError(w, http.StatusBadRequest, "action must be one of implement, close, discuss")
 		return
 	}
-	if req.Action == "close" && req.Comment == "" {
-		writeError(w, http.StatusBadRequest, "comment required when action is close")
+	if (req.Action == "close" || req.Action == "discuss") && req.Comment == "" {
+		writeError(w, http.StatusBadRequest, "comment required when action is close or discuss")
 		return
 	}
 	var t tatarav1alpha1.Task
@@ -375,8 +375,8 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if t.Spec.Kind != "triageIssue" {
-		writeError(w, http.StatusConflict, "issue outcome only applies to a triageIssue task")
+	if t.Spec.Kind != "triageIssue" && t.Spec.Kind != "issueLifecycle" {
+		writeError(w, http.StatusConflict, "issue outcome only applies to a triageIssue or issueLifecycle task")
 		return
 	}
 	t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
