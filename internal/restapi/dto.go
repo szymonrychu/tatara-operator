@@ -69,6 +69,7 @@ type taskStatusDTO struct {
 	ChangeSummary    *tatarav1alpha1.ChangeSummary `json:"changeSummary,omitempty"`
 	Handover         string                        `json:"handover,omitempty"`
 	Conditions       []metav1.Condition            `json:"conditions,omitempty"`
+	PendingComments  []string                      `json:"pendingComments,omitempty"`
 }
 
 // TaskDTO is the stable JSON shape for a Task CRD.
@@ -144,6 +145,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			IssueOutcome:     task.Status.IssueOutcome,
 			ChangeSummary:    task.Status.ChangeSummary,
 			Handover:         task.Status.Handover,
+			PendingComments:  task.Status.PendingComments,
 		},
 	}
 	if task.Spec.Source != nil {

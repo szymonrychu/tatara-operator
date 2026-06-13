@@ -385,6 +385,39 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
+// --- POST /tasks/{t}/comment ---
+
+type issueCommentReq struct {
+	Body string `json:"body"`
+}
+
+func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
+	var req issueCommentReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Body == "" {
+		writeError(w, http.StatusBadRequest, "body required")
+		return
+	}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Source == nil || t.Spec.Source.IssueRef == "" {
+		writeError(w, http.StatusConflict, "comment requires a task linked to an issue")
+		return
+	}
+	t.Status.PendingComments = append(t.Status.PendingComments, req.Body)
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 // --- M4 Task 2: POST /tasks/{t}/change-summary ---
 
 type changeSummaryReq struct {

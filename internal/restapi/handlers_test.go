@@ -503,3 +503,68 @@ func TestChangeSummary_InvalidBody(t *testing.T) {
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
+
+// --- POST /tasks/{t}/comment ---
+
+func taskWithSource(name, projectRef, issueRef string) *tatarav1alpha1.Task {
+	return &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    projectRef,
+			RepositoryRef: "repo",
+			Goal:          "g",
+			Kind:          "issueLifecycle",
+			Source:        &tatarav1alpha1.TaskSource{IssueRef: issueRef},
+		},
+	}
+}
+
+func TestPostComment_QueuesComment(t *testing.T) {
+	tk := taskWithSource("tc1", "alpha", "owner/repo#5")
+	r := buildRouter(t, tk)
+	body := strings.NewReader(`{"body":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/tc1/comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	// Re-read via a second GET to confirm PendingComments persisted
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/tasks/tc1", nil))
+	// The handler returns the updated task; verify comment in Status via re-GET
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, httptest.NewRequest(http.MethodGet, "/tasks/tc1", nil))
+	var got restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &got))
+	require.Contains(t, got.Status.PendingComments, "hello")
+}
+
+func TestPostComment_EmptyBodyRejected(t *testing.T) {
+	tk := taskWithSource("tc2", "alpha", "owner/repo#5")
+	r := buildRouter(t, tk)
+	body := strings.NewReader(`{"body":""}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/tc2/comment", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestPostComment_NoSourceConflict(t *testing.T) {
+	tk := taskWithKind("tc3", "alpha", "issueLifecycle")
+	r := buildRouter(t, tk)
+	body := strings.NewReader(`{"body":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/tc3/comment", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestPostComment_TaskNotFound(t *testing.T) {
+	r := buildRouter(t)
+	body := strings.NewReader(`{"body":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/missing/comment", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
