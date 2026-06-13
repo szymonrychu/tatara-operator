@@ -78,6 +78,19 @@ func (f *lifecycleFakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req
 func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
 func (f *lifecycleFakeSCMWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
 
+// commentBodies returns the comment bodies posted to the given issueRef, in order.
+func (f *lifecycleFakeSCMWriter) commentBodies(issueRef string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.commentCalls {
+		if c.issueRef == issueRef {
+			out = append(out, c.body)
+		}
+	}
+	return out
+}
+
 // newLifecycleReconciler builds a TaskReconciler wired with the given SCM writer.
 func newLifecycleReconciler(t *testing.T, fw *lifecycleFakeSCMWriter) *TaskReconciler {
 	t.Helper()
@@ -2083,5 +2096,46 @@ func TestLifecycleMainCI_DeadlineParks(t *testing.T) {
 	defer fw.mu.Unlock()
 	if len(fw.commentCalls) == 0 {
 		t.Error("deadline park must post comment")
+	}
+}
+
+// ----- C3: Drain PendingComments -----
+
+func TestReconcileLifecycle_DrainsPendingComments(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "owner/repo#7",
+		URL: "https://github.com/owner/repo/issues/7", Number: 7,
+	}
+	task := seedLifecycleTask(t,
+		"lc-drain-task", "lc-drain-proj", "lc-drain-repo", "lc-drain-scm", src)
+
+	// Set PendingComments on the task status.
+	task.Status.PendingComments = []string{"first", "second"}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set PendingComments: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	if _, err := r.reconcileLifecycle(ctx, task); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	// Comments must have been posted to the issue ref in order.
+	got := fw.commentBodies("owner/repo#7")
+	if len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Fatalf("posted comments = %#v, want [first second]", got)
+	}
+
+	// PendingComments must be cleared in the persisted task.
+	var reloaded tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "lc-drain-task"}, &reloaded); err != nil {
+		t.Fatalf("reload task: %v", err)
+	}
+	if len(reloaded.Status.PendingComments) != 0 {
+		t.Fatalf("PendingComments not cleared: %#v", reloaded.Status.PendingComments)
 	}
 }

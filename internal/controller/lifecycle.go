@@ -267,6 +267,30 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return ctrl.Result{}, fmt.Errorf("lifecycle: get project: %w", err)
 	}
 
+	// Drain agent-queued free-form comments (from the comment MCP tool) to the
+	// linked issue before anything else, then clear and requeue.
+	if len(task.Status.PendingComments) > 0 && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
+		_, _, writer, token, _, err := r.scmContext(ctx, task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, fmt.Errorf("lifecycle drain comments: %w", err)
+		}
+		for _, c := range task.Status.PendingComments {
+			if cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, c); cerr != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, fmt.Errorf("lifecycle drain comment: %w", cerr)
+			}
+			l.Info("lifecycle: agent comment posted",
+				"action", "scm_agent_comment", "resource_id", task.Name)
+		}
+		task.Status.PendingComments = nil
+		if err := r.Status().Update(ctx, task); err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, fmt.Errorf("lifecycle clear comments: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Memory + concurrency gates: apply only when about to spawn a new agent run.
 	if needsSpawn(task.Status.LifecycleState, task.Status.Phase) {
 		if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
