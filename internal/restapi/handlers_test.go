@@ -419,6 +419,48 @@ func TestIssueOutcome_CloseRequiresComment(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestIssueOutcome_DiscussRequiresComment(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"action":"discuss"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// issueLifecycle Triage agents record their outcome via the same endpoint;
+// the binders create issueLifecycle (not triageIssue) Tasks for issues, and
+// the Triage prompt directs the agent to call issue_outcome with
+// implement/discuss/close.
+func TestIssueOutcome_IssueLifecycleKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"close","comment":"already merged"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.IssueOutcome)
+	require.Equal(t, "close", out.Status.IssueOutcome.Action)
+	require.Equal(t, "already merged", out.Status.IssueOutcome.Comment)
+}
+
+func TestIssueOutcome_Discuss(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"discuss","comment":"what about X?"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.IssueOutcome)
+	require.Equal(t, "discuss", out.Status.IssueOutcome.Action)
+}
+
 func TestIssueOutcome_WrongKind(t *testing.T) {
 	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	body := strings.NewReader(`{"action":"implement"}`)
