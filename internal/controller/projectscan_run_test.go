@@ -639,3 +639,15 @@ func TestBrainstorm_ListErrorIsolatesRepo(t *testing.T) {
 		t.Fatalf("task RepositoryRef = %q, want %q", tasks[0].Spec.RepositoryRef, repoF.Name)
 	}
 }
+
+// ----- C5: Brainstorm goal names the deep-research skill -----
+
+func TestBrainstormGoal_NamesDeepResearchSkill(t *testing.T) {
+	g := brainstormGoal("tatara-cli")
+	if !strings.Contains(g, "tatara-deep-research") {
+		t.Fatalf("brainstorm goal does not invoke tatara-deep-research skill: %s", g)
+	}
+	if !strings.Contains(g, "tatara-cli") {
+		t.Fatalf("brainstorm goal lost the repo slug: %s", g)
+	}
+}

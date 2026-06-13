@@ -789,7 +789,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		if *budget <= 0 {
 			break
 		}
-		goal := "Propose a single, well-defined issue for repo " + slug
+		goal := brainstormGoal(slug)
 		if _, err := r.createBrainstormTask(ctx, proj, &repo, goal, act.Sources); err != nil {
 			l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", repo.Name)
 			continue
@@ -801,6 +801,14 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
 		"picked", created, "duration_ms", time.Since(start).Milliseconds())
+}
+
+// brainstormGoal returns the turn-0 goal text for a brainstorm task, directing
+// the agent to invoke the tatara-deep-research skill and file a single issue.
+func brainstormGoal(slug string) string {
+	return "Invoke the `tatara-deep-research` skill to research the platform deeply and propose a single, " +
+		"well-defined discovery issue for repo " + slug + ". The skill defines how to research via the " +
+		"tatara-memory graph and on-disk code, score leverage, dedup, and file exactly one issue via propose_issue."
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
