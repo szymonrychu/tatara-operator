@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -27,6 +28,8 @@ import (
 const (
 	capRequeue        = 15 * time.Second
 	pollRequeue       = 30 * time.Second
+	agentBootRequeue  = 5 * time.Second
+	agentBootDeadline = 5 * time.Minute
 	maxPodRecreations = 3
 	turnTimeoutGrace  = 60 * time.Second
 
@@ -36,6 +39,7 @@ const (
 	annPodRecreations        = "tatara.dev/pod-recreations"
 	annTurnStartedAt         = "tatara.dev/turn-started-at"
 	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
+	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
 )
 
 // TaskReconciler spawns one wrapper session per Task and drives it turn by
@@ -368,6 +372,73 @@ func (r *TaskReconciler) podReady(ctx context.Context, task *tatarav1alpha1.Task
 	return false, nil
 }
 
+// handleAgentUnreachable handles a SubmitTurn error: when it is an agent
+// UnreachableError (the wrapper pod's turn server is still booting even though
+// the pod is Ready), it returns a short fixed requeue so the reconcile does
+// NOT return an error - returning an error would trip controller-runtime's
+// exponential backoff and idle the task for minutes. handled=false means the
+// error is not a boot-race and the caller surfaces it as a real failure.
+//
+// To bound a pod that is permanently unreachable (Ready but never accepting
+// turns), the first boot-race stamps annAgentUnreachableSince; once the agent
+// has been unreachable for longer than agentBootDeadline the Task is
+// terminated instead of requeued forever. The marker is cleared on the next
+// successful turn submit (recordTurn) and on each lifecycle state reset.
+func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatarav1alpha1.Task, err error) (ctrl.Result, error, bool) {
+	var unreachable *agent.UnreachableError
+	if !errors.As(err, &unreachable) {
+		return ctrl.Result{}, nil, false
+	}
+	l := log.FromContext(ctx)
+
+	// A valid, in-range marker that is older than the boot deadline terminates
+	// the run: a Ready pod that never accepts turns must not requeue forever.
+	// An absent or unparseable marker is (re)stamped so the deadline is always
+	// anchored to a parseable time.
+	started, perr := time.Parse(time.RFC3339, task.Annotations[annAgentUnreachableSince])
+	switch {
+	case perr != nil:
+		if serr := r.stampUnreachableSince(ctx, task); serr != nil {
+			return ctrl.Result{}, fmt.Errorf("stamp agent-unreachable-since: %w", serr), true
+		}
+	case time.Now().After(started.Add(agentBootDeadline)):
+		l.Info("agent unreachable past boot deadline; failing task",
+			"task", task.Name, "since", started.Format(time.RFC3339), "deadline", agentBootDeadline.String())
+		res, terr := r.terminate(ctx, task, "Failed", "AgentUnreachable",
+			fmt.Sprintf("wrapper agent unreachable for over %s", agentBootDeadline))
+		return res, terr, true
+	}
+
+	r.Metrics.AgentBootRaceRequeue()
+	l.Info("agent not yet accepting turns; requeuing",
+		"task", task.Name, "requeueAfter", agentBootRequeue.String())
+	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
+}
+
+// stampUnreachableSince records the first time the agent was found unreachable
+// for the current run, so handleAgentUnreachable can enforce agentBootDeadline.
+// An existing VALID timestamp is preserved (the deadline is anchored to the
+// earliest sighting); an absent or unparseable value is overwritten with now.
+func (r *TaskReconciler) stampUnreachableSince(ctx context.Context, task *tatarav1alpha1.Task) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if cur := fresh.Annotations[annAgentUnreachableSince]; cur != "" {
+			if _, perr := time.Parse(time.RFC3339, cur); perr == nil {
+				return nil
+			}
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[annAgentUnreachableSince] = now
+		return r.Update(ctx, fresh)
+	})
+}
+
 // driveTurns runs the callback-driven turn loop: plan turn first, then one
 // Subtask per delivered turn-complete callback. planText is the turn-0 prompt;
 // callers supply it so lifecycle states can inject their own prompts.
@@ -381,6 +452,9 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	if current == "" {
 		id, err := r.Session.SubmitTurn(ctx, baseURL, planText, cbURL)
 		if err != nil {
+			if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
+				return res, herr
+			}
 			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
 		}
 		res, err := r.recordTurn(ctx, task, id, "")
@@ -446,6 +520,9 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task), task.Name), cbURL)
 	if err != nil {
+		if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
+			return res, herr
+		}
 		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
 	}
 	if next.Status.Phase != "Running" {
@@ -487,6 +564,7 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 	fresh.Annotations[annCurrentSubtask] = subtaskName
 	fresh.Annotations[annTurnStartedAt] = time.Now().UTC().Format(time.RFC3339)
 	delete(fresh.Annotations, annTurnComplete)
+	delete(fresh.Annotations, annAgentUnreachableSince)
 	if err := r.Update(ctx, fresh); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
 	}

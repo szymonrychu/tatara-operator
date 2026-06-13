@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -54,6 +55,30 @@ func TestSubmitTurn_409(t *testing.T) {
 	var he *agent.HTTPError
 	require.ErrorAs(t, err, &he)
 	require.Equal(t, 409, he.Status)
+}
+
+func TestSubmitTurn_TransportError_IsUnreachable(t *testing.T) {
+	// A closed port yields a dial-refused transport error: the wrapper pod is
+	// booting its turn server even though the Service has endpoints.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	s := agent.NewHTTPSession(staticToken)
+	_, err := s.SubmitTurn(context.Background(), url, "x", "y")
+	require.Error(t, err)
+	var ue *agent.UnreachableError
+	require.ErrorAs(t, err, &ue, "transport failure must classify as UnreachableError")
+}
+
+func TestSubmitTurn_HTTPError_NotUnreachable(t *testing.T) {
+	s, srv := newSession(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte("turn in flight"))
+	})
+	_, err := s.SubmitTurn(context.Background(), srv.URL, "x", "y")
+	var ue *agent.UnreachableError
+	require.False(t, errors.As(err, &ue), "an HTTP non-2xx response must NOT classify as UnreachableError")
 }
 
 func TestGetTurn(t *testing.T) {

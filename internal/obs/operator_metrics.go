@@ -20,6 +20,7 @@ type OperatorMetrics struct {
 	scanDurationSeconds     *prometheus.HistogramVec
 	issueOutcomeTotal       *prometheus.CounterVec
 	tasksInflightKind       *prometheus.GaugeVec
+	agentBootRaceRequeue    prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -87,6 +88,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "tatara_tasks_inflight",
 			Help: "In-flight Tasks by kind.",
 		}, []string{"kind"}),
+		agentBootRaceRequeue: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_agent_boot_race_requeue_total",
+			Help: "Times a turn submit hit a still-booting wrapper and was requeued instead of erroring.",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -103,6 +108,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.scanDurationSeconds,
 		m.issueOutcomeTotal,
 		m.tasksInflightKind,
+		m.agentBootRaceRequeue,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -152,6 +158,12 @@ func (m *OperatorMetrics) ObserveScanDuration(activity string, seconds float64) 
 // IssueOutcome increments tatara_issue_outcome_total for an action.
 func (m *OperatorMetrics) IssueOutcome(action string) {
 	m.issueOutcomeTotal.WithLabelValues(action).Inc()
+}
+
+// AgentBootRaceRequeue increments operator_agent_boot_race_requeue_total: a
+// turn submit reached a still-booting wrapper and was requeued (not errored).
+func (m *OperatorMetrics) AgentBootRaceRequeue() {
+	m.agentBootRaceRequeue.Inc()
 }
 
 // SetTasksInflightKind sets tatara_tasks_inflight for one Task kind.
