@@ -193,25 +193,6 @@ func TestSCMWritesTotal(t *testing.T) {
 	}
 }
 
-func TestApprovalGateHistogram(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewOperatorMetrics(reg)
-	m.ObserveApprovalGate(42.0)
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	var found bool
-	for _, mf := range mfs {
-		if mf.GetName() == "operator_approval_gate_seconds" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("operator_approval_gate_seconds not registered")
-	}
-}
-
 func TestScanMetricsRegistered(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
@@ -250,16 +231,6 @@ func TestOpenProposalsGauge(t *testing.T) {
 	m.SetOpenProposals("o/r", 2)
 	if got := testutil.ToFloat64(m.openProposals.WithLabelValues("o/r")); got != 2 {
 		t.Fatalf("openProposals{o/r} = %v, want 2", got)
-	}
-}
-
-func TestApprovalBackstopFlips(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewOperatorMetrics(reg)
-	m.ApprovalBackstopFlip()
-	m.ApprovalBackstopFlip()
-	if got := testutil.ToFloat64(m.approvalBackstopFlips); got != 2 {
-		t.Fatalf("approvalBackstopFlips = %v, want 2", got)
 	}
 }
 

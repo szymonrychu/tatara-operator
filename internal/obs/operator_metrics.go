@@ -14,7 +14,6 @@ type OperatorMetrics struct {
 	memoryProvisionDuration prometheus.Histogram
 	memoryStacks            *prometheus.GaugeVec
 	scmWritesTotal          *prometheus.CounterVec
-	approvalGateSeconds     prometheus.Histogram
 	scanItemsTotal          *prometheus.CounterVec
 	scanTasksCreatedTotal   *prometheus.CounterVec
 	scanDurationSeconds     *prometheus.HistogramVec
@@ -22,7 +21,6 @@ type OperatorMetrics struct {
 	tasksInflightKind       *prometheus.GaugeVec
 	agentBootRaceRequeue    prometheus.Counter
 	openProposals           *prometheus.GaugeVec
-	approvalBackstopFlips   prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -64,11 +62,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_scm_writes_total",
 			Help: "Total SCM write operations by provider, verb, and result.",
 		}, []string{"provider", "verb", "result"}),
-		approvalGateSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "operator_approval_gate_seconds",
-			Help:    "Wall-clock seconds a Task spent in AwaitingApproval.",
-			Buckets: prometheus.ExponentialBuckets(60, 2, 10),
-		}),
 		scanItemsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_scan_items_total",
 			Help: "Total scan candidates by activity and outcome.",
@@ -98,10 +91,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_open_proposals",
 			Help: "Open, unapproved agent-proposed issues per repo.",
 		}, []string{"repo"}),
-		approvalBackstopFlips: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "operator_approval_backstop_flips_total",
-			Help: "Approvals recovered by the backstop after a missed webhook.",
-		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -112,7 +101,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryProvisionDuration,
 		m.memoryStacks,
 		m.scmWritesTotal,
-		m.approvalGateSeconds,
 		m.scanItemsTotal,
 		m.scanTasksCreatedTotal,
 		m.scanDurationSeconds,
@@ -120,7 +108,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
 		m.openProposals,
-		m.approvalBackstopFlips,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -232,15 +219,7 @@ func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
 	m.scmWritesTotal.WithLabelValues(provider, verb, result).Inc()
 }
 
-// ObserveApprovalGate records the seconds a Task spent in AwaitingApproval.
-func (m *OperatorMetrics) ObserveApprovalGate(seconds float64) {
-	m.approvalGateSeconds.Observe(seconds)
-}
-
 // SetOpenProposals sets operator_open_proposals for a repo slug.
 func (m *OperatorMetrics) SetOpenProposals(repo string, n float64) {
 	m.openProposals.WithLabelValues(repo).Set(n)
 }
-
-// ApprovalBackstopFlip increments operator_approval_backstop_flips_total.
-func (m *OperatorMetrics) ApprovalBackstopFlip() { m.approvalBackstopFlips.Inc() }
