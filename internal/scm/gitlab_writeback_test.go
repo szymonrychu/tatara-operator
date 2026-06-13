@@ -52,6 +52,21 @@ func TestGitLabComment(t *testing.T) {
 	require.NoError(t, c.Comment(context.Background(), "gltok", "g/p#12", "done"))
 }
 
+func TestGitLabCommentMR(t *testing.T) {
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/projects/g%2Fp/merge_requests/42/notes", r.URL.EscapedPath())
+		require.Equal(t, "gltok", r.Header.Get("PRIVATE-TOKEN"))
+		var in map[string]string
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&in))
+		require.Equal(t, "done", in["body"])
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	require.NoError(t, c.Comment(context.Background(), "gltok", "g/p!42", "done"))
+}
+
 func TestGitLabOpenChangeErrorStatus(t *testing.T) {
 	c := newGitLab(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusConflict)
@@ -96,5 +111,18 @@ func TestGitLabHashRef(t *testing.T) {
 	require.Equal(t, 12, iid)
 
 	_, _, err = glHashRef("garbage")
+	require.Error(t, err)
+}
+
+func TestGitLabBangRef(t *testing.T) {
+	path, iid, err := glBangRef("g/sub/p!42")
+	require.NoError(t, err)
+	require.Equal(t, "g/sub/p", path)
+	require.Equal(t, 42, iid)
+
+	_, _, err = glBangRef("garbage")
+	require.Error(t, err)
+
+	_, _, err = glBangRef("g/p!notanumber")
 	require.Error(t, err)
 }

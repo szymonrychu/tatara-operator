@@ -314,9 +314,17 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
+	// GitLab MRs use the '!' separator and a distinct notes endpoint; issues use
+	// '#'. GitHub shares /issues/{n}/comments for both, so it stays on '#'. The
+	// ref must be faithful here so write-back/lifecycle comments land on the MR
+	// rather than an unrelated issue with the same iid.
+	sep := "#"
+	if srcCand.isPR && provider == "gitlab" {
+		sep = "!"
+	}
 	src := &tatarav1alpha1.TaskSource{
 		Provider: provider,
-		IssueRef: fmt.Sprintf("%s#%d", srcCand.repo, srcCand.number),
+		IssueRef: fmt.Sprintf("%s%s%d", srcCand.repo, sep, srcCand.number),
 		Number:   srcCand.number,
 		IsPR:     srcCand.isPR,
 	}

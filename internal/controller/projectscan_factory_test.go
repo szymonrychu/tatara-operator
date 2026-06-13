@@ -54,4 +54,58 @@ func TestCreateScanTask(t *testing.T) {
 	if got.Spec.Source == nil || got.Spec.Source.Number != 5 || !got.Spec.Source.IsPR || got.Spec.Source.Provider != "github" {
 		t.Fatalf("task source = %+v", got.Spec.Source)
 	}
+	// GitHub PRs and issues share /issues/{n}/comments, so the ref keeps '#'.
+	if got.Spec.Source.IssueRef != "o/r#5" {
+		t.Fatalf("github PR ref = %q, want o/r#5", got.Spec.Source.IssueRef)
+	}
+}
+
+func TestCreateScanTaskGitLabMR(t *testing.T) {
+	ctx := context.Background()
+	mkSecret(t, "factory-gl-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+	proj := &tatarav1alpha1.Project{}
+	proj.Name = "factory-gl-proj"
+	proj.Namespace = testNS
+	proj.Spec.ScmSecretRef = "factory-gl-scm"
+	proj.Spec.Scm = &tatarav1alpha1.ScmSpec{Provider: "gitlab", Owner: "g", BotLogin: "bot"}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	repo := &tatarav1alpha1.Repository{}
+	repo.Name = "factory-gl-repo"
+	repo.Namespace = testNS
+	repo.Spec = tatarav1alpha1.RepositorySpec{ProjectRef: "factory-gl-proj", URL: "https://gitlab.com/g/p.git", DefaultBranch: "main", ReingestSchedule: "0 6 * * *"}
+	if err := k8sClient.Create(ctx, repo); err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+
+	r := newScanReconciler(nil)
+
+	// MR candidate: ref must use '!' so write-back lands on the MR.
+	mr := candidate{repo: "g/p", number: 42, isPR: true}
+	created, err := r.createScanTask(ctx, proj, repo, mr, mr, "mrScan", "review", "review MR g/p!42", nil)
+	if err != nil {
+		t.Fatalf("createScanTask MR: %v", err)
+	}
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: created.Name}, got); err != nil {
+		t.Fatalf("get created MR task: %v", err)
+	}
+	if got.Spec.Source == nil || !got.Spec.Source.IsPR || got.Spec.Source.IssueRef != "g/p!42" {
+		t.Fatalf("gitlab MR ref = %q, want g/p!42 (source=%+v)", got.Spec.Source.IssueRef, got.Spec.Source)
+	}
+
+	// Issue candidate on GitLab keeps '#'.
+	iss := candidate{repo: "g/p", number: 7, isPR: false}
+	created2, err := r.createScanTask(ctx, proj, repo, iss, iss, "issueScan", "triageIssue", "triage issue g/p#7", nil)
+	if err != nil {
+		t.Fatalf("createScanTask issue: %v", err)
+	}
+	got2 := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: created2.Name}, got2); err != nil {
+		t.Fatalf("get created issue task: %v", err)
+	}
+	if got2.Spec.Source == nil || got2.Spec.Source.IsPR || got2.Spec.Source.IssueRef != "g/p#7" {
+		t.Fatalf("gitlab issue ref = %q, want g/p#7 (source=%+v)", got2.Spec.Source.IssueRef, got2.Spec.Source)
+	}
 }

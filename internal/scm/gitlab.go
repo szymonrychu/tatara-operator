@@ -227,8 +227,18 @@ func (c *GitLab) OpenChange(ctx context.Context, repoURL, token, sourceBranch, t
 	return out.WebURL, nil
 }
 
-// Comment posts a note on an issue identified by group/proj#iid.
+// Comment posts a note on the work item identified by the ref. A '!' ref
+// (group/proj!iid) targets a merge request; a '#' ref (group/proj#iid) targets
+// an issue. The ref is the single source of truth: GitLab issues and MRs have
+// distinct note endpoints, unlike GitHub where both share /issues/{n}/comments.
 func (c *GitLab) Comment(ctx context.Context, token, issueRef, body string) error {
+	if strings.Contains(issueRef, "!") {
+		proj, iid, err := glBangRef(issueRef)
+		if err != nil {
+			return err
+		}
+		return c.mrNote(ctx, c.base(), proj, iid, token, body)
+	}
 	proj, iid, err := glHashRef(issueRef)
 	if err != nil {
 		return err
@@ -470,6 +480,23 @@ func glHashRef(ref string) (string, int, error) {
 	proj, iidStr := ref[:at], ref[at+1:]
 	if proj == "" {
 		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+	}
+	iid, err := strconv.Atoi(iidStr)
+	if err != nil {
+		return "", 0, fmt.Errorf("gitlab: malformed iid in %q: %w", ref, err)
+	}
+	return proj, iid, nil
+}
+
+// glBangRef parses group/proj!iid into project path + iid (MR refs use '!').
+func glBangRef(ref string) (string, int, error) {
+	at := strings.LastIndex(ref, "!")
+	if at < 0 {
+		return "", 0, fmt.Errorf("gitlab: malformed mr ref %q", ref)
+	}
+	proj, iidStr := ref[:at], ref[at+1:]
+	if proj == "" {
+		return "", 0, fmt.Errorf("gitlab: malformed mr ref %q", ref)
 	}
 	iid, err := strconv.Atoi(iidStr)
 	if err != nil {
