@@ -11,6 +11,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -378,6 +379,7 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 			Source:        src,
 		},
 	}
+	agent.StampPodName(task, proj.Name, provider, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
 		return nil, fmt.Errorf("scan: set ownerref: %w", err)
 	}
@@ -391,6 +393,10 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 // createBrainstormTask creates a Kind=brainstorm Task. sources is recorded as a
 // comma-joined annotation the pod builder reads to decide the egress label.
 func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, goal string, sources []string) (*tatarav1alpha1.Task, error) {
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "brainstorm-",
@@ -405,6 +411,7 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 			Kind:          "brainstorm",
 		},
 	}
+	agent.StampPodName(task, proj.Name, provider, repo.Name)
 	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
 		return nil, fmt.Errorf("scan: set ownerref: %w", err)
 	}

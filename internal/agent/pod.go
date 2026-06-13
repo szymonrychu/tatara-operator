@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,11 @@ import (
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
 const wrapperPort = 8080
+
+// PodNameAnnotation, when set on a Task at creation, holds the descriptive
+// wrapper Pod/Service name. PodName prefers it; legacy Tasks created before this
+// annotation existed fall back to wrapper-<task-name>.
+const PodNameAnnotation = "tatara.dev/pod-name"
 
 // repoEntry is the JSON shape of one entry in TATARA_REPOS.
 type repoEntry struct {
@@ -43,9 +49,90 @@ func imagePullSecrets(cfg PodConfig) []corev1.LocalObjectReference {
 	return []corev1.LocalObjectReference{{Name: cfg.ImagePullSecret}}
 }
 
-// PodName returns the deterministic wrapper Pod (and Service) name for a Task.
+// PodName returns the wrapper Pod (and Service) name for a Task. It prefers the
+// descriptive name stamped at creation (PodNameAnnotation); legacy Tasks without
+// it fall back to the deterministic wrapper-<task-name>.
 func PodName(task *tatarav1alpha1.Task) string {
+	if n := task.Annotations[PodNameAnnotation]; n != "" {
+		return n
+	}
 	return "wrapper-" + task.Name
+}
+
+// providerAbbrev maps an SCM provider to its short Pod-name segment.
+func providerAbbrev(provider string) string {
+	switch provider {
+	case "github":
+		return "gh"
+	case "gitlab":
+		return "gl"
+	default:
+		return provider
+	}
+}
+
+// podNameSuffix is the work-item segment of a wrapper Pod name: the brainstorm
+// marker, the issue/mr number, or "scan" for Tasks not bound to a work item.
+func podNameSuffix(task *tatarav1alpha1.Task) string {
+	if task.Spec.Kind == "brainstorm" {
+		return "brainstorm"
+	}
+	if s := task.Spec.Source; s != nil && s.Number > 0 {
+		if s.IsPR {
+			return fmt.Sprintf("mr-%d", s.Number)
+		}
+		return fmt.Sprintf("issue-%d", s.Number)
+	}
+	return "scan"
+}
+
+// BuildPodName composes the descriptive wrapper Pod/Service name for a Task:
+//
+//	tatara-<project>-<gh|gl>-<repo>-<issue-N|mr-N|brainstorm|scan>
+//
+// repoRef is dropped when empty (project-board items not bound to a repo). The
+// result is sanitized to a DNS-1123 label and capped at 63 chars (the Service
+// name limit).
+func BuildPodName(projectName, provider, repoRef string, task *tatarav1alpha1.Task) string {
+	parts := []string{"tatara", projectName, providerAbbrev(provider)}
+	if repoRef != "" {
+		parts = append(parts, repoRef)
+	}
+	parts = append(parts, podNameSuffix(task))
+	return sanitizeDNS1123(strings.Join(parts, "-"))
+}
+
+// StampPodName sets the descriptive Pod-name annotation on a freshly-built Task,
+// creating the annotation map when absent. Call it at Task creation, after Kind
+// and Source are set.
+func StampPodName(task *tatarav1alpha1.Task, projectName, provider, repoRef string) {
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
+	task.Annotations[PodNameAnnotation] = BuildPodName(projectName, provider, repoRef, task)
+}
+
+// sanitizeDNS1123 lowercases s, collapses every run of non-[a-z0-9] into a single
+// '-', trims leading/trailing '-', and caps the result at 63 chars (the DNS-1123
+// label limit Services require).
+func sanitizeDNS1123(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 63 {
+		out = strings.Trim(out[:63], "-")
+	}
+	return out
 }
 
 func podLabels(task *tatarav1alpha1.Task) map[string]string {

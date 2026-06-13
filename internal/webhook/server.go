@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -326,6 +327,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			},
 		},
 	}
+	agent.StampPodName(task, proj.Name, provider, repo.Name)
 	if err := s.cfg.Client.Create(ctx, task); err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
@@ -470,6 +472,7 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 			},
 		},
 	}
+	agent.StampPodName(task, proj.Name, provider, repo.Name)
 	if err := s.cfg.Client.Create(ctx, task); err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
