@@ -241,10 +241,13 @@ func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatara
 	}
 }
 
-// brainstormHasProposal reports whether at least one proposal Task exists for
-// the given brainstorm Task. A proposal Task is any Task in the same namespace
-// with spec.proposedIssue set and the same spec.projectRef + spec.repositoryRef.
-// These are created by the agent calling the propose_issue MCP tool.
+// brainstormHasProposal reports whether at least one proposal Task from THIS
+// brainstorm run exists. A proposal Task is any Task in the same namespace with
+// spec.proposedIssue set and the same spec.projectRef + spec.repositoryRef,
+// created by the agent calling the propose_issue MCP tool. Proposal Tasks carry
+// no per-run linkage (the REST handler owns them to the Project, not the
+// brainstorm Task), so the run is scoped by creation time: only proposals
+// created at/after this brainstorm Task count, excluding prior-cycle proposals.
 func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatarav1alpha1.Task) bool {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(task.Namespace)); err != nil {
@@ -255,7 +258,8 @@ func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatara
 		t := &list.Items[i]
 		if t.Spec.ProposedIssue != nil &&
 			t.Spec.ProjectRef == task.Spec.ProjectRef &&
-			t.Spec.RepositoryRef == task.Spec.RepositoryRef {
+			t.Spec.RepositoryRef == task.Spec.RepositoryRef &&
+			!t.CreationTimestamp.Before(&task.CreationTimestamp) {
 			return true
 		}
 	}

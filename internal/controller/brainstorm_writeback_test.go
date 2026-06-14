@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -115,6 +116,40 @@ func TestDoWriteBackBrainstorm_NoProposal(t *testing.T) {
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
 	// Without a proposal child: must use BrainstormComplete, NOT BrainstormProposed.
 	require.Equal(t, "BrainstormComplete", cond.Reason, "brainstorm with no proposal must use BrainstormComplete")
+}
+
+// TestDoWriteBackBrainstorm_PriorCycleProposalNotCounted: a proposal Task from a
+// PRIOR brainstorm cycle (created before this brainstorm run) for the same
+// project+repo must NOT be counted as this run's yield -> BrainstormComplete.
+func TestDoWriteBackBrainstorm_PriorCycleProposalNotCounted(t *testing.T) {
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	proj, repo := "bswb-prior-proj", "bswb-prior-repo"
+
+	priorProposal := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "bswb-prior-child", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj, RepositoryRef: repo, Goal: "implement: prior", Kind: "implement",
+			ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
+				RepositoryRef: repo, Title: "Prior", Body: "x", Kind: "improvement",
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), priorProposal))
+	// CreationTimestamp is second-granular; ensure the brainstorm run lands in a
+	// strictly later second than the prior-cycle proposal.
+	time.Sleep(1100 * time.Millisecond)
+	task := seedWritebackKindTask(t, "bswb-prior-task", proj, repo, "bswb-prior-scm",
+		tatarav1alpha1.TaskSpec{Goal: "brainstorm new issues", Kind: "brainstorm"}, nil)
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	cond := findCond(got.Status.Conditions, "WritebackPending")
+	require.NotNil(t, cond)
+	require.Equal(t, "BrainstormComplete", cond.Reason, "a prior-cycle proposal must not count as this run's yield")
 }
 
 // TestBrainstormGoal_ContainsProposeIssueRequirement verifies the goal string
