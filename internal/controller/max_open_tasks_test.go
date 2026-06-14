@@ -31,6 +31,9 @@ func TestTaskOpen_TerminalPhases(t *testing.T) {
 		{"Running", "Stopped", false},
 		{"Running", "Parked", false},
 		{"Succeeded", "Done", false},
+		// Conversation = awaiting-human; must NOT consume creation budget.
+		{"Running", "Conversation", false},
+		{"Planning", "Conversation", false},
 	}
 	for _, tc := range cases {
 		tk := &tatarav1alpha1.Task{}
@@ -85,6 +88,29 @@ func TestOpenTaskCount(t *testing.T) {
 	got := openTaskCount(tasks)
 	if got != 2 {
 		t.Fatalf("openTaskCount = %d, want 2", got)
+	}
+}
+
+// TestOpenTaskCount_ConversationExcluded verifies that Conversation (awaiting-human)
+// issueLifecycle tasks do NOT consume the creation budget.  This is the core of the
+// brainstorm-starvation fix: 3 Conversation tasks with MaxOpenTasks=3 must leave
+// budget=3 for autonomous creation (brainstorm, issueScan, mrScan).
+func TestOpenTaskCount_ConversationExcluded(t *testing.T) {
+	tasks := []tatarav1alpha1.Task{
+		// Three Conversation tasks - the "all slots pinned" scenario that broke brainstorm.
+		{Status: tatarav1alpha1.TaskStatus{Phase: "Running", LifecycleState: "Conversation"}},
+		{Status: tatarav1alpha1.TaskStatus{Phase: "Planning", LifecycleState: "Conversation"}},
+		{Status: tatarav1alpha1.TaskStatus{Phase: "Pending", LifecycleState: "Conversation"}},
+		// One genuinely active task: must still count.
+		{Status: tatarav1alpha1.TaskStatus{Phase: "Running", LifecycleState: "Implement"}},
+		// Terminal tasks: must not count.
+		{Status: tatarav1alpha1.TaskStatus{Phase: "Running", LifecycleState: "Done"}},
+		{Status: tatarav1alpha1.TaskStatus{Phase: "Succeeded"}},
+	}
+	// Only the Implement task should count; Conversation + terminal = excluded.
+	got := openTaskCount(tasks)
+	if got != 1 {
+		t.Fatalf("openTaskCount with 3 Conversation tasks = %d, want 1 (only Implement counts)", got)
 	}
 }
 

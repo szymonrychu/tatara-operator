@@ -72,7 +72,7 @@ func lifecycleTriageText(task *tatarav1alpha1.Task, title, body string) string {
 		"You are the tatara lifecycle agent performing Triage for issue %s (%s).\n\n"+
 			"Issue title: %s\n"+
 			"Issue body:\n%s\n\n"+
-			"Invoke the `tatara-research-followup` skill, which defines how to research the gap, post design comments via the comment tool, and decide the outcome.\n\n"+
+			"Invoke the `tatara-research-followup` skill, which defines how to research the codebase and decide the outcome.\n\n"+
 			"Your job:\n"+
 			"1. Read the issue AND the full conversation thread carefully.\n"+
 			"2. Use tatara MCP tools (memory, code search, docs) to understand the codebase.\n"+
@@ -81,7 +81,9 @@ func lifecycleTriageText(task *tatarav1alpha1.Task, title, body string) string {
 			"   - A human decline, or duplicate / out-of-scope / not-actionable -> action=close (supply the reason as `comment`).\n"+
 			"   - Still under discussion or needing the human -> action=discuss (supply your questions as `comment`).\n"+
 			"4. IMPORTANT: if THIS issue was opened by tatara itself (a tatara idea), emit action=implement "+
-			"ONLY if a human has posted an approval comment in the thread; otherwise emit action=discuss and wait.\n"+
+			"ONLY if a human has posted an approval comment in the thread. "+
+			"If no human has commented yet, emit action=discuss with comment=\"\" (empty) - "+
+			"the operator will NOT post a comment in this case; do NOT use the comment tool to post one either.\n"+
 			"5. Call the `issue_outcome` MCP tool with your chosen action.\n\n"+
 			"You MUST call issue_outcome before finishing. Do not open PRs or make code changes in this turn.",
 		issueRef, issueURL, title, body)

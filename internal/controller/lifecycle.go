@@ -566,8 +566,30 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.triagePostComment(ctx, project, task, comment); err != nil {
-			return ctrl.Result{}, err
+		// Silence gate: for tatara-authored issues with no human reply, do not
+		// post a repeated "still awaiting go-ahead" comment on every triage cycle.
+		// Only post when a human has actually replied since the issue was opened.
+		// Human-filed issues always get the comment (authorship check returns false).
+		skipComment := false
+		authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
+		if aerr != nil {
+			l.Info("triage discuss: authorship check failed; posting comment (fail open)",
+				"action", "lifecycle_discuss_silence_check", "resource_id", task.Name, "err", aerr.Error())
+		} else if authored {
+			human, herr := r.hasHumanComment(ctx, project, task)
+			if herr != nil {
+				l.Info("triage discuss: hasHumanComment failed; posting comment (fail open)",
+					"action", "lifecycle_discuss_silence_check", "resource_id", task.Name, "err", herr.Error())
+			} else if !human {
+				skipComment = true
+				l.Info("triage discuss: tatara-authored issue with no human reply; suppressing comment",
+					"action", "lifecycle_discuss_silent_hold", "resource_id", task.Name)
+			}
+		}
+		if !skipComment {
+			if err := r.triagePostComment(ctx, project, task, comment); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err

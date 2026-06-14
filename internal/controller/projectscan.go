@@ -243,14 +243,16 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 }
 
 // taskOpen reports whether a Task counts as non-terminal ("open") for the
-// MaxOpenTasks cap. Terminal = Succeeded/Failed phase, or a terminal lifecycle
-// state (Done/Stopped/Parked) for issueLifecycle Tasks.
+// MaxOpenTasks creation budget. Terminal = Succeeded/Failed phase, or a terminal
+// lifecycle state (Done/Stopped/Parked). Conversation is excluded too: a task
+// blocked waiting for human input is externally gated and must not starve
+// autonomous creation (brainstorm, issueScan, mrScan).
 func taskOpen(t *tatarav1alpha1.Task) bool {
 	if isTerminal(t.Status.Phase) {
 		return false
 	}
 	switch t.Status.LifecycleState {
-	case "Done", "Stopped", "Parked":
+	case "Done", "Stopped", "Parked", "Conversation":
 		return false
 	}
 	return true
@@ -808,7 +810,11 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 func brainstormGoal(slug string) string {
 	return "Invoke the `tatara-deep-research` skill to research the platform deeply and propose a single, " +
 		"well-defined discovery issue for repo " + slug + ". The skill defines how to research via the " +
-		"tatara-memory graph and on-disk code, score leverage, dedup, and file exactly one issue via propose_issue."
+		"tatara-memory graph and on-disk code, score leverage, and dedup. " +
+		"You MUST call propose_issue with exactly one proposal before finishing - this is a hard requirement, not optional. " +
+		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
+		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input - " +
+		"pick the single highest-leverage issue, file it via propose_issue, then stop."
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
