@@ -110,6 +110,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		Metrics:             metrics,
+		LifecycleMetrics:    lifecycleMetrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
 		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
