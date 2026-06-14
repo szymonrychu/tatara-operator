@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds the env-scalar configuration for the operator. Each field is
@@ -51,6 +52,10 @@ type Config struct {
 	// during a rolling-update surge. Defaults on; set LEADER_ELECTION=false
 	// for envtest/local single-process runs.
 	LeaderElection bool
+	// PushMetricsTTL is how long a short-lived pod's pushed metric series are
+	// re-exposed on the operator's /metrics after the pod's last push, before
+	// they age out. Backstop for pods that exit without best-effort cleanup.
+	PushMetricsTTL time.Duration
 }
 
 func getDefault(key, def string) string {
@@ -58,6 +63,18 @@ func getDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func getDurationDefault(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }
 
 func getBoolDefault(key string, def bool) bool {
@@ -105,6 +122,7 @@ func Load() (Config, error) {
 		ChatPathPrefix:           getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
 		LeaderElection:           getBoolDefault("LEADER_ELECTION", true),
+		PushMetricsTTL:           getDurationDefault("PUSH_METRICS_TTL", 5*time.Minute),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")
