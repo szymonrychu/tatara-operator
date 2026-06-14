@@ -243,14 +243,16 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 }
 
 // taskOpen reports whether a Task counts as non-terminal ("open") for the
-// MaxOpenTasks cap. Terminal = Succeeded/Failed phase, or a terminal lifecycle
-// state (Done/Stopped/Parked) for issueLifecycle Tasks.
+// MaxOpenTasks creation budget. Terminal = Succeeded/Failed phase, or a terminal
+// lifecycle state (Done/Stopped/Parked). Conversation is excluded too: a task
+// blocked waiting for human input is externally gated and must not starve
+// autonomous creation (brainstorm, issueScan, mrScan).
 func taskOpen(t *tatarav1alpha1.Task) bool {
 	if isTerminal(t.Status.Phase) {
 		return false
 	}
 	switch t.Status.LifecycleState {
-	case "Done", "Stopped", "Parked":
+	case "Done", "Stopped", "Parked", "Conversation":
 		return false
 	}
 	return true
