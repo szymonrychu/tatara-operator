@@ -78,6 +78,10 @@ func (s *httpSession) SubmitTurn(ctx context.Context, baseURL, text, callbackURL
 	return out.TurnID, nil
 }
 
+func (s *httpSession) Interject(ctx context.Context, baseURL, text string) error {
+	return s.do(ctx, http.MethodPost, baseURL+"/v1/interject", map[string]string{"text": text}, nil)
+}
+
 func (s *httpSession) GetTurn(ctx context.Context, baseURL, turnID string) (TurnResult, error) {
 	var out struct {
 		State      string `json:"state"`
