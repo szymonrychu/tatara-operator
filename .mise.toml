@@ -4,9 +4,13 @@ min_version = "2026.6.3"
 go = "1.26.3"
 golangci-lint = "2.12.2"
 helm = "4.2.1"
+pre-commit = "4.6.0"
 
 [env]
 GOFLAGS = "-count=1"
+
+[hooks]
+postinstall = ["pre-commit install --hook-type pre-commit --hook-type pre-push || true"]
 
 [tasks.lint]
 run = "make lint"
