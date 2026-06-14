@@ -157,8 +157,16 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		if openErr != nil {
 			var he *scm.HTTPError
 			if errors.As(openErr, &he) && he.Status >= 400 && he.Status < 500 {
-				// 4xx permanent: branch missing or no diff - skip this repo.
-				l.Info("writeback: skipping repo (4xx)", "repo", repo.Name, "status", he.Status)
+				// 4xx permanent: skip this repo. A 422 "No commits" means the
+				// implement run produced nothing (empty branch); log it distinctly
+				// so a fix that never landed is visible, not masked as a generic skip.
+				if openChangeSkipReason(he) == "no-change" {
+					l.Info("writeback: implement produced no changes (branch has no commits)",
+						"action", "writeback_no_change", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
+				} else {
+					l.Info("writeback: skipping repo (4xx)",
+						"action", "writeback_skip_4xx", "repo", repo.Name, "task", task.Name, "status", he.Status, "path", he.Path, "body", he.Body)
+				}
 				lastSkipStatus = he.Status
 				continue
 			}
@@ -868,4 +876,14 @@ func (r *TaskReconciler) scmToken(ctx context.Context, ns, ref string) (string, 
 		return "", fmt.Errorf("scm secret %q missing token key", ref)
 	}
 	return string(v), nil
+}
+
+// openChangeSkipReason classifies a 4xx OpenChange failure. A 422 "No commits
+// between ..." means the head branch has no commits ahead of base (the implement
+// run produced nothing), a no-change result rather than a transient error.
+func openChangeSkipReason(he *scm.HTTPError) string {
+	if he.Status == 422 && strings.Contains(he.Body, "No commits between") {
+		return "no-change"
+	}
+	return "skip-4xx"
 }
