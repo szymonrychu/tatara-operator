@@ -1,0 +1,16 @@
+[tools]
+go = "1.26.3"
+golangci-lint = "2.12.2"
+helm = "4.2.1"
+
+[env]
+GOFLAGS = "-count=1"
+
+[tasks.lint]
+run = "make lint"
+
+[tasks.test]
+run = "make test"
+
+[tasks.build]
+run = "make build"
