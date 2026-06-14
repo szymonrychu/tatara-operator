@@ -135,6 +135,14 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		}
 		from = fresh.Status.LifecycleState
 		fresh.Status.LifecycleState = to
+		// A fresh entry into Implement (triage-implement, or a CI-failure/merge-
+		// conflict re-entry, or a human revival) starts a new implementation
+		// attempt, so reset the empty-run retry budget. The empty-run retry loop
+		// re-spawns via resetAgentRun (which never calls setLifecycleState), so
+		// this cannot clobber an in-progress retry count.
+		if to == "Implement" {
+			fresh.Status.ImplementEmptyRetries = 0
+		}
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
 		return fmt.Errorf("setLifecycleState: %w", err)
@@ -918,12 +926,50 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 	}
 
 	if fresh.Status.PrURL == "" {
-		// No PR opened (no diff / branch absent) -> park.
-		l.Info("implement: no PR opened; parking", "action", "lifecycle_implement_no_change", "resource_id", task.Name)
-		if err := r.setLifecycleState(ctx, fresh, "Parked", "no-change"); err != nil {
-			return ctrl.Result{}, err
+		// Implement run produced no commit -> no PR. Retry with a re-entry nudge
+		// up to the cap, then comment on the issue and park with a distinct reason.
+		const emptyRetryCap = 2
+		if fresh.Status.ImplementEmptyRetries < emptyRetryCap {
+			if err := r.setImplementEmptyRetries(ctx, fresh, fresh.Status.ImplementEmptyRetries+1); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.setImplementContext(ctx, fresh, emptyImplementReentryPrompt); err != nil {
+				return ctrl.Result{}, err
+			}
+			l.Info("implement: no commit produced; retrying with re-entry nudge",
+				"action", "lifecycle_implement_empty_retry", "resource_id", task.Name,
+				"attempt", fresh.Status.ImplementEmptyRetries, "cap", emptyRetryCap)
+			// resetAgentRun clears phase to "" and leaves LifecycleState=Implement,
+			// so the next reconcile re-spawns the Implement run with ImplementContext.
+			return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
+		}
+		l.Info("implement: no commit after retry cap; commenting + parking",
+			"action", "lifecycle_implement_empty_parked", "resource_id", task.Name)
+		msg := "The implement agent produced no change after " +
+			strconv.Itoa(emptyRetryCap) + " attempts. Leaving this for a human - " +
+			"the fix may be unclear, blocked, or already present."
+		// parkWithComment posts the comment (with the IsPR ref fallback) and parks
+		// atomically. If the SCM context is unavailable, still park so the task does
+		// not loop, just without a comment.
+		if _, _, writer, token, _, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
+			if err := r.parkWithComment(ctx, fresh, writer, token, "implement-empty", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			l.Error(scmErr, "implement: scm context for empty-park comment (parking without comment)",
+				"resource_id", task.Name)
+			if err := r.setLifecycleState(ctx, fresh, "Parked", "implement-empty"); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
+	}
+	// PR opened: clear any prior empty-retry count so a later re-entry into
+	// Implement starts fresh.
+	if fresh.Status.ImplementEmptyRetries > 0 {
+		if err := r.setImplementEmptyRetries(ctx, fresh, 0); err != nil {
+			l.Error(err, "implement: reset empty-retry counter (non-fatal)", "resource_id", task.Name)
+		}
 	}
 
 	// M4: open a follow-up issue when RemainingScope is set and not already done.
@@ -1178,6 +1224,33 @@ func (r *TaskReconciler) setImplementContext(ctx context.Context, task *tatarav1
 		task.Status.ImplementContext = msg
 		return nil
 	})
+}
+
+// emptyImplementReentryPrompt nudges a re-spawned Implement agent that produced
+// no diff on the prior turn to either deliver the change or stop and explain.
+const emptyImplementReentryPrompt = "Your previous attempt finished without " +
+	"committing any change, so no PR could be opened and the issue is still " +
+	"open. Re-read the issue and the repository, then EITHER implement the fix " +
+	"and commit it, OR if no code change is genuinely needed, state clearly why " +
+	"in your final summary so a human can close the issue."
+
+// setImplementEmptyRetries persists Status.ImplementEmptyRetries via RetryOnConflict.
+func (r *TaskReconciler) setImplementEmptyRetries(ctx context.Context, task *tatarav1alpha1.Task, n int) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ImplementEmptyRetries = n
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.ImplementEmptyRetries = n
+		return nil
+	}); err != nil {
+		return fmt.Errorf("setImplementEmptyRetries: %w", err)
+	}
+	return nil
 }
 
 // clearMergedChangeState resets the per-MR write-back fields (MergeCommitSHA,

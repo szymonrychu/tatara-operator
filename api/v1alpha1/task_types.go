@@ -160,6 +160,12 @@ type TaskStatus struct {
 	// Cleared after the turn is submitted so a later fresh entry is clean.
 	// +optional
 	ImplementContext string `json:"implementContext,omitempty"`
+	// ImplementEmptyRetries counts consecutive Implement runs that finished
+	// with zero commits (no PR opened). Bounded retry guard: after the cap the
+	// task is commented + parked with reason "implement-empty" instead of
+	// silently parked as a benign no-change. Reset to 0 when a run opens a PR.
+	// +optional
+	ImplementEmptyRetries int `json:"implementEmptyRetries,omitempty"`
 	// PendingComments are free-form comments queued by the agent via the
 	// comment MCP tool, posted to the task's linked issue on the next
 	// reconcile and then cleared. Does not change the lifecycle state.
