@@ -151,11 +151,12 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 }
 
 func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
-	// issue_comment created: find a live lifecycle Task for the issue and react.
-	// This is intercepted before the trigger-label gate so bot comments on issues
-	// without the triggerLabel still pass through correctly (they are ignored by
-	// the bot-author gate below).
-	if ev.Action == "created" && !ev.IsPR {
+	// issue_comment created (on an issue OR an MR): find a live lifecycle Task
+	// for the work item and react. Intercepted before the trigger-label gate so
+	// bot comments still pass through correctly (they are ignored by the
+	// bot-author gate in handleIssueComment). "created" is unique to
+	// issue_comment events, so this routes both issue and MR comments.
+	if ev.Action == "created" {
 		s.handleIssueComment(ctx, w, provider, proj, ev)
 		return
 	}
@@ -343,11 +344,16 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// handleIssueComment reacts to an issue_comment (action=created) webhook.
-// It finds the live lifecycle Task for the issue and, if the commenter is not
-// the bot, resets LastActivityAt/DeadlineAt and sets state to Triage (so the
-// reconciler re-spawns the agent with the updated thread). Bot comments are
-// ignored to prevent self-trigger loops.
+// handleIssueComment reacts to an issue_comment (action=created) webhook on an
+// issue OR an MR. Bot comments are ignored to prevent self-trigger loops.
+// Otherwise:
+//   - a live task with a turn in flight -> the comment is queued as a pending
+//     interjection so the reconciler injects it into the running session;
+//   - a live but idle task -> LastActivityAt/DeadlineAt are bumped and a
+//     Conversation/Stopped task is re-activated to Triage (a fresh triage
+//     re-reads the full thread);
+//   - no live task -> a Parked owning task is reactivated, else a fresh task is
+//     created at Triage.
 func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	botLogin := ""
 	if proj.Spec.Scm != nil {
@@ -365,23 +371,50 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 
 	task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef)
 	if !found {
-		// Per spec: "new comment under an older issue -> start from triage".
-		// Only for issues (IsPR=false) from human authors; PR comments are ignored.
-		if !ev.IsPR {
-			if parked, ok := s.findReactivatableTask(ctx, proj.Name, ev.IssueRef); ok {
-				s.reactivateTask(ctx, w, provider, proj, ev, parked)
-				return
-			}
-			s.createLifecycleTaskAtTriage(ctx, w, provider, proj, ev)
+		// No agent nursing this issue/MR: reactivate a Parked owning task, else
+		// create a fresh lifecycle task at Triage. Applies to issues AND MRs.
+		if parked, ok := s.findReactivatableTask(ctx, proj.Name, ev.IssueRef); ok {
+			s.reactivateTask(ctx, w, provider, proj, ev, parked)
 			return
 		}
-		s.log.InfoContext(ctx, "issue_comment: no live lifecycle task found (PR comment ignored)",
-			"project", proj.Name, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "ignored")
+		s.createLifecycleTaskAtTriage(ctx, w, provider, proj, ev)
+		return
+	}
+
+	// A live task is nursing this work item with a turn in flight: the comment
+	// must interrupt that run. Queue it as a pending interjection for the
+	// reconciler to inject into the live session (like a user adding context
+	// mid-session). Do not change lifecycle state or shorten the deadline.
+	if taskHasInflightTurn(task) {
+		if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1.Task{}
+			if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			now := metav1.Now()
+			fresh.Status.LastActivityAt = &now
+			if ev.CommentBody != "" {
+				fresh.Status.PendingInterjections = appendCapped(
+					fresh.Status.PendingInterjections, ev.CommentBody, maxPendingInterjections)
+			}
+			return s.cfg.Client.Status().Update(ctx, fresh)
+		}); updateErr != nil {
+			s.log.ErrorContext(ctx, "issue_comment: queue interjection", "error", updateErr, "task", task.Name)
+			s.count(provider, ev.Kind, ev.Action, "error")
+			http.Error(w, "update task", http.StatusInternalServerError)
+			return
+		}
+		s.log.InfoContext(ctx, "issue_comment: queued interjection for in-flight turn",
+			"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "accepted")
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
+	// Idle live task (between turns, Conversation, or Stopped): bump activity and
+	// deadline; re-activate Conversation/Stopped to Triage so the reconciler
+	// re-spawns. A fresh triage re-reads the full thread, so the new comment is
+	// already in context.
 	idleMinutes := 60
 	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
 		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
@@ -471,7 +504,7 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 				IssueRef:    ev.IssueRef,
 				URL:         ev.URL,
 				AuthorLogin: ev.AuthorLogin,
-				IsPR:        false,
+				IsPR:        ev.IsPR,
 				Number:      ev.Number,
 			},
 		},
@@ -604,6 +637,27 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 
 func mentionsBot(body, bot string) bool {
 	return bot != "" && strings.Contains(body, "@"+bot)
+}
+
+// maxPendingInterjections caps the queue of comments waiting to be injected into
+// a live turn, so a comment storm cannot grow Task status without bound. The
+// oldest entries are dropped first.
+const maxPendingInterjections = 20
+
+// taskHasInflightTurn reports whether the Task currently has an agent turn in
+// flight: a current-turn id is set and its completion callback has not arrived.
+func taskHasInflightTurn(t *tatarav1.Task) bool {
+	return t.Annotations[tatarav1.AnnCurrentTurn] != "" && t.Annotations[tatarav1.AnnTurnComplete] == ""
+}
+
+// appendCapped appends v to s, keeping at most max entries by dropping the
+// oldest. max <= 0 means unbounded.
+func appendCapped(s []string, v string, max int) []string {
+	s = append(s, v)
+	if max > 0 && len(s) > max {
+		s = s[len(s)-max:]
+	}
+	return s
 }
 
 func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) {
