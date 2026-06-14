@@ -26,9 +26,8 @@ jobs:
       - uses: jdx/mise-action@v2
         with:
           cache: true
-      - name: gofmt
-        run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; echo 'gofmt -s required'; exit 1; }
-      - run: mise run lint
+      - name: lint
+        run: pre-commit run --all-files
 
   test:
     runs-on: tatara-operator
