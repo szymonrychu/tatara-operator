@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -250,6 +251,48 @@ func TestSetLifecycleState_TransitionsStateAndIncrementMetric(t *testing.T) {
 	counter := testutil.ToFloat64(m.TransitionTotal("", "Triage"))
 	if counter != 1 {
 		t.Errorf("tatara_lifecycle_transition_total{from='',to=Triage} = %v, want 1", counter)
+	}
+}
+
+// TestSetLifecycleState_TerminalDeletesWrapper verifies that transitioning into
+// a terminal lifecycle state (Parked/Done/Stopped) tears down the wrapper
+// Pod+Service so idle agent sessions do not accumulate.
+func TestSetLifecycleState_TerminalDeletesWrapper(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-term-cleanup"
+	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7}
+	task := seedLifecycleTask(t, name, "lc-tc-proj", "lc-tc-repo", "lc-tc-sec", src)
+
+	// Stand up the wrapper Pod + Service the running session would have created.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: agent.PodName(task), Namespace: testNS},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "wrapper", Image: "wrapper:1"}}},
+	}
+	if err := k8sClient.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: agent.PodName(task), Namespace: testNS},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	if err := k8sClient.Create(ctx, svc); err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+
+	r := newLifecycleReconciler(t, nil)
+	if err := r.setLifecycleState(ctx, task, "Parked", "test-terminal"); err != nil {
+		t.Fatalf("setLifecycleState: %v", err)
+	}
+
+	// envtest has no kubelet, so a deleted Pod may linger with a DeletionTimestamp
+	// rather than vanishing; treat either as deleted (same as the terminate test).
+	gotPod := &corev1.Pod{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, gotPod); err == nil && gotPod.DeletionTimestamp == nil {
+		t.Error("wrapper pod should be deleted on terminal transition")
+	}
+	gotSvc := &corev1.Service{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, gotSvc); !apierrors.IsNotFound(err) {
+		t.Errorf("wrapper service should be deleted on terminal transition, got err=%v", err)
 	}
 }
 

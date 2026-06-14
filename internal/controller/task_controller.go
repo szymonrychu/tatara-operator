@@ -617,17 +617,8 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 		})
 	}
 
-	pod := &corev1.Pod{}
-	pod.Name = agent.PodName(task)
-	pod.Namespace = task.Namespace
-	if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("delete wrapper pod: %w", err)
-	}
-	svc := &corev1.Service{}
-	svc.Name = agent.PodName(task)
-	svc.Namespace = task.Namespace
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("delete wrapper service: %w", err)
+	if err := r.deleteWrapper(ctx, task); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if phase == "Succeeded" {
