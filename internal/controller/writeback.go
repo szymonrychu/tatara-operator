@@ -182,15 +182,20 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// (otherwise the work is invisible - no PR and no comment).
 		// Only surface a real result. An empty ResultSummary means the agent
 		// reported nothing; echoing task.Spec.Goal would post the issue body
-		// back verbatim (noise), so stay silent.
-		if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" && task.Status.ResultSummary != "" {
+		// back verbatim (noise), so stay silent. issueLifecycle Implement runs are
+		// also skipped here: finishImplement owns those issue comments (silent
+		// retries plus a single escalation), so echoing the per-run ResultSummary
+		// would spam the issue once per empty retry.
+		commented := task.Spec.Source != nil && task.Spec.Source.IssueRef != "" &&
+			task.Status.ResultSummary != "" && task.Status.LifecycleState != "Implement"
+		if commented {
 			if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary); err != nil {
 				l.Error(err, "writeback: comment result on work item (non-fatal)",
 					"issue_ref", task.Spec.Source.IssueRef)
 			}
 		}
-		msg := "no PR opened; no result to comment"
-		if task.Status.ResultSummary != "" {
+		msg := "no PR opened; no result commented"
+		if commented {
 			msg = "no PR opened; result commented on the issue"
 		}
 		if lastSkipStatus != 0 {

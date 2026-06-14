@@ -135,6 +135,14 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		}
 		from = fresh.Status.LifecycleState
 		fresh.Status.LifecycleState = to
+		// A fresh entry into Implement (triage-implement, or a CI-failure/merge-
+		// conflict re-entry, or a human revival) starts a new implementation
+		// attempt, so reset the empty-run retry budget. The empty-run retry loop
+		// re-spawns via resetAgentRun (which never calls setLifecycleState), so
+		// this cannot clobber an in-progress retry count.
+		if to == "Implement" {
+			fresh.Status.ImplementEmptyRetries = 0
+		}
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
 		return fmt.Errorf("setLifecycleState: %w", err)
@@ -937,15 +945,22 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		}
 		l.Info("implement: no commit after retry cap; commenting + parking",
 			"action", "lifecycle_implement_empty_parked", "resource_id", task.Name)
-		if _, _, writer, token, _, scmErr := r.scmContext(ctx, fresh); scmErr == nil &&
-			fresh.Spec.Source != nil && fresh.Spec.Source.IssueRef != "" {
-			msg := "The implement agent produced no change after " +
-				strconv.Itoa(emptyRetryCap) + " attempts. Leaving this for a human - " +
-				"the fix may be unclear, blocked, or already present."
-			_ = writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, msg)
-		}
-		if err := r.setLifecycleState(ctx, fresh, "Parked", "implement-empty"); err != nil {
-			return ctrl.Result{}, err
+		msg := "The implement agent produced no change after " +
+			strconv.Itoa(emptyRetryCap) + " attempts. Leaving this for a human - " +
+			"the fix may be unclear, blocked, or already present."
+		// parkWithComment posts the comment (with the IsPR ref fallback) and parks
+		// atomically. If the SCM context is unavailable, still park so the task does
+		// not loop, just without a comment.
+		if _, _, writer, token, _, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
+			if err := r.parkWithComment(ctx, fresh, writer, token, "implement-empty", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			l.Error(scmErr, "implement: scm context for empty-park comment (parking without comment)",
+				"resource_id", task.Name)
+			if err := r.setLifecycleState(ctx, fresh, "Parked", "implement-empty"); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
 	}

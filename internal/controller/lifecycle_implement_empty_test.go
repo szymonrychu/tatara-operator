@@ -193,3 +193,61 @@ func TestFinishImplement_PROpened_ResetsCounter(t *testing.T) {
 		t.Errorf("ImplementEmptyRetries = %d, want 0 (reset on PR opened)", got.Status.ImplementEmptyRetries)
 	}
 }
+
+// TestFinishImplement_AtCap_DoesNotEchoResultSummary: at the cap an Implement
+// task with a per-run ResultSummary must post exactly ONE issue comment (the
+// human-handoff escalation), not also echo the ResultSummary - finishImplement
+// owns the issue comment for the Implement path.
+func TestFinishImplement_AtCap_DoesNotEchoResultSummary(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-empty-nospam"
+	task, fw := seedEmptyImplementTask(t, name, "lc-erp-nospam", "lc-err-nospam", "lc-ers-nospam", 2)
+	task.Status.ResultSummary = "ran tests, found nothing to change"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set result summary: %v", err)
+	}
+
+	reconcileEmptyImplementTask(t, name, fw)
+
+	bodies := fw.commentBodies("o/r#200")
+	if len(bodies) != 1 {
+		t.Fatalf("want exactly 1 issue comment (escalation only), got %d: %v", len(bodies), bodies)
+	}
+	if !strings.Contains(bodies[0], "no change") {
+		t.Errorf("the single comment should be the escalation, got %q", bodies[0])
+	}
+	if strings.Contains(bodies[0], "ran tests, found nothing") {
+		t.Errorf("ResultSummary leaked into the issue comment: %q", bodies[0])
+	}
+}
+
+// TestSetLifecycleState_EntersImplement_ResetsEmptyRetries: a fresh entry into
+// Implement (e.g. a human reviving a Parked task) resets the empty-run retry
+// budget so the revived task gets a fresh set of attempts.
+func TestSetLifecycleState_EntersImplement_ResetsEmptyRetries(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-setstate-reset"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#203",
+		URL: "https://github.com/o/r/issues/203", Number: 203,
+	}
+	task := seedLifecycleTask(t, name, "lc-ssr-p", "lc-ssr-r", "lc-ssr-s", src)
+	task.Status.LifecycleState = "Triage"
+	task.Status.ImplementEmptyRetries = 2
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	r := newLifecycleReconciler(t, nil)
+	if err := r.setLifecycleState(ctx, task, "Implement", "test-entry"); err != nil {
+		t.Fatalf("setLifecycleState: %v", err)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.ImplementEmptyRetries != 0 {
+		t.Errorf("ImplementEmptyRetries = %d, want 0 after entering Implement", got.Status.ImplementEmptyRetries)
+	}
+}
