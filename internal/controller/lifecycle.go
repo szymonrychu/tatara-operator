@@ -121,9 +121,30 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 	return r.setLifecycleState(ctx, task, "Parked", reason)
 }
 
+// deleteWrapper best-effort deletes the wrapper Pod and Service for a task.
+// Idempotent: a missing object is not an error. Used by terminate (terminal
+// phase), resetAgentRun (re-spawn), and setLifecycleState (terminal lifecycle).
+func (r *TaskReconciler) deleteWrapper(ctx context.Context, task *tatarav1alpha1.Task) error {
+	pod := &corev1.Pod{}
+	pod.Name = agent.PodName(task)
+	pod.Namespace = task.Namespace
+	if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete wrapper pod: %w", err)
+	}
+	svc := &corev1.Service{}
+	svc.Name = agent.PodName(task)
+	svc.Namespace = task.Namespace
+	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete wrapper service: %w", err)
+	}
+	return nil
+}
+
 // setLifecycleState updates task.Status.LifecycleState to `to`, retrying on
 // conflict (same pattern as clearWritebackPending). It logs the transition at
-// INFO and increments tatara_lifecycle_transition_total{from,to}.
+// INFO and increments tatara_lifecycle_transition_total{from,to}. On a
+// transition into a terminal lifecycle state (Done/Stopped/Parked) it also
+// tears down the wrapper Pod+Service so idle agent sessions do not accumulate.
 func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1alpha1.Task, to, reason string) error {
 	l := log.FromContext(ctx)
 	from := task.Status.LifecycleState
@@ -166,6 +187,17 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 	}
 
 	task.Status.LifecycleState = to
+
+	// Terminal lifecycle states have no further agent run: tear down the wrapper
+	// Pod+Service so idle sessions do not leak CPU/mem + a work PVC. Best-effort;
+	// a failure here must not block the (already-applied) state transition.
+	if isLifecycleTerminal(to) {
+		if err := r.deleteWrapper(ctx, task); err != nil {
+			l.Error(err, "lifecycle: delete wrapper on terminal transition (non-fatal)",
+				"resource_id", task.Name, "to", to)
+		}
+	}
+
 	return nil
 }
 
@@ -177,17 +209,8 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 //   - deletes the wrapper Pod + Service (belt-and-suspenders; terminate already does this on success)
 func (r *TaskReconciler) resetAgentRun(ctx context.Context, task *tatarav1alpha1.Task) error {
 	// Delete wrapper pod + service (best-effort; may already be gone from terminate).
-	pod := &corev1.Pod{}
-	pod.Name = agent.PodName(task)
-	pod.Namespace = task.Namespace
-	if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("resetAgentRun: delete pod: %w", err)
-	}
-	svc := &corev1.Service{}
-	svc.Name = agent.PodName(task)
-	svc.Namespace = task.Namespace
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("resetAgentRun: delete service: %w", err)
+	if err := r.deleteWrapper(ctx, task); err != nil {
+		return fmt.Errorf("resetAgentRun: %w", err)
 	}
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
