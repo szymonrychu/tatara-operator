@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 // Config holds the env-scalar configuration for the operator. Each field is
@@ -47,6 +48,10 @@ type Config struct {
 	MemoryPathPrefix         string
 	ChatPathPrefix           string
 	ChatImage                string
+	// PushMetricsTTL is how long a wrapper run's pushed series survive after
+	// its last push before the operator evicts them (the staleness backstop for
+	// hard-killed pods). Set via PUSH_METRICS_TTL, default 5m.
+	PushMetricsTTL time.Duration
 	// LeaderElection guards against two managers reconciling concurrently
 	// during a rolling-update surge. Defaults on; set LEADER_ELECTION=false
 	// for envtest/local single-process runs.
@@ -70,6 +75,18 @@ func getBoolDefault(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func getDurationDefault(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
 }
 
 // Load reads the operator configuration from the environment, applying
@@ -104,6 +121,7 @@ func Load() (Config, error) {
 		MemoryPathPrefix:         getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
 		ChatPathPrefix:           getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
+		PushMetricsTTL:           getDurationDefault("PUSH_METRICS_TTL", 5*time.Minute),
 		LeaderElection:           getBoolDefault("LEADER_ELECTION", true),
 	}
 	if cfg.OIDCIssuer == "" {

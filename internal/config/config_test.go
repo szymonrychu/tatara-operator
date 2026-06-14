@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/szymonrychu/tatara-operator/internal/config"
 )
@@ -123,6 +124,34 @@ func TestLoad_LeaderElectionDisabled(t *testing.T) {
 	}
 	if cfg.LeaderElection {
 		t.Fatal("LeaderElection = true with LEADER_ELECTION=false, want false")
+	}
+}
+
+func TestLoad_PushMetricsTTLDefault(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("PUSH_METRICS_TTL", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PushMetricsTTL != 5*time.Minute {
+		t.Fatalf("PushMetricsTTL default = %v, want 5m", cfg.PushMetricsTTL)
+	}
+}
+
+func TestLoad_PushMetricsTTLOverride(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("PUSH_METRICS_TTL", "90s")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PushMetricsTTL != 90*time.Second {
+		t.Fatalf("PushMetricsTTL = %v, want 90s", cfg.PushMetricsTTL)
 	}
 }
 

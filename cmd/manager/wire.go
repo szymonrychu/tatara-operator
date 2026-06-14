@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -105,7 +106,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable.
-func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics) error {
+func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushMetrics http.Handler) error {
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
@@ -151,10 +152,11 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	}
 
 	cbServer := &controller.CallbackServer{
-		Client:    mgr.GetClient(),
-		Metrics:   metrics,
-		Session:   agent.NewHTTPSession(wrapperTokens.Token),
-		Namespace: cfg.Namespace,
+		Client:      mgr.GetClient(),
+		Metrics:     metrics,
+		Session:     agent.NewHTTPSession(wrapperTokens.Token),
+		Namespace:   cfg.Namespace,
+		PushMetrics: pushMetrics,
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return fmt.Errorf("add callback server: %w", err)

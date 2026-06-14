@@ -83,7 +83,12 @@ func run(ctx context.Context) error {
 	}
 	operatorMetrics := obs.NewOperatorMetrics(ctrlmetrics.Registry)
 	lifecycleMetrics := obs.NewLifecycleMetrics(ctrlmetrics.Registry)
-	if err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics); err != nil {
+	// Push-receiver for short-lived wrapper pods: registered into the same
+	// registry controller-runtime gathers, so pushed series are re-exposed on
+	// the operator's own /metrics for normal pull scraping.
+	pushMetrics := obs.NewPushAggregator(cfg.PushMetricsTTL)
+	ctrlmetrics.Registry.MustRegister(pushMetrics)
+	if err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics, pushMetrics); err != nil {
 		return err
 	}
 	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics); err != nil {

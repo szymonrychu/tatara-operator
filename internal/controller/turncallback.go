@@ -30,6 +30,9 @@ type CallbackServer struct {
 	Metrics   *obs.OperatorMetrics
 	Session   agent.Session
 	Namespace string
+	// PushMetrics is the wrapper push-receiver, mounted on the internal
+	// listener alongside the turn-complete callback. nil disables the route.
+	PushMetrics http.Handler
 }
 
 type turnCompletePayload struct {
@@ -56,6 +59,9 @@ type turnUsage struct {
 func (s *CallbackServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/turn-complete", s.handleTurnComplete)
+	if s.PushMetrics != nil {
+		mux.Handle("/internal/metrics/push", s.PushMetrics)
+	}
 	return mux
 }
 

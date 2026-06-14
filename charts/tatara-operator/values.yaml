@@ -43,6 +43,10 @@ ingressClassName: "nginx"
 memoryPathPrefix: "/api/v1/memory"
 chatPathPrefix: "/api/v1/chat"
 chatImage: ""
+# How long a short-lived wrapper run's pushed metrics survive after its last
+# push before the operator evicts them (staleness backstop for hard-killed
+# pods). Go duration string.
+pushMetricsTtl: "5m"
 # Leader election guards against two managers reconciling concurrently during a
 # rolling-update surge (replicaCount: 1, maxSurge rounds up to 1). Keep on; set
 # false only for single-process local/envtest runs.
