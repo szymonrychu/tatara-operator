@@ -934,3 +934,46 @@ func TestProviderForRemote(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteback_NoGoalEchoWhenNoPRAndEmptyResult: an implement task that
+// produced no commit (all 422) AND reported no ResultSummary must NOT echo the
+// issue body (task.Spec.Goal) back as a comment. Echoing the goal posts the
+// user's own request verbatim, which is noise. With nothing to surface, the
+// correct behavior is silence.
+func TestWriteback_NoGoalEchoWhenNoPRAndEmptyResult(t *testing.T) {
+	fw := &fakeWriter{openErr: &scm.HTTPError{Status: 422, Body: "No commits between", Path: "/pulls"}}
+	r := newWriteBackReconciler(t, fw)
+	task := seedWritebackPending(t, "wb-noecho", "wb-scm-noecho", "wb-proj-noecho", "wb-repo-noecho")
+
+	// Agent reported nothing.
+	task.Status.ResultSummary = ""
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	require.Empty(t, fw.commentArgs, "must not comment when there is no result and no PR (no goal echo)")
+}
+
+// TestWriteback_NoGoalEchoInPRCommentWhenEmptyResult: when a PR opens but the
+// agent reported no ResultSummary, the issue comment must announce the PR links
+// only - never append the issue body (task.Spec.Goal).
+func TestWriteback_NoGoalEchoInPRCommentWhenEmptyResult(t *testing.T) {
+	fw := &fakeWriter{prURL: "https://github.com/o/r/pull/9"}
+	r := newWriteBackReconciler(t, fw)
+	task := seedWritebackPending(t, "wb-prnoecho", "wb-scm-prnoecho", "wb-proj-prnoecho", "wb-repo-prnoecho")
+
+	task.Status.ResultSummary = ""
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	require.Len(t, fw.commentArgs, 1)
+	require.Contains(t, fw.commentArgs[0], "pull/9")
+	require.NotContains(t, fw.commentArgs[0], task.Spec.Goal, "must not echo the issue body/goal in the PR comment")
+}
