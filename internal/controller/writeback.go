@@ -180,17 +180,19 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// No repo had the branch / no code change: still post the agent's result
 		// to the issue, so report/question/verify tasks surface their answer
 		// (otherwise the work is invisible - no PR and no comment).
-		if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
-			summary := task.Status.ResultSummary
-			if summary == "" {
-				summary = task.Spec.Goal
-			}
-			if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, summary); err != nil {
+		// Only surface a real result. An empty ResultSummary means the agent
+		// reported nothing; echoing task.Spec.Goal would post the issue body
+		// back verbatim (noise), so stay silent.
+		if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" && task.Status.ResultSummary != "" {
+			if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary); err != nil {
 				l.Error(err, "writeback: comment result on work item (non-fatal)",
 					"issue_ref", task.Spec.Source.IssueRef)
 			}
 		}
-		msg := "no PR opened; result commented on the issue"
+		msg := "no PR opened; no result to comment"
+		if task.Status.ResultSummary != "" {
+			msg = "no PR opened; result commented on the issue"
+		}
 		if lastSkipStatus != 0 {
 			msg = fmt.Sprintf("PR/MR could not be opened or already exists: %d", lastSkipStatus)
 		}
@@ -213,11 +215,12 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 
 	// Comment on the originating issue with all PR links (non-fatal).
 	if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
-		resultSummary := task.Status.ResultSummary
-		if resultSummary == "" {
-			resultSummary = task.Spec.Goal
+		commentBody := "Done - opened PR/MR:\n" + strings.Join(prURLs, "\n")
+		// Append the agent's summary only when it produced one; never fall back
+		// to task.Spec.Goal (that just echoes the issue body).
+		if task.Status.ResultSummary != "" {
+			commentBody += "\n\n" + task.Status.ResultSummary
 		}
-		commentBody := "Done - opened PR/MR:\n" + strings.Join(prURLs, "\n") + "\n\n" + resultSummary
 		if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody); err != nil {
 			l.Error(err, "writeback: comment on work item (non-fatal)",
 				"issue_ref", task.Spec.Source.IssueRef)
