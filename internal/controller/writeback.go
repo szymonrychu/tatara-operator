@@ -47,7 +47,13 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 	case "brainstorm":
 		// Brainstorm proposals are created via propose_issue which spawns child
 		// Tasks. The brainstorm Task itself never opens a PR.
-		r.clearWritebackPending(ctx, task, "BrainstormProposed", "brainstorm proposals created via propose_issue; no PR to open")
+		// Only claim BrainstormProposed when at least one proposal child Task
+		// exists; otherwise use BrainstormComplete so a no-yield run is visible.
+		if r.brainstormHasProposal(ctx, task) {
+			r.clearWritebackPending(ctx, task, "BrainstormProposed", "brainstorm proposals created via propose_issue; no PR to open")
+		} else {
+			r.clearWritebackPending(ctx, task, "BrainstormComplete", "brainstorm finished with no proposal filed via propose_issue")
+		}
 		return ctrl.Result{}, nil
 	default:
 		// implement and other future kinds that open a change.
@@ -233,6 +239,27 @@ func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatara
 	}); err != nil {
 		log.FromContext(ctx).Error(err, "writeback: clear WritebackPending", "task", task.Name)
 	}
+}
+
+// brainstormHasProposal reports whether at least one proposal Task exists for
+// the given brainstorm Task. A proposal Task is any Task in the same namespace
+// with spec.proposedIssue set and the same spec.projectRef + spec.repositoryRef.
+// These are created by the agent calling the propose_issue MCP tool.
+func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(task.Namespace)); err != nil {
+		log.FromContext(ctx).Error(err, "writeback: brainstormHasProposal: list tasks (treating as no proposal)", "task", task.Name)
+		return false
+	}
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.ProposedIssue != nil &&
+			t.Spec.ProjectRef == task.Spec.ProjectRef &&
+			t.Spec.RepositoryRef == task.Spec.RepositoryRef {
+			return true
+		}
+	}
+	return false
 }
 
 // providerForRemote is a best-effort heuristic used only when
