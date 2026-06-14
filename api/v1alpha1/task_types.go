@@ -165,6 +165,12 @@ type TaskStatus struct {
 	// reconcile and then cleared. Does not change the lifecycle state.
 	// +optional
 	PendingComments []string `json:"pendingComments,omitempty"`
+	// PendingInterjections are comment bodies queued by the webhook when a new
+	// issue/MR comment arrives while an agent turn is in flight. The reconciler
+	// delivers each to the live wrapper session (as mid-session user input) and
+	// then clears them. Does not change the lifecycle state.
+	// +optional
+	PendingInterjections []string `json:"pendingInterjections,omitempty"`
 }
 
 // +kubebuilder:object:root=true
