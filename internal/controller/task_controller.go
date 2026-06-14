@@ -320,6 +320,12 @@ func (r *TaskReconciler) podRecreations(task *tatarav1alpha1.Task) int {
 	return n
 }
 
+// taskHasInflightTurn reports whether the Task has an agent turn in flight: a
+// current-turn id is set and its completion callback has not yet arrived.
+func taskHasInflightTurn(task *tatarav1alpha1.Task) bool {
+	return task.Annotations[annCurrentTurn] != "" && task.Annotations[annTurnComplete] == ""
+}
+
 func (r *TaskReconciler) bumpRecreations(ctx context.Context, task *tatarav1alpha1.Task) error {
 	fresh := &tatarav1alpha1.Task{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {

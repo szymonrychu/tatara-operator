@@ -315,6 +315,58 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// Drain webhook-queued interjections into the live wrapper session: new
+	// issue/MR comments that arrived while a turn was in flight must reach the
+	// running agent as mid-session input (issue #25). Delivered in order, then
+	// cleared under RetryOnConflict so a concurrently-appended interjection is
+	// preserved. Skipped when r.Session is nil (tests without a session).
+	if len(task.Status.PendingInterjections) > 0 && r.Session != nil {
+		// Stale if no turn is in flight: the next turn/triage re-reads the thread,
+		// so drop the queue rather than injecting into a session with nothing running.
+		if !taskHasInflightTurn(task) {
+			if err := r.clearPendingInterjections(ctx, task, len(task.Status.PendingInterjections)); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, fmt.Errorf("lifecycle drop stale interjections: %w", err)
+			}
+			l.Info("lifecycle: dropped stale interjections (no in-flight turn)",
+				"action", "interject_stale", "resource_id", task.Name)
+			return ctrl.Result{Requeue: true}, nil
+		}
+		baseURL := agent.BaseURL(task, task.Namespace)
+		total := len(task.Status.PendingInterjections)
+		delivered := 0
+		var deliverErr error
+		for _, text := range task.Status.PendingInterjections {
+			ierr := r.Session.Interject(ctx, baseURL, text)
+			if ierr != nil {
+				var unreachable *agent.UnreachableError
+				if errors.As(ierr, &unreachable) {
+					// Pod/turn server still booting: keep the queue intact, retry soon.
+					l.Info("lifecycle: interject unreachable; keeping queue",
+						"action", "interject_retry", "resource_id", task.Name)
+					return ctrl.Result{RequeueAfter: pollRequeue}, nil
+				}
+				deliverErr = ierr
+				l.Error(ierr, "lifecycle: interject failed", "resource_id", task.Name)
+				break
+			}
+			delivered++
+			l.Info("lifecycle: interjection delivered",
+				"action", "interject", "resource_id", task.Name)
+		}
+		if delivered > 0 {
+			if err := r.clearPendingInterjections(ctx, task, delivered); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, fmt.Errorf("lifecycle clear interjections: %w", err)
+			}
+		}
+		if deliverErr != nil || delivered < total {
+			// Interjections remain after a delivery error: back off, retry later.
+			return ctrl.Result{RequeueAfter: pollRequeue}, nil
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
 	// Memory + concurrency gates: apply only when about to spawn a new agent run.
 	if needsSpawn(task.Status.LifecycleState, task.Status.Phase) {
 		if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
@@ -638,6 +690,24 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, r.resetAgentRun(ctx, task)
+}
+
+// clearPendingInterjections removes the first n delivered interjections from
+// Status.PendingInterjections under RetryOnConflict, preserving any
+// concurrently-appended interjection (same trim pattern as PendingComments).
+func (r *TaskReconciler) clearPendingInterjections(ctx context.Context, task *tatarav1alpha1.Task, n int) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.Task
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), &fresh); err != nil {
+			return err
+		}
+		if len(fresh.Status.PendingInterjections) >= n {
+			fresh.Status.PendingInterjections = fresh.Status.PendingInterjections[n:]
+		} else {
+			fresh.Status.PendingInterjections = nil
+		}
+		return r.Status().Update(ctx, &fresh)
+	})
 }
 
 // clearIssueOutcome nils Status.IssueOutcome (RetryOnConflict). Called only
