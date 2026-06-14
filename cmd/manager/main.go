@@ -18,6 +18,7 @@ import (
 	apiv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/pushmetrics"
 	"github.com/szymonrychu/tatara-operator/internal/version"
 )
 
@@ -83,7 +84,11 @@ func run(ctx context.Context) error {
 	}
 	operatorMetrics := obs.NewOperatorMetrics(ctrlmetrics.Registry)
 	lifecycleMetrics := obs.NewLifecycleMetrics(ctrlmetrics.Registry)
-	if err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics); err != nil {
+	// Push-receiver for short-lived wrapper pods: aggregates their pushed
+	// series and re-exposes them on the operator's own /metrics registry.
+	pushReceiver := pushmetrics.New(cfg.PushMetricsTTL)
+	ctrlmetrics.Registry.MustRegister(pushReceiver)
+	if err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics, pushReceiver); err != nil {
 		return err
 	}
 	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics); err != nil {

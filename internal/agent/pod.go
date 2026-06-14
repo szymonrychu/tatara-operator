@@ -185,6 +185,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
 		{Name: "DEFAULT_CALLBACK_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/turn-complete"},
+		// Push-metrics: the wrapper Pod is too short-lived to be reliably
+		// scraped, so it pushes its /metrics to the operator's push-receiver
+		// (same internal listener as the callback), keyed by this run's id.
+		{Name: "OPERATOR_PUSH_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/metrics/push"},
+		{Name: "RUN_ID", Value: PodName(task)},
+		{Name: "POD_NAME", Value: PodName(task)},
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},

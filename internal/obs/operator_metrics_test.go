@@ -234,18 +234,58 @@ func TestOpenProposalsGauge(t *testing.T) {
 	}
 }
 
+func TestTurnTimeoutTotal(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.TurnTimeout("reconcile")
+	m.TurnTimeout("poll_backstop")
+	m.TurnTimeout("poll_backstop")
+	if got := testutil.ToFloat64(m.turnTimeoutTotal.WithLabelValues("reconcile")); got != 1 {
+		t.Fatalf("turn_timeout reconcile = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.turnTimeoutTotal.WithLabelValues("poll_backstop")); got != 2 {
+		t.Fatalf("turn_timeout poll_backstop = %v, want 2", got)
+	}
+}
+
+func TestIngestJobResultTotal(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.IngestJobResult("success")
+	m.IngestJobResult("failure")
+	m.IngestJobResult("failure")
+	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("success")); got != 1 {
+		t.Fatalf("ingest_job success = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("failure")); got != 2 {
+		t.Fatalf("ingest_job failure = %v, want 2", got)
+	}
+}
+
+func TestAgentUnreachableTermination(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.AgentUnreachableTermination()
+	if got := testutil.ToFloat64(m.agentUnreachableTermTotal); got != 1 {
+		t.Fatalf("agent_unreachable_termination_total = %v, want 1", got)
+	}
+}
+
 func TestOperatorMetricsNamesStable(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	_ = NewOperatorMetrics(reg)
 	mfs, _ := reg.Gather()
 	want := map[string]bool{
-		"operator_reconcile_total":                   false,
-		"operator_ingest_job_duration_seconds":       false,
-		"operator_turn_duration_seconds":             false,
-		"operator_webhook_events_total":              false,
-		"operator_tasks_inflight":                    false,
-		"operator_memory_provision_duration_seconds": false,
-		"operator_memory_stacks":                     false,
+		"operator_reconcile_total":                     false,
+		"operator_ingest_job_duration_seconds":         false,
+		"operator_turn_duration_seconds":               false,
+		"operator_webhook_events_total":                false,
+		"operator_tasks_inflight":                      false,
+		"operator_memory_provision_duration_seconds":   false,
+		"operator_memory_stacks":                       false,
+		"operator_turn_timeout_total":                  false,
+		"operator_ingest_job_total":                    false,
+		"operator_agent_unreachable_termination_total": false,
 	}
 	for _, mf := range mfs {
 		if _, ok := want[mf.GetName()]; ok {

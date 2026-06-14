@@ -6,21 +6,24 @@ import "github.com/prometheus/client_golang/prometheus"
 // tatara-operator. Construct one with NewOperatorMetrics and pass it to the
 // reconcilers.
 type OperatorMetrics struct {
-	reconcileTotal          *prometheus.CounterVec
-	ingestJobDuration       prometheus.Histogram
-	turnDuration            prometheus.Histogram
-	webhookEvents           *prometheus.CounterVec
-	tasksInflight           prometheus.Gauge
-	memoryProvisionDuration prometheus.Histogram
-	memoryStacks            *prometheus.GaugeVec
-	scmWritesTotal          *prometheus.CounterVec
-	scanItemsTotal          *prometheus.CounterVec
-	scanTasksCreatedTotal   *prometheus.CounterVec
-	scanDurationSeconds     *prometheus.HistogramVec
-	issueOutcomeTotal       *prometheus.CounterVec
-	tasksInflightKind       *prometheus.GaugeVec
-	agentBootRaceRequeue    prometheus.Counter
-	openProposals           *prometheus.GaugeVec
+	reconcileTotal            *prometheus.CounterVec
+	ingestJobDuration         prometheus.Histogram
+	turnDuration              prometheus.Histogram
+	webhookEvents             *prometheus.CounterVec
+	tasksInflight             prometheus.Gauge
+	memoryProvisionDuration   prometheus.Histogram
+	memoryStacks              *prometheus.GaugeVec
+	scmWritesTotal            *prometheus.CounterVec
+	scanItemsTotal            *prometheus.CounterVec
+	scanTasksCreatedTotal     *prometheus.CounterVec
+	scanDurationSeconds       *prometheus.HistogramVec
+	issueOutcomeTotal         *prometheus.CounterVec
+	tasksInflightKind         *prometheus.GaugeVec
+	agentBootRaceRequeue      prometheus.Counter
+	openProposals             *prometheus.GaugeVec
+	turnTimeoutTotal          *prometheus.CounterVec
+	ingestJobTotal            *prometheus.CounterVec
+	agentUnreachableTermTotal prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -91,6 +94,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_open_proposals",
 			Help: "Open, unapproved agent-proposed issues per repo.",
 		}, []string{"repo"}),
+		turnTimeoutTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_turn_timeout_total",
+			Help: "Agent turns that exceeded their deadline and were terminated, by detection source.",
+		}, []string{"source"}),
+		ingestJobTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_ingest_job_total",
+			Help: "Finished ingest Jobs by terminal result.",
+		}, []string{"result"}),
+		agentUnreachableTermTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_agent_unreachable_termination_total",
+			Help: "Tasks terminated because the wrapper agent stayed unreachable past the boot deadline.",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -108,6 +123,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
 		m.openProposals,
+		m.turnTimeoutTotal,
+		m.ingestJobTotal,
+		m.agentUnreachableTermTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -136,7 +154,32 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, action := range []string{"implement", "close"} {
 		m.issueOutcomeTotal.WithLabelValues(action)
 	}
+	for _, source := range []string{"reconcile", "poll_backstop"} {
+		m.turnTimeoutTotal.WithLabelValues(source)
+	}
+	for _, result := range []string{"success", "failure"} {
+		m.ingestJobTotal.WithLabelValues(result)
+	}
 	return m
+}
+
+// TurnTimeout increments operator_turn_timeout_total for the detection source
+// ("reconcile" or "poll_backstop").
+func (m *OperatorMetrics) TurnTimeout(source string) {
+	m.turnTimeoutTotal.WithLabelValues(source).Inc()
+}
+
+// IngestJobResult increments operator_ingest_job_total for a finished Job's
+// terminal result ("success" or "failure").
+func (m *OperatorMetrics) IngestJobResult(result string) {
+	m.ingestJobTotal.WithLabelValues(result).Inc()
+}
+
+// AgentUnreachableTermination increments
+// operator_agent_unreachable_termination_total: a Task was terminated because
+// its wrapper agent stayed unreachable past the boot deadline.
+func (m *OperatorMetrics) AgentUnreachableTermination() {
+	m.agentUnreachableTermTotal.Inc()
 }
 
 // ScanItem increments tatara_scan_items_total for an activity + outcome.

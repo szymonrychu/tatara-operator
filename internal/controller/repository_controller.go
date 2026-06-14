@@ -377,6 +377,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 	}
 
 	if jobSucceeded(job) {
+		r.Metrics.IngestJobResult("success")
 		sha, err := r.readResultSHA(ctx, repo)
 		if err != nil {
 			r.Metrics.ReconcileResult("Repository", "error")
@@ -406,6 +407,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 		return ctrl.Result{}, nil
 	}
 
+	r.Metrics.IngestJobResult("failure")
 	repo.Status.Phase = "Failed"
 	repo.Status.JobName = ""
 	repo.Status.IngestFailureCount++
