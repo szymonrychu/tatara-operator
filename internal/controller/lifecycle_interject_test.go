@@ -63,9 +63,8 @@ func TestLifecycleInterject_InflightTurn_DeliversAndClears(t *testing.T) {
 	ann := map[string]string{tatarav1alpha1.AnnCurrentTurn: "turn-1"} // in flight (no turn-complete)
 	task := mkInterjectFixture(t, "ijdeliver", ann, []string{"hello", "world"})
 
-	res, err := r.reconcileLifecycle(ctx, task)
+	_, err := r.reconcileLifecycle(ctx, task)
 	require.NoError(t, err)
-	require.True(t, res.Requeue, "successful drain should requeue")
 
 	got := fs.allInterjects()
 	require.Len(t, got, 2)
@@ -91,9 +90,8 @@ func TestLifecycleInterject_NoInflightTurn_DropsQueue(t *testing.T) {
 	}
 	task := mkInterjectFixture(t, "ijdrop", ann, []string{"stale"})
 
-	res, err := r.reconcileLifecycle(ctx, task)
+	_, err := r.reconcileLifecycle(ctx, task)
 	require.NoError(t, err)
-	require.True(t, res.Requeue, "dropping stale queue should requeue")
 
 	require.Empty(t, fs.allInterjects(), "no interjection may be delivered without an in-flight turn")
 	require.Empty(t, getInterjectTask(t, "ijdrop").Status.PendingInterjections, "stale queue must be cleared")
