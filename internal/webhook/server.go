@@ -578,18 +578,10 @@ func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRe
 // back to Triage, and stamps LastActivityAt/DeadlineAt so the reconciler
 // re-triages the issue with the new comment.
 func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent, task *tatarav1.Task) {
-	// Best-effort delete the wrapper pod + service.
-	pod := &corev1.Pod{}
-	pod.Name = agent.PodName(task)
-	pod.Namespace = s.cfg.Namespace
-	if err := s.cfg.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-		s.log.ErrorContext(ctx, "reactivate: delete pod (non-fatal)", "error", err, "task", task.Name)
-	}
-	svc := &corev1.Service{}
-	svc.Name = agent.PodName(task)
-	svc.Namespace = s.cfg.Namespace
-	if err := s.cfg.Client.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		s.log.ErrorContext(ctx, "reactivate: delete service (non-fatal)", "error", err, "task", task.Name)
+	// Best-effort delete the wrapper pod + service (shared helper; same teardown
+	// the controller runs on terminal lifecycle transitions).
+	if err := agent.DeleteWrapper(ctx, s.cfg.Client, s.cfg.Namespace, task); err != nil {
+		s.log.ErrorContext(ctx, "reactivate: delete wrapper (non-fatal)", "error", err, "task", task.Name)
 	}
 
 	idleMinutes := 60

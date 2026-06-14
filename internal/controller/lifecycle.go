@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -124,20 +122,10 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 // deleteWrapper best-effort deletes the wrapper Pod and Service for a task.
 // Idempotent: a missing object is not an error. Used by terminate (terminal
 // phase), resetAgentRun (re-spawn), and setLifecycleState (terminal lifecycle).
+// Thin receiver-bound wrapper over the shared agent.DeleteWrapper so the
+// webhook server (different receiver type) can reuse the same teardown.
 func (r *TaskReconciler) deleteWrapper(ctx context.Context, task *tatarav1alpha1.Task) error {
-	pod := &corev1.Pod{}
-	pod.Name = agent.PodName(task)
-	pod.Namespace = task.Namespace
-	if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete wrapper pod: %w", err)
-	}
-	svc := &corev1.Service{}
-	svc.Name = agent.PodName(task)
-	svc.Namespace = task.Namespace
-	if err := r.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete wrapper service: %w", err)
-	}
-	return nil
+	return agent.DeleteWrapper(ctx, r.Client, task.Namespace, task)
 }
 
 // setLifecycleState updates task.Status.LifecycleState to `to`, retrying on
