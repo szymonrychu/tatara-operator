@@ -688,7 +688,10 @@ func (n *noChangeSCMWriter) OpenChange(_ context.Context, _, _, _, _, _, _ strin
 
 func (n *noChangeSCMWriter) Comment(_ context.Context, _, _, _ string) error { return nil }
 
-func TestLifecycleImplement_NoPRTransitionsToParked(t *testing.T) {
+// TestLifecycleImplement_NoPRFirstEmptyRetries verifies that a first empty run
+// (no PR, counter==0) triggers a retry rather than immediately parking.
+// Parking now only happens after the retry cap (2) is exhausted.
+func TestLifecycleImplement_NoPRFirstEmptyRetries(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-impl-nopr"
 	proj := "lc-ip-nopr"
@@ -724,8 +727,12 @@ func TestLifecycleImplement_NoPRTransitionsToParked(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (no-change)", got.Status.LifecycleState)
+	// First empty run retries (counter 0 -> 1), stays Implement.
+	if got.Status.LifecycleState != "Implement" {
+		t.Errorf("LifecycleState = %q, want Implement (first empty run should retry, not park)", got.Status.LifecycleState)
+	}
+	if got.Status.ImplementEmptyRetries != 1 {
+		t.Errorf("ImplementEmptyRetries = %d, want 1", got.Status.ImplementEmptyRetries)
 	}
 }
 
