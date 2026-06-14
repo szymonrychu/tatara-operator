@@ -43,6 +43,36 @@ func TestTaskOpen_TerminalPhases(t *testing.T) {
 	}
 }
 
+func TestTaskActive_ExcludesTerminalLifecycle(t *testing.T) {
+	cases := []struct {
+		phase     string
+		lifecycle string
+		want      bool
+	}{
+		{"Running", "", true},
+		{"Planning", "", true},
+		{"Pending", "", false},
+		{"Succeeded", "", false},
+		{"Failed", "", false},
+		{"Running", "Triage", true},
+		// Deadlock cases: an active phase but a TERMINAL lifecycle must NOT
+		// occupy a concurrency slot. A Task Parked at maxIterations keeps a
+		// stale Planning phase; counting it deadlocks the cap.
+		{"Planning", "Parked", false},
+		{"Running", "Parked", false},
+		{"Running", "Done", false},
+		{"Running", "Stopped", false},
+	}
+	for _, tc := range cases {
+		tk := &tatarav1alpha1.Task{}
+		tk.Status.Phase = tc.phase
+		tk.Status.LifecycleState = tc.lifecycle
+		if got := taskActive(tk); got != tc.want {
+			t.Errorf("taskActive(phase=%q, lifecycle=%q) = %v, want %v", tc.phase, tc.lifecycle, got, tc.want)
+		}
+	}
+}
+
 func TestOpenTaskCount(t *testing.T) {
 	tasks := []tatarav1alpha1.Task{
 		{Status: tatarav1alpha1.TaskStatus{Phase: "Running"}},

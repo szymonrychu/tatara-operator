@@ -71,6 +71,14 @@ type TaskReconciler struct {
 func isTerminal(phase string) bool { return phase == "Succeeded" || phase == "Failed" }
 func isActive(phase string) bool   { return phase == "Planning" || phase == "Running" }
 
+// taskActive reports whether a Task occupies a concurrency slot: an active
+// phase (Planning/Running) that has NOT entered a terminal lifecycle state. A
+// Task Parked at maxIterations keeps a stale Planning phase; counting it by
+// phase alone (without the lifecycle check) deadlocks the concurrency cap.
+func taskActive(t *tatarav1alpha1.Task) bool {
+	return isActive(t.Status.Phase) && !isLifecycleTerminal(t.Status.LifecycleState)
+}
+
 // Reconcile drives a Task through spawn -> plan turn -> subtask turns ->
 // terminate. Turn results arrive via the /internal/turn-complete callback,
 // which annotates the Task to trigger the next reconcile.
@@ -244,7 +252,7 @@ func (r *TaskReconciler) atConcurrencyCap(ctx context.Context, project *tatarav1
 	active := 0
 	for i := range list.Items {
 		it := list.Items[i]
-		if it.Spec.ProjectRef == project.Name && it.Name != self && isActive(it.Status.Phase) {
+		if it.Spec.ProjectRef == project.Name && it.Name != self && taskActive(&it) {
 			active++
 		}
 	}
@@ -676,7 +684,7 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	n := 0
 	byKind := map[string]int{}
 	for i := range list.Items {
-		if isActive(list.Items[i].Status.Phase) {
+		if taskActive(&list.Items[i]) {
 			n++
 			byKind[list.Items[i].Spec.Kind]++
 		}
