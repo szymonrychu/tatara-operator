@@ -45,6 +45,36 @@ func TestSubmitTurn_202(t *testing.T) {
 	require.Equal(t, "turn-1", id)
 }
 
+func TestInterject_202(t *testing.T) {
+	s, srv := newSession(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, "/v1/interject", r.URL.Path)
+		require.Equal(t, "Bearer test-bearer", r.Header.Get("Authorization"))
+
+		var in struct {
+			Text string `json:"text"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&in))
+		require.Equal(t, "new context", in.Text)
+
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{})
+	})
+
+	require.NoError(t, s.Interject(context.Background(), srv.URL, "new context"))
+}
+
+func TestInterject_409WhenNoInflightTurn(t *testing.T) {
+	s, srv := newSession(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte("no in-flight turn"))
+	})
+	err := s.Interject(context.Background(), srv.URL, "x")
+	var he *agent.HTTPError
+	require.ErrorAs(t, err, &he)
+	require.Equal(t, 409, he.Status)
+}
+
 func TestSubmitTurn_409(t *testing.T) {
 	s, srv := newSession(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusConflict)

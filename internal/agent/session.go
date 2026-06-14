@@ -19,6 +19,10 @@ type TurnResult struct {
 // per-pod wrapper address (http://<svc>.<ns>.svc:8080).
 type Session interface {
 	SubmitTurn(ctx context.Context, baseURL, text, callbackURL string) (turnID string, err error)
+	// Interject injects new user input into the turn currently in flight, as a
+	// user typing into the live session mid-turn would. Returns an HTTPError
+	// with status 409 when no turn is in flight.
+	Interject(ctx context.Context, baseURL, text string) error
 	GetTurn(ctx context.Context, baseURL, turnID string) (TurnResult, error)
 	DeleteSession(ctx context.Context, baseURL string) error
 }

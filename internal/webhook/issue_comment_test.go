@@ -299,6 +299,78 @@ func TestIssueCommentReactivatesParkedOwningTask(t *testing.T) {
 	require.Empty(t, got.Annotations[tatarav1.AnnTurnComplete], "AnnTurnComplete must be cleared")
 }
 
+// TestIssueComment_InflightTurn_QueuesInterjection verifies that a human comment
+// on a task whose agent has a turn in flight is queued as a PendingInterjection
+// (for the reconciler to inject) WITHOUT changing the lifecycle state.
+func TestIssueComment_InflightTurn_QueuesInterjection(t *testing.T) {
+	const secretVal = "whsec-ij"
+	proj := projectWithBot("projij1", "projij1-scm", "tatara", "tatara-bot")
+	repo := repository("repoij1", "projij1", "https://github.com/o/r.git", "main")
+	task := lifecycleTask("taskij1", "projij1", "repoij1", 7, "Implement")
+	// Turn in flight: current-turn set, no completion callback yet.
+	task.Annotations = map[string]string{tatarav1.AnnCurrentTurn: "5"}
+
+	c := seedClient(t, proj, secret("projij1-scm", secretVal), repo)
+	require.NoError(t, c.Create(context.Background(), task))
+	require.NoError(t, c.Status().Update(context.Background(), task))
+
+	h, _ := newServer(t, c)
+
+	body := []byte(issueCommentBody)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issue_comment")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "projij1", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var got tatarav1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskij1"}, &got))
+	require.Equal(t, "Implement", got.Status.LifecycleState, "in-flight interjection must not change lifecycle state")
+	require.Equal(t, []string{"Please check the edge case"}, got.Status.PendingInterjections)
+
+	// No new task created.
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	require.Len(t, tasks.Items, 1)
+}
+
+// TestIssueComment_ParkedMR_Reactivated verifies that an MR comment on an MR
+// whose only owning Task is Parked reactivates that Task (issue #25: MR comments
+// with no nursing agent re-engage one).
+func TestIssueComment_ParkedMR_Reactivated(t *testing.T) {
+	const secretVal = "whsec-mrpark"
+	proj := projectWithBot("projmrp", "projmrp-scm", "tatara", "tatara-bot")
+	repo := repository("repomrp", "projmrp", "https://github.com/o/r.git", "main")
+	task := lifecycleTask("taskmrp", "projmrp", "repomrp", 11, "Parked")
+	task.Spec.Source.IssueRef = "o/r#11"
+	task.Spec.Source.IsPR = true
+	task.Status.Phase = "Planning"
+
+	c := seedClient(t, proj, secret("projmrp-scm", secretVal), repo)
+	require.NoError(t, c.Create(context.Background(), task))
+	require.NoError(t, c.Status().Update(context.Background(), task))
+
+	h, _ := newServer(t, c)
+
+	body := []byte(prCommentUntracked) // human comment on PR 11
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issue_comment")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "projmrp", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	require.Len(t, tasks.Items, 1, "Parked MR task must be reactivated, not duplicated")
+
+	var got tatarav1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskmrp"}, &got))
+	require.Equal(t, "Triage", got.Status.LifecycleState, "Parked MR task must transition to Triage")
+	require.Equal(t, "", got.Status.Phase)
+}
+
 // TestIssueCommentDoneOwningTaskCreatesFresh verifies that a human comment on
 // an issue with a Done (terminal) owning Task creates a fresh Triage Task.
 func TestIssueCommentDoneOwningTaskCreatesFresh(t *testing.T) {

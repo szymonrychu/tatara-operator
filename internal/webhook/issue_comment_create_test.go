@@ -1,7 +1,8 @@
 package webhook_test
 
-// Tests for FIX 2 (M2 code-review): issue_comment on an untracked issue
-// should create a lifecycle Task at Triage; PR comments and bot comments must not.
+// Tests for issue_comment on an untracked work item: a human comment on an
+// issue OR an MR with no live lifecycle task creates a Task at Triage (issue
+// #25); bot comments must not.
 
 import (
 	"context"
@@ -86,9 +87,11 @@ func TestIssueComment_BotOnUntrackedIssue_DoesNotCreateTask(t *testing.T) {
 	require.Empty(t, tasks.Items, "bot comment on untracked issue must NOT create a task")
 }
 
-// TestIssueComment_HumanOnUntrackedPR_DoesNotCreateTask verifies that a human
-// comment on a PR (IsPR=true) with no live task does NOT create a task.
-func TestIssueComment_HumanOnUntrackedPR_DoesNotCreateTask(t *testing.T) {
+// TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask verifies that a human
+// comment on an MR (IsPR=true) with no live task creates an issueLifecycle Task
+// at Triage with Source.IsPR set (issue #25: comments on an MR with no nursing
+// agent spawn one).
+func TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask(t *testing.T) {
 	const secretVal = "whsec-ut3"
 	proj := projectWithBot("projicut3", "projicut3-scm", "tatara", "tatara-bot")
 	repo := repository("repoicut3", "projicut3", "https://github.com/o/r.git", "main")
@@ -106,7 +109,15 @@ func TestIssueComment_HumanOnUntrackedPR_DoesNotCreateTask(t *testing.T) {
 
 	var tasks tatarav1.TaskList
 	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Empty(t, tasks.Items, "human PR comment on untracked PR must NOT create a task")
+	require.Len(t, tasks.Items, 1, "human MR comment on untracked MR must create one Task")
+
+	tk := tasks.Items[0]
+	require.Equal(t, "issueLifecycle", tk.Spec.Kind)
+	require.NotNil(t, tk.Spec.Source)
+	require.Equal(t, "o/r#11", tk.Spec.Source.IssueRef)
+	require.True(t, tk.Spec.Source.IsPR, "task must be IsPR for an MR comment")
+	require.Equal(t, "Triage", tk.Annotations[tatarav1.LifecycleEntryAnnotation])
+	require.Equal(t, "11", tk.Labels[tatarav1.LabelSourceNumber])
 }
 
 // TestIssueComment_HumanOnUntrackedIssue_ExistingLiveTask_NoNewTask verifies

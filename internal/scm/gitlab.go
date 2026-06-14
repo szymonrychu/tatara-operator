@@ -32,6 +32,7 @@ type glPayload struct {
 		IID          int    `json:"iid"`
 		Title        string `json:"title"`
 		Description  string `json:"description"`
+		Note         string `json:"note"`
 		URL          string `json:"url"`
 		Action       string `json:"action"`
 		SourceBranch string `json:"source_branch"`
@@ -148,6 +149,7 @@ func glNoteEvent(p glPayload) WebhookEvent {
 		Labels:      labels,
 		Title:       p.ObjectAttributes.Title,
 		Body:        p.ObjectAttributes.Description,
+		CommentBody: p.ObjectAttributes.Note,
 		IssueRef:    fmt.Sprintf("%s%s%d", p.Project.PathWithNamespace, sep, number),
 		URL:         p.ObjectAttributes.URL,
 		AuthorLogin: p.User.Username,

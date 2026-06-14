@@ -4,6 +4,12 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 ## Agent-loop follow-ups (found during 2026-06-08 dogfood)
 
+- [x] Issue/MR comments interrupt the agent nursing them (tatara-operator#25):
+  in-flight turn -> comment queued on `Status.PendingInterjections`, drained by
+  the reconciler to the wrapper `POST /v1/interject` (live PTY input); idle task
+  -> re-triage; no live agent -> reactivate Parked or create a Triage task, now
+  for MRs as well as issues.
+
 - [x] Phase-label dedup + orphan-recovery (presence+state, Option A) - four phase
   labels (brainstorming/approved/implementation/declined) as state-of-truth;
   dedup+backstop key on label presence + task state (not label-added-time);

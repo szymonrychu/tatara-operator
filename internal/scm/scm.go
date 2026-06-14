@@ -16,7 +16,8 @@ type WebhookEvent struct {
 	Branch       string // for push
 	Labels       []string
 	Title        string
-	Body         string
+	Body         string // issue/PR/MR description body
+	CommentBody  string // the comment text for issue_comment/note (created) events
 	IssueRef     string // owner/repo#123 (github) or group/proj!iid (gitlab)
 	URL          string
 	AuthorLogin  string // login of the issue/PR/MR author (the resource author)

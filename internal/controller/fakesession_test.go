@@ -17,13 +17,19 @@ type submittedTurn struct {
 
 // fakeSession records SubmitTurn/GetTurn/DeleteSession calls and returns
 // scripted turn ids. It is safe for concurrent use by the reconciler.
+type interjection struct {
+	BaseURL, Text string
+}
+
 type fakeSession struct {
-	mu        sync.Mutex
-	submits   []submittedTurn
-	nextID    int
-	getResult map[string]agent.TurnResult
-	deleted   []string
-	submitErr error
+	mu           sync.Mutex
+	submits      []submittedTurn
+	nextID       int
+	getResult    map[string]agent.TurnResult
+	deleted      []string
+	submitErr    error
+	interjects   []interjection
+	interjectErr error
 }
 
 func newFakeSession() *fakeSession {
@@ -40,6 +46,22 @@ func (f *fakeSession) SubmitTurn(_ context.Context, baseURL, text, callbackURL s
 	id := "turn-" + strconv.Itoa(f.nextID)
 	f.submits = append(f.submits, submittedTurn{BaseURL: baseURL, Text: text, CallbackURL: callbackURL, TurnID: id})
 	return id, nil
+}
+
+func (f *fakeSession) Interject(_ context.Context, baseURL, text string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.interjectErr != nil {
+		return f.interjectErr
+	}
+	f.interjects = append(f.interjects, interjection{BaseURL: baseURL, Text: text})
+	return nil
+}
+
+func (f *fakeSession) allInterjects() []interjection {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]interjection(nil), f.interjects...)
 }
 
 func (f *fakeSession) GetTurn(_ context.Context, _ string, turnID string) (agent.TurnResult, error) {
