@@ -386,6 +386,7 @@ func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatar
 			return ctrl.Result{}, fmt.Errorf("stamp agent-unreachable-since: %w", serr), true
 		}
 	case time.Now().After(started.Add(agentBootDeadline)):
+		r.Metrics.AgentUnreachableTermination()
 		l.Info("agent unreachable past boot deadline; failing task",
 			"task", task.Name, "since", started.Format(time.RFC3339), "deadline", agentBootDeadline.String())
 		res, terr := r.terminate(ctx, task, "Failed", "AgentUnreachable",
@@ -467,6 +468,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	// Turn in flight, no callback yet -> check for timeout, otherwise wait.
 	if task.Annotations[annTurnComplete] == "" {
 		if r.isTurnTimedOut(project, task) {
+			r.Metrics.TurnTimeout("reconcile")
 			return r.terminate(ctx, task, "Failed", "TurnTimeout",
 				fmt.Sprintf("turn %s exceeded timeout", current))
 		}

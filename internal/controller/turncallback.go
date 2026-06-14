@@ -214,6 +214,7 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 
 		// Check for turn timeout before hitting the wrapper.
 		if s.isTurnTimedOut(ctx, task) {
+			s.Metrics.TurnTimeout("poll_backstop")
 			l.Info("turn timed out in poll backstop", "action", "turn_timeout",
 				"task", task.Name, "turn_id", turn)
 			_ = s.expireTimedOutTurn(ctx, task, turn)
