@@ -107,3 +107,19 @@ subdirectory. The parent `.gitignore` keeps them out of this repo.
 - Update `ROADMAP.md` when you complete or re-scope a phase.
 - Use `/handoff` if you are approaching context limits; do not soldier
   on.
+
+## Toolchain (mise)
+
+Every tatara repo pins its build tools in a root `.mise.toml`. mise is already
+installed in the agent container and on PATH.
+
+- In a freshly cloned repo, run `mise install` once before building. This
+  installs the exact Go, golangci-lint, helm, etc. the repo pins.
+- Invoke pinned tools through mise: `mise exec -- go build ./...`,
+  `mise exec -- golangci-lint run`, or the repo task `mise run lint` /
+  `mise run test` / `mise run build`. Do NOT call a bare `go`/`helm` for a
+  build - it may be the wrong version. `mise exec` / `mise run` work in any
+  shell; bare tools only resolve via the shim PATH.
+- If you change a tool dependency, edit that repo's `.mise.toml` (pin an exact
+  version), never install ad-hoc.
+- `.mise.toml` under /workspace is pre-trusted; no `mise trust` needed.

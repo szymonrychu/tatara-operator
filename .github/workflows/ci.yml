@@ -21,44 +21,37 @@ jobs:
     runs-on: tatara-operator
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
       - name: gofmt
         run: test -z "$(gofmt -s -l .)" || { gofmt -s -l .; echo 'gofmt -s required'; exit 1; }
-      - uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.12.2
+      - run: mise run lint
 
   test:
     runs-on: tatara-operator
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - name: test
-        run: make test
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise run test
 
   build:
     runs-on: tatara-operator
     needs: [secscan, lint, test]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
       - name: build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
-      - name: build
-        run: make build
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise run build
 
   image:
     if: ${{ github.event_name == 'push' }}
