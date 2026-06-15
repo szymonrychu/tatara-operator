@@ -40,6 +40,7 @@ const (
 	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
 	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
 	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
+	annBootCrashAttempts     = "tatara.dev/boot-crash-attempts"
 )
 
 // TaskReconciler spawns one wrapper session per Task and drives it turn by
@@ -240,6 +241,15 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 		return ctrl.Result{}, err
 	}
 	if !ready {
+		// Boot-crash detection: a wrapper that exits non-zero before /readyz comes
+		// up leaves the Task wedged in Planning with no turn in flight, so neither
+		// the reconcile nor the poll-backstop turn-timeout ever fires (both need a
+		// turn-started-at). Detect a Failed/CrashLoopBackOff pod, or one that never
+		// became Ready within the boot deadline, and fail the boot fast -> respawn
+		// (bounded) instead of requeuing every 2s forever.
+		if res, herr, handled := r.handleBootCrash(ctx, task); handled {
+			return res, herr
+		}
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
@@ -362,6 +372,105 @@ func (r *TaskReconciler) podReady(ctx context.Context, task *tatarav1alpha1.Task
 		}
 	}
 	return false, nil
+}
+
+// bootCrashReason inspects a not-yet-Ready wrapper Pod and returns a non-empty
+// reason when its boot has definitively failed: the Pod reached a Failed phase
+// (restartPolicy=Never, so a wrapper that exits non-zero lands here), a
+// container is in CrashLoopBackOff, or a container terminated non-zero before
+// /readyz came up. Returns "" when the pod is merely still booting.
+func bootCrashReason(pod *corev1.Pod) string {
+	if pod.Status.Phase == corev1.PodFailed {
+		return "PodFailed"
+	}
+	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	for _, cs := range statuses {
+		if w := cs.State.Waiting; w != nil && w.Reason == "CrashLoopBackOff" {
+			return "CrashLoopBackOff"
+		}
+		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+			return "ContainerExited"
+		}
+	}
+	return ""
+}
+
+// bootDeadlineExceeded reports whether a not-yet-Ready pod has been alive longer
+// than agentBootDeadline without becoming Ready (readiness-never-true wedge).
+func bootDeadlineExceeded(pod *corev1.Pod) bool {
+	if pod.CreationTimestamp.IsZero() {
+		return false
+	}
+	return time.Since(pod.CreationTimestamp.Time) > agentBootDeadline
+}
+
+// handleBootCrash recovers a Task whose wrapper Pod failed to boot. On a crash
+// signal (Failed/CrashLoopBackOff/non-zero exit) or a pod that never became
+// Ready within agentBootDeadline, it respawns the run via resetAgentRun bounded
+// by maxPodRecreations boot attempts; once exhausted it fails the Task so the
+// lifecycle-orphan sweep can re-pick it rather than spinning forever.
+// handled=false means the pod is still legitimately booting -> caller requeues.
+func (r *TaskReconciler) handleBootCrash(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error, bool) {
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, pod); err != nil {
+		// NotFound: ensurePodAndService recreates it next reconcile. Transient
+		// errors: keep waiting. Either way this is not a boot crash to act on.
+		return ctrl.Result{}, nil, false
+	}
+	reason := bootCrashReason(pod)
+	if reason == "" {
+		if !bootDeadlineExceeded(pod) {
+			return ctrl.Result{}, nil, false
+		}
+		reason = "BootTimeout"
+	}
+
+	l := log.FromContext(ctx)
+	attempts := r.bootCrashAttempts(task) + 1
+	if attempts > maxPodRecreations {
+		r.Metrics.AgentBootCrash(reason, "failed")
+		l.Info("agent pod boot failed; recreation budget exhausted, failing task",
+			"action", "agent_boot_crash_exhausted", "resource_id", task.Name, "reason", reason, "attempts", maxPodRecreations)
+		res, terr := r.terminate(ctx, task, "Failed", "BootCrashLoop",
+			fmt.Sprintf("wrapper pod failed to boot (%s) after %d attempts", reason, maxPodRecreations))
+		return res, terr, true
+	}
+
+	r.Metrics.AgentBootCrash(reason, "respawn")
+	l.Info("agent pod boot failed; respawning",
+		"action", "agent_boot_crash", "resource_id", task.Name, "reason", reason, "attempt", attempts)
+	if err := r.bumpBootCrashAttempts(ctx, task); err != nil {
+		return ctrl.Result{}, err, true
+	}
+	if err := r.resetAgentRun(ctx, task); err != nil {
+		return ctrl.Result{}, err, true
+	}
+	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
+}
+
+// bootCrashAttempts returns the count of boot-crash respawns for the current
+// run. resetAgentRun preserves this annotation (unlike pod-recreations) so the
+// budget accumulates across respawns; recordTurn clears it once a turn lands.
+func (r *TaskReconciler) bootCrashAttempts(task *tatarav1alpha1.Task) int {
+	n, _ := strconv.Atoi(task.Annotations[annBootCrashAttempts])
+	return n
+}
+
+func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatarav1alpha1.Task) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		n, _ := strconv.Atoi(fresh.Annotations[annBootCrashAttempts])
+		fresh.Annotations[annBootCrashAttempts] = strconv.Itoa(n + 1)
+		return r.Update(ctx, fresh)
+	})
 }
 
 // handleAgentUnreachable handles a SubmitTurn error: when it is an agent
@@ -559,6 +668,7 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 	fresh.Annotations[annTurnStartedAt] = time.Now().UTC().Format(time.RFC3339)
 	delete(fresh.Annotations, annTurnComplete)
 	delete(fresh.Annotations, annAgentUnreachableSince)
+	delete(fresh.Annotations, annBootCrashAttempts)
 	if err := r.Update(ctx, fresh); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
 	}
