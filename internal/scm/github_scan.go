@@ -118,20 +118,22 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 		field = "Status"
 	}
 
+	const q = `query($owner:String!,$number:Int!,$field:String!,$after:String){
+		user(login:$owner){ projectV2(number:$number){ items(first:100,after:$after){ pageInfo{ hasNextPage endCursor } nodes { updatedAt fieldValueByName(name:$field){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } } }
+		organization(login:$owner){ projectV2(number:$number){ items(first:100,after:$after){ pageInfo{ hasNextPage endCursor } nodes { updatedAt fieldValueByName(name:$field){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } } }
+	}`
+
 	var out []BoardItem
-	cursor := ""
+	var cursor any // nil means no after-cursor (first page)
 	for {
-		afterArg := ""
-		if cursor != "" {
-			afterArg = fmt.Sprintf(`, after:%q`, cursor)
+		vars := map[string]any{
+			"owner":  board.Owner,
+			"number": board.GitHubProjectNumber,
+			"field":  field,
+			"after":  cursor,
 		}
-		sel := fmt.Sprintf(
-			`projectV2(number:%d){ items(first:100%s){ pageInfo{ hasNextPage endCursor } nodes { updatedAt fieldValueByName(name:%q){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } }`,
-			board.GitHubProjectNumber, afterArg, field,
-		)
-		q := fmt.Sprintf(`query { user(login:%q){ %s } organization(login:%q){ %s } }`, board.Owner, sel, board.Owner, sel)
 		var resp respShape
-		if err := c.ghGraphQL(ctx, c.token, q, nil, &resp); err != nil {
+		if err := c.ghGraphQL(ctx, c.token, q, vars, &resp); err != nil {
 			return nil, err
 		}
 		// Prefer user nodes if present, else org.
@@ -152,7 +154,7 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 		if !pv.Items.PageInfo.HasNextPage {
 			break
 		}
-		cursor = pv.Items.PageInfo.EndCursor
+		cursor = pv.Items.PageInfo.EndCursor // non-nil string triggers $after on next page
 	}
 	return out, nil
 }
