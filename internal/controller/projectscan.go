@@ -483,6 +483,53 @@ func (r *ProjectReconciler) scanReader(ctx context.Context, proj *tatarav1alpha1
 	return r.ReaderFor(proj.Spec.Scm.Provider, token)
 }
 
+// scanWriter resolves the SCMWriter + token for the Project's provider, mirroring
+// scanReader. Used by mrScan to close PRs that recovery has exhausted.
+func (r *ProjectReconciler) scanWriter(ctx context.Context, proj *tatarav1alpha1.Project) (scm.SCMWriter, string, error) {
+	if r.SCMFor == nil {
+		return nil, "", fmt.Errorf("scan: SCMFor not wired")
+	}
+	var sec corev1.Secret
+	key := types.NamespacedName{Namespace: proj.Namespace, Name: proj.Spec.ScmSecretRef}
+	if err := r.Get(ctx, key, &sec); err != nil {
+		return nil, "", fmt.Errorf("scan: get scm secret: %w", err)
+	}
+	token := string(sec.Data["token"])
+	w, err := r.SCMFor(proj.Spec.Scm.Provider)
+	if err != nil {
+		return nil, "", err
+	}
+	return w, token, nil
+}
+
+// closeExhaustedPR closes a bot PR that recovery could not land after
+// maxRecoveryAttempts. The branch is preserved (ClosePR does not delete it), so
+// reopening retries. Best-effort: failure to resolve repo/writer/token is logged
+// and the PR is left open (the scan still skips re-adoption via the caller).
+func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository, c candidate) {
+	l := log.FromContext(ctx)
+	repo, ok := r.matchRepoForSlug(repos, c.repo)
+	if !ok {
+		return
+	}
+	w, token, err := r.scanWriter(ctx, proj)
+	if err != nil {
+		l.Error(err, "mrScan: scanWriter for exhausted close (leaving PR open)",
+			"resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+		return
+	}
+	body := fmt.Sprintf("Autonomous recovery could not land this PR after %d attempts; "+
+		"closing as superseded. The branch is preserved - reopen to retry or hand-fix.", maxRecoveryAttempts)
+	if cerr := w.ClosePR(ctx, repo.Spec.URL, token, c.number, body); cerr != nil {
+		l.Error(cerr, "mrScan: close exhausted PR failed (leaving open)",
+			"resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+		return
+	}
+	r.Metrics.ScanItem("mrScan", "recovery_closed")
+	l.Info("mrScan: closed recovery-exhausted bot PR",
+		"action", "scan_recovery_closed", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+}
+
 // matchRepoForSlug returns the Project Repository whose URL maps to the given
 // owner/name slug, or ok=false.
 func (r *ProjectReconciler) matchRepoForSlug(repos []tatarav1alpha1.Repository, slug string) (tatarav1alpha1.Repository, bool) {
@@ -636,10 +683,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		if c.author == bot && bot != "" {
 			if priorTerminalAttempts(existing, c.repo, c.number) >= maxRecoveryAttempts {
 				r.Metrics.ScanItem("mrScan", "recovery_exhausted")
-				l.Info("mrScan: recovery exhausted; not re-adopting bot PR",
-					"action", "scan_recovery_exhausted", "resource_id", proj.Name,
-					"repo", c.repo, "pr", c.number,
-					"attempts", priorTerminalAttempts(existing, c.repo, c.number))
+				r.closeExhaustedPR(ctx, proj, repos, c)
 				continue
 			}
 			// Bot PR -> issueLifecycle entering at MRCI. Dedup key is the linked issue
