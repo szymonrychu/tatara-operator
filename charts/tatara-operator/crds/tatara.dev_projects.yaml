@@ -145,10 +145,11 @@ spec:
                           enabled:
                             type: boolean
                           maxOpenProposals:
-                            default: 3
+                            default: 5
                             description: |-
-                              MaxOpenProposals caps open, unapproved agent proposals per repo; at or
-                              above this the repo is skipped. Default 3.
+                              MaxOpenProposals caps the total open, unapproved agent proposals across
+                              ALL repos in the project; at or above this the brainstorm cycle is
+                              skipped. Default 5.
                             type: integer
                           maxPerCycle:
                             default: 1

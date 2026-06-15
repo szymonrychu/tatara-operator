@@ -754,9 +754,9 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	return len(selected) < len(eligible)
 }
 
-// brainstorm runs one brainstorm cycle: per-repo, backpressured by live open
-// proposal count. Replaces the old MaxPerCycle body; MaxPerCycle field is
-// retained for API compat but unused.
+// brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
+// Task per cycle for the whole project. MaxPerCycle field is retained for API
+// compat but unused.
 // budget is the shared open-task creation budget; brainstorm decrements it on
 // each successful create and stops creating when budget reaches zero.
 func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity, budget *int) {
@@ -764,57 +764,111 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	start := time.Now()
 	maxProp := act.MaxOpenProposals
 	if maxProp < 1 {
-		maxProp = 3
+		maxProp = 5
 	}
+
+	// Project-scoped in-flight guard: any non-terminal brainstorm Task blocks.
+	if brainstormInFlightProject(existing) {
+		r.Metrics.ScanItem("brainstorm", "skipped_inflight")
+		l.Info("brainstorm: in-flight project brainstorm task; skipping cycle",
+			"action", "scan_brainstorm", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+		return
+	}
+
+	// Budget guard.
+	if *budget <= 0 {
+		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+		return
+	}
+
 	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
-	created := 0
-	for i := range repos {
-		repo := repos[i]
-		slug := repoSlug(&repo)
+
+	// Deterministic primary repo: sort by name, first valid slug wins.
+	sortedRepos := make([]tatarav1alpha1.Repository, len(repos))
+	copy(sortedRepos, repos)
+	sort.Slice(sortedRepos, func(i, j int) bool {
+		return sortedRepos[i].Name < sortedRepos[j].Name
+	})
+
+	// Aggregate backlog across all repos; short-circuit once >= maxProp.
+	var primaryRepo *tatarav1alpha1.Repository
+	for i := range sortedRepos {
+		if s := repoSlug(&sortedRepos[i]); s != "" {
+			primaryRepo = &sortedRepos[i]
+			break
+		}
+	}
+	if primaryRepo == nil {
+		l.Info("brainstorm: no valid repos", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+		return
+	}
+
+	total := 0
+	for i := range sortedRepos {
+		rp := &sortedRepos[i]
+		slug := repoSlug(rp)
 		if slug == "" {
 			continue
 		}
-		if brainstormInFlight(existing, repo.Name) {
-			r.Metrics.ScanItem("brainstorm", "skipped_inflight")
-			continue
-		}
-		backlog, err := r.proposalBacklog(ctx, reader, &repo, brainstormingLabel, proj.Spec.Scm, existing)
+		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm, existing)
 		if err != nil {
-			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", repo.Name, "err", err.Error())
+			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
 		}
 		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		if backlog >= maxProp {
+		total += backlog
+		if total >= maxProp {
 			r.Metrics.ScanItem("brainstorm", "skipped_cap")
-			continue
+			l.Info("brainstorm: project backlog at cap; skipping cycle",
+				"action", "scan_brainstorm", "resource_id", proj.Name, "total", total, "cap", maxProp)
+			r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+			return
 		}
-		if *budget <= 0 {
-			break
-		}
-		goal := brainstormGoal(slug)
-		if _, err := r.createBrainstormTask(ctx, proj, &repo, goal, act.Sources); err != nil {
-			l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", repo.Name)
-			continue
-		}
-		r.Metrics.ScanItem("brainstorm", "picked")
-		created++
-		*budget--
 	}
+
+	// Collect all valid slugs for the project-spanning goal.
+	var slugs []string
+	for i := range sortedRepos {
+		if s := repoSlug(&sortedRepos[i]); s != "" {
+			slugs = append(slugs, s)
+		}
+	}
+
+	goal := brainstormGoalProject(slugs)
+	if _, err := r.createBrainstormTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
+		l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", primaryRepo.Name)
+		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+		return
+	}
+	r.Metrics.ScanItem("brainstorm", "picked")
+	*budget--
 	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
-		"picked", created, "duration_ms", time.Since(start).Milliseconds())
+		"picked", 1, "primary_repo", primaryRepo.Name, "duration_ms", time.Since(start).Milliseconds())
 }
 
-// brainstormGoal returns the turn-0 goal text for a brainstorm task, directing
-// the agent to invoke the tatara-deep-research skill and file a single issue.
-func brainstormGoal(slug string) string {
-	return "Invoke the `tatara-deep-research` skill to research the platform deeply and propose a single, " +
-		"well-defined discovery issue for repo " + slug + ". The skill defines how to research via the " +
-		"tatara-memory graph and on-disk code, score leverage, and dedup. " +
+// brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
+// task. The agent surveys ALL repos (available via TATARA_REPOS), identifies
+// the single best discovery opportunity across the project, and calls
+// propose_issue with the repo arg set to the chosen target repo.
+func brainstormGoalProject(slugs []string) string {
+	repoList := strings.Join(slugs, ", ")
+	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the single highest-leverage " +
+		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
+		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
 		"You MUST call propose_issue with exactly one proposal before finishing - this is a hard requirement, not optional. " +
+		"Set the `repo` argument of propose_issue to the specific repository that should own the issue (choose the best fit). " +
 		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
 		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input - " +
-		"pick the single highest-leverage issue, file it via propose_issue, then stop."
+		"pick the single highest-leverage issue across the whole project, file it via propose_issue, then stop."
+}
+
+// brainstormGoal kept for compatibility with tests referencing the old single-repo form.
+// New code calls brainstormGoalProject.
+func brainstormGoal(slug string) string {
+	return brainstormGoalProject([]string{slug})
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
@@ -826,11 +880,12 @@ func repoSlug(repo *tatarav1alpha1.Repository) string {
 	return owner + "/" + name
 }
 
-// brainstormInFlight reports whether a non-terminal brainstorm Task targets repoName.
-func brainstormInFlight(existing []tatarav1alpha1.Task, repoName string) bool {
+// brainstormInFlightProject reports whether ANY non-terminal brainstorm Task
+// exists in the project (project-scoped guard, replaces per-repo check).
+func brainstormInFlightProject(existing []tatarav1alpha1.Task) bool {
 	for i := range existing {
 		t := existing[i]
-		if t.Labels[labelActivity] == "brainstorm" && t.Spec.RepositoryRef == repoName && !isTerminal(t.Status.Phase) {
+		if t.Labels[labelActivity] == "brainstorm" && !isTerminal(t.Status.Phase) {
 			return true
 		}
 	}
