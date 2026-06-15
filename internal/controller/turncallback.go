@@ -303,6 +303,10 @@ func (s *CallbackServer) Start(ctx context.Context, addr string) error {
 				if s.Session != nil {
 					s.PollOnce(ctx)
 				}
+				// Backstop the one-shot teardown: reap wrapper pods whose Task
+				// is gone or terminal. Runs regardless of Session (orphans
+				// outlive their session).
+				s.ReapOrphans(ctx)
 			}
 		}
 	}()
