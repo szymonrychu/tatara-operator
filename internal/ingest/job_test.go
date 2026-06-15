@@ -277,9 +277,11 @@ func TestBuildJob_SemanticModelEnv(t *testing.T) {
 	}
 }
 
+func boolPtrJ(v bool) *bool { return &v }
+
 func TestBuildJob_SemanticIngestEnv_True(t *testing.T) {
 	repo := testRepository()
-	repo.Spec.SemanticIngest = true
+	repo.Spec.SemanticIngest = boolPtrJ(true)
 	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
 	main := job.Spec.Template.Spec.Containers[0]
 	if v := envValue(main, "SEMANTIC_INGEST"); v != "true" {
@@ -289,11 +291,25 @@ func TestBuildJob_SemanticIngestEnv_True(t *testing.T) {
 
 func TestBuildJob_SemanticIngestEnv_False(t *testing.T) {
 	repo := testRepository()
-	repo.Spec.SemanticIngest = false
+	repo.Spec.SemanticIngest = boolPtrJ(false)
 	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
 	main := job.Spec.Template.Spec.Containers[0]
 	if v := envValue(main, "SEMANTIC_INGEST"); v != "false" {
 		t.Errorf("SEMANTIC_INGEST = %q, want false", v)
+	}
+}
+
+// TestBuildJob_SemanticIngestEnv_NilDefaultsTrue verifies that a nil
+// SemanticIngest pointer (field absent from YAML, default not yet applied by
+// apiserver) is treated as true so ingest behaviour is unchanged for existing
+// repos created before the *bool migration.
+func TestBuildJob_SemanticIngestEnv_NilDefaultsTrue(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.SemanticIngest = nil
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_INGEST"); v != "true" {
+		t.Errorf("nil SemanticIngest should default to true, got SEMANTIC_INGEST=%q", v)
 	}
 }
 

@@ -43,7 +43,7 @@ type RepositoryDTO struct {
 	ProjectRef    string              `json:"projectRef,omitempty"`
 	URL           string              `json:"url,omitempty"`
 	DefaultBranch string              `json:"defaultBranch,omitempty"`
-	IngestEnabled bool                `json:"ingestEnabled"`
+	IngestEnabled bool                `json:"ingestEnabled"` // effective value; nil field defaults to true
 	Status        repositoryStatusDTO `json:"status"`
 }
 
@@ -118,7 +118,7 @@ func toProjectDTO(p tatarav1alpha1.Project) ProjectDTO {
 func toRepositoryDTO(r tatarav1alpha1.Repository) RepositoryDTO {
 	d := RepositoryDTO{
 		Name: r.Name, ProjectRef: r.Spec.ProjectRef, URL: r.Spec.URL,
-		DefaultBranch: r.Spec.DefaultBranch, IngestEnabled: r.Spec.IngestEnabled,
+		DefaultBranch: r.Spec.DefaultBranch, IngestEnabled: tatarav1alpha1.BoolVal(r.Spec.IngestEnabled, true),
 		Status: repositoryStatusDTO{
 			Phase: r.Status.Phase, LastIngestedCommit: r.Status.LastIngestedCommit,
 			JobName: r.Status.JobName, Conditions: r.Status.Conditions,

@@ -38,7 +38,7 @@ func semanticEnv(repo *tataradevv1alpha1.Repository, cfg Config) []corev1.EnvVar
 	}
 	env := []corev1.EnvVar{
 		{Name: "SEMANTIC_MODEL", Value: model},
-		{Name: "SEMANTIC_INGEST", Value: strconv.FormatBool(repo.Spec.SemanticIngest)},
+		{Name: "SEMANTIC_INGEST", Value: strconv.FormatBool(tataradevv1alpha1.BoolVal(repo.Spec.SemanticIngest, true))},
 	}
 	if cfg.OpenAISecretName != "" {
 		env = append(env, corev1.EnvVar{

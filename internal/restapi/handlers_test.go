@@ -18,6 +18,8 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 )
 
+func boolPtrH(v bool) *bool { return &v }
+
 func buildRouter(t *testing.T, objs ...client.Object) *chi.Mux {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -71,7 +73,7 @@ func TestGetProject_NotFound(t *testing.T) {
 func repository(name, projectRef string) *tatarav1alpha1.Repository {
 	return &tatarav1alpha1.Repository{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
-		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: projectRef, URL: "https://git/" + name, DefaultBranch: "main", IngestEnabled: true},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: projectRef, URL: "https://git/" + name, DefaultBranch: "main", IngestEnabled: boolPtrH(true)},
 	}
 }
 

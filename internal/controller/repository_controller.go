@@ -86,7 +86,7 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
 	}
 
-	if !repo.Spec.IngestEnabled {
+	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
 		return ctrl.Result{}, nil
 	}
 

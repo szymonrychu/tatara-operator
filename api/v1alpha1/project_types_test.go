@@ -10,6 +10,8 @@ import (
 	"github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
+func boolPtrPT(v bool) *bool { return &v }
+
 func TestProjectFields(t *testing.T) {
 	p := v1alpha1.Project{
 		Spec: v1alpha1.ProjectSpec{
@@ -43,7 +45,7 @@ func TestRepositoryFields(t *testing.T) {
 			ProjectRef:    "p",
 			URL:           "https://example/repo.git",
 			DefaultBranch: "main",
-			IngestEnabled: true,
+			IngestEnabled: boolPtrPT(true),
 		},
 		Status: v1alpha1.RepositoryStatus{
 			Phase:              "Ingested",
@@ -165,5 +167,25 @@ func TestBrainstormActivity_MaxOpenProposalsField(t *testing.T) {
 	b := v1alpha1.BrainstormActivity{MaxOpenProposals: 3}
 	if b.MaxOpenProposals != 3 {
 		t.Fatalf("MaxOpenProposals = %d, want 3", b.MaxOpenProposals)
+	}
+}
+
+// TestMemorySpec_DefaultFieldsExist guards Finding 7: the MemorySpec fields
+// that carry +kubebuilder:default markers exist and accept the default values
+// so the CRD schema and the Go struct stay in sync.
+func TestMemorySpec_DefaultFieldsExist(t *testing.T) {
+	m := v1alpha1.MemorySpec{
+		PgInstances:  1,
+		PgStorage:    "10Gi",
+		Neo4jStorage: "10Gi",
+	}
+	if m.PgInstances != 1 {
+		t.Errorf("PgInstances = %d, want 1", m.PgInstances)
+	}
+	if m.PgStorage != "10Gi" {
+		t.Errorf("PgStorage = %q, want 10Gi", m.PgStorage)
+	}
+	if m.Neo4jStorage != "10Gi" {
+		t.Errorf("Neo4jStorage = %q, want 10Gi", m.Neo4jStorage)
 	}
 }

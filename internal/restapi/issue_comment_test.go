@@ -133,7 +133,7 @@ func repoForProject(name, projectRef, url string) *tatarav1alpha1.Repository {
 			ProjectRef:    projectRef,
 			URL:           url,
 			DefaultBranch: "main",
-			IngestEnabled: true,
+			IngestEnabled: boolPtrH(true),
 		},
 	}
 }

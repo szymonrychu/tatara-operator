@@ -5,15 +5,18 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// MemorySpec configures the per-Project memory stack footprint. All fields
-// are optional; defaults (pgInstances 1, pgStorage 10Gi, neo4jStorage 10Gi)
-// are applied by the internal/memory builders, not by kubebuilder, so an
-// empty (or absent) spec.memory still provisions a complete stack.
+// MemorySpec configures the per-Project memory stack footprint. Defaults are
+// declared via +kubebuilder:default so they are enforced at admission and
+// visible in the persisted object; the internal/memory builders no longer need
+// to carry fallback constants.
 type MemorySpec struct {
+	// +kubebuilder:default=1
 	// +optional
 	PgInstances int `json:"pgInstances,omitempty"`
+	// +kubebuilder:default="10Gi"
 	// +optional
 	PgStorage string `json:"pgStorage,omitempty"`
+	// +kubebuilder:default="10Gi"
 	// +optional
 	Neo4jStorage string `json:"neo4jStorage,omitempty"`
 }

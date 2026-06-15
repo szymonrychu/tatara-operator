@@ -249,8 +249,9 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 }
 
 // laneOccupancy counts this Project's scan Tasks for repoSlug that still occupy
-// the repo's lane: Kind in kinds, phase not terminal and not AwaitingApproval
-// (an awaiting-approval proposal frees the lane for the next item).
+// the repo's lane: Kind in kinds, phase not terminal. AwaitingApproval is no
+// longer a valid Phase value (approval is driven by SCM labels); the branch is
+// gone. Use TaskTerminal for a single-source terminality predicate.
 func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...string) int {
 	label := sanitizeRepoLabel(repoSlug)
 	n := 0
@@ -268,7 +269,7 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 			continue
 		}
 		switch t.Status.Phase {
-		case "Succeeded", "Failed", "AwaitingApproval":
+		case "Succeeded", "Failed":
 			continue
 		}
 		n++
