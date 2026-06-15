@@ -27,6 +27,10 @@ type OperatorMetrics struct {
 	agentBootCrashTotal       *prometheus.CounterVec
 	orphanReapedTotal         *prometheus.CounterVec
 	reapDeleteErrorTotal      *prometheus.CounterVec
+	turnSubmitTotal           *prometheus.CounterVec
+	turnSubmitDuration        *prometheus.HistogramVec
+	agentHTTPTotal            *prometheus.CounterVec
+	agentHTTPDuration         *prometheus.HistogramVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -121,6 +125,24 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_reap_delete_error_total",
 			Help: "Errors deleting orphan wrappers by resource kind.",
 		}, []string{"kind"}),
+		turnSubmitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_turn_submit_total",
+			Help: "Total turn submissions to agent wrappers by kind and result.",
+		}, []string{"kind", "result"}),
+		turnSubmitDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "operator_turn_submit_duration_seconds",
+			Help:    "Wall-clock duration of SubmitTurn calls to agent wrappers.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
+		}, []string{"kind"}),
+		agentHTTPTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_agent_http_total",
+			Help: "Total agent wrapper HTTP calls by method and outcome.",
+		}, []string{"method", "outcome"}),
+		agentHTTPDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "operator_agent_http_duration_seconds",
+			Help:    "Wall-clock duration of agent wrapper HTTP calls by method.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
+		}, []string{"method"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -144,6 +166,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentBootCrashTotal,
 		m.orphanReapedTotal,
 		m.reapDeleteErrorTotal,
+		m.turnSubmitTotal,
+		m.turnSubmitDuration,
+		m.agentHTTPTotal,
+		m.agentHTTPDuration,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -303,4 +329,20 @@ func (m *OperatorMetrics) OrphanReaped(reason string) {
 // kind that failed to delete ("pod" or "service").
 func (m *OperatorMetrics) ReapDeleteError(kind string) {
 	m.reapDeleteErrorTotal.WithLabelValues(kind).Inc()
+}
+
+// TurnSubmit increments operator_turn_submit_total for the task kind and result
+// ("ok" or "error"), and records the SubmitTurn call latency in seconds.
+func (m *OperatorMetrics) TurnSubmit(kind, result string, seconds float64) {
+	m.turnSubmitTotal.WithLabelValues(kind, result).Inc()
+	m.turnSubmitDuration.WithLabelValues(kind).Observe(seconds)
+}
+
+// AgentHTTP increments operator_agent_http_total for the HTTP method and outcome
+// ("ok", "http_error", "unreachable", "timeout"), and records the call latency.
+// method is the logical operation name (e.g. "submit_turn", "get_turn",
+// "delete_session", "interject").
+func (m *OperatorMetrics) AgentHTTP(method, outcome string, seconds float64) {
+	m.agentHTTPTotal.WithLabelValues(method, outcome).Inc()
+	m.agentHTTPDuration.WithLabelValues(method).Observe(seconds)
 }
