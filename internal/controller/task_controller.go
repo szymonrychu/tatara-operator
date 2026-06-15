@@ -32,12 +32,20 @@ const (
 	agentBootDeadline = 5 * time.Minute
 	maxPodRecreations = 3
 	turnTimeoutGrace  = 60 * time.Second
+	// planningStallDeadline bounds how long a Task may sit in Planning without
+	// ever acquiring an in-flight turn before the spawn watchdog fails it. Set
+	// well beyond the boot-crash budget (maxPodRecreations * agentBootDeadline)
+	// so the watchdog never preempts a legitimately slow/crash-looping boot; it
+	// is the last-resort catch for a Task wedged where boot-crash cannot act
+	// (e.g. a duplicate lifecycle Task whose pod name collided with the live one).
+	planningStallDeadline = 4 * agentBootDeadline
 
 	annCurrentTurn           = tatarav1alpha1.AnnCurrentTurn
 	annCurrentSubtask        = tatarav1alpha1.AnnCurrentSubtask
 	annTurnComplete          = tatarav1alpha1.AnnTurnComplete
 	annPodRecreations        = tatarav1alpha1.AnnPodRecreations
 	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
+	annPlanningSince         = tatarav1alpha1.AnnPlanningSince
 	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
 	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
 	annBootCrashAttempts     = "tatara.dev/boot-crash-attempts"
@@ -217,6 +225,27 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 	// reconcile-level error would re-enter the handler at Phase=="" and
 	// re-run its iteration increment, spinning the count to the backstop.
 	if task.Status.Phase == "" {
+		// Stamp planning-since (metadata) before the status flip so the spawn
+		// watchdog can detect a Task wedged in Planning that never acquires a
+		// turn. Annotations are metadata, so this is a separate Update from the
+		// status write below. Overwrite unconditionally: every spawn re-enters
+		// here at Phase=="" and must measure from its own start, not a prior one.
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			if fresh.Status.Phase != "" {
+				return nil // already advanced by a prior attempt
+			}
+			if fresh.Annotations == nil {
+				fresh.Annotations = map[string]string{}
+			}
+			fresh.Annotations[annPlanningSince] = time.Now().UTC().Format(time.RFC3339)
+			return r.Update(ctx, fresh)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("stamp planning-since: %w", err)
+		}
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fresh := &tatarav1alpha1.Task{}
 			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {

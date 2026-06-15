@@ -149,6 +149,46 @@ func TestResolveTaskByTurn_SkipsEmptyAnnotation(t *testing.T) {
 
 // ----- Fix 2: per-turn timeout in poll backstop -----
 
+// ----- Spawn watchdog: Planning-without-turn past the stall deadline -----
+
+func TestPollOnce_FailsStalledPlanning(t *testing.T) {
+	mkTaskProject(t, "p-stall", 3)
+	mkTaskRepository(t, "r-stall", "p-stall")
+	mkTask(t, "t-stall", "p-stall", "r-stall")
+	setTaskPhase(t, "t-stall", "Planning")
+	// Entered Planning long ago, no current-turn ever acquired.
+	annotate(t, "t-stall", map[string]string{annPlanningSince: "2000-01-01T00:00:00Z"})
+
+	cb := newCallbackServer()
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-stall")
+	if tk.Status.Phase != "Failed" {
+		t.Errorf("phase = %q, want Failed after planning stall", tk.Status.Phase)
+	}
+	cond := findCond(tk.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "PlanningStalled" {
+		t.Errorf("expected Ready/PlanningStalled condition, got %+v", cond)
+	}
+}
+
+func TestPollOnce_LeavesFreshPlanning(t *testing.T) {
+	mkTaskProject(t, "p-fresh", 3)
+	mkTaskRepository(t, "r-fresh", "p-fresh")
+	mkTask(t, "t-fresh", "p-fresh", "r-fresh")
+	setTaskPhase(t, "t-fresh", "Planning")
+	// Just entered Planning: well within the stall deadline.
+	annotate(t, "t-fresh", map[string]string{annPlanningSince: time.Now().UTC().Format(time.RFC3339)})
+
+	cb := newCallbackServer()
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-fresh")
+	if tk.Status.Phase != "Planning" {
+		t.Errorf("phase = %q, want Planning unchanged for a fresh spawn", tk.Status.Phase)
+	}
+}
+
 func TestPollOnce_ExpiresTurnTimeout(t *testing.T) {
 	mkTaskProject(t, "p-timeout", 3)
 	mkTaskRepository(t, "r-timeout", "p-timeout")

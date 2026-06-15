@@ -13,6 +13,12 @@ const (
 	AnnTurnComplete   = "tatara.dev/turn-complete"
 	AnnTurnStartedAt  = "tatara.dev/turn-started-at"
 	AnnPodRecreations = "tatara.dev/pod-recreations"
+	// AnnPlanningSince is the RFC3339 timestamp stamped when a Task first enters
+	// the Planning phase on a spawn. The spawn watchdog uses it to fail a Task
+	// wedged in Planning that never acquires an in-flight turn (e.g. a duplicate
+	// lifecycle Task whose pod name collided with the live one), which is
+	// otherwise invisible to the turn-timeout backstop.
+	AnnPlanningSince = "tatara.dev/planning-since"
 )
 
 // LifecycleEntryAnnotation carries the entry LifecycleState for a newly

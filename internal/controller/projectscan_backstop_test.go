@@ -158,6 +158,55 @@ func TestBackstopSkipsIssueWithLiveTask(t *testing.T) {
 	}
 }
 
+// TestBackstopSkipsIssueWithConversationTask is the regression for the #44 wedge:
+// a Conversation (human-blocked) lifecycle Task already owns the issue's pod name,
+// so the backstop must NOT spawn a second lifecycle Task for the same issue when
+// the issue later gains an implementation phase label. Counting Conversation as a
+// live lifecycle Task closes the dedup gap that let a duplicate through.
+func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
+	proj, repo := seedBackstopProject(t, "backstop-conv")
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 7}, "issueScan", "issueLifecycle")
+	pre.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef:    "backstop-conv",
+		RepositoryRef: repo.Name,
+		Goal:          "g",
+		Kind:          "issueLifecycle",
+	}
+	if err := k8sClient.Create(context.Background(), pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	// Conversation lifecycle state, empty phase: human-blocked, no running pod,
+	// but still owns the issue's pod name.
+	pre.Status.LifecycleState = "Conversation"
+	_ = k8sClient.Status().Update(context.Background(), pre)
+
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/r": {{Repo: "o/r", Number: 7, Labels: []string{"tatara-implementation"}, UpdatedAt: time.Unix(100, 0)}},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	budget := 3
+	repos := []tatarav1alpha1.Repository{repo}
+	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+
+	tasks := listScanTasks(t, "backstop-conv")
+	if len(tasks) != 1 {
+		t.Fatalf("want only the pre-existing Conversation task (no duplicate), got %d", len(tasks))
+	}
+	if tasks[0].Name != pre.Name {
+		t.Fatalf("unexpected task %q", tasks[0].Name)
+	}
+	if budget != 3 {
+		t.Fatalf("budget should be unchanged (no create), got %d", budget)
+	}
+}
+
 func TestBackstopSkipsDeclined(t *testing.T) {
 	proj, repo := seedBackstopProject(t, "backstop-declined")
 	reader := &perRepoFakeReader{
