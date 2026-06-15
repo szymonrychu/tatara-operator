@@ -55,6 +55,17 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 			r.clearWritebackPending(ctx, task, "BrainstormComplete", "brainstorm finished with no proposal filed via propose_issue")
 		}
 		return ctrl.Result{}, nil
+	case "healthCheck":
+		// Health-check findings are filed via propose_issue (like brainstorm);
+		// the healthCheck Task itself never opens a PR. Claim HealthCheckProposed
+		// only when a proposal child Task exists; otherwise HealthCheckComplete so
+		// a no-yield audit run is visible.
+		if r.brainstormHasProposal(ctx, task) {
+			r.clearWritebackPending(ctx, task, "HealthCheckProposed", "health-check proposal created via propose_issue; no PR to open")
+		} else {
+			r.clearWritebackPending(ctx, task, "HealthCheckComplete", "health-check finished with no proposal filed via propose_issue")
+		}
+		return ctrl.Result{}, nil
 	default:
 		// implement and other future kinds that open a change.
 	}

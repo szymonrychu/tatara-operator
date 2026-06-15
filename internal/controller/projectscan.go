@@ -590,6 +590,9 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 	case "brainstorm":
 		schedule = proj.Spec.Scm.Cron.Brainstorm.Schedule
 		last = proj.Status.LastBrainstorm
+	case "healthCheck":
+		schedule = proj.Spec.Scm.Cron.HealthCheck.Schedule
+		last = proj.Status.LastHealthCheck
 	}
 	base := proj.CreationTimestamp.Time
 	if last != nil {
@@ -621,6 +624,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
+		case "healthCheck":
+			fresh.Status.LastHealthCheck = &now
+			proj.Status.LastHealthCheck = &now
 		}
 		return r.Status().Update(ctx, fresh)
 	})
@@ -978,6 +984,183 @@ func brainstormInFlightProject(existing []tatarav1alpha1.Task) bool {
 	return false
 }
 
+// healthCheck runs one repo-health audit cycle at PROJECT scope: at most one
+// healthCheck Task per cycle, targeting ONE repo chosen stale-first so coverage
+// rotates across the project over successive cycles. It is the maintenance
+// sibling of brainstorm; both file discovery proposals via propose_issue and
+// share the open-proposal backlog as backpressure.
+// budget is the shared open-task creation budget; healthCheck decrements it on a
+// successful create and stops creating when budget reaches zero.
+func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.HealthCheckActivity, budget *int) {
+	l := log.FromContext(ctx)
+	start := time.Now()
+	maxFind := act.MaxOpenFindings
+	if maxFind < 1 {
+		maxFind = 5
+	}
+
+	// Project-scoped in-flight guard: any non-terminal healthCheck Task blocks.
+	if healthCheckInFlightProject(existing) {
+		r.Metrics.ScanItem("healthCheck", "skipped_inflight")
+		l.Info("healthCheck: in-flight project health task; skipping cycle",
+			"action", "scan_health", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
+	// Budget guard.
+	if *budget <= 0 {
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
+	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
+
+	// Aggregate open-proposal backlog across all repos; short-circuit at cap.
+	// Health findings file the same discovery proposals as brainstorm, so the
+	// brainstorming-labeled backlog is the shared backpressure signal.
+	total := 0
+	for i := range repos {
+		rp := &repos[i]
+		slug := repoSlug(rp)
+		if slug == "" {
+			continue
+		}
+		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm, existing)
+		if err != nil {
+			l.Info("healthCheck: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
+			continue
+		}
+		total += backlog
+		if total >= maxFind {
+			r.Metrics.ScanItem("healthCheck", "skipped_cap")
+			l.Info("healthCheck: project backlog at cap; skipping cycle",
+				"action", "scan_health", "resource_id", proj.Name, "total", total, "cap", maxFind)
+			r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+			return
+		}
+	}
+
+	// Pick ONE target repo, stale-first (least-recently health-checked).
+	target := pickHealthCheckRepo(repos, existing)
+	if target == nil {
+		l.Info("healthCheck: no valid repos", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
+	goal := healthCheckGoalRepo(repoSlug(target))
+	if _, err := r.createHealthCheckTask(ctx, proj, target, goal); err != nil {
+		l.Error(err, "scan: create healthCheck task", "resource_id", proj.Name, "repo", target.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+	r.Metrics.ScanItem("healthCheck", "picked")
+	*budget--
+	r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+	l.Info("healthCheck complete", "action", "scan_health", "resource_id", proj.Name,
+		"picked", 1, "target_repo", target.Name, "duration_ms", time.Since(start).Milliseconds())
+}
+
+// healthCheckInFlightProject reports whether ANY non-terminal healthCheck Task
+// exists in the project (project-scoped guard).
+func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
+	for i := range existing {
+		t := existing[i]
+		if t.Labels[labelActivity] == "healthCheck" && !isTerminal(t.Status.Phase) {
+			return true
+		}
+	}
+	return false
+}
+
+// pickHealthCheckRepo selects ONE repo to audit this cycle, stale-first: the
+// repo whose most recent healthCheck Task is oldest (a repo never checked, or
+// whose tasks have aged out, sorts first) wins. Ties break by name so the
+// rotation is deterministic. Returns nil when no repo has a valid slug.
+func pickHealthCheckRepo(repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task) *tatarav1alpha1.Repository {
+	sorted := make([]tatarav1alpha1.Repository, len(repos))
+	copy(sorted, repos)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Name < sorted[j].Name
+	})
+
+	lastChecked := func(repoName string) time.Time {
+		var latest time.Time
+		for i := range existing {
+			t := &existing[i]
+			if t.Labels[labelActivity] == "healthCheck" && t.Spec.RepositoryRef == repoName {
+				if t.CreationTimestamp.After(latest) {
+					latest = t.CreationTimestamp.Time
+				}
+			}
+		}
+		return latest
+	}
+
+	var target *tatarav1alpha1.Repository
+	var targetLast time.Time
+	for i := range sorted {
+		rp := &sorted[i]
+		if repoSlug(rp) == "" {
+			continue
+		}
+		last := lastChecked(rp.Name)
+		if target == nil || last.Before(targetLast) {
+			target = rp
+			targetLast = last
+		}
+	}
+	return target
+}
+
+// createHealthCheckTask creates a Kind=healthCheck Task targeting one repo.
+func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, goal string) (*tatarav1alpha1.Task, error) {
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "healthcheck-",
+			Namespace:    proj.Namespace,
+			Labels:       map[string]string{labelActivity: "healthCheck"},
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    proj.Name,
+			RepositoryRef: repo.Name,
+			Goal:          goal,
+			Kind:          "healthCheck",
+		},
+	}
+	agent.StampPodName(task, proj.Name, provider, repo.Name)
+	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
+		return nil, fmt.Errorf("scan: set ownerref: %w", err)
+	}
+	if err := r.Create(ctx, task); err != nil {
+		return nil, fmt.Errorf("scan: create healthCheck task: %w", err)
+	}
+	r.Metrics.ScanTaskCreated("healthCheck", "healthCheck")
+	return task, nil
+}
+
+// healthCheckGoalRepo returns the turn-0 goal for a repo-health audit task. The
+// agent audits the single named repo's health and files exactly one discovery
+// proposal via propose_issue. Naming the skill in the goal is the per-kind
+// prompt that drives semantic skill selection, mirroring how brainstorm names
+// tatara-deep-research.
+func healthCheckGoalRepo(slug string) string {
+	return "Invoke the `tatara-repo-health` skill to audit the health of the repository " + slug + ". " +
+		"The skill defines the five health lenses (CI/pipeline failures, missing pipeline steps, coverage gaps, " +
+		"code to simplify, other tech debt), how to gather evidence via the tatara-memory graph and on-disk code, and how to dedup. " +
+		"Audit ONLY this repository - do not propose cross-repo or platform-wide work. " +
+		"You MUST call propose_issue with exactly one targeted proposal before finishing - this is a hard requirement, not optional. " +
+		"Set the `repo` argument of propose_issue to " + slug + ". " +
+		"The proposal must be self-contained: problem statement, file:line evidence, proposed approach, and a single explicit decision for the human " +
+		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input - " +
+		"pick the single best health finding for this repo, file it via propose_issue, then stop."
+}
+
 // proposalBacklog counts open, undecided ideas for repo: open non-PR issues
 // bearing the idea label (live ListOpenIssues). This subsumes tatara-originated
 // proposals and any human-filed issue parked as an idea, providing conservative
@@ -1194,6 +1377,24 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		} else if cronSpec.Brainstorm.Schedule != "" {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Brainstorm.Schedule), "scan: invalid brainstorm cron, disabling",
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "brainstorm")
+		}
+	}
+
+	// healthCheck (opt-in)
+	if cronSpec.HealthCheck.Enabled {
+		if _, due, next, ok := r.activityDue(proj, "healthCheck"); ok {
+			if due {
+				r.healthCheck(ctx, proj, reader, repos, existing, cronSpec.HealthCheck, &budget)
+				r.stampScan(ctx, proj, "healthCheck")
+				if next2, ok2 := activityNextFire(cronSpec.HealthCheck.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
+				consider(next)
+			}
+		} else if cronSpec.HealthCheck.Schedule != "" {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.HealthCheck.Schedule), "scan: invalid healthCheck cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "healthCheck")
 		}
 	}
 
