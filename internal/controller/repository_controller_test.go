@@ -26,11 +26,12 @@ func newRepoReconciler() *RepositoryReconciler {
 		Scheme:  k8sClient.Scheme(),
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 		IngestConfig: ingest.Config{
-			IngesterImage: "registry.example/ingester:1.2.3",
-			OIDCIssuer:    "https://kc.example/realms/tatara",
-			OIDCClientID:  "tatara-operator",
-			OIDCAudience:  "tatara-memory",
-			Namespace:     testNS,
+			IngesterImage:  "registry.example/ingester:1.2.3",
+			OIDCIssuer:     "https://kc.example/realms/tatara",
+			OIDCClientID:   "tatara-operator",
+			OIDCSecretName: "tatara-operator",
+			OIDCAudience:   "tatara-memory",
+			Namespace:      testNS,
 		},
 	}
 }
