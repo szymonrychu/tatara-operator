@@ -24,7 +24,13 @@ import (
 
 // CallbackServer handles the in-cluster /internal/turn-complete endpoint the
 // wrapper POSTs to on each turn, and runs the poll backstop for missed
-// callbacks. It has no OIDC: INTERNAL_ADDR is not exposed via ingress.
+// callbacks.
+// Security note (finding 5): this listener has no OIDC/HMAC authn. It relies
+// on INTERNAL_ADDR not being ingress-exposed. Any in-cluster pod that can reach
+// the Service can POST a forged callback. The REST API and wrapper-bound paths
+// are OIDC-gated via auth.Middleware; this internal path is the one trust gap.
+// Acceptable for a single-tenant in-cluster operator, but a shared-secret
+// HMAC or client-credentials bearer check would close the gap.
 type CallbackServer struct {
 	Client    client.Client
 	Metrics   *obs.OperatorMetrics
@@ -84,10 +90,25 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "turnId is required", http.StatusBadRequest)
 		return
 	}
-	s.Metrics.ObserveTurnDuration(p.DurationSeconds)
+	if s.Metrics != nil {
+		s.Metrics.ObserveTurnDuration(p.DurationSeconds)
+	}
+
+	// Resolve once; pass the resolved task into both writes to avoid a second
+	// full-namespace List call (finding 2).
+	task, err := s.resolveTaskByTurn(r.Context(), p.TurnID)
+	if err != nil {
+		if errors.Is(err, errTurnNotFound) {
+			http.Error(w, "unknown turn", http.StatusNotFound)
+			return
+		}
+		l.Error(err, "resolve task by turn", "turn_id", p.TurnID)
+		http.Error(w, "resolve failed", http.StatusInternalServerError)
+		return
+	}
 
 	if len(p.Usage) > 0 {
-		if err := s.recordUsage(r.Context(), p.TurnID, p.Usage); err != nil {
+		if err := s.recordUsage(r.Context(), task, p.Usage); err != nil {
 			l.Error(err, "record turn usage (non-fatal)", "turn_id", p.TurnID)
 			// non-fatal: continue to record the result
 		}
@@ -95,11 +116,7 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 
 	if err := s.recordResult(r.Context(), agent.TurnResult{
 		State: p.State, FinalText: p.FinalText, StopReason: p.StopReason, Err: p.Error,
-	}, p.TurnID); err != nil {
-		if errors.Is(err, errTurnNotFound) {
-			http.Error(w, "unknown turn", http.StatusNotFound)
-			return
-		}
+	}, task, p.TurnID); err != nil {
 		l.Error(err, "record turn result", "turn_id", p.TurnID)
 		http.Error(w, "record failed", http.StatusInternalServerError)
 		return
@@ -113,17 +130,15 @@ var errTurnNotFound = errors.New("no task with that current turn")
 // recordUsage parses a raw usage JSON blob and persists LastTurnInputTokens /
 // CumulativeTokens on the matching Task via RetryOnConflict.
 // Absent or unparseable usage is silently tolerated (no-op).
-func (s *CallbackServer) recordUsage(ctx context.Context, turnID string, raw json.RawMessage) error {
+// task must be the already-resolved Task (resolved by the caller to avoid a
+// second full-namespace List call).
+func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.Task, raw json.RawMessage) error {
 	if len(raw) == 0 {
 		return nil
 	}
 	var u turnUsage
 	if err := json.Unmarshal(raw, &u); err != nil {
 		return nil // tolerate malformed usage
-	}
-	task, err := s.resolveTaskByTurn(ctx, turnID)
-	if err != nil {
-		return err
 	}
 	inputTotal := u.InputTokens + u.CacheReadInputTokens
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -141,12 +156,11 @@ func (s *CallbackServer) recordUsage(ctx context.Context, turnID string, raw jso
 // the Task's turn-complete annotation to requeue its reconcile.
 // Both the Subtask status write and the Task annotation update are wrapped in
 // RetryOnConflict to handle concurrent reconcile updates.
-func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, turnID string) error {
-	task, err := s.resolveTaskByTurn(ctx, turnID)
-	if err != nil {
-		return err
-	}
-
+// task must be the already-resolved Task; turnID is the turn being completed.
+// A stale/duplicate callback (turnID != fresh annCurrentTurn) is silently
+// ignored so it cannot complete the wrong in-flight turn (finding 1).
+// Callbacks for already-terminal tasks are also ignored (finding 4).
+func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, task *tatarav1alpha1.Task, turnID string) error {
 	// Write subtask result on the status subresource; retry on conflict.
 	if sub := task.Annotations[annCurrentSubtask]; sub != "" {
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -165,10 +179,20 @@ func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, 
 	}
 
 	// Stamp turn-complete on the Task annotation; retry on conflict with a fresh Get.
+	// Guard: bail out if the Task has advanced to a different turn (stale callback)
+	// or is already in a terminal phase (findings 1, 4).
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return fmt.Errorf("reload task: %w", err)
+		}
+		if fresh.Annotations[annCurrentTurn] != turnID {
+			// Turn has advanced or been cleared; stale callback - no-op.
+			return nil
+		}
+		if isTerminal(fresh.Status.Phase) {
+			// Task already terminated (e.g. by the reconcile); no-op.
+			return nil
 		}
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
@@ -223,7 +247,9 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 			// turn-started-at). Fail it once past the stall deadline so the
 			// lifecycle-orphan sweep can re-pick the issue cleanly.
 			if s.isPlanningStalled(task) {
-				s.Metrics.TurnTimeout("planning_watchdog")
+				if s.Metrics != nil {
+					s.Metrics.TurnTimeout("planning_watchdog")
+				}
 				l.Info("task stalled in Planning with no turn; failing via spawn watchdog",
 					"action", "planning_watchdog", "task", task.Name)
 				_ = s.expireStalledPlanning(ctx, task)
@@ -236,7 +262,9 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 
 		// Check for turn timeout before hitting the wrapper.
 		if s.isTurnTimedOut(ctx, task) {
-			s.Metrics.TurnTimeout("poll_backstop")
+			if s.Metrics != nil {
+				s.Metrics.TurnTimeout("poll_backstop")
+			}
 			l.Info("turn timed out in poll backstop", "action", "turn_timeout",
 				"task", task.Name, "turn_id", turn)
 			_ = s.expireTimedOutTurn(ctx, task, turn)
@@ -251,7 +279,7 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 			continue
 		}
 		if tr.State == "completed" || tr.State == "failed" {
-			_ = s.recordResult(ctx, tr, turn)
+			_ = s.recordResult(ctx, tr, task, turn)
 		}
 	}
 }
@@ -280,7 +308,11 @@ func (s *CallbackServer) isTurnTimedOut(ctx context.Context, task *tatarav1alpha
 }
 
 // expireTimedOutTurn performs the terminal cleanup for a timed-out turn:
-// deletes the session + Pod/Service and sets Task phase=Failed/TurnTimeout.
+// deletes the session + Pod/Service, clears the current-turn annotations so
+// late callbacks cannot resolve this task, and sets Task phase=Failed/TurnTimeout.
+// It is a no-op if the task is already terminal (finding 4 - guard against
+// double teardown racing with the reconcile). The status update uses
+// RetryOnConflict to handle a concurrent reconcile write (finding 4).
 func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1alpha1.Task, turn string) error {
 	if s.Session != nil {
 		_ = s.Session.DeleteSession(ctx, agent.BaseURL(task, s.Namespace))
@@ -295,19 +327,40 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 	svc.Namespace = task.Namespace
 	_ = s.Client.Delete(ctx, svc)
 
-	fresh := &tatarav1alpha1.Task{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-		return err
-	}
-	fresh.Status.Phase = "Failed"
-	apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "TurnTimeout",
-		Message:            fmt.Sprintf("turn %s exceeded timeout", turn),
-		ObservedGeneration: fresh.Generation,
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		// Guard: if reconcile already set a terminal phase, do not overwrite it
+		// (finding 4 - prevents duplicate terminal writes and status conflicts).
+		if isTerminal(fresh.Status.Phase) {
+			return nil
+		}
+		// Clear turn annotations so late/duplicate callbacks cannot resolve this
+		// task and stamp annTurnComplete on an already-failed task (finding 3).
+		if fresh.Annotations != nil {
+			delete(fresh.Annotations, annCurrentTurn)
+			delete(fresh.Annotations, annTurnStartedAt)
+			delete(fresh.Annotations, annTurnComplete)
+		}
+		if err := s.Client.Update(ctx, fresh); err != nil {
+			return err
+		}
+		// Re-get after annotation update so status write uses the latest resourceVersion.
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.Phase = "Failed"
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "Ready",
+			Status:             metav1.ConditionTrue,
+			Reason:             "TurnTimeout",
+			Message:            fmt.Sprintf("turn %s exceeded timeout", turn),
+			ObservedGeneration: fresh.Generation,
+		})
+		return s.Client.Status().Update(ctx, fresh)
 	})
-	return s.Client.Status().Update(ctx, fresh)
 }
 
 // isPlanningStalled reports whether a Task has been in Planning past the stall
