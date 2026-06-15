@@ -152,4 +152,37 @@ func TestProjectReconcile_MissingKeys(t *testing.T) {
 	}
 }
 
+// TestGaugeRecomputeThrottled verifies that maybeRecomputeGauges skips the
+// expensive ProjectList+TaskList scans when called within the throttle interval
+// and runs them once the interval has elapsed.
+func TestGaugeRecomputeThrottled(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	// Two reconcilers with different intervals to test behaviour precisely.
+	r := newProjectReconciler()
+	// Short interval: first call should fire; second immediate call should skip.
+	r.GaugeRecomputeInterval = 5 * time.Minute
+
+	// First call: lastGaugeRecompute is zero, so recompute must run.
+	before := r.lastGaugeRecompute
+	r.maybeRecomputeGauges(ctx)
+	if !r.lastGaugeRecompute.After(before) {
+		t.Fatal("first maybeRecomputeGauges call did not update lastGaugeRecompute")
+	}
+	after := r.lastGaugeRecompute
+
+	// Immediate second call: interval not elapsed, so lastGaugeRecompute must NOT change.
+	r.maybeRecomputeGauges(ctx)
+	if !r.lastGaugeRecompute.Equal(after) {
+		t.Fatal("second immediate maybeRecomputeGauges call updated lastGaugeRecompute; expected skip")
+	}
+
+	// Backdate lastGaugeRecompute past the interval and confirm a third call fires.
+	r.lastGaugeRecompute = time.Now().Add(-r.GaugeRecomputeInterval - time.Second)
+	r.maybeRecomputeGauges(ctx)
+	if !r.lastGaugeRecompute.After(after) {
+		t.Fatal("third maybeRecomputeGauges call (interval elapsed) did not update lastGaugeRecompute")
+	}
+}
+
 var _ = client.IgnoreNotFound

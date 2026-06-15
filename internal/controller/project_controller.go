@@ -25,6 +25,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// defaultGaugeRecomputeInterval is how often updateMemoryStackCounts and
+// updateLifecycleStateCounts run. Both do a full ProjectList / TaskList scan;
+// running them on every per-Project reconcile is O(N) per cycle per project.
+// 60 s is coarse-grained enough to avoid list pressure while still converging
+// the gauges quickly after any phase/state change.
+const defaultGaugeRecomputeInterval = 60 * time.Second
+
 // ProjectReconciler validates a Project's SCM secret and publishes its
 // webhook URL.
 type ProjectReconciler struct {
@@ -39,6 +46,14 @@ type ProjectReconciler struct {
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
 	// SCMFor returns the SCMWriter for a provider name (token passed per call).
 	SCMFor func(provider string) (scm.SCMWriter, error)
+
+	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
+	// (updateMemoryStackCounts + updateLifecycleStateCounts) run. Defaults to
+	// defaultGaugeRecomputeInterval when zero. MaxConcurrentReconciles=1 means
+	// this field is read/written under the controller's serialised call path;
+	// no mutex required.
+	GaugeRecomputeInterval time.Duration
+	lastGaugeRecompute     time.Time
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -88,8 +103,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, memErr
 	}
 
-	r.updateMemoryStackCounts(ctx)
-	r.updateLifecycleStateCounts(ctx)
+	r.maybeRecomputeGauges(ctx)
 
 	scanRequeue, scanErr := r.runScans(ctx, &project)
 	if scanErr != nil {
@@ -125,6 +139,23 @@ func soonestRequeue(a, b time.Duration) time.Duration {
 	default:
 		return b
 	}
+}
+
+// maybeRecomputeGauges runs updateMemoryStackCounts and updateLifecycleStateCounts
+// at most once per GaugeRecomputeInterval (defaultGaugeRecomputeInterval when
+// zero). Calling it on every Reconcile is safe: it skips the expensive full
+// ProjectList + TaskList scans until the interval has elapsed.
+func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
+	interval := r.GaugeRecomputeInterval
+	if interval == 0 {
+		interval = defaultGaugeRecomputeInterval
+	}
+	if !r.lastGaugeRecompute.IsZero() && time.Since(r.lastGaugeRecompute) < interval {
+		return
+	}
+	r.updateMemoryStackCounts(ctx)
+	r.updateLifecycleStateCounts(ctx)
+	r.lastGaugeRecompute = time.Now()
 }
 
 // updateMemoryStackCounts lists all Projects and sets the operator_memory_stacks

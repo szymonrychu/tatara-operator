@@ -366,6 +366,9 @@ func TestMemoryStackGauge_ClusterWideCounts(t *testing.T) {
 	// baseline before creating the test Projects and assert deltas to avoid
 	// counting Projects from other tests in the shared test namespace.
 	r, reg := newMemoryReconcilerWithReg()
+	// Disable the throttle so every reconcile triggers a fresh gauge recompute.
+	// This test is verifying gauge correctness, not throttle behaviour.
+	r.GaugeRecomputeInterval = 1
 
 	p1 := mkMemoryProject(t, "gauge-prov")
 	p2 := mkMemoryProject(t, "gauge-ready")
