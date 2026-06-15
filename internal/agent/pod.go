@@ -21,6 +21,19 @@ const wrapperPort = 8080
 // annotation existed fall back to wrapper-<task-name>.
 const PodNameAnnotation = "tatara.dev/pod-name"
 
+// Wrapper Pod/Service label keys. The orphan reaper selects on LabelManagedBy +
+// LabelComponent and correlates back to the owning Task via LabelTask /
+// LabelTaskUID, so it never has to reconstruct PodName.
+const (
+	LabelManagedBy = "tatara.dev/managed-by"
+	LabelComponent = "app.kubernetes.io/component"
+	LabelTask      = "tatara.dev/task"
+	LabelTaskUID   = "tatara.dev/task-uid"
+
+	ManagedByValue = "tatara-operator"
+	ComponentAgent = "agent"
+)
+
 // repoEntry is the JSON shape of one entry in TATARA_REPOS.
 type repoEntry struct {
 	Name   string `json:"name"`
@@ -136,11 +149,27 @@ func sanitizeDNS1123(s string) string {
 }
 
 func podLabels(task *tatarav1alpha1.Task) map[string]string {
+	l := map[string]string{
+		"app.kubernetes.io/name": "tatara-operator",
+		LabelComponent:           ComponentAgent,
+		LabelManagedBy:           ManagedByValue,
+		LabelTask:                task.Name,
+	}
+	// Task UID lets the reaper distinguish a live pod from one left over by a
+	// prior Task incarnation that reused the same name. Omitted when empty (the
+	// UID is unset on a Task object built in unit tests).
+	if task.UID != "" {
+		l[LabelTaskUID] = string(task.UID)
+	}
+	return l
+}
+
+// WrapperPodSelector is the label selector matching every wrapper Pod/Service
+// the operator manages, used by the orphan reaper to enumerate candidates.
+func WrapperPodSelector() map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":      "tatara-operator",
-		"app.kubernetes.io/component": "agent",
-		"tatara.dev/managed-by":       "tatara-operator",
-		"tatara.dev/task":             task.Name,
+		LabelManagedBy: ManagedByValue,
+		LabelComponent: ComponentAgent,
 	}
 }
 
