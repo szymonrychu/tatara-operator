@@ -5,25 +5,31 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 // Config holds the REST server dependencies.
 type Config struct {
 	Client    client.Client
 	Namespace string
+	// SCMFor returns an SCMWriter for the given provider name ("github"|"gitlab").
+	// When nil, the /projects/{p}/issue-comment endpoint returns 501.
+	SCMFor func(provider string) (scm.SCMWriter, error)
 }
 
 // Server exposes OIDC-gated CRUD over the tatara CRDs, backed by the
 // controller-runtime client. It shares the HTTP_ADDR listener with the
 // webhook server; callers mount it onto a shared chi router.
 type Server struct {
-	c  client.Client
-	ns string
+	c      client.Client
+	ns     string
+	scmFor func(provider string) (scm.SCMWriter, error)
 }
 
 // NewServer constructs a Server from cfg.
 func NewServer(cfg Config) *Server {
-	return &Server{c: cfg.Client, ns: cfg.Namespace}
+	return &Server{c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor}
 }
 
 // Mount registers the REST routes on r. verify is the OIDC middleware;
@@ -51,6 +57,7 @@ func (s *Server) routes(r chi.Router) {
 	r.Post("/tasks/{t}/subtasks", s.createSubtask)
 	r.Patch("/subtasks/{s}", s.patchSubtask)
 	r.Post("/projects/{p}/issues", s.proposeIssue)
+	r.Post("/projects/{p}/issue-comment", s.commentOnIssue)
 	r.Post("/tasks/{t}/review", s.reviewVerdict)
 	r.Post("/tasks/{t}/pr-outcome", s.prOutcome)
 	r.Post("/tasks/{t}/issue-outcome", s.issueOutcome)

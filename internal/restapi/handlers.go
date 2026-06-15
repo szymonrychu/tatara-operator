@@ -9,14 +9,18 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -266,6 +270,115 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	// The proposal Task starts Pending; the controller opens the idea-labelled
 	// issue and completes the Task (Succeeded). No AwaitingApproval parking.
 	writeJSON(w, http.StatusCreated, toTaskDTO(*task))
+}
+
+// --- POST /projects/{p}/issue-comment ---
+
+type issueCommentOnProjectReq struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	Body   string `json:"body"`
+}
+
+// commentOnIssue posts a comment on a specific issue via the Project's SCM
+// provider and bot token. This is the egress-mediation path for the
+// comment_on_issue tool call from a brainstorm agent.
+//
+// Request body: { repo: "owner/repo", number: N, body: "..." }
+// Response:     200 { status: "ok" }
+// Errors:       400 missing/zero fields; 404 project/repo not found; 500 SCM error.
+func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
+	l := log.FromContext(r.Context())
+	var req issueCommentOnProjectReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Body == "" {
+		writeError(w, http.StatusBadRequest, "body required")
+		return
+	}
+	if req.Number <= 0 {
+		writeError(w, http.StatusBadRequest, "number must be > 0")
+		return
+	}
+	if req.Repo == "" {
+		writeError(w, http.StatusBadRequest, "repo required")
+		return
+	}
+
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+
+	// Find the matching Repository by slug (owner/repo from URL).
+	var repoList tatarav1alpha1.RepositoryList
+	if err := s.c.List(r.Context(), &repoList, client.InNamespace(s.ns)); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	var matchedRepoURL string
+	for i := range repoList.Items {
+		if repoList.Items[i].Spec.ProjectRef != projName {
+			continue
+		}
+		o, n, err := scm.OwnerRepo(repoList.Items[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		if o+"/"+n == req.Repo {
+			matchedRepoURL = repoList.Items[i].Spec.URL
+			break
+		}
+	}
+	if matchedRepoURL == "" {
+		writeError(w, http.StatusNotFound, "repo not found in project")
+		return
+	}
+
+	// Resolve the SCM writer.
+	if s.scmFor == nil {
+		writeError(w, http.StatusNotImplemented, "scm writer not configured")
+		return
+	}
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	writer, err := s.scmFor(provider)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "scm: "+err.Error())
+		return
+	}
+
+	// Fetch the project's SCM token from its secret.
+	var sec corev1.Secret
+	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
+		if apierrors.IsNotFound(err) {
+			writeError(w, http.StatusInternalServerError, "scm secret not found")
+			return
+		}
+		writeClientErr(w, err)
+		return
+	}
+	token := string(sec.Data["token"])
+
+	issueRef := fmt.Sprintf("%s#%d", req.Repo, req.Number)
+	if err := writer.Comment(r.Context(), token, issueRef, req.Body); err != nil {
+		writeError(w, http.StatusInternalServerError, "scm comment: "+err.Error())
+		return
+	}
+
+	l.Info("restapi: posted issue comment via scm",
+		"action", "scm_issue_comment",
+		"project", projName,
+		"repo", req.Repo,
+		"number", req.Number)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 type reviewVerdictReq struct {

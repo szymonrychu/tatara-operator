@@ -922,7 +922,10 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		}
 	}
 
-	goal := brainstormGoalProject(slugs)
+	// Build rich open-issues context for dedup-first reasoning.
+	issuesCtx := r.buildIssuesContext(ctx, proj, reader, sortedRepos)
+
+	goal := brainstormGoalProject(slugs, issuesCtx)
 	if _, err := r.createBrainstormTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
 		l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", primaryRepo.Name)
 		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
@@ -936,25 +939,93 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 }
 
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
-// task. The agent surveys ALL repos (available via TATARA_REPOS), identifies
-// the single best discovery opportunity across the project, and calls
-// propose_issue with the repo arg set to the chosen target repo.
-func brainstormGoalProject(slugs []string) string {
+// task. issuesCtx is a pre-built string of open issues across all repos
+// (one line each: "repo#N [labels] title"), used to guide dedup-first reasoning.
+// When issuesCtx is empty the dedup section is still present but notes no open
+// issues were found.
+func brainstormGoalProject(slugs []string, issuesCtx string) string {
 	repoList := strings.Join(slugs, ", ")
+
+	existingBlock := "No open issues found across the project."
+	if issuesCtx != "" {
+		existingBlock = "OPEN ISSUES (survey these FIRST before proposing anything new):\n" + issuesCtx
+	}
+
 	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the single highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
-		"You MUST call propose_issue with exactly one proposal before finishing - this is a hard requirement, not optional. " +
-		"Set the `repo` argument of propose_issue to the specific repository that should own the issue (choose the best fit). " +
+		"\n\n" + existingBlock + "\n\n" +
+		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
+		"1. If the best idea DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
+		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
+		"2. If the best idea is a sub-aspect or connecting improvement TO an existing issue: " +
+		"call comment_on_issue(repo, number, body) on that issue. Do NOT call propose_issue.\n" +
+		"3. ONLY if the idea is genuinely novel AND standalone (no existing issue covers it): " +
+		"call propose_issue with exactly one proposal. " +
+		"Set the `repo` argument to the specific repository that should own the issue. " +
 		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
-		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input - " +
-		"pick the single highest-leverage issue across the whole project, file it via propose_issue, then stop."
+		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input.\n\n" +
+		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
 }
 
 // brainstormGoal kept for compatibility with tests referencing the old single-repo form.
 // New code calls brainstormGoalProject.
 func brainstormGoal(slug string) string {
-	return brainstormGoalProject([]string{slug})
+	return brainstormGoalProject([]string{slug}, "")
+}
+
+// buildIssuesContext lists all open non-PR issues across repos and builds the
+// rich context string embedded in the brainstorm goal for dedup-first reasoning.
+// Format per line: "repo#N [label1,label2] title - body-snippet"
+// Capped at 60 issues; if more exist, appends a "(+N more omitted)" line.
+// ListOpenIssues errors per repo are skipped non-fatally.
+const maxIssuesContext = 60
+
+func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository) string {
+	l := log.FromContext(ctx)
+	var lines []string
+	total := 0
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		issues, err := reader.ListOpenIssues(ctx, owner, name)
+		if err != nil {
+			l.Info("brainstorm: buildIssuesContext: ListOpenIssues error (skipped)",
+				"repo", repos[i].Name, "err", err.Error())
+			continue
+		}
+		for _, iss := range issues {
+			if iss.IsPR {
+				continue
+			}
+			if len(lines) >= maxIssuesContext {
+				total++
+				continue
+			}
+			total++
+			slug := owner + "/" + name
+			labels := strings.Join(iss.Labels, ",")
+			title := iss.Title
+			// Collapse newlines in title for a single-line entry.
+			title = strings.ReplaceAll(title, "\n", " ")
+			title = strings.ReplaceAll(title, "\r", "")
+			line := fmt.Sprintf("%s#%d [%s] %s", slug, iss.Number, labels, title)
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	omitted := total - len(lines)
+	result := strings.Join(lines, "\n")
+	if omitted > 0 {
+		result += fmt.Sprintf("\n(+%d more omitted)", omitted)
+		l.Info("brainstorm: buildIssuesContext: capped issues context",
+			"shown", len(lines), "omitted", omitted)
+	}
+	return result
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
