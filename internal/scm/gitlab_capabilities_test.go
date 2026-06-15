@@ -3,6 +3,8 @@ package scm
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -129,7 +131,7 @@ func TestGitLabCapabilities(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetPRState: %v", err)
 		}
-		if st.Author != "bob" || st.HeadSHA != "sha1" || st.HeadBranch != "feat" || !st.Mergeable || st.CIStatus != "success" {
+		if st.Author != "bob" || st.HeadSHA != "sha1" || st.HeadBranch != "feat" || st.CIStatus != "success" {
 			t.Fatalf("state = %+v", st)
 		}
 	})
@@ -169,6 +171,24 @@ func TestGitLabCapabilities(t *testing.T) {
 			t.Fatalf("add_labels = %+v", body["add_labels"])
 		}
 	})
+}
+
+// TestGitLabMergeConflict verifies that Merge returns ErrMergeConflict on 405/406/409.
+func TestGitLabMergeConflict(t *testing.T) {
+	for _, status := range []int{405, 406, 409} {
+		status := status
+		t.Run(fmt.Sprintf("http%d", status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			c := &GitLab{apiBase: srv.URL}
+			_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash")
+			if !errors.Is(err, ErrMergeConflict) {
+				t.Fatalf("expected ErrMergeConflict for HTTP %d, got %v", status, err)
+			}
+		})
+	}
 }
 
 func TestGitLabDetectAndVerifyFields(t *testing.T) {

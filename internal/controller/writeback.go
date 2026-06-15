@@ -745,17 +745,14 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		}
 		_, err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
 		r.recordSCM(provider, "merge", err)
-		// 405 or body contains "conflict" -> merge conflict on an in-flight task.
+		// ErrMergeConflict -> merge conflict on an in-flight task.
 		// Do NOT return the error: that would trigger controller-runtime backoff loop.
 		// Instead clear WritebackPending and let the task be re-triaged.
-		if err != nil {
-			var he *scm.HTTPError
-			if errors.As(err, &he) && (he.Status == 405 || strings.Contains(strings.ToLower(he.Body), "conflict")) {
-				l.Info("self-improve merge conflict (405); clearing writeback pending",
-					"action", "scm_selfimprove_conflict", "resource_id", task.Name)
-				r.clearWritebackPending(ctx, task, "MergeConflict", "merge conflict; left for re-triage")
-				return ctrl.Result{}, nil
-			}
+		if errors.Is(err, scm.ErrMergeConflict) {
+			l.Info("self-improve merge conflict; clearing writeback pending",
+				"action", "scm_selfimprove_conflict", "resource_id", task.Name)
+			r.clearWritebackPending(ctx, task, "MergeConflict", "merge conflict; left for re-triage")
+			return ctrl.Result{}, nil
 		}
 	default:
 		err = fmt.Errorf("unknown pr outcome %q", out.Action)

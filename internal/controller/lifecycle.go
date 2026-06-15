@@ -1733,27 +1733,24 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		return ctrl.Result{}, nil
 	}
 
-	// 405 or body contains "conflict" -> re-implement with resolve instruction.
-	var he *scm.HTTPError
-	if errors.As(mergeErr, &he) {
-		if he.Status == 405 || strings.Contains(strings.ToLower(he.Body), "conflict") {
-			branch := task.Status.HeadBranch
-			ctxMsg := fmt.Sprintf("Merge conflict on branch `%s`. Rebase the default branch into it, resolve conflicts, and push.", branch)
-			if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.clearDeadline(ctx, task); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.setLifecycleState(ctx, task, "Implement", "merge-conflict"); err != nil {
-				return ctrl.Result{}, err
-			}
-			// MUST return nil error - not returning the error prevents controller-runtime backoff loop.
-			return ctrl.Result{}, nil
+	// ErrMergeConflict -> re-implement with resolve instruction.
+	if errors.Is(mergeErr, scm.ErrMergeConflict) {
+		branch := task.Status.HeadBranch
+		ctxMsg := fmt.Sprintf("Merge conflict on branch `%s`. Rebase the default branch into it, resolve conflicts, and push.", branch)
+		if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
+			return ctrl.Result{}, err
 		}
+		if err := r.clearDeadline(ctx, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setLifecycleState(ctx, task, "Implement", "merge-conflict"); err != nil {
+			return ctrl.Result{}, err
+		}
+		// MUST return nil error - not returning the error prevents controller-runtime backoff loop.
+		return ctrl.Result{}, nil
 	}
 
 	// Transient error: requeue or deadline park.

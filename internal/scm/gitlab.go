@@ -300,7 +300,7 @@ func glDoWithHeaders(ctx context.Context, base, path, token string, out any) (ne
 	}
 	req.Header.Set("PRIVATE-TOKEN", token)
 	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := scmHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("gitlab: do request: %w", err)
 	}
@@ -338,7 +338,7 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 	if rdr != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := scmHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("gitlab: do request: %w", err)
 	}
@@ -410,7 +410,6 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		} `json:"author"`
 		SHA          string `json:"sha"`
 		SourceBranch string `json:"source_branch"`
-		MergeStatus  string `json:"merge_status"`
 		HeadPipeline struct {
 			Status string `json:"status"`
 		} `json:"head_pipeline"`
@@ -423,7 +422,6 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		Author:     mr.Author.Username,
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
-		Mergeable:  mr.MergeStatus == "can_be_merged",
 		CIStatus:   glCIStatus(mr.HeadPipeline.Status),
 	}, nil
 }
@@ -491,7 +489,8 @@ func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int,
 	return nil
 }
 
-// Merge merges an MR. Returns the merge commit SHA on success.
+// Merge merges an MR. Returns the merge commit SHA on success. Returns
+// ErrMergeConflict when GitLab signals the MR is not mergeable (405/406/409).
 func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
@@ -503,6 +502,10 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
+		var he *HTTPError
+		if errors.As(err, &he) && (he.Status == 405 || he.Status == 406 || he.Status == 409) {
+			return "", ErrMergeConflict
+		}
 		return "", err
 	}
 	return resp.MergeCommitSHA, nil

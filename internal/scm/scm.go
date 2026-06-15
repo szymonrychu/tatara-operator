@@ -74,13 +74,21 @@ type BoardItem struct {
 }
 
 // PRState is the inspected state of a PR/MR.
+// Author is the SCM login of the PR author. An empty Author means the account
+// was deleted or GitHub returned user:null; callers MUST treat Author==""
+// as "not the bot" and never allow it to pass an equality gate.
 type PRState struct {
 	Author     string
 	HeadSHA    string
 	HeadBranch string
-	Mergeable  bool
 	CIStatus   string // "" none | pending | success | failure
 }
+
+// ErrMergeConflict is returned by Merge when the SCM signals the PR is not
+// mergeable or a conflict prevents the merge (GitHub 405/409, GitLab 405/406/409).
+// Callers should use errors.Is(err, ErrMergeConflict) and re-triage rather than
+// hard-erroring.
+var ErrMergeConflict = fmt.Errorf("scm: merge conflict or PR not mergeable")
 
 // Suggestion is one inline code suggestion on a PR/MR.
 type Suggestion struct {

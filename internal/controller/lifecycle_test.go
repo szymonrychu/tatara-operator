@@ -1853,7 +1853,7 @@ func seedMergeTask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMerge,
 func TestLifecycleMerge_AllowedOK_TransitionsToMainCIWithSHA(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	fw := &lifecycleFakeSCMWriterMerge{
-		prState:  scm.PRState{Author: "bot", Mergeable: true, CIStatus: "success"},
+		prState:  scm.PRState{Author: "bot", CIStatus: "success"},
 		mergeSHA: "abc123sha",
 	}
 	r, name := seedMergeTask(t, "ok", fw, time.Hour)
@@ -1881,8 +1881,8 @@ func TestLifecycleMerge_AllowedOK_TransitionsToMainCIWithSHA(t *testing.T) {
 func TestLifecycleMerge_405ConflictSpawnsResolveAttempt_ErrNil(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	fw := &lifecycleFakeSCMWriterMerge{
-		prState:  scm.PRState{Author: "bot", Mergeable: true, CIStatus: "success"},
-		mergeErr: &scm.HTTPError{Status: 405, Body: "merge conflict", Path: "/merge"},
+		prState:  scm.PRState{Author: "bot", CIStatus: "success"},
+		mergeErr: scm.ErrMergeConflict,
 	}
 	r, name := seedMergeTask(t, "405", fw, time.Hour)
 
