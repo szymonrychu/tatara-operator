@@ -264,6 +264,15 @@ spec:
                 type: string
               mergeCommitSHA:
                 type: string
+              mergedHeadSHA:
+                description: |-
+                  MergedHeadSHA is the source-branch head commit SHA of the most recently
+                  merged PR/MR. Recorded on a successful Merge and deliberately preserved
+                  across clearMergedChangeState so the next MRCI cycle can detect a re-opened
+                  PR that re-proposes the already-merged commits with no new fix (the
+                  deterministic task branch is reused; if a post-merge re-implement does not
+                  advance it, writeBackOpenChange opens a duplicate of the merged change).
+                type: string
               pendingComments:
                 description: |-
                   PendingComments are free-form comments queued by the agent via the
