@@ -97,7 +97,27 @@ type BrainstormActivity struct {
 	Sources []string `json:"sources,omitempty"`
 }
 
-// ScmCron groups the three cron-driven scan activities.
+// HealthCheckActivity schedules the opt-in periodic project-health-check scan:
+// a sibling to brainstorm that surveys repo health (CI failures, coverage gaps,
+// code to simplify, pipeline steps to add, other tech-debt) and proposes one
+// targeted discovery issue per cycle via the tatara-health-check skill.
+type HealthCheckActivity struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+	// MaxOpenProposals caps the total open, unapproved agent proposals across
+	// ALL repos in the project; at or above this the health-check cycle is
+	// skipped. Default 5.
+	// +kubebuilder:default=5
+	// +optional
+	MaxOpenProposals int `json:"maxOpenProposals,omitempty"`
+	// +kubebuilder:validation:items:Enum=docs;memory;internet
+	// +optional
+	Sources []string `json:"sources,omitempty"`
+}
+
+// ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
 	MRScan CronActivity `json:"mrScan,omitempty"`
@@ -105,6 +125,8 @@ type ScmCron struct {
 	IssueScan CronActivity `json:"issueScan,omitempty"`
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
+	// +optional
+	HealthCheck HealthCheckActivity `json:"healthCheck,omitempty"`
 }
 
 // ScmSpec binds a Project to one SCM provider and its board/merge policy.
@@ -113,6 +135,12 @@ type ScmSpec struct {
 	Provider string `json:"provider"`
 	Owner    string `json:"owner"`
 	BotLogin string `json:"botLogin"`
+	// MaintainerLogins are the human maintainer accounts. Together with BotLogin
+	// they form the "trusted insider" set: issues opened by anyone OUTSIDE this
+	// set (third-party contributors) are autoapproved through triage without the
+	// self-approve hold. Empty means only BotLogin is excluded from autoapprove.
+	// +optional
+	MaintainerLogins []string `json:"maintainerLogins,omitempty"`
 	// +optional
 	Board *BoardSpec `json:"board,omitempty"`
 	// +kubebuilder:validation:Enum=afterApproval;autoMergeOnGreenCI
@@ -205,6 +233,8 @@ type ProjectStatus struct {
 	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
 	// +optional
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
+	// +optional
+	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
 }
 
 // +kubebuilder:object:root=true

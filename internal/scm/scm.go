@@ -59,6 +59,7 @@ type IssueRef struct {
 	Repo      string    `json:"repo"`
 	Number    int       `json:"number"`
 	Title     string    `json:"title,omitempty"`
+	Author    string    `json:"author,omitempty"` // issue author login; drives the author-tiered autoapprove gate
 	Labels    []string  `json:"labels,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 	IsPR      bool      `json:"isPr"` // GitHub /issues returns PRs; filter these out

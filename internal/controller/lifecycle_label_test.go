@@ -38,6 +38,17 @@ func reconcilerFor(w scm.SCMWriter, rdr scm.SCMReader) *TaskReconciler {
 		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return rdr, nil }}
 }
 
+// setTaskAuthor overrides the task's Source.AuthorLogin (seedLabelTask defaults
+// it to "human"). Used to exercise the author-tiered autoapprove gate.
+func setTaskAuthor(t *testing.T, name, login string) {
+	t.Helper()
+	ctx := context.Background()
+	var fresh tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, &fresh))
+	fresh.Spec.Source.AuthorLogin = login
+	require.NoError(t, k8sClient.Update(ctx, &fresh))
+}
+
 func markSucceededWithOutcome(t *testing.T, name, action string) {
 	t.Helper()
 	ctx := context.Background()
@@ -95,12 +106,13 @@ func TestFinishTriage_Discuss_Idea(t *testing.T) {
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
-// Authorship is detected via the tataraAuthoredMarker in the issue body, NOT
-// Source.AuthorLogin (which issueScan leaves empty). seedLabelTask sets
-// AuthorLogin="human", so these tests prove the guard fires on the cron path
-// purely from the marker.
+// The self-approve guard applies to tatara's OWN ideas, which the bot opens, so
+// the realistic source author is the bot login (not a third party). Authorship
+// is then confirmed via the tataraAuthoredMarker in the issue body. A bot author
+// is not third-party, so the author-tiered autoapprove does not bypass the guard.
 func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testing.T) {
 	_, task, w := seedLabelTask(t, "auth-noh", nil)
+	setTaskAuthor(t, task.Name, "tatara-bot")
 	r := reconcilerFor(w, &commentReader{body: "an idea\n\n" + tataraAuthoredMarker})
 	proj := projOf(t, task)
 	markSucceededWithOutcome(t, task.Name, "implement")
@@ -112,6 +124,7 @@ func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testin
 
 func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testing.T) {
 	_, task, w := seedLabelTask(t, "auth-h", nil)
+	setTaskAuthor(t, task.Name, "tatara-bot")
 	r := reconcilerFor(w, &commentReader{
 		body:     "an idea\n\n" + tataraAuthoredMarker,
 		comments: []scm.IssueComment{{Author: "szymon", Body: "approved, go"}},
@@ -124,10 +137,12 @@ func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testi
 	require.Equal(t, "Implement", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
-// Fail-closed: when the authorship check errors, treat the issue as tatara-authored
-// and park it (never auto-approve on an unknown).
+// Fail-closed: with no captured author (board-sourced issue) the author tier does
+// not apply, and when the marker authorship check errors we treat the issue as
+// tatara-authored and park it (never auto-approve on an unknown).
 func TestFinishTriage_AuthorshipCheckError_FailsClosed_ParksIdea(t *testing.T) {
 	_, task, w := seedLabelTask(t, "auth-err", nil)
+	setTaskAuthor(t, task.Name, "") // board/legacy path: author unknown
 	r := reconcilerFor(w, &errGetIssueReader{})
 	proj := projOf(t, task)
 	markSucceededWithOutcome(t, task.Name, "implement")

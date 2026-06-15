@@ -356,7 +356,7 @@ func candidatesFromIssues(iss []scm.IssueRef) []candidate {
 			continue
 		}
 		out = append(out, candidate{
-			repo: i.Repo, number: i.Number, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
 		})
 	}
 	return out
@@ -466,6 +466,42 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 		return nil, fmt.Errorf("scan: create brainstorm task: %w", err)
 	}
 	r.Metrics.ScanTaskCreated("brainstorm", "brainstorm")
+	return task, nil
+}
+
+// createHealthCheckTask creates a project-health-check Task. It reuses Kind
+// "brainstorm" (same pod egress, writeback arm, and propose_issue flow) but
+// carries the distinct "healthCheck" activity label so scheduling, dedup, and
+// the in-flight guard stay independent from brainstorm; the pod name is
+// disambiguated by that label (see agent.podNameSuffix). sources is recorded as
+// a comma-joined annotation the pod builder reads to decide the egress label.
+func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, goal string, sources []string) (*tatarav1alpha1.Task, error) {
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "healthcheck-",
+			Namespace:    proj.Namespace,
+			Labels:       map[string]string{labelActivity: "healthCheck"},
+			Annotations:  map[string]string{annBrainstormSources: strings.Join(sources, ",")},
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    proj.Name,
+			RepositoryRef: repo.Name,
+			Goal:          goal,
+			Kind:          "brainstorm",
+		},
+	}
+	agent.StampPodName(task, proj.Name, provider, repo.Name)
+	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
+		return nil, fmt.Errorf("scan: set ownerref: %w", err)
+	}
+	if err := r.Create(ctx, task); err != nil {
+		return nil, fmt.Errorf("scan: create healthCheck task: %w", err)
+	}
+	r.Metrics.ScanTaskCreated("healthCheck", "brainstorm")
 	return task, nil
 }
 
@@ -590,6 +626,9 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 	case "brainstorm":
 		schedule = proj.Spec.Scm.Cron.Brainstorm.Schedule
 		last = proj.Status.LastBrainstorm
+	case "healthCheck":
+		schedule = proj.Spec.Scm.Cron.HealthCheck.Schedule
+		last = proj.Status.LastHealthCheck
 	}
 	base := proj.CreationTimestamp.Time
 	if last != nil {
@@ -621,6 +660,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
+		case "healthCheck":
+			fresh.Status.LastHealthCheck = &now
+			proj.Status.LastHealthCheck = &now
 		}
 		return r.Status().Update(ctx, fresh)
 	})
@@ -938,6 +980,105 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		"picked", 1, "primary_repo", primaryRepo.Name, "duration_ms", time.Since(start).Milliseconds())
 }
 
+// healthCheck runs one project-health-check cycle at PROJECT scope: at most one
+// healthCheck Task per cycle for the whole project. It mirrors brainstorm (single
+// in-flight guard, budget guard, shared proposal-backlog cap, project-spanning
+// goal) but drives the tatara-health-check skill. budget is the shared open-task
+// creation budget; healthCheck decrements it on a successful create.
+func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.HealthCheckActivity, budget *int) {
+	l := log.FromContext(ctx)
+	start := time.Now()
+	maxProp := act.MaxOpenProposals
+	if maxProp < 1 {
+		maxProp = 5
+	}
+
+	// Project-scoped in-flight guard: any non-terminal healthCheck Task blocks.
+	if healthCheckInFlightProject(existing) {
+		r.Metrics.ScanItem("healthCheck", "skipped_inflight")
+		l.Info("healthCheck: in-flight project health-check task; skipping cycle",
+			"action", "scan_healthcheck", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
+	// Budget guard.
+	if *budget <= 0 {
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
+	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
+
+	// Deterministic primary repo: sort by name, first valid slug wins.
+	sortedRepos := make([]tatarav1alpha1.Repository, len(repos))
+	copy(sortedRepos, repos)
+	sort.Slice(sortedRepos, func(i, j int) bool {
+		return sortedRepos[i].Name < sortedRepos[j].Name
+	})
+
+	var primaryRepo *tatarav1alpha1.Repository
+	for i := range sortedRepos {
+		if s := repoSlug(&sortedRepos[i]); s != "" {
+			primaryRepo = &sortedRepos[i]
+			break
+		}
+	}
+	if primaryRepo == nil {
+		l.Info("healthCheck: no valid repos", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
+	// Aggregate proposal backlog across all repos; short-circuit once >= maxProp.
+	// Shares proposalBacklog with brainstorm: both autonomous activities back off
+	// against the same open-idea pressure so the project is not flooded.
+	total := 0
+	for i := range sortedRepos {
+		rp := &sortedRepos[i]
+		slug := repoSlug(rp)
+		if slug == "" {
+			continue
+		}
+		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm, existing)
+		if err != nil {
+			l.Info("healthCheck: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
+			continue
+		}
+		total += backlog
+		if total >= maxProp {
+			r.Metrics.ScanItem("healthCheck", "skipped_cap")
+			l.Info("healthCheck: project backlog at cap; skipping cycle",
+				"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
+			r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+			return
+		}
+	}
+
+	// Collect all valid slugs for the project-spanning goal.
+	var slugs []string
+	for i := range sortedRepos {
+		if s := repoSlug(&sortedRepos[i]); s != "" {
+			slugs = append(slugs, s)
+		}
+	}
+
+	// Build rich open-issues context for dedup-first reasoning.
+	issuesCtx := r.buildIssuesContext(ctx, proj, reader, sortedRepos)
+
+	goal := healthCheckGoalProject(slugs, issuesCtx)
+	if _, err := r.createHealthCheckTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
+		l.Error(err, "scan: create healthCheck task", "resource_id", proj.Name, "repo", primaryRepo.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+	r.Metrics.ScanItem("healthCheck", "picked")
+	*budget--
+	r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+	l.Info("healthCheck complete", "action", "scan_healthcheck", "resource_id", proj.Name,
+		"picked", 1, "primary_repo", primaryRepo.Name, "duration_ms", time.Since(start).Milliseconds())
+}
+
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
 // task. issuesCtx is a pre-built string of open issues across all repos
 // (one line each: "repo#N [labels] title"), used to guide dedup-first reasoning.
@@ -972,6 +1113,42 @@ func brainstormGoalProject(slugs []string, issuesCtx string) string {
 // New code calls brainstormGoalProject.
 func brainstormGoal(slug string) string {
 	return brainstormGoalProject([]string{slug}, "")
+}
+
+// healthCheckGoalProject returns the turn-0 goal for a project-level health-check
+// task. It mirrors brainstormGoalProject (same dedup-first contract and issuesCtx
+// shape) but drives the tatara-health-check skill across all repo slugs.
+func healthCheckGoalProject(slugs []string, issuesCtx string) string {
+	repoList := strings.Join(slugs, ", ")
+
+	existingBlock := "No open issues found across the project."
+	if issuesCtx != "" {
+		existingBlock = "OPEN ISSUES (survey these FIRST before proposing anything new):\n" + issuesCtx
+	}
+
+	return "Invoke the `tatara-health-check` skill to survey the HEALTH of the project's repositories " +
+		"and identify the single highest-leverage health issue across ALL repositories: " + repoList + ". " +
+		"The skill defines the five health dimensions (CI failures, code coverage gaps, code to simplify, " +
+		"CI/CD pipeline steps worth adding, other tech-debt), how to gather evidence (on-disk CI config, an " +
+		"actual test/lint run, and the tatara-memory code graph), score leverage, and dedup. " +
+		"\n\n" + existingBlock + "\n\n" +
+		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
+		"1. If the best finding DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
+		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
+		"2. If the best finding is a sub-aspect or connecting improvement TO an existing issue: " +
+		"call comment_on_issue(repo, number, body) on that issue. Do NOT call propose_issue.\n" +
+		"3. ONLY if the finding is genuinely novel AND standalone (no existing issue covers it): " +
+		"call propose_issue with exactly one proposal. " +
+		"Set the `repo` argument to the specific repository that should own the issue. " +
+		"The proposal must be self-contained: the concrete defect with file:line evidence, the proposed fix, " +
+		"and a single explicit decision for the human (approve to implement or comment to refine). " +
+		"Do NOT produce a list of open questions or ask for input.\n\n" +
+		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
+}
+
+// healthCheckGoal is the single-repo convenience form, mirroring brainstormGoal.
+func healthCheckGoal(slug string) string {
+	return healthCheckGoalProject([]string{slug}, "")
 }
 
 // buildIssuesContext lists all open non-PR issues across repos and builds the
@@ -1043,6 +1220,18 @@ func brainstormInFlightProject(existing []tatarav1alpha1.Task) bool {
 	for i := range existing {
 		t := existing[i]
 		if t.Labels[labelActivity] == "brainstorm" && !isTerminal(t.Status.Phase) {
+			return true
+		}
+	}
+	return false
+}
+
+// healthCheckInFlightProject reports whether ANY non-terminal healthCheck Task
+// exists in the project (project-scoped guard, mirrors brainstormInFlightProject).
+func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
+	for i := range existing {
+		t := existing[i]
+		if t.Labels[labelActivity] == "healthCheck" && !isTerminal(t.Status.Phase) {
 			return true
 		}
 	}
@@ -1273,6 +1462,24 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		} else if cronSpec.Brainstorm.Schedule != "" {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Brainstorm.Schedule), "scan: invalid brainstorm cron, disabling",
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "brainstorm")
+		}
+	}
+
+	// healthCheck (opt-in)
+	if cronSpec.HealthCheck.Enabled {
+		if _, due, next, ok := r.activityDue(proj, "healthCheck"); ok {
+			if due {
+				r.healthCheck(ctx, proj, reader, repos, existing, cronSpec.HealthCheck, &budget)
+				r.stampScan(ctx, proj, "healthCheck")
+				if next2, ok2 := activityNextFire(cronSpec.HealthCheck.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
+				consider(next)
+			}
+		} else if cronSpec.HealthCheck.Schedule != "" {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.HealthCheck.Schedule), "scan: invalid healthCheck cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "healthCheck")
 		}
 	}
 

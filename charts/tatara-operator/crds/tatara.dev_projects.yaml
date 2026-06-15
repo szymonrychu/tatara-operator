@@ -136,7 +136,7 @@ spec:
                     default: 60
                     type: integer
                   cron:
-                    description: ScmCron groups the three cron-driven scan activities.
+                    description: ScmCron groups the cron-driven scan activities.
                     properties:
                       brainstorm:
                         description: BrainstormActivity schedules the opt-in self-driven
@@ -153,6 +153,33 @@ spec:
                             type: integer
                           maxPerCycle:
                             default: 1
+                            type: integer
+                          schedule:
+                            type: string
+                          sources:
+                            items:
+                              enum:
+                              - docs
+                              - memory
+                              - internet
+                              type: string
+                            type: array
+                        type: object
+                      healthCheck:
+                        description: |-
+                          HealthCheckActivity schedules the opt-in periodic project-health-check scan:
+                          a sibling to brainstorm that surveys repo health (CI failures, coverage gaps,
+                          code to simplify, pipeline steps to add, other tech-debt) and proposes one
+                          targeted discovery issue per cycle via the tatara-health-check skill.
+                        properties:
+                          enabled:
+                            type: boolean
+                          maxOpenProposals:
+                            default: 5
+                            description: |-
+                              MaxOpenProposals caps the total open, unapproved agent proposals across
+                              ALL repos in the project; at or above this the health-check cycle is
+                              skipped. Default 5.
                             type: integer
                           schedule:
                             type: string
@@ -209,6 +236,15 @@ spec:
                     description: ImplementationLabel marks an issue whose implementation
                       is in flight.
                     type: string
+                  maintainerLogins:
+                    description: |-
+                      MaintainerLogins are the human maintainer accounts. Together with BotLogin
+                      they form the "trusted insider" set: issues opened by anyone OUTSIDE this
+                      set (third-party contributors) are autoapproved through triage without the
+                      self-approve hold. Empty means only BotLogin is excluded from autoapprove.
+                    items:
+                      type: string
+                    type: array
                   mergePolicy:
                     default: afterApproval
                     enum:
@@ -311,6 +347,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               lastBrainstorm:
+                format: date-time
+                type: string
+              lastHealthCheck:
                 format: date-time
                 type: string
               lastIssueScan:

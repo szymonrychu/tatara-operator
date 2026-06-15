@@ -216,6 +216,7 @@ func TestBuildPodName(t *testing.T) {
 		provider string
 		repoRef  string
 		kind     string
+		labels   map[string]string
 		source   *tatarav1alpha1.TaskSource
 		want     string
 	}{
@@ -255,10 +256,20 @@ func TestBuildPodName(t *testing.T) {
 			source: nil,
 			want:   "tatara-tatara-gl-brainstorm",
 		},
+		{
+			name:    "github healthCheck disambiguated by activity label",
+			project: "tatara", provider: "github", repoRef: "tatara-operator", kind: "brainstorm",
+			labels: map[string]string{tatarav1alpha1.LabelActivity: "healthCheck"},
+			source: nil,
+			want:   "tatara-tatara-gh-tatara-operator-healthcheck",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Kind: tc.kind, Source: tc.source}}
+			task := &tatarav1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Labels: tc.labels},
+				Spec:       tatarav1alpha1.TaskSpec{Kind: tc.kind, Source: tc.source},
+			}
 			require.Equal(t, tc.want, agent.BuildPodName(tc.project, tc.provider, tc.repoRef, task))
 		})
 	}
