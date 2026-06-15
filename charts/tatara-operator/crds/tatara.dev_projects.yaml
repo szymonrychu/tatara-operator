@@ -110,6 +110,23 @@ spec:
                     default: tatara-approved
                     description: ApprovedLabel marks an issue approved for implementation.
                     type: string
+                  autoApproveThirdParty:
+                    default: brainstorming
+                    description: |-
+                      AutoApproveThirdParty controls how far an issue filed by a THIRD-PARTY
+                      author (any human that is neither the bot nor the maintainer Owner) is
+                      auto-advanced without waiting on the maintainer:
+                        off            - no auto-advance; implementation waits for the maintainer.
+                        brainstorming  - auto-advance through discovery; implementation still
+                                         waits for the maintainer (default).
+                        implementation - auto-advance all the way to implementation.
+                      It never applies to bot-authored issues (the self-approve guard is
+                      inviolate) or maintainer-authored issues (already trusted).
+                    enum:
+                    - "off"
+                    - brainstorming
+                    - implementation
+                    type: string
                   babysitDeadlineMinutes:
                     default: 60
                     type: integer

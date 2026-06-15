@@ -356,7 +356,7 @@ func candidatesFromIssues(iss []scm.IssueRef) []candidate {
 			continue
 		}
 		out = append(out, candidate{
-			repo: i.Repo, number: i.Number, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
 		})
 	}
 	return out
@@ -1257,7 +1257,7 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			if !ok {
 				continue
 			}
-			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt}
+			cand := candidate{repo: slug, number: iss.Number, author: iss.Author, labels: iss.Labels, updatedAt: iss.UpdatedAt}
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: entry}
 			if _, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann); cerr != nil {
 				l.Error(cerr, "backstop: create recovery task", "action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)

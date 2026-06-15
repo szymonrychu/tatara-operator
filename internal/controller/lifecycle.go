@@ -669,35 +669,25 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 
 	default: // "implement" and anything else
-		// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
-		// human has engaged. Authorship is detected via the tatara-authored marker
-		// in the issue body - reliable and egress-verified, unlike Source.AuthorLogin
-		// which is empty for cron-scanned issues and untrusted on the webhook path.
-		authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
-		if aerr != nil {
-			l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
-				"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
-			authored = true
-		}
-		if authored {
-			human, herr := r.hasHumanComment(ctx, project, task)
-			if herr != nil {
-				l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
-					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
-				human = false
+		// Approval gate by author tier. The bot self-approve guard (R1/R2) is
+		// inviolate: tatara never approves its OWN idea before a human has engaged.
+		// Maintainer-authored issues proceed (trusted). Third-party issues are
+		// auto-advanced per ScmSpec.AutoApproveThirdParty - at the "implementation"
+		// tier they skip this await-approval park and go straight to Implement;
+		// otherwise implementation still waits for the maintainer.
+		if needApproval, reason := r.triageNeedsApproval(ctx, project, task); needApproval {
+			l.Info("triage: implementation awaits maintainer approval; parking",
+				"action", "lifecycle_triage_guard", "resource_id", task.Name, "reason", reason)
+			if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
+				return ctrl.Result{}, err
 			}
-			if !human {
-				if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
-					return ctrl.Result{}, err
-				}
-				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
-					return ctrl.Result{}, err
-				}
-				if err := r.clearIssueOutcome(ctx, task); err != nil {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, r.resetAgentRun(ctx, task)
+			if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+				return ctrl.Result{}, err
 			}
+			if err := r.clearIssueOutcome(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.resetAgentRun(ctx, task)
 		}
 		if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {
 			return ctrl.Result{}, err
@@ -711,6 +701,89 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, r.resetAgentRun(ctx, task)
+}
+
+// authorTier classifies the issue author for the autoapprove gate.
+type authorTier int
+
+const (
+	tierBot authorTier = iota
+	tierMaintainer
+	tierThirdParty
+)
+
+// classifyAuthor returns the author tier for the task's source issue. Bot
+// detection uses the egress-verified tatara-authored body marker (reliable)
+// OR a Source.AuthorLogin == BotLogin match. The maintainer/third-party split
+// uses Source.AuthorLogin captured at pick time; an empty/unknown author falls
+// back to maintainer so behavior is unchanged from before this gate existed
+// (a third party is auto-advanced only when positively identified). The error
+// from the authorship probe is returned so the caller can fail closed.
+func (r *TaskReconciler) classifyAuthor(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (authorTier, error) {
+	authored, err := r.tataraAuthoredIssue(ctx, project, task)
+	if err != nil {
+		return tierBot, err
+	}
+	bot, owner := "", ""
+	if project.Spec.Scm != nil {
+		bot = project.Spec.Scm.BotLogin
+		owner = project.Spec.Scm.Owner
+	}
+	login := ""
+	if task.Spec.Source != nil {
+		login = task.Spec.Source.AuthorLogin
+	}
+	if authored || (bot != "" && login == bot) {
+		return tierBot, nil
+	}
+	if login == "" || (owner != "" && login == owner) {
+		return tierMaintainer, nil
+	}
+	return tierThirdParty, nil
+}
+
+// autoApproveThirdParty returns the configured third-party autoapprove tier,
+// defaulting to "brainstorming" when unset.
+func autoApproveThirdParty(scmSpec *tatarav1alpha1.ScmSpec) string {
+	if scmSpec == nil || scmSpec.AutoApproveThirdParty == "" {
+		return "brainstorming"
+	}
+	return scmSpec.AutoApproveThirdParty
+}
+
+// triageNeedsApproval decides whether an "implement" triage outcome must wait
+// for the maintainer before proceeding to Implement, based on the author tier:
+//   - BOT (tatara-authored, R1/R2 guard): waits until a human has commented on
+//     the issue. Preserved exactly.
+//   - MAINTAINER (Source.AuthorLogin == Owner, or author unknown): proceeds.
+//   - THIRD-PARTY: proceeds only when AutoApproveThirdParty == "implementation";
+//     otherwise implementation waits for the maintainer.
+//
+// The returned string is a short reason for logging. Probe errors fail closed
+// (treat as bot needing approval).
+func (r *TaskReconciler) triageNeedsApproval(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (bool, string) {
+	tier, err := r.classifyAuthor(ctx, project, task)
+	if err != nil {
+		tier = tierBot // fail closed: authorship probe failed
+	}
+	switch tier {
+	case tierMaintainer:
+		return false, "maintainer-authored"
+	case tierThirdParty:
+		if autoApproveThirdParty(project.Spec.Scm) == "implementation" {
+			return false, "third-party; autoApproveThirdParty=implementation"
+		}
+		return true, "third-party; implementation awaits maintainer approval"
+	default: // tierBot
+		human, herr := r.hasHumanComment(ctx, project, task)
+		if herr != nil {
+			return true, "bot-authored; human-comment check failed (fail closed)"
+		}
+		if !human {
+			return true, "bot-authored; no human engagement yet"
+		}
+		return false, "bot-authored; human has engaged"
+	}
 }
 
 // clearPendingInterjections removes the first n delivered interjections from

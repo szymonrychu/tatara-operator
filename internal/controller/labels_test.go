@@ -63,7 +63,7 @@ func seedLabelTask(t *testing.T, suffix string, currentLabels []string) (*TaskRe
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "lbl-task-" + suffix, Namespace: testNS},
 		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "issueLifecycle",
-			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7, AuthorLogin: "human"}},
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7, AuthorLogin: "o"}},
 	}
 	require.NoError(t, k8sClient.Create(ctx, task))
 	var fresh tatarav1alpha1.Task

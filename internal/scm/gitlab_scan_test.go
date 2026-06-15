@@ -35,7 +35,7 @@ func TestGitLabListOpenIssues(t *testing.T) {
 			t.Fatalf("path=%q query=%q", glTestPath(r), r.URL.RawQuery)
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"iid": 7, "labels": []string{"bug"}, "updated_at": "2026-06-10T12:00:00Z"},
+			{"iid": 7, "labels": []string{"bug"}, "author": map[string]any{"username": "bob"}, "updated_at": "2026-06-10T12:00:00Z"},
 		})
 	}))
 	defer srv.Close()
@@ -44,7 +44,7 @@ func TestGitLabListOpenIssues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListOpenIssues: %v", err)
 	}
-	if len(iss) != 1 || iss[0].Repo != "g/p" || iss[0].Number != 7 || iss[0].IsPR || iss[0].Labels[0] != "bug" {
+	if len(iss) != 1 || iss[0].Repo != "g/p" || iss[0].Number != 7 || iss[0].IsPR || iss[0].Labels[0] != "bug" || iss[0].Author != "bob" {
 		t.Fatalf("iss = %+v", iss)
 	}
 }

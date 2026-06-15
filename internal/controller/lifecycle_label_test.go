@@ -95,10 +95,11 @@ func TestFinishTriage_Discuss_Idea(t *testing.T) {
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
 }
 
-// Authorship is detected via the tataraAuthoredMarker in the issue body, NOT
-// Source.AuthorLogin (which issueScan leaves empty). seedLabelTask sets
-// AuthorLogin="human", so these tests prove the guard fires on the cron path
-// purely from the marker.
+// Bot detection is driven by the tataraAuthoredMarker in the issue body (the
+// egress-verified signal), which takes precedence over the author tier.
+// seedLabelTask sets AuthorLogin="o" (the maintainer Owner), so these tests
+// prove the self-approve guard fires from the marker even for a maintainer-tier
+// author. Third-party tier behavior is covered in lifecycle_autoapprove_test.go.
 func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testing.T) {
 	_, task, w := seedLabelTask(t, "auth-noh", nil)
 	r := reconcilerFor(w, &commentReader{body: "an idea\n\n" + tataraAuthoredMarker})

@@ -40,7 +40,7 @@ func TestGitHubListOpenIssuesFiltersPRs(t *testing.T) {
 			t.Fatalf("path=%q query=%q", r.URL.Path, r.URL.RawQuery)
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"number": 7, "labels": []map[string]any{{"name": "bug"}}, "updated_at": "2026-06-10T12:00:00Z"},
+			{"number": 7, "labels": []map[string]any{{"name": "bug"}}, "user": map[string]any{"login": "alice"}, "updated_at": "2026-06-10T12:00:00Z"},
 			{"number": 8, "pull_request": map[string]any{"url": "x"}, "updated_at": "2026-06-10T12:00:00Z"},
 		})
 	}))
@@ -53,8 +53,8 @@ func TestGitHubListOpenIssuesFiltersPRs(t *testing.T) {
 	if len(iss) != 2 {
 		t.Fatalf("want 2 items (IsPR set), got %+v", iss)
 	}
-	if iss[0].Number != 7 || iss[0].IsPR {
-		t.Fatalf("issue 7 should not be PR: %+v", iss[0])
+	if iss[0].Number != 7 || iss[0].IsPR || iss[0].Author != "alice" {
+		t.Fatalf("issue 7 should not be PR and authored by alice: %+v", iss[0])
 	}
 	if iss[1].Number != 8 || !iss[1].IsPR {
 		t.Fatalf("issue 8 should be flagged IsPR: %+v", iss[1])

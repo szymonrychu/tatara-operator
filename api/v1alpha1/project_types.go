@@ -143,6 +143,19 @@ type ScmSpec struct {
 	// +kubebuilder:default="labeledOrMentioned"
 	// +optional
 	PRReactionScope string `json:"prReactionScope,omitempty"`
+	// AutoApproveThirdParty controls how far an issue filed by a THIRD-PARTY
+	// author (any human that is neither the bot nor the maintainer Owner) is
+	// auto-advanced without waiting on the maintainer:
+	//   off            - no auto-advance; implementation waits for the maintainer.
+	//   brainstorming  - auto-advance through discovery; implementation still
+	//                    waits for the maintainer (default).
+	//   implementation - auto-advance all the way to implementation.
+	// It never applies to bot-authored issues (the self-approve guard is
+	// inviolate) or maintainer-authored issues (already trusted).
+	// +kubebuilder:validation:Enum=off;brainstorming;implementation
+	// +kubebuilder:default="brainstorming"
+	// +optional
+	AutoApproveThirdParty string `json:"autoApproveThirdParty,omitempty"`
 	// ApprovalLabel is DEPRECATED and no longer used: approval is now driven by
 	// the conversation (the triage agent reads the thread) and projected onto the
 	// idea/approved/rejected labels below. Kept only for migration tooling.
