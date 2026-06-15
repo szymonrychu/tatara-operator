@@ -117,6 +117,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
 			return scm.ReaderByProvider(provider, token)
 		},
+		SCMFor: func(provider string) (scm.SCMWriter, error) {
+			return scm.ByProvider(provider)
+		},
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
