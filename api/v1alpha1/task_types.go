@@ -95,7 +95,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;healthCheck;issueLifecycle
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`

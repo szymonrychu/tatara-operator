@@ -58,6 +58,7 @@ spec:
                 - selfImprove
                 - triageIssue
                 - brainstorm
+                - healthCheck
                 - issueLifecycle
                 type: string
               maxTurns:

@@ -97,7 +97,25 @@ type BrainstormActivity struct {
 	Sources []string `json:"sources,omitempty"`
 }
 
-// ScmCron groups the three cron-driven scan activities.
+// HealthCheckActivity schedules the opt-in self-driven repo-health audit scan.
+// It is the maintenance sibling of BrainstormActivity: instead of hunting a
+// whole-platform feature improvement, each cycle audits ONE repo's health
+// (CI/pipeline failures, coverage gaps, code to simplify, tech debt) and files
+// one targeted discovery proposal via propose_issue.
+type HealthCheckActivity struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+	// MaxOpenFindings caps the total open, unapproved health proposals across
+	// ALL repos in the project; at or above this the health-check cycle is
+	// skipped. Default 5.
+	// +kubebuilder:default=5
+	// +optional
+	MaxOpenFindings int `json:"maxOpenFindings,omitempty"`
+}
+
+// ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
 	MRScan CronActivity `json:"mrScan,omitempty"`
@@ -105,6 +123,8 @@ type ScmCron struct {
 	IssueScan CronActivity `json:"issueScan,omitempty"`
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
+	// +optional
+	HealthCheck HealthCheckActivity `json:"healthCheck,omitempty"`
 }
 
 // ScmSpec binds a Project to one SCM provider and its board/merge policy.
@@ -205,6 +225,8 @@ type ProjectStatus struct {
 	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
 	// +optional
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
+	// +optional
+	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
 }
 
 // +kubebuilder:object:root=true
