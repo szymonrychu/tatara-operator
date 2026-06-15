@@ -15,11 +15,92 @@ import (
 
 func staticToken(_ context.Context) (string, error) { return "test-bearer", nil }
 
+// recordedCall holds one call to the metrics recorder.
+type recordedCall struct {
+	method, outcome string
+	seconds         float64
+}
+
+type fakeMetrics struct {
+	calls []recordedCall
+}
+
+func (f *fakeMetrics) AgentHTTP(method, outcome string, seconds float64) {
+	f.calls = append(f.calls, recordedCall{method, outcome, seconds})
+}
+
 func newSession(t *testing.T, h http.HandlerFunc) (agent.Session, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return agent.NewHTTPSession(staticToken), srv
+}
+
+func newSessionWithMetrics(t *testing.T, h http.HandlerFunc, m agent.AgentHTTPRecorder) (agent.Session, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	return agent.NewHTTPSessionWithMetrics(staticToken, m), srv
+}
+
+// TestHTTPMetrics_SuccessRecorded checks that a successful do() call records
+// method="submit_turn" and outcome="ok".
+func TestHTTPMetrics_SuccessRecorded(t *testing.T) {
+	m := &fakeMetrics{}
+	s, srv := newSessionWithMetrics(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"turnId": "t1"})
+	}, m)
+
+	_, err := s.SubmitTurn(context.Background(), srv.URL, "hi", "http://cb")
+	require.NoError(t, err)
+
+	require.Len(t, m.calls, 1)
+	require.Equal(t, "submit_turn", m.calls[0].method)
+	require.Equal(t, "ok", m.calls[0].outcome)
+	require.Positive(t, m.calls[0].seconds)
+}
+
+// TestHTTPMetrics_HTTPErrorRecorded checks that an HTTP error records outcome="http_error".
+func TestHTTPMetrics_HTTPErrorRecorded(t *testing.T) {
+	m := &fakeMetrics{}
+	s, srv := newSessionWithMetrics(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte("conflict"))
+	}, m)
+
+	_, err := s.SubmitTurn(context.Background(), srv.URL, "hi", "http://cb")
+	require.Error(t, err)
+
+	require.Len(t, m.calls, 1)
+	require.Equal(t, "submit_turn", m.calls[0].method)
+	require.Equal(t, "http_error", m.calls[0].outcome)
+}
+
+// TestHTTPMetrics_UnreachableRecorded checks that a transport error records outcome="unreachable".
+func TestHTTPMetrics_UnreachableRecorded(t *testing.T) {
+	m := &fakeMetrics{}
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+
+	s := agent.NewHTTPSessionWithMetrics(staticToken, m)
+	_, err := s.SubmitTurn(context.Background(), url, "hi", "http://cb")
+	require.Error(t, err)
+
+	require.Len(t, m.calls, 1)
+	require.Equal(t, "submit_turn", m.calls[0].method)
+	require.Equal(t, "unreachable", m.calls[0].outcome)
+}
+
+// TestHTTPMetrics_NilRecorder ensures NewHTTPSession (no metrics) does not panic.
+func TestHTTPMetrics_NilRecorder(t *testing.T) {
+	s, srv := newSession(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"turnId": "t2"})
+	})
+	_, err := s.SubmitTurn(context.Background(), srv.URL, "hi", "http://cb")
+	require.NoError(t, err) // must not panic
 }
 
 func TestSubmitTurn_202(t *testing.T) {

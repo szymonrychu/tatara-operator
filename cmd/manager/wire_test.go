@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
@@ -25,7 +26,7 @@ func TestPodConfigFromConfig(t *testing.T) {
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("podConfigFromConfig = %+v, want %+v", got, want)
 	}
 }

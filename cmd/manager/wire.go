@@ -158,7 +158,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Scheme:           mgr.GetScheme(),
 		Metrics:          metrics,
 		LifecycleMetrics: lifecycleMetrics,
-		Session:          agent.NewHTTPSession(wrapperTokens.Token),
+		Session:          agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
 		PodConfig:        podConfigFromConfig(cfg),
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
@@ -173,7 +173,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	cbServer := &controller.CallbackServer{
 		Client:      mgr.GetClient(),
 		Metrics:     metrics,
-		Session:     agent.NewHTTPSession(wrapperTokens.Token),
+		Session:     agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
 		Namespace:   cfg.Namespace,
 		PushMetrics: pushReceiver.PushHandler(),
 	}
