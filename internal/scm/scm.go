@@ -169,8 +169,14 @@ type HTTPError struct {
 	Path   string
 }
 
+const httpErrorBodyLimit = 200
+
 func (e *HTTPError) Error() string {
-	return fmt.Sprintf("scm: %s -> %d: %s", e.Path, e.Status, e.Body)
+	body := e.Body
+	if len(body) > httpErrorBodyLimit {
+		body = body[:httpErrorBodyLimit] + "...[truncated]"
+	}
+	return fmt.Sprintf("scm: %s -> %d: %s", e.Path, e.Status, body)
 }
 
 // GitHub implements Client for GitHub.
