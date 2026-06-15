@@ -2,6 +2,8 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] Project-level brainstorm (one Task per project per cycle, not per-repo): summed backlog, project-scoped in-flight guard, deterministic primary repo, updated goal prompt listing all repos. CRD MaxOpenProposals default 3->5 (project-wide). PR feat/project-level-brainstorm; awaiting deploy.
+
 ## Agent-loop follow-ups (found during 2026-06-08 dogfood)
 
 - [x] Issue/MR comments interrupt the agent nursing them (tatara-operator#25):

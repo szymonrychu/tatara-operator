@@ -509,8 +509,9 @@ func listBrainstormTasks(t *testing.T, project string) []tatarav1alpha1.Task {
 	return out
 }
 
-// TestBrainstorm_UnderCap_CreatesOnePerRepo: 2 repos, 0 proposals each -> 2 brainstorm tasks.
-func TestBrainstorm_UnderCap_CreatesOnePerRepo(t *testing.T) {
+// TestBrainstorm_UnderCap_CreatesOneProjectTask: 2 repos, 0 proposals each ->
+// exactly ONE brainstorm task (project-level, not per-repo).
+func TestBrainstorm_UnderCap_CreatesOneProjectTask(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "bs-undercap", []string{"o/a", "o/b"}, 3)
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
@@ -526,17 +527,9 @@ func TestBrainstorm_UnderCap_CreatesOnePerRepo(t *testing.T) {
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs)
 
 	tasks := listBrainstormTasks(t, "bs-undercap")
-	if len(tasks) != 2 {
-		t.Fatalf("want 2 brainstorm tasks (one per repo), got %d", len(tasks))
-	}
-	repoRefs := map[string]bool{}
-	for _, tk := range tasks {
-		repoRefs[tk.Spec.RepositoryRef] = true
-	}
-	for _, rp := range repos {
-		if !repoRefs[rp.Name] {
-			t.Fatalf("no brainstorm task for repo %s", rp.Name)
-		}
+	// Project-level: one task per cycle, not one per repo.
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 brainstorm task (project-level), got %d", len(tasks))
 	}
 }
 
@@ -603,8 +596,10 @@ func TestBrainstorm_InFlight_SkipsRepo(t *testing.T) {
 	}
 }
 
-// TestBrainstorm_ListErrorIsolatesRepo: reader error for repo A does not block repo B.
-func TestBrainstorm_ListErrorIsolatesRepo(t *testing.T) {
+// TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask: reader error for repo
+// E's backlog is non-fatal; the project task is still created with the
+// alphabetically-first sorted repo as primary (e before f).
+func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "bs-isolate", []string{"o/e", "o/f"}, 3)
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
@@ -621,22 +616,22 @@ func TestBrainstorm_ListErrorIsolatesRepo(t *testing.T) {
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs4)
 
 	tasks := listBrainstormTasks(t, "bs-isolate")
-	// Only repo f should get a task; repo e errored and was skipped.
+	// One project-level task is still created; the backlog error for e is non-fatal.
 	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task (for repo f only), got %d", len(tasks))
+		t.Fatalf("want 1 brainstorm task (backlog error non-fatal), got %d", len(tasks))
 	}
-	// Find repo for o/f
-	var repoF *tatarav1alpha1.Repository
+	// Primary repo is sorted-first by name: "bs-isolate-o-e" < "bs-isolate-o-f".
+	var repoE *tatarav1alpha1.Repository
 	for i := range repos {
-		if strings.Contains(repos[i].Spec.URL, "o/f") {
-			repoF = &repos[i]
+		if strings.Contains(repos[i].Spec.URL, "o/e") {
+			repoE = &repos[i]
 		}
 	}
-	if repoF == nil {
-		t.Fatal("could not find repo for o/f")
+	if repoE == nil {
+		t.Fatal("could not find repo for o/e")
 	}
-	if tasks[0].Spec.RepositoryRef != repoF.Name {
-		t.Fatalf("task RepositoryRef = %q, want %q", tasks[0].Spec.RepositoryRef, repoF.Name)
+	if tasks[0].Spec.RepositoryRef != repoE.Name {
+		t.Fatalf("primary repo = %q, want sorted-first %q", tasks[0].Spec.RepositoryRef, repoE.Name)
 	}
 }
 
