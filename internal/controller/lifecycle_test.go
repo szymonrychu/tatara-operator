@@ -1051,7 +1051,8 @@ func TestReconcileLifecycle_NoAnnotationDefaultsTriage(t *testing.T) {
 // ----- Task 2: Implement re-entry context prompt + field clear -----
 
 // TestLifecycleImplementPlanText_PlainWhenContextEmpty verifies that when
-// ImplementContext is empty the prompt is the plain planTurnText output.
+// ImplementContext is empty the prompt contains the base planTurnText and the
+// hard decline_implementation instruction but no re-entry block.
 func TestLifecycleImplementPlanText_PlainWhenContextEmpty(t *testing.T) {
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "task-plain", Namespace: testNS},
@@ -1062,9 +1063,15 @@ func TestLifecycleImplementPlanText_PlainWhenContextEmpty(t *testing.T) {
 		Status: tatarav1alpha1.TaskStatus{ImplementContext: ""},
 	}
 	got := implementPrompt(task)
-	want := planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)
-	if got != want {
-		t.Errorf("implementPrompt with empty context:\ngot:  %q\nwant: %q", got, want)
+	base := planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)
+	if !strings.Contains(got, base) {
+		t.Errorf("implementPrompt must contain base planTurnText; got: %q", got)
+	}
+	if !strings.Contains(got, "decline_implementation") {
+		t.Errorf("implementPrompt must contain decline_implementation instruction; got: %q", got)
+	}
+	if strings.Contains(got, "## Re-entry context") {
+		t.Errorf("implementPrompt with empty context must not contain re-entry block; got: %q", got)
 	}
 }
 
