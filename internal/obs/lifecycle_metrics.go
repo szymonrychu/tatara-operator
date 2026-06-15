@@ -76,15 +76,11 @@ func (m *LifecycleMetrics) TransitionTotal(from, to string) prometheus.Counter {
 	return m.transitionTotal.WithLabelValues(from, to)
 }
 
-// SetLifecycleState sets tatara_lifecycle_state{state} to n.
+// SetLifecycleState sets tatara_lifecycle_state{state} to n. This is the only
+// writer of the gauge: ProjectReconciler.updateLifecycleStateCounts recomputes
+// every state from authoritative cluster state on each Project reconcile.
 func (m *LifecycleMetrics) SetLifecycleState(state string, n float64) {
 	m.lifecycleState.WithLabelValues(state).Set(n)
-}
-
-// AddLifecycleState adds delta to tatara_lifecycle_state{state}.
-// Use +1 when entering a state and -1 when leaving.
-func (m *LifecycleMetrics) AddLifecycleState(state string, delta float64) {
-	m.lifecycleState.WithLabelValues(state).Add(delta)
 }
 
 // RecordHandover increments tatara_lifecycle_handover_total.

@@ -30,6 +30,7 @@ type ProjectReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	Metrics             *obs.OperatorMetrics
+	LifecycleMetrics    *obs.LifecycleMetrics
 	ExternalWebhookBase string
 	MemoryConfig        memory.Config
 	// ReaderFor returns a token-bound scm.SCMReader for a provider name and token.
@@ -85,6 +86,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	r.updateMemoryStackCounts(ctx)
+	r.updateLifecycleStateCounts(ctx)
 
 	scanRequeue, scanErr := r.runScans(ctx, &project)
 	if scanErr != nil {
@@ -146,6 +148,44 @@ func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 		}
 	}
 	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed)
+}
+
+// lifecycleStates is the full set of issueLifecycle states the
+// tatara_lifecycle_state gauge tracks. updateLifecycleStateCounts Sets every one
+// each pass (including 0 for drained states) so a state that empties out reads 0
+// rather than retaining its last value.
+var lifecycleStates = []string{
+	"Triage", "Implement", "Conversation", "MRCI", "Merge", "MainCI",
+	"Done", "Stopped", "Parked",
+}
+
+// updateLifecycleStateCounts recomputes tatara_lifecycle_state from authoritative
+// cluster state: it lists every issueLifecycle Task, counts them by
+// Status.LifecycleState, and Sets the gauge for all known states (zeros
+// included). This is the sole writer of the gauge; it is restart-safe and
+// terminal-safe, unlike the per-transition deltas it replaced, and mirrors
+// updateMemoryStackCounts. Tasks of other Kinds carry an empty LifecycleState and
+// are naturally excluded; the explicit Kind filter guards against ever emitting a
+// state="" series.
+func (r *ProjectReconciler) updateLifecycleStateCounts(ctx context.Context) {
+	if r.LifecycleMetrics == nil {
+		return
+	}
+	var list tataradevv1alpha1.TaskList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	counts := make(map[string]int, len(lifecycleStates))
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.Kind != "issueLifecycle" || t.Status.LifecycleState == "" {
+			continue
+		}
+		counts[t.Status.LifecycleState]++
+	}
+	for _, state := range lifecycleStates {
+		r.LifecycleMetrics.SetLifecycleState(state, float64(counts[state]))
+	}
 }
 
 // validateSecret returns the condition (reason, message, ready) for the

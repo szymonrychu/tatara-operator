@@ -167,11 +167,11 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 
 	if r.LifecycleMetrics != nil {
 		r.LifecycleMetrics.RecordTransition(from, to)
-		// Track live task counts per state via delta adjustments on the gauge.
-		if from != "" {
-			r.LifecycleMetrics.AddLifecycleState(from, -1)
-		}
-		r.LifecycleMetrics.AddLifecycleState(to, 1)
+		// The tatara_lifecycle_state gauge is NOT maintained by deltas here: it is
+		// recomputed from authoritative cluster state by
+		// ProjectReconciler.updateLifecycleStateCounts. Delta maintenance drifted on
+		// restart (from-series went negative) and never decremented GC'd terminal
+		// Tasks; the periodic list-and-Set is the single source of truth.
 	}
 
 	task.Status.LifecycleState = to
