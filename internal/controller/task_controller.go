@@ -81,6 +81,14 @@ type TaskReconciler struct {
 func isTerminal(phase string) bool { return phase == "Succeeded" || phase == "Failed" }
 func isActive(phase string) bool   { return phase == "Planning" || phase == "Running" }
 
+// isFieldSelectorUnsupported reports whether a list error is "field label not
+// supported", which happens when a direct (non-cached) client is used without a
+// registered field index. In that case callers fall back to a full-namespace scan
+// with in-Go filtering.
+func isFieldSelectorUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "field label not supported")
+}
+
 // taskActive reports whether a Task occupies a concurrency slot: an active
 // phase (Planning/Running) that has NOT entered a terminal lifecycle state. A
 // Task Parked at maxIterations keeps a stale Planning phase; counting it by
@@ -287,39 +295,73 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 }
 
 // atConcurrencyCap reports whether the Project already has maxConcurrentTasks
-// active Tasks, excluding self.
+// active Tasks, excluding self. Uses the cached field index on spec.projectRef
+// when available (production: informer cache), falling back to a full-namespace
+// scan (tests: direct client without custom field indexes).
 func (r *TaskReconciler) atConcurrencyCap(ctx context.Context, project *tatarav1alpha1.Project, self string) (bool, error) {
 	max := project.Spec.MaxConcurrentTasks
 	if max <= 0 {
 		max = 3
 	}
 	var list tatarav1alpha1.TaskList
-	if err := r.List(ctx, &list, client.InNamespace(project.Namespace)); err != nil {
+	err := r.List(ctx, &list,
+		client.InNamespace(project.Namespace),
+		client.MatchingFields{taskIndexProjectRef: project.Name},
+	)
+	if err != nil && isFieldSelectorUnsupported(err) {
+		// Fall back to full scan (direct client in tests, no field index registered).
+		err = r.List(ctx, &list, client.InNamespace(project.Namespace))
+		if err != nil {
+			return false, fmt.Errorf("list tasks: %w", err)
+		}
+		active := 0
+		for i := range list.Items {
+			it := list.Items[i]
+			if it.Spec.ProjectRef == project.Name && it.Name != self && taskActive(&it) {
+				active++
+			}
+		}
+		return active >= max, nil
+	}
+	if err != nil {
 		return false, fmt.Errorf("list tasks: %w", err)
 	}
 	active := 0
 	for i := range list.Items {
 		it := list.Items[i]
-		if it.Spec.ProjectRef == project.Name && it.Name != self && taskActive(&it) {
+		if it.Name != self && taskActive(&it) {
 			active++
 		}
 	}
 	return active >= max, nil
 }
 
-// projectRepos returns all Repositories belonging to a Project.
+// projectRepos returns all Repositories belonging to a Project. Uses the
+// cached field index on spec.projectRef when available, falling back to
+// a full-namespace scan for direct clients (tests).
 func (r *TaskReconciler) projectRepos(ctx context.Context, project *tatarav1alpha1.Project) ([]tatarav1alpha1.Repository, error) {
 	var list tatarav1alpha1.RepositoryList
-	if err := r.List(ctx, &list, client.InNamespace(project.Namespace)); err != nil {
+	err := r.List(ctx, &list,
+		client.InNamespace(project.Namespace),
+		client.MatchingFields{taskIndexRepositoryRef: project.Name},
+	)
+	if err != nil && isFieldSelectorUnsupported(err) {
+		err = r.List(ctx, &list, client.InNamespace(project.Namespace))
+		if err != nil {
+			return nil, fmt.Errorf("list repositories: %w", err)
+		}
+		out := list.Items[:0]
+		for i := range list.Items {
+			if list.Items[i].Spec.ProjectRef == project.Name {
+				out = append(out, list.Items[i])
+			}
+		}
+		return out, nil
+	}
+	if err != nil {
 		return nil, fmt.Errorf("list repositories: %w", err)
 	}
-	var out []tatarav1alpha1.Repository
-	for i := range list.Items {
-		if list.Items[i].Spec.ProjectRef == project.Name {
-			out = append(out, list.Items[i])
-		}
-	}
-	return out, nil
+	return list.Items, nil
 }
 
 // ensurePodAndService creates the wrapper Pod+Service if absent. For an
@@ -375,16 +417,18 @@ func taskHasInflightTurn(task *tatarav1alpha1.Task) bool {
 }
 
 func (r *TaskReconciler) bumpRecreations(ctx context.Context, task *tatarav1alpha1.Task) error {
-	fresh := &tatarav1alpha1.Task{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-		return fmt.Errorf("reload task for recreation bump: %w", err)
-	}
-	if fresh.Annotations == nil {
-		fresh.Annotations = map[string]string{}
-	}
-	n, _ := strconv.Atoi(fresh.Annotations[annPodRecreations])
-	fresh.Annotations[annPodRecreations] = strconv.Itoa(n + 1)
-	return r.Update(ctx, fresh)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		n, _ := strconv.Atoi(fresh.Annotations[annPodRecreations])
+		fresh.Annotations[annPodRecreations] = strconv.Itoa(n + 1)
+		return r.Update(ctx, fresh)
+	})
 }
 
 // podReady reports whether the wrapper Pod has the Ready condition true.
@@ -427,9 +471,16 @@ func bootCrashReason(pod *corev1.Pod) string {
 	return ""
 }
 
-// bootDeadlineExceeded reports whether a not-yet-Ready pod has been alive longer
-// than agentBootDeadline without becoming Ready (readiness-never-true wedge).
+// bootDeadlineExceeded reports whether a not-yet-Ready pod has exceeded
+// agentBootDeadline without becoming Ready. The deadline is anchored to
+// pod.Status.StartTime (when the container runtime started the pod) so that
+// image-pull and scheduling latency do not consume the readiness window.
+// Falls back to CreationTimestamp only when StartTime has not been set yet
+// (e.g. the pod is still being scheduled).
 func bootDeadlineExceeded(pod *corev1.Pod) bool {
+	if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
+		return time.Since(pod.Status.StartTime.Time) > agentBootDeadline
+	}
 	if pod.CreationTimestamp.IsZero() {
 		return false
 	}
@@ -558,13 +609,13 @@ func (r *TaskReconciler) stampUnreachableSince(ctx context.Context, task *tatara
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
 		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
 		if cur := fresh.Annotations[annAgentUnreachableSince]; cur != "" {
 			if _, perr := time.Parse(time.RFC3339, cur); perr == nil {
 				return nil
 			}
-		}
-		if fresh.Annotations == nil {
-			fresh.Annotations = map[string]string{}
 		}
 		fresh.Annotations[annAgentUnreachableSince] = now
 		return r.Update(ctx, fresh)
@@ -575,6 +626,7 @@ func (r *TaskReconciler) stampUnreachableSince(ctx context.Context, task *tatara
 // Subtask per delivered turn-complete callback. planText is the turn-0 prompt;
 // callers supply it so lifecycle states can inject their own prompts.
 func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, planText string) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
 	baseURL := agent.BaseURL(task, task.Namespace)
 	cbURL := strings.TrimSuffix(r.PodConfig.CallbackURL, "/") + "/internal/turn-complete"
 
@@ -582,13 +634,19 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	// No turn yet -> submit the plan turn (turn 0).
 	if current == "" {
+		t0 := time.Now()
 		id, err := r.Session.SubmitTurn(ctx, baseURL, planText, cbURL)
+		elapsed := time.Since(t0).Seconds()
 		if err != nil {
+			r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
 			if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
 				return res, herr
 			}
 			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
 		}
+		r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
+		l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
+			"turn_id", id, "subtask", "", "duration_ms", int64(elapsed*1000))
 		res, err := r.recordTurn(ctx, task, id, "")
 		if err != nil {
 			return ctrl.Result{}, err
@@ -635,29 +693,46 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 			fmt.Sprintf("reached turn cap %d", turnCap(project, task)))
 	}
 
-	// Pick the next Pending Subtask.
+	// Pick the next Pending Subtask. Uses the field index when available
+	// (production cached client), falls back to full scan for direct clients (tests).
 	var subs tatarav1alpha1.SubtaskList
-	if err := r.List(ctx, &subs, client.InNamespace(task.Namespace)); err != nil {
-		return ctrl.Result{}, fmt.Errorf("list subtasks: %w", err)
-	}
-	mine := make([]tatarav1alpha1.Subtask, 0, len(subs.Items))
-	for i := range subs.Items {
-		if subs.Items[i].Spec.TaskRef == task.Name {
-			mine = append(mine, subs.Items[i])
+	subErr := r.List(ctx, &subs,
+		client.InNamespace(task.Namespace),
+		client.MatchingFields{subtaskIndexTaskRef: task.Name},
+	)
+	if subErr != nil && isFieldSelectorUnsupported(subErr) {
+		var allSubs tatarav1alpha1.SubtaskList
+		if subErr = r.List(ctx, &allSubs, client.InNamespace(task.Namespace)); subErr != nil {
+			return ctrl.Result{}, fmt.Errorf("list subtasks: %w", subErr)
 		}
+		mine := allSubs.Items[:0]
+		for i := range allSubs.Items {
+			if allSubs.Items[i].Spec.TaskRef == task.Name {
+				mine = append(mine, allSubs.Items[i])
+			}
+		}
+		subs.Items = mine
+	} else if subErr != nil {
+		return ctrl.Result{}, fmt.Errorf("list subtasks: %w", subErr)
 	}
-	next, ok := nextPendingSubtask(mine)
+	next, ok := nextPendingSubtask(subs.Items)
 	if !ok {
 		return r.terminate(ctx, task, "Succeeded", "NoPendingSubtasks", "all subtasks complete")
 	}
 
+	t0 := time.Now()
 	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task), task.Name), cbURL)
+	elapsed := time.Since(t0).Seconds()
 	if err != nil {
+		r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
 		if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
 			return res, herr
 		}
 		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
 	}
+	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
+	l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
+		"turn_id", id, "subtask", next.Name, "duration_ms", int64(elapsed*1000))
 	if next.Status.Phase != "Running" {
 		next.Status.Phase = "Running"
 		if err := r.Status().Update(ctx, next); err != nil {
@@ -684,27 +759,40 @@ func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
 
 // recordTurn writes the in-flight turn id + executing subtask onto the Task,
 // clears the turn-complete marker, and bumps turnsCompleted when a turn closed.
+// Both the metadata update and the status increment are wrapped in
+// RetryOnConflict: the callback server writes the same Task's annotations and
+// status subresource concurrently, so plain updates race and lose the increment.
 func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Task, turnID, subtaskName string) (ctrl.Result, error) {
-	fresh := &tatarav1alpha1.Task{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-		return ctrl.Result{}, fmt.Errorf("reload task: %w", err)
-	}
-	if fresh.Annotations == nil {
-		fresh.Annotations = map[string]string{}
-	}
-	hadCallback := fresh.Annotations[annTurnComplete] != ""
-	fresh.Annotations[annCurrentTurn] = turnID
-	fresh.Annotations[annCurrentSubtask] = subtaskName
-	fresh.Annotations[annTurnStartedAt] = time.Now().UTC().Format(time.RFC3339)
-	delete(fresh.Annotations, annTurnComplete)
-	delete(fresh.Annotations, annAgentUnreachableSince)
-	delete(fresh.Annotations, annBootCrashAttempts)
-	if err := r.Update(ctx, fresh); err != nil {
+	startedAt := time.Now().UTC().Format(time.RFC3339)
+	var hadCallback bool
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		hadCallback = fresh.Annotations[annTurnComplete] != ""
+		fresh.Annotations[annCurrentTurn] = turnID
+		fresh.Annotations[annCurrentSubtask] = subtaskName
+		fresh.Annotations[annTurnStartedAt] = startedAt
+		delete(fresh.Annotations, annTurnComplete)
+		delete(fresh.Annotations, annAgentUnreachableSince)
+		delete(fresh.Annotations, annBootCrashAttempts)
+		return r.Update(ctx, fresh)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
 	}
 	if hadCallback {
-		fresh.Status.TurnsCompleted++
-		if err := r.Status().Update(ctx, fresh); err != nil {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+				return err
+			}
+			fresh.Status.TurnsCompleted++
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("record turns completed: %w", err)
 		}
 	}
@@ -712,21 +800,25 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 }
 
 // markSubtaskDone sets a Subtask Done, recording the turn id (its result is
-// written by the callback before this reconcile runs).
+// written by the callback before this reconcile runs). Wrapped in
+// RetryOnConflict because the callback's recordResult writes the same
+// Subtask's status subresource concurrently and may race the reconcile.
 func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, name, turnID string) error {
-	st := &tatarav1alpha1.Subtask{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: taskNamespace, Name: name}, st); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		st := &tatarav1alpha1.Subtask{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: taskNamespace, Name: name}, st); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("get subtask %s: %w", name, err)
 		}
-		return fmt.Errorf("get subtask %s: %w", name, err)
-	}
-	st.Status.Phase = "Done"
-	st.Status.TurnID = turnID
-	if err := r.Status().Update(ctx, st); err != nil {
-		return fmt.Errorf("mark subtask done: %w", err)
-	}
-	return nil
+		st.Status.Phase = "Done"
+		st.Status.TurnID = turnID
+		if err := r.Status().Update(ctx, st); err != nil {
+			return fmt.Errorf("mark subtask done: %w", err)
+		}
+		return nil
+	})
 }
 
 // deriveResultSummary fills task.Status.ResultSummary from Done subtasks when
@@ -763,6 +855,11 @@ func (r *TaskReconciler) deriveResultSummary(ctx context.Context, task *tatarav1
 
 // terminate ends the Task: set phase, record turns, delete the wrapper
 // session + Pod + Service, and leave the M5 write-back hook marker.
+// The terminal status write is wrapped in RetryOnConflict: by the time
+// terminate runs, the callback server may have updated the Task's status
+// (CumulativeTokens, LastTurnInputTokens), bumping the resourceVersion.
+// Every other terminal-state transition must win despite the concurrent write,
+// and the teardown (deleteWrapper) above is idempotent so a retry is safe.
 func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Task, phase, reason, msg string) (ctrl.Result, error) {
 	baseURL := agent.BaseURL(task, task.Namespace)
 	if err := r.Session.DeleteSession(ctx, baseURL); err != nil {
@@ -780,21 +877,36 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	if phase == "Succeeded" {
 		r.deriveResultSummary(ctx, task)
 	}
-	task.Status.Phase = phase
-	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-		Type: "Ready", Status: metav1.ConditionTrue, Reason: reason, Message: msg,
-		ObservedGeneration: task.Generation,
-	})
-	// M5 write-back hook: the SCM PR/MR + issue comment path keys off this
-	// condition. M4 only sets it; M5 clears it once the change is landed.
-	if phase == "Succeeded" {
-		apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-			Type: "WritebackPending", Status: metav1.ConditionTrue,
-			Reason: "AwaitingM5", Message: "agent run complete; SCM write-back handled in M5",
-			ObservedGeneration: task.Generation,
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		// Carry over any ResultSummary derived before the retry.
+		if task.Status.ResultSummary != "" && fresh.Status.ResultSummary == "" {
+			fresh.Status.ResultSummary = task.Status.ResultSummary
+		}
+		// Preserve any SessionDeleteFailed condition set above.
+		for _, c := range task.Status.Conditions {
+			if c.Type == "SessionDeleteFailed" {
+				apimeta.SetStatusCondition(&fresh.Status.Conditions, c)
+			}
+		}
+		fresh.Status.Phase = phase
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type: "Ready", Status: metav1.ConditionTrue, Reason: reason, Message: msg,
+			ObservedGeneration: fresh.Generation,
 		})
-	}
-	if err := r.Status().Update(ctx, task); err != nil {
+		if phase == "Succeeded" {
+			apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+				Type: "WritebackPending", Status: metav1.ConditionTrue,
+				Reason: "AwaitingM5", Message: "agent run complete; SCM write-back handled in M5",
+				ObservedGeneration: fresh.Generation,
+			})
+		}
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set terminal status: %w", err)
 	}
 	r.updateInflightGauge(ctx)
@@ -851,9 +963,61 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	}
 }
 
+// taskIndexProjectRef is the field index key for Task.Spec.ProjectRef.
+const taskIndexProjectRef = ".spec.projectRef"
+
+// taskIndexRepositoryRef is the field index key for Task.Spec.RepositoryRef.
+const taskIndexRepositoryRef = ".spec.repositoryRef"
+
+// subtaskIndexTaskRef is the field index key for Subtask.Spec.TaskRef.
+const subtaskIndexTaskRef = ".spec.taskRef"
+
+// registerFieldIndexes registers the field indexes required by TaskReconciler
+// so hot-path list operations are O(matching) against the informer cache
+// rather than O(all-tasks). Called from SetupWithManager and in test suites
+// that start a manager.
+func (r *TaskReconciler) registerFieldIndexes(idx client.FieldIndexer) error {
+	if err := idx.IndexField(context.Background(), &tatarav1alpha1.Task{}, taskIndexProjectRef,
+		func(obj client.Object) []string {
+			t := obj.(*tatarav1alpha1.Task)
+			if t.Spec.ProjectRef == "" {
+				return nil
+			}
+			return []string{t.Spec.ProjectRef}
+		}); err != nil {
+		return fmt.Errorf("index Task.spec.projectRef: %w", err)
+	}
+	if err := idx.IndexField(context.Background(), &tatarav1alpha1.Repository{}, taskIndexRepositoryRef,
+		func(obj client.Object) []string {
+			repo := obj.(*tatarav1alpha1.Repository)
+			if repo.Spec.ProjectRef == "" {
+				return nil
+			}
+			return []string{repo.Spec.ProjectRef}
+		}); err != nil {
+		return fmt.Errorf("index Repository.spec.projectRef: %w", err)
+	}
+	if err := idx.IndexField(context.Background(), &tatarav1alpha1.Subtask{}, subtaskIndexTaskRef,
+		func(obj client.Object) []string {
+			st := obj.(*tatarav1alpha1.Subtask)
+			if st.Spec.TaskRef == "" {
+				return nil
+			}
+			return []string{st.Spec.TaskRef}
+		}); err != nil {
+		return fmt.Errorf("index Subtask.spec.taskRef: %w", err)
+	}
+	return nil
+}
+
 // SetupWithManager registers the Task reconciler, watching Tasks and the
-// Pods/Services it owns.
+// Pods/Services it owns, and registers field indexers so hot-path list
+// operations (atConcurrencyCap, projectRepos, subtask listing) are
+// O(matching) against the cache rather than O(all-tasks).
 func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := r.registerFieldIndexes(mgr.GetFieldIndexer()); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tatarav1alpha1.Task{}).
 		Owns(&corev1.Pod{}).
