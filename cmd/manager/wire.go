@@ -49,7 +49,7 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 		IngesterImage:    cfg.IngesterImage,
 		OIDCIssuer:       cfg.OIDCIssuer,
 		OIDCClientID:     cfg.OperatorOIDCClientID,
-		OIDCClientSecret: cfg.OperatorOIDCClientSecret,
+		OIDCSecretName:   cfg.OperatorOIDCSecretName,
 		OIDCAudience:     memoryAudience,
 		Namespace:        cfg.Namespace,
 		ImagePullSecret:  cfg.ImagePullSecret,

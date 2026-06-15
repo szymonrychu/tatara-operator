@@ -78,6 +78,7 @@ OPENAI_SECRET_NAME: {{ .Values.openaiSecretName | quote }}
 INGESTER_IMAGE: {{ .Values.ingesterImage | quote }}
 EXTERNAL_WEBHOOK_BASE: {{ .Values.externalWebhookBase | quote }}
 OPERATOR_OIDC_CLIENT_ID: {{ .Values.operatorOidcClientId | quote }}
+OPERATOR_OIDC_SECRET_NAME: {{ default (include "tatara-operator.fullname" .) .Values.operatorOidcSecretName | quote }}
 ANTHROPIC_SECRET_NAME: {{ .Values.anthropicSecretName | quote }}
 CLI_OIDC_SECRET_NAME: {{ .Values.cliOidcSecretName | quote }}
 IMAGE_PULL_SECRET: {{ .Values.imagePullSecret | quote }}

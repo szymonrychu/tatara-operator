@@ -38,16 +38,21 @@ type Config struct {
 	ExternalWebhookBase      string
 	OperatorOIDCClientID     string
 	OperatorOIDCClientSecret string
-	AnthropicSecretName      string
-	CLIOIDCSecretName        string
-	ImagePullSecret          string
-	Namespace                string
-	LogLevel                 string
-	IngressHost              string
-	IngressClassName         string
-	MemoryPathPrefix         string
-	ChatPathPrefix           string
-	ChatImage                string
+	// OperatorOIDCSecretName is the name of the Kubernetes Secret that holds
+	// OPERATOR_OIDC_CLIENT_SECRET. Ingest Jobs source the OIDC client secret
+	// via SecretKeyRef from this Secret rather than embedding the plaintext
+	// value in the Job spec.
+	OperatorOIDCSecretName string
+	AnthropicSecretName    string
+	CLIOIDCSecretName      string
+	ImagePullSecret        string
+	Namespace              string
+	LogLevel               string
+	IngressHost            string
+	IngressClassName       string
+	MemoryPathPrefix       string
+	ChatPathPrefix         string
+	ChatImage              string
 	// LeaderElection guards against two managers reconciling concurrently
 	// during a rolling-update surge. Defaults on; set LEADER_ELECTION=false
 	// for envtest/local single-process runs.
@@ -119,6 +124,7 @@ func Load() (Config, error) {
 		ExternalWebhookBase:      os.Getenv("EXTERNAL_WEBHOOK_BASE"),
 		OperatorOIDCClientID:     os.Getenv("OPERATOR_OIDC_CLIENT_ID"),
 		OperatorOIDCClientSecret: os.Getenv("OPERATOR_OIDC_CLIENT_SECRET"),
+		OperatorOIDCSecretName:   os.Getenv("OPERATOR_OIDC_SECRET_NAME"),
 		AnthropicSecretName:      os.Getenv("ANTHROPIC_SECRET_NAME"),
 		CLIOIDCSecretName:        os.Getenv("CLI_OIDC_SECRET_NAME"),
 		ImagePullSecret:          os.Getenv("IMAGE_PULL_SECRET"),

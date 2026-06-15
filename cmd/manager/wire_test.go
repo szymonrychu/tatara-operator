@@ -48,20 +48,20 @@ func TestPodConfigFromConfig_HealthAddrDistinctFromInternalAddr(t *testing.T) {
 
 func TestIngestConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
-		IngesterImage:            "img:1",
-		OIDCIssuer:               "https://kc/realms/t",
-		OperatorOIDCClientID:     "tatara-operator",
-		OperatorOIDCClientSecret: "secret",
-		Namespace:                "tatara",
-		OpenAISecretName:         "tatara-openai",
-		SemanticModel:            "gpt-4o-mini",
+		IngesterImage:          "img:1",
+		OIDCIssuer:             "https://kc/realms/t",
+		OperatorOIDCClientID:   "tatara-operator",
+		OperatorOIDCSecretName: "tatara-operator",
+		Namespace:              "tatara",
+		OpenAISecretName:       "tatara-openai",
+		SemanticModel:          "gpt-4o-mini",
 	}
 	got := ingestConfigFromConfig(cfg, "tatara-memory")
 	want := ingest.Config{
 		IngesterImage:    "img:1",
 		OIDCIssuer:       "https://kc/realms/t",
 		OIDCClientID:     "tatara-operator",
-		OIDCClientSecret: "secret",
+		OIDCSecretName:   "tatara-operator",
 		OIDCAudience:     "tatara-memory",
 		Namespace:        "tatara",
 		OpenAISecretName: "tatara-openai",

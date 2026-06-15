@@ -30,6 +30,10 @@ openaiSecretName: ""
 ingesterImage: ""
 externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"
+# operatorOidcSecretName overrides the Secret that holds OPERATOR_OIDC_CLIENT_SECRET.
+# Defaults to the release fullname (the Secret rendered by secret.yaml). Set when
+# using an externally-managed Secret that differs from existingSecret.
+operatorOidcSecretName: ""
 anthropicSecretName: ""
 cliOidcSecretName: ""
 # imagePullSecret is cluster-specific (rule 14); set via infra helmfile values.
