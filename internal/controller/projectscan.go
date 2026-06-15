@@ -1072,9 +1072,16 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 	return n, nil
 }
 
-// hasNonTerminalTaskForIssue reports whether any open (non-terminal) Task exists
-// for (slug, number) in the snapshot.
-func hasNonTerminalTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
+// hasLiveLifecycleTaskForIssue reports whether any non-terminal Task exists for
+// (slug, number) in the snapshot, counting Conversation (human-blocked) Tasks
+// too. recoverOrphans uses this rather than taskOpen-based counting: a
+// Conversation lifecycle Task still owns the issue's pod name, so spawning a
+// second lifecycle Task for the same issue collides on the pod and wedges the
+// new Task in Planning forever. Dedup must keep at most one live lifecycle Task
+// per (repo, issue) regardless of whether that Task currently holds a
+// concurrency slot (which is what taskOpen answers, and why Conversation is
+// excluded there).
+func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
 	repoLabel := sanitizeRepoLabel(slug)
 	numLabel := strconv.Itoa(number)
 	for i := range existing {
@@ -1082,9 +1089,10 @@ func hasNonTerminalTaskForIssue(existing []tatarav1alpha1.Task, slug string, num
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		if taskOpen(t) {
-			return true
+		if isTerminal(t.Status.Phase) || isLifecycleTerminal(t.Status.LifecycleState) {
+			continue
 		}
+		return true
 	}
 	return false
 }
@@ -1135,7 +1143,7 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			default:
 				continue
 			}
-			if hasNonTerminalTaskForIssue(existing, slug, iss.Number) {
+			if hasLiveLifecycleTaskForIssue(existing, slug, iss.Number) {
 				continue
 			}
 			if *budget <= 0 {

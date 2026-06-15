@@ -207,8 +207,24 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 	}
 	for i := range list.Items {
 		task := &list.Items[i]
+		if isTerminal(task.Status.Phase) {
+			continue
+		}
 		turn := task.Annotations[annCurrentTurn]
-		if turn == "" || isTerminal(task.Status.Phase) || task.Annotations[annTurnComplete] != "" {
+		if turn == "" {
+			// Spawn watchdog: a Task wedged in Planning with no in-flight turn
+			// can never time out via the turn backstop (that needs a
+			// turn-started-at). Fail it once past the stall deadline so the
+			// lifecycle-orphan sweep can re-pick the issue cleanly.
+			if s.isPlanningStalled(task) {
+				s.Metrics.TurnTimeout("planning_watchdog")
+				l.Info("task stalled in Planning with no turn; failing via spawn watchdog",
+					"action", "planning_watchdog", "task", task.Name)
+				_ = s.expireStalledPlanning(ctx, task)
+			}
+			continue
+		}
+		if task.Annotations[annTurnComplete] != "" {
 			continue
 		}
 
@@ -283,6 +299,49 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 		Status:             metav1.ConditionTrue,
 		Reason:             "TurnTimeout",
 		Message:            fmt.Sprintf("turn %s exceeded timeout", turn),
+		ObservedGeneration: fresh.Generation,
+	})
+	return s.Client.Status().Update(ctx, fresh)
+}
+
+// isPlanningStalled reports whether a Task has been in Planning past the stall
+// deadline without acquiring a turn. Returns false on any missing/unparseable
+// signal (safe default), or when the Task is not in Planning.
+func (s *CallbackServer) isPlanningStalled(task *tatarav1alpha1.Task) bool {
+	if task.Status.Phase != "Planning" {
+		return false
+	}
+	raw := task.Annotations[annPlanningSince]
+	if raw == "" {
+		return false
+	}
+	since, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return false
+	}
+	return time.Now().After(since.Add(planningStallDeadline))
+}
+
+// expireStalledPlanning fails a Task wedged in Planning. It only sets the Task
+// phase: unlike expireTimedOutTurn it does NOT delete the Pod/Service, because a
+// duplicate Task shares the live Task's pod name and deleting by name would kill
+// the live agent's pod. The orphan reaper correlates pods to Tasks by UID and
+// reaps this Task's own pod (if any) once it is terminal. The pre-write re-Get
+// guards against racing the reconcile that may have advanced the Task meanwhile.
+func (s *CallbackServer) expireStalledPlanning(ctx context.Context, task *tatarav1alpha1.Task) error {
+	fresh := &tatarav1alpha1.Task{}
+	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+		return err
+	}
+	if fresh.Status.Phase != "Planning" || fresh.Annotations[annCurrentTurn] != "" {
+		return nil // advanced since we observed it
+	}
+	fresh.Status.Phase = "Failed"
+	apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		Reason:             "PlanningStalled",
+		Message:            fmt.Sprintf("stuck in Planning with no turn past %s", planningStallDeadline),
 		ObservedGeneration: fresh.Generation,
 	})
 	return s.Client.Status().Update(ctx, fresh)
