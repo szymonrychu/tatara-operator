@@ -75,7 +75,15 @@ func isActive(phase string) bool   { return phase == "Planning" || phase == "Run
 // phase (Planning/Running) that has NOT entered a terminal lifecycle state. A
 // Task Parked at maxIterations keeps a stale Planning phase; counting it by
 // phase alone (without the lifecycle check) deadlocks the concurrency cap.
+//
+// Conversation (awaiting-human) is excluded for the same reason taskOpen
+// excludes it from the creation budget: a task blocked on human input is
+// externally gated and must not pinch the concurrency cap for autonomous work
+// (brainstorm/implement). This keeps atConcurrencyCap aligned with taskOpen.
 func taskActive(t *tatarav1alpha1.Task) bool {
+	if t.Status.LifecycleState == "Conversation" {
+		return false
+	}
 	return isActive(t.Status.Phase) && !isLifecycleTerminal(t.Status.LifecycleState)
 }
 

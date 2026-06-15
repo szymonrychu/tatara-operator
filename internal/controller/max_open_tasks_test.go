@@ -65,6 +65,10 @@ func TestTaskActive_ExcludesTerminalLifecycle(t *testing.T) {
 		{"Running", "Parked", false},
 		{"Running", "Done", false},
 		{"Running", "Stopped", false},
+		// Conversation = awaiting-human; externally gated, must NOT occupy a
+		// concurrency slot (aligns atConcurrencyCap with taskOpen / creation budget).
+		{"Running", "Conversation", false},
+		{"Planning", "Conversation", false},
 	}
 	for _, tc := range cases {
 		tk := &tatarav1alpha1.Task{}
