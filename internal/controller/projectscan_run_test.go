@@ -123,6 +123,43 @@ func TestIssueScan_PerRepoTopUp(t *testing.T) {
 	}
 }
 
+func TestIssueScan_PropagatesAuthorToTaskSource(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
+	proj, _ := seedScanProject(t, "iss-author", cron)
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, "iss-author", "iss-author-a", "https://github.com/o/a.git"),
+	}
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/a", Number: 1, Author: "third-party-dev", UpdatedAt: time.Unix(100, 0)},
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	b := 99
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
+	tasks := listScanTasks(t, "iss-author")
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 task, got %d", len(tasks))
+	}
+	src := tasks[0].Spec.Source
+	if src == nil || src.AuthorLogin != "third-party-dev" {
+		t.Fatalf("want Source.AuthorLogin=third-party-dev, got %+v", src)
+	}
+}
+
+func TestCandidatesFromIssues_CarriesAuthor(t *testing.T) {
+	cands := candidatesFromIssues([]scm.IssueRef{
+		{Repo: "o/a", Number: 1, Author: "alice"},
+		{Repo: "o/a", Number: 2, Author: "bob", IsPR: true}, // dropped
+	})
+	if len(cands) != 1 {
+		t.Fatalf("want 1 candidate (PR dropped), got %d", len(cands))
+	}
+	if cands[0].author != "alice" {
+		t.Fatalf("want candidate author=alice, got %q", cands[0].author)
+	}
+}
+
 func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "fanout-hold", cron)

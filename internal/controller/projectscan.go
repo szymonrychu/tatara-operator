@@ -356,7 +356,7 @@ func candidatesFromIssues(iss []scm.IssueRef) []candidate {
 			continue
 		}
 		out = append(out, candidate{
-			repo: i.Repo, number: i.Number, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
 		})
 	}
 	return out

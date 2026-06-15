@@ -21,9 +21,12 @@ type ghPR struct {
 }
 
 type ghIssueItem struct {
-	Number      int       `json:"number"`
-	Title       string    `json:"title"`
-	Body        string    `json:"body"`
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
+	User   struct {
+		Login string `json:"login"`
+	} `json:"user"`
 	Labels      []ghLabel `json:"labels"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	PullRequest *struct {
@@ -69,7 +72,7 @@ func (c *GitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	out := make([]IssueRef, 0, len(raw))
 	for _, i := range raw {
 		out = append(out, IssueRef{
-			Repo: slug, Number: i.Number, Title: i.Title, Labels: ghLabelNames(i.Labels),
+			Repo: slug, Number: i.Number, Title: i.Title, Author: i.User.Login, Labels: ghLabelNames(i.Labels),
 			UpdatedAt: i.UpdatedAt, IsPR: i.PullRequest != nil,
 		})
 	}

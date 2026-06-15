@@ -20,8 +20,11 @@ type glMR struct {
 }
 
 type glIssueItem struct {
-	IID       int       `json:"iid"`
-	Title     string    `json:"title"`
+	IID    int    `json:"iid"`
+	Title  string `json:"title"`
+	Author struct {
+		Username string `json:"username"`
+	} `json:"author"`
 	Labels    []string  `json:"labels"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -55,7 +58,7 @@ func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	out := make([]IssueRef, 0, len(raw))
 	for _, i := range raw {
 		out = append(out, IssueRef{
-			Repo: proj, Number: i.IID, Title: i.Title, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false,
+			Repo: proj, Number: i.IID, Title: i.Title, Author: i.Author.Username, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false,
 		})
 	}
 	return out, nil
