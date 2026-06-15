@@ -65,34 +65,42 @@ func getDefault(key, def string) string {
 	return def
 }
 
-func getDurationDefault(key string, def time.Duration) time.Duration {
+func getDurationDefault(key string, def time.Duration) (time.Duration, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return def, nil
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		return def
+		return 0, fmt.Errorf("config: %s=%q is not a valid duration: %w", key, v, err)
 	}
-	return d
+	return d, nil
 }
 
-func getBoolDefault(key string, def bool) bool {
+func getBoolDefault(key string, def bool) (bool, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return def, nil
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return def
+		return false, fmt.Errorf("config: %s=%q is not a valid bool: %w", key, v, err)
 	}
-	return b
+	return b, nil
 }
 
 // Load reads the operator configuration from the environment, applying
 // defaults for the listener addresses and log level. OIDC issuer and
 // audience are required.
 func Load() (Config, error) {
+	leaderElection, err := getBoolDefault("LEADER_ELECTION", true)
+	if err != nil {
+		return Config{}, err
+	}
+	pushMetricsTTL, err := getDurationDefault("PUSH_METRICS_TTL", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		HTTPAddr:                 getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:              getDefault("METRICS_ADDR", ":9090"),
@@ -117,12 +125,12 @@ func Load() (Config, error) {
 		Namespace:                getDefault("NAMESPACE", "tatara"),
 		LogLevel:                 getDefault("LOG_LEVEL", "info"),
 		IngressHost:              os.Getenv("INGRESS_HOST"),
-		IngressClassName:         getDefault("INGRESS_CLASS_NAME", "nginx"),
+		IngressClassName:         os.Getenv("INGRESS_CLASS_NAME"),
 		MemoryPathPrefix:         getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
 		ChatPathPrefix:           getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
-		LeaderElection:           getBoolDefault("LEADER_ELECTION", true),
-		PushMetricsTTL:           getDurationDefault("PUSH_METRICS_TTL", 5*time.Minute),
+		LeaderElection:           leaderElection,
+		PushMetricsTTL:           pushMetricsTTL,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

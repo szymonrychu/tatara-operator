@@ -140,3 +140,44 @@ func TestLoad_Defaults(t *testing.T) {
 			cfg.HealthAddr, cfg.InternalAddr)
 	}
 }
+
+// TestLoad_IngressClassNameDefaultEmpty asserts that when INGRESS_CLASS_NAME is
+// unset the field defaults to "" (let K8s use the cluster default IngressClass)
+// rather than hard-coding "nginx", which would violate hard rule 14.
+func TestLoad_IngressClassNameDefaultEmpty(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("INGRESS_CLASS_NAME", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.IngressClassName != "" {
+		t.Fatalf("IngressClassName default = %q, want \"\" (cluster default)", cfg.IngressClassName)
+	}
+}
+
+// TestLoad_MalformedLeaderElection asserts that a non-bool LEADER_ELECTION value
+// causes Load() to return an error rather than silently falling back to the default.
+func TestLoad_MalformedLeaderElection(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("LEADER_ELECTION", "yes") // not a valid bool
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for malformed LEADER_ELECTION=yes, got nil")
+	}
+}
+
+// TestLoad_MalformedPushMetricsTTL asserts that an invalid PUSH_METRICS_TTL value
+// causes Load() to return an error rather than silently falling back to the default.
+func TestLoad_MalformedPushMetricsTTL(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("PUSH_METRICS_TTL", "5minutes") // not a valid duration
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for malformed PUSH_METRICS_TTL=5minutes, got nil")
+	}
+}
