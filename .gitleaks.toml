@@ -1,0 +1,15 @@
+# gitleaks config for tatara-operator.
+#
+# Extends the default ruleset, then allowlists MEMORY.md. MEMORY.md is a
+# human/agent prose decision log (not code); its dense decision text trips
+# entropy/generic-api-key heuristics (e.g. a "KEY distinction kept: ..." phrase
+# flagged as generic-api-key). Those are false positives. Real secrets live in
+# code and remain fully scanned; the secscan CI job runs `gitleaks detect`.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "MEMORY.md is a prose decision log, not code - exclude it from secret scanning to avoid false positives on decision text."
+paths = [
+  '''MEMORY\.md''',
+]
