@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/config"
@@ -57,6 +58,17 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 	}
 }
 
+// newWebhookMux returns a chi.Mux pre-wired with the observability middleware
+// stack: RequestID (correlation) and Recoverer (panic -> 500 instead of
+// closed connection, satisfying hard rules 12 and 13). Routes are mounted by
+// the callers.
+func newWebhookMux() *chi.Mux {
+	mux := chi.NewRouter()
+	mux.Use(middleware.RequestID)
+	mux.Use(middleware.Recoverer)
+	return mux
+}
+
 // addWebhookServer builds the shared HTTP listener that serves both the M2
 // SCM webhook routes and the M3 OIDC-gated REST API on HTTP_ADDR. Both route
 // groups are mounted onto one chi.Mux and wrapped in a single HandlerRunnable.
@@ -64,7 +76,7 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 // Webhook routes (/operator/webhooks/...) are unauthenticated - HMAC
 // verification happens inside the handler. REST routes are OIDC-gated.
 func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics) error {
-	httpMux := chi.NewRouter()
+	httpMux := newWebhookMux()
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
 	webhook.NewServer(webhook.Config{

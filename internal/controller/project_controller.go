@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -226,5 +227,9 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&networkingv1.Ingress{}).
+		// MaxConcurrentReconciles: 1 is explicit here because laneOccupancy gating
+		// assumes serialised reconciles per kind; raising this without revisiting
+		// that invariant would cause correctness bugs.
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

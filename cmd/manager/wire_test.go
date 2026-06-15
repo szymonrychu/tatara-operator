@@ -1,8 +1,11 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
@@ -65,6 +68,43 @@ func TestIngestConfigFromConfig(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("ingestConfigFromConfig = %+v, want %+v", got, want)
+	}
+}
+
+// TestNewWebhookMux_RecovererReturns500 verifies that a handler panic does not
+// silently drop the request but instead returns HTTP 500. Without
+// middleware.Recoverer the net/http server would close the connection without
+// writing a status, making the event invisible to the caller.
+func TestNewWebhookMux_RecovererReturns500(t *testing.T) {
+	mux := newWebhookMux()
+	mux.Get("/panic", func(w http.ResponseWriter, r *http.Request) {
+		panic("simulated handler panic")
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 after handler panic, got %d", rec.Code)
+	}
+}
+
+// TestNewWebhookMux_RequestIDPropagated verifies that the RequestID middleware
+// injects a request-id into the request context so handlers can log it for
+// correlation (hard rule 12). chi.middleware.RequestID stores the id in the
+// context; the handler reads it via middleware.GetReqID and echoes it as a
+// response header for inspection.
+func TestNewWebhookMux_RequestIDPropagated(t *testing.T) {
+	mux := newWebhookMux()
+	mux.Get("/ok", func(w http.ResponseWriter, r *http.Request) {
+		rid := chiMiddleware.GetReqID(r.Context())
+		w.Header().Set("X-Request-Id", rid)
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	mux.ServeHTTP(rec, req)
+	if rec.Header().Get("X-Request-Id") == "" {
+		t.Fatal("request-id not in context: RequestID middleware is missing")
 	}
 }
 
