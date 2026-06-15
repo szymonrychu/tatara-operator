@@ -378,10 +378,13 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), token, nil, &pr); err != nil {
 		return PRState{}, err
 	}
-	// Delegate CI derivation to GetCommitCIStatus which folds check-runs and
-	// the legacy combined-status endpoint (CI systems that report via Commit
-	// Statuses are otherwise invisible from check-runs alone).
-	ciStatus, err := c.GetCommitCIStatus(ctx, owner, repo, pr.Head.SHA)
+	// Derive CI by folding check-runs and the legacy combined-status endpoint
+	// (CI systems that report via Commit Statuses are otherwise invisible from
+	// check-runs alone). Use the per-call token, not c.token: the writer client
+	// from ByProvider has an empty c.token and supplies the real token per call,
+	// so delegating to GetCommitCIStatus (which reads c.token) would issue an
+	// unauthenticated request and fail on private repos.
+	ciStatus, err := c.commitCIStatus(ctx, owner, repo, pr.Head.SHA, token)
 	if err != nil {
 		return PRState{}, err
 	}
@@ -501,11 +504,19 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 //
 // Returns "" (none) | "pending" | "success" | "failure".
 func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error) {
+	return c.commitCIStatus(ctx, owner, repo, sha, c.token)
+}
+
+// commitCIStatus is the token-parameterized implementation behind both
+// GetCommitCIStatus (reader path, token=c.token) and GetPRState (writer path,
+// per-call token). Keeping the token explicit prevents the empty-c.token writer
+// client from issuing unauthenticated CI requests.
+func (c *GitHub) commitCIStatus(ctx context.Context, owner, repo, sha, token string) (string, error) {
 	var checks struct {
 		CheckRuns []ghCheckRun `json:"check_runs"`
 	}
 	checkPath := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, sha)
-	if err := ghDo(ctx, c.base(), http.MethodGet, checkPath, c.token, nil, &checks); err != nil {
+	if err := ghDo(ctx, c.base(), http.MethodGet, checkPath, token, nil, &checks); err != nil {
 		return "", err
 	}
 	checkStatus := deriveGHCIStatus(checks.CheckRuns)
@@ -517,7 +528,7 @@ func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string)
 		TotalCount int    `json:"total_count"`
 	}
 	statusPath := fmt.Sprintf("/repos/%s/%s/commits/%s/status", owner, repo, sha)
-	if err := ghDo(ctx, c.base(), http.MethodGet, statusPath, c.token, nil, &combined); err != nil {
+	if err := ghDo(ctx, c.base(), http.MethodGet, statusPath, token, nil, &combined); err != nil {
 		return "", err
 	}
 	// combined.State is always present (even "pending" when TotalCount==0).

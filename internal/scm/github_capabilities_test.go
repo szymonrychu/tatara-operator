@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -173,6 +174,49 @@ func TestGitHubGetPRState_CombinedStatusFolded(t *testing.T) {
 	}
 	if st.CIStatus != "success" {
 		t.Fatalf("CIStatus = %q, want %q (combined-status not folded)", st.CIStatus, "success")
+	}
+}
+
+// TestGitHubGetPRState_UsesPerCallToken is a regression test: GetPRState must
+// derive CI status using the per-call token, not the (empty) client token. The
+// writer client from ByProvider has an empty c.token and supplies the token per
+// call; delegating CI derivation to a c.token-based path issued an
+// unauthenticated request that failed on private repos. The server here rejects
+// any commit request that does not carry the per-call bearer token.
+func TestGitHubGetPRState_UsesPerCallToken(t *testing.T) {
+	const wantToken = "per-call-tok"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/commits/") {
+			if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+		}
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user": map[string]any{"login": "bot"},
+				"head": map[string]any{"sha": "abc", "ref": "feat"},
+			})
+		case "/repos/o/r/commits/abc/check-runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"check_runs": []map[string]any{{"status": "completed", "conclusion": "success"}},
+			})
+		case "/repos/o/r/commits/abc/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	// Empty client token, exactly the ByProvider writer-client configuration.
+	c := &GitHub{apiBase: srv.URL}
+	st, err := c.GetPRState(context.Background(), "https://github.com/o/r", wantToken, 5)
+	if err != nil {
+		t.Fatalf("GetPRState: %v (CI request likely unauthenticated)", err)
+	}
+	if st.CIStatus != "success" {
+		t.Fatalf("CIStatus = %q, want success", st.CIStatus)
 	}
 }
 

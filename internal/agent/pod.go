@@ -371,22 +371,50 @@ func BaseURL(task *tatarav1alpha1.Task, namespace string) string {
 // buildResourceRequirements constructs corev1.ResourceRequirements from the
 // string scalars in PodConfig. Any empty string means no constraint for that
 // resource dimension; the caller gets a zero-value entry for that key.
+// Malformed quantities are skipped rather than panicking: resource.MustParse
+// would crash the reconcile hot path on a single operator-config typo, turning
+// a misconfiguration into a controller boot-crash. ValidatePodResourceQuantities
+// catches typos at config load; this is the defence in depth on the hot path.
 func buildResourceRequirements(cfg PodConfig) corev1.ResourceRequirements {
 	req := corev1.ResourceList{}
 	lim := corev1.ResourceList{}
-	if cfg.CPURequest != "" {
-		req[corev1.ResourceCPU] = resource.MustParse(cfg.CPURequest)
+	setQty := func(list corev1.ResourceList, name corev1.ResourceName, raw string) {
+		if raw == "" {
+			return
+		}
+		if q, err := resource.ParseQuantity(raw); err == nil {
+			list[name] = q
+		}
 	}
-	if cfg.MemoryRequest != "" {
-		req[corev1.ResourceMemory] = resource.MustParse(cfg.MemoryRequest)
-	}
-	if cfg.CPULimit != "" {
-		lim[corev1.ResourceCPU] = resource.MustParse(cfg.CPULimit)
-	}
-	if cfg.MemoryLimit != "" {
-		lim[corev1.ResourceMemory] = resource.MustParse(cfg.MemoryLimit)
-	}
+	setQty(req, corev1.ResourceCPU, cfg.CPURequest)
+	setQty(req, corev1.ResourceMemory, cfg.MemoryRequest)
+	setQty(lim, corev1.ResourceCPU, cfg.CPULimit)
+	setQty(lim, corev1.ResourceMemory, cfg.MemoryLimit)
 	return corev1.ResourceRequirements{Requests: req, Limits: lim}
+}
+
+// ValidatePodResourceQuantities returns an error if any non-empty resource
+// scalar in cfg is not a valid Kubernetes quantity. Call this at config load so
+// a typo fails operator startup loudly instead of being silently dropped on the
+// reconcile hot path.
+func ValidatePodResourceQuantities(cfg PodConfig) error {
+	for _, p := range []struct {
+		name string
+		raw  string
+	}{
+		{"cpuRequest", cfg.CPURequest},
+		{"cpuLimit", cfg.CPULimit},
+		{"memoryRequest", cfg.MemoryRequest},
+		{"memoryLimit", cfg.MemoryLimit},
+	} {
+		if p.raw == "" {
+			continue
+		}
+		if _, err := resource.ParseQuantity(p.raw); err != nil {
+			return fmt.Errorf("agent: %s=%q is not a valid resource quantity: %w", p.name, p.raw, err)
+		}
+	}
+	return nil
 }
 
 // buildSecurityContext returns a container SecurityContext from PodConfig.

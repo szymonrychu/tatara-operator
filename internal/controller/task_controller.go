@@ -368,6 +368,12 @@ func (r *TaskReconciler) projectRepos(ctx context.Context, project *tatarav1alph
 // already-active Task it counts recreations; when the budget is exhausted it
 // returns exhausted=true so the caller fails the Task.
 func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task) (bool, error) {
+	// Fail fast with a clear operator-side error when a required secret ref is
+	// missing, instead of letting the kubelet surface an opaque
+	// CreateContainerConfigError after the Pod is already created.
+	if err := agent.ValidatePodSecretRefs(project, r.PodConfig); err != nil {
+		return false, err
+	}
 	repos, err := r.projectRepos(ctx, project)
 	if err != nil {
 		return false, err

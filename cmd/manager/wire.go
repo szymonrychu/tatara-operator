@@ -125,6 +125,11 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable.
 func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) error {
+	// Fail fast at startup if any wrapper-pod resource quantity is malformed,
+	// rather than silently dropping it on every reconcile.
+	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
+		return fmt.Errorf("invalid wrapper pod resource config: %w", err)
+	}
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),

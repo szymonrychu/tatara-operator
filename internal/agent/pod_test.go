@@ -328,6 +328,35 @@ func TestBuildPod_ResourcesEmpty(t *testing.T) {
 	require.True(t, c.Resources.Limits.Cpu().IsZero())
 }
 
+// TestBuildPod_ResourcesMalformedNoPanic asserts that a malformed resource
+// quantity does not panic the reconcile hot path (resource.MustParse would).
+// The malformed dimension is dropped; valid dimensions still apply.
+func TestBuildPod_ResourcesMalformedNoPanic(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.CPURequest = "1OO m" // typo: letter O, embedded space - invalid
+	cfg.MemoryRequest = "128Mi"
+	require.NotPanics(t, func() {
+		c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+		require.True(t, c.Resources.Requests.Cpu().IsZero(), "malformed cpu should be dropped")
+		require.Equal(t, "128Mi", c.Resources.Requests.Memory().String())
+	})
+}
+
+// TestValidatePodResourceQuantities flags malformed quantities at config load.
+func TestValidatePodResourceQuantities(t *testing.T) {
+	_, _, _, cfg := sampleInputs()
+	cfg.CPURequest = "100m"
+	cfg.MemoryLimit = "512Mi"
+	require.NoError(t, agent.ValidatePodResourceQuantities(cfg))
+
+	bad := cfg
+	bad.CPULimit = "not-a-qty"
+	require.ErrorContains(t, agent.ValidatePodResourceQuantities(bad), "cpuLimit")
+
+	empty := agent.PodConfig{}
+	require.NoError(t, agent.ValidatePodResourceQuantities(empty), "empty scalars are valid")
+}
+
 // TestBuildPod_SecurityContext asserts that the container gets a restrictive
 // securityContext when RunAsNonRoot is enabled in PodConfig.
 func TestBuildPod_SecurityContext(t *testing.T) {

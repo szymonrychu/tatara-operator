@@ -58,17 +58,17 @@ func (s *httpSession) doOnce(ctx context.Context, method, url string, body any, 
 	if body != nil {
 		b, merr := json.Marshal(body)
 		if merr != nil {
-			return "ok", fmt.Errorf("agent: marshal body: %w", merr)
+			return "client_error", fmt.Errorf("agent: marshal body: %w", merr)
 		}
 		rdr = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, url, rdr)
 	if err != nil {
-		return "ok", fmt.Errorf("agent: new request: %w", err)
+		return "client_error", fmt.Errorf("agent: new request: %w", err)
 	}
 	tok, err := s.token(ctx)
 	if err != nil {
-		return "ok", fmt.Errorf("agent: mint token: %w", err)
+		return "token_error", fmt.Errorf("agent: mint token: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Accept", "application/json")
@@ -84,7 +84,7 @@ func (s *httpSession) doOnce(ctx context.Context, method, url string, body any, 
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return "timeout", fmt.Errorf("agent: do request: %w", err)
 		}
-		return "ok", fmt.Errorf("agent: do request: %w", err)
+		return "transport_error", fmt.Errorf("agent: do request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -93,7 +93,7 @@ func (s *httpSession) doOnce(ctx context.Context, method, url string, body any, 
 	}
 	if out != nil && resp.StatusCode != http.StatusNoContent {
 		if derr := json.NewDecoder(resp.Body).Decode(out); derr != nil {
-			return "ok", fmt.Errorf("agent: decode response: %w", derr)
+			return "decode_error", fmt.Errorf("agent: decode response: %w", derr)
 		}
 	}
 	return "ok", nil
