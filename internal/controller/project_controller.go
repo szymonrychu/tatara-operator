@@ -36,6 +36,8 @@ type ProjectReconciler struct {
 	// ReaderFor returns a token-bound scm.SCMReader for a provider name and token.
 	// Nil in tests that do not exercise scanning; wired in wire.go at runtime.
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
+	// SCMFor returns the SCMWriter for a provider name (token passed per call).
+	SCMFor func(provider string) (scm.SCMWriter, error)
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
