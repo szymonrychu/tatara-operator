@@ -669,34 +669,42 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 
 	default: // "implement" and anything else
-		// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
-		// human has engaged. Authorship is detected via the tatara-authored marker
-		// in the issue body - reliable and egress-verified, unlike Source.AuthorLogin
-		// which is empty for cron-scanned issues and untrusted on the webhook path.
-		authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
-		if aerr != nil {
-			l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
-				"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
-			authored = true
-		}
-		if authored {
-			human, herr := r.hasHumanComment(ctx, project, task)
-			if herr != nil {
-				l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
-					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
-				human = false
+		// Author-tiered autoapprove (issue #56): an issue opened by a known
+		// third-party contributor (author is neither the bot nor a maintainer) is
+		// trusted, so the triage agent's implement decision is honored straight
+		// through without the self-approve hold. Bot- and tatara-authored ideas,
+		// and the empty/maintainer-authored case, fall through to the guard below.
+		if !thirdPartyAuthor(project, task) {
+			// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
+			// human has engaged. Authorship is detected via the tatara-authored marker
+			// in the issue body - the reliable, egress-verified fallback for the
+			// bot/maintainer/empty-author case the third-party tier does not cover
+			// (Source.AuthorLogin is empty for board-sourced candidates).
+			authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
+			if aerr != nil {
+				l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
+					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
+				authored = true
 			}
-			if !human {
-				if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
-					return ctrl.Result{}, err
+			if authored {
+				human, herr := r.hasHumanComment(ctx, project, task)
+				if herr != nil {
+					l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
+						"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
+					human = false
 				}
-				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
-					return ctrl.Result{}, err
+				if !human {
+					if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
+						return ctrl.Result{}, err
+					}
+					if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+						return ctrl.Result{}, err
+					}
+					if err := r.clearIssueOutcome(ctx, task); err != nil {
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{}, r.resetAgentRun(ctx, task)
 				}
-				if err := r.clearIssueOutcome(ctx, task); err != nil {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, r.resetAgentRun(ctx, task)
 			}
 		}
 		if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {

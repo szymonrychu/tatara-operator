@@ -182,6 +182,30 @@ func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alph
 	return false, nil
 }
 
+// thirdPartyAuthor reports whether the task's source issue was opened by a
+// known external contributor: a non-empty Source.AuthorLogin that is neither
+// the configured BotLogin nor any MaintainerLogin. Third-party issues are
+// trusted and autoapproved through triage without the self-approve hold
+// (issue #56). AuthorLogin is authoritative here - for cron-scanned issues it
+// is captured from the authenticated ListOpenIssues call, and on the webhook
+// path it comes from the HMAC-verified payload. A genuine tatara-authored issue
+// carries the bot login, so it never reads as third-party.
+func thirdPartyAuthor(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
+	if proj.Spec.Scm == nil || task.Spec.Source == nil {
+		return false
+	}
+	author := task.Spec.Source.AuthorLogin
+	if author == "" || author == proj.Spec.Scm.BotLogin {
+		return false
+	}
+	for _, m := range proj.Spec.Scm.MaintainerLogins {
+		if author == m {
+			return false
+		}
+	}
+	return true
+}
+
 // tataraAuthoredIssue reports whether the task's source issue was opened by
 // tatara, detected by the tataraAuthoredMarker in the issue body. This is the
 // reliable, egress-verified authorship signal for the self-approve guard:

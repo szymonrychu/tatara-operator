@@ -113,6 +113,12 @@ type ScmSpec struct {
 	Provider string `json:"provider"`
 	Owner    string `json:"owner"`
 	BotLogin string `json:"botLogin"`
+	// MaintainerLogins are the human maintainer accounts. Together with BotLogin
+	// they form the "trusted insider" set: issues opened by anyone OUTSIDE this
+	// set (third-party contributors) are autoapproved through triage without the
+	// self-approve hold. Empty means only BotLogin is excluded from autoapprove.
+	// +optional
+	MaintainerLogins []string `json:"maintainerLogins,omitempty"`
 	// +optional
 	Board *BoardSpec `json:"board,omitempty"`
 	// +kubebuilder:validation:Enum=afterApproval;autoMergeOnGreenCI

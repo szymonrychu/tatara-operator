@@ -209,6 +209,15 @@ spec:
                     description: ImplementationLabel marks an issue whose implementation
                       is in flight.
                     type: string
+                  maintainerLogins:
+                    description: |-
+                      MaintainerLogins are the human maintainer accounts. Together with BotLogin
+                      they form the "trusted insider" set: issues opened by anyone OUTSIDE this
+                      set (third-party contributors) are autoapproved through triage without the
+                      self-approve hold. Empty means only BotLogin is excluded from autoapprove.
+                    items:
+                      type: string
+                    type: array
                   mergePolicy:
                     default: afterApproval
                     enum:
