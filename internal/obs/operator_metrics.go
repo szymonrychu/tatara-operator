@@ -24,6 +24,7 @@ type OperatorMetrics struct {
 	turnTimeoutTotal          *prometheus.CounterVec
 	ingestJobTotal            *prometheus.CounterVec
 	agentUnreachableTermTotal prometheus.Counter
+	agentBootCrashTotal       *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -106,6 +107,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_agent_unreachable_termination_total",
 			Help: "Tasks terminated because the wrapper agent stayed unreachable past the boot deadline.",
 		}),
+		agentBootCrashTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_agent_boot_crash_total",
+			Help: "Wrapper Pods that failed to boot before /readyz came up, by reason and outcome.",
+		}, []string{"reason", "outcome"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -126,6 +131,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
 		m.agentUnreachableTermTotal,
+		m.agentBootCrashTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -206,6 +212,14 @@ func (m *OperatorMetrics) IssueOutcome(action string) {
 // turn submit reached a still-booting wrapper and was requeued (not errored).
 func (m *OperatorMetrics) AgentBootRaceRequeue() {
 	m.agentBootRaceRequeue.Inc()
+}
+
+// AgentBootCrash increments operator_agent_boot_crash_total for a wrapper Pod
+// that failed to boot before /readyz came up. reason is the detection signal
+// ("PodFailed", "CrashLoopBackOff", "ContainerExited", "BootTimeout"); outcome
+// is "respawn" (recreation budget remained) or "failed" (budget exhausted).
+func (m *OperatorMetrics) AgentBootCrash(reason, outcome string) {
+	m.agentBootCrashTotal.WithLabelValues(reason, outcome).Inc()
 }
 
 // SetTasksInflightKind sets tatara_tasks_inflight for one Task kind.
