@@ -22,11 +22,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// linkedIssueNumber is a package-local alias for scm.LinkedIssueNumber so
-// the mrScan call sites remain readable without a long qualifier.
-func linkedIssueNumber(body string) (int, bool) {
-	return scm.LinkedIssueNumber(body)
-}
+// labelRecoveryExhausted is stamped on a bot PR after closeExhaustedPR runs so
+// subsequent mrScan cycles skip both re-adoption AND re-close. A human who
+// removes the label resets recovery.
+const labelRecoveryExhausted = "tatara-recovery-exhausted"
 
 // isLifecycleTerminal reports whether a lifecycle state counts as terminal for
 // dedup purposes (Done/Stopped/Parked free the (repo,number) key on newer activity).
@@ -541,8 +540,8 @@ func (r *ProjectReconciler) scanWriter(ctx context.Context, proj *tatarav1alpha1
 
 // closeExhaustedPR closes a bot PR that recovery could not land after
 // maxRecoveryAttempts. The branch is preserved (ClosePR does not delete it), so
-// reopening retries. Best-effort: failure to resolve repo/writer/token is logged
-// and the PR is left open (the scan still skips re-adoption via the caller).
+// a human can reopen to retry after removing the tatara-recovery-exhausted label.
+// Errors are counted via recovery_close_error so a stuck close path is observable.
 func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository, c candidate) {
 	l := log.FromContext(ctx)
 	repo, ok := r.matchRepoForSlug(repos, c.repo)
@@ -553,13 +552,17 @@ func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1
 	if err != nil {
 		l.Error(err, "mrScan: scanWriter for exhausted close (leaving PR open)",
 			"resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+		r.Metrics.ScanItem("mrScan", "recovery_close_error")
 		return
 	}
 	body := fmt.Sprintf("Autonomous recovery could not land this PR after %d attempts; "+
-		"closing as superseded. The branch is preserved - reopen to retry or hand-fix.", maxRecoveryAttempts)
+		"closing as superseded. The branch is preserved - reopen to retry or hand-fix.\n"+
+		"To reset recovery, remove the `%s` label from the PR before reopening.",
+		maxRecoveryAttempts, labelRecoveryExhausted)
 	if cerr := w.ClosePR(ctx, repo.Spec.URL, token, c.number, body); cerr != nil {
 		l.Error(cerr, "mrScan: close exhausted PR failed (leaving open)",
 			"resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+		r.Metrics.ScanItem("mrScan", "recovery_close_error")
 		return
 	}
 	r.Metrics.ScanItem("mrScan", "recovery_closed")
@@ -644,9 +647,10 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 
 // stampScan records the per-activity Last*Scan and persists status.
 // RetryOnConflict handles racing reconcile updates so the stamp always lands.
-func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string) {
+// Returns non-nil on persistent failure so the caller can log+metric the event.
+func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string) error {
 	now := metav1.Now()
-	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Project{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
 			return err
@@ -711,8 +715,10 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	// via old writeback arm.
 	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
 		func(slug string) int { return laneOccupancy(existing, slug, "issueLifecycle", "review") })
-	for i := 0; i < len(eligible)-len(selected); i++ {
-		r.Metrics.ScanItem("mrScan", "skipped_cap")
+	if diff := len(eligible) - len(selected); diff > 0 {
+		for i := 0; i < diff; i++ {
+			r.Metrics.ScanItem("mrScan", "skipped_cap")
+		}
 	}
 	created := 0
 	for _, c := range selected {
@@ -721,9 +727,15 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
+			r.Metrics.ScanItem("mrScan", "skipped_norepo")
 			continue
 		}
 		if c.author == bot && bot != "" {
+			// Skip re-adoption AND re-close if the PR already carries the exhaustion label.
+			if hasLabel(c.labels, labelRecoveryExhausted) {
+				r.Metrics.ScanItem("mrScan", "recovery_exhausted")
+				continue
+			}
 			if priorTerminalAttempts(existing, c.repo, c.number) >= maxRecoveryAttempts {
 				r.Metrics.ScanItem("mrScan", "recovery_exhausted")
 				r.closeExhaustedPR(ctx, proj, repos, c)
@@ -732,7 +744,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			// Bot PR -> issueLifecycle entering at MRCI. Dedup key is the linked issue
 			// number from "Closes #N" if present, else the PR number.
 			dedupNumber := c.number
-			if issueNum, linked := linkedIssueNumber(c.body); linked {
+			if issueNum, linked := scm.LinkedIssueNumber(c.body); linked {
 				dedupNumber = issueNum
 			}
 			// labelCand carries the dedup key (issue number when present).
@@ -748,12 +760,14 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
 			if _, err := r.createScanTask(ctx, proj, &repo, labelCand, srcCand, "mrScan", "issueLifecycle", goal, ann); err != nil {
 				l.Error(err, "scan: create mrScan issueLifecycle task", "resource_id", proj.Name, "repo", repo.Name)
+				r.Metrics.ScanItem("mrScan", "create_error")
 				continue
 			}
 		} else {
 			goal := fmt.Sprintf("Triage review PR %s#%d", c.repo, c.number)
 			if _, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, nil); err != nil {
 				l.Error(err, "scan: create mrScan task", "resource_id", proj.Name, "repo", repo.Name)
+				r.Metrics.ScanItem("mrScan", "create_error")
 				continue
 			}
 		}
@@ -764,7 +778,8 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
-	return len(selected) < len(eligible)
+	// backlog=true if: cap removed items OR budget truncated selected (finding 3)
+	return len(selected) < len(eligible) || created < len(selected)
 }
 
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
@@ -835,6 +850,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		})
 		if err != nil {
 			l.Error(err, "issueScan: reactivate conversation task", "action", "reactivate_conv", "resource_id", task.Name)
+			r.Metrics.ScanItem("issueScan", "reactivate_error")
 			continue
 		}
 		l.Info("issueScan: reactivated conversation task", "action", "reactivate_conv", "resource_id", task.Name,
@@ -856,8 +872,10 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// "triageIssue" tasks created before this deploy still complete via old writeback arm.
 	selected := selectPerRepo(eligible, proj.Spec.Scm.PriorityLabel, act.MaxPerRepo,
 		func(slug string) int { return laneOccupancy(existing, slug, "issueLifecycle") })
-	for i := 0; i < len(eligible)-len(selected); i++ {
-		r.Metrics.ScanItem("issueScan", "skipped_cap")
+	if diff := len(eligible) - len(selected); diff > 0 {
+		for i := 0; i < diff; i++ {
+			r.Metrics.ScanItem("issueScan", "skipped_cap")
+		}
 	}
 	created := 0
 	for _, c := range selected {
@@ -866,11 +884,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
+			r.Metrics.ScanItem("issueScan", "skipped_norepo")
 			continue
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
 		if _, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil); err != nil {
 			l.Error(err, "scan: create issueScan task", "resource_id", proj.Name, "repo", repo.Name)
+			r.Metrics.ScanItem("issueScan", "create_error")
 			continue
 		}
 		r.Metrics.ScanItem("issueScan", "picked")
@@ -880,12 +900,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
-	return len(selected) < len(eligible)
+	// backlog=true if: cap removed items OR budget truncated selected (finding 3)
+	return len(selected) < len(eligible) || created < len(selected)
 }
 
 // brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
-// Task per cycle for the whole project. MaxPerCycle field is retained for API
-// compat but unused.
+// Task per cycle for the whole project. BrainstormActivity.MaxPerCycle is
+// deprecated and ignored; the hard cap of one per cycle is enforced here.
 // budget is the shared open-task creation budget; brainstorm decrements it on
 // each successful create and stops creating when budget reaches zero.
 func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity, budget *int) {
@@ -920,28 +941,29 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		return sortedRepos[i].Name < sortedRepos[j].Name
 	})
 
-	// Aggregate backlog across all repos; short-circuit once >= maxProp.
+	// Single pass: resolve slug, set primaryRepo, accumulate backlog, collect slugs.
+	// SetOpenProposals is called for every repo queried so the gauge is never stale
+	// for repos processed before the cap (finding 8). Short-circuit stops querying
+	// but does not skip gauge updates for already-queried repos.
 	var primaryRepo *tatarav1alpha1.Repository
-	for i := range sortedRepos {
-		if s := repoSlug(&sortedRepos[i]); s != "" {
-			primaryRepo = &sortedRepos[i]
-			break
-		}
-	}
-	if primaryRepo == nil {
-		l.Info("brainstorm: no valid repos", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-		return
-	}
-
+	var slugs []string
 	total := 0
+	atCap := false
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
 		slug := repoSlug(rp)
 		if slug == "" {
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm, existing)
+		if primaryRepo == nil {
+			primaryRepo = rp
+		}
+		slugs = append(slugs, slug)
+		if atCap {
+			// Already over cap; don't issue more SCM calls but still collect slugs.
+			continue
+		}
+		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm)
 		if err != nil {
 			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
@@ -949,20 +971,20 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		r.Metrics.SetOpenProposals(slug, float64(backlog))
 		total += backlog
 		if total >= maxProp {
-			r.Metrics.ScanItem("brainstorm", "skipped_cap")
-			l.Info("brainstorm: project backlog at cap; skipping cycle",
-				"action", "scan_brainstorm", "resource_id", proj.Name, "total", total, "cap", maxProp)
-			r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-			return
+			atCap = true
 		}
 	}
-
-	// Collect all valid slugs for the project-spanning goal.
-	var slugs []string
-	for i := range sortedRepos {
-		if s := repoSlug(&sortedRepos[i]); s != "" {
-			slugs = append(slugs, s)
-		}
+	if primaryRepo == nil {
+		l.Info("brainstorm: no valid repos", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+		return
+	}
+	if atCap {
+		r.Metrics.ScanItem("brainstorm", "skipped_cap")
+		l.Info("brainstorm: project backlog at cap; skipping cycle",
+			"action", "scan_brainstorm", "resource_id", proj.Name, "total", total, "cap", maxProp)
+		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
+		return
 	}
 
 	// Build rich open-issues context for dedup-first reasoning.
@@ -1041,7 +1063,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		if slug == "" {
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm, existing)
+		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm)
 		if err != nil {
 			l.Info("healthCheck: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
@@ -1110,12 +1132,6 @@ func brainstormGoalProject(slugs []string, issuesCtx string) string {
 		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
 }
 
-// brainstormGoal kept for compatibility with tests referencing the old single-repo form.
-// New code calls brainstormGoalProject.
-func brainstormGoal(slug string) string {
-	return brainstormGoalProject([]string{slug}, "")
-}
-
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
 // task. It mirrors brainstormGoalProject (same dedup-first contract and issuesCtx
 // shape) but drives the tatara-health-check skill across all repo slugs.
@@ -1145,11 +1161,6 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"and a single explicit decision for the human (approve to implement or comment to refine). " +
 		"Do NOT produce a list of open questions or ask for input.\n\n" +
 		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
-}
-
-// healthCheckGoal is the single-repo convenience form, mirroring brainstormGoal.
-func healthCheckGoal(slug string) string {
-	return healthCheckGoalProject([]string{slug}, "")
 }
 
 // buildIssuesContext lists all open non-PR issues across repos and builds the
@@ -1243,7 +1254,7 @@ func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
 // bearing the idea label (live ListOpenIssues). This subsumes tatara-originated
 // proposals and any human-filed issue parked as an idea, providing conservative
 // brainstorm backpressure.
-func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, brainstormingLabel string, scmSpec *tatarav1alpha1.ScmSpec, _ []tatarav1alpha1.Task) (int, error) {
+func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMReader, repo *tatarav1alpha1.Repository, brainstormingLabel string, scmSpec *tatarav1alpha1.ScmSpec) (int, error) {
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
 	if err != nil {
 		return 0, err
@@ -1409,7 +1420,11 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
 		if due {
 			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan, &budget)
-			r.stampScan(ctx, proj, "mrScan")
+			if serr := r.stampScan(ctx, proj, "mrScan"); serr != nil {
+				l.Error(serr, "scan: persist mrScan stamp failed",
+					"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "mrScan")
+				r.Metrics.ScanItem("mrScan", "stamp_error")
+			}
 			// Recompute next-fire from now so the post-stamp schedule produces a
 			// positive RequeueAfter (the pre-fire next is in the past).
 			if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
@@ -1430,7 +1445,11 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
 			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
-			r.stampScan(ctx, proj, "issueScan")
+			if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
+				l.Error(serr, "scan: persist issueScan stamp failed",
+					"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "issueScan")
+				r.Metrics.ScanItem("issueScan", "stamp_error")
+			}
 			if budget > 0 {
 				r.recoverOrphans(ctx, proj, reader, repos, &budget)
 			}
@@ -1453,7 +1472,11 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		if _, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
 			if due {
 				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, &budget)
-				r.stampScan(ctx, proj, "brainstorm")
+				if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
+					l.Error(serr, "scan: persist brainstorm stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
+					r.Metrics.ScanItem("brainstorm", "stamp_error")
+				}
 				if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
 					consider(next2)
 				}
@@ -1471,7 +1494,11 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		if _, due, next, ok := r.activityDue(proj, "healthCheck"); ok {
 			if due {
 				r.healthCheck(ctx, proj, reader, repos, existing, cronSpec.HealthCheck, &budget)
-				r.stampScan(ctx, proj, "healthCheck")
+				if serr := r.stampScan(ctx, proj, "healthCheck"); serr != nil {
+					l.Error(serr, "scan: persist healthCheck stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "healthCheck")
+					r.Metrics.ScanItem("healthCheck", "stamp_error")
+				}
 				if next2, ok2 := activityNextFire(cronSpec.HealthCheck.Schedule, now); ok2 {
 					consider(next2)
 				}

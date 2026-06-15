@@ -86,6 +86,9 @@ type BrainstormActivity struct {
 	Enabled bool `json:"enabled,omitempty"`
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
+	// Deprecated: MaxPerCycle is retained for API compatibility only. The controller
+	// hard-caps brainstorm at one Task per project per cycle regardless of this value.
+	// Setting it has no effect. See MEMORY.md for rationale.
 	// +kubebuilder:default=1
 	// +optional
 	MaxPerCycle int `json:"maxPerCycle,omitempty"`

@@ -155,7 +155,7 @@ func TestDoWriteBackBrainstorm_PriorCycleProposalNotCounted(t *testing.T) {
 // TestBrainstormGoal_ContainsProposeIssueRequirement verifies the goal string
 // explicitly mandates propose_issue and single-proposal framing.
 func TestBrainstormGoal_ContainsProposeIssueRequirement(t *testing.T) {
-	goal := brainstormGoal("owner/repo")
+	goal := brainstormGoalProject([]string{"owner/repo"}, "")
 	require.Contains(t, goal, "propose_issue", "brainstorm goal must name propose_issue as a hard requirement")
 	require.Contains(t, goal, "exactly one", "brainstorm goal must state exactly one proposal")
 	// Must frame the decision explicitly so the agent does not invite open-ended back-and-forth.

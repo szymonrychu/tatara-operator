@@ -21,12 +21,12 @@ func TestLaneOccupancy(t *testing.T) {
 	}
 	existing := []tatarav1alpha1.Task{
 		mk("o/a", "triageIssue", "Running"),          // occupies a/issue lane
-		mk("o/a", "triageIssue", "AwaitingApproval"), // does NOT occupy
+		mk("o/a", "triageIssue", "AwaitingApproval"), // occupies (no longer a special Phase; Succeeded/Failed only are terminal)
 		mk("o/a", "triageIssue", "Succeeded"),        // terminal, no
 		mk("o/b", "review", "Planning"),              // occupies b/mr lane
 		mk("o/a", "selfImprove", "Running"),          // wrong kind for issue lane
 	}
-	require.Equal(t, 1, laneOccupancy(existing, "o/a", "triageIssue"))
+	require.Equal(t, 2, laneOccupancy(existing, "o/a", "triageIssue"))
 	require.Equal(t, 1, laneOccupancy(existing, "o/b", "review", "selfImprove"))
 	require.Equal(t, 0, laneOccupancy(existing, "o/c", "triageIssue"))
 }
