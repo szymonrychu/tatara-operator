@@ -29,6 +29,7 @@ func newProjectReconcilerWithReg() (*ProjectReconciler, *prometheus.Registry) {
 		Client:              k8sClient,
 		Scheme:              k8sClient.Scheme(),
 		Metrics:             obs.NewOperatorMetrics(reg),
+		LifecycleMetrics:    obs.NewLifecycleMetrics(reg),
 		ExternalWebhookBase: "https://tatara.example/operator/webhooks",
 		MemoryConfig: memory.Config{
 			Namespace:        testNS,
