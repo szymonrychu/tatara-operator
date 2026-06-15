@@ -25,6 +25,8 @@ type OperatorMetrics struct {
 	ingestJobTotal            *prometheus.CounterVec
 	agentUnreachableTermTotal prometheus.Counter
 	agentBootCrashTotal       *prometheus.CounterVec
+	orphanReapedTotal         *prometheus.CounterVec
+	reapDeleteErrorTotal      *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -111,6 +113,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_agent_boot_crash_total",
 			Help: "Wrapper Pods that failed to boot before /readyz came up, by reason and outcome.",
 		}, []string{"reason", "outcome"}),
+		orphanReapedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_orphan_reaped_total",
+			Help: "Orphan wrapper pods reaped by the backstop reaper, by reason.",
+		}, []string{"reason"}),
+		reapDeleteErrorTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_reap_delete_error_total",
+			Help: "Errors deleting orphan wrappers by resource kind.",
+		}, []string{"kind"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -132,6 +142,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.ingestJobTotal,
 		m.agentUnreachableTermTotal,
 		m.agentBootCrashTotal,
+		m.orphanReapedTotal,
+		m.reapDeleteErrorTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -279,4 +291,16 @@ func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
 // SetOpenProposals sets operator_open_proposals for a repo slug.
 func (m *OperatorMetrics) SetOpenProposals(repo string, n float64) {
 	m.openProposals.WithLabelValues(repo).Set(n)
+}
+
+// OrphanReaped increments operator_orphan_reaped_total for the given reason
+// (e.g. "task absent", "stale task incarnation", "task phase Failed").
+func (m *OperatorMetrics) OrphanReaped(reason string) {
+	m.orphanReapedTotal.WithLabelValues(reason).Inc()
+}
+
+// ReapDeleteError increments operator_reap_delete_error_total for the resource
+// kind that failed to delete ("pod" or "service").
+func (m *OperatorMetrics) ReapDeleteError(kind string) {
+	m.reapDeleteErrorTotal.WithLabelValues(kind).Inc()
 }

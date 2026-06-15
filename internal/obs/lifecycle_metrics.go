@@ -10,13 +10,14 @@ import (
 // issueLifecycle state machine. Separate from OperatorMetrics to keep the
 // lifecycle concerns isolated and testable with a fresh registry.
 type LifecycleMetrics struct {
-	lifecycleState   *prometheus.GaugeVec
-	transitionTotal  *prometheus.CounterVec
-	handoverTotal    prometheus.Counter
-	giveupTotal      *prometheus.CounterVec
-	idleStopTotal    prometheus.Counter
-	mrciWaitSeconds  prometheus.Histogram
-	lifecycleSeconds prometheus.Histogram
+	lifecycleState      *prometheus.GaugeVec
+	transitionTotal     *prometheus.CounterVec
+	handoverTotal       prometheus.Counter
+	giveupTotal         *prometheus.CounterVec
+	idleStopTotal       prometheus.Counter
+	mrciWaitSeconds     prometheus.Histogram
+	lifecycleSeconds    prometheus.Histogram
+	implementEmptyRetry prometheus.Counter
 }
 
 // NewLifecycleMetrics registers the lifecycle collectors on reg and returns the
@@ -53,6 +54,10 @@ func NewLifecycleMetrics(reg prometheus.Registerer) *LifecycleMetrics {
 			Help:    "Wall-clock seconds from issue open to Done (full lifecycle).",
 			Buckets: prometheus.ExponentialBuckets(60, 2, 12),
 		}),
+		implementEmptyRetry: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tatara_lifecycle_implement_empty_retry_total",
+			Help: "Total times the Implement state produced no commit and was retried with a re-entry nudge.",
+		}),
 	}
 	reg.MustRegister(
 		m.lifecycleState,
@@ -62,6 +67,7 @@ func NewLifecycleMetrics(reg prometheus.Registerer) *LifecycleMetrics {
 		m.idleStopTotal,
 		m.mrciWaitSeconds,
 		m.lifecycleSeconds,
+		m.implementEmptyRetry,
 	)
 	return m
 }
@@ -111,4 +117,11 @@ func (m *LifecycleMetrics) ObserveMRCIWait(seconds float64) {
 // ObserveLifecycle records the full issue-open-to-Done duration.
 func (m *LifecycleMetrics) ObserveLifecycle(seconds float64) {
 	m.lifecycleSeconds.Observe(seconds)
+}
+
+// ImplementEmptyRetry increments tatara_lifecycle_implement_empty_retry_total:
+// the Implement state produced no commit and is being retried with a re-entry
+// nudge. Operators can alert on this counter to detect projects burning retries.
+func (m *LifecycleMetrics) ImplementEmptyRetry() {
+	m.implementEmptyRetry.Inc()
 }

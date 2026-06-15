@@ -163,7 +163,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Metrics:     metrics,
 		Session:     agent.NewHTTPSession(wrapperTokens.Token),
 		Namespace:   cfg.Namespace,
-		PushMetrics: pushReceiver.Handler(),
+		PushMetrics: pushReceiver.PushHandler(),
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return fmt.Errorf("add callback server: %w", err)

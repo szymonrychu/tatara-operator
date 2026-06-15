@@ -203,6 +203,8 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 	l := log.FromContext(ctx)
 	var list tatarav1alpha1.TaskList
 	if err := s.Client.List(ctx, &list, client.InNamespace(s.Namespace)); err != nil {
+		l.Error(err, "poll backstop: list tasks failed; backstop disabled this cycle",
+			"action", "poll_backstop_list_error")
 		return
 	}
 	for i := range list.Items {

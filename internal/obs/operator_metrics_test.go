@@ -273,7 +273,10 @@ func TestAgentUnreachableTermination(t *testing.T) {
 
 func TestOperatorMetricsNamesStable(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	_ = NewOperatorMetrics(reg)
+	m := NewOperatorMetrics(reg)
+	// Touch counters/vecs that require a label-value observation to appear.
+	m.OrphanReaped("test")
+	m.ReapDeleteError("pod")
 	mfs, _ := reg.Gather()
 	want := map[string]bool{
 		"operator_reconcile_total":                     false,
@@ -286,6 +289,8 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 		"operator_turn_timeout_total":                  false,
 		"operator_ingest_job_total":                    false,
 		"operator_agent_unreachable_termination_total": false,
+		"operator_orphan_reaped_total":                 false,
+		"operator_reap_delete_error_total":             false,
 	}
 	for _, mf := range mfs {
 		if _, ok := want[mf.GetName()]; ok {
@@ -296,5 +301,33 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 		if !seen {
 			t.Errorf("metric %q not registered", name)
 		}
+	}
+}
+
+func TestOrphanReaped(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.OrphanReaped("task absent")
+	m.OrphanReaped("task absent")
+	m.OrphanReaped("stale task incarnation")
+	if got := testutil.ToFloat64(m.orphanReapedTotal.WithLabelValues("task absent")); got != 2 {
+		t.Fatalf("orphan_reaped{task absent} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.orphanReapedTotal.WithLabelValues("stale task incarnation")); got != 1 {
+		t.Fatalf("orphan_reaped{stale task incarnation} = %v, want 1", got)
+	}
+}
+
+func TestReapDeleteError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.ReapDeleteError("pod")
+	m.ReapDeleteError("service")
+	m.ReapDeleteError("pod")
+	if got := testutil.ToFloat64(m.reapDeleteErrorTotal.WithLabelValues("pod")); got != 2 {
+		t.Fatalf("reap_delete_error{pod} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.reapDeleteErrorTotal.WithLabelValues("service")); got != 1 {
+		t.Fatalf("reap_delete_error{service} = %v, want 1", got)
 	}
 }

@@ -48,6 +48,7 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		}
 		l.Info("reaping orphan wrapper pod", "action", "reap_orphan",
 			"resource_id", pod.Name, "task", pod.Labels[agent.LabelTask], "reason", reason)
+		s.Metrics.OrphanReaped(reason)
 		s.reapWrapper(ctx, pod.Name)
 	}
 }
@@ -92,11 +93,13 @@ func (s *CallbackServer) reapWrapper(ctx context.Context, name string) {
 	pod.Namespace = s.Namespace
 	if err := s.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 		l.Error(err, "reaper: delete pod", "resource_id", name)
+		s.Metrics.ReapDeleteError("pod")
 	}
 	svc := &corev1.Service{}
 	svc.Name = name
 	svc.Namespace = s.Namespace
 	if err := s.Client.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
 		l.Error(err, "reaper: delete service", "resource_id", name)
+		s.Metrics.ReapDeleteError("service")
 	}
 }
