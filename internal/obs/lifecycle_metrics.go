@@ -125,3 +125,13 @@ func (m *LifecycleMetrics) ObserveLifecycle(seconds float64) {
 func (m *LifecycleMetrics) ImplementEmptyRetry() {
 	m.implementEmptyRetry.Inc()
 }
+
+// GiveupTotal returns the giveup counter for a specific reason, for test assertions.
+func (m *LifecycleMetrics) GiveupTotal(reason string) prometheus.Counter {
+	return m.giveupTotal.WithLabelValues(reason)
+}
+
+// ImplementEmptyRetryTotal returns the implement-empty-retry counter for test assertions.
+func (m *LifecycleMetrics) ImplementEmptyRetryTotal() prometheus.Counter {
+	return m.implementEmptyRetry
+}

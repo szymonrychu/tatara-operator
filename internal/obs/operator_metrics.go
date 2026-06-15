@@ -246,6 +246,11 @@ func (m *OperatorMetrics) IssueOutcome(action string) {
 	m.issueOutcomeTotal.WithLabelValues(action).Inc()
 }
 
+// IssueOutcomeTotal returns the counter for a specific action, for test assertions.
+func (m *OperatorMetrics) IssueOutcomeTotal(action string) prometheus.Counter {
+	return m.issueOutcomeTotal.WithLabelValues(action)
+}
+
 // AgentBootRaceRequeue increments operator_agent_boot_race_requeue_total: a
 // turn submit reached a still-booting wrapper and was requeued (not errored).
 func (m *OperatorMetrics) AgentBootRaceRequeue() {

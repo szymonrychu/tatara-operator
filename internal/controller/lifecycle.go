@@ -25,6 +25,12 @@ import (
 
 const babysitDefaultDeadlineMinutes = 60
 
+// conversationDefaultIdleMinutes is the fallback conversation idle window when
+// ConversationIdleMinutes is unset in the project config. Both enterConversation
+// and the handleConversation nil-deadline safety net use this constant so they
+// can never silently drift apart.
+const conversationDefaultIdleMinutes = 60
+
 // lifecyclePR returns the PR number and URL for a lifecycle task. When the task
 // was opened via an issue (issue path), finishImplement writes PrNumber/PrURL;
 // when entered directly from a bot PR (IsPR=true), the Source fields carry them.
@@ -98,6 +104,10 @@ func (r *TaskReconciler) clearDeadline(ctx context.Context, task *tatarav1alpha1
 // tasks with no issue ref, it falls back to the PR ref derived from lifecyclePR.
 func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alpha1.Task, writer scm.SCMWriter, token, reason, msg string) error {
 	l := log.FromContext(ctx)
+	provider := ""
+	if task.Spec.Source != nil {
+		provider = task.Spec.Source.Provider
+	}
 	if task.Spec.Source != nil {
 		commentRef := task.Spec.Source.IssueRef
 		// For bot-PR-entry tasks the binder sets IssueRef to "owner/repo#N" (the PR
@@ -111,7 +121,9 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 			commentRef = prURL
 		}
 		if commentRef != "" {
-			if cerr := writer.Comment(ctx, token, commentRef, msg); cerr != nil {
+			cerr := writer.Comment(ctx, token, commentRef, msg)
+			r.recordSCM(provider, "comment", cerr)
+			if cerr != nil {
 				l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
 			}
 		}
@@ -154,9 +166,38 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 			fresh.Status.ImplementEmptyRetries = 0
 			fresh.Status.ImplementOutcome = nil
 		}
-		return r.Status().Update(ctx, fresh)
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		return fmt.Errorf("setLifecycleState: %w", err)
+	}
+
+	// Clear annBootCrashAttempts on any lifecycle-state transition. The boot-crash
+	// budget must accumulate across respawns WITHIN a single lifecycle state (handled
+	// by bumpBootCrashAttempts / handleBootCrash), but must NOT carry over into the
+	// next state. A fresh Implement/Triage/etc. entry that boot-crashes before any
+	// turn starts must get its own maxPodRecreations budget, not an already-spent one.
+	// recordTurn also clears this annotation (on a successful turn landing), so the
+	// within-state respawn path is unaffected.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh2 := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
+			return err
+		}
+		if fresh2.Annotations == nil {
+			return nil
+		}
+		if _, ok := fresh2.Annotations[annBootCrashAttempts]; !ok {
+			return nil
+		}
+		delete(fresh2.Annotations, annBootCrashAttempts)
+		return r.Update(ctx, fresh2)
+	}); err != nil {
+		// Non-fatal: log and continue. The state transition itself already succeeded.
+		log.FromContext(ctx).Error(err, "setLifecycleState: clear boot-crash annotation (non-fatal)",
+			"resource_id", task.Name, "to", to)
 	}
 
 	l.Info("lifecycle transition",
@@ -450,7 +491,7 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return res, nil
 
 	case "Conversation":
-		res, err := r.handleConversation(ctx, task)
+		res, err := r.handleConversation(ctx, &project, task)
 		if err != nil {
 			r.Metrics.ReconcileResult("Task", "error")
 			return ctrl.Result{}, err
@@ -576,6 +617,9 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if err := r.setLifecycleState(ctx, task, "Parked", "triage-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("triage-failed")
+		}
 		return ctrl.Result{}, r.resetAgentRun(ctx, task)
 	}
 
@@ -664,6 +708,9 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 				return ctrl.Result{}, err
 			}
 		}
+		if r.Metrics != nil {
+			r.Metrics.IssueOutcome("discuss")
+		}
 		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -712,6 +759,9 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
 			return ctrl.Result{}, err
+		}
+		if r.Metrics != nil {
+			r.Metrics.IssueOutcome("implement")
 		}
 	}
 
@@ -778,7 +828,7 @@ func (r *TaskReconciler) clearImplementOutcome(ctx context.Context, task *tatara
 // transitions the task to Conversation with the given reason. Shared by the
 // discuss and bot-await-approval triage outcomes.
 func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, reason string) error {
-	idleMinutes := 60
+	idleMinutes := conversationDefaultIdleMinutes
 	if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
 		idleMinutes = project.Spec.Scm.ConversationIdleMinutes
 	}
@@ -801,12 +851,19 @@ func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav
 // handleConversation manages the idle wait state. No pod is ever spawned here.
 // If the deadline has passed the task transitions to Stopped (idle-stop, resumable).
 // If DeadlineAt is nil (safety net for tasks whose deadline was never set), set it
-// once and requeue so the normal deadline path runs on the next reconcile.
+// once using project.Spec.Scm.ConversationIdleMinutes (same logic as enterConversation)
+// and requeue so the normal deadline path runs on the next reconcile.
 // Otherwise it requeues until the deadline.
-func (r *TaskReconciler) handleConversation(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	if task.Status.DeadlineAt == nil {
 		// Safety net: set deadline once rather than returning false from
 		// deadlinePassed forever and requeuing without bound.
+		// Use the same idle-minutes resolution as enterConversation so the
+		// safety-net window is consistent with the configured value.
+		idleMinutes := conversationDefaultIdleMinutes
+		if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
+			idleMinutes = project.Spec.Scm.ConversationIdleMinutes
+		}
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fresh := &tatarav1alpha1.Task{}
 			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
@@ -816,7 +873,7 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, task *tatarav1a
 				task.Status.DeadlineAt = fresh.Status.DeadlineAt
 				return nil
 			}
-			dl := metav1.NewTime(time.Now().Add(60 * time.Minute))
+			dl := metav1.NewTime(time.Now().Add(time.Duration(idleMinutes) * time.Minute))
 			fresh.Status.DeadlineAt = &dl
 			if err := r.Status().Update(ctx, fresh); err != nil {
 				return err
@@ -887,11 +944,13 @@ func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha
 	if task.Spec.Source == nil {
 		return nil
 	}
-	_, _, writer, token, _, err := r.scmContext(ctx, task)
+	_, _, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("triage discuss: %w", err)
 	}
-	if cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, comment); cerr != nil {
+	cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, comment)
+	r.recordSCM(provider, "comment", cerr)
+	if cerr != nil {
 		return fmt.Errorf("triage discuss comment: %w", cerr)
 	}
 	log.FromContext(ctx).Info("lifecycle triage: discuss comment posted",
@@ -935,10 +994,14 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 		}
 		if task.Status.LifecycleIterations >= maxIter {
 			// Backstop: too many attempts. Post comment and park.
-			_, _, writer, token, _, scmErr := r.scmContext(ctx, task)
+			_, _, writer, token, provider, scmErr := r.scmContext(ctx, task)
 			if scmErr == nil && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 				msg := "max lifecycle iterations reached; leaving for a human"
-				_ = writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
+				cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
+				r.recordSCM(provider, "comment", cerr)
+				if cerr != nil {
+					log.FromContext(ctx).Error(cerr, "implement: max-iterations comment (non-fatal)", "resource_id", task.Name)
+				}
 			}
 			if err := r.setLifecycleState(ctx, task, "Parked", "maxIterations"); err != nil {
 				return ctrl.Result{}, err
@@ -1024,6 +1087,9 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		if err := r.setLifecycleState(ctx, task, "Parked", "implement-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("implement-failed")
+		}
 		return ctrl.Result{}, r.resetAgentRun(ctx, task)
 	}
 
@@ -1050,23 +1116,28 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			// park with reason "refused", clear ImplementOutcome, reset retries.
 			l.Info("implement: agent declared decline; parking as refused",
 				"action", "lifecycle_implement_refused", "resource_id", task.Name)
-			if _, _, writer, token, _, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
+			// Capture the Project from scmContext so we can pass it to ensurePhaseLabel
+			// without a redundant Get (finding 15).
+			if refusalProj, _, writer, token, provider, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
 				if fresh.Spec.Source != nil && fresh.Spec.Source.IssueRef != "" {
-					if cerr := writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, outcome.Reason); cerr != nil {
+					cerr := writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, outcome.Reason)
+					r.recordSCM(provider, "comment", cerr)
+					if cerr != nil {
 						l.Error(cerr, "implement: post refusal comment (non-fatal)", "resource_id", task.Name)
 					}
 				}
-				var proj tatarav1alpha1.Project
-				if perr := r.Get(ctx, client.ObjectKey{Namespace: fresh.Namespace, Name: fresh.Spec.ProjectRef}, &proj); perr == nil {
-					if err := r.ensurePhaseLabel(ctx, &proj, fresh, "declined"); err != nil {
-						l.Error(err, "implement: apply declined label (non-fatal)", "resource_id", task.Name)
-					}
+				// Use the Project returned by scmContext (no redundant Get, finding 15).
+				if err := r.ensurePhaseLabel(ctx, &refusalProj, fresh, "declined"); err != nil {
+					l.Error(err, "implement: apply declined label (non-fatal)", "resource_id", task.Name)
 				}
 			} else {
 				l.Error(scmErr, "implement: scm context for refusal comment (non-fatal)", "resource_id", task.Name)
 			}
 			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused"); err != nil {
 				return ctrl.Result{}, err
+			}
+			if r.LifecycleMetrics != nil {
+				r.LifecycleMetrics.RecordGiveup("refused")
 			}
 			if err := r.clearImplementOutcome(ctx, fresh); err != nil {
 				return ctrl.Result{}, err
@@ -1088,8 +1159,16 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			l.Info("implement: no commit produced; retrying with re-entry nudge",
 				"action", "lifecycle_implement_empty_retry", "resource_id", task.Name,
 				"attempt", fresh.Status.ImplementEmptyRetries, "cap", emptyRetryCap)
+			if r.LifecycleMetrics != nil {
+				r.LifecycleMetrics.ImplementEmptyRetry()
+			}
 			// resetAgentRun clears phase to "" and leaves LifecycleState=Implement,
 			// so the next reconcile re-spawns the Implement run with ImplementContext.
+			// NOTE: LifecycleIterations will also be incremented on the re-spawn
+			// (Phase="" path). This is intentional: each empty-retry is a real
+			// spawn cycle and must count against MaxLifecycleIterations so the
+			// backstop can fire. See MEMORY.md: the two counters are coupled and
+			// MaxLifecycleIterations must always be set > emptyRetryCap.
 			return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
 		}
 		l.Info("implement: no commit after retry cap and no explanation; commenting + parking",
@@ -1110,6 +1189,9 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused-no-explanation"); err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("refused-no-explanation")
 		}
 		return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
 	}
@@ -1132,10 +1214,15 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, fmt.Errorf("implement: re-get after followup: %w", err)
 	}
 
-	// Record head branch, PR number, clear any stale deadline (e.g. from a prior
-	// Conversation idle deadline), and transition to MRCI in one RetryOnConflict
-	// block to minimise conflict surface.
+	// Record head branch, PR number, and clear the stale deadline (e.g. from a
+	// prior Conversation idle deadline) in one RetryOnConflict write BEFORE the
+	// state transition. setLifecycleState handles the log/metric/teardown so they
+	// live in exactly one place (finding 6: no hand-rolled transition logic here).
 	prNumber := parsePRNumber(fresh.Status.PrURL)
+	if prNumber == 0 && fresh.Status.PrURL != "" {
+		l.Error(nil, "implement: parsePRNumber returned 0 for non-empty PrURL; unexpected URL shape",
+			"resource_id", task.Name, "pr_url", fresh.Status.PrURL)
+	}
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		t2 := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), t2); err != nil {
@@ -1144,23 +1231,16 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		t2.Status.HeadBranch = taskBranch(task)
 		t2.Status.PRNumber = prNumber
 		t2.Status.DeadlineAt = nil // clear stale Conversation/Implement deadline; MRCI sets its own via ensureDeadline
-		t2.Status.LifecycleState = "MRCI"
 		return r.Status().Update(ctx, t2)
 	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("implement: record pr fields + MRCI transition: %w", err)
+		return ctrl.Result{}, fmt.Errorf("implement: record pr fields: %w", err)
 	}
 
-	l.Info("lifecycle transition",
-		"action", "lifecycle_transition",
-		"resource_id", task.Name,
-		"from", "Implement",
-		"to", "MRCI",
-		"reason", "implement-done",
-	)
-	if r.LifecycleMetrics != nil {
-		r.LifecycleMetrics.RecordTransition("Implement", "MRCI")
+	// Delegate the state transition to setLifecycleState so the transition log,
+	// metric, and wrapper teardown all live in one place.
+	if err := r.setLifecycleState(ctx, task, "MRCI", "implement-done"); err != nil {
+		return ctrl.Result{}, err
 	}
-	task.Status.LifecycleState = "MRCI"
 
 	// Re-get for resetAgentRun.
 	fresh2 := &tatarav1alpha1.Task{}
@@ -1185,7 +1265,7 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 		return nil
 	}
 
-	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("followup: scm context: %w", err)
 	}
@@ -1198,6 +1278,7 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 		Title: issueTitle,
 		Body:  issueBody,
 	})
+	r.recordSCM(provider, "create_issue", cerr)
 	if cerr != nil {
 		return fmt.Errorf("followup: create issue: %w", cerr)
 	}
@@ -1235,7 +1316,9 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 }
 
 // parsePRNumber extracts the trailing integer from a PR/MR URL
-// (e.g. https://github.com/o/r/pull/42 -> 42).
+// (e.g. https://github.com/o/r/pull/42 -> 42). Returns 0 when the URL is
+// empty or the trailing segment is not numeric; the caller should log a WARN
+// when a non-empty URL produces 0 (indicates an unexpected URL shape).
 func parsePRNumber(prURL string) int {
 	if prURL == "" {
 		return 0
@@ -1244,7 +1327,12 @@ func parsePRNumber(prURL string) int {
 	if len(parts) == 0 {
 		return 0
 	}
-	n, _ := strconv.Atoi(parts[len(parts)-1])
+	n, err := strconv.Atoi(parts[len(parts)-1])
+	if err != nil {
+		// Non-numeric trailing segment: malformed or unexpected URL format.
+		// Returns 0; the caller (finishImplement) logs at WARN.
+		return 0
+	}
 	return n
 }
 
@@ -1252,7 +1340,7 @@ func parsePRNumber(prURL string) int {
 // transitions to Merge (green), Implement (failure), or Parked (deadline/not-bot).
 func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
-	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("mrci: %w", err)
 	}
@@ -1267,11 +1355,15 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		if err := r.parkWithComment(ctx, task, writer, token, "no-pr-number", msg); err != nil {
 			return ctrl.Result{}, err
 		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("no-pr-number")
+		}
 		return ctrl.Result{}, nil
 	}
 
 	// Authorship gate: PR must be bot-authored.
 	st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+	r.recordSCM(provider, "get_pr_state", serr)
 	if serr != nil {
 		return ctrl.Result{}, fmt.Errorf("mrci: get pr state: %w", serr)
 	}
@@ -1306,7 +1398,9 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 			"action", "lifecycle_mrci_duplicate_merged", "resource_id", task.Name,
 			"pr", number, "head_sha", st.HeadSHA)
 		closeMsg := fmt.Sprintf("Closing as a duplicate: this branch was already merged (head %s) and the post-merge default-branch pipeline failure needs a genuinely new fix, not a re-proposal of the same commits.", st.HeadSHA)
-		if cerr := writer.ClosePR(ctx, repo.Spec.URL, token, number, closeMsg); cerr != nil {
+		cerr := writer.ClosePR(ctx, repo.Spec.URL, token, number, closeMsg)
+		r.recordSCM(provider, "close_pr", cerr)
+		if cerr != nil {
 			l.Error(cerr, "mrci: close duplicate PR (non-fatal)", "resource_id", task.Name, "pr", number)
 		}
 		msg := fmt.Sprintf("lifecycle: PR #%d re-proposes the already-merged change (head %s) with no new fix after the post-merge pipeline failure; parking for a human.", number, st.HeadSHA)
@@ -1509,6 +1603,28 @@ func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *t
 		}
 	}
 
+	// Persist Handover on status FIRST. If the annotation write below fails, the
+	// task is left with Handover set but annPendingHandoverResume unset: safe
+	// (implementPrompt ignores the Handover block) and self-heals on retry.
+	// The prior ordering (annotation first) was unsafe: a status-write failure
+	// left pending-handover-resume=true with empty Handover, causing a silent
+	// no-op resume that consumed the annotation without injecting any context.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.Handover = handover
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.Handover = handover
+		return nil
+	}); err != nil {
+		return fmt.Errorf("maybeMarkHandoverResume: set handover status: %w", err)
+	}
+
+	// Persist the resume annotation after the status is committed.
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
@@ -1527,22 +1643,6 @@ func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *t
 		return fmt.Errorf("maybeMarkHandoverResume: set annotation: %w", err)
 	}
 
-	// Persist Handover on status.
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
-		fresh.Status.Handover = handover
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		task.Status.Handover = handover
-		return nil
-	}); err != nil {
-		return fmt.Errorf("maybeMarkHandoverResume: set handover status: %w", err)
-	}
-
 	if r.LifecycleMetrics != nil {
 		r.LifecycleMetrics.RecordHandover()
 	}
@@ -1552,7 +1652,7 @@ func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *t
 // handleMerge attempts to merge the PR. Handles 405-conflict as a re-implement
 // signal (MUST NOT return the error to avoid controller-runtime backoff loop).
 func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
-	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("merge: %w", err)
 	}
@@ -1603,11 +1703,13 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	// (best-effort: on error mergedHead stays "" and the guard simply never fires).
 	mergedHead := ""
 	if ps, perr := writer.GetPRState(ctx, repo.Spec.URL, token, number); perr == nil {
+		r.recordSCM(provider, "get_pr_state", nil)
 		mergedHead = ps.HeadSHA
 	}
 
 	// Attempt merge.
 	sha, mergeErr := writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
+	r.recordSCM(provider, "merge", mergeErr)
 	if mergeErr == nil {
 		// Success: record SHA and advance.
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1738,6 +1840,7 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 			repoSlug, _, slugErr := repoSlugFromURL(repo.Spec.URL, provider)
 			if slugErr == nil {
 				closeErr := writer.CloseIssue(ctx, token, repoSlug, task.Spec.Source.Number, "")
+				r.recordSCM(provider, "close_issue", closeErr)
 				if closeErr != nil {
 					var closeHE *scm.HTTPError
 					if !errors.As(closeErr, &closeHE) || (closeHE.Status != 404 && closeHE.Status != 422) {
