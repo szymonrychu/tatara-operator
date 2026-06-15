@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -38,6 +39,12 @@ const backlogRequeue = 60 * time.Second
 const (
 	baseIngestBackoff = 30 * time.Second
 	maxIngestBackoff  = 30 * time.Minute
+
+	// incrementalFallbackThreshold is the number of consecutive incremental-ingest
+	// failures after which the controller falls back to a full ingest. This
+	// self-heals repos whose LastIngestedCommit no longer exists in history (e.g.
+	// after a force-push / branch rewrite).
+	incrementalFallbackThreshold = 3
 )
 
 // ingestBackoff returns the back-off duration for the given consecutive failure
@@ -86,7 +93,7 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
 	}
 
-	if !repo.Spec.IngestEnabled {
+	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
 		return ctrl.Result{}, nil
 	}
 
@@ -157,6 +164,23 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	since, want := r.ingestDecision(&repo)
 	if !want {
+		// Finding 5: when there is nothing to ingest and the repo is no longer
+		// in a failing state, clear any stale IngestBackoff condition so it does
+		// not misreport health.
+		if repo.Status.IngestFailureCount == 0 {
+			if meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
+				Type:               "IngestBackoff",
+				Status:             metav1.ConditionFalse,
+				Reason:             "IngestIdle",
+				Message:            "no ingest pending and no recent failures",
+				ObservedGeneration: repo.Generation,
+			}) {
+				if err := r.Status().Update(ctx, &repo); err != nil {
+					r.Metrics.ReconcileResult("Repository", "error")
+					return ctrl.Result{}, fmt.Errorf("clear stale IngestBackoff condition: %w", err)
+				}
+			}
+		}
 		res, err := r.scheduleNextReingest(ctx, &repo)
 		if err != nil {
 			r.Metrics.ReconcileResult("Repository", "error")
@@ -239,6 +263,9 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 // ingestDecision returns (sinceSHA, wantIngest). Full ingest (empty since)
 // when lastIngestedCommit is empty. Incremental (since=lastIngestedCommit)
 // when the reingest-requested annotation is newer than lastIngestTime.
+// Finding 4: when IngestFailureCount has reached incrementalFallbackThreshold,
+// the since SHA is cleared so the Job performs a full ingest; this self-heals
+// repos whose LastIngestedCommit was removed from history (force-push/rewrite).
 func (r *RepositoryReconciler) ingestDecision(repo *tataradevv1alpha1.Repository) (string, bool) {
 	if repo.Status.LastIngestedCommit == "" {
 		return "", true
@@ -257,6 +284,12 @@ func (r *RepositoryReconciler) ingestDecision(repo *tataradevv1alpha1.Repository
 		lastIngestTime = repo.Status.LastIngestTime.Time
 	}
 	if requested.After(lastIngestTime) {
+		// Fall back to a full ingest after repeated incremental failures so a
+		// force-pushed branch (where the since-SHA no longer exists in history)
+		// can self-heal rather than looping forever.
+		if repo.Status.IngestFailureCount >= incrementalFallbackThreshold {
+			return "", true
+		}
 		return repo.Status.LastIngestedCommit, true
 	}
 	return "", false
@@ -319,18 +352,21 @@ func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *t
 		return ctrl.Result{RequeueAfter: maxScheduleRequeue}, nil
 	}
 
+	// Finding 3: persist the dedup guard (LastScheduledReingest) in status
+	// BEFORE stamping the annotation that triggers a new reconcile. This ensures
+	// that any concurrent reconcile already sees the guard and cannot double-stamp.
+	scheduled := metav1.NewTime(now)
+	repo.Status.LastScheduledReingest = &scheduled
+	if err := r.Status().Update(ctx, repo); err != nil {
+		return ctrl.Result{}, fmt.Errorf("update lastScheduledReingest: %w", err)
+	}
+
 	if repo.Annotations == nil {
 		repo.Annotations = map[string]string{}
 	}
 	repo.Annotations[ReingestAnnotation] = now.UTC().Format(time.RFC3339)
 	if err := r.Update(ctx, repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stamp scheduled reingest annotation: %w", err)
-	}
-
-	scheduled := metav1.NewTime(now)
-	repo.Status.LastScheduledReingest = &scheduled
-	if err := r.Status().Update(ctx, repo); err != nil {
-		return ctrl.Result{}, fmt.Errorf("update lastScheduledReingest: %w", err)
 	}
 
 	l.Info("scheduled re-ingest requested",
@@ -401,6 +437,19 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
 		}
+		// Finding 2: consume the reingest-requested annotation so the trigger is
+		// self-extinguishing instead of relying on timestamp ordering to suppress
+		// re-fires. Delete after the status write so the status always reflects the
+		// completed ingest even if the metadata patch is retried.
+		if _, ok := repo.Annotations[ReingestAnnotation]; ok {
+			delete(repo.Annotations, ReingestAnnotation)
+			if err := r.Update(ctx, repo); err != nil {
+				// Non-fatal: the timestamp ordering in ingestDecision still prevents
+				// a spurious re-trigger; log and continue.
+				l.Error(err, "clear reingest annotation after success",
+					"action", "ingest_annotation_clear", "resource_id", repo.Name)
+			}
+		}
 		l.Info("ingest succeeded",
 			"action", "ingest_succeeded", "resource_id", repo.Name, "sha", sha, "job", job.Name)
 		r.Metrics.ReconcileResult("Repository", "success")
@@ -428,7 +477,10 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 		"action", "ingest_failed", "resource_id", repo.Name, "job", job.Name,
 		"failure_count", repo.Status.IngestFailureCount)
 	r.Metrics.ReconcileResult("Repository", "error")
-	return ctrl.Result{}, nil
+	// Finding 1: return the computed backoff as RequeueAfter so the reconciler
+	// wakes at the correct retry time instead of relying on the 600s Job TTL
+	// to trigger the next pass.
+	return ctrl.Result{RequeueAfter: ingestBackoff(repo.Status.IngestFailureCount)}, nil
 }
 
 // jobSucceeded reports whether the Job has a Complete=True condition.
@@ -472,5 +524,9 @@ func (r *RepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&tataradevv1alpha1.Repository{}).
 		Owns(&batchv1.Job{}).
 		Owns(&corev1.ConfigMap{}).
+		// MaxConcurrentReconciles: 1 is explicit here because laneOccupancy gating
+		// assumes serialised reconciles per kind; raising this without revisiting
+		// that invariant would cause correctness bugs.
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

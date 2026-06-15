@@ -20,6 +20,7 @@ type ProposedIssueSpec struct {
 // Suggestion is one inline code suggestion on a PR/MR.
 type Suggestion struct {
 	Path string `json:"path"`
+	// +kubebuilder:validation:Minimum=1
 	Line int    `json:"line"`
 	Body string `json:"body"`
 }
@@ -105,9 +106,26 @@ type TaskSpec struct {
 	ProposedIssue *ProposedIssueSpec `json:"proposedIssue,omitempty"`
 }
 
+// TaskTerminal reports whether t has reached a terminal state, accounting for
+// the dual Phase / LifecycleState design: issueLifecycle tasks leave Phase
+// empty for their whole life and signal completion via LifecycleState. Any
+// predicate that must treat finished lifecycle tasks as terminal MUST call
+// this helper instead of testing Phase alone.
+func TaskTerminal(t *Task) bool {
+	if t.Status.Phase == "Succeeded" || t.Status.Phase == "Failed" {
+		return true
+	}
+	ls := t.Status.LifecycleState
+	return ls == "Done" || ls == "Stopped" || ls == "Parked"
+}
+
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
-	// +kubebuilder:validation:Enum=Pending;AwaitingApproval;Planning;Running;Succeeded;Failed
+	// +kubebuilder:validation:Enum=Planning;Running;Succeeded;Failed
+	// NOTE: Pending and AwaitingApproval are intentionally absent: no code path
+	// ever writes them (approval is now driven by the SCM conversation flow and
+	// projected onto labels, not a Phase transition). They are removed here to
+	// keep the CRD enum honest and prevent confusion with LifecycleState.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional
@@ -201,6 +219,8 @@ type TaskStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Lifecycle",type=string,JSONPath=`.status.lifecycleState`
+// +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.kind`
 // +kubebuilder:printcolumn:name="Turns",type=integer,JSONPath=`.status.turnsCompleted`
 
 // Task is one agent session driving a Repository toward a goal.

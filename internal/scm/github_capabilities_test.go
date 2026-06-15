@@ -6,9 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -69,7 +72,12 @@ func TestGitHubIssueAuthor(t *testing.T) {
 	t.Run("RemoveLabel", func(t *testing.T) {
 		var gotPath, gotMethod string
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			gotPath, gotMethod = r.URL.Path, r.Method
+			// Use RawPath when set so URL-encoded segments are not decoded.
+			raw := r.URL.RawPath
+			if raw == "" {
+				raw = r.URL.Path
+			}
+			gotPath, gotMethod = raw, r.Method
 		}))
 		defer srv.Close()
 		c := &GitHub{apiBase: srv.URL}
@@ -79,8 +87,11 @@ func TestGitHubIssueAuthor(t *testing.T) {
 		if gotMethod != http.MethodDelete {
 			t.Fatalf("method = %q", gotMethod)
 		}
-		if gotPath != "/repos/o/r/issues/7/labels/tatara/awaiting-approval" {
-			t.Fatalf("path = %q", gotPath)
+		// The slash in "tatara/awaiting-approval" must be URL-encoded to %2F
+		// so the DELETE hits the correct GitHub API route.
+		const want = "/repos/o/r/issues/7/labels/tatara%2Fawaiting-approval"
+		if gotPath != want {
+			t.Fatalf("path = %q, want %q", gotPath, want)
 		}
 	})
 }
@@ -102,9 +113,8 @@ func TestGitHubGetPRState(t *testing.T) {
 				switch r.URL.Path {
 				case "/repos/o/r/pulls/5":
 					_ = json.NewEncoder(w).Encode(map[string]any{
-						"user":      map[string]any{"login": "alice"},
-						"mergeable": true,
-						"head":      map[string]any{"sha": "abc", "ref": "feature"},
+						"user": map[string]any{"login": "alice"},
+						"head": map[string]any{"sha": "abc", "ref": "feature"},
 					})
 				case "/repos/o/r/commits/abc/check-runs":
 					runs := make([]map[string]any, 0, len(tc.runs))
@@ -112,6 +122,9 @@ func TestGitHubGetPRState(t *testing.T) {
 						runs = append(runs, map[string]any{"status": run["status"], "conclusion": run["conclusion"]})
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": runs})
+				case "/repos/o/r/commits/abc/status":
+					// No legacy commit statuses; check-runs dominate.
+					_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
 				default:
 					t.Fatalf("unexpected path %q", r.URL.Path)
 				}
@@ -122,11 +135,104 @@ func TestGitHubGetPRState(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetPRState: %v", err)
 			}
-			if st.Author != "alice" || st.HeadSHA != "abc" || st.HeadBranch != "feature" || !st.Mergeable {
+			if st.Author != "alice" || st.HeadSHA != "abc" || st.HeadBranch != "feature" {
 				t.Fatalf("state = %+v", st)
 			}
 			if st.CIStatus != tc.wantCI {
 				t.Fatalf("CIStatus = %q, want %q", st.CIStatus, tc.wantCI)
+			}
+		})
+	}
+}
+
+// TestGitHubGetPRState_CombinedStatusFolded verifies that GetPRState folds
+// the legacy combined-status API (via GetCommitCIStatus), so CI systems that
+// report via Commit Statuses are visible to the merge gate.
+func TestGitHubGetPRState_CombinedStatusFolded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user": map[string]any{"login": "bot"},
+				"head": map[string]any{"sha": "abc", "ref": "feat"},
+			})
+		case "/repos/o/r/commits/abc/check-runs":
+			// No check-runs; CI reports via commit statuses only.
+			_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []any{}})
+		case "/repos/o/r/commits/abc/status":
+			// One legacy commit status reporting success.
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "success", "total_count": 1})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	st, err := c.GetPRState(context.Background(), "https://github.com/o/r", "tok", 5)
+	if err != nil {
+		t.Fatalf("GetPRState: %v", err)
+	}
+	if st.CIStatus != "success" {
+		t.Fatalf("CIStatus = %q, want %q (combined-status not folded)", st.CIStatus, "success")
+	}
+}
+
+// TestGitHubGetPRState_UsesPerCallToken is a regression test: GetPRState must
+// derive CI status using the per-call token, not the (empty) client token. The
+// writer client from ByProvider has an empty c.token and supplies the token per
+// call; delegating CI derivation to a c.token-based path issued an
+// unauthenticated request that failed on private repos. The server here rejects
+// any commit request that does not carry the per-call bearer token.
+func TestGitHubGetPRState_UsesPerCallToken(t *testing.T) {
+	const wantToken = "per-call-tok"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/commits/") {
+			if got := r.Header.Get("Authorization"); got != "Bearer "+wantToken {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+		}
+		switch r.URL.Path {
+		case "/repos/o/r/pulls/5":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user": map[string]any{"login": "bot"},
+				"head": map[string]any{"sha": "abc", "ref": "feat"},
+			})
+		case "/repos/o/r/commits/abc/check-runs":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"check_runs": []map[string]any{{"status": "completed", "conclusion": "success"}},
+			})
+		case "/repos/o/r/commits/abc/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "total_count": 0})
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	// Empty client token, exactly the ByProvider writer-client configuration.
+	c := &GitHub{apiBase: srv.URL}
+	st, err := c.GetPRState(context.Background(), "https://github.com/o/r", wantToken, 5)
+	if err != nil {
+		t.Fatalf("GetPRState: %v (CI request likely unauthenticated)", err)
+	}
+	if st.CIStatus != "success" {
+		t.Fatalf("CIStatus = %q, want success", st.CIStatus)
+	}
+}
+
+// TestGitHubMergeConflict verifies that Merge returns ErrMergeConflict on 405/409.
+func TestGitHubMergeConflict(t *testing.T) {
+	for _, status := range []int{405, 409} {
+		status := status
+		t.Run(fmt.Sprintf("http%d", status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			c := &GitHub{apiBase: srv.URL}
+			_, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash")
+			if !errors.Is(err, ErrMergeConflict) {
+				t.Fatalf("expected ErrMergeConflict for HTTP %d, got %v", status, err)
 			}
 		})
 	}

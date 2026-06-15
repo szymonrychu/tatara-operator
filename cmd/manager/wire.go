@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/config"
@@ -48,13 +50,24 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 		IngesterImage:    cfg.IngesterImage,
 		OIDCIssuer:       cfg.OIDCIssuer,
 		OIDCClientID:     cfg.OperatorOIDCClientID,
-		OIDCClientSecret: cfg.OperatorOIDCClientSecret,
+		OIDCSecretName:   cfg.OperatorOIDCSecretName,
 		OIDCAudience:     memoryAudience,
 		Namespace:        cfg.Namespace,
 		ImagePullSecret:  cfg.ImagePullSecret,
 		OpenAISecretName: cfg.OpenAISecretName,
 		SemanticModel:    cfg.SemanticModel,
 	}
+}
+
+// newWebhookMux returns a chi.Mux pre-wired with the observability middleware
+// stack: RequestID (correlation) and Recoverer (panic -> 500 instead of
+// closed connection, satisfying hard rules 12 and 13). Routes are mounted by
+// the callers.
+func newWebhookMux() *chi.Mux {
+	mux := chi.NewRouter()
+	mux.Use(middleware.RequestID)
+	mux.Use(middleware.Recoverer)
+	return mux
 }
 
 // addWebhookServer builds the shared HTTP listener that serves both the M2
@@ -64,7 +77,7 @@ func ingestConfigFromConfig(cfg config.Config, memoryAudience string) ingest.Con
 // Webhook routes (/operator/webhooks/...) are unauthenticated - HMAC
 // verification happens inside the handler. REST routes are OIDC-gated.
 func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics) error {
-	httpMux := chi.NewRouter()
+	httpMux := newWebhookMux()
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
 	webhook.NewServer(webhook.Config{
@@ -88,6 +101,8 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
+		Logger:  slog.Default(),
+		Metrics: metrics,
 	}).Mount(httpMux, auth.Middleware(verifier))
 
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))
@@ -110,6 +125,11 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable.
 func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) error {
+	// Fail fast at startup if any wrapper-pod resource quantity is malformed,
+	// rather than silently dropping it on every reconcile.
+	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
+		return fmt.Errorf("invalid wrapper pod resource config: %w", err)
+	}
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
@@ -146,7 +166,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Scheme:           mgr.GetScheme(),
 		Metrics:          metrics,
 		LifecycleMetrics: lifecycleMetrics,
-		Session:          agent.NewHTTPSession(wrapperTokens.Token),
+		Session:          agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
 		PodConfig:        podConfigFromConfig(cfg),
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
@@ -161,9 +181,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	cbServer := &controller.CallbackServer{
 		Client:      mgr.GetClient(),
 		Metrics:     metrics,
-		Session:     agent.NewHTTPSession(wrapperTokens.Token),
+		Session:     agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
 		Namespace:   cfg.Namespace,
-		PushMetrics: pushReceiver.Handler(),
+		PushMetrics: pushReceiver.PushHandler(),
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return fmt.Errorf("add callback server: %w", err)

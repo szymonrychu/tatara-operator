@@ -18,17 +18,20 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+func boolPtrRC(v bool) *bool { return &v }
+
 func newRepoReconciler() *RepositoryReconciler {
 	return &RepositoryReconciler{
 		Client:  k8sClient,
 		Scheme:  k8sClient.Scheme(),
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 		IngestConfig: ingest.Config{
-			IngesterImage: "registry.example/ingester:1.2.3",
-			OIDCIssuer:    "https://kc.example/realms/tatara",
-			OIDCClientID:  "tatara-operator",
-			OIDCAudience:  "tatara-memory",
-			Namespace:     testNS,
+			IngesterImage:  "registry.example/ingester:1.2.3",
+			OIDCIssuer:     "https://kc.example/realms/tatara",
+			OIDCClientID:   "tatara-operator",
+			OIDCSecretName: "tatara-operator",
+			OIDCAudience:   "tatara-memory",
+			Namespace:      testNS,
 		},
 	}
 }
@@ -60,7 +63,7 @@ func mkRepo(t *testing.T, name, projectRef string) *tataradevv1alpha1.Repository
 	r.Spec.ProjectRef = projectRef
 	r.Spec.URL = "https://github.com/acme/" + name + ".git"
 	r.Spec.DefaultBranch = "main"
-	r.Spec.IngestEnabled = true
+	r.Spec.IngestEnabled = boolPtrRC(true)
 	r.Spec.ReingestSchedule = "0 6 * * *"
 	if err := k8sClient.Create(context.Background(), r); err != nil {
 		t.Fatalf("create repo %s: %v", name, err)

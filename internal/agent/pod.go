@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -51,6 +52,44 @@ type PodConfig struct {
 	CLIOIDCSecretName   string
 	ImagePullSecret     string
 	OperatorURL         string // operator REST base URL for the agent's task_*/subtask_* MCP tools
+
+	// Resource requests/limits for the wrapper container. Parsed from camelCase
+	// config scalars (cpu-request, cpu-limit, memory-request, memory-limit in the
+	// operator ConfigMap). Empty strings mean no constraint is set (BestEffort).
+	CPURequest    string
+	CPULimit      string
+	MemoryRequest string
+	MemoryLimit   string
+
+	// RunAsNonRoot and RunAsUser configure the container SecurityContext.
+	// RunAsNonRoot=true rejects images that run as root. RunAsUser overrides the
+	// image default UID when non-nil. Supply both to lock down the container.
+	RunAsNonRoot bool
+	RunAsUser    *int64
+
+	// NodeSelector, Tolerations and Affinity control Pod placement. All three
+	// are cluster-specific and must be supplied by the helmfile, not baked into
+	// the chart. Nil/empty means no scheduling constraint (default).
+	NodeSelector map[string]string
+	Tolerations  []corev1.Toleration
+	Affinity     *corev1.Affinity
+}
+
+// ValidatePodSecretRefs returns an error when any secret-name field required to
+// build the wrapper Pod is empty. Call this before BuildPod/ensurePodAndService
+// so that a mis-provisioned Project produces a clear operator-side error instead
+// of an opaque kubelet CreateContainerConfigError.
+func ValidatePodSecretRefs(project *tatarav1alpha1.Project, cfg PodConfig) error {
+	if project.Spec.ScmSecretRef == "" {
+		return fmt.Errorf("agent: ScmSecretRef is empty on Project %q; cannot build wrapper Pod", project.Name)
+	}
+	if cfg.AnthropicSecretName == "" {
+		return fmt.Errorf("agent: AnthropicSecretName is empty in PodConfig; cannot build wrapper Pod")
+	}
+	if cfg.CLIOIDCSecretName == "" {
+		return fmt.Errorf("agent: CLIOIDCSecretName is empty in PodConfig; cannot build wrapper Pod")
+	}
+	return nil
 }
 
 // imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
@@ -259,6 +298,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 				})
 			}
 		}
+		// repoEntry contains only string fields so json.Marshal cannot fail;
+		// ignoring the error is safe here.
 		buf, _ := json.Marshal(entries)
 		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
@@ -278,11 +319,16 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		Spec: corev1.PodSpec{
 			RestartPolicy:    corev1.RestartPolicyNever,
 			ImagePullSecrets: imagePullSecrets(cfg),
+			NodeSelector:     cfg.NodeSelector,
+			Tolerations:      cfg.Tolerations,
+			Affinity:         cfg.Affinity,
 			Containers: []corev1.Container{{
-				Name:  "wrapper",
-				Image: project.Spec.Agent.Image,
-				Env:   env,
-				Ports: []corev1.ContainerPort{{ContainerPort: wrapperPort}},
+				Name:            "wrapper",
+				Image:           project.Spec.Agent.Image,
+				Env:             env,
+				Ports:           []corev1.ContainerPort{{ContainerPort: wrapperPort}},
+				Resources:       buildResourceRequirements(cfg),
+				SecurityContext: buildSecurityContext(cfg),
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{
 						HTTPGet: &corev1.HTTPGetAction{
@@ -320,6 +366,72 @@ func BuildService(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposito
 // BaseURL returns the in-cluster wrapper address for a Task's Service.
 func BaseURL(task *tatarav1alpha1.Task, namespace string) string {
 	return "http://" + PodName(task) + "." + namespace + ".svc:" + strconv.Itoa(wrapperPort)
+}
+
+// buildResourceRequirements constructs corev1.ResourceRequirements from the
+// string scalars in PodConfig. Any empty string means no constraint for that
+// resource dimension; the caller gets a zero-value entry for that key.
+// Malformed quantities are skipped rather than panicking: resource.MustParse
+// would crash the reconcile hot path on a single operator-config typo, turning
+// a misconfiguration into a controller boot-crash. ValidatePodResourceQuantities
+// catches typos at config load; this is the defence in depth on the hot path.
+func buildResourceRequirements(cfg PodConfig) corev1.ResourceRequirements {
+	req := corev1.ResourceList{}
+	lim := corev1.ResourceList{}
+	setQty := func(list corev1.ResourceList, name corev1.ResourceName, raw string) {
+		if raw == "" {
+			return
+		}
+		if q, err := resource.ParseQuantity(raw); err == nil {
+			list[name] = q
+		}
+	}
+	setQty(req, corev1.ResourceCPU, cfg.CPURequest)
+	setQty(req, corev1.ResourceMemory, cfg.MemoryRequest)
+	setQty(lim, corev1.ResourceCPU, cfg.CPULimit)
+	setQty(lim, corev1.ResourceMemory, cfg.MemoryLimit)
+	return corev1.ResourceRequirements{Requests: req, Limits: lim}
+}
+
+// ValidatePodResourceQuantities returns an error if any non-empty resource
+// scalar in cfg is not a valid Kubernetes quantity. Call this at config load so
+// a typo fails operator startup loudly instead of being silently dropped on the
+// reconcile hot path.
+func ValidatePodResourceQuantities(cfg PodConfig) error {
+	for _, p := range []struct {
+		name string
+		raw  string
+	}{
+		{"cpuRequest", cfg.CPURequest},
+		{"cpuLimit", cfg.CPULimit},
+		{"memoryRequest", cfg.MemoryRequest},
+		{"memoryLimit", cfg.MemoryLimit},
+	} {
+		if p.raw == "" {
+			continue
+		}
+		if _, err := resource.ParseQuantity(p.raw); err != nil {
+			return fmt.Errorf("agent: %s=%q is not a valid resource quantity: %w", p.name, p.raw, err)
+		}
+	}
+	return nil
+}
+
+// buildSecurityContext returns a container SecurityContext from PodConfig.
+// Returns nil when no security settings are configured.
+func buildSecurityContext(cfg PodConfig) *corev1.SecurityContext {
+	if !cfg.RunAsNonRoot && cfg.RunAsUser == nil {
+		return nil
+	}
+	sc := &corev1.SecurityContext{}
+	if cfg.RunAsNonRoot {
+		b := true
+		sc.RunAsNonRoot = &b
+	}
+	if cfg.RunAsUser != nil {
+		sc.RunAsUser = cfg.RunAsUser
+	}
+	return sc
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list

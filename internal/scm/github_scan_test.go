@@ -180,6 +180,150 @@ func TestGitHubGetIssue(t *testing.T) {
 	}
 }
 
+// TestGitHubListOpenPRsPaginated verifies that ListOpenPRs follows Link rel="next" headers
+// and returns items from all pages concatenated.
+func TestGitHubListOpenPRsPaginated(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/pulls" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			// First page: set Link header pointing to page 2.
+			w.Header().Set("Link", `<`+srv.URL+`/repos/o/r/pulls?state=open&per_page=100&page=2>; rel="next"`)
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"number": 1, "user": map[string]any{"login": "a"}, "head": map[string]any{"sha": "s1"}, "updated_at": "2026-01-01T00:00:00Z"},
+			})
+		} else {
+			// Second page: no Link header.
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"number": 2, "user": map[string]any{"login": "b"}, "head": map[string]any{"sha": "s2"}, "updated_at": "2026-01-02T00:00:00Z"},
+			})
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	prs, err := c.ListOpenPRs(context.Background(), "o", "r")
+	if err != nil {
+		t.Fatalf("ListOpenPRs paginated: %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("want 2 PRs across 2 pages, got %d: %+v", len(prs), prs)
+	}
+}
+
+// TestGitHubListOpenIssuesPaginated verifies that ListOpenIssues follows Link rel="next".
+func TestGitHubListOpenIssuesPaginated(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			w.Header().Set("Link", `<`+srv.URL+`/repos/o/r/issues?state=open&per_page=100&page=2>; rel="next"`)
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"number": 10, "user": map[string]any{"login": "a"}, "updated_at": "2026-01-01T00:00:00Z"},
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"number": 20, "user": map[string]any{"login": "b"}, "updated_at": "2026-01-02T00:00:00Z"},
+			})
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	issues, err := c.ListOpenIssues(context.Background(), "o", "r")
+	if err != nil {
+		t.Fatalf("ListOpenIssues paginated: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("want 2 issues across 2 pages, got %d: %+v", len(issues), issues)
+	}
+}
+
+// TestGitHubListIssueCommentsPaginated verifies that ListIssueComments follows Link rel="next".
+func TestGitHubListIssueCommentsPaginated(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			w.Header().Set("Link", `<`+srv.URL+`/repos/o/r/issues/5/comments?per_page=100&page=2>; rel="next"`)
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"user": map[string]any{"login": "a"}, "body": "p1c1", "created_at": "2026-01-01T00:00:00Z"},
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"user": map[string]any{"login": "b"}, "body": "p2c1", "created_at": "2026-01-02T00:00:00Z"},
+			})
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	comments, err := c.ListIssueComments(context.Background(), "o", "r", 5)
+	if err != nil {
+		t.Fatalf("ListIssueComments paginated: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("want 2 comments across 2 pages, got %d: %+v", len(comments), comments)
+	}
+}
+
+// TestGitHubListBoardItemsPaginated verifies that ListBoardItems follows GraphQL cursors
+// when hasNextPage is true.
+func TestGitHubListBoardItemsPaginated(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			// First page: hasNextPage=true, endCursor=cur1
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"user": map[string]any{
+						"projectV2": map[string]any{
+							"items": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": true, "endCursor": "cur1"},
+								"nodes": []map[string]any{
+									{"updatedAt": "2026-01-01T00:00:00Z",
+										"fieldValueByName": map[string]any{"name": "Todo"},
+										"content":          map[string]any{"number": 1, "repository": map[string]any{"nameWithOwner": "o/r"}}},
+								},
+							},
+						},
+					},
+					"organization": map[string]any{"projectV2": map[string]any{"items": map[string]any{"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""}, "nodes": []any{}}}},
+				},
+			})
+		} else {
+			// Second page: hasNextPage=false
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"user": map[string]any{
+						"projectV2": map[string]any{
+							"items": map[string]any{
+								"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+								"nodes": []map[string]any{
+									{"updatedAt": "2026-01-02T00:00:00Z",
+										"fieldValueByName": map[string]any{"name": "Done"},
+										"content":          map[string]any{"number": 2, "repository": map[string]any{"nameWithOwner": "o/r"}}},
+								},
+							},
+						},
+					},
+					"organization": map[string]any{"projectV2": map[string]any{"items": map[string]any{"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""}, "nodes": []any{}}}},
+				},
+			})
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{graphQLBase: srv.URL}
+	items, err := c.ListBoardItems(context.Background(), BoardRef{Owner: "o", GitHubProjectNumber: 1})
+	if err != nil {
+		t.Fatalf("ListBoardItems paginated: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("want 2 board items across 2 pages, got %d: %+v", len(items), items)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
 		func() bool {

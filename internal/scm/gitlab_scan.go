@@ -29,12 +29,12 @@ type glIssueItem struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// ListOpenPRs lists opened merge requests for the project path owner/repo.
+// ListOpenPRs lists opened merge requests for the project path owner/repo. All pages are fetched.
 func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error) {
 	proj := owner + "/" + repo
-	var raw []glMR
-	path := "/projects/" + url.PathEscape(proj) + "/merge_requests?state=opened"
-	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests?state=opened&per_page=100"
+	raw, err := glDoPaged[glMR](ctx, c.base(), path, c.token)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]PRRef, 0, len(raw))
@@ -47,12 +47,12 @@ func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 	return out, nil
 }
 
-// ListOpenIssues lists opened issues for the project path owner/repo.
+// ListOpenIssues lists opened issues for the project path owner/repo. All pages are fetched.
 func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error) {
 	proj := owner + "/" + repo
-	var raw []glIssueItem
-	path := "/projects/" + url.PathEscape(proj) + "/issues?state=opened"
-	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+	path := "/projects/" + url.PathEscape(proj) + "/issues?state=opened&per_page=100"
+	raw, err := glDoPaged[glIssueItem](ctx, c.base(), path, c.token)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]IssueRef, 0, len(raw))
@@ -95,12 +95,12 @@ func (c *GitLab) GetIssue(ctx context.Context, owner, _ string, number int) (Iss
 	return IssueContent{Title: raw.Title, Body: raw.Description}, nil
 }
 
-// ListIssueComments returns non-system notes on issue number, oldest-first.
+// ListIssueComments returns non-system notes on issue number, oldest-first. All pages are fetched.
 // For GitLab owner carries the full project path (group/sub/project); repo is unused.
 func (c *GitLab) ListIssueComments(ctx context.Context, owner, _ string, number int) ([]IssueComment, error) {
-	var raw []glNote
-	path := "/projects/" + url.PathEscape(owner) + "/issues/" + strconv.Itoa(number) + "/notes"
-	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+	path := "/projects/" + url.PathEscape(owner) + "/issues/" + strconv.Itoa(number) + "/notes?per_page=100"
+	raw, err := glDoPaged[glNote](ctx, c.base(), path, c.token)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]IssueComment, 0, len(raw))
@@ -110,6 +110,8 @@ func (c *GitLab) ListIssueComments(ctx context.Context, owner, _ string, number 
 		}
 		out = append(out, IssueComment{Author: n.Author.Username, Body: n.Body, CreatedAt: n.CreatedAt})
 	}
+	// Defensive sort: GitLab returns notes newest-first by default; sort guards
+	// ordering within the fetched set regardless of server-side default.
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
 }

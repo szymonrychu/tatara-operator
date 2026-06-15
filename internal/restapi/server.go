@@ -1,11 +1,13 @@
 package restapi
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -15,21 +17,29 @@ type Config struct {
 	Namespace string
 	// SCMFor returns an SCMWriter for the given provider name ("github"|"gitlab").
 	// When nil, the /projects/{p}/issue-comment endpoint returns 501.
-	SCMFor func(provider string) (scm.SCMWriter, error)
+	SCMFor  func(provider string) (scm.SCMWriter, error)
+	Logger  *slog.Logger
+	Metrics *obs.OperatorMetrics
 }
 
 // Server exposes OIDC-gated CRUD over the tatara CRDs, backed by the
 // controller-runtime client. It shares the HTTP_ADDR listener with the
 // webhook server; callers mount it onto a shared chi router.
 type Server struct {
-	c      client.Client
-	ns     string
-	scmFor func(provider string) (scm.SCMWriter, error)
+	c       client.Client
+	ns      string
+	scmFor  func(provider string) (scm.SCMWriter, error)
+	log     *slog.Logger
+	metrics *obs.OperatorMetrics
 }
 
 // NewServer constructs a Server from cfg.
 func NewServer(cfg Config) *Server {
-	return &Server{c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor}
+	l := cfg.Logger
+	if l == nil {
+		l = slog.Default()
+	}
+	return &Server{c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, log: l, metrics: cfg.Metrics}
 }
 
 // Mount registers the REST routes on r. verify is the OIDC middleware;

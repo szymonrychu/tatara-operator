@@ -12,6 +12,7 @@
 package pushmetrics
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,8 +46,8 @@ type run struct {
 
 // Receiver aggregates pushed wrapper metrics and re-exposes them as a
 // prometheus.Collector. It is safe for concurrent use. Register it on the same
-// registry that backs the operator's /metrics endpoint, and mount Handler on
-// the internal (non-ingress) listener for wrappers to push to.
+// registry that backs the operator's /metrics endpoint, and mount PushHandler
+// on the internal (non-ingress) listener for wrappers to push to.
 type Receiver struct {
 	ttl time.Duration
 	now func() time.Time
@@ -54,8 +55,9 @@ type Receiver struct {
 	mu   sync.Mutex
 	runs map[string]*run
 
-	receiveTotal *prometheus.CounterVec
-	evictedTotal prometheus.Counter
+	receiveTotal       *prometheus.CounterVec
+	evictedTotal       prometheus.Counter
+	seriesDroppedTotal *prometheus.CounterVec
 }
 
 // New returns a Receiver that evicts a run's series ttl after its last push.
@@ -72,6 +74,10 @@ func New(ttl time.Duration) *Receiver {
 			Name: "operator_pushed_runs_evicted_total",
 			Help: "Total wrapper runs whose pushed series were evicted by TTL.",
 		}),
+		seriesDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_push_series_dropped_total",
+			Help: "Pushed metric series silently dropped by the receiver, by reason.",
+		}, []string{"reason"}),
 	}
 }
 
@@ -85,6 +91,10 @@ func (r *Receiver) Describe(chan<- *prometheus.Desc) {}
 // per-metric-name label set padded to the union of label names seen for that
 // name, so the gathered output is dimensionally consistent even when different
 // runs push the same metric with different labels.
+//
+// Type collisions (same name, different MetricType across runs) are resolved by
+// keeping the first-seen type and counting dropped conflicting series under
+// operator_push_series_dropped_total{reason="type_conflict"}.
 func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 	r.evictExpired()
 
@@ -97,10 +107,12 @@ func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 	r.mu.Unlock()
 
 	// Per metric name: stable help text, type, and the union of label names.
+	// type_conflict tracks names where two runs disagree on MetricType.
 	type schema struct {
-		help   string
-		typ    dto.MetricType
-		labels map[string]struct{}
+		help         string
+		typ          dto.MetricType
+		labels       map[string]struct{}
+		typeConflict bool
 	}
 	schemas := map[string]*schema{}
 	for _, rn := range runs {
@@ -109,6 +121,8 @@ func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 			if s == nil {
 				s = &schema{help: fam.GetHelp(), typ: fam.GetType(), labels: map[string]struct{}{}}
 				schemas[name] = s
+			} else if s.typ != fam.GetType() {
+				s.typeConflict = true
 			}
 			for _, m := range fam.GetMetric() {
 				for _, lp := range m.GetLabel() {
@@ -121,11 +135,20 @@ func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 	for _, rn := range runs {
 		for name, fam := range rn.families {
 			s := schemas[name]
+			// Skip entire family for this run when the type disagrees with the
+			// first-seen schema, counting each dropped series.
+			if s.typeConflict && s.typ != fam.GetType() {
+				r.seriesDroppedTotal.WithLabelValues("type_conflict").Add(float64(len(fam.GetMetric())))
+				continue
+			}
 			labelNames := sortedKeys(s.labels)
 			for _, m := range fam.GetMetric() {
-				if metric := constMetric(name, s.help, s.typ, labelNames, m); metric != nil {
-					ch <- metric
+				metric := constMetric(name, s.help, s.typ, labelNames, m)
+				if metric == nil {
+					r.seriesDroppedTotal.WithLabelValues("build_error").Inc()
+					continue
 				}
+				ch <- metric
 			}
 		}
 	}
@@ -136,6 +159,7 @@ func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 	)
 	r.receiveTotal.Collect(ch)
 	r.evictedTotal.Collect(ch)
+	r.seriesDroppedTotal.Collect(ch)
 }
 
 // constMetric converts one parsed dto.Metric into a prometheus.Metric using the
@@ -200,13 +224,28 @@ func (r *Receiver) evictExpired() {
 	}
 }
 
-// Handler returns the HTTP handler for the push endpoint. POST stores (or
-// replaces) a run's series; DELETE removes them (best-effort cleanup on a
-// wrapper's graceful exit). The run_id query parameter is required on both.
+// PushHandler returns the push endpoint as a plain http.HandlerFunc so callers
+// can mount it directly on any mux without the extra inner-mux dispatch layer
+// that Handler() added (KISS, finding 20). The outer mux owns the path routing.
+func (r *Receiver) PushHandler() http.Handler {
+	return http.HandlerFunc(r.handlePush)
+}
+
+// Handler returns an http.ServeMux with a single route /internal/metrics/push.
+// Prefer PushHandler() when mounting on an existing mux.
+//
+// Deprecated: use PushHandler() and mount at the desired path on the outer mux.
 func (r *Receiver) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/metrics/push", r.handlePush)
 	return mux
+}
+
+// isMaxBytesError reports whether err signals that http.MaxBytesReader hit its
+// limit. Uses errors.As against *http.MaxBytesError (Go 1.21+).
+func isMaxBytesError(err error) bool {
+	var mbe *http.MaxBytesError
+	return errors.As(err, &mbe)
 }
 
 func (r *Receiver) handlePush(w http.ResponseWriter, req *http.Request) {
@@ -231,10 +270,20 @@ func (r *Receiver) handlePush(w http.ResponseWriter, req *http.Request) {
 		if job := req.URL.Query().Get(labelJob); job != "" {
 			identity[labelJob] = job
 		}
-		families, err := parseAndStamp(io.LimitReader(req.Body, maxBodyBytes), identity)
+		req.Body = http.MaxBytesReader(w, req.Body, maxBodyBytes)
+		families, err := parseAndStamp(req.Body, identity)
 		if err != nil {
-			r.receiveTotal.WithLabelValues("rejected").Inc()
-			http.Error(w, fmt.Sprintf("parse metrics: %v", err), http.StatusBadRequest)
+			// http.MaxBytesReader sets the response status to 413 via
+			// (*maxBytesReader).Read when the limit is exceeded; we mirror
+			// that here for the metric label.
+			result := "rejected"
+			status := http.StatusBadRequest
+			if isMaxBytesError(err) {
+				result = "too_large"
+				status = http.StatusRequestEntityTooLarge
+			}
+			r.receiveTotal.WithLabelValues(result).Inc()
+			http.Error(w, fmt.Sprintf("parse metrics: %v", err), status)
 			return
 		}
 		r.mu.Lock()

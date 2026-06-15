@@ -42,11 +42,11 @@ func ghLabelNames(in []ghLabel) []string {
 	return out
 }
 
-// ListOpenPRs lists open pull requests for owner/repo.
+// ListOpenPRs lists open pull requests for owner/repo. All pages are fetched.
 func (c *GitHub) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error) {
-	var raw []ghPR
-	path := fmt.Sprintf("/repos/%s/%s/pulls?state=open", owner, repo)
-	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+	path := fmt.Sprintf("/repos/%s/%s/pulls?state=open&per_page=100", owner, repo)
+	raw, err := ghDoPaged[ghPR](ctx, c.base(), path, c.token)
+	if err != nil {
 		return nil, err
 	}
 	slug := owner + "/" + repo
@@ -61,11 +61,11 @@ func (c *GitHub) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 }
 
 // ListOpenIssues lists open issues for owner/repo. GitHub returns PRs in the
-// issues feed; IsPR is set so the caller can filter.
+// issues feed; IsPR is set so the caller can filter. All pages are fetched.
 func (c *GitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error) {
-	var raw []ghIssueItem
-	path := fmt.Sprintf("/repos/%s/%s/issues?state=open", owner, repo)
-	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+	path := fmt.Sprintf("/repos/%s/%s/issues?state=open&per_page=100", owner, repo)
+	raw, err := ghDoPaged[ghIssueItem](ctx, c.base(), path, c.token)
+	if err != nil {
 		return nil, err
 	}
 	slug := owner + "/" + repo
@@ -80,6 +80,7 @@ func (c *GitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 }
 
 // ListBoardItems lists ProjectV2 board items via GraphQL, dual user/org query.
+// All pages are fetched by following pageInfo.hasNextPage/endCursor.
 func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardItem, error) {
 	type itemNode struct {
 		UpdatedAt        time.Time `json:"updatedAt"`
@@ -93,12 +94,17 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 			} `json:"repository"`
 		} `json:"content"`
 	}
+	type pageInfo struct {
+		HasNextPage bool   `json:"hasNextPage"`
+		EndCursor   string `json:"endCursor"`
+	}
 	type projectV2Items struct {
 		Items struct {
-			Nodes []itemNode `json:"nodes"`
+			PageInfo pageInfo   `json:"pageInfo"`
+			Nodes    []itemNode `json:"nodes"`
 		} `json:"items"`
 	}
-	var resp struct {
+	type respShape struct {
 		User struct {
 			ProjectV2 projectV2Items `json:"projectV2"`
 		} `json:"user"`
@@ -106,32 +112,49 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 			ProjectV2 projectV2Items `json:"projectV2"`
 		} `json:"organization"`
 	}
+
 	field := board.StatusField
 	if field == "" {
 		field = "Status"
 	}
-	sel := fmt.Sprintf(
-		`projectV2(number:%d){ items(first:100){ nodes { updatedAt fieldValueByName(name:%q){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } }`,
-		board.GitHubProjectNumber, field,
-	)
-	q := fmt.Sprintf(`query { user(login:%q){ %s } organization(login:%q){ %s } }`, board.Owner, sel, board.Owner, sel)
-	if err := c.ghGraphQL(ctx, c.token, q, nil, &resp); err != nil {
-		return nil, err
-	}
-	nodes := resp.Organization.ProjectV2.Items.Nodes
-	if len(resp.User.ProjectV2.Items.Nodes) > 0 {
-		nodes = resp.User.ProjectV2.Items.Nodes
-	}
-	out := make([]BoardItem, 0, len(nodes))
-	for _, n := range nodes {
-		col := ""
-		if n.FieldValueByName != nil {
-			col = n.FieldValueByName.Name
+
+	const q = `query($owner:String!,$number:Int!,$field:String!,$after:String){
+		user(login:$owner){ projectV2(number:$number){ items(first:100,after:$after){ pageInfo{ hasNextPage endCursor } nodes { updatedAt fieldValueByName(name:$field){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } } }
+		organization(login:$owner){ projectV2(number:$number){ items(first:100,after:$after){ pageInfo{ hasNextPage endCursor } nodes { updatedAt fieldValueByName(name:$field){ ... on ProjectV2ItemFieldSingleSelectValue { name } } content { ... on Issue { number repository { nameWithOwner } } } } } } }
+	}`
+
+	var out []BoardItem
+	var cursor any // nil means no after-cursor (first page)
+	for {
+		vars := map[string]any{
+			"owner":  board.Owner,
+			"number": board.GitHubProjectNumber,
+			"field":  field,
+			"after":  cursor,
 		}
-		out = append(out, BoardItem{
-			Repo: n.Content.Repository.NameWithOwner, Number: n.Content.Number,
-			Column: col, UpdatedAt: n.UpdatedAt,
-		})
+		var resp respShape
+		if err := c.ghGraphQL(ctx, c.token, q, vars, &resp); err != nil {
+			return nil, err
+		}
+		// Prefer user nodes if present, else org.
+		pv := resp.Organization.ProjectV2
+		if len(resp.User.ProjectV2.Items.Nodes) > 0 || resp.User.ProjectV2.Items.PageInfo.HasNextPage {
+			pv = resp.User.ProjectV2
+		}
+		for _, n := range pv.Items.Nodes {
+			col := ""
+			if n.FieldValueByName != nil {
+				col = n.FieldValueByName.Name
+			}
+			out = append(out, BoardItem{
+				Repo: n.Content.Repository.NameWithOwner, Number: n.Content.Number,
+				Column: col, UpdatedAt: n.UpdatedAt,
+			})
+		}
+		if !pv.Items.PageInfo.HasNextPage {
+			break
+		}
+		cursor = pv.Items.PageInfo.EndCursor // non-nil string triggers $after on next page
 	}
 	return out, nil
 }
@@ -161,17 +184,19 @@ type ghIssueComment struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// ListIssueComments returns the comments on issue number, oldest-first.
+// ListIssueComments returns the comments on issue number, oldest-first. All pages are fetched.
 func (c *GitHub) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
-	var raw []ghIssueComment
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, number)
-	if err := ghDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=100", owner, repo, number)
+	raw, err := ghDoPaged[ghIssueComment](ctx, c.base(), path, c.token)
+	if err != nil {
 		return nil, err
 	}
 	out := make([]IssueComment, 0, len(raw))
 	for _, c := range raw {
 		out = append(out, IssueComment{Author: c.User.Login, Body: c.Body, CreatedAt: c.CreatedAt})
 	}
+	// Defensive sort: GitHub returns comments oldest-first by default, but sort
+	// guards against any ordering surprise within the fetched set.
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
 }

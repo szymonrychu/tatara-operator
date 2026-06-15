@@ -154,6 +154,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
 		}
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
+		r.recordSCM(provider, "open_change", openErr)
 		if openErr != nil {
 			var he *scm.HTTPError
 			if errors.As(openErr, &he) && he.Status >= 400 && he.Status < 500 {
@@ -189,8 +190,10 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		commented := task.Spec.Source != nil && task.Spec.Source.IssueRef != "" &&
 			task.Status.ResultSummary != "" && task.Status.LifecycleState != "Implement"
 		if commented {
-			if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary); err != nil {
-				l.Error(err, "writeback: comment result on work item (non-fatal)",
+			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary)
+			r.recordSCM(provider, "comment", cerr)
+			if cerr != nil {
+				l.Error(cerr, "writeback: comment result on work item (non-fatal)",
 					"issue_ref", task.Spec.Source.IssueRef)
 			}
 		}
@@ -206,15 +209,24 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	}
 
 	// Record primary PR URL (first in list) and all URLs in the condition message.
-	task.Status.PrURL = prURLs[0]
-	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-		Type:               "WritebackPending",
-		Status:             metav1.ConditionFalse,
-		Reason:             "Written",
-		Message:            "pr/mr opened: " + strings.Join(prURLs, " "),
-		ObservedGeneration: task.Generation,
-	})
-	if err := r.Status().Update(ctx, task); err != nil {
+	// RetryOnConflict ensures this idempotency key lands even when a concurrent
+	// lifecycle reconcile has bumped the resource version.
+	prURLsMsg := strings.Join(prURLs, " ")
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
+			return gerr
+		}
+		fresh.Status.PrURL = prURLs[0]
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "WritebackPending",
+			Status:             metav1.ConditionFalse,
+			Reason:             "Written",
+			Message:            "pr/mr opened: " + prURLsMsg,
+			ObservedGeneration: fresh.Generation,
+		})
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("writeback: update prURL: %w", err)
 	}
 
@@ -226,8 +238,10 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		if task.Status.ResultSummary != "" {
 			commentBody += "\n\n" + task.Status.ResultSummary
 		}
-		if err := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody); err != nil {
-			l.Error(err, "writeback: comment on work item (non-fatal)",
+		cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody)
+		r.recordSCM(provider, "comment", cerr)
+		if cerr != nil {
+			l.Error(cerr, "writeback: comment on work item (non-fatal)",
 				"issue_ref", task.Spec.Source.IssueRef)
 			// Non-fatal: PRs exist; continue.
 		}
@@ -266,7 +280,16 @@ func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatara
 // created at/after this brainstorm Task count, excluding prior-cycle proposals.
 func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatarav1alpha1.Task) bool {
 	var list tatarav1alpha1.TaskList
-	if err := r.List(ctx, &list, client.InNamespace(task.Namespace)); err != nil {
+	err := r.List(ctx, &list,
+		client.InNamespace(task.Namespace),
+		client.MatchingFields{taskIndexProjectRef: task.Spec.ProjectRef},
+	)
+	if err != nil && isFieldSelectorUnsupported(err) {
+		// Fall back to full-namespace scan when the field index is not registered
+		// (direct-client test environments without a manager).
+		err = r.List(ctx, &list, client.InNamespace(task.Namespace))
+	}
+	if err != nil {
 		log.FromContext(ctx).Error(err, "writeback: brainstormHasProposal: list tasks (treating as no proposal)", "task", task.Name)
 		return false
 	}
@@ -422,7 +445,7 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 				"action", "scm_propose_skip_duplicate",
 				"resource_id", task.Name,
 				"existing_number", existing.Number)
-			return r.recordExistingProposal(ctx, proj, task, existing)
+			return r.recordExistingProposal(ctx, proj, task, existing, repo.Spec.URL)
 		}
 	}
 
@@ -520,11 +543,11 @@ func (r *TaskReconciler) completeProposal(ctx context.Context, task *tatarav1alp
 
 // recordExistingProposal wires the task to an existing open issue that matches
 // the proposal title, skipping CreateIssue. Used by the (C) title-dedup path.
-func (r *TaskReconciler) recordExistingProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, existing scm.IssueRef) (ctrl.Result, error) {
-	issueURL := fmt.Sprintf("https://github.com/%s/issues/%d", existing.Repo, existing.Number)
-	if proj.Spec.Scm.Provider == "gitlab" {
-		issueURL = fmt.Sprintf("https://gitlab.com/%s/-/issues/%d", existing.Repo, existing.Number)
-	}
+// repoURL is the configured Repository URL; the base (scheme+host) is derived
+// from it so self-hosted GitLab instances produce a correct issue URL instead
+// of the hardcoded gitlab.com host.
+func (r *TaskReconciler) recordExistingProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, existing scm.IssueRef, repoURL string) (ctrl.Result, error) {
+	issueURL := issueURLFromRepoURL(repoURL, proj.Spec.Scm.Provider, existing.Repo, existing.Number)
 	issueRef := fmt.Sprintf("%s#%d", existing.Repo, existing.Number)
 
 	src := &tatarav1alpha1.TaskSource{
@@ -637,13 +660,16 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 	}
 	_ = proj
 	number := task.Spec.Source.Number
+	var verbSent bool
 	switch v.Decision {
 	case "approve":
 		err = writer.Approve(ctx, repo.Spec.URL, token, number, v.Body)
 		r.recordSCM(provider, "approve", err)
+		verbSent = err == nil
 	case "request_changes":
 		err = writer.RequestChanges(ctx, repo.Spec.URL, token, number, v.Body)
 		r.recordSCM(provider, "request_changes", err)
+		verbSent = err == nil
 		if err == nil && len(v.Suggestions) > 0 {
 			serr := writer.Suggest(ctx, repo.Spec.URL, token, number, toSCMSuggestions(v.Suggestions))
 			r.recordSCM(provider, "suggest", serr)
@@ -651,10 +677,17 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 	case "comment":
 		err = writer.Comment(ctx, token, task.Spec.Source.IssueRef, v.Body)
 		r.recordSCM(provider, "comment", err)
+		verbSent = err == nil
 	default:
 		err = fmt.Errorf("unknown review decision %q", v.Decision)
 	}
 	if err != nil {
+		// If the verb reached the server (verbSent) but a later persistence step
+		// fails, clear WritebackPending before returning so a requeue does not
+		// re-post the same non-idempotent verb (duplicate approve/request_changes).
+		if verbSent {
+			r.clearWritebackPending(ctx, task, "Reviewed", "review verdict posted: "+v.Decision)
+		}
 		return ctrl.Result{}, fmt.Errorf("writeback review: %w", err)
 	}
 	l.Info("review verdict posted", "action", "scm_review", "resource_id", task.Name, "decision", v.Decision)
@@ -701,7 +734,7 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		err = writer.ClosePR(ctx, repo.Spec.URL, token, number, out.Reason)
 		r.recordSCM(provider, "close", err)
 	case "merge":
-		ok, merr := r.mergeAllowed(ctx, &proj, repo, writer, token, number)
+		ok, merr := r.mergeAllowed(ctx, &proj, repo, writer, token, number, st)
 		if merr != nil {
 			return ctrl.Result{}, merr
 		}
@@ -712,17 +745,14 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		}
 		_, err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
 		r.recordSCM(provider, "merge", err)
-		// 405 or body contains "conflict" -> merge conflict on an in-flight task.
+		// ErrMergeConflict -> merge conflict on an in-flight task.
 		// Do NOT return the error: that would trigger controller-runtime backoff loop.
 		// Instead clear WritebackPending and let the task be re-triaged.
-		if err != nil {
-			var he *scm.HTTPError
-			if errors.As(err, &he) && (he.Status == 405 || strings.Contains(strings.ToLower(he.Body), "conflict")) {
-				l.Info("self-improve merge conflict (405); clearing writeback pending",
-					"action", "scm_selfimprove_conflict", "resource_id", task.Name)
-				r.clearWritebackPending(ctx, task, "MergeConflict", "merge conflict; left for re-triage")
-				return ctrl.Result{}, nil
-			}
+		if errors.Is(err, scm.ErrMergeConflict) {
+			l.Info("self-improve merge conflict; clearing writeback pending",
+				"action", "scm_selfimprove_conflict", "resource_id", task.Name)
+			r.clearWritebackPending(ctx, task, "MergeConflict", "merge conflict; left for re-triage")
+			return ctrl.Result{}, nil
 		}
 	default:
 		err = fmt.Errorf("unknown pr outcome %q", out.Action)
@@ -844,16 +874,14 @@ func (r *TaskReconciler) selfImproveBotAuthored(ctx context.Context, proj *tatar
 // mergeAllowed enforces MergePolicy. autoMergeOnGreenCI merges only when CI is
 // present and green; CI absent falls back to afterApproval (trusts pr_outcome=merge
 // as the agent's relay of an approving signal).
-func (r *TaskReconciler) mergeAllowed(ctx context.Context, proj *tatarav1alpha1.Project, repo tatarav1alpha1.Repository, writer scm.SCMWriter, token string, number int) (bool, error) {
+// st is the PR state already fetched by the authorship gate; passing it avoids
+// a second GetPRState call on the hot merge path.
+func (r *TaskReconciler) mergeAllowed(_ context.Context, proj *tatarav1alpha1.Project, _ tatarav1alpha1.Repository, _ scm.SCMWriter, _ string, _ int, st scm.PRState) (bool, error) {
 	policy := "afterApproval"
 	if proj.Spec.Scm != nil && proj.Spec.Scm.MergePolicy != "" {
 		policy = proj.Spec.Scm.MergePolicy
 	}
 	if policy == "autoMergeOnGreenCI" {
-		st, err := writer.GetPRState(ctx, repo.Spec.URL, token, number)
-		if err != nil {
-			return false, fmt.Errorf("merge policy: get pr state: %w", err)
-		}
 		if st.CIStatus == "success" {
 			return true, nil
 		}
@@ -894,4 +922,32 @@ func openChangeSkipReason(he *scm.HTTPError) string {
 		return "no-change"
 	}
 	return "skip-4xx"
+}
+
+// issueURLFromRepoURL constructs an issue web URL by deriving the base
+// (scheme+host) from repoURL rather than hardcoding github.com or gitlab.com.
+// This correctly handles self-hosted GitLab instances.
+func issueURLFromRepoURL(repoURL, provider, repo string, number int) string {
+	base := "https://github.com"
+	if u, err := parseRepoBase(repoURL); err == nil {
+		base = u
+	} else if provider == "gitlab" {
+		base = "https://gitlab.com"
+	}
+	if provider == "gitlab" {
+		return fmt.Sprintf("%s/%s/-/issues/%d", base, repo, number)
+	}
+	return fmt.Sprintf("%s/%s/issues/%d", base, repo, number)
+}
+
+// parseRepoBase returns the scheme+host of repoURL (e.g. "https://gitlab.example.com").
+func parseRepoBase(repoURL string) (string, error) {
+	if i := strings.Index(repoURL, "://"); i >= 0 {
+		rest := repoURL[i+3:]
+		if j := strings.IndexByte(rest, '/'); j >= 0 {
+			return repoURL[:i+3] + rest[:j], nil
+		}
+		return repoURL[:i+3] + rest, nil
+	}
+	return "", fmt.Errorf("no scheme in %q", repoURL)
 }

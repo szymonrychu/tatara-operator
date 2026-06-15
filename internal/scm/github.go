@@ -12,9 +12,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// scmHTTPClient is a shared http.Client with a sane timeout for all SCM REST
+// calls. http.DefaultClient has no timeout and can hang indefinitely.
+var scmHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 type ghLabel struct {
 	Name string `json:"name"`
@@ -202,6 +208,68 @@ func ghIssueRef(ref string) (string, string, int, error) {
 	return oParts[0], oParts[1], n, nil
 }
 
+// ghLinkNext parses the RFC5988 Link header and returns the URL for rel="next", or "".
+var ghLinkNextRE = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+
+func ghLinkNext(header string) string {
+	m := ghLinkNextRE.FindStringSubmatch(header)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// ghDoPaged performs paginated GET requests following Link rel="next" headers.
+// It decodes each page into a []T and appends to a single slice returned to the caller.
+// in must be nil (GET only). out must be a *[]T.
+func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error) {
+	var all []T
+	nextURL := base + path
+	for nextURL != "" {
+		var page []T
+		link, err := ghDoWithHeaders(ctx, nextURL, token, &page)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		raw := ghLinkNext(link)
+		if raw == "" {
+			break
+		}
+		// The next URL may be absolute; strip the base so ghDoWithHeaders can use it directly.
+		nextURL = raw
+	}
+	return all, nil
+}
+
+// ghDoWithHeaders performs a single GET, decodes JSON body into out, and returns the Link header.
+func ghDoWithHeaders(ctx context.Context, fullURL, token string, out any) (linkHeader string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("github: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := scmHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("github: do request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	link := resp.Header.Get("Link")
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(resp.Body)
+		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: fullURL}
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return "", fmt.Errorf("github: decode response: %w", err)
+		}
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	return link, nil
+}
+
 func ghDo(ctx context.Context, base, method, path, token string, in, out any) error {
 	var rdr io.Reader
 	if in != nil {
@@ -220,7 +288,7 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 	if rdr != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := scmHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("github: do request: %w", err)
 	}
@@ -271,16 +339,28 @@ func (c *GitHub) AddLabel(ctx context.Context, token, issueRef, label string) er
 }
 
 // RemoveLabel removes a single label from an issue/PR.
+// The label name is URL-encoded so slashes in tatara/* phase labels hit the
+// correct DELETE /repos/{owner}/{repo}/issues/{n}/labels/{name} route.
 func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
 	owner, repo, number, err := ghIssueRef(issueRef)
 	if err != nil {
 		return err
 	}
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, label)
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, url.PathEscape(label))
 	return ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
 }
 
-// GetPRState reads a PR plus its head check-runs, deriving CIStatus.
+// ghCheckRun is the decoded shape of one GitHub check-run entry.
+type ghCheckRun struct {
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}
+
+// GetPRState reads a PR and derives CIStatus by delegating to GetCommitCIStatus,
+// which folds both check-runs and the legacy combined-status API. This keeps the
+// merge gate and the scan loop consistent across all CI reporting styles.
+// GitHub returns mergeable:null while it computes mergeability; the field is
+// advisory-only and not part of PRState (see ErrMergeConflict for the merge gate).
 func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
@@ -290,8 +370,7 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 		User struct {
 			Login string `json:"login"`
 		} `json:"user"`
-		Mergeable bool `json:"mergeable"`
-		Head      struct {
+		Head struct {
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
@@ -299,24 +378,20 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), token, nil, &pr); err != nil {
 		return PRState{}, err
 	}
-	st := PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, Mergeable: pr.Mergeable}
-	var checks struct {
-		CheckRuns []struct {
-			Status     string `json:"status"`
-			Conclusion string `json:"conclusion"`
-		} `json:"check_runs"`
-	}
-	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, pr.Head.SHA), token, nil, &checks); err != nil {
+	// Derive CI by folding check-runs and the legacy combined-status endpoint
+	// (CI systems that report via Commit Statuses are otherwise invisible from
+	// check-runs alone). Use the per-call token, not c.token: the writer client
+	// from ByProvider has an empty c.token and supplies the real token per call,
+	// so delegating to GetCommitCIStatus (which reads c.token) would issue an
+	// unauthenticated request and fail on private repos.
+	ciStatus, err := c.commitCIStatus(ctx, owner, repo, pr.Head.SHA, token)
+	if err != nil {
 		return PRState{}, err
 	}
-	st.CIStatus = deriveGHCIStatus(checks.CheckRuns)
-	return st, nil
+	return PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, CIStatus: ciStatus}, nil
 }
 
-func deriveGHCIStatus(runs []struct {
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-}) string {
+func deriveGHCIStatus(runs []ghCheckRun) string {
 	if len(runs) == 0 {
 		return ""
 	}
@@ -380,7 +455,11 @@ func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int,
 }
 
 // Merge merges a PR with the given method (squash|merge|rebase).
-// Returns the merge commit SHA on success.
+// Returns the merge commit SHA on success. Returns ErrMergeConflict when
+// GitHub signals the PR is not mergeable (405 Method Not Allowed) or a
+// conflict/head mismatch occurred (409 Conflict). The poll model means CI
+// must be green before this is called; use pollRequeue to avoid rate-limit
+// storms while waiting for CI rather than enabling platform auto-merge.
 func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
@@ -391,6 +470,10 @@ func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, m
 		SHA string `json:"sha"`
 	}
 	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, &resp); err != nil {
+		var he *HTTPError
+		if errors.As(err, &he) && (he.Status == 405 || he.Status == 409) {
+			return "", ErrMergeConflict
+		}
 		return "", err
 	}
 	return resp.SHA, nil
@@ -421,14 +504,19 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 //
 // Returns "" (none) | "pending" | "success" | "failure".
 func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string) (string, error) {
+	return c.commitCIStatus(ctx, owner, repo, sha, c.token)
+}
+
+// commitCIStatus is the token-parameterized implementation behind both
+// GetCommitCIStatus (reader path, token=c.token) and GetPRState (writer path,
+// per-call token). Keeping the token explicit prevents the empty-c.token writer
+// client from issuing unauthenticated CI requests.
+func (c *GitHub) commitCIStatus(ctx context.Context, owner, repo, sha, token string) (string, error) {
 	var checks struct {
-		CheckRuns []struct {
-			Status     string `json:"status"`
-			Conclusion string `json:"conclusion"`
-		} `json:"check_runs"`
+		CheckRuns []ghCheckRun `json:"check_runs"`
 	}
 	checkPath := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", owner, repo, sha)
-	if err := ghDo(ctx, c.base(), http.MethodGet, checkPath, c.token, nil, &checks); err != nil {
+	if err := ghDo(ctx, c.base(), http.MethodGet, checkPath, token, nil, &checks); err != nil {
 		return "", err
 	}
 	checkStatus := deriveGHCIStatus(checks.CheckRuns)
@@ -440,7 +528,7 @@ func (c *GitHub) GetCommitCIStatus(ctx context.Context, owner, repo, sha string)
 		TotalCount int    `json:"total_count"`
 	}
 	statusPath := fmt.Sprintf("/repos/%s/%s/commits/%s/status", owner, repo, sha)
-	if err := ghDo(ctx, c.base(), http.MethodGet, statusPath, c.token, nil, &combined); err != nil {
+	if err := ghDo(ctx, c.base(), http.MethodGet, statusPath, token, nil, &combined); err != nil {
 		return "", err
 	}
 	// combined.State is always present (even "pending" when TotalCount==0).

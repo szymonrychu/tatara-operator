@@ -2,7 +2,10 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -42,6 +45,9 @@ type Server struct {
 func NewServer(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.Metrics == nil {
+		panic("webhook.NewServer: cfg.Metrics must not be nil")
 	}
 	return &Server{cfg: cfg, log: cfg.Logger}
 }
@@ -205,9 +211,16 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// bot PR -> issueLifecycle (was "selfImprove"); migration note: in-flight
 	// "implement"/"selfImprove" tasks created before this deploy still complete
 	// via the old writeback arms.
+	//
+	// For GitLab, AuthorLogin == ActorLogin (the webhook carries only the event
+	// actor, not the MR author). Trusting AuthorLogin==bot for kind selection
+	// would misclassify any event the bot triggers on a human's MR. Restrict the
+	// bot-authorship branch to GitHub, where AuthorLogin is the real PR author.
+	// GitLab MRs default to "review" and the authoritative authorship gate runs
+	// in the controller via GetPRState (see scm-author-vs-actor-egress-gate memory).
 	kind := "issueLifecycle"
 	if ev.IsPR {
-		if ev.AuthorLogin == bot && bot != "" {
+		if ev.AuthorLogin == bot && bot != "" && provider == "github" {
 			kind = "issueLifecycle"
 		} else {
 			kind = "review"
@@ -250,8 +263,18 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// Dedupe: creating an issue with the label fires both issues.opened and
 	// issues.labeled for the same issue. Skip if a non-terminal Task already
 	// exists for this issue ref (re-labeling after completion still re-triggers).
+	// Use MatchingLabels so the cache filters Tasks to the dedup key before the
+	// in-Go scan, avoiding an O(all-tasks) walk per webhook.
+	dedupSlug, _ := issueRefRepoSlug(ev.IssueRef)
 	var existing tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &existing, client.InNamespace(s.cfg.Namespace)); err != nil {
+	listOpts := []client.ListOption{
+		client.InNamespace(s.cfg.Namespace),
+		client.MatchingLabels{
+			tatarav1.LabelSourceRepo:   dedupSlug,
+			tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
+		},
+	}
+	if err := s.cfg.Client.List(ctx, &existing, listOpts...); err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "list tasks", http.StatusInternalServerError)
 		return
@@ -286,7 +309,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			if issueNum, linked := scm.LinkedIssueNumber(ev.Body); linked {
 				dedupNumber = issueNum
 			}
-			repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+			repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
 			labels = map[string]string{
 				tatarav1.LabelSourceRepo:   repoSlug,
 				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
@@ -295,7 +318,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			}
 		} else {
 			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
-			repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+			repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
 			labels = map[string]string{
 				tatarav1.LabelSourceRepo:   repoSlug,
 				tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
@@ -305,9 +328,22 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
+	// For issueLifecycle tasks, use a deterministic name derived from the dedup
+	// key so concurrent webhook deliveries for the same work item race to a
+	// single winner: the second Create returns AlreadyExists instead of silently
+	// creating a duplicate (GenerateName makes both succeeds). review tasks use
+	// GenerateName because multiple review Tasks per PR are intentional.
+	taskName := ""
+	taskGenerateName := "task-"
+	if kind == "issueLifecycle" {
+		taskName = issueLifecycleTaskName(proj.Name, ev.IssueRef)
+		taskGenerateName = ""
+	}
+
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName:    "task-",
+			Name:            taskName,
+			GenerateName:    taskGenerateName,
 			Namespace:       s.cfg.Namespace,
 			Annotations:     ann,
 			Labels:          labels,
@@ -330,6 +366,13 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	agent.StampPodName(task, proj.Name, provider, repo.Name)
 	if err := s.cfg.Client.Create(ctx, task); err != nil {
+		if apierrors.IsAlreadyExists(err) && kind == "issueLifecycle" {
+			s.log.InfoContext(ctx, "work item task already exists (concurrent create); treating as duplicate",
+				"project", proj.Name, "issue_ref", ev.IssueRef)
+			s.count(provider, ev.Kind, ev.Action, "duplicate")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
@@ -477,7 +520,7 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	}
 
 	// Dedup labels matching the issueScan convention.
-	repoSlug := strings.ReplaceAll(ev.IssueRef[:strings.LastIndex(ev.IssueRef, "#")], "/", ".")
+	repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
 	labels := map[string]string{
 		tatarav1.LabelSourceRepo:   repoSlug,
 		tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
@@ -488,7 +531,7 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName:    "task-",
+			Name:            issueLifecycleTaskName(proj.Name, ev.IssueRef),
 			Namespace:       s.cfg.Namespace,
 			Annotations:     ann,
 			Labels:          labels,
@@ -511,6 +554,13 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	}
 	agent.StampPodName(task, proj.Name, provider, repo.Name)
 	if err := s.cfg.Client.Create(ctx, task); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			s.log.InfoContext(ctx, "issue_comment: lifecycle task already exists (concurrent create); treating as duplicate",
+				"project", proj.Name, "issue_ref", ev.IssueRef)
+			s.count(provider, ev.Kind, ev.Action, "duplicate")
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
@@ -525,7 +575,8 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 // issue ref within the project. Returns (task, true) when found.
 func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
 	var tasks tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+	opts := s.taskListOpts(issueRef)
+	if err := s.cfg.Client.List(ctx, &tasks, opts...); err != nil {
 		return nil, false
 	}
 	for i := range tasks.Items {
@@ -555,7 +606,8 @@ func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef st
 // NOT reactivated (their work is complete). Returns (task, true) when found.
 func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
 	var tasks tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+	opts := s.taskListOpts(issueRef)
+	if err := s.cfg.Client.List(ctx, &tasks, opts...); err != nil {
 		return nil, false
 	}
 	for i := range tasks.Items {
@@ -571,6 +623,22 @@ func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRe
 		}
 	}
 	return nil, false
+}
+
+// taskListOpts builds list options that pre-filter Tasks by the dedup labels
+// derived from issueRef. Falls back to namespace-only if the ref is unparseable.
+func (s *Server) taskListOpts(issueRef string) []client.ListOption {
+	repoSlug, ok := issueRefRepoSlug(issueRef)
+	if !ok {
+		return []client.ListOption{client.InNamespace(s.cfg.Namespace)}
+	}
+	return []client.ListOption{
+		client.InNamespace(s.cfg.Namespace),
+		client.MatchingLabels{
+			tatarav1.LabelSourceRepo: repoSlug,
+			tatarav1.LabelSourceKind: "issueLifecycle",
+		},
+	}
 }
 
 // reactivateTask resumes a Parked owning Task: it clears the agent-run state
@@ -631,6 +699,28 @@ func mentionsBot(body, bot string) bool {
 	return bot != "" && strings.Contains(body, "@"+bot)
 }
 
+// issueRefRepoSlug strips the trailing separator ('#' or '!') and numeric id
+// from an IssueRef of the form "owner/repo#N" (GitHub) or "group/proj!N"
+// (GitLab MR), returning the repo path with '/' replaced by '.'.
+// Returns ("", false) when neither separator is present or the ref is malformed.
+func issueRefRepoSlug(issueRef string) (string, bool) {
+	idx := strings.LastIndexAny(issueRef, "#!")
+	if idx < 0 {
+		return "", false
+	}
+	return strings.ReplaceAll(issueRef[:idx], "/", "."), true
+}
+
+// issueLifecycleTaskName returns a deterministic Kubernetes-safe Task name for
+// an issueLifecycle task scoped to (projectName, issueRef). Using a deterministic
+// name rather than GenerateName makes concurrent webhook deliveries for the same
+// work item idempotent: the second Create returns AlreadyExists which is treated
+// as a duplicate, preventing two live lifecycle Tasks for one work item.
+func issueLifecycleTaskName(projectName, issueRef string) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s", projectName, issueRef)))
+	return "lc-" + hex.EncodeToString(h[:])[:16]
+}
+
 // maxPendingInterjections caps the queue of comments waiting to be injected into
 // a live turn, so a comment storm cannot grow Task status without bound. The
 // oldest entries are dropped first.
@@ -660,6 +750,9 @@ func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) 
 	v, ok := sec.Data["webhookSecret"]
 	if !ok {
 		return "", errors.New("secret missing webhookSecret key")
+	}
+	if len(v) == 0 {
+		return "", errors.New("secret webhookSecret is empty")
 	}
 	return string(v), nil
 }

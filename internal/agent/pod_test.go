@@ -300,6 +300,119 @@ func TestBuildPodName_SanitizesAndCaps(t *testing.T) {
 	require.LessOrEqual(t, len(long), 63)
 }
 
+// TestBuildPod_Resources asserts that a PodConfig with resource requests/limits
+// wires them into the wrapper container.
+func TestBuildPod_Resources(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.CPURequest = "100m"
+	cfg.CPULimit = "500m"
+	cfg.MemoryRequest = "128Mi"
+	cfg.MemoryLimit = "512Mi"
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	require.Equal(t, "100m", c.Resources.Requests.Cpu().String())
+	require.Equal(t, "500m", c.Resources.Limits.Cpu().String())
+	require.Equal(t, "128Mi", c.Resources.Requests.Memory().String())
+	require.Equal(t, "512Mi", c.Resources.Limits.Memory().String())
+}
+
+// TestBuildPod_ResourcesEmpty asserts that an empty PodConfig produces no
+// resource requirements (zero value), preserving backward compatibility.
+func TestBuildPod_ResourcesEmpty(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.CPURequest = ""
+	cfg.CPULimit = ""
+	cfg.MemoryRequest = ""
+	cfg.MemoryLimit = ""
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	require.True(t, c.Resources.Requests.Cpu().IsZero())
+	require.True(t, c.Resources.Limits.Cpu().IsZero())
+}
+
+// TestBuildPod_ResourcesMalformedNoPanic asserts that a malformed resource
+// quantity does not panic the reconcile hot path (resource.MustParse would).
+// The malformed dimension is dropped; valid dimensions still apply.
+func TestBuildPod_ResourcesMalformedNoPanic(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.CPURequest = "1OO m" // typo: letter O, embedded space - invalid
+	cfg.MemoryRequest = "128Mi"
+	require.NotPanics(t, func() {
+		c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+		require.True(t, c.Resources.Requests.Cpu().IsZero(), "malformed cpu should be dropped")
+		require.Equal(t, "128Mi", c.Resources.Requests.Memory().String())
+	})
+}
+
+// TestValidatePodResourceQuantities flags malformed quantities at config load.
+func TestValidatePodResourceQuantities(t *testing.T) {
+	_, _, _, cfg := sampleInputs()
+	cfg.CPURequest = "100m"
+	cfg.MemoryLimit = "512Mi"
+	require.NoError(t, agent.ValidatePodResourceQuantities(cfg))
+
+	bad := cfg
+	bad.CPULimit = "not-a-qty"
+	require.ErrorContains(t, agent.ValidatePodResourceQuantities(bad), "cpuLimit")
+
+	empty := agent.PodConfig{}
+	require.NoError(t, agent.ValidatePodResourceQuantities(empty), "empty scalars are valid")
+}
+
+// TestBuildPod_SecurityContext asserts that the container gets a restrictive
+// securityContext when RunAsNonRoot is enabled in PodConfig.
+func TestBuildPod_SecurityContext(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.RunAsNonRoot = true
+	uid := int64(65534)
+	cfg.RunAsUser = &uid
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	sc := pod.Spec.Containers[0].SecurityContext
+	require.NotNil(t, sc)
+	require.True(t, *sc.RunAsNonRoot)
+	require.Equal(t, uid, *sc.RunAsUser)
+}
+
+// TestBuildPod_Tolerations asserts that Tolerations in PodConfig propagate to
+// the PodSpec.
+func TestBuildPod_Tolerations(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.Tolerations = []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	require.Len(t, pod.Spec.Tolerations, 1)
+	require.Equal(t, "node-role.kubernetes.io/control-plane", pod.Spec.Tolerations[0].Key)
+}
+
+// TestBuildPod_NodeSelector asserts that NodeSelector in PodConfig propagates
+// to the PodSpec.
+func TestBuildPod_NodeSelector(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	require.Equal(t, map[string]string{"kubernetes.io/os": "linux"}, pod.Spec.NodeSelector)
+}
+
+// TestValidatePodSecretRefs returns an error when ScmSecretRef is empty.
+func TestValidatePodSecretRefs(t *testing.T) {
+	proj, _, _, cfg := sampleInputs()
+
+	// All set: no error.
+	require.NoError(t, agent.ValidatePodSecretRefs(proj, cfg))
+
+	// Missing ScmSecretRef.
+	projNoSCM := *proj
+	projNoSCM.Spec.ScmSecretRef = ""
+	require.ErrorContains(t, agent.ValidatePodSecretRefs(&projNoSCM, cfg), "ScmSecretRef")
+
+	// Missing AnthropicSecretName.
+	cfgNoAnt := cfg
+	cfgNoAnt.AnthropicSecretName = ""
+	require.ErrorContains(t, agent.ValidatePodSecretRefs(proj, cfgNoAnt), "AnthropicSecretName")
+
+	// Missing CLIOIDCSecretName.
+	cfgNoCLI := cfg
+	cfgNoCLI.CLIOIDCSecretName = ""
+	require.ErrorContains(t, agent.ValidatePodSecretRefs(proj, cfgNoCLI), "CLIOIDCSecretName")
+}
+
 func TestBuildPodEgressLabel(t *testing.T) {
 	cases := []struct {
 		name    string

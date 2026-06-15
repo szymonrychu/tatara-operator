@@ -188,7 +188,8 @@ func glActionAndLabel(p glPayload) (string, string) {
 	case "":
 		return "other", ""
 	default:
-		return p.ObjectAttributes.Action, ""
+		// Return "other" rather than the raw action to keep the metric label a closed set.
+		return "other", ""
 	}
 }
 
@@ -233,8 +234,12 @@ func (c *GitLab) OpenChange(ctx context.Context, repoURL, token, sourceBranch, t
 // (group/proj!iid) targets a merge request; a '#' ref (group/proj#iid) targets
 // an issue. The ref is the single source of truth: GitLab issues and MRs have
 // distinct note endpoints, unlike GitHub where both share /issues/{n}/comments.
+// Routing uses LastIndex to match glBangRef/glHashRef semantics so project paths
+// containing '!' are not misrouted.
 func (c *GitLab) Comment(ctx context.Context, token, issueRef, body string) error {
-	if strings.Contains(issueRef, "!") {
+	bangAt := strings.LastIndex(issueRef, "!")
+	hashAt := strings.LastIndex(issueRef, "#")
+	if bangAt > hashAt {
 		proj, iid, err := glBangRef(issueRef)
 		if err != nil {
 			return err
@@ -264,6 +269,62 @@ func glProjectPath(repoURL string) (string, error) {
 // GitLabProjectPath parses a GitLab repo URL into its project path.
 func GitLabProjectPath(repoURL string) (string, error) { return glProjectPath(repoURL) }
 
+// glDoPaged performs paginated GET requests following the X-Next-Page header.
+// It decodes each page into a []T and returns all pages concatenated.
+func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error) {
+	var all []T
+	nextPath := path
+	for nextPath != "" {
+		var page []T
+		nextPage, err := glDoWithHeaders(ctx, base, nextPath, token, &page)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if nextPage == "" {
+			break
+		}
+		// Build the next path preserving existing query params and adding/updating page.
+		u, err := url.Parse(nextPath)
+		if err != nil {
+			break
+		}
+		q := u.Query()
+		q.Set("page", nextPage)
+		u.RawQuery = q.Encode()
+		nextPath = u.String()
+	}
+	return all, nil
+}
+
+// glDoWithHeaders performs a single GET and returns (X-Next-Page header, error).
+func glDoWithHeaders(ctx context.Context, base, path, token string, out any) (nextPage string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: build request: %w", err)
+	}
+	req.Header.Set("PRIVATE-TOKEN", token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := scmHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: do request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	next := resp.Header.Get("X-Next-Page")
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(resp.Body)
+		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return "", fmt.Errorf("gitlab: decode response: %w", err)
+		}
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	return next, nil
+}
+
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {
 	var rdr io.Reader
 	if in != nil {
@@ -282,7 +343,7 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 	if rdr != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := scmHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("gitlab: do request: %w", err)
 	}
@@ -354,7 +415,6 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		} `json:"author"`
 		SHA          string `json:"sha"`
 		SourceBranch string `json:"source_branch"`
-		MergeStatus  string `json:"merge_status"`
 		HeadPipeline struct {
 			Status string `json:"status"`
 		} `json:"head_pipeline"`
@@ -367,7 +427,6 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		Author:     mr.Author.Username,
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
-		Mergeable:  mr.MergeStatus == "can_be_merged",
 		CIStatus:   glCIStatus(mr.HeadPipeline.Status),
 	}, nil
 }
@@ -380,6 +439,10 @@ func glCIStatus(s string) string {
 		return "success"
 	case "failed", "canceled":
 		return "failure"
+	// skipped pipelines are effectively neutral (GitHub treats skipped/neutral as success).
+	// manual/scheduled/waiting_for_resource/preparing pipelines have not started yet; map to pending.
+	case "skipped":
+		return "success"
 	default:
 		return "pending"
 	}
@@ -435,11 +498,20 @@ func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int,
 	return nil
 }
 
-// Merge merges an MR. Returns the merge commit SHA on success.
+// Merge merges an MR. Returns the merge commit SHA on success. Returns
+// ErrMergeConflict when GitLab signals the MR is not mergeable (405/406/409).
+// method must be "squash" or "merge"; GitLab does not support "rebase" via the
+// merge endpoint and treating it silently as a non-squash merge would be wrong.
 func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
 		return "", err
+	}
+	switch method {
+	case "squash", "merge", "":
+		// supported
+	default:
+		return "", fmt.Errorf("gitlab: unsupported merge method %q (use \"squash\" or \"merge\")", method)
 	}
 	in := map[string]bool{"squash": method == "squash"}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/merge"
@@ -447,6 +519,10 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
+		var he *HTTPError
+		if errors.As(err, &he) && (he.Status == 405 || he.Status == 406 || he.Status == 409) {
+			return "", ErrMergeConflict
+		}
 		return "", err
 	}
 	return resp.MergeCommitSHA, nil
@@ -554,7 +630,7 @@ func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha s
 	var statuses []struct {
 		Status string `json:"status"`
 	}
-	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + sha + "/statuses"
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses"
 	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &statuses); err != nil {
 		return "", err
 	}

@@ -11,8 +11,8 @@ func TestValueTypesZero(t *testing.T) {
 	if ref.Ref != "o/r#1" || ref.URL == "" {
 		t.Fatalf("CreatedIssue fields not wired: %+v", ref)
 	}
-	st := PRState{Author: "a", HeadSHA: "sha", HeadBranch: "br", Mergeable: true, CIStatus: "success"}
-	if !st.Mergeable || st.CIStatus != "success" {
+	st := PRState{Author: "a", HeadSHA: "sha", HeadBranch: "br", CIStatus: "success"}
+	if st.CIStatus != "success" {
 		t.Fatalf("PRState fields not wired: %+v", st)
 	}
 	s := Suggestion{Path: "a.go", Line: 12, Body: "fix"}

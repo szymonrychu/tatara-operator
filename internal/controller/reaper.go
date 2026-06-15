@@ -3,10 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -40,35 +40,65 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		return
 	}
 
+	// Build a name->Task map with one List instead of one Get per pod.
+	var taskList tatarav1alpha1.TaskList
+	if err := s.Client.List(ctx, &taskList, client.InNamespace(s.Namespace)); err != nil {
+		l.Error(err, "reaper: list tasks")
+		return
+	}
+	tasks := make(map[string]*tatarav1alpha1.Task, len(taskList.Items))
+	for i := range taskList.Items {
+		tasks[taskList.Items[i].Name] = &taskList.Items[i]
+	}
+
 	for i := range pods.Items {
+		// Check context cancellation before each pod so we stop cleanly on shutdown.
+		if ctx.Err() != nil {
+			return
+		}
 		pod := &pods.Items[i]
-		reason, orphan := s.orphanReason(ctx, pod)
+		reason, orphan := s.orphanReason(pod, tasks)
 		if !orphan {
 			continue
 		}
-		l.Info("reaping orphan wrapper pod", "action", "reap_orphan",
-			"resource_id", pod.Name, "task", pod.Labels[agent.LabelTask], "reason", reason)
-		s.reapWrapper(ctx, pod.Name)
+		if err := s.reapWrapper(ctx, pod.Name); err != nil {
+			l.Error(err, "reaper: failed to reap orphan wrapper pod", "action", "reap_orphan",
+				"resource_id", pod.Name, "task", pod.Labels[agent.LabelTask], "reason", reason)
+		} else {
+			l.Info("reaped orphan wrapper pod", "action", "reap_orphan",
+				"resource_id", pod.Name, "task", pod.Labels[agent.LabelTask], "reason", reason)
+			s.Metrics.OrphanReaped(reason)
+		}
 	}
 }
 
 // orphanReason decides whether a wrapper pod should be reaped and why. It returns
 // (reason, true) when the pod is an orphan, or ("", false) when it backs a live,
 // non-terminal Task and must be left running.
-func (s *CallbackServer) orphanReason(ctx context.Context, pod *corev1.Pod) (string, bool) {
+//
+// Creation grace: never reap a pod younger than the grace window to avoid the
+// spawn-vs-reap race where a freshly created pod (or its Task) has not yet
+// propagated through the cache (fixing findings 1, 2, and 7).
+func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav1alpha1.Task) (string, bool) {
+	grace := s.ReaperGrace
+	if grace == 0 {
+		grace = pollRequeue
+	}
+	// Grace window: a pod just spawned may have a transiently absent Task in
+	// cache, or its Task may briefly appear terminal before the spawn settles.
+	if time.Since(pod.CreationTimestamp.Time) < grace {
+		return "", false
+	}
+
 	taskName := pod.Labels[agent.LabelTask]
 	if taskName == "" {
 		// Unlabelled wrapper pod: cannot correlate, leave it for a human.
 		return "", false
 	}
 
-	var task tatarav1alpha1.Task
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: taskName}, &task); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "task absent", true
-		}
-		// Transient API error: do not reap on uncertainty.
-		return "", false
+	task, ok := tasks[taskName]
+	if !ok {
+		return "task absent", true
 	}
 
 	if uid := pod.Labels[agent.LabelTaskUID]; uid != "" && uid != string(task.UID) {
@@ -84,19 +114,24 @@ func (s *CallbackServer) orphanReason(ctx context.Context, pod *corev1.Pod) (str
 }
 
 // reapWrapper best-effort deletes a wrapper Pod and its same-named Service by
-// name. A missing object is not an error.
-func (s *CallbackServer) reapWrapper(ctx context.Context, name string) {
+// name. A missing object is not an error. Returns a non-nil error only when an
+// unexpected delete failure occurs on the Pod (the primary resource).
+func (s *CallbackServer) reapWrapper(ctx context.Context, name string) error {
 	l := log.FromContext(ctx)
 	pod := &corev1.Pod{}
 	pod.Name = name
 	pod.Namespace = s.Namespace
 	if err := s.Client.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 		l.Error(err, "reaper: delete pod", "resource_id", name)
+		s.Metrics.ReapDeleteError("pod")
+		return err
 	}
 	svc := &corev1.Service{}
 	svc.Name = name
 	svc.Namespace = s.Namespace
 	if err := s.Client.Delete(ctx, svc); err != nil && !apierrors.IsNotFound(err) {
 		l.Error(err, "reaper: delete service", "resource_id", name)
+		s.Metrics.ReapDeleteError("service")
 	}
+	return nil
 }

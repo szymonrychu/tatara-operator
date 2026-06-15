@@ -140,3 +140,73 @@ func TestTaskAndSubtaskRegisteredInScheme(t *testing.T) {
 		}
 	}
 }
+
+// TestTaskTerminal covers Finding 3: the TaskTerminal helper must correctly
+// identify terminal tasks across both Phase and LifecycleState, so that
+// issueLifecycle tasks (which leave Phase empty for their whole life) are not
+// treated as indefinitely open by lane-occupancy and similar predicates.
+func TestTaskTerminal(t *testing.T) {
+	cases := []struct {
+		name  string
+		phase string
+		ls    string
+		want  bool
+	}{
+		{"phase succeeded", "Succeeded", "", true},
+		{"phase failed", "Failed", "", true},
+		{"phase running", "Running", "", false},
+		{"phase planning", "Planning", "", false},
+		{"phase empty+ls done", "", "Done", true},
+		{"phase empty+ls stopped", "", "Stopped", true},
+		{"phase empty+ls parked", "", "Parked", true},
+		{"phase empty+ls implement", "", "Implement", false},
+		{"phase empty+ls triage", "", "Triage", false},
+		{"phase empty+ls empty", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &v1alpha1.Task{
+				Status: v1alpha1.TaskStatus{
+					Phase:          tc.phase,
+					LifecycleState: tc.ls,
+				},
+			}
+			if got := v1alpha1.TaskTerminal(task); got != tc.want {
+				t.Errorf("TaskTerminal = %v, want %v (phase=%q ls=%q)", got, tc.want, tc.phase, tc.ls)
+			}
+		})
+	}
+}
+
+// TestSuggestionLineMarker verifies Suggestion.Line is present and accepts a
+// valid positive value (the +kubebuilder:validation:Minimum=1 marker is a
+// CRD-schema concern; this test guards the struct field exists and is
+// round-trippable).
+func TestSuggestionLineField(t *testing.T) {
+	s := v1alpha1.Suggestion{Path: "foo.go", Line: 42, Body: "comment"}
+	if s.Line != 42 {
+		t.Fatalf("Line = %d, want 42", s.Line)
+	}
+}
+
+// TestImplementOutcomeDeepCopy verifies that a non-nil ImplementOutcome is
+// deep-copied (not shallow-aliased) so mutations through the copy cannot
+// corrupt the informer-cache original (Finding 2).
+func TestImplementOutcomeDeepCopy(t *testing.T) {
+	task := &v1alpha1.Task{
+		Status: v1alpha1.TaskStatus{
+			ImplementOutcome: &v1alpha1.ImplementOutcome{Action: "declined", Reason: "scope too large"},
+		},
+	}
+	cp := task.DeepCopy()
+	if cp.Status.ImplementOutcome == task.Status.ImplementOutcome {
+		t.Fatal("ImplementOutcome must be a distinct pointer after DeepCopy")
+	}
+	if cp.Status.ImplementOutcome.Action != "declined" {
+		t.Errorf("Action = %q, want declined", cp.Status.ImplementOutcome.Action)
+	}
+	cp.Status.ImplementOutcome.Reason = "mutated"
+	if task.Status.ImplementOutcome.Reason == "mutated" {
+		t.Error("mutating copy's ImplementOutcome mutated original (shallow copy)")
+	}
+}

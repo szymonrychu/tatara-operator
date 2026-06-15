@@ -179,3 +179,57 @@ func TestRegistersOnSharedRegistryWithoutConflict(t *testing.T) {
 		t.Fatalf("gather: %v", err)
 	}
 }
+
+// Finding 20: PushHandler returns an http.HandlerFunc, not a nested mux.
+// Mounting it directly on the outer mux should serve the push endpoint.
+func TestPushHandler_ServesDirectly(t *testing.T) {
+	r := New(time.Minute)
+	h := r.PushHandler()
+	// h should handle a direct POST (no inner-mux path dispatch).
+	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?run_id=x",
+		strings.NewReader("# TYPE a_total counter\na_total 1\n"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("PushHandler direct: got %d, want 204", rec.Code)
+	}
+}
+
+// Finding 21: two runs pushing the same metric name with different types;
+// the conflicting run's series must be dropped and counted.
+func TestTypeConflict_DropsConflictingSeries(t *testing.T) {
+	r := New(time.Minute)
+	// run-1 publishes m as COUNTER
+	push(t, r, "run_id=run-1", "# TYPE m counter\nm 1\n")
+	// run-2 publishes m as GAUGE (type conflict)
+	push(t, r, "run_id=run-2", "# TYPE m gauge\nm 2\n")
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(r)
+	if _, err := reg.Gather(); err != nil {
+		t.Fatalf("gather with type conflict: %v", err)
+	}
+	// Conflicting run-2 series should be dropped and counted.
+	dropped := testutil.ToFloat64(r.seriesDroppedTotal.WithLabelValues("type_conflict"))
+	if dropped < 1 {
+		t.Fatalf("type_conflict dropped = %v, want >= 1", dropped)
+	}
+}
+
+// Finding 22: body larger than maxBodyBytes must be rejected with 413.
+func TestOversizeBody_Rejected(t *testing.T) {
+	r := New(time.Minute)
+	// Build a body larger than maxBodyBytes (1 MiB).
+	big := strings.Repeat("x", maxBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?run_id=big",
+		strings.NewReader(big))
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize body: got %d, want 413", rec.Code)
+	}
+	// must be counted as too_large not rejected
+	if got := testutil.ToFloat64(r.receiveTotal.WithLabelValues("too_large")); got != 1 {
+		t.Fatalf("receive_total{too_large} = %v, want 1", got)
+	}
+}

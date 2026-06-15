@@ -3,14 +3,28 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
+
+// reaperServer returns a CallbackServer with ReaperGrace=1ns so freshly
+// created test pods are not protected by the grace window.
+func reaperServer() *CallbackServer {
+	return &CallbackServer{
+		Client:      k8sClient,
+		Metrics:     obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Namespace:   testNS,
+		ReaperGrace: time.Nanosecond,
+	}
+}
 
 // mkWrapperPodSvc creates a labelled wrapper Pod + Service named after the pod,
 // correlated to taskName/taskUID via the reaper's labels.
@@ -54,7 +68,7 @@ func podExists(t *testing.T, name string) bool {
 
 func TestReapOrphans_TaskAbsent(t *testing.T) {
 	mkWrapperPodSvc(t, "reap-absent", "no-such-task", "uid-x")
-	newCallbackServer().ReapOrphans(context.Background())
+	reaperServer().ReapOrphans(context.Background())
 	if podExists(t, "reap-absent") {
 		t.Error("expected pod for absent task to be reaped")
 	}
@@ -67,7 +81,7 @@ func TestReapOrphans_TerminalPhase(t *testing.T) {
 	setTaskPhase(t, "t-reap-ph", "Succeeded")
 	mkWrapperPodSvc(t, "reap-phase", "t-reap-ph", string(getTask(t, "t-reap-ph").UID))
 
-	newCallbackServer().ReapOrphans(context.Background())
+	reaperServer().ReapOrphans(context.Background())
 	if podExists(t, "reap-phase") {
 		t.Error("expected pod for Succeeded task to be reaped")
 	}
@@ -84,7 +98,7 @@ func TestReapOrphans_TerminalLifecycle(t *testing.T) {
 	}
 	mkWrapperPodSvc(t, "reap-lc", "t-reap-lc", string(tk.UID))
 
-	newCallbackServer().ReapOrphans(context.Background())
+	reaperServer().ReapOrphans(context.Background())
 	if podExists(t, "reap-lc") {
 		t.Error("expected pod for Done lifecycle task to be reaped")
 	}
@@ -97,7 +111,7 @@ func TestReapOrphans_StaleUID(t *testing.T) {
 	// Pod carries a UID from a prior incarnation that reused the task name.
 	mkWrapperPodSvc(t, "reap-uid", "t-reap-uid", "stale-uid-from-old-task")
 
-	newCallbackServer().ReapOrphans(context.Background())
+	reaperServer().ReapOrphans(context.Background())
 	if podExists(t, "reap-uid") {
 		t.Error("expected pod with stale task-uid to be reaped")
 	}
@@ -110,8 +124,50 @@ func TestReapOrphans_LiveTaskKept(t *testing.T) {
 	setTaskPhase(t, "t-reap-live", "Running")
 	mkWrapperPodSvc(t, "reap-live", "t-reap-live", string(getTask(t, "t-reap-live").UID))
 
-	newCallbackServer().ReapOrphans(context.Background())
+	reaperServer().ReapOrphans(context.Background())
 	if !podExists(t, "reap-live") {
 		t.Error("expected pod for live non-terminal task to be kept")
 	}
+}
+
+// TestReapOrphans_CreationGrace verifies that a freshly spawned pod is never
+// reaped even when its task is absent in the cache snapshot (finding 1/2/7).
+func TestReapOrphans_CreationGrace(t *testing.T) {
+	// Use default grace (pollRequeue = 30s); pod is just created so it is fresh.
+	srv := &CallbackServer{
+		Client:    k8sClient,
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Namespace: testNS,
+		// ReaperGrace zero => uses pollRequeue default (30s)
+	}
+	mkWrapperPodSvc(t, "reap-grace", "no-such-task-grace", "uid-grace")
+	srv.ReapOrphans(context.Background())
+	if !podExists(t, "reap-grace") {
+		t.Error("expected freshly created pod to be protected by grace window")
+	}
+	// Clean up: delete with reaperServer (no grace) so subsequent tests are clean.
+	reaperServer().ReapOrphans(context.Background())
+}
+
+// TestReapOrphans_CtxCancelled verifies that a cancelled context stops the
+// reaper loop before issuing deletes (finding 6).
+func TestReapOrphans_CtxCancelled(t *testing.T) {
+	mkWrapperPodSvc(t, "reap-ctx", "no-such-task-ctx", "uid-ctx")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	srv := &CallbackServer{
+		Client:      k8sClient,
+		Metrics:     obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Namespace:   testNS,
+		ReaperGrace: time.Nanosecond,
+	}
+	srv.ReapOrphans(ctx)
+	// Pod should still exist: cancelled ctx means no deletes were issued.
+	if !podExists(t, "reap-ctx") {
+		t.Error("expected pod to be kept when context is already cancelled")
+	}
+	// Clean up
+	reaperServer().ReapOrphans(context.Background())
 }

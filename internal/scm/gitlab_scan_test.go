@@ -77,6 +77,90 @@ func TestGitLabGetIssue(t *testing.T) {
 	}
 }
 
+// TestGitLabListOpenPRsPaginated verifies that ListOpenPRs follows X-Next-Page headers.
+func TestGitLabListOpenPRsPaginated(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			w.Header().Set("X-Next-Page", "2")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"iid": 1, "sha": "s1", "author": map[string]any{"username": "a"}, "updated_at": "2026-01-01T00:00:00Z"},
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"iid": 2, "sha": "s2", "author": map[string]any{"username": "b"}, "updated_at": "2026-01-02T00:00:00Z"},
+			})
+		}
+		_ = srv // suppress unused variable warning
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	prs, err := c.ListOpenPRs(context.Background(), "g", "p")
+	if err != nil {
+		t.Fatalf("ListOpenPRs paginated: %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("want 2 PRs across 2 pages, got %d: %+v", len(prs), prs)
+	}
+}
+
+// TestGitLabListOpenIssuesPaginated verifies that ListOpenIssues follows X-Next-Page headers.
+func TestGitLabListOpenIssuesPaginated(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			w.Header().Set("X-Next-Page", "2")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"iid": 10, "author": map[string]any{"username": "a"}, "updated_at": "2026-01-01T00:00:00Z"},
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"iid": 20, "author": map[string]any{"username": "b"}, "updated_at": "2026-01-02T00:00:00Z"},
+			})
+		}
+		_ = srv
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	issues, err := c.ListOpenIssues(context.Background(), "g", "p")
+	if err != nil {
+		t.Fatalf("ListOpenIssues paginated: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("want 2 issues across 2 pages, got %d: %+v", len(issues), issues)
+	}
+}
+
+// TestGitLabListIssueCommentsPaginated verifies that ListIssueComments follows X-Next-Page.
+func TestGitLabListIssueCommentsPaginated(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		if page == "" || page == "1" {
+			w.Header().Set("X-Next-Page", "2")
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"author": map[string]any{"username": "a"}, "body": "p1", "created_at": "2026-01-01T00:00:00Z", "system": false},
+			})
+		} else {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"author": map[string]any{"username": "b"}, "body": "p2", "created_at": "2026-01-02T00:00:00Z", "system": false},
+			})
+		}
+		_ = srv
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	comments, err := c.ListIssueComments(context.Background(), "g/p", "", 3)
+	if err != nil {
+		t.Fatalf("ListIssueComments paginated: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("want 2 comments across 2 pages, got %d: %+v", len(comments), comments)
+	}
+}
+
 func TestGitLabCloseIssue(t *testing.T) {
 	paths := map[string]bool{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

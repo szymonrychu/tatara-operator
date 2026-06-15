@@ -5,6 +5,16 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// BoolVal returns the value of a *bool field, or def when the pointer is nil.
+// Use this to dereference IngestEnabled, SemanticIngest, and similar
+// +kubebuilder:default=true pointer fields without risking a nil dereference.
+func BoolVal(b *bool, def bool) bool {
+	if b == nil {
+		return def
+	}
+	return *b
+}
+
 // RepositorySpec defines the desired state of a Repository.
 type RepositorySpec struct {
 	ProjectRef string `json:"projectRef"`
@@ -14,13 +24,13 @@ type RepositorySpec struct {
 	DefaultBranch string `json:"defaultBranch,omitempty"`
 	// +kubebuilder:default=true
 	// +optional
-	IngestEnabled bool `json:"ingestEnabled,omitempty"`
+	IngestEnabled *bool `json:"ingestEnabled,omitempty"`
 	// SemanticIngest enables Phase 2 LLM semantic extraction for this
 	// repository's ingest Job. Defaults true; set false to run AST-only
 	// ingest and avoid per-changed-file LLM cost.
 	// +kubebuilder:default=true
 	// +optional
-	SemanticIngest bool `json:"semanticIngest,omitempty"`
+	SemanticIngest *bool `json:"semanticIngest,omitempty"`
 	// ReingestSchedule is a standard 5-field cron expression (e.g. "0 6 * * *")
 	// that triggers a periodic catch-up re-ingest in addition to push webhooks.
 	// +kubebuilder:validation:Required

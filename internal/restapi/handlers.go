@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	corev1 "k8s.io/api/core/v1"
@@ -23,22 +24,33 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
+// maxBodyBytes caps the request body at 1 MB, matching the webhook server's
+// approach and preventing unbounded memory reads on any POST/PATCH endpoint.
+const maxBodyBytes = 1 << 20 // 1 MB
+
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		// Headers already sent; log so the failure is visible server-side.
+		log.Log.Error(err, "restapi: writeJSON encode failed")
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeClientErr returns a generic 500 for non-404 errors, avoiding leaking
+// internal k8s error details to API callers.
 func writeClientErr(w http.ResponseWriter, err error) {
 	if apierrors.IsNotFound(err) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	writeError(w, http.StatusInternalServerError, err.Error())
+	// Log real error server-side; return generic message to caller.
+	log.Log.Error(err, "restapi: client error")
+	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +115,8 @@ type taskPatchReq struct {
 	Note          string  `json:"note,omitempty"`
 }
 
-func decodeJSON(r *http.Request, dst any) error {
+func decodeJSON(r *http.Request, w http.ResponseWriter, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	return dec.Decode(dst)
@@ -121,32 +134,38 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) patchTask(w http.ResponseWriter, r *http.Request) {
 	var req taskPatchReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	var t tatarav1alpha1.Task
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
+	var t tatarav1alpha1.Task
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		if req.ResultSummary != nil {
+			t.Status.ResultSummary = *req.ResultSummary
+		}
+		if req.Note != "" {
+			apimeta.SetStatusCondition(&t.Status.Conditions, metav1.Condition{
+				Type:               "AgentNote",
+				Status:             metav1.ConditionTrue,
+				Reason:             "AgentReport",
+				Message:            req.Note,
+				LastTransitionTime: metav1.NewTime(time.Now()),
+			})
+		}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	if req.ResultSummary != nil {
-		t.Status.ResultSummary = *req.ResultSummary
-	}
-	if req.Note != "" {
-		apimeta.SetStatusCondition(&t.Status.Conditions, metav1.Condition{
-			Type:               "AgentNote",
-			Status:             metav1.ConditionTrue,
-			Reason:             "AgentReport",
-			Message:            req.Note,
-			LastTransitionTime: metav1.NewTime(time.Now()),
-		})
-	}
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: patchTask",
+		"action", "patch_task",
+		"resource_id", key.Name,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -181,7 +200,7 @@ func (s *Server) listSubtasks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createSubtask(w http.ResponseWriter, r *http.Request) {
 	var req subtaskCreateReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -207,10 +226,16 @@ func (s *Server) createSubtask(w http.ResponseWriter, r *http.Request) {
 			TaskRef: taskName, Title: req.Title, Detail: req.Detail, Order: req.Order,
 		},
 	}
+	start := time.Now()
 	if err := s.c.Create(r.Context(), st); err != nil {
 		writeClientErr(w, err)
 		return
 	}
+	s.log.InfoContext(r.Context(), "restapi: createSubtask",
+		"action", "create_subtask",
+		"resource_id", st.Name,
+		"task", taskName,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusCreated, toSubtaskDTO(*st))
 }
 
@@ -225,7 +250,7 @@ type proposeIssueReq struct {
 
 func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	var req proposeIssueReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -237,6 +262,16 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	var proj tatarav1alpha1.Project
 	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
 		writeClientErr(w, err)
+		return
+	}
+	// Validate the repository: it must exist and belong to this project.
+	var repo tatarav1alpha1.Repository
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: req.RepositoryRef}, &repo); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if repo.Spec.ProjectRef != projName {
+		writeError(w, http.StatusBadRequest, "repository does not belong to project")
 		return
 	}
 	task := &tatarav1alpha1.Task{
@@ -263,10 +298,17 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 		provider = proj.Spec.Scm.Provider
 	}
 	agent.StampPodName(task, projName, provider, req.RepositoryRef)
+	start := time.Now()
 	if err := s.c.Create(r.Context(), task); err != nil {
 		writeClientErr(w, err)
 		return
 	}
+	s.log.InfoContext(r.Context(), "restapi: proposeIssue",
+		"action", "propose_issue",
+		"resource_id", task.Name,
+		"project", projName,
+		"repository", req.RepositoryRef,
+		"duration_ms", time.Since(start).Milliseconds())
 	// The proposal Task starts Pending; the controller opens the idea-labelled
 	// issue and completes the Task (Succeeded). No AwaitingApproval parking.
 	writeJSON(w, http.StatusCreated, toTaskDTO(*task))
@@ -290,7 +332,7 @@ type issueCommentOnProjectReq struct {
 func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	l := log.FromContext(r.Context())
 	var req issueCommentOnProjectReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -350,7 +392,7 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	writer, err := s.scmFor(provider)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "scm: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -358,7 +400,7 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	var sec corev1.Secret
 	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
 		if apierrors.IsNotFound(err) {
-			writeError(w, http.StatusInternalServerError, "scm secret not found")
+			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 		writeClientErr(w, err)
@@ -368,7 +410,7 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 
 	issueRef := fmt.Sprintf("%s#%d", req.Repo, req.Number)
 	if err := writer.Comment(r.Context(), token, issueRef, req.Body); err != nil {
-		writeError(w, http.StatusInternalServerError, "scm comment: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -389,7 +431,7 @@ type reviewVerdictReq struct {
 
 func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 	var req reviewVerdictReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -403,8 +445,19 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decision must be one of approve, request_changes, comment")
 		return
 	}
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		if t.Spec.Kind != "review" {
+			return nil // kind check handled outside retry
+		}
+		t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -412,11 +465,11 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "review verdict only applies to a review task")
 		return
 	}
-	t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: reviewVerdict",
+		"action", "review_verdict",
+		"resource_id", key.Name,
+		"decision", req.Decision,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -427,7 +480,7 @@ type prOutcomeReq struct {
 
 func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 	var req prOutcomeReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -441,8 +494,19 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "action must be one of merge, close")
 		return
 	}
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		if t.Spec.Kind != "selfImprove" {
+			return nil
+		}
+		t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -450,11 +514,11 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "pr outcome only applies to a selfImprove task")
 		return
 	}
-	t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: prOutcome",
+		"action", "pr_outcome",
+		"resource_id", key.Name,
+		"pr_action", req.Action,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -465,7 +529,7 @@ type issueOutcomeReq struct {
 
 func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 	var req issueOutcomeReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -483,8 +547,19 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "comment required when action is close or discuss")
 		return
 	}
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		if t.Spec.Kind != "triageIssue" && t.Spec.Kind != "issueLifecycle" {
+			return nil
+		}
+		t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -492,10 +567,13 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "issue outcome only applies to a triageIssue or issueLifecycle task")
 		return
 	}
-	t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
+	s.log.InfoContext(r.Context(), "restapi: issueOutcome",
+		"action", "issue_outcome",
+		"resource_id", key.Name,
+		"issue_action", req.Action,
+		"duration_ms", time.Since(start).Milliseconds())
+	if s.metrics != nil {
+		s.metrics.IssueOutcome(req.Action)
 	}
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
@@ -509,7 +587,7 @@ type implementOutcomeReq struct {
 
 func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 	var req implementOutcomeReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -525,8 +603,19 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "reason required when action is declined")
 		return
 	}
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		if t.Spec.Kind != "issueLifecycle" {
+			return nil
+		}
+		t.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{Action: req.Action, Reason: req.Reason}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -534,11 +623,11 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "implement outcome only applies to an issueLifecycle task")
 		return
 	}
-	t.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{Action: req.Action, Reason: req.Reason}
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: implementOutcome",
+		"action", "implement_outcome",
+		"resource_id", key.Name,
+		"impl_action", req.Action,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -550,7 +639,7 @@ type issueCommentReq struct {
 
 func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
 	var req issueCommentReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
@@ -574,6 +663,7 @@ func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "comment requires a task linked to an issue")
 		return
 	}
+	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh tatarav1alpha1.Task
 		if gerr := s.c.Get(r.Context(), key, &fresh); gerr != nil {
@@ -589,6 +679,10 @@ func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
+	s.log.InfoContext(r.Context(), "restapi: postComment",
+		"action", "post_comment",
+		"resource_id", key.Name,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -603,26 +697,32 @@ type changeSummaryReq struct {
 
 func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 	var req changeSummaryReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	var t tatarav1alpha1.Task
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
+	var t tatarav1alpha1.Task
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+			PRTitle:        req.PRTitle,
+			PRBody:         req.PRBody,
+			DeliveredScope: req.DeliveredScope,
+			RemainingScope: req.RemainingScope,
+		}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
-		PRTitle:        req.PRTitle,
-		PRBody:         req.PRBody,
-		DeliveredScope: req.DeliveredScope,
-		RemainingScope: req.RemainingScope,
-	}
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: changeSummary",
+		"action", "change_summary",
+		"resource_id", key.Name,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -634,27 +734,45 @@ type handoverReq struct {
 	Handover string `json:"handover"`
 }
 
+// truncateValidUTF8 cuts s to at most maxBytes bytes on a rune boundary.
+func truncateValidUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cap := maxBytes
+	for cap > 0 && !utf8.RuneStart(s[cap]) {
+		cap--
+	}
+	return s[:cap]
+}
+
 func (s *Server) handover(w http.ResponseWriter, r *http.Request) {
 	var req handoverReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	// Cap at 16KB.
+	// Cap at 16KB on a rune boundary to avoid splitting multi-byte UTF-8 sequences.
 	if len(req.Handover) > handoverMaxBytes {
-		req.Handover = req.Handover[:handoverMaxBytes]
+		req.Handover = truncateValidUTF8(req.Handover, handoverMaxBytes)
 	}
-	var t tatarav1alpha1.Task
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
+	var t tatarav1alpha1.Task
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		t.Status.Handover = req.Handover
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	t.Status.Handover = req.Handover
-	if err := s.c.Status().Update(r.Context(), &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: handover",
+		"action", "handover",
+		"resource_id", key.Name,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
@@ -668,28 +786,34 @@ type subtaskPatchReq struct {
 
 func (s *Server) patchSubtask(w http.ResponseWriter, r *http.Request) {
 	var req subtaskPatchReq
-	if err := decodeJSON(r, &req); err != nil {
+	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
 		return
 	}
-	var st tatarav1alpha1.Subtask
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "s")}
-	if err := s.c.Get(r.Context(), key, &st); err != nil {
+	var st tatarav1alpha1.Subtask
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &st); gerr != nil {
+			return gerr
+		}
+		if req.Phase != nil {
+			st.Status.Phase = *req.Phase
+		}
+		if req.Result != nil {
+			st.Status.Result = *req.Result
+		}
+		if req.TurnID != nil {
+			st.Status.TurnID = *req.TurnID
+		}
+		return s.c.Status().Update(r.Context(), &st)
+	}); err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	if req.Phase != nil {
-		st.Status.Phase = *req.Phase
-	}
-	if req.Result != nil {
-		st.Status.Result = *req.Result
-	}
-	if req.TurnID != nil {
-		st.Status.TurnID = *req.TurnID
-	}
-	if err := s.c.Status().Update(r.Context(), &st); err != nil {
-		writeClientErr(w, err)
-		return
-	}
+	s.log.InfoContext(r.Context(), "restapi: patchSubtask",
+		"action", "patch_subtask",
+		"resource_id", key.Name,
+		"duration_ms", time.Since(start).Milliseconds())
 	writeJSON(w, http.StatusOK, toSubtaskDTO(st))
 }
