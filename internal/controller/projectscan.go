@@ -233,6 +233,14 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 		if t.Labels[labelSourceRepo] != label || !slices.Contains(kinds, t.Spec.Kind) {
 			continue
 		}
+		// Lifecycle tasks signal terminality via LifecycleState (Phase stays
+		// empty); Conversation is human-blocked with no running pod. Such tasks
+		// hold no agent slot, so they must not occupy the repo's scan lane -
+		// otherwise terminal issueLifecycle tasks starve mrScan/issueScan
+		// recovery forever (maxPerRepo=1).
+		if isLifecycleTerminal(t.Status.LifecycleState) || t.Status.LifecycleState == "Conversation" {
+			continue
+		}
 		switch t.Status.Phase {
 		case "Succeeded", "Failed", "AwaitingApproval":
 			continue
