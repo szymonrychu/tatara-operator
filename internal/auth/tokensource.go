@@ -3,10 +3,17 @@ package auth
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 )
+
+// tokenMintTimeout caps the HTTP round-trip to the OIDC token endpoint so a
+// slow or wedged Keycloak cannot hold a controller-runtime reconcile worker
+// indefinitely.
+const tokenMintTimeout = 10 * time.Second
 
 // TokenSourceConfig configures a client-credentials TokenSource.
 type TokenSourceConfig struct {
@@ -33,7 +40,12 @@ func NewTokenSource(cfg TokenSourceConfig) *TokenSource {
 			"audience": {cfg.Audience},
 		},
 	}
-	return &TokenSource{src: c.TokenSource(context.Background())}
+	// Bake a finite-timeout HTTP client into the base context so a hung
+	// Keycloak cannot block the calling goroutine indefinitely. The
+	// ReuseTokenSource cache is preserved by the oauth2 library.
+	httpClient := &http.Client{Timeout: tokenMintTimeout}
+	baseCtx := context.WithValue(context.Background(), oauth2.HTTPClient, httpClient)
+	return &TokenSource{src: c.TokenSource(baseCtx)}
 }
 
 // Token returns a valid bearer access token, refreshing if the cached one is
