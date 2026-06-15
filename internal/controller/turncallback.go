@@ -33,6 +33,10 @@ type CallbackServer struct {
 	// PushMetrics, when set, mounts the wrapper push-metrics endpoint on the
 	// same internal listener (also not exposed via ingress).
 	PushMetrics http.Handler
+	// ReaperGrace is the minimum pod age before the reaper will consider
+	// deleting it. Zero means use the default (pollRequeue). Set to a small
+	// value in tests to bypass the grace window without waiting.
+	ReaperGrace time.Duration
 }
 
 type turnCompletePayload struct {
