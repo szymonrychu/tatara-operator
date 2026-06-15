@@ -1057,13 +1057,13 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			} else {
 				l.Error(scmErr, "implement: scm context for refusal comment (non-fatal)", "resource_id", task.Name)
 			}
+			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused"); err != nil {
+				return ctrl.Result{}, err
+			}
 			if err := r.clearImplementOutcome(ctx, fresh); err != nil {
 				return ctrl.Result{}, err
 			}
 			if err := r.setImplementEmptyRetries(ctx, fresh, 0); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused"); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
