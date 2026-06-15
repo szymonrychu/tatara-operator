@@ -264,6 +264,62 @@ func glProjectPath(repoURL string) (string, error) {
 // GitLabProjectPath parses a GitLab repo URL into its project path.
 func GitLabProjectPath(repoURL string) (string, error) { return glProjectPath(repoURL) }
 
+// glDoPaged performs paginated GET requests following the X-Next-Page header.
+// It decodes each page into a []T and returns all pages concatenated.
+func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error) {
+	var all []T
+	nextPath := path
+	for nextPath != "" {
+		var page []T
+		nextPage, err := glDoWithHeaders(ctx, base, nextPath, token, &page)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if nextPage == "" {
+			break
+		}
+		// Build the next path preserving existing query params and adding/updating page.
+		u, err := url.Parse(nextPath)
+		if err != nil {
+			break
+		}
+		q := u.Query()
+		q.Set("page", nextPage)
+		u.RawQuery = q.Encode()
+		nextPath = u.String()
+	}
+	return all, nil
+}
+
+// glDoWithHeaders performs a single GET and returns (X-Next-Page header, error).
+func glDoWithHeaders(ctx context.Context, base, path, token string, out any) (nextPage string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: build request: %w", err)
+	}
+	req.Header.Set("PRIVATE-TOKEN", token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("gitlab: do request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	next := resp.Header.Get("X-Next-Page")
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(resp.Body)
+		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return "", fmt.Errorf("gitlab: decode response: %w", err)
+		}
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	return next, nil
+}
+
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {
 	var rdr io.Reader
 	if in != nil {

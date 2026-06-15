@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -200,6 +201,68 @@ func ghIssueRef(ref string) (string, string, int, error) {
 		return "", "", 0, fmt.Errorf("github: malformed issue number in %q: %w", ref, err)
 	}
 	return oParts[0], oParts[1], n, nil
+}
+
+// ghLinkNext parses the RFC5988 Link header and returns the URL for rel="next", or "".
+var ghLinkNextRE = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+
+func ghLinkNext(header string) string {
+	m := ghLinkNextRE.FindStringSubmatch(header)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// ghDoPaged performs paginated GET requests following Link rel="next" headers.
+// It decodes each page into a []T and appends to a single slice returned to the caller.
+// in must be nil (GET only). out must be a *[]T.
+func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error) {
+	var all []T
+	nextURL := base + path
+	for nextURL != "" {
+		var page []T
+		link, err := ghDoWithHeaders(ctx, nextURL, token, &page)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		raw := ghLinkNext(link)
+		if raw == "" {
+			break
+		}
+		// The next URL may be absolute; strip the base so ghDoWithHeaders can use it directly.
+		nextURL = raw
+	}
+	return all, nil
+}
+
+// ghDoWithHeaders performs a single GET, decodes JSON body into out, and returns the Link header.
+func ghDoWithHeaders(ctx context.Context, fullURL, token string, out any) (linkHeader string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("github: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("github: do request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	link := resp.Header.Get("Link")
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(resp.Body)
+		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: fullURL}
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return "", fmt.Errorf("github: decode response: %w", err)
+		}
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	return link, nil
 }
 
 func ghDo(ctx context.Context, base, method, path, token string, in, out any) error {
