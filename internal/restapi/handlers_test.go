@@ -225,7 +225,9 @@ func TestPatchSubtask_NotFound(t *testing.T) {
 // --- Task 11: propose_issue / review_verdict / pr_outcome ---
 
 func TestProposeIssue(t *testing.T) {
-	r := buildRouter(t, project("alpha"))
+	// repo-a must exist and belong to "alpha" for the repository validation to pass.
+	repo := repository("repo-a", "alpha")
+	r := buildRouter(t, project("alpha"), repo)
 	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"Fix login","body":"login broken","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
