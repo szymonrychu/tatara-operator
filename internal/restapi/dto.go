@@ -57,19 +57,20 @@ type taskSourceDTO struct {
 }
 
 type taskStatusDTO struct {
-	Phase            string                        `json:"phase,omitempty"`
-	PodName          string                        `json:"podName,omitempty"`
-	TurnsCompleted   int                           `json:"turnsCompleted,omitempty"`
-	PrURL            string                        `json:"prURL,omitempty"`
-	ResultSummary    string                        `json:"resultSummary,omitempty"`
-	DiscoveredIssues []string                      `json:"discoveredIssues,omitempty"`
-	ReviewVerdict    *tatarav1alpha1.ReviewVerdict `json:"reviewVerdict,omitempty"`
-	PROutcome        *tatarav1alpha1.PROutcome     `json:"prOutcome,omitempty"`
-	IssueOutcome     *tatarav1alpha1.IssueOutcome  `json:"issueOutcome,omitempty"`
-	ChangeSummary    *tatarav1alpha1.ChangeSummary `json:"changeSummary,omitempty"`
-	Handover         string                        `json:"handover,omitempty"`
-	Conditions       []metav1.Condition            `json:"conditions,omitempty"`
-	PendingComments  []string                      `json:"pendingComments,omitempty"`
+	Phase            string                           `json:"phase,omitempty"`
+	PodName          string                           `json:"podName,omitempty"`
+	TurnsCompleted   int                              `json:"turnsCompleted,omitempty"`
+	PrURL            string                           `json:"prURL,omitempty"`
+	ResultSummary    string                           `json:"resultSummary,omitempty"`
+	DiscoveredIssues []string                         `json:"discoveredIssues,omitempty"`
+	ReviewVerdict    *tatarav1alpha1.ReviewVerdict    `json:"reviewVerdict,omitempty"`
+	PROutcome        *tatarav1alpha1.PROutcome        `json:"prOutcome,omitempty"`
+	IssueOutcome     *tatarav1alpha1.IssueOutcome     `json:"issueOutcome,omitempty"`
+	ImplementOutcome *tatarav1alpha1.ImplementOutcome `json:"implementOutcome,omitempty"`
+	ChangeSummary    *tatarav1alpha1.ChangeSummary    `json:"changeSummary,omitempty"`
+	Handover         string                           `json:"handover,omitempty"`
+	Conditions       []metav1.Condition               `json:"conditions,omitempty"`
+	PendingComments  []string                         `json:"pendingComments,omitempty"`
 }
 
 // TaskDTO is the stable JSON shape for a Task CRD.
@@ -143,6 +144,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			ReviewVerdict:    task.Status.ReviewVerdict,
 			PROutcome:        task.Status.PROutcome,
 			IssueOutcome:     task.Status.IssueOutcome,
+			ImplementOutcome: task.Status.ImplementOutcome,
 			ChangeSummary:    task.Status.ChangeSummary,
 			Handover:         task.Status.Handover,
 			PendingComments:  task.Status.PendingComments,

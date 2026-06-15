@@ -453,6 +453,77 @@ func TestIssueOutcome_TaskNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+// --- POST /tasks/{t}/implement-outcome ---
+
+func TestImplementOutcome_Writes(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"declined","reason":"already fixed in PR #5"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ImplementOutcome)
+	require.Equal(t, "declined", out.Status.ImplementOutcome.Action)
+	require.Equal(t, "already fixed in PR #5", out.Status.ImplementOutcome.Reason)
+}
+
+func TestImplementOutcome_MissingAction(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"reason":"some reason"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestImplementOutcome_InvalidAction(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"implement","reason":"x"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestImplementOutcome_EmptyReason(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"declined","reason":""}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestImplementOutcome_MissingReason(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"declined"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestImplementOutcome_WrongKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "implement"))
+	body := strings.NewReader(`{"action":"declined","reason":"not needed"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
+}
+
+func TestImplementOutcome_TaskNotFound(t *testing.T) {
+	r := buildRouter(t)
+	body := strings.NewReader(`{"action":"declined","reason":"not needed"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/missing/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
 // --- M4 Task 2: POST /tasks/{t}/change-summary ---
 
 func TestChangeSummary_WritesAllFields(t *testing.T) {

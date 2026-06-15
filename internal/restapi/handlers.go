@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -379,6 +380,48 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
+	if err := s.c.Status().Update(r.Context(), &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
+// --- POST /tasks/{t}/implement-outcome ---
+
+type implementOutcomeReq struct {
+	Action string `json:"action"`
+	Reason string `json:"reason"`
+}
+
+func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
+	var req implementOutcomeReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.Action == "" {
+		writeError(w, http.StatusBadRequest, "action required")
+		return
+	}
+	if req.Action != "declined" {
+		writeError(w, http.StatusBadRequest, "action must be declined")
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "reason required when action is declined")
+		return
+	}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if t.Spec.Kind != "issueLifecycle" {
+		writeError(w, http.StatusConflict, "implement outcome only applies to an issueLifecycle task")
+		return
+	}
+	t.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{Action: req.Action, Reason: req.Reason}
 	if err := s.c.Status().Update(r.Context(), &t); err != nil {
 		writeClientErr(w, err)
 		return

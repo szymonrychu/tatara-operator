@@ -227,6 +227,21 @@ spec:
                   task is commented + parked with reason "implement-empty" instead of
                   silently parked as a benign no-change. Reset to 0 when a run opens a PR.
                 type: integer
+              implementOutcome:
+                description: |-
+                  ImplementOutcome is the agent's declared outcome for an implement task when
+                  it opens no PR (e.g. a deliberate refusal). Mirrors IssueOutcome.
+                properties:
+                  action:
+                    enum:
+                    - declined
+                    type: string
+                  reason:
+                    type: string
+                required:
+                - action
+                - reason
+                type: object
               issueOutcome:
                 description: IssueOutcome is the agent's outcome for an issue-triage
                   task.

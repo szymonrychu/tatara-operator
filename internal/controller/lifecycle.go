@@ -146,11 +146,13 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		fresh.Status.LifecycleState = to
 		// A fresh entry into Implement (triage-implement, or a CI-failure/merge-
 		// conflict re-entry, or a human revival) starts a new implementation
-		// attempt, so reset the empty-run retry budget. The empty-run retry loop
+		// attempt, so reset the empty-run retry budget and clear any stale
+		// ImplementOutcome from the prior run. The empty-run retry loop
 		// re-spawns via resetAgentRun (which never calls setLifecycleState), so
 		// this cannot clobber an in-progress retry count.
 		if to == "Implement" {
 			fresh.Status.ImplementEmptyRetries = 0
+			fresh.Status.ImplementOutcome = nil
 		}
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
@@ -747,6 +749,23 @@ func (r *TaskReconciler) clearIssueOutcome(ctx context.Context, task *tatarav1al
 	return nil
 }
 
+// clearImplementOutcome nils Status.ImplementOutcome (RetryOnConflict). Called
+// after the refusal arm has committed its state transition.
+func (r *TaskReconciler) clearImplementOutcome(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ImplementOutcome = nil
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return fmt.Errorf("implement: clear ImplementOutcome: %w", err)
+	}
+	task.Status.ImplementOutcome = nil
+	return nil
+}
+
 // enterConversation sets the conversation idle deadline + LastActivityAt and
 // transitions the task to Conversation with the given reason. Shared by the
 // discuss and bot-await-approval triage outcomes.
@@ -878,6 +897,12 @@ func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha
 //     "## Resume from handover" block so the agent resumes with full context.
 func implementPrompt(task *tatarav1alpha1.Task) string {
 	base := planTurnText(task.Spec.Goal, taskBranch(task), task.Spec.ProjectRef, task.Name)
+	// Hard instruction: if after investigation no PR should be opened, the agent
+	// MUST call decline_implementation instead of finishing silently.
+	base += "\n\n**IMPORTANT:** If after investigation you will NOT implement this " +
+		"issue, you MUST call `decline_implementation` with a clear reason (what you " +
+		"considered and why it should not / need not be done). A silent finish with no " +
+		"PR and no `decline_implementation` call is NOT allowed and will be re-prompted."
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
 	}
@@ -1007,9 +1032,44 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 	}
 
 	if fresh.Status.PrURL == "" {
-		// Implement run produced no commit -> no PR. Retry with a re-entry nudge
-		// up to the cap, then comment on the issue and park with a distinct reason.
+		// No PR opened. Branch on whether the agent declared a refusal.
 		const emptyRetryCap = 2
+
+		outcome := fresh.Status.ImplementOutcome
+		if outcome != nil && outcome.Action == "declined" && strings.TrimSpace(outcome.Reason) != "" {
+			// CODIFIED REFUSAL: agent explicitly declined via decline_implementation.
+			// Post the reason as an issue comment, apply the declined label,
+			// park with reason "refused", clear ImplementOutcome, reset retries.
+			l.Info("implement: agent declared decline; parking as refused",
+				"action", "lifecycle_implement_refused", "resource_id", task.Name)
+			if _, _, writer, token, _, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
+				if fresh.Spec.Source != nil && fresh.Spec.Source.IssueRef != "" {
+					if cerr := writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, outcome.Reason); cerr != nil {
+						l.Error(cerr, "implement: post refusal comment (non-fatal)", "resource_id", task.Name)
+					}
+				}
+				var proj tatarav1alpha1.Project
+				if perr := r.Get(ctx, client.ObjectKey{Namespace: fresh.Namespace, Name: fresh.Spec.ProjectRef}, &proj); perr == nil {
+					if err := r.ensurePhaseLabel(ctx, &proj, fresh, "declined"); err != nil {
+						l.Error(err, "implement: apply declined label (non-fatal)", "resource_id", task.Name)
+					}
+				}
+			} else {
+				l.Error(scmErr, "implement: scm context for refusal comment (non-fatal)", "resource_id", task.Name)
+			}
+			if err := r.clearImplementOutcome(ctx, fresh); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.setImplementEmptyRetries(ctx, fresh, 0); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
+		}
+
+		// No declared decline. Re-prompt until cap, then park as refused-no-explanation.
 		if fresh.Status.ImplementEmptyRetries < emptyRetryCap {
 			if err := r.setImplementEmptyRetries(ctx, fresh, fresh.Status.ImplementEmptyRetries+1); err != nil {
 				return ctrl.Result{}, err
@@ -1024,22 +1084,22 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			// so the next reconcile re-spawns the Implement run with ImplementContext.
 			return ctrl.Result{}, r.resetAgentRun(ctx, fresh)
 		}
-		l.Info("implement: no commit after retry cap; commenting + parking",
+		l.Info("implement: no commit after retry cap and no explanation; commenting + parking",
 			"action", "lifecycle_implement_empty_parked", "resource_id", task.Name)
 		msg := "The implement agent produced no change after " +
-			strconv.Itoa(emptyRetryCap) + " attempts. Leaving this for a human - " +
-			"the fix may be unclear, blocked, or already present."
+			strconv.Itoa(emptyRetryCap) + " attempts and did not explain why via decline_implementation. " +
+			"Leaving this for a human - the fix may be unclear, blocked, or already present."
 		// parkWithComment posts the comment (with the IsPR ref fallback) and parks
 		// atomically. If the SCM context is unavailable, still park so the task does
 		// not loop, just without a comment.
 		if _, _, writer, token, _, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
-			if err := r.parkWithComment(ctx, fresh, writer, token, "implement-empty", msg); err != nil {
+			if err := r.parkWithComment(ctx, fresh, writer, token, "refused-no-explanation", msg); err != nil {
 				return ctrl.Result{}, err
 			}
 		} else {
 			l.Error(scmErr, "implement: scm context for empty-park comment (parking without comment)",
 				"resource_id", task.Name)
-			if err := r.setLifecycleState(ctx, fresh, "Parked", "implement-empty"); err != nil {
+			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused-no-explanation"); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -1337,10 +1397,13 @@ func (r *TaskReconciler) setImplementContext(ctx context.Context, task *tatarav1
 // emptyImplementReentryPrompt nudges a re-spawned Implement agent that produced
 // no diff on the prior turn to either deliver the change or stop and explain.
 const emptyImplementReentryPrompt = "Your previous attempt finished without " +
-	"committing any change, so no PR could be opened and the issue is still " +
-	"open. Re-read the issue and the repository, then EITHER implement the fix " +
-	"and commit it, OR if no code change is genuinely needed, state clearly why " +
-	"in your final summary so a human can close the issue."
+	"committing any change, so no PR could be opened and the issue is still open. " +
+	"Re-read the issue and the repository, then EITHER implement the fix and commit " +
+	"it, OR if this issue genuinely should not be implemented (already done, out of " +
+	"scope, wrong approach), you MUST call `decline_implementation` with a clear " +
+	"reason explaining what you considered and why no code change is needed. " +
+	"A silent finish with no PR and no `decline_implementation` call is NOT allowed " +
+	"and will be escalated to a human."
 
 // setImplementEmptyRetries persists Status.ImplementEmptyRetries via RetryOnConflict.
 func (r *TaskReconciler) setImplementEmptyRetries(ctx context.Context, task *tatarav1alpha1.Task, n int) error {

@@ -50,6 +50,14 @@ type IssueOutcome struct {
 	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
 }
 
+// ImplementOutcome is the agent's declared outcome for an implement task when
+// it opens no PR (e.g. a deliberate refusal). Mirrors IssueOutcome.
+type ImplementOutcome struct {
+	// +kubebuilder:validation:Enum=declined
+	Action string `json:"action"`
+	Reason string `json:"reason"` // required; why no implementation
+}
+
 // ChangeSummary holds the scope report submitted by the agent at the end of an
 // Implement run via the change_summary MCP tool.
 type ChangeSummary struct {
@@ -122,6 +130,8 @@ type TaskStatus struct {
 	PROutcome *PROutcome `json:"prOutcome,omitempty"`
 	// +optional
 	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
+	// +optional
+	ImplementOutcome *ImplementOutcome `json:"implementOutcome,omitempty"`
 	// +optional
 	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
 	// FollowupIssueURL is the URL of the follow-up issue opened when
