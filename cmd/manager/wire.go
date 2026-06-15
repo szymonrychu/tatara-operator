@@ -85,6 +85,9 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 	restapi.NewServer(restapi.Config{
 		Client:    mgr.GetClient(),
 		Namespace: cfg.Namespace,
+		SCMFor: func(provider string) (scm.SCMWriter, error) {
+			return scm.ByProvider(provider)
+		},
 	}).Mount(httpMux, auth.Middleware(verifier))
 
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))
