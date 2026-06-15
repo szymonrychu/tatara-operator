@@ -188,7 +188,8 @@ func glActionAndLabel(p glPayload) (string, string) {
 	case "":
 		return "other", ""
 	default:
-		return p.ObjectAttributes.Action, ""
+		// Return "other" rather than the raw action to keep the metric label a closed set.
+		return "other", ""
 	}
 }
 
@@ -233,8 +234,12 @@ func (c *GitLab) OpenChange(ctx context.Context, repoURL, token, sourceBranch, t
 // (group/proj!iid) targets a merge request; a '#' ref (group/proj#iid) targets
 // an issue. The ref is the single source of truth: GitLab issues and MRs have
 // distinct note endpoints, unlike GitHub where both share /issues/{n}/comments.
+// Routing uses LastIndex to match glBangRef/glHashRef semantics so project paths
+// containing '!' are not misrouted.
 func (c *GitLab) Comment(ctx context.Context, token, issueRef, body string) error {
-	if strings.Contains(issueRef, "!") {
+	bangAt := strings.LastIndex(issueRef, "!")
+	hashAt := strings.LastIndex(issueRef, "#")
+	if bangAt > hashAt {
 		proj, iid, err := glBangRef(issueRef)
 		if err != nil {
 			return err
@@ -434,6 +439,10 @@ func glCIStatus(s string) string {
 		return "success"
 	case "failed", "canceled":
 		return "failure"
+	// skipped pipelines are effectively neutral (GitHub treats skipped/neutral as success).
+	// manual/scheduled/waiting_for_resource/preparing pipelines have not started yet; map to pending.
+	case "skipped":
+		return "success"
 	default:
 		return "pending"
 	}
@@ -491,10 +500,18 @@ func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int,
 
 // Merge merges an MR. Returns the merge commit SHA on success. Returns
 // ErrMergeConflict when GitLab signals the MR is not mergeable (405/406/409).
+// method must be "squash" or "merge"; GitLab does not support "rebase" via the
+// merge endpoint and treating it silently as a non-squash merge would be wrong.
 func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
 		return "", err
+	}
+	switch method {
+	case "squash", "merge", "":
+		// supported
+	default:
+		return "", fmt.Errorf("gitlab: unsupported merge method %q (use \"squash\" or \"merge\")", method)
 	}
 	in := map[string]bool{"squash": method == "squash"}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/merge"
@@ -613,7 +630,7 @@ func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha s
 	var statuses []struct {
 		Status string `json:"status"`
 	}
-	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + sha + "/statuses"
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses"
 	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &statuses); err != nil {
 		return "", err
 	}
