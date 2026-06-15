@@ -718,3 +718,140 @@ func TestLifecycleMainCI_FailureClearsMergedChangeState(t *testing.T) {
 		t.Errorf("PRNumber = %d, want 0 so MRCI polls the new MR, not the merged one", got.Status.PRNumber)
 	}
 }
+
+// ============================================================
+// FIX 10 - MRCI must not nurse a PR that re-proposes the
+//          already-merged change. After a post-merge MainCI failure
+//          clearMergedChangeState clears PrURL/PRNumber so a fresh MR
+//          opens, but the deterministic task branch (tatara/task-<name>)
+//          is reused; if the re-implement does not advance it, the new
+//          PR re-proposes the SAME already-merged commits. Observed
+//          in-repo: tatara-operator PR #50 duplicated merged PR #46 with
+//          an identical head SHA. Nursing it re-merges identical code and
+//          fails MainCI again, bouncing to maxLifecycleIterations. The
+//          guard detects head SHA == MergedHeadSHA, closes the duplicate
+//          and parks for a human.
+// ============================================================
+
+type fakeWriterDupMerged struct {
+	lifecycleFakeSCMWriter
+	headSHA       string
+	closePRCalled bool
+	closePRNumber int
+}
+
+func (f *fakeWriterDupMerged) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	return scm.PRState{Author: "bot", HeadSHA: f.headSHA, CIStatus: "success"}, nil
+}
+
+func (f *fakeWriterDupMerged) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
+	return "", nil
+}
+
+func (f *fakeWriterDupMerged) ClosePR(_ context.Context, _, _ string, number int, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closePRCalled = true
+	f.closePRNumber = number
+	return nil
+}
+
+// TestLifecycleMRCI_DuplicateOfMergedHeadParks verifies that a re-opened PR whose
+// head equals the last merged head is closed and parked, not nursed into a loop.
+func TestLifecycleMRCI_DuplicateOfMergedHeadParks(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	name := "lc-mrci-dupmerged"
+	proj := "lc-dupm-proj"
+	repo := "lc-dupm-repo"
+	sec := "lc-dupm-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#21", URL: "https://github.com/o/r/issues/21",
+		Number: 21,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "MRCI"
+	task.Status.PRNumber = 50
+	task.Status.PrURL = "https://github.com/o/r/pull/50"
+	task.Status.HeadBranch = "tatara/task-" + name
+	// The branch was already merged at this head; the re-opened PR points at the
+	// SAME head -> re-proposes the merged change with no new fix.
+	task.Status.MergedHeadSHA = "82073dbd7d"
+	dl := metav1.NewTime(time.Now().Add(time.Hour))
+	task.Status.DeadlineAt = &dl
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &fakeWriterDupMerged{headSHA: "82073dbd7d"}
+	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked (duplicate of merged head)", got.Status.LifecycleState)
+	}
+	fw.mu.Lock()
+	closed := fw.closePRCalled
+	closedNum := fw.closePRNumber
+	fw.mu.Unlock()
+	if !closed {
+		t.Error("ClosePR must be called to close the duplicate PR")
+	}
+	if closedNum != 50 {
+		t.Errorf("ClosePR number = %d, want 50", closedNum)
+	}
+}
+
+// TestLifecycleMRCI_AdvancedHeadAfterMergeProceeds verifies the guard does NOT
+// fire when the re-implement genuinely advanced the branch (new head SHA): MRCI
+// proceeds to Merge as normal and the PR is not closed.
+func TestLifecycleMRCI_AdvancedHeadAfterMergeProceeds(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	name := "lc-mrci-advhead"
+	proj := "lc-advh-proj"
+	repo := "lc-advh-repo"
+	sec := "lc-advh-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#22", URL: "https://github.com/o/r/issues/22",
+		Number: 22,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "MRCI"
+	task.Status.PRNumber = 60
+	task.Status.PrURL = "https://github.com/o/r/pull/60"
+	task.Status.HeadBranch = "tatara/task-" + name
+	task.Status.MergedHeadSHA = "old-merged-head"
+	dl := metav1.NewTime(time.Now().Add(time.Hour))
+	task.Status.DeadlineAt = &dl
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Head differs from MergedHeadSHA -> a real new commit landed.
+	fw := &fakeWriterDupMerged{headSHA: "new-head-with-fix"}
+	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Merge" {
+		t.Errorf("LifecycleState = %q, want Merge (advanced head, green CI)", got.Status.LifecycleState)
+	}
+	fw.mu.Lock()
+	closed := fw.closePRCalled
+	fw.mu.Unlock()
+	if closed {
+		t.Error("ClosePR must NOT be called when the branch advanced past the merged head")
+	}
+}

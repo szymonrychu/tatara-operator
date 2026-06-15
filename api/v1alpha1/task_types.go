@@ -147,6 +147,14 @@ type TaskStatus struct {
 	PRNumber int `json:"prNumber,omitempty"`
 	// +optional
 	MergeCommitSHA string `json:"mergeCommitSHA,omitempty"`
+	// MergedHeadSHA is the source-branch head commit SHA of the most recently
+	// merged PR/MR. Recorded on a successful Merge and deliberately preserved
+	// across clearMergedChangeState so the next MRCI cycle can detect a re-opened
+	// PR that re-proposes the already-merged commits with no new fix (the
+	// deterministic task branch is reused; if a post-merge re-implement does not
+	// advance it, writeBackOpenChange opens a duplicate of the merged change).
+	// +optional
+	MergedHeadSHA string `json:"mergedHeadSHA,omitempty"`
 	// +optional
 	CumulativeTokens int64 `json:"cumulativeTokens,omitempty"`
 	// +optional

@@ -1224,6 +1224,33 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		return ctrl.Result{}, nil
 	}
 
+	// Duplicate-of-merged guard. After a post-merge MainCI failure,
+	// clearMergedChangeState clears PrURL/PRNumber so finishImplement opens a fresh
+	// MR. But the deterministic task branch (tatara/task-<name>) is reused, and if
+	// the re-implement did not advance it past the already-merged head, the new PR
+	// re-proposes the SAME already-merged commits. Observed in-repo: tatara-operator
+	// PR #50 duplicated merged PR #46 with an identical head SHA. Nursing it would
+	// re-merge identical code and fail MainCI again, bouncing until maxLifecycleIterations
+	// parks the task with no diagnostic. Detect it by the head SHA equaling the last
+	// merged head, close the duplicate, and park for a human now.
+	if task.Status.MergedHeadSHA != "" && st.HeadSHA != "" && st.HeadSHA == task.Status.MergedHeadSHA {
+		l.Info("mrci: PR re-proposes the already-merged head; parking",
+			"action", "lifecycle_mrci_duplicate_merged", "resource_id", task.Name,
+			"pr", number, "head_sha", st.HeadSHA)
+		closeMsg := fmt.Sprintf("Closing as a duplicate: this branch was already merged (head %s) and the post-merge default-branch pipeline failure needs a genuinely new fix, not a re-proposal of the same commits.", st.HeadSHA)
+		if cerr := writer.ClosePR(ctx, repo.Spec.URL, token, number, closeMsg); cerr != nil {
+			l.Error(cerr, "mrci: close duplicate PR (non-fatal)", "resource_id", task.Name, "pr", number)
+		}
+		msg := fmt.Sprintf("lifecycle: PR #%d re-proposes the already-merged change (head %s) with no new fix after the post-merge pipeline failure; parking for a human.", number, st.HeadSHA)
+		if err := r.parkWithComment(ctx, task, writer, token, "duplicate-merged-change", msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		if r.LifecycleMetrics != nil {
+			r.LifecycleMetrics.RecordGiveup("duplicate-merged-change")
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Set DeadlineAt on first entry.
 	if err := r.ensureDeadline(ctx, task, project); err != nil {
 		return ctrl.Result{}, fmt.Errorf("mrci: ensure deadline: %w", err)
@@ -1500,6 +1527,14 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
+	// Capture the source-branch head SHA being merged so a later MRCI cycle can
+	// detect a re-opened PR that re-proposes this exact already-merged change
+	// (best-effort: on error mergedHead stays "" and the guard simply never fires).
+	mergedHead := ""
+	if ps, perr := writer.GetPRState(ctx, repo.Spec.URL, token, number); perr == nil {
+		mergedHead = ps.HeadSHA
+	}
+
 	// Attempt merge.
 	sha, mergeErr := writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
 	if mergeErr == nil {
@@ -1510,11 +1545,13 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 				return err
 			}
 			fresh.Status.MergeCommitSHA = sha
+			fresh.Status.MergedHeadSHA = mergedHead
 			return r.Status().Update(ctx, fresh)
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("merge: record sha: %w", err)
 		}
 		task.Status.MergeCommitSHA = sha
+		task.Status.MergedHeadSHA = mergedHead
 		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
