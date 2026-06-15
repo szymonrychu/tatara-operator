@@ -95,6 +95,26 @@ func TestSelectPriorityThenStale(t *testing.T) {
 	}
 }
 
+func TestLaneOccupancy_TerminalAndConversationLifecycleFreeLane(t *testing.T) {
+	mkLC := func(repo, kind, lc string) tatarav1alpha1.Task {
+		return tatarav1alpha1.Task{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel(repo)}},
+			Spec:       tatarav1alpha1.TaskSpec{Kind: kind},
+			// Phase intentionally empty: real issueLifecycle tasks never set it.
+			Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
+		}
+	}
+	existing := []tatarav1alpha1.Task{
+		mkLC("o/r", "issueLifecycle", "Done"),
+		mkLC("o/r", "issueLifecycle", "Parked"),
+		mkLC("o/r", "issueLifecycle", "Stopped"),
+		mkLC("o/r", "issueLifecycle", "Conversation"),
+		mkLC("o/r", "issueLifecycle", "Implement"), // active -> occupies the lane
+	}
+	// Only the active task holds the lane; terminal + Conversation free it.
+	require.Equal(t, 1, laneOccupancy(existing, "o/r", "issueLifecycle", "review"))
+}
+
 var _ = scm.PRRef{}
 
 func TestCandidatesFromPRs(t *testing.T) {

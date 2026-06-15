@@ -38,6 +38,32 @@ func isLifecycleTerminal(state string) bool {
 	return false
 }
 
+// maxRecoveryAttempts bounds how many times mrScan re-adopts the same bot PR
+// before giving up. A PR driven to a terminal lifecycle this many times is not
+// fixable by another autonomous pass; stop re-spawning agents and leave it for
+// a human (the last park comment already explains why).
+const maxRecoveryAttempts = 3
+
+// priorTerminalAttempts counts terminal (Done/Stopped/Parked) tasks that already
+// targeted this exact PR, so mrScan can stop re-adopting an unfixable PR.
+func priorTerminalAttempts(existing []tatarav1alpha1.Task, repoSlug string, prNumber int) int {
+	want := sanitizeRepoLabel(repoSlug)
+	n := 0
+	for i := range existing {
+		t := &existing[i]
+		if t.Spec.Source == nil || !t.Spec.Source.IsPR || t.Spec.Source.Number != prNumber {
+			continue
+		}
+		if t.Labels[labelSourceRepo] != want {
+			continue
+		}
+		if isLifecycleTerminal(t.Status.LifecycleState) {
+			n++
+		}
+	}
+	return n
+}
+
 // activityNextFire parses a 5-field cron and returns the next fire after base.
 // ok=false when the schedule is empty (disabled) or malformed (caller logs).
 func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
@@ -231,6 +257,14 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 	for i := range existing {
 		t := &existing[i]
 		if t.Labels[labelSourceRepo] != label || !slices.Contains(kinds, t.Spec.Kind) {
+			continue
+		}
+		// Lifecycle tasks signal terminality via LifecycleState (Phase stays
+		// empty); Conversation is human-blocked with no running pod. Such tasks
+		// hold no agent slot, so they must not occupy the repo's scan lane -
+		// otherwise terminal issueLifecycle tasks starve mrScan/issueScan
+		// recovery forever (maxPerRepo=1).
+		if isLifecycleTerminal(t.Status.LifecycleState) || t.Status.LifecycleState == "Conversation" {
 			continue
 		}
 		switch t.Status.Phase {
@@ -600,6 +634,14 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			continue
 		}
 		if c.author == bot && bot != "" {
+			if priorTerminalAttempts(existing, c.repo, c.number) >= maxRecoveryAttempts {
+				r.Metrics.ScanItem("mrScan", "recovery_exhausted")
+				l.Info("mrScan: recovery exhausted; not re-adopting bot PR",
+					"action", "scan_recovery_exhausted", "resource_id", proj.Name,
+					"repo", c.repo, "pr", c.number,
+					"attempts", priorTerminalAttempts(existing, c.repo, c.number))
+				continue
+			}
 			// Bot PR -> issueLifecycle entering at MRCI. Dedup key is the linked issue
 			// number from "Closes #N" if present, else the PR number.
 			dedupNumber := c.number

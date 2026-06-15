@@ -109,12 +109,18 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		}
 	}
 
+	// changed tracks whether an actual add/remove API call landed, so the
+	// "lifecycle label set" log only fires on a real state change. Without this
+	// it logged on every reconcile (~160/h of misleading no-op lines) even when
+	// the label was already correct and AddLabel was skipped.
+	changed := false
 	if !known || !current[desired] {
 		if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
 			r.recordSCM(provider, "add_label", aerr)
 			return fmt.Errorf("set label add %q: %w", desired, aerr)
 		}
 		r.recordSCM(provider, "add_label", nil)
+		changed = true
 	}
 	for _, lb := range managed {
 		if lb == desired || (known && !current[lb]) {
@@ -127,9 +133,12 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 			continue
 		}
 		r.recordSCM(provider, "remove_label", nil)
+		changed = true
 	}
-	l.Info("lifecycle label set", "action", "scm_set_label",
-		"resource_id", task.Name, "issue_ref", issueRef, "label", desired)
+	if changed {
+		l.Info("lifecycle label set", "action", "scm_set_label",
+			"resource_id", task.Name, "issue_ref", issueRef, "label", desired)
+	}
 	return nil
 }
 
