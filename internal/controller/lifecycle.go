@@ -708,9 +708,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 				return ctrl.Result{}, err
 			}
 		}
-		if r.Metrics != nil {
-			r.Metrics.IssueOutcome("discuss")
-		}
+		r.Metrics.IssueOutcome("discuss")
 		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -760,9 +758,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
 			return ctrl.Result{}, err
 		}
-		if r.Metrics != nil {
-			r.Metrics.IssueOutcome("implement")
-		}
+		r.Metrics.IssueOutcome("implement")
 	}
 
 	if err := r.clearIssueOutcome(ctx, task); err != nil {
@@ -931,9 +927,7 @@ func (r *TaskReconciler) triageCloseIssue(ctx context.Context, project *tatarav1
 		return fmt.Errorf("triage close issue: %w", cerr)
 	}
 	r.recordSCM(provider, "close_issue", nil)
-	if r.Metrics != nil {
-		r.Metrics.IssueOutcome("close")
-	}
+	r.Metrics.IssueOutcome("close")
 	log.FromContext(ctx).Info("lifecycle triage: issue closed",
 		"action", "scm_issue_outcome", "resource_id", task.Name, "number", task.Spec.Source.Number)
 	return nil
@@ -1679,8 +1673,13 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		return ctrl.Result{}, fmt.Errorf("merge: ensure deadline: %w", err)
 	}
 
-	// Check mergeAllowed policy.
-	allowed, merr := r.mergeAllowed(ctx, project, repo, writer, token, number)
+	// Check mergeAllowed policy. Fetch PR state once here so mergeAllowed
+	// does not need a second round-trip.
+	prSt, pserr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+	if pserr != nil {
+		return ctrl.Result{}, fmt.Errorf("merge: get pr state: %w", pserr)
+	}
+	allowed, merr := r.mergeAllowed(ctx, project, repo, writer, token, number, prSt)
 	if merr != nil {
 		return ctrl.Result{}, merr
 	}

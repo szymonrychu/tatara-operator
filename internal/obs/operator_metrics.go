@@ -319,6 +319,11 @@ func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
 	m.scmWritesTotal.WithLabelValues(provider, verb, result).Inc()
 }
 
+// SCMWriteCounter returns the counter for (provider, verb, result) for test assertions.
+func (m *OperatorMetrics) SCMWriteCounter(provider, verb, result string) prometheus.Counter {
+	return m.scmWritesTotal.WithLabelValues(provider, verb, result)
+}
+
 // SetOpenProposals sets operator_open_proposals for a repo slug.
 func (m *OperatorMetrics) SetOpenProposals(repo string, n float64) {
 	m.openProposals.WithLabelValues(repo).Set(n)
