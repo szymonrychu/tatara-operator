@@ -84,10 +84,16 @@ func providerAbbrev(provider string) string {
 	}
 }
 
-// podNameSuffix is the work-item segment of a wrapper Pod name: the brainstorm
-// marker, the issue/mr number, or "scan" for Tasks not bound to a work item.
+// podNameSuffix is the work-item segment of a wrapper Pod name: the brainstorm /
+// health-check marker, the issue/mr number, or "scan" for Tasks not bound to a
+// work item. The health-check activity reuses Kind "brainstorm", so it is
+// disambiguated by the activity label to avoid a pod-name collision when both
+// project-scoped activities target the same primary repo.
 func podNameSuffix(task *tatarav1alpha1.Task) string {
 	if task.Spec.Kind == "brainstorm" {
+		if task.Labels[tatarav1alpha1.LabelActivity] == "healthCheck" {
+			return "healthcheck"
+		}
 		return "brainstorm"
 	}
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
