@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // ensureNeo4jPassword returns the neo4j password for the Project's memory
@@ -186,6 +187,14 @@ const memoryRequeue = 10 * time.Second
 // error (which leaves the phase unchanged and requeues with backoff rather
 // than flapping to Failed).
 func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1alpha1.Project) (time.Duration, error) {
+	l := log.FromContext(ctx)
+	if !p.DeletionTimestamp.IsZero() {
+		l.Info("project being deleted, skipping memory stack apply",
+			"action", "memory_retire",
+			"resource_id", p.Name)
+		return 0, nil
+	}
+
 	p.Status.Memory = ensureMemoryStatus(p)
 	prevPhase := p.Status.Memory.Phase
 	p.Status.Memory.Endpoint = memory.Endpoint(p.Name, r.MemoryConfig.Namespace)
@@ -203,12 +212,14 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		// A non-NotFound read is a transient API/cache blip, not a real failure
 		// (NotFound is already handled as not-yet-ready inside memoryStackHealth).
 		// Leave the phase and MemoryReady condition as they are so a healthy
-		// stack does not flap to Failed on a 30s blip, and requeue with backoff.
+		// stack does not flap to Failed on a 30s blip. Return memoryRequeue so
+		// the Provisioning polling cadence is preserved; error backoff also
+		// requeues but the caller may inspect the duration.
 		// Failed is reserved for genuine apply/password errors.
 		if p.Status.Memory.Phase == "" {
 			p.Status.Memory.Phase = "Provisioning"
 		}
-		return 0, fmt.Errorf("reconcile memory health: %w", err)
+		return memoryRequeue, fmt.Errorf("reconcile memory health: %w", err)
 	}
 
 	phase := memoryPhase(readyInstances, effectivePGInstances(p), neo4jReady, lightragAvail, memoryAvail)
