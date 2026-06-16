@@ -596,7 +596,11 @@ func TestLifecycleTriage_Implement(t *testing.T) {
 	}
 }
 
-func TestLifecycleTriage_NilOutcomeTreatedAsImplement(t *testing.T) {
+// TestLifecycleTriage_NilOutcomeDefaultsToDiscuss verifies that a triage run that
+// finishes with no IssueOutcome set (inconclusive run: turn cap, no subtasks, etc.)
+// enters Conversation (discuss) rather than Implement. Defaulting to Implement
+// silently converts an inconclusive triage into work (finding 2).
+func TestLifecycleTriage_NilOutcomeDefaultsToDiscuss(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	r, _, name := seedTriageSucceeded(t, "nilout", nil)
 
@@ -615,8 +619,12 @@ func TestLifecycleTriage_NilOutcomeTreatedAsImplement(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement (nil outcome defaults to implement)", got.Status.LifecycleState)
+	// After the fix: nil outcome -> Conversation (inconclusive, await human input).
+	if got.Status.LifecycleState == "Implement" {
+		t.Error("nil IssueOutcome must NOT enter Implement; inconclusive run should enter Conversation")
+	}
+	if got.Status.LifecycleState != "Conversation" {
+		t.Errorf("LifecycleState = %q, want Conversation (nil outcome is inconclusive, not implement)", got.Status.LifecycleState)
 	}
 }
 

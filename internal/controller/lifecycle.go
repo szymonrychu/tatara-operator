@@ -52,14 +52,13 @@ func deadlinePassed(task *tatarav1alpha1.Task) bool {
 	return time.Now().After(task.Status.DeadlineAt.Time)
 }
 
-// ensureDeadline sets DeadlineAt on first entry to a poll state when unset.
-func (r *TaskReconciler) ensureDeadline(ctx context.Context, task *tatarav1alpha1.Task, project *tatarav1alpha1.Project) error {
+// ensureDeadlineMinutes sets DeadlineAt on first entry to a poll state when
+// unset, using the provided idle window in minutes. Shared by ensureDeadline
+// (babysit window) and handleConversation (idle window) so both use the same
+// RetryOnConflict logic and can never silently drift apart (finding 15).
+func (r *TaskReconciler) ensureDeadlineMinutes(ctx context.Context, task *tatarav1alpha1.Task, minutes int) error {
 	if task.Status.DeadlineAt != nil {
 		return nil
-	}
-	minutes := babysitDefaultDeadlineMinutes
-	if project.Spec.Scm != nil && project.Spec.Scm.BabysitDeadlineMinutes > 0 {
-		minutes = project.Spec.Scm.BabysitDeadlineMinutes
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
@@ -78,6 +77,15 @@ func (r *TaskReconciler) ensureDeadline(ctx context.Context, task *tatarav1alpha
 		task.Status.DeadlineAt = fresh.Status.DeadlineAt
 		return nil
 	})
+}
+
+// ensureDeadline sets DeadlineAt on first entry to a poll state when unset.
+func (r *TaskReconciler) ensureDeadline(ctx context.Context, task *tatarav1alpha1.Task, project *tatarav1alpha1.Project) error {
+	minutes := babysitDefaultDeadlineMinutes
+	if project.Spec.Scm != nil && project.Spec.Scm.BabysitDeadlineMinutes > 0 {
+		minutes = project.Spec.Scm.BabysitDeadlineMinutes
+	}
+	return r.ensureDeadlineMinutes(ctx, task, minutes)
 }
 
 // clearDeadline clears DeadlineAt on transition out of a poll state.
@@ -104,11 +112,18 @@ func (r *TaskReconciler) clearDeadline(ctx context.Context, task *tatarav1alpha1
 // tasks with no issue ref, it falls back to the PR ref derived from lifecyclePR.
 func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alpha1.Task, writer scm.SCMWriter, token, reason, msg string) error {
 	l := log.FromContext(ctx)
-	provider := ""
 	if task.Spec.Source != nil {
-		provider = task.Spec.Source.Provider
-	}
-	if task.Spec.Source != nil {
+		provider := task.Spec.Source.Provider
+		// Fallback: board/cron-sourced tasks may have empty Source.Provider; resolve
+		// from the project so the SCM metric label is never empty (finding 9).
+		if provider == "" {
+			var proj tatarav1alpha1.Project
+			if gerr := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); gerr == nil {
+				if proj.Spec.Scm != nil {
+					provider = proj.Spec.Scm.Provider
+				}
+			}
+		}
 		commentRef := task.Spec.Source.IssueRef
 		// For bot-PR-entry tasks the binder sets IssueRef to "owner/repo#N" (the PR
 		// ref). In the rare case it is empty, fall back to URL from lifecyclePR so
@@ -129,6 +144,20 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 		}
 	}
 	return r.setLifecycleState(ctx, task, "Parked", reason)
+}
+
+// parkOnDeadline posts msg as a park comment and records the deadline giveup metric.
+// Used by MRCI, Merge, and MainCI, which share the identical
+// ensureDeadline -> deadlinePassed -> park + RecordGiveup("deadline") sequence
+// (finding 13). Returns an error if parkWithComment fails.
+func (r *TaskReconciler) parkOnDeadline(ctx context.Context, task *tatarav1alpha1.Task, writer scm.SCMWriter, token, msg string) error {
+	if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
+		return err
+	}
+	if r.LifecycleMetrics != nil {
+		r.LifecycleMetrics.RecordGiveup("deadline")
+	}
+	return nil
 }
 
 // deleteWrapper best-effort deletes the wrapper Pod and Service for a task.
@@ -156,15 +185,20 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		}
 		from = fresh.Status.LifecycleState
 		fresh.Status.LifecycleState = to
-		// A fresh entry into Implement (triage-implement, or a CI-failure/merge-
-		// conflict re-entry, or a human revival) starts a new implementation
-		// attempt, so reset the empty-run retry budget and clear any stale
-		// ImplementOutcome from the prior run. The empty-run retry loop
-		// re-spawns via resetAgentRun (which never calls setLifecycleState), so
-		// this cannot clobber an in-progress retry count.
+		// On every Implement entry, reset the empty-run retry budget so each
+		// attempt gets a clean counter. ImplementOutcome is only cleared on FRESH
+		// triage-initiated entries; CI-failure/merge-conflict re-entries leave a
+		// prior ImplementOutcome intact so a stale refusal from a failed
+		// clearImplementOutcome is surfaced rather than silently discarded on the
+		// next reconcile (finding 8). Human revival (triage-implement) resets both.
 		if to == "Implement" {
 			fresh.Status.ImplementEmptyRetries = 0
-			fresh.Status.ImplementOutcome = nil
+			// Only a fresh triage-implement entry clears ImplementOutcome.
+			// CI-failure and merge-conflict re-entries should not discard a stale
+			// refusal that clearImplementOutcome may have failed to remove.
+			if reason == "triage-implement" || reason == "initial" {
+				fresh.Status.ImplementOutcome = nil
+			}
 		}
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
@@ -181,23 +215,30 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 	// turn starts must get its own maxPodRecreations budget, not an already-spent one.
 	// recordTurn also clears this annotation (on a successful turn landing), so the
 	// within-state respawn path is unaffected.
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh2 := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
-			return err
+	// Fast-path: skip the retry loop entirely when the annotation is absent on the
+	// in-memory task (the common case). If a concurrent write added it between the
+	// status update above and here, the boot-crash budget carries over by one
+	// reconcile, which is benign (the budget resets on the NEXT transition). This
+	// avoids an extra Get+retry on every transition (finding 18).
+	if _, hasAnnotation := task.Annotations[annBootCrashAttempts]; hasAnnotation {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh2 := &tatarav1alpha1.Task{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
+				return err
+			}
+			if fresh2.Annotations == nil {
+				return nil
+			}
+			if _, ok := fresh2.Annotations[annBootCrashAttempts]; !ok {
+				return nil
+			}
+			delete(fresh2.Annotations, annBootCrashAttempts)
+			return r.Update(ctx, fresh2)
+		}); err != nil {
+			// Non-fatal: log and continue. The state transition itself already succeeded.
+			log.FromContext(ctx).Error(err, "setLifecycleState: clear boot-crash annotation (non-fatal)",
+				"resource_id", task.Name, "to", to)
 		}
-		if fresh2.Annotations == nil {
-			return nil
-		}
-		if _, ok := fresh2.Annotations[annBootCrashAttempts]; !ok {
-			return nil
-		}
-		delete(fresh2.Annotations, annBootCrashAttempts)
-		return r.Update(ctx, fresh2)
-	}); err != nil {
-		// Non-fatal: log and continue. The state transition itself already succeeded.
-		log.FromContext(ctx).Error(err, "setLifecycleState: clear boot-crash annotation (non-fatal)",
-			"resource_id", task.Name, "to", to)
 	}
 
 	l.Info("lifecycle transition",
@@ -451,6 +492,18 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		}
 	}
 
+	// dispatchLifecycle runs the per-state handler and stamps the reconcile metric
+	// exactly once, collapsing 6 identical error/success wrapping blocks (finding 14).
+	dispatchLifecycle := func(h func() (ctrl.Result, error)) (ctrl.Result, error) {
+		res, err := h()
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+	}
+
 	switch task.Status.LifecycleState {
 	case "":
 		// First reconcile: initialize from the lifecycle-entry annotation set at
@@ -471,65 +524,21 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		}
 		r.Metrics.ReconcileResult("Task", "success")
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
-
 	case "Triage":
-		res, err := r.handleTriage(ctx, &project, task)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleTriage(ctx, &project, task) })
 	case "Implement":
-		res, err := r.handleImplement(ctx, &project, task)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleImplement(ctx, &project, task) })
 	case "Conversation":
-		res, err := r.handleConversation(ctx, &project, task)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleConversation(ctx, &project, task) })
 	case "MRCI":
-		res, err := r.handleMRCI(ctx, &project, task)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMRCI(ctx, &project, task) })
 	case "Merge":
-		res, err := r.handleMerge(ctx, &project, task)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMerge(ctx, &project, task) })
 	case "MainCI":
-		res, err := r.handleMainCI(ctx, &project, task)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMainCI(ctx, &project, task) })
 	case "Done", "Stopped", "Parked":
 		r.Metrics.ReconcileResult("Task", "success")
 		return ctrl.Result{}, nil
-
 	default:
 		r.Metrics.ReconcileResult("Task", "error")
 		return ctrl.Result{}, fmt.Errorf("lifecycle: unknown lifecycleState %q for task %s", task.Status.LifecycleState, task.Name)
@@ -588,6 +597,12 @@ func (r *TaskReconciler) buildTriagePromptFor(ctx context.Context, project *tata
 	content, err := reader.GetIssue(ctx, owner, repoName, task.Spec.Source.Number)
 	if err != nil {
 		l.Info("triage: GetIssue failed (non-fatal)", "resource_id", task.Name, "err", err.Error())
+		// Intentional fall-through: content is the zero value so Title/Body are "".
+		// buildTriagePrompt handles empty fields gracefully. Unlike the token/reader/
+		// OwnerRepo error branches above (which return the lifecycle fallback text),
+		// a GetIssue failure keeps any ListIssueComments result that already landed
+		// on the next call, so the partial fetch is used rather than thrown away
+		// (finding 22).
 	}
 	comments, err := reader.ListIssueComments(ctx, owner, repoName, task.Spec.Source.Number)
 	if err != nil {
@@ -607,6 +622,85 @@ func (r *TaskReconciler) repoURLForTask(ctx context.Context, task *tatarav1alpha
 	return repo.Spec.URL
 }
 
+// triageReader holds the pre-resolved SCM reader context for finishTriage so the
+// authorship and human-comment checks can share one token fetch, one ReaderFor
+// call, and one repo-URL resolution (finding 6).
+type triageReader struct {
+	reader   scm.SCMReader
+	owner    string
+	repoName string
+	botLogin string
+	issueNum int
+	resolved bool // false = ReaderFor unavailable; callers treat as "not authored"
+}
+
+// resolveTriageReader resolves the SCM reader and repo coordinates once for
+// finishTriage. On any error resolved is false and callers fall back safely.
+func (r *TaskReconciler) resolveTriageReader(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) triageReader {
+	if r.ReaderFor == nil || task.Spec.Source == nil {
+		return triageReader{}
+	}
+	provider := task.Spec.Source.Provider
+	if provider == "" && project.Spec.Scm != nil {
+		provider = project.Spec.Scm.Provider
+	}
+	token, err := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef)
+	if err != nil {
+		return triageReader{}
+	}
+	reader, err := r.ReaderFor(provider, token)
+	if err != nil {
+		return triageReader{}
+	}
+	owner, repoName, err := scm.OwnerRepo(r.repoURLForTask(ctx, task))
+	if err != nil {
+		return triageReader{}
+	}
+	botLogin := ""
+	if project.Spec.Scm != nil {
+		botLogin = project.Spec.Scm.BotLogin
+	}
+	return triageReader{
+		reader:   reader,
+		owner:    owner,
+		repoName: repoName,
+		botLogin: botLogin,
+		issueNum: task.Spec.Source.Number,
+		resolved: true,
+	}
+}
+
+// isTataraAuthored uses the pre-resolved triageReader to check the tatara-authored
+// marker without an additional token/reader/repo fetch (finding 6).
+func (tr triageReader) isTataraAuthored(ctx context.Context) (bool, error) {
+	if !tr.resolved {
+		return false, nil
+	}
+	content, err := tr.reader.GetIssue(ctx, tr.owner, tr.repoName, tr.issueNum)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(content.Body, tataraAuthoredMarker), nil
+}
+
+// hasHumanReply uses the pre-resolved triageReader to check for a non-bot
+// comment without an additional token/reader/repo fetch (finding 6).
+func (tr triageReader) hasHumanReply(ctx context.Context) (bool, error) {
+	if !tr.resolved {
+		return false, nil
+	}
+	comments, err := tr.reader.ListIssueComments(ctx, tr.owner, tr.repoName, tr.issueNum)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range comments {
+		if c.Author != "" && c.Author != tr.botLogin {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // finishTriage consumes Status.IssueOutcome after a completed Triage agent run.
 func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
@@ -623,9 +717,19 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		return ctrl.Result{}, r.resetAgentRun(ctx, task)
 	}
 
+	// Resolve the SCM reader once so the discuss-arm silence gate and the
+	// implement-guard arm share one token fetch, one ReaderFor call, and one
+	// repo-URL resolution rather than repeating them in each helper (finding 6).
+	tr := r.resolveTriageReader(ctx, project, task)
+
 	// Phase == Succeeded: read outcome.
+	// A nil IssueOutcome means the agent ended without calling issue_outcome (turn cap,
+	// NoPendingSubtasks, etc.). Defaulting to "implement" silently converts an
+	// inconclusive triage into work; "discuss" is safer: it enters Conversation and
+	// awaits human input. Only an explicit outcome.Action=="implement" proceeds to
+	// the implement path (finding 2).
 	outcome := task.Status.IssueOutcome
-	action := "implement" // default when agent did not set outcome
+	action := "discuss" // default when agent did not set outcome (inconclusive run)
 	comment := ""
 	if outcome != nil {
 		action = outcome.Action
@@ -687,13 +791,14 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		// post a repeated "still awaiting go-ahead" comment on every triage cycle.
 		// Only post when a human has actually replied since the issue was opened.
 		// Human-filed issues always get the comment (authorship check returns false).
+		// Uses the pre-resolved triageReader (finding 6: no repeated token/reader fetch).
 		skipComment := false
-		authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
+		authored, aerr := tr.isTataraAuthored(ctx)
 		if aerr != nil {
 			l.Info("triage discuss: authorship check failed; posting comment (fail open)",
 				"action", "lifecycle_discuss_silence_check", "resource_id", task.Name, "err", aerr.Error())
 		} else if authored {
-			human, herr := r.hasHumanComment(ctx, project, task)
+			human, herr := tr.hasHumanReply(ctx)
 			if herr != nil {
 				l.Info("triage discuss: hasHumanComment failed; posting comment (fail open)",
 					"action", "lifecycle_discuss_silence_check", "resource_id", task.Name, "err", herr.Error())
@@ -708,10 +813,13 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 				return ctrl.Result{}, err
 			}
 		}
-		r.Metrics.IssueOutcome("discuss")
+		// Record metric AFTER enterConversation commits so a failed transition does not
+		// double-count on the next reconcile (findings 1 & 5). The implement arm records
+		// after setLifecycleState; this arm now matches that discipline.
 		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err
 		}
+		r.Metrics.IssueOutcome("discuss")
 
 	default: // "implement" and anything else
 		// Author-tiered autoapprove (issue #56): an issue opened by a known
@@ -725,14 +833,15 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 			// in the issue body - the reliable, egress-verified fallback for the
 			// bot/maintainer/empty-author case the third-party tier does not cover
 			// (Source.AuthorLogin is empty for board-sourced candidates).
-			authored, aerr := r.tataraAuthoredIssue(ctx, project, task)
+			// Uses the pre-resolved triageReader (finding 6: shared reader context).
+			authored, aerr := tr.isTataraAuthored(ctx)
 			if aerr != nil {
 				l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
 					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
 				authored = true
 			}
 			if authored {
-				human, herr := r.hasHumanComment(ctx, project, task)
+				human, herr := tr.hasHumanReply(ctx)
 				if herr != nil {
 					l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
 						"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
@@ -742,13 +851,20 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 					if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
 						return ctrl.Result{}, err
 					}
-					if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+					// Tear down the wrapper BEFORE transitioning to Conversation so a
+					// failed resetAgentRun leaves the task in Triage (still owns the pod)
+					// rather than in Conversation with a leaked live pod that nothing
+					// else will reap (finding 19).
+					if err := r.resetAgentRun(ctx, task); err != nil {
 						return ctrl.Result{}, err
 					}
 					if err := r.clearIssueOutcome(ctx, task); err != nil {
 						return ctrl.Result{}, err
 					}
-					return ctrl.Result{}, r.resetAgentRun(ctx, task)
+					if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+						return ctrl.Result{}, err
+					}
+					return ctrl.Result{}, nil
 				}
 			}
 		}
@@ -770,6 +886,12 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 // clearPendingInterjections removes the first n delivered interjections from
 // Status.PendingInterjections under RetryOnConflict, preserving any
 // concurrently-appended interjection (same trim pattern as PendingComments).
+//
+// INVARIANT: PendingInterjections is append-only. Items are only ever added at
+// the tail by the webhook path (AppendInterjection). The positional [n:] trim
+// is correct ONLY under this invariant: a prepend or reorder would drop the
+// wrong entries. If this invariant is ever relaxed, switch to match-and-remove
+// by value instead of positional slicing (finding 12).
 func (r *TaskReconciler) clearPendingInterjections(ctx context.Context, task *tatarav1alpha1.Task, n int) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh tatarav1alpha1.Task
@@ -853,35 +975,41 @@ func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav
 func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	if task.Status.DeadlineAt == nil {
 		// Safety net: set deadline once rather than returning false from
-		// deadlinePassed forever and requeuing without bound.
-		// Use the same idle-minutes resolution as enterConversation so the
-		// safety-net window is consistent with the configured value.
+		// deadlinePassed forever and requeuing without bound. Delegates to the
+		// shared ensureDeadlineMinutes so this logic cannot drift from the primary
+		// path in ensureDeadline (finding 15).
 		idleMinutes := conversationDefaultIdleMinutes
 		if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
 			idleMinutes = project.Spec.Scm.ConversationIdleMinutes
 		}
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
-			if fresh.Status.DeadlineAt != nil {
-				task.Status.DeadlineAt = fresh.Status.DeadlineAt
-				return nil
-			}
-			dl := metav1.NewTime(time.Now().Add(time.Duration(idleMinutes) * time.Minute))
-			fresh.Status.DeadlineAt = &dl
-			if err := r.Status().Update(ctx, fresh); err != nil {
-				return err
-			}
-			task.Status.DeadlineAt = fresh.Status.DeadlineAt
-			return nil
-		}); err != nil {
+		if err := r.ensureDeadlineMinutes(ctx, task, idleMinutes); err != nil {
 			return ctrl.Result{}, fmt.Errorf("conversation: set nil deadline: %w", err)
 		}
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 	if deadlinePassed(task) {
+		// Before stopping, check for pending interjections (finding 10): a human
+		// comment that arrived just before the deadline should not be dropped. If
+		// PendingInterjections is non-empty, refresh the deadline and re-drive rather
+		// than stopping. The interjection drain at the top of reconcileLifecycle will
+		// route them to the session (or drop as stale) on the next reconcile.
+		if len(task.Status.PendingInterjections) > 0 {
+			idleMinutes := conversationDefaultIdleMinutes
+			if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
+				idleMinutes = project.Spec.Scm.ConversationIdleMinutes
+			}
+			// Reset deadline so the conversation continues for another idle window.
+			if err := r.clearDeadline(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.ensureDeadlineMinutes(ctx, task, idleMinutes); err != nil {
+				return ctrl.Result{}, err
+			}
+			log.FromContext(ctx).Info("conversation: deadline passed but interjections pending; extending",
+				"action", "conversation_extend_pending", "resource_id", task.Name,
+				"pending", len(task.Status.PendingInterjections))
+			return ctrl.Result{RequeueAfter: pollRequeue}, nil
+		}
 		if err := r.setLifecycleState(ctx, task, "Stopped", "idle"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1203,15 +1331,12 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		l.Error(err, "implement: open follow-up issue (non-fatal)", "resource_id", task.Name)
 	}
 
-	// Re-read after follow-up so subsequent writes use the latest resourceVersion.
-	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-		return ctrl.Result{}, fmt.Errorf("implement: re-get after followup: %w", err)
-	}
-
 	// Record head branch, PR number, and clear the stale deadline (e.g. from a
 	// prior Conversation idle deadline) in one RetryOnConflict write BEFORE the
-	// state transition. setLifecycleState handles the log/metric/teardown so they
-	// live in exactly one place (finding 6: no hand-rolled transition logic here).
+	// state transition. The RetryOnConflict does its own Get internally so the
+	// extra re-Get after maybeOpenFollowupIssue is not needed (finding 17).
+	// fresh.Status.PrURL is current from the Get at the top of finishImplement;
+	// maybeOpenFollowupIssue does not modify PrURL.
 	prNumber := parsePRNumber(fresh.Status.PrURL)
 	if prNumber == 0 && fresh.Status.PrURL != "" {
 		l.Error(nil, "implement: parsePRNumber returned 0 for non-empty PrURL; unexpected URL shape",
@@ -1236,12 +1361,9 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, err
 	}
 
-	// Re-get for resetAgentRun.
-	fresh2 := &tatarav1alpha1.Task{}
-	if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
-		return ctrl.Result{}, fmt.Errorf("implement: get for reset: %w", err)
-	}
-	return ctrl.Result{}, r.resetAgentRun(ctx, fresh2)
+	// resetAgentRun does its own Get+RetryOnConflict internally so a fresh re-Get
+	// here is redundant (finding 17).
+	return ctrl.Result{}, r.resetAgentRun(ctx, task)
 }
 
 // maybeOpenFollowupIssue creates a follow-up issue when ChangeSummary.RemainingScope
@@ -1281,6 +1403,7 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 		"action", "scm_followup_issue",
 		"resource_id", task.Name,
 		"issue_url", created.URL,
+		"pr_url", prURL,
 	)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1415,13 +1538,7 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 	// Deadline check (do after authorship so a non-bot PR parks immediately).
 	if deadlinePassed(task) {
 		msg := fmt.Sprintf("lifecycle: MRCI deadline reached for PR #%d; parking.", number)
-		if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
-			return ctrl.Result{}, err
-		}
-		if r.LifecycleMetrics != nil {
-			r.LifecycleMetrics.RecordGiveup("deadline")
-		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.parkOnDeadline(ctx, task, writer, token, msg)
 	}
 
 	switch st.CIStatus {
@@ -1569,6 +1686,11 @@ func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *t
 		return nil
 	}
 	threshold := project.Spec.Agent.HandoverThresholdPercent
+	// <=0 is treated as "unset" and defaults to 50. A deliberately-configured 0
+	// ("always handover") cannot be expressed; use 1 for near-always behaviour.
+	// Integer division truncates toward zero, so the threshold is effectively
+	// raised by <1% (e.g., 49.9% reads as 49 < 50 so handover is delayed by at
+	// most one reconcile; intentional and documented here per finding 11).
 	if threshold <= 0 {
 		threshold = 50
 	}
@@ -1673,9 +1795,10 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		return ctrl.Result{}, fmt.Errorf("merge: ensure deadline: %w", err)
 	}
 
-	// Check mergeAllowed policy. Fetch PR state once here so mergeAllowed
-	// does not need a second round-trip.
+	// Check mergeAllowed policy. Fetch PR state once here; reuse HeadSHA below to
+	// avoid a second round-trip (findings 3 & 4).
 	prSt, pserr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+	r.recordSCM(provider, "get_pr_state", pserr)
 	if pserr != nil {
 		return ctrl.Result{}, fmt.Errorf("merge: get pr state: %w", pserr)
 	}
@@ -1686,25 +1809,14 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	if !allowed {
 		if deadlinePassed(task) {
 			msg := fmt.Sprintf("lifecycle: merge deadline reached for PR #%d; parking.", number)
-			if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
-				return ctrl.Result{}, err
-			}
-			if r.LifecycleMetrics != nil {
-				r.LifecycleMetrics.RecordGiveup("deadline")
-			}
-			return ctrl.Result{}, nil
+			return ctrl.Result{}, r.parkOnDeadline(ctx, task, writer, token, msg)
 		}
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
-	// Capture the source-branch head SHA being merged so a later MRCI cycle can
-	// detect a re-opened PR that re-proposes this exact already-merged change
-	// (best-effort: on error mergedHead stays "" and the guard simply never fires).
-	mergedHead := ""
-	if ps, perr := writer.GetPRState(ctx, repo.Spec.URL, token, number); perr == nil {
-		r.recordSCM(provider, "get_pr_state", nil)
-		mergedHead = ps.HeadSHA
-	}
+	// Reuse the already-fetched HeadSHA to detect a later MRCI re-proposal of the
+	// same already-merged commits, without a second GetPRState round-trip (finding 3).
+	mergedHead := prSt.HeadSHA
 
 	// Attempt merge.
 	sha, mergeErr := writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
@@ -1756,13 +1868,7 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	// Transient error: requeue or deadline park.
 	if deadlinePassed(task) {
 		msg := fmt.Sprintf("lifecycle: merge deadline reached (error: %v) for PR #%d; parking.", mergeErr, number)
-		if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
-			return ctrl.Result{}, err
-		}
-		if r.LifecycleMetrics != nil {
-			r.LifecycleMetrics.RecordGiveup("deadline")
-		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.parkOnDeadline(ctx, task, writer, token, msg)
 	}
 	return ctrl.Result{RequeueAfter: pollRequeue}, nil
 }
@@ -1781,14 +1887,7 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 	}
 
 	if deadlinePassed(task) {
-		msg := "lifecycle: MainCI deadline reached; parking."
-		if err := r.parkWithComment(ctx, task, writer, token, "deadline", msg); err != nil {
-			return ctrl.Result{}, err
-		}
-		if r.LifecycleMetrics != nil {
-			r.LifecycleMetrics.RecordGiveup("deadline")
-		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{}, r.parkOnDeadline(ctx, task, writer, token, "lifecycle: MainCI deadline reached; parking.")
 	}
 
 	// Get the CI status for the merge commit.
@@ -1822,7 +1921,16 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 		}
 	}
 	ciStatus, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha)
+	r.recordSCM(provider, "get_commit_ci_status", cerr)
 	if cerr != nil {
+		// Log at WARN so persistent CI-status read failures are visible instead of
+		// silently burning the deadline with zero observability (findings 7 & 16).
+		log.FromContext(ctx).Info("mainci: GetCommitCIStatus failed; requeueing",
+			"action", "scm_ci_status_error",
+			"resource_id", task.Name,
+			"sha", sha,
+			"err", cerr.Error(),
+		)
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 

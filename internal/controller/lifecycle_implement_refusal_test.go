@@ -215,8 +215,10 @@ func TestFinishImplement_PROpened_IgnoresImplementOutcome(t *testing.T) {
 	}
 }
 
-// TestSetLifecycleState_EntersImplement_ClearsImplementOutcome verifies that
-// entering Implement via setLifecycleState clears ImplementOutcome (fresh entry).
+// TestSetLifecycleState_EntersImplement_ClearsImplementOutcome verifies that a
+// triage-initiated Implement entry clears ImplementOutcome (fresh triage-implement
+// transition). CI-failure re-entries do NOT clear it so a stale refusal is not
+// silently discarded (finding 8).
 func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-refusal-entry-clear"
@@ -235,7 +237,10 @@ func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) 
 	}
 
 	r := newLifecycleReconciler(t, nil)
-	if err := r.setLifecycleState(ctx, task, "Implement", "test-entry"); err != nil {
+	// Use "triage-implement" reason: this is a fresh triage-initiated entry and must
+	// clear ImplementOutcome. CI-failure re-entries ("mrci-failure", "mainci-failure")
+	// must NOT clear it.
+	if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
 		t.Fatalf("setLifecycleState: %v", err)
 	}
 
@@ -244,6 +249,40 @@ func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) 
 		t.Fatalf("get: %v", err)
 	}
 	if got.Status.ImplementOutcome != nil {
-		t.Errorf("ImplementOutcome should be nil after entering Implement; got %+v", got.Status.ImplementOutcome)
+		t.Errorf("ImplementOutcome should be nil after triage-implement entry; got %+v", got.Status.ImplementOutcome)
+	}
+}
+
+// TestSetLifecycleState_CIFailureReentry_PreservesImplementOutcome verifies that
+// CI-failure re-entries do NOT clear ImplementOutcome (finding 8: stale refusal
+// must not be discarded silently on a re-implement).
+func TestSetLifecycleState_CIFailureReentry_PreservesImplementOutcome(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-refusal-ci-reentry"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#304",
+		URL: "https://github.com/o/r/issues/304", Number: 304,
+	}
+	task := seedLifecycleTask(t, name, "lc-rci-proj", "lc-rci-repo", "lc-rci-sec", src)
+	task.Status.LifecycleState = "MRCI"
+	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
+		Action: "declined",
+		Reason: "stale refusal from a failed clearImplementOutcome",
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	r := newLifecycleReconciler(t, nil)
+	if err := r.setLifecycleState(ctx, task, "Implement", "mrci-failure"); err != nil {
+		t.Fatalf("setLifecycleState: %v", err)
+	}
+
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.ImplementOutcome == nil {
+		t.Error("ImplementOutcome must NOT be cleared on CI-failure re-entry (finding 8)")
 	}
 }
