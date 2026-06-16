@@ -71,6 +71,10 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 						},
 						Env: []corev1.EnvVar{
 							secretEnv("PG_DSN", n.PGAppSecret, "uri"),
+							// Wire the shared OpenAI secret so the tatara-memory community
+							// labeler (NewOpenAILabelerFromEnv) finds OPENAI_API_KEY and
+							// uses LLM labels instead of silently falling back to member names.
+							secretEnv("OPENAI_API_KEY", cfg.OpenAISecretName, "LLM_BINDING_API_KEY"),
 						},
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
