@@ -64,8 +64,18 @@ type PodConfig struct {
 	// RunAsNonRoot and RunAsUser configure the container SecurityContext.
 	// RunAsNonRoot=true rejects images that run as root. RunAsUser overrides the
 	// image default UID when non-nil. Supply both to lock down the container.
+	// ValidatePodSecurityContext enforces that RunAsUser is set whenever
+	// RunAsNonRoot is true (the wrapper image runs as a named, non-numeric user,
+	// so omitting RunAsUser produces an unsatisfiable kubelet contract).
 	RunAsNonRoot bool
 	RunAsUser    *int64
+
+	// RunAttempt is the zero-based boot-crash-respawn counter for this agent
+	// run. It is appended to PodName to form RUN_ID so that push-metrics from
+	// successive respawns of the same Task are stored under distinct keys and do
+	// not overwrite each other. Callers should pass the current
+	// tatara.dev/boot-crash-attempts annotation value (0 on the first spawn).
+	RunAttempt int
 
 	// FSGroup, when non-nil, sets the pod-level SecurityContext fsGroup so
 	// mounted-volume ownership matches the runtime group (the same fix the CI
@@ -93,6 +103,19 @@ func ValidatePodSecretRefs(project *tatarav1alpha1.Project, cfg PodConfig) error
 	}
 	if cfg.CLIOIDCSecretName == "" {
 		return fmt.Errorf("agent: CLIOIDCSecretName is empty in PodConfig; cannot build wrapper Pod")
+	}
+	return nil
+}
+
+// ValidatePodSecurityContext returns an error when cfg.RunAsNonRoot is true but
+// cfg.RunAsUser is nil. The wrapper image runs as a named (non-numeric) user,
+// so RunAsNonRoot without RunAsUser is an unsatisfiable contract for the
+// kubelet: it will reject the container with CreateContainerConfigError. Fail
+// fast here (at config load / before BuildPod) so the error surfaces as a
+// clear operator-side message rather than an opaque per-spawn kubelet error.
+func ValidatePodSecurityContext(cfg PodConfig) error {
+	if cfg.RunAsNonRoot && cfg.RunAsUser == nil {
+		return fmt.Errorf("agent: RunAsNonRoot=true requires RunAsUser to be set (the wrapper image runs as a named user); set AGENT_RUN_AS_USER in the operator config")
 	}
 	return nil
 }
@@ -274,8 +297,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Push-metrics: the wrapper Pod is too short-lived to be reliably
 		// scraped, so it pushes its /metrics to the operator's push-receiver
 		// (same internal listener as the callback), keyed by this run's id.
+		// RUN_ID includes the RunAttempt counter so successive boot-crash
+		// respawns of the same Task store their metrics under distinct keys
+		// and do not overwrite each other. POD_NAME stays stable (equals the
+		// Pod/Service name) for addressing the wrapper HTTP endpoint.
 		{Name: "OPERATOR_PUSH_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/metrics/push"},
-		{Name: "RUN_ID", Value: PodName(task)},
+		{Name: "RUN_ID", Value: PodName(task) + "-" + strconv.Itoa(cfg.RunAttempt)},
 		{Name: "POD_NAME", Value: PodName(task)},
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},

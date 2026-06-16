@@ -101,7 +101,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"TURN_TIMEOUT_SECONDS": "1800",
 		"DEFAULT_CALLBACK_URL": "http://tatara-operator-internal.tatara.svc:8082/internal/turn-complete",
 		"OPERATOR_PUSH_URL":    "http://tatara-operator-internal.tatara.svc:8082/internal/metrics/push",
-		"RUN_ID":               "wrapper-task-7",
+		"RUN_ID":               "wrapper-task-7-0",
 		"POD_NAME":             "wrapper-task-7",
 		"TATARA_TASK":          "task-7",
 		"TATARA_PROJECT":       "demo",
@@ -463,6 +463,64 @@ func TestBuildPod_ChatURL(t *testing.T) {
 	got, ok := envValue(c, "TATARA_CHAT_URL")
 	require.True(t, ok, "TATARA_CHAT_URL missing from pod env")
 	require.Equal(t, "http://chat-demo.tatara.svc:8080", got)
+}
+
+// TestValidatePodSecurityContext rejects RunAsNonRoot=true without RunAsUser.
+// Defence-in-depth mirror of ValidatePodSecretRefs: the operator fails fast at
+// config load so kubelet CreateContainerConfigError never fires per-spawn.
+func TestValidatePodSecurityContext(t *testing.T) {
+	_, _, _, cfg := sampleInputs()
+
+	// Neither flag: no error (nil SecurityContext path).
+	require.NoError(t, agent.ValidatePodSecurityContext(cfg))
+
+	// RunAsUser set without RunAsNonRoot: fine.
+	uid := int64(65534)
+	cfgUser := cfg
+	cfgUser.RunAsUser = &uid
+	require.NoError(t, agent.ValidatePodSecurityContext(cfgUser))
+
+	// RunAsNonRoot=true with RunAsUser set: valid contract.
+	cfgBoth := cfg
+	cfgBoth.RunAsNonRoot = true
+	cfgBoth.RunAsUser = &uid
+	require.NoError(t, agent.ValidatePodSecurityContext(cfgBoth))
+
+	// RunAsNonRoot=true without RunAsUser: must error (unsatisfiable kubelet contract).
+	cfgNoUser := cfg
+	cfgNoUser.RunAsNonRoot = true
+	cfgNoUser.RunAsUser = nil
+	err := agent.ValidatePodSecurityContext(cfgNoUser)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "RunAsNonRoot")
+	require.Contains(t, err.Error(), "RunAsUser")
+}
+
+// TestBuildPod_RunIDUniqPerAttempt asserts that RUN_ID encodes the RunAttempt
+// counter so successive boot-crash respawns of the same Task store push-metrics
+// under distinct keys (POD_NAME remains stable for service addressing).
+func TestBuildPod_RunIDUniqPerAttempt(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+
+	// Attempt 0 (first spawn).
+	c0 := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	runID0, ok := envValue(c0, "RUN_ID")
+	require.True(t, ok, "RUN_ID missing")
+	podName0, _ := envValue(c0, "POD_NAME")
+	require.Equal(t, "wrapper-task-7-0", runID0)
+	require.Equal(t, "wrapper-task-7", podName0, "POD_NAME must stay stable")
+
+	// Attempt 1 (first boot-crash respawn).
+	cfg1 := cfg
+	cfg1.RunAttempt = 1
+	c1 := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg1).Spec.Containers[0]
+	runID1, _ := envValue(c1, "RUN_ID")
+	podName1, _ := envValue(c1, "POD_NAME")
+	require.Equal(t, "wrapper-task-7-1", runID1)
+	require.Equal(t, "wrapper-task-7", podName1, "POD_NAME must stay stable across respawns")
+
+	// Each attempt produces a distinct RUN_ID.
+	require.NotEqual(t, runID0, runID1, "RUN_ID must differ between respawns")
 }
 
 // TestBuildPodEgressLabel_UsesSharedConst asserts that the brainstorm-sources

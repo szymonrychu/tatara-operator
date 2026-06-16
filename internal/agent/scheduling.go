@@ -24,6 +24,12 @@ type Scheduling struct {
 // whitespace-only document (the chart default) yields a zero Scheduling with no
 // constraints. A malformed document returns an error so the operator fails fast
 // at startup instead of silently dropping placement constraints.
+//
+// DisallowUnknownFields is intentional: it catches camelCase typos in
+// helmfile-authored affinity/toleration docs loudly at operator boot. The
+// blast radius is a startup abort (operator will not serve until the config is
+// corrected). The caller (config.Load) wraps the error with the env var name
+// AGENT_SCHEDULING so the log message pinpoints the misconfigured input.
 func ParseScheduling(doc string) (Scheduling, error) {
 	var s Scheduling
 	doc = strings.TrimSpace(doc)
