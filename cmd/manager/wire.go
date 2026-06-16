@@ -26,19 +26,20 @@ import (
 // (tatara-memory), not the operator's own API audience.
 func memoryConfigFromConfig(cfg config.Config) memory.Config {
 	return memory.Config{
-		Namespace:        cfg.Namespace,
-		MemoryImage:      cfg.MemoryImage,
-		LightragImage:    cfg.LightragImage,
-		Neo4jImage:       cfg.Neo4jImage,
-		OpenAISecretName: cfg.OpenAISecretName,
-		OIDCIssuer:       cfg.OIDCIssuer,
-		OIDCAudience:     "tatara-memory",
-		ImagePullSecret:  cfg.ImagePullSecret,
-		IngressHost:      cfg.IngressHost,
-		IngressClassName: cfg.IngressClassName,
-		MemoryPathPrefix: cfg.MemoryPathPrefix,
-		ChatPathPrefix:   cfg.ChatPathPrefix,
-		ChatImage:        cfg.ChatImage,
+		Namespace:            cfg.Namespace,
+		MemoryImage:          cfg.MemoryImage,
+		LightragImage:        cfg.LightragImage,
+		Neo4jImage:           cfg.Neo4jImage,
+		OpenAISecretName:     cfg.OpenAISecretName,
+		OIDCIssuer:           cfg.OIDCIssuer,
+		OIDCAudience:         "tatara-memory",
+		ImagePullSecret:      cfg.ImagePullSecret,
+		IngressHost:          cfg.IngressHost,
+		IngressClassName:     cfg.IngressClassName,
+		IngressRewriteTarget: cfg.IngressRewriteTarget,
+		MemoryPathPrefix:     cfg.MemoryPathPrefix,
+		ChatPathPrefix:       cfg.ChatPathPrefix,
+		ChatImage:            cfg.ChatImage,
 	}
 }
 
@@ -109,8 +110,11 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 }
 
 // podConfigFromConfig maps operator config to the wrapper Pod/Service builder
-// config.
+// config, including resource/securityContext scalars and the cluster-specific
+// scheduling JSON. AGENT_SCHEDULING is validated at config.Load, so parsing here
+// cannot fail; an empty Scheduling on any residual error is safe (no placement).
 func podConfigFromConfig(cfg config.Config) agent.PodConfig {
+	scheduling, _ := agent.ParseScheduling(cfg.AgentScheduling)
 	return agent.PodConfig{
 		Namespace:           cfg.Namespace,
 		CallbackURL:         cfg.CallbackURL,
@@ -119,6 +123,16 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		CLIOIDCSecretName:   cfg.CLIOIDCSecretName,
 		ImagePullSecret:     cfg.ImagePullSecret,
 		OperatorURL:         cfg.OperatorURL,
+		CPURequest:          cfg.AgentCPURequest,
+		CPULimit:            cfg.AgentCPULimit,
+		MemoryRequest:       cfg.AgentMemoryRequest,
+		MemoryLimit:         cfg.AgentMemoryLimit,
+		RunAsNonRoot:        cfg.AgentRunAsNonRoot,
+		RunAsUser:           cfg.AgentRunAsUser,
+		FSGroup:             cfg.AgentFSGroup,
+		NodeSelector:        scheduling.NodeSelector,
+		Tolerations:         scheduling.Tolerations,
+		Affinity:            scheduling.Affinity,
 	}
 }
 

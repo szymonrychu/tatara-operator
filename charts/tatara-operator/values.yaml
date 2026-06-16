@@ -43,7 +43,13 @@ imagePullSecret: ""
 namespace: "tatara"
 logLevel: "info"
 ingressHost: ""
-ingressClassName: "nginx"
+# ingressClassName / ingressRewriteTarget drive the operator-managed per-Project
+# memory Ingress. Both default empty so the chart is cluster-agnostic (rule 14):
+# empty class lets the cluster default IngressClass apply; empty rewrite-target
+# omits the nginx-specific annotation. The deploying helmfile sets them (e.g.
+# "nginx" / "/$2") for its ingress controller.
+ingressClassName: ""
+ingressRewriteTarget: ""
 memoryPathPrefix: "/api/v1/memory"
 chatPathPrefix: "/api/v1/chat"
 chatImage: ""
@@ -51,6 +57,31 @@ chatImage: ""
 # rolling-update surge (replicaCount: 1, maxSurge rounds up to 1). Keep on; set
 # false only for single-process local/envtest runs.
 leaderElection: true
+
+# Agent wrapper Pod resource requests/limits + securityContext (rule 6: camelCase
+# scalar -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). These bound the
+# otherwise-unbounded agent pods. Resources/runAsNonRoot are chart-appropriate
+# defaults; runAsUser/fsGroup are left empty so the helmfile can pin them per
+# cluster (cluster-agnostic, rule 14). Empty resource scalar = no constraint.
+agentCpuRequest: "250m"
+agentCpuLimit: "2"
+agentMemoryRequest: "512Mi"
+agentMemoryLimit: "4Gi"
+agentRunAsNonRoot: true
+# Empty = unset (image default UID / no pod fsGroup). Pin per cluster in helmfile.
+agentRunAsUser: ""
+agentFsGroup: ""
+
+# agentScheduling is the cluster-specific Pod placement for spawned agent pods
+# (nodeSelector / tolerations / affinity). Rule 6 list-shaped data: rendered into
+# the operator ConfigMap as a single JSON document key (AGENT_SCHEDULING) and
+# parsed at runtime. EMPTY by default so the chart stays cluster-agnostic (rule
+# 14); the deploying helmfile supplies the real placement, e.g.
+#   agentScheduling:
+#     nodeSelector: {kubernetes.io/os: linux}
+#     tolerations: [{key: dedicated, operator: Exists, effect: NoSchedule}]
+#     affinity: {}
+agentScheduling: {}
 
 # Secret-backed scalars. Provided by a SOPS-encrypted values overlay at deploy
 # time. Set existingSecret to use an externally-managed Secret instead.

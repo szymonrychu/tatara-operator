@@ -67,6 +67,11 @@ type PodConfig struct {
 	RunAsNonRoot bool
 	RunAsUser    *int64
 
+	// FSGroup, when non-nil, sets the pod-level SecurityContext fsGroup so
+	// mounted-volume ownership matches the runtime group (the same fix the CI
+	// runners needed for Ceph RBD). Nil means no pod-level SecurityContext.
+	FSGroup *int64
+
 	// NodeSelector, Tolerations and Affinity control Pod placement. All three
 	// are cluster-specific and must be supplied by the helmfile, not baked into
 	// the chart. Nil/empty means no scheduling constraint (default).
@@ -322,6 +327,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			NodeSelector:     cfg.NodeSelector,
 			Tolerations:      cfg.Tolerations,
 			Affinity:         cfg.Affinity,
+			SecurityContext:  buildPodSecurityContext(cfg),
 			Containers: []corev1.Container{{
 				Name:            "wrapper",
 				Image:           project.Spec.Agent.Image,
@@ -432,6 +438,16 @@ func buildSecurityContext(cfg PodConfig) *corev1.SecurityContext {
 		sc.RunAsUser = cfg.RunAsUser
 	}
 	return sc
+}
+
+// buildPodSecurityContext returns a pod-level SecurityContext carrying FSGroup
+// when configured, else nil (no constraint). FSGroup is pod-scoped, not
+// container-scoped, so it lives here rather than in buildSecurityContext.
+func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
+	if cfg.FSGroup == nil {
+		return nil
+	}
+	return &corev1.PodSecurityContext{FSGroup: cfg.FSGroup}
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list

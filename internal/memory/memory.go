@@ -35,9 +35,14 @@ type Config struct {
 	ImagePullSecret  string
 	IngressHost      string
 	IngressClassName string
-	MemoryPathPrefix string
-	ChatPathPrefix   string
-	ChatImage        string
+	// IngressRewriteTarget is the value of the nginx-specific
+	// nginx.ingress.kubernetes.io/rewrite-target annotation. Empty (default)
+	// means the annotation is NOT emitted, so the chart stays cluster-agnostic
+	// (rule 14): a non-nginx ingress controller is not handed nginx annotations.
+	IngressRewriteTarget string
+	MemoryPathPrefix     string
+	ChatPathPrefix       string
+	ChatImage            string
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.

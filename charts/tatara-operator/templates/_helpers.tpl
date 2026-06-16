@@ -86,8 +86,18 @@ NAMESPACE: {{ .Values.namespace | quote }}
 LOG_LEVEL: {{ .Values.logLevel | quote }}
 INGRESS_HOST: {{ .Values.ingressHost | quote }}
 INGRESS_CLASS_NAME: {{ .Values.ingressClassName | quote }}
+INGRESS_REWRITE_TARGET: {{ .Values.ingressRewriteTarget | quote }}
 MEMORY_PATH_PREFIX: {{ .Values.memoryPathPrefix | quote }}
 CHAT_PATH_PREFIX: {{ .Values.chatPathPrefix | quote }}
 CHAT_IMAGE: {{ .Values.chatImage | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
+AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
+AGENT_CPU_LIMIT: {{ .Values.agentCpuLimit | quote }}
+AGENT_MEMORY_REQUEST: {{ .Values.agentMemoryRequest | quote }}
+AGENT_MEMORY_LIMIT: {{ .Values.agentMemoryLimit | quote }}
+AGENT_RUN_AS_NON_ROOT: {{ .Values.agentRunAsNonRoot | quote }}
+AGENT_RUN_AS_USER: {{ .Values.agentRunAsUser | quote }}
+AGENT_FS_GROUP: {{ .Values.agentFsGroup | quote }}
+{{/* List-shaped placement (rule 6): one JSON document key, empty default keeps the chart cluster-agnostic (rule 14). */}}
+AGENT_SCHEDULING: {{ .Values.agentScheduling | toJson | quote }}
 {{- end -}}
