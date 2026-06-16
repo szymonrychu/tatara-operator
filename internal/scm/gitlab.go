@@ -471,6 +471,7 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		HeadBranch: mr.SourceBranch,
 		CIStatus:   ciStatus,
 		Merged:     mr.State == "merged",
+		Closed:     mr.State == "closed",
 	}, nil
 }
 

@@ -15,6 +15,7 @@ type ghPR struct {
 	} `json:"user"`
 	Head struct {
 		SHA string `json:"sha"`
+		Ref string `json:"ref"` // head branch name (source branch)
 	} `json:"head"`
 	Labels    []ghLabel `json:"labels"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -54,7 +55,7 @@ func (c *GitHub) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 	for _, p := range raw {
 		out = append(out, PRRef{
 			Repo: slug, Number: p.Number, Author: p.User.Login,
-			HeadSHA: p.Head.SHA, Labels: ghLabelNames(p.Labels), UpdatedAt: p.UpdatedAt,
+			HeadSHA: p.Head.SHA, HeadBranch: p.Head.Ref, Labels: ghLabelNames(p.Labels), UpdatedAt: p.UpdatedAt,
 		})
 	}
 	return out, nil

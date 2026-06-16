@@ -407,7 +407,8 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
-		Merged bool `json:"merged"`
+		Merged bool   `json:"merged"`
+		State  string `json:"state"` // "open" | "closed"
 	}
 	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), token, nil, &pr); err != nil {
 		return PRState{}, err
@@ -422,7 +423,10 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	if err != nil {
 		return PRState{}, err
 	}
-	return PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, CIStatus: ciStatus, Merged: pr.Merged}, nil
+	return PRState{
+		Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref,
+		CIStatus: ciStatus, Merged: pr.Merged, Closed: pr.State == "closed",
+	}, nil
 }
 
 func deriveGHCIStatus(runs []ghCheckRun) string {

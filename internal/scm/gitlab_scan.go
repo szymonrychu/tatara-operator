@@ -10,9 +10,10 @@ import (
 )
 
 type glMR struct {
-	IID    int    `json:"iid"`
-	SHA    string `json:"sha"`
-	Author struct {
+	IID          int    `json:"iid"`
+	SHA          string `json:"sha"`
+	SourceBranch string `json:"source_branch"` // head/source branch name
+	Author       struct {
 		Username string `json:"username"`
 	} `json:"author"`
 	Labels    []string  `json:"labels"`
@@ -41,7 +42,7 @@ func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 	for _, m := range raw {
 		out = append(out, PRRef{
 			Repo: proj, Number: m.IID, Author: m.Author.Username,
-			HeadSHA: m.SHA, Labels: m.Labels, UpdatedAt: m.UpdatedAt,
+			HeadSHA: m.SHA, HeadBranch: m.SourceBranch, Labels: m.Labels, UpdatedAt: m.UpdatedAt,
 		})
 	}
 	return out, nil

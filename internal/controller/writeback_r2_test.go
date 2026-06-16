@@ -191,7 +191,7 @@ func TestWriteback_422AlreadyExists_RecoversPRURL(t *testing.T) {
 		headBranch: sourceBranch,
 	}
 	reader := &fakePRReader{
-		prs: []scm.PRRef{{Repo: "o/r", Number: 55, Author: "bot"}},
+		prs: []scm.PRRef{{Repo: "o/r", Number: 55, Author: "bot", HeadBranch: sourceBranch}},
 	}
 
 	r := &TaskReconciler{
@@ -572,13 +572,11 @@ func TestMergeAllowed_SignatureKISS(t *testing.T) {
 		},
 	}
 	// CI green -> allowed.
-	ok, err := r.mergeAllowed(proj, scm.PRState{CIStatus: "success"})
-	require.NoError(t, err)
+	ok := r.mergeAllowed(proj, scm.PRState{CIStatus: "success"})
 	require.True(t, ok, "autoMergeOnGreenCI must allow merge when CI is green")
 
 	// CI failure -> not allowed.
-	ok, err = r.mergeAllowed(proj, scm.PRState{CIStatus: "failure"})
-	require.NoError(t, err)
+	ok = r.mergeAllowed(proj, scm.PRState{CIStatus: "failure"})
 	require.False(t, ok, "autoMergeOnGreenCI must deny merge when CI is failure")
 }
 

@@ -1916,11 +1916,7 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	if pserr != nil {
 		return ctrl.Result{}, fmt.Errorf("merge: get pr state: %w", pserr)
 	}
-	allowed, merr := r.mergeAllowed(project, prSt)
-	if merr != nil {
-		return ctrl.Result{}, merr
-	}
-	if !allowed {
+	if !r.mergeAllowed(project, prSt) {
 		if deadlinePassed(task) {
 			msg := fmt.Sprintf("lifecycle: merge deadline reached for PR #%d; parking.", number)
 			return ctrl.Result{}, r.parkOnDeadline(ctx, task, writer, token, msg)

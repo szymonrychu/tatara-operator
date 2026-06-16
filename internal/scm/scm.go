@@ -45,13 +45,14 @@ type CreatedIssue struct {
 
 // PRRef is one open PR/MR listed for cron MR-triage.
 type PRRef struct {
-	Repo      string    `json:"repo"`
-	Number    int       `json:"number"`
-	Author    string    `json:"author"`
-	HeadSHA   string    `json:"headSha"`
-	Labels    []string  `json:"labels,omitempty"`
-	Body      string    `json:"body,omitempty"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Repo       string    `json:"repo"`
+	Number     int       `json:"number"`
+	Author     string    `json:"author"`
+	HeadSHA    string    `json:"headSha"`
+	HeadBranch string    `json:"headBranch,omitempty"` // source/head branch; set when available from list API
+	Labels     []string  `json:"labels,omitempty"`
+	Body       string    `json:"body,omitempty"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // IssueRef is one open issue listed for cron issue-triage.
@@ -83,6 +84,7 @@ type PRState struct {
 	HeadBranch string
 	CIStatus   string // "" none | pending | success | failure
 	Merged     bool   // true when the PR/MR is already merged
+	Closed     bool   // true when the PR/MR is closed (not merged, state=closed)
 }
 
 // ErrMergeConflict is returned by Merge when the SCM signals the PR is not
