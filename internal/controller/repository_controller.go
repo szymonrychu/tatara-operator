@@ -359,12 +359,25 @@ func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *t
 	// Stamp the annotation trigger first. LastScheduledReingest advances only
 	// after the annotation write succeeds so a failed trigger never advances
 	// the dedup base (which would cause the due-but-unstamped fire to be skipped
-	// entirely on the next reconcile).
-	if repo.Annotations == nil {
-		repo.Annotations = map[string]string{}
-	}
-	repo.Annotations[ReingestAnnotation] = now.UTC().Format(time.RFC3339)
-	if err := r.Update(ctx, repo); err != nil {
+	// entirely on the next reconcile). Wrapped in RetryOnConflict to match the
+	// hardening already applied to the LastScheduledReingest status write below.
+	stamp := now.UTC().Format(time.RFC3339)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tataradevv1alpha1.Repository{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[ReingestAnnotation] = stamp
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		// Propagate annotation update back to caller so the guard below works.
+		*repo = *fresh
+		return nil
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stamp scheduled reingest annotation: %w", err)
 	}
 
@@ -388,14 +401,22 @@ func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *t
 	return ctrl.Result{}, nil
 }
 
-// ensureResultConfigMap creates the empty <repo>-ingest-result ConfigMap
-// (owner-ref Repository) if absent so the Job can patch it and the reconciler
-// can read it back.
+// ensureResultConfigMap creates (or resets) the <repo>-ingest-result ConfigMap
+// (owner-ref Repository) so the Job can patch it and the reconciler can read
+// it back. data["sha"] is always reset to "" before each launch so a stale
+// value from a prior ingest does not slip through the cache race window where
+// the Job-Complete watch fires before the CM-patch watch.
 func (r *RepositoryReconciler) ensureResultConfigMap(ctx context.Context, repo *tataradevv1alpha1.Repository) error {
 	cm := &corev1.ConfigMap{}
-	cm.Name = ingest.ResultConfigMapName(repo)
-	cm.Namespace = repo.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}, cm); err == nil {
+	key := types.NamespacedName{Namespace: repo.Namespace, Name: ingest.ResultConfigMapName(repo)}
+	if err := r.Get(ctx, key, cm); err == nil {
+		// CM already exists: reset sha so readResultSHA rejects a stale value.
+		if cm.Data["sha"] != "" {
+			cm.Data["sha"] = ""
+			if updateErr := r.Update(ctx, cm); updateErr != nil {
+				return fmt.Errorf("reset result configmap sha: %w", updateErr)
+			}
+		}
 		return nil
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get result configmap: %w", err)
@@ -422,14 +443,25 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 	l := log.FromContext(ctx)
 
 	// Record duration for all finished jobs (success and failure). Failed jobs
-	// do not have CompletionTime set by Kubernetes, so fall back to time.Now()
-	// to capture the actual elapsed time (hard rule 13: metrics for everything
-	// that can fail).
+	// do not have CompletionTime set by Kubernetes; prefer the LastTransitionTime
+	// of the JobFailed condition (set by K8s when it marks the job failed) to
+	// avoid inflating the histogram with reconcile-observation lag. Fall back to
+	// time.Now() only when that condition timestamp is also absent.
 	if job.Status.StartTime != nil {
 		end := job.Status.CompletionTime
 		if end == nil {
-			now := metav1.Now()
-			end = &now
+			// Try the JobFailed condition timestamp first.
+			for i := range job.Status.Conditions {
+				c := &job.Status.Conditions[i]
+				if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue && !c.LastTransitionTime.IsZero() {
+					end = &c.LastTransitionTime
+					break
+				}
+			}
+			if end == nil {
+				now := metav1.Now()
+				end = &now
+			}
 		}
 		r.Metrics.ObserveIngestJobDuration(end.Sub(job.Status.StartTime.Time).Seconds())
 	}
