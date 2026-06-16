@@ -93,6 +93,39 @@ func TestTokenSource_RespectsCallerCtxCancellation(t *testing.T) {
 		"Token() blocked for %s after ctx cancel - ctx not honoured", elapsed)
 }
 
+// TestTokenSource_CachesToken verifies that multiple Token() calls reuse the
+// cached token and do NOT hit the token endpoint more than once per token
+// lifetime. Before the fix, each call minted a fresh token (storm).
+func TestTokenSource_CachesToken(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token": "cached-token",
+			"token_type":   "Bearer",
+			"expires_in":   300, // 5-minute TTL; second call must reuse this
+		})
+	}))
+	defer srv.Close()
+
+	ts := auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     srv.URL,
+		ClientID:     "tatara-operator",
+		ClientSecret: "shh",
+		Audience:     "tatara-memory",
+	})
+
+	for i := 0; i < 5; i++ {
+		tok, err := ts.Token(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, "cached-token", tok)
+	}
+
+	require.Equal(t, 1, calls,
+		"expected exactly 1 token-endpoint call for 5 Token() invocations; got %d (no caching)", calls)
+}
+
 // TestTokenSource_RespectsHTTPTimeout verifies that a hung token endpoint does
 // not block the caller indefinitely. The HTTP client baked into the source must
 // carry a finite timeout so a slow/wedged Keycloak cannot hold a reconcile

@@ -60,8 +60,9 @@ type Receiver struct {
 	ttl time.Duration
 	now func() time.Time
 
-	mu   sync.Mutex
-	runs map[string]*run
+	mu         sync.Mutex
+	runs       map[string]*run
+	conflicted map[string]struct{} // "metricName:runID" pairs already counted
 
 	receiveTotal       *prometheus.CounterVec
 	evictedTotal       prometheus.Counter
@@ -71,9 +72,10 @@ type Receiver struct {
 // New returns a Receiver that evicts a run's series ttl after its last push.
 func New(ttl time.Duration) *Receiver {
 	r := &Receiver{
-		ttl:  ttl,
-		now:  time.Now,
-		runs: map[string]*run{},
+		ttl:        ttl,
+		now:        time.Now,
+		runs:       map[string]*run{},
+		conflicted: map[string]struct{}{},
 		receiveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_push_receive_total",
 			Help: "Total wrapper metric pushes received by result.",
@@ -89,7 +91,8 @@ func New(ttl time.Duration) *Receiver {
 	}
 	// Pre-init label values so all result categories appear in Gather from
 	// startup, even before the first push, delete, or rejection arrives.
-	for _, result := range []string{"accepted", "rejected", "too_large", "deleted"} {
+	// "empty" covers pushes where every family was dropped for a reserved name.
+	for _, result := range []string{"accepted", "rejected", "too_large", "deleted", "empty"} {
 		r.receiveTotal.WithLabelValues(result)
 	}
 	for _, reason := range []string{"reserved_name", "type_conflict", "build_error"} {
@@ -157,26 +160,63 @@ func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 
-	for _, rn := range runs {
+	// newConflicted accumulates (name:runID) keys for type-conflicting series
+	// detected this Collect pass; only newly-seen keys increment the drop counter.
+	newConflicted := map[string]struct{}{}
+	for i, id := range ids {
+		rn := runs[i]
 		for name, fam := range rn.families {
 			s := schemas[name]
 			// Skip entire family for this run when the type disagrees with the
-			// first-seen schema, counting each dropped series.
+			// first-seen schema. Increment the drop counter only the first time
+			// this (name, runID) pair is flagged so repeated Collect calls do not
+			// inflate the counter for persistent long-lived conflicts.
 			if s.typeConflict && s.typ != fam.GetType() {
-				r.seriesDroppedTotal.WithLabelValues("type_conflict").Add(float64(len(fam.GetMetric())))
+				key := name + ":" + id
+				r.mu.Lock()
+				_, alreadyCounted := r.conflicted[key]
+				if !alreadyCounted {
+					r.conflicted[key] = struct{}{}
+				}
+				r.mu.Unlock()
+				if !alreadyCounted {
+					r.seriesDroppedTotal.WithLabelValues("type_conflict").Add(float64(len(fam.GetMetric())))
+				}
+				newConflicted[key] = struct{}{}
 				continue
 			}
 			labelNames := sortedKeys(s.labels)
 			for _, m := range fam.GetMetric() {
 				metric := constMetric(name, s.help, s.typ, labelNames, m)
 				if metric == nil {
-					r.seriesDroppedTotal.WithLabelValues("build_error").Inc()
+					// build_error: also count only once per (name, runID) to avoid
+					// per-scrape inflation. Use a distinct key prefix.
+					key := "build:" + name + ":" + id
+					r.mu.Lock()
+					_, alreadyCounted := r.conflicted[key]
+					if !alreadyCounted {
+						r.conflicted[key] = struct{}{}
+					}
+					r.mu.Unlock()
+					if !alreadyCounted {
+						r.seriesDroppedTotal.WithLabelValues("build_error").Inc()
+					}
+					newConflicted[key] = struct{}{}
 					continue
 				}
 				ch <- metric
 			}
 		}
 	}
+	// Prune conflicted keys that are no longer in the active run set so the set
+	// does not grow without bound when runs come and go.
+	r.mu.Lock()
+	for key := range r.conflicted {
+		if _, live := newConflicted[key]; !live {
+			delete(r.conflicted, key)
+		}
+	}
+	r.mu.Unlock()
 
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc("operator_pushed_runs", "Wrapper runs with live pushed series.", nil, nil),
@@ -310,6 +350,15 @@ func (r *Receiver) handlePush(w http.ResponseWriter, req *http.Request) {
 			}
 			r.receiveTotal.WithLabelValues(result).Inc()
 			http.Error(w, fmt.Sprintf("parse metrics: %v", err), status)
+			return
+		}
+		// Finding 27: if all families were dropped (e.g. every name used a
+		// reserved prefix), do not store an empty run slot and count it as
+		// "empty" so a misconfigured wrapper is visible instead of appearing
+		// accepted with zero contributing series.
+		if len(families) == 0 {
+			r.receiveTotal.WithLabelValues("empty").Inc()
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		r.mu.Lock()

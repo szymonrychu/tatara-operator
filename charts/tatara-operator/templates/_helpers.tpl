@@ -81,6 +81,7 @@ OPERATOR_OIDC_CLIENT_ID: {{ .Values.operatorOidcClientId | quote }}
 OPERATOR_OIDC_SECRET_NAME: {{ default (include "tatara-operator.fullname" .) .Values.operatorOidcSecretName | quote }}
 ANTHROPIC_SECRET_NAME: {{ .Values.anthropicSecretName | quote }}
 CLI_OIDC_SECRET_NAME: {{ .Values.cliOidcSecretName | quote }}
+CALLBACK_HMAC_SECRET_NAME: {{ .Values.callbackHmacSecretName | quote }}
 IMAGE_PULL_SECRET: {{ .Values.imagePullSecret | quote }}
 NAMESPACE: {{ .Values.namespace | quote }}
 LOG_LEVEL: {{ .Values.logLevel | quote }}

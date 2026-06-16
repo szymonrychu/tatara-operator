@@ -166,10 +166,17 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 						"action", "writeback_no_change", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
 					r.Metrics.WritebackOutcome("no_change")
 				} else if skipReason == "already-exists" {
-					if recovered, rerr := r.recoverExistingPRURL(ctx, writer, token, provider, repo.Spec.URL, sourceBranch); rerr == nil && recovered != "" {
+					if recovered, rerr := r.recoverExistingPRURL(ctx, token, provider, repo.Spec.URL, sourceBranch); rerr == nil && recovered != "" {
 						l.Info("writeback: pr/mr already exists, recovered url",
 							"action", "writeback_pr_recovered", "repo", repo.Name, "task", task.Name, "pr_url", recovered)
 						prURLs = append(prURLs, recovered)
+						// Persist the primary PR URL after recovery so a later transient
+						// failure on another repo does not lose this URL.
+						if len(prURLs) == 1 {
+							if perr := r.persistPrimaryPRURL(ctx, task, prURLs[0]); perr != nil {
+								return ctrl.Result{}, perr
+							}
+						}
 						continue
 					}
 					l.Info("writeback: skipping repo (4xx - already exists, could not recover)",
@@ -188,6 +195,14 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		l.Info("writeback: pr/mr opened", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
 		r.Metrics.WritebackOutcome("opened")
 		prURLs = append(prURLs, prURL)
+		// Persist the primary PR URL immediately after the first successful OpenChange
+		// so a transient failure on a later repo does not lose the already-opened URL.
+		// A requeue then finds PrURL set and skips re-opening.
+		if len(prURLs) == 1 {
+			if perr := r.persistPrimaryPRURL(ctx, task, prURLs[0]); perr != nil {
+				return ctrl.Result{}, perr
+			}
+		}
 	}
 
 	if len(prURLs) == 0 {
@@ -263,6 +278,23 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	return ctrl.Result{}, nil
 }
 
+// persistPrimaryPRURL writes the primary PR URL to Status.PrURL under
+// RetryOnConflict. Called after the first successful OpenChange so a transient
+// failure on a later repo in the loop does not lose the already-opened URL.
+func (r *TaskReconciler) persistPrimaryPRURL(ctx context.Context, task *tatarav1alpha1.Task, prURL string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Status.PrURL != "" {
+			return nil // already persisted (e.g. concurrent reconcile)
+		}
+		fresh.Status.PrURL = prURL
+		return r.Status().Update(ctx, fresh)
+	})
+}
+
 // clearWritebackPending sets WritebackPending=False and updates status.
 // RetryOnConflict handles concurrent reconcile updates so the clear always lands.
 // Returns an error when the clear fails so callers can propagate it and avoid
@@ -306,8 +338,12 @@ func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatara
 		client.MatchingFields{taskIndexProjectRef: task.Spec.ProjectRef},
 	)
 	if err != nil && isFieldSelectorUnsupported(err) {
-		// Fall back to full-namespace scan when the field index is not registered
-		// (direct-client test environments without a manager).
+		// Fall back to full-namespace scan when the field index is not registered.
+		// In a managed runtime this means the index was never registered; log WARN
+		// so the misconfiguration is visible rather than silently degrading every
+		// brainstorm dedup lookup to an unbounded namespace scan.
+		log.FromContext(ctx).Info("writeback: brainstormHasProposal: field index unsupported, falling back to full-namespace scan (expected only in test environments without a manager)",
+			"action", "writeback_brainstorm_fallback_scan", "task", task.Name, "namespace", task.Namespace)
 		err = r.List(ctx, &list, client.InNamespace(task.Namespace))
 	}
 	if err != nil {
@@ -631,6 +667,7 @@ func (r *TaskReconciler) findOpenIssueByTitle(ctx context.Context, proj *tatarav
 		}
 	}
 	issues, err := reader.ListOpenIssues(ctx, owner, repo)
+	r.recordSCM(proj.Spec.Scm.Provider, "list_open_issues", err)
 	if err != nil {
 		return scm.IssueRef{}, false, fmt.Errorf("proposal: list open issues: %w", err)
 	}
@@ -774,6 +811,7 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "AuthorshipWithheld", "project has no scm.botLogin")
 	}
 	st, perr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+	r.recordSCM(provider, "get_pr_state", perr)
 	if perr != nil {
 		return ctrl.Result{}, fmt.Errorf("writeback selfImprove: authorship gate: %w", perr)
 	}
@@ -786,10 +824,15 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 
 	switch out.Action {
 	case "close":
-		err = writer.ClosePR(ctx, repo.Spec.URL, token, number, out.Reason)
-		r.recordSCM(provider, "close", err)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("writeback selfImprove: %w", err)
+		// Short-circuit: if the PR is already closed (e.g. clearWritebackPending
+		// failed on a prior reconcile), skip ClosePR to avoid re-posting the close
+		// comment on an already-closed PR. st was fetched by the authorship gate above.
+		if !st.Closed {
+			err = writer.ClosePR(ctx, repo.Spec.URL, token, number, out.Reason)
+			r.recordSCM(provider, "close", err)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("writeback selfImprove: %w", err)
+			}
 		}
 		// Clear WritebackPending immediately after a successful state change so
 		// a requeue triggered by a transient comment failure does not re-call
@@ -797,11 +840,7 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		l.Info("self-improve outcome applied", "action", "scm_pr_outcome", "resource_id", task.Name, "outcome", out.Action)
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: "+out.Action)
 	case "merge":
-		ok, merr := r.mergeAllowed(&proj, st)
-		if merr != nil {
-			return ctrl.Result{}, merr
-		}
-		if !ok {
+		if !r.mergeAllowed(&proj, st) {
 			l.Info("self-improve merge withheld: policy not satisfied", "action", "scm_merge_withheld", "resource_id", task.Name)
 			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "MergeWithheld", "merge policy not satisfied")
 		}
@@ -814,6 +853,7 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		// treat as success rather than mis-labelling a completed merge as a conflict.
 		if errors.Is(err, scm.ErrMergeConflict) {
 			freshSt, stErr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+			r.recordSCM(provider, "get_pr_state", stErr)
 			if stErr == nil && freshSt.Merged {
 				l.Info("self-improve merge: PR already merged; treating as success",
 					"action", "scm_pr_outcome", "resource_id", task.Name, "outcome", "merge")
@@ -931,6 +971,7 @@ func (r *TaskReconciler) selfImproveBotAuthored(ctx context.Context, proj *tatar
 		return false, fmt.Errorf("authorship gate: scm token: %w", err)
 	}
 	st, err := writer.GetPRState(ctx, repo.Spec.URL, token, task.Spec.Source.Number)
+	r.recordSCM(provider, "get_pr_state", err)
 	if err != nil {
 		return false, fmt.Errorf("authorship gate: get pr state: %w", err)
 	}
@@ -942,22 +983,28 @@ func (r *TaskReconciler) selfImproveBotAuthored(ctx context.Context, proj *tatar
 // as the agent's relay of an approving signal).
 // st is the PR state already fetched by the authorship gate; passing it avoids
 // a second GetPRState call on the hot merge path.
-func (r *TaskReconciler) mergeAllowed(proj *tatarav1alpha1.Project, st scm.PRState) (bool, error) {
+//
+// afterApproval is an intentional trust-the-agent policy: the bot's pr_outcome=merge
+// signal is treated as the agent relaying an approving signal (human review happened
+// outside this gate). It does NOT consult live PR review state. If real approval
+// gating is required, use autoMergeOnGreenCI combined with a branch protection rule
+// requiring an approved review before CI can pass.
+func (r *TaskReconciler) mergeAllowed(proj *tatarav1alpha1.Project, st scm.PRState) bool {
 	policy := "afterApproval"
 	if proj.Spec.Scm != nil && proj.Spec.Scm.MergePolicy != "" {
 		policy = proj.Spec.Scm.MergePolicy
 	}
 	if policy == "autoMergeOnGreenCI" {
 		if st.CIStatus == "success" {
-			return true, nil
+			return true
 		}
 		if st.CIStatus != "" {
-			return false, nil // CI present but not green
+			return false // CI present but not green
 		}
 		// CI absent -> fall back to afterApproval below.
 	}
 	// afterApproval: trust pr_outcome=merge as the agent's relay of an approving signal.
-	return true, nil
+	return true
 }
 
 func toSCMSuggestions(in []tatarav1alpha1.Suggestion) []scm.Suggestion {
@@ -999,8 +1046,10 @@ func openChangeSkipReason(he *scm.HTTPError) string {
 // the given repo. Called when OpenChange returns 422 "A pull request already
 // exists" so the lifecycle path adopts the existing PR instead of treating the
 // task as empty/refused. Returns ("", nil) when no matching PR is found.
-func (r *TaskReconciler) recoverExistingPRURL(ctx context.Context, writer scm.SCMWriter, token, provider, repoURL, sourceBranch string) (string, error) {
+func (r *TaskReconciler) recoverExistingPRURL(ctx context.Context, token, provider, repoURL, sourceBranch string) (string, error) {
 	if r.ReaderFor == nil {
+		log.FromContext(ctx).Info("writeback: cannot recover existing PR URL: no reader wired; recovery degraded to skip_4xx",
+			"action", "writeback_recovery_no_reader", "repo_url", repoURL, "branch", sourceBranch)
 		return "", nil
 	}
 	reader, err := r.ReaderFor(provider, token)
@@ -1020,20 +1069,18 @@ func (r *TaskReconciler) recoverExistingPRURL(ctx context.Context, writer scm.SC
 		}
 	}
 	prs, err := reader.ListOpenPRs(ctx, owner, repo)
+	r.recordSCM(provider, "list_open_prs", err)
 	if err != nil {
 		return "", err
 	}
 	for _, pr := range prs {
-		// GetPRState has HeadBranch; PRRef does not, so we must call it per entry.
-		st, serr := writer.GetPRState(ctx, repoURL, token, pr.Number)
-		if serr != nil {
-			continue
-		}
-		if st.HeadBranch == sourceBranch {
+		// PRRef.HeadBranch is now populated from the list API (GitHub head.ref /
+		// GitLab source_branch), so no per-PR GetPRState fan-out is needed.
+		if pr.HeadBranch == sourceBranch {
 			// Construct the HTML PR URL from the repo URL base + PR number.
-			slug, _, serr2 := repoSlugFromURL(repoURL, provider)
-			if serr2 != nil {
-				return "", serr2
+			slug, _, serr := repoSlugFromURL(repoURL, provider)
+			if serr != nil {
+				return "", serr
 			}
 			base, berr := parseRepoBase(repoURL)
 			if berr != nil {

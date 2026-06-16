@@ -54,11 +54,19 @@ func TestPodConfigFromConfig(t *testing.T) {
 }
 
 // TestPodConfigFromConfig_Scheduling asserts the cluster-specific scheduling
-// JSON (nodeSelector/tolerations/affinity) is parsed and applied to PodConfig.
+// (nodeSelector/tolerations/affinity) is applied to PodConfig from the
+// pre-parsed cfg.Scheduling field set by config.Load - no re-parse, no
+// discarded error.
 func TestPodConfigFromConfig_Scheduling(t *testing.T) {
-	cfg := config.Config{
-		AgentScheduling: `{"nodeSelector":{"kubernetes.io/os":"linux"},` +
+	scheduling, err := agent.ParseScheduling(
+		`{"nodeSelector":{"kubernetes.io/os":"linux"},` +
 			`"tolerations":[{"key":"dedicated","operator":"Exists","effect":"NoSchedule"}]}`,
+	)
+	if err != nil {
+		t.Fatalf("ParseScheduling: %v", err)
+	}
+	cfg := config.Config{
+		Scheduling: scheduling,
 	}
 	got := podConfigFromConfig(cfg)
 	if got.NodeSelector["kubernetes.io/os"] != "linux" {
@@ -66,6 +74,30 @@ func TestPodConfigFromConfig_Scheduling(t *testing.T) {
 	}
 	if len(got.Tolerations) != 1 || got.Tolerations[0].Key != "dedicated" {
 		t.Fatalf("Tolerations not applied: %+v", got.Tolerations)
+	}
+}
+
+// TestPodConfigFromConfig_SchedulingUsesPreParsedStruct asserts that
+// podConfigFromConfig reads from cfg.Scheduling (the struct set once by
+// config.Load) and NOT from cfg.AgentScheduling (the raw string). A Config
+// whose AgentScheduling raw string is malformed but whose Scheduling struct is
+// valid still produces the correct PodConfig - demonstrating that the
+// error-discarding double-parse (scheduling, _ := agent.ParseScheduling(...))
+// has been removed.
+func TestPodConfigFromConfig_SchedulingUsesPreParsedStruct(t *testing.T) {
+	scheduling, err := agent.ParseScheduling(`{"nodeSelector":{"env":"prod"}}`)
+	if err != nil {
+		t.Fatalf("ParseScheduling: %v", err)
+	}
+	cfg := config.Config{
+		// Raw string intentionally diverges from Scheduling to prove the func
+		// reads the struct, not the string.
+		AgentScheduling: `{"nodeSelector":{"env":"staging"}}`,
+		Scheduling:      scheduling,
+	}
+	got := podConfigFromConfig(cfg)
+	if got.NodeSelector["env"] != "prod" {
+		t.Fatalf("podConfigFromConfig used AgentScheduling raw string instead of pre-parsed Scheduling: NodeSelector=%+v", got.NodeSelector)
 	}
 }
 

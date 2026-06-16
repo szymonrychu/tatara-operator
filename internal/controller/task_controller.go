@@ -926,9 +926,11 @@ func (r *TaskReconciler) deriveResultSummary(ctx context.Context, task *tatarav1
 // Every other terminal-state transition must win despite the concurrent write,
 // and the teardown (deleteWrapper) above is idempotent so a retry is safe.
 func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Task, phase, reason, msg string) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
 	baseURL := agent.BaseURL(task, task.Namespace)
 	if err := r.Session.DeleteSession(ctx, baseURL); err != nil {
 		// Best-effort: the pod is about to be deleted anyway.
+		l.Error(err, "terminate: delete session (non-fatal)", "resource_id", task.Name)
 		apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
 			Type: "SessionDeleteFailed", Status: metav1.ConditionTrue,
 			Reason: "DeleteError", Message: err.Error(),
@@ -974,6 +976,7 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set terminal status: %w", err)
 	}
+	l.Info("task terminated", "action", "task_terminate", "resource_id", task.Name, "phase", phase, "reason", reason)
 	r.updateInflightGauge(ctx)
 	return ctrl.Result{}, nil
 }
@@ -981,21 +984,10 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 // isTurnTimedOut reports whether the in-flight turn has exceeded
 // project.spec.agent.turnTimeoutSeconds + turnTimeoutGrace. It returns false
 // when the annotation is absent or unparseable (safe default: keep waiting).
+// Delegates to the free function turnTimedOut (turncallback.go) so the two
+// receivers share the same deadline arithmetic (finding 3/r3).
 func (r *TaskReconciler) isTurnTimedOut(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
-	raw := task.Annotations[annTurnStartedAt]
-	if raw == "" {
-		return false
-	}
-	startedAt, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return false
-	}
-	timeout := project.Spec.Agent.TurnTimeoutSeconds
-	if timeout <= 0 {
-		timeout = 1800
-	}
-	deadline := startedAt.Add(time.Duration(timeout)*time.Second + turnTimeoutGrace)
-	return time.Now().After(deadline)
+	return turnTimedOut(task.Annotations[annTurnStartedAt], project.Spec.Agent.TurnTimeoutSeconds)
 }
 
 // updateInflightGauge sets operator_tasks_inflight (aggregate) and

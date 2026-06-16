@@ -171,7 +171,7 @@ func TestMemoryStackHealth_MissingObjectsAreNotReadyNotError(t *testing.T) {
 	if ready != 0 || neo4j != 0 || lightrag != 0 || mem != 0 {
 		t.Fatalf("expected all-zero readiness, got %d/%d/%d/%d", ready, neo4j, lightrag, mem)
 	}
-	if got := memoryPhase(ready, effectivePGInstances(p), neo4j, lightrag, mem); got != "Provisioning" {
+	if got := memoryPhase(ready, memory.PgInstances(p), neo4j, lightrag, mem); got != "Provisioning" {
 		t.Fatalf("memoryPhase = %q, want Provisioning", got)
 	}
 }

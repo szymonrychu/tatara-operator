@@ -111,28 +111,28 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 
 // podConfigFromConfig maps operator config to the wrapper Pod/Service builder
 // config, including resource/securityContext scalars and the cluster-specific
-// scheduling JSON. AGENT_SCHEDULING is validated at config.Load, so parsing here
-// cannot fail; an empty Scheduling on any residual error is safe (no placement).
+// scheduling placement. cfg.Scheduling is parsed once by config.Load and
+// stored on the Config so no re-parse (and no discarded error) is needed here.
 func podConfigFromConfig(cfg config.Config) agent.PodConfig {
-	scheduling, _ := agent.ParseScheduling(cfg.AgentScheduling)
 	return agent.PodConfig{
-		Namespace:           cfg.Namespace,
-		CallbackURL:         cfg.CallbackURL,
-		OIDCIssuer:          cfg.OIDCIssuer,
-		AnthropicSecretName: cfg.AnthropicSecretName,
-		CLIOIDCSecretName:   cfg.CLIOIDCSecretName,
-		ImagePullSecret:     cfg.ImagePullSecret,
-		OperatorURL:         cfg.OperatorURL,
-		CPURequest:          cfg.AgentCPURequest,
-		CPULimit:            cfg.AgentCPULimit,
-		MemoryRequest:       cfg.AgentMemoryRequest,
-		MemoryLimit:         cfg.AgentMemoryLimit,
-		RunAsNonRoot:        cfg.AgentRunAsNonRoot,
-		RunAsUser:           cfg.AgentRunAsUser,
-		FSGroup:             cfg.AgentFSGroup,
-		NodeSelector:        scheduling.NodeSelector,
-		Tolerations:         scheduling.Tolerations,
-		Affinity:            scheduling.Affinity,
+		Namespace:              cfg.Namespace,
+		CallbackURL:            cfg.CallbackURL,
+		OIDCIssuer:             cfg.OIDCIssuer,
+		AnthropicSecretName:    cfg.AnthropicSecretName,
+		CLIOIDCSecretName:      cfg.CLIOIDCSecretName,
+		ImagePullSecret:        cfg.ImagePullSecret,
+		OperatorURL:            cfg.OperatorURL,
+		CPURequest:             cfg.AgentCPURequest,
+		CPULimit:               cfg.AgentCPULimit,
+		MemoryRequest:          cfg.AgentMemoryRequest,
+		MemoryLimit:            cfg.AgentMemoryLimit,
+		RunAsNonRoot:           cfg.AgentRunAsNonRoot,
+		RunAsUser:              cfg.AgentRunAsUser,
+		FSGroup:                cfg.AgentFSGroup,
+		NodeSelector:           cfg.Scheduling.NodeSelector,
+		Tolerations:            cfg.Scheduling.Tolerations,
+		Affinity:               cfg.Scheduling.Affinity,
+		CallbackHMACSecretName: cfg.CallbackHMACSecretName,
 	}
 }
 
@@ -193,11 +193,12 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	}
 
 	cbServer := &controller.CallbackServer{
-		Client:      mgr.GetClient(),
-		Metrics:     metrics,
-		Session:     agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
-		Namespace:   cfg.Namespace,
-		PushMetrics: pushReceiver.PushHandler(),
+		Client:         mgr.GetClient(),
+		Metrics:        metrics,
+		Session:        agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
+		Namespace:      cfg.Namespace,
+		PushMetrics:    pushReceiver.PushHandler(),
+		CallbackSecret: cfg.CallbackHMACSecret,
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return fmt.Errorf("add callback server: %w", err)

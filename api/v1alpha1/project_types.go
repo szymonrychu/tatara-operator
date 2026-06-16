@@ -53,6 +53,7 @@ type AgentSpec struct {
 	// +kubebuilder:default=50
 	// +optional
 	HandoverThresholdPercent int `json:"handoverThresholdPercent,omitempty"`
+	// +kubebuilder:validation:Minimum=3
 	// +kubebuilder:default=10
 	// +optional
 	MaxLifecycleIterations int `json:"maxLifecycleIterations,omitempty"`
@@ -72,6 +73,7 @@ type BoardSpec struct {
 // CronActivity schedules one Project scan activity (mrScan or issueScan).
 type CronActivity struct {
 	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables this activity.
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 	// MaxPerRepo caps the number of in-progress Tasks per repo (one lane per repo).
@@ -85,6 +87,7 @@ type CronActivity struct {
 type BrainstormActivity struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 	// Deprecated: MaxPerCycle is retained for API compatibility only. The controller
@@ -111,6 +114,7 @@ type BrainstormActivity struct {
 type HealthCheckActivity struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 	// MaxOpenProposals caps the total open, unapproved agent proposals across

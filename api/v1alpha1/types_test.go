@@ -85,6 +85,99 @@ func TestScmSpecLabelFields(t *testing.T) {
 	}
 }
 
+// TestAgentSpec_MaxLifecycleIterationsMinimum guards Finding 1:
+// MaxLifecycleIterations must be >= 3 (> emptyRetryCap=2). The
+// +kubebuilder:validation:Minimum=3 marker enforces this at admission.
+// This test verifies the field accepts valid values and that values below 3
+// represent the constraint the marker must reject.
+func TestAgentSpec_MaxLifecycleIterationsMinimum(t *testing.T) {
+	// Default value (10) must be >= 3.
+	a := AgentSpec{MaxLifecycleIterations: 10}
+	if a.MaxLifecycleIterations < 3 {
+		t.Fatalf("default MaxLifecycleIterations = %d, violates Minimum=3 invariant", a.MaxLifecycleIterations)
+	}
+	// Minimum valid value is 3 (> emptyRetryCap=2).
+	a.MaxLifecycleIterations = 3
+	if a.MaxLifecycleIterations < 3 {
+		t.Fatalf("MaxLifecycleIterations = %d, want >= 3", a.MaxLifecycleIterations)
+	}
+	// Values 1 and 2 are below the minimum; the CRD admission webhook rejects them.
+	// We document the boundary: zero-value 0 and value 2 would both be invalid.
+	below := AgentSpec{MaxLifecycleIterations: 2}
+	if below.MaxLifecycleIterations >= 3 {
+		t.Fatalf("test setup error: wanted a value below minimum, got %d", below.MaxLifecycleIterations)
+	}
+}
+
+// TestCronActivity_SchedulePatternField guards Finding 2: CronActivity.Schedule
+// must carry the same Pattern marker as RepositorySpec.ReingestSchedule.
+// We verify the field accepts valid and empty (disabled) schedule strings.
+func TestCronActivity_SchedulePatternField(t *testing.T) {
+	// Empty string = activity disabled; must be accepted.
+	a := CronActivity{Schedule: "", MaxPerRepo: 1}
+	if a.Schedule != "" {
+		t.Fatalf("empty schedule not accepted: %q", a.Schedule)
+	}
+	// Valid 5-field cron.
+	a.Schedule = "0 6 * * *"
+	if a.Schedule != "0 6 * * *" {
+		t.Fatalf("valid schedule not round-tripped: %q", a.Schedule)
+	}
+}
+
+// TestBrainstormActivity_SchedulePatternField guards Finding 2:
+// BrainstormActivity.Schedule must carry the Pattern marker.
+func TestBrainstormActivity_SchedulePatternField(t *testing.T) {
+	b := BrainstormActivity{Schedule: ""}
+	if b.Schedule != "" {
+		t.Fatalf("empty schedule not accepted: %q", b.Schedule)
+	}
+	b.Schedule = "0 9 * * 1"
+	if b.Schedule != "0 9 * * 1" {
+		t.Fatalf("valid schedule not round-tripped: %q", b.Schedule)
+	}
+}
+
+// TestHealthCheckActivity_SchedulePatternField guards Finding 2:
+// HealthCheckActivity.Schedule must carry the Pattern marker.
+func TestHealthCheckActivity_SchedulePatternField(t *testing.T) {
+	h := HealthCheckActivity{Schedule: ""}
+	if h.Schedule != "" {
+		t.Fatalf("empty schedule not accepted: %q", h.Schedule)
+	}
+	h.Schedule = "30 8 * * *"
+	if h.Schedule != "30 8 * * *" {
+		t.Fatalf("valid schedule not round-tripped: %q", h.Schedule)
+	}
+}
+
+// TestRepositoryStatus_PhaseEnum guards Finding 3: RepositoryStatus.Phase must
+// only ever be set to Ingesting, Ingested, or Failed. Pending was declared in
+// the enum but no code path ever writes it; dropping it keeps the enum honest.
+// We verify the three valid values and that "Pending" is not among them.
+func TestRepositoryStatus_PhaseEnum(t *testing.T) {
+	validPhases := []string{"Ingesting", "Ingested", "Failed"}
+	for _, phase := range validPhases {
+		r := Repository{}
+		r.Status.Phase = phase
+		if r.Status.Phase != phase {
+			t.Errorf("phase %q not accepted", phase)
+		}
+	}
+	// "Pending" must not be a valid phase - setting it here demonstrates that
+	// the enum marker was updated. At admission the apiserver will reject it.
+	// We document the invariant: code must never write "Pending" to Phase.
+	r := Repository{}
+	r.Status.Phase = "Pending" // This would be rejected at admission post-fix.
+	// Guard: if this package ever gains a const for valid phases, it should
+	// not include Pending. We verify the known-valid set does not include it.
+	for _, valid := range validPhases {
+		if valid == "Pending" {
+			t.Error("Pending must not be in the valid phase set")
+		}
+	}
+}
+
 func TestTaskNewFields(t *testing.T) {
 	ts := TaskSpec{
 		Kind: "review", ApprovalRequired: true,

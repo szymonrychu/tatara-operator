@@ -17,6 +17,11 @@ import (
 // wrapperPort is the wrapper's in-pod HTTP listener.
 const wrapperPort = 8080
 
+// CallbackHMACSecretKey is the data key holding the callback HMAC shared secret
+// in the Secret referenced by PodConfig.CallbackHMACSecretName. The same key is
+// read by the operator deployment via SecretKeyRef. Fixed by consumer code.
+const CallbackHMACSecretKey = "callback-hmac-secret"
+
 // PodNameAnnotation, when set on a Task at creation, holds the descriptive
 // wrapper Pod/Service name. PodName prefers it; legacy Tasks created before this
 // annotation existed fall back to wrapper-<task-name>.
@@ -52,6 +57,14 @@ type PodConfig struct {
 	CLIOIDCSecretName   string
 	ImagePullSecret     string
 	OperatorURL         string // operator REST base URL for the agent's task_*/subtask_* MCP tools
+	// CallbackHMACSecretName, when non-empty, is the name of the Secret holding
+	// the callback HMAC shared secret under key config.CallbackHMACSecretKey. It
+	// is injected into the wrapper Pod as CALLBACK_HMAC_SECRET via a SecretKeyRef
+	// (NOT a literal env value) so the secret never appears in the Pod spec /
+	// etcd object in plaintext, matching every other agent secret. The wrapper
+	// signs its turn-complete callbacks with it; the operator verifies via
+	// CallbackServer.CallbackSecret (finding 1/r3).
+	CallbackHMACSecretName string
 
 	// Resource requests/limits for the wrapper container. Parsed from camelCase
 	// config scalars (cpu-request, cpu-limit, memory-request, memory-limit in the
@@ -64,8 +77,18 @@ type PodConfig struct {
 	// RunAsNonRoot and RunAsUser configure the container SecurityContext.
 	// RunAsNonRoot=true rejects images that run as root. RunAsUser overrides the
 	// image default UID when non-nil. Supply both to lock down the container.
+	// ValidatePodSecurityContext enforces that RunAsUser is set whenever
+	// RunAsNonRoot is true (the wrapper image runs as a named, non-numeric user,
+	// so omitting RunAsUser produces an unsatisfiable kubelet contract).
 	RunAsNonRoot bool
 	RunAsUser    *int64
+
+	// RunAttempt is the zero-based boot-crash-respawn counter for this agent
+	// run. It is appended to PodName to form RUN_ID so that push-metrics from
+	// successive respawns of the same Task are stored under distinct keys and do
+	// not overwrite each other. Callers should pass the current
+	// tatara.dev/boot-crash-attempts annotation value (0 on the first spawn).
+	RunAttempt int
 
 	// FSGroup, when non-nil, sets the pod-level SecurityContext fsGroup so
 	// mounted-volume ownership matches the runtime group (the same fix the CI
@@ -93,6 +116,19 @@ func ValidatePodSecretRefs(project *tatarav1alpha1.Project, cfg PodConfig) error
 	}
 	if cfg.CLIOIDCSecretName == "" {
 		return fmt.Errorf("agent: CLIOIDCSecretName is empty in PodConfig; cannot build wrapper Pod")
+	}
+	return nil
+}
+
+// ValidatePodSecurityContext returns an error when cfg.RunAsNonRoot is true but
+// cfg.RunAsUser is nil. The wrapper image runs as a named (non-numeric) user,
+// so RunAsNonRoot without RunAsUser is an unsatisfiable contract for the
+// kubelet: it will reject the container with CreateContainerConfigError. Fail
+// fast here (at config load / before BuildPod) so the error surfaces as a
+// clear operator-side message rather than an opaque per-spawn kubelet error.
+func ValidatePodSecurityContext(cfg PodConfig) error {
+	if cfg.RunAsNonRoot && cfg.RunAsUser == nil {
+		return fmt.Errorf("agent: RunAsNonRoot=true requires RunAsUser to be set (the wrapper image runs as a named user); set AGENT_RUN_AS_USER in the operator config")
 	}
 	return nil
 }
@@ -274,8 +310,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Push-metrics: the wrapper Pod is too short-lived to be reliably
 		// scraped, so it pushes its /metrics to the operator's push-receiver
 		// (same internal listener as the callback), keyed by this run's id.
+		// RUN_ID includes the RunAttempt counter so successive boot-crash
+		// respawns of the same Task store their metrics under distinct keys
+		// and do not overwrite each other. POD_NAME stays stable (equals the
+		// Pod/Service name) for addressing the wrapper HTTP endpoint.
 		{Name: "OPERATOR_PUSH_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/metrics/push"},
-		{Name: "RUN_ID", Value: PodName(task)},
+		{Name: "RUN_ID", Value: PodName(task) + "-" + strconv.Itoa(cfg.RunAttempt)},
 		{Name: "POD_NAME", Value: PodName(task)},
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},
@@ -301,6 +341,14 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
 	}...)
+	// Inject callback HMAC secret when configured so the wrapper can sign its
+	// turn-complete callbacks (finding 1/r3). Delivered via SecretKeyRef (NOT a
+	// literal env value) so the secret never lands in the Pod spec / etcd object
+	// in plaintext, matching every other agent secret. Omitted when no secret
+	// name is set so existing deployments without HMAC work unchanged.
+	if cfg.CallbackHMACSecretName != "" {
+		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
+	}
 
 	if len(repos) > 0 {
 		var entries []repoEntry

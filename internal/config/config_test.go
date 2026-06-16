@@ -121,6 +121,27 @@ func TestLoad_AgentSchedulingDefaultEmpty(t *testing.T) {
 	if cfg.AgentScheduling != "" {
 		t.Fatalf("AgentScheduling default = %q, want empty", cfg.AgentScheduling)
 	}
+	if cfg.Scheduling.NodeSelector != nil || cfg.Scheduling.Tolerations != nil || cfg.Scheduling.Affinity != nil {
+		t.Fatalf("Scheduling should be zero value when AgentScheduling is empty: %+v", cfg.Scheduling)
+	}
+}
+
+// TestLoad_AgentSchedulingParsedIntoStruct asserts that Load parses
+// AGENT_SCHEDULING once and stores the result in cfg.Scheduling so callers
+// never re-parse the raw string and cannot silently discard a parse error.
+func TestLoad_AgentSchedulingParsedIntoStruct(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("AGENT_SCHEDULING", `{"nodeSelector":{"kubernetes.io/os":"linux"}}`)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Scheduling.NodeSelector["kubernetes.io/os"] != "linux" {
+		t.Fatalf("Scheduling.NodeSelector not populated by Load: %+v", cfg.Scheduling)
+	}
 }
 
 // TestLoad_AgentSchedulingMalformed asserts Load fails fast when AGENT_SCHEDULING
@@ -258,5 +279,24 @@ func TestLoad_MalformedPushMetricsTTL(t *testing.T) {
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("expected error for malformed PUSH_METRICS_TTL=5minutes, got nil")
+	}
+}
+
+// TestLoad_AgentRunAsNonRootDefaultFalse asserts that when AGENT_RUN_AS_NON_ROOT is
+// unset the Go default is false, matching the chart values.yaml default (agentRunAsNonRoot:
+// false). The two must agree: a divergence means running the binary outside the chart
+// yields the opposite securityContext from what the chart intends.
+func TestLoad_AgentRunAsNonRootDefaultFalse(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	// AGENT_RUN_AS_NON_ROOT intentionally not set.
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AgentRunAsNonRoot {
+		t.Fatal("AgentRunAsNonRoot default = true, want false (must match chart agentRunAsNonRoot: false)")
 	}
 }

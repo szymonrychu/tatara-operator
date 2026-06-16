@@ -23,8 +23,12 @@ import (
 )
 
 // labelRecoveryExhausted is stamped on a bot PR after closeExhaustedPR runs so
-// subsequent mrScan cycles skip both re-adoption AND re-close. A human who
-// removes the label resets recovery.
+// subsequent mrScan cycles skip both re-adoption AND re-close. Removing this
+// label alone does NOT fully reset recovery: priorTerminalAttempts still counts
+// the existing terminal Tasks for this PR, and if that count still reaches
+// maxRecoveryAttempts the very next mrScan cycle will re-close and re-stamp the
+// label. To fully reset, delete the terminal Tasks for the PR in addition to
+// removing this label, then reopen the PR.
 const labelRecoveryExhausted = "tatara-recovery-exhausted"
 
 // isLifecycleTerminal reports whether a lifecycle state counts as terminal for
@@ -432,6 +436,9 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 		return nil, fmt.Errorf("scan: create task: %w", err)
 	}
 	r.Metrics.ScanTaskCreated(activity, kind)
+	log.FromContext(ctx).Info("scan: task created",
+		"action", "scan_task_created", "resource_id", task.Name,
+		"repo", labelCand.repo, "number", labelCand.number, "kind", kind, "activity", activity)
 	return task, nil
 }
 
@@ -557,7 +564,10 @@ func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1
 	}
 	body := fmt.Sprintf("Autonomous recovery could not land this PR after %d attempts; "+
 		"closing as superseded. The branch is preserved - reopen to retry or hand-fix.\n"+
-		"To reset recovery, remove the `%s` label from the PR before reopening.",
+		"To fully reset recovery: (1) delete the existing terminal Tasks for this PR "+
+		"from the cluster, (2) remove the `%s` label from the PR, then reopen. "+
+		"Removing the label alone is not sufficient: prior terminal Task history "+
+		"is counted independently and will re-trigger an immediate re-close.",
 		maxRecoveryAttempts, labelRecoveryExhausted)
 	if cerr := w.ClosePR(ctx, repo.Spec.URL, token, c.number, body); cerr != nil {
 		l.Error(cerr, "mrScan: close exhausted PR failed (leaving open)",
@@ -566,8 +576,8 @@ func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1
 		return
 	}
 	// Stamp the exhaustion label so subsequent mrScan cycles skip re-adoption AND
-	// re-close (the line-731 guard becomes live). A human removes this label to
-	// reset recovery.
+	// re-close. Note: removing this label alone does NOT fully reset recovery;
+	// see the const comment on labelRecoveryExhausted for the full reset procedure.
 	sep := "#"
 	if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
 		sep = "!"
@@ -576,7 +586,14 @@ func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1
 	if lerr := w.AddLabel(ctx, token, issueRef, labelRecoveryExhausted); lerr != nil {
 		l.Error(lerr, "mrScan: stamp recovery-exhausted label (non-fatal)",
 			"resource_id", proj.Name, "repo", c.repo, "pr", c.number)
-		r.Metrics.ScanItem("mrScan", "recovery_close_error")
+		// Distinct outcome: PR was closed but the exhaustion label was not stamped.
+		// This is different from recovery_close_error (which means ClosePR itself failed).
+		// The next cycle will re-evaluate priorTerminalAttempts and attempt to re-close.
+		r.Metrics.ScanItem("mrScan", "recovery_label_error")
+		r.Metrics.ScanItem("mrScan", "recovery_closed")
+		l.Info("mrScan: closed recovery-exhausted bot PR (label stamp failed)",
+			"action", "scan_recovery_closed", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+		return
 	}
 	r.Metrics.ScanItem("mrScan", "recovery_closed")
 	l.Info("mrScan: closed recovery-exhausted bot PR",
@@ -756,6 +773,9 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				continue
 			}
 			if priorTerminalAttempts(existing, c.repo, c.number) >= maxRecoveryAttempts {
+				// recovery_close_attempt counts cycles entering the close branch, including
+				// retries of a previously-failed ClosePR. It is not a count of distinct
+				// PRs exhausted; use recovery_closed vs recovery_close_error for outcome rates.
 				r.Metrics.ScanItem("mrScan", "recovery_close_attempt")
 				r.closeExhaustedPR(ctx, proj, repos, c)
 				continue
@@ -765,6 +785,14 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			dedupNumber := c.number
 			if issueNum, linked := scm.LinkedIssueNumber(c.body); linked {
 				dedupNumber = issueNum
+			}
+			// Guard against re-adopting the same bot PR every cycle: the outer
+			// isDeduped check keyed on the PR number finds no match (the Task is
+			// labeled with the issue number), so we must check the issue-keyed
+			// live-lifecycle guard explicitly here.
+			if hasLiveLifecycleTaskForIssue(existing, c.repo, dedupNumber) {
+				r.Metrics.ScanItem("mrScan", "skipped_dedup")
+				continue
 			}
 			// labelCand carries the dedup key (issue number when present).
 			labelCand := candidate{
@@ -804,9 +832,15 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 // issueScan lists open issues (per-repo + board) and creates triageIssue Tasks.
 // budget is the shared open-task creation budget; issueScan decrements it on each
 // successful create and stops creating when budget reaches zero.
-func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity, budget *int) bool {
+// Returns (backlog, issueCache): backlog=true when cap or budget truncated the run;
+// issueCache holds the per-repo slices fetched this cycle so recoverOrphans can reuse
+// them without a second ListOpenIssues round-trip per repo (finding 4).
+func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity, budget *int) (bool, map[string][]scm.IssueRef) {
 	l := log.FromContext(ctx)
 	start := time.Now()
+	// issueCache is returned to the caller so recoverOrphans can reuse these
+	// slices instead of issuing a second ListOpenIssues per repo (finding 4).
+	issueCache := make(map[string][]scm.IssueRef)
 	seen := map[string]bool{}
 	var cands []candidate
 	addUnique := func(cs []candidate) {
@@ -829,6 +863,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			l.Error(err, "scan: ListOpenIssues", "action", "scan_list_error", "resource_id", proj.Name, "activity", "issueScan", "repo", repos[i].Name)
 			continue
 		}
+		issueCache[owner+"/"+name] = iss
 		addUnique(candidatesFromIssues(iss))
 	}
 	if proj.Spec.Scm.Board != nil {
@@ -924,7 +959,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
 	// backlog=true if: cap removed items OR budget truncated selected (finding 3)
-	return len(selected) < len(eligible) || created < len(selected)
+	return len(selected) < len(eligible) || created < len(selected), issueCache
 }
 
 // brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
@@ -987,7 +1022,10 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		}
 		slugs = append(slugs, slug)
 		if atCap {
-			// Already over cap; don't issue more SCM calls but still collect slugs.
+			// Already over cap; skip SCM calls but still collect slugs for the goal.
+			// SetOpenProposals is NOT called for repos past this short-circuit: their
+			// per-repo open-proposal gauges retain the value from the previous cycle
+			// (best-effort; documented intentional trade-off to avoid unnecessary SCM calls).
 			continue
 		}
 		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
@@ -1337,7 +1375,12 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 // stalled handler). It RE-LISTS existing Tasks so it sees Tasks mrScan/issueScan
 // created earlier this cycle (an open bot MR becomes a live MRCI Task -> not an
 // orphan). Bounded by the shared open-task budget.
-func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, budget *int) {
+//
+// issueCache is the per-repo slice map returned by issueScan this cycle. When a
+// repo's issues were already fetched by issueScan, recoverOrphans reuses that
+// slice instead of issuing a second ListOpenIssues round-trip (finding 4). A nil
+// or missing key falls back to a fresh ListOpenIssues call.
+func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, issueCache map[string][]scm.IssueRef, budget *int) {
 	if *budget <= 0 {
 		return
 	}
@@ -1354,12 +1397,19 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 		if oerr != nil {
 			continue
 		}
-		issues, lerr := reader.ListOpenIssues(ctx, owner, name)
-		if lerr != nil {
-			l.Error(lerr, "backstop: ListOpenIssues", "action", "backstop_list_error", "resource_id", proj.Name, "repo", repos[i].Name)
-			continue
-		}
 		slug := owner + "/" + name
+		var issues []scm.IssueRef
+		if cached, ok := issueCache[slug]; ok {
+			// Reuse the slice issueScan already fetched this cycle (finding 4).
+			issues = cached
+		} else {
+			var lerr error
+			issues, lerr = reader.ListOpenIssues(ctx, owner, name)
+			if lerr != nil {
+				l.Error(lerr, "backstop: ListOpenIssues", "action", "backstop_list_error", "resource_id", proj.Name, "repo", repos[i].Name)
+				continue
+			}
+		}
 		for _, iss := range issues {
 			if iss.IsPR {
 				continue
@@ -1456,17 +1506,22 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
 		if due {
 			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan, &budget)
-			if serr := r.stampScan(ctx, proj, "mrScan"); serr != nil {
-				l.Error(serr, "scan: persist mrScan stamp failed",
-					"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "mrScan")
-				r.Metrics.ScanItem("mrScan", "stamp_error")
-			}
-			// Recompute next-fire from now so the post-stamp schedule produces a
-			// positive RequeueAfter (the pre-fire next is in the past).
-			if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
-				consider(next2)
-			}
-			if backlog {
+			// Only advance the stamp when there is no backlog. When backlog=true the
+			// 60s short requeue must re-fire the activity; if we stamp now, activityDue
+			// computes next-fire from the fresh stamp and returns due=false for any
+			// non-sub-minute cron, making the backlog drain requeue a no-op (finding 3).
+			if !backlog {
+				if serr := r.stampScan(ctx, proj, "mrScan"); serr != nil {
+					l.Error(serr, "scan: persist mrScan stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "mrScan")
+					r.Metrics.ScanItem("mrScan", "stamp_error")
+				}
+				// Recompute next-fire from now so the post-stamp schedule produces a
+				// positive RequeueAfter (the pre-fire next is in the past).
+				if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
 				consider(now.Add(backlogRequeue))
 			}
 		} else {
@@ -1491,20 +1546,22 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	}
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
-			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
-			if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
-				l.Error(serr, "scan: persist issueScan stamp failed",
-					"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "issueScan")
-				r.Metrics.ScanItem("issueScan", "stamp_error")
+			backlog, issueCache := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
+			// Only advance the stamp when there is no backlog (mirrors mrScan fix, finding 3).
+			if !backlog {
+				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
+					l.Error(serr, "scan: persist issueScan stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "issueScan")
+					r.Metrics.ScanItem("issueScan", "stamp_error")
+				}
+				if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
+				consider(now.Add(backlogRequeue))
 			}
 			if budget > 0 {
-				r.recoverOrphans(ctx, proj, reader, repos, &budget)
-			}
-			if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
-				consider(next2)
-			}
-			if backlog {
-				consider(now.Add(backlogRequeue))
+				r.recoverOrphans(ctx, proj, reader, repos, issueCache, &budget)
 			}
 		} else {
 			consider(next)

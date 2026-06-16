@@ -62,8 +62,12 @@ type Config struct {
 	// AgentScheduling is the cluster-specific Pod-placement JSON document
 	// (nodeSelector/tolerations/affinity) for spawned agent Pods. Delivered as a
 	// single ConfigMap key (rule 6 list-shaped data), kept empty in the chart so
-	// the chart stays cluster-agnostic (rule 14). Validated at load.
-	AgentScheduling  string
+	// the chart stays cluster-agnostic (rule 14). Validated and parsed at load;
+	// callers consume Scheduling directly rather than re-parsing the raw string.
+	AgentScheduling string
+	// Scheduling is the result of parsing AgentScheduling. Populated by Load so
+	// callers never need to parse (and cannot silently discard a parse error).
+	Scheduling       agent.Scheduling
 	Namespace        string
 	LogLevel         string
 	IngressHost      string
@@ -83,6 +87,19 @@ type Config struct {
 	// re-exposed on the operator's /metrics after the pod's last push, before
 	// they age out. Backstop for pods that exit without best-effort cleanup.
 	PushMetricsTTL time.Duration
+	// CallbackHMACSecret, when non-empty, activates HMAC-SHA256 verification on
+	// the /internal/turn-complete callback endpoint. Set from
+	// CALLBACK_HMAC_SECRET (the operator reads the raw value via SecretKeyRef so
+	// the controller can verify inbound signatures). Empty = no verification
+	// (backward-compatible default).
+	CallbackHMACSecret string
+	// CallbackHMACSecretName is the name of the Secret holding the callback HMAC
+	// shared secret under the key callback-hmac-secret. Set from
+	// CALLBACK_HMAC_SECRET_NAME. Wrapper Pods reference this Secret via
+	// SecretKeyRef (NOT a literal env value) so the secret never appears in a
+	// Pod spec / etcd object in plaintext, matching every other agent secret
+	// (anthropic, scm, cli-oidc). Empty = HMAC injection disabled (finding 1/r3).
+	CallbackHMACSecretName string
 }
 
 func getDefault(key, def string) string {
@@ -194,6 +211,8 @@ func Load() (Config, error) {
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
 		LeaderElection:           leaderElection,
 		PushMetricsTTL:           pushMetricsTTL,
+		CallbackHMACSecret:       os.Getenv("CALLBACK_HMAC_SECRET"),
+		CallbackHMACSecretName:   os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")
@@ -208,10 +227,13 @@ func Load() (Config, error) {
 	if cfg.OperatorOIDCSecretName == "" {
 		return Config{}, fmt.Errorf("config: OPERATOR_OIDC_SECRET_NAME is required")
 	}
-	// Validate the cluster-specific scheduling JSON at load so a malformed
-	// document fails startup loudly instead of silently dropping placement.
-	if _, err := agent.ParseScheduling(cfg.AgentScheduling); err != nil {
+	// Parse the cluster-specific scheduling JSON once at load. Storing the
+	// parsed struct on Config means callers never re-parse the raw string and
+	// cannot silently discard a parse error.
+	scheduling, err := agent.ParseScheduling(cfg.AgentScheduling)
+	if err != nil {
 		return Config{}, fmt.Errorf("config: AGENT_SCHEDULING: %w", err)
 	}
+	cfg.Scheduling = scheduling
 	return cfg, nil
 }

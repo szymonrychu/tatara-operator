@@ -117,6 +117,7 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 			s.Metrics.ReapDeleteError("service")
 		} else {
 			l.Info("reaped orphan wrapper service", "action", "reap_orphan_service", "resource_id", svc.Name)
+			s.Metrics.OrphanReaped("orphan service")
 		}
 	}
 }

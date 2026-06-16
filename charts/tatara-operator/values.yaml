@@ -36,6 +36,12 @@ operatorOidcClientId: "tatara-operator"
 operatorOidcSecretName: ""
 anthropicSecretName: ""
 cliOidcSecretName: ""
+# Name of the Secret holding the callback HMAC shared secret (key
+# callback-hmac-secret). When set, the operator verifies HMAC-SHA256 signatures
+# on /internal/turn-complete and wrapper Pods sign their callbacks. Empty = HMAC
+# disabled (NetworkPolicy remains the sole control). Delivered to wrapper Pods
+# via SecretKeyRef, never a plaintext Pod-spec env value.
+callbackHmacSecretName: ""
 # imagePullSecret is cluster-specific (rule 14); set via infra helmfile values.
 # When non-empty, it is injected into every operator-spawned workload (neo4j
 # StatefulSet, lightrag Deployment, tatara-memory Deployment, cnpg Cluster).
@@ -103,6 +109,9 @@ cliOidcClientSecret: ""
 openaiApiKey: ""
 scmToken: ""
 scmWebhookSecret: ""
+# Callback HMAC shared secret value. Rendered into the Secret named by
+# callbackHmacSecretName under key callback-hmac-secret when both are set.
+callbackHmacSecret: ""
 
 service:
   type: ClusterIP
@@ -145,6 +154,8 @@ podSecurityContext:
   runAsUser: 65532
   runAsGroup: 65532
   fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
 
 containerSecurityContext:
   allowPrivilegeEscalation: false
