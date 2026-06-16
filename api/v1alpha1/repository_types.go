@@ -41,7 +41,7 @@ type RepositorySpec struct {
 
 // RepositoryStatus defines the observed state of a Repository.
 type RepositoryStatus struct {
-	// +kubebuilder:validation:Enum=Pending;Ingesting;Ingested;Failed
+	// +kubebuilder:validation:Enum=Ingesting;Ingested;Failed
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional
