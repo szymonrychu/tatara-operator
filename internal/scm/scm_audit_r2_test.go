@@ -210,6 +210,57 @@ func TestGitLabGetPRState_NullHeadPipelineFallsBack(t *testing.T) {
 	}
 }
 
+// TestGitLabGetPRState_NullHeadPipelineForwardsCallerToken guards the regression
+// where the head_pipeline-null fallback called the exported GetCommitCIStatus
+// (which uses c.token). The SCMWriter built by ByProvider has an EMPTY c.token
+// and supplies the real token per call, so the fallback must forward the
+// GetPRState token argument to the /statuses read - otherwise the request is
+// unauthenticated and 401s on private projects, breaking the merge gate.
+func TestGitLabGetPRState_NullHeadPipelineForwardsCallerToken(t *testing.T) {
+	const sha = "deadbeef"
+	const callerToken = "caller-tok"
+	var statusAuth string
+	var statusCalled bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/merge_requests/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"author":        map[string]any{"username": "bot"},
+				"sha":           sha,
+				"source_branch": "fix/x",
+				"state":         "opened",
+				// head_pipeline is null/absent -> fallback to /statuses
+			})
+		case strings.Contains(r.URL.Path, "/statuses"):
+			statusCalled = true
+			statusAuth = r.Header.Get("PRIVATE-TOKEN")
+			_ = json.NewEncoder(w).Encode([]map[string]any{{"status": "success"}})
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// Writer-style client: empty c.token, token supplied per call (the production
+	// shape from ByProvider).
+	c := &GitLab{apiBase: srv.URL}
+	state, err := c.GetPRState(context.Background(), "https://gitlab.com/g/p", callerToken, 7)
+	if err != nil {
+		t.Fatalf("GetPRState: %v", err)
+	}
+	if !statusCalled {
+		t.Fatal("statuses endpoint was never called; fallback not triggered")
+	}
+	if statusAuth != callerToken {
+		t.Errorf("statuses PRIVATE-TOKEN = %q, want %q (caller token not forwarded)", statusAuth, callerToken)
+	}
+	if state.CIStatus != "success" {
+		t.Errorf("CIStatus = %q, want \"success\"", state.CIStatus)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Finding 8: GitLab Suggest logs partial failures (best-effort, no API change)
 // ---------------------------------------------------------------------------

@@ -135,6 +135,8 @@ spec:
                 properties:
                   deliveredScope:
                     type: string
+                  mostProblematic:
+                    type: string
                   prBody:
                     type: string
                   prTitle:
@@ -263,6 +265,8 @@ spec:
                     - discuss
                     type: string
                   comment:
+                    type: string
+                  plan:
                     type: string
                 required:
                 - action

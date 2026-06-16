@@ -447,8 +447,11 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 	switch {
 	case mr.HeadPipeline == nil:
 		// No pipeline attached yet; fall back to commit statuses so external CI
-		// reporters (commit-status-only) are visible through the merge gate.
-		ciStatus, err = c.GetCommitCIStatus(ctx, proj, "", mr.SHA)
+		// reporters (commit-status-only) are visible through the merge gate. Use
+		// the per-call token, not c.token: the writer client from ByProvider has
+		// an empty c.token, so GetCommitCIStatus (which reads c.token) would issue
+		// an unauthenticated read and 401 on private projects.
+		ciStatus, err = c.commitCIStatus(ctx, proj, mr.SHA, token)
 		if err != nil {
 			return PRState{}, err
 		}
@@ -683,11 +686,21 @@ func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column strin
 // All pages are fetched (per_page=100) so a failing status beyond the
 // default 20-item first page is not missed.
 func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha string) (string, error) {
+	return c.commitCIStatus(ctx, owner, sha, c.token)
+}
+
+// commitCIStatus is the token-explicit core of GetCommitCIStatus, shared by
+// GetCommitCIStatus (reader path, token=c.token) and GetPRState (writer path,
+// per-call token). Keeping the token explicit prevents the empty-c.token writer
+// client (from ByProvider) issuing an unauthenticated statuses read - which
+// would 401 on private projects and break the merge gate when an MR has no head
+// pipeline yet.
+func (c *GitLab) commitCIStatus(ctx context.Context, owner, sha, token string) (string, error) {
 	type statusItem struct {
 		Status string `json:"status"`
 	}
 	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses?per_page=100"
-	statuses, err := glDoPaged[statusItem](ctx, c.base(), path, c.token)
+	statuses, err := glDoPaged[statusItem](ctx, c.base(), path, token)
 	if err != nil {
 		return "", err
 	}

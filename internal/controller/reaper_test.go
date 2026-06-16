@@ -214,3 +214,45 @@ func TestReapOrphans_OrphanedServiceReaped(t *testing.T) {
 		t.Error("expected orphaned Service (no backing Pod) to be reaped")
 	}
 }
+
+// TestReapOrphans_YoungServiceNotReaped guards the spawn-vs-reap race: a Service
+// is created right after its Pod, and the Pod LIST and Service LIST in one reaper
+// pass hit the cache at different instants. A freshly created Service whose Pod
+// has not yet propagated to the Pod LIST must NOT be deleted, or the reaper would
+// sever the operator -> wrapper connection for a still-starting agent.
+func TestReapOrphans_YoungServiceNotReaped(t *testing.T) {
+	ctx := context.Background()
+	// Real grace window so a just-created Service is protected.
+	srv := &CallbackServer{
+		Client:      k8sClient,
+		Metrics:     obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Namespace:   testNS,
+		ReaperGrace: time.Hour,
+	}
+
+	labels := map[string]string{
+		agent.LabelManagedBy: agent.ManagedByValue,
+		agent.LabelComponent: agent.ComponentAgent,
+		agent.LabelTask:      "no-such-task-young-svc",
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "reap-young-svc",
+			Namespace: testNS,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	if err := k8sClient.Create(ctx, svc); err != nil {
+		t.Fatalf("create young service: %v", err)
+	}
+
+	srv.ReapOrphans(ctx)
+
+	if !svcExists(t, "reap-young-svc") {
+		t.Error("expected young Service (within grace) to be kept; reaper raced a still-propagating Pod")
+	}
+
+	// Clean up so it does not leak into later tests.
+	_ = k8sClient.Delete(ctx, svc)
+}

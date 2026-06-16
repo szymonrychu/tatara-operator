@@ -87,6 +87,10 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		l.Error(err, "reaper: list wrapper services")
 		return
 	}
+	grace := s.ReaperGrace
+	if grace == 0 {
+		grace = pollRequeue
+	}
 	for i := range svcs.Items {
 		if ctx.Err() != nil {
 			return
@@ -94,6 +98,16 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		svc := &svcs.Items[i]
 		if _, alive := alivePods[svc.Name]; alive {
 			// Pod is present and non-orphan; Service is fine.
+			continue
+		}
+		// Creation grace: a Service is created right after its Pod (see
+		// ensurePodAndService: Pod first, then Service). The Pod LIST above and
+		// this Service LIST hit the cache at different instants, so a freshly
+		// spawned Pod can be missing from alivePods while its Service is already
+		// visible. Never reap a Service younger than the grace window or this pass
+		// would delete a live Service out from under a still-propagating agent Pod
+		// and sever the operator -> wrapper connection.
+		if time.Since(svc.CreationTimestamp.Time) < grace {
 			continue
 		}
 		// No live Pod backs this Service; delete it.

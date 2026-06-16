@@ -54,21 +54,34 @@ func writeClientErr(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorizeForTask checks that the caller's OIDC identity (Claims.Subject or
-// PreferredUsername) matches the expected agent pod for the given Task.
-// When no Claims are present in the context (auth middleware absent, e.g. tests),
-// the check is skipped. Returns false and writes a 403 when authorization fails.
+// authorizeForTask gates a mutating task handler on the caller carrying a valid
+// OIDC bearer token (a non-empty, verifier-validated Subject) for the operator
+// audience. The auth middleware has already verified the issuer, audience and
+// signature before this runs; this is the in-handler assertion that a verified
+// identity is present.
+//
+// NOTE: per-task (object-level) authorization keyed on the agent Pod name is NOT
+// enforceable under the current identity model. Every agent Pod mints its bearer
+// token via a SINGLE shared OIDC client (CLI_OIDC_CLIENT_ID/SECRET, client-
+// credentials grant), so the token's sub is the Keycloak service-account UUID
+// and preferred_username is "service-account-<client-id>" - identical for every
+// Pod and never equal to agent.PodName(t). Comparing claims to the Pod name
+// would 403 every legitimate agent write. Tightening to per-task scope requires
+// per-Pod identity (e.g. a projected ServiceAccount token whose sub is the Pod's
+// ServiceAccount, or a token-exchange that stamps the Pod/Task into the sub),
+// tracked in MEMORY/ROADMAP. When no Claims are present (middleware absent, e.g.
+// tests) the check is skipped. Returns false and writes a 403 on failure.
 func authorizeForTask(w http.ResponseWriter, r *http.Request, t *tatarav1alpha1.Task) bool {
+	_ = t
 	claims, ok := auth.ClaimsFromContext(r.Context())
 	if !ok {
 		// No auth middleware in this path; skip enforcement.
 		return true
 	}
-	podName := agent.PodName(t)
-	if claims.Subject == podName || claims.PreferredUsername == podName {
+	if claims.Subject != "" {
 		return true
 	}
-	writeError(w, http.StatusForbidden, "caller is not the agent for this task")
+	writeError(w, http.StatusForbidden, "caller has no verified identity")
 	return false
 }
 

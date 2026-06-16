@@ -17,6 +17,13 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 	return c, ok
 }
 
+// ContextWithClaims returns ctx with claims injected under the same key the
+// middleware uses, so handlers and downstream authz checks see them. Exported
+// for tests and any caller that needs to simulate an authenticated request.
+func ContextWithClaims(ctx context.Context, claims *Claims) context.Context {
+	return context.WithValue(ctx, ctxKey{}, claims)
+}
+
 const wwwAuthenticate = `Bearer realm="tatara-operator"`
 
 // Middleware returns a chi-compatible middleware that verifies the Bearer token,
