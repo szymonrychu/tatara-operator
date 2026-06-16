@@ -334,3 +334,154 @@ func TestIssueScan_SkippedNoRepo_EmitsMetric(t *testing.T) {
 		map[string]string{"activity": "issueScan", "outcome": "skipped_norepo"})
 	require.Equal(t, float64(1), cnt, "expected skipped_norepo metric for issue with no matching repo")
 }
+
+// --- Finding 1/3: closeExhaustedPR stamps tatara-recovery-exhausted label ---
+
+// TestCloseExhaustedPR_StampsLabel verifies that after a successful ClosePR,
+// closeExhaustedPR calls AddLabel with tatara-recovery-exhausted so the
+// line-731 skip-guard becomes live.
+func TestCloseExhaustedPR_StampsLabel(t *testing.T) {
+	const projName = "stamp-label-proj"
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
+	proj, repoObj := seedScanProject(t, projName, cron)
+
+	fw := &fullFakeSCMWriter{}
+	r := newScanReconciler(&fakeReader{})
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+
+	c := candidate{repo: "o/r", number: 77}
+	r.closeExhaustedPR(context.Background(), proj, []tatarav1alpha1.Repository{*repoObj}, c)
+
+	require.True(t, fw.closePRCalled, "ClosePR must be called")
+	require.True(t, fw.addLabelCalled, "AddLabel must be called after successful ClosePR")
+	require.Equal(t, labelRecoveryExhausted, fw.addLabelLabel,
+		"AddLabel must stamp tatara-recovery-exhausted label")
+	require.Contains(t, fw.addLabelIssueRef, "77",
+		"AddLabel issueRef must reference the PR number")
+}
+
+// --- Finding 6: skipped_budget metric for budget-exhausted items ---
+
+// TestMRScan_SkippedBudget_EmitsMetric verifies that when the global budget
+// runs out mid-selected-slice, mrScan emits skipped_budget for each dropped item.
+func TestMRScan_SkippedBudget_EmitsMetric(t *testing.T) {
+	const projName = "budget-metric-proj"
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
+	proj, _ := seedScanProject(t, projName, cron)
+
+	reader := &fakeReader{prs: []scm.PRRef{
+		{Repo: "o/r", Number: 11, Author: "human", UpdatedAt: time.Unix(100, 0)},
+		{Repo: "o/r", Number: 12, Author: "human", UpdatedAt: time.Unix(200, 0)},
+		{Repo: "o/r", Number: 13, Author: "human", UpdatedAt: time.Unix(300, 0)},
+	}}
+	r := newScanReconciler(reader)
+	reg := prometheus.NewRegistry()
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, projName, projName+"-repo-bm", "https://github.com/o/r.git"),
+	}
+	// Budget = 1: 3 selected, 1 created -> 2 remaining dropped by budget.
+	budget := 1
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &budget)
+
+	cnt := counterValue(t, reg, "tatara_scan_items_total",
+		map[string]string{"activity": "mrScan", "outcome": "skipped_budget"})
+	require.Equal(t, float64(2), cnt, "expected 2 skipped_budget metrics for 2 budget-dropped items")
+}
+
+// TestIssueScan_SkippedBudget_EmitsMetric same for issueScan.
+func TestIssueScan_SkippedBudget_EmitsMetric(t *testing.T) {
+	const projName = "issue-budget-metric-proj"
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
+	proj, _ := seedScanProject(t, projName, cron)
+
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/r", Number: 21, UpdatedAt: time.Unix(100, 0)},
+		{Repo: "o/r", Number: 22, UpdatedAt: time.Unix(200, 0)},
+		{Repo: "o/r", Number: 23, UpdatedAt: time.Unix(300, 0)},
+	}}
+	r := newScanReconciler(reader)
+	reg := prometheus.NewRegistry()
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, projName, projName+"-repo-ibm", "https://github.com/o/r.git"),
+	}
+	budget := 1
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &budget)
+
+	cnt := counterValue(t, reg, "tatara_scan_items_total",
+		map[string]string{"activity": "issueScan", "outcome": "skipped_budget"})
+	require.Equal(t, float64(2), cnt, "expected 2 skipped_budget metrics for 2 budget-dropped items")
+}
+
+// --- Finding 7/8: healthCheck calls SetOpenProposals ---
+
+// TestHealthCheck_SetOpenProposals verifies that healthCheck updates the
+// operator_open_proposals gauge for each repo it queries (matching brainstorm).
+func TestHealthCheck_SetOpenProposals(t *testing.T) {
+	proj, repos := seedHealthCheckProject(t, "hc-gauge-proj", []string{"o/p1", "o/p2"}, 10)
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/p1": {
+				{Repo: "o/p1", Number: 1, Labels: []string{"tatara-idea"}},
+			},
+			"o/p2": {
+				{Repo: "o/p2", Number: 2, Labels: []string{"tatara-idea"}},
+				{Repo: "o/p2", Number: 3, Labels: []string{"tatara-idea"}},
+			},
+		},
+	}
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 10}
+	budget := 99
+	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &budget)
+
+	g1 := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/p1"})
+	g2 := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/p2"})
+	require.Equal(t, float64(1), g1, "healthCheck must set open_proposals gauge for o/p1")
+	require.Equal(t, float64(2), g2, "healthCheck must set open_proposals gauge for o/p2")
+}
+
+// --- Finding 16: distinct recovery_close_attempt metric on close path ---
+
+// TestMRScan_RecoveryCloseAttempt_EmitsDistinctMetric verifies that when a bot
+// PR reaches maxRecoveryAttempts, mrScan emits recovery_close_attempt (not
+// recovery_exhausted) so the close and skip paths are separately countable.
+func TestMRScan_RecoveryCloseAttempt_EmitsDistinctMetric(t *testing.T) {
+	const projName = "close-attempt-metric-proj"
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
+	proj, repoObj := seedScanProject(t, projName, cron)
+
+	fw := &fullFakeSCMWriter{}
+	reader := &fakeReader{prs: []scm.PRRef{
+		{Repo: "o/r", Number: 60, Author: "tatara-bot", HeadSHA: "sha60", UpdatedAt: time.Unix(100, 0)},
+	}}
+	r := newScanReconciler(reader)
+	reg := prometheus.NewRegistry()
+	r.Metrics = obs.NewOperatorMetrics(reg)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+
+	existing := []tatarav1alpha1.Task{
+		mkPRTask("o/r", 60, "Parked"),
+		mkPRTask("o/r", 60, "Stopped"),
+		mkPRTask("o/r", 60, "Done"),
+	}
+	budget := 99
+	r.mrScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{*repoObj}, existing, cron.MRScan, &budget)
+
+	// recovery_close_attempt (not recovery_exhausted) must fire on the close branch.
+	closeAttempt := counterValue(t, reg, "tatara_scan_items_total",
+		map[string]string{"activity": "mrScan", "outcome": "recovery_close_attempt"})
+	require.Equal(t, float64(1), closeAttempt, "expected recovery_close_attempt on close branch")
+
+	// recovery_exhausted must NOT fire on the close branch (only on skip).
+	exhausted := counterValue(t, reg, "tatara_scan_items_total",
+		map[string]string{"activity": "mrScan", "outcome": "recovery_exhausted"})
+	require.Equal(t, float64(0), exhausted, "recovery_exhausted must NOT fire on close branch")
+}

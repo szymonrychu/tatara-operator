@@ -152,8 +152,7 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string) bo
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		lifecycleTerminal := t.Status.LifecycleState != "" && isLifecycleTerminal(t.Status.LifecycleState)
-		if !isTerminal(t.Status.Phase) && !lifecycleTerminal {
+		if !tatarav1alpha1.TaskTerminal(t) {
 			return true
 		}
 		if c.isPR {
@@ -231,7 +230,9 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 		}
 		staleFirst(withPriority)
 		staleFirst(rest)
-		out := append(withPriority, rest...)
+		out := make([]candidate, 0, len(withPriority)+len(rest))
+		out = append(out, withPriority...)
+		out = append(out, rest...)
 		if len(out) > n {
 			out = out[:n]
 		}
@@ -309,6 +310,9 @@ func maxOpenTasks(proj *tatarav1alpha1.Project) int {
 
 // selectPerRepo groups eligible candidates by repo and picks, per repo, the best
 // (priority-then-stale) items up to maxPerRepo minus that repo's lane occupancy.
+// Repo iteration follows first-appearance order in the eligible slice (per-repo
+// stale-first). Global stale-first across repos is intentionally NOT enforced
+// here: maxPerRepo already bounds per-repo consumption, providing fairness.
 func selectPerRepo(eligible []candidate, priorityLabel string, maxPerRepo int, occ func(repoSlug string) int) []candidate {
 	if maxPerRepo < 1 {
 		maxPerRepo = 1
@@ -559,6 +563,19 @@ func (r *ProjectReconciler) closeExhaustedPR(ctx context.Context, proj *tatarav1
 		r.Metrics.ScanItem("mrScan", "recovery_close_error")
 		return
 	}
+	// Stamp the exhaustion label so subsequent mrScan cycles skip re-adoption AND
+	// re-close (the line-731 guard becomes live). A human removes this label to
+	// reset recovery.
+	sep := "#"
+	if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
+		sep = "!"
+	}
+	issueRef := fmt.Sprintf("%s%s%d", c.repo, sep, c.number)
+	if lerr := w.AddLabel(ctx, token, issueRef, labelRecoveryExhausted); lerr != nil {
+		l.Error(lerr, "mrScan: stamp recovery-exhausted label (non-fatal)",
+			"resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+		r.Metrics.ScanItem("mrScan", "recovery_close_error")
+	}
 	r.Metrics.ScanItem("mrScan", "recovery_closed")
 	l.Info("mrScan: closed recovery-exhausted bot PR",
 		"action", "scan_recovery_closed", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
@@ -715,8 +732,12 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 	}
 	created := 0
-	for _, c := range selected {
+	for i, c := range selected {
 		if *budget <= 0 {
+			// Meter every remaining selected item that budget exhaustion drops.
+			for range selected[i:] {
+				r.Metrics.ScanItem("mrScan", "skipped_budget")
+			}
 			break
 		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
@@ -728,10 +749,12 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			// Skip re-adoption AND re-close if the PR already carries the exhaustion label.
 			if hasLabel(c.labels, labelRecoveryExhausted) {
 				r.Metrics.ScanItem("mrScan", "recovery_exhausted")
+				l.Info("mrScan: skipping permanently parked bot PR (recovery-exhausted label present)",
+					"action", "scan_recovery_parked", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
 				continue
 			}
 			if priorTerminalAttempts(existing, c.repo, c.number) >= maxRecoveryAttempts {
-				r.Metrics.ScanItem("mrScan", "recovery_exhausted")
+				r.Metrics.ScanItem("mrScan", "recovery_close_attempt")
 				r.closeExhaustedPR(ctx, proj, repos, c)
 				continue
 			}
@@ -872,8 +895,12 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		}
 	}
 	created := 0
-	for _, c := range selected {
+	for i, c := range selected {
 		if *budget <= 0 {
+			// Meter every remaining selected item that budget exhaustion drops.
+			for range selected[i:] {
+				r.Metrics.ScanItem("issueScan", "skipped_budget")
+			}
 			break
 		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
@@ -935,10 +962,14 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		return sortedRepos[i].Name < sortedRepos[j].Name
 	})
 
+	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
+
 	// Single pass: resolve slug, set primaryRepo, accumulate backlog, collect slugs.
-	// SetOpenProposals is called for every repo queried so the gauge is never stale
-	// for repos processed before the cap (finding 8). Short-circuit stops querying
-	// but does not skip gauge updates for already-queried repos.
+	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
+	// for reuse by buildIssuesContext below. SetOpenProposals is called for every
+	// repo queried up to the cap (best-effort: repos beyond the cap short-circuit
+	// and their gauges are not refreshed this cycle).
+	issuesBySlug := make(map[string][]scm.IssueRef)
 	var primaryRepo *tatarav1alpha1.Repository
 	var slugs []string
 	total := 0
@@ -957,11 +988,17 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			// Already over cap; don't issue more SCM calls but still collect slugs.
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm)
+		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
+		if err != nil {
+			continue
+		}
+		iss, err := reader.ListOpenIssues(ctx, owner, name)
 		if err != nil {
 			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
 		}
+		issuesBySlug[slug] = iss
+		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
 		r.Metrics.SetOpenProposals(slug, float64(backlog))
 		total += backlog
 		if total >= maxProp {
@@ -981,8 +1018,9 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		return
 	}
 
-	// Build rich open-issues context for dedup-first reasoning.
-	issuesCtx := r.buildIssuesContext(ctx, proj, reader, sortedRepos)
+	// Build rich open-issues context from already-fetched data (no second
+	// ListOpenIssues round-trip for the repos queried above - finding 5).
+	issuesCtx := r.buildIssuesContext(ctx, proj, issuesBySlug, sortedRepos)
 
 	goal := brainstormGoalProject(slugs, issuesCtx)
 	if _, err := r.createBrainstormTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
@@ -1047,21 +1085,33 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		return
 	}
 
+	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
+
 	// Aggregate proposal backlog across all repos; short-circuit once >= maxProp.
-	// Shares proposalBacklog with brainstorm: both autonomous activities back off
-	// against the same open-idea pressure so the project is not flooded.
+	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
+	// for reuse by buildIssuesContext below.
+	issuesBySlug := make(map[string][]scm.IssueRef)
 	total := 0
+	var slugs []string
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
 		slug := repoSlug(rp)
 		if slug == "" {
 			continue
 		}
-		backlog, err := r.proposalBacklog(ctx, reader, rp, brainstormingLabel, proj.Spec.Scm)
+		slugs = append(slugs, slug)
+		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
+		if err != nil {
+			continue
+		}
+		iss, err := reader.ListOpenIssues(ctx, owner, name)
 		if err != nil {
 			l.Info("healthCheck: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
 		}
+		issuesBySlug[slug] = iss
+		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
+		r.Metrics.SetOpenProposals(slug, float64(backlog))
 		total += backlog
 		if total >= maxProp {
 			r.Metrics.ScanItem("healthCheck", "skipped_cap")
@@ -1072,16 +1122,9 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		}
 	}
 
-	// Collect all valid slugs for the project-spanning goal.
-	var slugs []string
-	for i := range sortedRepos {
-		if s := repoSlug(&sortedRepos[i]); s != "" {
-			slugs = append(slugs, s)
-		}
-	}
-
-	// Build rich open-issues context for dedup-first reasoning.
-	issuesCtx := r.buildIssuesContext(ctx, proj, reader, sortedRepos)
+	// Build rich open-issues context from already-fetched data (no second
+	// ListOpenIssues round-trip for the repos queried above - finding 5).
+	issuesCtx := r.buildIssuesContext(ctx, proj, issuesBySlug, sortedRepos)
 
 	goal := healthCheckGoalProject(slugs, issuesCtx)
 	if _, err := r.createHealthCheckTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
@@ -1157,14 +1200,15 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
 }
 
-// buildIssuesContext lists all open non-PR issues across repos and builds the
-// rich context string embedded in the brainstorm goal for dedup-first reasoning.
-// Format per line: "repo#N [label1,label2] title - body-snippet"
+// buildIssuesContext builds the rich context string embedded in the brainstorm
+// goal for dedup-first reasoning from a pre-fetched per-repo issue map (the
+// caller fetches once and reuses the same slice for proposalBacklog, avoiding
+// duplicate ListOpenIssues calls per repo per cycle - finding 4 & 5).
+// Format per line: "repo#N [label1,label2] title"
 // Capped at 60 issues; if more exist, appends a "(+N more omitted)" line.
-// ListOpenIssues errors per repo are skipped non-fatally.
 const maxIssuesContext = 60
 
-func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository) string {
+func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1alpha1.Project, issuesBySlug map[string][]scm.IssueRef, repos []tatarav1alpha1.Repository) string {
 	l := log.FromContext(ctx)
 	var lines []string
 	total := 0
@@ -1173,12 +1217,8 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1a
 		if err != nil {
 			continue
 		}
-		issues, err := reader.ListOpenIssues(ctx, owner, name)
-		if err != nil {
-			l.Info("brainstorm: buildIssuesContext: ListOpenIssues error (skipped)",
-				"repo", repos[i].Name, "err", err.Error())
-			continue
-		}
+		slug := owner + "/" + name
+		issues := issuesBySlug[slug]
 		for _, iss := range issues {
 			if iss.IsPR {
 				continue
@@ -1188,7 +1228,6 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1a
 				continue
 			}
 			total++
-			slug := owner + "/" + name
 			labels := strings.Join(iss.Labels, ",")
 			title := iss.Title
 			// Collapse newlines in title for a single-line entry.
@@ -1244,6 +1283,18 @@ func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
 	return false
 }
 
+// proposalBacklogCount counts open, undecided ideas in a pre-fetched issue
+// slice: non-PR issues bearing the brainstorming or legacy-idea label.
+func proposalBacklogCount(issues []scm.IssueRef, brainstormingLabel, legacyIdea string) int {
+	n := 0
+	for _, iss := range issues {
+		if !iss.IsPR && (hasLabel(iss.Labels, brainstormingLabel) || hasLabel(iss.Labels, legacyIdea)) {
+			n++
+		}
+	}
+	return n
+}
+
 // proposalBacklog counts open, undecided ideas for repo: open non-PR issues
 // bearing the idea label (live ListOpenIssues). This subsumes tatara-originated
 // proposals and any human-filed issue parked as an idea, providing conservative
@@ -1258,13 +1309,7 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 		return 0, err
 	}
 	legacyIdea, _ := legacyLabels(scmSpec)
-	n := 0
-	for _, iss := range issues {
-		if !iss.IsPR && (hasLabel(iss.Labels, brainstormingLabel) || hasLabel(iss.Labels, legacyIdea)) {
-			n++
-		}
-	}
-	return n, nil
+	return proposalBacklogCount(issues, brainstormingLabel, legacyIdea), nil
 }
 
 // hasLiveLifecycleTaskForIssue reports whether any non-terminal Task exists for
@@ -1284,7 +1329,7 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
 			continue
 		}
-		if isTerminal(t.Status.Phase) || isLifecycleTerminal(t.Status.LifecycleState) {
+		if tatarav1alpha1.TaskTerminal(t) {
 			continue
 		}
 		return true
@@ -1373,6 +1418,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	cronSpec := proj.Spec.Scm.Cron
 	now := time.Now()
 	soonest := time.Duration(0)
+	soonestSet := false
 	consider := func(next time.Time) {
 		d := next.Sub(now)
 		if d < 0 {
@@ -1381,8 +1427,9 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		if d > maxScheduleRequeue {
 			d = maxScheduleRequeue
 		}
-		if soonest == 0 || d < soonest {
+		if !soonestSet || d < soonest {
 			soonest = d
+			soonestSet = true
 		}
 	}
 
@@ -1435,7 +1482,18 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 			"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "mrScan")
 	}
 
-	// issueScan
+	// issueScan: re-list existing so Tasks created by mrScan above are visible
+	// (prevents duplicate issueLifecycle tasks for bot-PR linked issues; mirrors
+	// recoverOrphans which already re-lists for the same reason).
+	if fresh, ferr := r.existingScanTasks(ctx, proj); ferr == nil {
+		existing = fresh
+		// Recompute budget against the fresh snapshot so mrScan-created Tasks are
+		// counted and the budget is not overspent.
+		budget = maxOpenTasks(proj) - openTaskCount(existing)
+		if budget < 0 {
+			budget = 0
+		}
+	}
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
 			backlog := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &budget)
