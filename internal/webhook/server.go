@@ -72,6 +72,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	body, err := readBody(r)
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			s.count("unknown", "other", "other", "too_large")
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		s.count("unknown", "other", "other", "bad_request")
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
@@ -94,6 +99,15 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		s.count(providerName, "other", "other", "error")
 		http.Error(w, "lookup project", http.StatusInternalServerError)
+		return
+	}
+
+	// Guard: reject misrouted webhooks before any signature work. A GitHub delivery
+	// to a GitLab-configured project (or vice versa) would otherwise fail with a
+	// confusing bad_signature 401 rather than a clear provider_mismatch 400.
+	if proj.Spec.Scm != nil && proj.Spec.Scm.Provider != "" && proj.Spec.Scm.Provider != providerName {
+		s.count(providerName, "other", "other", "provider_mismatch")
+		http.Error(w, "provider mismatch", http.StatusBadRequest)
 		return
 	}
 
@@ -260,18 +274,42 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		return
 	}
 
+	// Compute the dedup key once, before any scan or label/name derivation, so all
+	// three consumers (pre-create scan, created label, deterministic task name) agree.
+	//
+	// For a bot PR "Closes #N": dedupNumber = N (the linked issue), dedupRef = "o/r#N".
+	// This matches the dedup key an issueScan/mrScan task for issue #N carries, so
+	// the pre-create scan correctly detects the existing task and the task name hash
+	// equals the issueScan task name (AlreadyExists fires on concurrent creates).
+	// For a plain issue: dedupNumber = ev.Number, dedupRef = ev.IssueRef (unchanged).
+	dedupSlug, _ := issueRefRepoSlug(ev.IssueRef)
+	dedupNumber := ev.Number
+	dedupRef := ev.IssueRef
+	if kind == "issueLifecycle" && ev.IsPR {
+		if issueNum, linked := scm.LinkedIssueNumber(ev.Body); linked {
+			dedupNumber = issueNum
+			// Reconstruct the linked issue's IssueRef so the task name hash matches
+			// the issueScan task for that issue. ev.IssueRef is "owner/repo#<prNum>";
+			// replace the trailing number with the linked issue number.
+			if idx := strings.LastIndexByte(ev.IssueRef, '#'); idx >= 0 {
+				dedupRef = ev.IssueRef[:idx+1] + strconv.Itoa(dedupNumber)
+			}
+		}
+	}
+
 	// Dedupe: creating an issue with the label fires both issues.opened and
 	// issues.labeled for the same issue. Skip if a non-terminal Task already
-	// exists for this issue ref (re-labeling after completion still re-triggers).
+	// exists for the dedup key (re-labeling after completion still re-triggers).
 	// Use MatchingLabels so the cache filters Tasks to the dedup key before the
-	// in-Go scan, avoiding an O(all-tasks) walk per webhook.
-	dedupSlug, _ := issueRefRepoSlug(ev.IssueRef)
+	// in-Go scan, avoiding an O(all-tasks) walk per webhook. The IssueRef equality
+	// check is omitted for the bot-PR arm: the existing task carries the linked
+	// issue's IssueRef ("o/r#7") not the PR ref ("o/r#21").
 	var existing tatarav1.TaskList
 	listOpts := []client.ListOption{
 		client.InNamespace(s.cfg.Namespace),
 		client.MatchingLabels{
 			tatarav1.LabelSourceRepo:   dedupSlug,
-			tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
+			tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
 		},
 	}
 	if err := s.cfg.Client.List(ctx, &existing, listOpts...); err != nil {
@@ -281,10 +319,9 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	for i := range existing.Items {
 		t := &existing.Items[i]
-		if t.Spec.Source != nil && t.Spec.Source.IssueRef == ev.IssueRef &&
-			t.Status.Phase != "Succeeded" && t.Status.Phase != "Failed" {
+		if t.Spec.Source != nil && t.Status.Phase != "Succeeded" && t.Status.Phase != "Failed" {
 			s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
-				"project", proj.Name, "issue_ref", ev.IssueRef, "task", t.Name)
+				"project", proj.Name, "issue_ref", ev.IssueRef, "dedup_ref", dedupRef, "task", t.Name)
 			s.count(provider, ev.Kind, ev.Action, "duplicate")
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -303,25 +340,17 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	if kind == "issueLifecycle" {
 		if ev.IsPR {
 			ann[tatarav1.LifecycleEntryAnnotation] = "MRCI"
-			// Bot-PR dedup key: linked issue number from "Closes #N" when present,
-			// else the PR number - mirroring mrScan's key exactly.
-			dedupNumber := ev.Number
-			if issueNum, linked := scm.LinkedIssueNumber(ev.Body); linked {
-				dedupNumber = issueNum
-			}
-			repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
 			labels = map[string]string{
-				tatarav1.LabelSourceRepo:   repoSlug,
+				tatarav1.LabelSourceRepo:   dedupSlug,
 				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
 				tatarav1.LabelSourceKind:   kind,
 				tatarav1.LabelActivity:     "webhook",
 			}
 		} else {
 			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
-			repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
 			labels = map[string]string{
-				tatarav1.LabelSourceRepo:   repoSlug,
-				tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
+				tatarav1.LabelSourceRepo:   dedupSlug,
+				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
 				tatarav1.LabelSourceKind:   kind,
 				tatarav1.LabelActivity:     "webhook",
 			}
@@ -331,12 +360,14 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// For issueLifecycle tasks, use a deterministic name derived from the dedup
 	// key so concurrent webhook deliveries for the same work item race to a
 	// single winner: the second Create returns AlreadyExists instead of silently
-	// creating a duplicate (GenerateName makes both succeeds). review tasks use
+	// creating a duplicate (GenerateName makes both succeed). review tasks use
 	// GenerateName because multiple review Tasks per PR are intentional.
+	// The name is derived from dedupRef (not ev.IssueRef) so a bot PR "Closes #7"
+	// hashes identically to an issueScan task for issue #7.
 	taskName := ""
 	taskGenerateName := "task-"
 	if kind == "issueLifecycle" {
-		taskName = issueLifecycleTaskName(proj.Name, ev.IssueRef)
+		taskName = issueLifecycleTaskName(proj.Name, dedupRef)
 		taskGenerateName = ""
 	}
 
@@ -602,8 +633,13 @@ func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef st
 }
 
 // findReactivatableTask returns an owning issueLifecycle Task for issueRef that
-// went terminal but is resumable (LifecycleState == "Parked"). Done tasks are
-// NOT reactivated (their work is complete). Returns (task, true) when found.
+// is resumable: LifecycleState=="Parked" OR LifecycleState=="Stopped" (regardless
+// of Phase). Done tasks are NOT reactivated (their work is complete). A Stopped
+// task that has also reached a terminal Phase (Succeeded/Failed) is still treated
+// as resumable - a new comment signals the user wants another attempt, and
+// reactivating the existing Task is idempotent (same deterministic name, same owner
+// chain) whereas createLifecycleTaskAtTriage would produce a duplicate.
+// Returns (task, true) when found.
 func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
 	var tasks tatarav1.TaskList
 	opts := s.taskListOpts(issueRef)
@@ -618,7 +654,7 @@ func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRe
 		if t.Spec.Source == nil || t.Spec.Source.IssueRef != issueRef {
 			continue
 		}
-		if t.Status.LifecycleState == "Parked" {
+		if t.Status.LifecycleState == "Parked" || t.Status.LifecycleState == "Stopped" {
 			return t, true
 		}
 	}
@@ -656,7 +692,9 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
 		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
 	}
-	if updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	// Step 1: status update (LifecycleState, Phase, timers). This is the critical
+	// reactivation: once it commits, the reconciler can re-triage the task.
+	if statusErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1.Task{}
 		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
@@ -667,10 +705,20 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 		fresh.Status.Phase = ""
 		fresh.Status.LastActivityAt = &now
 		fresh.Status.DeadlineAt = &deadline
-		if err := s.cfg.Client.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		// Clear turn annotations (metadata update, separate from status).
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	}); statusErr != nil {
+		s.log.ErrorContext(ctx, "reactivate: update task status", "error", statusErr, "task", task.Name)
+		s.count(provider, ev.Kind, ev.Action, "error")
+		http.Error(w, "reactivate task", http.StatusInternalServerError)
+		return
+	}
+
+	// Step 2: clear turn annotations (metadata update, separate from status subresource).
+	// Non-fatal: stale annotations are cosmetic. A conflict on this step means a
+	// concurrent reconcile already advanced state; the reactivation is still
+	// committed from step 1. On error we log and return 202 - GitHub will not
+	// redeliver and re-stamp the already-committed Triage status.
+	if annErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh2 := &tatarav1.Task{}
 		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
 			return err
@@ -683,11 +731,9 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 			delete(fresh2.Annotations, tatarav1.AnnPodRecreations)
 		}
 		return s.cfg.Client.Update(ctx, fresh2)
-	}); updateErr != nil {
-		s.log.ErrorContext(ctx, "reactivate: update task", "error", updateErr, "task", task.Name)
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "reactivate task", http.StatusInternalServerError)
-		return
+	}); annErr != nil {
+		// Best-effort: reactivation already committed; stale annotations are non-fatal.
+		s.log.ErrorContext(ctx, "reactivate: clear annotations (non-fatal, reactivation committed)", "error", annErr, "task", task.Name)
 	}
 	s.log.InfoContext(ctx, "issue_comment: reactivated parked lifecycle task",
 		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
@@ -765,10 +811,25 @@ func objKey(ns, name string) client.ObjectKey {
 	return client.ObjectKey{Namespace: ns, Name: name}
 }
 
+const maxBodyBytes = 5 << 20 // 5 MiB
+
 func readBody(r *http.Request) ([]byte, error) {
 	defer func() { _ = r.Body.Close() }()
-	return io.ReadAll(io.LimitReader(r.Body, 5<<20))
+	// Read up to maxBodyBytes+1 so we can detect overflow without consuming the full
+	// stream. If the read returns more than maxBodyBytes the payload is too large.
+	b, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxBodyBytes {
+		return nil, errBodyTooLarge
+	}
+	return b, nil
 }
+
+// errBodyTooLarge is a sentinel error returned by readBody when the payload
+// exceeds the per-request size limit. The handler converts it to a 413.
+var errBodyTooLarge = errors.New("request body too large")
 
 // Runnable adapts the webhook Server to controller-runtime's manager.Runnable.
 type Runnable struct {

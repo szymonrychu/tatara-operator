@@ -116,12 +116,26 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 		URL:          wi.HTMLURL,
 		AuthorLogin:  wi.User.Login,
 		ActorLogin:   p.Sender.Login,
-		Action:       p.Action,
+		Action:       ghNormalizeAction(p.Action),
 		Number:       wi.Number,
 		IsPR:         isPR,
 		HeadSHA:      wi.Head.SHA,
 		HeadBranch:   wi.Head.Ref,
 		ChangedLabel: p.Label.Name,
+	}
+}
+
+// ghNormalizeAction maps a raw GitHub action to the same closed label set that
+// the GitLab path produces (see glActionAndLabel in gitlab.go). Any action not
+// in the known set collapses to "other" so the Prometheus label cardinality is
+// bounded regardless of which webhook event types are enabled on the repository.
+func ghNormalizeAction(action string) string {
+	switch action {
+	case "opened", "reopened", "labeled", "unlabeled", "closed",
+		"synchronize", "submitted", "created":
+		return action
+	default:
+		return "other"
 	}
 }
 
