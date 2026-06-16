@@ -24,13 +24,16 @@ type TokenSourceConfig struct {
 }
 
 // TokenSource mints bearer tokens via the OIDC client-credentials grant,
-// passing the target audience as a Keycloak "audience" form value. Tokens are
-// cached internally by the underlying oauth2 source until near expiry.
+// passing the target audience as a Keycloak "audience" form value. Each Token
+// call derives a fresh per-call source bound to the caller's context so
+// cancellations and deadlines are honoured. Caching is per-call (no cross-call
+// token reuse), but the baked tokenMintTimeout caps the worst-case latency.
 type TokenSource struct {
-	src oauth2.TokenSource
+	cfg        clientcredentials.Config
+	httpClient *http.Client
 }
 
-// NewTokenSource returns a caching client-credentials TokenSource.
+// NewTokenSource returns a client-credentials TokenSource.
 func NewTokenSource(cfg TokenSourceConfig) *TokenSource {
 	c := clientcredentials.Config{
 		ClientID:     cfg.ClientID,
@@ -40,18 +43,15 @@ func NewTokenSource(cfg TokenSourceConfig) *TokenSource {
 			"audience": {cfg.Audience},
 		},
 	}
-	// Bake a finite-timeout HTTP client into the base context so a hung
-	// Keycloak cannot block the calling goroutine indefinitely. The
-	// ReuseTokenSource cache is preserved by the oauth2 library.
 	httpClient := &http.Client{Timeout: tokenMintTimeout}
-	baseCtx := context.WithValue(context.Background(), oauth2.HTTPClient, httpClient)
-	return &TokenSource{src: c.TokenSource(baseCtx)}
+	return &TokenSource{cfg: c, httpClient: httpClient}
 }
 
-// Token returns a valid bearer access token, refreshing if the cached one is
-// near expiry.
+// Token returns a valid bearer access token. The caller's ctx is honoured:
+// cancellation or deadline expiry aborts the mint immediately.
 func (t *TokenSource) Token(ctx context.Context) (string, error) {
-	tok, err := t.src.Token()
+	ctxWithClient := context.WithValue(ctx, oauth2.HTTPClient, t.httpClient)
+	tok, err := t.cfg.TokenSource(ctxWithClient).Token()
 	if err != nil {
 		return "", fmt.Errorf("auth: mint client-credentials token: %w", err)
 	}

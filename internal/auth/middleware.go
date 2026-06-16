@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
 type ctxKey struct{}
@@ -17,14 +19,15 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 
 const wwwAuthenticate = `Bearer realm="tatara-operator"`
 
-// Middleware returns a chi-compatible middleware that verifies the Bearer token
-// and injects parsed Claims into the request context.
-func Middleware(v *Verifier) func(http.Handler) http.Handler {
+// Middleware returns a chi-compatible middleware that verifies the Bearer token,
+// injects parsed Claims into the request context, and records auth outcomes via m.
+func Middleware(v *Verifier, m *obs.OperatorMetrics) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw, reason := bearerToken(r)
 			if raw == "" {
 				slog.WarnContext(r.Context(), "auth: rejected", "reason", reason)
+				m.RecordAuth(reason)
 				w.Header().Set("WWW-Authenticate", wwwAuthenticate)
 				http.Error(w, "missing bearer token", http.StatusUnauthorized)
 				return
@@ -32,10 +35,12 @@ func Middleware(v *Verifier) func(http.Handler) http.Handler {
 			claims, err := v.Verify(r.Context(), raw)
 			if err != nil {
 				slog.WarnContext(r.Context(), "auth: rejected", "reason", "invalid_token")
+				m.RecordAuth("invalid_token")
 				w.Header().Set("WWW-Authenticate", wwwAuthenticate)
 				http.Error(w, "invalid token", http.StatusUnauthorized)
 				return
 			}
+			m.RecordAuth("accepted")
 			ctx := context.WithValue(r.Context(), ctxKey{}, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

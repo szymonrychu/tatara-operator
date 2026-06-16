@@ -104,7 +104,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		},
 		Logger:  slog.Default(),
 		Metrics: metrics,
-	}).Mount(httpMux, auth.Middleware(verifier))
+	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))
 }
