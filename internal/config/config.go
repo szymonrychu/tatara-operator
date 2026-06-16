@@ -62,8 +62,12 @@ type Config struct {
 	// AgentScheduling is the cluster-specific Pod-placement JSON document
 	// (nodeSelector/tolerations/affinity) for spawned agent Pods. Delivered as a
 	// single ConfigMap key (rule 6 list-shaped data), kept empty in the chart so
-	// the chart stays cluster-agnostic (rule 14). Validated at load.
-	AgentScheduling  string
+	// the chart stays cluster-agnostic (rule 14). Validated and parsed at load;
+	// callers consume Scheduling directly rather than re-parsing the raw string.
+	AgentScheduling string
+	// Scheduling is the result of parsing AgentScheduling. Populated by Load so
+	// callers never need to parse (and cannot silently discard a parse error).
+	Scheduling       agent.Scheduling
 	Namespace        string
 	LogLevel         string
 	IngressHost      string
@@ -208,10 +212,13 @@ func Load() (Config, error) {
 	if cfg.OperatorOIDCSecretName == "" {
 		return Config{}, fmt.Errorf("config: OPERATOR_OIDC_SECRET_NAME is required")
 	}
-	// Validate the cluster-specific scheduling JSON at load so a malformed
-	// document fails startup loudly instead of silently dropping placement.
-	if _, err := agent.ParseScheduling(cfg.AgentScheduling); err != nil {
+	// Parse the cluster-specific scheduling JSON once at load. Storing the
+	// parsed struct on Config means callers never re-parse the raw string and
+	// cannot silently discard a parse error.
+	scheduling, err := agent.ParseScheduling(cfg.AgentScheduling)
+	if err != nil {
 		return Config{}, fmt.Errorf("config: AGENT_SCHEDULING: %w", err)
 	}
+	cfg.Scheduling = scheduling
 	return cfg, nil
 }
