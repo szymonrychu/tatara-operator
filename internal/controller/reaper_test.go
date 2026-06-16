@@ -215,6 +215,64 @@ func TestReapOrphans_OrphanedServiceReaped(t *testing.T) {
 	}
 }
 
+// TestReapOrphans_OrphanServiceSuccessCounter verifies that a successful second-pass
+// orphan Service delete increments operator_orphan_reaped_total (finding: success
+// metric missing from else branch, violating rule 13).
+func TestReapOrphans_OrphanServiceSuccessCounter(t *testing.T) {
+	ctx := context.Background()
+	reg := prometheus.NewRegistry()
+	srv := &CallbackServer{
+		Client:      k8sClient,
+		Metrics:     obs.NewOperatorMetrics(reg),
+		Namespace:   testNS,
+		ReaperGrace: time.Nanosecond,
+	}
+
+	labels := map[string]string{
+		agent.LabelManagedBy: agent.ManagedByValue,
+		agent.LabelComponent: agent.ComponentAgent,
+		agent.LabelTask:      "no-such-task-svc-counter",
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "reap-svc-counter",
+			Namespace: testNS,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	if err := k8sClient.Create(ctx, svc); err != nil {
+		t.Fatalf("create orphan service: %v", err)
+	}
+
+	srv.ReapOrphans(ctx)
+
+	if svcExists(t, "reap-svc-counter") {
+		t.Fatal("expected orphaned Service to be reaped")
+	}
+
+	// Verify operator_orphan_reaped_total{reason="orphan service"} == 1.
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	var got float64
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_orphan_reaped_total" {
+			for _, m := range mf.GetMetric() {
+				for _, lp := range m.GetLabel() {
+					if lp.GetName() == "reason" && lp.GetValue() == "orphan service" {
+						got = m.GetCounter().GetValue()
+					}
+				}
+			}
+		}
+	}
+	if got != 1 {
+		t.Errorf("operator_orphan_reaped_total{reason=orphan service} = %v, want 1", got)
+	}
+}
+
 // TestReapOrphans_YoungServiceNotReaped guards the spawn-vs-reap race: a Service
 // is created right after its Pod, and the Pod LIST and Service LIST in one reaper
 // pass hit the cache at different instants. A freshly created Service whose Pod
