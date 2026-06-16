@@ -331,3 +331,155 @@ func TestReapDeleteError(t *testing.T) {
 		t.Fatalf("reap_delete_error{service} = %v, want 1", got)
 	}
 }
+
+// Finding 25: planning_watchdog must be pre-seeded so the series exists from
+// startup without waiting for the first stall to fire.
+func TestTurnTimeoutTotal_PlanningWatchdogPreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_turn_timeout_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "source" && lp.GetValue() == "planning_watchdog" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_turn_timeout_total{source=planning_watchdog} not pre-seeded")
+	}
+	// Calling TurnTimeout must increment it.
+	m.TurnTimeout("planning_watchdog")
+	if got := testutil.ToFloat64(m.turnTimeoutTotal.WithLabelValues("planning_watchdog")); got != 1 {
+		t.Fatalf("turn_timeout planning_watchdog = %v, want 1", got)
+	}
+}
+
+// Finding 8: auth_total counter must exist and RecordAuth must increment it.
+func TestRecordAuth(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.RecordAuth("accepted")
+	m.RecordAuth("accepted")
+	m.RecordAuth("invalid_token")
+	m.RecordAuth("missing_token")
+	m.RecordAuth("invalid_scheme")
+
+	if got := testutil.ToFloat64(m.AuthCounter("accepted")); got != 2 {
+		t.Fatalf("auth accepted = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.AuthCounter("invalid_token")); got != 1 {
+		t.Fatalf("auth invalid_token = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.AuthCounter("missing_token")); got != 1 {
+		t.Fatalf("auth missing_token = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.AuthCounter("invalid_scheme")); got != 1 {
+		t.Fatalf("auth invalid_scheme = %v, want 1", got)
+	}
+}
+
+// Finding 8: all auth result labels must be pre-seeded so the series exist
+// from startup (zero-baseline for alerts on auth rejection spikes).
+func TestAuthTotal_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	want := map[string]bool{
+		"accepted":       false,
+		"missing_token":  false,
+		"invalid_scheme": false,
+		"invalid_token":  false,
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_auth_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "result" {
+					want[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	for label, seen := range want {
+		if !seen {
+			t.Errorf("operator_auth_total{result=%q} not pre-seeded", label)
+		}
+	}
+}
+
+// Finding 15: WritebackOutcome counter must exist and be incrementable.
+func TestWritebackOutcome(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.WritebackOutcome("no_change")
+	m.WritebackOutcome("skip_4xx")
+	m.WritebackOutcome("no_pr")
+	m.WritebackOutcome("opened")
+	m.WritebackOutcome("opened")
+
+	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("no_change")); got != 1 {
+		t.Fatalf("writeback no_change = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("skip_4xx")); got != 1 {
+		t.Fatalf("writeback skip_4xx = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("no_pr")); got != 1 {
+		t.Fatalf("writeback no_pr = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("opened")); got != 2 {
+		t.Fatalf("writeback opened = %v, want 2", got)
+	}
+}
+
+// Finding 15: all writeback outcome labels must be pre-seeded.
+func TestWritebackOutcome_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	want := map[string]bool{
+		"no_change": false,
+		"skip_4xx":  false,
+		"no_pr":     false,
+		"opened":    false,
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_writeback_outcome_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "result" {
+					want[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	for label, seen := range want {
+		if !seen {
+			t.Errorf("operator_writeback_outcome_total{result=%q} not pre-seeded", label)
+		}
+	}
+}
