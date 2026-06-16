@@ -46,6 +46,8 @@ type IssueOutcome struct {
 	Action string `json:"action"`
 	// +optional
 	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
+	// +optional
+	Plan string `json:"plan,omitempty"` // short description of what will be implemented; posted as an implementation-start message when Action==implement
 }
 
 // ImplementOutcome is the agent's declared outcome for an implement task when
@@ -67,6 +69,8 @@ type ChangeSummary struct {
 	DeliveredScope string `json:"deliveredScope,omitempty"`
 	// +optional
 	RemainingScope string `json:"remainingScope,omitempty"`
+	// +optional
+	MostProblematic string `json:"mostProblematic,omitempty"` // most problematic part of the change; from the cli most_problematic field
 }
 
 // TaskSource records the SCM work-item that originated a webhook-born Task.
