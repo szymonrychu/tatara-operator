@@ -147,6 +147,16 @@ func TestNewWebhookMux_RequestIDPropagated(t *testing.T) {
 	}
 }
 
+// TestCallbackRunnableNeedLeaderElection verifies that callbackRunnable opts out
+// of leader-election gating so the callback/push-metrics server starts on every
+// replica, not only on the leader.
+func TestCallbackRunnableNeedLeaderElection(t *testing.T) {
+	r := callbackRunnable{}
+	if r.NeedLeaderElection() {
+		t.Fatal("callbackRunnable.NeedLeaderElection() = true, want false: callback server must start on every replica")
+	}
+}
+
 func TestMemoryConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
 		Namespace:        "tatara",

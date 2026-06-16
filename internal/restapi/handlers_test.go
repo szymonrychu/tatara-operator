@@ -85,7 +85,7 @@ func task(name, projectRef string) *tatarav1alpha1.Task {
 }
 
 func TestListRepositories_FilteredByProject(t *testing.T) {
-	r := buildRouter(t, repository("r1", "alpha"), repository("r2", "alpha"), repository("r3", "beta"))
+	r := buildRouter(t, project("alpha"), project("beta"), repository("r1", "alpha"), repository("r2", "alpha"), repository("r3", "beta"))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/alpha/repositories", nil))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -97,8 +97,15 @@ func TestListRepositories_FilteredByProject(t *testing.T) {
 	}
 }
 
+func TestListRepositories_ProjectNotFound(t *testing.T) {
+	r := buildRouter(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/missing/repositories", nil))
+	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
 func TestListTasks_FilteredByProject(t *testing.T) {
-	r := buildRouter(t, task("t1", "alpha"), task("t2", "beta"))
+	r := buildRouter(t, project("alpha"), project("beta"), task("t1", "alpha"), task("t2", "beta"))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/alpha/tasks", nil))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -106,6 +113,13 @@ func TestListTasks_FilteredByProject(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
 	require.Len(t, out, 1)
 	require.Equal(t, "t1", out[0].Name)
+}
+
+func TestListTasks_ProjectNotFound(t *testing.T) {
+	r := buildRouter(t)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/projects/missing/tasks", nil))
+	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
 func TestGetTask(t *testing.T) {
@@ -655,4 +669,70 @@ func TestPostComment_TaskNotFound(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// --- Finding 2: issueOutcome with plan field ---
+
+func TestIssueOutcome_PlanFieldAccepted(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "triageIssue"))
+	body := strings.NewReader(`{"action":"implement","plan":"implement login flow via OAuth2"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.IssueOutcome)
+	require.Equal(t, "implement", out.Status.IssueOutcome.Action)
+	require.Equal(t, "implement login flow via OAuth2", out.Status.IssueOutcome.Plan)
+}
+
+// --- Finding 6: changeSummary with mostProblematic field ---
+
+func TestChangeSummary_MostProblematicAccepted(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"))
+	body := strings.NewReader(`{"prTitle":"feat: login","prBody":"body","deliveredScope":"login","mostProblematic":"token refresh"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ChangeSummary)
+	require.Equal(t, "token refresh", out.Status.ChangeSummary.MostProblematic)
+}
+
+// --- Findings 9/11: proposeIssue kind enum validation ---
+
+func TestProposeIssue_InvalidKindRejected(t *testing.T) {
+	r := buildRouter(t, project("alpha"), repository("repo-a", "alpha"))
+	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"T","body":"B","kind":"feature"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "bug or improvement")
+}
+
+func TestProposeIssue_BugKindAccepted(t *testing.T) {
+	r := buildRouter(t, project("alpha"), repository("repo-a", "alpha"))
+	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"T","body":"B","kind":"bug"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+}
+
+func TestProposeIssue_ImprovementKindAccepted(t *testing.T) {
+	r := buildRouter(t, project("alpha"), repository("repo-a", "alpha"))
+	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"T","body":"B","kind":"improvement"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
 }

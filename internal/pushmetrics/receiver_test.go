@@ -68,14 +68,14 @@ wrapper_runs_total{job="wrapper",pod="pod-a",run_id="run-1",step="plan"} 3
 // run_id label in the body is overwritten by the query parameter.
 func TestPushOverwritesSpoofedIdentity(t *testing.T) {
 	r := New(time.Minute)
-	body := "# TYPE a_total counter\na_total{run_id=\"evil\"} 1\n"
+	body := "# TYPE wrapper_a_total counter\nwrapper_a_total{run_id=\"evil\"} 1\n"
 	push(t, r, "run_id=real", body)
 	want := `
-# HELP a_total
-# TYPE a_total counter
-a_total{run_id="real"} 1
+# HELP wrapper_a_total
+# TYPE wrapper_a_total counter
+wrapper_a_total{run_id="real"} 1
 `
-	if err := testutil.CollectAndCompare(r, strings.NewReader(want), "a_total"); err != nil {
+	if err := testutil.CollectAndCompare(r, strings.NewReader(want), "wrapper_a_total"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -84,32 +84,32 @@ a_total{run_id="real"} 1
 // cleanly (union-padded), not error out the whole scrape.
 func TestConcurrentRunsDifferentLabelsGatherCleanly(t *testing.T) {
 	r := New(time.Minute)
-	push(t, r, "run_id=run-1", "# TYPE q_total counter\nq_total{a=\"1\"} 1\n")
-	push(t, r, "run_id=run-2", "# TYPE q_total counter\nq_total{b=\"2\"} 2\n")
+	push(t, r, "run_id=run-1", "# TYPE wrapper_q_total counter\nwrapper_q_total{a=\"1\"} 1\n")
+	push(t, r, "run_id=run-2", "# TYPE wrapper_q_total counter\nwrapper_q_total{b=\"2\"} 2\n")
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(r)
 	if _, err := reg.Gather(); err != nil {
 		t.Fatalf("gather with inconsistent label sets: %v", err)
 	}
-	if got := testutil.CollectAndCount(r, "q_total"); got != 2 {
-		t.Fatalf("q_total series: got %d, want 2", got)
+	if got := testutil.CollectAndCount(r, "wrapper_q_total"); got != 2 {
+		t.Fatalf("wrapper_q_total series: got %d, want 2", got)
 	}
 }
 
 func TestHistogramRoundTrips(t *testing.T) {
 	r := New(time.Minute)
-	body := `# TYPE lat histogram
-lat_bucket{le="0.5"} 1
-lat_bucket{le="1"} 2
-lat_bucket{le="+Inf"} 2
-lat_sum 1.3
-lat_count 2
+	body := `# TYPE wrapper_lat histogram
+wrapper_lat_bucket{le="0.5"} 1
+wrapper_lat_bucket{le="1"} 2
+wrapper_lat_bucket{le="+Inf"} 2
+wrapper_lat_sum 1.3
+wrapper_lat_count 2
 `
 	if code := push(t, r, "run_id=h1", body); code != http.StatusNoContent {
 		t.Fatalf("push histogram: got %d", code)
 	}
-	if got := testutil.CollectAndCount(r, "lat"); got != 1 {
+	if got := testutil.CollectAndCount(r, "wrapper_lat"); got != 1 {
 		t.Fatalf("histogram series: got %d, want 1", got)
 	}
 }
@@ -117,13 +117,13 @@ lat_count 2
 func TestTTLEviction(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	r := newTestReceiver(clk, time.Minute)
-	push(t, r, "run_id=run-1", "# TYPE a_total counter\na_total 1\n")
+	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 
-	if got := testutil.CollectAndCount(r, "a_total"); got != 1 {
+	if got := testutil.CollectAndCount(r, "wrapper_a_total"); got != 1 {
 		t.Fatalf("before TTL: got %d, want 1", got)
 	}
 	clk.advance(2 * time.Minute)
-	if got := testutil.CollectAndCount(r, "a_total"); got != 0 {
+	if got := testutil.CollectAndCount(r, "wrapper_a_total"); got != 0 {
 		t.Fatalf("after TTL: got %d, want 0", got)
 	}
 	if got := testutil.ToFloat64(r.evictedTotal); got != 1 {
@@ -135,18 +135,18 @@ func TestTTLEviction(t *testing.T) {
 func TestPushResetsTTL(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	r := newTestReceiver(clk, time.Minute)
-	push(t, r, "run_id=run-1", "# TYPE a_total counter\na_total 1\n")
+	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 	clk.advance(40 * time.Second)
-	push(t, r, "run_id=run-1", "# TYPE a_total counter\na_total 2\n")
+	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 2\n")
 	clk.advance(40 * time.Second)
-	if got := testutil.CollectAndCount(r, "a_total"); got != 1 {
+	if got := testutil.CollectAndCount(r, "wrapper_a_total"); got != 1 {
 		t.Fatalf("active run wrongly evicted: got %d, want 1", got)
 	}
 }
 
 func TestDeleteRemovesSeries(t *testing.T) {
 	r := New(time.Minute)
-	push(t, r, "run_id=run-1", "# TYPE a_total counter\na_total 1\n")
+	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 
 	req := httptest.NewRequest(http.MethodDelete, "/internal/metrics/push?run_id=run-1", nil)
 	rec := httptest.NewRecorder()
@@ -154,15 +154,15 @@ func TestDeleteRemovesSeries(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: got %d, want 204", rec.Code)
 	}
-	if got := testutil.CollectAndCount(r, "a_total"); got != 0 {
+	if got := testutil.CollectAndCount(r, "wrapper_a_total"); got != 0 {
 		t.Fatalf("after delete: got %d, want 0", got)
 	}
 }
 
 func TestActiveRunsGauge(t *testing.T) {
 	r := New(time.Minute)
-	push(t, r, "run_id=run-1", "# TYPE a_total counter\na_total 1\n")
-	push(t, r, "run_id=run-2", "# TYPE a_total counter\na_total 1\n")
+	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
+	push(t, r, "run_id=run-2", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 	want := "# HELP operator_pushed_runs Wrapper runs with live pushed series.\n# TYPE operator_pushed_runs gauge\noperator_pushed_runs 2\n"
 	if err := testutil.CollectAndCompare(r, strings.NewReader(want), "operator_pushed_runs"); err != nil {
 		t.Fatal(err)
@@ -188,7 +188,7 @@ func TestPushHandler_ServesDirectly(t *testing.T) {
 	h := r.PushHandler()
 	// h should handle a direct POST (no inner-mux path dispatch).
 	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?run_id=x",
-		strings.NewReader("# TYPE a_total counter\na_total 1\n"))
+		strings.NewReader("# TYPE wrapper_a_total counter\nwrapper_a_total 1\n"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
@@ -200,10 +200,10 @@ func TestPushHandler_ServesDirectly(t *testing.T) {
 // the conflicting run's series must be dropped and counted.
 func TestTypeConflict_DropsConflictingSeries(t *testing.T) {
 	r := New(time.Minute)
-	// run-1 publishes m as COUNTER
-	push(t, r, "run_id=run-1", "# TYPE m counter\nm 1\n")
-	// run-2 publishes m as GAUGE (type conflict)
-	push(t, r, "run_id=run-2", "# TYPE m gauge\nm 2\n")
+	// run-1 publishes wrapper_m as COUNTER
+	push(t, r, "run_id=run-1", "# TYPE wrapper_m counter\nwrapper_m 1\n")
+	// run-2 publishes wrapper_m as GAUGE (type conflict)
+	push(t, r, "run_id=run-2", "# TYPE wrapper_m gauge\nwrapper_m 2\n")
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(r)
@@ -224,11 +224,11 @@ func TestTypeConflict_DropsConflictingSeries(t *testing.T) {
 // deterministically by run key.
 func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
 	r := New(time.Minute)
-	// run-a publishes m as COUNTER value 1; run-z as GAUGE value 2. With a stable
-	// (sorted) iteration order, run-a is first-seen, so its COUNTER value 1 wins
-	// every scrape.
-	push(t, r, "run_id=run-a", "# TYPE m counter\nm 1\n")
-	push(t, r, "run_id=run-z", "# TYPE m gauge\nm 2\n")
+	// run-a publishes wrapper_m as COUNTER value 1; run-z as GAUGE value 2. With
+	// a stable (sorted) iteration order, run-a is first-seen, so its COUNTER
+	// value 1 wins every scrape.
+	push(t, r, "run_id=run-a", "# TYPE wrapper_m counter\nwrapper_m 1\n")
+	push(t, r, "run_id=run-z", "# TYPE wrapper_m gauge\nwrapper_m 2\n")
 
 	survivingM := func() float64 {
 		ch := make(chan prometheus.Metric, 64)
@@ -239,7 +239,7 @@ func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
 			if err := metric.Write(&pb); err != nil {
 				continue
 			}
-			if !strings.HasPrefix(metric.Desc().String(), `Desc{fqName: "m"`) {
+			if !strings.HasPrefix(metric.Desc().String(), `Desc{fqName: "wrapper_m"`) {
 				continue
 			}
 			switch {
@@ -250,7 +250,7 @@ func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
 			}
 		}
 		if len(vals) != 1 {
-			t.Fatalf("expected exactly 1 surviving 'm' series, got %d (%v)", len(vals), vals)
+			t.Fatalf("expected exactly 1 surviving 'wrapper_m' series, got %d (%v)", len(vals), vals)
 		}
 		return vals[0]
 	}
@@ -258,8 +258,88 @@ func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
 	first := survivingM()
 	for i := 0; i < 20; i++ {
 		if got := survivingM(); got != first {
-			t.Fatalf("surviving 'm' series flickered: scrape %d = %v, first = %v", i, got, first)
+			t.Fatalf("surviving 'wrapper_m' series flickered: scrape %d = %v, first = %v", i, got, first)
 		}
+	}
+}
+
+// Finding 1: pushed series whose names do not carry an allowed prefix must be
+// dropped and counted under operator_push_series_dropped_total{reason="reserved_name"}.
+// This prevents wrapper pushes from colliding with operator-owned collectors.
+func TestReservedNamePrefix_Dropped(t *testing.T) {
+	r := New(time.Minute)
+	// "operator_reconcile_total" matches no allowed prefix -> must be dropped.
+	body := "# TYPE operator_reconcile_total counter\noperator_reconcile_total 99\n"
+	if code := push(t, r, "run_id=bad", body); code != http.StatusNoContent {
+		t.Fatalf("push reserved name: got %d, want 204 (parse succeeds, series dropped silently)", code)
+	}
+	// The reserved series must not appear in Collect output.
+	if got := testutil.CollectAndCount(r, "operator_reconcile_total"); got != 0 {
+		t.Fatalf("reserved name still emitted: got %d series, want 0", got)
+	}
+	// It must be counted in the dropped counter.
+	dropped := testutil.ToFloat64(r.seriesDroppedTotal.WithLabelValues("reserved_name"))
+	if dropped < 1 {
+		t.Fatalf("reserved_name dropped = %v, want >= 1", dropped)
+	}
+}
+
+// Finding 1: series with an allowed prefix must pass through unharmed.
+func TestAllowedPrefix_PassesThrough(t *testing.T) {
+	r := New(time.Minute)
+	body := "# TYPE wrapper_runs_total counter\nwrapper_runs_total 7\n"
+	push(t, r, "run_id=ok", body)
+	if got := testutil.CollectAndCount(r, "wrapper_runs_total"); got != 1 {
+		t.Fatalf("allowed prefix dropped: got %d, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.seriesDroppedTotal.WithLabelValues("reserved_name")); got != 0 {
+		t.Fatalf("allowed prefix wrongly counted as reserved_name: %v", got)
+	}
+}
+
+// Finding 24: DELETE must increment operator_push_receive_total{result="deleted"}.
+func TestDelete_CountedInReceiveTotal(t *testing.T) {
+	r := New(time.Minute)
+	push(t, r, "run_id=run-del", "# TYPE wrapper_x_total counter\nwrapper_x_total 1\n")
+
+	req := httptest.NewRequest(http.MethodDelete, "/internal/metrics/push?run_id=run-del", nil)
+	rec := httptest.NewRecorder()
+	r.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("delete: got %d, want 204", rec.Code)
+	}
+	if got := testutil.ToFloat64(r.receiveTotal.WithLabelValues("deleted")); got != 1 {
+		t.Fatalf("receive_total{deleted} = %v, want 1", got)
+	}
+}
+
+// Finding 24: "deleted" label must be pre-seeded so it appears in Gather even
+// before the first DELETE arrives. testutil.CollectAndCount on the underlying
+// CounterVec confirms at least one series exists.
+func TestDeleteLabel_PreSeeded(t *testing.T) {
+	r := New(time.Minute)
+	// The pre-seeded "deleted" series must exist at zero before any DELETE call.
+	n := testutil.CollectAndCount(r.receiveTotal, "operator_push_receive_total")
+	if n == 0 {
+		t.Fatal("receiveTotal has no pre-seeded series at all")
+	}
+	// Confirm the deleted label value is among them.
+	var found bool
+	ch := make(chan prometheus.Metric, 16)
+	go func() { r.receiveTotal.Collect(ch); close(ch) }()
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			continue
+		}
+		for _, lp := range pb.GetLabel() {
+			if lp.GetName() == "result" && lp.GetValue() == "deleted" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_push_receive_total{result=deleted} not pre-seeded")
 	}
 }
 

@@ -75,6 +75,7 @@ type CronActivity struct {
 	// +optional
 	Schedule string `json:"schedule,omitempty"`
 	// MaxPerRepo caps the number of in-progress Tasks per repo (one lane per repo).
+	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	// +optional
 	MaxPerRepo int `json:"maxPerRepo,omitempty"`

@@ -517,6 +517,59 @@ func TestReconcileMemory_HealthErrorReturnsRequeue(t *testing.T) {
 	}
 }
 
+// TestPasswordFromSecret_EmptyReturnsError verifies that passwordFromSecret
+// returns an error for an empty or absent password key, enforcing the same
+// invariant on both the primary and race-loser read paths in ensureNeo4jPassword.
+func TestPasswordFromSecret_EmptyReturnsError(t *testing.T) {
+	cases := []struct {
+		name    string
+		data    map[string][]byte
+		wantErr bool
+	}{
+		{"nil data", nil, true},
+		{"missing key", map[string][]byte{"other": []byte("x")}, true},
+		{"empty value", map[string][]byte{"password": []byte("")}, true},
+		{"valid", map[string][]byte{"password": []byte("s3cr3t")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sec := &corev1.Secret{Data: tc.data}
+			pw, err := passwordFromSecret(sec, "test-secret")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got pw=%q", pw)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if pw != "s3cr3t" {
+					t.Fatalf("pw = %q, want s3cr3t", pw)
+				}
+			}
+		})
+	}
+}
+
+// TestReconcile_ProvisioningRequeuePreservedNoError verifies that Reconcile
+// returns RequeueAfter: memoryRequeue (not zero) when the memory stack is still
+// Provisioning and no error occurs. This exercises the same return value as the
+// transient-health-error path (which now also returns nil error + memoryRequeue
+// so the caller preserves the fixed 10s cadence rather than falling back to
+// exponential backoff).
+func TestReconcile_ProvisioningRequeuePreservedNoError(t *testing.T) {
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "prov-requeue-preserved")
+
+	res, err := reconcileMemory(t, r, p.Name)
+	if err != nil {
+		t.Fatalf("reconcile error: %v", err)
+	}
+	if res.RequeueAfter != memoryRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v (provisioning cadence)", res.RequeueAfter, memoryRequeue)
+	}
+}
+
 // fakeStackHealthy patches the owned objects' status subresources to the
 // healthy values the reconciler reads (no kubelet/cnpg-operator in envtest).
 func fakeStackHealthy(t *testing.T, project string) {

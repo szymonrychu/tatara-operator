@@ -17,6 +17,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,13 @@ const (
 // maxBodyBytes caps a single push body to keep a misbehaving client from
 // exhausting operator memory.
 const maxBodyBytes = 1 << 20 // 1 MiB
+
+// allowedPrefixes is the closed set of metric name prefixes accepted from
+// pushed wrapper series. Any family whose name does not start with one of
+// these is dropped and counted under
+// operator_push_series_dropped_total{reason="reserved_name"} so it cannot
+// collide with operator-owned collectors on the shared registry.
+var allowedPrefixes = []string{"wrapper_", "agent_"}
 
 // run holds one wrapper run's last pushed snapshot plus the time of that push.
 type run struct {
@@ -62,7 +70,7 @@ type Receiver struct {
 
 // New returns a Receiver that evicts a run's series ttl after its last push.
 func New(ttl time.Duration) *Receiver {
-	return &Receiver{
+	r := &Receiver{
 		ttl:  ttl,
 		now:  time.Now,
 		runs: map[string]*run{},
@@ -79,6 +87,15 @@ func New(ttl time.Duration) *Receiver {
 			Help: "Pushed metric series silently dropped by the receiver, by reason.",
 		}, []string{"reason"}),
 	}
+	// Pre-init label values so all result categories appear in Gather from
+	// startup, even before the first push, delete, or rejection arrives.
+	for _, result := range []string{"accepted", "rejected", "too_large", "deleted"} {
+		r.receiveTotal.WithLabelValues(result)
+	}
+	for _, reason := range []string{"reserved_name", "type_conflict", "build_error"} {
+		r.seriesDroppedTotal.WithLabelValues(reason)
+	}
+	return r
 }
 
 // Describe sends nothing, which registers the Receiver as an unchecked
@@ -269,6 +286,7 @@ func (r *Receiver) handlePush(w http.ResponseWriter, req *http.Request) {
 		r.mu.Lock()
 		delete(r.runs, runID)
 		r.mu.Unlock()
+		r.receiveTotal.WithLabelValues("deleted").Inc()
 		w.WriteHeader(http.StatusNoContent)
 	case http.MethodPost:
 		identity := map[string]string{labelRunID: runID}
@@ -279,7 +297,7 @@ func (r *Receiver) handlePush(w http.ResponseWriter, req *http.Request) {
 			identity[labelJob] = job
 		}
 		req.Body = http.MaxBytesReader(w, req.Body, maxBodyBytes)
-		families, err := parseAndStamp(req.Body, identity)
+		families, err := r.parseAndStamp(req.Body, identity)
 		if err != nil {
 			// http.MaxBytesReader sets the response status to 413 via
 			// (*maxBytesReader).Read when the limit is exceeded; we mirror
@@ -304,20 +322,39 @@ func (r *Receiver) handlePush(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// parseAndStamp parses Prometheus text-format metrics and overwrites the
-// identity labels on every series so a run can never spoof another's identity.
-func parseAndStamp(body io.Reader, identity map[string]string) (map[string]*dto.MetricFamily, error) {
+// parseAndStamp parses Prometheus text-format metrics, enforces the allowed
+// name prefix set, and overwrites the identity labels on every series so a run
+// can never spoof another's identity. Families whose names do not start with an
+// allowed prefix are dropped and counted under
+// operator_push_series_dropped_total{reason="reserved_name"}.
+func (r *Receiver) parseAndStamp(body io.Reader, identity map[string]string) (map[string]*dto.MetricFamily, error) {
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	families, err := parser.TextToMetricFamilies(body)
 	if err != nil {
 		return nil, err
 	}
-	for _, fam := range families {
+	out := make(map[string]*dto.MetricFamily, len(families))
+	for name, fam := range families {
+		if !hasAllowedPrefix(name) {
+			r.seriesDroppedTotal.WithLabelValues("reserved_name").Add(float64(len(fam.GetMetric())))
+			continue
+		}
 		for _, m := range fam.GetMetric() {
 			m.Label = stampLabels(m.GetLabel(), identity)
 		}
+		out[name] = fam
 	}
-	return families, nil
+	return out, nil
+}
+
+// hasAllowedPrefix reports whether name starts with one of allowedPrefixes.
+func hasAllowedPrefix(name string) bool {
+	for _, p := range allowedPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // stampLabels returns the label pairs with the identity labels forced to the

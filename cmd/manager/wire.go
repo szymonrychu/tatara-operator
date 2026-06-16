@@ -104,7 +104,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		},
 		Logger:  slog.Default(),
 		Metrics: metrics,
-	}).Mount(httpMux, auth.Middleware(verifier))
+	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))
 }
@@ -213,3 +213,8 @@ type callbackRunnable struct {
 func (c callbackRunnable) Start(ctx context.Context) error {
 	return c.srv.Start(ctx, c.addr)
 }
+
+// NeedLeaderElection implements manager.LeaderElectionRunnable. The callback
+// and push-metrics server is stateless and must start on every replica,
+// independent of leadership.
+func (c callbackRunnable) NeedLeaderElection() bool { return false }

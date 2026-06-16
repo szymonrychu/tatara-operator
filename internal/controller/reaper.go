@@ -51,6 +51,9 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		tasks[taskList.Items[i].Name] = &taskList.Items[i]
 	}
 
+	// Track which pod names are still alive (present and non-orphan) so the
+	// Service pass below can identify Services whose Pod is gone.
+	alivePods := make(map[string]struct{}, len(pods.Items))
 	for i := range pods.Items {
 		// Check context cancellation before each pod so we stop cleanly on shutdown.
 		if ctx.Err() != nil {
@@ -59,6 +62,7 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		pod := &pods.Items[i]
 		reason, orphan := s.orphanReason(pod, tasks)
 		if !orphan {
+			alivePods[pod.Name] = struct{}{}
 			continue
 		}
 		if err := s.reapWrapper(ctx, pod.Name); err != nil {
@@ -68,6 +72,51 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 			l.Info("reaped orphan wrapper pod", "action", "reap_orphan",
 				"resource_id", pod.Name, "task", pod.Labels[agent.LabelTask], "reason", reason)
 			s.Metrics.OrphanReaped(reason)
+		}
+	}
+
+	// Second pass: reap Services whose backing Pod is absent or was just reaped.
+	// This gives an independent retry path for Services whose delete failed
+	// transiently on a previous reaper cycle (the Pod may already be gone by
+	// then, so the pod-list-only pass would never see them again).
+	var svcs corev1.ServiceList
+	if err := s.Client.List(ctx, &svcs,
+		client.InNamespace(s.Namespace),
+		client.MatchingLabels(agent.WrapperPodSelector()),
+	); err != nil {
+		l.Error(err, "reaper: list wrapper services")
+		return
+	}
+	grace := s.ReaperGrace
+	if grace == 0 {
+		grace = pollRequeue
+	}
+	for i := range svcs.Items {
+		if ctx.Err() != nil {
+			return
+		}
+		svc := &svcs.Items[i]
+		if _, alive := alivePods[svc.Name]; alive {
+			// Pod is present and non-orphan; Service is fine.
+			continue
+		}
+		// Creation grace: a Service is created right after its Pod (see
+		// ensurePodAndService: Pod first, then Service). The Pod LIST above and
+		// this Service LIST hit the cache at different instants, so a freshly
+		// spawned Pod can be missing from alivePods while its Service is already
+		// visible. Never reap a Service younger than the grace window or this pass
+		// would delete a live Service out from under a still-propagating agent Pod
+		// and sever the operator -> wrapper connection.
+		if time.Since(svc.CreationTimestamp.Time) < grace {
+			continue
+		}
+		// No live Pod backs this Service; delete it.
+		del := svc.DeepCopy()
+		if err := s.Client.Delete(ctx, del); err != nil && !apierrors.IsNotFound(err) {
+			l.Error(err, "reaper: delete orphan service", "action", "reap_orphan_service", "resource_id", svc.Name)
+			s.Metrics.ReapDeleteError("service")
+		} else {
+			l.Info("reaped orphan wrapper service", "action", "reap_orphan_service", "resource_id", svc.Name)
 		}
 	}
 }

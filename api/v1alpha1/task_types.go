@@ -5,9 +5,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// ConditionApprovalApproved is set True once a human removes the approval label.
-const ConditionApprovalApproved = "ApprovalApproved"
-
 // ProposedIssueSpec is a tatara-proposed issue awaiting human approval.
 type ProposedIssueSpec struct {
 	RepositoryRef string `json:"repositoryRef"`
@@ -49,6 +46,8 @@ type IssueOutcome struct {
 	Action string `json:"action"`
 	// +optional
 	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
+	// +optional
+	Plan string `json:"plan,omitempty"` // short description of what will be implemented; posted as an implementation-start message when Action==implement
 }
 
 // ImplementOutcome is the agent's declared outcome for an implement task when
@@ -70,6 +69,8 @@ type ChangeSummary struct {
 	DeliveredScope string `json:"deliveredScope,omitempty"`
 	// +optional
 	RemainingScope string `json:"remainingScope,omitempty"`
+	// +optional
+	MostProblematic string `json:"mostProblematic,omitempty"` // most problematic part of the change; from the cli most_problematic field
 }
 
 // TaskSource records the SCM work-item that originated a webhook-born Task.
@@ -100,6 +101,9 @@ type TaskSpec struct {
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`
+	// ApprovalRequired is reserved for future use; no production code path reads
+	// this field for any gating decision. Approval is driven by the SCM
+	// conversation flow. Do not set this field expecting behavior - it has none.
 	// +optional
 	ApprovalRequired bool `json:"approvalRequired,omitempty"`
 	// +optional

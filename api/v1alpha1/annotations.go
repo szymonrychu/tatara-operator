@@ -29,6 +29,12 @@ const (
 // Status.LifecycleState == "").
 const LifecycleEntryAnnotation = "tatara.dev/lifecycle-entry"
 
+// AnnBrainstormSources is the annotation key carrying the comma-separated
+// brainstorm source list stamped on brainstorm Tasks by projectscan and read by
+// agent.BuildPod to gate the egress network label. Centralised here so the two
+// sites cannot drift.
+const AnnBrainstormSources = "tatara.dev/brainstorm-sources"
+
 // Label keys shared between the webhook binder and cron mrScan/issueScan so
 // their dedup keys are consistent.
 const (

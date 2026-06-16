@@ -46,7 +46,11 @@ type CallbackServer struct {
 }
 
 type turnCompletePayload struct {
-	TurnID          string          `json:"turnId"`
+	TurnID string `json:"turnId"`
+	// TaskName is optionally set by the wrapper (TATARA_TASK env) to enable
+	// O(1) task resolution via direct Get instead of full-namespace List+scan
+	// (findings 4, 6).
+	TaskName        string          `json:"taskName,omitempty"`
 	State           string          `json:"state"`
 	FinalText       string          `json:"finalText"`
 	StopReason      string          `json:"stopReason"`
@@ -95,8 +99,10 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Resolve once; pass the resolved task into both writes to avoid a second
-	// full-namespace List call (finding 2).
-	task, err := s.resolveTaskByTurn(r.Context(), p.TurnID)
+	// full-namespace List call. When the wrapper supplies taskName we do a
+	// direct Get (O(1)); otherwise fall back to the full-namespace List+scan
+	// for legacy wrappers (findings 4, 6).
+	task, err := s.resolveTaskByTurnWithHint(r.Context(), p.TurnID, p.TaskName)
 	if err != nil {
 		if errors.Is(err, errTurnNotFound) {
 			http.Error(w, "unknown turn", http.StatusNotFound)
@@ -108,7 +114,7 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 	}
 
 	if len(p.Usage) > 0 {
-		if err := s.recordUsage(r.Context(), task, p.Usage); err != nil {
+		if err := s.recordUsage(r.Context(), task, p.Usage, p.TurnID); err != nil {
 			l.Error(err, "record turn usage (non-fatal)", "turn_id", p.TurnID)
 			// non-fatal: continue to record the result
 		}
@@ -130,9 +136,12 @@ var errTurnNotFound = errors.New("no task with that current turn")
 // recordUsage parses a raw usage JSON blob and persists LastTurnInputTokens /
 // CumulativeTokens on the matching Task via RetryOnConflict.
 // Absent or unparseable usage is silently tolerated (no-op).
+// turnID is the turn being completed; the guard inside the closure bails when
+// the fresh Task's annCurrentTurn no longer matches (stale/duplicate callback)
+// or the task is terminal, preventing double-counting (finding 1).
 // task must be the already-resolved Task (resolved by the caller to avoid a
 // second full-namespace List call).
-func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.Task, raw json.RawMessage) error {
+func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.Task, raw json.RawMessage, turnID string) error {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -146,6 +155,13 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: task.Name}, fresh); err != nil {
 			return fmt.Errorf("reload task for usage: %w", err)
 		}
+		// Guard: stale callback or task already terminal - skip to avoid double-count.
+		if fresh.Annotations[annCurrentTurn] != turnID {
+			return nil
+		}
+		if isTerminal(fresh.Status.Phase) {
+			return nil
+		}
 		fresh.Status.LastTurnInputTokens = inputTotal
 		fresh.Status.CumulativeTokens += u.OutputTokens
 		return s.Client.Status().Update(ctx, fresh)
@@ -154,38 +170,21 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 
 // recordResult writes finalText onto the executing Subtask (if any) and bumps
 // the Task's turn-complete annotation to requeue its reconcile.
-// Both the Subtask status write and the Task annotation update are wrapped in
-// RetryOnConflict to handle concurrent reconcile updates.
+// Both writes happen inside a single RetryOnConflict that first fetches a fresh
+// Task and verifies the stale-turn and terminal guards before resolving the
+// current subtask name. This prevents a stale/duplicate callback from writing
+// its FinalText onto a newer subtask (findings 2, 5, 8).
 // task must be the already-resolved Task; turnID is the turn being completed.
-// A stale/duplicate callback (turnID != fresh annCurrentTurn) is silently
-// ignored so it cannot complete the wrong in-flight turn (finding 1).
-// Callbacks for already-terminal tasks are also ignored (finding 4).
 func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, task *tatarav1alpha1.Task, turnID string) error {
-	// Write subtask result on the status subresource; retry on conflict.
-	if sub := task.Annotations[annCurrentSubtask]; sub != "" {
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			st := &tatarav1alpha1.Subtask{}
-			if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: sub}, st); err != nil {
-				if apierrors.IsNotFound(err) {
-					return nil
-				}
-				return fmt.Errorf("get executing subtask: %w", err)
-			}
-			st.Status.Result = tr.FinalText
-			return s.Client.Status().Update(ctx, st)
-		}); err != nil {
-			return fmt.Errorf("write subtask result: %w", err)
-		}
-	}
-
-	// Stamp turn-complete on the Task annotation; retry on conflict with a fresh Get.
-	// Guard: bail out if the Task has advanced to a different turn (stale callback)
-	// or is already in a terminal phase (findings 1, 4).
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return fmt.Errorf("reload task: %w", err)
 		}
+		// Guard: bail out if the Task has advanced to a different turn (stale
+		// callback) or is already in a terminal phase. Must be checked before
+		// the subtask write so a stale callback cannot clobber a newer subtask
+		// result (findings 1, 2, 4, 5).
 		if fresh.Annotations[annCurrentTurn] != turnID {
 			// Turn has advanced or been cleared; stale callback - no-op.
 			return nil
@@ -194,18 +193,63 @@ func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, 
 			// Task already terminated (e.g. by the reconcile); no-op.
 			return nil
 		}
+
+		// Resolve annCurrentSubtask from the fresh object, not the caller's
+		// potentially-stale snapshot (finding 8).
+		if sub := fresh.Annotations[annCurrentSubtask]; sub != "" {
+			if err := func() error {
+				return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+					st := &tatarav1alpha1.Subtask{}
+					if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: sub}, st); err != nil {
+						if apierrors.IsNotFound(err) {
+							return nil
+						}
+						return fmt.Errorf("get executing subtask: %w", err)
+					}
+					st.Status.Result = tr.FinalText
+					return s.Client.Status().Update(ctx, st)
+				})
+			}(); err != nil {
+				return fmt.Errorf("write subtask result: %w", err)
+			}
+		}
+
+		// Stamp turn-complete to requeue the reconcile.
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
 		fresh.Annotations[annTurnComplete] = time.Now().UTC().Format(time.RFC3339)
-		if err := s.Client.Update(ctx, fresh); err != nil {
-			return err
-		}
-		return nil
+		return s.Client.Update(ctx, fresh)
 	})
 }
 
-// resolveTaskByTurn finds the Task whose current-turn annotation matches turnID.
+// resolveTaskByTurnWithHint finds the Task whose current-turn annotation
+// matches turnID. When taskName is non-empty it does a direct Get (O(1))
+// and verifies the annotation equality; this eliminates the full-namespace
+// List+scan on the hot callback path (findings 4, 6). When taskName is empty
+// (legacy wrappers that pre-date the taskName field) it falls back to the
+// full-namespace List+scan. Tasks with an empty annCurrentTurn are skipped to
+// prevent empty-to-empty matches.
+func (s *CallbackServer) resolveTaskByTurnWithHint(ctx context.Context, turnID, taskName string) (*tatarav1alpha1.Task, error) {
+	if taskName != "" {
+		t := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: taskName}, t); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, errTurnNotFound
+			}
+			return nil, fmt.Errorf("get task by name: %w", err)
+		}
+		if t.Annotations[annCurrentTurn] != turnID {
+			return nil, errTurnNotFound
+		}
+		return t, nil
+	}
+	return s.resolveTaskByTurn(ctx, turnID)
+}
+
+// resolveTaskByTurn finds the Task whose current-turn annotation matches turnID
+// via a full-namespace List scan. Prefer resolveTaskByTurnWithHint when the
+// caller knows the task name.
 // Tasks with an empty annCurrentTurn are skipped to prevent empty-to-empty matches.
 func (s *CallbackServer) resolveTaskByTurn(ctx context.Context, turnID string) (*tatarav1alpha1.Task, error) {
 	var list tatarav1alpha1.TaskList
@@ -430,7 +474,11 @@ func (s *CallbackServer) Start(ctx context.Context, addr string) error {
 	}()
 	go func() {
 		<-ctx.Done()
-		_ = srv.Shutdown(context.Background())
+		// Use a bounded context to avoid blocking shutdown forever if an
+		// in-flight handler is stuck (finding 7, mirrors webhook/server.go:823).
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
 	}()
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("callback server: %w", err)

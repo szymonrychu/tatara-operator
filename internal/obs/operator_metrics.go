@@ -31,6 +31,8 @@ type OperatorMetrics struct {
 	turnSubmitDuration        *prometheus.HistogramVec
 	agentHTTPTotal            *prometheus.CounterVec
 	agentHTTPDuration         *prometheus.HistogramVec
+	authTotal                 *prometheus.CounterVec
+	writebackOutcomeTotal     *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -143,6 +145,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help:    "Wall-clock duration of agent wrapper HTTP calls by method.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
 		}, []string{"method"}),
+		authTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_auth_total",
+			Help: "Total REST API auth attempts by result.",
+		}, []string{"result"}),
+		writebackOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_writeback_outcome_total",
+			Help: "Writeback terminal outcomes by result.",
+		}, []string{"result"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -170,6 +180,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.turnSubmitDuration,
 		m.agentHTTPTotal,
 		m.agentHTTPDuration,
+		m.authTotal,
+		m.writebackOutcomeTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -198,11 +210,17 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, action := range []string{"implement", "close"} {
 		m.issueOutcomeTotal.WithLabelValues(action)
 	}
-	for _, source := range []string{"reconcile", "poll_backstop"} {
+	for _, source := range []string{"reconcile", "poll_backstop", "planning_watchdog"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
 	for _, result := range []string{"success", "failure"} {
 		m.ingestJobTotal.WithLabelValues(result)
+	}
+	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token"} {
+		m.authTotal.WithLabelValues(result)
+	}
+	for _, result := range []string{"no_change", "skip_4xx", "no_pr", "opened"} {
+		m.writebackOutcomeTotal.WithLabelValues(result)
 	}
 	return m
 }
@@ -355,4 +373,26 @@ func (m *OperatorMetrics) TurnSubmit(kind, result string, seconds float64) {
 func (m *OperatorMetrics) AgentHTTP(method, outcome string, seconds float64) {
 	m.agentHTTPTotal.WithLabelValues(method, outcome).Inc()
 	m.agentHTTPDuration.WithLabelValues(method).Observe(seconds)
+}
+
+// RecordAuth increments operator_auth_total for the given result.
+// Valid results: "accepted", "missing_token", "invalid_scheme", "invalid_token".
+func (m *OperatorMetrics) RecordAuth(result string) {
+	m.authTotal.WithLabelValues(result).Inc()
+}
+
+// AuthCounter returns the counter for (result) for test assertions.
+func (m *OperatorMetrics) AuthCounter(result string) prometheus.Counter {
+	return m.authTotal.WithLabelValues(result)
+}
+
+// WritebackOutcome increments operator_writeback_outcome_total for the given
+// terminal result ("no_change", "skip_4xx", "no_pr", "opened").
+func (m *OperatorMetrics) WritebackOutcome(result string) {
+	m.writebackOutcomeTotal.WithLabelValues(result).Inc()
+}
+
+// WritebackOutcomeCounter returns the counter for (result) for test assertions.
+func (m *OperatorMetrics) WritebackOutcomeCounter(result string) prometheus.Counter {
+	return m.writebackOutcomeTotal.WithLabelValues(result)
 }

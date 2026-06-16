@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -115,12 +116,26 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 		URL:          wi.HTMLURL,
 		AuthorLogin:  wi.User.Login,
 		ActorLogin:   p.Sender.Login,
-		Action:       p.Action,
+		Action:       ghNormalizeAction(p.Action),
 		Number:       wi.Number,
 		IsPR:         isPR,
 		HeadSHA:      wi.Head.SHA,
 		HeadBranch:   wi.Head.Ref,
 		ChangedLabel: p.Label.Name,
+	}
+}
+
+// ghNormalizeAction maps a raw GitHub action to the same closed label set that
+// the GitLab path produces (see glActionAndLabel in gitlab.go). Any action not
+// in the known set collapses to "other" so the Prometheus label cardinality is
+// bounded regardless of which webhook event types are enabled on the repository.
+func ghNormalizeAction(action string) string {
+	switch action {
+	case "opened", "reopened", "labeled", "unlabeled", "closed",
+		"synchronize", "submitted", "created":
+		return action
+	default:
+		return "other"
 	}
 }
 
@@ -185,10 +200,12 @@ func ghOwnerRepo(repoURL string) (string, string, error) {
 	}
 	p := strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
 	parts := strings.Split(p, "/")
-	if len(parts) < 2 || parts[len(parts)-1] == "" || parts[len(parts)-2] == "" {
+	// GitHub repo URLs are exactly owner/repo; deeper paths (enterprise, teams,
+	// etc.) must be rejected rather than silently truncated to the last two segments.
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", "", fmt.Errorf("github: cannot derive owner/repo from %q", repoURL)
 	}
-	return parts[len(parts)-2], parts[len(parts)-1], nil
+	return parts[0], parts[1], nil
 }
 
 func ghIssueRef(ref string) (string, string, int, error) {
@@ -219,13 +236,22 @@ func ghLinkNext(header string) string {
 	return m[1]
 }
 
+// maxPaginationPages is an upper bound on the number of pages ghDoPaged and
+// glDoPaged will follow.  A legitimate scan across hundreds of open PRs/issues
+// should never exceed a few pages at per_page=100; 500 pages is a safety net
+// against a self-referential or non-advancing next link.
+const maxPaginationPages = 500
+
 // ghDoPaged performs paginated GET requests following Link rel="next" headers.
 // It decodes each page into a []T and appends to a single slice returned to the caller.
 // in must be nil (GET only). out must be a *[]T.
+// A self-referential next URL or more than maxPaginationPages pages is treated
+// as an error to prevent infinite loops.
 func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error) {
 	var all []T
 	nextURL := base + path
-	for nextURL != "" {
+	for pageNum := 0; pageNum < maxPaginationPages; pageNum++ {
+		prevURL := nextURL
 		var page []T
 		link, err := ghDoWithHeaders(ctx, nextURL, token, &page)
 		if err != nil {
@@ -234,12 +260,15 @@ func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 		all = append(all, page...)
 		raw := ghLinkNext(link)
 		if raw == "" {
-			break
+			return all, nil
+		}
+		if raw == prevURL {
+			return nil, fmt.Errorf("github: pagination stuck: next URL equals current URL %q", raw)
 		}
 		// The next URL may be absolute; strip the base so ghDoWithHeaders can use it directly.
 		nextURL = raw
 	}
-	return all, nil
+	return nil, fmt.Errorf("github: pagination exceeded %d pages", maxPaginationPages)
 }
 
 // ghDoWithHeaders performs a single GET, decodes JSON body into out, and returns the Link header.
@@ -322,10 +351,14 @@ func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 		Number  int    `json:"number"`
 		HTMLURL string `json:"html_url"`
 	}
+	t0 := time.Now()
 	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "create_issue", "resource_id", owner+"/"+repo, "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return CreatedIssue{}, err
 	}
-	return CreatedIssue{Ref: fmt.Sprintf("%s/%s#%d", owner, repo, out.Number), URL: out.HTMLURL}, nil
+	ref := fmt.Sprintf("%s/%s#%d", owner, repo, out.Number)
+	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "create_issue", "resource_id", ref, "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
+	return CreatedIssue{Ref: ref, URL: out.HTMLURL}, nil
 }
 
 // AddLabel adds a single label to an issue/PR identified by owner/repo#number.
@@ -374,6 +407,7 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 			SHA string `json:"sha"`
 			Ref string `json:"ref"`
 		} `json:"head"`
+		Merged bool `json:"merged"`
 	}
 	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), token, nil, &pr); err != nil {
 		return PRState{}, err
@@ -388,7 +422,7 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	if err != nil {
 		return PRState{}, err
 	}
-	return PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, CIStatus: ciStatus}, nil
+	return PRState{Author: pr.User.Login, HeadSHA: pr.Head.SHA, HeadBranch: pr.Head.Ref, CIStatus: ciStatus, Merged: pr.Merged}, nil
 }
 
 func deriveGHCIStatus(runs []ghCheckRun) string {
@@ -433,7 +467,17 @@ func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, 
 
 // Approve posts an APPROVE review.
 func (c *GitHub) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
-	return c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	t0 := time.Now()
+	if err := c.review(ctx, repoURL, token, number, "APPROVE", body, nil); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "approve", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
+		return err
+	}
+	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "approve", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
+	return nil
 }
 
 // RequestChanges posts a REQUEST_CHANGES review.
@@ -469,13 +513,16 @@ func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, m
 	var resp struct {
 		SHA string `json:"sha"`
 	}
+	t0 := time.Now()
 	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, &resp); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "merge", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		var he *HTTPError
 		if errors.As(err, &he) && (he.Status == 405 || he.Status == 409) {
 			return "", ErrMergeConflict
 		}
 		return "", err
 	}
+	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "merge", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	return resp.SHA, nil
 }
 
@@ -486,9 +533,12 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 		return err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
+	t0 := time.Now()
 	if err := ghDo(ctx, c.base(), http.MethodPatch, path, token, map[string]string{"state": "closed"}, nil); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "close_pr", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return err
 	}
+	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "close_pr", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	if body == "" {
 		return nil
 	}
@@ -542,6 +592,11 @@ func (c *GitHub) commitCIStatus(ctx context.Context, owner, repo, sha, token str
 			combinedStatus = "pending"
 		case "failure", "error":
 			combinedStatus = "failure"
+		default:
+			// Unknown state with statuses present: fail-safe to "pending" so an
+			// unrecognised GitHub state never silently becomes no-data on the
+			// merge gate (unlike deriveGHCIStatus which fails closed).
+			combinedStatus = "pending"
 		}
 	}
 

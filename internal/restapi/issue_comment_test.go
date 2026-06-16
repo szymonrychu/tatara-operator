@@ -6,11 +6,15 @@ package restapi_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
@@ -21,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -240,4 +245,108 @@ func TestCommentOnIssue_LogsAction(t *testing.T) {
 	var resp map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	require.Equal(t, "ok", resp["status"])
+}
+
+// --- Finding 8: project with no SCM provider returns 409 not 500 ---
+
+func projectWithoutSCM(name string) *tatarav1alpha1.Project {
+	return &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
+		Spec: tatarav1alpha1.ProjectSpec{
+			TriggerLabel:       "tatara",
+			MaxConcurrentTasks: 3,
+			ScmSecretRef:       name + "-scm",
+		},
+	}
+}
+
+func TestCommentOnIssue_NoSCMProvider_Returns409(t *testing.T) {
+	writer := &fakeWriter{}
+	proj := projectWithoutSCM("proj6")
+	secret := scmSecret("proj6-scm", "tok6")
+	repo := repoForProject("proj6-repo", "proj6", "https://github.com/o/r.git")
+
+	r := buildRouterWithSCM(t, writer, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":1,"body":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/proj6/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "no scm provider")
+}
+
+// --- Finding 4/12: SCM comment metric is recorded ---
+
+func buildRouterWithSCMAndMetrics(t *testing.T, writer scm.SCMWriter, m *obs.OperatorMetrics, objs ...client.Object) *chi.Mux {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&tatarav1alpha1.Project{}, &tatarav1alpha1.Repository{},
+			&tatarav1alpha1.Task{}, &tatarav1alpha1.Subtask{}).
+		Build()
+	s := restapi.NewServer(restapi.Config{
+		Client:    fc,
+		Namespace: "tatara",
+		SCMFor: func(_ string) (scm.SCMWriter, error) {
+			return writer, nil
+		},
+		Metrics: m,
+	})
+	r := chi.NewRouter()
+	s.Mount(r, nil)
+	return r
+}
+
+func TestCommentOnIssue_RecordsSCMWriteMetric(t *testing.T) {
+	writer := &fakeWriter{}
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	proj := projectWithSCM("proj7", "proj7-scm")
+	secret := scmSecret("proj7-scm", "tok7")
+	repo := repoForProject("proj7-repo", "proj7", "https://github.com/o/repo.git")
+
+	r := buildRouterWithSCMAndMetrics(t, writer, m, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/repo","number":10,"body":"metric test"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/proj7/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	// Confirm metric was incremented for provider=github, verb=comment, result=ok.
+	ctr := m.SCMWriteCounter("github", "comment", "ok")
+	require.NotNil(t, ctr)
+	var metric dto.Metric
+	require.NoError(t, ctr.Write(&metric))
+	require.EqualValues(t, 1, metric.GetCounter().GetValue())
+}
+
+func TestCommentOnIssue_RecordsSCMWriteMetricOnError(t *testing.T) {
+	writer := &fakeWriter{commentErr: fmt.Errorf("scm unavailable")}
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	proj := projectWithSCM("proj8", "proj8-scm")
+	secret := scmSecret("proj8-scm", "tok8")
+	repo := repoForProject("proj8-repo", "proj8", "https://github.com/o/repo2.git")
+
+	r := buildRouterWithSCMAndMetrics(t, writer, m, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/repo2","number":11,"body":"will fail"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/proj8/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	ctr := m.SCMWriteCounter("github", "comment", "error")
+	require.NotNil(t, ctr)
+	var metric dto.Metric
+	require.NoError(t, ctr.Write(&metric))
+	require.EqualValues(t, 1, metric.GetCounter().GetValue())
 }

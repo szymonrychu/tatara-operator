@@ -59,6 +59,40 @@ func TestTokenSource_PropagatesError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestTokenSource_RespectsCallerCtxCancellation verifies that Token honours a
+// caller-supplied cancelled context and returns promptly rather than running up
+// to the baked tokenMintTimeout.
+func TestTokenSource_RespectsCallerCtxCancellation(t *testing.T) {
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-unblock // block until test unblocks
+	}))
+	defer func() {
+		close(unblock)
+		srv.Close()
+	}()
+
+	ts := auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     srv.URL,
+		ClientID:     "tatara-operator",
+		ClientSecret: "shh",
+		Audience:     "tatara-memory",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel immediately before calling Token.
+	cancel()
+
+	start := time.Now()
+	_, err := ts.Token(ctx)
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "expected error from cancelled context")
+	// Should return almost instantly (well under 1s), not block for tokenMintTimeout (10s).
+	require.Less(t, elapsed, 2*time.Second,
+		"Token() blocked for %s after ctx cancel - ctx not honoured", elapsed)
+}
+
 // TestTokenSource_RespectsHTTPTimeout verifies that a hung token endpoint does
 // not block the caller indefinitely. The HTTP client baked into the source must
 // carry a finite timeout so a slow/wedged Keycloak cannot hold a reconcile

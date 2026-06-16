@@ -15,10 +15,13 @@ type Verifier struct {
 }
 
 // Claims holds the parsed and validated token claims.
+// Subject and Issuer are set from the verifier-validated token fields
+// (tok.Subject / tok.Issuer), not from the raw JSON payload, so they carry
+// no json tags. Only PreferredUsername is decoded via Claims() from the payload.
 type Claims struct {
-	Subject           string `json:"sub"`
+	Subject           string
 	PreferredUsername string `json:"preferred_username"`
-	Issuer            string `json:"iss"`
+	Issuer            string
 }
 
 // NewVerifier discovers the OIDC provider at cfg.Issuer and returns a ready Verifier.

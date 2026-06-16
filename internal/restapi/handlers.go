@@ -21,6 +21,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -53,6 +54,37 @@ func writeClientErr(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
+// authorizeForTask gates a mutating task handler on the caller carrying a valid
+// OIDC bearer token (a non-empty, verifier-validated Subject) for the operator
+// audience. The auth middleware has already verified the issuer, audience and
+// signature before this runs; this is the in-handler assertion that a verified
+// identity is present.
+//
+// NOTE: per-task (object-level) authorization keyed on the agent Pod name is NOT
+// enforceable under the current identity model. Every agent Pod mints its bearer
+// token via a SINGLE shared OIDC client (CLI_OIDC_CLIENT_ID/SECRET, client-
+// credentials grant), so the token's sub is the Keycloak service-account UUID
+// and preferred_username is "service-account-<client-id>" - identical for every
+// Pod and never equal to agent.PodName(t). Comparing claims to the Pod name
+// would 403 every legitimate agent write. Tightening to per-task scope requires
+// per-Pod identity (e.g. a projected ServiceAccount token whose sub is the Pod's
+// ServiceAccount, or a token-exchange that stamps the Pod/Task into the sub),
+// tracked in MEMORY/ROADMAP. When no Claims are present (middleware absent, e.g.
+// tests) the check is skipped. Returns false and writes a 403 on failure.
+func authorizeForTask(w http.ResponseWriter, r *http.Request, t *tatarav1alpha1.Task) bool {
+	_ = t
+	claims, ok := auth.ClaimsFromContext(r.Context())
+	if !ok {
+		// No auth middleware in this path; skip enforcement.
+		return true
+	}
+	if claims.Subject != "" {
+		return true
+	}
+	writeError(w, http.StatusForbidden, "caller has no verified identity")
+	return false
+}
+
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 	var list tatarav1alpha1.ProjectList
 	if err := s.c.List(r.Context(), &list, client.InNamespace(s.ns)); err != nil {
@@ -77,7 +109,12 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
-	proj := chi.URLParam(r, "p")
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
 	var list tatarav1alpha1.RepositoryList
 	if err := s.c.List(r.Context(), &list, client.InNamespace(s.ns)); err != nil {
 		writeClientErr(w, err)
@@ -85,7 +122,7 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]RepositoryDTO, 0)
 	for i := range list.Items {
-		if list.Items[i].Spec.ProjectRef == proj {
+		if list.Items[i].Spec.ProjectRef == projName {
 			out = append(out, toRepositoryDTO(list.Items[i]))
 		}
 	}
@@ -93,7 +130,12 @@ func (s *Server) listRepositories(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
-	proj := chi.URLParam(r, "p")
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
 	var list tatarav1alpha1.TaskList
 	if err := s.c.List(r.Context(), &list, client.InNamespace(s.ns)); err != nil {
 		writeClientErr(w, err)
@@ -101,7 +143,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]TaskDTO, 0)
 	for i := range list.Items {
-		if list.Items[i].Spec.ProjectRef == proj {
+		if list.Items[i].Spec.ProjectRef == projName {
 			out = append(out, toTaskDTO(list.Items[i]))
 		}
 	}
@@ -140,6 +182,13 @@ func (s *Server) patchTask(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
@@ -258,6 +307,12 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "repositoryRef, title, body, kind required")
 		return
 	}
+	switch req.Kind {
+	case "bug", "improvement":
+	default:
+		writeError(w, http.StatusBadRequest, "kind must be bug or improvement")
+		return
+	}
 	projName := chi.URLParam(r, "p")
 	var proj tatarav1alpha1.Project
 	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
@@ -309,6 +364,9 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 		"project", projName,
 		"repository", req.RepositoryRef,
 		"duration_ms", time.Since(start).Milliseconds())
+	if s.metrics != nil {
+		s.metrics.ScanTaskCreated("propose", "implement")
+	}
 	// The proposal Task starts Pending; the controller opens the idea-labelled
 	// issue and completes the Task (Succeeded). No AwaitingApproval parking.
 	writeJSON(w, http.StatusCreated, toTaskDTO(*task))
@@ -330,7 +388,6 @@ type issueCommentOnProjectReq struct {
 // Response:     200 { status: "ok" }
 // Errors:       400 missing/zero fields; 404 project/repo not found; 500 SCM error.
 func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
-	l := log.FromContext(r.Context())
 	var req issueCommentOnProjectReq
 	if err := decodeJSON(r, w, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
@@ -390,8 +447,14 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
+	if provider == "" {
+		writeError(w, http.StatusConflict, "project has no scm provider configured")
+		return
+	}
 	writer, err := s.scmFor(provider)
 	if err != nil {
+		s.log.ErrorContext(r.Context(), "restapi: commentOnIssue scm factory failed",
+			"err", err, "project", projName, "provider", provider)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -399,6 +462,8 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	// Fetch the project's SCM token from its secret.
 	var sec corev1.Secret
 	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
+		s.log.ErrorContext(r.Context(), "restapi: commentOnIssue secret fetch failed",
+			"err", err, "project", projName, "secret", proj.Spec.ScmSecretRef)
 		if apierrors.IsNotFound(err) {
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -408,17 +473,29 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	token := string(sec.Data["token"])
 
+	start := time.Now()
 	issueRef := fmt.Sprintf("%s#%d", req.Repo, req.Number)
-	if err := writer.Comment(r.Context(), token, issueRef, req.Body); err != nil {
+	commentErr := writer.Comment(r.Context(), token, issueRef, req.Body)
+	result := "ok"
+	if commentErr != nil {
+		result = "error"
+	}
+	if s.metrics != nil {
+		s.metrics.SCMWrite(provider, "comment", result)
+	}
+	if commentErr != nil {
+		s.log.ErrorContext(r.Context(), "restapi: commentOnIssue scm write failed",
+			"err", commentErr, "project", projName, "repo", req.Repo)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
-	l.Info("restapi: posted issue comment via scm",
+	s.log.InfoContext(r.Context(), "restapi: commentOnIssue",
 		"action", "scm_issue_comment",
 		"project", projName,
 		"repo", req.Repo,
-		"number", req.Number)
+		"number", req.Number,
+		"duration_ms", time.Since(start).Milliseconds())
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -447,13 +524,24 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
+	if t.Spec.Kind != "review" {
+		writeError(w, http.StatusConflict, "review verdict only applies to a review task")
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
 			return gerr
 		}
 		if t.Spec.Kind != "review" {
-			return nil // kind check handled outside retry
+			return nil
 		}
 		t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
 		return s.c.Status().Update(r.Context(), &t)
@@ -496,6 +584,17 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
+	if t.Spec.Kind != "selfImprove" {
+		writeError(w, http.StatusConflict, "pr outcome only applies to a selfImprove task")
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
@@ -525,6 +624,7 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 type issueOutcomeReq struct {
 	Action  string `json:"action"`
 	Comment string `json:"comment,omitempty"`
+	Plan    string `json:"plan,omitempty"` // posted as implementation-start message when action==implement
 }
 
 func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
@@ -549,6 +649,17 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
+	if t.Spec.Kind != "triageIssue" && t.Spec.Kind != "issueLifecycle" {
+		writeError(w, http.StatusConflict, "issue outcome only applies to a triageIssue or issueLifecycle task")
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
@@ -557,7 +668,7 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		if t.Spec.Kind != "triageIssue" && t.Spec.Kind != "issueLifecycle" {
 			return nil
 		}
-		t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment}
+		t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment, Plan: req.Plan}
 		return s.c.Status().Update(r.Context(), &t)
 	}); err != nil {
 		writeClientErr(w, err)
@@ -605,6 +716,17 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
+	if t.Spec.Kind != "issueLifecycle" {
+		writeError(w, http.StatusConflict, "implement outcome only applies to an issueLifecycle task")
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
@@ -653,6 +775,9 @@ func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
 	// Only issueLifecycle Tasks have the reconcile drain that posts queued
 	// comments; queuing on any other kind would leak forever.
 	if t.Spec.Kind != "issueLifecycle" {
@@ -689,10 +814,11 @@ func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
 // --- M4 Task 2: POST /tasks/{t}/change-summary ---
 
 type changeSummaryReq struct {
-	PRTitle        string `json:"prTitle,omitempty"`
-	PRBody         string `json:"prBody,omitempty"`
-	DeliveredScope string `json:"deliveredScope,omitempty"`
-	RemainingScope string `json:"remainingScope,omitempty"`
+	PRTitle         string `json:"prTitle,omitempty"`
+	PRBody          string `json:"prBody,omitempty"`
+	DeliveredScope  string `json:"deliveredScope,omitempty"`
+	RemainingScope  string `json:"remainingScope,omitempty"`
+	MostProblematic string `json:"mostProblematic,omitempty"` // from cli most_problematic field
 }
 
 func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
@@ -703,16 +829,24 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
 			return gerr
 		}
 		t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
-			PRTitle:        req.PRTitle,
-			PRBody:         req.PRBody,
-			DeliveredScope: req.DeliveredScope,
-			RemainingScope: req.RemainingScope,
+			PRTitle:         req.PRTitle,
+			PRBody:          req.PRBody,
+			DeliveredScope:  req.DeliveredScope,
+			RemainingScope:  req.RemainingScope,
+			MostProblematic: req.MostProblematic,
 		}
 		return s.c.Status().Update(r.Context(), &t)
 	}); err != nil {
@@ -758,6 +892,13 @@ func (s *Server) handover(w http.ResponseWriter, r *http.Request) {
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
 	start := time.Now()
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {

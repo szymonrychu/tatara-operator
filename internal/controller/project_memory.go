@@ -31,11 +31,7 @@ func (r *ProjectReconciler) ensureNeo4jPassword(ctx context.Context, p *tatarade
 	err := r.Get(ctx, key, &existing)
 	switch {
 	case err == nil:
-		pw := string(existing.Data["password"])
-		if pw == "" {
-			return "", fmt.Errorf("neo4j secret %s missing password key", names.Neo4jSecret)
-		}
-		return pw, nil
+		return passwordFromSecret(&existing, names.Neo4jSecret)
 	case !apierrors.IsNotFound(err):
 		return "", fmt.Errorf("get neo4j secret: %w", err)
 	}
@@ -51,9 +47,20 @@ func (r *ProjectReconciler) ensureNeo4jPassword(ctx context.Context, p *tatarade
 			if err := r.Get(ctx, key, &existing); err != nil {
 				return "", fmt.Errorf("get neo4j secret after race: %w", err)
 			}
-			return string(existing.Data["password"]), nil
+			return passwordFromSecret(&existing, names.Neo4jSecret)
 		}
 		return "", fmt.Errorf("create neo4j secret: %w", err)
+	}
+	return pw, nil
+}
+
+// passwordFromSecret extracts and validates the "password" key from a Secret.
+// It returns an error if the key is absent or empty, applying the same
+// invariant on every read path (primary and race-loser).
+func passwordFromSecret(sec *corev1.Secret, secretName string) (string, error) {
+	pw := string(sec.Data["password"])
+	if pw == "" {
+		return "", fmt.Errorf("neo4j secret %s missing password key", secretName)
 	}
 	return pw, nil
 }
@@ -212,14 +219,19 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		// A non-NotFound read is a transient API/cache blip, not a real failure
 		// (NotFound is already handled as not-yet-ready inside memoryStackHealth).
 		// Leave the phase and MemoryReady condition as they are so a healthy
-		// stack does not flap to Failed on a 30s blip. Return memoryRequeue so
-		// the Provisioning polling cadence is preserved; error backoff also
-		// requeues but the caller may inspect the duration.
+		// stack does not flap to Failed on a 30s blip. Return nil so the caller
+		// preserves the 10s memoryRequeue cadence; returning an error here would
+		// cause the caller to discard requeueAfter and fall back to exponential
+		// backoff instead of the intended fixed poll.
 		// Failed is reserved for genuine apply/password errors.
 		if p.Status.Memory.Phase == "" {
 			p.Status.Memory.Phase = "Provisioning"
 		}
-		return memoryRequeue, fmt.Errorf("reconcile memory health: %w", err)
+		l.Info("transient memory health read error, will retry",
+			"action", "memory_health_retry",
+			"resource_id", p.Name,
+			"error", err.Error())
+		return memoryRequeue, nil
 	}
 
 	phase := memoryPhase(readyInstances, effectivePGInstances(p), neo4jReady, lightragAvail, memoryAvail)

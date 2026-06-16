@@ -494,6 +494,11 @@ type fullFakeSCMWriter struct {
 	// triageIssue path
 	closeIssueCalled bool
 	closeIssueNumber int
+	// AddLabel
+	addLabelCalled   bool
+	addLabelIssueRef string
+	addLabelLabel    string
+	addLabelErr      error
 	// GetPRState
 	prState    scm.PRState
 	prStateErr error
@@ -537,6 +542,12 @@ func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, 
 	f.closePRCalled = true
 	f.closePRNumber = number
 	return nil
+}
+func (f *fullFakeSCMWriter) AddLabel(_ context.Context, _, issueRef, label string) error {
+	f.addLabelCalled = true
+	f.addLabelIssueRef = issueRef
+	f.addLabelLabel = label
+	return f.addLabelErr
 }
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr

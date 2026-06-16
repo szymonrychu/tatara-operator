@@ -34,17 +34,23 @@ func TestMemoryDeployment(t *testing.T) {
 	require.True(t, cmRef, "configMapRef mem-acme missing from envFrom")
 	require.True(t, secRef, "secretRef mem-acme missing from envFrom")
 
-	// PG_DSN from the cnpg app secret key uri.
-	var dsn corev1.EnvVar
-	var found bool
+	// Env vars: PG_DSN and OPENAI_API_KEY must both be present.
+	envByName := make(map[string]corev1.EnvVar)
 	for _, e := range c.Env {
-		if e.Name == "PG_DSN" {
-			dsn, found = e, true
-		}
+		envByName[e.Name] = e
 	}
-	require.True(t, found)
+
+	dsn, found := envByName["PG_DSN"]
+	require.True(t, found, "PG_DSN env missing")
 	require.Equal(t, "mem-acme-pg-app", dsn.ValueFrom.SecretKeyRef.Name)
 	require.Equal(t, "uri", dsn.ValueFrom.SecretKeyRef.Key)
+
+	// OPENAI_API_KEY must be wired to the shared OpenAI secret so the
+	// tatara-memory community labeler can use LLM labels (not degrade silently).
+	oai, found := envByName["OPENAI_API_KEY"]
+	require.True(t, found, "OPENAI_API_KEY env missing from MemoryDeployment")
+	require.Equal(t, "tatara-openai", oai.ValueFrom.SecretKeyRef.Name)
+	require.Equal(t, "LLM_BINDING_API_KEY", oai.ValueFrom.SecretKeyRef.Key)
 }
 
 func TestMemoryDeployment_ImagePullSecrets(t *testing.T) {

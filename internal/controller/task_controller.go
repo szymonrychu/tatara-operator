@@ -270,7 +270,10 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 			return ctrl.Result{}, fmt.Errorf("set planning phase: %w", err)
 		}
 		task.Status.Phase = "Planning"
-		r.updateInflightGauge(ctx)
+		// updateInflightGauge is called by Reconcile on the shared success path;
+		// calling it here again would produce two full-namespace TaskList calls
+		// per reconcile on the Planning transition (the only case where both this
+		// branch and Reconcile's success path both run).
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
@@ -739,17 +742,48 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
 	l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
 		"turn_id", id, "subtask", next.Name, "duration_ms", int64(elapsed*1000))
+	// Persist the new turn id BEFORE flipping phases so that if either
+	// Status().Update below conflicts (the callback server may write the same
+	// Task's status subresource concurrently), the turn id is already recorded
+	// and a retry does not re-enter the 'callback arrived' branch with the old
+	// turn, which would skip this subtask entirely.
+	res, rerr := r.recordTurn(ctx, task, id, next.Name)
+	if rerr != nil {
+		return ctrl.Result{}, rerr
+	}
+	// Flip subtask and task to Running. Both are wrapped in RetryOnConflict
+	// to match the pattern used everywhere else in this controller: the
+	// callback server writes status concurrently on the turn-complete path,
+	// so a plain update races and may return a conflict.
 	if next.Status.Phase != "Running" {
-		next.Status.Phase = "Running"
-		if err := r.Status().Update(ctx, next); err != nil {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Subtask{}
+			if err := r.Get(ctx, types.NamespacedName{Namespace: next.Namespace, Name: next.Name}, fresh); err != nil {
+				return err
+			}
+			if fresh.Status.Phase == "Running" {
+				return nil
+			}
+			fresh.Status.Phase = "Running"
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("set subtask running: %w", err)
 		}
 	}
-	task.Status.Phase = "Running"
-	if err := r.Status().Update(ctx, task); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if fresh.Status.Phase == "Running" {
+			return nil
+		}
+		fresh.Status.Phase = "Running"
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set task running: %w", err)
 	}
-	return r.recordTurn(ctx, task, id, next.Name)
+	return res, nil
 }
 
 // turnCap returns the maximum turns allowed for this Task.
