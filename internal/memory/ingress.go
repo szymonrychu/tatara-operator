@@ -32,14 +32,24 @@ func Ingress(p *tatarav1alpha1.Project, cfg Config) *networkingv1.Ingress {
 				Name: "chat-" + p.Name, Port: networkingv1.ServiceBackendPort{Number: 8080}}},
 		})
 	}
-	className := cfg.IngressClassName
 	meta := objectMeta(p, cfg, p.Name)
-	meta.Annotations = map[string]string{"nginx.ingress.kubernetes.io/rewrite-target": "/$2"}
+	// Emit the nginx-specific rewrite-target annotation only when configured, so
+	// a non-nginx controller is not handed nginx annotations (rule 14).
+	if cfg.IngressRewriteTarget != "" {
+		meta.Annotations = map[string]string{"nginx.ingress.kubernetes.io/rewrite-target": cfg.IngressRewriteTarget}
+	}
+	// Leave IngressClassName nil (cluster default IngressClass applies) when
+	// unconfigured, rather than a pointer-to-empty-string.
+	var className *string
+	if cfg.IngressClassName != "" {
+		c := cfg.IngressClassName
+		className = &c
+	}
 	return &networkingv1.Ingress{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "Ingress"},
 		ObjectMeta: meta,
 		Spec: networkingv1.IngressSpec{
-			IngressClassName: &className,
+			IngressClassName: className,
 			Rules: []networkingv1.IngressRule{{
 				Host:             cfg.IngressHost,
 				IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{Paths: paths}},

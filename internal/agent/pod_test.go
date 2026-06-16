@@ -371,6 +371,46 @@ func TestBuildPod_SecurityContext(t *testing.T) {
 	require.Equal(t, uid, *sc.RunAsUser)
 }
 
+// TestBuildPod_FSGroup asserts that FSGroup in PodConfig propagates to a
+// pod-level SecurityContext so mounted-volume ownership matches the runtime UID.
+func TestBuildPod_FSGroup(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	fsg := int64(65532)
+	cfg.FSGroup = &fsg
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	require.NotNil(t, pod.Spec.SecurityContext)
+	require.Equal(t, fsg, *pod.Spec.SecurityContext.FSGroup)
+}
+
+// TestBuildPod_NoPodSecurityContextWhenUnset asserts that an unset FSGroup
+// leaves the pod-level SecurityContext nil (no constraint).
+func TestBuildPod_NoPodSecurityContextWhenUnset(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.FSGroup = nil
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	require.Nil(t, pod.Spec.SecurityContext)
+}
+
+// TestBuildPod_Affinity asserts that Affinity in PodConfig propagates to the
+// PodSpec.
+func TestBuildPod_Affinity(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.Affinity = &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key: "disktype", Operator: corev1.NodeSelectorOpIn, Values: []string{"ssd"},
+					}},
+				}},
+			},
+		},
+	}
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	require.NotNil(t, pod.Spec.Affinity)
+	require.NotNil(t, pod.Spec.Affinity.NodeAffinity)
+}
+
 // TestBuildPod_Tolerations asserts that Tolerations in PodConfig propagate to
 // the PodSpec.
 func TestBuildPod_Tolerations(t *testing.T) {

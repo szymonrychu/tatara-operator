@@ -13,21 +13,59 @@ import (
 )
 
 func TestPodConfigFromConfig(t *testing.T) {
+	uid := int64(65532)
+	fsg := int64(65532)
 	cfg := config.Config{
 		Namespace:           "tatara",
 		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082",
+		OIDCIssuer:          "https://kc/realms/tatara",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
+		ImagePullSecret:     "regcred",
+		OperatorURL:         "http://tatara-operator.tatara.svc:8080",
+		AgentCPURequest:     "250m",
+		AgentCPULimit:       "1",
+		AgentMemoryRequest:  "256Mi",
+		AgentMemoryLimit:    "1Gi",
+		AgentRunAsNonRoot:   true,
+		AgentRunAsUser:      &uid,
+		AgentFSGroup:        &fsg,
 	}
 	got := podConfigFromConfig(cfg)
 	want := agent.PodConfig{
 		Namespace:           "tatara",
 		CallbackURL:         "http://tatara-operator-internal.tatara.svc:8082",
+		OIDCIssuer:          "https://kc/realms/tatara",
 		AnthropicSecretName: "anthropic",
 		CLIOIDCSecretName:   "tatara-cli-oidc",
+		ImagePullSecret:     "regcred",
+		OperatorURL:         "http://tatara-operator.tatara.svc:8080",
+		CPURequest:          "250m",
+		CPULimit:            "1",
+		MemoryRequest:       "256Mi",
+		MemoryLimit:         "1Gi",
+		RunAsNonRoot:        true,
+		RunAsUser:           &uid,
+		FSGroup:             &fsg,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("podConfigFromConfig = %+v, want %+v", got, want)
+	}
+}
+
+// TestPodConfigFromConfig_Scheduling asserts the cluster-specific scheduling
+// JSON (nodeSelector/tolerations/affinity) is parsed and applied to PodConfig.
+func TestPodConfigFromConfig_Scheduling(t *testing.T) {
+	cfg := config.Config{
+		AgentScheduling: `{"nodeSelector":{"kubernetes.io/os":"linux"},` +
+			`"tolerations":[{"key":"dedicated","operator":"Exists","effect":"NoSchedule"}]}`,
+	}
+	got := podConfigFromConfig(cfg)
+	if got.NodeSelector["kubernetes.io/os"] != "linux" {
+		t.Fatalf("NodeSelector not applied: %+v", got.NodeSelector)
+	}
+	if len(got.Tolerations) != 1 || got.Tolerations[0].Key != "dedicated" {
+		t.Fatalf("Tolerations not applied: %+v", got.Tolerations)
 	}
 }
 

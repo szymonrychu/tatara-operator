@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 // fakeClock is a manually advanced clock for deterministic TTL tests.
@@ -213,6 +214,52 @@ func TestTypeConflict_DropsConflictingSeries(t *testing.T) {
 	dropped := testutil.ToFloat64(r.seriesDroppedTotal.WithLabelValues("type_conflict"))
 	if dropped < 1 {
 		t.Fatalf("type_conflict dropped = %v, want >= 1", dropped)
+	}
+}
+
+// TestTypeConflict_StableSurvivingSeries asserts that on a metric-name type
+// conflict the SAME run's series survives across scrapes (residual #3). The
+// first-seen type was previously decided by nondeterministic map iteration, so
+// the surviving series flickered scrape-to-scrape. Collect must order runs
+// deterministically by run key.
+func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
+	r := New(time.Minute)
+	// run-a publishes m as COUNTER value 1; run-z as GAUGE value 2. With a stable
+	// (sorted) iteration order, run-a is first-seen, so its COUNTER value 1 wins
+	// every scrape.
+	push(t, r, "run_id=run-a", "# TYPE m counter\nm 1\n")
+	push(t, r, "run_id=run-z", "# TYPE m gauge\nm 2\n")
+
+	survivingM := func() float64 {
+		ch := make(chan prometheus.Metric, 64)
+		go func() { r.Collect(ch); close(ch) }()
+		var vals []float64
+		for metric := range ch {
+			var pb dto.Metric
+			if err := metric.Write(&pb); err != nil {
+				continue
+			}
+			if !strings.HasPrefix(metric.Desc().String(), `Desc{fqName: "m"`) {
+				continue
+			}
+			switch {
+			case pb.Counter != nil:
+				vals = append(vals, pb.Counter.GetValue())
+			case pb.Gauge != nil:
+				vals = append(vals, pb.Gauge.GetValue())
+			}
+		}
+		if len(vals) != 1 {
+			t.Fatalf("expected exactly 1 surviving 'm' series, got %d (%v)", len(vals), vals)
+		}
+		return vals[0]
+	}
+
+	first := survivingM()
+	for i := 0; i < 20; i++ {
+		if got := survivingM(); got != first {
+			t.Fatalf("surviving 'm' series flickered: scrape %d = %v, first = %v", i, got, first)
+		}
 	}
 }
 

@@ -18,7 +18,7 @@ func TestIngress_NilWhenNoHost(t *testing.T) {
 }
 
 func TestIngress_MemoryPathOnly(t *testing.T) {
-	cfg := Config{Namespace: "tatara", IngressHost: "tatara.szymonrichert.pl", IngressClassName: "nginx", MemoryPathPrefix: "/api/v1/memory"}
+	cfg := Config{Namespace: "tatara", IngressHost: "tatara.szymonrichert.pl", IngressClassName: "nginx", IngressRewriteTarget: "/$2", MemoryPathPrefix: "/api/v1/memory"}
 	ing := Ingress(testProject("alpha"), cfg)
 	if ing == nil {
 		t.Fatal("expected non-nil ingress")
@@ -59,6 +59,41 @@ func TestIngress_AddsChatPath(t *testing.T) {
 	}
 	if paths[1].Path != "/api/v1/chat/alpha(/|$)(.*)" || paths[1].Backend.Service.Name != "chat-alpha" {
 		t.Fatalf("chat path/backend: %s %s", paths[1].Path, paths[1].Backend.Service.Name)
+	}
+}
+
+// TestIngress_NoRewriteWhenUnset asserts the nginx-specific rewrite-target
+// annotation is NOT emitted when IngressRewriteTarget is empty (cluster-agnostic,
+// rule 14): a non-nginx controller must not be handed nginx annotations.
+func TestIngress_NoRewriteWhenUnset(t *testing.T) {
+	cfg := Config{Namespace: "tatara", IngressHost: "h", MemoryPathPrefix: "/api/v1/memory"}
+	ing := Ingress(testProject("alpha"), cfg)
+	if ing == nil {
+		t.Fatal("expected non-nil ingress")
+	}
+	if _, ok := ing.Annotations["nginx.ingress.kubernetes.io/rewrite-target"]; ok {
+		t.Fatalf("rewrite annotation must be absent when unset: %v", ing.Annotations)
+	}
+}
+
+// TestIngress_ClassNameNilWhenUnset asserts IngressClassName is left nil (let the
+// cluster default IngressClass apply) rather than a pointer-to-empty-string when
+// unconfigured.
+func TestIngress_ClassNameNilWhenUnset(t *testing.T) {
+	cfg := Config{Namespace: "tatara", IngressHost: "h", MemoryPathPrefix: "/api/v1/memory"}
+	ing := Ingress(testProject("alpha"), cfg)
+	if ing.Spec.IngressClassName != nil {
+		t.Fatalf("IngressClassName must be nil when unset, got %q", *ing.Spec.IngressClassName)
+	}
+}
+
+// TestIngress_CustomRewriteTarget asserts a configured non-nginx-default rewrite
+// target is honored verbatim.
+func TestIngress_CustomRewriteTarget(t *testing.T) {
+	cfg := Config{Namespace: "tatara", IngressHost: "h", IngressRewriteTarget: "/$2", MemoryPathPrefix: "/api/v1/memory"}
+	ing := Ingress(testProject("alpha"), cfg)
+	if ing.Annotations["nginx.ingress.kubernetes.io/rewrite-target"] != "/$2" {
+		t.Fatalf("rewrite annotation = %v", ing.Annotations)
 	}
 }
 

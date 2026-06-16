@@ -28,6 +28,14 @@ func TestLoad(t *testing.T) {
 		"CLI_OIDC_SECRET_NAME":        "cli-oidc",
 		"IMAGE_PULL_SECRET":           "regcred",
 		"LOG_LEVEL":                   "debug",
+		"OPERATOR_OIDC_SECRET_NAME":   "tatara-operator",
+		"AGENT_CPU_REQUEST":           "250m",
+		"AGENT_CPU_LIMIT":             "1",
+		"AGENT_MEMORY_REQUEST":        "256Mi",
+		"AGENT_MEMORY_LIMIT":          "1Gi",
+		"AGENT_RUN_AS_NON_ROOT":       "true",
+		"AGENT_RUN_AS_USER":           "65532",
+		"AGENT_FS_GROUP":              "65532",
 	}
 	for k, v := range env {
 		t.Setenv(k, v)
@@ -63,6 +71,11 @@ func TestLoad(t *testing.T) {
 		{"CLIOIDCSecretName", cfg.CLIOIDCSecretName, "cli-oidc"},
 		{"ImagePullSecret", cfg.ImagePullSecret, "regcred"},
 		{"LogLevel", cfg.LogLevel, "debug"},
+		{"OperatorOIDCSecretName", cfg.OperatorOIDCSecretName, "tatara-operator"},
+		{"AgentCPURequest", cfg.AgentCPURequest, "250m"},
+		{"AgentCPULimit", cfg.AgentCPULimit, "1"},
+		{"AgentMemoryRequest", cfg.AgentMemoryRequest, "256Mi"},
+		{"AgentMemoryLimit", cfg.AgentMemoryLimit, "1Gi"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -70,6 +83,67 @@ func TestLoad(t *testing.T) {
 				t.Fatalf("%s = %q, want %q", tt.name, tt.got, tt.want)
 			}
 		})
+	}
+	if !cfg.AgentRunAsNonRoot {
+		t.Fatal("AgentRunAsNonRoot = false, want true")
+	}
+	if cfg.AgentRunAsUser == nil || *cfg.AgentRunAsUser != 65532 {
+		t.Fatalf("AgentRunAsUser = %v, want 65532", cfg.AgentRunAsUser)
+	}
+	if cfg.AgentFSGroup == nil || *cfg.AgentFSGroup != 65532 {
+		t.Fatalf("AgentFSGroup = %v, want 65532", cfg.AgentFSGroup)
+	}
+}
+
+// TestLoad_RequiresOperatorOIDCSecretName asserts Load fails fast when
+// OPERATOR_OIDC_SECRET_NAME is empty: the ingest Job's secretKeyRef.name would
+// otherwise render empty and resolve to a missing Secret (residual #2).
+func TestLoad_RequiresOperatorOIDCSecretName(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "")
+	_, err := config.Load()
+	if err == nil {
+		t.Fatal("expected error for empty OPERATOR_OIDC_SECRET_NAME, got nil")
+	}
+}
+
+// TestLoad_AgentSchedulingDefaultEmpty asserts the scheduling document defaults
+// to empty (chart stays cluster-agnostic, rule 14).
+func TestLoad_AgentSchedulingDefaultEmpty(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AgentScheduling != "" {
+		t.Fatalf("AgentScheduling default = %q, want empty", cfg.AgentScheduling)
+	}
+}
+
+// TestLoad_AgentSchedulingMalformed asserts Load fails fast when AGENT_SCHEDULING
+// is not valid scheduling JSON, rather than silently dropping placement.
+func TestLoad_AgentSchedulingMalformed(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("AGENT_SCHEDULING", `{"nodeSelector": [bad`)
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for malformed AGENT_SCHEDULING, got nil")
+	}
+}
+
+// TestLoad_AgentRunAsUserMalformed asserts a non-integer AGENT_RUN_AS_USER fails
+// fast at load.
+func TestLoad_AgentRunAsUserMalformed(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("AGENT_RUN_AS_USER", "root")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for malformed AGENT_RUN_AS_USER, got nil")
 	}
 }
 
@@ -87,6 +161,7 @@ func TestLoad_MissingRequired(t *testing.T) {
 func TestLoad_SemanticModelDefault(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
 	t.Setenv("SEMANTIC_MODEL", "")
 
 	cfg, err := config.Load()
@@ -101,6 +176,7 @@ func TestLoad_SemanticModelDefault(t *testing.T) {
 func TestLoad_LeaderElectionDefaultsOn(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
 	t.Setenv("LEADER_ELECTION", "")
 
 	cfg, err := config.Load()
@@ -115,6 +191,7 @@ func TestLoad_LeaderElectionDefaultsOn(t *testing.T) {
 func TestLoad_LeaderElectionDisabled(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
 	t.Setenv("LEADER_ELECTION", "false")
 
 	cfg, err := config.Load()
@@ -129,6 +206,7 @@ func TestLoad_LeaderElectionDisabled(t *testing.T) {
 func TestLoad_Defaults(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
 	// Do not set HEALTH_ADDR or INTERNAL_ADDR so defaults apply.
 
 	cfg, err := config.Load()
@@ -147,6 +225,7 @@ func TestLoad_Defaults(t *testing.T) {
 func TestLoad_IngressClassNameDefaultEmpty(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
 	t.Setenv("INGRESS_CLASS_NAME", "")
 
 	cfg, err := config.Load()

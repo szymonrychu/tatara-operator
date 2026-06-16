@@ -248,9 +248,14 @@ func selectCandidates(in []candidate, priorityLabel string, n int) []candidate {
 }
 
 // laneOccupancy counts this Project's scan Tasks for repoSlug that still occupy
-// the repo's lane: Kind in kinds, phase not terminal. AwaitingApproval is no
-// longer a valid Phase value (approval is driven by SCM labels); the branch is
-// gone. Use TaskTerminal for a single-source terminality predicate.
+// the repo's lane: Kind in kinds and not terminal. Terminality is decided by the
+// single-source api/v1alpha1.TaskTerminal predicate (it covers both the
+// Phase=Succeeded/Failed tasks and the Phase-less lifecycle tasks that signal
+// completion via LifecycleState=Done/Stopped/Parked). Conversation is treated
+// the same as terminal here: it is human-blocked with no running pod, so it
+// holds no agent slot and must not occupy the lane - otherwise terminal/blocked
+// issueLifecycle tasks would starve mrScan/issueScan recovery forever
+// (maxPerRepo=1).
 func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...string) int {
 	label := sanitizeRepoLabel(repoSlug)
 	n := 0
@@ -259,16 +264,7 @@ func laneOccupancy(existing []tatarav1alpha1.Task, repoSlug string, kinds ...str
 		if t.Labels[labelSourceRepo] != label || !slices.Contains(kinds, t.Spec.Kind) {
 			continue
 		}
-		// Lifecycle tasks signal terminality via LifecycleState (Phase stays
-		// empty); Conversation is human-blocked with no running pod. Such tasks
-		// hold no agent slot, so they must not occupy the repo's scan lane -
-		// otherwise terminal issueLifecycle tasks starve mrScan/issueScan
-		// recovery forever (maxPerRepo=1).
-		if isLifecycleTerminal(t.Status.LifecycleState) || t.Status.LifecycleState == "Conversation" {
-			continue
-		}
-		switch t.Status.Phase {
-		case "Succeeded", "Failed":
+		if tatarav1alpha1.TaskTerminal(t) || t.Status.LifecycleState == "Conversation" {
 			continue
 		}
 		n++
