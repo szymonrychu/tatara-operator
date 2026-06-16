@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -88,10 +90,46 @@ type TaskSource struct {
 	Number int `json:"number,omitempty"`
 }
 
+// repoScopedKinds are task kinds that require a non-empty RepositoryRef.
+var repoScopedKinds = map[string]bool{
+	"implement":      true,
+	"review":         true,
+	"selfImprove":    true,
+	"triageIssue":    true,
+	"issueLifecycle": true,
+}
+
+// projectScopedKinds are task kinds that must have an empty RepositoryRef.
+var projectScopedKinds = map[string]bool{
+	"brainstorm":  true,
+	"healthCheck": true,
+}
+
+// ValidateTaskSpec validates the RepositoryRef contract for a TaskSpec:
+//   - repo-scoped kinds require a non-empty RepositoryRef.
+//   - project-scoped kinds require an empty RepositoryRef.
+//
+// Returns nil when valid. This is a lightweight server-side guard; CRD
+// schema validation enforces the same rules at admission.
+func ValidateTaskSpec(spec TaskSpec) error {
+	kind := spec.Kind
+	if kind == "" {
+		kind = "implement" // matches +kubebuilder:default="implement"
+	}
+	if repoScopedKinds[kind] && spec.RepositoryRef == "" {
+		return fmt.Errorf("task kind %q requires a non-empty repositoryRef", kind)
+	}
+	if projectScopedKinds[kind] && spec.RepositoryRef != "" {
+		return fmt.Errorf("task kind %q must have an empty repositoryRef (project-scoped); got %q", kind, spec.RepositoryRef)
+	}
+	return nil
+}
+
 // TaskSpec defines the desired state of a Task.
 type TaskSpec struct {
-	ProjectRef    string `json:"projectRef"`
-	RepositoryRef string `json:"repositoryRef"`
+	ProjectRef string `json:"projectRef"`
+	// +optional
+	RepositoryRef string `json:"repositoryRef,omitempty"`
 	Goal          string `json:"goal"`
 	// +optional
 	Source *TaskSource `json:"source,omitempty"`
