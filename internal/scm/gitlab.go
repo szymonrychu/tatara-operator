@@ -415,6 +415,7 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		} `json:"author"`
 		SHA          string `json:"sha"`
 		SourceBranch string `json:"source_branch"`
+		State        string `json:"state"`
 		HeadPipeline struct {
 			Status string `json:"status"`
 		} `json:"head_pipeline"`
@@ -428,6 +429,7 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
 		CIStatus:   glCIStatus(mr.HeadPipeline.Status),
+		Merged:     mr.State == "merged",
 	}, nil
 }
 

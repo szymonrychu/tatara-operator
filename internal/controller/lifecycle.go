@@ -1679,7 +1679,7 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	if pserr != nil {
 		return ctrl.Result{}, fmt.Errorf("merge: get pr state: %w", pserr)
 	}
-	allowed, merr := r.mergeAllowed(ctx, project, repo, writer, token, number, prSt)
+	allowed, merr := r.mergeAllowed(project, prSt)
 	if merr != nil {
 		return ctrl.Result{}, merr
 	}

@@ -144,7 +144,7 @@ func TestClearWritebackPendingRetriesOnConflict(t *testing.T) {
 		Session: newFakeSession(),
 	}
 
-	r.clearWritebackPending(ctx, task, "TestReason", "test cleared despite conflict")
+	require.NoError(t, r.clearWritebackPending(ctx, task, "TestReason", "test cleared despite conflict"))
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "cwp-retry-task"}, &got))

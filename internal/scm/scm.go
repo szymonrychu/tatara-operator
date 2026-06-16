@@ -82,6 +82,7 @@ type PRState struct {
 	HeadSHA    string
 	HeadBranch string
 	CIStatus   string // "" none | pending | success | failure
+	Merged     bool   // true when the PR/MR is already merged
 }
 
 // ErrMergeConflict is returned by Merge when the SCM signals the PR is not
