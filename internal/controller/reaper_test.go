@@ -66,6 +66,15 @@ func podExists(t *testing.T, name string) bool {
 	return err == nil
 }
 
+func svcExists(t *testing.T, name string) bool {
+	t.Helper()
+	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, &corev1.Service{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get service %s: %v", name, err)
+	}
+	return err == nil
+}
+
 func TestReapOrphans_TaskAbsent(t *testing.T) {
 	mkWrapperPodSvc(t, "reap-absent", "no-such-task", "uid-x")
 	reaperServer().ReapOrphans(context.Background())
@@ -170,4 +179,38 @@ func TestReapOrphans_CtxCancelled(t *testing.T) {
 	}
 	// Clean up
 	reaperServer().ReapOrphans(context.Background())
+}
+
+// TestReapOrphans_OrphanedServiceReaped verifies that a Service whose backing
+// Pod is already gone is reaped on the next reaper pass (finding: service leak
+// when Pod delete succeeds but Service delete fails transiently, pod already
+// gone on next pass so pod-list-only reaper never sees it again).
+func TestReapOrphans_OrphanedServiceReaped(t *testing.T) {
+	ctx := context.Background()
+	srv := reaperServer()
+
+	// Create a labelled Service without a matching Pod to simulate the state
+	// left behind after a successful Pod delete but a failed Service delete.
+	labels := map[string]string{
+		agent.LabelManagedBy: agent.ManagedByValue,
+		agent.LabelComponent: agent.ComponentAgent,
+		agent.LabelTask:      "no-such-task-svc-orphan",
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "reap-orphan-svc",
+			Namespace: testNS,
+			Labels:    labels,
+		},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	if err := k8sClient.Create(ctx, svc); err != nil {
+		t.Fatalf("create orphan service: %v", err)
+	}
+
+	srv.ReapOrphans(ctx)
+
+	if svcExists(t, "reap-orphan-svc") {
+		t.Error("expected orphaned Service (no backing Pod) to be reaped")
+	}
 }
