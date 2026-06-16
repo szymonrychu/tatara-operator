@@ -213,3 +213,8 @@ type callbackRunnable struct {
 func (c callbackRunnable) Start(ctx context.Context) error {
 	return c.srv.Start(ctx, c.addr)
 }
+
+// NeedLeaderElection implements manager.LeaderElectionRunnable. The callback
+// and push-metrics server is stateless and must start on every replica,
+// independent of leadership.
+func (c callbackRunnable) NeedLeaderElection() bool { return false }

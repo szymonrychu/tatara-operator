@@ -71,6 +71,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 	logger := obs.NewLogger(os.Stdout, obs.ParseLevel(cfg.LogLevel))
+	slog.SetDefault(logger)
 	ctrl.SetLogger(slogToLogr(logger))
 	mgr, err := buildManager(cfg, newScheme())
 	if err != nil {
@@ -104,6 +105,7 @@ func run(ctx context.Context) error {
 
 func main() {
 	bootstrap := obs.NewLogger(os.Stdout, slog.LevelInfo)
+	slog.SetDefault(bootstrap)
 	ctrl.SetLogger(slogToLogr(bootstrap))
 	if err := run(ctrl.SetupSignalHandler()); err != nil {
 		bootstrap.Error("manager exited with error", slog.String("error", err.Error()))

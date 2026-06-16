@@ -804,6 +804,11 @@ func (run *HandlerRunnable) Start(ctx context.Context) error {
 	return serveHTTP(ctx, run.addr, run.handler)
 }
 
+// NeedLeaderElection implements manager.LeaderElectionRunnable. The webhook
+// and REST API servers are stateless and must start on every replica
+// immediately, before the leader lease is acquired.
+func (run *HandlerRunnable) NeedLeaderElection() bool { return false }
+
 func serveHTTP(ctx context.Context, addr string, handler http.Handler) error {
 	httpSrv := &http.Server{
 		Addr:              addr,
