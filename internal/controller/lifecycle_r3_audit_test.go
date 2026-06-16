@@ -169,9 +169,9 @@ func TestCommentDrain_ReconcileResultSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
-	// Must requeue (drain path).
-	if !res.Requeue && res.RequeueAfter == 0 {
-		t.Error("expected requeue after comment drain")
+	// Must requeue (drain path) via RequeueAfter (finding 18: no bare Requeue:true).
+	if res.RequeueAfter == 0 {
+		t.Error("expected RequeueAfter after comment drain")
 	}
 
 	// ReconcileResult "success" must have been recorded.
