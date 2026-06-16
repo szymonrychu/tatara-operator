@@ -50,4 +50,10 @@ const (
 	LabelHeadSHA = "tatara.io/head-sha"
 	// LabelActivity is the scan activity name.
 	LabelActivity = "tatara.io/activity"
+	// LabelIsPR disambiguates a GitHub PR task from an issue task with the same
+	// number. Values: "true" | "false". Set by the webhook binder on every
+	// issueLifecycle Task; tasks without this label are treated as issues
+	// (backward-compatible default). The label is NOT set on scan-created tasks
+	// (they predate this label); its absence is interpreted as "false" (issue).
+	LabelIsPR = "tatara.io/is-pr"
 )

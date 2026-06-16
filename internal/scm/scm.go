@@ -18,6 +18,8 @@ type WebhookEvent struct {
 	Title        string
 	Body         string // issue/PR/MR description body
 	CommentBody  string // the comment text for issue_comment/note (created) events
+	CommentID    int    // provider comment id for idempotency (0 when not a comment event)
+	IsComment    bool   // true only for issue_comment/Note-Hook events (not label/state events)
 	IssueRef     string // owner/repo#123 (github) or group/proj!iid (gitlab)
 	URL          string
 	AuthorLogin  string // login of the issue/PR/MR author (the resource author)

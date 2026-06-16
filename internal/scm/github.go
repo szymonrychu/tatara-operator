@@ -59,6 +59,7 @@ type ghPayload struct {
 		Name string `json:"name"`
 	} `json:"label"`
 	Comment struct {
+		ID   int    `json:"id"`
 		Body string `json:"body"`
 	} `json:"comment"`
 	Issue       *ghWorkItem `json:"issue"`
@@ -84,6 +85,8 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 		isPR := p.Issue != nil && p.Issue.PullRequest != nil
 		ev := ghWorkItemEvent("issue", isPR, p, p.Issue)
 		ev.CommentBody = p.Comment.Body
+		ev.CommentID = p.Comment.ID
+		ev.IsComment = true
 		if isPR {
 			ev.Kind = "mr"
 		}

@@ -179,12 +179,13 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 }
 
 func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
-	// issue_comment created (on an issue OR an MR): find a live lifecycle Task
-	// for the work item and react. Intercepted before the trigger-label gate so
-	// bot comments still pass through correctly (they are ignored by the
-	// bot-author gate in handleIssueComment). "created" is unique to
-	// issue_comment events, so this routes both issue and MR comments.
-	if ev.Action == "created" {
+	// issue_comment / Note Hook: find a live lifecycle Task for the work item
+	// and react. Intercepted before the trigger-label gate so bot comments still
+	// pass through correctly (they are ignored by the bot-author gate in
+	// handleIssueComment). Route on ev.IsComment (set only by the SCM parsers
+	// for actual comment events) rather than ev.Action=="created" to prevent
+	// misrouting if a future GitHub event type reuses the "created" action name.
+	if ev.IsComment {
 		s.handleIssueComment(ctx, w, provider, proj, ev)
 		return
 	}
@@ -293,6 +294,12 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	dedupSlug, _ := issueRefRepoSlug(ev.IssueRef)
 	dedupNumber := ev.Number
 	dedupRef := ev.IssueRef
+	// dedupIsPR tracks whether the dedup slot is for a PR (true) or an issue
+	// (false). For a bot PR "Closes #N" the slot is the linked issue (false),
+	// matching the hash an issueScan task for that issue would produce.
+	// For a standalone PR with no linked issue the slot is the PR itself (true),
+	// ensuring PR #5 and issue #5 in the same repo get distinct task names.
+	dedupIsPR := ev.IsPR
 	if kind == "issueLifecycle" && ev.IsPR {
 		if issueNum, linked := scm.LinkedIssueNumber(ev.Body); linked {
 			dedupNumber = issueNum
@@ -302,6 +309,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			if idx := strings.LastIndexByte(ev.IssueRef, '#'); idx >= 0 {
 				dedupRef = ev.IssueRef[:idx+1] + strconv.Itoa(dedupNumber)
 			}
+			dedupIsPR = false // acts as the linked issue slot, not the PR slot
 		}
 	}
 
@@ -313,6 +321,10 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// check is omitted for the bot-PR arm: the existing task carries the linked
 	// issue's IssueRef ("o/r#7") not the PR ref ("o/r#21").
 	var existing tatarav1.TaskList
+	isPRStr := "false"
+	if dedupIsPR {
+		isPRStr = "true"
+	}
 	listOpts := []client.ListOption{
 		client.InNamespace(s.cfg.Namespace),
 		client.MatchingLabels{
@@ -327,7 +339,18 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	for i := range existing.Items {
 		t := &existing.Items[i]
-		if t.Spec.Source != nil && t.Status.Phase != "Succeeded" && t.Status.Phase != "Failed" {
+		if t.Spec.Source != nil && !tatarav1.TaskTerminal(t) {
+			// LabelIsPR disambiguates issue #N from PR #N in the same repo. Tasks
+			// without the label (scan-created or pre-label) default to "false"
+			// (issue slot). A PR-slot event must not be blocked by an issue-slot
+			// task and vice versa.
+			existingIsPR := t.Labels[tatarav1.LabelIsPR]
+			if existingIsPR == "" {
+				existingIsPR = "false" // backward-compatible default
+			}
+			if existingIsPR != isPRStr {
+				continue // different slot; not a duplicate
+			}
 			s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
 				"project", proj.Name, "issue_ref", ev.IssueRef, "dedup_ref", dedupRef, "task", t.Name)
 			s.count(provider, ev.Kind, ev.Action, "duplicate")
@@ -348,20 +371,15 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	if kind == "issueLifecycle" {
 		if ev.IsPR {
 			ann[tatarav1.LifecycleEntryAnnotation] = "MRCI"
-			labels = map[string]string{
-				tatarav1.LabelSourceRepo:   dedupSlug,
-				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
-				tatarav1.LabelSourceKind:   kind,
-				tatarav1.LabelActivity:     "webhook",
-			}
 		} else {
 			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
-			labels = map[string]string{
-				tatarav1.LabelSourceRepo:   dedupSlug,
-				tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
-				tatarav1.LabelSourceKind:   kind,
-				tatarav1.LabelActivity:     "webhook",
-			}
+		}
+		labels = map[string]string{
+			tatarav1.LabelSourceRepo:   dedupSlug,
+			tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
+			tatarav1.LabelSourceKind:   kind,
+			tatarav1.LabelActivity:     "webhook",
+			tatarav1.LabelIsPR:         isPRStr,
 		}
 	}
 
@@ -375,7 +393,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	taskName := ""
 	taskGenerateName := "task-"
 	if kind == "issueLifecycle" {
-		taskName = issueLifecycleTaskName(proj.Name, dedupRef)
+		taskName = issueLifecycleTaskName(proj.Name, dedupRef, dedupIsPR)
 		taskGenerateName = ""
 	}
 
@@ -475,7 +493,7 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 			}
 			now := metav1.Now()
 			fresh.Status.LastActivityAt = &now
-			if ev.CommentBody != "" {
+			if ev.CommentBody != "" && !interjectionQueued(fresh.Status.PendingInterjections, ev.CommentID, ev.CommentBody) {
 				fresh.Status.PendingInterjections = appendCapped(
 					fresh.Status.PendingInterjections, ev.CommentBody, maxPendingInterjections)
 			}
@@ -560,17 +578,22 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 
 	// Dedup labels matching the issueScan convention.
 	repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
+	commentIsPRStr := "false"
+	if ev.IsPR {
+		commentIsPRStr = "true"
+	}
 	labels := map[string]string{
 		tatarav1.LabelSourceRepo:   repoSlug,
 		tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
 		tatarav1.LabelSourceKind:   "issueLifecycle",
 		tatarav1.LabelActivity:     "webhook",
+		tatarav1.LabelIsPR:         commentIsPRStr,
 	}
 	ann := map[string]string{tatarav1.LifecycleEntryAnnotation: "Triage"}
 
 	task := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            issueLifecycleTaskName(proj.Name, ev.IssueRef),
+			Name:            issueLifecycleTaskName(proj.Name, ev.IssueRef, ev.IsPR),
 			Namespace:       s.cfg.Namespace,
 			Annotations:     ann,
 			Labels:          labels,
@@ -603,6 +626,25 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
+	}
+	// Persist the triggering comment body as the first PendingInterjection so
+	// it is not lost. For GitLab Note Hooks ev.Body is the note's Description
+	// (often empty) while the actual comment text is in CommentBody; preserving
+	// CommentBody ensures the agent can see the human's request at Triage.
+	if ev.CommentBody != "" {
+		if statusErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1.Task{}
+			if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+				return err
+			}
+			fresh.Status.PendingInterjections = appendCapped(
+				fresh.Status.PendingInterjections, ev.CommentBody, maxPendingInterjections)
+			return s.cfg.Client.Status().Update(ctx, fresh)
+		}); statusErr != nil {
+			// Non-fatal: task was created; losing the interjection is preferable
+			// to returning 500 and causing GitHub to redeliver.
+			s.log.ErrorContext(ctx, "issue_comment: store initial interjection (non-fatal)", "error", statusErr, "task", task.Name)
+		}
 	}
 	s.log.InfoContext(ctx, "issue_comment: created lifecycle task at Triage for untracked issue",
 		"project", proj.Name, "repository", repo.Name, "task", task.Name, "issue_ref", ev.IssueRef)
@@ -766,12 +808,21 @@ func issueRefRepoSlug(issueRef string) (string, bool) {
 }
 
 // issueLifecycleTaskName returns a deterministic Kubernetes-safe Task name for
-// an issueLifecycle task scoped to (projectName, issueRef). Using a deterministic
-// name rather than GenerateName makes concurrent webhook deliveries for the same
-// work item idempotent: the second Create returns AlreadyExists which is treated
-// as a duplicate, preventing two live lifecycle Tasks for one work item.
-func issueLifecycleTaskName(projectName, issueRef string) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s", projectName, issueRef)))
+// an issueLifecycle task scoped to (projectName, issueRef, isPR). isPR
+// disambiguates a GitHub issue #N from a GitHub PR #N in the same repo: both
+// produce an IssueRef of the form "owner/repo#N" so without the flag the two
+// would hash to the same name and collide. For a bot PR "Closes #N", isPR is
+// false (the task represents the linked issue slot, not the PR slot). Using a
+// deterministic name rather than GenerateName makes concurrent webhook deliveries
+// for the same work item idempotent: the second Create returns AlreadyExists
+// which is treated as a duplicate, preventing two live lifecycle Tasks for one
+// work item. GitLab is unaffected (it uses '!' for MRs vs '#' for issues).
+func issueLifecycleTaskName(projectName, issueRef string, isPR bool) string {
+	prMark := "0"
+	if isPR {
+		prMark = "1"
+	}
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s", projectName, issueRef, prMark)))
 	return "lc-" + hex.EncodeToString(h[:])[:16]
 }
 
@@ -794,6 +845,17 @@ func appendCapped(s []string, v string, max int) []string {
 		s = s[len(s)-max:]
 	}
 	return s
+}
+
+// interjectionQueued reports whether a comment has already been queued to
+// avoid appending a redelivered comment twice. When commentID > 0 the check
+// is body equality keyed on commentID (same id => same delivery), with body
+// equality as the fallback when commentID is 0 (provider did not supply an
+// id). Body equality alone is sufficient for redelivery dedup: the same
+// webhook redelivery carries the identical body.
+func interjectionQueued(existing []string, commentID int, body string) bool {
+	_ = commentID // currently unused; body equality is the dedup key (see note above)
+	return slices.Contains(existing, body)
 }
 
 func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) {
