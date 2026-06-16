@@ -5,9 +5,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// ConditionApprovalApproved is set True once a human removes the approval label.
-const ConditionApprovalApproved = "ApprovalApproved"
-
 // ProposedIssueSpec is a tatara-proposed issue awaiting human approval.
 type ProposedIssueSpec struct {
 	RepositoryRef string `json:"repositoryRef"`
@@ -100,6 +97,9 @@ type TaskSpec struct {
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`
+	// ApprovalRequired is reserved for future use; no production code path reads
+	// this field for any gating decision. Approval is driven by the SCM
+	// conversation flow. Do not set this field expecting behavior - it has none.
 	// +optional
 	ApprovalRequired bool `json:"approvalRequired,omitempty"`
 	// +optional

@@ -18,6 +18,12 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.lifecycleState
+      name: Lifecycle
+      type: string
+    - jsonPath: .spec.kind
+      name: Kind
+      type: string
     - jsonPath: .status.turnsCompleted
       name: Turns
       type: integer
@@ -47,6 +53,10 @@ spec:
             description: TaskSpec defines the desired state of a Task.
             properties:
               approvalRequired:
+                description: |-
+                  ApprovalRequired is reserved for future use; no production code path reads
+                  this field for any gating decision. Approval is driven by the SCM
+                  conversation flow. Do not set this field expecting behavior - it has none.
                 type: boolean
               goal:
                 type: string
@@ -306,9 +316,12 @@ spec:
                   type: string
                 type: array
               phase:
+                description: |-
+                  NOTE: Pending and AwaitingApproval are intentionally absent: no code path
+                  ever writes them (approval is now driven by the SCM conversation flow and
+                  projected onto labels, not a Phase transition). They are removed here to
+                  keep the CRD enum honest and prevent confusion with LifecycleState.
                 enum:
-                - Pending
-                - AwaitingApproval
                 - Planning
                 - Running
                 - Succeeded
@@ -355,6 +368,7 @@ spec:
                         body:
                           type: string
                         line:
+                          minimum: 1
                           type: integer
                         path:
                           type: string

@@ -83,16 +83,19 @@ spec:
                 type: integer
               memory:
                 description: |-
-                  MemorySpec configures the per-Project memory stack footprint. All fields
-                  are optional; defaults (pgInstances 1, pgStorage 10Gi, neo4jStorage 10Gi)
-                  are applied by the internal/memory builders, not by kubebuilder, so an
-                  empty (or absent) spec.memory still provisions a complete stack.
+                  MemorySpec configures the per-Project memory stack footprint. Defaults are
+                  declared via +kubebuilder:default so they are enforced at admission and
+                  visible in the persisted object; the internal/memory builders no longer need
+                  to carry fallback constants.
                 properties:
                   neo4jStorage:
+                    default: 10Gi
                     type: string
                   pgInstances:
+                    default: 1
                     type: integer
                   pgStorage:
+                    default: 10Gi
                     type: string
                 type: object
               scm:
@@ -153,6 +156,10 @@ spec:
                             type: integer
                           maxPerCycle:
                             default: 1
+                            description: |-
+                              Deprecated: MaxPerCycle is retained for API compatibility only. The controller
+                              hard-caps brainstorm at one Task per project per cycle regardless of this value.
+                              Setting it has no effect. See MEMORY.md for rationale.
                             type: integer
                           schedule:
                             type: string
@@ -200,6 +207,7 @@ spec:
                             default: 1
                             description: MaxPerRepo caps the number of in-progress
                               Tasks per repo (one lane per repo).
+                            minimum: 1
                             type: integer
                           schedule:
                             description: Schedule is a 5-field cron (robfig ParseStandard).
@@ -214,6 +222,7 @@ spec:
                             default: 1
                             description: MaxPerRepo caps the number of in-progress
                               Tasks per repo (one lane per repo).
+                            minimum: 1
                             type: integer
                           schedule:
                             description: Schedule is a 5-field cron (robfig ParseStandard).
