@@ -241,7 +241,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			m.scanItemsTotal.WithLabelValues(activity, outcome)
 		}
 	}
-	for _, action := range []string{"implement", "close"} {
+	for _, action := range []string{"implement", "close", "discuss", "close-withheld"} {
 		m.issueOutcomeTotal.WithLabelValues(action)
 	}
 	for _, source := range []string{"reconcile", "poll_backstop", "planning_watchdog"} {
@@ -250,7 +250,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, result := range []string{"success", "failure"} {
 		m.ingestJobTotal.WithLabelValues(result)
 	}
-	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token"} {
+	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
 	}
 	for _, result := range []string{"no_change", "skip_4xx", "no_pr", "opened"} {

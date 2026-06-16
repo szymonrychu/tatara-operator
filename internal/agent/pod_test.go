@@ -523,6 +523,34 @@ func TestBuildPod_RunIDUniqPerAttempt(t *testing.T) {
 	require.NotEqual(t, runID0, runID1, "RUN_ID must differ between respawns")
 }
 
+// TestBuildPod_CallbackHMACSecretViaSecretKeyRef asserts that when a callback
+// HMAC secret name is configured, CALLBACK_HMAC_SECRET is injected as a
+// SecretKeyRef (never a literal Pod-spec value) so the shared secret never lands
+// in the Pod object / etcd in plaintext, matching every other agent secret.
+func TestBuildPod_CallbackHMACSecretViaSecretKeyRef(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+
+	// Not configured: CALLBACK_HMAC_SECRET must be absent entirely.
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	if _, ok := envSecretRef(c, "CALLBACK_HMAC_SECRET"); ok {
+		t.Fatal("CALLBACK_HMAC_SECRET injected without a configured secret name")
+	}
+	if v, ok := envValue(c, "CALLBACK_HMAC_SECRET"); ok {
+		t.Fatalf("CALLBACK_HMAC_SECRET present as a literal value %q without a secret name", v)
+	}
+
+	// Configured: must be a SecretKeyRef, never a literal Value.
+	cfg.CallbackHMACSecretName = "tatara-callback-hmac"
+	c = agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	if v, ok := envValue(c, "CALLBACK_HMAC_SECRET"); ok && v != "" {
+		t.Fatalf("CALLBACK_HMAC_SECRET leaked as a literal Pod-spec value %q; must be a SecretKeyRef", v)
+	}
+	ref, ok := envSecretRef(c, "CALLBACK_HMAC_SECRET")
+	require.True(t, ok, "CALLBACK_HMAC_SECRET must be a SecretKeyRef when a secret name is configured")
+	require.Equal(t, "tatara-callback-hmac", ref.Name)
+	require.Equal(t, agent.CallbackHMACSecretKey, ref.Key)
+}
+
 // TestBuildPodEgressLabel_UsesSharedConst asserts that the brainstorm-sources
 // annotation key in the egress-label gate is the same literal as
 // tatarav1alpha1.AnnBrainstormSources, so the two sites cannot silently drift.

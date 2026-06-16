@@ -17,6 +17,11 @@ import (
 // wrapperPort is the wrapper's in-pod HTTP listener.
 const wrapperPort = 8080
 
+// CallbackHMACSecretKey is the data key holding the callback HMAC shared secret
+// in the Secret referenced by PodConfig.CallbackHMACSecretName. The same key is
+// read by the operator deployment via SecretKeyRef. Fixed by consumer code.
+const CallbackHMACSecretKey = "callback-hmac-secret"
+
 // PodNameAnnotation, when set on a Task at creation, holds the descriptive
 // wrapper Pod/Service name. PodName prefers it; legacy Tasks created before this
 // annotation existed fall back to wrapper-<task-name>.
@@ -52,10 +57,14 @@ type PodConfig struct {
 	CLIOIDCSecretName   string
 	ImagePullSecret     string
 	OperatorURL         string // operator REST base URL for the agent's task_*/subtask_* MCP tools
-	// CallbackHMACSecret, when non-empty, is injected into the wrapper Pod as
-	// CALLBACK_HMAC_SECRET so the wrapper signs its turn-complete callbacks.
-	// Matches CallbackServer.CallbackSecret on the operator side (finding 1/r3).
-	CallbackHMACSecret string
+	// CallbackHMACSecretName, when non-empty, is the name of the Secret holding
+	// the callback HMAC shared secret under key config.CallbackHMACSecretKey. It
+	// is injected into the wrapper Pod as CALLBACK_HMAC_SECRET via a SecretKeyRef
+	// (NOT a literal env value) so the secret never appears in the Pod spec /
+	// etcd object in plaintext, matching every other agent secret. The wrapper
+	// signs its turn-complete callbacks with it; the operator verifies via
+	// CallbackServer.CallbackSecret (finding 1/r3).
+	CallbackHMACSecretName string
 
 	// Resource requests/limits for the wrapper container. Parsed from camelCase
 	// config scalars (cpu-request, cpu-limit, memory-request, memory-limit in the
@@ -333,10 +342,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
 	}...)
 	// Inject callback HMAC secret when configured so the wrapper can sign its
-	// turn-complete callbacks (finding 1/r3). Omitted when empty so existing
-	// deployments without the secret work unchanged.
-	if cfg.CallbackHMACSecret != "" {
-		env = append(env, corev1.EnvVar{Name: "CALLBACK_HMAC_SECRET", Value: cfg.CallbackHMACSecret})
+	// turn-complete callbacks (finding 1/r3). Delivered via SecretKeyRef (NOT a
+	// literal env value) so the secret never lands in the Pod spec / etcd object
+	// in plaintext, matching every other agent secret. Omitted when no secret
+	// name is set so existing deployments without HMAC work unchanged.
+	if cfg.CallbackHMACSecretName != "" {
+		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
 	}
 
 	if len(repos) > 0 {

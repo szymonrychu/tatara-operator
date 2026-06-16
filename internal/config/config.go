@@ -89,10 +89,17 @@ type Config struct {
 	PushMetricsTTL time.Duration
 	// CallbackHMACSecret, when non-empty, activates HMAC-SHA256 verification on
 	// the /internal/turn-complete callback endpoint. Set from
-	// CALLBACK_HMAC_SECRET. The same value is injected into wrapper Pods as
-	// CALLBACK_HMAC_SECRET so the wrapper can sign its callbacks (finding 1/r3).
-	// Empty = no verification (backward-compatible default).
+	// CALLBACK_HMAC_SECRET (the operator reads the raw value via SecretKeyRef so
+	// the controller can verify inbound signatures). Empty = no verification
+	// (backward-compatible default).
 	CallbackHMACSecret string
+	// CallbackHMACSecretName is the name of the Secret holding the callback HMAC
+	// shared secret under the key callback-hmac-secret. Set from
+	// CALLBACK_HMAC_SECRET_NAME. Wrapper Pods reference this Secret via
+	// SecretKeyRef (NOT a literal env value) so the secret never appears in a
+	// Pod spec / etcd object in plaintext, matching every other agent secret
+	// (anthropic, scm, cli-oidc). Empty = HMAC injection disabled (finding 1/r3).
+	CallbackHMACSecretName string
 }
 
 func getDefault(key, def string) string {
@@ -205,6 +212,7 @@ func Load() (Config, error) {
 		LeaderElection:           leaderElection,
 		PushMetricsTTL:           pushMetricsTTL,
 		CallbackHMACSecret:       os.Getenv("CALLBACK_HMAC_SECRET"),
+		CallbackHMACSecretName:   os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

@@ -47,9 +47,12 @@ type CallbackServer struct {
 	Session   agent.Session
 	Namespace string
 	// CallbackSecret, when non-empty, activates HMAC-SHA256 verification on
-	// /internal/turn-complete. Set from CALLBACK_HMAC_SECRET config scalar
-	// (injected into wrapper Pods as CALLBACK_HMAC_SECRET env). Closes the
-	// trust gap documented in the original security note (finding 1/r3).
+	// /internal/turn-complete. Read from CALLBACK_HMAC_SECRET (delivered to the
+	// operator via SecretKeyRef from the callback-hmac Secret). Wrapper Pods get
+	// the same secret via SecretKeyRef (CALLBACK_HMAC_SECRET_NAME) and sign their
+	// callbacks. Closes the trust gap documented in the original security note
+	// when the secret is configured; when empty the NetworkPolicy remains the
+	// sole control (finding 1/r3).
 	CallbackSecret string
 	// PushMetrics, when set, mounts the wrapper push-metrics endpoint on the
 	// same internal listener (also not exposed via ingress).
