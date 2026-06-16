@@ -1028,9 +1028,12 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&tatarav1alpha1.Task{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
-		// MaxConcurrentReconciles: 1 is explicit here because laneOccupancy gating
-		// assumes serialised reconciles per kind; raising this without revisiting
-		// that invariant would cause correctness bugs.
+		// MaxConcurrentReconciles: 1 is explicit here because atConcurrencyCap
+		// gating is a read-then-create check (count open Tasks, then admit one)
+		// that races under parallel reconciles and would over-admit past
+		// maxConcurrentTasks. Serialising Task reconciles keeps it correct.
+		// (laneOccupancy is Project-scoped, enforced in the Project reconciler,
+		// and is unrelated to this Task-controller setting.)
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
