@@ -198,14 +198,20 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
-	var repo tatarav1alpha1.Repository
-	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
-		r.Metrics.ReconcileResult("Task", "error")
-		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
+	// Project-scoped kinds (brainstorm, healthCheck) have an empty RepositoryRef;
+	// skip the single-repo Get and pass nil to driveAgentRun.
+	var repoPtr *tatarav1alpha1.Repository
+	if task.Spec.RepositoryRef != "" {
+		var repo tatarav1alpha1.Repository
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
+		}
+		repoPtr = &repo
 	}
 
 	planText := planTurnText(task.Spec.Goal, taskBranch(&task), project.Name, task.Name)
-	res, err := r.driveAgentRun(ctx, &project, &repo, &task, planText)
+	res, err := r.driveAgentRun(ctx, &project, repoPtr, &task, planText)
 	if err != nil {
 		r.Metrics.ReconcileResult("Task", "error")
 		return ctrl.Result{}, err

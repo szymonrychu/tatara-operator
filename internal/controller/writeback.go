@@ -290,11 +290,15 @@ func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatara
 
 // brainstormHasProposal reports whether at least one proposal Task from THIS
 // brainstorm run exists. A proposal Task is any Task in the same namespace with
-// spec.proposedIssue set and the same spec.projectRef + spec.repositoryRef,
-// created by the agent calling the propose_issue MCP tool. Proposal Tasks carry
-// no per-run linkage (the REST handler owns them to the Project, not the
-// brainstorm Task), so the run is scoped by creation time: only proposals
-// created at/after this brainstorm Task count, excluding prior-cycle proposals.
+// spec.proposedIssue set and the same spec.projectRef, created by the agent
+// calling the propose_issue MCP tool. Proposal Tasks carry no per-run linkage
+// (the REST handler owns them to the Project, not the brainstorm Task), so the
+// run is scoped by creation time: only proposals created at/after this
+// brainstorm Task count, excluding prior-cycle proposals.
+//
+// For repo-scoped brainstorm tasks (non-empty RepositoryRef) the filter
+// additionally restricts to the same repo. For project-scoped tasks (empty
+// RepositoryRef) any proposal in the project counts regardless of repo.
 func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatarav1alpha1.Task) bool {
 	var list tatarav1alpha1.TaskList
 	err := r.List(ctx, &list,
@@ -310,12 +314,20 @@ func (r *TaskReconciler) brainstormHasProposal(ctx context.Context, task *tatara
 		log.FromContext(ctx).Error(err, "writeback: brainstormHasProposal: list tasks (treating as no proposal)", "task", task.Name)
 		return false
 	}
+	projectScoped := task.Spec.RepositoryRef == ""
 	for i := range list.Items {
 		t := &list.Items[i]
-		if t.Spec.ProposedIssue != nil &&
-			t.Spec.ProjectRef == task.Spec.ProjectRef &&
-			t.Spec.RepositoryRef == task.Spec.RepositoryRef &&
-			!t.CreationTimestamp.Before(&task.CreationTimestamp) {
+		if t.Spec.ProposedIssue == nil {
+			continue
+		}
+		if t.Spec.ProjectRef != task.Spec.ProjectRef {
+			continue
+		}
+		// For repo-scoped brainstorm tasks, only count proposals for the same repo.
+		if !projectScoped && t.Spec.RepositoryRef != task.Spec.RepositoryRef {
+			continue
+		}
+		if !t.CreationTimestamp.Before(&task.CreationTimestamp) {
 			return true
 		}
 	}
@@ -641,10 +653,14 @@ func boardRefFromSpec(s *tatarav1alpha1.ScmSpec) scm.BoardRef {
 }
 
 // scmContext resolves project, primary repo, writer, token, and provider for a Task.
+// It must not be called for project-scoped tasks (empty RepositoryRef).
 func (r *TaskReconciler) scmContext(ctx context.Context, task *tatarav1alpha1.Task) (tatarav1alpha1.Project, tatarav1alpha1.Repository, scm.SCMWriter, string, string, error) {
 	var proj tatarav1alpha1.Project
 	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil {
 		return proj, tatarav1alpha1.Repository{}, nil, "", "", fmt.Errorf("writeback: get project: %w", err)
+	}
+	if task.Spec.RepositoryRef == "" {
+		return proj, tatarav1alpha1.Repository{}, nil, "", "", fmt.Errorf("writeback: scmContext called for project-scoped task %q (empty repositoryRef)", task.Name)
 	}
 	var repo tatarav1alpha1.Repository
 	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
