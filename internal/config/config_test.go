@@ -260,3 +260,22 @@ func TestLoad_MalformedPushMetricsTTL(t *testing.T) {
 		t.Fatal("expected error for malformed PUSH_METRICS_TTL=5minutes, got nil")
 	}
 }
+
+// TestLoad_AgentRunAsNonRootDefaultFalse asserts that when AGENT_RUN_AS_NON_ROOT is
+// unset the Go default is false, matching the chart values.yaml default (agentRunAsNonRoot:
+// false). The two must agree: a divergence means running the binary outside the chart
+// yields the opposite securityContext from what the chart intends.
+func TestLoad_AgentRunAsNonRootDefaultFalse(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	// AGENT_RUN_AS_NON_ROOT intentionally not set.
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AgentRunAsNonRoot {
+		t.Fatal("AgentRunAsNonRoot default = true, want false (must match chart agentRunAsNonRoot: false)")
+	}
+}
