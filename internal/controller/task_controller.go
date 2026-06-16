@@ -152,6 +152,25 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{RequeueAfter: capRequeue}, nil
 	}
 
+	// RepositoryRef contract guard: repo-scoped kinds require a non-empty
+	// RepositoryRef; project-scoped kinds (brainstorm/healthCheck) require it
+	// empty. The CRD schema cannot express this kind-conditional rule, so it is
+	// enforced here. Terminate (not error) on violation: an errored reconcile
+	// would hot-loop the Task forever, while a malformed spec is permanent.
+	if !isActive(task.Status.Phase) {
+		if verr := tatarav1alpha1.ValidateTaskSpec(task.Spec); verr != nil {
+			l.Info("task invalid spec; terminating",
+				"action", "task_invalid_spec", "resource_id", task.Name, "project", project.Name, "err", verr.Error())
+			res, terr := r.terminate(ctx, &task, "Failed", "InvalidTaskSpec", verr.Error())
+			if terr != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, terr
+			}
+			r.Metrics.ReconcileResult("Task", "success")
+			return res, nil
+		}
+	}
+
 	// Concurrency gate: only applies to Tasks not yet active.
 	if !isActive(task.Status.Phase) {
 		atCap, err := r.atConcurrencyCap(ctx, &project, task.Name)

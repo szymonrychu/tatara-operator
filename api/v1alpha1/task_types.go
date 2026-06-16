@@ -109,8 +109,10 @@ var projectScopedKinds = map[string]bool{
 //   - repo-scoped kinds require a non-empty RepositoryRef.
 //   - project-scoped kinds require an empty RepositoryRef.
 //
-// Returns nil when valid. This is a lightweight server-side guard; CRD
-// schema validation enforces the same rules at admission.
+// Returns nil when valid. The CRD schema cannot express this kind-conditional
+// rule (a field required for some kinds and forbidden for others), so the
+// TaskReconciler calls this as a reconcile guard and terminates Tasks that
+// violate the contract.
 func ValidateTaskSpec(spec TaskSpec) error {
 	kind := spec.Kind
 	if kind == "" {
