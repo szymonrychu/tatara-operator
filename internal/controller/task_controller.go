@@ -926,9 +926,11 @@ func (r *TaskReconciler) deriveResultSummary(ctx context.Context, task *tatarav1
 // Every other terminal-state transition must win despite the concurrent write,
 // and the teardown (deleteWrapper) above is idempotent so a retry is safe.
 func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Task, phase, reason, msg string) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
 	baseURL := agent.BaseURL(task, task.Namespace)
 	if err := r.Session.DeleteSession(ctx, baseURL); err != nil {
 		// Best-effort: the pod is about to be deleted anyway.
+		l.Error(err, "terminate: delete session (non-fatal)", "resource_id", task.Name)
 		apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
 			Type: "SessionDeleteFailed", Status: metav1.ConditionTrue,
 			Reason: "DeleteError", Message: err.Error(),
@@ -974,6 +976,7 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set terminal status: %w", err)
 	}
+	l.Info("task terminated", "action", "task_terminate", "resource_id", task.Name, "phase", phase, "reason", reason)
 	r.updateInflightGauge(ctx)
 	return ctrl.Result{}, nil
 }
