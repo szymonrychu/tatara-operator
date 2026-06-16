@@ -99,11 +99,19 @@ func (r *Receiver) Collect(ch chan<- prometheus.Metric) {
 	r.evictExpired()
 
 	r.mu.Lock()
-	runs := make([]*run, 0, len(r.runs))
-	for _, rn := range r.runs {
-		runs = append(runs, rn)
+	ids := make([]string, 0, len(r.runs))
+	for id := range r.runs {
+		ids = append(ids, id)
 	}
 	active := len(r.runs)
+	// Sort runs by run id so the first-seen type for a name (which wins on a
+	// type conflict) and the per-scrape emission order are deterministic; map
+	// iteration order would otherwise flicker the surviving series scrape-to-scrape.
+	sort.Strings(ids)
+	runs := make([]*run, 0, len(ids))
+	for _, id := range ids {
+		runs = append(runs, r.runs[id])
+	}
 	r.mu.Unlock()
 
 	// Per metric name: stable help text, type, and the union of label names.
