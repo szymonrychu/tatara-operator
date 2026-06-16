@@ -55,7 +55,7 @@ func TestBackstopRecoversImplementationOrphanToImplement(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-impl")
 	if len(tasks) != 1 {
@@ -82,7 +82,7 @@ func TestBackstopRecoversBrainstormingOrphanToTriage(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-bs")
 	if len(tasks) != 1 {
@@ -105,7 +105,7 @@ func TestBackstopRecoversLegacyIdeaOrphanToTriage(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-legacy")
 	if len(tasks) != 1 {
@@ -146,7 +146,7 @@ func TestBackstopSkipsIssueWithLiveTask(t *testing.T) {
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
 	// Pass the pre-existing task but recoverOrphans re-lists, so it will see pre.
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-live")
 	// Only the pre-existing one; no new recovery task.
@@ -193,7 +193,7 @@ func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-conv")
 	if len(tasks) != 1 {
@@ -219,7 +219,7 @@ func TestBackstopSkipsDeclined(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-declined")
 	if len(tasks) != 0 {
@@ -242,7 +242,7 @@ func TestBackstopRespectsBudgetZero(t *testing.T) {
 
 	budget := 0
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-budget")
 	if len(tasks) != 0 {
@@ -262,7 +262,7 @@ func TestBackstopApprovedOrphanToImplement(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
 	tasks := listScanTasks(t, "backstop-approved")
 	if len(tasks) != 1 {

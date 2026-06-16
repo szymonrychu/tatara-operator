@@ -74,7 +74,7 @@ func TestIssueScanLaneOccupancyCountsIssueLifecycle(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	b2 := 99
-	backlog := r.issueScan(context.Background(), proj, reader,
+	backlog, _ := r.issueScan(context.Background(), proj, reader,
 		[]tatarav1alpha1.Repository{*repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
 	if !backlog {
 		t.Fatalf("want backlog=true (#2 blocked by the Running issueLifecycle #1 lane)")

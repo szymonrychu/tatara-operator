@@ -109,7 +109,7 @@ func TestIssueScan_PerRepoTopUp(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	b := 99
-	backlog := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
+	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
 	if !backlog {
 		t.Fatalf("want backlog=true (2 of 4 issues remain after per-repo top-up)")
 	}
@@ -185,7 +185,7 @@ func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	b2 := 99
-	backlog := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
+	backlog, _ := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
 	if !backlog {
 		t.Fatalf("want backlog=true (#2 blocked by the Running #1 lane)")
 	}
