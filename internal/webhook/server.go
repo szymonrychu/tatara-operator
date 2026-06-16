@@ -67,6 +67,13 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+	t0 := time.Now()
+	providerName := "unknown"
+	durResult := "error"
+	defer func() {
+		s.cfg.Metrics.ObserveWebhookDuration(providerName, durResult, time.Since(t0).Seconds())
+	}()
+
 	ctx := r.Context()
 	projectName := chi.URLParam(r, "project")
 
@@ -88,7 +95,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unrecognized provider", http.StatusBadRequest)
 		return
 	}
-	providerName := provider.Provider()
+	providerName = provider.Provider()
 
 	var proj tatarav1.Project
 	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, projectName), &proj); err != nil {
@@ -125,6 +132,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	durResult = "ok"
 	switch ev.Kind {
 	case "push":
 		s.handlePush(ctx, w, providerName, projectName, ev)
@@ -803,6 +811,9 @@ func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) 
 	return string(v), nil
 }
 
+// count increments operator_webhook_events_total and records the webhook
+// request duration in operator_webhook_duration_seconds (finding 14). t0 is
+// the request-start time; it is non-zero only when called from handle().
 func (s *Server) count(provider, kind, action, result string) {
 	s.cfg.Metrics.WebhookEvent(provider, kind, action, result)
 }

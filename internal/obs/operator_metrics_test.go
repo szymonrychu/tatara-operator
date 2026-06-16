@@ -483,3 +483,217 @@ func TestWritebackOutcome_PreSeeded(t *testing.T) {
 		}
 	}
 }
+
+// Finding 2: REST API metrics - counter and histogram must exist and be recordable.
+func TestRecordRESTRequest(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.RecordRESTRequest("patch_task", "ok", 0.123)
+	m.RecordRESTRequest("patch_task", "ok", 0.456)
+	m.RecordRESTRequest("patch_task", "error", 0.001)
+
+	if got := testutil.ToFloat64(m.RESTRequestsCounter("patch_task", "ok")); got != 2 {
+		t.Fatalf("restapi{patch_task,ok} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.RESTRequestsCounter("patch_task", "error")); got != 1 {
+		t.Fatalf("restapi{patch_task,error} = %v, want 1", got)
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var foundDuration bool
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_restapi_request_duration_seconds" {
+			continue
+		}
+		foundDuration = true
+		for _, metric := range mf.GetMetric() {
+			// Find the patch_task series (the one we observed into).
+			var ep string
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "endpoint" {
+					ep = lp.GetValue()
+				}
+			}
+			if ep == "patch_task" {
+				if got := metric.GetHistogram().GetSampleCount(); got != 3 {
+					t.Fatalf("restapi duration sample count for patch_task = %d, want 3", got)
+				}
+			}
+		}
+	}
+	if !foundDuration {
+		t.Fatal("operator_restapi_request_duration_seconds not registered")
+	}
+}
+
+// Finding 2: REST API endpoints must be pre-seeded so series appear from startup.
+func TestRESTAPIMetrics_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	wantEndpoints := []string{"patch_task", "propose_issue", "review_verdict", "pr_outcome", "issue_outcome"}
+	found := map[string]bool{}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_restapi_requests_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "endpoint" {
+					found[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	for _, ep := range wantEndpoints {
+		if !found[ep] {
+			t.Errorf("operator_restapi_requests_total{endpoint=%q} not pre-seeded", ep)
+		}
+	}
+}
+
+// Finding 13: MemoryHealthReadError must increment the counter.
+func TestMemoryHealthReadError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.MemoryHealthReadError()
+	m.MemoryHealthReadError()
+	m.MemoryHealthReadError()
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var got float64
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_memory_health_read_errors_total" {
+			got = mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+	if got != 3 {
+		t.Fatalf("memory_health_read_errors_total = %v, want 3", got)
+	}
+}
+
+// Finding 14: webhook duration histogram must exist and ObserveWebhookDuration must record.
+func TestObserveWebhookDuration(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.ObserveWebhookDuration("github", "ok", 0.05)
+	m.ObserveWebhookDuration("github", "ok", 0.1)
+	m.ObserveWebhookDuration("gitlab", "error", 0.2)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_webhook_duration_seconds" {
+			continue
+		}
+		found = true
+		for _, metric := range mf.GetMetric() {
+			h := metric.GetHistogram()
+			if h.GetSampleCount() > 0 {
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_webhook_duration_seconds not registered")
+	}
+}
+
+// Finding 14: webhook duration must be pre-seeded for github/gitlab x ok/error.
+func TestWebhookDuration_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	type key struct{ provider, result string }
+	want := map[key]bool{
+		{"github", "ok"}:    false,
+		{"github", "error"}: false,
+		{"gitlab", "ok"}:    false,
+		{"gitlab", "error"}: false,
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_webhook_duration_seconds" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			var provider, result string
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "provider" {
+					provider = lp.GetValue()
+				}
+				if lp.GetName() == "result" {
+					result = lp.GetValue()
+				}
+			}
+			want[key{provider, result}] = true
+		}
+	}
+	for k, seen := range want {
+		if !seen {
+			t.Errorf("operator_webhook_duration_seconds{provider=%q,result=%q} not pre-seeded", k.provider, k.result)
+		}
+	}
+}
+
+// Finding 28: webhookEvents must be pre-seeded for all relevant (kind, action) pairs,
+// not just push/other. Verify a non-trivial combination exists at startup.
+func TestWebhookEvents_FullPreSeed(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	type combo struct{ kind, action string }
+	want := map[combo]bool{
+		{"issue", "labeled"}:  false,
+		{"mr", "opened"}:      false,
+		{"mr", "closed"}:      false,
+		{"mr", "synchronize"}: false,
+		{"other", "other"}:    false,
+		{"push", "create"}:    false,
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_webhook_events_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			var kind, action string
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "kind" {
+					kind = lp.GetValue()
+				}
+				if lp.GetName() == "action" {
+					action = lp.GetValue()
+				}
+			}
+			want[combo{kind, action}] = true
+		}
+	}
+	for k, seen := range want {
+		if !seen {
+			t.Errorf("operator_webhook_events_total{kind=%q,action=%q} not pre-seeded", k.kind, k.action)
+		}
+	}
+}

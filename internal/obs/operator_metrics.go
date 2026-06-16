@@ -33,6 +33,10 @@ type OperatorMetrics struct {
 	agentHTTPDuration         *prometheus.HistogramVec
 	authTotal                 *prometheus.CounterVec
 	writebackOutcomeTotal     *prometheus.CounterVec
+	webhookDuration           *prometheus.HistogramVec
+	restapiRequestsTotal      *prometheus.CounterVec
+	restapiRequestDuration    *prometheus.HistogramVec
+	memoryHealthReadErrors    prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -153,6 +157,30 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_writeback_outcome_total",
 			Help: "Writeback terminal outcomes by result.",
 		}, []string{"result"}),
+		// Finding 14: webhook duration histogram so slow apiserver/secret lookups
+		// during webhook handling surface before GitHub's 10s delivery timeout.
+		webhookDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "operator_webhook_duration_seconds",
+			Help:    "Wall-clock duration of webhook request handling, by provider and result.",
+			Buckets: prometheus.ExponentialBuckets(0.005, 2, 10),
+		}, []string{"provider", "result"}),
+		// Finding 2: REST API request counter and latency histogram. Endpoint label
+		// is the handler name (e.g. "patch_task", "propose_issue").
+		restapiRequestsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_restapi_requests_total",
+			Help: "Total REST API requests by endpoint and result.",
+		}, []string{"endpoint", "result"}),
+		restapiRequestDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "operator_restapi_request_duration_seconds",
+			Help:    "Wall-clock duration of REST API handler execution by endpoint.",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 10),
+		}, []string{"endpoint"}),
+		// Finding 13: counter for transient memory-health read errors so repeated
+		// blips surfacing as healthy reconciles are visible in Prometheus.
+		memoryHealthReadErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_memory_health_read_errors_total",
+			Help: "Total transient errors reading memory-stack health (not real stack failures).",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -182,6 +210,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentHTTPDuration,
 		m.authTotal,
 		m.writebackOutcomeTotal,
+		m.webhookDuration,
+		m.restapiRequestsTotal,
+		m.restapiRequestDuration,
+		m.memoryHealthReadErrors,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -190,10 +222,12 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			m.reconcileTotal.WithLabelValues(kind, result)
 		}
 	}
+	// Finding 28: pre-seed all (kind,action) pairs the webhook handler emits so
+	// dashboards/alerts see a zero baseline rather than gaps before the first event.
 	for _, provider := range []string{"github", "gitlab"} {
-		for _, kind := range []string{"push"} {
-			for _, action := range []string{"other"} {
-				for _, result := range []string{"accepted", "rejected"} {
+		for _, kind := range []string{"push", "issue", "mr", "other"} {
+			for _, action := range []string{"other", "labeled", "opened", "closed", "synchronize", "create"} {
+				for _, result := range []string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"} {
 					m.webhookEvents.WithLabelValues(provider, kind, action, result)
 				}
 			}
@@ -221,6 +255,23 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	for _, result := range []string{"no_change", "skip_4xx", "no_pr", "opened"} {
 		m.writebackOutcomeTotal.WithLabelValues(result)
+	}
+	// Pre-seed webhook duration by provider/result so the series exist from startup.
+	for _, provider := range []string{"github", "gitlab"} {
+		for _, result := range []string{"ok", "error"} {
+			m.webhookDuration.WithLabelValues(provider, result)
+		}
+	}
+	// Pre-seed REST API metrics for common endpoints.
+	for _, endpoint := range []string{
+		"patch_task", "create_subtask", "patch_subtask", "propose_issue",
+		"review_verdict", "pr_outcome", "issue_outcome", "implement_outcome",
+		"post_comment", "change_summary", "handover",
+	} {
+		for _, result := range []string{"ok", "error"} {
+			m.restapiRequestsTotal.WithLabelValues(endpoint, result)
+		}
+		m.restapiRequestDuration.WithLabelValues(endpoint)
 	}
 	return m
 }
@@ -395,4 +446,29 @@ func (m *OperatorMetrics) WritebackOutcome(result string) {
 // WritebackOutcomeCounter returns the counter for (result) for test assertions.
 func (m *OperatorMetrics) WritebackOutcomeCounter(result string) prometheus.Counter {
 	return m.writebackOutcomeTotal.WithLabelValues(result)
+}
+
+// ObserveWebhookDuration records the wall-clock seconds a webhook request took,
+// labeled by provider and result ("ok" or "error"). Finding 14.
+func (m *OperatorMetrics) ObserveWebhookDuration(provider, result string, seconds float64) {
+	m.webhookDuration.WithLabelValues(provider, result).Observe(seconds)
+}
+
+// RecordRESTRequest increments operator_restapi_requests_total and records the
+// handler duration in operator_restapi_request_duration_seconds. Finding 2.
+// endpoint is the handler name (e.g. "patch_task"); result is "ok" or "error".
+func (m *OperatorMetrics) RecordRESTRequest(endpoint, result string, seconds float64) {
+	m.restapiRequestsTotal.WithLabelValues(endpoint, result).Inc()
+	m.restapiRequestDuration.WithLabelValues(endpoint).Observe(seconds)
+}
+
+// RESTRequestsCounter returns the counter for (endpoint, result) for test assertions.
+func (m *OperatorMetrics) RESTRequestsCounter(endpoint, result string) prometheus.Counter {
+	return m.restapiRequestsTotal.WithLabelValues(endpoint, result)
+}
+
+// MemoryHealthReadError increments operator_memory_health_read_errors_total.
+// Called when memoryStackHealth returns a transient non-NotFound error. Finding 13.
+func (m *OperatorMetrics) MemoryHealthReadError() {
+	m.memoryHealthReadErrors.Inc()
 }
