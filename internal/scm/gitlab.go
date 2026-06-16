@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type glLabel struct {
@@ -271,10 +273,13 @@ func GitLabProjectPath(repoURL string) (string, error) { return glProjectPath(re
 
 // glDoPaged performs paginated GET requests following the X-Next-Page header.
 // It decodes each page into a []T and returns all pages concatenated.
+// A non-advancing page number or more than maxPaginationPages pages is treated
+// as an error to prevent infinite loops.
 func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error) {
 	var all []T
 	nextPath := path
-	for nextPath != "" {
+	prevPage := ""
+	for pageNum := 0; nextPath != "" && pageNum < maxPaginationPages; pageNum++ {
 		var page []T
 		nextPage, err := glDoWithHeaders(ctx, base, nextPath, token, &page)
 		if err != nil {
@@ -284,6 +289,10 @@ func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 		if nextPage == "" {
 			break
 		}
+		if nextPage == prevPage {
+			return nil, fmt.Errorf("gitlab: pagination stuck: X-Next-Page %q did not advance", nextPage)
+		}
+		prevPage = nextPage
 		// Build the next path preserving existing query params and adding/updating page.
 		u, err := url.Parse(nextPath)
 		if err != nil {
@@ -377,10 +386,14 @@ func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 		WebURL string `json:"web_url"`
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/issues"
+	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "create_issue", "resource_id", proj, "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return CreatedIssue{}, err
 	}
-	return CreatedIssue{Ref: fmt.Sprintf("%s#%d", proj, out.IID), URL: out.WebURL}, nil
+	ref := fmt.Sprintf("%s#%d", proj, out.IID)
+	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "create_issue", "resource_id", ref, "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
+	return CreatedIssue{Ref: ref, URL: out.WebURL}, nil
 }
 
 // AddLabel adds a label to an issue identified by group/proj#iid.
@@ -404,6 +417,10 @@ func (c *GitLab) RemoveLabel(ctx context.Context, token, issueRef, label string)
 }
 
 // GetPRState reads an MR and its head pipeline status.
+// When head_pipeline is null (pipeline not yet attached) or its SHA does not
+// match the MR's current SHA (stale pipeline), the status falls back to the
+// commit-statuses endpoint so external CI reporters are visible and the merge
+// gate does not act on a stale success.
 func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
@@ -416,7 +433,8 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 		SHA          string `json:"sha"`
 		SourceBranch string `json:"source_branch"`
 		State        string `json:"state"`
-		HeadPipeline struct {
+		HeadPipeline *struct {
+			SHA    string `json:"sha"`
 			Status string `json:"status"`
 		} `json:"head_pipeline"`
 	}
@@ -424,11 +442,31 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 	if err := glDo(ctx, c.base(), http.MethodGet, path, token, nil, &mr); err != nil {
 		return PRState{}, err
 	}
+
+	ciStatus := ""
+	switch {
+	case mr.HeadPipeline == nil:
+		// No pipeline attached yet; fall back to commit statuses so external CI
+		// reporters (commit-status-only) are visible through the merge gate.
+		ciStatus, err = c.GetCommitCIStatus(ctx, proj, "", mr.SHA)
+		if err != nil {
+			return PRState{}, err
+		}
+	case mr.HeadPipeline.SHA != "" && mr.HeadPipeline.SHA != mr.SHA:
+		// Pipeline is present but belongs to a previous commit (lag window after
+		// a push). Treat as pending so the merge gate waits for the new pipeline
+		// rather than acting on a stale success.
+		ciStatus = "pending"
+	default:
+		// Pipeline is for the current SHA (or SHA field not reported by the API).
+		ciStatus = glCIStatus(mr.HeadPipeline.Status)
+	}
+
 	return PRState{
 		Author:     mr.Author.Username,
 		HeadSHA:    mr.SHA,
 		HeadBranch: mr.SourceBranch,
-		CIStatus:   glCIStatus(mr.HeadPipeline.Status),
+		CIStatus:   ciStatus,
 		Merged:     mr.State == "merged",
 	}, nil
 }
@@ -457,9 +495,12 @@ func (c *GitLab) Approve(ctx context.Context, repoURL, token string, number int,
 		return err
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/approve"
+	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPost, path, token, nil, nil); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "approve", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return err
 	}
+	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "approve", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	if body == "" {
 		return nil
 	}
@@ -485,15 +526,20 @@ func (c *GitLab) RequestChanges(ctx context.Context, repoURL, token string, numb
 	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
 
-// Suggest posts inline ```suggestion notes on the MR.
+// Suggest posts inline ```suggestion notes on the MR. Notes are posted
+// one-by-one (GitLab has no batch review API). On the first error the
+// remaining suggestions are abandoned and the partial-post count is logged
+// so callers can reason about retries (retrying re-posts already-posted
+// suggestions as duplicates since there is no idempotency key).
 func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
 		return err
 	}
-	for _, s := range sugg {
+	for i, s := range sugg {
 		note := fmt.Sprintf("`%s:%d`\n```suggestion\n%s\n```", s.Path, s.Line, s.Body)
 		if err := c.mrNote(ctx, c.base(), proj, number, token, note); err != nil {
+			slog.WarnContext(ctx, "suggest partial failure", "provider", "gitlab", "resource_id", fmt.Sprintf("%s!%d", proj, number), "posted", i, "total", len(sugg), "error", err.Error())
 			return err
 		}
 	}
@@ -520,13 +566,16 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 	var resp struct {
 		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
+	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "merge", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		var he *HTTPError
 		if errors.As(err, &he) && (he.Status == 405 || he.Status == 406 || he.Status == 409) {
 			return "", ErrMergeConflict
 		}
 		return "", err
 	}
+	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "merge", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	return resp.MergeCommitSHA, nil
 }
 
@@ -537,9 +586,12 @@ func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int,
 		return err
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"state_event": "close"}, nil); err != nil {
+		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "close_pr", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return err
 	}
+	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "close_pr", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	if body == "" {
 		return nil
 	}
@@ -628,12 +680,15 @@ func (c *GitLab) setBoardLabel(ctx context.Context, token, itemURL, column strin
 // GetCommitCIStatus returns the CI status for a commit sha by reading its
 // statuses. owner is the project path (group/project). Returns "" (none) |
 // "pending" | "success" | "failure".
+// All pages are fetched (per_page=100) so a failing status beyond the
+// default 20-item first page is not missed.
 func (c *GitLab) GetCommitCIStatus(ctx context.Context, owner, _ /*repo*/, sha string) (string, error) {
-	var statuses []struct {
+	type statusItem struct {
 		Status string `json:"status"`
 	}
-	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses"
-	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &statuses); err != nil {
+	path := "/projects/" + url.PathEscape(owner) + "/repository/commits/" + url.PathEscape(sha) + "/statuses?per_page=100"
+	statuses, err := glDoPaged[statusItem](ctx, c.base(), path, c.token)
+	if err != nil {
 		return "", err
 	}
 	if len(statuses) == 0 {

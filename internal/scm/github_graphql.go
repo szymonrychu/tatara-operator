@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 func (c *GitHub) graphQLEndpoint() string {
@@ -32,7 +34,7 @@ func (c *GitHub) ghGraphQL(ctx context.Context, token, query string, vars map[st
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := scmHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("github: do graphql request: %w", err)
 	}
@@ -51,7 +53,11 @@ func (c *GitHub) ghGraphQL(ctx context.Context, token, query string, vars map[st
 		return fmt.Errorf("github: decode graphql: %w", err)
 	}
 	if len(env.Errors) > 0 {
-		return fmt.Errorf("github: graphql error: %s", env.Errors[0].Message)
+		msgs := make([]string, len(env.Errors))
+		for i, e := range env.Errors {
+			msgs[i] = e.Message
+		}
+		return fmt.Errorf("github: graphql error: %s", strings.Join(msgs, "; "))
 	}
 	if out == nil {
 		return nil
@@ -178,7 +184,33 @@ func (c *GitHub) ghProjectID(ctx context.Context, token string, board BoardRef) 
 	return "", fmt.Errorf("github: project %d not found for owner %q", board.GitHubProjectNumber, board.Owner)
 }
 
+// validGitHubItemURL rejects itemURL values that are not https github.com
+// resources. Parameterised GraphQL prevents injection, but unvalidated
+// attacker-controlled URLs would still be forwarded to GitHub's resolver.
+func (c *GitHub) validGitHubItemURL(itemURL string) error {
+	u, err := url.Parse(itemURL)
+	if err != nil || u.Scheme != "https" {
+		return fmt.Errorf("github: itemURL must be https: %q", itemURL)
+	}
+	// Allow the configured graphQL host (for testing) or api.github.com / github.com.
+	allowedHosts := []string{"github.com", "api.github.com"}
+	if c.graphQLBase != "" {
+		if gu, err2 := url.Parse(c.graphQLBase); err2 == nil {
+			allowedHosts = append(allowedHosts, gu.Host)
+		}
+	}
+	for _, h := range allowedHosts {
+		if u.Host == h {
+			return nil
+		}
+	}
+	return fmt.Errorf("github: itemURL host %q not allowed", u.Host)
+}
+
 func (c *GitHub) ghResourceID(ctx context.Context, token, itemURL string) (string, error) {
+	if err := c.validGitHubItemURL(itemURL); err != nil {
+		return "", err
+	}
 	var out struct {
 		Resource struct {
 			ID string `json:"id"`
@@ -195,6 +227,9 @@ func (c *GitHub) ghResourceID(ctx context.Context, token, itemURL string) (strin
 }
 
 func (c *GitHub) ghProjectItemID(ctx context.Context, token, itemURL, projectID string) (string, error) {
+	if err := c.validGitHubItemURL(itemURL); err != nil {
+		return "", err
+	}
 	var out struct {
 		Resource struct {
 			ProjectItems struct {
