@@ -178,6 +178,55 @@ func TestTaskTerminal(t *testing.T) {
 	}
 }
 
+// TestTaskSpec_ValidateRepositoryRef tests the ValidateTaskSpec helper that
+// enforces the RepositoryRef contract:
+//   - repo-scoped kinds (implement, review, selfImprove, triageIssue, issueLifecycle)
+//     REQUIRE a non-empty RepositoryRef.
+//   - project-scoped kinds (brainstorm, healthCheck) MUST have an empty RepositoryRef.
+func TestTaskSpec_ValidateRepositoryRef(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		repoRef string
+		wantErr bool
+	}{
+		// repo-scoped: ref required
+		{"implement with ref", "implement", "my-repo", false},
+		{"review with ref", "review", "my-repo", false},
+		{"selfImprove with ref", "selfImprove", "my-repo", false},
+		{"triageIssue with ref", "triageIssue", "my-repo", false},
+		{"issueLifecycle with ref", "issueLifecycle", "my-repo", false},
+		// repo-scoped: ref missing -> error
+		{"implement empty ref", "implement", "", true},
+		{"review empty ref", "review", "", true},
+		{"selfImprove empty ref", "selfImprove", "", true},
+		{"triageIssue empty ref", "triageIssue", "", true},
+		{"issueLifecycle empty ref", "issueLifecycle", "", true},
+		// project-scoped: ref must be empty
+		{"brainstorm empty ref", "brainstorm", "", false},
+		{"healthCheck empty ref", "healthCheck", "", false},
+		// project-scoped: ref non-empty -> error
+		{"brainstorm with ref", "brainstorm", "my-repo", true},
+		{"healthCheck with ref", "healthCheck", "my-repo", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{
+				ProjectRef:    "proj",
+				RepositoryRef: tc.repoRef,
+				Kind:          tc.kind,
+				Goal:          "do something",
+			})
+			if tc.wantErr && err == nil {
+				t.Fatalf("want validation error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want no error, got %v", err)
+			}
+		})
+	}
+}
+
 // TestSuggestionLineMarker verifies Suggestion.Line is present and accepts a
 // valid positive value (the +kubebuilder:validation:Minimum=1 marker is a
 // CRD-schema concern; this test guards the struct field exists and is

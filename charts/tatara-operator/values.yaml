@@ -67,8 +67,13 @@ agentCpuRequest: "250m"
 agentCpuLimit: "2"
 agentMemoryRequest: "512Mi"
 agentMemoryLimit: "4Gi"
-agentRunAsNonRoot: true
-# Empty = unset (image default UID / no pod fsGroup). Pin per cluster in helmfile.
+# Default false (cluster-agnostic, rule 14): the chart cannot know the agent image's
+# numeric uid, and runAsNonRoot:true without a numeric runAsUser hard-fails any
+# non-numeric-USER image (CreateContainerConfigError). The deploying helmfile opts
+# into non-root by setting BOTH agentRunAsNonRoot:true AND a numeric agentRunAsUser.
+agentRunAsNonRoot: false
+# When agentRunAsNonRoot is true this MUST be the image's numeric uid; the chart
+# fail-renders otherwise (see _helpers.tpl). The wrapper image is uid 10001.
 agentRunAsUser: ""
 agentFsGroup: ""
 

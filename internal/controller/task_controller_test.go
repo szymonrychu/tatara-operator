@@ -299,6 +299,95 @@ func TestTaskReconcile_GatesAtCap(t *testing.T) {
 	_ = metav1.Now
 }
 
+// mkTaskKind creates a Task with an explicit Kind and RepositoryRef.
+func mkTaskKind(t *testing.T, name, projectRef, repoRef, kind string) {
+	t.Helper()
+	tk := &tatarav1alpha1.Task{}
+	tk.Name = name
+	tk.Namespace = testNS
+	tk.Spec.ProjectRef = projectRef
+	tk.Spec.RepositoryRef = repoRef
+	tk.Spec.Kind = kind
+	tk.Spec.Goal = "do the thing"
+	if err := k8sClient.Create(context.Background(), tk); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+}
+
+// TestTaskReconcile_RepoScopedKindEmptyRef_TerminatesInvalid: a repo-scoped kind
+// (implement) with an empty RepositoryRef must be terminated Failed with
+// InvalidTaskSpec, NOT silently driven (which would build a project-scoped pod
+// for a repo-scoped task and wedge writeback). The reconcile must not error
+// (erroring would hot-loop the Task forever).
+func TestTaskReconcile_RepoScopedKindEmptyRef_TerminatesInvalid(t *testing.T) {
+	mkTaskProject(t, "p-invref", 3)
+	mkTaskKind(t, "t-invref", "p-invref", "", "implement")
+	setProjectMemoryReady(t, "p-invref", "http://mem-p-invref.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-invref"); err != nil {
+		t.Fatalf("reconcile must not error on invalid spec (would hot-loop): %v", err)
+	}
+	tk := getTask(t, "t-invref")
+	if tk.Status.Phase != "Failed" {
+		t.Fatalf("phase = %q, want Failed", tk.Status.Phase)
+	}
+	cond := findCond(tk.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "InvalidTaskSpec" {
+		t.Fatalf("Ready condition reason = %v, want InvalidTaskSpec", cond)
+	}
+	// No pod should be spawned for an invalid task.
+	pod := &corev1.Pod{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: agent.PodName(tk)}, pod); !apierrors.IsNotFound(err) {
+		t.Errorf("invalid task must not spawn a pod, got err=%v", err)
+	}
+}
+
+// TestTaskReconcile_ProjectScopedKindWithRef_TerminatesInvalid: a project-scoped
+// kind (brainstorm) carrying a non-empty RepositoryRef must be terminated Failed
+// with InvalidTaskSpec.
+func TestTaskReconcile_ProjectScopedKindWithRef_TerminatesInvalid(t *testing.T) {
+	mkTaskProject(t, "p-bsref", 3)
+	mkTaskRepository(t, "r-bsref", "p-bsref")
+	mkTaskKind(t, "t-bsref", "p-bsref", "r-bsref", "brainstorm")
+	setProjectMemoryReady(t, "p-bsref", "http://mem-p-bsref.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-bsref"); err != nil {
+		t.Fatalf("reconcile must not error on invalid spec: %v", err)
+	}
+	tk := getTask(t, "t-bsref")
+	if tk.Status.Phase != "Failed" {
+		t.Fatalf("phase = %q, want Failed", tk.Status.Phase)
+	}
+	cond := findCond(tk.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "InvalidTaskSpec" {
+		t.Fatalf("Ready condition reason = %v, want InvalidTaskSpec", cond)
+	}
+}
+
+// TestTaskReconcile_ProjectScopedKindEmptyRef_Spawns: a valid project-scoped
+// brainstorm Task (empty RepositoryRef) passes validation and spawns a pod.
+func TestTaskReconcile_ProjectScopedKindEmptyRef_Spawns(t *testing.T) {
+	mkTaskProject(t, "p-bsok", 3)
+	mkTaskRepository(t, "r-bsok", "p-bsok")
+	mkTaskKind(t, "t-bsok", "p-bsok", "", "brainstorm")
+	setProjectMemoryReady(t, "p-bsok", "http://mem-p-bsok.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-bsok"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	tk := getTask(t, "t-bsok")
+	if tk.Status.Phase != "Planning" {
+		t.Fatalf("phase = %q, want Planning (valid project-scoped task)", tk.Status.Phase)
+	}
+}
+
 func TestTaskReconcile_TerminalNoop(t *testing.T) {
 	mkTaskProject(t, "p-term", 3)
 	mkTaskRepository(t, "r-term", "p-term")

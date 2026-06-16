@@ -95,6 +95,9 @@ AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
 AGENT_CPU_LIMIT: {{ .Values.agentCpuLimit | quote }}
 AGENT_MEMORY_REQUEST: {{ .Values.agentMemoryRequest | quote }}
 AGENT_MEMORY_LIMIT: {{ .Values.agentMemoryLimit | quote }}
+{{- if and .Values.agentRunAsNonRoot (not .Values.agentRunAsUser) }}
+{{- fail "agentRunAsNonRoot:true requires a numeric agentRunAsUser: the kubelet cannot verify a non-numeric image USER (e.g. agent) is non-root, so agent pods fail with CreateContainerConfigError. Set agentRunAsUser to the image's numeric uid, or set agentRunAsNonRoot:false." }}
+{{- end }}
 AGENT_RUN_AS_NON_ROOT: {{ .Values.agentRunAsNonRoot | quote }}
 AGENT_RUN_AS_USER: {{ .Values.agentRunAsUser | quote }}
 AGENT_FS_GROUP: {{ .Values.agentFsGroup | quote }}

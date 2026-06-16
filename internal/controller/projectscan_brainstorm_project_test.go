@@ -6,7 +6,6 @@ package controller
 
 import (
 	"context"
-	"sort"
 	"strings"
 	"testing"
 
@@ -145,8 +144,9 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_UnderCap_Creates(t *testing.T) {
 	}
 }
 
-// TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo: sorting is stable;
-// running brainstorm twice produces tasks targeting the same primary repo.
+// TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo: brainstorm tasks are
+// project-scoped (empty RepositoryRef); the goal encodes all repos sorted by
+// name for determinism across cycles.
 func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	// Seed repos with names that have a non-trivial sort order.
 	proj, repos := seedBrainstormProject(t, "bs-proj-det", []string{"o/zzz", "o/aaa", "o/mmm"}, 5)
@@ -157,14 +157,6 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 			"o/mmm": {},
 		},
 	}
-
-	// Sort repo names the same way the impl should.
-	repoNames := make([]string, len(repos))
-	for i, rp := range repos {
-		repoNames[i] = rp.Name
-	}
-	sort.Strings(repoNames)
-	wantPrimary := repoNames[0]
 
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
@@ -177,8 +169,15 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("want 1 task, got %d", len(tasks))
 	}
-	if tasks[0].Spec.RepositoryRef != wantPrimary {
-		t.Fatalf("primary repo = %q, want first sorted %q", tasks[0].Spec.RepositoryRef, wantPrimary)
+	// Project-scoped: no single primary repo pinned.
+	if tasks[0].Spec.RepositoryRef != "" {
+		t.Fatalf("brainstorm task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	}
+	// Goal must mention all three repos.
+	for _, slug := range []string{"o/aaa", "o/mmm", "o/zzz"} {
+		if !strings.Contains(tasks[0].Spec.Goal, slug) {
+			t.Fatalf("goal missing slug %q", slug)
+		}
 	}
 }
 
@@ -243,6 +242,85 @@ func TestBrainstorm_ProjectLevel_ShortCircuit_Backlog(t *testing.T) {
 	tasks := listBrainstormTasks(t, "bs-proj-sc")
 	if len(tasks) != 0 {
 		t.Fatalf("want 0 tasks (at cap after sc1), got %d", len(tasks))
+	}
+}
+
+// TestBrainstorm_ProjectLevel_EmptyRepositoryRef: brainstorm creates a Task with
+// an empty RepositoryRef (project-scoped, no single-repo pin).
+func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-proj-emptyref", []string{"o/alpha", "o/beta"}, 5)
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/alpha": {},
+			"o/beta":  {},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
+	budget := 99
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+
+	tasks := listBrainstormTasks(t, "bs-proj-emptyref")
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	}
+	if tasks[0].Spec.RepositoryRef != "" {
+		t.Fatalf("brainstorm task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	}
+}
+
+// TestHealthCheck_ProjectLevel_EmptyRepositoryRef: healthCheck creates a Task with
+// an empty RepositoryRef (project-scoped).
+func TestHealthCheck_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
+	proj, repos := seedHealthCheckProject(t, "hc-emptyref", []string{"o/a", "o/b"}, 3)
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{"o/a": {}, "o/b": {}},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
+	b := 99
+	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
+
+	tasks := listHealthCheckTasks(t, "hc-emptyref")
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 healthCheck task, got %d", len(tasks))
+	}
+	if tasks[0].Spec.RepositoryRef != "" {
+		t.Fatalf("healthCheck task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	}
+}
+
+// TestBrainstorm_ProjectLevel_ProjectScopedPodName: brainstorm task pod name is
+// project-scoped (no repo segment in the name).
+func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-proj-podname", []string{"o/alpha", "o/beta"}, 5)
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{"o/alpha": {}, "o/beta": {}},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
+	budget := 99
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+
+	tasks := listBrainstormTasks(t, "bs-proj-podname")
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	}
+	podName := tasks[0].Annotations["tatara.dev/pod-name"]
+	// Project-scoped name must NOT contain any repo name segment.
+	for _, rp := range repos {
+		if strings.Contains(podName, rp.Name) {
+			t.Fatalf("brainstorm pod name %q must not contain repo segment %q (must be project-scoped)", podName, rp.Name)
+		}
+	}
+	if !strings.Contains(podName, "brainstorm") {
+		t.Fatalf("brainstorm pod name %q must contain 'brainstorm' suffix", podName)
 	}
 }
 

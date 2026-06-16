@@ -634,8 +634,8 @@ func TestBrainstorm_InFlight_SkipsRepo(t *testing.T) {
 }
 
 // TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask: reader error for repo
-// E's backlog is non-fatal; the project task is still created with the
-// alphabetically-first sorted repo as primary (e before f).
+// E's backlog is non-fatal; the project task is still created (project-scoped,
+// empty RepositoryRef). The goal still includes both repo slugs.
 func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "bs-isolate", []string{"o/e", "o/f"}, 3)
 	reader := &perRepoFakeReader{
@@ -657,19 +657,11 @@ func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("want 1 brainstorm task (backlog error non-fatal), got %d", len(tasks))
 	}
-	// Primary repo is sorted-first by name: "bs-isolate-o-e" < "bs-isolate-o-f".
-	var repoE *tatarav1alpha1.Repository
-	for i := range repos {
-		if strings.Contains(repos[i].Spec.URL, "o/e") {
-			repoE = &repos[i]
-		}
+	// Project-scoped: no single primary repo pinned.
+	if tasks[0].Spec.RepositoryRef != "" {
+		t.Fatalf("brainstorm task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
 	}
-	if repoE == nil {
-		t.Fatal("could not find repo for o/e")
-	}
-	if tasks[0].Spec.RepositoryRef != repoE.Name {
-		t.Fatalf("primary repo = %q, want sorted-first %q", tasks[0].Spec.RepositoryRef, repoE.Name)
-	}
+	_ = repos // repos used for setup only
 }
 
 // ----- C5: Brainstorm goal names the deep-research skill -----

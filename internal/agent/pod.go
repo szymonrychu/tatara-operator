@@ -255,11 +255,18 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 
 // BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
 // repos is the full list of Project Repositories; the task's own repo is placed
-// first in TATARA_REPOS. Pass nil when there is only one repo (env is omitted).
+// first in TATARA_REPOS when repo is non-nil. When repo is nil (project-scoped
+// task such as brainstorm/healthCheck), REPO_URL and REPO_BRANCH are omitted and
+// TATARA_REPOS is set to all repos sorted by name (deterministic, no primary).
 func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, repos []tatarav1alpha1.Repository, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
-	env := []corev1.EnvVar{
-		{Name: "REPO_URL", Value: repo.Spec.URL},
-		{Name: "REPO_BRANCH", Value: repo.Spec.DefaultBranch},
+	env := []corev1.EnvVar{}
+	if repo != nil {
+		env = append(env,
+			corev1.EnvVar{Name: "REPO_URL", Value: repo.Spec.URL},
+			corev1.EnvVar{Name: "REPO_BRANCH", Value: repo.Spec.DefaultBranch},
+		)
+	}
+	env = append(env, []corev1.EnvVar{
 		{Name: "MODEL", Value: project.Spec.Agent.Model},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
@@ -293,17 +300,37 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("GIT_TOKEN", project.Spec.ScmSecretRef, "token"),
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
-	}
+	}...)
 
 	if len(repos) > 0 {
-		// Primary repo first, then the rest.
-		entries := []repoEntry{{Name: repo.Name, URL: repo.Spec.URL, Branch: repo.Spec.DefaultBranch}}
-		for i := range repos {
-			if repos[i].Name != repo.Name {
+		var entries []repoEntry
+		if repo != nil {
+			// Primary repo first, then the rest.
+			entries = []repoEntry{{Name: repo.Name, URL: repo.Spec.URL, Branch: repo.Spec.DefaultBranch}}
+			for i := range repos {
+				if repos[i].Name != repo.Name {
+					entries = append(entries, repoEntry{
+						Name:   repos[i].Name,
+						URL:    repos[i].Spec.URL,
+						Branch: repos[i].Spec.DefaultBranch,
+					})
+				}
+			}
+		} else {
+			// Project-scoped (no primary): sort all repos by name for determinism.
+			sorted := make([]tatarav1alpha1.Repository, len(repos))
+			copy(sorted, repos)
+			// Sort by Name (stable deterministic order, same algorithm as brainstorm/healthCheck).
+			for i := 1; i < len(sorted); i++ {
+				for j := i; j > 0 && sorted[j].Name < sorted[j-1].Name; j-- {
+					sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+				}
+			}
+			for _, r := range sorted {
 				entries = append(entries, repoEntry{
-					Name:   repos[i].Name,
-					URL:    repos[i].Spec.URL,
-					Branch: repos[i].Spec.DefaultBranch,
+					Name:   r.Name,
+					URL:    r.Spec.URL,
+					Branch: r.Spec.DefaultBranch,
 				})
 			}
 		}

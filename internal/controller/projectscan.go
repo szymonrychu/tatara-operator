@@ -435,9 +435,10 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 	return task, nil
 }
 
-// createBrainstormTask creates a Kind=brainstorm Task. sources is recorded as a
-// comma-joined annotation the pod builder reads to decide the egress label.
-func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, goal string, sources []string) (*tatarav1alpha1.Task, error) {
+// createBrainstormTask creates a Kind=brainstorm Task with empty RepositoryRef
+// (project-scoped). sources is recorded as a comma-joined annotation the pod
+// builder reads to decide the egress label.
+func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (*tatarav1alpha1.Task, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
@@ -450,13 +451,13 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 			Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
 		},
 		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:    proj.Name,
-			RepositoryRef: repo.Name,
-			Goal:          goal,
-			Kind:          "brainstorm",
+			ProjectRef: proj.Name,
+			// RepositoryRef intentionally empty: brainstorm is project-scoped.
+			Goal: goal,
+			Kind: "brainstorm",
 		},
 	}
-	agent.StampPodName(task, proj.Name, provider, repo.Name)
+	agent.StampPodName(task, proj.Name, provider, "")
 	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
 		return nil, fmt.Errorf("scan: set ownerref: %w", err)
 	}
@@ -467,13 +468,14 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 	return task, nil
 }
 
-// createHealthCheckTask creates a project-health-check Task. It reuses Kind
-// "brainstorm" (same pod egress, writeback arm, and propose_issue flow) but
-// carries the distinct "healthCheck" activity label so scheduling, dedup, and
-// the in-flight guard stay independent from brainstorm; the pod name is
-// disambiguated by that label (see agent.podNameSuffix). sources is recorded as
-// a comma-joined annotation the pod builder reads to decide the egress label.
-func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, goal string, sources []string) (*tatarav1alpha1.Task, error) {
+// createHealthCheckTask creates a project-health-check Task with empty
+// RepositoryRef (project-scoped). It reuses Kind "brainstorm" (same pod egress,
+// writeback arm, and propose_issue flow) but carries the distinct "healthCheck"
+// activity label so scheduling, dedup, and the in-flight guard stay independent
+// from brainstorm; the pod name is disambiguated by that label (see
+// agent.podNameSuffix). sources is recorded as a comma-joined annotation the
+// pod builder reads to decide the egress label.
+func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (*tatarav1alpha1.Task, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
@@ -486,13 +488,13 @@ func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tat
 			Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
 		},
 		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:    proj.Name,
-			RepositoryRef: repo.Name,
-			Goal:          goal,
-			Kind:          "brainstorm",
+			ProjectRef: proj.Name,
+			// RepositoryRef intentionally empty: healthCheck is project-scoped.
+			Goal: goal,
+			Kind: "brainstorm",
 		},
 	}
-	agent.StampPodName(task, proj.Name, provider, repo.Name)
+	agent.StampPodName(task, proj.Name, provider, "")
 	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
 		return nil, fmt.Errorf("scan: set ownerref: %w", err)
 	}
@@ -1023,8 +1025,8 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	issuesCtx := r.buildIssuesContext(ctx, proj, issuesBySlug, sortedRepos)
 
 	goal := brainstormGoalProject(slugs, issuesCtx)
-	if _, err := r.createBrainstormTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
-		l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name, "repo", primaryRepo.Name)
+	if _, err := r.createBrainstormTask(ctx, proj, goal, act.Sources); err != nil {
+		l.Error(err, "scan: create brainstorm task", "resource_id", proj.Name)
 		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 		return
 	}
@@ -1032,7 +1034,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	*budget--
 	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
-		"picked", 1, "primary_repo", primaryRepo.Name, "duration_ms", time.Since(start).Milliseconds())
+		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
 }
 
 // healthCheck runs one project-health-check cycle at PROJECT scope: at most one
@@ -1065,25 +1067,12 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 
 	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
 
-	// Deterministic primary repo: sort by name, first valid slug wins.
+	// Sort repos by name for deterministic iteration.
 	sortedRepos := make([]tatarav1alpha1.Repository, len(repos))
 	copy(sortedRepos, repos)
 	sort.Slice(sortedRepos, func(i, j int) bool {
 		return sortedRepos[i].Name < sortedRepos[j].Name
 	})
-
-	var primaryRepo *tatarav1alpha1.Repository
-	for i := range sortedRepos {
-		if s := repoSlug(&sortedRepos[i]); s != "" {
-			primaryRepo = &sortedRepos[i]
-			break
-		}
-	}
-	if primaryRepo == nil {
-		l.Info("healthCheck: no valid repos", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-		return
-	}
 
 	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
 
@@ -1122,13 +1111,19 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		}
 	}
 
+	if len(slugs) == 0 {
+		l.Info("healthCheck: no valid repos", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
+	}
+
 	// Build rich open-issues context from already-fetched data (no second
 	// ListOpenIssues round-trip for the repos queried above - finding 5).
 	issuesCtx := r.buildIssuesContext(ctx, proj, issuesBySlug, sortedRepos)
 
 	goal := healthCheckGoalProject(slugs, issuesCtx)
-	if _, err := r.createHealthCheckTask(ctx, proj, primaryRepo, goal, act.Sources); err != nil {
-		l.Error(err, "scan: create healthCheck task", "resource_id", proj.Name, "repo", primaryRepo.Name)
+	if _, err := r.createHealthCheckTask(ctx, proj, goal, act.Sources); err != nil {
+		l.Error(err, "scan: create healthCheck task", "resource_id", proj.Name)
 		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
 		return
 	}
@@ -1136,7 +1131,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	*budget--
 	r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
 	l.Info("healthCheck complete", "action", "scan_healthcheck", "resource_id", proj.Name,
-		"picked", 1, "primary_repo", primaryRepo.Name, "duration_ms", time.Since(start).Milliseconds())
+		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
 }
 
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
