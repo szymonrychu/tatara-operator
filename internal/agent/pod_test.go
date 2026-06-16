@@ -110,6 +110,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
 		"TATARA_MEMORY_URL":    "http://mem-demo.tatara.svc:8080",
 		"TATARA_OPERATOR_URL":  "http://tatara-operator.tatara.svc:8080",
+		"TATARA_CHAT_URL":      "http://chat-demo.tatara.svc:8080",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)
@@ -453,6 +454,35 @@ func TestValidatePodSecretRefs(t *testing.T) {
 	require.ErrorContains(t, agent.ValidatePodSecretRefs(proj, cfgNoCLI), "CLIOIDCSecretName")
 }
 
+// TestBuildPod_ChatURL asserts that BuildPod injects TATARA_CHAT_URL pointing at
+// the in-cluster chat service for the project so agent chat tools do not fall
+// through to the public ingress default.
+func TestBuildPod_ChatURL(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "TATARA_CHAT_URL")
+	require.True(t, ok, "TATARA_CHAT_URL missing from pod env")
+	require.Equal(t, "http://chat-demo.tatara.svc:8080", got)
+}
+
+// TestBuildPodEgressLabel_UsesSharedConst asserts that the brainstorm-sources
+// annotation key in the egress-label gate is the same literal as
+// tatarav1alpha1.AnnBrainstormSources, so the two sites cannot silently drift.
+func TestBuildPodEgressLabel_UsesSharedConst(t *testing.T) {
+	require.Equal(t, "tatara.dev/brainstorm-sources", tatarav1alpha1.AnnBrainstormSources,
+		"AnnBrainstormSources value changed; update pod.go and projectscan.go")
+
+	task := &tatarav1alpha1.Task{}
+	task.Name = "bs"
+	task.Spec.Kind = "brainstorm"
+	task.Annotations = map[string]string{tatarav1alpha1.AnnBrainstormSources: "internet"}
+	proj := &tatarav1alpha1.Project{}
+	repo := &tatarav1alpha1.Repository{}
+	pod := agent.BuildPod(proj, repo, task, nil, "http://mem", agent.PodConfig{Namespace: "tatara"})
+	require.Equal(t, "internet", pod.Labels["tatara.io/egress"],
+		"egress label not set when annotation key matches AnnBrainstormSources")
+}
+
 func TestBuildPodEgressLabel(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -469,7 +499,7 @@ func TestBuildPodEgressLabel(t *testing.T) {
 			task.Name = "bs"
 			task.Spec.Kind = "brainstorm"
 			if tc.sources != "" {
-				task.Annotations = map[string]string{"tatara.dev/brainstorm-sources": tc.sources}
+				task.Annotations = map[string]string{tatarav1alpha1.AnnBrainstormSources: tc.sources}
 			}
 			proj := &tatarav1alpha1.Project{}
 			repo := &tatarav1alpha1.Repository{}

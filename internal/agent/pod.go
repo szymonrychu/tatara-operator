@@ -282,6 +282,10 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Operator REST URL: the agent's tatara-cli task_*/subtask_* MCP tools reach
 		// the operator API at TATARA_OPERATOR_URL.
 		{Name: "TATARA_OPERATOR_URL", Value: cfg.OperatorURL},
+		// Per-project chat endpoint: the agent's tatara-cli chat MCP tools reach
+		// the in-cluster chat service at TATARA_CHAT_URL instead of falling through
+		// to the public ingress default (DefaultChatBaseURL in cli config.go).
+		{Name: "TATARA_CHAT_URL", Value: fmt.Sprintf("http://chat-%s.%s.svc:8080", project.Name, cfg.Namespace)},
 		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
 		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},
@@ -310,7 +314,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	}
 
 	labels := podLabels(task)
-	if task.Spec.Kind == "brainstorm" && hasInternetSource(task.Annotations["tatara.dev/brainstorm-sources"]) {
+	if task.Spec.Kind == "brainstorm" && hasInternetSource(task.Annotations[tatarav1alpha1.AnnBrainstormSources]) {
 		labels["tatara.io/egress"] = "internet"
 	}
 

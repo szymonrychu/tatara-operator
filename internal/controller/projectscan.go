@@ -372,8 +372,6 @@ func candidatesFromBoard(items []scm.BoardItem) []candidate {
 	return out
 }
 
-const annBrainstormSources = "tatara.dev/brainstorm-sources"
-
 // createScanTask creates one cron Task for a candidate with the dedup labels,
 // a TaskSource pointing at the work item, and an owner-ref to the Project.
 //
@@ -445,7 +443,7 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 			GenerateName: "brainstorm-",
 			Namespace:    proj.Namespace,
 			Labels:       map[string]string{labelActivity: "brainstorm"},
-			Annotations:  map[string]string{annBrainstormSources: strings.Join(sources, ",")},
+			Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
 		},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
@@ -481,7 +479,7 @@ func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tat
 			GenerateName: "healthcheck-",
 			Namespace:    proj.Namespace,
 			Labels:       map[string]string{labelActivity: "healthCheck"},
-			Annotations:  map[string]string{annBrainstormSources: strings.Join(sources, ",")},
+			Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
 		},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
