@@ -79,15 +79,6 @@ func randomPassword(nBytes int) (string, error) {
 // per-project memory stack.
 const memoryFieldOwner = "tatara-operator"
 
-// effectivePGInstances returns the configured pg instance count for the
-// Project, defaulting to 1 when spec.memory is unset or zero.
-func effectivePGInstances(p *tataradevv1alpha1.Project) int {
-	if p.Spec.Memory != nil && p.Spec.Memory.PgInstances > 0 {
-		return p.Spec.Memory.PgInstances
-	}
-	return 1
-}
-
 // applyMemoryStack server-side-applies every object in the Project's memory
 // stack (owner-ref'd by the N1 builders). The neo4j password Secret is created
 // separately by ensureNeo4jPassword and is NOT applied here, so it is never
@@ -227,6 +218,7 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		if p.Status.Memory.Phase == "" {
 			p.Status.Memory.Phase = "Provisioning"
 		}
+		r.Metrics.MemoryHealthReadError()
 		l.Info("transient memory health read error, will retry",
 			"action", "memory_health_retry",
 			"resource_id", p.Name,
@@ -234,7 +226,7 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		return memoryRequeue, nil
 	}
 
-	phase := memoryPhase(readyInstances, effectivePGInstances(p), neo4jReady, lightragAvail, memoryAvail)
+	phase := memoryPhase(readyInstances, memory.PgInstances(p), neo4jReady, lightragAvail, memoryAvail)
 	p.Status.Memory.Phase = phase
 
 	condStatus := metav1.ConditionFalse

@@ -122,8 +122,10 @@ func imagePullSecrets(cfg Config) []corev1.LocalObjectReference {
 	return []corev1.LocalObjectReference{{Name: cfg.ImagePullSecret}}
 }
 
-// pgInstances resolves the postgres instance count from spec, defaulting.
-func pgInstances(p *tatarav1alpha1.Project) int {
+// PgInstances resolves the postgres instance count from spec, defaulting to 1.
+// Exported so the controller's readiness gate and the builder derive the count
+// from one source of truth (hard rule 2: KISS/DRY).
+func PgInstances(p *tatarav1alpha1.Project) int {
 	if p.Spec.Memory != nil && p.Spec.Memory.PgInstances > 0 {
 		return p.Spec.Memory.PgInstances
 	}

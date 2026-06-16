@@ -38,7 +38,7 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 		},
 		ObjectMeta: objectMeta(p, cfg, n.PGCluster),
 		Spec: cnpgv1.ClusterSpec{
-			Instances:        pgInstances(p),
+			Instances:        PgInstances(p),
 			ImagePullSecrets: pgImagePullSecrets(cfg),
 			StorageConfiguration: cnpgv1.StorageConfiguration{
 				Size: pgStorage(p),
