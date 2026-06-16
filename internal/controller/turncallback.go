@@ -2,10 +2,15 @@ package controller
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,20 +27,30 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
+// pollGetTurnTimeout is the per-task context deadline applied to each GetTurn
+// call in PollOnce. It ensures a single slow or unreachable wrapper pod cannot
+// stall the entire backstop cycle beyond this window (finding 4).
+const pollGetTurnTimeout = 5 * time.Second
+
 // CallbackServer handles the in-cluster /internal/turn-complete endpoint the
 // wrapper POSTs to on each turn, and runs the poll backstop for missed
 // callbacks.
-// Security note (finding 5): this listener has no OIDC/HMAC authn. It relies
-// on INTERNAL_ADDR not being ingress-exposed. Any in-cluster pod that can reach
-// the Service can POST a forged callback. The REST API and wrapper-bound paths
-// are OIDC-gated via auth.Middleware; this internal path is the one trust gap.
-// Acceptable for a single-tenant in-cluster operator, but a shared-secret
-// HMAC or client-credentials bearer check would close the gap.
+// When CallbackSecret is non-empty the handler enforces HMAC-SHA256
+// verification: the operator injects the secret into each wrapper Pod env
+// (CALLBACK_HMAC_SECRET) and the wrapper sends X-Tatara-Signature:
+// sha256=<hex(HMAC-SHA256(body, secret))>. Requests that omit or mismatch the
+// header are rejected 401. When CallbackSecret is empty the check is skipped
+// (backward-compatible with existing deployments that pre-date the field).
 type CallbackServer struct {
 	Client    client.Client
 	Metrics   *obs.OperatorMetrics
 	Session   agent.Session
 	Namespace string
+	// CallbackSecret, when non-empty, activates HMAC-SHA256 verification on
+	// /internal/turn-complete. Set from CALLBACK_HMAC_SECRET config scalar
+	// (injected into wrapper Pods as CALLBACK_HMAC_SECRET env). Closes the
+	// trust gap documented in the original security note (finding 1/r3).
+	CallbackSecret string
 	// PushMetrics, when set, mounts the wrapper push-metrics endpoint on the
 	// same internal listener (also not exposed via ingress).
 	PushMetrics http.Handler
@@ -85,8 +100,27 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Read body once so we can both verify the HMAC and decode the payload.
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body failed", http.StatusBadRequest)
+		return
+	}
+	// HMAC verification: enforced when CallbackSecret is configured (finding 1/r3).
+	if s.CallbackSecret != "" {
+		sig := r.Header.Get("X-Tatara-Signature")
+		if !validHMACSignature(rawBody, sig, s.CallbackSecret) {
+			l.Info("turn-complete rejected: invalid or missing HMAC signature",
+				"action", "callback_authn_failed")
+			if s.Metrics != nil {
+				s.Metrics.RecordAuth("rejected")
+			}
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
 	var p turnCompletePayload
-	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+	if err := json.Unmarshal(rawBody, &p); err != nil {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
@@ -157,6 +191,13 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		}
 		// Guard: stale callback or task already terminal - skip to avoid double-count.
 		if fresh.Annotations[annCurrentTurn] != turnID {
+			return nil
+		}
+		// Guard: annTurnComplete being non-empty means recordResult already landed
+		// for this turn (it stamps annTurnComplete). A duplicate callback arriving
+		// before the reconcile advances annCurrentTurn would pass the guard above
+		// but must not re-accumulate CumulativeTokens (finding 2/r3).
+		if fresh.Annotations[annTurnComplete] != "" {
 			return nil
 		}
 		if isTerminal(fresh.Status.Phase) {
@@ -318,7 +359,11 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 		if s.Session == nil {
 			continue
 		}
-		tr, err := s.Session.GetTurn(ctx, agent.BaseURL(task, s.Namespace), turn)
+		// Bound each GetTurn call so a single slow/unreachable wrapper cannot
+		// stall the entire backstop cycle (finding 4/r3).
+		getTurnCtx, cancel := context.WithTimeout(ctx, pollGetTurnTimeout)
+		tr, err := s.Session.GetTurn(getTurnCtx, agent.BaseURL(task, s.Namespace), turn)
+		cancel()
 		if err != nil {
 			continue
 		}
@@ -328,27 +373,51 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 	}
 }
 
-// isTurnTimedOut checks the turn-started-at annotation against the project
-// turnTimeoutSeconds + grace. Returns false when any lookup fails (safe default).
-func (s *CallbackServer) isTurnTimedOut(ctx context.Context, task *tatarav1alpha1.Task) bool {
-	raw := task.Annotations[annTurnStartedAt]
-	if raw == "" {
+// turnTimedOut reports whether a turn that started at startedAtRaw has exceeded
+// timeoutSeconds + turnTimeoutGrace. Returns false (safe default) when
+// startedAtRaw is empty or unparseable. This is a free function so both
+// CallbackServer.isTurnTimedOut and TaskReconciler.isTurnTimedOut can call it
+// without duplicating the deadline arithmetic (finding 3/r3).
+func turnTimedOut(startedAtRaw string, timeoutSeconds int) bool {
+	if startedAtRaw == "" {
 		return false
 	}
-	startedAt, err := time.Parse(time.RFC3339, raw)
+	startedAt, err := time.Parse(time.RFC3339, startedAtRaw)
 	if err != nil {
 		return false
 	}
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 1800
+	}
+	deadline := startedAt.Add(time.Duration(timeoutSeconds)*time.Second + turnTimeoutGrace)
+	return time.Now().After(deadline)
+}
+
+// validHMACSignature checks that sig == "sha256=<hex(HMAC-SHA256(body, secret))>".
+// Returns false for any malformed or mismatched signature.
+func validHMACSignature(body []byte, sig, secret string) bool {
+	const prefix = "sha256="
+	if !strings.HasPrefix(sig, prefix) {
+		return false
+	}
+	got, err := hex.DecodeString(sig[len(prefix):])
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	expected := mac.Sum(nil)
+	return hmac.Equal(got, expected)
+}
+
+// isTurnTimedOut checks the turn-started-at annotation against the project
+// turnTimeoutSeconds + grace. Returns false when any lookup fails (safe default).
+func (s *CallbackServer) isTurnTimedOut(ctx context.Context, task *tatarav1alpha1.Task) bool {
 	var project tatarav1alpha1.Project
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &project); err != nil {
 		return false
 	}
-	timeout := project.Spec.Agent.TurnTimeoutSeconds
-	if timeout <= 0 {
-		timeout = 1800
-	}
-	deadline := startedAt.Add(time.Duration(timeout)*time.Second + turnTimeoutGrace)
-	return time.Now().After(deadline)
+	return turnTimedOut(task.Annotations[annTurnStartedAt], project.Spec.Agent.TurnTimeoutSeconds)
 }
 
 // expireTimedOutTurn performs the terminal cleanup for a timed-out turn:

@@ -52,6 +52,10 @@ type PodConfig struct {
 	CLIOIDCSecretName   string
 	ImagePullSecret     string
 	OperatorURL         string // operator REST base URL for the agent's task_*/subtask_* MCP tools
+	// CallbackHMACSecret, when non-empty, is injected into the wrapper Pod as
+	// CALLBACK_HMAC_SECRET so the wrapper signs its turn-complete callbacks.
+	// Matches CallbackServer.CallbackSecret on the operator side (finding 1/r3).
+	CallbackHMACSecret string
 
 	// Resource requests/limits for the wrapper container. Parsed from camelCase
 	// config scalars (cpu-request, cpu-limit, memory-request, memory-limit in the
@@ -328,6 +332,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
 	}...)
+	// Inject callback HMAC secret when configured so the wrapper can sign its
+	// turn-complete callbacks (finding 1/r3). Omitted when empty so existing
+	// deployments without the secret work unchanged.
+	if cfg.CallbackHMACSecret != "" {
+		env = append(env, corev1.EnvVar{Name: "CALLBACK_HMAC_SECRET", Value: cfg.CallbackHMACSecret})
+	}
 
 	if len(repos) > 0 {
 		var entries []repoEntry

@@ -981,21 +981,10 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 // isTurnTimedOut reports whether the in-flight turn has exceeded
 // project.spec.agent.turnTimeoutSeconds + turnTimeoutGrace. It returns false
 // when the annotation is absent or unparseable (safe default: keep waiting).
+// Delegates to the free function turnTimedOut (turncallback.go) so the two
+// receivers share the same deadline arithmetic (finding 3/r3).
 func (r *TaskReconciler) isTurnTimedOut(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
-	raw := task.Annotations[annTurnStartedAt]
-	if raw == "" {
-		return false
-	}
-	startedAt, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return false
-	}
-	timeout := project.Spec.Agent.TurnTimeoutSeconds
-	if timeout <= 0 {
-		timeout = 1800
-	}
-	deadline := startedAt.Add(time.Duration(timeout)*time.Second + turnTimeoutGrace)
-	return time.Now().After(deadline)
+	return turnTimedOut(task.Annotations[annTurnStartedAt], project.Spec.Agent.TurnTimeoutSeconds)
 }
 
 // updateInflightGauge sets operator_tasks_inflight (aggregate) and

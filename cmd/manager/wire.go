@@ -132,6 +132,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		NodeSelector:        cfg.Scheduling.NodeSelector,
 		Tolerations:         cfg.Scheduling.Tolerations,
 		Affinity:            cfg.Scheduling.Affinity,
+		CallbackHMACSecret:  cfg.CallbackHMACSecret,
 	}
 }
 
@@ -192,11 +193,12 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	}
 
 	cbServer := &controller.CallbackServer{
-		Client:      mgr.GetClient(),
-		Metrics:     metrics,
-		Session:     agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
-		Namespace:   cfg.Namespace,
-		PushMetrics: pushReceiver.PushHandler(),
+		Client:         mgr.GetClient(),
+		Metrics:        metrics,
+		Session:        agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
+		Namespace:      cfg.Namespace,
+		PushMetrics:    pushReceiver.PushHandler(),
+		CallbackSecret: cfg.CallbackHMACSecret,
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return fmt.Errorf("add callback server: %w", err)

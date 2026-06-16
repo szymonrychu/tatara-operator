@@ -107,6 +107,26 @@ func (r *TaskReconciler) clearDeadline(ctx context.Context, task *tatarav1alpha1
 	})
 }
 
+// setDeadlineMinutes unconditionally sets DeadlineAt to now+minutes in a single
+// RetryOnConflict. Use it whenever a deadline needs to be reset (overwritten),
+// e.g. the interjection-extend path in handleConversation. This replaces the
+// clearDeadline+ensureDeadlineMinutes two-write pattern with one write (finding 3/r3).
+func (r *TaskReconciler) setDeadlineMinutes(ctx context.Context, task *tatarav1alpha1.Task, minutes int) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		dl := metav1.NewTime(time.Now().Add(time.Duration(minutes) * time.Minute))
+		fresh.Status.DeadlineAt = &dl
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.DeadlineAt = fresh.Status.DeadlineAt
+		return nil
+	})
+}
+
 // parkWithComment posts a comment on the PR/issue and transitions to Parked.
 // For issue-linked tasks it comments on the issue (IssueRef). For bot-PR-entry
 // tasks with no issue ref, it falls back to the PR ref derived from lifecyclePR.
@@ -999,10 +1019,9 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatara
 				idleMinutes = project.Spec.Scm.ConversationIdleMinutes
 			}
 			// Reset deadline so the conversation continues for another idle window.
-			if err := r.clearDeadline(ctx, task); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.ensureDeadlineMinutes(ctx, task, idleMinutes); err != nil {
+			// setDeadlineMinutes replaces the two-write clearDeadline+ensureDeadlineMinutes
+			// pattern with a single RetryOnConflict (finding 3/r3).
+			if err := r.setDeadlineMinutes(ctx, task, idleMinutes); err != nil {
 				return ctrl.Result{}, err
 			}
 			log.FromContext(ctx).Info("conversation: deadline passed but interjections pending; extending",

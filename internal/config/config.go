@@ -87,6 +87,12 @@ type Config struct {
 	// re-exposed on the operator's /metrics after the pod's last push, before
 	// they age out. Backstop for pods that exit without best-effort cleanup.
 	PushMetricsTTL time.Duration
+	// CallbackHMACSecret, when non-empty, activates HMAC-SHA256 verification on
+	// the /internal/turn-complete callback endpoint. Set from
+	// CALLBACK_HMAC_SECRET. The same value is injected into wrapper Pods as
+	// CALLBACK_HMAC_SECRET so the wrapper can sign its callbacks (finding 1/r3).
+	// Empty = no verification (backward-compatible default).
+	CallbackHMACSecret string
 }
 
 func getDefault(key, def string) string {
@@ -198,6 +204,7 @@ func Load() (Config, error) {
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
 		LeaderElection:           leaderElection,
 		PushMetricsTTL:           pushMetricsTTL,
+		CallbackHMACSecret:       os.Getenv("CALLBACK_HMAC_SECRET"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")
