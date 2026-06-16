@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 )
 
 type glLabel struct {
@@ -60,6 +59,9 @@ type glPayload struct {
 
 // DetectAndVerify verifies the X-Gitlab-Token and parses the payload.
 func (*GitLab) DetectAndVerify(h http.Header, payload []byte, secret string) (WebhookEvent, error) {
+	if secret == "" {
+		return WebhookEvent{}, errors.New("gitlab: empty webhook secret")
+	}
 	token := h.Get("X-Gitlab-Token")
 	if token == "" {
 		return WebhookEvent{}, errors.New("gitlab: missing X-Gitlab-Token")
@@ -165,6 +167,10 @@ func glNoteEvent(p glPayload) WebhookEvent {
 
 // glActionAndLabel normalizes the GitLab action and derives labeled/unlabeled
 // plus the single changed label from object_attributes.action + changes.labels.
+// Single-event limitation: when a GitLab webhook atomically adds and removes
+// labels in one update, only the first added label is reported as "labeled";
+// the removed label's "unlabeled" event is not surfaced. Tatara's phase-label
+// dedup keys on label presence (not events), so this has no functional impact.
 func glActionAndLabel(p glPayload) (string, string) {
 	prev := labelSet(p.Changes.Labels.Previous)
 	cur := labelSet(p.Changes.Labels.Current)
@@ -296,7 +302,7 @@ func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 		// Build the next path preserving existing query params and adding/updating page.
 		u, err := url.Parse(nextPath)
 		if err != nil {
-			break
+			return nil, fmt.Errorf("gitlab: build next page url %q: %w", nextPath, err)
 		}
 		q := u.Query()
 		q.Set("page", nextPage)
@@ -386,13 +392,10 @@ func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 		WebURL string `json:"web_url"`
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/issues"
-	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "create_issue", "resource_id", proj, "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return CreatedIssue{}, err
 	}
 	ref := fmt.Sprintf("%s#%d", proj, out.IID)
-	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "create_issue", "resource_id", ref, "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	return CreatedIssue{Ref: ref, URL: out.WebURL}, nil
 }
 
@@ -499,12 +502,9 @@ func (c *GitLab) Approve(ctx context.Context, repoURL, token string, number int,
 		return err
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/approve"
-	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPost, path, token, nil, nil); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "approve", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return err
 	}
-	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "approve", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	if body == "" {
 		return nil
 	}
@@ -570,16 +570,13 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 	var resp struct {
 		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
-	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "merge", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		var he *HTTPError
 		if errors.As(err, &he) && (he.Status == 405 || he.Status == 406 || he.Status == 409) {
 			return "", ErrMergeConflict
 		}
 		return "", err
 	}
-	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "merge", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	return resp.MergeCommitSHA, nil
 }
 
@@ -590,12 +587,9 @@ func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int,
 		return err
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
-	t0 := time.Now()
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"state_event": "close"}, nil); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "close_pr", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return err
 	}
-	slog.InfoContext(ctx, "scm action", "provider", "gitlab", "action", "close_pr", "resource_id", fmt.Sprintf("%s!%d", proj, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	if body == "" {
 		return nil
 	}

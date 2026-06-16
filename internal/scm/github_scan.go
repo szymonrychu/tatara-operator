@@ -17,6 +17,7 @@ type ghPR struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"` // head branch name (source branch)
 	} `json:"head"`
+	Body      string    `json:"body"`
 	Labels    []ghLabel `json:"labels"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -55,7 +56,7 @@ func (c *GitHub) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 	for _, p := range raw {
 		out = append(out, PRRef{
 			Repo: slug, Number: p.Number, Author: p.User.Login,
-			HeadSHA: p.Head.SHA, HeadBranch: p.Head.Ref, Labels: ghLabelNames(p.Labels), UpdatedAt: p.UpdatedAt,
+			HeadSHA: p.Head.SHA, HeadBranch: p.Head.Ref, Body: p.Body, Labels: ghLabelNames(p.Labels), UpdatedAt: p.UpdatedAt,
 		})
 	}
 	return out, nil
@@ -126,7 +127,8 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 
 	var out []BoardItem
 	var cursor any // nil means no after-cursor (first page)
-	for {
+	prevCursor := ""
+	for pageNum := 0; pageNum < maxPaginationPages; pageNum++ {
 		vars := map[string]any{
 			"owner":  board.Owner,
 			"number": board.GitHubProjectNumber,
@@ -153,11 +155,19 @@ func (c *GitHub) ListBoardItems(ctx context.Context, board BoardRef) ([]BoardIte
 			})
 		}
 		if !pv.Items.PageInfo.HasNextPage {
-			break
+			return out, nil
 		}
-		cursor = pv.Items.PageInfo.EndCursor // non-nil string triggers $after on next page
+		next := pv.Items.PageInfo.EndCursor
+		if next == "" {
+			return nil, fmt.Errorf("github: board pagination: hasNextPage=true but endCursor is empty")
+		}
+		if next == prevCursor {
+			return nil, fmt.Errorf("github: board pagination stuck: endCursor %q did not advance", next)
+		}
+		prevCursor = next
+		cursor = next // non-nil string triggers $after on next page
 	}
-	return out, nil
+	return nil, fmt.Errorf("github: board pagination exceeded %d pages", maxPaginationPages)
 }
 
 // CloseIssue posts a comment then PATCHes the issue state to closed.

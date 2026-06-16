@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -140,6 +139,9 @@ func ghNormalizeAction(action string) string {
 }
 
 func verifyGitHubSig(header string, payload []byte, secret string) error {
+	if secret == "" {
+		return errors.New("github: empty webhook secret")
+	}
 	if header == "" {
 		return errors.New("github: missing X-Hub-Signature-256")
 	}
@@ -265,7 +267,7 @@ func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 		if raw == prevURL {
 			return nil, fmt.Errorf("github: pagination stuck: next URL equals current URL %q", raw)
 		}
-		// The next URL may be absolute; strip the base so ghDoWithHeaders can use it directly.
+		// The next URL from the Link header is absolute and is passed to ghDoWithHeaders as the full request URL.
 		nextURL = raw
 	}
 	return nil, fmt.Errorf("github: pagination exceeded %d pages", maxPaginationPages)
@@ -351,13 +353,10 @@ func (c *GitHub) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 		Number  int    `json:"number"`
 		HTMLURL string `json:"html_url"`
 	}
-	t0 := time.Now()
 	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "create_issue", "resource_id", owner+"/"+repo, "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return CreatedIssue{}, err
 	}
 	ref := fmt.Sprintf("%s/%s#%d", owner, repo, out.Number)
-	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "create_issue", "resource_id", ref, "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	return CreatedIssue{Ref: ref, URL: out.HTMLURL}, nil
 }
 
@@ -471,21 +470,15 @@ func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, 
 
 // Approve posts an APPROVE review.
 func (c *GitHub) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
-	owner, repo, err := ghOwnerRepo(repoURL)
-	if err != nil {
-		return err
-	}
-	t0 := time.Now()
-	if err := c.review(ctx, repoURL, token, number, "APPROVE", body, nil); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "approve", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
-		return err
-	}
-	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "approve", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
-	return nil
+	return c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
 }
 
 // RequestChanges posts a REQUEST_CHANGES review.
+// GitHub requires a non-empty body for REQUEST_CHANGES (422 otherwise); default it to match GitLab parity.
 func (c *GitHub) RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error {
+	if body == "" {
+		body = "Requesting changes."
+	}
 	return c.review(ctx, repoURL, token, number, "REQUEST_CHANGES", body, nil)
 }
 
@@ -517,16 +510,13 @@ func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, m
 	var resp struct {
 		SHA string `json:"sha"`
 	}
-	t0 := time.Now()
 	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, &resp); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "merge", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		var he *HTTPError
 		if errors.As(err, &he) && (he.Status == 405 || he.Status == 409) {
 			return "", ErrMergeConflict
 		}
 		return "", err
 	}
-	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "merge", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	return resp.SHA, nil
 }
 
@@ -537,12 +527,9 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 		return err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
-	t0 := time.Now()
 	if err := ghDo(ctx, c.base(), http.MethodPatch, path, token, map[string]string{"state": "closed"}, nil); err != nil {
-		slog.InfoContext(ctx, "scm action", "provider", "github", "action", "close_pr", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "error")
 		return err
 	}
-	slog.InfoContext(ctx, "scm action", "provider", "github", "action", "close_pr", "resource_id", fmt.Sprintf("%s/%s#%d", owner, repo, number), "duration_ms", time.Since(t0).Milliseconds(), "result", "ok")
 	if body == "" {
 		return nil
 	}
