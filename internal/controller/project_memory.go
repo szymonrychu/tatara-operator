@@ -93,7 +93,6 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		memory.LightragDeployment(p, cfg),
 		memory.LightragService(p, cfg),
 		memory.MemoryConfigMap(p, cfg),
-		memory.MemorySecret(p, cfg),
 		memory.MemoryDeployment(p, cfg),
 		memory.MemoryService(p, cfg),
 	}

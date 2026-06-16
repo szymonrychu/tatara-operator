@@ -21,7 +21,7 @@ func TestMemoryDeployment(t *testing.T) {
 	require.Equal(t, "harbor/tatara-memory:0.2.0", c.Image)
 	require.Equal(t, int32(8080), c.Ports[0].ContainerPort)
 
-	// envFrom references the ConfigMap and Secret.
+	// envFrom references ONLY the ConfigMap - no empty speculative Secret (KISS rule).
 	var cmRef, secRef bool
 	for _, ef := range c.EnvFrom {
 		if ef.ConfigMapRef != nil && ef.ConfigMapRef.Name == "mem-acme" {
@@ -32,7 +32,7 @@ func TestMemoryDeployment(t *testing.T) {
 		}
 	}
 	require.True(t, cmRef, "configMapRef mem-acme missing from envFrom")
-	require.True(t, secRef, "secretRef mem-acme missing from envFrom")
+	require.False(t, secRef, "empty speculative SecretRef mem-acme must not appear in envFrom")
 
 	// Env vars: PG_DSN and OPENAI_API_KEY must both be present.
 	envByName := make(map[string]corev1.EnvVar)
@@ -77,14 +77,6 @@ func TestMemoryConfigMap(t *testing.T) {
 	require.Equal(t, "info", cm.Data["LOG_LEVEL"])
 	require.Contains(t, cm.Data, "WORKER_POOL_SIZE")
 	require.Len(t, cm.OwnerReferences, 1)
-}
-
-func TestMemorySecret(t *testing.T) {
-	p := testProject("acme")
-	s := memory.MemorySecret(p, testCfg())
-	require.Equal(t, "mem-acme", s.Name)
-	require.Equal(t, corev1.SecretTypeOpaque, s.Type)
-	require.Len(t, s.OwnerReferences, 1)
 }
 
 func TestMemoryService(t *testing.T) {

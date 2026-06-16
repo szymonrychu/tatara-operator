@@ -27,21 +27,9 @@ func MemoryConfigMap(p *tatarav1alpha1.Project, cfg Config) *corev1.ConfigMap {
 	}
 }
 
-// MemorySecret is the per-Project tatara-memory Secret. The real PG DSN comes
-// from the cnpg app Secret via an inline PG_DSN env (see MemoryDeployment);
-// this Secret exists for envFrom symmetry and future non-cnpg secret env.
-func MemorySecret(p *tatarav1alpha1.Project, cfg Config) *corev1.Secret {
-	n := NamesFor(p.Name)
-	return &corev1.Secret{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: objectMeta(p, cfg, n.Memory),
-		Type:       corev1.SecretTypeOpaque,
-	}
-}
-
 // MemoryDeployment builds the per-Project tatara-memory Deployment (port 8080).
-// Non-secret env via the ConfigMap, the per-Project Secret via envFrom, and
-// PG_DSN inline from the cnpg app Secret key uri.
+// Non-secret env via the ConfigMap; PG_DSN and OPENAI_API_KEY inline from
+// their respective Secrets.
 func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
 	n := NamesFor(p.Name)
 	replicas := int32(1)
@@ -67,7 +55,6 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 						},
 						EnvFrom: []corev1.EnvFromSource{
 							{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: n.Memory}}},
-							{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: n.Memory}}},
 						},
 						Env: []corev1.EnvVar{
 							secretEnv("PG_DSN", n.PGAppSecret, "uri"),
