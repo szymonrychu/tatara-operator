@@ -86,7 +86,15 @@ const (
 // in the main container, then writes the cloned HEAD SHA into the repo's
 // result ConfigMap via the in-cluster API.
 func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Repository, since, baseURL string, cfg Config) *batchv1.Job {
+	// Incremental jobs use BackoffLimit=0: a missing-since-SHA failure (e.g. after
+	// a force-push) is deterministic and not retryable at the pod level. Zero retries
+	// means the controller reaches its full-ingest fallback after one pod attempt
+	// instead of burning 3 pod runs before escalating (hard rule 13, finding 4).
+	// Full ingests keep BackoffLimit=2 (transient clone/network failures can self-heal).
 	backoff := int32(2)
+	if since != "" {
+		backoff = 0
+	}
 	ttl := int32(600)
 	controller := true
 

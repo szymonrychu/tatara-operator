@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -309,7 +310,10 @@ func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *t
 
 	// Only schedule once a repo has been ingested at least once; a first full
 	// ingest is driven by ingestDecision, not the cron.
-	if repo.Status.LastIngestedCommit == "" || repo.Spec.ReingestSchedule == "" {
+	// Only schedule once a repo has been ingested at least once. ReingestSchedule
+	// is a Required+MinLength field so the empty-string branch is unreachable for
+	// any object that passed admission; the parse below handles malformed values.
+	if repo.Status.LastIngestedCommit == "" {
 		return ctrl.Result{}, nil
 	}
 
@@ -352,21 +356,30 @@ func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *t
 		return ctrl.Result{RequeueAfter: maxScheduleRequeue}, nil
 	}
 
-	// Finding 3: persist the dedup guard (LastScheduledReingest) in status
-	// BEFORE stamping the annotation that triggers a new reconcile. This ensures
-	// that any concurrent reconcile already sees the guard and cannot double-stamp.
-	scheduled := metav1.NewTime(now)
-	repo.Status.LastScheduledReingest = &scheduled
-	if err := r.Status().Update(ctx, repo); err != nil {
-		return ctrl.Result{}, fmt.Errorf("update lastScheduledReingest: %w", err)
-	}
-
+	// Stamp the annotation trigger first. LastScheduledReingest advances only
+	// after the annotation write succeeds so a failed trigger never advances
+	// the dedup base (which would cause the due-but-unstamped fire to be skipped
+	// entirely on the next reconcile).
 	if repo.Annotations == nil {
 		repo.Annotations = map[string]string{}
 	}
 	repo.Annotations[ReingestAnnotation] = now.UTC().Format(time.RFC3339)
 	if err := r.Update(ctx, repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stamp scheduled reingest annotation: %w", err)
+	}
+
+	// Persist the dedup guard only after the trigger is safely written.
+	scheduled := metav1.NewTime(now)
+	repo.Status.LastScheduledReingest = &scheduled
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tataradevv1alpha1.Repository{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
+			return err
+		}
+		fresh.Status.LastScheduledReingest = &scheduled
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("update lastScheduledReingest: %w", err)
 	}
 
 	l.Info("scheduled re-ingest requested",
@@ -408,8 +421,17 @@ func (r *RepositoryReconciler) ensureResultConfigMap(ctx context.Context, repo *
 func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tataradevv1alpha1.Repository, job *batchv1.Job) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	if job.Status.StartTime != nil && job.Status.CompletionTime != nil {
-		r.Metrics.ObserveIngestJobDuration(job.Status.CompletionTime.Sub(job.Status.StartTime.Time).Seconds())
+	// Record duration for all finished jobs (success and failure). Failed jobs
+	// do not have CompletionTime set by Kubernetes, so fall back to time.Now()
+	// to capture the actual elapsed time (hard rule 13: metrics for everything
+	// that can fail).
+	if job.Status.StartTime != nil {
+		end := job.Status.CompletionTime
+		if end == nil {
+			now := metav1.Now()
+			end = &now
+		}
+		r.Metrics.ObserveIngestJobDuration(end.Sub(job.Status.StartTime.Time).Seconds())
 	}
 
 	if jobSucceeded(job) {
@@ -419,27 +441,38 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("read ingest result sha: %w", err)
 		}
-		now := metav1.Now()
-		repo.Status.LastIngestedCommit = sha
-		repo.Status.LastIngestTime = &now
-		repo.Status.Phase = "Ingested"
-		repo.Status.JobName = ""
-		repo.Status.IngestFailureCount = 0
-		repo.Status.LastIngestFailureTime = nil
-		meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-			Type:               "Ingested",
-			Status:             metav1.ConditionTrue,
-			Reason:             "IngestSucceeded",
-			Message:            "ingested at " + sha,
-			ObservedGeneration: repo.Generation,
-		})
-		if err := r.Status().Update(ctx, repo); err != nil {
+		ingestTime := metav1.Now()
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tataradevv1alpha1.Repository{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
+				return err
+			}
+			fresh.Status.LastIngestedCommit = sha
+			fresh.Status.LastIngestTime = &ingestTime
+			fresh.Status.Phase = "Ingested"
+			fresh.Status.JobName = ""
+			fresh.Status.IngestFailureCount = 0
+			fresh.Status.LastIngestFailureTime = nil
+			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+				Type:               "Ingested",
+				Status:             metav1.ConditionTrue,
+				Reason:             "IngestSucceeded",
+				Message:            "ingested at " + sha,
+				ObservedGeneration: fresh.Generation,
+			})
+			if updateErr := r.Status().Update(ctx, fresh); updateErr != nil {
+				return updateErr
+			}
+			// Refresh repo for the annotation clear below.
+			*repo = *fresh
+			return nil
+		}); err != nil {
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
 		}
-		// Finding 2: consume the reingest-requested annotation so the trigger is
+		// Consume the reingest-requested annotation so the trigger is
 		// self-extinguishing instead of relying on timestamp ordering to suppress
-		// re-fires. Delete after the status write so the status always reflects the
+		// re-fires. Done after the status write so the status always reflects the
 		// completed ingest even if the metadata patch is retried.
 		if _, ok := repo.Annotations[ReingestAnnotation]; ok {
 			delete(repo.Annotations, ReingestAnnotation)
@@ -457,30 +490,38 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 	}
 
 	r.Metrics.IngestJobResult("failure")
-	repo.Status.Phase = "Failed"
-	repo.Status.JobName = ""
-	repo.Status.IngestFailureCount++
 	failTime := metav1.NewTime(time.Now())
-	repo.Status.LastIngestFailureTime = &failTime
-	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-		Type:               "Ingested",
-		Status:             metav1.ConditionFalse,
-		Reason:             "IngestFailed",
-		Message:            "ingest job " + job.Name + " failed",
-		ObservedGeneration: repo.Generation,
-	})
-	if err := r.Status().Update(ctx, repo); err != nil {
+	var newFailureCount int
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tataradevv1alpha1.Repository{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
+			return err
+		}
+		fresh.Status.Phase = "Failed"
+		fresh.Status.JobName = ""
+		fresh.Status.IngestFailureCount++
+		fresh.Status.LastIngestFailureTime = &failTime
+		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "Ingested",
+			Status:             metav1.ConditionFalse,
+			Reason:             "IngestFailed",
+			Message:            "ingest job " + job.Name + " failed",
+			ObservedGeneration: fresh.Generation,
+		})
+		if updateErr := r.Status().Update(ctx, fresh); updateErr != nil {
+			return updateErr
+		}
+		newFailureCount = fresh.Status.IngestFailureCount
+		return nil
+	}); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
 	}
 	l.Info("ingest failed",
 		"action", "ingest_failed", "resource_id", repo.Name, "job", job.Name,
-		"failure_count", repo.Status.IngestFailureCount)
+		"failure_count", newFailureCount)
 	r.Metrics.ReconcileResult("Repository", "error")
-	// Finding 1: return the computed backoff as RequeueAfter so the reconciler
-	// wakes at the correct retry time instead of relying on the 600s Job TTL
-	// to trigger the next pass.
-	return ctrl.Result{RequeueAfter: ingestBackoff(repo.Status.IngestFailureCount)}, nil
+	return ctrl.Result{RequeueAfter: ingestBackoff(newFailureCount)}, nil
 }
 
 // jobSucceeded reports whether the Job has a Complete=True condition.

@@ -45,6 +45,17 @@ func testConfig() Config {
 	}
 }
 
+// TestBuildJob_IncrementalBackoffLimitIsZero verifies that incremental ingest
+// jobs (since != "") use BackoffLimit=0. A missing-since-SHA failure (e.g. after
+// a force-push) is deterministic at the pod level; zero retries ensures the
+// controller reaches its full-ingest fallback after one pod attempt.
+func TestBuildJob_IncrementalBackoffLimitIsZero(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "abc123", testBaseURL, testConfig())
+	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 0 {
+		t.Errorf("incremental ingest BackoffLimit = %v, want 0", job.Spec.BackoffLimit)
+	}
+}
+
 func TestBuildJob_TTLSecondsAfterFinished(t *testing.T) {
 	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 	if job.Spec.TTLSecondsAfterFinished == nil {
@@ -88,8 +99,9 @@ func TestBuildJob_FullIngest(t *testing.T) {
 	if got := job.Spec.Template.Spec.RestartPolicy; got != corev1.RestartPolicyNever {
 		t.Errorf("restartPolicy = %q, want Never", got)
 	}
+	// Full ingest (since="") keeps BackoffLimit=2 for transient-failure retry.
 	if job.Spec.BackoffLimit == nil || *job.Spec.BackoffLimit != 2 {
-		t.Errorf("backoffLimit = %v, want 2", job.Spec.BackoffLimit)
+		t.Errorf("full ingest backoffLimit = %v, want 2", job.Spec.BackoffLimit)
 	}
 
 	if len(job.OwnerReferences) != 1 {
