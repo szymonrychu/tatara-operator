@@ -28,6 +28,8 @@ lightragImage: ""
 neo4jImage: ""
 openaiSecretName: ""
 ingesterImage: ""
+# grafana-mcp image for the optional per-project Grafana incident-response feature.
+grafanaMcpImage: ""
 externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"
 # operatorOidcSecretName overrides the Secret that holds OPERATOR_OIDC_CLIENT_SECRET.

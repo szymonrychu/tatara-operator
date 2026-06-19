@@ -91,6 +91,7 @@ INGRESS_REWRITE_TARGET: {{ .Values.ingressRewriteTarget | quote }}
 MEMORY_PATH_PREFIX: {{ .Values.memoryPathPrefix | quote }}
 CHAT_PATH_PREFIX: {{ .Values.chatPathPrefix | quote }}
 CHAT_IMAGE: {{ .Values.chatImage | quote }}
+GRAFANA_MCP_IMAGE: {{ .Values.grafanaMcpImage | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
 AGENT_CPU_LIMIT: {{ .Values.agentCpuLimit | quote }}
