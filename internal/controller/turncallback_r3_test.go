@@ -77,10 +77,11 @@ func TestRecordUsage_SameTurnDuplicateDoesNotDoubleCount(t *testing.T) {
 // --- Finding 3: turnTimedOut free function deduplication ---
 
 // TestTurnTimedOut_ExpiredReturnsTrue verifies that the free function
-// turnTimedOut returns true when started > timeout+grace ago.
+// turnTimedOut returns true when started > timeout+grace ago and there is no
+// later activity.
 func TestTurnTimedOut_ExpiredReturnsTrue(t *testing.T) {
 	startedAt := time.Now().Add(-2 * time.Hour)
-	if !turnTimedOut(startedAt.Format(time.RFC3339), 1800) {
+	if !turnTimedOut(startedAt.Format(time.RFC3339), "", 1800) {
 		t.Error("turnTimedOut must return true for a turn started 2h ago with 1800s timeout")
 	}
 }
@@ -89,7 +90,7 @@ func TestTurnTimedOut_ExpiredReturnsTrue(t *testing.T) {
 // for a turn started less than timeout+grace ago.
 func TestTurnTimedOut_RecentReturnsFalse(t *testing.T) {
 	startedAt := time.Now().Add(-10 * time.Second)
-	if turnTimedOut(startedAt.Format(time.RFC3339), 1800) {
+	if turnTimedOut(startedAt.Format(time.RFC3339), "", 1800) {
 		t.Error("turnTimedOut must return false for a turn started 10s ago with 1800s timeout")
 	}
 }
@@ -97,7 +98,7 @@ func TestTurnTimedOut_RecentReturnsFalse(t *testing.T) {
 // TestTurnTimedOut_EmptyStartedAtReturnsFalse verifies safe default when the
 // annotation is missing.
 func TestTurnTimedOut_EmptyStartedAtReturnsFalse(t *testing.T) {
-	if turnTimedOut("", 1800) {
+	if turnTimedOut("", "", 1800) {
 		t.Error("turnTimedOut must return false (safe default) for empty startedAt")
 	}
 }
@@ -105,8 +106,44 @@ func TestTurnTimedOut_EmptyStartedAtReturnsFalse(t *testing.T) {
 // TestTurnTimedOut_BadFormatReturnsFalse verifies safe default for unparseable
 // annotation values.
 func TestTurnTimedOut_BadFormatReturnsFalse(t *testing.T) {
-	if turnTimedOut("not-a-timestamp", 1800) {
+	if turnTimedOut("not-a-timestamp", "", 1800) {
 		t.Error("turnTimedOut must return false (safe default) for unparseable startedAt")
+	}
+}
+
+// TestTurnTimedOut_RecentActivityKeepsAlive verifies the stall semantics: a turn
+// started well past the window stays alive while recent activity keeps arriving.
+func TestTurnTimedOut_RecentActivityKeepsAlive(t *testing.T) {
+	startedAt := time.Now().Add(-2 * time.Hour)
+	lastActivity := time.Now().Add(-5 * time.Second)
+	if turnTimedOut(startedAt.Format(time.RFC3339), lastActivity.Format(time.RFC3339), 1800) {
+		t.Error("turnTimedOut must return false when last activity is recent, even if started long ago")
+	}
+}
+
+// TestTurnTimedOut_StaleActivityExpires verifies a turn fails once activity has
+// been silent past the window. The anchor is max(started, activity), so a recent
+// start with stale activity does NOT fire, but once both are stale it does.
+func TestTurnTimedOut_StaleActivityExpires(t *testing.T) {
+	recentStart := time.Now().Add(-10 * time.Second).Format(time.RFC3339)
+	stale := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
+	if turnTimedOut(recentStart, stale, 1800) {
+		t.Error("turnTimedOut must return false: anchor is max(started, activity) = recent start")
+	}
+	if !turnTimedOut(stale, stale, 1800) {
+		t.Error("turnTimedOut must return true when both start and last activity are past the window")
+	}
+}
+
+// TestTurnTimedOut_FallsBackToStartedAt verifies that an empty/unparseable
+// last-activity value falls back to the start anchor so the bound is never lost.
+func TestTurnTimedOut_FallsBackToStartedAt(t *testing.T) {
+	startedAt := time.Now().Add(-2 * time.Hour).Format(time.RFC3339)
+	if !turnTimedOut(startedAt, "", 1800) {
+		t.Error("empty last-activity must fall back to startedAt (expired -> true)")
+	}
+	if !turnTimedOut(startedAt, "not-a-timestamp", 1800) {
+		t.Error("unparseable last-activity must fall back to startedAt (expired -> true)")
 	}
 }
 

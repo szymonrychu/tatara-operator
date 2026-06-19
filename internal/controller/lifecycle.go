@@ -343,6 +343,7 @@ func (r *TaskReconciler) resetAgentRun(ctx context.Context, task *tatarav1alpha1
 			delete(fresh2.Annotations, annCurrentSubtask)
 			delete(fresh2.Annotations, annTurnComplete)
 			delete(fresh2.Annotations, annTurnStartedAt)
+			delete(fresh2.Annotations, annTurnLastActivity)
 			delete(fresh2.Annotations, annPodRecreations)
 			delete(fresh2.Annotations, annAgentUnreachableSince)
 		}

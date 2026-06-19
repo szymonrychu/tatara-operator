@@ -109,7 +109,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"repo"}),
 		turnTimeoutTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_turn_timeout_total",
-			Help: "Agent turns that exceeded their deadline and were terminated, by detection source.",
+			Help: "Agent turns terminated for stalling (no activity past the inactivity deadline), by detection source.",
 		}, []string{"source"}),
 		ingestJobTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_ingest_job_total",
