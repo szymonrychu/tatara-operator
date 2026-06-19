@@ -561,6 +561,38 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Hard-gate (cap 1): refuse a second bot comment on the same issue. Best-effort -
+	// empty BotLogin, no reader factory, or an SCM read error all fall open (post proceeds);
+	// the brainstorm prompt is the first line of defence, this is the authoritative backstop.
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	if botLogin != "" && s.readerFor != nil {
+		if reader, rerr := s.readerFor(provider, token); rerr == nil {
+			if owner, name, oerr := scm.OwnerRepo(matchedRepoURL); oerr == nil {
+				if comments, cerr := reader.ListIssueComments(r.Context(), owner, name, req.Number); cerr == nil {
+					for _, cm := range comments {
+						if cm.Author == botLogin {
+							if s.metrics != nil {
+								s.metrics.SCMWrite(provider, "comment", "blocked")
+							}
+							s.log.InfoContext(r.Context(), "restapi: commentOnIssue blocked",
+								append(reqLogFields(r),
+									"action", "scm_issue_comment_blocked",
+									"reason", "already_commented",
+									"project", projName,
+									"repo", req.Repo,
+									"number", req.Number)...)
+							writeError(w, http.StatusConflict, "bot already commented on this issue; pick another action")
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+
 	start := time.Now()
 	issueRef := fmt.Sprintf("%s#%d", req.Repo, req.Number)
 	commentErr := writer.Comment(r.Context(), token, issueRef, req.Body)

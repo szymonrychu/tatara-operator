@@ -102,6 +102,9 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
 		Logger:  slog.Default(),
 		Metrics: metrics,
 	}).Mount(httpMux, auth.Middleware(verifier, metrics))

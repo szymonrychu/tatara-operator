@@ -350,3 +350,110 @@ func TestCommentOnIssue_RecordsSCMWriteMetricOnError(t *testing.T) {
 	require.NoError(t, ctr.Write(&metric))
 	require.EqualValues(t, 1, metric.GetCounter().GetValue())
 }
+
+// --- Task 3: egress hard-gate (409 on duplicate bot comment) ---
+
+// fakeReader returns canned issue comments for the gate test.
+type fakeReader struct {
+	comments []scm.IssueComment
+}
+
+func (f *fakeReader) ListOpenPRs(_ context.Context, _, _ string) ([]scm.PRRef, error) {
+	return nil, nil
+}
+func (f *fakeReader) ListOpenIssues(_ context.Context, _, _ string) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReader) ListBoardItems(_ context.Context, _ scm.BoardRef) ([]scm.BoardItem, error) {
+	return nil, nil
+}
+func (f *fakeReader) GetCommitCIStatus(_ context.Context, _, _, _ string) (string, error) {
+	return "", nil
+}
+func (f *fakeReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return f.comments, nil
+}
+func (f *fakeReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
+	return scm.IssueContent{}, nil
+}
+
+// buildRouterWithReader injects both an SCMFor writer and a ReaderFor reader.
+func buildRouterWithReader(t *testing.T, writer scm.SCMWriter, reader scm.SCMReader, objs ...client.Object) *chi.Mux {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&tatarav1alpha1.Project{}, &tatarav1alpha1.Repository{},
+			&tatarav1alpha1.Task{}, &tatarav1alpha1.Subtask{}).
+		Build()
+	s := restapi.NewServer(restapi.Config{
+		Client:    fc,
+		Namespace: "tatara",
+		SCMFor: func(_ string) (scm.SCMWriter, error) {
+			return writer, nil
+		},
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) {
+			return reader, nil
+		},
+	})
+	r := chi.NewRouter()
+	s.Mount(r, nil)
+	return r
+}
+
+// projectWithBot is projectWithSCM plus a BotLogin (gate is a no-op without it).
+func projectWithBot(name, secretName, bot string) *tatarav1alpha1.Project {
+	p := projectWithSCM(name, secretName)
+	p.Spec.Scm.BotLogin = bot
+	return p
+}
+
+func TestCommentOnIssue_BlockedWhenBotAlreadyCommented(t *testing.T) {
+	writer := &fakeWriter{}
+	reader := &fakeReader{comments: []scm.IssueComment{
+		{Author: "someone", Body: "first"},
+		{Author: "tatara-bot", Body: "already weighed in"},
+	}}
+	proj := projectWithBot("projblk", "projblk-scm", "tatara-bot")
+	secret := scmSecret("projblk-scm", "tok")
+	repo := repoForProject("projblk-repo", "projblk", "https://github.com/o/r.git")
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"again"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projblk/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	require.Len(t, writer.comments, 0, "must not post when already commented")
+}
+
+func TestCommentOnIssue_PostsWhenBotNotYetCommented(t *testing.T) {
+	writer := &fakeWriter{}
+	reader := &fakeReader{comments: []scm.IssueComment{
+		{Author: "someone", Body: "first"},
+	}}
+	proj := projectWithBot("projok", "projok-scm", "tatara-bot")
+	secret := scmSecret("projok-scm", "tok")
+	repo := repoForProject("projok-repo", "projok", "https://github.com/o/r.git")
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"my take"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projok/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	require.Len(t, writer.comments, 1)
+}
