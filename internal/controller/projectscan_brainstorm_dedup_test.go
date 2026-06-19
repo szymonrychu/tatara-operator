@@ -8,6 +8,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -153,8 +154,9 @@ func TestBrainstorm_IssuesContextCappedAt60(t *testing.T) {
 // proposalBacklog counts them only if they carry the brainstorming label).
 type goalCapturingReader struct {
 	fakeReader
-	issuesByRepo map[string][]scm.IssueRef
-	queriedRepos map[string]int
+	issuesByRepo      map[string][]scm.IssueRef
+	queriedRepos      map[string]int
+	commentsBySlugNum map[string][]scm.IssueComment
 }
 
 func (g *goalCapturingReader) ListOpenIssues(_ context.Context, owner, repo string) ([]scm.IssueRef, error) {
@@ -164,4 +166,50 @@ func (g *goalCapturingReader) ListOpenIssues(_ context.Context, owner, repo stri
 	slug := owner + "/" + repo
 	g.queriedRepos[slug]++
 	return g.issuesByRepo[slug], nil
+}
+
+func (g *goalCapturingReader) ListIssueComments(_ context.Context, owner, repo string, number int) ([]scm.IssueComment, error) {
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	return g.commentsBySlugNum[key], nil
+}
+
+// TestBrainstorm_BotEngagedIssueFlagged verifies that an issue the bot already
+// commented on is marked [bot-engaged] in the goal, while an untouched issue is not.
+func TestBrainstorm_BotEngagedIssueFlagged(t *testing.T) {
+	proj, repos := seedBrainstormProject(t, "bs-botengaged", []string{"o/eng1", "o/eng2"}, 5)
+
+	reader := &goalCapturingReader{
+		issuesByRepo: map[string][]scm.IssueRef{
+			"o/eng1": {
+				{Repo: "o/eng1", Number: 7, Title: "improve caching layer", UpdatedAt: time.Now()},
+			},
+			"o/eng2": {
+				{Repo: "o/eng2", Number: 2, Title: "fix login redirect", UpdatedAt: time.Now()},
+			},
+		},
+		commentsBySlugNum: map[string][]scm.IssueComment{
+			// Bot already commented on o/eng1#7 (off-limits); o/eng2#2 untouched.
+			"o/eng1#7": {{Author: "tatara-bot", Body: "looking into this"}},
+		},
+	}
+
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
+	budget := 99
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+
+	tasks := listBrainstormTasks(t, "bs-botengaged")
+	if len(tasks) != 1 {
+		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	}
+	goal := tasks[0].Spec.Goal
+
+	if !strings.Contains(goal, "o/eng1#7 [] improve caching layer [bot-engaged]") {
+		t.Fatalf("bot-engaged issue not flagged:\n%s", goal)
+	}
+	if strings.Contains(goal, "fix login redirect [bot-engaged]") {
+		t.Fatalf("untouched issue wrongly flagged:\n%s", goal)
+	}
 }

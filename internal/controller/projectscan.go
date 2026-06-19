@@ -1060,7 +1060,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	// Build rich open-issues context from already-fetched data (no second
 	// ListOpenIssues round-trip for the repos queried above - finding 5).
-	issuesCtx := r.buildIssuesContext(ctx, proj, issuesBySlug, sortedRepos)
+	issuesCtx := r.buildIssuesContext(ctx, proj, reader, issuesBySlug, sortedRepos)
 
 	goal := brainstormGoalProject(slugs, issuesCtx)
 	if _, err := r.createBrainstormTask(ctx, proj, goal, act.Sources); err != nil {
@@ -1157,7 +1157,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 
 	// Build rich open-issues context from already-fetched data (no second
 	// ListOpenIssues round-trip for the repos queried above - finding 5).
-	issuesCtx := r.buildIssuesContext(ctx, proj, issuesBySlug, sortedRepos)
+	issuesCtx := r.buildIssuesContext(ctx, proj, reader, issuesBySlug, sortedRepos)
 
 	goal := healthCheckGoalProject(slugs, issuesCtx)
 	if _, err := r.createHealthCheckTask(ctx, proj, goal, act.Sources); err != nil {
@@ -1241,8 +1241,12 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 // Capped at 60 issues; if more exist, appends a "(+N more omitted)" line.
 const maxIssuesContext = 60
 
-func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1alpha1.Project, issuesBySlug map[string][]scm.IssueRef, repos []tatarav1alpha1.Repository) string {
+func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issuesBySlug map[string][]scm.IssueRef, repos []tatarav1alpha1.Repository) string {
 	l := log.FromContext(ctx)
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
 	var lines []string
 	total := 0
 	for i := range repos {
@@ -1267,6 +1271,9 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1a
 			title = strings.ReplaceAll(title, "\n", " ")
 			title = strings.ReplaceAll(title, "\r", "")
 			line := fmt.Sprintf("%s#%d [%s] %s", slug, iss.Number, labels, title)
+			if botCommentedOnIssue(ctx, reader, owner, name, iss.Number, botLogin) {
+				line += " [bot-engaged]"
+			}
 			lines = append(lines, line)
 		}
 	}
@@ -1281,6 +1288,25 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, _ *tatarav1a
 			"shown", len(lines), "omitted", omitted)
 	}
 	return result
+}
+
+// botCommentedOnIssue reports whether botLogin already authored a comment on the
+// issue. Empty botLogin or any SCM read error -> false (best-effort flag; the
+// commentOnIssue egress gate is the authoritative backstop).
+func botCommentedOnIssue(ctx context.Context, reader scm.SCMReader, owner, name string, number int, botLogin string) bool {
+	if botLogin == "" {
+		return false
+	}
+	comments, err := reader.ListIssueComments(ctx, owner, name, number)
+	if err != nil {
+		return false
+	}
+	for _, c := range comments {
+		if c.Author == botLogin {
+			return true
+		}
+	}
+	return false
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
