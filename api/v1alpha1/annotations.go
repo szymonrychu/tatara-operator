@@ -56,4 +56,11 @@ const (
 	// (backward-compatible default). The label is NOT set on scan-created tasks
 	// (they predate this label); its absence is interpreted as "false" (issue).
 	LabelIsPR = "tatara.io/is-pr"
+	// LabelAlertGroup is the per-alert-group dedup key on an incident Task.
+	LabelAlertGroup = "tatara.dev/alert-group"
+)
+
+const (
+	// AnnGrafanaAlert carries the rendered Grafana alert context on an incident Task.
+	AnnGrafanaAlert = "tatara.dev/grafana-alert"
 )

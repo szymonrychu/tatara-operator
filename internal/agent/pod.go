@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 )
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
@@ -175,6 +176,12 @@ func podNameSuffix(task *tatarav1alpha1.Task) string {
 			return "healthcheck"
 		}
 		return "brainstorm"
+	}
+	if task.Spec.Kind == "incident" {
+		if g := task.Labels[tatarav1alpha1.LabelAlertGroup]; g != "" {
+			return "incident-" + g
+		}
+		return "incident"
 	}
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
@@ -348,6 +355,15 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// name is set so existing deployments without HMAC work unchanged.
 	if cfg.CallbackHMACSecretName != "" {
 		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
+	}
+
+	if project.Spec.Grafana != nil && project.Spec.Grafana.Enabled {
+		// Per-project read-only grafana-mcp endpoint. The wrapper registers this
+		// as an HTTP MCP server so the agent can query Grafana for live debugging.
+		env = append(env, corev1.EnvVar{
+			Name:  "TATARA_GRAFANA_MCP_URL",
+			Value: grafanamcp.MCPURL(project.Name, cfg.Namespace),
+		})
 	}
 
 	if len(repos) > 0 {

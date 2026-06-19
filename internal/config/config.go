@@ -33,6 +33,7 @@ type Config struct {
 	OperatorURL              string
 	MemoryImage              string
 	LightragImage            string
+	GrafanaMCPImage          string
 	Neo4jImage               string
 	OpenAISecretName         string
 	SemanticModel            string
@@ -182,6 +183,7 @@ func Load() (Config, error) {
 		OperatorURL:              getDefault("OPERATOR_URL", "http://tatara-operator.tatara.svc:8080"),
 		MemoryImage:              os.Getenv("MEMORY_IMAGE"),
 		LightragImage:            os.Getenv("LIGHTRAG_IMAGE"),
+		GrafanaMCPImage:          os.Getenv("GRAFANA_MCP_IMAGE"),
 		Neo4jImage:               os.Getenv("NEO4J_IMAGE"),
 		OpenAISecretName:         os.Getenv("OPENAI_SECRET_NAME"),
 		SemanticModel:            getDefault("SEMANTIC_MODEL", "gpt-4o-mini"),

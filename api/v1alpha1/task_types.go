@@ -103,6 +103,7 @@ var repoScopedKinds = map[string]bool{
 var projectScopedKinds = map[string]bool{
 	"brainstorm":  true,
 	"healthCheck": true,
+	"incident":    true,
 }
 
 // ValidateTaskSpec validates the RepositoryRef contract for a TaskSpec:
@@ -137,7 +138,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`

@@ -164,7 +164,6 @@ spec:
                 type: string
               phase:
                 enum:
-                - Pending
                 - Ingesting
                 - Ingested
                 - Failed

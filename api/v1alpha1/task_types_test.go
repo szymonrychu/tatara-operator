@@ -227,6 +227,17 @@ func TestTaskSpec_ValidateRepositoryRef(t *testing.T) {
 	}
 }
 
+// TestValidateTaskSpec_Incident verifies that "incident" is project-scoped:
+// empty RepositoryRef is valid; a non-empty one must be rejected.
+func TestValidateTaskSpec_Incident(t *testing.T) {
+	if err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{Kind: "incident"}); err != nil {
+		t.Fatalf("incident with empty repositoryRef must be valid: %v", err)
+	}
+	if err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{Kind: "incident", RepositoryRef: "r"}); err == nil {
+		t.Fatalf("incident with a repositoryRef must be rejected (project-scoped)")
+	}
+}
+
 // TestSuggestionLineMarker verifies Suggestion.Line is present and accepts a
 // valid positive value (the +kubebuilder:validation:Minimum=1 marker is a
 // CRD-schema concern; this test guards the struct field exists and is

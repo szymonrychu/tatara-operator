@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +25,7 @@ import (
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/incident"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -56,6 +59,7 @@ func NewServer(cfg Config) *Server {
 // when composing with other route groups on a shared listener.
 func (s *Server) Mount(r chi.Router) {
 	r.Post("/operator/webhooks/{project}", s.handle)
+	r.Post("/operator/webhooks/{project}/grafana", s.handleGrafanaAlert)
 }
 
 // Handler returns a standalone http.Handler with the webhook route. Kept for
@@ -789,6 +793,139 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
 	s.count(provider, ev.Kind, ev.Action, "accepted")
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	projectName := chi.URLParam(r, "project")
+	body, err := readBody(r)
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	var proj tatarav1.Project
+	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, projectName), &proj); err != nil {
+		http.Error(w, "unknown project", http.StatusNotFound)
+		return
+	}
+	if proj.Spec.Grafana == nil || !proj.Spec.Grafana.Enabled {
+		http.Error(w, "grafana not enabled", http.StatusNotFound)
+		return
+	}
+	secret, err := s.webhookSecret(ctx, proj.Spec.Grafana.SecretRef)
+	if err != nil {
+		http.Error(w, "secret", http.StatusInternalServerError)
+		return
+	}
+	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) != 1 {
+		s.count("grafana", "alert", "other", "bad_signature")
+		http.Error(w, "verification failed", http.StatusUnauthorized)
+		return
+	}
+	alert, err := parseGrafanaAlert(body)
+	if err != nil {
+		http.Error(w, "parse alert", http.StatusBadRequest)
+		return
+	}
+	if alert.Status != "firing" {
+		s.count("grafana", "alert", alert.Status, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	groupHash := alertGroupHash(alert)
+	skip, reason, err := s.incidentDedup(ctx, proj.Name, groupHash, proj.Spec.Grafana.CooldownSeconds)
+	if err != nil {
+		http.Error(w, "dedup", http.StatusInternalServerError)
+		return
+	}
+	if skip {
+		s.count("grafana", "alert", "firing", reason)
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	if err := s.createIncidentTask(ctx, &proj, alert, groupHash); err != nil {
+		s.count("grafana", "alert", "firing", "error")
+		http.Error(w, "create task", http.StatusInternalServerError)
+		return
+	}
+	s.count("grafana", "alert", "firing", "created")
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// incidentDedup reports whether to skip creating an incident for this alert
+// group: skip if a non-terminal incident Task exists (in-flight), or the newest
+// incident Task for the group was created within cooldownSeconds.
+func (s *Server) incidentDedup(ctx context.Context, project, groupHash string, cooldownSeconds int) (bool, string, error) {
+	var tl tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tl,
+		client.InNamespace(s.cfg.Namespace),
+		client.MatchingLabels{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash}); err != nil {
+		return false, "", err
+	}
+	if cooldownSeconds <= 0 {
+		cooldownSeconds = 3600
+	}
+	var newest *tatarav1.Task
+	for i := range tl.Items {
+		tk := &tl.Items[i]
+		if tk.Spec.ProjectRef != project {
+			continue
+		}
+		if !tatarav1.TaskTerminal(tk) {
+			return true, "duplicate", nil // in-flight
+		}
+		if newest == nil || tk.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = tk
+		}
+	}
+	if newest != nil && time.Since(newest.CreationTimestamp.Time) < time.Duration(cooldownSeconds)*time.Second {
+		return true, "cooldown", nil
+	}
+	return false, "", nil
+}
+
+func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) error {
+	slugs := projectRepoSlugs(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name)
+	alertCtx := renderAlertContext(alert)
+	goal := incident.GoalProject(alertCtx, slugs)
+	task := &tatarav1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName:    "incident-",
+			Namespace:       s.cfg.Namespace,
+			Labels:          map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
+			Annotations:     map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(proj, tatarav1.GroupVersion.WithKind("Project"))},
+		},
+		Spec: tatarav1.TaskSpec{
+			ProjectRef: proj.Name,
+			// RepositoryRef intentionally empty: incident is project-scoped.
+			Goal: goal,
+			Kind: "incident",
+		},
+	}
+	agent.StampPodName(task, proj.Name, "", "")
+	return s.cfg.Client.Create(ctx, task)
+}
+
+// projectRepoSlugs returns the owner/repo slugs of a project's Repositories,
+// name-sorted, for the incident goal's repo list.
+func projectRepoSlugs(ctx context.Context, c client.Client, ns, project string) []string {
+	var rl tatarav1.RepositoryList
+	if err := c.List(ctx, &rl, client.InNamespace(ns)); err != nil {
+		return nil
+	}
+	var slugs []string
+	for i := range rl.Items {
+		if rl.Items[i].Spec.ProjectRef != project {
+			continue
+		}
+		if o, n, err := scm.OwnerRepo(rl.Items[i].Spec.URL); err == nil {
+			slugs = append(slugs, o+"/"+n)
+		}
+	}
+	sort.Strings(slugs)
+	return slugs
 }
 
 func mentionsBot(body, bot string) bool {
