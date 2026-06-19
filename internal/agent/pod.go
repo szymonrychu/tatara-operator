@@ -177,6 +177,12 @@ func podNameSuffix(task *tatarav1alpha1.Task) string {
 		}
 		return "brainstorm"
 	}
+	if task.Spec.Kind == "incident" {
+		if g := task.Labels[tatarav1alpha1.LabelAlertGroup]; g != "" {
+			return "incident-" + g
+		}
+		return "incident"
+	}
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
 			return fmt.Sprintf("mr-%d", s.Number)

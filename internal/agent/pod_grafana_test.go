@@ -43,3 +43,49 @@ func TestBuildPod_NoGrafanaMCPURL_WhenExplicitlyDisabled(t *testing.T) {
 		t.Fatalf("grafana mcp url env must be absent when grafana spec present but disabled")
 	}
 }
+
+func incidentTask(groupHash string) *tatarav1alpha1.Task {
+	t := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "inc-" + groupHash,
+			Labels: map[string]string{},
+		},
+		Spec: tatarav1alpha1.TaskSpec{Kind: "incident"},
+	}
+	if groupHash != "" {
+		t.Labels[tatarav1alpha1.LabelAlertGroup] = groupHash
+	}
+	return t
+}
+
+// TestIncidentPodSuffix_ContainsIncident verifies the suffix starts with "incident".
+func TestIncidentPodSuffix_ContainsIncident(t *testing.T) {
+	task := incidentTask("abc123")
+	suffix := podNameSuffix(task)
+	if len(suffix) < len("incident") || suffix[:8] != "incident" {
+		t.Fatalf("suffix %q does not start with 'incident'", suffix)
+	}
+}
+
+// TestIncidentPodSuffix_UniquePerAlertGroup verifies two tasks with different
+// LabelAlertGroup values produce different pod name suffixes (and thus different
+// pod names), preventing incident Tasks from colliding on the same pod name.
+func TestIncidentPodSuffix_UniquePerAlertGroup(t *testing.T) {
+	taskA := incidentTask("group-hash-aaa")
+	taskB := incidentTask("group-hash-bbb")
+	suffixA := podNameSuffix(taskA)
+	suffixB := podNameSuffix(taskB)
+	if suffixA == suffixB {
+		t.Fatalf("incident tasks with different alert groups must produce different suffixes; both got %q", suffixA)
+	}
+}
+
+// TestIncidentPodSuffix_NoLabelFallback verifies a graceful fallback when
+// LabelAlertGroup is absent.
+func TestIncidentPodSuffix_NoLabelFallback(t *testing.T) {
+	task := incidentTask("")
+	suffix := podNameSuffix(task)
+	if suffix != "incident" {
+		t.Fatalf("incident task with no alert-group label should produce 'incident', got %q", suffix)
+	}
+}
