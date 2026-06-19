@@ -46,6 +46,7 @@ const (
 	annTurnComplete          = tatarav1alpha1.AnnTurnComplete
 	annPodRecreations        = tatarav1alpha1.AnnPodRecreations
 	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
+	annTurnLastActivity      = tatarav1alpha1.AnnTurnLastActivity
 	annPlanningSince         = tatarav1alpha1.AnnPlanningSince
 	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
 	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
@@ -842,6 +843,7 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 		fresh.Annotations[annCurrentTurn] = turnID
 		fresh.Annotations[annCurrentSubtask] = subtaskName
 		fresh.Annotations[annTurnStartedAt] = startedAt
+		delete(fresh.Annotations, annTurnLastActivity)
 		delete(fresh.Annotations, annTurnComplete)
 		delete(fresh.Annotations, annAgentUnreachableSince)
 		delete(fresh.Annotations, annBootCrashAttempts)
@@ -981,13 +983,14 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	return ctrl.Result{}, nil
 }
 
-// isTurnTimedOut reports whether the in-flight turn has exceeded
-// project.spec.agent.turnTimeoutSeconds + turnTimeoutGrace. It returns false
-// when the annotation is absent or unparseable (safe default: keep waiting).
+// isTurnTimedOut reports whether the in-flight turn has stalled: no agent
+// activity for project.spec.agent.turnTimeoutSeconds + turnTimeoutGrace, anchored
+// on max(turn-started-at, turn-last-activity-at). It returns false when the
+// start annotation is absent or unparseable (safe default: keep waiting).
 // Delegates to the free function turnTimedOut (turncallback.go) so the two
 // receivers share the same deadline arithmetic (finding 3/r3).
 func (r *TaskReconciler) isTurnTimedOut(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
-	return turnTimedOut(task.Annotations[annTurnStartedAt], project.Spec.Agent.TurnTimeoutSeconds)
+	return turnTimedOut(task.Annotations[annTurnStartedAt], task.Annotations[annTurnLastActivity], project.Spec.Agent.TurnTimeoutSeconds)
 }
 
 // updateInflightGauge sets operator_tasks_inflight (aggregate) and

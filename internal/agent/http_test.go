@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -197,9 +198,10 @@ func TestGetTurn(t *testing.T) {
 		require.Equal(t, http.MethodGet, r.Method)
 		require.Equal(t, "/v1/messages/turn-9", r.URL.Path)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"state":      "completed",
-			"finalText":  "all green",
-			"stopReason": "end_turn",
+			"state":          "completed",
+			"finalText":      "all green",
+			"stopReason":     "end_turn",
+			"lastActivityAt": "2026-06-19T12:34:56Z",
 		})
 	})
 	tr, err := s.GetTurn(context.Background(), srv.URL, "turn-9")
@@ -208,6 +210,16 @@ func TestGetTurn(t *testing.T) {
 	require.Equal(t, "all green", tr.FinalText)
 	require.Equal(t, "end_turn", tr.StopReason)
 	require.Empty(t, tr.Err)
+	require.Equal(t, time.Date(2026, 6, 19, 12, 34, 56, 0, time.UTC), tr.LastActivityAt.UTC())
+}
+
+func TestGetTurn_MissingLastActivityIsZero(t *testing.T) {
+	s, srv := newSession(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "running"})
+	})
+	tr, err := s.GetTurn(context.Background(), srv.URL, "turn-1")
+	require.NoError(t, err)
+	require.True(t, tr.LastActivityAt.IsZero(), "absent lastActivityAt must deserialize to zero time")
 }
 
 func TestGetTurn_CarriesErrorField(t *testing.T) {

@@ -12,7 +12,14 @@ const (
 	AnnCurrentSubtask = "tatara.dev/current-subtask"
 	AnnTurnComplete   = "tatara.dev/turn-complete"
 	AnnTurnStartedAt  = "tatara.dev/turn-started-at"
-	AnnPodRecreations = "tatara.dev/pod-recreations"
+	// AnnTurnLastActivity is the RFC3339 timestamp of the in-flight turn's most
+	// recent agent activity (transcript stream event), read from the wrapper's
+	// session/turn status and refreshed by the poll backstop. The turn-timeout
+	// backstop anchors its deadline on max(turn-started-at, this) so an actively
+	// streaming turn is not killed as if it were hung; it is absent until the
+	// first backstop GetTurn, and consumers fall back to turn-started-at.
+	AnnTurnLastActivity = "tatara.dev/turn-last-activity-at"
+	AnnPodRecreations   = "tatara.dev/pod-recreations"
 	// AnnPlanningSince is the RFC3339 timestamp stamped when a Task first enters
 	// the Planning phase on a spawn. The spawn watchdog uses it to fail a Task
 	// wedged in Planning that never acquires an in-flight turn (e.g. a duplicate

@@ -370,29 +370,68 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 		if err != nil {
 			continue
 		}
+		// Refresh the last-activity annotation so the stall deadline (checked on
+		// the next cycle) tracks the wrapper. The backstop owns this annotation;
+		// the reconcile path only reads it.
+		if !tr.LastActivityAt.IsZero() {
+			s.refreshLastActivity(ctx, task.Name, task.Namespace, turn, tr.LastActivityAt.UTC().Format(time.RFC3339))
+		}
 		if tr.State == "completed" || tr.State == "failed" {
 			_ = s.recordResult(ctx, tr, task, turn)
 		}
 	}
 }
 
-// turnTimedOut reports whether a turn that started at startedAtRaw has exceeded
-// timeoutSeconds + turnTimeoutGrace. Returns false (safe default) when
-// startedAtRaw is empty or unparseable. This is a free function so both
-// CallbackServer.isTurnTimedOut and TaskReconciler.isTurnTimedOut can call it
-// without duplicating the deadline arithmetic (finding 3/r3).
-func turnTimedOut(startedAtRaw string, timeoutSeconds int) bool {
+// refreshLastActivity stamps the turn-last-activity-at annotation on the task,
+// best-effort. It is a no-op when the turn has advanced or the value is
+// unchanged, so it adds no write when an idle wrapper reports the same timestamp.
+func (s *CallbackServer) refreshLastActivity(ctx context.Context, taskName, namespace, turnID, lastActivity string) {
+	_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: taskName}, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations[annCurrentTurn] != turnID {
+			return nil
+		}
+		if fresh.Annotations[annTurnLastActivity] == lastActivity {
+			return nil
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[annTurnLastActivity] = lastActivity
+		return s.Client.Update(ctx, fresh)
+	})
+}
+
+// turnTimedOut reports whether a turn has stalled: no agent activity for
+// timeoutSeconds + turnTimeoutGrace. The deadline is anchored on the most recent
+// of startedAtRaw and lastActivityRaw, so timeoutSeconds is a stall (inactivity)
+// window rather than a fixed wall-clock cap: a turn that keeps streaming output
+// is not killed mid-work, while a silent (hung) turn still fails on schedule.
+// Returns false (safe default) when startedAtRaw is empty or unparseable; falls
+// back to startedAtRaw alone when lastActivityRaw is empty or unparseable (e.g.
+// the wrapper is unreachable) so the bound is never lost. This is a free function
+// so both CallbackServer.isTurnTimedOut and TaskReconciler.isTurnTimedOut can
+// call it without duplicating the deadline arithmetic (finding 3/r3).
+func turnTimedOut(startedAtRaw, lastActivityRaw string, timeoutSeconds int) bool {
 	if startedAtRaw == "" {
 		return false
 	}
-	startedAt, err := time.Parse(time.RFC3339, startedAtRaw)
+	anchor, err := time.Parse(time.RFC3339, startedAtRaw)
 	if err != nil {
 		return false
+	}
+	if lastActivityRaw != "" {
+		if la, laErr := time.Parse(time.RFC3339, lastActivityRaw); laErr == nil && la.After(anchor) {
+			anchor = la
+		}
 	}
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 1800
 	}
-	deadline := startedAt.Add(time.Duration(timeoutSeconds)*time.Second + turnTimeoutGrace)
+	deadline := anchor.Add(time.Duration(timeoutSeconds)*time.Second + turnTimeoutGrace)
 	return time.Now().After(deadline)
 }
 
@@ -413,14 +452,15 @@ func validHMACSignature(body []byte, sig, secret string) bool {
 	return hmac.Equal(got, expected)
 }
 
-// isTurnTimedOut checks the turn-started-at annotation against the project
-// turnTimeoutSeconds + grace. Returns false when any lookup fails (safe default).
+// isTurnTimedOut checks the turn against the project turnTimeoutSeconds + grace,
+// anchored on max(turn-started-at, turn-last-activity-at) so the window is a
+// stall (inactivity) deadline. Returns false when any lookup fails (safe default).
 func (s *CallbackServer) isTurnTimedOut(ctx context.Context, task *tatarav1alpha1.Task) bool {
 	var project tatarav1alpha1.Project
 	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &project); err != nil {
 		return false
 	}
-	return turnTimedOut(task.Annotations[annTurnStartedAt], project.Spec.Agent.TurnTimeoutSeconds)
+	return turnTimedOut(task.Annotations[annTurnStartedAt], task.Annotations[annTurnLastActivity], project.Spec.Agent.TurnTimeoutSeconds)
 }
 
 // expireTimedOutTurn performs the terminal cleanup for a timed-out turn:
@@ -458,6 +498,7 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 		if fresh.Annotations != nil {
 			delete(fresh.Annotations, annCurrentTurn)
 			delete(fresh.Annotations, annTurnStartedAt)
+			delete(fresh.Annotations, annTurnLastActivity)
 			delete(fresh.Annotations, annTurnComplete)
 		}
 		if err := s.Client.Update(ctx, fresh); err != nil {

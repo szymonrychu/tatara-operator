@@ -116,15 +116,22 @@ func (s *httpSession) Interject(ctx context.Context, baseURL, text string) error
 
 func (s *httpSession) GetTurn(ctx context.Context, baseURL, turnID string) (TurnResult, error) {
 	var out struct {
-		State      string `json:"state"`
-		FinalText  string `json:"finalText"`
-		StopReason string `json:"stopReason"`
-		Error      string `json:"error"`
+		State          string `json:"state"`
+		FinalText      string `json:"finalText"`
+		StopReason     string `json:"stopReason"`
+		Error          string `json:"error"`
+		LastActivityAt string `json:"lastActivityAt"`
 	}
 	if err := s.do(ctx, "get_turn", http.MethodGet, baseURL+"/v1/messages/"+turnID, nil, &out); err != nil {
 		return TurnResult{}, err
 	}
-	return TurnResult{State: out.State, FinalText: out.FinalText, StopReason: out.StopReason, Err: out.Error}, nil
+	var lastActivity time.Time
+	if out.LastActivityAt != "" {
+		if t, perr := time.Parse(time.RFC3339, out.LastActivityAt); perr == nil {
+			lastActivity = t
+		}
+	}
+	return TurnResult{State: out.State, FinalText: out.FinalText, StopReason: out.StopReason, Err: out.Error, LastActivityAt: lastActivity}, nil
 }
 
 func (s *httpSession) DeleteSession(ctx context.Context, baseURL string) error {

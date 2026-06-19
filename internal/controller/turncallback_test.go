@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
@@ -148,6 +149,87 @@ func TestResolveTaskByTurn_SkipsEmptyAnnotation(t *testing.T) {
 }
 
 // ----- Fix 2: per-turn timeout in poll backstop -----
+
+// TestPollOnce_RefreshesLastActivity verifies the backstop stamps the
+// turn-last-activity-at annotation from the wrapper's GetTurn report.
+func TestPollOnce_RefreshesLastActivity(t *testing.T) {
+	mkTaskProject(t, "p-act", 3)
+	mkTaskRepository(t, "r-act", "p-act")
+	mkTask(t, "t-act", "p-act", "r-act")
+	annotate(t, "t-act", map[string]string{
+		annCurrentTurn:   "turn-act",
+		annTurnStartedAt: time.Now().UTC().Format(time.RFC3339), // recent: not timed out
+	})
+
+	activity := time.Now().Add(-3 * time.Second).UTC().Truncate(time.Second)
+	fs := newFakeSession()
+	fs.getResult["turn-act"] = agent.TurnResult{State: "running", LastActivityAt: activity}
+
+	cb := newCallbackServer()
+	cb.Session = fs
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-act")
+	want := activity.Format(time.RFC3339)
+	if got := tk.Annotations[annTurnLastActivity]; got != want {
+		t.Errorf("turn-last-activity-at = %q, want %q", got, want)
+	}
+}
+
+// TestPollOnce_StallAwareKeepsActiveTurnAlive verifies the stall-aware backstop
+// does NOT expire a turn whose start is well past the window but whose last
+// activity is recent - the productive turns the wrapper inactivity-timer protects.
+func TestPollOnce_StallAwareKeepsActiveTurnAlive(t *testing.T) {
+	mkTaskProject(t, "p-keep", 3)
+	mkTaskRepository(t, "r-keep", "p-keep")
+	mkTask(t, "t-keep", "p-keep", "r-keep")
+	annotate(t, "t-keep", map[string]string{
+		annCurrentTurn:      "turn-keep",
+		annTurnStartedAt:    time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339),
+		annTurnLastActivity: time.Now().Add(-2 * time.Second).UTC().Format(time.RFC3339),
+	})
+
+	fs := newFakeSession()
+	fs.getResult["turn-keep"] = agent.TurnResult{State: "running"}
+	cb := newCallbackServer()
+	cb.Session = fs
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-keep")
+	if tk.Status.Phase == "Failed" {
+		t.Error("active turn (recent activity) must not be expired even though it started 2h ago")
+	}
+	if tk.Annotations[annCurrentTurn] != "turn-keep" {
+		t.Errorf("annCurrentTurn = %q, want turn-keep (turn must remain in flight)", tk.Annotations[annCurrentTurn])
+	}
+}
+
+// TestPollOnce_ExpiresStalledTurn verifies a turn that has gone silent past the
+// stall window is still failed by the backstop (hung-agent recovery unchanged).
+func TestPollOnce_ExpiresStalledTurn(t *testing.T) {
+	mkTaskProject(t, "p-stale", 3)
+	mkTaskRepository(t, "r-stale", "p-stale")
+	mkTask(t, "t-stale", "p-stale", "r-stale")
+	stale := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	annotate(t, "t-stale", map[string]string{
+		annCurrentTurn:      "turn-stale",
+		annTurnStartedAt:    stale,
+		annTurnLastActivity: stale,
+	})
+
+	cb := newCallbackServer()
+	cb.Session = newFakeSession()
+	cb.PollOnce(context.Background())
+
+	tk := getTask(t, "t-stale")
+	if tk.Status.Phase != "Failed" {
+		t.Errorf("phase = %q, want Failed for a turn silent past the stall window", tk.Status.Phase)
+	}
+	cond := findCond(tk.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "TurnTimeout" {
+		t.Errorf("expected Ready/TurnTimeout condition, got %+v", cond)
+	}
+}
 
 // ----- Spawn watchdog: Planning-without-turn past the stall deadline -----
 

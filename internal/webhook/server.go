@@ -782,6 +782,7 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 			delete(fresh2.Annotations, tatarav1.AnnCurrentSubtask)
 			delete(fresh2.Annotations, tatarav1.AnnTurnComplete)
 			delete(fresh2.Annotations, tatarav1.AnnTurnStartedAt)
+			delete(fresh2.Annotations, tatarav1.AnnTurnLastActivity)
 			delete(fresh2.Annotations, tatarav1.AnnPodRecreations)
 		}
 		return s.cfg.Client.Update(ctx, fresh2)

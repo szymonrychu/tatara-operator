@@ -7,12 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 )
 
 // TurnResult is the outcome of one wrapper turn, as reported by the wrapper's
 // GET /v1/messages/{turnId} response and the turn-complete callback.
 type TurnResult struct {
 	State, FinalText, StopReason, Err string
+	// LastActivityAt is the wrapper's most recent transcript activity timestamp
+	// for the turn. Zero when the wrapper does not report it (older wrapper or
+	// unparseable value); callers fall back to turn-started-at.
+	LastActivityAt time.Time
 }
 
 // Session is the operator's view of one wrapper session. baseURL is the

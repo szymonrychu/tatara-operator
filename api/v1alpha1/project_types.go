@@ -71,6 +71,10 @@ type AgentSpec struct {
 	// +kubebuilder:default=50
 	// +optional
 	MaxTurnsPerTask int `json:"maxTurnsPerTask,omitempty"`
+	// TurnTimeoutSeconds is the per-turn stall (inactivity) window in seconds: a
+	// turn is failed only after this long with no agent activity, not at a fixed
+	// wall-clock age, so a turn that keeps streaming output is not killed mid-work.
+	// The name is kept for CRD compatibility.
 	// +kubebuilder:default=1800
 	// +optional
 	TurnTimeoutSeconds int `json:"turnTimeoutSeconds,omitempty"`
