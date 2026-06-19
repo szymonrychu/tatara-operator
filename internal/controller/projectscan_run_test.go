@@ -311,7 +311,11 @@ func TestRunScans_RequeueAfterPositiveAfterFire(t *testing.T) {
 }
 
 func TestRunScans_BadCronDisablesNoCrash(t *testing.T) {
-	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "not a cron", MaxPerRepo: 1}}
+	// "x x x x x" passes the CRD schedule pattern (5 whitespace-separated fields)
+	// but fails cron parsing at reconcile time, exercising the graceful-disable
+	// path. A non-5-field string ("not a cron") is now rejected at admission by
+	// the schedule Pattern marker, so it can no longer be stored to reach reconcile.
+	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "x x x x x", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "badcron-proj", cron)
 	r := newScanReconciler(&fakeReader{})
 	res, err := r.runScans(context.Background(), proj)
