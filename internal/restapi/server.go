@@ -17,20 +17,25 @@ type Config struct {
 	Namespace string
 	// SCMFor returns an SCMWriter for the given provider name ("github"|"gitlab").
 	// When nil, the /projects/{p}/issue-comment endpoint returns 501.
-	SCMFor  func(provider string) (scm.SCMWriter, error)
-	Logger  *slog.Logger
-	Metrics *obs.OperatorMetrics
+	SCMFor func(provider string) (scm.SCMWriter, error)
+	// ReaderFor returns a token-bound SCMReader for the given provider name.
+	// Used by the issue-comment gate to detect an existing bot comment.
+	// When nil, the gate is skipped (post proceeds).
+	ReaderFor func(provider, token string) (scm.SCMReader, error)
+	Logger    *slog.Logger
+	Metrics   *obs.OperatorMetrics
 }
 
 // Server exposes OIDC-gated CRUD over the tatara CRDs, backed by the
 // controller-runtime client. It shares the HTTP_ADDR listener with the
 // webhook server; callers mount it onto a shared chi router.
 type Server struct {
-	c       client.Client
-	ns      string
-	scmFor  func(provider string) (scm.SCMWriter, error)
-	log     *slog.Logger
-	metrics *obs.OperatorMetrics
+	c         client.Client
+	ns        string
+	scmFor    func(provider string) (scm.SCMWriter, error)
+	readerFor func(provider, token string) (scm.SCMReader, error)
+	log       *slog.Logger
+	metrics   *obs.OperatorMetrics
 }
 
 // NewServer constructs a Server from cfg.
@@ -39,7 +44,7 @@ func NewServer(cfg Config) *Server {
 	if l == nil {
 		l = slog.Default()
 	}
-	return &Server{c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, log: l, metrics: cfg.Metrics}
+	return &Server{c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, readerFor: cfg.ReaderFor, log: l, metrics: cfg.Metrics}
 }
 
 // Mount registers the REST routes on r. verify is the OIDC middleware;
