@@ -173,6 +173,31 @@ func (g *goalCapturingReader) ListIssueComments(_ context.Context, owner, repo s
 	return g.commentsBySlugNum[key], nil
 }
 
+// TestGoalProjects_NoReCommentInstruction verifies both project goals tell the
+// agent not to re-comment a [bot-engaged] issue and to prefer new improvements.
+func TestGoalProjects_NoReCommentInstruction(t *testing.T) {
+	slugs := []string{"o/alpha"}
+	ctx := "o/alpha#1 [] Fix login bug [bot-engaged]"
+	for _, g := range []string{
+		brainstormGoalProject(slugs, ctx),
+		healthCheckGoalProject(slugs, ctx),
+	} {
+		if !strings.Contains(g, "[bot-engaged]") {
+			t.Fatalf("goal does not reference the bot-engaged marker:\n%s", g)
+		}
+		// Must instruct: do not comment again on a bot-engaged issue.
+		if !strings.Contains(g, "do NOT comment again") {
+			t.Fatalf("goal missing no-re-comment instruction:\n%s", g)
+		}
+		// Must still embed the context and keep the three action verbs.
+		for _, kw := range []string{"comment_on_issue", "propose_issue", ctx} {
+			if !strings.Contains(g, kw) {
+				t.Fatalf("goal missing %q:\n%s", kw, g)
+			}
+		}
+	}
+}
+
 // TestBrainstorm_BotEngagedIssueFlagged verifies that an issue the bot already
 // commented on is marked [bot-engaged] in the goal, while an untouched issue is not.
 func TestBrainstorm_BotEngagedIssueFlagged(t *testing.T) {

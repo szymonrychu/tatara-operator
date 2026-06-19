@@ -1192,8 +1192,13 @@ func brainstormGoalProject(slugs []string, issuesCtx string) string {
 		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
 		"1. If the best idea DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
 		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
-		"2. If the best idea is a sub-aspect or connecting improvement TO an existing issue: " +
-		"call comment_on_issue(repo, number, body) on that issue. Do NOT call propose_issue.\n" +
+		"2. If the best idea is a sub-aspect or connecting improvement TO an existing issue " +
+		"that is NOT marked [bot-engaged]: call comment_on_issue(repo, number, body) on that issue. " +
+		"Do NOT call propose_issue.\n" +
+		"   An issue marked [bot-engaged] already has your comment - do NOT comment again on it. " +
+		"Prefer a NEW improvement instead: a genuinely novel standalone idea (path 3, in ANY repo or " +
+		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
+		"twice on the same issue.\n" +
 		"3. ONLY if the idea is genuinely novel AND standalone (no existing issue covers it): " +
 		"call propose_issue with exactly one proposal. " +
 		"Set the `repo` argument to the specific repository that should own the issue. " +
@@ -1222,8 +1227,13 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
 		"1. If the best finding DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
 		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
-		"2. If the best finding is a sub-aspect or connecting improvement TO an existing issue: " +
-		"call comment_on_issue(repo, number, body) on that issue. Do NOT call propose_issue.\n" +
+		"2. If the best finding is a sub-aspect or connecting improvement TO an existing issue " +
+		"that is NOT marked [bot-engaged]: call comment_on_issue(repo, number, body) on that issue. " +
+		"Do NOT call propose_issue.\n" +
+		"   An issue marked [bot-engaged] already has your comment - do NOT comment again on it. " +
+		"Prefer a NEW finding instead: a genuinely novel standalone issue (path 3, in ANY repo or " +
+		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
+		"twice on the same issue.\n" +
 		"3. ONLY if the finding is genuinely novel AND standalone (no existing issue covers it): " +
 		"call propose_issue with exactly one proposal. " +
 		"Set the `repo` argument to the specific repository that should own the issue. " +
