@@ -57,6 +57,7 @@ spec:
                     type: string
                   maxLifecycleIterations:
                     default: 10
+                    minimum: 3
                     type: integer
                   maxTurnsPerTask:
                     default: 50
@@ -69,6 +70,31 @@ spec:
                   turnTimeoutSeconds:
                     default: 1800
                     type: integer
+                type: object
+              grafana:
+                description: |-
+                  GrafanaSpec configures the optional per-project Grafana incident-response
+                  feature: an operator-provisioned read-only grafana-mcp and an alert-webhook
+                  receiver. The feature is inert unless Enabled.
+                properties:
+                  cooldownSeconds:
+                    default: 3600
+                    description: CooldownSeconds is the per-alert-group refire window
+                      (default 3600).
+                    type: integer
+                  enabled:
+                    type: boolean
+                  secretRef:
+                    description: |-
+                      SecretRef names a Secret holding the Grafana credentials. Keys:
+                        serviceAccountToken - Grafana Viewer SA token (mounted into grafana-mcp)
+                        webhookSecret       - static bearer the alert webhook must present
+                    type: string
+                  url:
+                    description: URL is the Grafana base URL grafana-mcp queries (non-secret).
+                    type: string
+                required:
+                - enabled
                 type: object
               maxConcurrentTasks:
                 default: 3
@@ -162,6 +188,7 @@ spec:
                               Setting it has no effect. See MEMORY.md for rationale.
                             type: integer
                           schedule:
+                            pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                           sources:
                             items:
@@ -189,6 +216,7 @@ spec:
                               skipped. Default 5.
                             type: integer
                           schedule:
+                            pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                           sources:
                             items:
@@ -212,6 +240,7 @@ spec:
                           schedule:
                             description: Schedule is a 5-field cron (robfig ParseStandard).
                               Empty disables this activity.
+                            pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                         type: object
                       mrScan:
@@ -227,6 +256,7 @@ spec:
                           schedule:
                             description: Schedule is a 5-field cron (robfig ParseStandard).
                               Empty disables this activity.
+                            pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                         type: object
                     type: object
@@ -355,6 +385,15 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              grafana:
+                description: GrafanaStatus reports the observed state of the per-Project
+                  grafana-mcp.
+                properties:
+                  endpoint:
+                    type: string
+                  phase:
+                    type: string
+                type: object
               lastBrainstorm:
                 format: date-time
                 type: string

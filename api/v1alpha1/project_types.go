@@ -32,6 +32,33 @@ type MemoryStatus struct {
 	ExternalEndpoint string `json:"externalEndpoint,omitempty"`
 }
 
+// GrafanaSpec configures the optional per-project Grafana incident-response
+// feature: an operator-provisioned read-only grafana-mcp and an alert-webhook
+// receiver. The feature is inert unless Enabled.
+type GrafanaSpec struct {
+	Enabled bool `json:"enabled"`
+	// URL is the Grafana base URL grafana-mcp queries (non-secret).
+	// +optional
+	URL string `json:"url,omitempty"`
+	// SecretRef names a Secret holding the Grafana credentials. Keys:
+	//   serviceAccountToken - Grafana Viewer SA token (mounted into grafana-mcp)
+	//   webhookSecret       - static bearer the alert webhook must present
+	// +optional
+	SecretRef string `json:"secretRef,omitempty"`
+	// CooldownSeconds is the per-alert-group refire window (default 3600).
+	// +kubebuilder:default=3600
+	// +optional
+	CooldownSeconds int `json:"cooldownSeconds,omitempty"`
+}
+
+// GrafanaStatus reports the observed state of the per-Project grafana-mcp.
+type GrafanaStatus struct {
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+}
+
 // AgentSpec configures the wrapper agent session a Task runs.
 type AgentSpec struct {
 	// +optional
@@ -226,6 +253,8 @@ type ProjectSpec struct {
 	Memory *MemorySpec `json:"memory,omitempty"`
 	// +optional
 	Scm *ScmSpec `json:"scm,omitempty"`
+	// +optional
+	Grafana *GrafanaSpec `json:"grafana,omitempty"`
 }
 
 // ProjectStatus defines the observed state of a Project.
@@ -238,6 +267,8 @@ type ProjectStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	Memory *MemoryStatus `json:"memory,omitempty"`
+	// +optional
+	Grafana *GrafanaStatus `json:"grafana,omitempty"`
 	// +optional
 	LastMRScan *metav1.Time `json:"lastMRScan,omitempty"`
 	// +optional
