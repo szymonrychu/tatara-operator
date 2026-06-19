@@ -9,6 +9,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,6 +56,8 @@ func (r *ProjectReconciler) reconcileGrafanaMCP(ctx context.Context, p *tatarade
 		if d.Status.AvailableReplicas >= 1 {
 			phase = "Ready"
 		}
+	} else if !apierrors.IsNotFound(err) {
+		return grafanaRequeue, nil // transient cache blip; do not flap
 	}
 	p.Status.Grafana = &tataradevv1alpha1.GrafanaStatus{Phase: phase, Endpoint: grafanamcp.Endpoint(p.Name, ns)}
 	if phase != "Ready" {

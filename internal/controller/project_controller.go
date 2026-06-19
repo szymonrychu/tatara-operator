@@ -99,9 +99,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if grafErr != nil {
 		l.Error(grafErr, "grafana-mcp reconcile failed (non-blocking)", "resource_id", project.Name)
 	}
-	if grafanaRequeueAfter > 0 && (requeueAfter == 0 || grafanaRequeueAfter < requeueAfter) {
-		requeueAfter = grafanaRequeueAfter
-	}
+	requeueAfter = soonestRequeue(requeueAfter, grafanaRequeueAfter)
 
 	if err := r.Status().Update(ctx, &project); err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
