@@ -8,6 +8,7 @@ import (
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -41,6 +42,7 @@ type ProjectReconciler struct {
 	LifecycleMetrics    *obs.LifecycleMetrics
 	ExternalWebhookBase string
 	MemoryConfig        memory.Config
+	GrafanaConfig       grafanamcp.Config
 	// ReaderFor returns a token-bound scm.SCMReader for a provider name and token.
 	// Nil in tests that do not exercise scanning; wired in wire.go at runtime.
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
@@ -92,6 +94,14 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	})
 
 	requeueAfter, memErr := r.reconcileMemory(ctx, &project)
+
+	grafanaRequeueAfter, grafErr := r.reconcileGrafanaMCP(ctx, &project)
+	if grafErr != nil {
+		l.Error(grafErr, "grafana-mcp reconcile failed (non-blocking)", "resource_id", project.Name)
+	}
+	if grafanaRequeueAfter > 0 && (requeueAfter == 0 || grafanaRequeueAfter < requeueAfter) {
+		requeueAfter = grafanaRequeueAfter
+	}
 
 	if err := r.Status().Update(ctx, &project); err != nil {
 		r.Metrics.ReconcileResult("Project", "error")

@@ -11,6 +11,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
+	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -154,6 +155,11 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		LifecycleMetrics:    lifecycleMetrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
+		GrafanaConfig: grafanamcp.Config{
+			Namespace:       cfg.Namespace,
+			Image:           cfg.GrafanaMCPImage,
+			ImagePullSecret: cfg.ImagePullSecret,
+		},
 		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
 			return scm.ReaderByProvider(provider, token)
 		},
