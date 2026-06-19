@@ -1172,6 +1172,16 @@ func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha
 	if task.Spec.Source == nil {
 		return nil
 	}
+	// A blank/whitespace-only body is rejected by the SCM ("422 Body cannot be
+	// blank") and would loop the reconcile forever before enterConversation runs.
+	// This happens when the agent never calls issue_outcome (nil outcome defaults
+	// to discuss with an empty comment) or returns a whitespace-only comment.
+	// Nothing to say -> skip the post and let the discuss arm proceed.
+	if strings.TrimSpace(comment) == "" {
+		log.FromContext(ctx).Info("lifecycle triage: blank discuss comment; skipping post",
+			"action", "scm_issue_discuss_skipped_blank", "resource_id", task.Name)
+		return nil
+	}
 	_, _, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("triage discuss: %w", err)
