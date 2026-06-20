@@ -77,6 +77,13 @@ func ResultConfigMapName(repo *tataradevv1alpha1.Repository) string {
 const (
 	workspaceVolume = "workspace"
 	workspaceMount  = "/workspace"
+
+	// ingestHTTPTimeout is passed to the ingester as HTTP_TIMEOUT. The ingester
+	// defaults to 60s; during transient LLM-extraction windows (external OpenAI
+	// round-trips for semantic ingest) a single /code-graph:bulk call can exceed
+	// 60s, causing HTTP 499 client-abort and ingest pod failure. 300s covers the
+	// worst observed extraction latency with margin. (2026-06-20 incident)
+	ingestHTTPTimeout = "300s"
 )
 
 // BuildJob returns the *batchv1.Job that ingests repo for project. When since
@@ -220,6 +227,10 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 								},
 							},
 							{Name: "OIDC_AUDIENCE", Value: cfg.OIDCAudience},
+							// HTTP_TIMEOUT overrides the ingester's 60s default; semantic
+							// ingest POSTs /code-graph:bulk which can exceed 60s during
+							// transient LLM-extraction windows (2026-06-20 incident).
+							{Name: "HTTP_TIMEOUT", Value: ingestHTTPTimeout},
 						}, semanticEnv(repo, cfg)...),
 						VolumeMounts: []corev1.VolumeMount{{Name: workspaceVolume, MountPath: workspaceMount}},
 					}},
