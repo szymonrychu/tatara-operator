@@ -111,7 +111,7 @@ func buildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 	if p.Name != "" {
 		om.Name = p.Name
 	} else {
-		om.GenerateName = p.GenerateName
+		om.Name = qe.Name
 	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: om,

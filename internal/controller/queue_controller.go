@@ -7,6 +7,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -71,7 +72,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 			if err != nil {
 				return err
 			}
-			if err := r.Create(ctx, task); err != nil {
+			if err := r.Create(ctx, task); err != nil && !apierrors.IsAlreadyExists(err) {
 				// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
 				return err
 			}

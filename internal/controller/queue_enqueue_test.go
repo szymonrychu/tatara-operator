@@ -73,7 +73,10 @@ func TestBuildTaskFromQueuedEvent(t *testing.T) {
 	if task.Labels[LabelQueuedEvent] != "qe-1" || task.Labels["x"] != "y" {
 		t.Fatalf("missing labels: %v", task.Labels)
 	}
-	if task.GenerateName != "scan-" {
-		t.Fatalf("bad generateName: %q", task.GenerateName)
+	if task.Name != "qe-1" {
+		t.Fatalf("expected deterministic task.Name == qe.Name, got %q", task.Name)
+	}
+	if task.GenerateName != "" {
+		t.Fatalf("expected empty generateName, got %q", task.GenerateName)
 	}
 }
