@@ -6,13 +6,6 @@ import (
 	"strings"
 )
 
-// denylist are bare tokens that, alone, make a useless title.
-var denylist = map[string]bool{
-	"go": true, "update": true, "fix": true, "change": true, "wip": true,
-	"misc": true, "chore": true, "stuff": true, "changes": true, "updates": true,
-	"python": true, "golang": true, "helm": true, "docker": true, "ci": true,
-}
-
 // Weak reports whether a proposed issue/PR title is too weak to emit and,
 // when weak, a one-line guidance message the agent can act on that same turn.
 func Weak(s string) (bool, string) {
@@ -25,9 +18,6 @@ func Weak(s string) (bool, string) {
 	}
 	if len(strings.Fields(t)) <= 2 {
 		return true, fmt.Sprintf("title %q has too few words (<=2): name the component and the change", t)
-	}
-	if denylist[strings.ToLower(t)] {
-		return true, fmt.Sprintf("title %q is a bare token: describe the concrete change instead", t)
 	}
 	return false, ""
 }

@@ -394,12 +394,6 @@ func taskBranch(t *tatarav1alpha1.Task) string {
 	return agent.TaskBranch(t)
 }
 
-// weakTitle is a thin controller-local alias to titlecheck.Weak so other
-// files in this package can call it without qualifying the package name.
-func weakTitle(s string) (bool, string) {
-	return titlecheck.Weak(s)
-}
-
 // derivePRTitle returns the PR/MR title for a write-back. A strong
 // ChangeSummary.PRTitle wins; otherwise it derives a conventional title from the
 // captured work-item title (Source.Title), falling back to the goal first line.
@@ -1162,6 +1156,7 @@ func issueURLFromRepoURL(repoURL, provider, repo string, number int) string {
 func systemicRepoList(ctx context.Context, r *TaskReconciler, proj *tatarav1alpha1.Project) string {
 	repos, err := r.projectRepos(ctx, proj)
 	if err != nil {
+		log.FromContext(ctx).Info("proposal: systemic repo list failed (non-fatal)", "resource_id", proj.Name, "err", err.Error())
 		return ""
 	}
 	slugs := make([]string, 0, len(repos))
