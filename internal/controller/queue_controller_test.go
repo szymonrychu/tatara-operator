@@ -136,6 +136,31 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 	}
 }
 
+func TestPoolInflight_CountsUnlabelledPreQueueTasks(t *testing.T) {
+	r := &DispatcherReconciler{}
+	var qes []tatarav1alpha1.QueuedEvent
+	tasks := []tatarav1alpha1.Task{
+		preQueueTask("old-normal", "Running", "review", ""),     // no queued-event label -> normal pool
+		preQueueTask("old-incident", "Running", "incident", ""), // -> alert pool
+		preQueueTask("old-done", "Succeeded", "review", ""),     // terminal -> not counted
+	}
+	if got := r.poolInflight(qes, tasks, tatarav1alpha1.QueueClassNormal); got != 1 {
+		t.Fatalf("normal pre-queue inflight = %d, want 1", got)
+	}
+	if got := r.poolInflight(qes, tasks, tatarav1alpha1.QueueClassAlert); got != 1 {
+		t.Fatalf("alert pre-queue inflight = %d, want 1", got)
+	}
+}
+
+// preQueueTask: a Task with NO LabelQueuedEvent (created before the queue existed).
+func preQueueTask(name, phase, kind, _ string) tatarav1alpha1.Task {
+	return tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"}, // no labels
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: kind},
+		Status:     tatarav1alpha1.TaskStatus{Phase: phase},
+	}
+}
+
 func TestPoolInflight_CountsAdmittedNonTerminal(t *testing.T) {
 	r := &DispatcherReconciler{}
 	qes := []tatarav1alpha1.QueuedEvent{

@@ -31,7 +31,8 @@ func taskByName(tasks []tatarav1alpha1.Task, name string) *tatarav1alpha1.Task {
 }
 
 // poolInflight counts Admitted QueuedEvents of class whose Task is still
-// non-terminal. Migration of unlabelled pre-queue Tasks is added in Task 7.
+// non-terminal, plus non-terminal Tasks created before the queue existed (no
+// LabelQueuedEvent label) so capacity is not over-admitted at cutover.
 func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task, class string) int {
 	n := 0
 	for i := range qes {
@@ -41,6 +42,24 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 		}
 		t := taskByName(tasks, q.Status.TaskRef)
 		if t != nil && !tatarav1alpha1.TaskTerminal(t) {
+			n++
+		}
+	}
+	// Migration: non-terminal Tasks created before the queue (no queued-event
+	// label) count toward their pool so capacity is not over-admitted at cutover.
+	for i := range tasks {
+		t := &tasks[i]
+		if _, queued := t.Labels[LabelQueuedEvent]; queued {
+			continue
+		}
+		if tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		taskClass := tatarav1alpha1.QueueClassNormal
+		if t.Spec.Kind == "incident" {
+			taskClass = tatarav1alpha1.QueueClassAlert
+		}
+		if taskClass == class {
 			n++
 		}
 	}
