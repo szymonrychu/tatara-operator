@@ -14,6 +14,11 @@ type ProposedIssueSpec struct {
 	Body          string `json:"body"`
 	// +kubebuilder:validation:Enum=bug;improvement
 	Kind string `json:"kind"`
+	// SystemicID correlates one of several issues opened for a single systemic
+	// improvement. When set, createProposal stamps label tatara/systemic-<id>
+	// and a sibling footer; the group counts as one against maxOpenProposals.
+	// +optional
+	SystemicID string `json:"systemicId,omitempty"`
 }
 
 // Suggestion is one inline code suggestion on a PR/MR.
@@ -88,6 +93,10 @@ type TaskSource struct {
 	IsPR bool `json:"isPR,omitempty"`
 	// +optional
 	Number int `json:"number,omitempty"`
+	// Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
+	// branch slug (TaskBranch) and the no-agent PR-title fallback.
+	// +optional
+	Title string `json:"title,omitempty"`
 }
 
 // repoScopedKinds are task kinds that require a non-empty RepositoryRef.

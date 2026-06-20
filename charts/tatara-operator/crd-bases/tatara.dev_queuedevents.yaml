@@ -108,6 +108,11 @@ spec:
                         - github
                         - gitlab
                         type: string
+                      title:
+                        description: |-
+                          Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
+                          branch slug (TaskBranch) and the no-agent PR-title fallback.
+                        type: string
                       url:
                         type: string
                     required:

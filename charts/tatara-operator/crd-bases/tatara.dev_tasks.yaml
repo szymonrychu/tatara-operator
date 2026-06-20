@@ -88,6 +88,12 @@ spec:
                     type: string
                   repositoryRef:
                     type: string
+                  systemicId:
+                    description: |-
+                      SystemicID correlates one of several issues opened for a single systemic
+                      improvement. When set, createProposal stamps label tatara/systemic-<id>
+                      and a sibling footer; the group counts as one against maxOpenProposals.
+                    type: string
                   title:
                     type: string
                 required:
@@ -114,6 +120,11 @@ spec:
                     enum:
                     - github
                     - gitlab
+                    type: string
+                  title:
+                    description: |-
+                      Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
+                      branch slug (TaskBranch) and the no-agent PR-title fallback.
                     type: string
                   url:
                     type: string
