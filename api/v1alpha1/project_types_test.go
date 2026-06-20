@@ -189,3 +189,27 @@ func TestMemorySpec_DefaultFieldsExist(t *testing.T) {
 		t.Errorf("Neo4jStorage = %q, want 10Gi", m.Neo4jStorage)
 	}
 }
+
+func TestQueueDefaults(t *testing.T) {
+	// nil Queue: capacity falls back to MaxConcurrentTasks, cap to MaxOpenTasks, alert to 1.
+	p := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{MaxConcurrentTasks: 5, MaxOpenTasks: 6}}
+	if got := p.QueueCapacity(); got != 5 {
+		t.Fatalf("QueueCapacity nil-queue = %d, want 5", got)
+	}
+	if got := p.QueuedAutonomousCap(); got != 6 {
+		t.Fatalf("QueuedAutonomousCap nil-queue = %d, want 6", got)
+	}
+	if got := p.AlertCapacity(); got != 1 {
+		t.Fatalf("AlertCapacity nil-queue = %d, want 1", got)
+	}
+	// explicit Queue overrides.
+	p2 := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{MaxConcurrentTasks: 5, Queue: &v1alpha1.QueueSpec{Capacity: 2, AlertCapacity: 3, QueuedAutonomousCap: 10}}}
+	if p2.QueueCapacity() != 2 || p2.AlertCapacity() != 3 || p2.QueuedAutonomousCap() != 10 {
+		t.Fatalf("explicit queue not honoured: %d/%d/%d", p2.QueueCapacity(), p2.AlertCapacity(), p2.QueuedAutonomousCap())
+	}
+	// hard floor when nothing set anywhere.
+	p3 := &v1alpha1.Project{}
+	if p3.QueueCapacity() != 3 || p3.QueuedAutonomousCap() != 3 || p3.AlertCapacity() != 1 {
+		t.Fatalf("hard floors wrong: %d/%d/%d", p3.QueueCapacity(), p3.QueuedAutonomousCap(), p3.AlertCapacity())
+	}
+}
