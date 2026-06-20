@@ -16,7 +16,7 @@ operator-native Pod/Job spawning).
 
 ## Status
 
-Shipping 0.4.2. All milestones (M0-M6) and the per-project-memory line
+Shipping 0.4.3. All milestones (M0-M6) and the per-project-memory line
 (N1-N4) are complete. The manager reconciles Project/Repository/Task/
 Subtask, provisions a per-project `tatara-memory` stack (CNPG Postgres,
 Neo4j, LightRAG, memory service), ingests repositories and tracks the
@@ -44,6 +44,54 @@ internal/obs/                      # JSON slog + Prometheus metrics
 internal/version/                  # build-stamped version info
 charts/tatara-operator/            # cluster-agnostic Helm chart + CRDs
 ```
+
+## Observability
+
+Every long-running surface exposes Prometheus metrics on `/metrics`, and the
+chart ships the consumer side so loop failures alert and graph instead of
+sitting silent.
+
+Chart objects, each gated like the existing `serviceMonitor` and shipped on by
+default:
+
+- `serviceMonitor.enabled` - scrape target for the operator `/metrics`.
+- `prometheusRule.enabled` - a `tatara-loop` group of loop-failure alerts over
+  the operator's own `operator_*` / `tatara_*` series. Two classes: deadman /
+  liveness (operator down, no reconciles, no scan activity, a memory stack
+  Failed, Tasks pinned at the concurrency cap) and active failures (reconcile,
+  task-terminal, turn-timeout, boot-crash, agent-unreachable, ingest, lifecycle
+  giveup, SCM-write, push-rejected, reaper-delete). `severityLabel` and
+  `tasksInflightThreshold` are the only tunables; `additionalLabels` is the
+  cluster-specific knob the infra helmfile sets so the cluster Prometheus
+  `ruleSelector` matches (the chart bakes no selector label).
+- `dashboard.enabled` - the "Tatara Loop" Grafana dashboard as a ConfigMap
+  labelled `grafana_dashboard: "1"` for sidecar discovery, with `$project` /
+  `$repo` template variables. Panels cover the loop golden signals, task
+  outcomes, token usage (global / project / repo / issue), and the memory
+  corpus. It hardcodes no datasource UID - a `datasource` template variable
+  selects the cluster's Prometheus. `additionalLabels` and `folder` tune sidecar
+  discovery and placement.
+
+What stays cluster-side (never baked into this chart, per the cluster-agnostic
+rule): Alertmanager receivers / routing, the Grafana datasource, and the
+`ruleSelector` / sidecar label values.
+
+Metrics powering the above (registered in `internal/obs`):
+
+- `operator_task_tokens_total{project,repo,kind,issue,type}` - agent token spend
+  (input / output), the global / project / repo / issue denominator.
+- `operator_task_terminal_total{kind,phase,reason}` - every Task terminal
+  transition, metered once at the `terminate()` chokepoint; the uniform loop
+  success / failure denominator (terminal-failure reconciles return
+  `(Result{}, nil)`, so `operator_reconcile_total` cannot stand in).
+- `operator_lightrag_documents{project,status}` - per-project lightrag corpus
+  size, read best-effort from lightrag's `/documents/status_counts` during the
+  gauge recompute.
+
+Alerts deliberately avoid the push-receiver / wrapper (`ccw_*`) series the
+operator re-exposes: those TTL-evict and reset their run id per run, so
+`rate()` / `increase()` / `absent()` over them are unreliable. Alerts key only
+on the operator's own continuously-present series.
 
 ## Development
 
