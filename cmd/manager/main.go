@@ -89,10 +89,11 @@ func run(ctx context.Context) error {
 	// series and re-exposes them on the operator's own /metrics registry.
 	pushReceiver := pushmetrics.New(cfg.PushMetricsTTL)
 	ctrlmetrics.Registry.MustRegister(pushReceiver)
-	if err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics, pushReceiver); err != nil {
+	seqAlloc, err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics, pushReceiver)
+	if err != nil {
 		return err
 	}
-	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics); err != nil {
+	if err := addWebhookServer(ctx, mgr, cfg, operatorMetrics, seqAlloc); err != nil {
 		return err
 	}
 	logger.Info("starting manager",

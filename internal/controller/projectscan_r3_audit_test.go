@@ -132,15 +132,16 @@ func TestMRScan_BacklogTrue_WhenBudgetTruncates(t *testing.T) {
 }
 
 // TestIssueScan_BacklogFlag_ReturnedToCallerCorrectly verifies issueScan returns
-// the backlog flag correctly as the first return value.
+// backlog=true when the autonomous budget is exhausted before all eligible issues are processed.
 func TestIssueScan_BacklogFlag_ReturnedToCallerCorrectly(t *testing.T) {
 	const projName = "r3-iss-backlog-flag-proj"
-	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
 	proj, _ := seedScanProject(t, projName, cron)
 
 	reader := &fakeReader{issues: []scm.IssueRef{
 		{Repo: "o/r", Number: 1, UpdatedAt: time.Unix(100, 0)},
 		{Repo: "o/r", Number: 2, UpdatedAt: time.Unix(200, 0)},
+		{Repo: "o/r", Number: 3, UpdatedAt: time.Unix(300, 0)},
 	}}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
@@ -148,10 +149,10 @@ func TestIssueScan_BacklogFlag_ReturnedToCallerCorrectly(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{
 		mkScanRepo(t, projName, projName+"-xrepo", "https://github.com/o/r.git"),
 	}
-	budget := 99
+	// Budget=1: only 1 issue can be enqueued; 2 remain -> backlog=true.
+	budget := 1
 	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &budget)
-	// MaxPerRepo=1, 2 issues -> 1 selected, 1 remains -> backlog=true.
-	require.True(t, backlog, "expected backlog=true when per-repo cap truncates candidates")
+	require.True(t, backlog, "expected backlog=true when global budget truncates candidates")
 }
 
 // --- Finding 4: recoverOrphans reuses issueCache from issueScan ---
@@ -180,9 +181,9 @@ func TestRecoverOrphans_UsesCachedIssues(t *testing.T) {
 
 	// ListOpenIssues must NOT be called (cache hit for o/r).
 	require.Equal(t, 0, queryCount, "recoverOrphans must not re-fetch issues when cache is populated")
-	// Task must still be created (cache was used correctly).
-	tasks := listScanTasks(t, "r3-cache-orphan")
-	require.Equal(t, 1, len(tasks), "expected 1 recovery task using cached issues")
+	// QE must still be created (cache was used correctly).
+	qes := listScanQEs(t, "r3-cache-orphan")
+	require.Equal(t, 1, len(qes), "expected 1 recovery task using cached issues")
 }
 
 // countingReaderOrphan counts ListOpenIssues calls via a callback.

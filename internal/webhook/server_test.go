@@ -21,6 +21,7 @@ import (
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
 )
 
@@ -41,7 +42,7 @@ func newScheme(t *testing.T) *runtime.Scheme {
 
 func seedClient(t *testing.T, objs ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).
-		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{}, &tatarav1.Subtask{}).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{}, &tatarav1.Subtask{}, &tatarav1.QueuedEvent{}).
 		Build()
 }
 
@@ -68,10 +69,12 @@ func repository(name, projectRef, url, branch string) *tatarav1.Repository {
 
 func newServer(t *testing.T, c client.Client) (http.Handler, *prometheus.Registry) {
 	reg := prometheus.NewRegistry()
+	seq := &queue.SeqSource{Client: c, Namespace: ns}
 	srv := webhook.NewServer(webhook.Config{
 		Client:    c,
 		Namespace: ns,
 		Metrics:   obs.NewOperatorMetrics(reg),
+		Seq:       seq,
 	})
 	return srv.Handler(), reg
 }

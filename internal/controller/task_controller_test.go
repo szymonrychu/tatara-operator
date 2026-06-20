@@ -17,6 +17,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 )
 
 // gaugeValue reads a gauge metric value from a Prometheus registry by name+labels.
@@ -272,31 +273,50 @@ func TestTaskReconcile_SpawnsPodAndService(t *testing.T) {
 	}
 }
 
-func TestTaskReconcile_GatesAtCap(t *testing.T) {
-	mkTaskProject(t, "p-cap", 1)
-	mkTaskRepository(t, "r-cap", "p-cap")
-	mkTask(t, "t-running", "p-cap", "r-cap")
-	mkTask(t, "t-queued", "p-cap", "r-cap")
-	setTaskPhase(t, "t-running", "Running")
-	setProjectMemoryReady(t, "p-cap", "http://mem-p-cap.tatara.svc:8080")
+// TestReconcile_NoConcurrencyGate: an admitted Task (carries LabelQueuedEvent)
+// must NOT be blocked by a concurrency cap even when MaxConcurrentTasks=1 and
+// another Task is already Running. The admission queue is the only gate now;
+// the old execution-time atConcurrencyCap check is removed.
+func TestReconcile_NoConcurrencyGate(t *testing.T) {
+	mkTaskProject(t, "p-nogate", 1)
+	mkTaskRepository(t, "r-nogate", "p-nogate")
+
+	// t-nogate-running: already active, counts against MaxConcurrentTasks.
+	mkTask(t, "t-nogate-running", "p-nogate", "r-nogate")
+	setTaskPhase(t, "t-nogate-running", "Running")
+
+	// t-nogate-admitted: not yet active (Phase=""), but admitted by the queue
+	// (carries LabelQueuedEvent). The old atConcurrencyCap would have gated it;
+	// after deletion it must proceed to normal phase handling (spawn attempt).
+	admitted := &tatarav1alpha1.Task{}
+	admitted.Name = "t-nogate-admitted"
+	admitted.Namespace = testNS
+	admitted.Labels = map[string]string{queue.LabelQueuedEvent: "qe-nogate"}
+	admitted.Spec.ProjectRef = "p-nogate"
+	admitted.Spec.RepositoryRef = "r-nogate"
+	admitted.Spec.Goal = "admitted task"
+	if err := k8sClient.Create(context.Background(), admitted); err != nil {
+		t.Fatalf("create admitted task: %v", err)
+	}
+	setProjectMemoryReady(t, "p-nogate", "http://mem-p-nogate.tatara.svc:8080")
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
-	res, err := reconcileTask(t, r, "t-queued")
+	res, err := reconcileTask(t, r, "t-nogate-admitted")
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter == 0 {
-		t.Error("expected requeue at cap")
+	// Negative: must not be gated by the old concurrency cap.
+	if res.RequeueAfter == memGateRequeue {
+		t.Error("admitted task must not be requeued by concurrency cap; atConcurrencyCap is deleted")
 	}
-	// no pod created for the queued task
-	pod := &corev1.Pod{}
-	err = k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-queued"}, pod)
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("queued task must not spawn a pod, got err=%v", err)
+	// Positive: admitted task must have reached the spawn path. driveAgentRun
+	// sets Phase=Planning and returns pollRequeue (30s) on first spawn; any
+	// value other than pollRequeue here means the reconcile exited early via a
+	// gate (memory gate, cap gate, or similar) before reaching driveAgentRun.
+	if res.RequeueAfter != pollRequeue {
+		t.Errorf("admitted task must reach spawn path (pollRequeue=%v); got RequeueAfter=%v", pollRequeue, res.RequeueAfter)
 	}
-	_ = metav1.Now
 }
 
 // mkTaskKind creates a Task with an explicit Kind and RepositoryRef.

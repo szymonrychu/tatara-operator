@@ -32,9 +32,9 @@ func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-proj-one")
-	if len(tasks) != 1 {
-		t.Fatalf("want exactly 1 brainstorm task for 2-repo project, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-one")
+	if len(qes) != 1 {
+		t.Fatalf("want exactly 1 brainstorm QE for 2-repo project, got %d", len(qes))
 	}
 	// Budget should be decremented by 1.
 	if budget != 98 {
@@ -79,9 +79,13 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 	r.brainstorm(context.Background(), proj, reader, repos, existing, act, &budget)
 
 	tasks := listBrainstormTasks(t, "bs-proj-inflight")
-	// Only the pre-existing task; no new one created because ANY inflight blocks.
+	// Only the pre-existing Task; no new QE created because ANY inflight Task blocks.
 	if len(tasks) != 1 {
 		t.Fatalf("want 1 task (pre-existing only; project-level in-flight guard), got %d", len(tasks))
+	}
+	qes := listBrainstormQEs(t, "bs-proj-inflight")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 new QEs (in-flight guard), got %d", len(qes))
 	}
 }
 
@@ -110,9 +114,9 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_AtCap_Skips(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-proj-sumcap")
-	if len(tasks) != 0 {
-		t.Fatalf("want 0 brainstorm tasks (summed backlog >= maxOpenProposals), got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-sumcap")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 brainstorm QEs (summed backlog >= maxOpenProposals), got %d", len(qes))
 	}
 }
 
@@ -138,9 +142,9 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_UnderCap_Creates(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-proj-undersum")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task (sum=4 < maxOpenProposals=5), got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-undersum")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE (sum=4 < maxOpenProposals=5), got %d", len(qes))
 	}
 }
 
@@ -165,17 +169,17 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	b1 := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &b1)
 
-	tasks := listBrainstormTasks(t, "bs-proj-det")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 task, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-det")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
 	// Project-scoped: no single primary repo pinned.
-	if tasks[0].Spec.RepositoryRef != "" {
-		t.Fatalf("brainstorm task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	if qes[0].Spec.RepositoryRef != "" {
+		t.Fatalf("brainstorm QE RepositoryRef = %q, want empty (project-scoped)", qes[0].Spec.RepositoryRef)
 	}
 	// Goal must mention all three repos.
 	for _, slug := range []string{"o/aaa", "o/mmm", "o/zzz"} {
-		if !strings.Contains(tasks[0].Spec.Goal, slug) {
+		if !strings.Contains(qes[0].Spec.Payload.Goal, slug) {
 			t.Fatalf("goal missing slug %q", slug)
 		}
 	}
@@ -239,9 +243,9 @@ func TestBrainstorm_ProjectLevel_ShortCircuit_Backlog(t *testing.T) {
 	if queriedRepos["o/sc2"] > 0 || queriedRepos["o/sc3"] > 0 {
 		t.Fatalf("short-circuit failed: queried %v after hitting cap on sc1", queriedRepos)
 	}
-	tasks := listBrainstormTasks(t, "bs-proj-sc")
-	if len(tasks) != 0 {
-		t.Fatalf("want 0 tasks (at cap after sc1), got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-sc")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 QEs (at cap after sc1), got %d", len(qes))
 	}
 }
 
@@ -262,12 +266,12 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-proj-emptyref")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-emptyref")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE, got %d", len(qes))
 	}
-	if tasks[0].Spec.RepositoryRef != "" {
-		t.Fatalf("brainstorm task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	if qes[0].Spec.RepositoryRef != "" {
+		t.Fatalf("brainstorm QE RepositoryRef = %q, want empty (project-scoped)", qes[0].Spec.RepositoryRef)
 	}
 }
 
@@ -285,17 +289,17 @@ func TestHealthCheck_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	b := 99
 	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
 
-	tasks := listHealthCheckTasks(t, "hc-emptyref")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 healthCheck task, got %d", len(tasks))
+	qes := listHealthCheckQEs(t, "hc-emptyref")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 healthCheck QE, got %d", len(qes))
 	}
-	if tasks[0].Spec.RepositoryRef != "" {
-		t.Fatalf("healthCheck task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	if qes[0].Spec.RepositoryRef != "" {
+		t.Fatalf("healthCheck QE RepositoryRef = %q, want empty (project-scoped)", qes[0].Spec.RepositoryRef)
 	}
 }
 
-// TestBrainstorm_ProjectLevel_ProjectScopedPodName: brainstorm task pod name is
-// project-scoped (no repo segment in the name).
+// TestBrainstorm_ProjectLevel_ProjectScopedPodName: brainstorm QE is project-scoped.
+// PodRepo is empty because pod-name is stamped at admit time, not at enqueue time.
 func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "bs-proj-podname", []string{"o/alpha", "o/beta"}, 5)
 	reader := &perRepoFakeReader{
@@ -308,19 +312,13 @@ func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-proj-podname")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-proj-podname")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE, got %d", len(qes))
 	}
-	podName := tasks[0].Annotations["tatara.dev/pod-name"]
-	// Project-scoped name must NOT contain any repo name segment.
-	for _, rp := range repos {
-		if strings.Contains(podName, rp.Name) {
-			t.Fatalf("brainstorm pod name %q must not contain repo segment %q (must be project-scoped)", podName, rp.Name)
-		}
-	}
-	if !strings.Contains(podName, "brainstorm") {
-		t.Fatalf("brainstorm pod name %q must contain 'brainstorm' suffix", podName)
+	// Pod-name is NOT stamped at enqueue time; PodRepo must be empty (project-scoped).
+	if qes[0].Spec.Payload.PodRepo != "" {
+		t.Fatalf("brainstorm QE PodRepo = %q, want empty (project-scoped, stamped at admit)", qes[0].Spec.Payload.PodRepo)
 	}
 }
 

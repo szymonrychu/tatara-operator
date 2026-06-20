@@ -7,6 +7,7 @@ package webhook_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -43,25 +44,25 @@ func TestIssueComment_HumanOnUntrackedIssue_CreatesTriageTask(t *testing.T) {
 	w := post(t, h, "projicut1", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	// A lifecycle Task must have been created.
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "human issue_comment on untracked issue must create one Task")
+	// A lifecycle QueuedEvent must have been created.
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "human issue_comment on untracked issue must create one QueuedEvent")
 
-	tk := tasks.Items[0]
-	require.Equal(t, "issueLifecycle", tk.Spec.Kind)
-	require.NotNil(t, tk.Spec.Source)
-	require.Equal(t, "o/r#9", tk.Spec.Source.IssueRef)
-	require.False(t, tk.Spec.Source.IsPR, "task must not be IsPR for an issue comment")
+	qe := qel.Items[0]
+	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
+	require.NotNil(t, qe.Spec.Payload.Source)
+	require.Equal(t, "o/r#9", qe.Spec.Payload.Source.IssueRef)
+	require.False(t, qe.Spec.Payload.Source.IsPR, "task must not be IsPR for an issue comment")
 
 	// Lifecycle entry annotation must be "Triage".
-	require.Equal(t, "Triage", tk.Annotations[tatarav1.LifecycleEntryAnnotation],
+	require.Equal(t, "Triage", qe.Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation],
 		"issue_comment-created task must enter at Triage")
 
 	// Dedup labels must match issueScan convention.
-	require.Equal(t, "o.r", tk.Labels[tatarav1.LabelSourceRepo])
-	require.Equal(t, "9", tk.Labels[tatarav1.LabelSourceNumber])
-	require.Equal(t, "issueLifecycle", tk.Labels[tatarav1.LabelSourceKind])
+	require.Equal(t, "o.r", qe.Spec.Payload.Labels[tatarav1.LabelSourceRepo])
+	require.Equal(t, "9", qe.Spec.Payload.Labels[tatarav1.LabelSourceNumber])
+	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Labels[tatarav1.LabelSourceKind])
 }
 
 // TestIssueComment_BotOnUntrackedIssue_DoesNotCreateTask verifies that a bot
@@ -82,9 +83,9 @@ func TestIssueComment_BotOnUntrackedIssue_DoesNotCreateTask(t *testing.T) {
 	w := post(t, h, "projicut2", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Empty(t, tasks.Items, "bot comment on untracked issue must NOT create a task")
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Empty(t, qel.Items, "bot comment on untracked issue must NOT create a task")
 }
 
 // TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask verifies that a human
@@ -107,17 +108,47 @@ func TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask(t *testing.T) {
 	w := post(t, h, "projicut3", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "human MR comment on untracked MR must create one Task")
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "human MR comment on untracked MR must create one QueuedEvent")
 
-	tk := tasks.Items[0]
-	require.Equal(t, "issueLifecycle", tk.Spec.Kind)
-	require.NotNil(t, tk.Spec.Source)
-	require.Equal(t, "o/r#11", tk.Spec.Source.IssueRef)
-	require.True(t, tk.Spec.Source.IsPR, "task must be IsPR for an MR comment")
-	require.Equal(t, "Triage", tk.Annotations[tatarav1.LifecycleEntryAnnotation])
-	require.Equal(t, "11", tk.Labels[tatarav1.LabelSourceNumber])
+	qe := qel.Items[0]
+	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
+	require.NotNil(t, qe.Spec.Payload.Source)
+	require.Equal(t, "o/r#11", qe.Spec.Payload.Source.IssueRef)
+	require.True(t, qe.Spec.Payload.Source.IsPR, "task must be IsPR for an MR comment")
+	require.Equal(t, "Triage", qe.Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
+	require.Equal(t, "11", qe.Spec.Payload.Labels[tatarav1.LabelSourceNumber])
+}
+
+// TestIssueComment_TriageGoalContainsCommentBody asserts that when a lifecycle
+// QueuedEvent is created at Triage via createLifecycleTaskAtTriage, the
+// enqueued event's Payload.Goal contains the triggering comment text. This
+// ensures the triage agent sees the comment that triggered the task.
+func TestIssueComment_TriageGoalContainsCommentBody(t *testing.T) {
+	const secretVal = "whsec-ut5"
+	proj := projectWithBot("projicut5", "projicut5-scm", "tatara", "tatara-bot")
+	repo := repository("repoicut5", "projicut5", "https://github.com/o/r.git", "main")
+
+	c := seedClient(t, proj, secret("projicut5-scm", secretVal), repo)
+	h, _ := newServer(t, c)
+
+	// issueCommentUntracked has comment body "Any update on this?"
+	body := []byte(issueCommentUntracked)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issue_comment")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "projicut5", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1)
+
+	goal := qel.Items[0].Spec.Payload.Goal
+	require.True(t, strings.Contains(goal, "Any update on this?"),
+		"Goal must contain the triggering comment text, got: %q", goal)
 }
 
 // TestIssueComment_HumanOnUntrackedIssue_ExistingLiveTask_NoNewTask verifies
@@ -146,7 +177,8 @@ func TestIssueComment_HumanOnUntrackedIssue_ExistingLiveTask_NoNewTask(t *testin
 	w := post(t, h, "projicut4", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "when live task exists, only reactivate - do not create a second task")
+	// No new QueuedEvent should have been created (reactivate path, not create path).
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Empty(t, qel.Items, "when live task exists, only reactivate - do not create a QueuedEvent")
 }

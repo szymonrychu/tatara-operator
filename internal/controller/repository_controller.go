@@ -597,9 +597,9 @@ func (r *RepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&tataradevv1alpha1.Repository{}).
 		Owns(&batchv1.Job{}).
 		Owns(&corev1.ConfigMap{}).
-		// MaxConcurrentReconciles: 1 is explicit here because laneOccupancy gating
-		// assumes serialised reconciles per kind; raising this without revisiting
-		// that invariant would cause correctness bugs.
+		// MaxConcurrentReconciles: 1 serialises Repository reconciles to avoid
+		// races in read-then-write sequences; the admission queue seq accounting
+		// assumes a single active reconcile per controller kind.
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

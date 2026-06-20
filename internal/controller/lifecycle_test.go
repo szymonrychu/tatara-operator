@@ -822,12 +822,10 @@ func TestLifecycleImplement_FailedTransitionsToParked(t *testing.T) {
 	}
 }
 
-// ----- FIX 1: concurrency gate must not block terminal-phase outcome consumption -----
-
 // TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage asserts that a Triage
 // task with Phase=Succeeded still runs finishTriage (consumes outcome, transitions
-// to Implement) even when the project is at the MaxConcurrentTasks concurrency cap.
-// The gates must only fire on the SPAWN path, not when finishing a completed run.
+// to Implement). The concurrency gate no longer exists; this test verifies the
+// triage completion path still works unconditionally.
 func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
@@ -852,42 +850,9 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 		t.Fatalf("seed triage succeeded: %v", err)
 	}
 
-	// Fill the concurrency cap: create MaxConcurrentTasks (default 3) sibling tasks
-	// in active "Running" phase so atConcurrencyCap returns true.
-	proj := &tatarav1alpha1.Project{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: projName}, proj); err != nil {
-		t.Fatalf("get project: %v", err)
-	}
-	maxConc := proj.Spec.MaxConcurrentTasks
-	if maxConc <= 0 {
-		maxConc = 3
-	}
-	for i := range maxConc {
-		blockerName := "blocker-capgate-" + string(rune('a'+i))
-		blocker := &tatarav1alpha1.Task{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      blockerName,
-				Namespace: testNS,
-			},
-			Spec: tatarav1alpha1.TaskSpec{
-				ProjectRef:    projName,
-				RepositoryRef: repoName,
-				Goal:          "blocker",
-				Kind:          "implement",
-			},
-		}
-		if err := k8sClient.Create(ctx, blocker); err != nil {
-			t.Fatalf("create blocker task %d: %v", i, err)
-		}
-		blocker.Status.Phase = "Running"
-		if err := k8sClient.Status().Update(ctx, blocker); err != nil {
-			t.Fatalf("set blocker running %d: %v", i, err)
-		}
-	}
-
 	r := newLifecycleReconciler(t, &lifecycleFakeSCMWriter{})
 
-	// Reconcile: despite being at cap the terminal-phase Triage task must finish.
+	// Reconcile: the terminal-phase Triage task must finish (transition to Implement).
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
 		tk := &tatarav1alpha1.Task{}
 		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {

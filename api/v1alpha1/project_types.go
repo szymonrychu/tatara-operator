@@ -45,7 +45,9 @@ type GrafanaSpec struct {
 	//   webhookSecret       - static bearer the alert webhook must present
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
-	// CooldownSeconds is the per-alert-group refire window (default 3600).
+	// CooldownSeconds is DEPRECATED and no longer used: the per-alert-group refire
+	// window was replaced by in-flight dedup (admission-time idempotency).
+	// Retained for API compatibility; the value has no effect.
 	// +kubebuilder:default=3600
 	// +optional
 	CooldownSeconds int `json:"cooldownSeconds,omitempty"`
@@ -259,6 +261,50 @@ type ProjectSpec struct {
 	Scm *ScmSpec `json:"scm,omitempty"`
 	// +optional
 	Grafana *GrafanaSpec `json:"grafana,omitempty"`
+	// +optional
+	Queue *QueueSpec `json:"queue,omitempty"`
+}
+
+// QueueSpec configures the in-operator agent-work admission queue.
+type QueueSpec struct {
+	// Capacity N: max concurrently-admitted normal-class events (defaults to
+	// MaxConcurrentTasks, else 3).
+	// +optional
+	Capacity int `json:"capacity,omitempty"`
+	// AlertCapacity M: reserved concurrent slots for alert-class events (default 1).
+	// +optional
+	AlertCapacity int `json:"alertCapacity,omitempty"`
+	// QueuedAutonomousCap K: max Queued autonomous (cron) events; crons stop
+	// enqueuing past it (defaults to MaxOpenTasks, else 3). Webhooks/alerts exempt.
+	// +optional
+	QueuedAutonomousCap int `json:"queuedAutonomousCap,omitempty"`
+}
+
+func (p *Project) QueueCapacity() int {
+	if p.Spec.Queue != nil && p.Spec.Queue.Capacity > 0 {
+		return p.Spec.Queue.Capacity
+	}
+	if p.Spec.MaxConcurrentTasks > 0 {
+		return p.Spec.MaxConcurrentTasks
+	}
+	return 3
+}
+
+func (p *Project) AlertCapacity() int {
+	if p.Spec.Queue != nil && p.Spec.Queue.AlertCapacity > 0 {
+		return p.Spec.Queue.AlertCapacity
+	}
+	return 1
+}
+
+func (p *Project) QueuedAutonomousCap() int {
+	if p.Spec.Queue != nil && p.Spec.Queue.QueuedAutonomousCap > 0 {
+		return p.Spec.Queue.QueuedAutonomousCap
+	}
+	if p.Spec.MaxOpenTasks > 0 {
+		return p.Spec.MaxOpenTasks
+	}
+	return 3
 }
 
 // ProjectStatus defines the observed state of a Project.

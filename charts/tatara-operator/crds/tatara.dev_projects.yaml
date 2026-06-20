@@ -84,8 +84,10 @@ spec:
                 properties:
                   cooldownSeconds:
                     default: 3600
-                    description: CooldownSeconds is the per-alert-group refire window
-                      (default 3600).
+                    description: |-
+                      CooldownSeconds is DEPRECATED and no longer used: the per-alert-group refire
+                      window was replaced by in-flight dedup (admission-time idempotency).
+                      Retained for API compatibility; the value has no effect.
                     type: integer
                   enabled:
                     type: boolean
@@ -128,6 +130,25 @@ spec:
                   pgStorage:
                     default: 10Gi
                     type: string
+                type: object
+              queue:
+                description: QueueSpec configures the in-operator agent-work admission
+                  queue.
+                properties:
+                  alertCapacity:
+                    description: 'AlertCapacity M: reserved concurrent slots for alert-class
+                      events (default 1).'
+                    type: integer
+                  capacity:
+                    description: |-
+                      Capacity N: max concurrently-admitted normal-class events (defaults to
+                      MaxConcurrentTasks, else 3).
+                    type: integer
+                  queuedAutonomousCap:
+                    description: |-
+                      QueuedAutonomousCap K: max Queued autonomous (cron) events; crons stop
+                      enqueuing past it (defaults to MaxOpenTasks, else 3). Webhooks/alerts exempt.
+                    type: integer
                 type: object
               scm:
                 description: ScmSpec binds a Project to one SCM provider and its board/merge

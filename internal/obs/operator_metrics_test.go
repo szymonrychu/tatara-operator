@@ -3,6 +3,8 @@ package obs
 import (
 	"testing"
 
+	dto "github.com/prometheus/client_model/go"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -652,6 +654,49 @@ func TestWebhookDuration_PreSeeded(t *testing.T) {
 		if !seen {
 			t.Errorf("operator_webhook_duration_seconds{provider=%q,result=%q} not pre-seeded", k.provider, k.result)
 		}
+	}
+}
+
+func hasMetric(mfs []*dto.MetricFamily, name string) bool {
+	for _, mf := range mfs {
+		if mf.GetName() == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestQueueMetrics_RegisterAndObserve(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.QueueAdmitted("alert", "incident")
+	m.SetQueueDepth("myproject", "normal", 3)
+	m.SetQueueInflight("myproject", "alert", 1)
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMetric(mfs, "operator_queue_admitted_total") ||
+		!hasMetric(mfs, "operator_queue_depth") ||
+		!hasMetric(mfs, "operator_queue_inflight") {
+		t.Fatal("queue metrics not registered")
+	}
+	// Verify project label is present in the depth gauge.
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_queue_depth" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "project" && lp.GetValue() == "myproject" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_queue_depth missing project label")
 	}
 }
 

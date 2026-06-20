@@ -353,7 +353,7 @@ func (r *TaskReconciler) resetAgentRun(ctx context.Context, task *tatarav1alpha1
 }
 
 // needsSpawn reports whether the lifecycle state requires starting a new agent
-// run. Only these states need the memory + concurrency gates.
+// run. Only these states need the memory-ready gate.
 func needsSpawn(lifecycleState, phase string) bool {
 	switch lifecycleState {
 	case "", "Triage", "Implement":
@@ -389,10 +389,10 @@ func (r *TaskReconciler) ensurePhaseLabel(ctx context.Context, project *tatarav1
 }
 
 // reconcileLifecycle is the dispatch function for issueLifecycle Tasks. It
-// applies the memory-ready and concurrency gates ONLY on the spawn path (i.e.
-// when about to start a new agent run). Terminal-phase outcome consumption,
-// poll states, and terminal lifecycle states bypass the gates so a finished
-// run can always be torn down and its outcome consumed regardless of cap.
+// applies the memory-ready gate ONLY on the spawn path (i.e. when about to
+// start a new agent run). Terminal-phase outcome consumption, poll states,
+// and terminal lifecycle states bypass the gate so a finished run can always
+// be torn down and its outcome consumed.
 func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
@@ -522,25 +522,12 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
-	// Memory + concurrency gates: apply only when about to spawn a new agent run.
+	// Memory gate: apply only when about to spawn a new agent run.
 	if needsSpawn(task.Status.LifecycleState, task.Status.Phase) {
 		if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
 			l.Info("lifecycle task gated: project memory not ready",
 				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
-			return ctrl.Result{RequeueAfter: capRequeue}, nil
-		}
-
-		if !isActive(task.Status.Phase) {
-			atCap, err := r.atConcurrencyCap(ctx, &project, task.Name)
-			if err != nil {
-				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, err
-			}
-			if atCap {
-				l.Info("lifecycle task gated at concurrency cap",
-					"action", "task_gate", "resource_id", task.Name, "project", project.Name)
-				return ctrl.Result{RequeueAfter: capRequeue}, nil
-			}
+			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 		}
 	}
 

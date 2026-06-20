@@ -11,6 +11,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -48,6 +49,9 @@ type ProjectReconciler struct {
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
 	// SCMFor returns the SCMWriter for a provider name (token passed per call).
 	SCMFor func(provider string) (scm.SCMWriter, error)
+	// Seq provides durable per-project sequence numbers for QueuedEvents created
+	// by cron scans. Wired in wire.go; tests create via &queue.SeqSource{Client, Namespace}.
+	Seq *queue.SeqSource
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
 	// (updateMemoryStackCounts + updateLifecycleStateCounts) run. Defaults to
@@ -266,9 +270,8 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&networkingv1.Ingress{}).
-		// MaxConcurrentReconciles: 1 is explicit here because laneOccupancy gating
-		// assumes serialised reconciles per kind; raising this without revisiting
-		// that invariant would cause correctness bugs.
+		// MaxConcurrentReconciles: 1 is explicit here; scan dedup/cap logic
+		// assumes serialised reconciles per kind.
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

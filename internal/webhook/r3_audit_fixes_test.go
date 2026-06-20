@@ -72,9 +72,10 @@ func TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger(t *testing.T) {
 	w := post(t, h, "r3f12proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 2, "re-labeling after Done must create a new Task, not be a duplicate")
+	// Re-labeling after Done creates a QueuedEvent (not a second Task).
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "re-labeling after Done must create a new QueuedEvent, not be a duplicate")
 
 	// Must NOT be duplicate.
 	dupCount := counterValue(t, reg, "operator_webhook_events_total",
@@ -243,14 +244,14 @@ func TestR3Finding3_IssueAndPRSameNumber_DifferentTaskNames(t *testing.T) {
 	w2 := post(t, h, "r3f3proj", prHdr, prBody)
 	require.Equal(t, http.StatusAccepted, w2.Code)
 
-	// Two distinct tasks must exist: one for the issue, one for the PR.
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 2, "issue #5 and PR #5 must produce two distinct Tasks, not collide on same deterministic name")
+	// Two distinct QueuedEvents must exist: one for the issue, one for the PR.
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 2, "issue #5 and PR #5 must produce two distinct QueuedEvents, not collide on same deterministic name")
 
-	// Names must differ.
-	require.NotEqual(t, tasks.Items[0].Name, tasks.Items[1].Name,
-		"task names for issue #5 and PR #5 must differ to avoid AlreadyExists collision")
+	// Payload names must differ.
+	require.NotEqual(t, qel.Items[0].Spec.Payload.Name, qel.Items[1].Spec.Payload.Name,
+		"task names for issue #5 and PR #5 must differ to avoid dedup collision")
 }
 
 // --- Finding 4: redelivered comment appends to PendingInterjections twice ---
@@ -316,14 +317,12 @@ func TestR3Finding5_CommentBodyPreservedAtTriage(t *testing.T) {
 	w := post(t, h, "r3f5proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "human comment on untracked issue must create one Task")
-
-	got := tasks.Items[0]
-	// The triggering comment body must be preserved as the first PendingInterjection.
-	require.Contains(t, got.Status.PendingInterjections, "Please add retry logic",
-		"triggering comment body must be preserved as PendingInterjection, not discarded")
+	// A QueuedEvent must have been created (PendingInterjections initial store is dropped;
+	// comment body is in ev.Body passed as goal, dispatcher creates the Task).
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "human comment on untracked issue must create one QueuedEvent")
+	require.Equal(t, "issueLifecycle", qel.Items[0].Spec.Payload.Kind)
 }
 
 // --- Finding 6: routing on ev.Action=="created" is fragile; use IsComment flag ---

@@ -27,6 +27,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/incident"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -36,6 +37,7 @@ type Config struct {
 	Namespace string
 	Metrics   *obs.OperatorMetrics
 	Logger    *slog.Logger
+	Seq       *queue.SeqSource
 }
 
 // Server serves the SCM webhook endpoint.
@@ -51,6 +53,9 @@ func NewServer(cfg Config) *Server {
 	}
 	if cfg.Metrics == nil {
 		panic("webhook.NewServer: cfg.Metrics must not be nil")
+	}
+	if cfg.Seq == nil {
+		cfg.Seq = &queue.SeqSource{Client: cfg.Client, Namespace: cfg.Namespace}
 	}
 	return &Server{cfg: cfg, log: cfg.Logger}
 }
@@ -401,49 +406,44 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		taskGenerateName = ""
 	}
 
-	task := &tatarav1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            taskName,
-			GenerateName:    taskGenerateName,
-			Namespace:       s.cfg.Namespace,
-			Annotations:     ann,
-			Labels:          labels,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
+	payload := tatarav1.QueuedEventPayload{
+		Kind:          kind,
+		Goal:          ev.Body,
+		Labels:        labels,
+		Annotations:   ann,
+		RepositoryRef: repo.Name,
+		Source: &tatarav1.TaskSource{
+			Provider:    provider,
+			IssueRef:    ev.IssueRef,
+			URL:         ev.URL,
+			AuthorLogin: ev.AuthorLogin,
+			IsPR:        ev.IsPR,
+			Number:      ev.Number,
 		},
-		Spec: tatarav1.TaskSpec{
-			ProjectRef:    proj.Name,
-			RepositoryRef: repo.Name,
-			Goal:          ev.Body,
-			Kind:          kind,
-			Source: &tatarav1.TaskSource{
-				Provider:    provider,
-				IssueRef:    ev.IssueRef,
-				URL:         ev.URL,
-				AuthorLogin: ev.AuthorLogin,
-				IsPR:        ev.IsPR,
-				Number:      ev.Number,
-			},
-		},
+		Provider: provider,
+		PodRepo:  repo.Name,
 	}
-	agent.StampPodName(task, proj.Name, provider, repo.Name)
-	if err := s.cfg.Client.Create(ctx, task); err != nil {
-		if apierrors.IsAlreadyExists(err) && kind == "issueLifecycle" {
-			s.log.InfoContext(ctx, "work item task already exists (concurrent create); treating as duplicate",
-				"project", proj.Name, "issue_ref", ev.IssueRef)
-			s.count(provider, ev.Kind, ev.Action, "duplicate")
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
+	if kind == "issueLifecycle" {
+		payload.Name = taskName // deterministic name for idempotent dedup
+	} else {
+		payload.GenerateName = taskGenerateName // "task-" for review tasks
+	}
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, &proj, tatarav1.QueueClassNormal, false, taskName, payload)
+	if err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
-	// NOTE: No post-create Status().Update for lifecycle state. The entry state is
-	// carried by the LifecycleEntryAnnotation and consumed by reconcileLifecycle on
-	// the first reconcile.
-	s.log.InfoContext(ctx, "work item created task",
+	if !created {
+		s.log.InfoContext(ctx, "work item already queued (concurrent delivery); treating as duplicate",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "duplicate")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	s.log.InfoContext(ctx, "work item enqueued",
 		"project", proj.Name, "repository", repo.Name,
-		"task", task.Name, "issue_ref", ev.IssueRef, "kind", kind)
+		"task", taskName, "issue_ref", ev.IssueRef, "kind", kind)
 	s.count(provider, ev.Kind, ev.Action, "task_created")
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -595,63 +595,45 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	}
 	ann := map[string]string{tatarav1.LifecycleEntryAnnotation: "Triage"}
 
-	task := &tatarav1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            issueLifecycleTaskName(proj.Name, ev.IssueRef, ev.IsPR),
-			Namespace:       s.cfg.Namespace,
-			Annotations:     ann,
-			Labels:          labels,
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(&proj, tatarav1.GroupVersion.WithKind("Project"))},
-		},
-		Spec: tatarav1.TaskSpec{
-			ProjectRef:    proj.Name,
-			RepositoryRef: repo.Name,
-			Goal:          ev.Body,
-			Kind:          "issueLifecycle",
-			Source: &tatarav1.TaskSource{
-				Provider:    provider,
-				IssueRef:    ev.IssueRef,
-				URL:         ev.URL,
-				AuthorLogin: ev.AuthorLogin,
-				IsPR:        ev.IsPR,
-				Number:      ev.Number,
-			},
-		},
+	goal := ev.Body
+	if ev.CommentBody != "" {
+		goal += "\n\nTriggering comment:\n" + ev.CommentBody
 	}
-	agent.StampPodName(task, proj.Name, provider, repo.Name)
-	if err := s.cfg.Client.Create(ctx, task); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			s.log.InfoContext(ctx, "issue_comment: lifecycle task already exists (concurrent create); treating as duplicate",
-				"project", proj.Name, "issue_ref", ev.IssueRef)
-			s.count(provider, ev.Kind, ev.Action, "duplicate")
-			w.WriteHeader(http.StatusAccepted)
-			return
-		}
+	lifecycleName := issueLifecycleTaskName(proj.Name, ev.IssueRef, ev.IsPR)
+	payload := tatarav1.QueuedEventPayload{
+		Kind:          "issueLifecycle",
+		Goal:          goal,
+		Name:          lifecycleName,
+		Labels:        labels,
+		Annotations:   ann,
+		RepositoryRef: repo.Name,
+		Source: &tatarav1.TaskSource{
+			Provider:    provider,
+			IssueRef:    ev.IssueRef,
+			URL:         ev.URL,
+			AuthorLogin: ev.AuthorLogin,
+			IsPR:        ev.IsPR,
+			Number:      ev.Number,
+		},
+		Provider: provider,
+		PodRepo:  repo.Name,
+	}
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, &proj, tatarav1.QueueClassNormal, false, lifecycleName, payload)
+	if err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
-	// Persist the triggering comment body as the first PendingInterjection so
-	// it is not lost. For GitLab Note Hooks ev.Body is the note's Description
-	// (often empty) while the actual comment text is in CommentBody; preserving
-	// CommentBody ensures the agent can see the human's request at Triage.
-	if ev.CommentBody != "" {
-		if statusErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1.Task{}
-			if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
-			fresh.Status.PendingInterjections = appendCapped(
-				fresh.Status.PendingInterjections, ev.CommentBody, maxPendingInterjections)
-			return s.cfg.Client.Status().Update(ctx, fresh)
-		}); statusErr != nil {
-			// Non-fatal: task was created; losing the interjection is preferable
-			// to returning 500 and causing GitHub to redeliver.
-			s.log.ErrorContext(ctx, "issue_comment: store initial interjection (non-fatal)", "error", statusErr, "task", task.Name)
-		}
+	if !created {
+		s.log.InfoContext(ctx, "issue_comment: lifecycle task already queued (concurrent create); treating as duplicate",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.count(provider, ev.Kind, ev.Action, "duplicate")
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
+	// CommentBody is folded into Goal above so the triage agent sees the triggering comment.
 	s.log.InfoContext(ctx, "issue_comment: created lifecycle task at Triage for untracked issue",
-		"project", proj.Name, "repository", repo.Name, "task", task.Name, "issue_ref", ev.IssueRef)
+		"project", proj.Name, "repository", repo.Name, "task", lifecycleName, "issue_ref", ev.IssueRef)
 	s.count(provider, ev.Kind, ev.Action, "task_created")
 	w.WriteHeader(http.StatusAccepted)
 }
@@ -835,78 +817,33 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	groupHash := alertGroupHash(alert)
-	skip, reason, err := s.incidentDedup(ctx, proj.Name, groupHash, proj.Spec.Grafana.CooldownSeconds)
+	created, err := s.createIncidentTask(ctx, &proj, alert, groupHash)
 	if err != nil {
-		http.Error(w, "dedup", http.StatusInternalServerError)
-		return
-	}
-	if skip {
-		s.count("grafana", "alert", "firing", reason)
-		w.WriteHeader(http.StatusAccepted)
-		return
-	}
-	if err := s.createIncidentTask(ctx, &proj, alert, groupHash); err != nil {
 		s.count("grafana", "alert", "firing", "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
-	s.count("grafana", "alert", "firing", "created")
+	if !created {
+		s.count("grafana", "alert", "firing", "duplicate")
+	} else {
+		s.count("grafana", "alert", "firing", "created")
+	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// incidentDedup reports whether to skip creating an incident for this alert
-// group: skip if a non-terminal incident Task exists (in-flight), or the newest
-// incident Task for the group was created within cooldownSeconds.
-func (s *Server) incidentDedup(ctx context.Context, project, groupHash string, cooldownSeconds int) (bool, string, error) {
-	var tl tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &tl,
-		client.InNamespace(s.cfg.Namespace),
-		client.MatchingLabels{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash}); err != nil {
-		return false, "", err
-	}
-	if cooldownSeconds <= 0 {
-		cooldownSeconds = 3600
-	}
-	var newest *tatarav1.Task
-	for i := range tl.Items {
-		tk := &tl.Items[i]
-		if tk.Spec.ProjectRef != project {
-			continue
-		}
-		if !tatarav1.TaskTerminal(tk) {
-			return true, "duplicate", nil // in-flight
-		}
-		if newest == nil || tk.CreationTimestamp.After(newest.CreationTimestamp.Time) {
-			newest = tk
-		}
-	}
-	if newest != nil && time.Since(newest.CreationTimestamp.Time) < time.Duration(cooldownSeconds)*time.Second {
-		return true, "cooldown", nil
-	}
-	return false, "", nil
-}
-
-func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) error {
+func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) (bool, error) {
 	slugs := projectRepoSlugs(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name)
 	alertCtx := renderAlertContext(alert)
 	goal := incident.GoalProject(alertCtx, slugs)
-	task := &tatarav1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName:    "incident-",
-			Namespace:       s.cfg.Namespace,
-			Labels:          map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
-			Annotations:     map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(proj, tatarav1.GroupVersion.WithKind("Project"))},
-		},
-		Spec: tatarav1.TaskSpec{
-			ProjectRef: proj.Name,
-			// RepositoryRef intentionally empty: incident is project-scoped.
-			Goal: goal,
-			Kind: "incident",
-		},
+	payload := tatarav1.QueuedEventPayload{
+		Kind:         "incident",
+		Goal:         goal,
+		GenerateName: "incident-",
+		Labels:       map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
+		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}
-	agent.StampPodName(task, proj.Name, "", "")
-	return s.cfg.Client.Create(ctx, task)
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, groupHash, payload)
+	return created, err
 }
 
 // projectRepoSlugs returns the owner/repo slugs of a project's Repositories,

@@ -86,25 +86,25 @@ func TestMRScanCreatedTaskVisibleToIssueScan(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{*repoObj}
 	existing := []tatarav1alpha1.Task{}
 
-	// mrScan creates issueLifecycle task deduped on issue#42.
+	// mrScan enqueues a QE deduped on issue#42 (bot PR Closes #42 -> dedupKey = issueLifecycle\x00o/r#42).
 	budget := 10
 	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan, &budget)
 
-	// issueScan should see the task mrScan just created (via re-list or append).
-	// Re-list existing tasks now.
+	// issueScan sees issue#42. dedupExists in EnqueueEvent finds the mrScan QE (same dedupKey hash)
+	// and skips creating a duplicate QE.
 	freshExisting, err := r.existingScanTasks(context.Background(), proj)
 	require.NoError(t, err)
 	r.issueScan(context.Background(), proj, reader, repos, freshExisting, cron.IssueScan, &budget)
 
-	// Only 1 task for issue#42 (from mrScan). issueScan must NOT create a duplicate.
-	tasks := listScanTasks(t, projName)
-	issue42Tasks := 0
-	for _, tk := range tasks {
-		if tk.Labels[labelSourceNumber] == "42" {
-			issue42Tasks++
+	// Only 1 QE for issue#42 (from mrScan). issueScan must NOT create a duplicate.
+	qes := listScanQEs(t, projName)
+	issue42QEs := 0
+	for _, qe := range qes {
+		if qe.Spec.Payload.Labels[labelSourceNumber] == "42" {
+			issue42QEs++
 		}
 	}
-	require.Equal(t, 1, issue42Tasks, "expected exactly 1 task for issue#42 (no duplicate from issueScan)")
+	require.Equal(t, 1, issue42QEs, "expected exactly 1 task for issue#42 (no duplicate from issueScan)")
 }
 
 // --- Finding 3: Budget truncation metric and backlog flag ---

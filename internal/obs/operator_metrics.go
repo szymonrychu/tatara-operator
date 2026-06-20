@@ -37,6 +37,9 @@ type OperatorMetrics struct {
 	restapiRequestsTotal      *prometheus.CounterVec
 	restapiRequestDuration    *prometheus.HistogramVec
 	memoryHealthReadErrors    prometheus.Counter
+	queueAdmittedTotal        *prometheus.CounterVec
+	queueDepth                *prometheus.GaugeVec
+	queueInflight             *prometheus.GaugeVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -181,6 +184,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_health_read_errors_total",
 			Help: "Total transient errors reading memory-stack health (not real stack failures).",
 		}),
+		queueAdmittedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_queue_admitted_total",
+			Help: "Total QueuedEvents admitted to a Task, by pool class and event kind.",
+		}, []string{"class", "kind"}),
+		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_queue_depth",
+			Help: "Number of Queued (not yet admitted) QueuedEvents per project and pool class.",
+		}, []string{"project", "class"}),
+		queueInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_queue_inflight",
+			Help: "Number of admitted in-flight QueuedEvents per project and pool class.",
+		}, []string{"project", "class"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -214,6 +229,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.restapiRequestsTotal,
 		m.restapiRequestDuration,
 		m.memoryHealthReadErrors,
+		m.queueAdmittedTotal,
+		m.queueDepth,
+		m.queueInflight,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -471,4 +489,19 @@ func (m *OperatorMetrics) RESTRequestsCounter(endpoint, result string) prometheu
 // Called when memoryStackHealth returns a transient non-NotFound error. Finding 13.
 func (m *OperatorMetrics) MemoryHealthReadError() {
 	m.memoryHealthReadErrors.Inc()
+}
+
+// QueueAdmitted increments operator_queue_admitted_total for the pool class and event kind.
+func (m *OperatorMetrics) QueueAdmitted(class, kind string) {
+	m.queueAdmittedTotal.WithLabelValues(class, kind).Inc()
+}
+
+// SetQueueDepth sets operator_queue_depth for a project and pool class to n (Queued-state count).
+func (m *OperatorMetrics) SetQueueDepth(project, class string, n int) {
+	m.queueDepth.WithLabelValues(project, class).Set(float64(n))
+}
+
+// SetQueueInflight sets operator_queue_inflight for a project and pool class to n (in-flight admitted count).
+func (m *OperatorMetrics) SetQueueInflight(project, class string, n int) {
+	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
 }
