@@ -33,7 +33,10 @@ const (
 func TestMain(m *testing.M) {
 	code := func() int {
 		testEnv = &envtest.Environment{
-			CRDDirectoryPaths:     []string{filepath.Join("..", "..", "charts", "tatara-operator", "crds")},
+			CRDDirectoryPaths: []string{
+				filepath.Join("..", "..", "charts", "tatara-operator", "crds"),
+				filepath.Join("..", "..", "charts", "tatara-operator", "crd-bases"),
+			},
 			ErrorIfCRDPathMissing: true,
 		}
 		var err error
