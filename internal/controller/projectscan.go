@@ -198,6 +198,7 @@ type candidate struct {
 	labels    []string
 	updatedAt time.Time
 	isPR      bool
+	title     string
 }
 
 func hasLabel(labels []string, want string) bool {
@@ -227,6 +228,7 @@ func candidatesFromPRs(prs []scm.PRRef) []candidate {
 		out = append(out, candidate{
 			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
 			body: p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
+			title: firstLine(p.Body),
 		})
 	}
 	return out
@@ -242,6 +244,7 @@ func candidatesFromIssues(iss []scm.IssueRef) []candidate {
 		}
 		out = append(out, candidate{
 			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+			title: i.Title,
 		})
 	}
 	return out
@@ -269,24 +272,32 @@ func candidatesFromBoard(items []scm.BoardItem) []candidate {
 // most callers they are the same candidate. For bot-PR MRCI entries they
 // differ: labelCand carries the linked-issue number (dedup key) while srcCand
 // carries the PR identity (number, IsPR=true).
+// scanSourceFor builds a TaskSource for a scan-born task candidate. Extracted
+// for testability; callers should use createScanTask which infers provider.
+func scanSourceFor(provider string, c candidate) *tatarav1alpha1.TaskSource {
+	sep := "#"
+	if c.isPR && provider == "gitlab" {
+		sep = "!"
+	}
+	src := &tatarav1alpha1.TaskSource{
+		Provider: provider,
+		IssueRef: fmt.Sprintf("%s%s%d", c.repo, sep, c.number),
+		Number:   c.number,
+		IsPR:     c.isPR,
+		Title:    c.title,
+	}
+	if c.author != "" {
+		src.AuthorLogin = c.author
+	}
+	return src
+}
+
 func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, labelCand, srcCand candidate, activity, kind, goal string, extraAnnotations map[string]string) (bool, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
-	sep := "#"
-	if srcCand.isPR && provider == "gitlab" {
-		sep = "!"
-	}
-	src := &tatarav1alpha1.TaskSource{
-		Provider: provider,
-		IssueRef: fmt.Sprintf("%s%s%d", srcCand.repo, sep, srcCand.number),
-		Number:   srcCand.number,
-		IsPR:     srcCand.isPR,
-	}
-	if srcCand.author != "" {
-		src.AuthorLogin = srcCand.author
-	}
+	src := scanSourceFor(provider, srcCand)
 	// Dedup key is based on labelCand (the issue/PR that determines the task's identity).
 	// For bot-PR MRCI entries, labelCand.number is the linked issue (not the PR#),
 	// ensuring that mrScan and issueScan share the same dedup key for the same issue.
