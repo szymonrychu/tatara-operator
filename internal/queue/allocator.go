@@ -48,13 +48,13 @@ func (s *SeqRecoverer) Start(ctx context.Context) error {
 	if err := s.Client.List(ctx, &list, client.InNamespace(s.Namespace)); err != nil {
 		return err
 	}
-	var max int64
+	var maxSeq int64
 	for i := range list.Items {
-		if list.Items[i].Spec.Seq > max {
-			max = list.Items[i].Spec.Seq
+		if list.Items[i].Spec.Seq > maxSeq {
+			maxSeq = list.Items[i].Spec.Seq
 		}
 	}
-	s.Alloc.Recover(max)
-	log.FromContext(ctx).Info("queue: seq recovered", "action", "seq_recover", "max", max)
+	s.Alloc.Recover(maxSeq)
+	log.FromContext(ctx).Info("queue: seq recovered", "action", "seq_recover", "max", maxSeq)
 	return nil
 }

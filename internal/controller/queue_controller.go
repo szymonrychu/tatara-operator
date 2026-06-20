@@ -21,7 +21,6 @@ import (
 type DispatcherReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
-	Alloc   *queue.SeqAllocator
 	Metrics *obs.OperatorMetrics
 }
 
@@ -185,6 +184,23 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	if err := r.admit(ctx, &proj, qes, tasks); err != nil {
 		return ctrl.Result{}, err
+	}
+	// Re-list after admission to get fresh state for gauge snapshot.
+	qes, tasks, err = listProject()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if r.Metrics != nil {
+		for _, class := range []string{tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueClassAlert} {
+			depth := 0
+			for i := range qes {
+				if qes[i].Spec.Class == class && qes[i].Status.State == tatarav1alpha1.QueueStateQueued {
+					depth++
+				}
+			}
+			r.Metrics.SetQueueDepth(class, depth)
+			r.Metrics.SetQueueInflight(class, r.poolInflight(qes, tasks, class))
+		}
 	}
 	return ctrl.Result{}, nil
 }

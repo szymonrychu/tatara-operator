@@ -79,7 +79,7 @@ func newWebhookMux() *chi.Mux {
 //
 // Webhook routes (/operator/webhooks/...) are unauthenticated - HMAC
 // verification happens inside the handler. REST routes are OIDC-gated.
-func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics) error {
+func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, seqAlloc *queue.SeqAllocator) error {
 	httpMux := newWebhookMux()
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
@@ -87,6 +87,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		Client:    mgr.GetClient(),
 		Namespace: cfg.Namespace,
 		Metrics:   metrics,
+		Seq:       seqAlloc,
 	}).Mount(httpMux)
 
 	// M3 REST API - OIDC-gated. Discovery failures at startup are fatal so
@@ -142,13 +143,22 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 }
 
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
-// the turn-complete callback server as a manager Runnable.
-func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) error {
+// the turn-complete callback server as a manager Runnable. It returns the
+// shared SeqAllocator so callers can pass it to addWebhookServer.
+func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) (*queue.SeqAllocator, error) {
 	// Fail fast at startup if any wrapper-pod resource quantity is malformed,
 	// rather than silently dropping it on every reconcile.
 	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
-		return fmt.Errorf("invalid wrapper pod resource config: %w", err)
+		return nil, fmt.Errorf("invalid wrapper pod resource config: %w", err)
 	}
+
+	// Single shared allocator: webhook producer, cron producer, and recoverer
+	// all use the same instance so seq numbers are globally ordered.
+	seqAlloc := queue.NewSeqAllocator()
+	if err := mgr.Add(&queue.SeqRecoverer{Client: mgr.GetClient(), Alloc: seqAlloc, Namespace: cfg.Namespace}); err != nil {
+		return nil, fmt.Errorf("add SeqRecoverer: %w", err)
+	}
+
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
@@ -167,9 +177,17 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
-		Alloc: queue.NewSeqAllocator(),
+		Alloc: seqAlloc,
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup ProjectReconciler: %w", err)
+		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
+	}
+
+	if err := (&controller.DispatcherReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Metrics: metrics,
+	}).SetupWithManager(mgr); err != nil {
+		return nil, fmt.Errorf("setup DispatcherReconciler: %w", err)
 	}
 	if err := (&controller.RepositoryReconciler{
 		Client:       mgr.GetClient(),
@@ -177,7 +195,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Metrics:      metrics,
 		IngestConfig: ingestConfigFromConfig(cfg, "tatara-memory"),
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup RepositoryReconciler: %w", err)
+		return nil, fmt.Errorf("setup RepositoryReconciler: %w", err)
 	}
 
 	wrapperTokens := auth.NewTokenSource(auth.TokenSourceConfig{
@@ -200,7 +218,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 			return scm.ReaderByProvider(provider, token)
 		},
 	}).SetupWithManager(mgr); err != nil {
-		return fmt.Errorf("setup TaskReconciler: %w", err)
+		return nil, fmt.Errorf("setup TaskReconciler: %w", err)
 	}
 
 	cbServer := &controller.CallbackServer{
@@ -212,9 +230,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		CallbackSecret: cfg.CallbackHMACSecret,
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
-		return fmt.Errorf("add callback server: %w", err)
+		return nil, fmt.Errorf("add callback server: %w", err)
 	}
-	return nil
+	return seqAlloc, nil
 }
 
 type callbackRunnable struct {
