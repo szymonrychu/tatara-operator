@@ -8,6 +8,9 @@ metadata:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 rules:
   # CRDs reconciled by the manager (full CRUD on CRs + status subresource).
+  # Subtasks are created by the REST API (restapi.createSubtask, agent self-plan
+  # via POST /tasks/{t}/subtasks); delete is via owner-ref GC, but the verb is
+  # retained to match the markers and keep this rule a single coalesced block.
   - apiGroups: ["tatara.dev"]
     resources: ["projects", "repositories", "tasks", "subtasks", "queuedevents"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
