@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"sort"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -17,6 +18,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+// isQueued reports whether a QueuedEvent state is effectively Queued.
+// State=="" handles a QE whose Status().Update failed after Create (stranded ghost).
+func isQueued(state string) bool {
+	return state == tatarav1alpha1.QueueStateQueued || state == ""
+}
 
 type DispatcherReconciler struct {
 	client.Client
@@ -79,7 +86,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		inflight := r.poolInflight(qes, tasks, class)
 		queued := make([]*tatarav1alpha1.QueuedEvent, 0)
 		for i := range qes {
-			if qes[i].Spec.Class == class && qes[i].Status.State == tatarav1alpha1.QueueStateQueued {
+			if qes[i].Spec.Class == class && isQueued(qes[i].Status.State) {
 				queued = append(queued, &qes[i])
 			}
 		}
@@ -131,12 +138,11 @@ func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1
 		}
 		t := taskByName(tasks, q.Status.TaskRef)
 		if t == nil || tatarav1alpha1.TaskTerminal(t) {
-			q.Status.State = tatarav1alpha1.QueueStateDone
-			if err := r.Status().Update(ctx, q); err != nil {
+			log.FromContext(ctx).Info("queue: event done", "action", "queue_done", "resource_id", q.Name, "class", q.Spec.Class)
+			if err := r.Delete(ctx, q); err != nil && !apierrors.IsNotFound(err) {
 				return changed, err
 			}
 			changed = true
-			log.FromContext(ctx).Info("queue: event done", "action", "queue_done", "resource_id", q.Name, "class", q.Spec.Class)
 		}
 	}
 	return changed, nil
@@ -194,7 +200,7 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		for _, class := range []string{tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueClassAlert} {
 			depth := 0
 			for i := range qes {
-				if qes[i].Spec.Class == class && qes[i].Status.State == tatarav1alpha1.QueueStateQueued {
+				if qes[i].Spec.Class == class && isQueued(qes[i].Status.State) {
 					depth++
 				}
 			}
@@ -202,13 +208,33 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.Metrics.SetQueueInflight(class, r.poolInflight(qes, tasks, class))
 		}
 	}
+	// Backstop: if any pool has waiting (Queued/empty-state) work and is at capacity,
+	// requeue to catch missed Task-terminal watch events.
+	waiting := false
+	for _, class := range []string{tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueClassAlert} {
+		cap := proj.QueueCapacity()
+		if class == tatarav1alpha1.QueueClassAlert {
+			cap = proj.AlertCapacity()
+		}
+		if r.poolInflight(qes, tasks, class) >= cap {
+			for i := range qes {
+				if qes[i].Spec.Class == class && isQueued(qes[i].Status.State) {
+					waiting = true
+					break
+				}
+			}
+		}
+	}
+	if waiting {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
 func queuedAutonomousCount(qes []tatarav1alpha1.QueuedEvent) int {
 	n := 0
 	for i := range qes {
-		if qes[i].Spec.Autonomous && qes[i].Status.State == tatarav1alpha1.QueueStateQueued {
+		if qes[i].Spec.Autonomous && isQueued(qes[i].Status.State) {
 			n++
 		}
 	}

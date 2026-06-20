@@ -69,11 +69,13 @@ func repository(name, projectRef, url, branch string) *tatarav1.Repository {
 
 func newServer(t *testing.T, c client.Client) (http.Handler, *prometheus.Registry) {
 	reg := prometheus.NewRegistry()
+	alloc := queue.NewSeqAllocator()
+	alloc.Recover(0)
 	srv := webhook.NewServer(webhook.Config{
 		Client:    c,
 		Namespace: ns,
 		Metrics:   obs.NewOperatorMetrics(reg),
-		Seq:       queue.NewSeqAllocator(),
+		Seq:       alloc,
 	})
 	return srv.Handler(), reg
 }

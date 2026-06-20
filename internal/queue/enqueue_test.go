@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -27,6 +28,7 @@ func TestEnqueueEvent_AssignsSeqAndFields(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
 	alloc := NewSeqAllocator()
+	alloc.Recover(0)
 	proj := testProj("p", "tatara")
 	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
 	qe, created, err := EnqueueEvent(context.Background(), c, alloc, proj, tatarav1alpha1.QueueClassAlert, false, "grp1", pl)
@@ -45,6 +47,7 @@ func TestEnqueueEvent_DedupSkips(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
 	alloc := NewSeqAllocator()
+	alloc.Recover(0)
 	proj := testProj("p", "tatara")
 	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
 	if _, created, _ := EnqueueEvent(context.Background(), c, alloc, proj, tatarav1alpha1.QueueClassAlert, false, "grp1", pl); !created {
@@ -94,6 +97,7 @@ func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
 	alloc := NewSeqAllocator()
+	alloc.Recover(0)
 	proj := testProj("p", "tatara")
 	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
 
@@ -123,5 +127,28 @@ func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	}
 	if !created {
 		t.Fatal("should allow enqueue when existing dedupKey event is Done")
+	}
+}
+
+func TestEnqueueEvent_ErrSeqNotReady(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
+	alloc := NewSeqAllocator() // NOT recovered
+	proj := testProj("p", "tatara")
+	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
+	qe, created, err := EnqueueEvent(context.Background(), c, alloc, proj, tatarav1alpha1.QueueClassAlert, false, "grp-notready", pl)
+	if !errors.Is(err, ErrSeqNotReady) {
+		t.Fatalf("expected ErrSeqNotReady, got err=%v qe=%v created=%v", err, qe, created)
+	}
+	if created || qe != nil {
+		t.Fatalf("must not create when not ready: created=%v qe=%v", created, qe)
+	}
+	// Verify no QueuedEvent was persisted.
+	var list tatarav1alpha1.QueuedEventList
+	if err2 := c.List(context.Background(), &list); err2 != nil {
+		t.Fatal(err2)
+	}
+	if len(list.Items) != 0 {
+		t.Fatalf("expected 0 persisted QEs, got %d", len(list.Items))
 	}
 }

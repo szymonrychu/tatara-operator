@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -296,6 +297,10 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Alloc, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
+		if errors.Is(err, queue.ErrSeqNotReady) {
+			log.FromContext(ctx).Info("queue not ready; skipping scan cycle", "action", "scan_skip_not_ready")
+			return false, nil
+		}
 		return false, fmt.Errorf("scan: enqueue event: %w", err)
 	}
 	if created {
@@ -326,6 +331,10 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Alloc, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
+		if errors.Is(err, queue.ErrSeqNotReady) {
+			log.FromContext(ctx).Info("queue not ready; skipping scan cycle", "action", "scan_skip_not_ready")
+			return false, nil
+		}
 		return false, fmt.Errorf("scan: enqueue brainstorm event: %w", err)
 	}
 	if created {
@@ -353,6 +362,10 @@ func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tat
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Alloc, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
+		if errors.Is(err, queue.ErrSeqNotReady) {
+			log.FromContext(ctx).Info("queue not ready; skipping scan cycle", "action", "scan_skip_not_ready")
+			return false, nil
+		}
 		return false, fmt.Errorf("scan: enqueue healthCheck event: %w", err)
 	}
 	if created {

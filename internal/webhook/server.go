@@ -55,7 +55,9 @@ func NewServer(cfg Config) *Server {
 		panic("webhook.NewServer: cfg.Metrics must not be nil")
 	}
 	if cfg.Seq == nil {
-		cfg.Seq = queue.NewSeqAllocator()
+		a := queue.NewSeqAllocator()
+		a.Recover(0)
+		cfg.Seq = a
 	}
 	return &Server{cfg: cfg, log: cfg.Logger}
 }
@@ -430,6 +432,10 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, &proj, tatarav1.QueueClassNormal, false, taskName, payload)
 	if err != nil {
+		if errors.Is(err, queue.ErrSeqNotReady) {
+			http.Error(w, "queue not ready", http.StatusServiceUnavailable)
+			return
+		}
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
@@ -620,6 +626,10 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	}
 	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, &proj, tatarav1.QueueClassNormal, false, lifecycleName, payload)
 	if err != nil {
+		if errors.Is(err, queue.ErrSeqNotReady) {
+			http.Error(w, "queue not ready", http.StatusServiceUnavailable)
+			return
+		}
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
@@ -819,6 +829,10 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 	groupHash := alertGroupHash(alert)
 	created, err := s.createIncidentTask(ctx, &proj, alert, groupHash)
 	if err != nil {
+		if errors.Is(err, queue.ErrSeqNotReady) {
+			http.Error(w, "queue not ready", http.StatusServiceUnavailable)
+			return
+		}
 		s.count("grafana", "alert", "firing", "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return

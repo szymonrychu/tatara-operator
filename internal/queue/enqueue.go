@@ -93,6 +93,10 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, pro
 	if dup {
 		return nil, false, nil
 	}
+	seq, ok := alloc.Next()
+	if !ok {
+		return nil, false, ErrSeqNotReady
+	}
 	labels := map[string]string{}
 	if dedupKey != "" {
 		labels[LabelDedupKey] = dedupLabel(dedupKey)
@@ -104,7 +108,7 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, pro
 			Labels:       labels,
 		},
 		Spec: tatarav1alpha1.QueuedEventSpec{
-			Seq:           alloc.Next(),
+			Seq:           seq,
 			Class:         class,
 			Kind:          payload.Kind,
 			Autonomous:    autonomous,

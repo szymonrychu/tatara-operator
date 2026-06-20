@@ -6,7 +6,9 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -203,8 +205,10 @@ func TestDispatcherReconcile_AdmitsThenFreesOnTerminal(t *testing.T) {
 	if _, err := r.Reconcile(ctx, reqFor(q1)); err != nil {
 		t.Fatal(err)
 	}
-	if refreshQE(t, ctx, q1).Status.State != tatarav1alpha1.QueueStateDone {
-		t.Fatal("q1 should be Done")
+	q1gone := &tatarav1alpha1.QueuedEvent{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: q1.Name, Namespace: q1.Namespace}, q1gone)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("q1 should be deleted after terminal, got state=%q err=%v", q1gone.Status.State, err)
 	}
 	if refreshQE(t, ctx, q2).Status.State != tatarav1alpha1.QueueStateAdmitted {
 		t.Fatal("q2 should now be admitted")
@@ -215,6 +219,39 @@ func TestDispatcherReconcile_AdmitsThenFreesOnTerminal(t *testing.T) {
 	}
 	if refreshQE(t, ctx, q2).Status.State != tatarav1alpha1.QueueStateAdmitted {
 		t.Fatal("q2 should remain admitted after re-reconcile")
+	}
+}
+
+func TestDispatcherReconcile_HealsEmptyStateQE(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-heal", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 1, AlertCapacity: 1}},
+	}
+	mustCreate(t, ctx, proj)
+
+	// Simulate a stranded QE: Create without Status().Update (State=="").
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-heal-", Namespace: ns},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "incident", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "x-"},
+		},
+	}
+	mustCreate(t, ctx, q)
+	// Do NOT call mustStatusUpdate — State remains "".
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	if _, err := r.Reconcile(ctx, reqFor(q)); err != nil {
+		t.Fatal(err)
+	}
+	got := refreshQE(t, ctx, q)
+	if got.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("stranded QE (State=='') should be admitted, got %q", got.Status.State)
+	}
+	if got.Status.TaskRef == "" {
+		t.Fatal("admitted QE must have TaskRef set")
 	}
 }
 

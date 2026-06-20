@@ -2,18 +2,25 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+// ErrSeqNotReady is returned by EnqueueEvent when the seq allocator has not
+// yet recovered the high-water mark from existing QueuedEvents.
+var ErrSeqNotReady = errors.New("queue: seq allocator not yet recovered")
+
 // SeqAllocator hands out a strictly increasing int64 sequence. Correctness
 // relies on a single leader-elected active operator (one allocator instance).
 type SeqAllocator struct {
-	mu   sync.Mutex
-	next int64
+	mu    sync.Mutex
+	next  int64
+	ready atomic.Bool
 }
 
 func NewSeqAllocator() *SeqAllocator { return &SeqAllocator{next: 0} }
@@ -26,13 +33,19 @@ func (a *SeqAllocator) Recover(maxSeq int64) {
 	if maxSeq > a.next {
 		a.next = maxSeq
 	}
+	a.ready.Store(true)
 }
 
-func (a *SeqAllocator) Next() int64 {
+// Next returns the next sequence number and ok=true. Returns (0, false) if
+// Recover has not been called yet.
+func (a *SeqAllocator) Next() (int64, bool) {
+	if !a.ready.Load() {
+		return 0, false
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.next++
-	return a.next
+	return a.next, true
 }
 
 // SeqRecoverer is a manager.Runnable that recovers the allocator high-water mark
@@ -55,6 +68,6 @@ func (s *SeqRecoverer) Start(ctx context.Context) error {
 		}
 	}
 	s.Alloc.Recover(maxSeq)
-	log.FromContext(ctx).Info("queue: seq recovered", "action", "seq_recover", "max", maxSeq)
+	log.FromContext(ctx).Info("queue: seq recovered", "action", "seq_recover", "namespace", s.Namespace, "max", maxSeq)
 	return nil
 }
