@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -147,6 +149,87 @@ func TestProjectLifecycleConfigFields(t *testing.T) {
 	cp.Spec.Agent.ContextWindowTokens = 999
 	if p.Spec.Agent.ContextWindowTokens == 999 {
 		t.Error("mutating copy mutated original")
+	}
+}
+
+// TestAgentCustomizationFields asserts the Project-scoped customization fields
+// (issue #74) exist on AgentSpec, hold their values, and deep-copy independently
+// of the original (no shared slice/pointer backing).
+func TestAgentCustomizationFields(t *testing.T) {
+	p := &v1alpha1.Project{
+		Spec: v1alpha1.ProjectSpec{
+			ScmSecretRef: "scm",
+			Agent: v1alpha1.AgentSpec{
+				SystemPrompt: "you are a careful engineer",
+				MCPServers: []v1alpha1.MCPServer{
+					{Name: "github", ConfigJSON: `{"command":"npx","args":["-y","srv"]}`},
+				},
+				Plugins: []v1alpha1.Plugin{
+					{Name: "my-plugin", Source: "https://example/marketplace"},
+					{Name: "builtin"},
+				},
+				Skills: []v1alpha1.SkillSource{
+					{Name: "deploy", ConfigMapRef: "skill-deploy"},
+				},
+				Env: []corev1.EnvVar{
+					{Name: "FOO", Value: "bar"},
+					{Name: "SECRET", ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "s"},
+							Key:                  "k",
+						},
+					}},
+				},
+				Settings: &apiextensionsv1.JSON{Raw: []byte(`{"maxParallelism":4}`)},
+			},
+		},
+	}
+
+	cp := p.DeepCopy()
+
+	if cp.Spec.Agent.SystemPrompt != "you are a careful engineer" {
+		t.Errorf("SystemPrompt = %q", cp.Spec.Agent.SystemPrompt)
+	}
+	if len(cp.Spec.Agent.MCPServers) != 1 || cp.Spec.Agent.MCPServers[0].Name != "github" {
+		t.Errorf("MCPServers = %+v", cp.Spec.Agent.MCPServers)
+	}
+	if len(cp.Spec.Agent.Plugins) != 2 || cp.Spec.Agent.Plugins[0].Source != "https://example/marketplace" {
+		t.Errorf("Plugins = %+v", cp.Spec.Agent.Plugins)
+	}
+	if len(cp.Spec.Agent.Skills) != 1 || cp.Spec.Agent.Skills[0].ConfigMapRef != "skill-deploy" {
+		t.Errorf("Skills = %+v", cp.Spec.Agent.Skills)
+	}
+	if len(cp.Spec.Agent.Env) != 2 || cp.Spec.Agent.Env[1].ValueFrom.SecretKeyRef.Key != "k" {
+		t.Errorf("Env = %+v", cp.Spec.Agent.Env)
+	}
+	if cp.Spec.Agent.Settings == nil || string(cp.Spec.Agent.Settings.Raw) != `{"maxParallelism":4}` {
+		t.Errorf("Settings = %+v", cp.Spec.Agent.Settings)
+	}
+
+	// DeepCopy must produce independent backing arrays/pointers.
+	cp.Spec.Agent.MCPServers[0].Name = "mutated"
+	if p.Spec.Agent.MCPServers[0].Name == "mutated" {
+		t.Error("MCPServers slice shared with original (shallow copy)")
+	}
+	cp.Spec.Agent.Env[0].Value = "mutated"
+	if p.Spec.Agent.Env[0].Value == "mutated" {
+		t.Error("Env slice shared with original (shallow copy)")
+	}
+	cp.Spec.Agent.Settings.Raw[0] = 'X'
+	if p.Spec.Agent.Settings.Raw[0] == 'X' {
+		t.Error("Settings.Raw shared with original (shallow copy)")
+	}
+}
+
+// TestAgentCustomizationNilSafe asserts an AgentSpec with none of the new fields
+// set deep-copies cleanly to nil/zero (existing Projects unchanged).
+func TestAgentCustomizationNilSafe(t *testing.T) {
+	p := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Agent: v1alpha1.AgentSpec{Model: "m"}}}
+	cp := p.DeepCopy()
+	a := cp.Spec.Agent
+	if a.SystemPrompt != "" || a.MCPServers != nil || a.Plugins != nil ||
+		a.Skills != nil || a.Env != nil || a.Settings != nil {
+		t.Fatalf("unset customization fields must be zero/nil after DeepCopy: %+v", a)
 	}
 }
 

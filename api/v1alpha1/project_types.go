@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -96,6 +98,96 @@ type AgentSpec struct {
 	// +kubebuilder:default="xhigh"
 	// +optional
 	Effort string `json:"effort,omitempty"`
+
+	// SystemPrompt is free-form text injected as the agent's starting prompt: the
+	// operator renders it to a ConfigMap mounted at the wrapper's project CLAUDE.md
+	// path (PROJECT_CLAUDE_MD_PATH). Empty means no custom prompt (existing
+	// behaviour). Project-scoped: applies to every agent the Project spawns.
+	// +optional
+	SystemPrompt string `json:"systemPrompt,omitempty"`
+
+	// MCPServers are additional MCP servers (beyond tatara itself) made available
+	// to the agent. Each entry is rendered to one file in the wrapper's MCP overlay
+	// dir (MCP_OVERLAY_DIR) and merged into the session .mcp.json at bootstrap.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	MCPServers []MCPServer `json:"mcpServers,omitempty"`
+
+	// Plugins are claude-code plugins to install before the session starts,
+	// including from custom marketplace sources. Consumed by the wrapper at
+	// bootstrap.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Plugins []Plugin `json:"plugins,omitempty"`
+
+	// Skills are custom agent skills sourced from ConfigMaps the operator mounts
+	// under the wrapper's skills source dir. Each referenced ConfigMap's keys
+	// become files in a skill directory.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Skills []SkillSource `json:"skills,omitempty"`
+
+	// Env are additional environment variables injected into the wrapper
+	// container, appended after the operator's own variables. Secret material is
+	// supplied via valueFrom.secretKeyRef so the operator never handles plaintext
+	// (the same model the built-in agent secrets use).
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// Settings is a raw JSON object merged into the agent's claude-code
+	// settings.json (e.g. maxParallelism and other claude-code knobs) on top of
+	// the operator-managed model/effort/permission settings. Operator-managed keys
+	// win on conflict. Unknown fields are preserved.
+	// +optional
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Settings *apiextensionsv1.JSON `json:"settings,omitempty"`
+}
+
+// MCPServer is one additional MCP server made available to the agent. ConfigJSON
+// is the server's MCP config object as a JSON string (the value of one entry
+// under .mcpServers in a .mcp.json file), e.g.
+// {"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}.
+type MCPServer struct {
+	// Name is the MCP server key as it appears under .mcpServers. Must be unique
+	// within the list.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// ConfigJSON is the server's MCP config as a JSON object string.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	ConfigJSON string `json:"configJson"`
+}
+
+// Plugin is a claude-code plugin to install at bootstrap. Source is the plugin
+// source: a marketplace plugin reference (e.g. "name@marketplace"), a git URL, or
+// any source the wrapper's plugin installer understands. Empty Source installs by
+// Name from the default marketplace.
+type Plugin struct {
+	// Name is the plugin name. Must be unique within the list.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// Source is where to install the plugin from (marketplace ref, git URL, ...).
+	// +optional
+	Source string `json:"source,omitempty"`
+}
+
+// SkillSource references a ConfigMap whose keys are mounted as files of a custom
+// skill directory under the wrapper's skills source dir.
+type SkillSource struct {
+	// Name is the skill directory name. Must be unique within the list.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// ConfigMapRef is the name of a ConfigMap in the operator namespace holding
+	// the skill's files (e.g. SKILL.md and any helpers) as data keys.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	ConfigMapRef string `json:"configMapRef"`
 }
 
 // BoardSpec configures the project board tatara participates in.
