@@ -376,6 +376,9 @@ func (f *fakeReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([
 func (f *fakeReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
 }
+func (f *fakeReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
 
 // buildRouterWithReader injects both an SCMFor writer and a ReaderFor reader.
 func buildRouterWithReader(t *testing.T, writer scm.SCMWriter, reader scm.SCMReader, objs ...client.Object) *chi.Mux {

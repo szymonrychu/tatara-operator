@@ -238,6 +238,9 @@ func (f *fakeReaderCapture) ListIssueComments(_ context.Context, _, _ string, _ 
 func (f *fakeReaderCapture) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
 }
+func (f *fakeReaderCapture) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
 
 // seedGitLabMainCITask seeds a MainCI task backed by a GitLab nested-path repo.
 func seedGitLabMainCITask(t *testing.T, suffix string, reader *fakeReaderCapture) (*TaskReconciler, string) {

@@ -242,6 +242,9 @@ func (r *listMetricReader) ListIssueComments(_ context.Context, _, _ string, _ i
 func (r *listMetricReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
 }
+func (r *listMetricReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
 
 // TestWriteback_ListOpenPRsMetered verifies F3: ListOpenPRs in recoverExistingPRURL
 // emits a list_open_prs metric via recordSCM.

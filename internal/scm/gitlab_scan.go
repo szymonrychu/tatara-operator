@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -110,6 +111,31 @@ func (c *GitLab) GetIssue(ctx context.Context, owner, repo string, number int) (
 		return IssueContent{}, err
 	}
 	return IssueContent{Title: raw.Title, Body: raw.Description}, nil
+}
+
+// GetDefaultBranchHeadSHA resolves the default branch HEAD commit sha. owner
+// carries the full project path; repo is unused (matches GetCommitCIStatus).
+func (c *GitLab) GetDefaultBranchHeadSHA(ctx context.Context, owner, _ /*repo*/ string) (string, error) {
+	esc := url.PathEscape(owner)
+	var meta struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := glDo(ctx, c.base(), http.MethodGet, "/projects/"+esc, c.token, nil, &meta); err != nil {
+		return "", fmt.Errorf("gitlab: get project meta %s: %w", owner, err)
+	}
+	if meta.DefaultBranch == "" {
+		return "", fmt.Errorf("gitlab: empty default_branch for %s", owner)
+	}
+	var branch struct {
+		Commit struct {
+			ID string `json:"id"`
+		} `json:"commit"`
+	}
+	path := "/projects/" + esc + "/repository/branches/" + url.PathEscape(meta.DefaultBranch)
+	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &branch); err != nil {
+		return "", fmt.Errorf("gitlab: get default branch head %s@%s: %w", owner, meta.DefaultBranch, err)
+	}
+	return branch.Commit.ID, nil
 }
 
 // ListIssueComments returns non-system notes on issue number, oldest-first. All
