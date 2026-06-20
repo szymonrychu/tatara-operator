@@ -72,6 +72,11 @@ image:
 
 chart-lint:
 	$(HELM_BIN) lint charts/tatara-operator
+	@n=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'helm.sh/resource-policy: keep'); \
+		if [ "$$n" -ne 5 ]; then \
+			echo "chart-lint: expected 5 tatara.dev CRDs with resource-policy:keep, got $$n (controller-gen format may have shifted, breaking templates/crds.yaml inject)"; \
+			exit 1; \
+		fi
 
 ci: generate manifests lint test
 
