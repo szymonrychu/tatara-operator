@@ -185,9 +185,9 @@ func TestFinding2_ConcurrentDuplicateCreate_IdempotentViaAlreadyExists(t *testin
 	w2 := post(t, h, "f2proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w2.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "duplicate concurrent creates must result in exactly one Task")
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "duplicate concurrent creates must result in exactly one QueuedEvent")
 
 	require.Equal(t, 2.0, counterValue(t, reg, "operator_webhook_events_total",
 		map[string]string{"provider": "github", "kind": "issue", "action": "labeled", "result": "duplicate"})+
@@ -294,11 +294,10 @@ func TestFinding4_GitLabMR_BotActorDoesNotClassifyAsIssueLifecycle(t *testing.T)
 	w := post(t, h, "glf4proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "GitLab MR with bot actor must create a task")
-	tk := tasks.Items[0]
-	require.Equal(t, "review", tk.Spec.Kind,
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "GitLab MR with bot actor must create a QueuedEvent")
+	require.Equal(t, "review", qel.Items[0].Spec.Payload.Kind,
 		"GitLab MR where actor==bot must NOT be classified as issueLifecycle (actor != author)")
 }
 
@@ -436,12 +435,12 @@ func TestR2Finding1_BotPRTaskName_MatchesIssueDerivedName(t *testing.T) {
 	w1 := post(t, h, "r2f1bproj", hdr, issueBody)
 	require.Equal(t, http.StatusAccepted, w1.Code)
 
-	var tasksAfterIssue tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasksAfterIssue, client.InNamespace(ns)))
-	require.Len(t, tasksAfterIssue.Items, 1)
-	issueTaskName := tasksAfterIssue.Items[0].Name
+	var qelAfterIssue tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qelAfterIssue, client.InNamespace(ns)))
+	require.Len(t, qelAfterIssue.Items, 1)
+	issueTaskName := qelAfterIssue.Items[0].Spec.Payload.Name
 
-	// Second: bot PR #21 "Closes #7" -> must produce same task name -> AlreadyExists -> duplicate.
+	// Second: bot PR #21 "Closes #7" -> must produce same payload.Name -> dedup key collision -> duplicate.
 	prBody := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":21,"title":"fix closes #7","body":"Closes #7","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/21","head":{"sha":"abc","ref":"fix-branch"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 	hdr2 := http.Header{}
 	hdr2.Set("X-GitHub-Event", "pull_request")
@@ -449,11 +448,11 @@ func TestR2Finding1_BotPRTaskName_MatchesIssueDerivedName(t *testing.T) {
 	w2 := post(t, h, "r2f1bproj", hdr2, prBody)
 	require.Equal(t, http.StatusAccepted, w2.Code)
 
-	// Still only one task.
-	var tasksAfterPR tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasksAfterPR, client.InNamespace(ns)))
-	require.Len(t, tasksAfterPR.Items, 1, "bot PR 'Closes #7' must resolve to same task name as issue #7 task")
-	require.Equal(t, issueTaskName, tasksAfterPR.Items[0].Name, "task names must match so AlreadyExists fires")
+	// Still only one QueuedEvent.
+	var qelAfterPR tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qelAfterPR, client.InNamespace(ns)))
+	require.Len(t, qelAfterPR.Items, 1, "bot PR 'Closes #7' must resolve to same payload name as issue #7 QueuedEvent")
+	require.Equal(t, issueTaskName, qelAfterPR.Items[0].Spec.Payload.Name, "payload names must match so dedup fires")
 
 	dupCount := counterValue(t, reg, "operator_webhook_events_total",
 		map[string]string{"provider": "github", "kind": "mr", "action": "opened", "result": "duplicate"})

@@ -43,19 +43,19 @@ func TestLabeledIssueWebhookCreatesIssueLifecycleImplement(t *testing.T) {
 	w := post(t, h, "lc-issue-proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == "lc-issue-proj" {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == "lc-issue-proj" {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1)
-	tk := matching[0]
-	require.Equal(t, "issueLifecycle", tk.Spec.Kind, "labeled issue must create issueLifecycle kind")
+	qe := matching[0]
+	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind, "labeled issue must create issueLifecycle kind")
 	// Entry state is now carried by the lifecycle-entry annotation (FIX 3+5).
-	require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"], "trigger-labeled issue must have lifecycle-entry=Implement annotation")
+	require.Equal(t, "Implement", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"], "trigger-labeled issue must have lifecycle-entry=Implement annotation")
 }
 
 // TestBotPRWebhookCreatesIssueLifecycleMRCI asserts that a webhook for a
@@ -90,20 +90,20 @@ func TestBotPRWebhookCreatesIssueLifecycleMRCI(t *testing.T) {
 	w := post(t, h, "lc-botpr-proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == "lc-botpr-proj" {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == "lc-botpr-proj" {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1)
-	tk := matching[0]
-	require.Equal(t, "issueLifecycle", tk.Spec.Kind, "bot PR must create issueLifecycle kind")
+	qe := matching[0]
+	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind, "bot PR must create issueLifecycle kind")
 	// Entry state is now carried by the lifecycle-entry annotation (FIX 3+5).
-	require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"], "bot PR must have lifecycle-entry=MRCI annotation")
-	require.Equal(t, 9, tk.Spec.Source.Number, "Spec.Source.Number must be PR number")
+	require.Equal(t, "MRCI", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"], "bot PR must have lifecycle-entry=MRCI annotation")
+	require.Equal(t, 9, qe.Spec.Payload.Source.Number, "Spec.Source.Number must be PR number")
 }
 
 // ----- FIX 3 + FIX 5: atomic lifecycle entry via create-time annotation -----
@@ -138,21 +138,21 @@ func TestLabeledIssueWebhook_EntryAnnotationImplement(t *testing.T) {
 	w := post(t, h, "lc-ann-issue-proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == "lc-ann-issue-proj" {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == "lc-ann-issue-proj" {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1)
-	tk := matching[0]
-	require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"],
+	qe := matching[0]
+	require.Equal(t, "Implement", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"],
 		"trigger-labeled issue task must have lifecycle-entry=Implement annotation at create time")
-	// Spec.Source must be set at create time (atomic with the Task object).
-	require.NotNil(t, tk.Spec.Source)
-	require.Equal(t, 3, tk.Spec.Source.Number)
+	// Payload.Source must be set at create time (atomic with the QueuedEvent object).
+	require.NotNil(t, qe.Spec.Payload.Source)
+	require.Equal(t, 3, qe.Spec.Payload.Source.Number)
 }
 
 // TestBotPRWebhook_EntryAnnotationMRCIAndSpecSource asserts that a bot-PR webhook
@@ -185,22 +185,22 @@ func TestBotPRWebhook_EntryAnnotationMRCIAndSpecSource(t *testing.T) {
 	w := post(t, h, "lc-ann-botpr-proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == "lc-ann-botpr-proj" {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == "lc-ann-botpr-proj" {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1)
-	tk := matching[0]
-	require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"],
+	qe := matching[0]
+	require.Equal(t, "MRCI", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"],
 		"bot-PR task must have lifecycle-entry=MRCI annotation at create time")
-	require.NotNil(t, tk.Spec.Source, "Spec.Source must be set at create time")
-	require.Equal(t, 15, tk.Spec.Source.Number, "Spec.Source.Number must be PR number")
-	require.True(t, tk.Spec.Source.IsPR, "Spec.Source.IsPR must be true for bot PR")
-	require.Equal(t, "https://github.com/o/r/pull/15", tk.Spec.Source.URL)
+	require.NotNil(t, qe.Spec.Payload.Source, "Payload.Source must be set at create time")
+	require.Equal(t, 15, qe.Spec.Payload.Source.Number, "Source.Number must be PR number")
+	require.True(t, qe.Spec.Payload.Source.IsPR, "Source.IsPR must be true for bot PR")
+	require.Equal(t, "https://github.com/o/r/pull/15", qe.Spec.Payload.Source.URL)
 }
 
 // ----- FIX 4: bot-PR webhook dedup key uses linked issue number -----
@@ -236,17 +236,17 @@ func TestBotPRWebhook_DedupKeyLinkedIssue(t *testing.T) {
 	w := post(t, h, "lc-dedup-proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == "lc-dedup-proj" {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == "lc-dedup-proj" {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1)
-	tk := matching[0]
-	require.Equal(t, "7", tk.Labels["tatara.io/source-number"],
+	qe := matching[0]
+	require.Equal(t, "7", qe.Spec.Payload.Labels["tatara.io/source-number"],
 		"bot-PR with Closes #7 must have source-number=7 (linked issue), matching mrScan's dedup key")
 }
 
@@ -279,14 +279,14 @@ func TestHumanPRWebhookStillCreatesReview(t *testing.T) {
 	w := post(t, h, "lc-humanpr-proj", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == "lc-humanpr-proj" {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == "lc-humanpr-proj" {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1)
-	require.Equal(t, "review", matching[0].Spec.Kind, "human PR must still create review kind")
+	require.Equal(t, "review", matching[0].Spec.Payload.Kind, "human PR must still create review kind")
 }

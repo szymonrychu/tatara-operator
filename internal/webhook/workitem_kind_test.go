@@ -55,14 +55,14 @@ func newWebhookServer(t *testing.T, objs ...client.Object) (webhook.ExposedServe
 	return webhook.ExposedServer{Server: srv}, c
 }
 
-func singleTask(t *testing.T, c client.Client, projectName string) tatarav1.Task {
+func singleQueuedEvent(t *testing.T, c client.Client, projectName string) tatarav1.QueuedEvent {
 	t.Helper()
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	var matching []tatarav1.Task
-	for _, tk := range tasks.Items {
-		if tk.Spec.ProjectRef == projectName {
-			matching = append(matching, tk)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	var matching []tatarav1.QueuedEvent
+	for _, qe := range qel.Items {
+		if qe.Spec.ProjectRef == projectName {
+			matching = append(matching, qe)
 		}
 	}
 	require.Len(t, matching, 1, "expected exactly one task for project %q", projectName)
@@ -84,17 +84,16 @@ func TestHandleWorkItemKind(t *testing.T) {
 		w := post(t, h, proj.Name, hdr, body)
 		require.Equal(t, http.StatusAccepted, w.Code)
 
-		tk := singleTask(t, c, proj.Name)
+		qe := singleQueuedEvent(t, c, proj.Name)
 		// kind switch: was "implement", now "issueLifecycle" (migration note: in-flight
 		// "implement" tasks created before this deploy still complete via old writeback arm)
-		require.Equal(t, "issueLifecycle", tk.Spec.Kind)
+		require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
 		// Entry state is now carried by the create-time annotation (FIX 3).
-		require.Equal(t, "Implement", tk.Annotations["tatara.dev/lifecycle-entry"])
-		require.False(t, tk.Spec.ApprovalRequired)
-		require.NotNil(t, tk.Spec.Source)
-		require.Equal(t, "alice", tk.Spec.Source.AuthorLogin)
-		require.False(t, tk.Spec.Source.IsPR)
-		require.Equal(t, 7, tk.Spec.Source.Number)
+		require.Equal(t, "Implement", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"])
+		require.NotNil(t, qe.Spec.Payload.Source)
+		require.Equal(t, "alice", qe.Spec.Payload.Source.AuthorLogin)
+		require.False(t, qe.Spec.Payload.Source.IsPR)
+		require.Equal(t, 7, qe.Spec.Payload.Source.Number)
 	})
 
 	t.Run("PR opened by botLogin -> issueLifecycle MRCI task", func(t *testing.T) {
@@ -111,18 +110,17 @@ func TestHandleWorkItemKind(t *testing.T) {
 		w := post(t, h, proj.Name, hdr, body)
 		require.Equal(t, http.StatusAccepted, w.Code)
 
-		tk := singleTask(t, c, proj.Name)
+		qe := singleQueuedEvent(t, c, proj.Name)
 		// kind switch: was "selfImprove", now "issueLifecycle" (migration note: in-flight
 		// "selfImprove" tasks created before this deploy still complete via old writeback arm)
-		require.Equal(t, "issueLifecycle", tk.Spec.Kind)
+		require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
 		// Entry state is now carried by the create-time annotation, not a post-create
 		// Status().Update (FIX 3). reconcileLifecycle initializes LifecycleState from it.
-		require.Equal(t, "MRCI", tk.Annotations["tatara.dev/lifecycle-entry"])
-		require.False(t, tk.Spec.ApprovalRequired)
-		require.NotNil(t, tk.Spec.Source)
-		require.Equal(t, "tatara-bot", tk.Spec.Source.AuthorLogin)
-		require.True(t, tk.Spec.Source.IsPR)
-		require.Equal(t, 9, tk.Spec.Source.Number)
+		require.Equal(t, "MRCI", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"])
+		require.NotNil(t, qe.Spec.Payload.Source)
+		require.Equal(t, "tatara-bot", qe.Spec.Payload.Source.AuthorLogin)
+		require.True(t, qe.Spec.Payload.Source.IsPR)
+		require.Equal(t, 9, qe.Spec.Payload.Source.Number)
 	})
 
 	t.Run("human PR with trigger label -> review task", func(t *testing.T) {
@@ -139,13 +137,12 @@ func TestHandleWorkItemKind(t *testing.T) {
 		w := post(t, h, proj.Name, hdr, body)
 		require.Equal(t, http.StatusAccepted, w.Code)
 
-		tk := singleTask(t, c, proj.Name)
-		require.Equal(t, "review", tk.Spec.Kind)
-		require.False(t, tk.Spec.ApprovalRequired)
-		require.NotNil(t, tk.Spec.Source)
-		require.Equal(t, "alice", tk.Spec.Source.AuthorLogin)
-		require.True(t, tk.Spec.Source.IsPR)
-		require.Equal(t, 9, tk.Spec.Source.Number)
+		qe := singleQueuedEvent(t, c, proj.Name)
+		require.Equal(t, "review", qe.Spec.Payload.Kind)
+		require.NotNil(t, qe.Spec.Payload.Source)
+		require.Equal(t, "alice", qe.Spec.Payload.Source.AuthorLogin)
+		require.True(t, qe.Spec.Payload.Source.IsPR)
+		require.Equal(t, 9, qe.Spec.Payload.Source.Number)
 	})
 
 	t.Run("human PR without trigger label or mention -> no task (gated)", func(t *testing.T) {
@@ -162,8 +159,8 @@ func TestHandleWorkItemKind(t *testing.T) {
 		w := post(t, h, proj.Name, hdr, body)
 		require.Equal(t, http.StatusAccepted, w.Code)
 
-		var tasks tatarav1.TaskList
-		require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-		require.Empty(t, tasks.Items, "gated PR must not create a task")
+		var qel tatarav1.QueuedEventList
+		require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+		require.Empty(t, qel.Items, "gated PR must not create a task")
 	})
 }

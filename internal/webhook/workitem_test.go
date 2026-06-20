@@ -28,21 +28,22 @@ func TestIssueWithTriggerLabelCreatesTask(t *testing.T) {
 	w := post(t, h, "proj1wi", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1)
-	tk := tasks.Items[0]
-	require.Equal(t, "proj1wi", tk.Spec.ProjectRef)
-	require.Equal(t, "repo1wi", tk.Spec.RepositoryRef)
-	require.Equal(t, "please fix", tk.Spec.Goal)
-	require.NotNil(t, tk.Spec.Source)
-	require.Equal(t, "github", tk.Spec.Source.Provider)
-	require.Equal(t, "o/r#7", tk.Spec.Source.IssueRef)
-	require.Equal(t, "https://github.com/o/r/issues/7", tk.Spec.Source.URL)
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1)
+	qe := qel.Items[0]
+	require.Equal(t, "proj1wi", qe.Spec.ProjectRef)
+	require.Equal(t, "repo1wi", qe.Spec.RepositoryRef)
+	require.Equal(t, "please fix", qe.Spec.Payload.Goal)
+	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
+	require.NotNil(t, qe.Spec.Payload.Source)
+	require.Equal(t, "github", qe.Spec.Payload.Source.Provider)
+	require.Equal(t, "o/r#7", qe.Spec.Payload.Source.IssueRef)
+	require.Equal(t, "https://github.com/o/r/issues/7", qe.Spec.Payload.Source.URL)
 	// owner-ref'd to the Project
-	require.Len(t, tk.OwnerReferences, 1)
-	require.Equal(t, "Project", tk.OwnerReferences[0].Kind)
-	require.Equal(t, "proj1wi", tk.OwnerReferences[0].Name)
+	require.Len(t, qe.OwnerReferences, 1)
+	require.Equal(t, "Project", qe.OwnerReferences[0].Kind)
+	require.Equal(t, "proj1wi", qe.OwnerReferences[0].Name)
 
 	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "action": "opened", "result": "task_created"}))
 }
@@ -62,13 +63,13 @@ func TestDuplicateIssueEventDoesNotCreateSecondTask(t *testing.T) {
 	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
 
 	// Creating an issue with the label fires both issues.opened and
-	// issues.labeled for the SAME issue. Only one Task should result.
+	// issues.labeled for the SAME issue. Only one QueuedEvent should result.
 	require.Equal(t, http.StatusAccepted, post(t, h, "proj1wi", hdr, body).Code)
 	require.Equal(t, http.StatusAccepted, post(t, h, "proj1wi", hdr, body).Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "duplicate issue event must not create a second task")
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "duplicate issue event must not create a second QueuedEvent")
 	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total", map[string]string{"provider": "github", "kind": "issue", "action": "opened", "result": "duplicate"}))
 }
 

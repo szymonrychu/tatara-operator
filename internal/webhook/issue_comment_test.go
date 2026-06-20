@@ -329,10 +329,10 @@ func TestIssueComment_InflightTurn_QueuesInterjection(t *testing.T) {
 	require.Equal(t, "Implement", got.Status.LifecycleState, "in-flight interjection must not change lifecycle state")
 	require.Equal(t, []string{"Please check the edge case"}, got.Status.PendingInterjections)
 
-	// No new task created.
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1)
+	// No new QueuedEvent created.
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Empty(t, qel.Items)
 }
 
 // TestIssueComment_ParkedMR_Reactivated verifies that an MR comment on an MR
@@ -395,10 +395,10 @@ func TestIssueCommentDoneOwningTaskCreatesFresh(t *testing.T) {
 	w := post(t, h, "projpark2", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	// A NEW task must have been created (Done task stays, fresh task added).
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 2, "Done task must NOT be reactivated; a fresh Task must be created")
+	// A NEW QueuedEvent must have been created (Done task stays, fresh QueuedEvent added).
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "Done task must NOT be reactivated; a fresh QueuedEvent must be created")
 }
 
 // TestIssueCommentNoOwningTaskCreatesFresh verifies that a human comment on an
@@ -419,8 +419,8 @@ func TestIssueCommentNoOwningTaskCreatesFresh(t *testing.T) {
 	w := post(t, h, "projpark3", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "no owning task -> fresh Triage Task created")
-	require.Equal(t, "Triage", tasks.Items[0].Annotations[tatarav1.LifecycleEntryAnnotation])
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1, "no owning task -> fresh Triage QueuedEvent created")
+	require.Equal(t, "Triage", qel.Items[0].Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
 }
