@@ -45,7 +45,9 @@ type GrafanaSpec struct {
 	//   webhookSecret       - static bearer the alert webhook must present
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
-	// CooldownSeconds is the per-alert-group refire window (default 3600).
+	// CooldownSeconds is DEPRECATED and no longer used: the per-alert-group refire
+	// window was replaced by in-flight dedup (admission-time idempotency).
+	// Retained for API compatibility; the value has no effect.
 	// +kubebuilder:default=3600
 	// +optional
 	CooldownSeconds int `json:"cooldownSeconds,omitempty"`

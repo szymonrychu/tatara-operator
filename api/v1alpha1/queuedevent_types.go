@@ -13,7 +13,9 @@ const (
 
 	QueueStateQueued   = "Queued"
 	QueueStateAdmitted = "Admitted"
-	QueueStateDone     = "Done"
+	// QueueStateDone is retained for API/test compatibility. The dispatcher no
+	// longer transitions events to Done; reconcileDone GC-deletes them instead.
+	QueueStateDone = "Done"
 )
 
 // QueuedEventPayload is the Task blueprint a producer stashes; the dispatcher

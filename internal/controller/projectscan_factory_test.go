@@ -11,9 +11,7 @@ import (
 
 func newScanReconciler(reader scm.SCMReader) *ProjectReconciler {
 	r := newProjectReconciler()
-	alloc := queue.NewSeqAllocator()
-	alloc.MarkReady()
-	r.Alloc = alloc
+	r.Seq = &queue.SeqSource{Client: k8sClient, Namespace: testNS}
 	r.ReaderFor = func(string, string) (scm.SCMReader, error) { return reader, nil }
 	return r
 }

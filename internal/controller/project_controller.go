@@ -49,9 +49,9 @@ type ProjectReconciler struct {
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
 	// SCMFor returns the SCMWriter for a provider name (token passed per call).
 	SCMFor func(provider string) (scm.SCMWriter, error)
-	// Alloc provides monotonically increasing sequence numbers for QueuedEvents
-	// created by cron scans. Wired in wire.go; tests create via queue.NewSeqAllocator().
-	Alloc *queue.SeqAllocator
+	// Seq provides durable per-project sequence numbers for QueuedEvents created
+	// by cron scans. Wired in wire.go; tests create via &queue.SeqSource{Client, Namespace}.
+	Seq *queue.SeqSource
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
 	// (updateMemoryStackCounts + updateLifecycleStateCounts) run. Defaults to

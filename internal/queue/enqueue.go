@@ -54,7 +54,9 @@ func isLabelSafe(key string) bool {
 }
 
 // dedupExists reports whether a non-Done QueuedEvent or a non-terminal Task
-// with dedupKey already exists for the project.
+// with dedupKey already exists for the project. In practice no QE ever reaches
+// state Done (reconcileDone GC-deletes them on Task completion), so the != Done
+// guard is defensive; do not remove it as callers may set Done in tests.
 func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey string) (bool, error) {
 	if dedupKey == "" {
 		return false, nil
@@ -82,8 +84,10 @@ func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey 
 }
 
 // EnqueueEvent writes a QueuedEvent (seq-assigned, owned by Project, state=Queued).
-// Returns created=false when dedupKey already has live work.
-func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, proj *tatarav1alpha1.Project,
+// Returns created=false when dedupKey already has live work. The per-project seq
+// is allocated durably (per-project ConfigMap CAS) AFTER the dedup check so a
+// deduped event never burns a sequence number.
+func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *tatarav1alpha1.Project,
 	class string, autonomous bool, dedupKey string, payload tatarav1alpha1.QueuedEventPayload) (*tatarav1alpha1.QueuedEvent, bool, error) {
 
 	dup, err := dedupExists(ctx, c, proj.Namespace, proj.Name, dedupKey)
@@ -93,9 +97,9 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, pro
 	if dup {
 		return nil, false, nil
 	}
-	seq, ok := alloc.Next(proj.Name)
-	if !ok {
-		return nil, false, ErrSeqNotReady
+	seqNum, err := seq.Next(ctx, proj.Name)
+	if err != nil {
+		return nil, false, fmt.Errorf("enqueue: allocate seq: %w", err)
 	}
 	labels := map[string]string{}
 	if dedupKey != "" {
@@ -108,7 +112,7 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, pro
 			Labels:       labels,
 		},
 		Spec: tatarav1alpha1.QueuedEventSpec{
-			Seq:           seq,
+			Seq:           seqNum,
 			Class:         class,
 			Kind:          payload.Kind,
 			Autonomous:    autonomous,

@@ -670,8 +670,8 @@ func TestQueueMetrics_RegisterAndObserve(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 	m.QueueAdmitted("alert", "incident")
-	m.SetQueueDepth("normal", 3)
-	m.SetQueueInflight("alert", 1)
+	m.SetQueueDepth("myproject", "normal", 3)
+	m.SetQueueInflight("myproject", "alert", 1)
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatal(err)
@@ -680,6 +680,23 @@ func TestQueueMetrics_RegisterAndObserve(t *testing.T) {
 		!hasMetric(mfs, "operator_queue_depth") ||
 		!hasMetric(mfs, "operator_queue_inflight") {
 		t.Fatal("queue metrics not registered")
+	}
+	// Verify project label is present in the depth gauge.
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_queue_depth" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "project" && lp.GetValue() == "myproject" {
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_queue_depth missing project label")
 	}
 }
 

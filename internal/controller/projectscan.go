@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -307,13 +306,12 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 		Provider:      provider,
 		PodRepo:       repo.Name,
 	}
-	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Alloc, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
+	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
-		if errors.Is(err, queue.ErrSeqNotReady) {
-			log.FromContext(ctx).Info("queue not ready; skipping scan cycle", "action", "scan_skip_not_ready")
-			return false, nil
-		}
-		return false, fmt.Errorf("scan: enqueue event: %w", err)
+		// Transient enqueue error (e.g. seq CAS contention): log and skip this
+		// item rather than failing the whole scan cycle; the next cycle retries.
+		log.FromContext(ctx).Error(err, "scan: enqueue event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
+		return false, nil
 	}
 	if created {
 		r.Metrics.ScanTaskCreated(activity, kind)
@@ -341,13 +339,10 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 		Provider:     provider,
 		PodRepo:      "",
 	}
-	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Alloc, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
+	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
-		if errors.Is(err, queue.ErrSeqNotReady) {
-			log.FromContext(ctx).Info("queue not ready; skipping scan cycle", "action", "scan_skip_not_ready")
-			return false, nil
-		}
-		return false, fmt.Errorf("scan: enqueue brainstorm event: %w", err)
+		log.FromContext(ctx).Error(err, "scan: enqueue brainstorm event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
+		return false, nil
 	}
 	if created {
 		r.Metrics.ScanTaskCreated("brainstorm", "brainstorm")
@@ -372,13 +367,10 @@ func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tat
 		Provider:     provider,
 		PodRepo:      "",
 	}
-	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Alloc, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
+	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
-		if errors.Is(err, queue.ErrSeqNotReady) {
-			log.FromContext(ctx).Info("queue not ready; skipping scan cycle", "action", "scan_skip_not_ready")
-			return false, nil
-		}
-		return false, fmt.Errorf("scan: enqueue healthCheck event: %w", err)
+		log.FromContext(ctx).Error(err, "scan: enqueue healthCheck event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
+		return false, nil
 	}
 	if created {
 		r.Metrics.ScanTaskCreated("healthCheck", "brainstorm")

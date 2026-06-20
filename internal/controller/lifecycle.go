@@ -529,7 +529,6 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
 			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 		}
-
 	}
 
 	// dispatchLifecycle runs the per-state handler and stamps the reconcile metric

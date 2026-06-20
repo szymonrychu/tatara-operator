@@ -55,7 +55,7 @@ func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if err := r.admit(ctx, proj, qes, tasks); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,7 +94,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// First admit: creates Task, marks Admitted.
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if err := r.admit(ctx, proj, qes, tasks); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	got := refreshQE(t, ctx, qe)
@@ -113,7 +113,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// Second admit: Task already exists (AlreadyExists), must not create a second one.
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if err := r.admit(ctx, proj, qes, tasks); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks); err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
 
@@ -251,6 +251,193 @@ func TestDispatcherReconcile_HealsEmptyStateQE(t *testing.T) {
 		t.Fatalf("stranded QE (State=='') should be admitted, got %q", got.Status.State)
 	}
 	if got.Status.TaskRef == "" {
+		t.Fatal("admitted QE must have TaskRef set")
+	}
+}
+
+// TestAdmit_StaleTerminalTaskNameCollision covers Finding #4: when a deterministic
+// Task name collides with a TERMINAL Task, admit must delete the stale Task and
+// NOT mark the QE Admitted on the first pass. On the second pass it creates a
+// fresh Task and marks Admitted.
+func TestAdmit_StaleTerminalTaskNameCollision(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-stale-terminal", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 2, AlertCapacity: 2}},
+	}
+	mustCreate(t, ctx, proj)
+
+	const fixedName = "my-deterministic-task"
+	staleTask := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: fixedName, Namespace: ns},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "incident"},
+	}
+	mustCreate(t, ctx, staleTask)
+	staleTask.Status.Phase = "Succeeded"
+	mustStatusUpdate(t, ctx, staleTask)
+
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-stale-", Namespace: ns},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq:        10,
+			Class:      tatarav1alpha1.QueueClassNormal,
+			Kind:       "incident",
+			ProjectRef: proj.Name,
+			Payload:    tatarav1alpha1.QueuedEventPayload{Kind: "incident", Name: fixedName},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+	// First Reconcile: stale terminal Task collision -> delete stale, QE stays Queued.
+	if _, err := r.Reconcile(ctx, reqFor(q)); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	staleGot := &tatarav1alpha1.Task{}
+	err := k8sClient.Get(ctx, types.NamespacedName{Name: fixedName, Namespace: ns}, staleGot)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("stale terminal Task should be deleted after first Reconcile, got err=%v phase=%q", err, staleGot.Status.Phase)
+	}
+	got := refreshQE(t, ctx, q)
+	if got.Status.State == tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("QE must not be Admitted on first pass, got state=%q taskRef=%q", got.Status.State, got.Status.TaskRef)
+	}
+
+	// Second Reconcile: stale Task gone -> fresh Task created, QE Admitted.
+	if _, err := r.Reconcile(ctx, reqFor(q)); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got2 := refreshQE(t, ctx, q)
+	if got2.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("QE should be Admitted after second Reconcile, got state=%q", got2.Status.State)
+	}
+	if got2.Status.TaskRef == "" {
+		t.Fatal("admitted QE must have TaskRef set")
+	}
+	freshTask := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: fixedName, Namespace: ns}, freshTask); err != nil {
+		t.Fatalf("fresh Task %q not found: %v", fixedName, err)
+	}
+	if tatarav1alpha1.TaskTerminal(freshTask) {
+		t.Fatalf("fresh Task must be non-terminal, got phase=%q ls=%q", freshTask.Status.Phase, freshTask.Status.LifecycleState)
+	}
+}
+
+// TestAdmit_StaleTerminalDelete_RequeuesAndContinuesPool verifies that after a
+// stale terminal Task is deleted on name collision, the Reconcile result has
+// RequeueAfter > 0 AND a second QueuedEvent (no collision) in the same pool is
+// admitted in the SAME first pass (pool loop does not early-return).
+func TestAdmit_StaleTerminalDelete_RequeuesAndContinuesPool(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-stale-continue", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 2, AlertCapacity: 2}},
+	}
+	mustCreate(t, ctx, proj)
+
+	const fixedName = "my-det-task-continue"
+	staleTask := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: fixedName, Namespace: ns},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "incident"},
+	}
+	mustCreate(t, ctx, staleTask)
+	staleTask.Status.Phase = "Succeeded"
+	mustStatusUpdate(t, ctx, staleTask)
+
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-stale-cont-", Namespace: ns},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 10, Class: tatarav1alpha1.QueueClassNormal, Kind: "incident", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", Name: fixedName},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	q2 := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-normal-cont-", Namespace: ns},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 11, Class: tatarav1alpha1.QueueClassNormal, Kind: "incident", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "normal-task-"},
+		},
+	}
+	mustCreate(t, ctx, q2)
+	q2.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q2)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	result, err := r.Reconcile(ctx, reqFor(q))
+	if err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("expected RequeueAfter > 0 after stale delete, got %v", result.RequeueAfter)
+	}
+	got2 := refreshQE(t, ctx, q2)
+	if got2.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("q2 (seq=11, no collision) must be Admitted in first pass, got state=%q", got2.Status.State)
+	}
+}
+
+// TestAdmit_StaleTerminalDelete_SecondReconcileAdmits verifies the first
+// Reconcile signals RequeueAfter > 0 (no admission for the colliding QE) and the
+// second Reconcile admits the colliding QE against the fresh Task.
+func TestAdmit_StaleTerminalDelete_SecondReconcileAdmits(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-stale-second", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 2, AlertCapacity: 2}},
+	}
+	mustCreate(t, ctx, proj)
+
+	const fixedName = "my-det-task-second"
+	staleTask := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: fixedName, Namespace: ns},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "incident"},
+	}
+	mustCreate(t, ctx, staleTask)
+	staleTask.Status.Phase = "Succeeded"
+	mustStatusUpdate(t, ctx, staleTask)
+
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-stale-second-", Namespace: ns},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 10, Class: tatarav1alpha1.QueueClassNormal, Kind: "incident", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", Name: fixedName},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	result, err := r.Reconcile(ctx, reqFor(q))
+	if err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if result.RequeueAfter <= 0 {
+		t.Fatalf("expected RequeueAfter > 0 after stale delete, got %v", result.RequeueAfter)
+	}
+	got := refreshQE(t, ctx, q)
+	if got.Status.State == tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("QE must not be Admitted on first pass, got state=%q", got.Status.State)
+	}
+
+	if _, err := r.Reconcile(ctx, reqFor(q)); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got2 := refreshQE(t, ctx, q)
+	if got2.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("QE should be Admitted after second Reconcile, got state=%q", got2.Status.State)
+	}
+	if got2.Status.TaskRef == "" {
 		t.Fatal("admitted QE must have TaskRef set")
 	}
 }

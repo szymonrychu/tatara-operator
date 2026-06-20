@@ -84,8 +84,10 @@ spec:
                 properties:
                   cooldownSeconds:
                     default: 3600
-                    description: CooldownSeconds is the per-alert-group refire window
-                      (default 3600).
+                    description: |-
+                      CooldownSeconds is DEPRECATED and no longer used: the per-alert-group refire
+                      window was replaced by in-flight dedup (admission-time idempotency).
+                      Retained for API compatibility; the value has no effect.
                     type: integer
                   enabled:
                     type: boolean

@@ -79,8 +79,10 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 // admit drains the alert pool to AlertCapacity, then the normal pool to
 // QueueCapacity, each in strict ascending seq order (pure per-project FIFO within a
 // pool; head-of-line blocking accepted). Wired in Task 8 Reconcile.
+// Returns requeue=true when a stale terminal Task was deleted so Reconcile can
+// signal a prompt re-attempt via ctrl.Result{RequeueAfter: time.Second}.
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
-	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) error {
+	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) (requeue bool, err error) {
 
 	admitPool := func(class string, cap int) error {
 		inflight := r.poolInflight(qes, tasks, class)
@@ -99,9 +101,32 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 			if err != nil {
 				return err
 			}
-			if err := r.Create(ctx, task); err != nil && !apierrors.IsAlreadyExists(err) {
-				// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
-				return err
+			if err := r.Create(ctx, task); err != nil {
+				if !apierrors.IsAlreadyExists(err) {
+					// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
+					return err
+				}
+				// AlreadyExists: get the existing Task to determine if it is terminal.
+				existing := &tatarav1alpha1.Task{}
+				if getErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, existing); getErr != nil {
+					return getErr
+				}
+				if tatarav1alpha1.TaskTerminal(existing) {
+					// Name collision with a dead Task: delete it and signal a prompt
+					// requeue so the next pass creates a fresh Task. Continue processing
+					// the rest of the pool's queued events in this same pass so sibling
+					// events are not abandoned.
+					if delErr := r.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
+						return delErr
+					}
+					log.FromContext(ctx).Info("queue: deleted stale terminal task on name collision",
+						"action", "queue_stale_delete", "resource_id", q.Name, "task", task.Name)
+					requeue = true
+					continue
+				}
+				// Non-terminal Task with this name already exists: genuine idempotent
+				// re-admit (e.g. Status().Update failed on a prior pass). Fall through
+				// to mark Admitted pointing at the existing Task.
 			}
 			q.Status.State = tatarav1alpha1.QueueStateAdmitted
 			q.Status.TaskRef = task.Name
@@ -122,9 +147,12 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 	}
 
 	if err := admitPool(tatarav1alpha1.QueueClassAlert, proj.AlertCapacity()); err != nil {
-		return err
+		return false, err
 	}
-	return admitPool(tatarav1alpha1.QueueClassNormal, proj.QueueCapacity())
+	if err := admitPool(tatarav1alpha1.QueueClassNormal, proj.QueueCapacity()); err != nil {
+		return false, err
+	}
+	return requeue, nil
 }
 
 // reconcileDone flips Admitted events whose Task is terminal or gone to Done.
@@ -188,7 +216,8 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.admit(ctx, &proj, qes, tasks); err != nil {
+	requeue, err := r.admit(ctx, &proj, qes, tasks)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	// Re-list after admission to get fresh state for gauge snapshot.
@@ -204,8 +233,8 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					depth++
 				}
 			}
-			r.Metrics.SetQueueDepth(class, depth)
-			r.Metrics.SetQueueInflight(class, r.poolInflight(qes, tasks, class))
+			r.Metrics.SetQueueDepth(proj.Name, class, depth)
+			r.Metrics.SetQueueInflight(proj.Name, class, r.poolInflight(qes, tasks, class))
 		}
 	}
 	// Backstop: if any pool has waiting (Queued/empty-state) work and is at capacity,
@@ -224,6 +253,9 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				}
 			}
 		}
+	}
+	if requeue {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	if waiting {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil

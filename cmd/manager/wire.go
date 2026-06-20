@@ -79,7 +79,7 @@ func newWebhookMux() *chi.Mux {
 //
 // Webhook routes (/operator/webhooks/...) are unauthenticated - HMAC
 // verification happens inside the handler. REST routes are OIDC-gated.
-func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, seqAlloc *queue.SeqAllocator) error {
+func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, seq *queue.SeqSource) error {
 	httpMux := newWebhookMux()
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
@@ -87,7 +87,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		Client:    mgr.GetClient(),
 		Namespace: cfg.Namespace,
 		Metrics:   metrics,
-		Seq:       seqAlloc,
+		Seq:       seq,
 	}).Mount(httpMux)
 
 	// M3 REST API - OIDC-gated. Discovery failures at startup are fatal so
@@ -144,20 +144,19 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable. It returns the
-// shared SeqAllocator so callers can pass it to addWebhookServer.
-func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) (*queue.SeqAllocator, error) {
+// shared SeqSource so callers can pass it to addWebhookServer.
+func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) (*queue.SeqSource, error) {
 	// Fail fast at startup if any wrapper-pod resource quantity is malformed,
 	// rather than silently dropping it on every reconcile.
 	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
 		return nil, fmt.Errorf("invalid wrapper pod resource config: %w", err)
 	}
 
-	// Single shared allocator: webhook producer, cron producer, and recoverer
-	// all use the same instance so seq numbers are globally ordered.
-	seqAlloc := queue.NewSeqAllocator()
-	if err := mgr.Add(&queue.SeqRecoverer{Client: mgr.GetClient(), Alloc: seqAlloc, Namespace: cfg.Namespace}); err != nil {
-		return nil, fmt.Errorf("add SeqRecoverer: %w", err)
-	}
+	// Durable per-project seq source: webhook and cron producers all share this
+	// stateless allocator. Each project's counter lives in its own ConfigMap
+	// (queue-seq-<project>) updated via CAS, so any replica allocates safely with
+	// no leader dependency and no in-memory state.
+	seq := &queue.SeqSource{Client: mgr.GetClient(), Namespace: cfg.Namespace}
 
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
@@ -177,7 +176,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
-		Alloc: seqAlloc,
+		Seq: seq,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
@@ -232,7 +231,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return nil, fmt.Errorf("add callback server: %w", err)
 	}
-	return seqAlloc, nil
+	return seq, nil
 }
 
 type callbackRunnable struct {

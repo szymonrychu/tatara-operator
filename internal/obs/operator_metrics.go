@@ -190,12 +190,12 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"class", "kind"}),
 		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_queue_depth",
-			Help: "Number of Queued (not yet admitted) QueuedEvents per pool class.",
-		}, []string{"class"}),
+			Help: "Number of Queued (not yet admitted) QueuedEvents per project and pool class.",
+		}, []string{"project", "class"}),
 		queueInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_queue_inflight",
-			Help: "Number of admitted in-flight QueuedEvents per pool class.",
-		}, []string{"class"}),
+			Help: "Number of admitted in-flight QueuedEvents per project and pool class.",
+		}, []string{"project", "class"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -496,12 +496,12 @@ func (m *OperatorMetrics) QueueAdmitted(class, kind string) {
 	m.queueAdmittedTotal.WithLabelValues(class, kind).Inc()
 }
 
-// SetQueueDepth sets operator_queue_depth for a pool class to n (Queued-state count).
-func (m *OperatorMetrics) SetQueueDepth(class string, n int) {
-	m.queueDepth.WithLabelValues(class).Set(float64(n))
+// SetQueueDepth sets operator_queue_depth for a project and pool class to n (Queued-state count).
+func (m *OperatorMetrics) SetQueueDepth(project, class string, n int) {
+	m.queueDepth.WithLabelValues(project, class).Set(float64(n))
 }
 
-// SetQueueInflight sets operator_queue_inflight for a pool class to n (in-flight admitted count).
-func (m *OperatorMetrics) SetQueueInflight(class string, n int) {
-	m.queueInflight.WithLabelValues(class).Set(float64(n))
+// SetQueueInflight sets operator_queue_inflight for a project and pool class to n (in-flight admitted count).
+func (m *OperatorMetrics) SetQueueInflight(project, class string, n int) {
+	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
 }

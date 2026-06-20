@@ -69,11 +69,10 @@ func TestRunScans_AutonomousCapFull_CreatesNoQEs(t *testing.T) {
 	proj, _ := seedScanProject(t, "autocap-full", cron)
 
 	cap := proj.QueuedAutonomousCap()
-	alloc := queue.NewSeqAllocator()
-	alloc.MarkReady()
+	seq := &queue.SeqSource{Client: k8sClient, Namespace: testNS}
 	for i := 0; i < cap; i++ {
 		payload := tatarav1alpha1.QueuedEventPayload{Kind: "issueLifecycle", RepositoryRef: "autocap-full-repo", Goal: "g", GenerateName: "qe-"}
-		_, _, err := queue.EnqueueEvent(context.Background(), k8sClient, alloc, proj, tatarav1alpha1.QueueClassNormal, true, fmt.Sprintf("prefill-%d", i), payload)
+		_, _, err := queue.EnqueueEvent(context.Background(), k8sClient, seq, proj, tatarav1alpha1.QueueClassNormal, true, fmt.Sprintf("prefill-%d", i), payload)
 		if err != nil {
 			t.Fatalf("pre-fill QE %d: %v", i, err)
 		}
