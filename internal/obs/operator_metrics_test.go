@@ -742,3 +742,46 @@ func TestWebhookEvents_FullPreSeed(t *testing.T) {
 		}
 	}
 }
+
+func TestAddTaskTokens(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AddTaskTokens("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", 1200, 300)
+	m.AddTaskTokens("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", 800, 100)
+	// Project-scoped task: empty repo and issue labels, and a zero output delta is skipped.
+	m.AddTaskTokens("tatara", "", "brainstorm", "", 500, 0)
+
+	in := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "input"))
+	if in != 2000 {
+		t.Fatalf("issue input tokens = %v, want 2000", in)
+	}
+	out := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "output"))
+	if out != 400 {
+		t.Fatalf("issue output tokens = %v, want 400", out)
+	}
+	brainstormIn := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "", "brainstorm", "", "input"))
+	if brainstormIn != 500 {
+		t.Fatalf("brainstorm input tokens = %v, want 500", brainstormIn)
+	}
+	// Zero output delta must not create an output series.
+	if got := testutil.CollectAndCount(m.taskTokensTotal); got != 3 {
+		t.Fatalf("token series count = %d, want 3 (no zero-output series)", got)
+	}
+}
+
+func TestTaskTerminal(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.TaskTerminal("issueLifecycle", "Succeeded", "NoPendingSubtasks")
+	m.TaskTerminal("issueLifecycle", "Failed", "PodLost")
+	m.TaskTerminal("issueLifecycle", "Failed", "PodLost")
+
+	if got := testutil.ToFloat64(m.taskTerminalTotal.WithLabelValues("issueLifecycle", "Succeeded", "NoPendingSubtasks")); got != 1 {
+		t.Fatalf("Succeeded/NoPendingSubtasks = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.taskTerminalTotal.WithLabelValues("issueLifecycle", "Failed", "PodLost")); got != 2 {
+		t.Fatalf("Failed/PodLost = %v, want 2", got)
+	}
+}
