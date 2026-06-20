@@ -40,6 +40,10 @@ type OperatorMetrics struct {
 	queueAdmittedTotal        *prometheus.CounterVec
 	queueDepth                *prometheus.GaugeVec
 	queueInflight             *prometheus.GaugeVec
+	taskTokensTotal           *prometheus.CounterVec
+	taskTerminalTotal         *prometheus.CounterVec
+	lightragDocuments         *prometheus.GaugeVec
+	lightragQueryErrors       prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -196,6 +200,22 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_queue_inflight",
 			Help: "Number of admitted in-flight QueuedEvents per project and pool class.",
 		}, []string{"project", "class"}),
+		taskTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_tokens_total",
+			Help: "Agent token usage by project, repo, Task kind, issue, and type (input|output).",
+		}, []string{"project", "repo", "kind", "issue", "type"}),
+		taskTerminalTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_terminal_total",
+			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
+		}, []string{"kind", "phase", "reason"}),
+		lightragDocuments: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_lightrag_documents",
+			Help: "Documents in each per-project lightrag memory corpus by ingestion status.",
+		}, []string{"project", "status"}),
+		lightragQueryErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_lightrag_query_errors_total",
+			Help: "Failed attempts to read document counts from a project's lightrag.",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -232,6 +252,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.queueAdmittedTotal,
 		m.queueDepth,
 		m.queueInflight,
+		m.taskTokensTotal,
+		m.taskTerminalTotal,
+		m.lightragDocuments,
+		m.lightragQueryErrors,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -504,4 +528,39 @@ func (m *OperatorMetrics) SetQueueDepth(project, class string, n int) {
 // SetQueueInflight sets operator_queue_inflight for a project and pool class to n (in-flight admitted count).
 func (m *OperatorMetrics) SetQueueInflight(project, class string, n int) {
 	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
+}
+
+// AddTaskTokens increments operator_task_tokens_total by the input/output token
+// deltas a single agent turn consumed, labelled by the Task's project, repo,
+// kind, and issue. issue is "" for non-issue-scoped tasks to bound cardinality.
+// Zero or negative deltas are skipped so the series only ever moves forward.
+func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue string, input, output int64) {
+	if input > 0 {
+		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, "input").Add(float64(input))
+	}
+	if output > 0 {
+		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, "output").Add(float64(output))
+	}
+}
+
+// SetLightragDocuments sets operator_lightrag_documents for a project and
+// ingestion status (e.g. PROCESSED, PENDING, PROCESSING, FAILED) to n.
+func (m *OperatorMetrics) SetLightragDocuments(project, status string, n int) {
+	m.lightragDocuments.WithLabelValues(project, status).Set(float64(n))
+}
+
+// LightragQueryError increments operator_lightrag_query_errors_total: a
+// best-effort read of a project's lightrag document counts failed.
+func (m *OperatorMetrics) LightragQueryError() {
+	m.lightragQueryErrors.Inc()
+}
+
+// TaskTerminal increments operator_task_terminal_total for a Task reaching a
+// terminal phase ("Succeeded" or "Failed") with the given kind and the condition
+// reason recorded on the terminal transition. This is the uniform loop
+// success/failure denominator: every terminal transition is metered here exactly
+// once, including failure paths (PodLost, TurnTimeout, PlanningStalled, ...) that
+// the per-reason fault counters do not all cover.
+func (m *OperatorMetrics) TaskTerminal(kind, phase, reason string) {
+	m.taskTerminalTotal.WithLabelValues(kind, phase, reason).Inc()
 }

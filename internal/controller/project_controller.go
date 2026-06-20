@@ -3,7 +3,10 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
@@ -60,6 +63,13 @@ type ProjectReconciler struct {
 	// no mutex required.
 	GaugeRecomputeInterval time.Duration
 	lastGaugeRecompute     time.Time
+
+	// LightragHTTP is the client used to read per-project lightrag document
+	// counts during the gauge recompute. Nil falls back to a short-timeout
+	// default; tests inject an httptest-backed client. LightragBaseURL, when set,
+	// overrides the in-cluster Service DNS (tests point it at httptest).
+	LightragHTTP    *http.Client
+	LightragBaseURL func(project string) string
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -175,6 +185,7 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 	}
 	r.updateMemoryStackCounts(ctx)
 	r.updateLifecycleStateCounts(ctx)
+	r.updateLightragDocCounts(ctx)
 	r.lastGaugeRecompute = time.Now()
 }
 
@@ -202,6 +213,98 @@ func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 		}
 	}
 	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed)
+}
+
+// lightragDocStatuses is the full set of ingestion statuses lightrag reports for
+// a document (lightrag v1.4.16). updateLightragDocCounts Sets every one each
+// pass (0 when absent) so a status that drains reads 0 rather than retaining its
+// last value, mirroring updateMemoryStackCounts.
+var lightragDocStatuses = []string{"PENDING", "PROCESSING", "PROCESSED", "FAILED"}
+
+// lightragQueryTimeout bounds a single document-count read so a wedged lightrag
+// cannot stall the serialised reconcile path.
+const lightragQueryTimeout = 3 * time.Second
+
+// updateLightragDocCounts refreshes operator_lightrag_documents for every
+// Project whose memory stack is Ready by reading lightrag's cheap
+// /documents/status_counts endpoint. It is best-effort: a project whose lightrag
+// is unreachable or erroring is counted in operator_lightrag_query_errors_total
+// and skipped, never failing the reconcile. Only Ready stacks are queried so a
+// still-provisioning lightrag is not hammered.
+func (r *ProjectReconciler) updateLightragDocCounts(ctx context.Context) {
+	if r.Metrics == nil {
+		return
+	}
+	var list tataradevv1alpha1.ProjectList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	httpc := r.LightragHTTP
+	if httpc == nil {
+		httpc = &http.Client{Timeout: lightragQueryTimeout}
+	}
+	for i := range list.Items {
+		p := &list.Items[i]
+		if p.Status.Memory == nil || p.Status.Memory.Phase != "Ready" {
+			continue
+		}
+		counts, err := r.fetchLightragDocCounts(ctx, httpc, p.Name)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("lightrag doc-count read failed", "project", p.Name, "error", err.Error())
+			r.Metrics.LightragQueryError()
+			continue
+		}
+		for _, status := range lightragDocStatuses {
+			r.Metrics.SetLightragDocuments(p.Name, status, counts[status])
+		}
+	}
+}
+
+// lightragBaseURL returns the in-cluster base URL of a project's lightrag
+// Service, or the test override when set.
+func (r *ProjectReconciler) lightragBaseURL(project string) string {
+	if r.LightragBaseURL != nil {
+		return r.LightragBaseURL(project)
+	}
+	return fmt.Sprintf("http://%s.%s.svc:9621", memory.NamesFor(project).Lightrag, r.MemoryConfig.Namespace)
+}
+
+// fetchLightragDocCounts GETs /documents/status_counts from a project's lightrag
+// and returns the per-status document counts. lightrag runs in no-auth mode (no
+// AUTH_ACCOUNTS configured), so no Authorization header is needed - matching the
+// tatara-memory client.
+func (r *ProjectReconciler) fetchLightragDocCounts(ctx context.Context, httpc *http.Client, project string) (map[string]int, error) {
+	url := r.lightragBaseURL(project) + "/documents/status_counts"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lightrag status_counts: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return nil, err
+	}
+	return parseLightragStatusCounts(body)
+}
+
+// parseLightragStatusCounts decodes a lightrag StatusCountsResponse
+// ({"status_counts":{"PROCESSED":130,...}}) into a status->count map.
+func parseLightragStatusCounts(body []byte) (map[string]int, error) {
+	var payload struct {
+		StatusCounts map[string]int `json:"status_counts"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	return payload.StatusCounts, nil
 }
 
 // lifecycleStates is the full set of issueLifecycle states the

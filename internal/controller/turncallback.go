@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -187,7 +188,8 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		return nil // tolerate malformed usage
 	}
 	inputTotal := u.InputTokens + u.CacheReadInputTokens
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	var recorded bool
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: task.Name}, fresh); err != nil {
 			return fmt.Errorf("reload task for usage: %w", err)
@@ -208,8 +210,41 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		}
 		fresh.Status.LastTurnInputTokens = inputTotal
 		fresh.Status.CumulativeTokens += u.OutputTokens
-		return s.Client.Status().Update(ctx, fresh)
-	})
+		if err := s.Client.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		recorded = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Mirror the persisted per-turn delta into operator_task_tokens_total, but
+	// only when the status write actually landed (the guards above skip duplicate
+	// or stale callbacks), so the metric is not double-counted.
+	if recorded && s.Metrics != nil {
+		project, repo, kind, issue := taskTokenLabels(task)
+		s.Metrics.AddTaskTokens(project, repo, kind, issue, inputTotal, u.OutputTokens)
+	}
+	return nil
+}
+
+// taskTokenLabels returns the project, repo, kind, and issue labels for token
+// metrics. issue is set only for issue-scoped tasks (Spec.Source present),
+// preferring the IssueRef and falling back to the numeric Number, and is left
+// empty otherwise to bound series cardinality.
+func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue string) {
+	project = task.Spec.ProjectRef
+	repo = task.Spec.RepositoryRef
+	kind = task.Spec.Kind
+	if task.Spec.Source != nil {
+		switch {
+		case task.Spec.Source.IssueRef != "":
+			issue = task.Spec.Source.IssueRef
+		case task.Spec.Source.Number > 0:
+			issue = strconv.Itoa(task.Spec.Source.Number)
+		}
+	}
+	return
 }
 
 // recordResult writes finalText onto the executing Subtask (if any) and bumps
@@ -483,7 +518,8 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 	svc.Namespace = task.Namespace
 	_ = s.Client.Delete(ctx, svc)
 
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	var failed bool
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
@@ -516,8 +552,20 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 			Message:            fmt.Sprintf("turn %s exceeded timeout", turn),
 			ObservedGeneration: fresh.Generation,
 		})
-		return s.Client.Status().Update(ctx, fresh)
-	})
+		if err := s.Client.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		failed = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Meter the terminal transition once, only when this path actually set the
+	// Failed phase (the guard above skips when reconcile won the race).
+	if failed && s.Metrics != nil {
+		s.Metrics.TaskTerminal(task.Spec.Kind, "Failed", "TurnTimeout")
+	}
+	return nil
 }
 
 // isPlanningStalled reports whether a Task has been in Planning past the stall
@@ -560,7 +608,13 @@ func (s *CallbackServer) expireStalledPlanning(ctx context.Context, task *tatara
 		Message:            fmt.Sprintf("stuck in Planning with no turn past %s", planningStallDeadline),
 		ObservedGeneration: fresh.Generation,
 	})
-	return s.Client.Status().Update(ctx, fresh)
+	if err := s.Client.Status().Update(ctx, fresh); err != nil {
+		return err
+	}
+	if s.Metrics != nil {
+		s.Metrics.TaskTerminal(task.Spec.Kind, "Failed", "PlanningStalled")
+	}
+	return nil
 }
 
 // Start runs the callback HTTP server and the poll backstop until ctx is done.

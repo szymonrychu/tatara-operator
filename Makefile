@@ -78,6 +78,26 @@ chart-lint:
 			echo "chart-lint: expected 5 tatara.dev CRDs with resource-policy:keep, got $$n (controller-gen format may have shifted, breaking templates/crds.yaml inject)"; \
 			exit 1; \
 		fi
+	@on=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'kind: PrometheusRule'); \
+		off=$$($(HELM_BIN) template charts/tatara-operator --set prometheusRule.enabled=false | grep -c 'kind: PrometheusRule'); \
+		if [ "$$on" -ne 1 ] || [ "$$off" -ne 0 ]; then \
+			echo "chart-lint: PrometheusRule gating broken (enabled renders $$on want 1, disabled renders $$off want 0)"; \
+			exit 1; \
+		fi
+	@for m in operator_reconcile_total operator_task_terminal_total operator_turn_timeout_total operator_agent_boot_crash_total operator_agent_unreachable_termination_total operator_ingest_job_total operator_scm_writes_total operator_reap_delete_error_total operator_push_receive_total operator_memory_stacks operator_tasks_inflight tatara_scan_tasks_created_total tatara_scan_items_total tatara_lifecycle_giveup_total; do \
+		if ! $(HELM_BIN) template charts/tatara-operator | grep -q "$$m"; then \
+			echo "chart-lint: PrometheusRule references unknown/absent metric $$m"; \
+			exit 1; \
+		fi; \
+	done
+	@don=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'grafana_dashboard: "1"'); \
+		doff=$$($(HELM_BIN) template charts/tatara-operator --set dashboard.enabled=false | grep -c 'grafana_dashboard: "1"'); \
+		if [ "$$don" -ne 1 ] || [ "$$doff" -ne 0 ]; then \
+			echo "chart-lint: dashboard ConfigMap gating broken (enabled renders $$don want 1, disabled renders $$doff want 0)"; \
+			exit 1; \
+		fi
+	@python3 -m json.tool charts/tatara-operator/dashboards/tatara-loop.json >/dev/null || \
+		{ echo "chart-lint: dashboards/tatara-loop.json is not valid JSON"; exit 1; }
 
 rbac:
 	mkdir -p $(RBAC_GEN_DIR)

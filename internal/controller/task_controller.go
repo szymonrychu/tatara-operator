@@ -921,6 +921,13 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 		return ctrl.Result{}, fmt.Errorf("set terminal status: %w", err)
 	}
 	l.Info("task terminated", "action", "task_terminate", "resource_id", task.Name, "phase", phase, "reason", reason)
+	// Meter every terminal transition in this single chokepoint: the uniform
+	// loop success/failure denominator. operator_reconcile_total cannot stand in
+	// because terminal-failure reconciles return (Result{}, nil) and count as
+	// result="success".
+	if r.Metrics != nil {
+		r.Metrics.TaskTerminal(task.Spec.Kind, phase, reason)
+	}
 	r.updateInflightGauge(ctx)
 	return ctrl.Result{}, nil
 }

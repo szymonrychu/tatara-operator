@@ -1,0 +1,22 @@
+{{- if .Values.dashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}-dashboards
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+    # The Grafana sidecar discovers dashboard ConfigMaps by this label
+    # (sidecar.dashboards.searchNamespace / LABEL). The cluster sets the label
+    # value its sidecar watches; "1" is the upstream default.
+    grafana_dashboard: "1"
+    {{- with .Values.dashboard.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  annotations:
+    # k8s-sidecar folder annotation: which Grafana folder the dashboard lands in.
+    k8s-sidecar-target-directory: {{ .Values.dashboard.folder | quote }}
+data:
+  tatara-loop.json: |-
+    {{- .Files.Get "dashboards/tatara-loop.json" | nindent 4 }}
+{{- end }}

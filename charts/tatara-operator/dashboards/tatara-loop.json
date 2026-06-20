@@ -1,0 +1,769 @@
+{
+  "uid": "tatara-loop",
+  "title": "Tatara Loop",
+  "tags": [
+    "tatara"
+  ],
+  "timezone": "",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "datasource",
+        "label": "Data source",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "type": "query",
+        "name": "project",
+        "label": "Project",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(operator_task_tokens_total, project)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "hide": 0
+      },
+      {
+        "type": "query",
+        "name": "repo",
+        "label": "Repository",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": "label_values(operator_task_tokens_total{project=~\"$project\"}, repo)",
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Loop golden signals",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panel": {},
+      "id": 1
+    },
+    {
+      "type": "timeseries",
+      "title": "Lifecycle state by state",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (state) (tatara_lifecycle_state)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{state}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 2,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal"
+            },
+            "fillOpacity": 40
+          }
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "issueLifecycle Tasks per state. Operator self-metric (not project-scoped)."
+    },
+    {
+      "type": "timeseries",
+      "title": "Reconcile rate by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (rate(operator_reconcile_total[5m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{result}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 3,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Tasks in-flight by kind",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (kind) (tatara_tasks_inflight)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{kind}}",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "operator_tasks_inflight",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "total",
+          "format": "time_series"
+        }
+      ],
+      "id": 4,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Compare against the concurrency cap (TasksInflightPinned alert threshold)."
+    },
+    {
+      "type": "heatmap",
+      "title": "Turn duration heatmap",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(operator_turn_duration_seconds_bucket[5m])) by (le)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{le}}",
+          "format": "heatmap"
+        }
+      ],
+      "id": 5,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Failures & scan cadence",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "panel": {},
+      "id": 6
+    },
+    {
+      "type": "timeseries",
+      "title": "Failure rates",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 18
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(operator_turn_timeout_total[15m]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "turn timeouts",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(operator_agent_boot_crash_total{outcome=\"failed\"}[15m]))",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "boot crashes",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(operator_agent_unreachable_termination_total[15m]))",
+          "refId": "C",
+          "editorMode": "code",
+          "legendFormat": "agent unreachable",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(tatara_lifecycle_giveup_total[15m]))",
+          "refId": "D",
+          "editorMode": "code",
+          "legendFormat": "lifecycle giveups",
+          "format": "time_series"
+        }
+      ],
+      "id": 7,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Ingest success ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 18
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(operator_ingest_job_total{result=\"success\"}[1h])) / clamp_min(sum(rate(operator_ingest_job_total[1h])), 1)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "success ratio",
+          "format": "time_series"
+        }
+      ],
+      "id": 8,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Scan cadence (per hour)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(tatara_scan_tasks_created_total[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "tasks created/h",
+          "format": "time_series"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (outcome) (increase(tatara_scan_items_total[1h]))",
+          "refId": "B",
+          "editorMode": "code",
+          "legendFormat": "{{outcome}}/h",
+          "format": "time_series"
+        }
+      ],
+      "id": 9,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Task outcomes",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "panel": {},
+      "id": 10
+    },
+    {
+      "type": "timeseries",
+      "title": "Terminal transitions by phase/reason (per hour)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (phase, reason) (increase(operator_task_terminal_total[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{phase}} / {{reason}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 11,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "operator_task_terminal_total carries no project/repo label (operator-wide signal)."
+    },
+    {
+      "type": "stat",
+      "title": "Task success-rate SLO (6h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(operator_task_terminal_total{phase=\"Succeeded\"}[6h])) / clamp_min(sum(rate(operator_task_terminal_total[6h])), 1)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "success rate",
+          "format": "time_series"
+        }
+      ],
+      "id": 12,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Token usage (global / project / repo / issue)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 43
+      },
+      "panel": {},
+      "id": 13
+    },
+    {
+      "type": "stat",
+      "title": "Total tokens by type",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (type) (operator_task_tokens_total{project=~\"$project\", repo=~\"$repo\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{type}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 14,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Cumulative agent tokens, sliced by the $project / $repo variables."
+    },
+    {
+      "type": "timeseries",
+      "title": "Token rate by project (1h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 6,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project) (rate(operator_task_tokens_total{project=~\"$project\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{project}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 15,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "timeseries",
+      "title": "Token rate by repo (1h)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 9,
+        "x": 15,
+        "y": 44
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (repo) (rate(operator_task_tokens_total{project=~\"$project\", repo=~\"$repo\"}[1h]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{repo}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 16,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "table",
+      "title": "Top issues by tokens",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(10, sum by (issue) (operator_task_tokens_total{project=~\"$project\", repo=~\"$repo\", issue!=\"\"}))",
+          "refId": "A",
+          "editorMode": "code",
+          "instant": true,
+          "range": false,
+          "format": "table"
+        }
+      ],
+      "id": 17,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Highest token-consuming issues for the selected project/repo."
+    },
+    {
+      "type": "piechart",
+      "title": "Input vs output tokens",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (type) (operator_task_tokens_total{project=~\"$project\", repo=~\"$repo\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{type}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 18,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Memory corpus",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "panel": {},
+      "id": 19
+    },
+    {
+      "type": "timeseries",
+      "title": "Lightrag documents by project/status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, status) (operator_lightrag_documents{project=~\"$project\"})",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{project}} / {{status}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 20,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {},
+      "description": "Per-project lightrag document counts by ingestion status."
+    },
+    {
+      "type": "piechart",
+      "title": "Memory stacks by phase",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (phase) (operator_memory_stacks)",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{phase}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 21,
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {}
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "editable": true
+}

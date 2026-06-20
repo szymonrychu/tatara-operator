@@ -125,6 +125,30 @@ serviceMonitor:
   interval: "30s"
   scrapeTimeout: "10s"
 
+# prometheusRule ships a PrometheusRule of loop-failure alerts over the
+# operator's own operator_*/tatara_* series (same CRD family and deploy pattern
+# as serviceMonitor). additionalLabels is the only cluster-specific knob: the
+# infra helmfile sets whatever label the cluster Prometheus ruleSelector matches
+# on (the chart bakes none, per the cluster-agnostic rule). severityLabel is
+# stamped on every alert; tasksInflightThreshold tunes the concurrency-cap
+# deadman threshold. Alertmanager routing stays cluster-side.
+prometheusRule:
+  enabled: true
+  severityLabel: "warning"
+  tasksInflightThreshold: 8
+  additionalLabels: {}
+
+# dashboard ships the "Tatara Loop" Grafana dashboard as a ConfigMap labelled
+# grafana_dashboard: "1" so the Grafana sidecar auto-discovers it (same
+# ship-with-the-operator pattern as serviceMonitor). The chart hardcodes no
+# datasource UID - the dashboard exposes a datasource template variable, so the
+# cluster's default/selected Prometheus is used. additionalLabels lets the infra
+# helmfile match a non-default sidecar label; folder selects the Grafana folder.
+dashboard:
+  enabled: true
+  folder: "tatara"
+  additionalLabels: {}
+
 ingress:
   enabled: false
   className: nginx
