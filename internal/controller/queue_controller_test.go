@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -19,7 +20,7 @@ func qe(name, class, state, taskRef string) tatarav1alpha1.QueuedEvent {
 
 func tk(name, phase, lifecycle, queuedEvent string) tatarav1alpha1.Task {
 	return tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara", Labels: map[string]string{LabelQueuedEvent: queuedEvent}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara", Labels: map[string]string{queue.LabelQueuedEvent: queuedEvent}},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p"},
 		Status:     tatarav1alpha1.TaskStatus{Phase: phase, LifecycleState: lifecycle},
 	}
@@ -116,7 +117,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// Exactly one Task with the QueuedEvent label.
 	var tl tatarav1alpha1.TaskList
-	if err := k8sClient.List(ctx, &tl, client.InNamespace(ns), client.MatchingLabels{LabelQueuedEvent: qe.Name}); err != nil {
+	if err := k8sClient.List(ctx, &tl, client.InNamespace(ns), client.MatchingLabels{queue.LabelQueuedEvent: qe.Name}); err != nil {
 		t.Fatalf("list tasks: %v", err)
 	}
 	if len(tl.Items) != 1 {

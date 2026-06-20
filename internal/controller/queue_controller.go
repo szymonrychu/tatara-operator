@@ -53,7 +53,7 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 	// label) count toward their pool so capacity is not over-admitted at cutover.
 	for i := range tasks {
 		t := &tasks[i]
-		if _, queued := t.Labels[LabelQueuedEvent]; queued {
+		if _, queued := t.Labels[queue.LabelQueuedEvent]; queued {
 			continue
 		}
 		if tatarav1alpha1.TaskTerminal(t) {
@@ -89,7 +89,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 			if inflight >= cap {
 				break
 			}
-			task, err := buildTaskFromQueuedEvent(q, proj, r.Scheme)
+			task, err := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
 			if err != nil {
 				return err
 			}
@@ -211,7 +211,7 @@ func filterTasksByProject(in []tatarav1alpha1.Task, project string) []tatarav1al
 
 func (r *DispatcherReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	mapTaskToQE := func(_ context.Context, obj client.Object) []reconcile.Request {
-		qeName := obj.GetLabels()[LabelQueuedEvent]
+		qeName := obj.GetLabels()[queue.LabelQueuedEvent]
 		if qeName == "" {
 			return nil
 		}

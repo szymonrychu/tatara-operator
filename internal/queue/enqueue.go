@@ -1,4 +1,4 @@
-package controller
+package queue
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
-	"github.com/szymonrychu/tatara-operator/internal/queue"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -47,7 +46,7 @@ func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey 
 
 // EnqueueEvent writes a QueuedEvent (seq-assigned, owned by Project, state=Queued).
 // Returns created=false when dedupKey already has live work.
-func EnqueueEvent(ctx context.Context, c client.Client, alloc *queue.SeqAllocator, proj *tatarav1alpha1.Project,
+func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, proj *tatarav1alpha1.Project,
 	class string, autonomous bool, dedupKey string, payload tatarav1alpha1.QueuedEventPayload) (*tatarav1alpha1.QueuedEvent, bool, error) {
 
 	dup, err := dedupExists(ctx, c, proj.Namespace, proj.Name, dedupKey)
@@ -91,9 +90,10 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *queue.SeqAllocato
 	return qe, true, nil
 }
 
-// buildTaskFromQueuedEvent reconstructs the Task the producer described, labelled
+// BuildTaskFromQueuedEvent reconstructs the Task the producer described, labelled
 // with the QueuedEvent name (dispatcher completion mapping) and dedup key.
-func buildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alpha1.Project, scheme *runtime.Scheme) (*tatarav1alpha1.Task, error) {
+// When payload.Name is empty, task.Name is set to payload.GenerateName+qe.Name.
+func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alpha1.Project, scheme *runtime.Scheme) (*tatarav1alpha1.Task, error) {
 	p := qe.Spec.Payload
 	labels := map[string]string{}
 	for k, v := range p.Labels {
@@ -111,7 +111,7 @@ func buildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 	if p.Name != "" {
 		om.Name = p.Name
 	} else {
-		om.Name = qe.Name
+		om.Name = p.GenerateName + qe.Name
 	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: om,
