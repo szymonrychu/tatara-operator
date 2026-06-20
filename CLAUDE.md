@@ -8,7 +8,7 @@ canonical contract.
 ## What this repo is
 
 `tatara` is the docs and architecture index for the tatara platform. The
-platform is split into eight independent GitHub repositories under
+platform is split into seven independent GitHub repositories under
 `szymonrychu/`. See `README.md` for the full list and `ARCHITECTURE.md`
 for how they fit together. The previous monolithic implementation lives
 at `~/Documents/tatara-old` as a reference.
@@ -30,8 +30,8 @@ at `~/Documents/tatara-old` as a reference.
 ├── tatara-memory-repo-ingester/      # child repo (gitignored)
 ├── tatara-claude-code-wrapper/       # child repo (gitignored)
 ├── tatara-argo-workflows/            # child repo (gitignored)
-├── tatara-tasks/                     # child repo (gitignored)
-└── tatara-gitlab-bridge/             # child repo (gitignored)
+├── tatara-operator/                  # child repo (gitignored)
+└── tatara-chat/                      # child repo (gitignored)
 ```
 
 Each child clones from `github.com/szymonrychu/<name>` into the matching
