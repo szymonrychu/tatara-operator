@@ -764,7 +764,15 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 		if serr != nil {
 			return ctrl.Result{}, fmt.Errorf("writeback review comment: derive slug: %w", serr)
 		}
-		prRef := fmt.Sprintf("%s#%d", slug, number)
+		// This is always an MR/PR review. GitLab MRs use the '!' separator and a
+		// distinct notes endpoint; a '#' ref routes to /issues/{iid}/notes which
+		// 404s (issues and MRs have separate iid spaces). GitHub shares the issue
+		// endpoint for PRs, so it stays on '#'.
+		sep := "#"
+		if provider == "gitlab" {
+			sep = "!"
+		}
+		prRef := fmt.Sprintf("%s%s%d", slug, sep, number)
 		err = writer.Comment(ctx, token, prRef, v.Body)
 		r.recordSCM(provider, "comment", err)
 		verbSent = err == nil
