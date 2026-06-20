@@ -8,6 +8,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ type discussSilenceReader struct {
 	fakeProposalReader
 	issueBody string
 	comments  []scm.IssueComment
+	listErr   error // when set, ListIssueComments returns it (fail-open test)
 }
 
 func (r *discussSilenceReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
@@ -30,7 +32,7 @@ func (r *discussSilenceReader) GetIssue(_ context.Context, _, _ string, _ int) (
 }
 
 func (r *discussSilenceReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
-	return r.comments, nil
+	return r.comments, r.listErr
 }
 
 // commentCapturingWriter extends labelWriter with a Comment capture.
@@ -183,4 +185,28 @@ func TestFinishTriage_HumanFiled_Discuss_BotHasLastWord_Suppresses(t *testing.T)
 	w.mu.Unlock()
 	require.Zero(t, posted,
 		"human-filed issue where the bot has the last word must NOT re-post a discuss comment; got: %v", w.commentBodies)
+}
+
+// TestFinishTriage_HumanFiled_Discuss_ListCommentsError_PostsComment verifies the
+// botHasLastWord fail-open path: when ListIssueComments errors, the silence gate
+// must POST the discuss comment rather than suppress it.
+func TestFinishTriage_HumanFiled_Discuss_ListCommentsError_PostsComment(t *testing.T) {
+	task, proj := seedDiscussSilenceTask(t, "listerr")
+
+	rdr := &discussSilenceReader{
+		issueBody: "I want a new feature", // no marker -> human-filed, authored clause skipped
+		listErr:   errors.New("scm down"),
+	}
+	w := &commentCapturingWriter{}
+	r := reconcilerFor(w, rdr)
+
+	_, err := r.finishTriage(context.Background(), proj, task)
+	require.NoError(t, err)
+
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	w.mu.Lock()
+	posted := len(w.commentBodies)
+	w.mu.Unlock()
+	require.Equal(t, 1, posted,
+		"ListIssueComments error must fail open and POST the discuss comment; got: %v", w.commentBodies)
 }
