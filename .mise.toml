@@ -5,6 +5,7 @@ go = "1.26.3"
 golangci-lint = "2.12.2"
 helm = "4.2.1"
 pre-commit = "4.6.0"
+yq = "4.53.3"
 
 [env]
 GOFLAGS = "-count=1"
