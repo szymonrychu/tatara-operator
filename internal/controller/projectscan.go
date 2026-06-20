@@ -1047,22 +1047,26 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 }
 
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
-// task. issuesCtx is a pre-built string of open issues across all repos
-// (one line each: "repo#N [labels] title"), used to guide dedup-first reasoning.
-// When issuesCtx is empty the dedup section is still present but notes no open
-// issues were found.
-func brainstormGoalProject(slugs []string, issuesCtx string) string {
+// task. repoStateCtx is the rich three-block string built by buildRepoStateContext
+// (ISSUES / OPEN MRs / MAIN HEALTH). When empty a fallback note is substituted.
+func brainstormGoalProject(slugs []string, repoStateCtx string) string {
 	repoList := strings.Join(slugs, ", ")
 
-	existingBlock := "No open issues found across the project."
-	if issuesCtx != "" {
-		existingBlock = "OPEN ISSUES (survey these FIRST before proposing anything new):\n" + issuesCtx
+	stateBlock := "No live repo state available."
+	if repoStateCtx != "" {
+		stateBlock = repoStateCtx
 	}
 
-	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the single highest-leverage " +
+	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
-		"\n\n" + existingBlock + "\n\n" +
+		"Run at MAXIMUM reasoning effort. Decompose the survey: dispatch one parallel subagent per repository " +
+		"(use the Agent/Workflow tools to fan out, then synthesize their findings into one systemic conclusion). " +
+		"\n\n" + stateBlock + "\n\n" +
+		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning " +
+		">=2 repositories, a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - " +
+		"over a one-repo tweak. Survey the ISSUES, OPEN MRs, and MAIN HEALTH blocks above; manage the " +
+		"backlog by linking/labelling/commenting related existing issues (never close issues you do not own).\n\n" +
 		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
 		"1. If the best idea DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
 		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
@@ -1074,30 +1078,37 @@ func brainstormGoalProject(slugs []string, issuesCtx string) string {
 		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
 		"twice on the same issue.\n" +
 		"3. ONLY if the idea is genuinely novel AND standalone (no existing issue covers it): " +
-		"call propose_issue with exactly one proposal. " +
+		"call propose_issue. " +
 		"Set the `repo` argument to the specific repository that should own the issue. " +
 		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
 		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input.\n\n" +
-		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
+		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic " +
+		"improvement MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
+		"a single `systemicId` string you generate. State which path and scope you chose before executing."
 }
 
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
-// task. It mirrors brainstormGoalProject (same dedup-first contract and issuesCtx
+// task. It mirrors brainstormGoalProject (same dedup-first contract and repoStateCtx
 // shape) but drives the tatara-health-check skill across all repo slugs.
-func healthCheckGoalProject(slugs []string, issuesCtx string) string {
+func healthCheckGoalProject(slugs []string, repoStateCtx string) string {
 	repoList := strings.Join(slugs, ", ")
 
-	existingBlock := "No open issues found across the project."
-	if issuesCtx != "" {
-		existingBlock = "OPEN ISSUES (survey these FIRST before proposing anything new):\n" + issuesCtx
+	stateBlock := "No live repo state available."
+	if repoStateCtx != "" {
+		stateBlock = repoStateCtx
 	}
 
 	return "Invoke the `tatara-health-check` skill to survey the HEALTH of the project's repositories " +
-		"and identify the single highest-leverage health issue across ALL repositories: " + repoList + ". " +
+		"and identify the highest-leverage health issue across ALL repositories: " + repoList + ". " +
 		"The skill defines the five health dimensions (CI failures, code coverage gaps, code to simplify, " +
 		"CI/CD pipeline steps worth adding, other tech-debt), how to gather evidence (on-disk CI config, an " +
 		"actual test/lint run, and the tatara-memory code graph), score leverage, and dedup. " +
-		"\n\n" + existingBlock + "\n\n" +
+		"Run at MAXIMUM reasoning effort. Decompose the survey: dispatch one parallel subagent per repository " +
+		"(use the Agent/Workflow tools to fan out, then synthesize their findings into one systemic conclusion). " +
+		"\n\n" + stateBlock + "\n\n" +
+		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic health gap - a pattern spanning " +
+		">=2 repositories (e.g. missing test coverage everywhere, CI flakiness across repos) - " +
+		"over a one-repo tweak. Survey the ISSUES, OPEN MRs, and MAIN HEALTH blocks above.\n\n" +
 		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
 		"1. If the best finding DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
 		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
@@ -1109,12 +1120,14 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
 		"twice on the same issue.\n" +
 		"3. ONLY if the finding is genuinely novel AND standalone (no existing issue covers it): " +
-		"call propose_issue with exactly one proposal. " +
+		"call propose_issue. " +
 		"Set the `repo` argument to the specific repository that should own the issue. " +
 		"The proposal must be self-contained: the concrete defect with file:line evidence, the proposed fix, " +
 		"and a single explicit decision for the human (approve to implement or comment to refine). " +
 		"Do NOT produce a list of open questions or ask for input.\n\n" +
-		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
+		"ACTION RULE: a one-repo finding emits exactly ONE propose_issue. A genuinely systemic " +
+		"health gap MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
+		"a single `systemicId` string you generate. State which path and scope you chose before executing."
 }
 
 // gatherRepoCIState fetches open PRs, per-PR CI (bounded to the first 20 PRs),
