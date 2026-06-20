@@ -114,7 +114,7 @@ func scanTaskLabels(c candidate, activity, kind string) map[string]string {
 // candidate's updatedAt (meaning a new comment arrived that we missed). When
 // such a task exists the caller should reactivate it to Triage rather than
 // creating a duplicate Task. Returns nil when no reactivation is warranted.
-func findConvTaskToReactivate(c candidate, existing []tatarav1alpha1.Task) *tatarav1alpha1.Task {
+func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatarav1alpha1.Task, reader scm.SCMReader, botLogin string) *tatarav1alpha1.Task {
 	if c.isPR {
 		return nil
 	}
@@ -132,9 +132,21 @@ func findConvTaskToReactivate(c candidate, existing []tatarav1alpha1.Task) *tata
 		if t.Status.LastActivityAt == nil {
 			continue
 		}
-		if c.updatedAt.After(t.Status.LastActivityAt.Time) {
+		if !c.updatedAt.After(t.Status.LastActivityAt.Time) {
+			continue
+		}
+		// Author-aware gate: the bot's own queued comment lands after LastActivityAt
+		// and would otherwise re-trigger reactivation every scan (the Conversation
+		// re-comment loop). Only reactivate when a HUMAN comment is newer than our
+		// last activity. Fail-open (reactivate) when we cannot read the author.
+		owner, name, ok := strings.Cut(c.repo, "/")
+		if !ok || reader == nil || botLogin == "" {
 			return t
 		}
+		if humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, t.Status.LastActivityAt.Time) {
+			return t
+		}
+		return nil
 	}
 	return nil
 }
@@ -882,8 +894,12 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// Task's LastActivityAt (missed webhook), reset the Task to Triage instead
 	// of creating a duplicate. This runs before dedup so the reactivated task
 	// absorbs the candidate and the dedup check below skips it normally.
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
 	for _, c := range cands {
-		task := findConvTaskToReactivate(c, existing)
+		task := findConvTaskToReactivate(ctx, c, existing, reader, botLogin)
 		if task == nil {
 			continue
 		}
@@ -1298,6 +1314,24 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, proj *tatara
 			"shown", len(lines), "omitted", omitted)
 	}
 	return result
+}
+
+// humanCommentAfter reports whether the issue has a comment authored by a
+// non-bot (a human) with CreatedAt strictly after `since`. On a read error it
+// returns true (fail-open: the caller reactivates, preserving the missed-webhook
+// recovery the reactivation gate exists for; the discuss/close silence gate makes
+// an over-eager reactivation a silent no-op).
+func humanCommentAfter(ctx context.Context, reader scm.SCMReader, owner, name string, number int, botLogin string, since time.Time) bool {
+	comments, err := reader.ListIssueComments(ctx, owner, name, number)
+	if err != nil {
+		return true
+	}
+	for _, c := range comments {
+		if c.Author != "" && c.Author != botLogin && c.CreatedAt.After(since) {
+			return true
+		}
+	}
+	return false
 }
 
 // botCommentedOnIssue reports whether botLogin already authored a comment on the
