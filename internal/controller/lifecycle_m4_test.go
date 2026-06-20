@@ -129,9 +129,10 @@ func TestLifecycleImplement_ChangeSummaryUnsetFallsBack(t *testing.T) {
 		t.Fatal("expected OpenChange to be called")
 	}
 	call := fw.openCalls[0]
-	// M1 fallback: title must be first line of Goal only
-	if call.title != "Fix the login bug" {
-		t.Errorf("MR title = %q, want %q (M1 fallback)", call.title, "Fix the login bug")
+	// Derived fallback: no Source.Title, no strong ChangeSummary -> fix(<repo>): <firstLine(Goal)>
+	want := "fix(lc-m4-cnr): Fix the login bug"
+	if call.title != want {
+		t.Errorf("MR title = %q, want %q (derived fallback)", call.title, want)
 	}
 	// M1 fallback: body must NOT contain "## Delivered"
 	if strings.Contains(call.body, "## Delivered") {

@@ -118,15 +118,14 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	}
 
 	sourceBranch := taskBranch(task)
-	title := firstLine(task.Spec.Goal)
+	title := derivePRTitle(task, primaryRepo.Name)
 	baseBody := writeBackBody(task)
 
-	// M4: when the agent submitted a change_summary, use PRTitle + PRBody +
-	// Delivered block as the MR title/body instead of the M1 defaults.
+	// M4: when the agent submitted a change_summary, use PRBody + Delivered block
+	// as the MR body instead of the M1 defaults. Title is handled by derivePRTitle
+	// (strong ChangeSummary.PRTitle wins; weak or absent falls back to conventional
+	// derived form from Source.Title / Goal).
 	if cs := task.Status.ChangeSummary; cs != nil {
-		if cs.PRTitle != "" {
-			title = cs.PRTitle
-		}
 		deliveredBody := cs.PRBody
 		if cs.DeliveredScope != "" {
 			deliveredBody += "\n\n## Delivered\n" + cs.DeliveredScope
@@ -399,6 +398,31 @@ func taskBranch(t *tatarav1alpha1.Task) string {
 // files in this package can call it without qualifying the package name.
 func weakTitle(s string) (bool, string) {
 	return titlecheck.Weak(s)
+}
+
+// derivePRTitle returns the PR/MR title for a write-back. A strong
+// ChangeSummary.PRTitle wins; otherwise it derives a conventional title from the
+// captured work-item title (Source.Title), falling back to the goal first line.
+// It never returns a weak title.
+func derivePRTitle(task *tatarav1alpha1.Task, scope string) string {
+	if cs := task.Status.ChangeSummary; cs != nil && cs.PRTitle != "" {
+		if weak, _ := titlecheck.Weak(cs.PRTitle); !weak {
+			return cs.PRTitle
+		}
+	}
+	subject := ""
+	if task.Spec.Source != nil {
+		subject = strings.TrimSpace(task.Spec.Source.Title)
+	}
+	if subject == "" {
+		subject = firstLine(task.Spec.Goal)
+	}
+	kind := "feat"
+	switch task.Spec.Kind {
+	case "issueLifecycle", "incident":
+		kind = "fix"
+	}
+	return fmt.Sprintf("%s(%s): %s", kind, scope, subject)
 }
 
 func firstLine(s string) string {
