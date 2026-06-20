@@ -12,7 +12,7 @@ import (
 func newScanReconciler(reader scm.SCMReader) *ProjectReconciler {
 	r := newProjectReconciler()
 	alloc := queue.NewSeqAllocator()
-	alloc.Recover(0)
+	alloc.MarkReady()
 	r.Alloc = alloc
 	r.ReaderFor = func(string, string) (scm.SCMReader, error) { return reader, nil }
 	return r

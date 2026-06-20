@@ -93,7 +93,7 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, pro
 	if dup {
 		return nil, false, nil
 	}
-	seq, ok := alloc.Next()
+	seq, ok := alloc.Next(proj.Name)
 	if !ok {
 		return nil, false, ErrSeqNotReady
 	}

@@ -56,7 +56,7 @@ func NewServer(cfg Config) *Server {
 	}
 	if cfg.Seq == nil {
 		a := queue.NewSeqAllocator()
-		a.Recover(0)
+		a.MarkReady()
 		cfg.Seq = a
 	}
 	return &Server{cfg: cfg, log: cfg.Logger}

@@ -27,7 +27,7 @@ func grafanaRouter(t *testing.T, objs ...client.Object) (*chi.Mux, client.Client
 	fc := fake.NewClientBuilder().WithScheme(sch).WithObjects(objs...).
 		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Task{}, &tatarav1.QueuedEvent{}).Build()
 	alloc := queue.NewSeqAllocator()
-	alloc.Recover(0)
+	alloc.MarkReady()
 	s := NewServer(Config{Client: fc, Namespace: "tatara", Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()), Seq: alloc})
 	r := chi.NewRouter()
 	s.Mount(r)
@@ -143,7 +143,7 @@ func TestGrafana_DedupEmitsDuplicateMetric(t *testing.T) {
 	fc := fake.NewClientBuilder().WithScheme(sch).WithObjects(grafanaProject("p6"), grafanaSecret("p6")).
 		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Task{}, &tatarav1.QueuedEvent{}).Build()
 	alloc2 := queue.NewSeqAllocator()
-	alloc2.Recover(0)
+	alloc2.MarkReady()
 	s := NewServer(Config{Client: fc, Namespace: "tatara", Metrics: obs.NewOperatorMetrics(reg), Seq: alloc2})
 	r := chi.NewRouter()
 	s.Mount(r)
