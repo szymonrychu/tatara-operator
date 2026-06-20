@@ -7,6 +7,7 @@ package webhook_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -118,6 +119,36 @@ func TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask(t *testing.T) {
 	require.True(t, qe.Spec.Payload.Source.IsPR, "task must be IsPR for an MR comment")
 	require.Equal(t, "Triage", qe.Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
 	require.Equal(t, "11", qe.Spec.Payload.Labels[tatarav1.LabelSourceNumber])
+}
+
+// TestIssueComment_TriageGoalContainsCommentBody asserts that when a lifecycle
+// QueuedEvent is created at Triage via createLifecycleTaskAtTriage, the
+// enqueued event's Payload.Goal contains the triggering comment text. This
+// ensures the triage agent sees the comment that triggered the task.
+func TestIssueComment_TriageGoalContainsCommentBody(t *testing.T) {
+	const secretVal = "whsec-ut5"
+	proj := projectWithBot("projicut5", "projicut5-scm", "tatara", "tatara-bot")
+	repo := repository("repoicut5", "projicut5", "https://github.com/o/r.git", "main")
+
+	c := seedClient(t, proj, secret("projicut5-scm", secretVal), repo)
+	h, _ := newServer(t, c)
+
+	// issueCommentUntracked has comment body "Any update on this?"
+	body := []byte(issueCommentUntracked)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issue_comment")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "projicut5", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Len(t, qel.Items, 1)
+
+	goal := qel.Items[0].Spec.Payload.Goal
+	require.True(t, strings.Contains(goal, "Any update on this?"),
+		"Goal must contain the triggering comment text, got: %q", goal)
 }
 
 // TestIssueComment_HumanOnUntrackedIssue_ExistingLiveTask_NoNewTask verifies

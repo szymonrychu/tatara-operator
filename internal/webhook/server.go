@@ -595,10 +595,14 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	}
 	ann := map[string]string{tatarav1.LifecycleEntryAnnotation: "Triage"}
 
+	goal := ev.Body
+	if ev.CommentBody != "" {
+		goal += "\n\nTriggering comment:\n" + ev.CommentBody
+	}
 	lifecycleName := issueLifecycleTaskName(proj.Name, ev.IssueRef, ev.IsPR)
 	payload := tatarav1.QueuedEventPayload{
 		Kind:          "issueLifecycle",
-		Goal:          ev.Body,
+		Goal:          goal,
 		Name:          lifecycleName,
 		Labels:        labels,
 		Annotations:   ann,
@@ -627,8 +631,7 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	// NOTE: PendingInterjections initial store dropped. The Task is created by the
-	// dispatcher, not here; ev.CommentBody is carried in the QueuedEvent payload Goal.
+	// CommentBody is folded into Goal above so the triage agent sees the triggering comment.
 	s.log.InfoContext(ctx, "issue_comment: created lifecycle task at Triage for untracked issue",
 		"project", proj.Name, "repository", repo.Name, "task", lifecycleName, "issue_ref", ev.IssueRef)
 	s.count(provider, ev.Kind, ev.Action, "task_created")
@@ -814,16 +817,21 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	groupHash := alertGroupHash(alert)
-	if err := s.createIncidentTask(ctx, &proj, alert, groupHash); err != nil {
+	created, err := s.createIncidentTask(ctx, &proj, alert, groupHash)
+	if err != nil {
 		s.count("grafana", "alert", "firing", "error")
 		http.Error(w, "create task", http.StatusInternalServerError)
 		return
 	}
-	s.count("grafana", "alert", "firing", "created")
+	if !created {
+		s.count("grafana", "alert", "firing", "duplicate")
+	} else {
+		s.count("grafana", "alert", "firing", "created")
+	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) error {
+func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) (bool, error) {
 	slugs := projectRepoSlugs(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name)
 	alertCtx := renderAlertContext(alert)
 	goal := incident.GoalProject(alertCtx, slugs)
@@ -834,8 +842,8 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 		Labels:       map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
 		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}
-	_, _, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, groupHash, payload)
-	return err
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, groupHash, payload)
+	return created, err
 }
 
 // projectRepoSlugs returns the owner/repo slugs of a project's Repositories,

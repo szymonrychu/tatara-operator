@@ -133,6 +133,58 @@ func TestGrafana_DedupInFlight(t *testing.T) {
 	}
 }
 
+func TestGrafana_DedupEmitsDuplicateMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	sch := runtime.NewScheme()
+	_ = tatarav1.AddToScheme(sch)
+	_ = corev1.AddToScheme(sch)
+	fc := fake.NewClientBuilder().WithScheme(sch).WithObjects(grafanaProject("p6"), grafanaSecret("p6")).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Task{}, &tatarav1.QueuedEvent{}).Build()
+	s := NewServer(Config{Client: fc, Namespace: "tatara", Metrics: obs.NewOperatorMetrics(reg), Seq: queue.NewSeqAllocator()})
+	r := chi.NewRouter()
+	s.Mount(r)
+
+	// First firing: creates the QueuedEvent (result=created).
+	w1 := postGrafana(r, "p6", "tok", grafanaFiring)
+	if w1.Code != http.StatusAccepted {
+		t.Fatalf("first fire: want 202, got %d", w1.Code)
+	}
+	// Second firing: same alert group, QueuedEvent already exists (result=duplicate).
+	w2 := postGrafana(r, "p6", "tok", grafanaFiring)
+	if w2.Code != http.StatusAccepted {
+		t.Fatalf("second fire: want 202, got %d", w2.Code)
+	}
+
+	// Queue must still have exactly 1 incident QueuedEvent.
+	if n := len(listIncidentQueuedEvents(t, fc)); n != 1 {
+		t.Fatalf("dedup failed: want 1 incident QueuedEvent, got %d", n)
+	}
+
+	// The duplicate counter must have been incremented.
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	var dupCount float64
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_webhook_events_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["result"] == "duplicate" && labels["provider"] == "grafana" {
+				dupCount = m.GetCounter().GetValue()
+			}
+		}
+	}
+	if dupCount != 1 {
+		t.Fatalf("want duplicate metric count=1, got %g", dupCount)
+	}
+}
+
 func TestGrafana_DisabledProject(t *testing.T) {
 	p := &tatarav1.Project{ObjectMeta: metav1.ObjectMeta{Name: "p5", Namespace: "tatara"}} // no Grafana
 	r, _ := grafanaRouter(t, p)
