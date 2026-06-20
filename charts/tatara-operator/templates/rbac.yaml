@@ -9,10 +9,10 @@ metadata:
 rules:
   # CRDs reconciled by the manager (full CRUD on CRs + status subresource).
   - apiGroups: ["tatara.dev"]
-    resources: ["projects", "repositories", "tasks", "subtasks"]
+    resources: ["projects", "repositories", "tasks", "subtasks", "queuedevents"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["tatara.dev"]
-    resources: ["projects/status", "repositories/status", "tasks/status", "subtasks/status"]
+    resources: ["projects/status", "repositories/status", "tasks/status", "subtasks/status", "queuedevents/status"]
     verbs: ["get", "update", "patch"]
   # ingest Jobs (batch).
   - apiGroups: ["batch"]
