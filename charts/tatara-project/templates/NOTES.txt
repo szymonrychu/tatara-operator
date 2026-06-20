@@ -1,0 +1,11 @@
+tatara-project {{ .Chart.Version }} applied.
+
+Project:      {{ (.Values.project).name }}
+Namespace:    {{ include "tatara-project.namespace" . }}
+Repositories: {{ len (.Values.repositories | default list) }}
+
+The tatara-operator must already be running in this namespace and the Secret
+named in project.spec.scmSecretRef must exist (supplied by the helmfile, not
+this chart). Watch reconciliation with:
+
+  kubectl -n {{ include "tatara-project.namespace" . }} get projects,repositories

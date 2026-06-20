@@ -98,6 +98,18 @@ chart-lint:
 		fi
 	@python3 -m json.tool charts/tatara-operator/dashboards/tatara-loop.json >/dev/null || \
 		{ echo "chart-lint: dashboards/tatara-loop.json is not valid JSON"; exit 1; }
+	$(HELM_BIN) lint charts/tatara-project
+	@p=$$($(HELM_BIN) template charts/tatara-project -f deploy-samples/tatara-project-values.yaml | grep -c 'kind: Project'); \
+		r=$$($(HELM_BIN) template charts/tatara-project -f deploy-samples/tatara-project-values.yaml | grep -c 'kind: Repository'); \
+		if [ "$$p" -ne 1 ] || [ "$$r" -ne 2 ]; then \
+			echo "chart-lint: tatara-project sample must render 1 Project + 2 Repository CRs, got $$p/$$r"; \
+			exit 1; \
+		fi
+	@d=$$($(HELM_BIN) template charts/tatara-project | grep -c 'kind:'); \
+		if [ "$$d" -ne 0 ]; then \
+			echo "chart-lint: tatara-project with default (empty) values must render nothing, got $$d objects"; \
+			exit 1; \
+		fi
 
 rbac:
 	mkdir -p $(RBAC_GEN_DIR)

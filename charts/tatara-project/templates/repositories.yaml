@@ -1,0 +1,23 @@
+{{- $ns := include "tatara-project.namespace" . }}
+{{- $projectName := (.Values.project).name }}
+{{- range .Values.repositories }}
+{{- if not .name }}{{- fail "tatara-project: every entry in .Values.repositories needs a name" }}{{- end }}
+{{- if not (.spec).url }}{{- fail (printf "tatara-project: repository %q is missing spec.url" .name) }}{{- end }}
+{{- if not (.spec).reingestSchedule }}{{- fail (printf "tatara-project: repository %q is missing spec.reingestSchedule (required 5-field cron)" .name) }}{{- end }}
+---
+apiVersion: tatara.dev/v1alpha1
+kind: Repository
+metadata:
+  name: {{ .name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "tatara-project.labels" $ | nindent 4 }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* projectRef is auto-bound to this chart's Project so repos never repeat it. */}}
+  projectRef: {{ (.spec).projectRef | default $projectName }}
+  {{- toYaml (omit .spec "projectRef") | nindent 2 }}
+{{- end }}

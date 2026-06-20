@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tatara-project
+description: Declarative tatara Project + Repository CRs for one project, applied like the rook-ceph-cluster chart (the tatara-operator chart is the operator; this chart is the workload it reconciles).
+type: application
+version: 0.1.0
+appVersion: "0.4.3"

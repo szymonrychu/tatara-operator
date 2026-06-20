@@ -1,0 +1,81 @@
+# Sample values for the tatara-project chart: a full GitHub project codified
+# declaratively, exercising the issue #74 agent-customization fields.
+#
+#   helm install tatara charts/tatara-project -n tatara -f deploy-samples/tatara-project-values.yaml
+#
+# The tatara-scm Secret (key: token) must already exist in the namespace; it is
+# supplied by the helmfile (sops), not this chart.
+
+namespace: tatara
+
+project:
+  name: tatara
+  spec:
+    scmSecretRef: tatara-scm
+    triggerLabel: tatara
+    maxConcurrentTasks: 3
+    maxOpenTasks: 4
+    agent:
+      image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:latest
+      model: claude-opus-4-8
+      permissionMode: bypassPermissions
+      maxTurnsPerTask: 100
+      turnTimeoutSeconds: 1800
+      # --- issue #74 per-project customization ---
+      systemPrompt: |
+        This project follows KISS. Prefer the smallest correct change and
+        always run the repo's `mise run test` before opening a PR.
+      env:
+        - name: EXAMPLE_FLAG
+          value: "on"
+        - name: EXAMPLE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: example-extra-secret
+              key: token
+      mcpServers:
+        - name: context7
+          configJson: '{"type":"http","url":"http://context7.tatara.svc:8080"}'
+      plugins:
+        - name: formatter@acme
+          source: acme/claude-plugins
+      skills:
+        - name: deploy
+          configMapRef: skill-deploy
+      settings:
+        maxParallelism: 4
+    memory:
+      pgInstances: 1
+      pgStorage: 10Gi
+      neo4jStorage: 10Gi
+    scm:
+      provider: github
+      owner: szymonrychu
+      botLogin: szymonrychu-bot
+      priorityLabel: tatara/priority
+      cron:
+        mrScan:
+          schedule: "0 * * * *"
+          maxPerRepo: 1
+        issueScan:
+          schedule: "0 * * * *"
+          maxPerRepo: 1
+        brainstorm:
+          enabled: true
+          schedule: "0 * * * *"
+          maxOpenProposals: 8
+          sources: [docs, memory, internet]
+
+repositories:
+  - name: tatara-operator
+    spec:
+      url: https://github.com/szymonrychu/tatara-operator
+      defaultBranch: main
+      semanticIngest: true
+      reingestSchedule: "0 6 * * *"
+  - name: tatara-claude-code-wrapper
+    spec:
+      url: https://github.com/szymonrychu/tatara-claude-code-wrapper
+      defaultBranch: main
+      semanticIngest: true
+      reingestSchedule: "0 6 * * *"
