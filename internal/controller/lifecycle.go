@@ -756,6 +756,28 @@ func (tr triageReader) hasHumanReply(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
+// botHasLastWord reports whether the newest comment on the issue is authored by
+// the bot (the bot already had the last word). Newest is by CreatedAt, so it is
+// robust to SCM list ordering. No comments -> false (the bot has not spoken).
+// Used to suppress repeated hold comments once the bot has responded and no human
+// has replied since.
+func (tr triageReader) botHasLastWord(ctx context.Context) (bool, error) {
+	if !tr.resolved {
+		return false, nil
+	}
+	comments, err := tr.reader.ListIssueComments(ctx, tr.owner, tr.repoName, tr.issueNum)
+	if err != nil {
+		return false, err
+	}
+	newest := -1
+	for i := range comments {
+		if newest == -1 || comments[i].CreatedAt.After(comments[newest].CreatedAt) {
+			newest = i
+		}
+	}
+	return newest >= 0 && comments[newest].Author == tr.botLogin, nil
+}
+
 // finishTriage consumes Status.IssueOutcome after a completed Triage agent run.
 func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
@@ -836,6 +858,17 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 				}
 			}
 			if !skipComment {
+				lastWord, lerr := tr.botHasLastWord(ctx)
+				if lerr != nil {
+					l.Info("triage close-withheld: last-word check failed; posting note (fail open)",
+						"action", "lifecycle_close_withheld_silence_check", "resource_id", task.Name, "err", lerr.Error())
+				} else if lastWord {
+					skipComment = true
+					l.Info("triage close-withheld: bot already has the last word; suppressing note",
+						"action", "lifecycle_close_withheld_silent_hold", "resource_id", task.Name)
+				}
+			}
+			if !skipComment {
 				note := comment
 				if note != "" {
 					note += "\n\n"
@@ -889,6 +922,17 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 			} else if !human {
 				skipComment = true
 				l.Info("triage discuss: tatara-authored issue with no human reply; suppressing comment",
+					"action", "lifecycle_discuss_silent_hold", "resource_id", task.Name)
+			}
+		}
+		if !skipComment {
+			lastWord, lerr := tr.botHasLastWord(ctx)
+			if lerr != nil {
+				l.Info("triage discuss: last-word check failed; posting comment (fail open)",
+					"action", "lifecycle_discuss_silence_check", "resource_id", task.Name, "err", lerr.Error())
+			} else if lastWord {
+				skipComment = true
+				l.Info("triage discuss: bot already has the last word; suppressing comment",
 					"action", "lifecycle_discuss_silent_hold", "resource_id", task.Name)
 			}
 		}
