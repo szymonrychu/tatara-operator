@@ -69,9 +69,15 @@ func TestIssueScan_ReactivatesConversationTask(t *testing.T) {
 	_ = seedConvTask(t, "conv-reactivate", "conv-reactivate-repo", "conv-task-1", "Conversation",
 		lastActivityAt, deadline)
 
-	reader := &fakeReader{issues: []scm.IssueRef{
-		{Repo: "o/r", Number: 10, UpdatedAt: issueUpdatedAt},
-	}}
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 10, UpdatedAt: issueUpdatedAt},
+		},
+		// Supply a human comment newer than lastActivityAt so the author-aware gate passes.
+		comments: []scm.IssueComment{
+			{Author: "szymon", CreatedAt: issueUpdatedAt},
+		},
+	}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
@@ -113,9 +119,15 @@ func TestIssueScan_ReactivatesStoppedTask(t *testing.T) {
 	_ = seedConvTask(t, "stopped-reactivate", "stopped-reactivate-repo", "stopped-task-1", "Stopped",
 		lastActivityAt, time.Now().Add(-1*time.Minute))
 
-	reader := &fakeReader{issues: []scm.IssueRef{
-		{Repo: "o/r", Number: 10, UpdatedAt: issueUpdatedAt},
-	}}
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 10, UpdatedAt: issueUpdatedAt},
+		},
+		// Supply a human comment newer than lastActivityAt so the author-aware gate passes.
+		comments: []scm.IssueComment{
+			{Author: "szymon", CreatedAt: issueUpdatedAt},
+		},
+	}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
