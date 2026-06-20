@@ -98,6 +98,7 @@ chart-lint:
 		fi
 	@python3 -m json.tool charts/tatara-operator/dashboards/tatara-loop.json >/dev/null || \
 		{ echo "chart-lint: dashboards/tatara-loop.json is not valid JSON"; exit 1; }
+	$(HELM_BIN) lint charts/tatara-project -f deploy-samples/tatara-project-values.yaml
 
 rbac:
 	mkdir -p $(RBAC_GEN_DIR)

@@ -83,11 +83,13 @@ jobs:
         with:
           fetch-depth: 0
       - uses: azure/setup-helm@v4
-      - name: package and push chart
+      - name: package and push charts
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
           VERSION="$(git describe --tags --always --dirty)"
-          NAME="$(basename "$(ls -d charts/*/)")"
           helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
-          helm package "charts/$NAME" --version "0.0.0-${SHORT_SHA}" --app-version "${VERSION}"
-          helm push "${NAME}-0.0.0-${SHORT_SHA}.tgz" oci://harbor.szymonrichert.pl/charts
+          for dir in charts/*/; do
+            NAME="$(basename "$dir")"
+            helm package "$dir" --version "0.0.0-${SHORT_SHA}" --app-version "${VERSION}"
+            helm push "${NAME}-0.0.0-${SHORT_SHA}.tgz" oci://harbor.szymonrichert.pl/charts
+          done

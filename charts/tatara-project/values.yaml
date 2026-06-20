@@ -1,0 +1,73 @@
+# tatara-project values.
+#
+# This chart is the "cluster" half of the rook-ceph-style split: the
+# tatara-operator chart installs the operator + CRDs, and one release of THIS
+# chart codifies a single tatara Project plus its enrolled Repository CRs from
+# values, so a helmfile can declare whole projects declaratively.
+#
+# This is a CRD chart: the spec blocks below are rendered verbatim into the
+# Project/Repository custom resources (via toYaml), so any current or future
+# CRD field is settable here without a chart change. (The "no lists in
+# values.yaml" rule targets workload ENV config maps, not CRD spec data.)
+#
+# See deploy-samples/tatara-project-values.yaml for a full worked example and
+# README.md for the field reference.
+
+# namespace the CRs are created in. Empty -> the release namespace. Must match
+# the tatara-operator release namespace so the operator reconciles them.
+namespace: ""
+
+# nameOverride only affects the helm chart label, not the Project name.
+nameOverride: ""
+
+# The Project CR. Empty by default so a bare `helm install` is a no-op; a real
+# release must supply project.name and project.spec.scmSecretRef. `spec` is
+# rendered verbatim into Project.spec (see the tatara.dev Project CRD for every
+# field). scmSecretRef names an existing Secret (token) supplied by the helmfile
+# (sops), never by this chart (rule 14: charts carry no secret material).
+#
+# project:
+#   name: my-project
+#   annotations: {}
+#   spec:
+#     scmSecretRef: my-scm
+#     agent:
+#       model: claude-opus-4-8
+#       permissionMode: bypassPermissions
+#       effort: high
+#       # Extra env injected into every agent (secrets via valueFrom.secretKeyRef).
+#       extraEnvs:
+#         - name: MY_FLAG
+#           value: "on"
+#         - name: MY_SECRET
+#           valueFrom:
+#             secretKeyRef: { name: my-secret, key: token }
+#       extraEnvsFrom:
+#         - configMapRef: { name: my-extra-config }
+#       # Custom prompt / MCP overlay / skills mount as extra volumes onto the
+#       # wrapper's PROJECT_CLAUDE_MD_PATH, MCP_OVERLAY_DIR and SKILLS_SRC_DIRS.
+#       extraVolumes:
+#         - name: skills
+#           configMap: { name: my-skills }
+#       extraVolumeMounts:
+#         - name: skills
+#           mountPath: /etc/wrapper/skills
+#       hooks:
+#         conversationStart: "echo starting"
+#     scm:
+#       provider: github
+#       owner: acme
+#       botLogin: acme-bot
+project: {}
+
+# Repository CRs enrolled in the Project. projectRef is auto-bound to
+# project.name (omit it). url + reingestSchedule (5-field cron) are required.
+#
+# repositories:
+#   - name: my-repo
+#     spec:
+#       url: https://github.com/acme/my-repo
+#       defaultBranch: main
+#       semanticIngest: true
+#       reingestSchedule: "0 6 * * *"
+repositories: []
