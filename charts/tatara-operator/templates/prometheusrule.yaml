@@ -1,0 +1,129 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "tatara-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tatara-operator.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: tatara-loop
+      rules:
+        # ---- Class A: deadman / liveness (catch silent stalls that emit no event) ----
+        - alert: TataraOperatorDown
+          expr: up{job=~".*tatara-operator.*"} == 0
+          for: 5m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "tatara-operator is not being scraped"
+            description: "No tatara-operator scrape target has reported up for 5m. The autonomous loop's controller is down or its ServiceMonitor is mis-wired; none of the counter-based alerts below can fire while this is true."
+        - alert: TataraLoopWedged
+          expr: sum(increase(operator_reconcile_total[15m])) == 0
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "tatara-operator reconciled nothing for 15m"
+            description: "operator_reconcile_total has not increased for any kind in 15m while the operator is up: the workqueue is wedged even though the pod is alive."
+        - alert: TataraLoopStalled
+          expr: increase(tatara_scan_tasks_created_total[3h]) == 0 and increase(tatara_scan_items_total[3h]) == 0
+          for: 30m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "tatara loop produced no scan activity for 3h"
+            description: "Neither tatara_scan_items_total nor tatara_scan_tasks_created_total has moved in 3h. The hourly scan cron is producing no work: the loop is silently processing nothing with zero errors (the worst failure class)."
+        - alert: TataraMemoryStackFailed
+          expr: operator_memory_stacks{phase="Failed"} > 0
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a per-project memory stack is Failed"
+            description: "{{ "{{" }} $value {{ "}}" }} per-project memory stack(s) have been in phase Failed for 15m. The lightrag/neo4j/postgres backing the whole loop's recall is degraded."
+        - alert: TataraTasksInflightPinned
+          expr: operator_tasks_inflight >= {{ .Values.prometheusRule.tasksInflightThreshold }}
+          for: 2h
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "in-flight Tasks pinned at the concurrency cap"
+            description: "operator_tasks_inflight has stayed at or above {{ .Values.prometheusRule.tasksInflightThreshold }} for 2h with nothing draining: the concurrency-cap-deadlock signature (stuck, not erroring)."
+        # ---- Class B: active failures (operator-native counters, reliably scraped) ----
+        - alert: TataraReconcileErrors
+          expr: rate(operator_reconcile_total{result="error"}[15m]) > 0
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "tatara-operator reconciles are erroring"
+            description: "operator_reconcile_total{result=\"error\"} has been increasing for 15m; reconciliation is failing for at least one resource kind."
+        - alert: TataraTaskFailures
+          expr: increase(operator_task_terminal_total{phase="Failed"}[30m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "Tasks are reaching a terminal Failed phase"
+            description: "{{ "{{" }} $value {{ "}}" }} Task(s) terminated Failed in the last 30m (reason label carries why: PodLost, TurnTimeout, PlanningStalled, BootCrashLoop, ...). This is the uniform loop-failure signal."
+        - alert: TataraTurnTimeouts
+          expr: increase(operator_turn_timeout_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "agent turns are timing out"
+            description: "operator_turn_timeout_total increased in the last 1h: one or more agent turns stalled past the inactivity deadline."
+        - alert: TataraAgentBootCrashLoop
+          expr: increase(operator_agent_boot_crash_total{outcome="failed"}[30m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "wrapper agents are failing to boot"
+            description: "operator_agent_boot_crash_total{outcome=\"failed\"} increased in 30m: a wrapper Pod exhausted its recreation budget without /readyz coming up."
+        - alert: TataraAgentUnreachable
+          expr: increase(operator_agent_unreachable_termination_total[15m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "Tasks terminated for an unreachable wrapper"
+            description: "operator_agent_unreachable_termination_total increased in 15m: a Task was killed because its wrapper agent stayed unreachable past the boot deadline."
+        - alert: TataraIngestJobFailing
+          expr: increase(operator_ingest_job_total{result="failure"}[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "memory ingest Jobs are failing"
+            description: "operator_ingest_job_total{result=\"failure\"} increased in 1h: per-project memory ingestion is failing, so the recall corpus is going stale."
+        - alert: TataraLifecycleGiveups
+          expr: increase(tatara_lifecycle_giveup_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "issueLifecycle Tasks are giving up"
+            description: "tatara_lifecycle_giveup_total increased in 1h (reason label carries why): the loop abandoned work on an issue/PR."
+        - alert: TataraSCMWriteErrors
+          expr: increase(operator_scm_writes_total{result="error"}[15m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "SCM write-backs are failing"
+            description: "operator_scm_writes_total{result=\"error\"} increased in 15m: comments, PRs, labels, or board updates failed to write back to the SCM."
+        - alert: TataraPushMetricsRejected
+          expr: increase(operator_push_receive_total{result="rejected"}[15m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "wrapper metric pushes are being rejected"
+            description: "operator_push_receive_total{result=\"rejected\"} increased in 15m: ephemeral wrapper/ingest pod metrics are being lost at the push receiver, a self-observability blind spot."
+        - alert: TataraReaperDeleteErrors
+          expr: increase(operator_reap_delete_error_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "the orphan reaper cannot delete pods"
+            description: "operator_reap_delete_error_total increased in 1h: the backstop reaper failed to delete orphan wrapper pods/services, the zombie-pod-leak signal."
+{{- end }}
