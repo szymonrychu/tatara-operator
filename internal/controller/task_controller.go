@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	capRequeue        = 15 * time.Second
+	memGateRequeue    = 15 * time.Second
 	pollRequeue       = 30 * time.Second
 	agentBootRequeue  = 5 * time.Second
 	agentBootDeadline = 5 * time.Minute
@@ -90,15 +90,13 @@ func isFieldSelectorUnsupported(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "field label not supported")
 }
 
-// taskActive reports whether a Task occupies a concurrency slot: an active
+// taskActive reports whether a Task is occupying an agent slot: an active
 // phase (Planning/Running) that has NOT entered a terminal lifecycle state. A
 // Task Parked at maxIterations keeps a stale Planning phase; counting it by
-// phase alone (without the lifecycle check) deadlocks the concurrency cap.
+// phase alone (without the lifecycle check) would over-count in-flight agents.
 //
-// Conversation (awaiting-human) is excluded for the same reason taskOpen
-// excludes it from the creation budget: a task blocked on human input is
-// externally gated and must not pinch the concurrency cap for autonomous work
-// (brainstorm/implement). This keeps atConcurrencyCap aligned with taskOpen.
+// Conversation (awaiting-human) is excluded: a task blocked on human input is
+// externally gated and is not consuming an autonomous agent slot.
 func taskActive(t *tatarav1alpha1.Task) bool {
 	if t.Status.LifecycleState == "Conversation" {
 		return false
@@ -150,7 +148,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
 		l.Info("task gated: project memory not ready",
 			"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
-		return ctrl.Result{RequeueAfter: capRequeue}, nil
+		return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 	}
 
 	// RepositoryRef contract guard: repo-scoped kinds require a non-empty
@@ -169,20 +167,6 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			}
 			r.Metrics.ReconcileResult("Task", "success")
 			return res, nil
-		}
-	}
-
-	// Concurrency gate: only applies to Tasks not yet active.
-	if !isActive(task.Status.Phase) {
-		atCap, err := r.atConcurrencyCap(ctx, &project, task.Name)
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		if atCap {
-			l.Info("task gated at concurrency cap",
-				"action", "task_gate", "resource_id", task.Name, "project", project.Name)
-			return ctrl.Result{RequeueAfter: capRequeue}, nil
 		}
 	}
 
@@ -321,48 +305,6 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 	}
 
 	return r.driveTurns(ctx, project, task, planText)
-}
-
-// atConcurrencyCap reports whether the Project already has maxConcurrentTasks
-// active Tasks, excluding self. Uses the cached field index on spec.projectRef
-// when available (production: informer cache), falling back to a full-namespace
-// scan (tests: direct client without custom field indexes).
-func (r *TaskReconciler) atConcurrencyCap(ctx context.Context, project *tatarav1alpha1.Project, self string) (bool, error) {
-	max := project.Spec.MaxConcurrentTasks
-	if max <= 0 {
-		max = 3
-	}
-	var list tatarav1alpha1.TaskList
-	err := r.List(ctx, &list,
-		client.InNamespace(project.Namespace),
-		client.MatchingFields{taskIndexProjectRef: project.Name},
-	)
-	if err != nil && isFieldSelectorUnsupported(err) {
-		// Fall back to full scan (direct client in tests, no field index registered).
-		err = r.List(ctx, &list, client.InNamespace(project.Namespace))
-		if err != nil {
-			return false, fmt.Errorf("list tasks: %w", err)
-		}
-		active := 0
-		for i := range list.Items {
-			it := list.Items[i]
-			if it.Spec.ProjectRef == project.Name && it.Name != self && taskActive(&it) {
-				active++
-			}
-		}
-		return active >= max, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("list tasks: %w", err)
-	}
-	active := 0
-	for i := range list.Items {
-		it := list.Items[i]
-		if it.Name != self && taskActive(&it) {
-			active++
-		}
-	}
-	return active >= max, nil
 }
 
 // projectRepos returns all Repositories belonging to a Project. Uses the
@@ -1072,8 +1014,8 @@ func (r *TaskReconciler) registerFieldIndexes(idx client.FieldIndexer) error {
 
 // SetupWithManager registers the Task reconciler, watching Tasks and the
 // Pods/Services it owns, and registers field indexers so hot-path list
-// operations (atConcurrencyCap, projectRepos, subtask listing) are
-// O(matching) against the cache rather than O(all-tasks).
+// operations (projectRepos, subtask listing) are O(matching) against the
+// cache rather than O(all-tasks).
 func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := r.registerFieldIndexes(mgr.GetFieldIndexer()); err != nil {
 		return err
@@ -1082,12 +1024,9 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&tatarav1alpha1.Task{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
-		// MaxConcurrentReconciles: 1 is explicit here because atConcurrencyCap
-		// gating is a read-then-create check (count open Tasks, then admit one)
-		// that races under parallel reconciles and would over-admit past
-		// maxConcurrentTasks. Serialising Task reconciles keeps it correct.
-		// (laneOccupancy is Project-scoped, enforced in the Project reconciler,
-		// and is unrelated to this Task-controller setting.)
+		// MaxConcurrentReconciles: 1 serialises Task reconciles to avoid races in
+		// read-then-write sequences (pod creation, status updates, seq accounting
+		// in the admission queue). The admission queue is the sole concurrency gate.
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }

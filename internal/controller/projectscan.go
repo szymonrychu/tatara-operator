@@ -1220,13 +1220,12 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 
 // hasLiveLifecycleTaskForIssue reports whether any non-terminal Task exists for
 // (slug, number) in the snapshot, counting Conversation (human-blocked) Tasks
-// too. recoverOrphans uses this rather than taskOpen-based counting: a
-// Conversation lifecycle Task still owns the issue's pod name, so spawning a
-// second lifecycle Task for the same issue collides on the pod and wedges the
-// new Task in Planning forever. Dedup must keep at most one live lifecycle Task
-// per (repo, issue) regardless of whether that Task currently holds a
-// concurrency slot (which is what taskOpen answers, and why Conversation is
-// excluded there).
+// too. recoverOrphans uses this for dedup rather than checking only active-phase
+// tasks: a Conversation lifecycle Task still owns the issue's pod name, so
+// spawning a second lifecycle Task for the same issue collides on the pod and
+// wedges the new Task in Planning forever. Dedup must keep at most one live
+// lifecycle Task per (repo, issue) regardless of whether that Task is currently
+// running an agent.
 func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
 	repoLabel := sanitizeRepoLabel(slug)
 	numLabel := strconv.Itoa(number)

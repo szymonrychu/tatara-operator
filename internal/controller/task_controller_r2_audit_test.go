@@ -242,9 +242,7 @@ func TestUpdateInflightGauge_NotCalledTwiceOnPlanningTransition(t *testing.T) {
 
 	total := listCalls2.Load()
 	// In test mode (no field-index) a Planning-transition reconcile makes
-	// exactly 3 TaskList calls:
-	//   1. atConcurrencyCap full-scan fallback
-	//   2. updateInflightGauge (called once from Reconcile's success path)
+	// at most 3 TaskList calls (updateInflightGauge + any incidental lists).
 	// Before the fix driveAgentRun also called updateInflightGauge, giving 4.
 	// We assert < 4 to verify the duplicate is gone while tolerating the
 	// legitimate lists above.

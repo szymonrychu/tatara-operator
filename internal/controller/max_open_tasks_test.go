@@ -26,15 +26,15 @@ func TestTaskActive_ExcludesTerminalLifecycle(t *testing.T) {
 		{"Succeeded", "", false},
 		{"Failed", "", false},
 		{"Running", "Triage", true},
-		// Deadlock cases: an active phase but a TERMINAL lifecycle must NOT
-		// occupy a concurrency slot. A Task Parked at maxIterations keeps a
-		// stale Planning phase; counting it deadlocks the cap.
+		// Active phase + terminal lifecycle must NOT count as in-flight. A Task
+		// Parked at maxIterations keeps a stale Planning phase; counting it would
+		// inflate the inflight gauge and misrepresent running agents.
 		{"Planning", "Parked", false},
 		{"Running", "Parked", false},
 		{"Running", "Done", false},
 		{"Running", "Stopped", false},
-		// Conversation = awaiting-human; externally gated, must NOT occupy a
-		// concurrency slot (aligns atConcurrencyCap with taskOpen / creation budget).
+		// Conversation = awaiting-human; externally gated, must NOT count as
+		// in-flight (the agent is not running).
 		{"Running", "Conversation", false},
 		{"Planning", "Conversation", false},
 	}
