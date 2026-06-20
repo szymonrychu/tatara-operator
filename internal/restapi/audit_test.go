@@ -152,7 +152,7 @@ func TestImplementOutcome_RetryOnConflict_HappyPath(t *testing.T) {
 func TestChangeSummary_RetryOnConflict_HappyPath(t *testing.T) {
 	r := buildRouter(t, task("t-cs-retry", "alpha"))
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t-cs-retry/change-summary",
-		strings.NewReader(`{"prTitle":"feat: x","prBody":"y","deliveredScope":"z"}`))
+		strings.NewReader(`{"prTitle":"feat(auth): implement OAuth2 login flow","prBody":"y","deliveredScope":"z"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -212,7 +212,7 @@ func repoForPropose(name, projectRef string) *tatarav1alpha1.Repository {
 // that does not exist causes a 404 (not a silent create with an invalid ref).
 func TestProposeIssue_UnknownRepo_Returns404(t *testing.T) {
 	r := buildRouterForProposeIssue(t, project("alpha"))
-	body := strings.NewReader(`{"repositoryRef":"no-such-repo","title":"T","body":"B","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"no-such-repo","title":"fix(auth): login broken on OIDC redirect","body":"B","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -225,7 +225,7 @@ func TestProposeIssue_UnknownRepo_Returns404(t *testing.T) {
 func TestProposeIssue_CrossProjectRepo_Returns400(t *testing.T) {
 	// repo-x belongs to "beta", not "alpha"
 	r := buildRouterForProposeIssue(t, project("alpha"), repoForPropose("repo-x", "beta"))
-	body := strings.NewReader(`{"repositoryRef":"repo-x","title":"T","body":"B","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"repo-x","title":"fix(auth): login broken on OIDC redirect","body":"B","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -236,7 +236,7 @@ func TestProposeIssue_CrossProjectRepo_Returns400(t *testing.T) {
 // TestProposeIssue_ValidRepo_Succeeds ensures the happy path still works with validation.
 func TestProposeIssue_ValidRepo_Succeeds(t *testing.T) {
 	r := buildRouterForProposeIssue(t, project("alpha"), repoForPropose("repo-alpha", "alpha"))
-	body := strings.NewReader(`{"repositoryRef":"repo-alpha","title":"T","body":"B","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"repo-alpha","title":"fix(auth): login broken on OIDC redirect","body":"B","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
