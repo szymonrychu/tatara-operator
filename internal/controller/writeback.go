@@ -19,6 +19,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/titlecheck"
 )
 
 // Writer is the SCM egress contract the reconciler uses. It is the full
@@ -391,6 +392,12 @@ func providerForRemote(ctx context.Context, remote string) string {
 // the operator opens the PR/MR targeting this same branch.
 func taskBranch(t *tatarav1alpha1.Task) string {
 	return agent.TaskBranch(t)
+}
+
+// weakTitle is a thin controller-local alias to titlecheck.Weak so other
+// files in this package can call it without qualifying the package name.
+func weakTitle(s string) (bool, string) {
+	return titlecheck.Weak(s)
 }
 
 func firstLine(s string) string {
