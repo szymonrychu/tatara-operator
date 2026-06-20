@@ -867,7 +867,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	// Single pass: resolve slug, set primaryRepo, accumulate backlog, collect slugs.
 	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildIssuesContext below. SetOpenProposals is called for every
+	// for reuse by buildRepoStateContext below. SetOpenProposals is called for every
 	// repo queried up to the cap (best-effort: repos beyond the cap short-circuit
 	// and their gauges are not refreshed this cycle).
 	issuesBySlug := make(map[string][]scm.IssueRef)
@@ -922,9 +922,60 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		return
 	}
 
-	// Build rich open-issues context from already-fetched data (no second
-	// ListOpenIssues round-trip for the repos queried above - finding 5).
-	issuesCtx := r.buildIssuesContext(ctx, proj, reader, issuesBySlug, sortedRepos)
+	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
+	prsBySlug := map[string][]scm.PRRef{}
+	prCIBySlug := map[string]map[int]string{}
+	mainCIBySlug := map[string]string{}
+	for i := range sortedRepos {
+		rp := &sortedRepos[i]
+		slug := repoSlug(rp)
+		if slug == "" {
+			continue
+		}
+		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
+		if err != nil {
+			continue
+		}
+		if prs, perr := reader.ListOpenPRs(ctx, owner, name); perr == nil {
+			prsBySlug[slug] = prs
+			ci := map[int]string{}
+			const prCILimit = 20
+			for j, pr := range prs {
+				if j >= prCILimit {
+					break
+				}
+				if pr.HeadSHA != "" {
+					if st, serr := reader.GetCommitCIStatus(ctx, owner, name, pr.HeadSHA); serr == nil {
+						ci[pr.Number] = st
+					}
+				}
+			}
+			prCIBySlug[slug] = ci
+		} else {
+			l.Info("brainstorm: list open PRs failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", perr.Error())
+		}
+		// Main-branch CI: resolve default branch HEAD, then query CI status.
+		var ciOwner, ciRepo string
+		if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
+			if pp, perr := scm.GitLabProjectPath(rp.Spec.URL); perr == nil {
+				ciOwner = pp
+				ciRepo = ""
+			}
+		} else {
+			ciOwner = owner
+			ciRepo = name
+		}
+		if sha, serr := reader.GetDefaultBranchHeadSHA(ctx, ciOwner, ciRepo); serr == nil && sha != "" {
+			if st, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha); cerr == nil {
+				mainCIBySlug[slug] = st
+			}
+		} else if serr != nil {
+			l.Info("brainstorm: main head sha failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", serr.Error())
+		}
+	}
+
+	// Build rich context from already-fetched data + bounded MR/main reads.
+	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
 	goal := brainstormGoalProject(slugs, issuesCtx)
 	created, err := r.createBrainstormTask(ctx, proj, goal, act.Sources)
@@ -983,7 +1034,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 
 	// Aggregate proposal backlog across all repos; short-circuit once >= maxProp.
 	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildIssuesContext below.
+	// for reuse by buildRepoStateContext below.
 	issuesBySlug := make(map[string][]scm.IssueRef)
 	total := 0
 	var slugs []string
@@ -1022,9 +1073,59 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		return
 	}
 
-	// Build rich open-issues context from already-fetched data (no second
-	// ListOpenIssues round-trip for the repos queried above - finding 5).
-	issuesCtx := r.buildIssuesContext(ctx, proj, reader, issuesBySlug, sortedRepos)
+	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
+	hcPRsBySlug := map[string][]scm.PRRef{}
+	hcPRCIBySlug := map[string]map[int]string{}
+	hcMainCIBySlug := map[string]string{}
+	for i := range sortedRepos {
+		rp := &sortedRepos[i]
+		slug := repoSlug(rp)
+		if slug == "" {
+			continue
+		}
+		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
+		if err != nil {
+			continue
+		}
+		if prs, perr := reader.ListOpenPRs(ctx, owner, name); perr == nil {
+			hcPRsBySlug[slug] = prs
+			ci := map[int]string{}
+			const prCILimit = 20
+			for j, pr := range prs {
+				if j >= prCILimit {
+					break
+				}
+				if pr.HeadSHA != "" {
+					if st, serr := reader.GetCommitCIStatus(ctx, owner, name, pr.HeadSHA); serr == nil {
+						ci[pr.Number] = st
+					}
+				}
+			}
+			hcPRCIBySlug[slug] = ci
+		} else {
+			l.Info("healthCheck: list open PRs failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", perr.Error())
+		}
+		var ciOwner, ciRepo string
+		if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
+			if pp, perr := scm.GitLabProjectPath(rp.Spec.URL); perr == nil {
+				ciOwner = pp
+				ciRepo = ""
+			}
+		} else {
+			ciOwner = owner
+			ciRepo = name
+		}
+		if sha, serr := reader.GetDefaultBranchHeadSHA(ctx, ciOwner, ciRepo); serr == nil && sha != "" {
+			if st, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha); cerr == nil {
+				hcMainCIBySlug[slug] = st
+			}
+		} else if serr != nil {
+			l.Info("healthCheck: main head sha failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", serr.Error())
+		}
+	}
+
+	// Build rich context from already-fetched data + bounded MR/main reads.
+	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug, sortedRepos)
 
 	goal := healthCheckGoalProject(slugs, issuesCtx)
 	created, err := r.createHealthCheckTask(ctx, proj, goal, act.Sources)
@@ -1113,22 +1214,26 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
 }
 
-// buildIssuesContext builds the rich context string embedded in the brainstorm
-// goal for dedup-first reasoning from a pre-fetched per-repo issue map (the
-// caller fetches once and reuses the same slice for proposalBacklog, avoiding
-// duplicate ListOpenIssues calls per repo per cycle - finding 4 & 5).
-// Format per line: "repo#N [label1,label2] title"
-// Capped at 60 issues; if more exist, appends a "(+N more omitted)" line.
+// buildRepoStateContext builds the rich context string embedded in the brainstorm
+// / healthCheck goal. It emits three blocks: ISSUES (pre-fetched, cap 60),
+// OPEN MRs (from prsBySlug, cap 40, per-PR CI from prCIBySlug), and MAIN HEALTH
+// (one line per repo from mainCIBySlug). All maps are caller-built and may be nil
+// (degrade gracefully).
 const maxIssuesContext = 60
+const maxMRsContext = 40
 
-func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issuesBySlug map[string][]scm.IssueRef, repos []tatarav1alpha1.Repository) string {
+func (r *ProjectReconciler) buildRepoStateContext(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issuesBySlug map[string][]scm.IssueRef, prsBySlug map[string][]scm.PRRef, prCIBySlug map[string]map[int]string, mainCIBySlug map[string]string, repos []tatarav1alpha1.Repository) string {
 	l := log.FromContext(ctx)
 	botLogin := ""
+	provider := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
+		provider = proj.Spec.Scm.Provider
 	}
-	var lines []string
-	total := 0
+
+	// ISSUES block.
+	var issueLines []string
+	issueTotal := 0
 	for i := range repos {
 		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
 		if err != nil {
@@ -1140,34 +1245,84 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, proj *tatara
 			if iss.IsPR {
 				continue
 			}
-			if len(lines) >= maxIssuesContext {
-				total++
+			if len(issueLines) >= maxIssuesContext {
+				issueTotal++
 				continue
 			}
-			total++
+			issueTotal++
 			labels := strings.Join(iss.Labels, ",")
-			title := iss.Title
-			// Collapse newlines in title for a single-line entry.
-			title = strings.ReplaceAll(title, "\n", " ")
-			title = strings.ReplaceAll(title, "\r", "")
+			title := strings.ReplaceAll(strings.ReplaceAll(iss.Title, "\n", " "), "\r", "")
 			line := fmt.Sprintf("%s#%d [%s] %s", slug, iss.Number, labels, title)
 			if botCommentedOnIssue(ctx, reader, owner, name, iss.Number, botLogin) {
 				line += " [bot-engaged]"
 			}
-			lines = append(lines, line)
+			issueLines = append(issueLines, line)
 		}
 	}
-	if len(lines) == 0 {
-		return ""
-	}
-	omitted := total - len(lines)
-	result := strings.Join(lines, "\n")
+	omitted := issueTotal - len(issueLines)
+	issuesBlock := strings.Join(issueLines, "\n")
 	if omitted > 0 {
-		result += fmt.Sprintf("\n(+%d more omitted)", omitted)
-		l.Info("brainstorm: buildIssuesContext: capped issues context",
-			"shown", len(lines), "omitted", omitted)
+		issuesBlock += fmt.Sprintf("\n(+%d more omitted)", omitted)
+		l.Info("brainstorm: buildRepoStateContext: capped issues context",
+			"shown", len(issueLines), "omitted", omitted)
 	}
-	return result
+
+	// OPEN MRs block: provider-correct separator (! for gitlab, # for github).
+	mrSep := "#"
+	if provider == "gitlab" {
+		mrSep = "!"
+	}
+	var mrLines []string
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		slug := owner + "/" + name
+		prs := prsBySlug[slug]
+		ciMap := prCIBySlug[slug]
+		for _, pr := range prs {
+			if len(mrLines) >= maxMRsContext {
+				break
+			}
+			ciStatus := "unknown"
+			if ciMap != nil {
+				if st, ok := ciMap[pr.Number]; ok && st != "" {
+					ciStatus = st
+				}
+			}
+			title := firstLine(pr.Body)
+			mrLines = append(mrLines, fmt.Sprintf("%s%s%d [ci:%s] %s", slug, mrSep, pr.Number, ciStatus, title))
+		}
+	}
+
+	// MAIN HEALTH block: one line per repo.
+	var healthLines []string
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		slug := owner + "/" + name
+		status := "unknown"
+		if mainCIBySlug != nil {
+			if st, ok := mainCIBySlug[slug]; ok && st != "" {
+				status = st
+			}
+		}
+		healthLines = append(healthLines, fmt.Sprintf("%s main CI: %s", slug, status))
+	}
+
+	var sb strings.Builder
+	sb.WriteString("ISSUES:\n")
+	if issuesBlock != "" {
+		sb.WriteString(issuesBlock)
+	}
+	sb.WriteString("\n\nOPEN MRs:\n")
+	sb.WriteString(strings.Join(mrLines, "\n"))
+	sb.WriteString("\n\nMAIN HEALTH:\n")
+	sb.WriteString(strings.Join(healthLines, "\n"))
+	return sb.String()
 }
 
 // humanCommentAfter reports whether the issue has a comment authored by a
