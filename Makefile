@@ -17,6 +17,7 @@ ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_V
 ENVTEST_K8S_VERSION ?= 1.33.0
 
 CHART_CRD_DIR := charts/tatara-operator/crd-bases
+RBAC_GEN_DIR := .rbac-gen
 
 # Resolve helm binary via mise to avoid homebrew helm 4.x shadow.
 HELM_BIN := $(shell mise exec -- bash -c 'echo $$PATH' 2>/dev/null | tr ':' '\n' | grep -m1 'mise/installs/helm/' || true)
@@ -26,7 +27,7 @@ else
 HELM_BIN := helm
 endif
 
-.PHONY: all generate manifests test lint build image fmt tidy chart-lint clean ci
+.PHONY: all generate manifests test lint build image fmt tidy chart-lint clean ci rbac rbac-check
 
 all: generate manifests lint test build
 
@@ -78,7 +79,14 @@ chart-lint:
 			exit 1; \
 		fi
 
-ci: generate manifests lint test
+rbac:
+	mkdir -p $(RBAC_GEN_DIR)
+	$(CONTROLLER_GEN) rbac:roleName=tatara-operator-manager paths="./internal/controller/..." output:dir=$(RBAC_GEN_DIR)
+
+rbac-check:
+	HELM_BIN="$(HELM_BIN)" CONTROLLER_GEN="$(CONTROLLER_GEN)" RBAC_GEN_DIR="$(RBAC_GEN_DIR)" bash hack/check-rbac-drift.sh
+
+ci: generate manifests lint test rbac-check
 
 clean:
 	rm -rf bin dist

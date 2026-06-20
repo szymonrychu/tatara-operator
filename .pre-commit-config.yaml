@@ -43,3 +43,9 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-push]
+      - id: rbac-drift
+        name: rbac drift guard
+        entry: make rbac-check
+        language: system
+        pass_filenames: false
+        files: '(internal/controller/.*\.go|charts/tatara-operator/templates/rbac\.yaml)$'

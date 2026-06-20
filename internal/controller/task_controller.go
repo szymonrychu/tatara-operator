@@ -74,10 +74,10 @@ type TaskReconciler struct {
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=tasks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=tasks/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=tatara.dev,resources=subtasks,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=tatara.dev,resources=subtasks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tatara.dev,resources=subtasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects;repositories,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=pods;services,verbs=get;list;watch;create;update;patch;delete
 
 func isTerminal(phase string) bool { return phase == "Succeeded" || phase == "Failed" }
 func isActive(phase string) bool   { return phase == "Planning" || phase == "Running" }
