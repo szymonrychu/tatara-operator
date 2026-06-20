@@ -10,8 +10,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 type DispatcherReconciler struct {
@@ -69,8 +73,6 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 // admit drains the alert pool to AlertCapacity, then the normal pool to
 // QueueCapacity, each in strict ascending seq order (pure global FIFO within a
 // pool; head-of-line blocking accepted). Wired in Task 8 Reconcile.
-//
-//nolint:unused
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
 	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) error {
 
@@ -121,8 +123,6 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 
 // reconcileDone flips Admitted events whose Task is terminal or gone to Done.
 // Called by the Reconcile loop added in Task 8.
-//
-//nolint:unused
 func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) (bool, error) {
 	changed := false
 	for i := range qes {
@@ -141,4 +141,84 @@ func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1
 		}
 	}
 	return changed, nil
+}
+
+func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var qe tatarav1alpha1.QueuedEvent
+	if err := r.Get(ctx, req.NamespacedName, &qe); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	var proj tatarav1alpha1.Project
+	if err := r.Get(ctx, types.NamespacedName{Namespace: qe.Namespace, Name: qe.Spec.ProjectRef}, &proj); err != nil {
+		// Project gone (deleted mid-flight): nothing to admit against. Drop
+		// the not-found so we do not loop on a zero-value Project whose
+		// capacities read 0 and silently block all admission.
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if proj.Name == "" {
+		return ctrl.Result{}, nil
+	}
+
+	listProject := func() ([]tatarav1alpha1.QueuedEvent, []tatarav1alpha1.Task, error) {
+		var qel tatarav1alpha1.QueuedEventList
+		if err := r.List(ctx, &qel, client.InNamespace(qe.Namespace)); err != nil {
+			return nil, nil, err
+		}
+		var tl tatarav1alpha1.TaskList
+		if err := r.List(ctx, &tl, client.InNamespace(qe.Namespace)); err != nil {
+			return nil, nil, err
+		}
+		return filterQEsByProject(qel.Items, proj.Name), filterTasksByProject(tl.Items, proj.Name), nil
+	}
+
+	qes, tasks, err := listProject()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if _, err := r.reconcileDone(ctx, qes, tasks); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Re-list after Done mutations so admission sees fresh QE and Task state.
+	qes, tasks, err = listProject()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.admit(ctx, &proj, qes, tasks); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func filterQEsByProject(in []tatarav1alpha1.QueuedEvent, project string) []tatarav1alpha1.QueuedEvent {
+	out := make([]tatarav1alpha1.QueuedEvent, 0)
+	for i := range in {
+		if in[i].Spec.ProjectRef == project {
+			out = append(out, in[i])
+		}
+	}
+	return out
+}
+
+func filterTasksByProject(in []tatarav1alpha1.Task, project string) []tatarav1alpha1.Task {
+	out := make([]tatarav1alpha1.Task, 0)
+	for i := range in {
+		if in[i].Spec.ProjectRef == project {
+			out = append(out, in[i])
+		}
+	}
+	return out
+}
+
+func (r *DispatcherReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	mapTaskToQE := func(_ context.Context, obj client.Object) []reconcile.Request {
+		qeName := obj.GetLabels()[LabelQueuedEvent]
+		if qeName == "" {
+			return nil
+		}
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: qeName}}}
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&tatarav1alpha1.QueuedEvent{}).
+		Watches(&tatarav1alpha1.Task{}, handler.EnqueueRequestsFromMapFunc(mapTaskToQE)).
+		Complete(r)
 }

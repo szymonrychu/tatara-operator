@@ -161,6 +161,62 @@ func preQueueTask(name, phase, kind, _ string) tatarav1alpha1.Task {
 	}
 }
 
+func TestDispatcherReconcile_AdmitsThenFreesOnTerminal(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-disp", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 1, AlertCapacity: 1}},
+	}
+	mustCreate(t, ctx, proj)
+
+	mk := func(seq int64) *tatarav1alpha1.QueuedEvent {
+		q := &tatarav1alpha1.QueuedEvent{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-", Namespace: ns},
+			Spec: tatarav1alpha1.QueuedEventSpec{Seq: seq, Class: tatarav1alpha1.QueueClassNormal, Kind: "incident", ProjectRef: proj.Name,
+				Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "x-"}},
+		}
+		mustCreate(t, ctx, q)
+		q.Status.State = tatarav1alpha1.QueueStateQueued
+		mustStatusUpdate(t, ctx, q)
+		return q
+	}
+	q1 := mk(1)
+	q2 := mk(2)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	if _, err := r.Reconcile(ctx, reqFor(q1)); err != nil {
+		t.Fatal(err)
+	}
+	// capacity 1: q1 admitted, q2 still queued (head-of-line).
+	if refreshQE(t, ctx, q1).Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatal("q1 should be admitted")
+	}
+	if refreshQE(t, ctx, q2).Status.State != tatarav1alpha1.QueueStateQueued {
+		t.Fatal("q2 should still be queued (capacity 1)")
+	}
+	// Drive q1's task terminal, reconcile -> q1 Done, q2 admitted.
+	task := taskForQE(t, ctx, refreshQE(t, ctx, q1))
+	task.Status.Phase = "Succeeded"
+	mustStatusUpdate(t, ctx, task)
+	if _, err := r.Reconcile(ctx, reqFor(q1)); err != nil {
+		t.Fatal(err)
+	}
+	if refreshQE(t, ctx, q1).Status.State != tatarav1alpha1.QueueStateDone {
+		t.Fatal("q1 should be Done")
+	}
+	if refreshQE(t, ctx, q2).Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatal("q2 should now be admitted")
+	}
+	// Reconciling from q2's own request must be a stable no-op (idempotent).
+	if _, err := r.Reconcile(ctx, reqFor(q2)); err != nil {
+		t.Fatal(err)
+	}
+	if refreshQE(t, ctx, q2).Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatal("q2 should remain admitted after re-reconcile")
+	}
+}
+
 func TestPoolInflight_CountsAdmittedNonTerminal(t *testing.T) {
 	r := &DispatcherReconciler{}
 	qes := []tatarav1alpha1.QueuedEvent{

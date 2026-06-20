@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -83,4 +84,22 @@ func refreshQE(t *testing.T, ctx context.Context, q *tatarav1alpha1.QueuedEvent)
 		t.Fatalf("refreshQE %s: %v", q.Name, err)
 	}
 	return got
+}
+
+// reqFor returns a ctrl.Request for the given object.
+func reqFor(obj client.Object) ctrl.Request {
+	return ctrl.Request{NamespacedName: types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}}
+}
+
+// taskForQE fetches the Task referenced by a QueuedEvent via its Status.TaskRef.
+func taskForQE(t *testing.T, ctx context.Context, q *tatarav1alpha1.QueuedEvent) *tatarav1alpha1.Task {
+	t.Helper()
+	if q.Status.TaskRef == "" {
+		t.Fatalf("taskForQE %s: TaskRef is empty (not admitted)", q.Name)
+	}
+	task := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: q.Status.TaskRef, Namespace: q.Namespace}, task); err != nil {
+		t.Fatalf("taskForQE %s (taskRef=%s): %v", q.Name, q.Status.TaskRef, err)
+	}
+	return task
 }
