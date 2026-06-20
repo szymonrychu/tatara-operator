@@ -522,7 +522,13 @@ func (c *GitLab) RequestChanges(ctx context.Context, repoURL, token string, numb
 	}
 	base := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
 	if err := glDo(ctx, c.base(), http.MethodPost, base+"/unapprove", token, nil, nil); err != nil {
-		return err
+		// GitLab returns 404 from unapprove when the caller never approved the MR
+		// (the common case for the review bot). Nothing to unapprove is benign;
+		// proceed to the thumbsdown + note. Other failures still abort.
+		var he *HTTPError
+		if !errors.As(err, &he) || he.Status != http.StatusNotFound {
+			return err
+		}
 	}
 	if err := glDo(ctx, c.base(), http.MethodPost, base+"/award_emoji", token, map[string]string{"name": "thumbsdown"}, nil); err != nil {
 		return err

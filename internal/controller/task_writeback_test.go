@@ -727,6 +727,38 @@ func TestDoWriteBackKind(t *testing.T) {
 		require.Zero(t, fw.openCalls, "OpenChange must NOT be called")
 	})
 
+	t.Run("review/comment gitlab uses MR ref", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "wbk-rev-cmt-gl", "wbk-proj-cmtgl", "wbk-repo-cmtgl", "wbk-scm-cmtgl",
+			tatarav1alpha1.TaskSpec{
+				Goal: "comment on an MR",
+				Kind: "review",
+				Source: &tatarav1alpha1.TaskSource{
+					Provider: "gitlab", IssueRef: "g/p!12", IsPR: true, Number: 12,
+				},
+			}, nil)
+		// Point the repo at a GitLab URL so repoSlugFromURL yields the project path.
+		var repo tatarav1alpha1.Repository
+		require.NoError(t, k8sClient.Get(context.Background(),
+			types.NamespacedName{Namespace: testNS, Name: "wbk-repo-cmtgl"}, &repo))
+		repo.Spec.URL = "https://gitlab.com/g/p.git"
+		require.NoError(t, k8sClient.Update(context.Background(), &repo))
+
+		task.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: "comment", Body: "nice MR"}
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.commentCalled, "Comment must be called for decision=comment")
+		// MR addressing ('!'), not issue addressing ('#'): a GitLab MR iid posted to
+		// /issues/{iid}/notes 404s (separate iid space).
+		require.Equal(t, "g/p!12", fw.commentIssueRef)
+		require.Equal(t, "nice MR", fw.commentBody)
+		require.Zero(t, fw.openCalls, "OpenChange must NOT be called")
+	})
+
 	t.Run("selfImprove/merge afterApproval", func(t *testing.T) {
 		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: ""}}
 		r := newFullFakeReconciler(t, fw)
