@@ -403,6 +403,24 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
 	}
 
+	// Lifecycle hooks: emit one HOOK_<NAME> env var per non-empty command so the
+	// wrapper runs it at the matching lifecycle point. Omitted hooks produce no
+	// env var (the wrapper treats an unset/empty command as "no hook").
+	if h := project.Spec.Agent.Hooks; h != nil {
+		for _, hk := range []struct{ name, cmd string }{
+			{"HOOK_PRE_CLONE", h.PreClone},
+			{"HOOK_POST_CLONE", h.PostClone},
+			{"HOOK_CONVERSATION_START", h.ConversationStart},
+			{"HOOK_CONVERSATION_RESTART", h.ConversationRestart},
+			{"HOOK_AGENT_TURN_FINISHED", h.AgentTurnFinished},
+			{"HOOK_CONVERSATION_FINISHED", h.ConversationFinished},
+		} {
+			if hk.cmd != "" {
+				env = append(env, corev1.EnvVar{Name: hk.name, Value: hk.cmd})
+			}
+		}
+	}
+
 	if project.Spec.Grafana != nil && project.Spec.Grafana.Enabled {
 		// Per-project read-only grafana-mcp endpoint. The wrapper registers this
 		// as an HTTP MCP server so the agent can query Grafana for live debugging.
@@ -450,10 +468,38 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
 
+	// Operator-supplied extra envs are appended LAST, after every variable the
+	// operator itself sets, so a stray extra named like a required variable
+	// (e.g. TATARA_TASK) cannot silently shadow it -- the later duplicate in a
+	// Pod env list does not override an earlier one for the operator's vars.
+	env = append(env, project.Spec.Agent.ExtraEnvs...)
+
 	labels := podLabels(task)
 	if task.Spec.Kind == "brainstorm" && hasInternetSource(task.Annotations[tatarav1alpha1.AnnBrainstormSources]) {
 		labels["tatara.io/egress"] = "internet"
 	}
+
+	wrapper := corev1.Container{
+		Name:            "wrapper",
+		Image:           project.Spec.Agent.Image,
+		Env:             env,
+		EnvFrom:         project.Spec.Agent.ExtraEnvsFrom,
+		VolumeMounts:    project.Spec.Agent.ExtraVolumeMounts,
+		Ports:           []corev1.ContainerPort{{ContainerPort: wrapperPort}},
+		Resources:       buildResourceRequirements(cfg),
+		SecurityContext: buildSecurityContext(cfg),
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/readyz",
+					Port: intstr.FromInt(wrapperPort),
+				},
+			},
+		},
+	}
+	// Sidecars run alongside the wrapper (appended after it); init containers run
+	// to completion before it. Both come straight from the Project spec.
+	containers := append([]corev1.Container{wrapper}, project.Spec.Agent.ExtraSidecarContainers...)
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -469,22 +515,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			Tolerations:      cfg.Tolerations,
 			Affinity:         cfg.Affinity,
 			SecurityContext:  buildPodSecurityContext(cfg),
-			Containers: []corev1.Container{{
-				Name:            "wrapper",
-				Image:           project.Spec.Agent.Image,
-				Env:             env,
-				Ports:           []corev1.ContainerPort{{ContainerPort: wrapperPort}},
-				Resources:       buildResourceRequirements(cfg),
-				SecurityContext: buildSecurityContext(cfg),
-				ReadinessProbe: &corev1.Probe{
-					ProbeHandler: corev1.ProbeHandler{
-						HTTPGet: &corev1.HTTPGetAction{
-							Path: "/readyz",
-							Port: intstr.FromInt(wrapperPort),
-						},
-					},
-				},
-			}},
+			InitContainers:   project.Spec.Agent.ExtraInitContainers,
+			Volumes:          project.Spec.Agent.ExtraVolumes,
+			Containers:       containers,
 		},
 	}
 }

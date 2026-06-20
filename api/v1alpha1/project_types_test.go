@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -147,6 +148,62 @@ func TestProjectLifecycleConfigFields(t *testing.T) {
 	cp.Spec.Agent.ContextWindowTokens = 999
 	if p.Spec.Agent.ContextWindowTokens == 999 {
 		t.Error("mutating copy mutated original")
+	}
+}
+
+// TestAgentSpec_HooksAndExtrasDeepCopy asserts the lifecycle hooks and extra*
+// pod-shaping fields exist on AgentSpec and deep-copy independently of the
+// original (no shared slice/pointer backing).
+func TestAgentSpec_HooksAndExtrasDeepCopy(t *testing.T) {
+	p := &v1alpha1.Project{
+		Spec: v1alpha1.ProjectSpec{
+			Agent: v1alpha1.AgentSpec{
+				Hooks: &v1alpha1.LifecycleHooks{
+					PreClone:             "echo pre $1",
+					PostClone:            "echo post $1",
+					ConversationStart:    "echo start",
+					ConversationRestart:  "echo restart",
+					AgentTurnFinished:    "echo turn",
+					ConversationFinished: "echo finished",
+				},
+				ExtraEnvs:              []corev1.EnvVar{{Name: "FOO", Value: "bar"}},
+				ExtraEnvsFrom:          []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}}}},
+				ExtraVolumeMounts:      []corev1.VolumeMount{{Name: "vol", MountPath: "/data"}},
+				ExtraVolumes:           []corev1.Volume{{Name: "vol"}},
+				ExtraSidecarContainers: []corev1.Container{{Name: "sidecar", Image: "busybox"}},
+				ExtraInitContainers:    []corev1.Container{{Name: "init", Image: "busybox"}},
+			},
+		},
+	}
+
+	cp := p.DeepCopy()
+
+	if cp.Spec.Agent.Hooks == p.Spec.Agent.Hooks {
+		t.Fatal("hooks pointer not deep-copied")
+	}
+	if !reflect.DeepEqual(cp.Spec.Agent, p.Spec.Agent) {
+		t.Fatalf("agent spec mismatch after deep copy:\n%+v\nvs\n%+v", cp.Spec.Agent, p.Spec.Agent)
+	}
+	// Mutating the copy must not affect the original (independent backing arrays).
+	cp.Spec.Agent.Hooks.PreClone = "mutated"
+	cp.Spec.Agent.ExtraEnvs[0].Value = "mutated"
+	if p.Spec.Agent.Hooks.PreClone == "mutated" {
+		t.Fatal("mutating copied hook mutated original (shallow copy)")
+	}
+	if p.Spec.Agent.ExtraEnvs[0].Value == "mutated" {
+		t.Fatal("mutating copied extra env mutated original (shared slice)")
+	}
+}
+
+// TestAgentSpec_HooksNilSafe guards the common no-hooks case.
+func TestAgentSpec_HooksNilSafe(t *testing.T) {
+	p := &v1alpha1.Project{}
+	cp := p.DeepCopy()
+	if cp.Spec.Agent.Hooks != nil {
+		t.Fatal("nil hooks must deep-copy to nil")
+	}
+	if cp.Spec.Agent.ExtraEnvs != nil || cp.Spec.Agent.ExtraSidecarContainers != nil {
+		t.Fatal("nil extras must deep-copy to nil")
 	}
 }
 

@@ -600,3 +600,107 @@ func TestBuildPodEgressLabel(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildPod_HookEnvs(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	proj.Spec.Agent.Hooks = &tatarav1alpha1.LifecycleHooks{
+		PreClone:             "echo pre",
+		PostClone:            "echo post",
+		ConversationStart:    "echo start",
+		ConversationRestart:  "echo restart",
+		AgentTurnFinished:    "echo turn",
+		ConversationFinished: "echo finished",
+	}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	for k, want := range map[string]string{
+		"HOOK_PRE_CLONE":             "echo pre",
+		"HOOK_POST_CLONE":            "echo post",
+		"HOOK_CONVERSATION_START":    "echo start",
+		"HOOK_CONVERSATION_RESTART":  "echo restart",
+		"HOOK_AGENT_TURN_FINISHED":   "echo turn",
+		"HOOK_CONVERSATION_FINISHED": "echo finished",
+	} {
+		got, ok := envValue(c, k)
+		require.Truef(t, ok, "hook env %s missing", k)
+		require.Equalf(t, want, got, "hook env %s", k)
+	}
+}
+
+func TestBuildPod_HookEnvs_OnlyNonEmptyEmitted(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	// Only one hook set: the other five must not appear as env vars.
+	proj.Spec.Agent.Hooks = &tatarav1alpha1.LifecycleHooks{PreClone: "echo pre"}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "HOOK_PRE_CLONE")
+	require.True(t, ok)
+	require.Equal(t, "echo pre", got)
+	for _, k := range []string{
+		"HOOK_POST_CLONE", "HOOK_CONVERSATION_START", "HOOK_CONVERSATION_RESTART",
+		"HOOK_AGENT_TURN_FINISHED", "HOOK_CONVERSATION_FINISHED",
+	} {
+		_, ok := envValue(c, k)
+		require.Falsef(t, ok, "unset hook %s must not be emitted", k)
+	}
+}
+
+func TestBuildPod_NoHooks_NoHookEnvs(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	for _, e := range c.Env {
+		require.NotContains(t, e.Name, "HOOK_", "no HOOK_* env when Hooks is nil")
+	}
+}
+
+func TestBuildPod_ExtraEnvsAndEnvFrom(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	proj.Spec.Agent.ExtraEnvs = []corev1.EnvVar{{Name: "FOO", Value: "bar"}}
+	proj.Spec.Agent.ExtraEnvsFrom = []corev1.EnvFromSource{
+		{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}}},
+	}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+
+	got, ok := envValue(c, "FOO")
+	require.True(t, ok)
+	require.Equal(t, "bar", got)
+	require.Equal(t, proj.Spec.Agent.ExtraEnvsFrom, c.EnvFrom)
+}
+
+func TestBuildPod_ExtraEnvsAppendedLast(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	// An extra env named like a required operator var must not shadow it: the
+	// operator's value must still be the first occurrence in the list.
+	proj.Spec.Agent.ExtraEnvs = []corev1.EnvVar{{Name: "TATARA_TASK", Value: "hijacked"}}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "TATARA_TASK")
+	require.True(t, ok)
+	require.Equal(t, task.Name, got, "operator value must win (appears before the extra)")
+}
+
+func TestBuildPod_ExtraVolumesMountsSidecarsInit(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	proj.Spec.Agent.ExtraVolumeMounts = []corev1.VolumeMount{{Name: "vol", MountPath: "/data"}}
+	proj.Spec.Agent.ExtraVolumes = []corev1.Volume{{Name: "vol"}}
+	proj.Spec.Agent.ExtraSidecarContainers = []corev1.Container{{Name: "sidecar", Image: "busybox"}}
+	proj.Spec.Agent.ExtraInitContainers = []corev1.Container{{Name: "init", Image: "busybox"}}
+
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+
+	require.Equal(t, proj.Spec.Agent.ExtraVolumes, pod.Spec.Volumes)
+	require.Equal(t, proj.Spec.Agent.ExtraInitContainers, pod.Spec.InitContainers)
+	require.Equal(t, proj.Spec.Agent.ExtraVolumeMounts, pod.Spec.Containers[0].VolumeMounts)
+
+	// Wrapper stays first; sidecar is appended after it.
+	require.Len(t, pod.Spec.Containers, 2)
+	require.Equal(t, "wrapper", pod.Spec.Containers[0].Name)
+	require.Equal(t, "sidecar", pod.Spec.Containers[1].Name)
+}
+
+func TestBuildPod_NoExtras_EmptyByDefault(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	pod := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg)
+	require.Empty(t, pod.Spec.Volumes)
+	require.Empty(t, pod.Spec.InitContainers)
+	require.Empty(t, pod.Spec.Containers[0].EnvFrom)
+	require.Empty(t, pod.Spec.Containers[0].VolumeMounts)
+	require.Len(t, pod.Spec.Containers, 1, "no sidecars by default")
+}
