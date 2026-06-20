@@ -146,7 +146,7 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 		if humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, t.Status.LastActivityAt.Time) {
 			return t
 		}
-		return nil
+		continue
 	}
 	return nil
 }
