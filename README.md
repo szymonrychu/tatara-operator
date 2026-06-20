@@ -45,6 +45,32 @@ internal/version/                  # build-stamped version info
 charts/tatara-operator/            # cluster-agnostic Helm chart + CRDs
 ```
 
+## Agent pod customization
+
+`Project.spec.agent` carries optional knobs that shape the wrapper Pod and hook
+into the agent session lifecycle. All are optional; omitting them leaves the
+default Pod unchanged.
+
+- `agent.hooks` - shell commands the wrapper runs (via `sh -c`) at fixed
+  lifecycle points: `preClone`, `postClone`, `conversationStart`,
+  `conversationRestart`, `agentTurnFinished`, `conversationFinished`. The
+  operator passes each non-empty command to the wrapper as a `HOOK_*` env var.
+  Hooks are best-effort: a non-zero exit is logged and counted
+  (`ccw_lifecycle_hook_total`) but never aborts the agent run. `preClone`
+  receives the repo URL and `postClone` the clone directory (as `$1` and via
+  `TATARA_HOOK_REPO_URL` / `TATARA_HOOK_CLONE_DEST`); the conversation/turn
+  hooks see `TATARA_TASK` / `TATARA_PROJECT` (and `agentTurnFinished` also
+  `TATARA_TURN_ID`).
+- `agent.extraEnvs` / `agent.extraEnvsFrom` - extra env vars / `envFrom`
+  sources on the wrapper container. `extraEnvs` are appended AFTER the
+  operator's own variables, so a stray extra cannot shadow a required one.
+- `agent.extraVolumes` / `agent.extraVolumeMounts` - extra Pod volumes and
+  wrapper-container mounts.
+- `agent.extraInitContainers` / `agent.extraSidecarContainers` - extra init
+  containers (run before the wrapper) and sidecars (run alongside it).
+
+See `deploy-samples/tatara-project.yaml` for a worked example.
+
 ## Observability
 
 Every long-running surface exposes Prometheus metrics on `/metrics`, and the

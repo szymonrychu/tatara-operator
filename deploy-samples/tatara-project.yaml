@@ -9,6 +9,41 @@ spec:
     image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:0.1.13
     model: claude-opus-4-8
     permissionMode: bypassPermissions
+    # Optional lifecycle hooks: shell commands the wrapper runs via `sh -c` at
+    # fixed points. Best-effort - a non-zero exit is logged and counted but never
+    # aborts the agent run. preClone gets the repo URL as $1 (and
+    # $TATARA_HOOK_REPO_URL); postClone gets the clone dir as $1 (and
+    # $TATARA_HOOK_CLONE_DEST). The conversation/turn hooks see $TATARA_TASK /
+    # $TATARA_PROJECT (and agentTurnFinished sees $TATARA_TURN_ID).
+    # hooks:
+    #   preClone: 'echo "about to clone $1"'
+    #   postClone: 'git -C "$1" lfs pull || true'
+    #   conversationStart: 'echo "session $TATARA_TASK starting"'
+    #   conversationRestart: 'echo "session $TATARA_TASK resumed"'
+    #   agentTurnFinished: 'echo "turn $TATARA_TURN_ID done"'
+    #   conversationFinished: 'echo "session $TATARA_TASK finished"'
+    # Optional pod-shaping extras, applied straight to the agent Pod / wrapper
+    # container. extraEnvs are appended AFTER the operator's own vars (so they
+    # cannot shadow a required one).
+    # extraEnvs:
+    #   - name: HTTP_PROXY
+    #     value: http://proxy.internal:3128
+    # extraEnvsFrom:
+    #   - configMapRef: {name: agent-extra-config}
+    # extraVolumes:
+    #   - name: cache
+    #     emptyDir: {}
+    # extraVolumeMounts:
+    #   - name: cache
+    #     mountPath: /cache
+    # extraInitContainers:
+    #   - name: warm-cache
+    #     image: busybox
+    #     command: ['sh', '-c', 'echo warming']
+    # extraSidecarContainers:
+    #   - name: tunnel
+    #     image: busybox
+    #     command: ['sh', '-c', 'sleep infinity']
   memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
   # PAT-based activation (no bot account / no Project board). botLogin == the PAT
   # owner, so mrScan routes the owner's own PRs to selfImprove and others' to
