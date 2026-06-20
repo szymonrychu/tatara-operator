@@ -42,6 +42,8 @@ func seqConfigMapName(project string) string {
 // sanitizeDNS1123 lowercases s, collapses every run of non-[a-z0-9] into a single
 // '-', trims leading/trailing '-', and caps the result at 53 chars so the
 // "queue-seq-" prefix (10 chars) keeps the full name within the 63-char limit.
+// Project names are themselves DNS-1123 object names, so this is near-identity in
+// practice; a counter collision between two distinct projects is not reachable.
 func sanitizeDNS1123(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder

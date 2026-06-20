@@ -155,8 +155,8 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 	return requeue, nil
 }
 
-// reconcileDone flips Admitted events whose Task is terminal or gone to Done.
-// Called by the Reconcile loop added in Task 8.
+// reconcileDone GC-deletes Admitted events whose Task is terminal or gone
+// (completed QueuedEvents are removed, not tombstoned to Done).
 func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) (bool, error) {
 	changed := false
 	for i := range qes {
