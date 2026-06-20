@@ -11,6 +11,14 @@ import (
 	"time"
 )
 
+// SubmitTimeout is the http.Client deadline for wrapper turn-submit calls.
+// 30s was too tight: on a freshly-enrolled project the wrapper Pod boots Claude
+// from cold, which can take 60-90s before it accepts /v1/messages. Firing the
+// deadline produces a "context deadline exceeded" ERROR in the reconciler even
+// though the request self-heals on the next reconcile (~400ms later). 120s
+// gives comfortable headroom without masking a truly hung wrapper.
+const SubmitTimeout = 120 * time.Second
+
 // TokenFunc mints a bearer token for the wrapper audience.
 type TokenFunc func(ctx context.Context) (string, error)
 
@@ -31,14 +39,14 @@ type httpSession struct {
 // NewHTTPSession returns a Session that authenticates wrapper calls with a
 // bearer minted by token (audience tatara-claude-code-wrapper).
 func NewHTTPSession(token TokenFunc) Session {
-	return &httpSession{token: token, hc: &http.Client{Timeout: 30 * time.Second}}
+	return &httpSession{token: token, hc: &http.Client{Timeout: SubmitTimeout}}
 }
 
 // NewHTTPSessionWithMetrics is like NewHTTPSession but instruments every do()
 // call via rec. Use this in production; NewHTTPSession is a zero-metrics
 // convenience for tests that do not need the counter/histogram overhead.
 func NewHTTPSessionWithMetrics(token TokenFunc, rec AgentHTTPRecorder) Session {
-	return &httpSession{token: token, hc: &http.Client{Timeout: 30 * time.Second}, metrics: rec}
+	return &httpSession{token: token, hc: &http.Client{Timeout: SubmitTimeout}, metrics: rec}
 }
 
 // do executes one HTTP call and records metrics when s.metrics is set.

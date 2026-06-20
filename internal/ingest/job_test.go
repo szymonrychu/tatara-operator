@@ -396,6 +396,20 @@ func TestBuildJob_ShellInjectionBranchNotInCmd(t *testing.T) {
 	}
 }
 
+// TestBuildJob_HTTPTimeoutEnv verifies that the ingest main container carries
+// HTTP_TIMEOUT set to ingestHTTPTimeout (300s). Without this, the ingester
+// defaults to 60s, which fired during transient LLM-extraction round-trips on
+// 2026-06-20 (tatara-memory #47 incident: HTTP 499 client-abort -> ingest pods
+// Errored).
+func TestBuildJob_HTTPTimeoutEnv(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	v := envValue(main, "HTTP_TIMEOUT")
+	if v != "300s" {
+		t.Errorf("HTTP_TIMEOUT = %q, want 300s", v)
+	}
+}
+
 // TestBuildJob_ShellInjectionURLNotInCmd verifies that a URL containing
 // shell metacharacters is NOT interpolated into the clone command string.
 func TestBuildJob_ShellInjectionURLNotInCmd(t *testing.T) {
