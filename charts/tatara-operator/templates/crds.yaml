@@ -1,0 +1,6 @@
+{{- if .Values.installCRDs }}
+{{- range $path, $_ := .Files.Glob "crd-bases/tatara.dev_*.yaml" }}
+{{ $.Files.Get $path | replace "  annotations:\n    controller-gen.kubebuilder.io/version:" "  annotations:\n    helm.sh/resource-policy: keep\n    controller-gen.kubebuilder.io/version:" }}
+---
+{{- end }}
+{{- end }}

@@ -16,7 +16,7 @@ ENVTEST_VERSION ?= release-0.21
 ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)
 ENVTEST_K8S_VERSION ?= 1.33.0
 
-CHART_CRD_DIR := charts/tatara-operator/crds
+CHART_CRD_DIR := charts/tatara-operator/crd-bases
 
 # Resolve helm binary via mise to avoid homebrew helm 4.x shadow.
 HELM_BIN := $(shell mise exec -- bash -c 'echo $$PATH' 2>/dev/null | tr ':' '\n' | grep -m1 'mise/installs/helm/' || true)
@@ -72,6 +72,11 @@ image:
 
 chart-lint:
 	$(HELM_BIN) lint charts/tatara-operator
+	@n=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'helm.sh/resource-policy: keep'); \
+		if [ "$$n" -ne 5 ]; then \
+			echo "chart-lint: expected 5 tatara.dev CRDs with resource-policy:keep, got $$n (controller-gen format may have shifted, breaking templates/crds.yaml inject)"; \
+			exit 1; \
+		fi
 
 ci: generate manifests lint test
 
