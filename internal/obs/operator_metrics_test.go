@@ -785,3 +785,26 @@ func TestTaskTerminal(t *testing.T) {
 		t.Fatalf("Failed/PodLost = %v, want 2", got)
 	}
 }
+
+func TestSetLightragDocuments(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetLightragDocuments("tatara", "PROCESSED", 130)
+	m.SetLightragDocuments("tatara", "PENDING", 10)
+	// A re-set replaces (gauge), it does not accumulate.
+	m.SetLightragDocuments("tatara", "PROCESSED", 131)
+
+	if got := testutil.ToFloat64(m.lightragDocuments.WithLabelValues("tatara", "PROCESSED")); got != 131 {
+		t.Fatalf("PROCESSED = %v, want 131", got)
+	}
+	if got := testutil.ToFloat64(m.lightragDocuments.WithLabelValues("tatara", "PENDING")); got != 10 {
+		t.Fatalf("PENDING = %v, want 10", got)
+	}
+
+	m.LightragQueryError()
+	m.LightragQueryError()
+	if got := testutil.ToFloat64(m.lightragQueryErrors); got != 2 {
+		t.Fatalf("operator_lightrag_query_errors_total = %v, want 2", got)
+	}
+}

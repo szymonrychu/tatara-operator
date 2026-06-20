@@ -42,6 +42,8 @@ type OperatorMetrics struct {
 	queueInflight             *prometheus.GaugeVec
 	taskTokensTotal           *prometheus.CounterVec
 	taskTerminalTotal         *prometheus.CounterVec
+	lightragDocuments         *prometheus.GaugeVec
+	lightragQueryErrors       prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -206,6 +208,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_task_terminal_total",
 			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
 		}, []string{"kind", "phase", "reason"}),
+		lightragDocuments: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_lightrag_documents",
+			Help: "Documents in each per-project lightrag memory corpus by ingestion status.",
+		}, []string{"project", "status"}),
+		lightragQueryErrors: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_lightrag_query_errors_total",
+			Help: "Failed attempts to read document counts from a project's lightrag.",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -244,6 +254,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.queueInflight,
 		m.taskTokensTotal,
 		m.taskTerminalTotal,
+		m.lightragDocuments,
+		m.lightragQueryErrors,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -529,6 +541,18 @@ func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue string, input
 	if output > 0 {
 		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, "output").Add(float64(output))
 	}
+}
+
+// SetLightragDocuments sets operator_lightrag_documents for a project and
+// ingestion status (e.g. PROCESSED, PENDING, PROCESSING, FAILED) to n.
+func (m *OperatorMetrics) SetLightragDocuments(project, status string, n int) {
+	m.lightragDocuments.WithLabelValues(project, status).Set(float64(n))
+}
+
+// LightragQueryError increments operator_lightrag_query_errors_total: a
+// best-effort read of a project's lightrag document counts failed.
+func (m *OperatorMetrics) LightragQueryError() {
+	m.lightragQueryErrors.Inc()
 }
 
 // TaskTerminal increments operator_task_terminal_total for a Task reaching a
