@@ -154,14 +154,34 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 		}
 		commentRef := task.Spec.Source.IssueRef
 		// For bot-PR-entry tasks the binder sets IssueRef to "owner/repo#N" (the PR
-		// ref). In the rare case it is empty, fall back to URL from lifecyclePR so
-		// the park is never silent.
+		// ref). In the rare case it is empty, build a proper sigil ref so the SCM
+		// driver can route to the correct endpoint.  GitLab's Comment() requires
+		// "group/proj!iid" (MR) or "group/proj#iid" (issue); a bare web URL has no
+		// sigil and causes glBangRef/glHashRef to return "malformed ref", silently
+		// losing the park comment.  Match the pattern used by writeBackReview and
+		// createScanTask throughout the controller.
 		if commentRef == "" && task.Spec.Source.IsPR {
-			_, prURL := lifecyclePR(task)
-			if prURL == "" {
-				prURL = task.Spec.Source.URL
+			number, _ := lifecyclePR(task)
+			if number > 0 {
+				repoURL := r.repoURLForTask(ctx, task)
+				if slug, _, serr := repoSlugFromURL(repoURL, provider); serr == nil && slug != "" {
+					sep := "#"
+					if provider == "gitlab" {
+						sep = "!"
+					}
+					commentRef = fmt.Sprintf("%s%s%d", slug, sep, number)
+				}
 			}
-			commentRef = prURL
+			// If slug derivation failed or number is unknown, fall back to the PR web
+			// URL. This is still wrong for GitLab (will be non-fatal logged), but it
+			// avoids silencing the comment on every provider.
+			if commentRef == "" {
+				if _, prURL := lifecyclePR(task); prURL != "" {
+					commentRef = prURL
+				} else {
+					commentRef = task.Spec.Source.URL
+				}
+			}
 		}
 		if commentRef != "" {
 			cerr := writer.Comment(ctx, token, commentRef, msg)

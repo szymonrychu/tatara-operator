@@ -176,6 +176,9 @@ func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1
 	return changed, nil
 }
 
+// +kubebuilder:rbac:groups=tatara.dev,resources=queuedevents,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tatara.dev,resources=queuedevents/status,verbs=get;update;patch
+
 func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var qe tatarav1alpha1.QueuedEvent
 	if err := r.Get(ctx, req.NamespacedName, &qe); err != nil {
