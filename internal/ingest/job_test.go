@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 
@@ -42,6 +43,7 @@ func testConfig() Config {
 		ImagePullSecret:  "regcred",
 		OpenAISecretName: "tatara-openai",
 		SemanticModel:    "gpt-4o-mini",
+		CallbackURL:      "http://tatara-operator-internal.tatara.svc:8082",
 	}
 }
 
@@ -310,6 +312,47 @@ func TestBuildJob_SemanticModelEnv(t *testing.T) {
 	main := job.Spec.Template.Spec.Containers[0]
 	if v := envValue(main, "SEMANTIC_MODEL"); v != "gpt-4o-mini" {
 		t.Errorf("SEMANTIC_MODEL = %q, want gpt-4o-mini", v)
+	}
+}
+
+// TestBuildJob_MetricsPushURL verifies the ingest Job is wired to push its
+// Prometheus metrics to the operator's pushmetrics receiver: METRICS_PUSH_URL
+// must be the receiver path with run_id (the Job name, so retries overwrite one
+// run's series) and job=tatara-ingest already in the query string, since the
+// ingester POSTs the URL verbatim without adding query parameters.
+func TestBuildJob_MetricsPushURL(t *testing.T) {
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
+	main := job.Spec.Template.Spec.Containers[0]
+	raw := envValue(main, "METRICS_PUSH_URL")
+	if raw == "" {
+		t.Fatal("METRICS_PUSH_URL must be set when CallbackURL is configured")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("METRICS_PUSH_URL %q is not a valid URL: %v", raw, err)
+	}
+	if u.Scheme+"://"+u.Host+u.Path != "http://tatara-operator-internal.tatara.svc:8082/internal/metrics/push" {
+		t.Errorf("METRICS_PUSH_URL base = %q, want operator receiver path", u.Scheme+"://"+u.Host+u.Path)
+	}
+	if got := u.Query().Get("run_id"); got != job.Name {
+		t.Errorf("METRICS_PUSH_URL run_id = %q, want job name %q", got, job.Name)
+	}
+	if got := u.Query().Get("job"); got != "tatara-ingest" {
+		t.Errorf("METRICS_PUSH_URL job = %q, want tatara-ingest", got)
+	}
+}
+
+// TestBuildJob_MetricsPushURLOmittedWhenCallbackUnset verifies the env is
+// omitted (push is a no-op in the ingester) when CallbackURL is not configured.
+func TestBuildJob_MetricsPushURLOmittedWhenCallbackUnset(t *testing.T) {
+	cfg := testConfig()
+	cfg.CallbackURL = ""
+	job := BuildJob(testProject(), testRepository(), "", testBaseURL, cfg)
+	main := job.Spec.Template.Spec.Containers[0]
+	for _, e := range main.Env {
+		if e.Name == "METRICS_PUSH_URL" {
+			t.Fatal("METRICS_PUSH_URL must be omitted when CallbackURL is unset")
+		}
 	}
 }
 
