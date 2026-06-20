@@ -189,6 +189,16 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, nil
 }
 
+func queuedAutonomousCount(qes []tatarav1alpha1.QueuedEvent) int {
+	n := 0
+	for i := range qes {
+		if qes[i].Spec.Autonomous && qes[i].Status.State == tatarav1alpha1.QueueStateQueued {
+			n++
+		}
+	}
+	return n
+}
+
 func filterQEsByProject(in []tatarav1alpha1.QueuedEvent, project string) []tatarav1alpha1.QueuedEvent {
 	out := make([]tatarav1alpha1.QueuedEvent, 0)
 	for i := range in {

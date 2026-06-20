@@ -92,7 +92,47 @@ func mkScanRepo(t *testing.T, project, name, url string) tatarav1alpha1.Reposito
 	return *rp
 }
 
+func listScanQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	var list tatarav1alpha1.QueuedEventList
+	if err := k8sClient.List(context.Background(), &list); err != nil {
+		t.Fatalf("list QEs: %v", err)
+	}
+	var out []tatarav1alpha1.QueuedEvent
+	for i := range list.Items {
+		if list.Items[i].Spec.ProjectRef == project {
+			out = append(out, list.Items[i])
+		}
+	}
+	return out
+}
+
+func listBrainstormQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	qes := listScanQEs(t, project)
+	var out []tatarav1alpha1.QueuedEvent
+	for _, qe := range qes {
+		if qe.Spec.Payload.Labels[labelActivity] == "brainstorm" {
+			out = append(out, qe)
+		}
+	}
+	return out
+}
+
+func listHealthCheckQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	qes := listScanQEs(t, project)
+	var out []tatarav1alpha1.QueuedEvent
+	for _, qe := range qes {
+		if qe.Spec.Payload.Labels[labelActivity] == "healthCheck" {
+			out = append(out, qe)
+		}
+	}
+	return out
+}
+
 func TestIssueScan_PerRepoTopUp(t *testing.T) {
+	// Per-repo cap is gone: all 4 eligible issues get QEs; backlog=false.
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "fanout-iss", cron)
 	repos := []tatarav1alpha1.Repository{
@@ -110,16 +150,12 @@ func TestIssueScan_PerRepoTopUp(t *testing.T) {
 
 	b := 99
 	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
-	if !backlog {
-		t.Fatalf("want backlog=true (2 of 4 issues remain after per-repo top-up)")
+	if backlog {
+		t.Fatalf("want backlog=false (no per-repo cap; all 4 issues enqueued)")
 	}
-	tasks := listScanTasks(t, "fanout-iss")
-	bySlug := map[string]int{}
-	for i := range tasks {
-		bySlug[tasks[i].Labels[labelSourceRepo]]++
-	}
-	if len(tasks) != 2 || bySlug[sanitizeRepoLabel("o/a")] != 1 || bySlug[sanitizeRepoLabel("o/b")] != 1 {
-		t.Fatalf("want 1 task per repo (o/a, o/b), got %d tasks: %v", len(tasks), bySlug)
+	qes := listScanQEs(t, "fanout-iss")
+	if len(qes) != 4 {
+		t.Fatalf("want 4 QEs (all 4 issues enqueued without per-repo cap), got %d", len(qes))
 	}
 }
 
@@ -137,13 +173,13 @@ func TestIssueScan_PropagatesAuthorToTaskSource(t *testing.T) {
 
 	b := 99
 	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
-	tasks := listScanTasks(t, "iss-author")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 task, got %d", len(tasks))
+	qes := listScanQEs(t, "iss-author")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
-	src := tasks[0].Spec.Source
+	src := qes[0].Spec.Payload.Source
 	if src == nil || src.AuthorLogin != "third-party-dev" {
-		t.Fatalf("want Source.AuthorLogin=third-party-dev, got %+v", src)
+		t.Fatalf("want Payload.Source.AuthorLogin=third-party-dev, got %+v", src)
 	}
 }
 
@@ -161,11 +197,12 @@ func TestCandidatesFromIssues_CarriesAuthor(t *testing.T) {
 }
 
 func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
+	// Per-repo lane cap is gone. Issue #1 is deduped (non-terminal Task for it).
+	// Issue #2 is NOT blocked -> gets a QE. backlog=false (eligible=1, created=1).
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "fanout-hold", cron)
 	repoA := mkScanRepo(t, "fanout-hold", "fanout-hold-a", "https://github.com/o/a.git")
 
-	// issueLifecycle (not triageIssue) holds the lane for the new binder.
 	pre := &tatarav1alpha1.Task{}
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
@@ -178,23 +215,32 @@ func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	reader := &fakeReader{issues: []scm.IssueRef{
-		{Repo: "o/a", Number: 1, UpdatedAt: time.Unix(100, 0)}, // in-flight (deduped)
-		{Repo: "o/a", Number: 2, UpdatedAt: time.Unix(200, 0)}, // blocked by the held lane
+		{Repo: "o/a", Number: 1, UpdatedAt: time.Unix(100, 0)}, // in-flight -> deduped
+		{Repo: "o/a", Number: 2, UpdatedAt: time.Unix(200, 0)}, // eligible -> gets QE
 	}}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	b2 := 99
 	backlog, _ := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
-	if !backlog {
-		t.Fatalf("want backlog=true (#2 blocked by the Running #1 lane)")
+	if backlog {
+		t.Fatalf("want backlog=false (#1 deduped, #2 gets QE)")
 	}
+	// 1 pre-existing Task + 1 new QE for #2.
 	if tasks := listScanTasks(t, "fanout-hold"); len(tasks) != 1 {
-		t.Fatalf("want only the pre-existing task (lane held by Running #1), got %d", len(tasks))
+		t.Fatalf("want only pre-existing task (no new Tasks; scan creates QEs), got %d tasks", len(tasks))
+	}
+	qes := listScanQEs(t, "fanout-hold")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 new QE for #2, got %d", len(qes))
+	}
+	if qes[0].Spec.Payload.Source == nil || qes[0].Spec.Payload.Source.Number != 2 {
+		t.Fatalf("QE source = %+v, want number=2", qes[0].Spec.Payload.Source)
 	}
 }
 
 func TestMRScan_PerRepoTopUp(t *testing.T) {
+	// Per-repo cap is gone: all 4 eligible PRs get QEs; backlog=false.
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "fanout-mr", cron)
 	repos := []tatarav1alpha1.Repository{
@@ -202,9 +248,9 @@ func TestMRScan_PerRepoTopUp(t *testing.T) {
 		mkScanRepo(t, "fanout-mr", "fanout-mr-b", "https://github.com/o/b.git"),
 	}
 	reader := &fakeReader{prs: []scm.PRRef{
-		{Repo: "o/a", Number: 1, Author: "tatara-bot", UpdatedAt: time.Unix(100, 0)}, // o/a stalest -> issueLifecycle/MRCI
+		{Repo: "o/a", Number: 1, Author: "tatara-bot", UpdatedAt: time.Unix(100, 0)},
 		{Repo: "o/a", Number: 2, Author: "human", UpdatedAt: time.Unix(200, 0)},
-		{Repo: "o/b", Number: 3, Author: "human", UpdatedAt: time.Unix(100, 0)}, // o/b stalest -> review
+		{Repo: "o/b", Number: 3, Author: "human", UpdatedAt: time.Unix(100, 0)},
 		{Repo: "o/b", Number: 4, Author: "tatara-bot", UpdatedAt: time.Unix(200, 0)},
 	}}
 	r := newScanReconciler(reader)
@@ -212,19 +258,18 @@ func TestMRScan_PerRepoTopUp(t *testing.T) {
 
 	b3 := 99
 	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b3)
-	if !backlog {
-		t.Fatalf("want backlog=true (2 of 4 PRs remain after per-repo top-up)")
+	if backlog {
+		t.Fatalf("want backlog=false (no per-repo cap; all 4 PRs enqueued)")
 	}
-	tasks := listScanTasks(t, "fanout-mr")
-	bySlug := map[string]int{}
-	for i := range tasks {
-		bySlug[tasks[i].Labels[labelSourceRepo]]++
-		if k := tasks[i].Spec.Kind; k != "review" && k != "issueLifecycle" {
-			t.Fatalf("unexpected kind %q", k)
+	qes := listScanQEs(t, "fanout-mr")
+	if len(qes) != 4 {
+		t.Fatalf("want 4 QEs (all 4 PRs enqueued), got %d", len(qes))
+	}
+	for _, qe := range qes {
+		k := qe.Spec.Kind
+		if k != "review" && k != "issueLifecycle" {
+			t.Fatalf("unexpected QE kind %q", k)
 		}
-	}
-	if len(tasks) != 2 || bySlug[sanitizeRepoLabel("o/a")] != 1 || bySlug[sanitizeRepoLabel("o/b")] != 1 {
-		t.Fatalf("want 1 mr task per repo (o/a, o/b), got %d tasks: %v", len(tasks), bySlug)
 	}
 }
 
@@ -243,13 +288,13 @@ func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
 	if _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
-	tasks := listScanTasks(t, "mrscan-proj")
-	if len(tasks) != 2 {
-		t.Fatalf("want 2 tasks, got %d", len(tasks))
+	qes := listScanQEs(t, "mrscan-proj")
+	if len(qes) != 2 {
+		t.Fatalf("want 2 QEs, got %d", len(qes))
 	}
 	kinds := map[string]bool{}
-	for _, tk := range tasks {
-		kinds[tk.Spec.Kind] = true
+	for _, qe := range qes {
+		kinds[qe.Spec.Kind] = true
 	}
 	if !kinds["issueLifecycle"] || !kinds["review"] {
 		t.Fatalf("want review+issueLifecycle kinds, got %+v", kinds)
@@ -262,6 +307,7 @@ func TestRunScans_MRScanCreatesReviewAndSelfImprove(t *testing.T) {
 }
 
 func TestRunScans_IssueScanCap(t *testing.T) {
+	// MaxPerRepo=1 is now ignored; both issues get QEs (bounded only by autonomous cap).
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 1}}
 	proj, _ := seedScanProject(t, "issuescan-proj", cron)
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
@@ -275,12 +321,14 @@ func TestRunScans_IssueScanCap(t *testing.T) {
 	if _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
-	tasks := listScanTasks(t, "issuescan-proj")
-	if len(tasks) != 1 {
-		t.Fatalf("cap=1 should create 1 task, got %d", len(tasks))
+	qes := listScanQEs(t, "issuescan-proj")
+	if len(qes) != 2 {
+		t.Fatalf("both issues should be enqueued (no per-repo cap), got %d QEs", len(qes))
 	}
-	if tasks[0].Spec.Kind != "issueLifecycle" {
-		t.Fatalf("kind = %q, want issueLifecycle", tasks[0].Spec.Kind)
+	for _, qe := range qes {
+		if qe.Spec.Kind != "issueLifecycle" {
+			t.Fatalf("QE kind = %q, want issueLifecycle", qe.Spec.Kind)
+		}
 	}
 }
 
@@ -412,31 +460,24 @@ func TestRunScans_DedupBeforeCap(t *testing.T) {
 		t.Fatalf("runScans: %v", err)
 	}
 
-	// Exactly 1 new task must be created (for #11, not #10).
+	// Exactly 1 new QE must be created (for #11, not #10).
+	// Pre-existing Task for #10 is not a QE; check tasks still contains only pre.
 	tasks := listScanTasks(t, "dedupbefore-proj")
-	newTasks := 0
-	for _, tk := range tasks {
-		if tk.Name != pre.Name {
-			newTasks++
-			if tk.Spec.Source == nil || tk.Spec.Source.Number != 11 {
-				t.Fatalf("expected new task for #11, got source=%+v", tk.Spec.Source)
-			}
-		}
+	if len(tasks) != 1 || tasks[0].Name != pre.Name {
+		t.Fatalf("want only pre-existing task, got %d tasks", len(tasks))
 	}
-	if newTasks != 1 {
-		t.Fatalf("want exactly 1 new task for #11, got %d new tasks (total %d)", newTasks, len(tasks))
+	qes := listScanQEs(t, "dedupbefore-proj")
+	if len(qes) != 1 {
+		t.Fatalf("want exactly 1 new QE for #11, got %d", len(qes))
+	}
+	if qes[0].Spec.Payload.Source == nil || qes[0].Spec.Payload.Source.Number != 11 {
+		t.Fatalf("expected QE for #11, got source=%+v", qes[0].Spec.Payload.Source)
 	}
 
 	// skipped_dedup must be incremented for #10.
 	dedupCount := counterValue(t, reg, "tatara_scan_items_total", map[string]string{"activity": "issueScan", "outcome": "skipped_dedup"})
 	if dedupCount < 1 {
 		t.Fatalf("skipped_dedup counter = %v, want >= 1", dedupCount)
-	}
-
-	// skipped_cap must be 0 (eligible=1 item after dedup, cap=1 -> no truncation).
-	capCount := counterValue(t, reg, "tatara_scan_items_total", map[string]string{"activity": "issueScan", "outcome": "skipped_cap"})
-	if capCount != 0 {
-		t.Fatalf("skipped_cap counter = %v, want 0", capCount)
 	}
 }
 
@@ -463,9 +504,12 @@ func TestRunScans_DedupSkipsInFlight(t *testing.T) {
 	if _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
-	// only the pre-existing one; no new task for #10
+	// only the pre-existing task; no new QE for #10 (deduped by running Task)
 	if n := len(listScanTasks(t, "dedup-proj")); n != 1 {
 		t.Fatalf("dedup failed: want 1 task, got %d", n)
+	}
+	if n := len(listScanQEs(t, "dedup-proj")); n != 0 {
+		t.Fatalf("dedup failed: want 0 QEs for in-flight issue, got %d", n)
 	}
 }
 
@@ -551,7 +595,7 @@ func listBrainstormTasks(t *testing.T, project string) []tatarav1alpha1.Task {
 }
 
 // TestBrainstorm_UnderCap_CreatesOneProjectTask: 2 repos, 0 proposals each ->
-// exactly ONE brainstorm task (project-level, not per-repo).
+// exactly ONE brainstorm QueuedEvent (project-level, not per-repo).
 func TestBrainstorm_UnderCap_CreatesOneProjectTask(t *testing.T) {
 	proj, repos := seedBrainstormProject(t, "bs-undercap", []string{"o/a", "o/b"}, 3)
 	reader := &perRepoFakeReader{
@@ -567,10 +611,10 @@ func TestBrainstorm_UnderCap_CreatesOneProjectTask(t *testing.T) {
 	bbs := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs)
 
-	tasks := listBrainstormTasks(t, "bs-undercap")
-	// Project-level: one task per cycle, not one per repo.
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task (project-level), got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-undercap")
+	// Project-level: one QE per cycle, not one per repo.
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE (project-level), got %d", len(qes))
 	}
 }
 
@@ -594,9 +638,9 @@ func TestBrainstorm_AtCap_SkipsRepo(t *testing.T) {
 	bbs2 := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs2)
 
-	tasks := listBrainstormTasks(t, "bs-atcap")
-	if len(tasks) != 0 {
-		t.Fatalf("want 0 brainstorm tasks (at cap), got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-atcap")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 brainstorm QEs (at cap), got %d", len(qes))
 	}
 }
 
@@ -631,9 +675,14 @@ func TestBrainstorm_InFlight_SkipsRepo(t *testing.T) {
 	bbs3 := 99
 	r.brainstorm(context.Background(), proj, reader, repos, existing, act, &bbs3)
 
+	// Pre-existing Task with labelActivity=brainstorm blocks new QE (in-flight guard).
 	tasks := listBrainstormTasks(t, "bs-inflight")
 	if len(tasks) != 1 {
-		t.Fatalf("want 1 task (pre-existing only, in-flight guard), got %d", len(tasks))
+		t.Fatalf("want 1 pre-existing task (in-flight guard blocks new QE), got %d", len(tasks))
+	}
+	qes := listBrainstormQEs(t, "bs-inflight")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 new QEs (in-flight guard), got %d", len(qes))
 	}
 }
 
@@ -656,14 +705,14 @@ func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 	bbs4 := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs4)
 
-	tasks := listBrainstormTasks(t, "bs-isolate")
-	// One project-level task is still created; the backlog error for e is non-fatal.
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task (backlog error non-fatal), got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-isolate")
+	// One project-level QE is still created; the backlog error for e is non-fatal.
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE (backlog error non-fatal), got %d", len(qes))
 	}
-	// Project-scoped: no single primary repo pinned.
-	if tasks[0].Spec.RepositoryRef != "" {
-		t.Fatalf("brainstorm task RepositoryRef = %q, want empty (project-scoped)", tasks[0].Spec.RepositoryRef)
+	// Project-scoped: RepositoryRef must be empty.
+	if qes[0].Spec.RepositoryRef != "" {
+		t.Fatalf("brainstorm QE RepositoryRef = %q, want empty (project-scoped)", qes[0].Spec.RepositoryRef)
 	}
 	_ = repos // repos used for setup only
 }

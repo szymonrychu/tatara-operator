@@ -5,12 +5,13 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 func newScanReconciler(reader scm.SCMReader) *ProjectReconciler {
 	r := newProjectReconciler()
+	r.Alloc = queue.NewSeqAllocator()
 	r.ReaderFor = func(string, string) (scm.SCMReader, error) { return reader, nil }
 	return r
 }
@@ -36,27 +37,40 @@ func TestCreateScanTask(t *testing.T) {
 
 	r := newScanReconciler(nil)
 	c := candidate{repo: "o/r", number: 5, headSHA: "abc", isPR: true}
-	created, err := r.createScanTask(ctx, proj, repo, c, c, "mrScan", "review", "review PR o/r#5", nil)
+	ok, err := r.createScanTask(ctx, proj, repo, c, c, "mrScan", "review", "review PR o/r#5", nil)
 	if err != nil {
 		t.Fatalf("createScanTask: %v", err)
 	}
+	if !ok {
+		t.Fatalf("createScanTask: want created=true")
+	}
 
-	got := &tatarav1alpha1.Task{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: created.Name}, got); err != nil {
-		t.Fatalf("get created task: %v", err)
+	var qel tatarav1alpha1.QueuedEventList
+	if err := k8sClient.List(ctx, &qel); err != nil {
+		t.Fatalf("list QEs: %v", err)
 	}
-	if got.Spec.Kind != "review" || got.Spec.ProjectRef != "factory-proj" || got.Spec.RepositoryRef != "factory-repo" {
-		t.Fatalf("task spec = %+v", got.Spec)
+	var got *tatarav1alpha1.QueuedEvent
+	for i := range qel.Items {
+		if qel.Items[i].Spec.ProjectRef == "factory-proj" {
+			got = &qel.Items[i]
+			break
+		}
 	}
-	if got.Labels[labelSourceRepo] != "o.r" || got.Labels[labelSourceNumber] != "5" || got.Labels[labelHeadSHA] != "abc" || got.Labels[labelActivity] != "mrScan" {
-		t.Fatalf("task labels = %+v", got.Labels)
+	if got == nil {
+		t.Fatalf("no QueuedEvent created for factory-proj")
 	}
-	if got.Spec.Source == nil || got.Spec.Source.Number != 5 || !got.Spec.Source.IsPR || got.Spec.Source.Provider != "github" {
-		t.Fatalf("task source = %+v", got.Spec.Source)
+	if got.Spec.Kind != "review" || got.Spec.RepositoryRef != "factory-repo" {
+		t.Fatalf("QE spec = %+v", got.Spec)
 	}
-	// GitHub PRs and issues share /issues/{n}/comments, so the ref keeps '#'.
-	if got.Spec.Source.IssueRef != "o/r#5" {
-		t.Fatalf("github PR ref = %q, want o/r#5", got.Spec.Source.IssueRef)
+	if got.Spec.Payload.Labels[labelSourceRepo] != "o.r" || got.Spec.Payload.Labels[labelSourceNumber] != "5" || got.Spec.Payload.Labels[labelHeadSHA] != "abc" || got.Spec.Payload.Labels[labelActivity] != "mrScan" {
+		t.Fatalf("QE payload labels = %+v", got.Spec.Payload.Labels)
+	}
+	src := got.Spec.Payload.Source
+	if src == nil || src.Number != 5 || !src.IsPR || src.Provider != "github" {
+		t.Fatalf("QE source = %+v", src)
+	}
+	if src.IssueRef != "o/r#5" {
+		t.Fatalf("github PR ref = %q, want o/r#5", src.IssueRef)
 	}
 }
 
@@ -83,29 +97,58 @@ func TestCreateScanTaskGitLabMR(t *testing.T) {
 
 	// MR candidate: ref must use '!' so write-back lands on the MR.
 	mr := candidate{repo: "g/p", number: 42, isPR: true}
-	created, err := r.createScanTask(ctx, proj, repo, mr, mr, "mrScan", "review", "review MR g/p!42", nil)
+	ok, err := r.createScanTask(ctx, proj, repo, mr, mr, "mrScan", "review", "review MR g/p!42", nil)
 	if err != nil {
 		t.Fatalf("createScanTask MR: %v", err)
 	}
-	got := &tatarav1alpha1.Task{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: created.Name}, got); err != nil {
-		t.Fatalf("get created MR task: %v", err)
+	if !ok {
+		t.Fatalf("createScanTask MR: want created=true")
 	}
-	if got.Spec.Source == nil || !got.Spec.Source.IsPR || got.Spec.Source.IssueRef != "g/p!42" {
-		t.Fatalf("gitlab MR ref = %q, want g/p!42 (source=%+v)", got.Spec.Source.IssueRef, got.Spec.Source)
+
+	var qel tatarav1alpha1.QueuedEventList
+	if err := k8sClient.List(ctx, &qel); err != nil {
+		t.Fatalf("list QEs: %v", err)
+	}
+	var mrQE *tatarav1alpha1.QueuedEvent
+	for i := range qel.Items {
+		if qel.Items[i].Spec.ProjectRef == "factory-gl-proj" && qel.Items[i].Spec.Payload.Source != nil && qel.Items[i].Spec.Payload.Source.IsPR {
+			mrQE = &qel.Items[i]
+			break
+		}
+	}
+	if mrQE == nil {
+		t.Fatalf("no MR QueuedEvent found for factory-gl-proj")
+	}
+	src := mrQE.Spec.Payload.Source
+	if src == nil || !src.IsPR || src.IssueRef != "g/p!42" {
+		t.Fatalf("gitlab MR ref = %q, want g/p!42 (source=%+v)", src.IssueRef, src)
 	}
 
 	// Issue candidate on GitLab keeps '#'.
 	iss := candidate{repo: "g/p", number: 7, isPR: false}
-	created2, err := r.createScanTask(ctx, proj, repo, iss, iss, "issueScan", "triageIssue", "triage issue g/p#7", nil)
+	ok2, err := r.createScanTask(ctx, proj, repo, iss, iss, "issueScan", "issueLifecycle", "triage issue g/p#7", nil)
 	if err != nil {
 		t.Fatalf("createScanTask issue: %v", err)
 	}
-	got2 := &tatarav1alpha1.Task{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: created2.Name}, got2); err != nil {
-		t.Fatalf("get created issue task: %v", err)
+	if !ok2 {
+		t.Fatalf("createScanTask issue: want created=true")
 	}
-	if got2.Spec.Source == nil || got2.Spec.Source.IsPR || got2.Spec.Source.IssueRef != "g/p#7" {
-		t.Fatalf("gitlab issue ref = %q, want g/p#7 (source=%+v)", got2.Spec.Source.IssueRef, got2.Spec.Source)
+
+	if err := k8sClient.List(ctx, &qel); err != nil {
+		t.Fatalf("list QEs 2: %v", err)
+	}
+	var issQE *tatarav1alpha1.QueuedEvent
+	for i := range qel.Items {
+		if qel.Items[i].Spec.ProjectRef == "factory-gl-proj" && qel.Items[i].Spec.Payload.Source != nil && !qel.Items[i].Spec.Payload.Source.IsPR {
+			issQE = &qel.Items[i]
+			break
+		}
+	}
+	if issQE == nil {
+		t.Fatalf("no issue QueuedEvent found for factory-gl-proj")
+	}
+	src2 := issQE.Spec.Payload.Source
+	if src2 == nil || src2.IsPR || src2.IssueRef != "g/p#7" {
+		t.Fatalf("gitlab issue ref = %q, want g/p#7 (source=%+v)", src2.IssueRef, src2)
 	}
 }

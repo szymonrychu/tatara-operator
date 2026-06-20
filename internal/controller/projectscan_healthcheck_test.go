@@ -86,16 +86,16 @@ func TestHealthCheck_UnderCap_CreatesOneProjectTask(t *testing.T) {
 	b := 99
 	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
 
-	tasks := listHealthCheckTasks(t, "hc-undercap")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 healthCheck task (project-level), got %d", len(tasks))
+	qes := listHealthCheckQEs(t, "hc-undercap")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 healthCheck QE (project-level), got %d", len(qes))
 	}
-	tk := tasks[0]
-	if tk.Spec.Kind != "brainstorm" {
-		t.Fatalf("healthCheck task Kind = %q, want brainstorm (reused)", tk.Spec.Kind)
+	qe := qes[0]
+	if qe.Spec.Kind != "brainstorm" {
+		t.Fatalf("healthCheck QE Kind = %q, want brainstorm (reused)", qe.Spec.Kind)
 	}
-	if !strings.Contains(tk.Spec.Goal, "tatara-health-check") {
-		t.Fatalf("healthCheck goal does not invoke tatara-health-check skill: %s", tk.Spec.Goal)
+	if !strings.Contains(qe.Spec.Payload.Goal, "tatara-health-check") {
+		t.Fatalf("healthCheck goal does not invoke tatara-health-check skill: %s", qe.Spec.Payload.Goal)
 	}
 }
 
@@ -119,8 +119,8 @@ func TestHealthCheck_AtCap_SkipsRepo(t *testing.T) {
 	b := 99
 	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
 
-	if tasks := listHealthCheckTasks(t, "hc-atcap"); len(tasks) != 0 {
-		t.Fatalf("want 0 healthCheck tasks (at cap), got %d", len(tasks))
+	if qes := listHealthCheckQEs(t, "hc-atcap"); len(qes) != 0 {
+		t.Fatalf("want 0 healthCheck QEs (at cap), got %d", len(qes))
 	}
 }
 
@@ -156,6 +156,9 @@ func TestHealthCheck_InFlight_SkipsRepo(t *testing.T) {
 	if tasks := listHealthCheckTasks(t, "hc-inflight"); len(tasks) != 1 {
 		t.Fatalf("want 1 task (pre-existing only, in-flight guard), got %d", len(tasks))
 	}
+	if qes := listHealthCheckQEs(t, "hc-inflight"); len(qes) != 0 {
+		t.Fatalf("want 0 new QEs (in-flight guard), got %d", len(qes))
+	}
 }
 
 // TestHealthCheck_DoesNotBlockBrainstorm: an in-flight brainstorm Task must NOT
@@ -181,8 +184,8 @@ func TestHealthCheck_DoesNotBlockBrainstorm(t *testing.T) {
 	b := 99
 	r.healthCheck(context.Background(), proj, reader, repos, []tatarav1alpha1.Task{*bs}, act, &b)
 
-	if tasks := listHealthCheckTasks(t, "hc-indep"); len(tasks) != 1 {
-		t.Fatalf("want 1 healthCheck task (brainstorm in-flight must not block), got %d", len(tasks))
+	if qes := listHealthCheckQEs(t, "hc-indep"); len(qes) != 1 {
+		t.Fatalf("want 1 healthCheck QE (brainstorm in-flight must not block), got %d", len(qes))
 	}
 }
 
@@ -215,8 +218,8 @@ func TestRunScans_HealthCheckStampsLastHealthCheck(t *testing.T) {
 		t.Fatalf("runScans: %v", err)
 	}
 
-	if tasks := listHealthCheckTasks(t, "hc-stamp"); len(tasks) != 1 {
-		t.Fatalf("want 1 healthCheck task created by runScans, got %d", len(tasks))
+	if qes := listHealthCheckQEs(t, "hc-stamp"); len(qes) != 1 {
+		t.Fatalf("want 1 healthCheck QE created by runScans, got %d", len(qes))
 	}
 	var got tatarav1alpha1.Project
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "hc-stamp"}, &got); err != nil {

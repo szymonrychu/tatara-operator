@@ -13,7 +13,7 @@ import (
 )
 
 // TestBindersNeverCreateTriageIssueOrSelfImprove asserts that neither issueScan
-// nor mrScan creates Tasks with Kind=triageIssue or Kind=selfImprove. These kinds
+// nor mrScan creates QEs with Kind=triageIssue or Kind=selfImprove. These kinds
 // are kept as reachable writeback arms for in-flight migration safety, but no new
 // binder creates them.
 func TestBindersNeverCreateTriageIssueOrSelfImprove(t *testing.T) {
@@ -44,24 +44,24 @@ func TestBindersNeverCreateTriageIssueOrSelfImprove(t *testing.T) {
 	b = 99
 	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b)
 
-	tasks := listScanTasks(t, "noleak-proj")
-	for _, tk := range tasks {
-		if tk.Spec.Kind == "triageIssue" {
-			t.Errorf("binder created triageIssue task %s - binders must not create this kind", tk.Name)
+	qes := listScanQEs(t, "noleak-proj")
+	for _, qe := range qes {
+		if qe.Spec.Kind == "triageIssue" {
+			t.Errorf("binder created triageIssue QE %s - binders must not create this kind", qe.Name)
 		}
-		if tk.Spec.Kind == "selfImprove" {
-			t.Errorf("binder created selfImprove task %s - binders must not create this kind", tk.Name)
+		if qe.Spec.Kind == "selfImprove" {
+			t.Errorf("binder created selfImprove QE %s - binders must not create this kind", qe.Name)
 		}
 	}
 	// Verify the expected new kinds are present
 	kinds := map[string]int{}
-	for _, tk := range tasks {
-		kinds[tk.Spec.Kind]++
+	for _, qe := range qes {
+		kinds[qe.Spec.Kind]++
 	}
 	if kinds["issueLifecycle"] == 0 {
-		t.Errorf("expected issueLifecycle tasks from binders, got kinds: %v", kinds)
+		t.Errorf("expected issueLifecycle QEs from binders, got kinds: %v", kinds)
 	}
 	if kinds["review"] == 0 {
-		t.Errorf("expected review task from human PR, got kinds: %v", kinds)
+		t.Errorf("expected review QE from human PR, got kinds: %v", kinds)
 	}
 }

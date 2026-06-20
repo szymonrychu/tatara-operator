@@ -57,13 +57,13 @@ func TestBackstopRecoversImplementationOrphanToImplement(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-impl")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 recovery task, got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-impl")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 recovery QE, got %d", len(qes))
 	}
-	tk := tasks[0]
-	if tk.Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "Implement" {
-		t.Fatalf("entry = %q, want Implement", tk.Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
+	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+	if entry != "Implement" {
+		t.Fatalf("entry = %q, want Implement", entry)
 	}
 	if budget != 2 {
 		t.Fatalf("budget = %d, want 2", budget)
@@ -84,12 +84,13 @@ func TestBackstopRecoversBrainstormingOrphanToTriage(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-bs")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 recovery task, got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-bs")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 recovery QE, got %d", len(qes))
 	}
-	if tasks[0].Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "Triage" {
-		t.Fatalf("entry = %q, want Triage", tasks[0].Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
+	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+	if entry != "Triage" {
+		t.Fatalf("entry = %q, want Triage", entry)
 	}
 }
 
@@ -107,12 +108,13 @@ func TestBackstopRecoversLegacyIdeaOrphanToTriage(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-legacy")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 recovery task, got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-legacy")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 recovery QE, got %d", len(qes))
 	}
-	if tasks[0].Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "Triage" {
-		t.Fatalf("entry = %q, want Triage", tasks[0].Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
+	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+	if entry != "Triage" {
+		t.Fatalf("entry = %q, want Triage", entry)
 	}
 }
 
@@ -145,16 +147,16 @@ func TestBackstopSkipsIssueWithLiveTask(t *testing.T) {
 
 	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	// Pass the pre-existing task but recoverOrphans re-lists, so it will see pre.
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-live")
-	// Only the pre-existing one; no new recovery task.
-	if len(tasks) != 1 {
-		t.Fatalf("want only pre-existing task (live task present), got %d", len(tasks))
+	// Pre-existing live Task blocks; no new QE created.
+	qes := listScanQEs(t, "backstop-live")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 QEs (live task present), got %d", len(qes))
 	}
-	if tasks[0].Name != pre.Name {
-		t.Fatalf("unexpected task %q", tasks[0].Name)
+	tasks := listScanTasks(t, "backstop-live")
+	if len(tasks) != 1 || tasks[0].Name != pre.Name {
+		t.Fatalf("want only pre-existing task, got %d tasks", len(tasks))
 	}
 }
 
@@ -195,12 +197,13 @@ func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-conv")
-	if len(tasks) != 1 {
-		t.Fatalf("want only the pre-existing Conversation task (no duplicate), got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-conv")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 QEs (Conversation task present, no duplicate), got %d", len(qes))
 	}
-	if tasks[0].Name != pre.Name {
-		t.Fatalf("unexpected task %q", tasks[0].Name)
+	tasks := listScanTasks(t, "backstop-conv")
+	if len(tasks) != 1 || tasks[0].Name != pre.Name {
+		t.Fatalf("want only the pre-existing Conversation task, got %d tasks", len(tasks))
 	}
 	if budget != 3 {
 		t.Fatalf("budget should be unchanged (no create), got %d", budget)
@@ -221,9 +224,9 @@ func TestBackstopSkipsDeclined(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-declined")
-	if len(tasks) != 0 {
-		t.Fatalf("declined issue should create no tasks, got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-declined")
+	if len(qes) != 0 {
+		t.Fatalf("declined issue should create no QEs, got %d", len(qes))
 	}
 	if budget != 3 {
 		t.Fatalf("budget should be unchanged for declined, got %d", budget)
@@ -244,9 +247,9 @@ func TestBackstopRespectsBudgetZero(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-budget")
-	if len(tasks) != 0 {
-		t.Fatalf("budget=0 should create no tasks, got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-budget")
+	if len(qes) != 0 {
+		t.Fatalf("budget=0 should create no QEs, got %d", len(qes))
 	}
 }
 
@@ -264,19 +267,20 @@ func TestBackstopApprovedOrphanToImplement(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
 
-	tasks := listScanTasks(t, "backstop-approved")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 recovery task for approved orphan, got %d", len(tasks))
+	qes := listScanQEs(t, "backstop-approved")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 recovery QE for approved orphan, got %d", len(qes))
 	}
-	if tasks[0].Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "Implement" {
-		t.Fatalf("entry = %q, want Implement", tasks[0].Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
+	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+	if entry != "Implement" {
+		t.Fatalf("entry = %q, want Implement", entry)
 	}
 }
 
 // TestRunScans_BackstopFiredAfterIssueScan verifies recoverOrphans is wired into
 // runScans and fires after the issueScan pass when issueScan is due.
 // Scenario: issue has tatara-implementation label and a terminal task (orphan).
-// issueScan dedupes it (managed label present). backstop creates the Implement recovery task.
+// issueScan dedupes it (managed label present). backstop creates the Implement recovery QE.
 func TestRunScans_BackstopFiredAfterIssueScan(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 5}}
 	proj, repo := seedScanProject(t, "backstop-wired", cron)
@@ -300,7 +304,7 @@ func TestRunScans_BackstopFiredAfterIssueScan(t *testing.T) {
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	// Issue has tatara-implementation label -> isDeduped (managed label present) -> issueScan skips.
-	// backstop should create an Implement recovery task.
+	// backstop should create an Implement recovery QE.
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/r": {{Repo: "o/r", Number: 20, Labels: []string{"tatara-implementation"}, UpdatedAt: time.Now()}},
@@ -313,17 +317,12 @@ func TestRunScans_BackstopFiredAfterIssueScan(t *testing.T) {
 		t.Fatalf("runScans: %v", err)
 	}
 
-	tasks := listScanTasks(t, "backstop-wired")
-	newTasks := 0
-	for _, tk := range tasks {
-		if tk.Name != pre.Name {
-			newTasks++
-			if tk.Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "Implement" {
-				t.Fatalf("backstop entry = %q, want Implement", tk.Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
-			}
-		}
+	qes := listScanQEs(t, "backstop-wired")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 backstop recovery QE (Implement), got %d", len(qes))
 	}
-	if newTasks != 1 {
-		t.Fatalf("want 1 backstop recovery task (Implement), got %d new tasks", newTasks)
+	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+	if entry != "Implement" {
+		t.Fatalf("backstop QE entry = %q, want Implement", entry)
 	}
 }

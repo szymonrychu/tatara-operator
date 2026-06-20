@@ -16,6 +16,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/pushmetrics"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
@@ -166,6 +167,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
+		Alloc: queue.NewSeqAllocator(),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup ProjectReconciler: %w", err)
 	}

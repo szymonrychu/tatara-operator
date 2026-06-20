@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -17,14 +18,50 @@ const (
 	LabelDedupKey    = "tatara.dev/dedup-key"
 )
 
+// dedupLabel converts a dedup key into a K8s-label-safe value.
+// K8s label values must match [a-zA-Z0-9][-_.a-zA-Z0-9]* and be <= 63 chars.
+// Keys that contain '/', '#', '\x00', or other unsafe chars are sha256-hashed.
+// Simple alphanumeric keys (e.g. "grp1", "brainstorm-myproj") pass through unchanged.
+func dedupLabel(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 63 && isLabelSafe(key) {
+		return key
+	}
+	h := sha256.Sum256([]byte(key))
+	return fmt.Sprintf("%x", h[:16])
+}
+
+// isLabelSafe returns true when key matches the K8s label-value format:
+// [a-zA-Z0-9][-_.a-zA-Z0-9]* with an optional leading char requirement.
+// Empty string is handled by the caller.
+func isLabelSafe(key string) bool {
+	for i, ch := range key {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+		case ch >= 'A' && ch <= 'Z':
+		case ch >= '0' && ch <= '9':
+		case ch == '-' || ch == '_' || ch == '.':
+			if i == 0 {
+				return false // must start with alphanumeric
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // dedupExists reports whether a non-Done QueuedEvent or a non-terminal Task
 // with dedupKey already exists for the project.
 func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey string) (bool, error) {
 	if dedupKey == "" {
 		return false, nil
 	}
+	label := dedupLabel(dedupKey)
 	var qel tatarav1alpha1.QueuedEventList
-	if err := c.List(ctx, &qel, client.InNamespace(ns), client.MatchingLabels{LabelDedupKey: dedupKey}); err != nil {
+	if err := c.List(ctx, &qel, client.InNamespace(ns), client.MatchingLabels{LabelDedupKey: label}); err != nil {
 		return false, err
 	}
 	for i := range qel.Items {
@@ -33,7 +70,7 @@ func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey 
 		}
 	}
 	var tl tatarav1alpha1.TaskList
-	if err := c.List(ctx, &tl, client.InNamespace(ns), client.MatchingLabels{LabelDedupKey: dedupKey}); err != nil {
+	if err := c.List(ctx, &tl, client.InNamespace(ns), client.MatchingLabels{LabelDedupKey: label}); err != nil {
 		return false, err
 	}
 	for i := range tl.Items {
@@ -58,7 +95,7 @@ func EnqueueEvent(ctx context.Context, c client.Client, alloc *SeqAllocator, pro
 	}
 	labels := map[string]string{}
 	if dedupKey != "" {
-		labels[LabelDedupKey] = dedupKey
+		labels[LabelDedupKey] = dedupLabel(dedupKey)
 	}
 	qe := &tatarav1alpha1.QueuedEvent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -101,7 +138,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 	}
 	labels[LabelQueuedEvent] = qe.Name
 	if qe.Spec.DedupKey != "" {
-		labels[LabelDedupKey] = qe.Spec.DedupKey
+		labels[LabelDedupKey] = dedupLabel(qe.Spec.DedupKey)
 	}
 	om := metav1.ObjectMeta{
 		Namespace:   qe.Namespace,

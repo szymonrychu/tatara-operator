@@ -12,8 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestIssueScanCreatesIssueLifecycleKind asserts that issueScan creates Tasks with
-// Kind=issueLifecycle (not triageIssue) and labels source-kind=issueLifecycle.
+// TestIssueScanCreatesIssueLifecycleKind asserts that issueScan creates QEs with
+// Kind=issueLifecycle and labels source-kind=issueLifecycle.
 func TestIssueScanCreatesIssueLifecycleKind(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
 	proj, _ := seedScanProject(t, "binder-issue-kind", cron)
@@ -30,28 +30,28 @@ func TestIssueScanCreatesIssueLifecycleKind(t *testing.T) {
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-issue-kind", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}, nil, cron.IssueScan, &b)
 
-	tasks := listScanTasks(t, "binder-issue-kind")
-	if len(tasks) == 0 {
-		t.Fatalf("expected tasks to be created")
+	qes := listScanQEs(t, "binder-issue-kind")
+	if len(qes) == 0 {
+		t.Fatalf("expected QEs to be created")
 	}
-	for _, tk := range tasks {
-		if tk.Spec.Kind != "issueLifecycle" {
-			t.Errorf("task %s Kind = %q, want issueLifecycle", tk.Name, tk.Spec.Kind)
+	for _, qe := range qes {
+		if qe.Spec.Kind != "issueLifecycle" {
+			t.Errorf("QE %s Kind = %q, want issueLifecycle", qe.Name, qe.Spec.Kind)
 		}
-		if tk.Labels[labelSourceKind] != "issueLifecycle" {
-			t.Errorf("task %s source-kind label = %q, want issueLifecycle", tk.Name, tk.Labels[labelSourceKind])
+		if qe.Spec.Payload.Labels[labelSourceKind] != "issueLifecycle" {
+			t.Errorf("QE %s source-kind label = %q, want issueLifecycle", qe.Name, qe.Spec.Payload.Labels[labelSourceKind])
 		}
 	}
 }
 
-// TestIssueScanLaneOccupancyCountsIssueLifecycle asserts that issueScan uses
-// laneOccupancy with "issueLifecycle" kind (not "triageIssue") when determining
-// per-repo slot availability.
-func TestIssueScanLaneOccupancyCountsIssueLifecycle(t *testing.T) {
+// TestIssueScanDedupBlocksRunningTask asserts that a Running issueLifecycle task for
+// issue #1 dedupes that issue; issue #2 (no pre-existing task) gets a QE.
+// (Per-repo lane occupancy is removed; dedup still blocks re-creation for the same issue.)
+func TestIssueScanDedupBlocksRunningTask(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 1}}
 	proj, repoA := seedScanProject(t, "binder-lane-lifecycle", cron)
 
-	// Pre-create a Running issueLifecycle task for o/r#1; this should hold the lane.
+	// Pre-create a Running issueLifecycle task for o/r#1; this dedupes #1.
 	pre := &tatarav1alpha1.Task{}
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
@@ -67,22 +67,23 @@ func TestIssueScanLaneOccupancyCountsIssueLifecycle(t *testing.T) {
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	reader := &fakeReader{issues: []scm.IssueRef{
-		{Repo: "o/r", Number: 1, UpdatedAt: time.Unix(100, 0)}, // deduped
-		{Repo: "o/r", Number: 2, UpdatedAt: time.Unix(200, 0)}, // blocked by held lane
+		{Repo: "o/r", Number: 1, UpdatedAt: time.Unix(100, 0)}, // deduped by running Task
+		{Repo: "o/r", Number: 2, UpdatedAt: time.Unix(200, 0)}, // no pre-existing -> QE created
 	}}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	b2 := 99
-	backlog, _ := r.issueScan(context.Background(), proj, reader,
+	_, _ = r.issueScan(context.Background(), proj, reader,
 		[]tatarav1alpha1.Repository{*repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
-	if !backlog {
-		t.Fatalf("want backlog=true (#2 blocked by the Running issueLifecycle #1 lane)")
+
+	// #1 is deduped; #2 should get a QE.
+	qes := listScanQEs(t, "binder-lane-lifecycle")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 QE for #2 (no dedup), got %d", len(qes))
 	}
-	// Only the pre-existing task should exist (lane held, no new task for #2).
-	tasks := listScanTasks(t, "binder-lane-lifecycle")
-	if len(tasks) != 1 {
-		t.Fatalf("want only the pre-existing task (lane held), got %d", len(tasks))
+	if qes[0].Spec.Payload.Source == nil || qes[0].Spec.Payload.Source.Number != 2 {
+		t.Fatalf("want QE for #2, got source=%+v", qes[0].Spec.Payload.Source)
 	}
 }
 
@@ -169,7 +170,7 @@ func TestIssueScanDedupLifecycleTerminals(t *testing.T) {
 }
 
 // TestMRScanBotPRCreatesIssueLifecycleMRCI asserts that mrScan for a bot-authored PR
-// creates Kind=issueLifecycle with LifecycleState=MRCI and prNumber/PrURL set.
+// creates a QE with Kind=issueLifecycle and LifecycleEntryAnnotation=MRCI.
 func TestMRScanBotPRCreatesIssueLifecycleMRCI(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
 	proj, _ := seedScanProject(t, "binder-mr-bot", cron)
@@ -187,51 +188,51 @@ func TestMRScanBotPRCreatesIssueLifecycleMRCI(t *testing.T) {
 	b3 := 99
 	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b3)
 
-	tasks := listScanTasks(t, "binder-mr-bot")
-	if len(tasks) != 2 {
-		t.Fatalf("want 2 tasks (bot+human), got %d", len(tasks))
+	qes := listScanQEs(t, "binder-mr-bot")
+	if len(qes) != 2 {
+		t.Fatalf("want 2 QEs (bot+human), got %d", len(qes))
 	}
 
-	var botTask, humanTask *tatarav1alpha1.Task
-	for i := range tasks {
-		if tasks[i].Spec.Source != nil && tasks[i].Spec.Source.Number == 9 {
-			botTask = &tasks[i]
+	var botQE, humanQE *tatarav1alpha1.QueuedEvent
+	for i := range qes {
+		src := qes[i].Spec.Payload.Source
+		if src != nil && src.Number == 9 {
+			botQE = &qes[i]
 		}
-		if tasks[i].Spec.Source != nil && tasks[i].Spec.Source.Number == 10 {
-			humanTask = &tasks[i]
+		if src != nil && src.Number == 10 {
+			humanQE = &qes[i]
 		}
 	}
-	if botTask == nil {
-		t.Fatalf("no task found for bot PR #9")
+	if botQE == nil {
+		t.Fatalf("no QE found for bot PR #9")
 	}
-	if humanTask == nil {
-		t.Fatalf("no task found for human PR #10")
+	if humanQE == nil {
+		t.Fatalf("no QE found for human PR #10")
 	}
 
-	// Bot PR -> issueLifecycle with MRCI entry annotation; Spec.Source carries PR identity.
-	if botTask.Spec.Kind != "issueLifecycle" {
-		t.Errorf("bot PR task Kind = %q, want issueLifecycle", botTask.Spec.Kind)
+	// Bot PR -> issueLifecycle with MRCI entry annotation.
+	if botQE.Spec.Kind != "issueLifecycle" {
+		t.Errorf("bot PR QE Kind = %q, want issueLifecycle", botQE.Spec.Kind)
 	}
-	// Entry state is now carried by the create-time annotation (FIX 3+5).
-	if botTask.Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "MRCI" {
-		t.Errorf("bot PR task lifecycle-entry annotation = %q, want MRCI", botTask.Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
+	if botQE.Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation] != "MRCI" {
+		t.Errorf("bot PR QE lifecycle-entry annotation = %q, want MRCI", botQE.Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation])
 	}
-	// PR number is in Spec.Source (set at create time), not Status.PRNumber.
-	if botTask.Spec.Source == nil || botTask.Spec.Source.Number != 9 {
-		t.Errorf("bot PR task Spec.Source.Number = %d, want 9", func() int {
-			if botTask.Spec.Source == nil {
+	src := botQE.Spec.Payload.Source
+	if src == nil || src.Number != 9 {
+		t.Errorf("bot PR QE Spec.Payload.Source.Number = %d, want 9", func() int {
+			if src == nil {
 				return 0
 			}
-			return botTask.Spec.Source.Number
+			return src.Number
 		}())
 	}
-	if botTask.Spec.Source == nil || !botTask.Spec.Source.IsPR {
-		t.Errorf("bot PR task Spec.Source.IsPR must be true")
+	if src == nil || !src.IsPR {
+		t.Errorf("bot PR QE Spec.Payload.Source.IsPR must be true")
 	}
 
 	// Human PR -> review (unchanged)
-	if humanTask.Spec.Kind != "review" {
-		t.Errorf("human PR task Kind = %q, want review", humanTask.Spec.Kind)
+	if humanQE.Spec.Kind != "review" {
+		t.Errorf("human PR QE Kind = %q, want review", humanQE.Spec.Kind)
 	}
 }
 
@@ -254,22 +255,22 @@ func TestMRScanBotPRClosesIssueKeyedOnLinkedIssue(t *testing.T) {
 	b4 := 99
 	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b4)
 
-	tasks := listScanTasks(t, "binder-mr-closes")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 task, got %d", len(tasks))
+	qes := listScanQEs(t, "binder-mr-closes")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
-	tk := tasks[0]
 	// source-number label should be the linked issue number (17), not the PR number (42)
-	if tk.Labels[labelSourceNumber] != "17" {
-		t.Errorf("source-number label = %q, want 17 (linked issue)", tk.Labels[labelSourceNumber])
+	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "17" {
+		t.Errorf("source-number label = %q, want 17 (linked issue)", qes[0].Spec.Payload.Labels[labelSourceNumber])
 	}
-	// PR number is in Spec.Source.Number (set at create time, not via Status).
-	if tk.Spec.Source == nil || tk.Spec.Source.Number != 42 {
+	// PR number is in Payload.Source.Number (set at create time, not via Status).
+	src := qes[0].Spec.Payload.Source
+	if src == nil || src.Number != 42 {
 		n := 0
-		if tk.Spec.Source != nil {
-			n = tk.Spec.Source.Number
+		if src != nil {
+			n = src.Number
 		}
-		t.Errorf("Spec.Source.Number = %d, want 42 (the actual PR)", n)
+		t.Errorf("Payload.Source.Number = %d, want 42 (the actual PR)", n)
 	}
 }
 
@@ -292,50 +293,12 @@ func TestMRScanBotPRNoClosesKeyedOnPRNumber(t *testing.T) {
 	b5 := 99
 	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b5)
 
-	tasks := listScanTasks(t, "binder-mr-noclose")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 task, got %d", len(tasks))
+	qes := listScanQEs(t, "binder-mr-noclose")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
 	// source-number label should be the PR number (55) when no Closes #N
-	if tasks[0].Labels[labelSourceNumber] != "55" {
-		t.Errorf("source-number label = %q, want 55 (PR number)", tasks[0].Labels[labelSourceNumber])
-	}
-}
-
-// TestMRScanLaneOccupancyCountsIssueLifecycle asserts that mrScan uses
-// laneOccupancy with "issueLifecycle" + "review" (not "selfImprove").
-func TestMRScanLaneOccupancyCountsIssueLifecycle(t *testing.T) {
-	existing := []tatarav1alpha1.Task{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel("o/r")},
-			},
-			Spec:   tatarav1alpha1.TaskSpec{Kind: "issueLifecycle"},
-			Status: tatarav1alpha1.TaskStatus{Phase: "Running"},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel("o/r")},
-			},
-			Spec:   tatarav1alpha1.TaskSpec{Kind: "review"},
-			Status: tatarav1alpha1.TaskStatus{Phase: "Planning"},
-		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel("o/r")},
-			},
-			Spec:   tatarav1alpha1.TaskSpec{Kind: "selfImprove"}, // legacy - should not count for new binder
-			Status: tatarav1alpha1.TaskStatus{Phase: "Running"},
-		},
-	}
-	// mrScan uses "issueLifecycle" + "review" for lane occupancy
-	occ := laneOccupancy(existing, "o/r", "issueLifecycle", "review")
-	if occ != 2 {
-		t.Errorf("laneOccupancy(issueLifecycle+review) = %d, want 2", occ)
-	}
-	// selfImprove alone should not be counted
-	occLegacy := laneOccupancy(existing, "o/r", "selfImprove")
-	if occLegacy != 1 {
-		t.Errorf("laneOccupancy(selfImprove) = %d, want 1", occLegacy)
+	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "55" {
+		t.Errorf("source-number label = %q, want 55 (PR number)", qes[0].Spec.Payload.Labels[labelSourceNumber])
 	}
 }

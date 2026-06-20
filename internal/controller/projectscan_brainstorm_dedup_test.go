@@ -89,11 +89,11 @@ func TestBrainstorm_ConsultsListOpenIssuesForContext(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, capturedGoals, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-dedup-ctx")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-dedup-ctx")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE, got %d", len(qes))
 	}
-	goal := tasks[0].Spec.Goal
+	goal := qes[0].Spec.Payload.Goal
 
 	// The issue titles must be embedded in the task goal.
 	if !strings.Contains(goal, "improve caching layer") {
@@ -139,11 +139,11 @@ func TestBrainstorm_IssuesContextCappedAt60(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-dedup-cap60")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-dedup-cap60")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE, got %d", len(qes))
 	}
-	goal := tasks[0].Spec.Goal
+	goal := qes[0].Spec.Payload.Goal
 	if !strings.Contains(goal, "omitted") {
 		t.Fatalf("task goal should contain 'omitted' truncation note:\n%s", goal)
 	}
@@ -225,11 +225,11 @@ func TestBrainstorm_BotEngagedIssueFlagged(t *testing.T) {
 	budget := 99
 	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
 
-	tasks := listBrainstormTasks(t, "bs-botengaged")
-	if len(tasks) != 1 {
-		t.Fatalf("want 1 brainstorm task, got %d", len(tasks))
+	qes := listBrainstormQEs(t, "bs-botengaged")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 brainstorm QE, got %d", len(qes))
 	}
-	goal := tasks[0].Spec.Goal
+	goal := qes[0].Spec.Payload.Goal
 
 	if !strings.Contains(goal, "o/eng1#7 [] improve caching layer [bot-engaged]") {
 		t.Fatalf("bot-engaged issue not flagged:\n%s", goal)
