@@ -923,56 +923,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	}
 
 	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
-	prsBySlug := map[string][]scm.PRRef{}
-	prCIBySlug := map[string]map[int]string{}
-	mainCIBySlug := map[string]string{}
-	for i := range sortedRepos {
-		rp := &sortedRepos[i]
-		slug := repoSlug(rp)
-		if slug == "" {
-			continue
-		}
-		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
-		if err != nil {
-			continue
-		}
-		if prs, perr := reader.ListOpenPRs(ctx, owner, name); perr == nil {
-			prsBySlug[slug] = prs
-			ci := map[int]string{}
-			const prCILimit = 20
-			for j, pr := range prs {
-				if j >= prCILimit {
-					break
-				}
-				if pr.HeadSHA != "" {
-					if st, serr := reader.GetCommitCIStatus(ctx, owner, name, pr.HeadSHA); serr == nil {
-						ci[pr.Number] = st
-					}
-				}
-			}
-			prCIBySlug[slug] = ci
-		} else {
-			l.Info("brainstorm: list open PRs failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", perr.Error())
-		}
-		// Main-branch CI: resolve default branch HEAD, then query CI status.
-		var ciOwner, ciRepo string
-		if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
-			if pp, perr := scm.GitLabProjectPath(rp.Spec.URL); perr == nil {
-				ciOwner = pp
-				ciRepo = ""
-			}
-		} else {
-			ciOwner = owner
-			ciRepo = name
-		}
-		if sha, serr := reader.GetDefaultBranchHeadSHA(ctx, ciOwner, ciRepo); serr == nil && sha != "" {
-			if st, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha); cerr == nil {
-				mainCIBySlug[slug] = st
-			}
-		} else if serr != nil {
-			l.Info("brainstorm: main head sha failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", serr.Error())
-		}
-	}
+	prsBySlug, prCIBySlug, mainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, "brainstorm")
 
 	// Build rich context from already-fetched data + bounded MR/main reads.
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
@@ -1074,55 +1025,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	}
 
 	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
-	hcPRsBySlug := map[string][]scm.PRRef{}
-	hcPRCIBySlug := map[string]map[int]string{}
-	hcMainCIBySlug := map[string]string{}
-	for i := range sortedRepos {
-		rp := &sortedRepos[i]
-		slug := repoSlug(rp)
-		if slug == "" {
-			continue
-		}
-		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
-		if err != nil {
-			continue
-		}
-		if prs, perr := reader.ListOpenPRs(ctx, owner, name); perr == nil {
-			hcPRsBySlug[slug] = prs
-			ci := map[int]string{}
-			const prCILimit = 20
-			for j, pr := range prs {
-				if j >= prCILimit {
-					break
-				}
-				if pr.HeadSHA != "" {
-					if st, serr := reader.GetCommitCIStatus(ctx, owner, name, pr.HeadSHA); serr == nil {
-						ci[pr.Number] = st
-					}
-				}
-			}
-			hcPRCIBySlug[slug] = ci
-		} else {
-			l.Info("healthCheck: list open PRs failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", perr.Error())
-		}
-		var ciOwner, ciRepo string
-		if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
-			if pp, perr := scm.GitLabProjectPath(rp.Spec.URL); perr == nil {
-				ciOwner = pp
-				ciRepo = ""
-			}
-		} else {
-			ciOwner = owner
-			ciRepo = name
-		}
-		if sha, serr := reader.GetDefaultBranchHeadSHA(ctx, ciOwner, ciRepo); serr == nil && sha != "" {
-			if st, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha); cerr == nil {
-				hcMainCIBySlug[slug] = st
-			}
-		} else if serr != nil {
-			l.Info("healthCheck: main head sha failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", serr.Error())
-		}
-	}
+	hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, "healthCheck")
 
 	// Build rich context from already-fetched data + bounded MR/main reads.
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug, sortedRepos)
@@ -1214,6 +1117,71 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
 }
 
+// gatherRepoCIState fetches open PRs, per-PR CI (bounded to the first 20 PRs),
+// and main-branch CI for each repo in sortedRepos. activity is a log prefix
+// ("brainstorm" or "healthCheck"). For GitLab repos the CI owner is the full
+// project path (URL-encoded by the gitlab client), matching the pattern already
+// used by lifecycle.go for main-CI and GetCommitCIStatus. All errors are
+// non-fatal; missing data degrades to empty/unknown in the returned maps.
+func (r *ProjectReconciler) gatherRepoCIState(
+	ctx context.Context,
+	proj *tatarav1alpha1.Project,
+	reader scm.SCMReader,
+	sortedRepos []tatarav1alpha1.Repository,
+	activity string,
+) (prsBySlug map[string][]scm.PRRef, prCIBySlug map[string]map[int]string, mainCIBySlug map[string]string) {
+	l := log.FromContext(ctx)
+	prsBySlug = map[string][]scm.PRRef{}
+	prCIBySlug = map[string]map[int]string{}
+	mainCIBySlug = map[string]string{}
+	isGitLab := proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab"
+	for i := range sortedRepos {
+		rp := &sortedRepos[i]
+		slug := repoSlug(rp)
+		if slug == "" {
+			continue
+		}
+		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
+		if err != nil {
+			continue
+		}
+		// Resolve provider-correct owner/repo for CI lookups.
+		ciOwner, ciRepo := owner, name
+		if isGitLab {
+			if pp, perr := scm.GitLabProjectPath(rp.Spec.URL); perr == nil {
+				ciOwner = pp
+				ciRepo = ""
+			}
+		}
+		if prs, perr := reader.ListOpenPRs(ctx, owner, name); perr == nil {
+			prsBySlug[slug] = prs
+			ci := map[int]string{}
+			const prCILimit = 20
+			for j, pr := range prs {
+				if j >= prCILimit {
+					break
+				}
+				if pr.HeadSHA != "" {
+					if st, serr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, pr.HeadSHA); serr == nil {
+						ci[pr.Number] = st
+					}
+				}
+			}
+			prCIBySlug[slug] = ci
+		} else {
+			l.Info(activity+": list open PRs failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", perr.Error())
+		}
+		if sha, serr := reader.GetDefaultBranchHeadSHA(ctx, ciOwner, ciRepo); serr == nil && sha != "" {
+			if st, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha); cerr == nil {
+				mainCIBySlug[slug] = st
+			}
+		} else if serr != nil {
+			l.Info(activity+": main head sha failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", serr.Error())
+		}
+	}
+	return
+}
+
 // buildRepoStateContext builds the rich context string embedded in the brainstorm
 // / healthCheck goal. It emits three blocks: ISSUES (pre-fetched, cap 60),
 // OPEN MRs (from prsBySlug, cap 40, per-PR CI from prCIBySlug), and MAIN HEALTH
@@ -1291,7 +1259,10 @@ func (r *ProjectReconciler) buildRepoStateContext(ctx context.Context, proj *tat
 					ciStatus = st
 				}
 			}
-			title := firstLine(pr.Body)
+			title := ""
+			if pr.Body != "" {
+				title = firstLine(pr.Body)
+			}
 			mrLines = append(mrLines, fmt.Sprintf("%s%s%d [ci:%s] %s", slug, mrSep, pr.Number, ciStatus, title))
 		}
 	}
