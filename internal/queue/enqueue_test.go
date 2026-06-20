@@ -28,7 +28,7 @@ func TestEnqueueEvent_AssignsSeqAndFields(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
 	alloc := NewSeqAllocator()
-	alloc.Recover(0)
+	alloc.MarkReady()
 	proj := testProj("p", "tatara")
 	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
 	qe, created, err := EnqueueEvent(context.Background(), c, alloc, proj, tatarav1alpha1.QueueClassAlert, false, "grp1", pl)
@@ -47,7 +47,7 @@ func TestEnqueueEvent_DedupSkips(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
 	alloc := NewSeqAllocator()
-	alloc.Recover(0)
+	alloc.MarkReady()
 	proj := testProj("p", "tatara")
 	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
 	if _, created, _ := EnqueueEvent(context.Background(), c, alloc, proj, tatarav1alpha1.QueueClassAlert, false, "grp1", pl); !created {
@@ -97,7 +97,7 @@ func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
 	alloc := NewSeqAllocator()
-	alloc.Recover(0)
+	alloc.MarkReady()
 	proj := testProj("p", "tatara")
 	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
 

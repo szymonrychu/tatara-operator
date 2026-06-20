@@ -77,7 +77,7 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 }
 
 // admit drains the alert pool to AlertCapacity, then the normal pool to
-// QueueCapacity, each in strict ascending seq order (pure global FIFO within a
+// QueueCapacity, each in strict ascending seq order (pure per-project FIFO within a
 // pool; head-of-line blocking accepted). Wired in Task 8 Reconcile.
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
 	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) error {

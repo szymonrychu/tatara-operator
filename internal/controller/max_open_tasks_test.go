@@ -70,7 +70,7 @@ func TestRunScans_AutonomousCapFull_CreatesNoQEs(t *testing.T) {
 
 	cap := proj.QueuedAutonomousCap()
 	alloc := queue.NewSeqAllocator()
-	alloc.Recover(0)
+	alloc.MarkReady()
 	for i := 0; i < cap; i++ {
 		payload := tatarav1alpha1.QueuedEventPayload{Kind: "issueLifecycle", RepositoryRef: "autocap-full-repo", Goal: "g", GenerateName: "qe-"}
 		_, _, err := queue.EnqueueEvent(context.Background(), k8sClient, alloc, proj, tatarav1alpha1.QueueClassNormal, true, fmt.Sprintf("prefill-%d", i), payload)
