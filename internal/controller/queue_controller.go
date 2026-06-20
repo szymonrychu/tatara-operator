@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"sort"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -44,8 +46,61 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 	return n
 }
 
+// admit drains the alert pool to AlertCapacity, then the normal pool to
+// QueueCapacity, each in strict ascending seq order (pure global FIFO within a
+// pool; head-of-line blocking accepted). Wired in Task 8 Reconcile.
+//
+//nolint:unused
+func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
+	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) error {
+
+	admitPool := func(class string, cap int) error {
+		inflight := r.poolInflight(qes, tasks, class)
+		queued := make([]*tatarav1alpha1.QueuedEvent, 0)
+		for i := range qes {
+			if qes[i].Spec.Class == class && qes[i].Status.State == tatarav1alpha1.QueueStateQueued {
+				queued = append(queued, &qes[i])
+			}
+		}
+		sort.Slice(queued, func(i, j int) bool { return queued[i].Spec.Seq < queued[j].Spec.Seq })
+		for _, q := range queued {
+			if inflight >= cap {
+				break
+			}
+			task, err := buildTaskFromQueuedEvent(q, proj, r.Scheme)
+			if err != nil {
+				return err
+			}
+			if err := r.Create(ctx, task); err != nil {
+				// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
+				return err
+			}
+			q.Status.State = tatarav1alpha1.QueueStateAdmitted
+			q.Status.TaskRef = task.Name
+			now := metav1.Now()
+			q.Status.AdmittedAt = &now
+			if err := r.Status().Update(ctx, q); err != nil {
+				return err
+			}
+			inflight++
+			if r.Metrics != nil {
+				r.Metrics.QueueAdmitted(class, q.Spec.Kind)
+			}
+			log.FromContext(ctx).Info("queue: admitted",
+				"action", "queue_admit", "resource_id", q.Name, "task", task.Name,
+				"class", class, "seq", q.Spec.Seq, "kind", q.Spec.Kind)
+		}
+		return nil
+	}
+
+	if err := admitPool(tatarav1alpha1.QueueClassAlert, proj.AlertCapacity()); err != nil {
+		return err
+	}
+	return admitPool(tatarav1alpha1.QueueClassNormal, proj.QueueCapacity())
+}
+
 // reconcileDone flips Admitted events whose Task is terminal or gone to Done.
-// Called by the Reconcile loop added in Task 6.
+// Called by the Reconcile loop added in Task 8.
 //
 //nolint:unused
 func (r *DispatcherReconciler) reconcileDone(ctx context.Context, qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) (bool, error) {

@@ -472,3 +472,6 @@ func (m *OperatorMetrics) RESTRequestsCounter(endpoint, result string) prometheu
 func (m *OperatorMetrics) MemoryHealthReadError() {
 	m.memoryHealthReadErrors.Inc()
 }
+
+// QueueAdmitted is a stub; real counter wired in Task 12.
+func (m *OperatorMetrics) QueueAdmitted(class, kind string) {}

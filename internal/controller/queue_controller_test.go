@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -20,6 +21,48 @@ func tk(name, phase, lifecycle, queuedEvent string) tatarav1alpha1.Task {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara", Labels: map[string]string{LabelQueuedEvent: queuedEvent}},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p"},
 		Status:     tatarav1alpha1.TaskStatus{Phase: phase, LifecycleState: lifecycle},
+	}
+}
+
+func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-admit", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 1, AlertCapacity: 1}},
+	}
+	mustCreate(t, ctx, proj)
+
+	mkQE := func(seq int64, class string) *tatarav1alpha1.QueuedEvent {
+		q := &tatarav1alpha1.QueuedEvent{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-", Namespace: ns},
+			Spec: tatarav1alpha1.QueuedEventSpec{
+				Seq: seq, Class: class, Kind: "incident", ProjectRef: proj.Name,
+				Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "x-"},
+			},
+		}
+		mustCreate(t, ctx, q)
+		q.Status.State = tatarav1alpha1.QueueStateQueued
+		mustStatusUpdate(t, ctx, q)
+		return q
+	}
+	normalQE := mkQE(1, tatarav1alpha1.QueueClassNormal) // older
+	alertQE := mkQE(2, tatarav1alpha1.QueueClassAlert)   // newer but priority pool
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	qes, tasks := listQEsTasks(t, ctx, proj.Name)
+	if err := r.admit(ctx, proj, qes, tasks); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both pools have capacity 1: one alert + one normal admitted.
+	got := refreshQE(t, ctx, alertQE)
+	if got.Status.State != tatarav1alpha1.QueueStateAdmitted || got.Status.TaskRef == "" {
+		t.Fatalf("alert not admitted: %+v", got.Status)
+	}
+	gotN := refreshQE(t, ctx, normalQE)
+	if gotN.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("normal not admitted: %+v", gotN.Status)
 	}
 }
 
