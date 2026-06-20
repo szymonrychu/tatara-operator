@@ -90,6 +90,14 @@ chart-lint:
 			exit 1; \
 		fi; \
 	done
+	@don=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'grafana_dashboard: "1"'); \
+		doff=$$($(HELM_BIN) template charts/tatara-operator --set dashboard.enabled=false | grep -c 'grafana_dashboard: "1"'); \
+		if [ "$$don" -ne 1 ] || [ "$$doff" -ne 0 ]; then \
+			echo "chart-lint: dashboard ConfigMap gating broken (enabled renders $$don want 1, disabled renders $$doff want 0)"; \
+			exit 1; \
+		fi
+	@python3 -m json.tool charts/tatara-operator/dashboards/tatara-loop.json >/dev/null || \
+		{ echo "chart-lint: dashboards/tatara-loop.json is not valid JSON"; exit 1; }
 
 rbac:
 	mkdir -p $(RBAC_GEN_DIR)

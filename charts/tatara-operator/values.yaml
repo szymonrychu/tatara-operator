@@ -138,6 +138,17 @@ prometheusRule:
   tasksInflightThreshold: 8
   additionalLabels: {}
 
+# dashboard ships the "Tatara Loop" Grafana dashboard as a ConfigMap labelled
+# grafana_dashboard: "1" so the Grafana sidecar auto-discovers it (same
+# ship-with-the-operator pattern as serviceMonitor). The chart hardcodes no
+# datasource UID - the dashboard exposes a datasource template variable, so the
+# cluster's default/selected Prometheus is used. additionalLabels lets the infra
+# helmfile match a non-default sidecar label; folder selects the Grafana folder.
+dashboard:
+  enabled: true
+  folder: "tatara"
+  additionalLabels: {}
+
 ingress:
   enabled: false
   className: nginx
