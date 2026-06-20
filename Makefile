@@ -16,7 +16,7 @@ ENVTEST_VERSION ?= release-0.21
 ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(ENVTEST_VERSION)
 ENVTEST_K8S_VERSION ?= 1.33.0
 
-CHART_CRD_DIR := charts/tatara-operator/crds
+CHART_CRD_DIR := charts/tatara-operator/crd-bases
 
 # Resolve helm binary via mise to avoid homebrew helm 4.x shadow.
 HELM_BIN := $(shell mise exec -- bash -c 'echo $$PATH' 2>/dev/null | tr ':' '\n' | grep -m1 'mise/installs/helm/' || true)

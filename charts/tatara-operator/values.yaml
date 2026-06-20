@@ -171,3 +171,6 @@ resources:
     memory: 128Mi
   limits:
     memory: 256Mi
+
+# render+upgrade the tatara.dev CRDs as templates; set false if CRDs are managed externally
+installCRDs: true
