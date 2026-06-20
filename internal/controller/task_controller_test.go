@@ -306,11 +306,16 @@ func TestReconcile_NoConcurrencyGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	// The task must NOT be requeued with memGateRequeue, which was the value
-	// returned by the old concurrency cap gate. It should proceed to spawn or
-	// return a zero Result.
+	// Negative: must not be gated by the old concurrency cap.
 	if res.RequeueAfter == memGateRequeue {
 		t.Error("admitted task must not be requeued by concurrency cap; atConcurrencyCap is deleted")
+	}
+	// Positive: admitted task must have reached the spawn path. driveAgentRun
+	// sets Phase=Planning and returns pollRequeue (30s) on first spawn; any
+	// value other than pollRequeue here means the reconcile exited early via a
+	// gate (memory gate, cap gate, or similar) before reaching driveAgentRun.
+	if res.RequeueAfter != pollRequeue {
+		t.Errorf("admitted task must reach spawn path (pollRequeue=%v); got RequeueAfter=%v", pollRequeue, res.RequeueAfter)
 	}
 }
 

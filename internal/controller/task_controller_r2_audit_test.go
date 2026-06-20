@@ -241,13 +241,13 @@ func TestUpdateInflightGauge_NotCalledTwiceOnPlanningTransition(t *testing.T) {
 	}
 
 	total := listCalls2.Load()
-	// In test mode (no field-index) a Planning-transition reconcile makes
-	// at most 3 TaskList calls (updateInflightGauge + any incidental lists).
-	// Before the fix driveAgentRun also called updateInflightGauge, giving 4.
-	// We assert < 4 to verify the duplicate is gone while tolerating the
-	// legitimate lists above.
-	if total >= 4 {
-		t.Errorf("TaskList called %d times in a Planning-transition reconcile; expected < 4 (duplicate updateInflightGauge must be removed from driveAgentRun)", total)
+	// A Planning-transition reconcile has exactly one legitimate TaskList call:
+	// updateInflightGauge on Reconcile's success path (line ~924). The old
+	// atConcurrencyCap list is deleted, so no other list runs on this path.
+	// Before the fix driveAgentRun also called updateInflightGauge, giving 2.
+	// We assert <= 1 to catch any re-introduced duplicate.
+	if total > 1 {
+		t.Errorf("TaskList called %d times in a Planning-transition reconcile; expected 1 (updateInflightGauge only; duplicate from driveAgentRun must stay removed)", total)
 	}
 	_ = gaugeListsBefore
 }
