@@ -1,0 +1,17 @@
+{{- if .Values.project }}
+{{- if not .Values.project.name }}{{- fail "tatara-project: .Values.project.name is required" }}{{- end }}
+{{- if not (.Values.project.spec).scmSecretRef }}{{- fail "tatara-project: .Values.project.spec.scmSecretRef is required (the operator namespace Secret holding the SCM token; supplied by the helmfile, not this chart)" }}{{- end }}
+apiVersion: tatara.dev/v1alpha1
+kind: Project
+metadata:
+  name: {{ .Values.project.name }}
+  namespace: {{ include "tatara-project.namespace" . }}
+  labels:
+    {{- include "tatara-project.labels" . | nindent 4 }}
+  {{- with .Values.project.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- toYaml .Values.project.spec | nindent 2 }}
+{{- end }}
