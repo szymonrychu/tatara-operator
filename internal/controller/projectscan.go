@@ -663,7 +663,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				labels: c.labels, updatedAt: c.updatedAt, isPR: c.isPR,
 			}
 			srcCand := candidate{
-				repo: c.repo, number: c.number, author: c.author, isPR: true,
+				repo: c.repo, number: c.number, author: c.author, isPR: true, title: c.title,
 			}
 			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
@@ -1361,7 +1361,7 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			if !ok {
 				continue
 			}
-			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt}
+			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt, title: iss.Title}
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: entry}
 			ok2, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann)
 			if cerr != nil {
