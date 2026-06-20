@@ -1242,14 +1242,33 @@ func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
 
 // proposalBacklogCount counts open, undecided ideas in a pre-fetched issue
 // slice: non-PR issues bearing the brainstorming or legacy-idea label.
+// Issues sharing a tatara/systemic-<id> label count as a single entry so that
+// a multi-repo systemic improvement does not inflate the backlog cap.
 func proposalBacklogCount(issues []scm.IssueRef, brainstormingLabel, legacyIdea string) int {
-	n := 0
+	const systemicPrefix = "tatara/systemic-"
+	groups := map[string]bool{}
+	standalone := 0
 	for _, iss := range issues {
-		if !iss.IsPR && (hasLabel(iss.Labels, brainstormingLabel) || hasLabel(iss.Labels, legacyIdea)) {
-			n++
+		if iss.IsPR {
+			continue
+		}
+		if !hasLabel(iss.Labels, brainstormingLabel) && !hasLabel(iss.Labels, legacyIdea) {
+			continue
+		}
+		sid := ""
+		for _, l := range iss.Labels {
+			if strings.HasPrefix(l, systemicPrefix) {
+				sid = l
+				break
+			}
+		}
+		if sid != "" {
+			groups[sid] = true
+		} else {
+			standalone++
 		}
 	}
-	return n
+	return standalone + len(groups)
 }
 
 // proposalBacklog counts open, undecided ideas for repo: open non-PR issues

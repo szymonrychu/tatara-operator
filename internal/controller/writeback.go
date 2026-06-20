@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -522,12 +523,17 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	}
 
 	brainstorming, _, _, _ := lifecycleLabels(proj.Spec.Scm)
-	label := brainstorming
-	body := task.Spec.ProposedIssue.Body + "\n\n" + tataraAuthoredMarker
+	labels := []string{brainstorming}
+	body := task.Spec.ProposedIssue.Body
+	if sid := task.Spec.ProposedIssue.SystemicID; sid != "" {
+		labels = append(labels, "tatara/systemic-"+sid)
+		body += fmt.Sprintf("\n\nPart of systemic improvement %s spanning: %s", sid, systemicRepoList(ctx, r, proj))
+	}
+	body += "\n\n" + tataraAuthoredMarker
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 		Title:  proposalTitle,
 		Body:   body,
-		Labels: []string{label},
+		Labels: labels,
 	})
 	if err != nil {
 		r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "error")
@@ -1124,6 +1130,24 @@ func issueURLFromRepoURL(repoURL, provider, repo string, number int) string {
 		return fmt.Sprintf("%s/%s/-/issues/%d", base, repo, number)
 	}
 	return fmt.Sprintf("%s/%s/issues/%d", base, repo, number)
+}
+
+// systemicRepoList returns a comma-joined sorted list of owner/repo slugs for
+// all repos in the project. Used for the systemic-improvement footer in
+// createProposal. On error it degrades gracefully to an empty list.
+func systemicRepoList(ctx context.Context, r *TaskReconciler, proj *tatarav1alpha1.Project) string {
+	repos, err := r.projectRepos(ctx, proj)
+	if err != nil {
+		return ""
+	}
+	slugs := make([]string, 0, len(repos))
+	for i := range repos {
+		if owner, name, oerr := scm.OwnerRepo(repos[i].Spec.URL); oerr == nil {
+			slugs = append(slugs, owner+"/"+name)
+		}
+	}
+	sort.Strings(slugs)
+	return strings.Join(slugs, ", ")
 }
 
 // parseRepoBase returns the scheme+host of repoURL (e.g. "https://gitlab.example.com").
