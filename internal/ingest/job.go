@@ -4,6 +4,7 @@ package ingest
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -29,6 +30,12 @@ type Config struct {
 	ImagePullSecret  string
 	OpenAISecretName string
 	SemanticModel    string
+	// CallbackURL is the operator's internal callback base URL (the same value
+	// the agent Pod gets as OPERATOR_PUSH_URL's prefix). The ingest Job uses it
+	// to build METRICS_PUSH_URL so the short-lived Job can push its Prometheus
+	// metrics to the operator's pushmetrics receiver. When empty the ingester
+	// runs with metrics push disabled (a no-op).
+	CallbackURL string
 }
 
 // semanticEnv returns the env vars that drive the ingester's Phase 2 semantic
@@ -57,6 +64,25 @@ func semanticEnv(repo *tataradevv1alpha1.Repository, cfg Config) []corev1.EnvVar
 		})
 	}
 	return env
+}
+
+// metricsPushEnv returns the env that lets the short-lived ingest Job push its
+// Prometheus metrics to the operator's pushmetrics receiver. The ingester reads
+// METRICS_PUSH_URL and POSTs the gathered text to it verbatim (it does not
+// append query parameters), so the full receiver URL - including the required
+// run_id and the job label - is built here. run_id is the Job name so the up-to
+// BackoffLimit pod retries of one Job overwrite a single run's series instead of
+// leaving evicted partials. When CallbackURL is unset the env is omitted and the
+// ingester's push is a no-op.
+func metricsPushEnv(jobName string, cfg Config) []corev1.EnvVar {
+	if cfg.CallbackURL == "" {
+		return nil
+	}
+	q := url.Values{}
+	q.Set("run_id", jobName)
+	q.Set("job", "tatara-ingest")
+	pushURL := strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/metrics/push?" + q.Encode()
+	return []corev1.EnvVar{{Name: "METRICS_PUSH_URL", Value: pushURL}}
 }
 
 // imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,
@@ -105,6 +131,11 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 	ttl := int32(600)
 	controller := true
 
+	// jobName is computed once and reused as both the Job's name and the
+	// metrics-push run_id so the BackoffLimit pod retries of one Job overwrite a
+	// single run's pushed series.
+	jobName := repo.Name + "-ingest-" + rand.String(5)
+
 	// Clone into a directory that mirrors the repo namespace (owner/.../repo),
 	// not a flat "/workspace/repo", so concurrent clones never collide.
 	// namespacePath may return an empty or host-only string for degenerate
@@ -143,7 +174,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      repo.Name + "-ingest-" + rand.String(5),
+			Name:      jobName,
 			Namespace: cfg.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":      "tatara-operator",
@@ -231,7 +262,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 							// ingest POSTs /code-graph:bulk which can exceed 60s during
 							// transient LLM-extraction windows (2026-06-20 incident).
 							{Name: "HTTP_TIMEOUT", Value: ingestHTTPTimeout},
-						}, semanticEnv(repo, cfg)...),
+						}, append(semanticEnv(repo, cfg), metricsPushEnv(jobName, cfg)...)...),
 						VolumeMounts: []corev1.VolumeMount{{Name: workspaceVolume, MountPath: workspaceMount}},
 					}},
 				},
