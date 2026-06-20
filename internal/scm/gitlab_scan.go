@@ -31,9 +31,23 @@ type glIssueItem struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// glProjectID builds the GitLab project identifier from a (owner, repo) pair.
+// It accepts both calling conventions: a split pair ("g", "p") joins to "g/p",
+// and a full-path-in-owner pair ("g/p", "") returns "g/p" without a trailing
+// slash (a trailing slash 404s). Controller callers derive coordinates via
+// scm.OwnerRepo (split) for GitHub-shaped two-segment URLs and via
+// scm.GitLabProjectPath (full path, empty repo) for subgroup-aware paths; both
+// must resolve to the same project id here.
+func glProjectID(owner, repo string) string {
+	if repo == "" {
+		return owner
+	}
+	return owner + "/" + repo
+}
+
 // ListOpenPRs lists opened merge requests for the project path owner/repo. All pages are fetched.
 func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, error) {
-	proj := owner + "/" + repo
+	proj := glProjectID(owner, repo)
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests?state=opened&per_page=100"
 	raw, err := glDoPaged[glMR](ctx, c.base(), path, c.token)
 	if err != nil {
@@ -51,7 +65,7 @@ func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 
 // ListOpenIssues lists opened issues for the project path owner/repo. All pages are fetched.
 func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]IssueRef, error) {
-	proj := owner + "/" + repo
+	proj := glProjectID(owner, repo)
 	path := "/projects/" + url.PathEscape(proj) + "/issues?state=opened&per_page=100"
 	raw, err := glDoPaged[glIssueItem](ctx, c.base(), path, c.token)
 	if err != nil {
@@ -83,24 +97,26 @@ type glNote struct {
 	System    bool      `json:"system"`
 }
 
-// GetIssue returns the title and body of an issue.
-// For GitLab owner carries the full project path; repo is unused.
-func (c *GitLab) GetIssue(ctx context.Context, owner, _ string, number int) (IssueContent, error) {
+// GetIssue returns the title and body of an issue. The (owner, repo) pair is
+// resolved to a project id by glProjectID, accepting both the split and
+// full-path calling conventions.
+func (c *GitLab) GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error) {
 	var raw struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 	}
-	path := "/projects/" + url.PathEscape(owner) + "/issues/" + strconv.Itoa(number)
+	path := "/projects/" + url.PathEscape(glProjectID(owner, repo)) + "/issues/" + strconv.Itoa(number)
 	if err := glDo(ctx, c.base(), http.MethodGet, path, c.token, nil, &raw); err != nil {
 		return IssueContent{}, err
 	}
 	return IssueContent{Title: raw.Title, Body: raw.Description}, nil
 }
 
-// ListIssueComments returns non-system notes on issue number, oldest-first. All pages are fetched.
-// For GitLab owner carries the full project path (group/sub/project); repo is unused.
-func (c *GitLab) ListIssueComments(ctx context.Context, owner, _ string, number int) ([]IssueComment, error) {
-	path := "/projects/" + url.PathEscape(owner) + "/issues/" + strconv.Itoa(number) + "/notes?per_page=100"
+// ListIssueComments returns non-system notes on issue number, oldest-first. All
+// pages are fetched. The (owner, repo) pair is resolved to a project id by
+// glProjectID, accepting both the split and full-path calling conventions.
+func (c *GitLab) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	path := "/projects/" + url.PathEscape(glProjectID(owner, repo)) + "/issues/" + strconv.Itoa(number) + "/notes?per_page=100"
 	raw, err := glDoPaged[glNote](ctx, c.base(), path, c.token)
 	if err != nil {
 		return nil, err
@@ -118,7 +134,9 @@ func (c *GitLab) ListIssueComments(ctx context.Context, owner, _ string, number 
 	return out, nil
 }
 
-// CloseIssue posts a note then PUTs the issue state_event=close.
+// CloseIssue posts a note then PUTs the issue state_event=close. Unlike the
+// reader methods, repo here is the already-joined full project path (callers
+// pass a complete slug), so it is used directly as the project id.
 func (c *GitLab) CloseIssue(ctx context.Context, token, repo string, number int, comment string) error {
 	proj := repo
 	if comment != "" {

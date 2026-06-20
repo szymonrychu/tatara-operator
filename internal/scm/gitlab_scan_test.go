@@ -77,6 +77,66 @@ func TestGitLabGetIssue(t *testing.T) {
 	}
 }
 
+// TestGitLabGetIssueSplitOwnerRepo verifies the project id is built from a
+// split (owner, repo) coordinate pair, not owner alone. Controller callers that
+// derive coordinates via scm.OwnerRepo pass ("g", "p"); the GitLab project path
+// must be the joined "g/p" so the read hits the real project, not "/projects/g".
+func TestGitLabGetIssueSplitOwnerRepo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/issues/21" {
+			t.Fatalf("unexpected path: %q", glTestPath(r))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"title": "t", "description": "b"})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	content, err := c.GetIssue(context.Background(), "g", "p", 21)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if content.Title != "t" || content.Body != "b" {
+		t.Fatalf("content = %+v", content)
+	}
+}
+
+// TestGitLabListIssueCommentsSplitOwnerRepo verifies notes are read from the
+// joined "g/p" project path when the caller passes split (owner, repo).
+func TestGitLabListIssueCommentsSplitOwnerRepo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/issues/3/notes" {
+			t.Fatalf("unexpected path: %q", glTestPath(r))
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"author": map[string]any{"username": "alice"}, "body": "hi", "created_at": "2026-01-01T00:00:00Z", "system": false},
+		})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	comments, err := c.ListIssueComments(context.Background(), "g", "p", 3)
+	if err != nil {
+		t.Fatalf("ListIssueComments: %v", err)
+	}
+	if len(comments) != 1 || comments[0].Author != "alice" {
+		t.Fatalf("comments = %+v", comments)
+	}
+}
+
+// TestGitLabListOpenIssuesFullPathEmptyRepo verifies that the full-path calling
+// convention (owner="g/p", repo="") does not append a trailing slash, which 404s.
+func TestGitLabListOpenIssuesFullPathEmptyRepo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/issues" {
+			t.Fatalf("unexpected path: %q", glTestPath(r))
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	if _, err := c.ListOpenIssues(context.Background(), "g/p", ""); err != nil {
+		t.Fatalf("ListOpenIssues: %v", err)
+	}
+}
+
 // TestGitLabListOpenPRsPaginated verifies that ListOpenPRs follows X-Next-Page headers.
 func TestGitLabListOpenPRsPaginated(t *testing.T) {
 	var srv *httptest.Server
