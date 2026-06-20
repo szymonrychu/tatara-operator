@@ -25,6 +25,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/titlecheck"
 )
 
 // maxBodyBytes caps the request body at 1 MB, matching the webhook server's
@@ -369,6 +370,7 @@ type proposeIssueReq struct {
 	Title         string `json:"title"`
 	Body          string `json:"body"`
 	Kind          string `json:"kind"`
+	SystemicID    string `json:"systemicId,omitempty"`
 }
 
 func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
@@ -385,6 +387,10 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	case "bug", "improvement":
 	default:
 		writeError(w, http.StatusBadRequest, "kind must be bug or improvement")
+		return
+	}
+	if weak, guidance := titlecheck.Weak(req.Title); weak {
+		writeError(w, http.StatusBadRequest, "weak title: "+guidance)
 		return
 	}
 	projName := chi.URLParam(r, "p")
@@ -419,6 +425,7 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 			ApprovalRequired: false,
 			ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
 				RepositoryRef: req.RepositoryRef, Title: req.Title, Body: req.Body, Kind: req.Kind,
+				SystemicID: req.SystemicID,
 			},
 		},
 	}
@@ -976,6 +983,12 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(r, w, &req); err != nil {
 		writeDecodeError(w, r, err)
 		return
+	}
+	if req.PRTitle != "" {
+		if weak, guidance := titlecheck.Weak(req.PRTitle); weak {
+			writeError(w, http.StatusBadRequest, "weak pr title: "+guidance)
+			return
+		}
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task

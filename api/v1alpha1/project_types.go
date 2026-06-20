@@ -90,6 +90,12 @@ type AgentSpec struct {
 	// +kubebuilder:default=10
 	// +optional
 	MaxLifecycleIterations int `json:"maxLifecycleIterations,omitempty"`
+	// Effort is the reasoning-effort level passed to the wrapper agent as the
+	// EFFORT env var (the "ultracode" lever). Highest by default.
+	// +kubebuilder:validation:Enum=low;medium;high;xhigh;max
+	// +kubebuilder:default="xhigh"
+	// +optional
+	Effort string `json:"effort,omitempty"`
 }
 
 // BoardSpec configures the project board tatara participates in.

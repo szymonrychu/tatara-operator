@@ -50,6 +50,18 @@ spec:
                   contextWindowTokens:
                     default: 200000
                     type: integer
+                  effort:
+                    default: xhigh
+                    description: |-
+                      Effort is the reasoning-effort level passed to the wrapper agent as the
+                      EFFORT env var (the "ultracode" lever). Highest by default.
+                    enum:
+                    - low
+                    - medium
+                    - high
+                    - xhigh
+                    - max
+                    type: string
                   handoverThresholdPercent:
                     default: 50
                     type: integer

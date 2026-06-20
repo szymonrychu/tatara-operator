@@ -56,6 +56,14 @@ type taskSourceDTO struct {
 	Number      int    `json:"number,omitempty"`
 }
 
+type proposedIssueDTO struct {
+	RepositoryRef string `json:"repositoryRef,omitempty"`
+	Title         string `json:"title,omitempty"`
+	Body          string `json:"body,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	SystemicID    string `json:"systemicId,omitempty"`
+}
+
 type taskStatusDTO struct {
 	Phase            string                           `json:"phase,omitempty"`
 	PodName          string                           `json:"podName,omitempty"`
@@ -75,15 +83,16 @@ type taskStatusDTO struct {
 
 // TaskDTO is the stable JSON shape for a Task CRD.
 type TaskDTO struct {
-	Name             string         `json:"name"`
-	ProjectRef       string         `json:"projectRef,omitempty"`
-	RepositoryRef    string         `json:"repositoryRef,omitempty"`
-	Goal             string         `json:"goal,omitempty"`
-	Kind             string         `json:"kind,omitempty"`
-	ApprovalRequired bool           `json:"approvalRequired,omitempty"`
-	Source           *taskSourceDTO `json:"source,omitempty"`
-	MaxTurns         int            `json:"maxTurns,omitempty"`
-	Status           taskStatusDTO  `json:"status"`
+	Name             string            `json:"name"`
+	ProjectRef       string            `json:"projectRef,omitempty"`
+	RepositoryRef    string            `json:"repositoryRef,omitempty"`
+	Goal             string            `json:"goal,omitempty"`
+	Kind             string            `json:"kind,omitempty"`
+	ApprovalRequired bool              `json:"approvalRequired,omitempty"`
+	Source           *taskSourceDTO    `json:"source,omitempty"`
+	ProposedIssue    *proposedIssueDTO `json:"proposedIssue,omitempty"`
+	MaxTurns         int               `json:"maxTurns,omitempty"`
+	Status           taskStatusDTO     `json:"status"`
 }
 
 type subtaskStatusDTO struct {
@@ -155,6 +164,15 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			Provider: task.Spec.Source.Provider, IssueRef: task.Spec.Source.IssueRef,
 			URL: task.Spec.Source.URL, AuthorLogin: task.Spec.Source.AuthorLogin,
 			IsPR: task.Spec.Source.IsPR, Number: task.Spec.Source.Number,
+		}
+	}
+	if task.Spec.ProposedIssue != nil {
+		d.ProposedIssue = &proposedIssueDTO{
+			RepositoryRef: task.Spec.ProposedIssue.RepositoryRef,
+			Title:         task.Spec.ProposedIssue.Title,
+			Body:          task.Spec.ProposedIssue.Body,
+			Kind:          task.Spec.ProposedIssue.Kind,
+			SystemicID:    task.Spec.ProposedIssue.SystemicID,
 		}
 	}
 	return d

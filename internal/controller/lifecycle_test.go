@@ -704,7 +704,7 @@ func TestLifecycleImplement_SucceededOpensMRAndEntersMRCI(t *testing.T) {
 	if len(fw.openCalls) == 0 {
 		t.Fatal("OpenChange must be called for Implement succeeded")
 	}
-	wantBranch := taskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS}})
+	wantBranch := taskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS}, Spec: tatarav1alpha1.TaskSpec{Kind: "issueLifecycle", Source: src}})
 	if fw.openCalls[0].sourceBranch != wantBranch {
 		t.Errorf("OpenChange sourceBranch = %q, want %q", fw.openCalls[0].sourceBranch, wantBranch)
 	}
@@ -2005,6 +2005,9 @@ func (f *fakeReaderMainCI) ListIssueComments(_ context.Context, _, _ string, _ i
 }
 func (f *fakeReaderMainCI) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
+}
+func (f *fakeReaderMainCI) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
 }
 
 func seedMainCITask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMainCI, deadlineOffset time.Duration) (*TaskReconciler, string) {

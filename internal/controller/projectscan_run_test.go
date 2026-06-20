@@ -43,6 +43,9 @@ func (f *fakeReader) ListIssueComments(context.Context, string, string, int) ([]
 func (f *fakeReader) GetIssue(context.Context, string, string, int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
 }
+func (f *fakeReader) GetDefaultBranchHeadSHA(context.Context, string, string) (string, error) {
+	return "", nil
+}
 
 func seedScanProject(t *testing.T, name string, cron *tatarav1alpha1.ScmCron) (*tatarav1alpha1.Project, *tatarav1alpha1.Repository) {
 	t.Helper()

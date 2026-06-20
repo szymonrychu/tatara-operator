@@ -306,6 +306,10 @@ func (r *ciStatusReader) ListIssueComments(_ context.Context, _, _ string, _ int
 	return nil, nil
 }
 
+func (r *ciStatusReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
+
 func seedMainCITaskR2(t *testing.T, suffix string) (*tatarav1alpha1.Task, string, string) {
 	t.Helper()
 	name := "r2-mainci-" + suffix

@@ -242,7 +242,7 @@ func TestProposeIssue(t *testing.T) {
 	// repo-a must exist and belong to "alpha" for the repository validation to pass.
 	repo := repository("repo-a", "alpha")
 	r := buildRouter(t, project("alpha"), repo)
-	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"Fix login","body":"login broken","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"fix(auth): login broken on OIDC redirect","body":"login broken","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -269,7 +269,7 @@ func TestProposeIssue_MissingFields(t *testing.T) {
 
 func TestProposeIssue_ProjectNotFound(t *testing.T) {
 	r := buildRouter(t)
-	body := strings.NewReader(`{"repositoryRef":"r","title":"T","body":"B","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"r","title":"fix(auth): login broken on OIDC redirect","body":"B","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/missing/issues", body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -578,7 +578,7 @@ func TestChangeSummary_WritesWithoutRemainingScope(t *testing.T) {
 
 func TestChangeSummary_TaskNotFound(t *testing.T) {
 	r := buildRouter(t)
-	body := strings.NewReader(`{"prTitle":"x","prBody":"y","deliveredScope":"z"}`)
+	body := strings.NewReader(`{"prTitle":"fix(auth): login broken on OIDC redirect","prBody":"y","deliveredScope":"z"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/missing/change-summary", body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -692,7 +692,7 @@ func TestIssueOutcome_PlanFieldAccepted(t *testing.T) {
 
 func TestChangeSummary_MostProblematicAccepted(t *testing.T) {
 	r := buildRouter(t, task("t1", "alpha"))
-	body := strings.NewReader(`{"prTitle":"feat: login","prBody":"body","deliveredScope":"login","mostProblematic":"token refresh"}`)
+	body := strings.NewReader(`{"prTitle":"feat(auth): implement OAuth2 login flow","prBody":"body","deliveredScope":"login","mostProblematic":"token refresh"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -719,7 +719,7 @@ func TestProposeIssue_InvalidKindRejected(t *testing.T) {
 
 func TestProposeIssue_BugKindAccepted(t *testing.T) {
 	r := buildRouter(t, project("alpha"), repository("repo-a", "alpha"))
-	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"T","body":"B","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"fix(auth): login broken on OIDC redirect","body":"B","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -729,7 +729,7 @@ func TestProposeIssue_BugKindAccepted(t *testing.T) {
 
 func TestProposeIssue_ImprovementKindAccepted(t *testing.T) {
 	r := buildRouter(t, project("alpha"), repository("repo-a", "alpha"))
-	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"T","body":"B","kind":"improvement"}`)
+	body := strings.NewReader(`{"repositoryRef":"repo-a","title":"Add retry logic for flaky CI push events","body":"B","kind":"improvement"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/alpha/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

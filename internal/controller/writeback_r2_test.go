@@ -179,6 +179,9 @@ func (r *fakePRReader) ListIssueComments(_ context.Context, _, _ string, _ int) 
 func (r *fakePRReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
 }
+func (r *fakePRReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
+}
 
 // TestWriteback_422AlreadyExists_RecoversPRURL verifies finding 2: when OpenChange
 // returns 422 "A pull request already exists", the controller recovers the
@@ -253,6 +256,9 @@ func (r *gitlabProjectPathReader) ListIssueComments(_ context.Context, _, _ stri
 }
 func (r *gitlabProjectPathReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
 	return scm.IssueContent{}, nil
+}
+func (r *gitlabProjectPathReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
+	return "", nil
 }
 
 // TestFindOpenIssueByTitle_GitLabProjectPath verifies finding 3: for GitLab

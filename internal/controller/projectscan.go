@@ -198,6 +198,7 @@ type candidate struct {
 	labels    []string
 	updatedAt time.Time
 	isPR      bool
+	title     string
 }
 
 func hasLabel(labels []string, want string) bool {
@@ -227,6 +228,7 @@ func candidatesFromPRs(prs []scm.PRRef) []candidate {
 		out = append(out, candidate{
 			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
 			body: p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
+			title: firstLine(p.Body),
 		})
 	}
 	return out
@@ -242,6 +244,7 @@ func candidatesFromIssues(iss []scm.IssueRef) []candidate {
 		}
 		out = append(out, candidate{
 			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+			title: i.Title,
 		})
 	}
 	return out
@@ -269,24 +272,32 @@ func candidatesFromBoard(items []scm.BoardItem) []candidate {
 // most callers they are the same candidate. For bot-PR MRCI entries they
 // differ: labelCand carries the linked-issue number (dedup key) while srcCand
 // carries the PR identity (number, IsPR=true).
+// scanSourceFor builds a TaskSource for a scan-born task candidate. Extracted
+// for testability; callers should use createScanTask which infers provider.
+func scanSourceFor(provider string, c candidate) *tatarav1alpha1.TaskSource {
+	sep := "#"
+	if c.isPR && provider == "gitlab" {
+		sep = "!"
+	}
+	src := &tatarav1alpha1.TaskSource{
+		Provider: provider,
+		IssueRef: fmt.Sprintf("%s%s%d", c.repo, sep, c.number),
+		Number:   c.number,
+		IsPR:     c.isPR,
+		Title:    c.title,
+	}
+	if c.author != "" {
+		src.AuthorLogin = c.author
+	}
+	return src
+}
+
 func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, labelCand, srcCand candidate, activity, kind, goal string, extraAnnotations map[string]string) (bool, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
-	sep := "#"
-	if srcCand.isPR && provider == "gitlab" {
-		sep = "!"
-	}
-	src := &tatarav1alpha1.TaskSource{
-		Provider: provider,
-		IssueRef: fmt.Sprintf("%s%s%d", srcCand.repo, sep, srcCand.number),
-		Number:   srcCand.number,
-		IsPR:     srcCand.isPR,
-	}
-	if srcCand.author != "" {
-		src.AuthorLogin = srcCand.author
-	}
+	src := scanSourceFor(provider, srcCand)
 	// Dedup key is based on labelCand (the issue/PR that determines the task's identity).
 	// For bot-PR MRCI entries, labelCand.number is the linked issue (not the PR#),
 	// ensuring that mrScan and issueScan share the same dedup key for the same issue.
@@ -652,7 +663,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				labels: c.labels, updatedAt: c.updatedAt, isPR: c.isPR,
 			}
 			srcCand := candidate{
-				repo: c.repo, number: c.number, author: c.author, isPR: true,
+				repo: c.repo, number: c.number, author: c.author, isPR: true, title: c.title,
 			}
 			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
@@ -856,7 +867,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	// Single pass: resolve slug, set primaryRepo, accumulate backlog, collect slugs.
 	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildIssuesContext below. SetOpenProposals is called for every
+	// for reuse by buildRepoStateContext below. SetOpenProposals is called for every
 	// repo queried up to the cap (best-effort: repos beyond the cap short-circuit
 	// and their gauges are not refreshed this cycle).
 	issuesBySlug := make(map[string][]scm.IssueRef)
@@ -911,9 +922,11 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		return
 	}
 
-	// Build rich open-issues context from already-fetched data (no second
-	// ListOpenIssues round-trip for the repos queried above - finding 5).
-	issuesCtx := r.buildIssuesContext(ctx, proj, reader, issuesBySlug, sortedRepos)
+	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
+	prsBySlug, prCIBySlug, mainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, "brainstorm")
+
+	// Build rich context from already-fetched data + bounded MR/main reads.
+	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
 	goal := brainstormGoalProject(slugs, issuesCtx)
 	created, err := r.createBrainstormTask(ctx, proj, goal, act.Sources)
@@ -972,7 +985,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 
 	// Aggregate proposal backlog across all repos; short-circuit once >= maxProp.
 	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildIssuesContext below.
+	// for reuse by buildRepoStateContext below.
 	issuesBySlug := make(map[string][]scm.IssueRef)
 	total := 0
 	var slugs []string
@@ -1011,9 +1024,11 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		return
 	}
 
-	// Build rich open-issues context from already-fetched data (no second
-	// ListOpenIssues round-trip for the repos queried above - finding 5).
-	issuesCtx := r.buildIssuesContext(ctx, proj, reader, issuesBySlug, sortedRepos)
+	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
+	hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, "healthCheck")
+
+	// Build rich context from already-fetched data + bounded MR/main reads.
+	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug, sortedRepos)
 
 	goal := healthCheckGoalProject(slugs, issuesCtx)
 	created, err := r.createHealthCheckTask(ctx, proj, goal, act.Sources)
@@ -1032,22 +1047,26 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 }
 
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
-// task. issuesCtx is a pre-built string of open issues across all repos
-// (one line each: "repo#N [labels] title"), used to guide dedup-first reasoning.
-// When issuesCtx is empty the dedup section is still present but notes no open
-// issues were found.
-func brainstormGoalProject(slugs []string, issuesCtx string) string {
+// task. repoStateCtx is the rich three-block string built by buildRepoStateContext
+// (ISSUES / OPEN MRs / MAIN HEALTH). When empty a fallback note is substituted.
+func brainstormGoalProject(slugs []string, repoStateCtx string) string {
 	repoList := strings.Join(slugs, ", ")
 
-	existingBlock := "No open issues found across the project."
-	if issuesCtx != "" {
-		existingBlock = "OPEN ISSUES (survey these FIRST before proposing anything new):\n" + issuesCtx
+	stateBlock := "No live repo state available."
+	if repoStateCtx != "" {
+		stateBlock = repoStateCtx
 	}
 
-	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the single highest-leverage " +
+	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
-		"\n\n" + existingBlock + "\n\n" +
+		"Run at MAXIMUM reasoning effort. Decompose the survey: dispatch one parallel subagent per repository " +
+		"(use the Agent/Workflow tools to fan out, then synthesize their findings into one systemic conclusion). " +
+		"\n\n" + stateBlock + "\n\n" +
+		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning " +
+		">=2 repositories, a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - " +
+		"over a one-repo tweak. Survey the ISSUES, OPEN MRs, and MAIN HEALTH blocks above; manage the " +
+		"backlog by linking/labelling/commenting related existing issues (never close issues you do not own).\n\n" +
 		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
 		"1. If the best idea DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
 		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
@@ -1059,30 +1078,37 @@ func brainstormGoalProject(slugs []string, issuesCtx string) string {
 		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
 		"twice on the same issue.\n" +
 		"3. ONLY if the idea is genuinely novel AND standalone (no existing issue covers it): " +
-		"call propose_issue with exactly one proposal. " +
+		"call propose_issue. " +
 		"Set the `repo` argument to the specific repository that should own the issue. " +
 		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
 		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input.\n\n" +
-		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
+		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic " +
+		"improvement MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
+		"a single `systemicId` string you generate. State which path and scope you chose before executing."
 }
 
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
-// task. It mirrors brainstormGoalProject (same dedup-first contract and issuesCtx
+// task. It mirrors brainstormGoalProject (same dedup-first contract and repoStateCtx
 // shape) but drives the tatara-health-check skill across all repo slugs.
-func healthCheckGoalProject(slugs []string, issuesCtx string) string {
+func healthCheckGoalProject(slugs []string, repoStateCtx string) string {
 	repoList := strings.Join(slugs, ", ")
 
-	existingBlock := "No open issues found across the project."
-	if issuesCtx != "" {
-		existingBlock = "OPEN ISSUES (survey these FIRST before proposing anything new):\n" + issuesCtx
+	stateBlock := "No live repo state available."
+	if repoStateCtx != "" {
+		stateBlock = repoStateCtx
 	}
 
 	return "Invoke the `tatara-health-check` skill to survey the HEALTH of the project's repositories " +
-		"and identify the single highest-leverage health issue across ALL repositories: " + repoList + ". " +
+		"and identify the highest-leverage health issue across ALL repositories: " + repoList + ". " +
 		"The skill defines the five health dimensions (CI failures, code coverage gaps, code to simplify, " +
 		"CI/CD pipeline steps worth adding, other tech-debt), how to gather evidence (on-disk CI config, an " +
 		"actual test/lint run, and the tatara-memory code graph), score leverage, and dedup. " +
-		"\n\n" + existingBlock + "\n\n" +
+		"Run at MAXIMUM reasoning effort. Decompose the survey: dispatch one parallel subagent per repository " +
+		"(use the Agent/Workflow tools to fan out, then synthesize their findings into one systemic conclusion). " +
+		"\n\n" + stateBlock + "\n\n" +
+		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic health gap - a pattern spanning " +
+		">=2 repositories (e.g. missing test coverage everywhere, CI flakiness across repos) - " +
+		"over a one-repo tweak. Survey the ISSUES, OPEN MRs, and MAIN HEALTH blocks above.\n\n" +
 		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
 		"1. If the best finding DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
 		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
@@ -1094,30 +1120,101 @@ func healthCheckGoalProject(slugs []string, issuesCtx string) string {
 		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
 		"twice on the same issue.\n" +
 		"3. ONLY if the finding is genuinely novel AND standalone (no existing issue covers it): " +
-		"call propose_issue with exactly one proposal. " +
+		"call propose_issue. " +
 		"Set the `repo` argument to the specific repository that should own the issue. " +
 		"The proposal must be self-contained: the concrete defect with file:line evidence, the proposed fix, " +
 		"and a single explicit decision for the human (approve to implement or comment to refine). " +
 		"Do NOT produce a list of open questions or ask for input.\n\n" +
-		"State which path you chose and why before executing it. Exactly one action per run - no exceptions."
+		"ACTION RULE: a one-repo finding emits exactly ONE propose_issue. A genuinely systemic " +
+		"health gap MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
+		"a single `systemicId` string you generate. State which path and scope you chose before executing."
 }
 
-// buildIssuesContext builds the rich context string embedded in the brainstorm
-// goal for dedup-first reasoning from a pre-fetched per-repo issue map (the
-// caller fetches once and reuses the same slice for proposalBacklog, avoiding
-// duplicate ListOpenIssues calls per repo per cycle - finding 4 & 5).
-// Format per line: "repo#N [label1,label2] title"
-// Capped at 60 issues; if more exist, appends a "(+N more omitted)" line.
-const maxIssuesContext = 60
+// gatherRepoCIState fetches open PRs, per-PR CI (bounded to the first 20 PRs),
+// and main-branch CI for each repo in sortedRepos. activity is a log prefix
+// ("brainstorm" or "healthCheck"). For GitLab repos the CI owner is the full
+// project path (URL-encoded by the gitlab client), matching the pattern already
+// used by lifecycle.go for main-CI and GetCommitCIStatus. All errors are
+// non-fatal; missing data degrades to empty/unknown in the returned maps.
+func (r *ProjectReconciler) gatherRepoCIState(
+	ctx context.Context,
+	proj *tatarav1alpha1.Project,
+	reader scm.SCMReader,
+	sortedRepos []tatarav1alpha1.Repository,
+	activity string,
+) (prsBySlug map[string][]scm.PRRef, prCIBySlug map[string]map[int]string, mainCIBySlug map[string]string) {
+	l := log.FromContext(ctx)
+	prsBySlug = map[string][]scm.PRRef{}
+	prCIBySlug = map[string]map[int]string{}
+	mainCIBySlug = map[string]string{}
+	isGitLab := proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab"
+	for i := range sortedRepos {
+		rp := &sortedRepos[i]
+		slug := repoSlug(rp)
+		if slug == "" {
+			continue
+		}
+		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
+		if err != nil {
+			continue
+		}
+		// Resolve provider-correct owner/repo for CI lookups.
+		ciOwner, ciRepo := owner, name
+		if isGitLab {
+			if pp, perr := scm.GitLabProjectPath(rp.Spec.URL); perr == nil {
+				ciOwner = pp
+				ciRepo = ""
+			}
+		}
+		if prs, perr := reader.ListOpenPRs(ctx, owner, name); perr == nil {
+			prsBySlug[slug] = prs
+			ci := map[int]string{}
+			const prCILimit = 20
+			for j, pr := range prs {
+				if j >= prCILimit {
+					break
+				}
+				if pr.HeadSHA != "" {
+					if st, serr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, pr.HeadSHA); serr == nil {
+						ci[pr.Number] = st
+					}
+				}
+			}
+			prCIBySlug[slug] = ci
+		} else {
+			l.Info(activity+": list open PRs failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", perr.Error())
+		}
+		if sha, serr := reader.GetDefaultBranchHeadSHA(ctx, ciOwner, ciRepo); serr == nil && sha != "" {
+			if st, cerr := reader.GetCommitCIStatus(ctx, ciOwner, ciRepo, sha); cerr == nil {
+				mainCIBySlug[slug] = st
+			}
+		} else if serr != nil {
+			l.Info(activity+": main head sha failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", serr.Error())
+		}
+	}
+	return
+}
 
-func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issuesBySlug map[string][]scm.IssueRef, repos []tatarav1alpha1.Repository) string {
+// buildRepoStateContext builds the rich context string embedded in the brainstorm
+// / healthCheck goal. It emits three blocks: ISSUES (pre-fetched, cap 60),
+// OPEN MRs (from prsBySlug, cap 40, per-PR CI from prCIBySlug), and MAIN HEALTH
+// (one line per repo from mainCIBySlug). All maps are caller-built and may be nil
+// (degrade gracefully).
+const maxIssuesContext = 60
+const maxMRsContext = 40
+
+func (r *ProjectReconciler) buildRepoStateContext(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issuesBySlug map[string][]scm.IssueRef, prsBySlug map[string][]scm.PRRef, prCIBySlug map[string]map[int]string, mainCIBySlug map[string]string, repos []tatarav1alpha1.Repository) string {
 	l := log.FromContext(ctx)
 	botLogin := ""
+	provider := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
+		provider = proj.Spec.Scm.Provider
 	}
-	var lines []string
-	total := 0
+
+	// ISSUES block.
+	var issueLines []string
+	issueTotal := 0
 	for i := range repos {
 		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
 		if err != nil {
@@ -1129,34 +1226,87 @@ func (r *ProjectReconciler) buildIssuesContext(ctx context.Context, proj *tatara
 			if iss.IsPR {
 				continue
 			}
-			if len(lines) >= maxIssuesContext {
-				total++
+			if len(issueLines) >= maxIssuesContext {
+				issueTotal++
 				continue
 			}
-			total++
+			issueTotal++
 			labels := strings.Join(iss.Labels, ",")
-			title := iss.Title
-			// Collapse newlines in title for a single-line entry.
-			title = strings.ReplaceAll(title, "\n", " ")
-			title = strings.ReplaceAll(title, "\r", "")
+			title := strings.ReplaceAll(strings.ReplaceAll(iss.Title, "\n", " "), "\r", "")
 			line := fmt.Sprintf("%s#%d [%s] %s", slug, iss.Number, labels, title)
 			if botCommentedOnIssue(ctx, reader, owner, name, iss.Number, botLogin) {
 				line += " [bot-engaged]"
 			}
-			lines = append(lines, line)
+			issueLines = append(issueLines, line)
 		}
 	}
-	if len(lines) == 0 {
-		return ""
-	}
-	omitted := total - len(lines)
-	result := strings.Join(lines, "\n")
+	omitted := issueTotal - len(issueLines)
+	issuesBlock := strings.Join(issueLines, "\n")
 	if omitted > 0 {
-		result += fmt.Sprintf("\n(+%d more omitted)", omitted)
-		l.Info("brainstorm: buildIssuesContext: capped issues context",
-			"shown", len(lines), "omitted", omitted)
+		issuesBlock += fmt.Sprintf("\n(+%d more omitted)", omitted)
+		l.Info("brainstorm: buildRepoStateContext: capped issues context",
+			"shown", len(issueLines), "omitted", omitted)
 	}
-	return result
+
+	// OPEN MRs block: provider-correct separator (! for gitlab, # for github).
+	mrSep := "#"
+	if provider == "gitlab" {
+		mrSep = "!"
+	}
+	var mrLines []string
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		slug := owner + "/" + name
+		prs := prsBySlug[slug]
+		ciMap := prCIBySlug[slug]
+		for _, pr := range prs {
+			if len(mrLines) >= maxMRsContext {
+				break
+			}
+			ciStatus := "unknown"
+			if ciMap != nil {
+				if st, ok := ciMap[pr.Number]; ok && st != "" {
+					ciStatus = st
+				}
+			}
+			title := ""
+			if pr.Body != "" {
+				title = firstLine(pr.Body)
+			}
+			mrLines = append(mrLines, fmt.Sprintf("%s%s%d [ci:%s] %s", slug, mrSep, pr.Number, ciStatus, title))
+		}
+	}
+
+	// MAIN HEALTH block: one line per repo.
+	var healthLines []string
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		slug := owner + "/" + name
+		status := "unknown"
+		if mainCIBySlug != nil {
+			if st, ok := mainCIBySlug[slug]; ok && st != "" {
+				status = st
+			}
+		}
+		healthLines = append(healthLines, fmt.Sprintf("%s main CI: %s", slug, status))
+	}
+
+	var sb strings.Builder
+	sb.WriteString("ISSUES:\n")
+	if issuesBlock != "" {
+		sb.WriteString(issuesBlock)
+	}
+	sb.WriteString("\n\nOPEN MRs:\n")
+	sb.WriteString(strings.Join(mrLines, "\n"))
+	sb.WriteString("\n\nMAIN HEALTH:\n")
+	sb.WriteString(strings.Join(healthLines, "\n"))
+	return sb.String()
 }
 
 // humanCommentAfter reports whether the issue has a comment authored by a
@@ -1231,14 +1381,33 @@ func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
 
 // proposalBacklogCount counts open, undecided ideas in a pre-fetched issue
 // slice: non-PR issues bearing the brainstorming or legacy-idea label.
+// Issues sharing a tatara/systemic-<id> label count as a single entry so that
+// a multi-repo systemic improvement does not inflate the backlog cap.
 func proposalBacklogCount(issues []scm.IssueRef, brainstormingLabel, legacyIdea string) int {
-	n := 0
+	const systemicPrefix = "tatara/systemic-"
+	groups := map[string]bool{}
+	standalone := 0
 	for _, iss := range issues {
-		if !iss.IsPR && (hasLabel(iss.Labels, brainstormingLabel) || hasLabel(iss.Labels, legacyIdea)) {
-			n++
+		if iss.IsPR {
+			continue
+		}
+		if !hasLabel(iss.Labels, brainstormingLabel) && !hasLabel(iss.Labels, legacyIdea) {
+			continue
+		}
+		sid := ""
+		for _, l := range iss.Labels {
+			if strings.HasPrefix(l, systemicPrefix) {
+				sid = l
+				break
+			}
+		}
+		if sid != "" {
+			groups[sid] = true
+		} else {
+			standalone++
 		}
 	}
-	return n
+	return standalone + len(groups)
 }
 
 // proposalBacklog counts open, undecided ideas for repo: open non-PR issues
@@ -1350,7 +1519,7 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			if !ok {
 				continue
 			}
-			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt}
+			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt, title: iss.Title}
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: entry}
 			ok2, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann)
 			if cerr != nil {

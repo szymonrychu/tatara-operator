@@ -156,6 +156,10 @@ type SCMReader interface {
 	// GetIssue returns the title and body of an issue.
 	// For GitLab owner carries the full project path; repo is unused.
 	GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error)
+	// GetDefaultBranchHeadSHA resolves the default branch HEAD commit sha.
+	// For GitLab owner carries the full project path; repo is unused. Paired
+	// with GetCommitCIStatus to report per-repo main-branch CI health.
+	GetDefaultBranchHeadSHA(ctx context.Context, owner, repo string) (string, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;

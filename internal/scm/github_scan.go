@@ -222,6 +222,26 @@ func (c *GitHub) GetIssue(ctx context.Context, owner, repo string, number int) (
 	return IssueContent{Title: raw.Title, Body: raw.Body}, nil
 }
 
+// GetDefaultBranchHeadSHA resolves the default branch HEAD commit sha for owner/repo.
+func (c *GitHub) GetDefaultBranchHeadSHA(ctx context.Context, owner, repo string) (string, error) {
+	var meta struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s", owner, repo), c.token, nil, &meta); err != nil {
+		return "", fmt.Errorf("github: get repo meta %s/%s: %w", owner, repo, err)
+	}
+	if meta.DefaultBranch == "" {
+		return "", fmt.Errorf("github: empty default_branch for %s/%s", owner, repo)
+	}
+	var commit struct {
+		SHA string `json:"sha"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s", owner, repo, meta.DefaultBranch), c.token, nil, &commit); err != nil {
+		return "", fmt.Errorf("github: get default branch head %s/%s@%s: %w", owner, repo, meta.DefaultBranch, err)
+	}
+	return commit.SHA, nil
+}
+
 func ghOwnerRepoFromSlug(slug string) (string, string, error) {
 	for i := len(slug) - 1; i >= 0; i-- {
 		if slug[i] == '/' {

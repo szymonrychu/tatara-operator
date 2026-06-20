@@ -215,7 +215,7 @@ func TestPostComment_RecordsMetric(t *testing.T) {
 func TestChangeSummary_RecordsMetric(t *testing.T) {
 	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	r := buildRouterWithMetrics(t, m, task("tm8", "alpha"))
-	req := httptest.NewRequest(http.MethodPost, "/tasks/tm8/change-summary", strings.NewReader(`{"prTitle":"x","prBody":"y","deliveredScope":"z"}`))
+	req := httptest.NewRequest(http.MethodPost, "/tasks/tm8/change-summary", strings.NewReader(`{"prTitle":"fix(scan): retry flaky push events on CI timeout","prBody":"y","deliveredScope":"z"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -362,7 +362,7 @@ func TestProposeIssue_RecordsRESTMetricNotScanMetric(t *testing.T) {
 	r := chi.NewRouter()
 	s.Mount(r, nil)
 
-	body := strings.NewReader(`{"repositoryRef":"pm1-repo","title":"T","body":"B","kind":"bug"}`)
+	body := strings.NewReader(`{"repositoryRef":"pm1-repo","title":"Add systemic correlation labels to brainstorm proposals","body":"B","kind":"bug"}`)
 	req := httptest.NewRequest(http.MethodPost, "/projects/pm1/issues", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

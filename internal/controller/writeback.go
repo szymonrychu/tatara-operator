@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -19,6 +20,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/titlecheck"
 )
 
 // Writer is the SCM egress contract the reconciler uses. It is the full
@@ -116,15 +118,14 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	}
 
 	sourceBranch := taskBranch(task)
-	title := firstLine(task.Spec.Goal)
+	title := derivePRTitle(task, primaryRepo.Name)
 	baseBody := writeBackBody(task)
 
-	// M4: when the agent submitted a change_summary, use PRTitle + PRBody +
-	// Delivered block as the MR title/body instead of the M1 defaults.
+	// M4: when the agent submitted a change_summary, use PRBody + Delivered block
+	// as the MR body instead of the M1 defaults. Title is handled by derivePRTitle
+	// (strong ChangeSummary.PRTitle wins; weak or absent falls back to conventional
+	// derived form from Source.Title / Goal).
 	if cs := task.Status.ChangeSummary; cs != nil {
-		if cs.PRTitle != "" {
-			title = cs.PRTitle
-		}
 		deliveredBody := cs.PRBody
 		if cs.DeliveredScope != "" {
 			deliveredBody += "\n\n## Delivered\n" + cs.DeliveredScope
@@ -393,6 +394,31 @@ func taskBranch(t *tatarav1alpha1.Task) string {
 	return agent.TaskBranch(t)
 }
 
+// derivePRTitle returns the PR/MR title for a write-back. A strong
+// ChangeSummary.PRTitle wins; otherwise it derives a conventional title from the
+// captured work-item title (Source.Title), falling back to the goal first line.
+// It never returns a weak title.
+func derivePRTitle(task *tatarav1alpha1.Task, scope string) string {
+	if cs := task.Status.ChangeSummary; cs != nil && cs.PRTitle != "" {
+		if weak, _ := titlecheck.Weak(cs.PRTitle); !weak {
+			return cs.PRTitle
+		}
+	}
+	subject := ""
+	if task.Spec.Source != nil {
+		subject = strings.TrimSpace(task.Spec.Source.Title)
+	}
+	if subject == "" {
+		subject = firstLine(task.Spec.Goal)
+	}
+	kind := "feat"
+	switch task.Spec.Kind {
+	case "issueLifecycle", "incident":
+		kind = "fix"
+	}
+	return fmt.Sprintf("%s(%s): %s", kind, scope, subject)
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		s = s[:i]
@@ -515,12 +541,17 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	}
 
 	brainstorming, _, _, _ := lifecycleLabels(proj.Spec.Scm)
-	label := brainstorming
-	body := task.Spec.ProposedIssue.Body + "\n\n" + tataraAuthoredMarker
+	labels := []string{brainstorming}
+	body := task.Spec.ProposedIssue.Body
+	if sid := task.Spec.ProposedIssue.SystemicID; sid != "" {
+		labels = append(labels, "tatara/systemic-"+sid)
+		body += fmt.Sprintf("\n\nPart of systemic improvement %s spanning: %s", sid, systemicRepoList(ctx, r, proj))
+	}
+	body += "\n\n" + tataraAuthoredMarker
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 		Title:  proposalTitle,
 		Body:   body,
-		Labels: []string{label},
+		Labels: labels,
 	})
 	if err != nil {
 		r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "error")
@@ -1117,6 +1148,25 @@ func issueURLFromRepoURL(repoURL, provider, repo string, number int) string {
 		return fmt.Sprintf("%s/%s/-/issues/%d", base, repo, number)
 	}
 	return fmt.Sprintf("%s/%s/issues/%d", base, repo, number)
+}
+
+// systemicRepoList returns a comma-joined sorted list of owner/repo slugs for
+// all repos in the project. Used for the systemic-improvement footer in
+// createProposal. On error it degrades gracefully to an empty list.
+func systemicRepoList(ctx context.Context, r *TaskReconciler, proj *tatarav1alpha1.Project) string {
+	repos, err := r.projectRepos(ctx, proj)
+	if err != nil {
+		log.FromContext(ctx).Info("proposal: systemic repo list failed (non-fatal)", "resource_id", proj.Name, "err", err.Error())
+		return ""
+	}
+	slugs := make([]string, 0, len(repos))
+	for i := range repos {
+		if owner, name, oerr := scm.OwnerRepo(repos[i].Spec.URL); oerr == nil {
+			slugs = append(slugs, owner+"/"+name)
+		}
+	}
+	sort.Strings(slugs)
+	return strings.Join(slugs, ", ")
 }
 
 // parseRepoBase returns the scheme+host of repoURL (e.g. "https://gitlab.example.com").
