@@ -289,10 +289,55 @@ func secretEnv(name, secretName, key string) corev1.EnvVar {
 	}
 }
 
-// TaskBranch is the deterministic work branch for a Task's agent run, the
-// single source operator write-back, the turn prompts, and the wrapper all
-// agree on. Convention: tatara/task-<task-name>.
+// slugifyTitle lowercases s, collapses every run of non-[a-z0-9] into a single
+// '-', trims leading/trailing '-', and caps at 40 chars (trimmed again so a cut
+// never leaves a trailing '-').
+func slugifyTitle(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	prevDash := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevDash = false
+		} else if !prevDash {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if len(out) > 40 {
+		out = strings.Trim(out[:40], "-")
+	}
+	return out
+}
+
+// branchKind maps a Task to a conventional branch prefix.
+func branchKind(t *tatarav1alpha1.Task) string {
+	switch t.Spec.Kind {
+	case "issueLifecycle", "incident":
+		return "fix"
+	case "implement":
+		return "feat"
+	default: // review, brainstorm, healthCheck, selfImprove, triageIssue
+		return "chore"
+	}
+}
+
+// TaskBranch is the deterministic work branch all of the operator write-back,
+// the turn prompts, and the wrapper agree on. When the Task carries an issue/PR
+// number it is tatara/<kind>-<number>-<slug>; otherwise tatara/task-<task-name>.
 func TaskBranch(t *tatarav1alpha1.Task) string {
+	if t.Spec.Source != nil && t.Spec.Source.Number > 0 {
+		base := fmt.Sprintf("tatara/%s-%d", branchKind(t), t.Spec.Source.Number)
+		if slug := slugifyTitle(t.Spec.Source.Title); slug != "" {
+			base += "-" + slug
+		}
+		if len(base) > 63 {
+			base = strings.Trim(base[:63], "-")
+		}
+		return base
+	}
 	return "tatara/task-" + t.Name
 }
 
