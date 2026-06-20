@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -61,6 +62,37 @@ type GrafanaStatus struct {
 	Endpoint string `json:"endpoint,omitempty"`
 }
 
+// LifecycleHooks holds optional shell commands the claude-code wrapper runs at
+// fixed points in an agent session. Each is a command string executed via
+// `sh -c`; an empty field is skipped. Hooks are best-effort: a non-zero exit is
+// logged and counted but never aborts the agent run. preClone receives the repo
+// URL and postClone the clone destination (passed as a positional arg and via
+// env); the conversation/turn hooks receive the task context already present in
+// the pod env (TATARA_TASK, TATARA_PROJECT).
+type LifecycleHooks struct {
+	// PreClone runs before each repository clone, with the repo URL as argument.
+	// +optional
+	PreClone string `json:"preClone,omitempty"`
+	// PostClone runs after each successful clone+checkout, with the clone
+	// destination directory as argument.
+	// +optional
+	PostClone string `json:"postClone,omitempty"`
+	// ConversationStart runs once after the agent session boots successfully.
+	// +optional
+	ConversationStart string `json:"conversationStart,omitempty"`
+	// ConversationRestart runs each time the session is relaunched/resumed after
+	// a crash (the --continue path).
+	// +optional
+	ConversationRestart string `json:"conversationRestart,omitempty"`
+	// AgentTurnFinished runs after each agent turn completes (after the work is
+	// committed and pushed).
+	// +optional
+	AgentTurnFinished string `json:"agentTurnFinished,omitempty"`
+	// ConversationFinished runs once during session teardown.
+	// +optional
+	ConversationFinished string `json:"conversationFinished,omitempty"`
+}
+
 // AgentSpec configures the wrapper agent session a Task runs.
 type AgentSpec struct {
 	// +optional
@@ -96,6 +128,29 @@ type AgentSpec struct {
 	// +kubebuilder:default="xhigh"
 	// +optional
 	Effort string `json:"effort,omitempty"`
+	// Hooks are optional lifecycle commands the wrapper runs at fixed points
+	// (clone, conversation start/restart, turn finished, conversation finished).
+	// +optional
+	Hooks *LifecycleHooks `json:"hooks,omitempty"`
+	// ExtraEnvs are appended to the wrapper container's env, after the operator's
+	// own variables (so a stray extra cannot shadow a required one).
+	// +optional
+	ExtraEnvs []corev1.EnvVar `json:"extraEnvs,omitempty"`
+	// ExtraEnvsFrom populates the wrapper container's envFrom (ConfigMap/Secret refs).
+	// +optional
+	ExtraEnvsFrom []corev1.EnvFromSource `json:"extraEnvsFrom,omitempty"`
+	// ExtraVolumeMounts are appended to the wrapper container's volumeMounts.
+	// +optional
+	ExtraVolumeMounts []corev1.VolumeMount `json:"extraVolumeMounts,omitempty"`
+	// ExtraVolumes are appended to the agent Pod's volumes.
+	// +optional
+	ExtraVolumes []corev1.Volume `json:"extraVolumes,omitempty"`
+	// ExtraSidecarContainers are appended to the agent Pod's containers, after the wrapper.
+	// +optional
+	ExtraSidecarContainers []corev1.Container `json:"extraSidecarContainers,omitempty"`
+	// ExtraInitContainers populate the agent Pod's initContainers.
+	// +optional
+	ExtraInitContainers []corev1.Container `json:"extraInitContainers,omitempty"`
 }
 
 // BoardSpec configures the project board tatara participates in.

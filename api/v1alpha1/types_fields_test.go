@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestNewFields_JSONRoundTrip(t *testing.T) {
@@ -18,6 +20,34 @@ func TestNewFields_JSONRoundTrip(t *testing.T) {
 				return json.Marshal(AgentSpec{Effort: "max"})
 			},
 			want: `"effort":"max"`,
+		},
+		{
+			name: "LifecycleHooks json keys camelCase",
+			marshal: func() ([]byte, error) {
+				return json.Marshal(LifecycleHooks{
+					PreClone:             "a",
+					PostClone:            "b",
+					ConversationStart:    "c",
+					ConversationRestart:  "d",
+					AgentTurnFinished:    "e",
+					ConversationFinished: "f",
+				})
+			},
+			want: `"preClone":"a","postClone":"b","conversationStart":"c","conversationRestart":"d","agentTurnFinished":"e","conversationFinished":"f"`,
+		},
+		{
+			name: "AgentSpec.Hooks json key hooks",
+			marshal: func() ([]byte, error) {
+				return json.Marshal(AgentSpec{Hooks: &LifecycleHooks{PreClone: "x"}})
+			},
+			want: `"hooks":{"preClone":"x"}`,
+		},
+		{
+			name: "AgentSpec.ExtraEnvs json key extraEnvs",
+			marshal: func() ([]byte, error) {
+				return json.Marshal(AgentSpec{ExtraEnvs: []corev1.EnvVar{{Name: "FOO", Value: "bar"}}})
+			},
+			want: `"extraEnvs":[{"name":"FOO","value":"bar"}]`,
 		},
 		{
 			name: "TaskSource.Title json key title",
