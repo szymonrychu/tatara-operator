@@ -88,20 +88,34 @@ not reactivate.
   That is acceptable - such actions are webhook-driven, and the periodic scan is a
   backstop for missed comment webhooks specifically.
 
-### Layer C - silence gate on "bot has the last word"
+### Layer C - silence gate gains a "bot has the last word" clause
 
-Replace the `isTataraAuthored && !hasHumanReply` precondition in both the discuss
-and close-withheld arms with: suppress the hold comment when the bot already has
-the last word (no human comment newer than the bot's last comment). This:
+Keep the existing `isTataraAuthored && !hasHumanReply` suppression (it correctly
+silences the bot on its OWN zero-engagement idea from the very first cycle - the
+#29 fix) and ADD a second suppression clause: also suppress when the bot already
+has the last word (the newest issue comment is the bot's). Final predicate in the
+discuss and close-withheld arms:
 
-- drops the `tatara-authored` marker dependency, so it covers human-authored
-  brainstorming issues like #74;
-- changes "human ever replied" to "human replied since the bot last spoke", so a
-  single stale human reply no longer unlocks perpetual re-posting;
-- still posts when a human has genuinely replied since the bot's last comment
-  (the legitimate "respond to the maintainer" case).
+```
+suppress = (isTataraAuthored && !hasHumanReply) || botHasLastWord
+```
 
-Fail-open on read error (post the comment), matching the current arms' discipline.
+This:
+
+- adds marker-independent coverage for human-authored brainstorming issues like
+  #74, where one stale human reply (06-16) had unlocked perpetual re-posting;
+- still posts the FIRST genuine response to a human (at that moment the human's
+  comment is newest, so `botHasLastWord` is false), then suppresses the repeats;
+- preserves all three existing discuss-silence tests unchanged (each uses
+  `comments == nil`, where `botHasLastWord` is false, so the existing clause alone
+  decides them).
+
+The implement-arm self-approve guard (lifecycle.go:921) is NOT touched -
+`isTataraAuthored`/`hasHumanReply` keep their existing meaning there.
+
+`botHasLastWord` determines "newest" by `IssueComment.CreatedAt` (max). No comments
+-> false (the bot has not spoken). Fail-open on read error (post the comment),
+matching the current arms' discipline.
 
 ## Components touched
 
