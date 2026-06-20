@@ -349,6 +349,20 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 	if err != nil {
 		return false, err
 	}
+	// Create the per-Project agent customization ConfigMaps (issue #74) the Pod
+	// mounts, before the Pod so the kubelet never hits a missing-ConfigMap mount.
+	// Owner-referenced to the Task, so they are GC'd with it.
+	for _, cm := range agent.BuildAgentConfigMaps(project, task, r.PodConfig) {
+		existingCM := &corev1.ConfigMap{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: cm.Namespace, Name: cm.Name}, existingCM)
+		if apierrors.IsNotFound(err) {
+			if err := r.Create(ctx, cm); err != nil {
+				return false, fmt.Errorf("create agent configmap %s: %w", cm.Name, err)
+			}
+		} else if err != nil {
+			return false, fmt.Errorf("get agent configmap %s: %w", cm.Name, err)
+		}
+	}
 	pod := agent.BuildPod(project, repo, task, repos, project.Status.Memory.Endpoint, r.PodConfig)
 	existing := &corev1.Pod{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, existing)

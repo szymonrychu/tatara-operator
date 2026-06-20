@@ -450,6 +450,15 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
 
+	// Per-Project agent customization (issue #74): mount the operator-generated
+	// prompt/MCP/settings/plugins ConfigMaps and the user-provided skill
+	// ConfigMaps, advertise the two non-default paths via env, then append the
+	// Project's own env vars LAST so a Project can override nothing operator-owned
+	// by accident but can add to the environment (secrets via secretKeyRef).
+	custVols, custMounts, custEnv := agentCustomization(project, task)
+	env = append(env, custEnv...)
+	env = append(env, project.Spec.Agent.Env...)
+
 	labels := podLabels(task)
 	if task.Spec.Kind == "brainstorm" && hasInternetSource(task.Annotations[tatarav1alpha1.AnnBrainstormSources]) {
 		labels["tatara.io/egress"] = "internet"
@@ -469,6 +478,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			Tolerations:      cfg.Tolerations,
 			Affinity:         cfg.Affinity,
 			SecurityContext:  buildPodSecurityContext(cfg),
+			Volumes:          custVols,
 			Containers: []corev1.Container{{
 				Name:            "wrapper",
 				Image:           project.Spec.Agent.Image,
@@ -476,6 +486,7 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 				Ports:           []corev1.ContainerPort{{ContainerPort: wrapperPort}},
 				Resources:       buildResourceRequirements(cfg),
 				SecurityContext: buildSecurityContext(cfg),
+				VolumeMounts:    custMounts,
 				ReadinessProbe: &corev1.Probe{
 					ProbeHandler: corev1.ProbeHandler{
 						HTTPGet: &corev1.HTTPGetAction{
