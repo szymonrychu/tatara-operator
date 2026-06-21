@@ -228,6 +228,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Namespace:      cfg.Namespace,
 		PushMetrics:    pushReceiver.PushHandler(),
 		CallbackSecret: cfg.CallbackHMACSecret,
+		TaskRetention:  cfg.TaskRetention,
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return nil, fmt.Errorf("add callback server: %w", err)

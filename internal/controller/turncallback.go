@@ -62,6 +62,11 @@ type CallbackServer struct {
 	// deleting it. Zero means use the default (pollRequeue). Set to a small
 	// value in tests to bypass the grace window without waiting.
 	ReaperGrace time.Duration
+	// TaskRetention is how long a terminal Task is kept before the reaper
+	// garbage-collects it (its Subtasks cascade via owner reference). Set from
+	// config.TaskRetention, already clamped to config.MinTaskRetention. Zero or
+	// negative disables the GC pass (e.g. tests that do not exercise it).
+	TaskRetention time.Duration
 }
 
 type turnCompletePayload struct {

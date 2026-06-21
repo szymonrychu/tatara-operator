@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
@@ -55,6 +56,15 @@ func mkWrapperPodSvc(t *testing.T, name, taskName, taskUID string) {
 	if err := k8sClient.Create(context.Background(), svc); err != nil {
 		t.Fatalf("create service %s: %v", name, err)
 	}
+}
+
+func taskExists(t *testing.T, name string) bool {
+	t.Helper()
+	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, &tatarav1alpha1.Task{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get task %s: %v", name, err)
+	}
+	return err == nil
 }
 
 func podExists(t *testing.T, name string) bool {
@@ -313,4 +323,104 @@ func TestReapOrphans_YoungServiceNotReaped(t *testing.T) {
 
 	// Clean up so it does not leak into later tests.
 	_ = k8sClient.Delete(ctx, svc)
+}
+
+// gcServer returns a CallbackServer with the given terminal-Task retention and a
+// tiny ReaperGrace so pod/service passes never interfere with the GC assertions.
+func gcServer(reg *prometheus.Registry, retention time.Duration) *CallbackServer {
+	return &CallbackServer{
+		Client:        k8sClient,
+		Metrics:       obs.NewOperatorMetrics(reg),
+		Namespace:     testNS,
+		ReaperGrace:   time.Nanosecond,
+		TaskRetention: retention,
+	}
+}
+
+// TestReapOrphans_GCOldTerminalTask verifies a terminal Task older than the
+// retention window is garbage-collected and the operator_tasks_gc_total counter
+// increments for its kind.
+func TestReapOrphans_GCOldTerminalTask(t *testing.T) {
+	mkTaskProject(t, "p-gc-old", 3)
+	mkTaskRepository(t, "r-gc-old", "p-gc-old")
+	mkTask(t, "t-gc-old", "p-gc-old", "r-gc-old")
+	setTaskPhase(t, "t-gc-old", "Succeeded")
+
+	reg := prometheus.NewRegistry()
+	// Retention of 1ns: the just-created Task is already past the window.
+	gcServer(reg, time.Nanosecond).ReapOrphans(context.Background())
+
+	if taskExists(t, "t-gc-old") {
+		t.Error("expected terminal Task past retention to be garbage-collected")
+	}
+
+	kind := "implement" // mkTask Tasks default to kind=implement
+	var got float64
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_tasks_gc_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "kind" && lp.GetValue() == kind {
+					got = m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	// >= 1 (not == 1): GC lists Tasks namespace-wide and other tests in this
+	// shared-envtest package may leave terminal Tasks the same sweep collects.
+	if got < 1 {
+		t.Errorf("operator_tasks_gc_total{kind=%s} = %v, want >= 1", kind, got)
+	}
+}
+
+// TestReapOrphans_GCKeepsYoungTerminalTask verifies a terminal Task younger than
+// the retention window is kept.
+func TestReapOrphans_GCKeepsYoungTerminalTask(t *testing.T) {
+	mkTaskProject(t, "p-gc-young", 3)
+	mkTaskRepository(t, "r-gc-young", "p-gc-young")
+	mkTask(t, "t-gc-young", "p-gc-young", "r-gc-young")
+	setTaskPhase(t, "t-gc-young", "Failed")
+
+	gcServer(prometheus.NewRegistry(), time.Hour).ReapOrphans(context.Background())
+
+	if !taskExists(t, "t-gc-young") {
+		t.Error("expected terminal Task within retention window to be kept")
+	}
+}
+
+// TestReapOrphans_GCKeepsNonTerminalTask verifies a non-terminal Task is never
+// garbage-collected regardless of age.
+func TestReapOrphans_GCKeepsNonTerminalTask(t *testing.T) {
+	mkTaskProject(t, "p-gc-live", 3)
+	mkTaskRepository(t, "r-gc-live", "p-gc-live")
+	mkTask(t, "t-gc-live", "p-gc-live", "r-gc-live")
+	setTaskPhase(t, "t-gc-live", "Running")
+
+	gcServer(prometheus.NewRegistry(), time.Nanosecond).ReapOrphans(context.Background())
+
+	if !taskExists(t, "t-gc-live") {
+		t.Error("expected non-terminal Task to be kept by GC")
+	}
+}
+
+// TestReapOrphans_GCDisabledWhenRetentionZero verifies a zero retention disables
+// the GC pass entirely (the unset-field safety guard).
+func TestReapOrphans_GCDisabledWhenRetentionZero(t *testing.T) {
+	mkTaskProject(t, "p-gc-off", 3)
+	mkTaskRepository(t, "r-gc-off", "p-gc-off")
+	mkTask(t, "t-gc-off", "p-gc-off", "r-gc-off")
+	setTaskPhase(t, "t-gc-off", "Succeeded")
+
+	// reaperServer() leaves TaskRetention at zero.
+	reaperServer().ReapOrphans(context.Background())
+
+	if !taskExists(t, "t-gc-off") {
+		t.Error("expected GC disabled (retention=0) to keep the terminal Task")
+	}
 }

@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/szymonrychu/tatara-operator/internal/config"
 )
@@ -279,6 +280,70 @@ func TestLoad_MalformedPushMetricsTTL(t *testing.T) {
 
 	if _, err := config.Load(); err == nil {
 		t.Fatal("expected error for malformed PUSH_METRICS_TTL=5minutes, got nil")
+	}
+}
+
+// TestLoad_TaskRetentionDefault asserts the terminal-Task GC retention defaults
+// to a week when TASK_RETENTION_HOURS is unset.
+func TestLoad_TaskRetentionDefault(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TaskRetention != config.DefaultTaskRetention {
+		t.Fatalf("TaskRetention default = %v, want %v", cfg.TaskRetention, config.DefaultTaskRetention)
+	}
+}
+
+// TestLoad_TaskRetentionCustom asserts an integer-hours TASK_RETENTION_HOURS is
+// parsed into a Duration.
+func TestLoad_TaskRetentionCustom(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("TASK_RETENTION_HOURS", "72")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TaskRetention != 72*time.Hour {
+		t.Fatalf("TaskRetention = %v, want 72h", cfg.TaskRetention)
+	}
+}
+
+// TestLoad_TaskRetentionClampedToFloor asserts a retention below the safety floor
+// is clamped up so GC can never delete a Task still anchoring a dedup/cooldown
+// window.
+func TestLoad_TaskRetentionClampedToFloor(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("TASK_RETENTION_HOURS", "1") // below the 2h floor
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TaskRetention != config.MinTaskRetention {
+		t.Fatalf("TaskRetention = %v, want clamp to floor %v", cfg.TaskRetention, config.MinTaskRetention)
+	}
+}
+
+// TestLoad_MalformedTaskRetention asserts a non-integer TASK_RETENTION_HOURS
+// fails fast rather than silently falling back to the default.
+func TestLoad_MalformedTaskRetention(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("TASK_RETENTION_HOURS", "7d") // not an integer
+
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for malformed TASK_RETENTION_HOURS=7d, got nil")
 	}
 }
 

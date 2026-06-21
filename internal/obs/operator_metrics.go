@@ -27,6 +27,7 @@ type OperatorMetrics struct {
 	agentBootCrashTotal       *prometheus.CounterVec
 	orphanReapedTotal         *prometheus.CounterVec
 	reapDeleteErrorTotal      *prometheus.CounterVec
+	tasksGCTotal              *prometheus.CounterVec
 	turnSubmitTotal           *prometheus.CounterVec
 	turnSubmitDuration        *prometheus.HistogramVec
 	agentHTTPTotal            *prometheus.CounterVec
@@ -138,6 +139,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_reap_delete_error_total",
 			Help: "Errors deleting orphan wrappers by resource kind.",
 		}, []string{"kind"}),
+		tasksGCTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_tasks_gc_total",
+			Help: "Terminal Tasks garbage-collected by the reaper past the retention window, by Task kind.",
+		}, []string{"kind"}),
 		turnSubmitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_turn_submit_total",
 			Help: "Total turn submissions to agent wrappers by kind and result.",
@@ -239,6 +244,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentBootCrashTotal,
 		m.orphanReapedTotal,
 		m.reapDeleteErrorTotal,
+		m.tasksGCTotal,
 		m.turnSubmitTotal,
 		m.turnSubmitDuration,
 		m.agentHTTPTotal,
@@ -285,6 +291,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	for _, action := range []string{"implement", "close", "discuss", "close-withheld"} {
 		m.issueOutcomeTotal.WithLabelValues(action)
+	}
+	// Pre-seed terminal-Task GC by kind so the series exist before the first sweep.
+	for _, kind := range []string{
+		"implement", "review", "selfImprove", "triageIssue",
+		"brainstorm", "issueLifecycle", "incident",
+	} {
+		m.tasksGCTotal.WithLabelValues(kind)
 	}
 	for _, source := range []string{"reconcile", "poll_backstop", "planning_watchdog"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
@@ -447,9 +460,15 @@ func (m *OperatorMetrics) OrphanReaped(reason string) {
 }
 
 // ReapDeleteError increments operator_reap_delete_error_total for the resource
-// kind that failed to delete ("pod" or "service").
+// kind that failed to delete ("pod", "service", or "task").
 func (m *OperatorMetrics) ReapDeleteError(kind string) {
 	m.reapDeleteErrorTotal.WithLabelValues(kind).Inc()
+}
+
+// TasksGC increments operator_tasks_gc_total for a terminal Task of the given
+// kind garbage-collected past the retention window.
+func (m *OperatorMetrics) TasksGC(kind string) {
+	m.tasksGCTotal.WithLabelValues(kind).Inc()
 }
 
 // TurnSubmit increments operator_turn_submit_total for the task kind and result
