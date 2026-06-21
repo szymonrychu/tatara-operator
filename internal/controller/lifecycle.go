@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -682,8 +683,13 @@ type triageReader struct {
 	owner    string
 	repoName string
 	botLogin string
-	issueNum int
-	resolved bool // false = ReaderFor unavailable; callers treat as "not authored"
+	// approvers is the effective maintainer/approver allowlist for the task's repo
+	// (issue #102). When non-empty, only a comment from one of these accounts
+	// counts as the human approval go-ahead; empty preserves the historical
+	// behavior (any non-bot human reply releases the self-approve hold).
+	approvers []string
+	issueNum  int
+	resolved  bool // false = ReaderFor unavailable; callers treat as "not authored"
 }
 
 // resolveTriageReader resolves the SCM reader and repo coordinates once for
@@ -722,13 +728,24 @@ func (r *TaskReconciler) resolveTriageReaderURL(ctx context.Context, project *ta
 	if project.Spec.Scm != nil {
 		botLogin = project.Spec.Scm.BotLogin
 	}
+	// Effective approver list for the self-approve-hold release (issue #102),
+	// honoring any per-repository MaintainerLogins override. Best-effort Get: on
+	// failure approvers falls back to the project list (nil repo).
+	var repo *tatarav1alpha1.Repository
+	if task.Spec.RepositoryRef != "" {
+		var repoObj tatarav1alpha1.Repository
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repoObj); err == nil {
+			repo = &repoObj
+		}
+	}
 	return triageReader{
-		reader:   reader,
-		owner:    owner,
-		repoName: repoName,
-		botLogin: botLogin,
-		issueNum: task.Spec.Source.Number,
-		resolved: true,
+		reader:    reader,
+		owner:     owner,
+		repoName:  repoName,
+		botLogin:  botLogin,
+		approvers: tatarav1alpha1.EffectiveMaintainerLogins(project, repo),
+		issueNum:  task.Spec.Source.Number,
+		resolved:  true,
 	}
 }
 
@@ -745,8 +762,10 @@ func (tr triageReader) isTataraAuthored(ctx context.Context) (bool, error) {
 	return strings.Contains(content.Body, tataraAuthoredMarker), nil
 }
 
-// hasHumanReply uses the pre-resolved triageReader to check for a non-bot
-// comment without an additional token/reader/repo fetch (finding 6).
+// hasHumanReply uses the pre-resolved triageReader to check for a human comment
+// that releases the self-approve hold, without an additional token/reader/repo
+// fetch (finding 6). When an approver allowlist is configured (issue #102) only
+// a comment from an approver counts; otherwise any non-bot comment does.
 func (tr triageReader) hasHumanReply(ctx context.Context) (bool, error) {
 	if !tr.resolved {
 		return false, nil
@@ -756,9 +775,13 @@ func (tr triageReader) hasHumanReply(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	for _, c := range comments {
-		if c.Author != "" && c.Author != tr.botLogin {
-			return true, nil
+		if c.Author == "" || c.Author == tr.botLogin {
+			continue
 		}
+		if len(tr.approvers) > 0 && !slices.Contains(tr.approvers, c.Author) {
+			continue
+		}
+		return true, nil
 	}
 	return false, nil
 }

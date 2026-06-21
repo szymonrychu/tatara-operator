@@ -183,7 +183,8 @@ func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alph
 
 // thirdPartyAuthor reports whether the task's source issue was opened by a
 // known external contributor: a non-empty Source.AuthorLogin that is neither
-// the configured BotLogin nor any MaintainerLogin. Third-party issues are
+// the configured BotLogin nor any MaintainerLogin, and (issue #102) that is an
+// allowed reporter. Third-party issues are
 // trusted and autoapproved through triage without the self-approve hold
 // (issue #56). AuthorLogin is authoritative here - for cron-scanned issues it
 // is captured from the authenticated ListOpenIssues call, and on the webhook
@@ -201,6 +202,13 @@ func thirdPartyAuthor(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) b
 		if author == m {
 			return false
 		}
+	}
+	// Issue #102: only autoapprove third-party authors that are allowed reporters.
+	// With an empty reporter allowlist this is a no-op (every external author is
+	// trusted, preserving issue #56); once an allowlist is configured a non-reporter
+	// would already have been dropped at intake, so this is belt-and-braces.
+	if !tatarav1alpha1.IsAllowedReporter(proj, nil, author) {
+		return false
 	}
 	return true
 }
