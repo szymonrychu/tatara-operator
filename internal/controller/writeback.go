@@ -51,8 +51,10 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		// Only claim BrainstormProposed when at least one proposal child Task
 		// exists; otherwise use BrainstormComplete so a no-yield run is visible.
 		if r.brainstormHasProposal(ctx, task) {
+			r.Metrics.BrainstormOutcome("proposed")
 			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "BrainstormProposed", "brainstorm proposals created via propose_issue; no PR to open")
 		}
+		r.Metrics.BrainstormOutcome("no_yield")
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "BrainstormComplete", "brainstorm finished with no proposal filed via propose_issue")
 	default:
 		// implement and other future kinds that open a change.

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -166,6 +167,54 @@ func TestBrainstormGoal_ContainsProposeIssueRequirement(t *testing.T) {
 	require.True(t, hasDecisionFraming, "brainstorm goal must include single-decision framing (approve/refine)")
 	// Old single-action clause must be gone (multi-issue systemic is now allowed).
 	require.NotContains(t, goal, "Exactly one action per run", "stale single-action clause must be removed")
+}
+
+// TestDoWriteBackBrainstorm_Metrics verifies the per-run yield counter
+// operator_brainstorm_outcome_total is incremented on the right branch: a run
+// with a proposal child bumps result="proposed", a no-yield run bumps
+// result="no_yield".
+func TestDoWriteBackBrainstorm_Metrics(t *testing.T) {
+	t.Run("proposed", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "bswb-metric-prop-task", "bswb-metric-prop-proj", "bswb-metric-prop-repo", "bswb-metric-prop-scm",
+			tatarav1alpha1.TaskSpec{Goal: "brainstorm new issues", Kind: "brainstorm"}, nil)
+
+		proposalTask := &tatarav1alpha1.Task{
+			ObjectMeta: metav1.ObjectMeta{Name: "bswb-metric-prop-child", Namespace: testNS},
+			Spec: tatarav1alpha1.TaskSpec{
+				ProjectRef: task.Spec.ProjectRef, RepositoryRef: task.Spec.RepositoryRef,
+				Goal: "implement: idea", Kind: "implement",
+				ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
+					RepositoryRef: task.Spec.RepositoryRef, Title: "idea", Body: "body", Kind: "improvement",
+				},
+			},
+		}
+		require.NoError(t, k8sClient.Create(context.Background(), proposalTask))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.Equal(t, float64(1), testutil.ToFloat64(r.Metrics.BrainstormOutcomeCounter("proposed")),
+			"a brainstorm run with a proposal child must bump result=proposed")
+		require.Equal(t, float64(0), testutil.ToFloat64(r.Metrics.BrainstormOutcomeCounter("no_yield")),
+			"a proposed run must not bump result=no_yield")
+	})
+
+	t.Run("no_yield", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "bswb-metric-noyield-task", "bswb-metric-noyield-proj", "bswb-metric-noyield-repo", "bswb-metric-noyield-scm",
+			tatarav1alpha1.TaskSpec{Goal: "brainstorm new issues", Kind: "brainstorm"}, nil)
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.Equal(t, float64(1), testutil.ToFloat64(r.Metrics.BrainstormOutcomeCounter("no_yield")),
+			"a brainstorm run with no proposal must bump result=no_yield")
+		require.Equal(t, float64(0), testutil.ToFloat64(r.Metrics.BrainstormOutcomeCounter("proposed")),
+			"a no-yield run must not bump result=proposed")
+	})
 }
 
 // seedBrainstormWithPendingWriteback seeds a brainstorm Task in WritebackPending

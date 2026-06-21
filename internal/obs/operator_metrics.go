@@ -33,6 +33,7 @@ type OperatorMetrics struct {
 	agentHTTPDuration         *prometheus.HistogramVec
 	authTotal                 *prometheus.CounterVec
 	writebackOutcomeTotal     *prometheus.CounterVec
+	brainstormOutcomeTotal    *prometheus.CounterVec
 	webhookDuration           *prometheus.HistogramVec
 	restapiRequestsTotal      *prometheus.CounterVec
 	restapiRequestDuration    *prometheus.HistogramVec
@@ -164,6 +165,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_writeback_outcome_total",
 			Help: "Writeback terminal outcomes by result.",
 		}, []string{"result"}),
+		// Per-run brainstorm yield. The brainstorm Task itself never opens a PR, so
+		// a dedicated counter (rather than overloading writeback_outcome) keeps the
+		// "a PR/MR write was attempted" semantics of writeback_outcome clean.
+		brainstormOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_brainstorm_outcome_total",
+			Help: "Brainstorm run yield outcomes by result.",
+		}, []string{"result"}),
 		// Finding 14: webhook duration histogram so slow apiserver/secret lookups
 		// during webhook handling surface before GitHub's 10s delivery timeout.
 		webhookDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -245,6 +253,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentHTTPDuration,
 		m.authTotal,
 		m.writebackOutcomeTotal,
+		m.brainstormOutcomeTotal,
 		m.webhookDuration,
 		m.restapiRequestsTotal,
 		m.restapiRequestDuration,
@@ -297,6 +306,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	for _, result := range []string{"no_change", "skip_4xx", "no_pr", "opened"} {
 		m.writebackOutcomeTotal.WithLabelValues(result)
+	}
+	for _, result := range []string{"proposed", "no_yield"} {
+		m.brainstormOutcomeTotal.WithLabelValues(result)
 	}
 	// Pre-seed webhook duration by provider/result so the series exist from startup.
 	for _, provider := range []string{"github", "gitlab"} {
@@ -488,6 +500,17 @@ func (m *OperatorMetrics) WritebackOutcome(result string) {
 // WritebackOutcomeCounter returns the counter for (result) for test assertions.
 func (m *OperatorMetrics) WritebackOutcomeCounter(result string) prometheus.Counter {
 	return m.writebackOutcomeTotal.WithLabelValues(result)
+}
+
+// BrainstormOutcome increments operator_brainstorm_outcome_total for the given
+// per-run yield result ("proposed", "no_yield").
+func (m *OperatorMetrics) BrainstormOutcome(result string) {
+	m.brainstormOutcomeTotal.WithLabelValues(result).Inc()
+}
+
+// BrainstormOutcomeCounter returns the counter for (result) for test assertions.
+func (m *OperatorMetrics) BrainstormOutcomeCounter(result string) prometheus.Counter {
+	return m.brainstormOutcomeTotal.WithLabelValues(result)
 }
 
 // ObserveWebhookDuration records the wall-clock seconds a webhook request took,
