@@ -88,6 +88,12 @@ type Config struct {
 	// re-exposed on the operator's /metrics after the pod's last push, before
 	// they age out. Backstop for pods that exit without best-effort cleanup.
 	PushMetricsTTL time.Duration
+	// TaskRetention is how long a terminal (Succeeded/Failed/Done/Stopped/Parked)
+	// Task is kept before the reaper garbage-collects it (its Subtasks cascade via
+	// owner reference). Loaded from TASK_RETENTION_HOURS as an integer hour count.
+	// Defaults to DefaultTaskRetention and is clamped up to MinTaskRetention so GC
+	// can never delete a Task that still anchors a dedup/cooldown window.
+	TaskRetention time.Duration
 	// CallbackHMACSecret, when non-empty, activates HMAC-SHA256 verification on
 	// the /internal/turn-complete callback endpoint. Set from
 	// CALLBACK_HMAC_SECRET (the operator reads the raw value via SecretKeyRef so
@@ -102,6 +108,19 @@ type Config struct {
 	// (anthropic, scm, cli-oidc). Empty = HMAC injection disabled (finding 1/r3).
 	CallbackHMACSecretName string
 }
+
+// DefaultTaskRetention is the default age after which a terminal Task is
+// garbage-collected. A week comfortably exceeds every dedup/cooldown window the
+// loop relies on (the longest is the 1h incident-alert cooldown) and preserves a
+// week of Task history for human debugging.
+const DefaultTaskRetention = 168 * time.Hour
+
+// MinTaskRetention is the hard lower bound on TaskRetention. Terminal-Task GC
+// must never delete a Task that still anchors a dedup/cooldown window; the
+// longest such window is the 1h incident-alert cooldown (internal/webhook). A
+// 2h floor keeps GC clear of that window even if an operator configures an
+// aggressively short retention. TaskRetention is clamped up to this in Load.
+const MinTaskRetention = 2 * time.Hour
 
 func getDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -120,6 +139,20 @@ func getDurationDefault(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s=%q is not a valid duration: %w", key, v, err)
 	}
 	return d, nil
+}
+
+// getHoursDefault parses key as an integer number of hours into a Duration,
+// returning def when unset and an error when present but not a valid integer.
+func getHoursDefault(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q is not a valid integer hours: %w", key, v, err)
+	}
+	return time.Duration(n) * time.Hour, nil
 }
 
 func getBoolDefault(key string, def bool) (bool, error) {
@@ -159,6 +192,15 @@ func Load() (Config, error) {
 	pushMetricsTTL, err := getDurationDefault("PUSH_METRICS_TTL", 5*time.Minute)
 	if err != nil {
 		return Config{}, err
+	}
+	taskRetention, err := getHoursDefault("TASK_RETENTION_HOURS", DefaultTaskRetention)
+	if err != nil {
+		return Config{}, err
+	}
+	// Clamp up to the floor: GC must never delete a Task that still anchors a
+	// dedup/cooldown window (see MinTaskRetention).
+	if taskRetention < MinTaskRetention {
+		taskRetention = MinTaskRetention
 	}
 	agentRunAsNonRoot, err := getBoolDefault("AGENT_RUN_AS_NON_ROOT", false)
 	if err != nil {
@@ -213,6 +255,7 @@ func Load() (Config, error) {
 		ChatImage:                os.Getenv("CHAT_IMAGE"),
 		LeaderElection:           leaderElection,
 		PushMetricsTTL:           pushMetricsTTL,
+		TaskRetention:            taskRetention,
 		CallbackHMACSecret:       os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:   os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 	}

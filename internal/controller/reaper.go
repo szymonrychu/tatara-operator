@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -50,6 +51,10 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 	for i := range taskList.Items {
 		tasks[taskList.Items[i].Name] = &taskList.Items[i]
 	}
+
+	// Garbage-collect terminal Tasks past the retention window, reusing the list
+	// already fetched above (no extra API call). Subtasks cascade via owner ref.
+	s.gcTerminalTasks(ctx, taskList.Items)
 
 	// Track which pod names are still alive (present and non-orphan) so the
 	// Service pass below can identify Services whose Pod is gone.
@@ -184,4 +189,46 @@ func (s *CallbackServer) reapWrapper(ctx context.Context, name string) error {
 		s.Metrics.ReapDeleteError("service")
 	}
 	return nil
+}
+
+// gcTerminalTasks deletes Tasks that are terminal (TaskTerminal: Succeeded/Failed
+// phase or Done/Stopped/Parked lifecycle) AND older than the retention window.
+// Subtasks carry a controller OwnerReference to their Task, so background-
+// propagation delete cascades to them through normal Kubernetes garbage
+// collection - the GC only has to delete the Tasks.
+//
+// Without GC the operator's hot paths (reaper, projectscan max-open/dedup,
+// incident dedup) do unindexed full-namespace Task Lists whose cost grows with
+// every terminal Task ever created; this bounds that set. Non-terminal Tasks are
+// never touched. A zero/negative retention disables the pass entirely.
+func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1alpha1.Task) {
+	if s.TaskRetention <= 0 {
+		return
+	}
+	l := log.FromContext(ctx)
+	cutoff := time.Now().Add(-s.TaskRetention)
+	policy := metav1.DeletePropagationBackground
+	for i := range tasks {
+		if ctx.Err() != nil {
+			return
+		}
+		tk := &tasks[i]
+		if !tatarav1alpha1.TaskTerminal(tk) {
+			continue
+		}
+		if tk.CreationTimestamp.After(cutoff) {
+			continue // younger than the retention window
+		}
+		age := time.Since(tk.CreationTimestamp.Time)
+		del := tk.DeepCopy()
+		if err := s.Client.Delete(ctx, del, &client.DeleteOptions{PropagationPolicy: &policy}); err != nil && !apierrors.IsNotFound(err) {
+			l.Error(err, "reaper: gc terminal task", "action", "gc_task",
+				"resource_id", tk.Name, "kind", tk.Spec.Kind)
+			s.Metrics.ReapDeleteError("task")
+			continue
+		}
+		l.Info("garbage-collected terminal task", "action", "gc_task",
+			"resource_id", tk.Name, "kind", tk.Spec.Kind, "age_seconds", age.Seconds())
+		s.Metrics.TasksGC(tk.Spec.Kind)
+	}
 }

@@ -66,6 +66,15 @@ chatImage: ""
 # false only for single-process local/envtest runs.
 leaderElection: true
 
+# taskRetentionHours bounds how long a terminal (Succeeded/Failed/Done/Stopped/
+# Parked) Task is kept before the reaper garbage-collects it; its Subtasks cascade
+# via owner reference. Without this the control-plane's own Task objects accumulate
+# unbounded in etcd and the operator's full-namespace Task Lists slow down over
+# time. Default 7 days (168h) preserves a week of history for debugging. The
+# operator clamps any value up to a 2h floor so GC never deletes a Task still
+# anchoring a dedup/cooldown window (the longest is the 1h incident cooldown).
+taskRetentionHours: 168
+
 # Agent wrapper Pod resource requests/limits + securityContext (rule 6: camelCase
 # scalar -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). These bound the
 # otherwise-unbounded agent pods. Resources/runAsNonRoot are chart-appropriate
