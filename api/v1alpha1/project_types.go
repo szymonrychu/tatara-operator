@@ -240,12 +240,25 @@ type ScmSpec struct {
 	Provider string `json:"provider"`
 	Owner    string `json:"owner"`
 	BotLogin string `json:"botLogin"`
-	// MaintainerLogins are the human maintainer accounts. Together with BotLogin
-	// they form the "trusted insider" set: issues opened by anyone OUTSIDE this
-	// set (third-party contributors) are autoapproved through triage without the
-	// self-approve hold. Empty means only BotLogin is excluded from autoapprove.
+	// MaintainerLogins are the human maintainer accounts. They are the unified
+	// trusted-insider AND approver set (issue #102): together with BotLogin they
+	// form the "trusted insider" set used for issue #56 autoapprove, and - when
+	// non-empty - a thread comment counts as the human approval go-ahead only if
+	// its author is in this list. Empty preserves the historical behavior (any
+	// non-bot human reply releases the self-approve hold; only BotLogin is
+	// excluded from #56 autoapprove). Overridable per-repository via
+	// RepositorySpec.MaintainerLogins.
 	// +optional
 	MaintainerLogins []string `json:"maintainerLogins,omitempty"`
+	// ReporterLogins gates issue/issue-comment intake (issue #102). When non-empty
+	// the operator only acts on issues and issue-comments authored by the bot, a
+	// maintainer, or an account in this list; everything else is dropped at intake
+	// (cron scan and webhook) so unknown third parties cannot drive the lifecycle
+	// via prompt injection. Empty preserves the historical open behavior (any
+	// author is accepted). Overridable per-repository via
+	// RepositorySpec.ReporterLogins.
+	// +optional
+	ReporterLogins []string `json:"reporterLogins,omitempty"`
 	// +optional
 	Board *BoardSpec `json:"board,omitempty"`
 	// +kubebuilder:validation:Enum=afterApproval;autoMergeOnGreenCI

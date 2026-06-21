@@ -53,6 +53,15 @@ spec:
               ingestEnabled:
                 default: true
                 type: boolean
+              maintainerLogins:
+                description: |-
+                  MaintainerLogins, when non-nil, overrides the Project's
+                  ScmSpec.MaintainerLogins (the unified maintainer/approver set) for THIS
+                  repository (issue #102). A nil value inherits the project list; an explicit
+                  empty list ([]) clears the maintainer/approver set for this repo only.
+                items:
+                  type: string
+                type: array
               projectRef:
                 type: string
               reingestSchedule:
@@ -62,6 +71,14 @@ spec:
                 minLength: 9
                 pattern: ^(\S+\s+){4}\S+$
                 type: string
+              reporterLogins:
+                description: |-
+                  ReporterLogins, when non-nil, overrides the Project's ScmSpec.ReporterLogins
+                  intake allowlist for THIS repository (issue #102). A nil value inherits the
+                  project list; an explicit empty list ([]) opens intake for this repo only.
+                items:
+                  type: string
+                type: array
               semanticIngest:
                 default: true
                 description: |-

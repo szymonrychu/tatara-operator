@@ -37,6 +37,17 @@ type RepositorySpec struct {
 	// +kubebuilder:validation:MinLength=9
 	// +kubebuilder:validation:Pattern=`^(\S+\s+){4}\S+$`
 	ReingestSchedule string `json:"reingestSchedule"`
+	// ReporterLogins, when non-nil, overrides the Project's ScmSpec.ReporterLogins
+	// intake allowlist for THIS repository (issue #102). A nil value inherits the
+	// project list; an explicit empty list ([]) opens intake for this repo only.
+	// +optional
+	ReporterLogins *[]string `json:"reporterLogins,omitempty"`
+	// MaintainerLogins, when non-nil, overrides the Project's
+	// ScmSpec.MaintainerLogins (the unified maintainer/approver set) for THIS
+	// repository (issue #102). A nil value inherits the project list; an explicit
+	// empty list ([]) clears the maintainer/approver set for this repo only.
+	// +optional
+	MaintainerLogins *[]string `json:"maintainerLogins,omitempty"`
 }
 
 // RepositoryStatus defines the observed state of a Repository.

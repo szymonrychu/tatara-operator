@@ -746,6 +746,25 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	for range cands {
 		r.Metrics.ScanItem("issueScan", "scanned")
 	}
+	// Reporter intake gate (issue #102): drop candidates authored by accounts
+	// outside the per-repo/per-project reporter allowlist so injected issues never
+	// become tasks (and never reactivate a conversation below). Board candidates
+	// carry no author and are board-curated, so they pass. An empty allowlist
+	// preserves the open default.
+	if len(cands) > 0 {
+		var gated []candidate
+		for _, c := range cands {
+			if c.author != "" {
+				if repo, ok := r.matchRepoForSlug(repos, c.repo); ok &&
+					!tatarav1alpha1.IsAllowedReporter(proj, &repo, c.author) {
+					r.Metrics.ScanItem("issueScan", "skipped_unauthorized")
+					continue
+				}
+			}
+			gated = append(gated, c)
+		}
+		cands = gated
+	}
 	// Reactivation pass: when an issue was updated after the bound lifecycle
 	// Task's LastActivityAt (missed webhook), reset the Task to Triage instead
 	// of creating a duplicate. This runs before dedup so the reactivated task

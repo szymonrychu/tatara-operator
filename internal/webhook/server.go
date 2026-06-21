@@ -187,6 +187,24 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// matchRepo returns the Project's Repository whose URL maps to the given remote,
+// or (nil, nil) when none matches. A non-nil error is a transient list failure
+// the caller should surface as 500 so the SCM retries. Shared by the work-item
+// router, the comment intake gate, and lifecycle-task creation.
+func (s *Server) matchRepo(ctx context.Context, projName, remote string) (*tatarav1.Repository, error) {
+	var repos tatarav1.RepositoryList
+	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
+		return nil, err
+	}
+	for i := range repos.Items {
+		r := &repos.Items[i]
+		if r.Spec.ProjectRef == projName && scm.SameRemote(r.Spec.URL, remote) {
+			return r, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	// issue_comment / Note Hook: find a live lifecycle Task for the work item
 	// and react. Intercepted before the trigger-label gate so bot comments still
@@ -270,24 +288,30 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
-	var repos tatarav1.RepositoryList
-	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
+	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "list repositories", http.StatusInternalServerError)
 		return
-	}
-	var repo *tatarav1.Repository
-	for i := range repos.Items {
-		r := &repos.Items[i]
-		if r.Spec.ProjectRef == proj.Name && scm.SameRemote(r.Spec.URL, ev.Repo) {
-			repo = r
-			break
-		}
 	}
 	if repo == nil {
 		s.log.InfoContext(ctx, "work item labeled but no matching repository",
 			"project", proj.Name, "remote", ev.Repo, "issue_ref", ev.IssueRef)
 		s.count(provider, ev.Kind, ev.Action, "no_repo")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	// Reporter intake gate (issue #102): for plain issues, only act on issues
+	// authored by an allowed reporter so an unknown third party cannot drive the
+	// lifecycle via a labelled issue. PR review items are governed by
+	// prReactionScope above, and bot-PR issueLifecycle items carry the bot author,
+	// so both pass. An empty reporter allowlist preserves the open default.
+	if kind == "issueLifecycle" && !ev.IsPR &&
+		!tatarav1.IsAllowedReporter(&proj, repo, ev.AuthorLogin) {
+		s.log.InfoContext(ctx, "issue intake: author not an allowed reporter; ignoring",
+			"project", proj.Name, "repository", repo.Name, "issue_ref", ev.IssueRef, "author", ev.AuthorLogin)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -474,6 +498,21 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
+	// Reporter intake gate (issue #102): ignore comments from accounts outside the
+	// reporter allowlist so an injected comment body cannot drive the lifecycle
+	// (reactivate a parked task, queue an interjection, or trigger a fresh triage).
+	// An empty allowlist preserves the open default. Repo override is honored when
+	// the comment maps to a known repository; on a lookup miss/error the project
+	// list applies (fail-safe: the gate stays active, never bypassed).
+	commentRepo, _ := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if !tatarav1.IsAllowedReporter(&proj, commentRepo, ev.ActorLogin) {
+		s.log.InfoContext(ctx, "issue_comment: author not an allowed reporter; ignoring",
+			"project", proj.Name, "issue_ref", ev.IssueRef, "author", ev.ActorLogin)
+		s.count(provider, ev.Kind, ev.Action, "ignored")
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
 	task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef)
 	if !found {
 		// No agent nursing this issue/MR: reactivate a Parked owning task, else
@@ -559,19 +598,11 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 // and lifecycle-entry annotation as issueScan so the two paths share the same key.
 func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	// Find the matching Repository for the event's repo URL.
-	var repos tatarav1.RepositoryList
-	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
+	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
 		http.Error(w, "list repositories", http.StatusInternalServerError)
 		return
-	}
-	var repo *tatarav1.Repository
-	for i := range repos.Items {
-		r := &repos.Items[i]
-		if r.Spec.ProjectRef == proj.Name && scm.SameRemote(r.Spec.URL, ev.Repo) {
-			repo = r
-			break
-		}
 	}
 	if repo == nil {
 		s.log.InfoContext(ctx, "issue_comment: no matching repository for untracked issue",

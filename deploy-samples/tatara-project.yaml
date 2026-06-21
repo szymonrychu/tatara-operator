@@ -53,6 +53,17 @@ spec:
     provider: github
     owner: szymonrychu
     botLogin: szymonrychu
+    # Trusted-login allowlists (issue #102). Both are optional and empty by
+    # default (open: any author may file issues/comments; the maintainer set is
+    # the issue #56 autoapprove tier). When set:
+    #   maintainerLogins - the unified maintainer/approver set; only these
+    #     accounts' comments count as the human approval go-ahead.
+    #   reporterLogins - the operator only acts on issues/issue-comments from the
+    #     bot, a maintainer, or a listed reporter; everything else is dropped at
+    #     intake, closing the prompt-injection vector. Both are overridable
+    #     per-Repository (RepositorySpec.maintainerLogins / reporterLogins).
+    # maintainerLogins: [szymonrychu]
+    # reporterLogins: [szymonrychu]
     priorityLabel: tatara/priority
     cron:
       mrScan:
