@@ -486,6 +486,56 @@ func TestWritebackOutcome_PreSeeded(t *testing.T) {
 	}
 }
 
+// All brainstorm-outcome labels must be pre-seeded so both series exist at zero
+// before any brainstorm run completes (the yield rate is graphable from startup).
+func TestBrainstormOutcome_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	want := map[string]bool{
+		"proposed": false,
+		"no_yield": false,
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_brainstorm_outcome_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "result" {
+					want[lp.GetValue()] = true
+				}
+			}
+		}
+	}
+	for label, seen := range want {
+		if !seen {
+			t.Errorf("operator_brainstorm_outcome_total{result=%q} not pre-seeded", label)
+		}
+	}
+}
+
+// BrainstormOutcome increments the right series per result.
+func TestBrainstormOutcome(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.BrainstormOutcome("proposed")
+	m.BrainstormOutcome("no_yield")
+	m.BrainstormOutcome("no_yield")
+
+	if got := testutil.ToFloat64(m.BrainstormOutcomeCounter("proposed")); got != 1 {
+		t.Fatalf("brainstorm proposed = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.BrainstormOutcomeCounter("no_yield")); got != 2 {
+		t.Fatalf("brainstorm no_yield = %v, want 2", got)
+	}
+}
+
 // Finding 2: REST API metrics - counter and histogram must exist and be recordable.
 func TestRecordRESTRequest(t *testing.T) {
 	reg := prometheus.NewRegistry()
