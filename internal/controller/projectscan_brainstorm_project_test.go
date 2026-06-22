@@ -181,7 +181,7 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 // to pick the best repo via propose_issue's repo arg.
 func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 	slugs := []string{"o/alpha", "o/beta", "o/gamma"}
-	g := brainstormGoalProject(slugs, "")
+	g := brainstormGoalProject(slugs, "", "")
 
 	// Must mention all repos.
 	for _, slug := range slugs {

@@ -6,7 +6,7 @@ import (
 )
 
 func TestBrainstormGoalProject_SystemicMandate(t *testing.T) {
-	goal := brainstormGoalProject([]string{"o/a", "o/b"}, "ISSUES:\no/a#1 [bug] x\nOPEN MRs:\no/a#2 [ci:failure] y\nMAIN HEALTH:\no/a main CI: failure")
+	goal := brainstormGoalProject([]string{"o/a", "o/b"}, "ISSUES:\no/a#1 [bug] x\nOPEN MRs:\no/a#2 [ci:failure] y\nMAIN HEALTH:\no/a main CI: failure", "")
 	for _, want := range []string{
 		"systemic", "subagent", "Workflow", "systemicId", "MAIN HEALTH:", "OPEN MRs:", "skip_brainstorm",
 	} {
@@ -23,7 +23,7 @@ func TestBrainstormGoalProject_SystemicMandate(t *testing.T) {
 }
 
 func TestHealthCheckGoalProject_SystemicMandate(t *testing.T) {
-	goal := healthCheckGoalProject([]string{"o/a"}, "ISSUES:\nMAIN HEALTH:\no/a main CI: success")
+	goal := healthCheckGoalProject([]string{"o/a"}, "ISSUES:\nMAIN HEALTH:\no/a main CI: success", "")
 	for _, want := range []string{"systemic", "subagent", "tatara-health-check", "systemicId"} {
 		if !strings.Contains(goal, want) {
 			t.Fatalf("goal missing %q", want)

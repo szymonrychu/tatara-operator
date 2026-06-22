@@ -975,7 +975,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	// Build rich context from already-fetched data + bounded MR/main reads.
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
-	goal := brainstormGoalProject(slugs, issuesCtx)
+	goal := brainstormGoalProject(slugs, issuesCtx, scmGuidance(proj))
 	created, err := r.createBrainstormTask(ctx, proj, goal, act.Sources)
 	if err != nil {
 		l.Error(err, "scan: enqueue brainstorm event", "resource_id", proj.Name)
@@ -1070,7 +1070,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	// Build rich context from already-fetched data + bounded MR/main reads.
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug, sortedRepos)
 
-	goal := healthCheckGoalProject(slugs, issuesCtx)
+	goal := healthCheckGoalProject(slugs, issuesCtx, scmGuidance(proj))
 	created, err := r.createHealthCheckTask(ctx, proj, goal, act.Sources)
 	if err != nil {
 		l.Error(err, "scan: enqueue healthCheck event", "resource_id", proj.Name)
@@ -1085,10 +1085,26 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
 }
 
+// appendGuidance appends a PROJECT CHARTER block when guidance is non-empty.
+func appendGuidance(goal, guidance string) string {
+	if strings.TrimSpace(guidance) == "" {
+		return goal
+	}
+	return goal + "\n\nPROJECT CHARTER: " + guidance
+}
+
+// scmGuidance returns the Guidance field from a Project's Scm spec, nil-safe.
+func scmGuidance(proj *tatarav1alpha1.Project) string {
+	if proj.Spec.Scm == nil {
+		return ""
+	}
+	return proj.Spec.Scm.Guidance
+}
+
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
 // task. repoStateCtx is the rich three-block string built by buildRepoStateContext
 // (ISSUES / OPEN MRs / MAIN HEALTH). When empty a fallback note is substituted.
-func brainstormGoalProject(slugs []string, repoStateCtx string) string {
+func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string) string {
 	repoList := strings.Join(slugs, ", ")
 
 	stateBlock := "No live repo state available."
@@ -1096,7 +1112,7 @@ func brainstormGoalProject(slugs []string, repoStateCtx string) string {
 		stateBlock = repoStateCtx
 	}
 
-	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
+	goal := "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
 		"Run at MAXIMUM reasoning effort. " +
@@ -1123,12 +1139,13 @@ func brainstormGoalProject(slugs []string, repoStateCtx string) string {
 		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY emit one " +
 		"propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` string you generate. " +
 		"State which path and scope you chose before executing."
+	return appendGuidance(goal, guidance)
 }
 
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
 // task. It mirrors brainstormGoalProject (same dedup-first contract and repoStateCtx
 // shape) but drives the tatara-health-check skill across all repo slugs.
-func healthCheckGoalProject(slugs []string, repoStateCtx string) string {
+func healthCheckGoalProject(slugs []string, repoStateCtx string, guidance string) string {
 	repoList := strings.Join(slugs, ", ")
 
 	stateBlock := "No live repo state available."
@@ -1136,7 +1153,7 @@ func healthCheckGoalProject(slugs []string, repoStateCtx string) string {
 		stateBlock = repoStateCtx
 	}
 
-	return "Invoke the `tatara-health-check` skill to survey the HEALTH of the project's repositories " +
+	goal := "Invoke the `tatara-health-check` skill to survey the HEALTH of the project's repositories " +
 		"and identify the highest-leverage health issue across ALL repositories: " + repoList + ". " +
 		"The skill defines the five health dimensions (CI failures, code coverage gaps, code to simplify, " +
 		"CI/CD pipeline steps worth adding, other tech-debt), how to gather evidence (on-disk CI config, an " +
@@ -1166,6 +1183,7 @@ func healthCheckGoalProject(slugs []string, repoStateCtx string) string {
 		"ACTION RULE: a one-repo finding emits exactly ONE propose_issue. A genuinely systemic " +
 		"health gap MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
 		"a single `systemicId` string you generate. State which path and scope you chose before executing."
+	return appendGuidance(goal, guidance)
 }
 
 // gatherRepoCIState fetches open PRs, per-PR CI (bounded to the first 20 PRs),

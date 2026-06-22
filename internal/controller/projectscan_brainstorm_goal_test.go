@@ -6,7 +6,7 @@ import (
 )
 
 func TestBrainstormGoalDropsCommentPathAddsEarlyExit(t *testing.T) {
-	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE")
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
 	if strings.Contains(g, "comment_on_issue") {
 		t.Fatal("brainstorm goal must NOT instruct comment_on_issue (path-2 dropped)")
 	}
