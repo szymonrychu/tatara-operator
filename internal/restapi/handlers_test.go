@@ -542,6 +542,43 @@ func TestImplementOutcome_TaskNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+// --- POST /tasks/{t}/brainstorm-outcome ---
+
+func TestBrainstormOutcomeRecordsNone(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "brainstorm"))
+	body := strings.NewReader(`{"action":"none","reason":"nothing novel"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/brainstorm-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.BrainstormOutcome)
+	require.Equal(t, "none", out.Status.BrainstormOutcome.Action)
+	require.Equal(t, "nothing novel", out.Status.BrainstormOutcome.Reason)
+}
+
+func TestBrainstormOutcomeRejectsEmptyReason(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "brainstorm"))
+	body := strings.NewReader(`{"action":"none"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/brainstorm-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestBrainstormOutcomeRejectsNonBrainstormTask(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"none","reason":"nothing novel"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/brainstorm-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code)
+}
+
 // --- M4 Task 2: POST /tasks/{t}/change-summary ---
 
 func TestChangeSummary_WritesAllFields(t *testing.T) {

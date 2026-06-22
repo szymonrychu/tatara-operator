@@ -54,8 +54,12 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 			r.Metrics.BrainstormOutcome("proposed")
 			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "BrainstormProposed", "brainstorm proposals created via propose_issue; no PR to open")
 		}
+		reason := "brainstorm finished with no proposal filed via propose_issue"
+		if o := task.Status.BrainstormOutcome; o != nil && o.Action == "none" && strings.TrimSpace(o.Reason) != "" {
+			reason = "early-exit: " + o.Reason
+		}
 		r.Metrics.BrainstormOutcome("no_yield")
-		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "BrainstormComplete", "brainstorm finished with no proposal filed via propose_issue")
+		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "BrainstormComplete", reason)
 	default:
 		// implement and other future kinds that open a change.
 	}

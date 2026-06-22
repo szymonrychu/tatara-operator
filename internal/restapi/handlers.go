@@ -889,6 +889,66 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toTaskDTO(t))
 }
 
+// --- POST /tasks/{t}/brainstorm-outcome ---
+
+type brainstormOutcomeReq struct {
+	Action string `json:"action"`
+	Reason string `json:"reason"`
+}
+
+func (s *Server) brainstormOutcome(w http.ResponseWriter, r *http.Request) {
+	var req brainstormOutcomeReq
+	if err := decodeJSON(r, w, &req); err != nil {
+		writeDecodeError(w, r, err)
+		return
+	}
+	if req.Action != "none" {
+		writeError(w, http.StatusBadRequest, "action must be none")
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(w, http.StatusBadRequest, "reason required")
+		return
+	}
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForTask(w, r, &t) {
+		return
+	}
+	if t.Spec.Kind != "brainstorm" {
+		writeError(w, http.StatusConflict, "brainstorm outcome only applies to a brainstorm task")
+		return
+	}
+	start := time.Now()
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		t.Status.BrainstormOutcome = &tatarav1alpha1.BrainstormOutcome{Action: req.Action, Reason: req.Reason}
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest("brainstorm_outcome", "error", time.Since(start).Seconds())
+		}
+		writeClientErr(w, err)
+		return
+	}
+	elapsed := time.Since(start)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("brainstorm_outcome", "ok", elapsed.Seconds())
+	}
+	s.log.InfoContext(r.Context(), "restapi: brainstormOutcome",
+		append(reqLogFields(r),
+			"action", "brainstorm_outcome",
+			"resource_id", key.Name,
+			"duration_ms", elapsed.Milliseconds())...)
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 // --- POST /tasks/{t}/comment ---
 
 type issueCommentReq struct {

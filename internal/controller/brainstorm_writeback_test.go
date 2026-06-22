@@ -217,6 +217,35 @@ func TestDoWriteBackBrainstorm_Metrics(t *testing.T) {
 	})
 }
 
+// TestWriteBackBrainstormNoneIsComplete: a brainstorm Task with
+// Status.BrainstormOutcome={Action:"none", Reason:"x"} and no proposal child
+// must clear WritebackPending with reason BrainstormComplete and a message
+// containing the early-exit prefix.
+func TestWriteBackBrainstormNoneIsComplete(t *testing.T) {
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	task := seedWritebackKindTask(t, "bswb-none-task", "bswb-none-proj", "bswb-none-repo", "bswb-none-scm",
+		tatarav1alpha1.TaskSpec{
+			Goal: "brainstorm ideas",
+			Kind: "brainstorm",
+		}, nil)
+	task.Status.BrainstormOutcome = &tatarav1alpha1.BrainstormOutcome{Action: "none", Reason: "x"}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.Zero(t, fw.openCalls, "brainstorm Task must not call OpenChange")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	cond := findCond(got.Status.Conditions, "WritebackPending")
+	require.NotNil(t, cond)
+	require.Equal(t, metav1.ConditionFalse, cond.Status)
+	require.Equal(t, "BrainstormComplete", cond.Reason)
+	require.Contains(t, cond.Message, "early-exit: x", "message must contain the early-exit reason")
+}
+
 // seedBrainstormWithPendingWriteback seeds a brainstorm Task in WritebackPending
 // but with no prURL, verifying idempotency guard doesn't short-circuit the fix.
 func TestDoWriteBackBrainstorm_AlreadyDone(t *testing.T) {

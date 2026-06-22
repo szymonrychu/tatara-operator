@@ -65,6 +65,14 @@ type ImplementOutcome struct {
 	Reason string `json:"reason"` // required; why no implementation
 }
 
+// BrainstormOutcome is the agent's declared outcome for a brainstorm task when
+// it files no proposal (a deliberate early-exit). Mirrors ImplementOutcome.
+type BrainstormOutcome struct {
+	// +kubebuilder:validation:Enum=none
+	Action string `json:"action"`
+	Reason string `json:"reason"` // required; why nothing was proposed
+}
+
 // ChangeSummary holds the scope report submitted by the agent at the end of an
 // Implement run via the change_summary MCP tool.
 type ChangeSummary struct {
@@ -204,6 +212,8 @@ type TaskStatus struct {
 	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
 	// +optional
 	ImplementOutcome *ImplementOutcome `json:"implementOutcome,omitempty"`
+	// +optional
+	BrainstormOutcome *BrainstormOutcome `json:"brainstormOutcome,omitempty"`
 	// +optional
 	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
 	// FollowupIssueURL is the URL of the follow-up issue opened when
