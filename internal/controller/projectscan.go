@@ -616,9 +616,7 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 
 // mrScan lists open PRs across repos, dedups, and enqueues QueuedEvents routed
 // by authoritative author -> review (human) | issueLifecycle/MRCI (bot).
-// remaining is the shared autonomous-cap budget; mrScan decrements it on each
-// successful enqueue and stops when remaining reaches zero.
-func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity, remaining *int) bool {
+func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) bool {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	bot := ""
@@ -660,13 +658,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 	}
 	created := 0
-	for i, c := range eligible {
-		if *remaining <= 0 {
-			for range eligible[i:] {
-				r.Metrics.ScanItem("mrScan", "skipped_budget")
-			}
-			break
-		}
+	for _, c := range eligible {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			r.Metrics.ScanItem("mrScan", "skipped_norepo")
@@ -710,7 +702,6 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if ok2 {
 				r.Metrics.ScanItem("mrScan", "picked")
 				created++
-				*remaining--
 			}
 		} else {
 			goal := fmt.Sprintf("Triage review PR %s#%d", c.repo, c.number)
@@ -723,7 +714,6 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if ok2 {
 				r.Metrics.ScanItem("mrScan", "picked")
 				created++
-				*remaining--
 			}
 		}
 	}
@@ -734,12 +724,11 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 }
 
 // issueScan lists open issues (per-repo + board) and enqueues QueuedEvents.
-// remaining is the shared autonomous-cap budget; issueScan decrements it on each
-// successful enqueue and stops when remaining reaches zero.
-// Returns (backlog, issueCache): backlog=true when budget truncated the run;
-// issueCache holds the per-repo slices fetched this cycle so recoverOrphans can reuse
-// them without a second ListOpenIssues round-trip per repo (finding 4).
-func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity, remaining *int) (bool, map[string][]scm.IssueRef) {
+// Returns (backlog, issueCache): backlog=true when all eligible issues were NOT
+// enqueued this cycle; issueCache holds the per-repo slices fetched this cycle
+// so recoverOrphans can reuse them without a second ListOpenIssues round-trip
+// per repo (finding 4).
+func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) (bool, map[string][]scm.IssueRef) {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	issueCache := make(map[string][]scm.IssueRef)
@@ -837,7 +826,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		r.Metrics.ScanItem("issueScan", "reactivated")
 	}
 
-	// Dedup BEFORE budget so a stale-but-in-flight item does not waste a slot.
+	// Dedup BEFORE enqueue so a stale-but-in-flight item is not re-created.
 	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
@@ -848,13 +837,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		}
 	}
 	created := 0
-	for i, c := range eligible {
-		if *remaining <= 0 {
-			for range eligible[i:] {
-				r.Metrics.ScanItem("issueScan", "skipped_budget")
-			}
-			break
-		}
+	for _, c := range eligible {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			r.Metrics.ScanItem("issueScan", "skipped_norepo")
@@ -889,7 +872,6 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		if ok2 {
 			r.Metrics.ScanItem("issueScan", "picked")
 			created++
-			*remaining--
 		}
 	}
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
@@ -901,14 +883,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 // brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
 // QueuedEvent per cycle for the whole project. BrainstormActivity.MaxPerCycle is
 // deprecated and ignored; the hard cap of one per cycle is enforced here.
-// remaining is the shared autonomous-cap budget; brainstorm decrements it on
-// each successful enqueue and stops when remaining reaches zero.
-func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity, remaining *int) {
+// Concurrency is bounded solely by the dispatcher's QueueCapacity.
+func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	maxProp := act.MaxOpenProposals
 	if maxProp < 1 {
-		maxProp = 5
+		maxProp = 10
 	}
 
 	// Project-scoped in-flight guard: any non-terminal brainstorm Task blocks.
@@ -916,12 +897,6 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		r.Metrics.ScanItem("brainstorm", "skipped_inflight")
 		l.Info("brainstorm: in-flight project brainstorm task; skipping cycle",
 			"action", "scan_brainstorm", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-		return
-	}
-
-	// Budget guard.
-	if *remaining <= 0 {
 		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 		return
 	}
@@ -1009,7 +984,6 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	}
 	if created {
 		r.Metrics.ScanItem("brainstorm", "picked")
-		*remaining--
 	}
 	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
@@ -1018,15 +992,15 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 // healthCheck runs one project-health-check cycle at PROJECT scope: at most one
 // healthCheck QueuedEvent per cycle for the whole project. It mirrors brainstorm
-// (single in-flight guard, budget guard, shared proposal-backlog cap, project-spanning
-// goal) but drives the tatara-health-check skill. remaining is the shared autonomous-cap
-// budget; healthCheck decrements it on a successful enqueue.
-func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.HealthCheckActivity, remaining *int) {
+// (single in-flight guard, proposal-backlog cap, project-spanning goal) but
+// drives the tatara-health-check skill. Concurrency is bounded solely by the
+// dispatcher's QueueCapacity.
+func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.HealthCheckActivity) {
 	l := log.FromContext(ctx)
 	start := time.Now()
 	maxProp := act.MaxOpenProposals
 	if maxProp < 1 {
-		maxProp = 5
+		maxProp = 10
 	}
 
 	// Project-scoped in-flight guard: any non-terminal healthCheck Task blocks.
@@ -1034,12 +1008,6 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		r.Metrics.ScanItem("healthCheck", "skipped_inflight")
 		l.Info("healthCheck: in-flight project health-check task; skipping cycle",
 			"action", "scan_healthcheck", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-		return
-	}
-
-	// Budget guard.
-	if *remaining <= 0 {
 		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
 		return
 	}
@@ -1111,7 +1079,6 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	}
 	if created {
 		r.Metrics.ScanItem("healthCheck", "picked")
-		*remaining--
 	}
 	r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
 	l.Info("healthCheck complete", "action", "scan_healthcheck", "resource_id", proj.Name,
@@ -1132,31 +1099,30 @@ func brainstormGoalProject(slugs []string, repoStateCtx string) string {
 	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
-		"Run at MAXIMUM reasoning effort. Decompose the survey: dispatch one parallel subagent per repository " +
-		"(use the Agent/Workflow tools to fan out, then synthesize their findings into one systemic conclusion). " +
+		"Run at MAXIMUM reasoning effort. " +
 		"\n\n" + stateBlock + "\n\n" +
-		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning " +
-		">=2 repositories, a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - " +
-		"over a one-repo tweak. Survey the ISSUES, OPEN MRs, and MAIN HEALTH blocks above; manage the " +
-		"backlog by linking/labelling/commenting related existing issues (never close issues you do not own).\n\n" +
-		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
-		"1. If the best idea DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
-		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
-		"2. If the best idea is a sub-aspect or connecting improvement TO an existing issue " +
-		"that is NOT marked [bot-engaged]: call comment_on_issue(repo, number, body) on that issue. " +
-		"Do NOT call propose_issue.\n" +
-		"   An issue marked [bot-engaged] already has your comment - do NOT comment again on it. " +
-		"Prefer a NEW improvement instead: a genuinely novel standalone idea (path 3, in ANY repo or " +
-		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
-		"twice on the same issue.\n" +
-		"3. ONLY if the idea is genuinely novel AND standalone (no existing issue covers it): " +
-		"call propose_issue. " +
-		"Set the `repo` argument to the specific repository that should own the issue. " +
-		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
-		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input.\n\n" +
-		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic " +
-		"improvement MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
-		"a single `systemicId` string you generate. State which path and scope you chose before executing."
+		"EARLY EXIT (do this FIRST, cheaply): before dispatching the per-repo deep-research fan-out, do a quick scan of " +
+		"the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears the bar for a genuinely novel, high-leverage " +
+		"NEW proposal this cycle, call `skip_brainstorm(reason)` and STOP. Do NOT run the expensive fan-out just to conclude " +
+		"there is nothing to propose.\n\n" +
+		"OTHERWISE decompose the survey: dispatch one parallel subagent per repository (use the Agent/Workflow tools to fan " +
+		"out, then synthesize their findings into one systemic conclusion).\n\n" +
+		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning >=2 repositories, " +
+		"a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - over a one-repo tweak.\n\n" +
+		"NEW-IDEAS-ONLY CONTRACT - this is a discovery cycle for NEW proposals; nursing existing issues is handled " +
+		"elsewhere. Follow exactly ONE path:\n" +
+		"1. If the best idea DUPLICATES or is merely a sub-aspect of an existing open issue listed above: do NOT propose. " +
+		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N'). Do NOT comment on it.\n" +
+		"2. If the idea is genuinely novel AND standalone: call `propose_issue`. Set `repo` to the owning repository. " +
+		"The proposal must be self-contained AND give the maintainer granular directional control. Required body shape: " +
+		"(a) a one-paragraph problem statement; (b) a DECOMPOSITION of the problem into its smaller constituent " +
+		"sub-problems / decision points; (c) for EACH sub-problem, 2-3 concrete implementation OPTIONS, each with a " +
+		"one-line tradeoff, and YOUR recommended pick; (d) the maintainer's decision framed as choosing one option per " +
+		"sub-problem (approve the recommended set, pick alternatives, or comment to refine). Every choice MUST come with " +
+		"concrete options and a recommendation - do NOT produce a flat list of open questions.\n\n" +
+		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY emit one " +
+		"propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` string you generate. " +
+		"State which path and scope you chose before executing."
 }
 
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
@@ -1527,16 +1493,13 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 // carries an active phase label but has no live Task (a missed/never-started or
 // stalled handler). It RE-LISTS existing Tasks so it sees Tasks mrScan/issueScan
 // created earlier this cycle (an open bot MR becomes a live MRCI Task -> not an
-// orphan). Bounded by the shared open-task budget.
+// orphan).
 //
 // issueCache is the per-repo slice map returned by issueScan this cycle. When a
 // repo's issues were already fetched by issueScan, recoverOrphans reuses that
 // slice instead of issuing a second ListOpenIssues round-trip (finding 4). A nil
 // or missing key falls back to a fresh ListOpenIssues call.
-func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, issueCache map[string][]scm.IssueRef, remaining *int) {
-	if *remaining <= 0 {
-		return
-	}
+func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, issueCache map[string][]scm.IssueRef) {
 	l := log.FromContext(ctx)
 	existing, err := r.existingScanTasks(ctx, proj)
 	if err != nil {
@@ -1584,9 +1547,6 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			if hasLiveLifecycleTaskForIssue(existing, slug, iss.Number) {
 				continue
 			}
-			if *remaining <= 0 {
-				return
-			}
 			repo, ok := r.matchRepoForSlug(repos, slug)
 			if !ok {
 				continue
@@ -1604,7 +1564,6 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			l.Info("backstop: recovered orphaned issue", "action", "backstop_recover",
 				"resource_id", proj.Name, "issue", fmt.Sprintf("%s#%d", slug, iss.Number), "entry", entry)
 			r.Metrics.ScanItem("backstop", "recovered")
-			*remaining--
 		}
 	}
 }
@@ -1649,25 +1608,10 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		return 0, err
 	}
 
-	// Compute remaining autonomous-QE budget.
-	var qel tatarav1alpha1.QueuedEventList
-	if err := r.List(ctx, &qel, client.InNamespace(proj.Namespace)); err != nil {
-		return 0, err
-	}
-	qes := filterQEsByProject(qel.Items, proj.Name)
-	remaining := proj.QueuedAutonomousCap() - queuedAutonomousCount(qes)
-	if remaining < 0 {
-		remaining = 0
-	}
-	if remaining == 0 {
-		l.Info("scan: at queued-autonomous cap; skipping autonomous creation",
-			"action", "scan_open_cap", "resource_id", proj.Name, "cap", proj.QueuedAutonomousCap())
-	}
-
 	// mrScan
 	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
 		if due {
-			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan, &remaining)
+			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
 			// Only advance the stamp when there is no backlog. When backlog=true the
 			// 60s short requeue must re-fire the activity; if we stamp now, activityDue
 			// computes next-fire from the fresh stamp and returns due=false for any
@@ -1696,21 +1640,12 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 
 	// issueScan: re-list existing Tasks so Tasks created by mrScan above are visible
 	// (prevents duplicate issueLifecycle tasks for bot-PR linked issues).
-	// Also re-list QEs to update remaining count after mrScan enqueues.
 	if fresh, ferr := r.existingScanTasks(ctx, proj); ferr == nil {
 		existing = fresh
 	}
-	var qelFresh tatarav1alpha1.QueuedEventList
-	if err := r.List(ctx, &qelFresh, client.InNamespace(proj.Namespace)); err == nil {
-		qes = filterQEsByProject(qelFresh.Items, proj.Name)
-		remaining = proj.QueuedAutonomousCap() - queuedAutonomousCount(qes)
-		if remaining < 0 {
-			remaining = 0
-		}
-	}
 	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
 		if due {
-			backlog, issueCache := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan, &remaining)
+			backlog, issueCache := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
 			// Only advance the stamp when there is no backlog (mirrors mrScan fix, finding 3).
 			if !backlog {
 				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
@@ -1724,9 +1659,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 			} else {
 				consider(now.Add(backlogRequeue))
 			}
-			if remaining > 0 {
-				r.recoverOrphans(ctx, proj, reader, repos, issueCache, &remaining)
-			}
+			r.recoverOrphans(ctx, proj, reader, repos, issueCache)
 		} else {
 			consider(next)
 		}
@@ -1739,7 +1672,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if cronSpec.Brainstorm.Enabled {
 		if _, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
 			if due {
-				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, &remaining)
+				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
 				if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
 					l.Error(serr, "scan: persist brainstorm stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
@@ -1761,7 +1694,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if cronSpec.HealthCheck.Enabled {
 		if _, due, next, ok := r.activityDue(proj, "healthCheck"); ok {
 			if due {
-				r.healthCheck(ctx, proj, reader, repos, existing, cronSpec.HealthCheck, &remaining)
+				r.healthCheck(ctx, proj, reader, repos, existing, cronSpec.HealthCheck)
 				if serr := r.stampScan(ctx, proj, "healthCheck"); serr != nil {
 					l.Error(serr, "scan: persist healthCheck stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "healthCheck")

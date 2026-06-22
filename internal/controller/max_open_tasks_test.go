@@ -62,15 +62,17 @@ func TestQueuedAutonomousCount(t *testing.T) {
 	}
 }
 
-// TestRunScans_AutonomousCapFull_CreatesNoQEs: project with QueuedAutonomousCap=N,
-// N pre-existing autonomous Queued events -> runScans must create 0 new QEs.
-func TestRunScans_AutonomousCapFull_CreatesNoQEs(t *testing.T) {
+// TestRunScans_AutonomousCapFull_StillEnqueues: the old QueuedAutonomousCap budget
+// gate is removed; pre-seeding N autonomous Queued events no longer blocks new
+// issueScan enqueues. runScans must create QEs for all eligible issues.
+func TestRunScans_AutonomousCapFull_StillEnqueues(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 5}}
 	proj, _ := seedScanProject(t, "autocap-full", cron)
 
-	cap := proj.QueuedAutonomousCap()
+	// Pre-seed cap-many autonomous QEs (old behavior would have blocked here).
+	oldCap := proj.QueuedAutonomousCap()
 	seq := &queue.SeqSource{Client: k8sClient, Namespace: testNS}
-	for i := 0; i < cap; i++ {
+	for i := 0; i < oldCap; i++ {
 		payload := tatarav1alpha1.QueuedEventPayload{Kind: "issueLifecycle", RepositoryRef: "autocap-full-repo", Goal: "g", GenerateName: "qe-"}
 		_, _, err := queue.EnqueueEvent(context.Background(), k8sClient, seq, proj, tatarav1alpha1.QueueClassNormal, true, fmt.Sprintf("prefill-%d", i), payload)
 		if err != nil {
@@ -92,27 +94,28 @@ func TestRunScans_AutonomousCapFull_CreatesNoQEs(t *testing.T) {
 	if _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
+	// Both issues must be enqueued regardless of pre-existing autonomous QE count.
+	newQEs := 0
 	var qel tatarav1alpha1.QueuedEventList
 	if err := k8sClient.List(context.Background(), &qel); err != nil {
 		t.Fatalf("list QEs: %v", err)
 	}
-	newQEs := 0
 	for _, qe := range qel.Items {
-		if qe.Spec.ProjectRef == "autocap-full" && qe.Spec.Seq > int64(cap) {
+		if qe.Spec.ProjectRef == "autocap-full" && qe.Spec.Seq > int64(oldCap) {
 			newQEs++
 		}
 	}
-	if newQEs != 0 {
-		t.Fatalf("cap full: want 0 new QEs, got %d", newQEs)
+	if newQEs != 2 {
+		t.Fatalf("budget removed: want 2 new QEs for 2 eligible issues, got %d", newQEs)
 	}
 }
 
-// TestRunScans_AutonomousCapTwo_EnqueuesAtMostTwo: project with QueuedAutonomousCap=2
-// and 3 eligible issues -> at most 2 QEs created, 0 Tasks directly.
-func TestRunScans_AutonomousCapTwo_EnqueuesAtMostTwo(t *testing.T) {
+// TestRunScans_QueuedAutonomousCapIgnored: QueuedAutonomousCap is now ignored;
+// 3 eligible issues all get QEs even when cap=2 pre-exists in spec.
+func TestRunScans_QueuedAutonomousCapIgnored(t *testing.T) {
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "* * * * *", MaxPerRepo: 5}}
 	proj, _ := seedScanProject(t, "autocap-two", cron)
-	// Persist Queue spec to K8s so runScans reads the correct cap.
+	// Persist Queue spec to K8s (field retained for CRD compat but ignored).
 	proj.Spec.Queue = &tatarav1alpha1.QueueSpec{QueuedAutonomousCap: 2}
 	if err := k8sClient.Update(context.Background(), proj); err != nil {
 		t.Fatalf("update proj spec: %v", err)
@@ -133,6 +136,7 @@ func TestRunScans_AutonomousCapTwo_EnqueuesAtMostTwo(t *testing.T) {
 	if _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
+	// All 3 issues enqueued (cap=2 no longer limits creation).
 	var qel tatarav1alpha1.QueuedEventList
 	if err := k8sClient.List(context.Background(), &qel); err != nil {
 		t.Fatalf("list QEs: %v", err)
@@ -143,11 +147,8 @@ func TestRunScans_AutonomousCapTwo_EnqueuesAtMostTwo(t *testing.T) {
 			count++
 		}
 	}
-	if count > 2 {
-		t.Fatalf("cap=2: want at most 2 QEs, got %d", count)
-	}
-	if count == 0 {
-		t.Fatalf("cap=2: want at least 1 QE, got 0")
+	if count != 3 {
+		t.Fatalf("cap ignored: want 3 QEs for 3 eligible issues, got %d", count)
 	}
 	tasks := listScanTasks(t, "autocap-two")
 	if len(tasks) != 0 {

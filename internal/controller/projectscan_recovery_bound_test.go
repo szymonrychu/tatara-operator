@@ -69,8 +69,7 @@ func TestMRScanRecoveryExhaustedClosesPR(t *testing.T) {
 		mkPRTask("o/r", 50, "Done"),
 	}
 
-	budget := 99
-	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan)
 
 	// ClosePR must have been called with PR number 50.
 	require.True(t, fw.closePRCalled, "expected ClosePR to be called for exhausted bot PR")

@@ -53,8 +53,7 @@ func TestMRScan_BotPR_NoDuplicateAdoption(t *testing.T) {
 	}
 	existing := []tatarav1alpha1.Task{liveTask}
 
-	budget := 99
-	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan)
 
 	// No new task must be created (dedup on issue#10 must fire).
 	tasks := listScanTasks(t, projName)
@@ -97,8 +96,7 @@ func TestMRScan_BotPR_DedupMetricFires(t *testing.T) {
 	}
 	existing := []tatarav1alpha1.Task{liveTask}
 
-	budget := 99
-	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan)
 
 	cnt := counterValue(t, reg, "tatara_scan_items_total",
 		map[string]string{"activity": "mrScan", "outcome": "skipped_dedup"})
@@ -107,10 +105,9 @@ func TestMRScan_BotPR_DedupMetricFires(t *testing.T) {
 
 // --- Finding 3: backlog flag returned correctly ---
 
-// TestMRScan_BacklogTrue_WhenBudgetTruncates verifies mrScan returns backlog=true
-// when budget exhaustion drops items from the selected slice, so the caller knows
-// to withhold the stamp and schedule a short requeue.
-func TestMRScan_BacklogTrue_WhenBudgetTruncates(t *testing.T) {
+// TestMRScan_NoBacklog_AllItemsEnqueued verifies mrScan returns backlog=false when
+// all eligible items are enqueued (budget gate removed; previously tested truncation).
+func TestMRScan_NoBacklog_AllItemsEnqueued(t *testing.T) {
 	const projName = "r3-backlog-flag-proj"
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
 	proj, _ := seedScanProject(t, projName, cron)
@@ -125,15 +122,14 @@ func TestMRScan_BacklogTrue_WhenBudgetTruncates(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{
 		mkScanRepo(t, projName, projName+"-xrepo", "https://github.com/o/r.git"),
 	}
-	budget := 1
-	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &budget)
-	require.True(t, backlog, "expected backlog=true when budget exhaustion truncates selected")
-	require.Equal(t, 0, budget, "budget must reach 0 after exhaustion")
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
+	// Budget gate removed: all 2 eligible PRs enqueued; backlog=false.
+	require.False(t, backlog, "expected backlog=false when all items enqueued (no budget gate)")
 }
 
-// TestIssueScan_BacklogFlag_ReturnedToCallerCorrectly verifies issueScan returns
-// backlog=true when the autonomous budget is exhausted before all eligible issues are processed.
-func TestIssueScan_BacklogFlag_ReturnedToCallerCorrectly(t *testing.T) {
+// TestIssueScan_BacklogFlag_AllEnqueued verifies issueScan returns backlog=false
+// when all eligible issues are processed (budget gate removed).
+func TestIssueScan_BacklogFlag_AllEnqueued(t *testing.T) {
 	const projName = "r3-iss-backlog-flag-proj"
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
 	proj, _ := seedScanProject(t, projName, cron)
@@ -149,10 +145,9 @@ func TestIssueScan_BacklogFlag_ReturnedToCallerCorrectly(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{
 		mkScanRepo(t, projName, projName+"-xrepo", "https://github.com/o/r.git"),
 	}
-	// Budget=1: only 1 issue can be enqueued; 2 remain -> backlog=true.
-	budget := 1
-	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &budget)
-	require.True(t, backlog, "expected backlog=true when global budget truncates candidates")
+	// Budget gate removed: all 3 issues enqueued; backlog=false.
+	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	require.False(t, backlog, "expected backlog=false when all candidates enqueued (no budget gate)")
 }
 
 // --- Finding 4: recoverOrphans reuses issueCache from issueScan ---
@@ -176,8 +171,7 @@ func TestRecoverOrphans_UsesCachedIssues(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	// Pre-populate cache with the already-fetched issues.
 	issueCache := map[string][]scm.IssueRef{"o/r": issues}
-	budget := 3
-	r.recoverOrphans(context.Background(), proj, reader, repos, issueCache, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, issueCache)
 
 	// ListOpenIssues must NOT be called (cache hit for o/r).
 	require.Equal(t, 0, queryCount, "recoverOrphans must not re-fetch issues when cache is populated")

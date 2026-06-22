@@ -139,6 +139,21 @@ spec:
           status:
             description: TaskStatus defines the observed state of a Task.
             properties:
+              brainstormOutcome:
+                description: |-
+                  BrainstormOutcome is the agent's declared outcome for a brainstorm task when
+                  it files no proposal (a deliberate early-exit). Mirrors ImplementOutcome.
+                properties:
+                  action:
+                    enum:
+                    - none
+                    type: string
+                  reason:
+                    type: string
+                required:
+                - action
+                - reason
+                type: object
               changeSummary:
                 description: |-
                   ChangeSummary holds the scope report submitted by the agent at the end of an

@@ -39,10 +39,14 @@ func TestBrainstormGoalProject_ContainsDedupInstructions(t *testing.T) {
 	}
 
 	// Dedup-first: must instruct agent to check existing issues first.
-	for _, kw := range []string{"duplicate", "comment_on_issue", "propose_issue"} {
+	for _, kw := range []string{"duplicate", "propose_issue", "skip_brainstorm"} {
 		if !strings.Contains(g, kw) {
 			t.Fatalf("goal missing dedup keyword %q: %s", kw, g)
 		}
+	}
+	// comment_on_issue path dropped from brainstorm (path-2 removed).
+	if strings.Contains(g, "comment_on_issue") {
+		t.Fatalf("goal must NOT contain comment_on_issue: %s", g)
 	}
 
 	// Issues context block must appear verbatim in the goal.
@@ -86,8 +90,7 @@ func TestBrainstorm_ConsultsListOpenIssuesForContext(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, capturedGoals, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, capturedGoals, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-dedup-ctx")
 	if len(qes) != 1 {
@@ -136,8 +139,7 @@ func TestBrainstorm_IssuesContextCappedAt60(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 200}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-dedup-cap60")
 	if len(qes) != 1 {
@@ -173,29 +175,43 @@ func (g *goalCapturingReader) ListIssueComments(_ context.Context, owner, repo s
 	return g.commentsBySlugNum[key], nil
 }
 
-// TestGoalProjects_NoReCommentInstruction verifies both project goals tell the
-// agent not to re-comment a [bot-engaged] issue and to prefer new improvements.
+// TestGoalProjects_NoReCommentInstruction verifies project goals handle [bot-engaged] issues.
+// brainstormGoalProject: drops comment_on_issue path entirely; [bot-engaged] appears only in
+// the embedded state block, not as an instruction verb.
+// healthCheckGoalProject: retains the three-path dedup with no-re-comment instruction.
 func TestGoalProjects_NoReCommentInstruction(t *testing.T) {
 	slugs := []string{"o/alpha"}
 	ctx := "o/alpha#1 [] Fix login bug [bot-engaged]"
-	for _, g := range []string{
-		brainstormGoalProject(slugs, ctx),
-		healthCheckGoalProject(slugs, ctx),
-	} {
+
+	t.Run("brainstorm embeds context and keeps propose_issue; no comment path", func(t *testing.T) {
+		g := brainstormGoalProject(slugs, ctx)
+		// Context block (including the [bot-engaged] marker) must be embedded verbatim.
+		if !strings.Contains(g, ctx) {
+			t.Fatalf("goal does not embed issues context:\n%s", g)
+		}
+		if !strings.Contains(g, "propose_issue") {
+			t.Fatalf("goal missing propose_issue:\n%s", g)
+		}
+		// comment_on_issue path dropped in brainstorm.
+		if strings.Contains(g, "comment_on_issue") {
+			t.Fatalf("brainstorm goal must NOT contain comment_on_issue:\n%s", g)
+		}
+	})
+
+	t.Run("healthCheck retains no-re-comment instruction and three-path dedup", func(t *testing.T) {
+		g := healthCheckGoalProject(slugs, ctx)
 		if !strings.Contains(g, "[bot-engaged]") {
-			t.Fatalf("goal does not reference the bot-engaged marker:\n%s", g)
+			t.Fatalf("healthCheck goal does not reference the bot-engaged marker:\n%s", g)
 		}
-		// Must instruct: do not comment again on a bot-engaged issue.
 		if !strings.Contains(g, "do NOT comment again") {
-			t.Fatalf("goal missing no-re-comment instruction:\n%s", g)
+			t.Fatalf("healthCheck goal missing no-re-comment instruction:\n%s", g)
 		}
-		// Must still embed the context and keep the three action verbs.
 		for _, kw := range []string{"comment_on_issue", "propose_issue", ctx} {
 			if !strings.Contains(g, kw) {
-				t.Fatalf("goal missing %q:\n%s", kw, g)
+				t.Fatalf("healthCheck goal missing %q:\n%s", kw, g)
 			}
 		}
-	}
+	})
 }
 
 // TestBrainstorm_BotEngagedIssueFlagged verifies that an issue the bot already
@@ -222,8 +238,7 @@ func TestBrainstorm_BotEngagedIssueFlagged(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-botengaged")
 	if len(qes) != 1 {

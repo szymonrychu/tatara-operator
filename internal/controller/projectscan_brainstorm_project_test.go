@@ -29,16 +29,11 @@ func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-proj-one")
 	if len(qes) != 1 {
 		t.Fatalf("want exactly 1 brainstorm QE for 2-repo project, got %d", len(qes))
-	}
-	// Budget should be decremented by 1.
-	if budget != 98 {
-		t.Fatalf("budget = %d after 1 create, want 98", budget)
 	}
 }
 
@@ -75,8 +70,7 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 
 	existing := []tatarav1alpha1.Task{*pre}
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, existing, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, existing, act)
 
 	tasks := listBrainstormTasks(t, "bs-proj-inflight")
 	// Only the pre-existing Task; no new QE created because ANY inflight Task blocks.
@@ -111,8 +105,7 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_AtCap_Skips(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-proj-sumcap")
 	if len(qes) != 0 {
@@ -139,8 +132,7 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_UnderCap_Creates(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-proj-undersum")
 	if len(qes) != 1 {
@@ -166,8 +158,7 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	b1 := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &b1)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-proj-det")
 	if len(qes) != 1 {
@@ -236,8 +227,7 @@ func TestBrainstorm_ProjectLevel_ShortCircuit_Backlog(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	// sc1 hits cap -> sc2 and sc3 should NOT be queried.
 	if queriedRepos["o/sc2"] > 0 || queriedRepos["o/sc3"] > 0 {
@@ -263,8 +253,7 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-proj-emptyref")
 	if len(qes) != 1 {
@@ -286,8 +275,7 @@ func TestHealthCheck_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
-	b := 99
-	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
+	r.healthCheck(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listHealthCheckQEs(t, "hc-emptyref")
 	if len(qes) != 1 {
@@ -309,8 +297,7 @@ func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-proj-podname")
 	if len(qes) != 1 {
@@ -319,6 +306,45 @@ func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	// Pod-name is NOT stamped at enqueue time; PodRepo must be empty (project-scoped).
 	if qes[0].Spec.Payload.PodRepo != "" {
 		t.Fatalf("brainstorm QE PodRepo = %q, want empty (project-scoped, stamped at admit)", qes[0].Spec.Payload.PodRepo)
+	}
+}
+
+// TestBrainstormDefaultProposalCapIsTen: MaxOpenProposals=0 (unset) should
+// default to 10. 9 open proposals must NOT cap-skip; 10 must cap-skip.
+func TestBrainstormDefaultProposalCapIsTen(t *testing.T) {
+	tests := []struct {
+		name      string
+		projName  string
+		openCount int
+		wantSkip  bool
+	}{
+		{"nine_under_default_cap", "bs-defcap-9", 9, false},
+		{"ten_at_default_cap", "bs-defcap-10", 10, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proj, repos := seedBrainstormProject(t, tc.projName, []string{"o/r1"}, 0)
+
+			var issues []scm.IssueRef
+			for i := 1; i <= tc.openCount; i++ {
+				issues = append(issues, scm.IssueRef{Repo: "o/r1", Number: i, Labels: []string{"tatara-idea"}})
+			}
+			reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r1": issues}}
+			r := newScanReconciler(reader)
+			r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+			// MaxOpenProposals=0 -> falls back to default.
+			act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 0}
+			r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+
+			qes := listBrainstormQEs(t, tc.projName)
+			if tc.wantSkip && len(qes) != 0 {
+				t.Fatalf("want cap-skip (0 QEs), got %d", len(qes))
+			}
+			if !tc.wantSkip && len(qes) != 1 {
+				t.Fatalf("want 1 QE (under cap), got %d", len(qes))
+			}
+		})
 	}
 }
 

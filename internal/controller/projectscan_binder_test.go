@@ -24,11 +24,10 @@ func TestIssueScanCreatesIssueLifecycleKind(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b := 99
 	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-issue-kind-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-issue-kind", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
-	}, nil, cron.IssueScan, &b)
+	}, nil, cron.IssueScan)
 
 	qes := listScanQEs(t, "binder-issue-kind")
 	if len(qes) == 0 {
@@ -73,9 +72,8 @@ func TestIssueScanDedupBlocksRunningTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b2 := 99
 	_, _ = r.issueScan(context.Background(), proj, reader,
-		[]tatarav1alpha1.Repository{*repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
+		[]tatarav1alpha1.Repository{*repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan)
 
 	// #1 is deduped; #2 should get a QE.
 	qes := listScanQEs(t, "binder-lane-lifecycle")
@@ -185,8 +183,7 @@ func TestMRScanBotPRCreatesIssueLifecycleMRCI(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-mr-bot-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-mr-bot", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}
-	b3 := 99
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b3)
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
 	qes := listScanQEs(t, "binder-mr-bot")
 	if len(qes) != 2 {
@@ -252,8 +249,7 @@ func TestMRScanBotPRClosesIssueKeyedOnLinkedIssue(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-mr-closes-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-mr-closes", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}
-	b4 := 99
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b4)
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
 	qes := listScanQEs(t, "binder-mr-closes")
 	if len(qes) != 1 {
@@ -290,8 +286,7 @@ func TestMRScanBotPRNoClosesKeyedOnPRNumber(t *testing.T) {
 		{ObjectMeta: metav1.ObjectMeta{Name: "binder-mr-noclose-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "binder-mr-noclose", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
 	}
-	b5 := 99
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b5)
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
 	qes := listScanQEs(t, "binder-mr-noclose")
 	if len(qes) != 1 {

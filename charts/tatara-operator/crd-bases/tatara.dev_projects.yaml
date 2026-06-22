@@ -5398,10 +5398,9 @@ spec:
               maxOpenTasks:
                 default: 3
                 description: |-
-                  MaxOpenTasks is the hard ceiling on non-terminal Tasks the operator will
-                  autonomously create for this Project (cron scans + brainstorm). At the cap,
-                  scan/brainstorm creation is skipped until open Tasks finish. The reactive
-                  webhook path is exempt (human-initiated).
+                  MaxOpenTasks: Deprecated: no longer enforced. The queue bounds CONCURRENCY
+                  (QueueCapacity), not event creation; over-limit events wait in Queued.
+                  Retained for CRD backward-compatibility; ignored.
                 type: integer
               memory:
                 description: |-
@@ -5435,8 +5434,9 @@ spec:
                     type: integer
                   queuedAutonomousCap:
                     description: |-
-                      QueuedAutonomousCap K: max Queued autonomous (cron) events; crons stop
-                      enqueuing past it (defaults to MaxOpenTasks, else 3). Webhooks/alerts exempt.
+                      QueuedAutonomousCap: Deprecated: no longer enforced. The queue bounds CONCURRENCY
+                      (QueueCapacity), not event creation; over-limit events wait in Queued.
+                      Retained for CRD backward-compatibility; ignored.
                     type: integer
                 type: object
               scm:
