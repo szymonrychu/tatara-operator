@@ -320,10 +320,9 @@ type ProjectSpec struct {
 	// +kubebuilder:default=3
 	// +optional
 	MaxConcurrentTasks int `json:"maxConcurrentTasks,omitempty"`
-	// MaxOpenTasks is the hard ceiling on non-terminal Tasks the operator will
-	// autonomously create for this Project (cron scans + brainstorm). At the cap,
-	// scan/brainstorm creation is skipped until open Tasks finish. The reactive
-	// webhook path is exempt (human-initiated).
+	// MaxOpenTasks: Deprecated: no longer enforced. The queue bounds CONCURRENCY
+	// (QueueCapacity), not event creation; over-limit events wait in Queued.
+	// Retained for CRD backward-compatibility; ignored.
 	// +kubebuilder:default=3
 	// +optional
 	MaxOpenTasks int `json:"maxOpenTasks,omitempty"`
@@ -348,8 +347,9 @@ type QueueSpec struct {
 	// AlertCapacity M: reserved concurrent slots for alert-class events (default 1).
 	// +optional
 	AlertCapacity int `json:"alertCapacity,omitempty"`
-	// QueuedAutonomousCap K: max Queued autonomous (cron) events; crons stop
-	// enqueuing past it (defaults to MaxOpenTasks, else 3). Webhooks/alerts exempt.
+	// QueuedAutonomousCap: Deprecated: no longer enforced. The queue bounds CONCURRENCY
+	// (QueueCapacity), not event creation; over-limit events wait in Queued.
+	// Retained for CRD backward-compatibility; ignored.
 	// +optional
 	QueuedAutonomousCap int `json:"queuedAutonomousCap,omitempty"`
 }

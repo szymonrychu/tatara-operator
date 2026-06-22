@@ -53,9 +53,8 @@ func TestBackstopRecoversImplementationOrphanToImplement(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	qes := listScanQEs(t, "backstop-impl")
 	if len(qes) != 1 {
@@ -64,9 +63,6 @@ func TestBackstopRecoversImplementationOrphanToImplement(t *testing.T) {
 	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
 	if entry != "Implement" {
 		t.Fatalf("entry = %q, want Implement", entry)
-	}
-	if budget != 2 {
-		t.Fatalf("budget = %d, want 2", budget)
 	}
 }
 
@@ -80,9 +76,8 @@ func TestBackstopRecoversBrainstormingOrphanToTriage(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	qes := listScanQEs(t, "backstop-bs")
 	if len(qes) != 1 {
@@ -104,9 +99,8 @@ func TestBackstopRecoversLegacyIdeaOrphanToTriage(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	qes := listScanQEs(t, "backstop-legacy")
 	if len(qes) != 1 {
@@ -145,9 +139,8 @@ func TestBackstopSkipsIssueWithLiveTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	// Pre-existing live Task blocks; no new QE created.
 	qes := listScanQEs(t, "backstop-live")
@@ -193,9 +186,8 @@ func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	qes := listScanQEs(t, "backstop-conv")
 	if len(qes) != 0 {
@@ -204,9 +196,6 @@ func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
 	tasks := listScanTasks(t, "backstop-conv")
 	if len(tasks) != 1 || tasks[0].Name != pre.Name {
 		t.Fatalf("want only the pre-existing Conversation task, got %d tasks", len(tasks))
-	}
-	if budget != 3 {
-		t.Fatalf("budget should be unchanged (no create), got %d", budget)
 	}
 }
 
@@ -220,20 +209,18 @@ func TestBackstopSkipsDeclined(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	qes := listScanQEs(t, "backstop-declined")
 	if len(qes) != 0 {
 		t.Fatalf("declined issue should create no QEs, got %d", len(qes))
 	}
-	if budget != 3 {
-		t.Fatalf("budget should be unchanged for declined, got %d", budget)
-	}
 }
 
-func TestBackstopRespectsBudgetZero(t *testing.T) {
+// TestBackstopAlwaysRuns verifies that recoverOrphans always runs (budget gate
+// removed) and enqueues eligible orphaned issues.
+func TestBackstopAlwaysRuns(t *testing.T) {
 	proj, repo := seedBackstopProject(t, "backstop-budget")
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
@@ -243,13 +230,13 @@ func TestBackstopRespectsBudgetZero(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 0
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
+	// Budget gate removed: the orphaned implementation issue is now enqueued.
 	qes := listScanQEs(t, "backstop-budget")
-	if len(qes) != 0 {
-		t.Fatalf("budget=0 should create no QEs, got %d", len(qes))
+	if len(qes) != 1 {
+		t.Fatalf("budget gate removed: want 1 QE for orphaned implementation issue, got %d", len(qes))
 	}
 }
 
@@ -263,9 +250,8 @@ func TestBackstopApprovedOrphanToImplement(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	budget := 3
 	repos := []tatarav1alpha1.Repository{repo}
-	r.recoverOrphans(context.Background(), proj, reader, repos, nil, &budget)
+	r.recoverOrphans(context.Background(), proj, reader, repos, nil)
 
 	qes := listScanQEs(t, "backstop-approved")
 	if len(qes) != 1 {

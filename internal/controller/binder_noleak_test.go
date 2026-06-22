@@ -39,10 +39,8 @@ func TestBindersNeverCreateTriageIssueOrSelfImprove(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b := 99
-	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
-	b = 99
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b)
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
 	qes := listScanQEs(t, "noleak-proj")
 	for _, qe := range qes {

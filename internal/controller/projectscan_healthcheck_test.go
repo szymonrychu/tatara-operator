@@ -83,8 +83,7 @@ func TestHealthCheck_UnderCap_CreatesOneProjectTask(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
-	b := 99
-	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
+	r.healthCheck(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listHealthCheckQEs(t, "hc-undercap")
 	if len(qes) != 1 {
@@ -116,8 +115,7 @@ func TestHealthCheck_AtCap_SkipsRepo(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
-	b := 99
-	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &b)
+	r.healthCheck(context.Background(), proj, reader, repos, nil, act)
 
 	if qes := listHealthCheckQEs(t, "hc-atcap"); len(qes) != 0 {
 		t.Fatalf("want 0 healthCheck QEs (at cap), got %d", len(qes))
@@ -150,8 +148,7 @@ func TestHealthCheck_InFlight_SkipsRepo(t *testing.T) {
 
 	existing := []tatarav1alpha1.Task{*pre}
 	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
-	b := 99
-	r.healthCheck(context.Background(), proj, reader, repos, existing, act, &b)
+	r.healthCheck(context.Background(), proj, reader, repos, existing, act)
 
 	if tasks := listHealthCheckTasks(t, "hc-inflight"); len(tasks) != 1 {
 		t.Fatalf("want 1 task (pre-existing only, in-flight guard), got %d", len(tasks))
@@ -181,8 +178,7 @@ func TestHealthCheck_DoesNotBlockBrainstorm(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
-	b := 99
-	r.healthCheck(context.Background(), proj, reader, repos, []tatarav1alpha1.Task{*bs}, act, &b)
+	r.healthCheck(context.Background(), proj, reader, repos, []tatarav1alpha1.Task{*bs}, act)
 
 	if qes := listHealthCheckQEs(t, "hc-indep"); len(qes) != 1 {
 		t.Fatalf("want 1 healthCheck QE (brainstorm in-flight must not block), got %d", len(qes))

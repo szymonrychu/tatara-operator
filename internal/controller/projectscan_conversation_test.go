@@ -82,11 +82,10 @@ func TestIssueScan_ReactivatesConversationTask(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	existing := listAllTasks(t, "conv-reactivate")
-	b := 99
 	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{
 		{ObjectMeta: metav1.ObjectMeta{Name: "conv-reactivate-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "conv-reactivate", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
-	}, existing, cron.IssueScan, &b)
+	}, existing, cron.IssueScan)
 
 	// Must NOT create a new task.
 	tasks := listAllTasks(t, "conv-reactivate")
@@ -132,11 +131,10 @@ func TestIssueScan_ReactivatesStoppedTask(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	existing := listAllTasks(t, "stopped-reactivate")
-	b2 := 99
 	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{
 		{ObjectMeta: metav1.ObjectMeta{Name: "stopped-reactivate-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "stopped-reactivate", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
-	}, existing, cron.IssueScan, &b2)
+	}, existing, cron.IssueScan)
 
 	tasks := listAllTasks(t, "stopped-reactivate")
 	if len(tasks) != 1 {
@@ -172,11 +170,10 @@ func TestIssueScan_NoReactivationWhenIssueNotNewer(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	existing := listAllTasks(t, "conv-no-reactivate")
-	b3 := 99
 	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{
 		{ObjectMeta: metav1.ObjectMeta{Name: "conv-no-reactivate-repo", Namespace: testNS},
 			Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "conv-no-reactivate", URL: "https://github.com/o/r.git", DefaultBranch: "main"}},
-	}, existing, cron.IssueScan, &b3)
+	}, existing, cron.IssueScan)
 
 	// Task count unchanged, state unchanged.
 	tasks := listAllTasks(t, "conv-no-reactivate")

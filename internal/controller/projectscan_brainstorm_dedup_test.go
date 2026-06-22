@@ -86,8 +86,7 @@ func TestBrainstorm_ConsultsListOpenIssuesForContext(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, capturedGoals, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, capturedGoals, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-dedup-ctx")
 	if len(qes) != 1 {
@@ -136,8 +135,7 @@ func TestBrainstorm_IssuesContextCappedAt60(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 200}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-dedup-cap60")
 	if len(qes) != 1 {
@@ -222,8 +220,7 @@ func TestBrainstorm_BotEngagedIssueFlagged(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-botengaged")
 	if len(qes) != 1 {

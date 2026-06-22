@@ -152,8 +152,7 @@ func TestIssueScan_PerRepoTopUp(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b := 99
-	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
+	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
 	if backlog {
 		t.Fatalf("want backlog=false (no per-repo cap; all 4 issues enqueued)")
 	}
@@ -175,8 +174,7 @@ func TestIssueScan_PropagatesAuthorToTaskSource(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b := 99
-	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &b)
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
 	qes := listScanQEs(t, "iss-author")
 	if len(qes) != 1 {
 		t.Fatalf("want 1 QE, got %d", len(qes))
@@ -225,8 +223,7 @@ func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b2 := 99
-	backlog, _ := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan, &b2)
+	backlog, _ := r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repoA}, []tatarav1alpha1.Task{*pre}, cron.IssueScan)
 	if backlog {
 		t.Fatalf("want backlog=false (#1 deduped, #2 gets QE)")
 	}
@@ -260,8 +257,7 @@ func TestMRScan_PerRepoTopUp(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	b3 := 99
-	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &b3)
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 	if backlog {
 		t.Fatalf("want backlog=false (no per-repo cap; all 4 PRs enqueued)")
 	}
@@ -612,8 +608,7 @@ func TestBrainstorm_UnderCap_CreatesOneProjectTask(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	bbs := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-undercap")
 	// Project-level: one QE per cycle, not one per repo.
@@ -639,8 +634,7 @@ func TestBrainstorm_AtCap_SkipsRepo(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	bbs2 := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs2)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-atcap")
 	if len(qes) != 0 {
@@ -676,8 +670,7 @@ func TestBrainstorm_InFlight_SkipsRepo(t *testing.T) {
 
 	existing := []tatarav1alpha1.Task{*pre}
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	bbs3 := 99
-	r.brainstorm(context.Background(), proj, reader, repos, existing, act, &bbs3)
+	r.brainstorm(context.Background(), proj, reader, repos, existing, act)
 
 	// Pre-existing Task with labelActivity=brainstorm blocks new QE (in-flight guard).
 	tasks := listBrainstormTasks(t, "bs-inflight")
@@ -706,8 +699,7 @@ func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	bbs4 := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &bbs4)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	qes := listBrainstormQEs(t, "bs-isolate")
 	// One project-level QE is still created; the backlog error for e is non-fatal.

@@ -45,8 +45,7 @@ func TestRecoveryExhaustedLabel_SkipsRecloseWhenLabelPresent(t *testing.T) {
 		mkPRTask("o/r", 55, "Done"),
 	}
 
-	budget := 99
-	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan)
 
 	// Label present: ClosePR must NOT be called (PR is already known-exhausted).
 	require.False(t, fw.closePRCalled, "expected ClosePR NOT called when label already present")
@@ -87,14 +86,13 @@ func TestMRScanCreatedTaskVisibleToIssueScan(t *testing.T) {
 	existing := []tatarav1alpha1.Task{}
 
 	// mrScan enqueues a QE deduped on issue#42 (bot PR Closes #42 -> dedupKey = issueLifecycle\x00o/r#42).
-	budget := 10
-	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, repos, existing, cron.MRScan)
 
 	// issueScan sees issue#42. dedupExists in EnqueueEvent finds the mrScan QE (same dedupKey hash)
 	// and skips creating a duplicate QE.
 	freshExisting, err := r.existingScanTasks(context.Background(), proj)
 	require.NoError(t, err)
-	r.issueScan(context.Background(), proj, reader, repos, freshExisting, cron.IssueScan, &budget)
+	r.issueScan(context.Background(), proj, reader, repos, freshExisting, cron.IssueScan)
 
 	// Only 1 QE for issue#42 (from mrScan). issueScan must NOT create a duplicate.
 	qes := listScanQEs(t, projName)
@@ -109,9 +107,9 @@ func TestMRScanCreatedTaskVisibleToIssueScan(t *testing.T) {
 
 // --- Finding 3: Budget truncation metric and backlog flag ---
 
-// TestMRScan_BudgetTruncationBacklog verifies that when the global budget runs out
-// mid-selected-slice, mrScan returns backlog=true so a short requeue fires.
-func TestMRScan_BudgetTruncationBacklog(t *testing.T) {
+// TestMRScan_NoBacklog_AllEnqueued verifies that mrScan returns backlog=false
+// when all eligible items are enqueued (budget gate removed; all 3 PRs enqueued).
+func TestMRScan_NoBacklog_AllEnqueued(t *testing.T) {
 	const projName = "budget-truncate-proj"
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
 	proj, _ := seedScanProject(t, projName, cron)
@@ -128,13 +126,12 @@ func TestMRScan_BudgetTruncationBacklog(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{
 		mkScanRepo(t, projName, projName+"-repo2", "https://github.com/o/r.git"),
 	}
-	// Budget = 1: selected=3, budget stops after 1 create -> 2 remaining
-	budget := 1
-	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &budget)
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
-	// backlog must be true: budget truncated before selected was exhausted.
-	require.True(t, backlog, "expected backlog=true when budget truncates selected items")
-	require.Equal(t, 0, budget, "budget must be 0 after single create")
+	// Budget removed: all 3 eligible PRs are enqueued; backlog=false.
+	require.False(t, backlog, "expected backlog=false when all items are enqueued (no budget gate)")
+	qes := listScanQEs(t, projName)
+	require.Equal(t, 3, len(qes), "all 3 PRs must be enqueued")
 }
 
 // --- Finding 6: stampScan error is logged ---
@@ -176,8 +173,7 @@ func TestBrainstorm_SetOpenProposals_CapDoesNotLeaveStaleGauge(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(reg)
 
 	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 2}
-	budget := 99
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
 
 	// o/g1 gauge must be set to 2.
 	g1Val := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/g1"})
@@ -305,8 +301,7 @@ func TestMRScan_SkippedNoRepo_EmitsMetric(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(reg)
 
 	repos := []tatarav1alpha1.Repository{*repoObj}
-	budget := 99
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
 	cnt := counterValue(t, reg, "tatara_scan_items_total",
 		map[string]string{"activity": "mrScan", "outcome": "skipped_norepo"})
@@ -327,8 +322,7 @@ func TestIssueScan_SkippedNoRepo_EmitsMetric(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(reg)
 
 	repos := []tatarav1alpha1.Repository{*repoObj}
-	budget := 99
-	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &budget)
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
 
 	cnt := counterValue(t, reg, "tatara_scan_items_total",
 		map[string]string{"activity": "issueScan", "outcome": "skipped_norepo"})
@@ -363,8 +357,8 @@ func TestCloseExhaustedPR_StampsLabel(t *testing.T) {
 
 // --- Finding 6: skipped_budget metric for budget-exhausted items ---
 
-// TestMRScan_SkippedBudget_EmitsMetric verifies that when the global budget
-// runs out mid-selected-slice, mrScan emits skipped_budget for each dropped item.
+// TestMRScan_SkippedBudget_EmitsMetric verifies that all eligible PRs are enqueued
+// (no budget cap drops items - budget param removed, all selected items are processed).
 func TestMRScan_SkippedBudget_EmitsMetric(t *testing.T) {
 	const projName = "budget-metric-proj"
 	cron := &tatarav1alpha1.ScmCron{MRScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
@@ -382,16 +376,15 @@ func TestMRScan_SkippedBudget_EmitsMetric(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{
 		mkScanRepo(t, projName, projName+"-repo-bm", "https://github.com/o/r.git"),
 	}
-	// Budget = 1: 3 selected, 1 created -> 2 remaining dropped by budget.
-	budget := 1
-	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan, &budget)
+	// All 3 eligible PRs are enqueued - no budget cap.
+	r.mrScan(context.Background(), proj, reader, repos, nil, cron.MRScan)
 
-	cnt := counterValue(t, reg, "tatara_scan_items_total",
-		map[string]string{"activity": "mrScan", "outcome": "skipped_budget"})
-	require.Equal(t, float64(2), cnt, "expected 2 skipped_budget metrics for 2 budget-dropped items")
+	qes := listScanQEs(t, projName)
+	require.Equal(t, 3, len(qes), "expected all 3 PRs enqueued (no budget cap)")
 }
 
-// TestIssueScan_SkippedBudget_EmitsMetric same for issueScan.
+// TestIssueScan_SkippedBudget_EmitsMetric verifies that all eligible issues are enqueued
+// (no budget cap drops items - budget param removed, all selected items are processed).
 func TestIssueScan_SkippedBudget_EmitsMetric(t *testing.T) {
 	const projName = "issue-budget-metric-proj"
 	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
@@ -409,12 +402,11 @@ func TestIssueScan_SkippedBudget_EmitsMetric(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{
 		mkScanRepo(t, projName, projName+"-repo-ibm", "https://github.com/o/r.git"),
 	}
-	budget := 1
-	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan, &budget)
+	// All 3 eligible issues are enqueued - no budget cap.
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
 
-	cnt := counterValue(t, reg, "tatara_scan_items_total",
-		map[string]string{"activity": "issueScan", "outcome": "skipped_budget"})
-	require.Equal(t, float64(2), cnt, "expected 2 skipped_budget metrics for 2 budget-dropped items")
+	qes := listScanQEs(t, projName)
+	require.Equal(t, 3, len(qes), "expected all 3 issues enqueued (no budget cap)")
 }
 
 // --- Finding 7/8: healthCheck calls SetOpenProposals ---
@@ -439,8 +431,7 @@ func TestHealthCheck_SetOpenProposals(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(reg)
 
 	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 10}
-	budget := 99
-	r.healthCheck(context.Background(), proj, reader, repos, nil, act, &budget)
+	r.healthCheck(context.Background(), proj, reader, repos, nil, act)
 
 	g1 := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/p1"})
 	g2 := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/p2"})
@@ -472,8 +463,7 @@ func TestMRScan_RecoveryCloseAttempt_EmitsDistinctMetric(t *testing.T) {
 		mkPRTask("o/r", 60, "Stopped"),
 		mkPRTask("o/r", 60, "Done"),
 	}
-	budget := 99
-	r.mrScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{*repoObj}, existing, cron.MRScan, &budget)
+	r.mrScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{*repoObj}, existing, cron.MRScan)
 
 	// recovery_close_attempt (not recovery_exhausted) must fire on the close branch.
 	closeAttempt := counterValue(t, reg, "tatara_scan_items_total",
