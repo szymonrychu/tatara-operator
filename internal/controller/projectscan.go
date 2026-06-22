@@ -213,7 +213,7 @@ func lastTerminalNoLabelTask(c candidate, existing []tatarav1alpha1.Task, manage
 		if !tatarav1alpha1.TaskTerminal(t) {
 			return nil
 		}
-		if latest == nil || t.CreationTimestamp.Time.After(latest.CreationTimestamp.Time) {
+		if latest == nil || t.CreationTimestamp.After(latest.CreationTimestamp.Time) {
 			latest = t
 		}
 	}
