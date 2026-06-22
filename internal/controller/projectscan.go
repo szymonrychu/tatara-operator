@@ -889,7 +889,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	start := time.Now()
 	maxProp := act.MaxOpenProposals
 	if maxProp < 1 {
-		maxProp = 5
+		maxProp = 10
 	}
 
 	// Project-scoped in-flight guard: any non-terminal brainstorm Task blocks.
@@ -1000,7 +1000,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	start := time.Now()
 	maxProp := act.MaxOpenProposals
 	if maxProp < 1 {
-		maxProp = 5
+		maxProp = 10
 	}
 
 	// Project-scoped in-flight guard: any non-terminal healthCheck Task blocks.

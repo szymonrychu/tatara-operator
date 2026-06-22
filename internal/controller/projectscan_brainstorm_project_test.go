@@ -309,6 +309,45 @@ func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	}
 }
 
+// TestBrainstormDefaultProposalCapIsTen: MaxOpenProposals=0 (unset) should
+// default to 10. 9 open proposals must NOT cap-skip; 10 must cap-skip.
+func TestBrainstormDefaultProposalCapIsTen(t *testing.T) {
+	tests := []struct {
+		name      string
+		projName  string
+		openCount int
+		wantSkip  bool
+	}{
+		{"nine_under_default_cap", "bs-defcap-9", 9, false},
+		{"ten_at_default_cap", "bs-defcap-10", 10, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proj, repos := seedBrainstormProject(t, tc.projName, []string{"o/r1"}, 0)
+
+			var issues []scm.IssueRef
+			for i := 1; i <= tc.openCount; i++ {
+				issues = append(issues, scm.IssueRef{Repo: "o/r1", Number: i, Labels: []string{"tatara-idea"}})
+			}
+			reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r1": issues}}
+			r := newScanReconciler(reader)
+			r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+			// MaxOpenProposals=0 -> falls back to default.
+			act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 0}
+			r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+
+			qes := listBrainstormQEs(t, tc.projName)
+			if tc.wantSkip && len(qes) != 0 {
+				t.Fatalf("want cap-skip (0 QEs), got %d", len(qes))
+			}
+			if !tc.wantSkip && len(qes) != 1 {
+				t.Fatalf("want 1 QE (under cap), got %d", len(qes))
+			}
+		})
+	}
+}
+
 // countingReader wraps perRepoFakeReader and records which repos were queried.
 type countingReader struct {
 	issuesByRepo map[string][]scm.IssueRef
