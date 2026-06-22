@@ -1099,31 +1099,30 @@ func brainstormGoalProject(slugs []string, repoStateCtx string) string {
 	return "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
-		"Run at MAXIMUM reasoning effort. Decompose the survey: dispatch one parallel subagent per repository " +
-		"(use the Agent/Workflow tools to fan out, then synthesize their findings into one systemic conclusion). " +
+		"Run at MAXIMUM reasoning effort. " +
 		"\n\n" + stateBlock + "\n\n" +
-		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning " +
-		">=2 repositories, a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - " +
-		"over a one-repo tweak. Survey the ISSUES, OPEN MRs, and MAIN HEALTH blocks above; manage the " +
-		"backlog by linking/labelling/commenting related existing issues (never close issues you do not own).\n\n" +
-		"DEDUP RULE - you MUST follow exactly ONE of these three paths, in order:\n" +
-		"1. If the best idea DUPLICATES an existing open issue listed above: do NOT call propose_issue. " +
-		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N').\n" +
-		"2. If the best idea is a sub-aspect or connecting improvement TO an existing issue " +
-		"that is NOT marked [bot-engaged]: call comment_on_issue(repo, number, body) on that issue. " +
-		"Do NOT call propose_issue.\n" +
-		"   An issue marked [bot-engaged] already has your comment - do NOT comment again on it. " +
-		"Prefer a NEW improvement instead: a genuinely novel standalone idea (path 3, in ANY repo or " +
-		"project-wide), or a comment on a DIFFERENT issue that is not [bot-engaged]. Never comment " +
-		"twice on the same issue.\n" +
-		"3. ONLY if the idea is genuinely novel AND standalone (no existing issue covers it): " +
-		"call propose_issue. " +
-		"Set the `repo` argument to the specific repository that should own the issue. " +
-		"The proposal must be self-contained: problem statement, proposed approach, and a single explicit decision for the human " +
-		"(approve to implement or comment to refine). Do NOT produce a list of open questions or ask for input.\n\n" +
-		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic " +
-		"improvement MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
-		"a single `systemicId` string you generate. State which path and scope you chose before executing."
+		"EARLY EXIT (do this FIRST, cheaply): before dispatching the per-repo deep-research fan-out, do a quick scan of " +
+		"the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears the bar for a genuinely novel, high-leverage " +
+		"NEW proposal this cycle, call `skip_brainstorm(reason)` and STOP. Do NOT run the expensive fan-out just to conclude " +
+		"there is nothing to propose.\n\n" +
+		"OTHERWISE decompose the survey: dispatch one parallel subagent per repository (use the Agent/Workflow tools to fan " +
+		"out, then synthesize their findings into one systemic conclusion).\n\n" +
+		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning >=2 repositories, " +
+		"a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - over a one-repo tweak.\n\n" +
+		"NEW-IDEAS-ONLY CONTRACT - this is a discovery cycle for NEW proposals; nursing existing issues is handled " +
+		"elsewhere. Follow exactly ONE path:\n" +
+		"1. If the best idea DUPLICATES or is merely a sub-aspect of an existing open issue listed above: do NOT propose. " +
+		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N'). Do NOT comment on it.\n" +
+		"2. If the idea is genuinely novel AND standalone: call `propose_issue`. Set `repo` to the owning repository. " +
+		"The proposal must be self-contained AND give the maintainer granular directional control. Required body shape: " +
+		"(a) a one-paragraph problem statement; (b) a DECOMPOSITION of the problem into its smaller constituent " +
+		"sub-problems / decision points; (c) for EACH sub-problem, 2-3 concrete implementation OPTIONS, each with a " +
+		"one-line tradeoff, and YOUR recommended pick; (d) the maintainer's decision framed as choosing one option per " +
+		"sub-problem (approve the recommended set, pick alternatives, or comment to refine). Every choice MUST come with " +
+		"concrete options and a recommendation - do NOT produce a flat list of open questions.\n\n" +
+		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY emit one " +
+		"propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` string you generate. " +
+		"State which path and scope you chose before executing."
 }
 
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
