@@ -186,7 +186,7 @@ func TestHealthCheck_DoesNotBlockBrainstorm(t *testing.T) {
 }
 
 func TestHealthCheckGoal_NamesHealthCheckSkill(t *testing.T) {
-	g := healthCheckGoalProject([]string{"tatara-cli"}, "")
+	g := healthCheckGoalProject([]string{"tatara-cli"}, "", "")
 	if !strings.Contains(g, "tatara-health-check") {
 		t.Fatalf("healthCheck goal does not invoke tatara-health-check skill: %s", g)
 	}

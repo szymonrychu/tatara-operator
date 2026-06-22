@@ -26,7 +26,7 @@ import (
 func TestBrainstormGoalProject_ContainsDedupInstructions(t *testing.T) {
 	slugs := []string{"o/alpha", "o/beta"}
 	ctx := "o/alpha#1 [] Fix login bug\no/beta#3 [enhancement] Add caching layer"
-	g := brainstormGoalProject(slugs, ctx)
+	g := brainstormGoalProject(slugs, ctx, "")
 
 	// Must still name repos and skill.
 	for _, slug := range slugs {
@@ -59,7 +59,7 @@ func TestBrainstormGoalProject_ContainsDedupInstructions(t *testing.T) {
 // no open issues are found the goal degrades gracefully (no panic, no stale ctx).
 func TestBrainstormGoalProject_NoContext_EmptyIssueSectionOmitted(t *testing.T) {
 	slugs := []string{"o/solo"}
-	g := brainstormGoalProject(slugs, "")
+	g := brainstormGoalProject(slugs, "", "")
 	if !strings.Contains(g, "o/solo") {
 		t.Fatalf("goal missing slug: %s", g)
 	}
@@ -184,7 +184,7 @@ func TestGoalProjects_NoReCommentInstruction(t *testing.T) {
 	ctx := "o/alpha#1 [] Fix login bug [bot-engaged]"
 
 	t.Run("brainstorm embeds context and keeps propose_issue; no comment path", func(t *testing.T) {
-		g := brainstormGoalProject(slugs, ctx)
+		g := brainstormGoalProject(slugs, ctx, "")
 		// Context block (including the [bot-engaged] marker) must be embedded verbatim.
 		if !strings.Contains(g, ctx) {
 			t.Fatalf("goal does not embed issues context:\n%s", g)
@@ -199,7 +199,7 @@ func TestGoalProjects_NoReCommentInstruction(t *testing.T) {
 	})
 
 	t.Run("healthCheck retains no-re-comment instruction and three-path dedup", func(t *testing.T) {
-		g := healthCheckGoalProject(slugs, ctx)
+		g := healthCheckGoalProject(slugs, ctx, "")
 		if !strings.Contains(g, "[bot-engaged]") {
 			t.Fatalf("healthCheck goal does not reference the bot-engaged marker:\n%s", g)
 		}

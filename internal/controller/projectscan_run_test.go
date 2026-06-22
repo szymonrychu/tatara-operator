@@ -716,7 +716,7 @@ func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 // ----- C5: Brainstorm goal names the deep-research skill -----
 
 func TestBrainstormGoal_NamesDeepResearchSkill(t *testing.T) {
-	g := brainstormGoalProject([]string{"tatara-cli"}, "")
+	g := brainstormGoalProject([]string{"tatara-cli"}, "", "")
 	if !strings.Contains(g, "tatara-deep-research") {
 		t.Fatalf("brainstorm goal does not invoke tatara-deep-research skill: %s", g)
 	}

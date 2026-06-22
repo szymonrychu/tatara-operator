@@ -303,6 +303,10 @@ type ScmSpec struct {
 	PriorityLabel string `json:"priorityLabel,omitempty"`
 	// +optional
 	Cron *ScmCron `json:"cron,omitempty"`
+	// Guidance is free-form project charter text appended verbatim to the
+	// brainstorm and healthCheck goal context. Empty leaves the goal unchanged.
+	// +optional
+	Guidance string `json:"guidance,omitempty"`
 	// +kubebuilder:default=60
 	// +optional
 	BabysitDeadlineMinutes int `json:"babysitDeadlineMinutes,omitempty"`

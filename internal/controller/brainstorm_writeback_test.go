@@ -158,7 +158,7 @@ func TestDoWriteBackBrainstorm_PriorCycleProposalNotCounted(t *testing.T) {
 // single-decision framing. The old "Exactly one action per run" clause is gone:
 // systemic proposals allow one propose_issue per affected repo (bounded <=6).
 func TestBrainstormGoal_ContainsProposeIssueRequirement(t *testing.T) {
-	goal := brainstormGoalProject([]string{"owner/repo"}, "")
+	goal := brainstormGoalProject([]string{"owner/repo"}, "", "")
 	require.Contains(t, goal, "propose_issue", "brainstorm goal must name propose_issue as a hard requirement")
 	require.Contains(t, goal, "systemicId", "brainstorm goal must mention systemicId for multi-repo proposals")
 	// Must frame the decision explicitly so the agent does not invite open-ended back-and-forth.

@@ -5580,6 +5580,11 @@ spec:
                     description: DeclinedLabel marks an issue declined before implementation
                       (triage reject).
                     type: string
+                  guidance:
+                    description: |-
+                      Guidance is free-form project charter text appended verbatim to the
+                      brainstorm and healthCheck goal context. Empty leaves the goal unchanged.
+                    type: string
                   ideaLabel:
                     default: tatara-idea
                     description: IdeaLabel is DEPRECATED (legacy alias for BrainstormingLabel);
