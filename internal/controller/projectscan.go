@@ -186,6 +186,40 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string) bo
 	return false
 }
 
+// lastTerminalNoLabelTask returns the most recent matching terminal Task for an
+// issue candidate when the candidate carries no managed phase label and EVERY
+// matching Task is terminal. It returns nil otherwise (PR candidate, a managed
+// label is present, a non-terminal Task exists, or there are no matching Tasks).
+//
+// This isolates the only isDeduped path that lets a dormant issue through on the
+// cron cadence: terminal-only Tasks, no managed label, with issue updatedAt
+// advanced past a terminal Task's creation (projectscan.go isDeduped). The
+// operator's own write-back comment advances updatedAt, so without an
+// author-aware gate every scan cycle spawns a fresh Task. Callers use the
+// returned Task's creation time as the "since" for humanCommentAfter, mirroring
+// the reactivation gate in findConvTaskToReactivate.
+func lastTerminalNoLabelTask(c candidate, existing []tatarav1alpha1.Task, managed []string) *tatarav1alpha1.Task {
+	if c.isPR || hasAnyLabel(c.labels, managed) {
+		return nil
+	}
+	repoLabel := sanitizeRepoLabel(c.repo)
+	numLabel := strconv.Itoa(c.number)
+	var latest *tatarav1alpha1.Task
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+			continue
+		}
+		if !tatarav1alpha1.TaskTerminal(t) {
+			return nil
+		}
+		if latest == nil || t.CreationTimestamp.Time.After(latest.CreationTimestamp.Time) {
+			latest = t
+		}
+	}
+	return latest
+}
+
 // candidate is one scannable work item (PR, issue, or board item) normalized
 // for selection + dedup. number/repo identify it; labels drive priority;
 // updatedAt drives stale-first ordering. body is used for PR "Closes #N" parsing.
@@ -825,6 +859,25 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		if !ok {
 			r.Metrics.ScanItem("issueScan", "skipped_norepo")
 			continue
+		}
+		// Human-activity gate on fresh creation (issue #105): when the only
+		// matching Tasks are terminal and the issue has no managed phase label,
+		// the bot's own write-back advances updatedAt and isDeduped lets the
+		// candidate through, spawning a fresh Task every cron cycle on a dormant
+		// issue. Mirror the reactivation gate: create only when a HUMAN comment
+		// is newer than the last terminal Task. Fail open (create) when the
+		// author cannot be read, preserving current behavior on read errors.
+		if lt := lastTerminalNoLabelTask(c, existing, managed); lt != nil {
+			owner, name, cut := strings.Cut(c.repo, "/")
+			if cut && reader != nil && botLogin != "" &&
+				!humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, lt.CreationTimestamp.Time) {
+				r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
+				l.Info("issueScan: skipped fresh task creation, no human activity since last terminal task",
+					"action", "scan_issue", "resource_id", proj.Name,
+					"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
+					"last_terminal_task", lt.Name)
+				continue
+			}
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
 		ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil)
