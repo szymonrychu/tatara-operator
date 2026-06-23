@@ -1023,12 +1023,23 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	l := log.FromContext(ctx)
 	baseURL := agent.BaseURL(task, task.Namespace)
 	if err := r.Session.DeleteSession(ctx, baseURL); err != nil {
-		// Best-effort: the pod is about to be deleted anyway.
-		l.Error(err, "terminate: delete session (non-fatal)", "resource_id", task.Name)
-		apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-			Type: "SessionDeleteFailed", Status: metav1.ConditionTrue,
-			Reason: "DeleteError", Message: err.Error(),
-		})
+		// Best-effort: the pod is about to be deleted anyway. Classify the error
+		// before recording a failure condition. An UnreachableError means the
+		// wrapper pod is already gone (reaped on a prior turn, evicted, or the
+		// Service has no endpoints). For a DELETE whose goal is to make the session
+		// not exist, a gone pod IS the desired terminal state, so that is a clean
+		// teardown, not a failure. Only a reachable-but-refused wrapper (HTTPError)
+		// or a timeout leaves the session possibly still alive and worth surfacing.
+		var unreachable *agent.UnreachableError
+		if errors.As(err, &unreachable) {
+			l.Info("terminate: session already gone", "action", "task_terminate", "resource_id", task.Name)
+		} else {
+			l.Error(err, "terminate: delete session (non-fatal)", "resource_id", task.Name)
+			apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+				Type: "SessionDeleteFailed", Status: metav1.ConditionTrue,
+				Reason: "DeleteError", Message: err.Error(),
+			})
+		}
 	}
 
 	if err := r.deleteWrapper(ctx, task); err != nil {
