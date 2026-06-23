@@ -1575,6 +1575,28 @@ func botCommentedOnIssue(ctx context.Context, reader scm.SCMReader, owner, name 
 	return false
 }
 
+// systemicMarker returns the idempotency marker + human-facing body for a
+// collapsed sibling issue. The returned string is checked against existing
+// comments by commentSiblingMarker (reconcile-safe).
+func systemicMarker(lead int) string {
+	return fmt.Sprintf("Tracked by #%d (systemic group). No separate agent.", lead)
+}
+
+// commentSiblingMarker posts the marker once. It is a no-op when a comment
+// whose body contains the marker already exists (reconcile-safe).
+func commentSiblingMarker(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, token, repo string, number, lead int) error {
+	owner, name, _ := strings.Cut(repo, "/")
+	marker := systemicMarker(lead)
+	if comments, err := reader.ListIssueComments(ctx, owner, name, number); err == nil {
+		for _, c := range comments {
+			if strings.Contains(c.Body, marker) {
+				return nil
+			}
+		}
+	}
+	return writer.Comment(ctx, token, fmt.Sprintf("%s#%d", repo, number), marker)
+}
+
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
 func repoSlug(repo *tatarav1alpha1.Repository) string {
 	owner, name, err := scm.OwnerRepo(repo.Spec.URL)

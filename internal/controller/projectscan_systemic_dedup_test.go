@@ -1,8 +1,55 @@
 package controller
 
 import (
+	"context"
+	"fmt"
 	"testing"
+
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
+
+// siblingFakeSCM implements both scm.SCMReader and scm.SCMWriter for
+// commentSiblingMarker tests. Only ListIssueComments and Comment are used.
+type siblingFakeSCM struct {
+	scm.SCMReader
+	scm.SCMWriter
+	comments     map[string][]scm.IssueComment
+	commentCalls int
+}
+
+func (f *siblingFakeSCM) ListIssueComments(_ context.Context, owner, repo string, number int) ([]scm.IssueComment, error) {
+	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
+	return f.comments[key], nil
+}
+
+func (f *siblingFakeSCM) Comment(_ context.Context, _, _, _ string) error {
+	f.commentCalls++
+	return nil
+}
+
+func TestCommentSiblingMarker_Idempotent(t *testing.T) {
+	marker := systemicMarker(12)
+	// reader with a comment containing the marker -> writer must NOT be called.
+	reader := &siblingFakeSCM{comments: map[string][]scm.IssueComment{
+		"o/r1#15": {{Author: "bot", Body: "earlier " + marker + " trailing"}},
+	}}
+	writer := &siblingFakeSCM{}
+	if err := commentSiblingMarker(context.Background(), reader, writer, "tok", "o/r1", 15, 12); err != nil {
+		t.Fatal(err)
+	}
+	if writer.commentCalls != 0 {
+		t.Fatalf("marker already present, must not re-post; got %d calls", writer.commentCalls)
+	}
+	// fresh issue (no existing comments) -> must post once.
+	reader2 := &siblingFakeSCM{comments: map[string][]scm.IssueComment{}}
+	writer2 := &siblingFakeSCM{}
+	if err := commentSiblingMarker(context.Background(), reader2, writer2, "tok", "o/r1", 16, 12); err != nil {
+		t.Fatal(err)
+	}
+	if writer2.commentCalls != 1 {
+		t.Fatalf("fresh issue must post once; got %d", writer2.commentCalls)
+	}
+}
 
 func TestElectSystemicLeads(t *testing.T) {
 	cands := []candidate{
