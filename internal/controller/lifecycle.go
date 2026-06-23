@@ -1903,11 +1903,13 @@ func (r *TaskReconciler) setImplementContext(ctx context.Context, task *tatarav1
 // no diff on the prior turn to either deliver the change or stop and explain.
 const emptyImplementReentryPrompt = "Your previous attempt finished without " +
 	"committing any change, so no PR could be opened and the issue is still open. " +
-	"Re-read the issue and the repository, then EITHER implement the fix and commit " +
-	"it, OR if this issue genuinely should not be implemented (already done, out of " +
-	"scope, wrong approach), you MUST call `decline_implementation` with a clear " +
-	"reason explaining what you considered and why no code change is needed. " +
-	"A silent finish with no PR and no `decline_implementation` call is NOT allowed " +
+	"Re-read the issue and the repository, then do EXACTLY ONE of: " +
+	"(1) implement the fix and commit it; " +
+	"(2) if the change is ALREADY PRESENT (e.g. another run already committed it on the shared branch), " +
+	"call `already_done` with a reason naming where the fix already lives; " +
+	"(3) if this issue genuinely should NOT be implemented (out of scope, wrong approach, blocked), " +
+	"call `decline_implementation` with a clear reason. " +
+	"A silent finish with no PR and no `already_done`/`decline_implementation` call is NOT allowed " +
 	"and will be escalated to a human."
 
 // setImplementEmptyRetries persists Status.ImplementEmptyRetries via RetryOnConflict.
