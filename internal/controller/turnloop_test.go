@@ -124,3 +124,55 @@ func TestLifecycleTriageText_ApprovalInstructions(t *testing.T) {
 		t.Fatalf("triage prompt missing conversation-approval guidance:\n%s", got)
 	}
 }
+
+func TestLifecyclePhaseGuidance_CommentPhaseNotRestored(t *testing.T) {
+	g := lifecyclePhaseGuidance("Triage")
+	if !strings.Contains(g, "Lifecycle phase: Triage") {
+		t.Errorf("guidance missing phase name: %q", g)
+	}
+	if !strings.Contains(g, "transient") {
+		t.Errorf("guidance missing transient-workspace note: %q", g)
+	}
+	if !strings.Contains(g, "NOT be restored") {
+		t.Errorf("comment-phase guidance must say file edits are not restored: %q", g)
+	}
+	if strings.Contains(g, "ARE restored") {
+		t.Errorf("comment-phase guidance must not promise restored changes: %q", g)
+	}
+}
+
+func TestLifecyclePhaseGuidance_ImplementPhaseRestored(t *testing.T) {
+	g := lifecyclePhaseGuidance("Implement")
+	if !strings.Contains(g, "Lifecycle phase: Implement") {
+		t.Errorf("guidance missing phase name: %q", g)
+	}
+	if !strings.Contains(g, "ARE restored") {
+		t.Errorf("implement-phase guidance must say committed+pushed changes are restored: %q", g)
+	}
+	if !strings.Contains(g, "commit and push") {
+		t.Errorf("implement-phase guidance must reference commit and push: %q", g)
+	}
+}
+
+func TestLifecycleTriageText_IncludesPhaseGuidance(t *testing.T) {
+	task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r#1", URL: "u"}}}
+	got := lifecycleTriageText(task, "T", "B")
+	if !strings.Contains(got, "## Lifecycle phase: Triage") {
+		t.Errorf("triage prompt missing phase guidance: %q", got)
+	}
+	if !strings.Contains(got, "NOT be restored") {
+		t.Errorf("triage prompt missing transient-workspace note: %q", got)
+	}
+}
+
+func TestImplementPrompt_IncludesPhaseGuidance(t *testing.T) {
+	task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{ProjectRef: "proj", Goal: "g", Kind: "issueLifecycle"}}
+	task.Name = "task-phase"
+	got := implementPrompt(task)
+	if !strings.Contains(got, "## Lifecycle phase: Implement") {
+		t.Errorf("implement prompt missing phase guidance: %q", got)
+	}
+	if !strings.Contains(got, "ARE restored") {
+		t.Errorf("implement prompt missing restored-changes note: %q", got)
+	}
+}

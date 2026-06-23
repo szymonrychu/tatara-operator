@@ -1286,6 +1286,7 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 		"issue, you MUST call `decline_implementation` with a clear reason (what you " +
 		"considered and why it should not / need not be done). A silent finish with no " +
 		"PR and no `decline_implementation` call is NOT allowed and will be re-prompted."
+	base += lifecyclePhaseGuidance("Implement")
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
 	}
