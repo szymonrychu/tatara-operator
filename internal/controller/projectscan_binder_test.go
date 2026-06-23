@@ -10,6 +10,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // TestIssueScanCreatesIssueLifecycleKind asserts that issueScan creates QEs with
@@ -295,5 +296,76 @@ func TestMRScanBotPRNoClosesKeyedOnPRNumber(t *testing.T) {
 	// source-number label should be the PR number (55) when no Closes #N
 	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "55" {
 		t.Errorf("source-number label = %q, want 55 (PR number)", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	}
+}
+
+// TestIssueScanAdoptsParkedTaskInsteadOfDuplicating asserts the false-refusal fix:
+// a Parked issueLifecycle Task for an issue with new human activity is RE-ENTERED to
+// Triage (adopted) rather than producing a second Task / QueuedEvent. One Task per issue.
+func TestIssueScanAdoptsParkedTaskInsteadOfDuplicating(t *testing.T) {
+	ctx := context.Background()
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
+	proj, repoA := seedScanProject(t, "adopt-parked", cron)
+
+	created := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+
+	// Pre-create a Parked issueLifecycle Task for o/r#8 (the duplicate-storm state).
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 8}, "issueScan", "issueLifecycle")
+	pre.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef: "adopt-parked", RepositoryRef: repoA.Name,
+		Goal: "g", Kind: "issueLifecycle",
+	}
+	if err := k8sClient.Create(ctx, pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	pre.CreationTimestamp = created
+	pre.Status.Phase = "Succeeded"
+	pre.Status.LifecycleState = "Parked"
+	pre.Status.ImplementEmptyRetries = 2
+	if err := k8sClient.Status().Update(ctx, pre); err != nil {
+		t.Fatalf("pre status: %v", err)
+	}
+
+	// Issue updated after the Parked task, with a NEW human comment after creation
+	// (so the line-182 human-activity gate lets it through to the adoption branch).
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 8, UpdatedAt: time.Now()},
+		},
+		comments: []scm.IssueComment{
+			{Author: "szymon", CreatedAt: time.Now()}, // human, after the Parked task creation
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	r.issueScan(ctx, proj, reader, []tatarav1alpha1.Repository{*repoA},
+		[]tatarav1alpha1.Task{*pre}, cron.IssueScan)
+
+	// No new QueuedEvent: the Parked Task was adopted, not duplicated.
+	qes := listScanQEs(t, "adopt-parked")
+	if len(qes) != 0 {
+		t.Fatalf("want 0 QEs (adopted, not duplicated), got %d", len(qes))
+	}
+
+	// The existing Task is re-entered to Triage with a clean run state.
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got); err != nil {
+		t.Fatalf("get adopted task: %v", err)
+	}
+	if got.Status.LifecycleState != "Triage" {
+		t.Fatalf("adopted task LifecycleState = %q, want Triage", got.Status.LifecycleState)
+	}
+	if got.Status.Phase != "" {
+		t.Fatalf("adopted task Phase = %q, want cleared", got.Status.Phase)
+	}
+	if got.Status.ImplementEmptyRetries != 0 {
+		t.Fatalf("adopted task ImplementEmptyRetries = %d, want 0", got.Status.ImplementEmptyRetries)
+	}
+	if got.Status.LastActivityAt == nil || got.Status.DeadlineAt == nil {
+		t.Fatalf("adopted task must stamp LastActivityAt + DeadlineAt")
 	}
 }

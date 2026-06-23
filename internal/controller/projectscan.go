@@ -149,6 +149,33 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 	return nil
 }
 
+// adoptLifecycleTask re-enters an existing issueLifecycle Task to Triage in place
+// of creating a duplicate. It mirrors the reactivation pass: clear the terminal run
+// state (Phase, ImplementEmptyRetries) and re-arm the lifecycle (LifecycleState=Triage,
+// LastActivityAt=now, DeadlineAt=now+idle). The Task's pod name and branch are derived
+// deterministically from its labels/source, so the next TaskReconciler reconcile reuses
+// the same pod/branch. RetryOnConflict handles racing reconcile writes.
+func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
+	now := metav1.Now()
+	idleMinutes := 60
+	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
+		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
+	}
+	deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.LifecycleState = "Triage"
+		fresh.Status.Phase = ""
+		fresh.Status.ImplementEmptyRetries = 0
+		fresh.Status.LastActivityAt = &now
+		fresh.Status.DeadlineAt = &deadline
+		return r.Status().Update(ctx, fresh)
+	})
+}
+
 // isDeduped reports whether a candidate already has a Task that should suppress
 // a re-pick. Phase labels are the issue's state-of-truth (Option A):
 //   - any non-terminal Task for (repo,number) -> skip (fast path)
@@ -849,6 +876,25 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			r.Metrics.ScanItem("issueScan", "skipped_norepo")
+			continue
+		}
+		// Adoption (B1): if an issueLifecycle Task already exists for this issue
+		// (Parked from a false refusal, or otherwise live), re-enter it to Triage
+		// instead of creating a duplicate. One Task per issue forever; the shared
+		// pod/branch is intentional. Done/Stopped Tasks are excluded by the helper
+		// so deliberately-closed issues still create fresh on new activity.
+		if adopt := hasLiveOrAdoptableTask(existing, c.repo, c.number); adopt != nil {
+			if err := r.adoptLifecycleTask(ctx, proj, adopt); err != nil {
+				l.Error(err, "issueScan: adopt existing lifecycle task",
+					"action", "adopt_lifecycle", "resource_id", adopt.Name,
+					"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+				r.Metrics.ScanItem("issueScan", "adopt_error")
+				continue
+			}
+			l.Info("issueScan: adopted existing lifecycle task (re-triage, no duplicate)",
+				"action", "adopt_lifecycle", "resource_id", adopt.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			r.Metrics.ScanItem("issueScan", "adopted")
 			continue
 		}
 		// Human-activity gate on fresh creation (issue #105): when the only
