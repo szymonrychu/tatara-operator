@@ -166,6 +166,14 @@ type TaskSpec struct {
 	ApprovalRequired bool `json:"approvalRequired,omitempty"`
 	// +optional
 	ProposedIssue *ProposedIssueSpec `json:"proposedIssue,omitempty"`
+	// ReposInScope is the optional declarative list of Project Repository CR
+	// names this Task is expected to change. When set, the implement prompt tells
+	// the agent the issue spans these repos and writeback posts a WARNING comment
+	// for any in-scope repo whose branch produced no commits, instead of skipping
+	// it silently. Absent/empty = single-repo behavior (primary repo only), so
+	// existing Tasks are unaffected.
+	// +optional
+	ReposInScope []string `json:"reposInScope,omitempty"`
 }
 
 // TaskTerminal reports whether t has reached a terminal state, accounting for

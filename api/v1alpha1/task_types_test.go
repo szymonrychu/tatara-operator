@@ -249,6 +249,31 @@ func TestSuggestionLineField(t *testing.T) {
 	}
 }
 
+func TestTaskSpecReposInScope(t *testing.T) {
+	// Absent field defaults to nil (single-repo behavior, no regression).
+	var empty v1alpha1.TaskSpec
+	if empty.ReposInScope != nil {
+		t.Fatalf("zero-value ReposInScope = %v, want nil", empty.ReposInScope)
+	}
+
+	// Populated field round-trips and deep-copies independently.
+	spec := v1alpha1.TaskSpec{
+		ProjectRef:    "proj",
+		RepositoryRef: "tatara-helmfile",
+		Goal:          "fix #8",
+		ReposInScope:  []string{"tatara-helmfile", "terraform", "ansible"},
+	}
+	task := &v1alpha1.Task{Spec: spec}
+	cp := task.DeepCopy()
+	cp.Spec.ReposInScope[0] = "mutated"
+	if task.Spec.ReposInScope[0] != "tatara-helmfile" {
+		t.Fatalf("DeepCopy did not isolate ReposInScope: original mutated to %q", task.Spec.ReposInScope[0])
+	}
+	if len(cp.Spec.ReposInScope) != 3 {
+		t.Fatalf("DeepCopy lost elements: got %d, want 3", len(cp.Spec.ReposInScope))
+	}
+}
+
 // TestImplementOutcomeDeepCopy verifies that a non-nil ImplementOutcome is
 // deep-copied (not shallow-aliased) so mutations through the copy cannot
 // corrupt the informer-cache original (Finding 2).

@@ -102,6 +102,17 @@ spec:
                 - repositoryRef
                 - title
                 type: object
+              reposInScope:
+                description: |-
+                  ReposInScope is the optional declarative list of Project Repository CR
+                  names this Task is expected to change. When set, the implement prompt tells
+                  the agent the issue spans these repos and writeback posts a WARNING comment
+                  for any in-scope repo whose branch produced no commits, instead of skipping
+                  it silently. Absent/empty = single-repo behavior (primary repo only), so
+                  existing Tasks are unaffected.
+                items:
+                  type: string
+                type: array
               repositoryRef:
                 type: string
               source:
