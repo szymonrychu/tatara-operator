@@ -790,6 +790,23 @@ func TestBuildPod_S3SessionIDReplay(t *testing.T) {
 	require.Equal(t, "sid-abc", got)
 }
 
+func TestBuildPod_S3CompactionSkipsFullResume(t *testing.T) {
+	// When the pending-handover-resume annotation is set (context over threshold),
+	// BuildPod must NOT emit CONVERSATION_SESSION_ID (so the wrapper starts fresh
+	// and the operator's compacted handover is used instead) while still emitting
+	// the object key so the fresh compacted session is persisted.
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Bucket = "tatara-conversations"
+	task.Status.SessionID = "sid-abc"
+	task.Annotations = map[string]string{tatarav1alpha1.AnnPendingHandoverResume: "true"}
+
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	_, hasSID := envValue(c, "CONVERSATION_SESSION_ID")
+	require.False(t, hasSID, "compaction must skip full resume (no CONVERSATION_SESSION_ID)")
+	_, hasKey := envValue(c, "CONVERSATION_OBJECT_KEY")
+	require.True(t, hasKey, "object key still emitted so the compacted session is persisted")
+}
+
 func TestBuildPod_S3NoCredsWhenSecretEmpty(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	cfg.S3Bucket = "tatara-conversations" // no S3SecretName -> default cred chain (IRSA)

@@ -443,10 +443,20 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// this Task's stable conversation object key so the wrapper uploads the
 	// transcript after each turn and restores it on boot. Gated on S3Bucket: with
 	// no bucket configured NO S3 env is emitted and the wrapper behaves as before.
-	// CONVERSATION_SESSION_ID is set only once a prior run has recorded the
-	// session id on Status (subtask 6), which triggers `claude --resume`. AWS
-	// creds come via SecretKeyRef from S3SecretName; an empty secret name leaves
-	// the wrapper on the default credential chain (IRSA).
+	// AWS creds come via SecretKeyRef from S3SecretName; an empty secret name
+	// leaves the wrapper on the default credential chain (IRSA).
+	//
+	// Full resume vs compaction (decision 2) is mutually exclusive and gated by
+	// the pending-handover-resume annotation, which maybeMarkHandoverResume sets
+	// when LastTurnInputTokens crosses HandoverThresholdPercent (25%) of the
+	// context window:
+	//   - annotation unset (under threshold): emit CONVERSATION_SESSION_ID so the
+	//     wrapper does a FULL conversation replay (claude --resume).
+	//   - annotation "true" (at/over threshold): SKIP CONVERSATION_SESSION_ID so
+	//     the wrapper starts fresh and implementPrompt injects the compacted
+	//     "## Resume from handover" text instead. CONVERSATION_OBJECT_KEY is still
+	//     emitted so the fresh (compacted) session is itself persisted and the
+	//     next turn-complete records its new, shorter sessionId.
 	if cfg.S3Bucket != "" {
 		env = append(env,
 			corev1.EnvVar{Name: "S3_ENDPOINT", Value: cfg.S3Endpoint},
@@ -456,7 +466,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			corev1.EnvVar{Name: "S3_FORCE_PATH_STYLE", Value: strconv.FormatBool(cfg.S3ForcePathStyle)},
 			corev1.EnvVar{Name: "CONVERSATION_OBJECT_KEY", Value: ConversationKey(task)},
 		)
-		if task.Status.SessionID != "" {
+		compacting := task.Annotations[tatarav1alpha1.AnnPendingHandoverResume] == "true"
+		if task.Status.SessionID != "" && !compacting {
 			env = append(env, corev1.EnvVar{Name: "CONVERSATION_SESSION_ID", Value: task.Status.SessionID})
 		}
 		if cfg.S3SecretName != "" {

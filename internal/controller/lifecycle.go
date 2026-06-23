@@ -1290,6 +1290,13 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
 	}
+	// Compaction path (issue #114 decision 2): when pending-handover-resume is set
+	// (LastTurnInputTokens crossed HandoverThresholdPercent), inject the compacted
+	// text handover. This is mutually exclusive with full conversation replay:
+	// agent.BuildPod skips CONVERSATION_SESSION_ID under the same annotation, so
+	// the agent gets EITHER the full transcript (--resume, under threshold) OR the
+	// handover summary (at/over threshold), never both (which would overflow the
+	// context window the threshold exists to protect).
 	if task.Annotations[annPendingHandoverResume] == "true" && task.Status.Handover != "" {
 		base += "\n\n## Resume from handover\n" + task.Status.Handover
 	}
@@ -1886,13 +1893,16 @@ func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *t
 		return nil
 	}
 	threshold := project.Spec.Agent.HandoverThresholdPercent
-	// <=0 is treated as "unset" and defaults to 50. A deliberately-configured 0
-	// ("always handover") cannot be expressed; use 1 for near-always behaviour.
-	// Integer division truncates toward zero, so the threshold is effectively
-	// raised by <1% (e.g., 49.9% reads as 49 < 50 so handover is delayed by at
-	// most one reconcile; intentional and documented here per finding 11).
+	// <=0 is treated as "unset" and defaults to 25 (issue #114 decision 2: past
+	// 25% of the context window, compact instead of full resume). Mirrors the
+	// CRD default; the in-code fallback covers objects created before the default
+	// (e.g. envtest direct creation). A deliberately-configured 0 ("always
+	// handover") cannot be expressed; use 1 for near-always behaviour. Integer
+	// division truncates toward zero, so the threshold is effectively raised by
+	// <1% (e.g. 24.9% reads as 24 < 25 so handover is delayed by at most one
+	// reconcile; intentional).
 	if threshold <= 0 {
-		threshold = 50
+		threshold = 25
 	}
 	pct := task.Status.LastTurnInputTokens * 100 / int64(ctxWin)
 	if pct < int64(threshold) {

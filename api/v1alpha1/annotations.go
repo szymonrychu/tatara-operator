@@ -26,6 +26,13 @@ const (
 	// lifecycle Task whose pod name collided with the live one), which is
 	// otherwise invisible to the turn-timeout backstop.
 	AnnPlanningSince = "tatara.dev/planning-since"
+	// AnnPendingHandoverResume, when "true", means the next Implement spawn should
+	// resume from the compacted text Handover rather than a full conversation
+	// replay (issue #114 decision 2: past HandoverThresholdPercent of the context
+	// window, compact instead of full resume). Set by maybeMarkHandoverResume and
+	// read by both implementPrompt (inject the handover block) and agent.BuildPod
+	// (skip CONVERSATION_SESSION_ID so the two paths are mutually exclusive).
+	AnnPendingHandoverResume = "tatara.dev/pending-handover-resume"
 )
 
 // LifecycleEntryAnnotation carries the entry LifecycleState for a newly
