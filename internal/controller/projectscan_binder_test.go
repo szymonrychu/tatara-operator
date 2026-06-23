@@ -438,3 +438,78 @@ func TestIssueScanBotCommentDoesNotRespawnTask(t *testing.T) {
 		t.Fatalf("human comment: task must be adopted to Triage, got %q", got2.Status.LifecycleState)
 	}
 }
+
+// TestIssueScanAdoptionDoesNotLoopWithoutNewHumanComment asserts Defect A:
+// a Parked task that was already adopted once must NOT be re-adopted on the
+// NEXT issueScan cycle when no NEW human comment has arrived since the task's
+// LastActivityAt (adoption timestamp). The old human comment predates
+// LastActivityAt so it must not re-trigger. The task must stay Parked.
+//
+// Timeline:
+//
+//	now+0: task CreationTimestamp (API server)
+//	now+1h: human comment (after creation -> isDeduped lets candidate through)
+//	now+2h: LastActivityAt (previous adoption; after human comment -> new gate must block)
+//
+// Without the fix, adoption gates on humanCommentAfter(since=CreationTimestamp)
+// which never advances: the +1h human comment is always after creation, so every
+// cron cycle re-adopts the Parked task unconditionally. The fix mirrors
+// findConvTaskToReactivate by gating on LastActivityAt instead.
+func TestIssueScanAdoptionDoesNotLoopWithoutNewHumanComment(t *testing.T) {
+	ctx := context.Background()
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
+	proj, repoA := seedScanProject(t, "adopt-noloop", cron)
+
+	// Human comment is in the future relative to wall clock so it is definitely
+	// after the task's CreationTimestamp (set by API server to ~now). This ensures
+	// isDeduped lets the candidate through to the adoption branch.
+	humanCommentTime := time.Now().Add(1 * time.Hour)
+	// LastActivityAt simulates a prior adoption: stamped AFTER the human comment.
+	// The fix must block re-adoption because the human comment predates LastActivityAt.
+	firstAdoptionTime := time.Now().Add(2 * time.Hour)
+
+	// Pre-create a Parked issueLifecycle Task whose LastActivityAt is after the human comment.
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 77}, "issueScan", "issueLifecycle")
+	pre.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef: "adopt-noloop", RepositoryRef: repoA.Name,
+		Goal: "g", Kind: "issueLifecycle",
+	}
+	if err := k8sClient.Create(ctx, pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	laa := metav1.NewTime(firstAdoptionTime)
+	pre.Status.Phase = "Succeeded"
+	pre.Status.LifecycleState = "Parked"
+	pre.Status.LastActivityAt = &laa
+	if err := k8sClient.Status().Update(ctx, pre); err != nil {
+		t.Fatalf("pre status: %v", err)
+	}
+
+	// The only human comment (at +1h) predates LastActivityAt (+2h): no new activity.
+	reader := &fakeReader{
+		issues:   []scm.IssueRef{{Repo: "o/r", Number: 77, UpdatedAt: time.Now()}},
+		comments: []scm.IssueComment{{Author: "szymon", CreatedAt: humanCommentTime}},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	r.issueScan(ctx, proj, reader, []tatarav1alpha1.Repository{*repoA},
+		[]tatarav1alpha1.Task{*pre}, cron.IssueScan)
+
+	// Must produce zero QEs (task not duplicated).
+	if qes := listScanQEs(t, "adopt-noloop"); len(qes) != 0 {
+		t.Fatalf("no-new-human-comment: want 0 QEs, got %d", len(qes))
+	}
+
+	// Task must stay Parked - NOT re-adopted to Triage without new human activity.
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status.LifecycleState != "Parked" {
+		t.Fatalf("no-new-human-comment: task must stay Parked, got %q (Defect A: adoption re-looped without new human input)", got.Status.LifecycleState)
+	}
+}

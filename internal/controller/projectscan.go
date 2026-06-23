@@ -896,7 +896,26 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		// instead of creating a duplicate. One Task per issue forever; the shared
 		// pod/branch is intentional. Done/Stopped Tasks are excluded by the helper
 		// so deliberately-closed issues still create fresh on new activity.
+		//
+		// Defect A gate: mirror findConvTaskToReactivate - only adopt when a HUMAN
+		// comment arrived after the task's LastActivityAt. This prevents the
+		// re-adoption loop where the same old comment (after CreationTimestamp but
+		// before LastActivityAt) re-triggers adoption every cron cycle on a Parked
+		// task. Fail-open (adopt) when LastActivityAt is nil (first adoption) or
+		// when the SCM reader/botLogin/owner-split is unavailable.
 		if adopt := hasLiveOrAdoptableTask(existing, c.repo, c.number); adopt != nil {
+			if adopt.Status.LastActivityAt != nil {
+				owner, name, cut := strings.Cut(c.repo, "/")
+				if cut && reader != nil && botLogin != "" &&
+					!humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, adopt.Status.LastActivityAt.Time) {
+					r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
+					l.Info("issueScan: skipped adoption, no human activity since last activity",
+						"action", "adopt_lifecycle", "resource_id", adopt.Name,
+						"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
+						"last_activity_at", adopt.Status.LastActivityAt.Time)
+					continue
+				}
+			}
 			if err := r.adoptLifecycleTask(ctx, proj, adopt); err != nil {
 				l.Error(err, "issueScan: adopt existing lifecycle task",
 					"action", "adopt_lifecycle", "resource_id", adopt.Name,
