@@ -813,10 +813,11 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		}
 	}
 
-	// Check maxTurns cap before picking next subtask.
-	if task.Status.TurnsCompleted >= turnCap(project, task) {
+	// Check maxTurns cap before picking next subtask. Implementation kinds run
+	// uncapped (capped=false), so the cap branch is skipped entirely.
+	if limit, capped := turnCap(project, task); capped && task.Status.TurnsCompleted >= limit {
 		return r.terminate(ctx, task, "Succeeded", "MaxTurnsReached",
-			fmt.Sprintf("reached turn cap %d", turnCap(project, task)))
+			fmt.Sprintf("reached turn cap %d", limit))
 	}
 
 	// Pick the next Pending Subtask. Uses the field index when available
@@ -903,15 +904,22 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	return res, nil
 }
 
-// turnCap returns the maximum turns allowed for this Task.
-func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
+// turnCap returns the maximum turns allowed for this Task and whether a cap
+// applies at all. An explicit task.Spec.MaxTurns always wins. Otherwise the
+// implementation kinds (implement, issueLifecycle) run uncapped - long but
+// healthy coding runs must not be cut off; per-turn timeout and
+// maxPodRecreations remain the runaway bounds. All other kinds keep the cap.
+func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (int, bool) {
 	if task.Spec.MaxTurns > 0 {
-		return task.Spec.MaxTurns
+		return task.Spec.MaxTurns, true
+	}
+	if task.Spec.Kind == "implement" || task.Spec.Kind == "issueLifecycle" {
+		return 0, false
 	}
 	if project.Spec.Agent.MaxTurnsPerTask > 0 {
-		return project.Spec.Agent.MaxTurnsPerTask
+		return project.Spec.Agent.MaxTurnsPerTask, true
 	}
-	return 50
+	return 50, true
 }
 
 // recordTurn writes the in-flight turn id + executing subtask onto the Task,
