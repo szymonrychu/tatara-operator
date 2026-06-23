@@ -238,6 +238,20 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		if prevPhase != "Ready" {
 			r.Metrics.ObserveMemoryProvisionDuration(time.Since(p.CreationTimestamp.Time).Seconds())
 		}
+		// Fold a sustained retrieval-probe failure into the condition. Replica
+		// readiness alone cannot see a memory pod that is Available but serving a
+		// stale or broken HTTP contract; updateMemoryRetrievalProbe meters that and
+		// counts consecutive unhealthy cycles per project. Once that run reaches
+		// memoryRetrievalUnhealthyThreshold (~3 min), a replica-Available stack
+		// reads MemoryReady=False/RetrievalUnreachable instead of falsely green.
+		// The replica gate stays the precondition (a still-Provisioning stack is
+		// never probed) and phase stays "Ready", so the probe keeps running and the
+		// condition clears itself once the surface recovers.
+		if r.memoryUnhealthyCycles[p.Name] >= memoryRetrievalUnhealthyThreshold {
+			condStatus = metav1.ConditionFalse
+			reason = "RetrievalUnreachable"
+			msg = "memory replicas available but retrieval surface unreachable at " + p.Status.Memory.Endpoint
+		}
 	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               "MemoryReady",
