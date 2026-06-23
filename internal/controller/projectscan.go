@@ -338,6 +338,67 @@ func candidatesFromBoard(items []scm.BoardItem) []candidate {
 	return out
 }
 
+const systemicLabelPrefix = "tatara/systemic-"
+
+func systemicIDOf(labels []string) string {
+	for _, l := range labels {
+		if strings.HasPrefix(l, systemicLabelPrefix) {
+			return strings.TrimPrefix(l, systemicLabelPrefix)
+		}
+	}
+	return ""
+}
+
+type systemicDecision struct {
+	sid              string
+	isLead           bool
+	leadNumber       int
+	sameRepoSiblings []int
+	crossRepo        []string
+}
+
+func electSystemicLeads(cands []candidate) map[string]systemicDecision {
+	group := map[string][]candidate{}
+	for _, c := range cands {
+		if c.isPR {
+			continue
+		}
+		if sid := systemicIDOf(c.labels); sid != "" {
+			group[sid] = append(group[sid], c)
+		}
+	}
+	out := map[string]systemicDecision{}
+	for sid, members := range group {
+		if len(members) < 2 {
+			continue
+		}
+		leadByRepo := map[string]int{}
+		for _, m := range members {
+			if cur, ok := leadByRepo[m.repo]; !ok || m.number < cur {
+				leadByRepo[m.repo] = m.number
+			}
+		}
+		for _, m := range members {
+			key := fmt.Sprintf("%s#%d", m.repo, m.number)
+			d := systemicDecision{sid: sid, leadNumber: leadByRepo[m.repo]}
+			d.isLead = m.number == leadByRepo[m.repo]
+			if d.isLead {
+				for _, o := range members {
+					if o.repo == m.repo && o.number != m.number {
+						d.sameRepoSiblings = append(d.sameRepoSiblings, o.number)
+					} else if o.repo != m.repo {
+						d.crossRepo = append(d.crossRepo, fmt.Sprintf("%s#%d - %s", o.repo, o.number, o.title))
+					}
+				}
+				sort.Ints(d.sameRepoSiblings)
+				sort.Strings(d.crossRepo)
+			}
+			out[key] = d
+		}
+	}
+	return out
+}
+
 // createScanTask enqueues one QueuedEvent for a candidate. Returns created=true
 // when a new event was enqueued (dedupKey had no existing live work).
 //
