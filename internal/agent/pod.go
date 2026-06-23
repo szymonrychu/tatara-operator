@@ -102,6 +102,18 @@ type PodConfig struct {
 	NodeSelector map[string]string
 	Tolerations  []corev1.Toleration
 	Affinity     *corev1.Affinity
+
+	// S3 conversation persistence (issue #114). Empty S3Bucket disables the
+	// feature: BuildPod injects no S3/conversation env, so the wrapper behaves
+	// exactly as before. S3SecretName holds the AWS creds
+	// (keys AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY), injected via SecretKeyRef;
+	// empty means the wrapper falls back to the default credential chain (IRSA).
+	S3Endpoint       string
+	S3Bucket         string
+	S3Region         string
+	S3KeyPrefix      string
+	S3ForcePathStyle bool
+	S3SecretName     string
 }
 
 // ValidatePodSecretRefs returns an error when any secret-name field required to
@@ -341,6 +353,30 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 	return "tatara/task-" + t.Name
 }
 
+// ConversationKey is the stable per-Task S3 object key under which the wrapper
+// stores and restores the Claude conversation transcript (issue #114). It is
+// keyed by the issue/PR number when present (human-readable and stable across
+// the lifecycle phases, since the Task is 1:1 with the issue), else by the Task
+// name. The wrapper's storage client prepends the configured key prefix.
+// task.Status.ConversationObjectKey overrides this when set (e.g. a forked key
+// for a brainstorm-derived issue, subtask 8).
+func ConversationKey(task *tatarav1alpha1.Task) string {
+	if task.Status.ConversationObjectKey != "" {
+		return task.Status.ConversationObjectKey
+	}
+	if task.Spec.Source != nil && task.Spec.Source.Number > 0 {
+		kind := "issue"
+		if task.Spec.Source.IsPR {
+			kind = "pr"
+		}
+		if task.Spec.RepositoryRef != "" {
+			return fmt.Sprintf("%s/%s/%s-%d.jsonl", task.Spec.ProjectRef, task.Spec.RepositoryRef, kind, task.Spec.Source.Number)
+		}
+		return fmt.Sprintf("%s/%s-%d.jsonl", task.Spec.ProjectRef, kind, task.Spec.Source.Number)
+	}
+	return fmt.Sprintf("%s/task-%s.jsonl", task.Spec.ProjectRef, task.Name)
+}
+
 // BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
 // repos is the full list of Project Repositories; the task's own repo is placed
 // first in TATARA_REPOS when repo is non-nil. When repo is nil (project-scoped
@@ -401,6 +437,34 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// name is set so existing deployments without HMAC work unchanged.
 	if cfg.CallbackHMACSecretName != "" {
 		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
+	}
+
+	// Conversation persistence (issue #114): inject the S3 connection config plus
+	// this Task's stable conversation object key so the wrapper uploads the
+	// transcript after each turn and restores it on boot. Gated on S3Bucket: with
+	// no bucket configured NO S3 env is emitted and the wrapper behaves as before.
+	// CONVERSATION_SESSION_ID is set only once a prior run has recorded the
+	// session id on Status (subtask 6), which triggers `claude --resume`. AWS
+	// creds come via SecretKeyRef from S3SecretName; an empty secret name leaves
+	// the wrapper on the default credential chain (IRSA).
+	if cfg.S3Bucket != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "S3_ENDPOINT", Value: cfg.S3Endpoint},
+			corev1.EnvVar{Name: "S3_BUCKET", Value: cfg.S3Bucket},
+			corev1.EnvVar{Name: "S3_REGION", Value: cfg.S3Region},
+			corev1.EnvVar{Name: "S3_KEY_PREFIX", Value: cfg.S3KeyPrefix},
+			corev1.EnvVar{Name: "S3_FORCE_PATH_STYLE", Value: strconv.FormatBool(cfg.S3ForcePathStyle)},
+			corev1.EnvVar{Name: "CONVERSATION_OBJECT_KEY", Value: ConversationKey(task)},
+		)
+		if task.Status.SessionID != "" {
+			env = append(env, corev1.EnvVar{Name: "CONVERSATION_SESSION_ID", Value: task.Status.SessionID})
+		}
+		if cfg.S3SecretName != "" {
+			env = append(env,
+				secretEnv("AWS_ACCESS_KEY_ID", cfg.S3SecretName, "AWS_ACCESS_KEY_ID"),
+				secretEnv("AWS_SECRET_ACCESS_KEY", cfg.S3SecretName, "AWS_SECRET_ACCESS_KEY"),
+			)
+		}
 	}
 
 	// Lifecycle hooks: emit one HOOK_<NAME> env var per non-empty command so the

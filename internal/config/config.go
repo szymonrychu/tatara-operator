@@ -49,6 +49,16 @@ type Config struct {
 	AnthropicSecretName    string
 	CLIOIDCSecretName      string
 	ImagePullSecret        string
+	// S3 conversation persistence (issue #114). Empty S3Bucket disables the
+	// feature: BuildPod injects no S3 env, so wrapper pods behave as before.
+	// S3SecretName holds the AWS creds (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY);
+	// empty means the wrapper uses the default credential chain (e.g. IRSA).
+	S3Endpoint       string
+	S3Bucket         string
+	S3Region         string
+	S3KeyPrefix      string
+	S3ForcePathStyle bool
+	S3SecretName     string
 	// Agent wrapper Pod resource + securityContext scalars (rule 6: camelCase
 	// chart value -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). Empty
 	// resource strings mean no constraint. AgentRunAsUser/AgentFSGroup are
@@ -206,6 +216,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	s3ForcePathStyle, err := getBoolDefault("S3_FORCE_PATH_STYLE", false)
+	if err != nil {
+		return Config{}, err
+	}
 	agentRunAsUser, err := getInt64Ptr("AGENT_RUN_AS_USER")
 	if err != nil {
 		return Config{}, err
@@ -237,6 +251,12 @@ func Load() (Config, error) {
 		AnthropicSecretName:      os.Getenv("ANTHROPIC_SECRET_NAME"),
 		CLIOIDCSecretName:        os.Getenv("CLI_OIDC_SECRET_NAME"),
 		ImagePullSecret:          os.Getenv("IMAGE_PULL_SECRET"),
+		S3Endpoint:               os.Getenv("S3_ENDPOINT"),
+		S3Bucket:                 os.Getenv("S3_BUCKET"),
+		S3Region:                 os.Getenv("S3_REGION"),
+		S3KeyPrefix:              os.Getenv("S3_KEY_PREFIX"),
+		S3ForcePathStyle:         s3ForcePathStyle,
+		S3SecretName:             os.Getenv("S3_SECRET_NAME"),
 		AgentCPURequest:          os.Getenv("AGENT_CPU_REQUEST"),
 		AgentCPULimit:            os.Getenv("AGENT_CPU_LIMIT"),
 		AgentMemoryRequest:       os.Getenv("AGENT_MEMORY_REQUEST"),

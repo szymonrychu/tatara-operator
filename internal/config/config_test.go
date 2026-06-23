@@ -111,6 +111,49 @@ func TestLoad_RequiresOperatorOIDCSecretName(t *testing.T) {
 
 // TestLoad_AgentSchedulingDefaultEmpty asserts the scheduling document defaults
 // to empty (chart stays cluster-agnostic, rule 14).
+func TestLoad_S3DefaultsOff(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.S3Bucket != "" || cfg.S3ForcePathStyle {
+		t.Fatalf("S3 must default off: bucket=%q forcePathStyle=%v", cfg.S3Bucket, cfg.S3ForcePathStyle)
+	}
+}
+
+func TestLoad_S3FromEnv(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("S3_ENDPOINT", "http://rgw")
+	t.Setenv("S3_BUCKET", "conv")
+	t.Setenv("S3_REGION", "us-east-1")
+	t.Setenv("S3_KEY_PREFIX", "p")
+	t.Setenv("S3_FORCE_PATH_STYLE", "true")
+	t.Setenv("S3_SECRET_NAME", "tatara-s3")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.S3Endpoint != "http://rgw" || cfg.S3Bucket != "conv" || cfg.S3Region != "us-east-1" ||
+		cfg.S3KeyPrefix != "p" || !cfg.S3ForcePathStyle || cfg.S3SecretName != "tatara-s3" {
+		t.Fatalf("S3 config not loaded: %+v", cfg)
+	}
+}
+
+func TestLoad_S3ForcePathStyleInvalid(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("S3_FORCE_PATH_STYLE", "notabool")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load must error on an invalid S3_FORCE_PATH_STYLE")
+	}
+}
+
 func TestLoad_AgentSchedulingDefaultEmpty(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")

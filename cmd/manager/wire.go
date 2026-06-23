@@ -140,6 +140,12 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		Tolerations:            cfg.Scheduling.Tolerations,
 		Affinity:               cfg.Scheduling.Affinity,
 		CallbackHMACSecretName: cfg.CallbackHMACSecretName,
+		S3Endpoint:             cfg.S3Endpoint,
+		S3Bucket:               cfg.S3Bucket,
+		S3Region:               cfg.S3Region,
+		S3KeyPrefix:            cfg.S3KeyPrefix,
+		S3ForcePathStyle:       cfg.S3ForcePathStyle,
+		S3SecretName:           cfg.S3SecretName,
 	}
 }
 
