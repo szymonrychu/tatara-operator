@@ -81,6 +81,12 @@ type turnCompletePayload struct {
 	Error           string          `json:"error"`
 	DurationSeconds float64         `json:"durationSeconds"`
 	Usage           json.RawMessage `json:"usage,omitempty"`
+	// SessionID and ConversationObjectKey are the persisted-conversation pointer
+	// the wrapper reports when conversation persistence is on (issue #114). Empty
+	// when the feature is off; recorded on the Task Status and replayed on the
+	// next-phase pod.
+	SessionID             string `json:"sessionId,omitempty"`
+	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
 }
 
 // turnUsage mirrors the usage object the wrapper posts in the turn-complete
@@ -170,6 +176,12 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "record failed", http.StatusInternalServerError)
 		return
 	}
+	// Record the conversation pointer (issue #114) so the next-phase pod resumes.
+	// Non-fatal: the sessionId is stable across turns, so a missed write is
+	// recovered on the next turn-complete.
+	if err := s.recordConversation(r.Context(), task, p.SessionID, p.ConversationObjectKey); err != nil {
+		l.Error(err, "record conversation pointer (non-fatal)", "turn_id", p.TurnID)
+	}
 	l.Info("recorded turn result", "action", "turn_complete", "turn_id", p.TurnID, "state", p.State)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -231,6 +243,40 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		s.Metrics.AddTaskTokens(project, repo, kind, issue, inputTotal, u.OutputTokens)
 	}
 	return nil
+}
+
+// recordConversation persists the conversation pointer (SessionID +
+// ConversationObjectKey) reported by the wrapper onto the Task Status via
+// RetryOnConflict, so the next-phase pod resumes the prior conversation (issue
+// #114). It is a no-op when persistence is off (sessionID empty). Unlike usage,
+// it carries no per-turn accumulation, so no stale-turn guard is needed: the
+// sessionId is stable across a conversation and the latest pointer always wins.
+// It writes only when a field actually changes, to avoid status churn.
+func (s *CallbackServer) recordConversation(ctx context.Context, task *tatarav1alpha1.Task, sessionID, objectKey string) error {
+	if sessionID == "" {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: task.Name}, fresh); err != nil {
+			return fmt.Errorf("reload task for conversation pointer: %w", err)
+		}
+		changed := false
+		if fresh.Status.SessionID != sessionID {
+			fresh.Status.SessionID = sessionID
+			changed = true
+		}
+		// Record the object key only if reported and not already set; never
+		// overwrite a key (e.g. a fork key set by the operator, subtask 8).
+		if objectKey != "" && fresh.Status.ConversationObjectKey == "" {
+			fresh.Status.ConversationObjectKey = objectKey
+			changed = true
+		}
+		if !changed {
+			return nil
+		}
+		return s.Client.Status().Update(ctx, fresh)
+	})
 }
 
 // taskTokenLabels returns the project, repo, kind, and issue labels for token
