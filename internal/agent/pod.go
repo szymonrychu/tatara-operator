@@ -103,6 +103,13 @@ type PodConfig struct {
 	Tolerations  []corev1.Toleration
 	Affinity     *corev1.Affinity
 
+	// SerenaURL, when non-empty, is the in-cluster URL of the Serena
+	// code-intelligence MCP server. Injected as TATARA_SERENA_URL into the agent
+	// pod so the wrapper registers it as an HTTP MCP server (mirroring
+	// TATARA_GRAFANA_MCP_URL). Empty by default; Phase 1 wires the code path only,
+	// no server is deployed. Phase 2 sets this from tatara-helmfile.
+	SerenaURL string
+
 	// S3 conversation persistence (issue #114). Empty S3Bucket disables the
 	// feature: BuildPod injects no S3/conversation env, so the wrapper behaves
 	// exactly as before. S3SecretName holds the AWS creds
@@ -527,6 +534,13 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			Name:  "TATARA_GRAFANA_MCP_URL",
 			Value: grafanamcp.MCPURL(project.Name, cfg.Namespace),
 		})
+	}
+
+	if cfg.SerenaURL != "" {
+		// Serena code-intelligence MCP endpoint (env-gated, off by default).
+		// Mirrors TATARA_GRAFANA_MCP_URL: the wrapper registers it as an HTTP MCP
+		// server when set. Phase 1 wires the path only; no server is deployed.
+		env = append(env, corev1.EnvVar{Name: "TATARA_SERENA_URL", Value: cfg.SerenaURL})
 	}
 
 	if len(repos) > 0 {

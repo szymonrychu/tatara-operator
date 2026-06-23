@@ -8,7 +8,7 @@ import (
 func TestBrainstormGoalProject_SystemicMandate(t *testing.T) {
 	goal := brainstormGoalProject([]string{"o/a", "o/b"}, "ISSUES:\no/a#1 [bug] x\nOPEN MRs:\no/a#2 [ci:failure] y\nMAIN HEALTH:\no/a main CI: failure", "")
 	for _, want := range []string{
-		"systemic", "subagent", "Workflow", "systemicId", "MAIN HEALTH:", "OPEN MRs:", "skip_brainstorm",
+		"systemic", "subagent", "Workflow", "systemicId", "MAIN HEALTH:", "OPEN MRs:", "skip_research",
 	} {
 		if !strings.Contains(goal, want) {
 			t.Fatalf("goal missing %q", want)

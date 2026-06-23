@@ -1127,12 +1127,18 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string)
 		"\n\n" + stateBlock + "\n\n" +
 		"EARLY EXIT (do this FIRST, cheaply): before dispatching the per-repo deep-research fan-out, do a quick scan of " +
 		"the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears the bar for a genuinely novel, high-leverage " +
-		"NEW proposal this cycle, call `skip_brainstorm(reason)` and STOP. Do NOT run the expensive fan-out just to conclude " +
+		"NEW proposal this cycle, call `skip_research(reason)` and STOP. Do NOT run the expensive fan-out just to conclude " +
 		"there is nothing to propose.\n\n" +
 		"OTHERWISE decompose the survey: dispatch one parallel subagent per repository (use the Agent/Workflow tools to fan " +
 		"out, then synthesize their findings into one systemic conclusion).\n\n" +
 		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning >=2 repositories, " +
 		"a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - over a one-repo tweak.\n\n" +
+		"ARCHITECTURAL RESEARCH: when the highest-leverage opportunity is net-new architecture or a structural pattern the " +
+		"platform has never adopted (not maintenance of what exists), invoke the `tatara-deep-architectural-research` skill " +
+		"instead. Its output may be a long-lived ADR/RFC artifact (problem, options with tradeoffs, recommended option, a " +
+		"strangler migration sketch, and the fitness function that would gate it) that can be championed across cycles and is " +
+		"exempt from silence-over-noise. Open questions are allowed in an ADR. It is a proposal only: never self-implement; " +
+		"the maintainer human-gates every structural change.\n\n" +
 		"NEW-IDEAS-ONLY CONTRACT - this is a discovery cycle for NEW proposals; nursing existing issues is handled " +
 		"elsewhere. Follow exactly ONE path:\n" +
 		"1. If the best idea DUPLICATES or is merely a sub-aspect of an existing open issue listed above: do NOT propose. " +
