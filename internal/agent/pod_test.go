@@ -713,3 +713,157 @@ func TestBuildPod_NoExtras_EmptyByDefault(t *testing.T) {
 	require.Empty(t, pod.Spec.Containers[0].VolumeMounts)
 	require.Len(t, pod.Spec.Containers, 1, "no sidecars by default")
 }
+
+func TestConversationKey(t *testing.T) {
+	// issue-numbered task.
+	issue := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-issue"},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "tatara", RepositoryRef: "tatara-operator",
+			Source: &tatarav1alpha1.TaskSource{Number: 114},
+		},
+	}
+	require.Equal(t, "tatara/tatara-operator/issue-114.jsonl", agent.ConversationKey(issue))
+
+	// PR-numbered task.
+	pr := issue.DeepCopy()
+	pr.Spec.Source.IsPR = true
+	require.Equal(t, "tatara/tatara-operator/pr-114.jsonl", agent.ConversationKey(pr))
+
+	// No source -> keyed by task name.
+	noSrc := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "brainstorm-x"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "tatara"},
+	}
+	require.Equal(t, "tatara/task-brainstorm-x.jsonl", agent.ConversationKey(noSrc))
+
+	// Status override wins (e.g. a forked key, subtask 8).
+	forked := issue.DeepCopy()
+	forked.Status.ConversationObjectKey = "tatara/forked/issue-200.jsonl"
+	require.Equal(t, "tatara/forked/issue-200.jsonl", agent.ConversationKey(forked))
+}
+
+func TestBuildPod_S3DisabledByDefault(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs() // no S3Bucket
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	for _, k := range []string{"S3_BUCKET", "S3_ENDPOINT", "CONVERSATION_OBJECT_KEY", "AWS_ACCESS_KEY_ID"} {
+		_, ok := envValue(c, k)
+		_, okSecret := envSecretRef(c, k)
+		require.False(t, ok || okSecret, "%s must NOT be set when no S3 bucket configured", k)
+	}
+}
+
+func TestBuildPod_S3EnabledInjectsEnvCredsAndKey(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Endpoint = "http://rook-ceph-rgw.tatara.svc"
+	cfg.S3Bucket = "tatara-conversations"
+	cfg.S3Region = "us-east-1"
+	cfg.S3KeyPrefix = "conv"
+	cfg.S3ForcePathStyle = true
+	cfg.S3SecretName = "tatara-s3"
+	task.Spec.Source = &tatarav1alpha1.TaskSource{Number: 114}
+
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	requireEnv := func(name, want string) {
+		got, ok := envValue(c, name)
+		require.True(t, ok, "%s must be set", name)
+		require.Equal(t, want, got)
+	}
+	requireEnv("S3_ENDPOINT", "http://rook-ceph-rgw.tatara.svc")
+	requireEnv("S3_BUCKET", "tatara-conversations")
+	requireEnv("S3_REGION", "us-east-1")
+	requireEnv("S3_KEY_PREFIX", "conv")
+	requireEnv("S3_FORCE_PATH_STYLE", "true")
+	requireEnv("CONVERSATION_OBJECT_KEY", "demo/repo1/issue-114.jsonl")
+
+	// CONVERSATION_SESSION_ID only once Status.SessionID is recorded.
+	_, hasSID := envValue(c, "CONVERSATION_SESSION_ID")
+	require.False(t, hasSID, "no session id env until a prior run recorded it")
+
+	// AWS creds via SecretKeyRef, not literal env.
+	ref, ok := envSecretRef(c, "AWS_ACCESS_KEY_ID")
+	require.True(t, ok)
+	require.Equal(t, "tatara-s3", ref.Name)
+	require.Equal(t, "AWS_ACCESS_KEY_ID", ref.Key)
+	_, ok = envSecretRef(c, "AWS_SECRET_ACCESS_KEY")
+	require.True(t, ok)
+}
+
+func TestBuildPod_S3SessionIDReplay(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Bucket = "tatara-conversations"
+	task.Status.SessionID = "sid-abc"
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "CONVERSATION_SESSION_ID")
+	require.True(t, ok, "CONVERSATION_SESSION_ID must be set when Status.SessionID is recorded")
+	require.Equal(t, "sid-abc", got)
+}
+
+func TestBuildPod_S3CompactionSkipsFullResume(t *testing.T) {
+	// When the pending-handover-resume annotation is set (context over threshold),
+	// BuildPod must NOT emit CONVERSATION_SESSION_ID (so the wrapper starts fresh
+	// and the operator's compacted handover is used instead) while still emitting
+	// the object key so the fresh compacted session is persisted.
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Bucket = "tatara-conversations"
+	task.Status.SessionID = "sid-abc"
+	task.Annotations = map[string]string{tatarav1alpha1.AnnPendingHandoverResume: "true"}
+
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	_, hasSID := envValue(c, "CONVERSATION_SESSION_ID")
+	require.False(t, hasSID, "compaction must skip full resume (no CONVERSATION_SESSION_ID)")
+	_, hasKey := envValue(c, "CONVERSATION_OBJECT_KEY")
+	require.True(t, hasKey, "object key still emitted so the compacted session is persisted")
+}
+
+func TestBuildPod_S3ForkFromKey(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Bucket = "tatara-conversations"
+	task.Annotations = map[string]string{tatarav1alpha1.AnnForkFromConversationKey: "demo/task-brainstorm.jsonl"}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "CONVERSATION_FORK_FROM_KEY")
+	require.True(t, ok, "CONVERSATION_FORK_FROM_KEY must be set when the fork annotation is present")
+	require.Equal(t, "demo/task-brainstorm.jsonl", got)
+
+	// Absent annotation -> no fork env.
+	_, _, task2, _ := sampleInputs()
+	c2 := agent.BuildPod(proj, repo, task2, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	_, ok = envValue(c2, "CONVERSATION_FORK_FROM_KEY")
+	require.False(t, ok, "no fork env without the annotation")
+}
+
+func TestBuildPod_ReviewChecksOutPRHeadAndDoesNotPush(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	task.Spec.Kind = "review"
+	task.Spec.Source = &tatarav1alpha1.TaskSource{Number: 77, IsPR: true}
+	task.Annotations = map[string]string{tatarav1alpha1.AnnReviewHeadBranch: "feature/user-pr"}
+
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	tb, _ := envValue(c, "TASK_BRANCH")
+	require.Equal(t, "", tb, "review must not push: TASK_BRANCH empty")
+	cb, ok := envValue(c, "CHECKOUT_BRANCH")
+	require.True(t, ok)
+	require.Equal(t, "feature/user-pr", cb, "review checks out the PR head")
+}
+
+func TestBuildPod_ReviewWithoutHeadBranchFallsBackToTaskBranch(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	task.Spec.Kind = "review"
+	task.Spec.Source = &tatarav1alpha1.TaskSource{Number: 77, IsPR: true}
+	// No AnnReviewHeadBranch -> behaves as before (synthetic task branch, no checkout override).
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	tb, _ := envValue(c, "TASK_BRANCH")
+	require.NotEmpty(t, tb, "without a head branch the review keeps the default task branch")
+	_, ok := envValue(c, "CHECKOUT_BRANCH")
+	require.False(t, ok, "no CHECKOUT_BRANCH without a head branch")
+}
+
+func TestBuildPod_S3NoCredsWhenSecretEmpty(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Bucket = "tatara-conversations" // no S3SecretName -> default cred chain (IRSA)
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	_, ok := envSecretRef(c, "AWS_ACCESS_KEY_ID")
+	require.False(t, ok, "no AWS creds injected when S3SecretName is empty")
+	_, ok = envValue(c, "S3_BUCKET")
+	require.True(t, ok, "S3 config still injected for the IRSA path")
+}

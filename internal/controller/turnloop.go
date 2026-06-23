@@ -35,6 +35,48 @@ func planTurnText(goal, branch, project, task string) string {
 		task, project, task, project, goal, branch, task, branch)
 }
 
+// lifecyclePhaseGuidance returns a "## Lifecycle phase" block telling the agent
+// which lifecycle phase it is running in and what the transient workspace
+// guarantees are. The workspace is rebuilt by git clone+checkout on every run,
+// so the agent must know which of its outputs survive to the next run:
+//   - comment phases (Triage, Conversation): file edits are discarded; only the
+//     issue/MR conversation (comments, the issue_outcome decision) is durable.
+//   - implementation phases (Implement, MRCI, Merge, MainCI): changes committed
+//     and pushed to the task branch are restored on the next run.
+func lifecyclePhaseGuidance(state string) string {
+	durable := "Only what you post to the issue/MR conversation (comments, the issue_outcome decision) survives to the next run. Any file edits you make in this workspace are discarded and will NOT be restored."
+	switch state {
+	case "Implement", "MRCI", "Merge", "MainCI":
+		durable = "Changes you commit and push to the task branch ARE restored on the next run (the workspace is re-cloned and the branch checked out). Uncommitted file edits are discarded."
+	}
+	return fmt.Sprintf(
+		"\n\n## Lifecycle phase: %s\n"+
+			"This issue is handled as a multi-phase conversation and you are currently in the %s phase. "+
+			"The workspace is transient: it is rebuilt by git clone+checkout on every run and nothing on disk carries over between runs by itself. "+
+			"%s",
+		state, state, durable)
+}
+
+// reviewText is the turn-0 prompt for a kind=review Task (MR/PR review, issue
+// #114 decision 4). The PR head is checked out in the workspace so the agent can
+// review AND test it; it MUST submit a verdict via review_verdict and never
+// pushes (the review pod has no push branch).
+func reviewText(goal, project, task string) string {
+	return fmt.Sprintf(
+		"You are working on Task `%s` in Project `%s`. "+
+			"Use the tatara MCP tools with task=`%s` (and project=`%s`).\n\n"+
+			"%s\n\n"+
+			"This is an MR/PR REVIEW. The pull request's head branch is already checked out "+
+			"in the workspace under `/workspace/<owner>/<repo>`, so you can read the diff AND "+
+			"actually run it. Your job:\n"+
+			"1. Review the change for correctness, security, and quality.\n"+
+			"2. TEST it: build it and run the repo's tests/linters where present; note what you ran and the result.\n"+
+			"3. Submit your verdict with the `review_verdict` MCP tool - this is REQUIRED before you finish.\n\n"+
+			"Do NOT commit, push, or open a PR: the workspace is transient and read-only for review, and nothing "+
+			"you change on disk is kept. Communicate only through the review verdict.",
+		task, project, task, project, goal)
+}
+
 // nextPendingSubtask returns the lowest-order Pending subtask, if any.
 func nextPendingSubtask(subs []tatarav1alpha1.Subtask) (*tatarav1alpha1.Subtask, bool) {
 	pending := make([]tatarav1alpha1.Subtask, 0, len(subs))
@@ -86,7 +128,7 @@ func lifecycleTriageText(task *tatarav1alpha1.Task, title, body string) string {
 			"the operator will NOT post a comment in this case; do NOT use the comment tool to post one either.\n"+
 			"5. Call the `issue_outcome` MCP tool with your chosen action.\n\n"+
 			"You MUST call issue_outcome before finishing. Do not open PRs or make code changes in this turn.",
-		issueRef, issueURL, title, body)
+		issueRef, issueURL, title, body) + lifecyclePhaseGuidance("Triage")
 }
 
 // buildTriagePrompt constructs the turn-0 prompt for the Triage state. When

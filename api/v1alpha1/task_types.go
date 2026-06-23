@@ -255,6 +255,18 @@ type TaskStatus struct {
 	LifecycleIterations int `json:"lifecycleIterations,omitempty"`
 	// +optional
 	Handover string `json:"handover,omitempty"`
+	// ConversationObjectKey is the S3 object key under which the wrapper stores
+	// and restores this Task's full Claude conversation transcript (issue #114).
+	// Stable across lifecycle phases. Empty until conversation persistence is
+	// configured and the first run has reported it (or a forked key is set for a
+	// brainstorm-derived issue).
+	// +optional
+	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
+	// SessionID is the Claude session id of the persisted conversation. The
+	// operator passes it back to the next pod (as CONVERSATION_SESSION_ID) so a
+	// fresh pod resumes via `claude --resume <id>` instead of starting empty.
+	// +optional
+	SessionID string `json:"sessionID,omitempty"`
 	// ImplementContext is an optional re-entry prompt injected at the start of
 	// the next Implement agent turn (e.g. CI failure details, conflict notice).
 	// Cleared after the turn is submitted so a later fresh entry is clean.

@@ -102,6 +102,18 @@ type PodConfig struct {
 	NodeSelector map[string]string
 	Tolerations  []corev1.Toleration
 	Affinity     *corev1.Affinity
+
+	// S3 conversation persistence (issue #114). Empty S3Bucket disables the
+	// feature: BuildPod injects no S3/conversation env, so the wrapper behaves
+	// exactly as before. S3SecretName holds the AWS creds
+	// (keys AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY), injected via SecretKeyRef;
+	// empty means the wrapper falls back to the default credential chain (IRSA).
+	S3Endpoint       string
+	S3Bucket         string
+	S3Region         string
+	S3KeyPrefix      string
+	S3ForcePathStyle bool
+	S3SecretName     string
 }
 
 // ValidatePodSecretRefs returns an error when any secret-name field required to
@@ -341,6 +353,30 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 	return "tatara/task-" + t.Name
 }
 
+// ConversationKey is the stable per-Task S3 object key under which the wrapper
+// stores and restores the Claude conversation transcript (issue #114). It is
+// keyed by the issue/PR number when present (human-readable and stable across
+// the lifecycle phases, since the Task is 1:1 with the issue), else by the Task
+// name. The wrapper's storage client prepends the configured key prefix.
+// task.Status.ConversationObjectKey overrides this when set (e.g. a forked key
+// for a brainstorm-derived issue, subtask 8).
+func ConversationKey(task *tatarav1alpha1.Task) string {
+	if task.Status.ConversationObjectKey != "" {
+		return task.Status.ConversationObjectKey
+	}
+	if task.Spec.Source != nil && task.Spec.Source.Number > 0 {
+		kind := "issue"
+		if task.Spec.Source.IsPR {
+			kind = "pr"
+		}
+		if task.Spec.RepositoryRef != "" {
+			return fmt.Sprintf("%s/%s/%s-%d.jsonl", task.Spec.ProjectRef, task.Spec.RepositoryRef, kind, task.Spec.Source.Number)
+		}
+		return fmt.Sprintf("%s/%s-%d.jsonl", task.Spec.ProjectRef, kind, task.Spec.Source.Number)
+	}
+	return fmt.Sprintf("%s/task-%s.jsonl", task.Spec.ProjectRef, task.Name)
+}
+
 // BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
 // repos is the full list of Project Repositories; the task's own repo is placed
 // first in TATARA_REPOS when repo is non-nil. When repo is nil (project-scoped
@@ -348,6 +384,18 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 // TATARA_REPOS is set to all repos sorted by name (deterministic, no primary).
 func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, repos []tatarav1alpha1.Repository, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
 	env := []corev1.EnvVar{}
+	// Branch wiring. Normal tasks push to TASK_BRANCH. An MR review (issue #114
+	// decision 4) instead checks out the PR head READ-ONLY via CHECKOUT_BRANCH and
+	// leaves TASK_BRANCH empty so the wrapper never pushes (and cannot clobber the
+	// user's PR).
+	taskBranchVal := TaskBranch(task)
+	checkoutBranchVal := ""
+	if task.Spec.Kind == "review" {
+		if hb := task.Annotations[tatarav1alpha1.AnnReviewHeadBranch]; hb != "" {
+			taskBranchVal = ""
+			checkoutBranchVal = hb
+		}
+	}
 	if repo != nil {
 		env = append(env,
 			corev1.EnvVar{Name: "REPO_URL", Value: repo.Spec.URL},
@@ -374,8 +422,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},
 		// Work branch the wrapper checks out and pushes; the operator opens the
-		// PR from this same branch (see TaskBranch).
-		{Name: "TASK_BRANCH", Value: TaskBranch(task)},
+		// PR from this same branch (see TaskBranch). Empty for review tasks, which
+		// check out the PR head via CHECKOUT_BRANCH and never push.
+		{Name: "TASK_BRANCH", Value: taskBranchVal},
 		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
 		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
 		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},
@@ -394,6 +443,10 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
 	}...)
+	// Review tasks check out the PR head read-only (no push); see taskBranchVal.
+	if checkoutBranchVal != "" {
+		env = append(env, corev1.EnvVar{Name: "CHECKOUT_BRANCH", Value: checkoutBranchVal})
+	}
 	// Inject callback HMAC secret when configured so the wrapper can sign its
 	// turn-complete callbacks (finding 1/r3). Delivered via SecretKeyRef (NOT a
 	// literal env value) so the secret never lands in the Pod spec / etcd object
@@ -401,6 +454,52 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// name is set so existing deployments without HMAC work unchanged.
 	if cfg.CallbackHMACSecretName != "" {
 		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
+	}
+
+	// Conversation persistence (issue #114): inject the S3 connection config plus
+	// this Task's stable conversation object key so the wrapper uploads the
+	// transcript after each turn and restores it on boot. Gated on S3Bucket: with
+	// no bucket configured NO S3 env is emitted and the wrapper behaves as before.
+	// AWS creds come via SecretKeyRef from S3SecretName; an empty secret name
+	// leaves the wrapper on the default credential chain (IRSA).
+	//
+	// Full resume vs compaction (decision 2) is mutually exclusive and gated by
+	// the pending-handover-resume annotation, which maybeMarkHandoverResume sets
+	// when LastTurnInputTokens crosses HandoverThresholdPercent (25%) of the
+	// context window:
+	//   - annotation unset (under threshold): emit CONVERSATION_SESSION_ID so the
+	//     wrapper does a FULL conversation replay (claude --resume).
+	//   - annotation "true" (at/over threshold): SKIP CONVERSATION_SESSION_ID so
+	//     the wrapper starts fresh and implementPrompt injects the compacted
+	//     "## Resume from handover" text instead. CONVERSATION_OBJECT_KEY is still
+	//     emitted so the fresh (compacted) session is itself persisted and the
+	//     next turn-complete records its new, shorter sessionId.
+	if cfg.S3Bucket != "" {
+		env = append(env,
+			corev1.EnvVar{Name: "S3_ENDPOINT", Value: cfg.S3Endpoint},
+			corev1.EnvVar{Name: "S3_BUCKET", Value: cfg.S3Bucket},
+			corev1.EnvVar{Name: "S3_REGION", Value: cfg.S3Region},
+			corev1.EnvVar{Name: "S3_KEY_PREFIX", Value: cfg.S3KeyPrefix},
+			corev1.EnvVar{Name: "S3_FORCE_PATH_STYLE", Value: strconv.FormatBool(cfg.S3ForcePathStyle)},
+			corev1.EnvVar{Name: "CONVERSATION_OBJECT_KEY", Value: ConversationKey(task)},
+		)
+		compacting := task.Annotations[tatarav1alpha1.AnnPendingHandoverResume] == "true"
+		if task.Status.SessionID != "" && !compacting {
+			env = append(env, corev1.EnvVar{Name: "CONVERSATION_SESSION_ID", Value: task.Status.SessionID})
+		}
+		// Fork source (issue #114 decision 3): on the first run of a
+		// brainstorm-derived issue, the wrapper copies this parent conversation
+		// onto the issue's own key and resumes it. Ignored once the issue has its
+		// own conversation (CONVERSATION_SESSION_ID set, normal resume wins).
+		if fk := task.Annotations[tatarav1alpha1.AnnForkFromConversationKey]; fk != "" {
+			env = append(env, corev1.EnvVar{Name: "CONVERSATION_FORK_FROM_KEY", Value: fk})
+		}
+		if cfg.S3SecretName != "" {
+			env = append(env,
+				secretEnv("AWS_ACCESS_KEY_ID", cfg.S3SecretName, "AWS_ACCESS_KEY_ID"),
+				secretEnv("AWS_SECRET_ACCESS_KEY", cfg.S3SecretName, "AWS_SECRET_ACCESS_KEY"),
+			)
+		}
 	}
 
 	// Lifecycle hooks: emit one HOOK_<NAME> env var per non-empty command so the

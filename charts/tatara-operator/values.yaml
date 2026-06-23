@@ -75,6 +75,25 @@ leaderElection: true
 # anchoring a dedup/cooldown window (the longest is the 1h incident cooldown).
 taskRetentionHours: 168
 
+# S3 conversation persistence (issue #114): the wrapper stores/restores each
+# issue's Claude conversation transcript in an S3-compatible bucket so a fresh
+# pod resumes the prior conversation. Cluster-agnostic (rule 14): all values are
+# empty here and supplied per-environment by the helmfile. The whole feature is
+# OFF until s3Bucket is set; one client targets both AWS S3 and rook-ceph (Ceph
+# RGW) via s3Endpoint + s3ForcePathStyle. s3SecretName names the Secret holding
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (empty = default cred chain / IRSA).
+s3Endpoint: ""
+s3Bucket: ""
+s3Region: ""
+s3KeyPrefix: ""
+s3ForcePathStyle: false
+s3SecretName: ""
+# s3ConversationRetentionHours is the grace after a conversation's whole batch
+# (brainstorm + sibling issues) goes terminal before the reaper deletes its S3
+# objects (issue #114 decision 5). Kept under taskRetentionHours so conversations
+# GC before their Tasks (which carry the keys) are reaped.
+s3ConversationRetentionHours: 72
+
 # Agent wrapper Pod resource requests/limits + securityContext (rule 6: camelCase
 # scalar -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). These bound the
 # otherwise-unbounded agent pods. Resources/runAsNonRoot are chart-appropriate

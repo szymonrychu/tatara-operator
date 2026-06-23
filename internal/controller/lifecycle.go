@@ -630,10 +630,78 @@ func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alph
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("triage: get repo: %w", err)
 	}
+	// Best-effort: on the first Triage of a brainstorm-derived issue, set the
+	// fork-from-conversation annotation so the pod forks the brainstorm
+	// conversation (issue #114 decision 3). Non-fatal so a fork-setup hiccup never
+	// blocks triage.
+	if err := r.maybeSetupConversationFork(ctx, task); err != nil {
+		log.FromContext(ctx).Info("triage: conversation fork setup failed (non-fatal)",
+			"resource_id", task.Name, "err", err.Error())
+	}
 	// Pass the already-fetched repo URL into buildTriagePromptFor so resolveTriageReader
 	// inside it can reuse the URL without another Get (finding 7).
 	prompt := r.buildTriagePromptFor(ctx, project, task, repo.Spec.URL)
 	return r.driveAgentRun(ctx, project, &repo, task, prompt)
+}
+
+// maybeSetupConversationFork, on the first Triage of a brainstorm-derived issue,
+// correlates this issueLifecycle Task to the proposal Task that opened the issue
+// (matching repo + issue number) and copies the proposal's parent-conversation
+// key onto this Task as the fork-from annotation, so the first pod forks the
+// brainstorm conversation (issue #114 decision 3). No-op when S3 is off, when
+// the Task already carries a fork pointer or its own conversation, when it has no
+// issue number, or when no matching proposal with a parent key is found.
+func (r *TaskReconciler) maybeSetupConversationFork(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if r.PodConfig.S3Bucket == "" {
+		return nil
+	}
+	if task.Spec.Source == nil || task.Spec.Source.Number == 0 {
+		return nil
+	}
+	if task.Annotations[annForkFromConversationKey] != "" ||
+		task.Status.SessionID != "" || task.Status.ConversationObjectKey != "" {
+		return nil
+	}
+	var tasks tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
+		return err
+	}
+	parentKey := ""
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProposedIssue == nil || t.Spec.Source == nil {
+			continue
+		}
+		if t.Spec.RepositoryRef != task.Spec.RepositoryRef || t.Spec.Source.Number != task.Spec.Source.Number {
+			continue
+		}
+		if k := t.Annotations[annParentConversationKey]; k != "" {
+			parentKey = k
+			break
+		}
+	}
+	if parentKey == "" {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		if fresh.Annotations[annForkFromConversationKey] != "" {
+			return nil
+		}
+		fresh.Annotations[annForkFromConversationKey] = parentKey
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Annotations = fresh.Annotations
+		task.ResourceVersion = fresh.ResourceVersion
+		return nil
+	})
 }
 
 // buildTriagePromptFor fetches issue content and comments via ReaderFor (if wired) and
@@ -1292,9 +1360,17 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 		"issue, you MUST call `decline_implementation` with a clear reason (what you " +
 		"considered and why it should not / need not be done). A silent finish with no " +
 		"PR and no `decline_implementation` call is NOT allowed and will be re-prompted."
+	base += lifecyclePhaseGuidance("Implement")
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
 	}
+	// Compaction path (issue #114 decision 2): when pending-handover-resume is set
+	// (LastTurnInputTokens crossed HandoverThresholdPercent), inject the compacted
+	// text handover. This is mutually exclusive with full conversation replay:
+	// agent.BuildPod skips CONVERSATION_SESSION_ID under the same annotation, so
+	// the agent gets EITHER the full transcript (--resume, under threshold) OR the
+	// handover summary (at/over threshold), never both (which would overflow the
+	// context window the threshold exists to protect).
 	if task.Annotations[annPendingHandoverResume] == "true" && task.Status.Handover != "" {
 		base += "\n\n## Resume from handover\n" + task.Status.Handover
 	}
@@ -1891,13 +1967,16 @@ func (r *TaskReconciler) maybeMarkHandoverResume(ctx context.Context, project *t
 		return nil
 	}
 	threshold := project.Spec.Agent.HandoverThresholdPercent
-	// <=0 is treated as "unset" and defaults to 50. A deliberately-configured 0
-	// ("always handover") cannot be expressed; use 1 for near-always behaviour.
-	// Integer division truncates toward zero, so the threshold is effectively
-	// raised by <1% (e.g., 49.9% reads as 49 < 50 so handover is delayed by at
-	// most one reconcile; intentional and documented here per finding 11).
+	// <=0 is treated as "unset" and defaults to 25 (issue #114 decision 2: past
+	// 25% of the context window, compact instead of full resume). Mirrors the
+	// CRD default; the in-code fallback covers objects created before the default
+	// (e.g. envtest direct creation). A deliberately-configured 0 ("always
+	// handover") cannot be expressed; use 1 for near-always behaviour. Integer
+	// division truncates toward zero, so the threshold is effectively raised by
+	// <1% (e.g. 24.9% reads as 24 < 25 so handover is delayed by at most one
+	// reconcile; intentional).
 	if threshold <= 0 {
-		threshold = 50
+		threshold = 25
 	}
 	pct := task.Status.LastTurnInputTokens * 100 / int64(ctxWin)
 	if pct < int64(threshold) {

@@ -115,7 +115,12 @@ type AgentSpec struct {
 	// +kubebuilder:default=200000
 	// +optional
 	ContextWindowTokens int `json:"contextWindowTokens,omitempty"`
-	// +kubebuilder:default=50
+	// HandoverThresholdPercent is the share of the context window (LastTurnInput
+	// tokens) past which the lifecycle compacts instead of replaying the full
+	// conversation: below it the next pod resumes the full transcript (issue #114
+	// full resume), at/above it it falls back to the compacted text Handover. 25%
+	// per issue #114 decision 2.
+	// +kubebuilder:default=25
 	// +optional
 	HandoverThresholdPercent int `json:"handoverThresholdPercent,omitempty"`
 	// +kubebuilder:validation:Minimum=3

@@ -26,6 +26,25 @@ const (
 	// lifecycle Task whose pod name collided with the live one), which is
 	// otherwise invisible to the turn-timeout backstop.
 	AnnPlanningSince = "tatara.dev/planning-since"
+	// AnnPendingHandoverResume, when "true", means the next Implement spawn should
+	// resume from the compacted text Handover rather than a full conversation
+	// replay (issue #114 decision 2: past HandoverThresholdPercent of the context
+	// window, compact instead of full resume). Set by maybeMarkHandoverResume and
+	// read by both implementPrompt (inject the handover block) and agent.BuildPod
+	// (skip CONVERSATION_SESSION_ID so the two paths are mutually exclusive).
+	AnnPendingHandoverResume = "tatara.dev/pending-handover-resume"
+	// AnnParentConversationKey is stamped on a brainstorm proposal Task with the
+	// S3 conversation key of the brainstorm that produced it (issue #114 decision
+	// 3). AnnForkFromConversationKey is stamped on the resulting issueLifecycle
+	// Task (correlated by repo+issue number) and injected into its first pod as
+	// CONVERSATION_FORK_FROM_KEY so the wrapper forks (copies) the brainstorm
+	// conversation onto the issue's own key.
+	AnnParentConversationKey   = "tatara.dev/parent-conversation-key"
+	AnnForkFromConversationKey = "tatara.dev/fork-from-conversation-key"
+	// AnnReviewHeadBranch carries the PR/MR head (source) branch on a review Task
+	// so its pod checks out the PR head read-only and can run/test it (issue #114
+	// decision 4). The review agent never pushes (its TASK_BRANCH stays empty).
+	AnnReviewHeadBranch = "tatara.dev/review-head-branch"
 )
 
 // LifecycleEntryAnnotation carries the entry LifecycleState for a newly

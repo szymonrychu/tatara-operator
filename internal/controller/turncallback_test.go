@@ -56,6 +56,53 @@ func TestTurnComplete_RecordsResultAndRequeues(t *testing.T) {
 	}
 }
 
+func TestTurnComplete_RecordsConversationPointer(t *testing.T) {
+	mkTaskProject(t, "p-conv", 3)
+	mkTaskRepository(t, "r-conv", "p-conv")
+	mkTask(t, "t-conv", "p-conv", "r-conv")
+	annotate(t, "t-conv", map[string]string{annCurrentTurn: "turn-c1"})
+
+	cb := newCallbackServer()
+	body, _ := json.Marshal(map[string]any{
+		"turnId": "turn-c1", "state": "completed",
+		"sessionId": "sid-xyz", "conversationObjectKey": "p-conv/r-conv/issue-1.jsonl",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+	tk := getTask(t, "t-conv")
+	if tk.Status.SessionID != "sid-xyz" {
+		t.Errorf("Status.SessionID = %q, want sid-xyz", tk.Status.SessionID)
+	}
+	if tk.Status.ConversationObjectKey != "p-conv/r-conv/issue-1.jsonl" {
+		t.Errorf("Status.ConversationObjectKey = %q, want recorded", tk.Status.ConversationObjectKey)
+	}
+}
+
+func TestTurnComplete_NoConversationPointerWhenSessionEmpty(t *testing.T) {
+	mkTaskProject(t, "p-noconv", 3)
+	mkTaskRepository(t, "r-noconv", "p-noconv")
+	mkTask(t, "t-noconv", "p-noconv", "r-noconv")
+	annotate(t, "t-noconv", map[string]string{annCurrentTurn: "turn-n1"})
+
+	cb := newCallbackServer()
+	body, _ := json.Marshal(map[string]any{"turnId": "turn-n1", "state": "completed"})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	tk := getTask(t, "t-noconv")
+	if tk.Status.SessionID != "" || tk.Status.ConversationObjectKey != "" {
+		t.Errorf("conversation pointer must stay empty when no sessionId reported: sid=%q key=%q",
+			tk.Status.SessionID, tk.Status.ConversationObjectKey)
+	}
+}
+
 func TestTurnComplete_UnknownTurn404(t *testing.T) {
 	cb := newCallbackServer()
 	body, _ := json.Marshal(map[string]any{"turnId": "nope", "state": "completed"})

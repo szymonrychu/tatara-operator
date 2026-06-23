@@ -14,6 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
+	"github.com/szymonrychu/tatara-operator/internal/objstore"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/pushmetrics"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
@@ -140,6 +141,12 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		Tolerations:            cfg.Scheduling.Tolerations,
 		Affinity:               cfg.Scheduling.Affinity,
 		CallbackHMACSecretName: cfg.CallbackHMACSecretName,
+		S3Endpoint:             cfg.S3Endpoint,
+		S3Bucket:               cfg.S3Bucket,
+		S3Region:               cfg.S3Region,
+		S3KeyPrefix:            cfg.S3KeyPrefix,
+		S3ForcePathStyle:       cfg.S3ForcePathStyle,
+		S3SecretName:           cfg.S3SecretName,
 	}
 }
 
@@ -229,6 +236,22 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		PushMetrics:    pushReceiver.PushHandler(),
 		CallbackSecret: cfg.CallbackHMACSecret,
 		TaskRetention:  cfg.TaskRetention,
+	}
+	// Conversation GC (issue #114 decision 5): wire the operator's S3 client when a
+	// bucket is configured so the reaper can delete fully-closed batches' objects.
+	if oc := (objstore.Config{
+		Endpoint:       cfg.S3Endpoint,
+		Bucket:         cfg.S3Bucket,
+		Region:         cfg.S3Region,
+		KeyPrefix:      cfg.S3KeyPrefix,
+		ForcePathStyle: cfg.S3ForcePathStyle,
+	}); oc.Enabled() {
+		oclient, err := objstore.New(context.Background(), oc)
+		if err != nil {
+			return nil, fmt.Errorf("objstore client: %w", err)
+		}
+		cbServer.ConvStore = oclient
+		cbServer.ConversationRetention = cfg.S3ConversationRetention
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return nil, fmt.Errorf("add callback server: %w", err)

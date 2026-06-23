@@ -124,3 +124,72 @@ func TestLifecycleTriageText_ApprovalInstructions(t *testing.T) {
 		t.Fatalf("triage prompt missing conversation-approval guidance:\n%s", got)
 	}
 }
+
+func TestReviewText_ReviewAndTestAndVerdict(t *testing.T) {
+	txt := reviewText("Review and test PR o/r#5", "proj1", "task-rev")
+	low := strings.ToLower(txt)
+	if !strings.Contains(low, "review") || !strings.Contains(low, "test") {
+		t.Errorf("review prompt must mention review AND test: %q", txt)
+	}
+	if !strings.Contains(txt, "review_verdict") {
+		t.Errorf("review prompt must require the review_verdict tool: %q", txt)
+	}
+	if !strings.Contains(low, "do not commit") && !strings.Contains(low, "not push") {
+		t.Errorf("review prompt must say not to push/commit: %q", txt)
+	}
+	if !strings.Contains(txt, "task-rev") || !strings.Contains(txt, "proj1") {
+		t.Errorf("review prompt missing task/project: %q", txt)
+	}
+}
+
+func TestLifecyclePhaseGuidance_CommentPhaseNotRestored(t *testing.T) {
+	g := lifecyclePhaseGuidance("Triage")
+	if !strings.Contains(g, "Lifecycle phase: Triage") {
+		t.Errorf("guidance missing phase name: %q", g)
+	}
+	if !strings.Contains(g, "transient") {
+		t.Errorf("guidance missing transient-workspace note: %q", g)
+	}
+	if !strings.Contains(g, "NOT be restored") {
+		t.Errorf("comment-phase guidance must say file edits are not restored: %q", g)
+	}
+	if strings.Contains(g, "ARE restored") {
+		t.Errorf("comment-phase guidance must not promise restored changes: %q", g)
+	}
+}
+
+func TestLifecyclePhaseGuidance_ImplementPhaseRestored(t *testing.T) {
+	g := lifecyclePhaseGuidance("Implement")
+	if !strings.Contains(g, "Lifecycle phase: Implement") {
+		t.Errorf("guidance missing phase name: %q", g)
+	}
+	if !strings.Contains(g, "ARE restored") {
+		t.Errorf("implement-phase guidance must say committed+pushed changes are restored: %q", g)
+	}
+	if !strings.Contains(g, "commit and push") {
+		t.Errorf("implement-phase guidance must reference commit and push: %q", g)
+	}
+}
+
+func TestLifecycleTriageText_IncludesPhaseGuidance(t *testing.T) {
+	task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r#1", URL: "u"}}}
+	got := lifecycleTriageText(task, "T", "B")
+	if !strings.Contains(got, "## Lifecycle phase: Triage") {
+		t.Errorf("triage prompt missing phase guidance: %q", got)
+	}
+	if !strings.Contains(got, "NOT be restored") {
+		t.Errorf("triage prompt missing transient-workspace note: %q", got)
+	}
+}
+
+func TestImplementPrompt_IncludesPhaseGuidance(t *testing.T) {
+	task := &tatarav1alpha1.Task{Spec: tatarav1alpha1.TaskSpec{ProjectRef: "proj", Goal: "g", Kind: "issueLifecycle"}}
+	task.Name = "task-phase"
+	got := implementPrompt(task)
+	if !strings.Contains(got, "## Lifecycle phase: Implement") {
+		t.Errorf("implement prompt missing phase guidance: %q", got)
+	}
+	if !strings.Contains(got, "ARE restored") {
+		t.Errorf("implement prompt missing restored-changes note: %q", got)
+	}
+}

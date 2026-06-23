@@ -164,3 +164,23 @@ func TestContextGuard_LightContext_MRCIFailure_NoMarker(t *testing.T) {
 			annPendingHandoverResume, got.Annotations[annPendingHandoverResume])
 	}
 }
+
+// TestContextGuard_DefaultThresholdIs25 verifies the issue #114 decision-2
+// default: with HandoverThresholdPercent unset (0 -> defaulted to 25), a 30%
+// context trips compaction (it would NOT have under the old 50% default).
+func TestContextGuard_DefaultThresholdIs25(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	// thresholdPct=0 -> CRD/in-code default 25. LastTurnInputTokens = 60000
+	// (30% of 200000) -> over 25%, under the old 50%, so it must trip now.
+	r, _, name := seedMRCITaskWithTokens(t, "default25", 200000, 0, 60000,
+		scm.PRState{Author: "bot", CIStatus: "failure"})
+
+	if _, err := r.reconcileLifecycle(ctx, fetchTask(t, name)); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+	got := fetchTask(t, name)
+	if got.Annotations[annPendingHandoverResume] != "true" {
+		t.Errorf("annotation %q = %q, want 'true' (30%% over the 25%% default)",
+			annPendingHandoverResume, got.Annotations[annPendingHandoverResume])
+	}
+}

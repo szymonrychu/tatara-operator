@@ -106,4 +106,12 @@ AGENT_RUN_AS_USER: {{ .Values.agentRunAsUser | quote }}
 AGENT_FS_GROUP: {{ .Values.agentFsGroup | quote }}
 {{/* List-shaped placement (rule 6): one JSON document key, empty default keeps the chart cluster-agnostic (rule 14). */}}
 AGENT_SCHEDULING: {{ .Values.agentScheduling | toJson | quote }}
+{{/* S3 conversation persistence (issue #114): empty s3Bucket disables it. */}}
+S3_ENDPOINT: {{ .Values.s3Endpoint | quote }}
+S3_BUCKET: {{ .Values.s3Bucket | quote }}
+S3_REGION: {{ .Values.s3Region | quote }}
+S3_KEY_PREFIX: {{ .Values.s3KeyPrefix | quote }}
+S3_FORCE_PATH_STYLE: {{ .Values.s3ForcePathStyle | quote }}
+S3_SECRET_NAME: {{ .Values.s3SecretName | quote }}
+S3_CONVERSATION_RETENTION_HOURS: {{ .Values.s3ConversationRetentionHours | quote }}
 {{- end -}}

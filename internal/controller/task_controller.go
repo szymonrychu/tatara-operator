@@ -41,16 +41,18 @@ const (
 	// (e.g. a duplicate lifecycle Task whose pod name collided with the live one).
 	planningStallDeadline = 4 * agentBootDeadline
 
-	annCurrentTurn           = tatarav1alpha1.AnnCurrentTurn
-	annCurrentSubtask        = tatarav1alpha1.AnnCurrentSubtask
-	annTurnComplete          = tatarav1alpha1.AnnTurnComplete
-	annPodRecreations        = tatarav1alpha1.AnnPodRecreations
-	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
-	annTurnLastActivity      = tatarav1alpha1.AnnTurnLastActivity
-	annPlanningSince         = tatarav1alpha1.AnnPlanningSince
-	annPendingHandoverResume = "tatara.dev/pending-handover-resume"
-	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
-	annBootCrashAttempts     = "tatara.dev/boot-crash-attempts"
+	annCurrentTurn             = tatarav1alpha1.AnnCurrentTurn
+	annCurrentSubtask          = tatarav1alpha1.AnnCurrentSubtask
+	annTurnComplete            = tatarav1alpha1.AnnTurnComplete
+	annPodRecreations          = tatarav1alpha1.AnnPodRecreations
+	annTurnStartedAt           = tatarav1alpha1.AnnTurnStartedAt
+	annTurnLastActivity        = tatarav1alpha1.AnnTurnLastActivity
+	annPlanningSince           = tatarav1alpha1.AnnPlanningSince
+	annPendingHandoverResume   = tatarav1alpha1.AnnPendingHandoverResume
+	annParentConversationKey   = tatarav1alpha1.AnnParentConversationKey
+	annForkFromConversationKey = tatarav1alpha1.AnnForkFromConversationKey
+	annAgentUnreachableSince   = "tatara.dev/agent-unreachable-since"
+	annBootCrashAttempts       = "tatara.dev/boot-crash-attempts"
 	// annBootCrashDiagnostics holds the most recent boot-crash cause captured from
 	// pod.Status (failing container, exit code, log tail). resetAgentRun preserves
 	// it (like annBootCrashAttempts) so the cause survives the per-attempt pod
@@ -224,7 +226,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		repoPtr = &repo
 	}
 
+	// Review tasks (MR/PR review, issue #114 decision 4) get a review/test prompt
+	// instead of the implement-oriented plan prompt.
 	planText := planTurnText(task.Spec.Goal, taskBranch(&task), project.Name, task.Name)
+	if task.Spec.Kind == "review" {
+		planText = reviewText(task.Spec.Goal, project.Name, task.Name)
+	}
 	res, err := r.driveAgentRun(ctx, &project, repoPtr, &task, planText)
 	if err != nil {
 		r.Metrics.ReconcileResult("Task", "error")

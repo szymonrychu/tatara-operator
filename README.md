@@ -26,6 +26,32 @@ Tasks, runs the agent turn loop in `tatara-claude-code-wrapper` Pods, and
 writes results back to the SCM as one PR per changed repo plus an issue
 comment. Remaining work is the gated deploy steps tracked in `ROADMAP.md`.
 
+## Conversation persistence (issue #114)
+
+When an S3 bucket is configured (`s3*` Helm values -> operator ConfigMap +
+`s3SecretName` creds), an issue's Claude conversation is persisted to S3 and
+resumed across pods so a follow-up message continues the prior conversation
+instead of starting from an empty context. The wrapper does the object I/O; the
+operator records the pointer and drives the policy:
+
+- Each `Task` is the durable, per-issue home for the conversation pointer
+  (`Status.ConversationObjectKey` + `Status.SessionID`), recorded from the
+  turn-complete callback and replayed to the next pod as `CONVERSATION_*` env in
+  `BuildPod`.
+- Resume vs compaction: under `handoverThresholdPercent` (default 25%) of the
+  context window the next pod replays the full transcript; at/over it the pod
+  starts fresh and gets the compacted text handover instead (the two are
+  mutually exclusive, so the window never overflows).
+- Forked conversations: each issue proposed by a brainstorm forks (S3
+  copy-object) the brainstorm conversation onto its own key so siblings diverge.
+- MR review: every MR, including user-authored, spins up a review/test agent
+  with its own conversation, the PR head checked out read-only (it never pushes).
+- GC: the reaper deletes a batch's S3 objects once all its sibling issues are
+  closed (grace `s3ConversationRetentionHours`, default 72h).
+
+The whole feature is **off and fully backwards-compatible until `s3Bucket` is
+set** (no S3 env is injected, so pods behave exactly as before).
+
 ## Layout
 
 ```
