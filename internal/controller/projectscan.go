@@ -948,8 +948,11 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	}
 	// Systemic-group dedup: for issues carrying a tatara/systemic-<id> label and
 	// having at least one sibling in the group, elect one lead per (sid, repo).
-	// Non-lead siblings get a marker comment and no agent.
-	systemicLeads := electSystemicLeads(eligible)
+	// Non-lead siblings get a marker comment and no agent. Election runs on the
+	// full candidate set (not the post-dedup eligible set) so a sibling stays
+	// collapsed even when its lead is currently in-flight (deduped out): a higher-
+	// numbered sibling must never be promoted to lead and spawn a second agent.
+	systemicLeads := electSystemicLeads(cands)
 	created := 0
 	for _, c := range eligible {
 		key := fmt.Sprintf("%s#%d", c.repo, c.number)

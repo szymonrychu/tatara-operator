@@ -132,3 +132,46 @@ func TestIssueScan_SystemicDedup_CollapsesSiblings(t *testing.T) {
 		t.Fatalf("tatara_systemic_siblings_collapsed_total = %v, want >= 1", collapsedCount)
 	}
 }
+
+// TestIssueScan_SystemicDedup_LeadInFlightStillCollapsesSibling guards the seam
+// where the elected lead already has a live (non-terminal) Task and is therefore
+// deduped out of the eligible set. Election must still run over the full
+// candidate set so the surviving sibling is recognised as a non-lead and
+// collapsed, instead of being promoted to lead and spawning a second agent.
+func TestIssueScan_SystemicDedup_LeadInFlightStillCollapsesSibling(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, _ := seedScanProject(t, "systemic-dedup-inflight", cron)
+	repo := mkScanRepo(t, "systemic-dedup-inflight", "systemic-dedup-inflight-r", "https://github.com/o/r.git")
+
+	// Lead #12 already has a live Task (in-flight) -> deduped out of eligible.
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 12}, "issueScan", "issueLifecycle")
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "systemic-dedup-inflight", RepositoryRef: repo.Name, Goal: "g", Kind: "issueLifecycle"}
+	if err := k8sClient.Create(context.Background(), pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	pre.Status.Phase = "Running"
+	_ = k8sClient.Status().Update(context.Background(), pre)
+
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/r", Number: 12, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(100, 0), Title: "A"},
+		{Repo: "o/r", Number: 15, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(200, 0), Title: "C"},
+	}}
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, []tatarav1alpha1.Task{*pre}, cron.IssueScan)
+
+	// No new QE: lead is in-flight (deduped), sibling is collapsed (no agent).
+	if qes := listScanQEs(t, "systemic-dedup-inflight"); len(qes) != 0 {
+		t.Fatalf("want 0 new QEs (lead in-flight, sibling collapsed), got %d: %+v", len(qes), qes)
+	}
+	// Sibling #15 must be collapsed, not promoted to lead.
+	collapsedCount := counterValue(t, reg, "tatara_systemic_siblings_collapsed_total", map[string]string{"project": "systemic-dedup-inflight"})
+	if collapsedCount < 1 {
+		t.Fatalf("sibling must be collapsed even with lead in-flight; collapsed counter = %v", collapsedCount)
+	}
+}
