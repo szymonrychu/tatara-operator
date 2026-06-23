@@ -480,14 +480,19 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	}
 
 	wrapper := corev1.Container{
-		Name:            "wrapper",
-		Image:           project.Spec.Agent.Image,
-		Env:             env,
-		EnvFrom:         project.Spec.Agent.ExtraEnvsFrom,
-		VolumeMounts:    project.Spec.Agent.ExtraVolumeMounts,
-		Ports:           []corev1.ContainerPort{{ContainerPort: wrapperPort}},
-		Resources:       buildResourceRequirements(cfg),
-		SecurityContext: buildSecurityContext(cfg),
+		Name:         "wrapper",
+		Image:        project.Spec.Agent.Image,
+		Env:          env,
+		EnvFrom:      project.Spec.Agent.ExtraEnvsFrom,
+		VolumeMounts: project.Spec.Agent.ExtraVolumeMounts,
+		Ports:        []corev1.ContainerPort{{ContainerPort: wrapperPort}},
+		Resources:    buildResourceRequirements(cfg),
+		// On a non-zero exit the kubelet captures the tail of the container's
+		// stdout/stderr into ContainerStatus.State.Terminated.Message, so a wrapper
+		// that crashes before /readyz comes up leaves its cause on pod.Status for
+		// handleBootCrash to surface (no logs API / RBAC needed). See bootCrashDetail.
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+		SecurityContext:          buildSecurityContext(cfg),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
