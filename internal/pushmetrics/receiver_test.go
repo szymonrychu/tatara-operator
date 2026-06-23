@@ -21,7 +21,7 @@ func (c *fakeClock) now() time.Time          { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func newTestReceiver(clk *fakeClock, ttl time.Duration) *Receiver {
-	r := New(ttl)
+	r := New(ttl, nil)
 	r.now = clk.now
 	return r
 }
@@ -35,21 +35,21 @@ func push(t *testing.T, r *Receiver, query, body string) int {
 }
 
 func TestPushRejectsMissingRunID(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	if code := push(t, r, "", "a_total 1\n"); code != http.StatusBadRequest {
 		t.Fatalf("missing run_id: got %d, want 400", code)
 	}
 }
 
 func TestPushRejectsBadBody(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	if code := push(t, r, "run_id=x", "this is not metrics text {{{"); code != http.StatusBadRequest {
 		t.Fatalf("bad body: got %d, want 400", code)
 	}
 }
 
 func TestPushStampsIdentityAndReExposes(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	body := "# TYPE wrapper_runs_total counter\nwrapper_runs_total{step=\"plan\"} 3\n"
 	if code := push(t, r, "run_id=run-1&pod=pod-a&job=wrapper", body); code != http.StatusNoContent {
 		t.Fatalf("push: got %d, want 204", code)
@@ -64,10 +64,46 @@ wrapper_runs_total{job="wrapper",pod="pod-a",run_id="run-1",step="plan"} 3
 	}
 }
 
+// A receiver configured with a custom prefix set accepts matching families and
+// drops the rest. This is what lets the scheduled eval (memory_) and the repo
+// ingester (ingest_) push without a receiver code change.
+func TestConfigurablePrefixes(t *testing.T) {
+	r := New(time.Minute, []string{"memory_"})
+	body := "# TYPE memory_eval_recall_at_k gauge\nmemory_eval_recall_at_k{k=\"10\"} 0.8\n"
+	if code := push(t, r, "run_id=eval-1&job=memory-eval", body); code != http.StatusNoContent {
+		t.Fatalf("memory_ push: got %d, want 204", code)
+	}
+	if got := testutil.CollectAndCount(r, "memory_eval_recall_at_k"); got != 1 {
+		t.Fatalf("memory_eval_recall_at_k series: got %d, want 1 (accepted)", got)
+	}
+	// A wrapper_ family is not in this receiver's allowlist, so it is dropped.
+	if code := push(t, r, "run_id=eval-2", "# TYPE wrapper_x_total counter\nwrapper_x_total 1\n"); code != http.StatusNoContent {
+		t.Fatalf("wrapper_ push: got %d, want 204", code)
+	}
+	if got := testutil.CollectAndCount(r, "wrapper_x_total"); got != 0 {
+		t.Fatalf("wrapper_x_total series: got %d, want 0 (dropped, not in allowlist)", got)
+	}
+	if got := testutil.ToFloat64(r.seriesDroppedTotal.WithLabelValues("reserved_name")); got != 1 {
+		t.Fatalf("series_dropped{reserved_name} = %v, want 1", got)
+	}
+}
+
+// The default allowlist (New called with nil) stays wrapper_/agent_, so a
+// memory_ family is dropped until a deploy widens PUSH_METRICS_ALLOWED_PREFIXES.
+func TestDefaultPrefixesRejectMemory(t *testing.T) {
+	r := New(time.Minute, nil)
+	if code := push(t, r, "run_id=d1", "# TYPE memory_eval_mrr gauge\nmemory_eval_mrr 0.5\n"); code != http.StatusNoContent {
+		t.Fatalf("push: got %d, want 204", code)
+	}
+	if got := testutil.CollectAndCount(r, "memory_eval_mrr"); got != 0 {
+		t.Fatalf("memory_eval_mrr series: got %d, want 0 (dropped under default allowlist)", got)
+	}
+}
+
 // A wrapper must not be able to spoof another run's identity: an inbound
 // run_id label in the body is overwritten by the query parameter.
 func TestPushOverwritesSpoofedIdentity(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	body := "# TYPE wrapper_a_total counter\nwrapper_a_total{run_id=\"evil\"} 1\n"
 	push(t, r, "run_id=real", body)
 	want := `
@@ -83,7 +119,7 @@ wrapper_a_total{run_id="real"} 1
 // Two runs pushing the same metric name with different label sets must gather
 // cleanly (union-padded), not error out the whole scrape.
 func TestConcurrentRunsDifferentLabelsGatherCleanly(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	push(t, r, "run_id=run-1", "# TYPE wrapper_q_total counter\nwrapper_q_total{a=\"1\"} 1\n")
 	push(t, r, "run_id=run-2", "# TYPE wrapper_q_total counter\nwrapper_q_total{b=\"2\"} 2\n")
 
@@ -98,7 +134,7 @@ func TestConcurrentRunsDifferentLabelsGatherCleanly(t *testing.T) {
 }
 
 func TestHistogramRoundTrips(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	body := `# TYPE wrapper_lat histogram
 wrapper_lat_bucket{le="0.5"} 1
 wrapper_lat_bucket{le="1"} 2
@@ -145,7 +181,7 @@ func TestPushResetsTTL(t *testing.T) {
 }
 
 func TestDeleteRemovesSeries(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 
 	req := httptest.NewRequest(http.MethodDelete, "/internal/metrics/push?run_id=run-1", nil)
@@ -160,7 +196,7 @@ func TestDeleteRemovesSeries(t *testing.T) {
 }
 
 func TestActiveRunsGauge(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	push(t, r, "run_id=run-1", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 	push(t, r, "run_id=run-2", "# TYPE wrapper_a_total counter\nwrapper_a_total 1\n")
 	want := "# HELP operator_pushed_runs Wrapper runs with live pushed series.\n# TYPE operator_pushed_runs gauge\noperator_pushed_runs 2\n"
@@ -170,7 +206,7 @@ func TestActiveRunsGauge(t *testing.T) {
 }
 
 func TestRegistersOnSharedRegistryWithoutConflict(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	reg := prometheus.NewRegistry()
 	if err := reg.Register(r); err != nil {
 		t.Fatalf("register receiver: %v", err)
@@ -184,7 +220,7 @@ func TestRegistersOnSharedRegistryWithoutConflict(t *testing.T) {
 // Finding 20: PushHandler returns an http.HandlerFunc, not a nested mux.
 // Mounting it directly on the outer mux should serve the push endpoint.
 func TestPushHandler_ServesDirectly(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	h := r.PushHandler()
 	// h should handle a direct POST (no inner-mux path dispatch).
 	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?run_id=x",
@@ -199,7 +235,7 @@ func TestPushHandler_ServesDirectly(t *testing.T) {
 // Finding 21: two runs pushing the same metric name with different types;
 // the conflicting run's series must be dropped and counted.
 func TestTypeConflict_DropsConflictingSeries(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	// run-1 publishes wrapper_m as COUNTER
 	push(t, r, "run_id=run-1", "# TYPE wrapper_m counter\nwrapper_m 1\n")
 	// run-2 publishes wrapper_m as GAUGE (type conflict)
@@ -223,7 +259,7 @@ func TestTypeConflict_DropsConflictingSeries(t *testing.T) {
 // the surviving series flickered scrape-to-scrape. Collect must order runs
 // deterministically by run key.
 func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	// run-a publishes wrapper_m as COUNTER value 1; run-z as GAUGE value 2. With
 	// a stable (sorted) iteration order, run-a is first-seen, so its COUNTER
 	// value 1 wins every scrape.
@@ -267,7 +303,7 @@ func TestTypeConflict_StableSurvivingSeries(t *testing.T) {
 // dropped and counted under operator_push_series_dropped_total{reason="reserved_name"}.
 // This prevents wrapper pushes from colliding with operator-owned collectors.
 func TestReservedNamePrefix_Dropped(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	// "operator_reconcile_total" matches no allowed prefix -> must be dropped.
 	body := "# TYPE operator_reconcile_total counter\noperator_reconcile_total 99\n"
 	if code := push(t, r, "run_id=bad", body); code != http.StatusNoContent {
@@ -286,7 +322,7 @@ func TestReservedNamePrefix_Dropped(t *testing.T) {
 
 // Finding 1: series with an allowed prefix must pass through unharmed.
 func TestAllowedPrefix_PassesThrough(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	body := "# TYPE wrapper_runs_total counter\nwrapper_runs_total 7\n"
 	push(t, r, "run_id=ok", body)
 	if got := testutil.CollectAndCount(r, "wrapper_runs_total"); got != 1 {
@@ -299,7 +335,7 @@ func TestAllowedPrefix_PassesThrough(t *testing.T) {
 
 // Finding 24: DELETE must increment operator_push_receive_total{result="deleted"}.
 func TestDelete_CountedInReceiveTotal(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	push(t, r, "run_id=run-del", "# TYPE wrapper_x_total counter\nwrapper_x_total 1\n")
 
 	req := httptest.NewRequest(http.MethodDelete, "/internal/metrics/push?run_id=run-del", nil)
@@ -317,7 +353,7 @@ func TestDelete_CountedInReceiveTotal(t *testing.T) {
 // before the first DELETE arrives. testutil.CollectAndCount on the underlying
 // CounterVec confirms at least one series exists.
 func TestDeleteLabel_PreSeeded(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	// The pre-seeded "deleted" series must exist at zero before any DELETE call.
 	n := testutil.CollectAndCount(r.receiveTotal, "operator_push_receive_total")
 	if n == 0 {
@@ -347,7 +383,7 @@ func TestDeleteLabel_PreSeeded(t *testing.T) {
 // the conflicting runs are still live. It must be incremented once at ingest
 // time (or equivalent), not once per Collect call.
 func TestTypeConflict_CounterNotInflatedPerScrape(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	push(t, r, "run_id=run-1", "# TYPE wrapper_conflict counter\nwrapper_conflict 1\n")
 	push(t, r, "run_id=run-2", "# TYPE wrapper_conflict gauge\nwrapper_conflict 2\n")
 
@@ -402,7 +438,7 @@ func TestBuildError_CounterNotInflatedPerScrape(t *testing.T) {
 // It should be counted as "empty" (or another distinct label) so a
 // misconfigured wrapper pushing only reserved names is visible.
 func TestAllReservedNames_NotCountedAccepted(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	// Only reserved names (no allowed prefix) - all dropped at parse/stamp time.
 	body := "# TYPE operator_x_total counter\noperator_x_total 1\n"
 	if code := push(t, r, "run_id=empty-run", body); code != http.StatusNoContent {
@@ -424,7 +460,7 @@ func TestAllReservedNames_NotCountedAccepted(t *testing.T) {
 
 // Finding 22: body larger than maxBodyBytes must be rejected with 413.
 func TestOversizeBody_Rejected(t *testing.T) {
-	r := New(time.Minute)
+	r := New(time.Minute, nil)
 	// Build a body larger than maxBodyBytes (1 MiB).
 	big := strings.Repeat("x", maxBodyBytes+1)
 	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?run_id=big",

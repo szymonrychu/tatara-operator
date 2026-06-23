@@ -39,12 +39,15 @@ const (
 // exhausting operator memory.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// allowedPrefixes is the closed set of metric name prefixes accepted from
-// pushed wrapper series. Any family whose name does not start with one of
-// these is dropped and counted under
+// DefaultAllowedPrefixes is the closed set of metric name prefixes accepted
+// from pushed series when New is called with an empty prefix list. Any family
+// whose name does not start with one of the receiver's allowed prefixes is
+// dropped and counted under
 // operator_push_series_dropped_total{reason="reserved_name"} so it cannot
-// collide with operator-owned collectors on the shared registry.
-var allowedPrefixes = []string{"wrapper_", "agent_"}
+// collide with operator-owned collectors on the shared registry. The deployed
+// set is configurable (PUSH_METRICS_ALLOWED_PREFIXES) so new short-lived-pod
+// producers (eval, ingest) can push their own families without a code change.
+var DefaultAllowedPrefixes = []string{"wrapper_", "agent_"}
 
 // run holds one wrapper run's last pushed snapshot plus the time of that push.
 type run struct {
@@ -57,8 +60,9 @@ type run struct {
 // registry that backs the operator's /metrics endpoint, and mount PushHandler
 // on the internal (non-ingress) listener for wrappers to push to.
 type Receiver struct {
-	ttl time.Duration
-	now func() time.Time
+	ttl             time.Duration
+	allowedPrefixes []string
+	now             func() time.Time
 
 	mu         sync.Mutex
 	runs       map[string]*run
@@ -69,13 +73,19 @@ type Receiver struct {
 	seriesDroppedTotal *prometheus.CounterVec
 }
 
-// New returns a Receiver that evicts a run's series ttl after its last push.
-func New(ttl time.Duration) *Receiver {
+// New returns a Receiver that evicts a run's series ttl after its last push and
+// accepts only series whose metric name starts with one of allowedPrefixes. An
+// empty allowedPrefixes falls back to DefaultAllowedPrefixes.
+func New(ttl time.Duration, allowedPrefixes []string) *Receiver {
+	if len(allowedPrefixes) == 0 {
+		allowedPrefixes = DefaultAllowedPrefixes
+	}
 	r := &Receiver{
-		ttl:        ttl,
-		now:        time.Now,
-		runs:       map[string]*run{},
-		conflicted: map[string]struct{}{},
+		ttl:             ttl,
+		allowedPrefixes: allowedPrefixes,
+		now:             time.Now,
+		runs:            map[string]*run{},
+		conflicted:      map[string]struct{}{},
 		receiveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_push_receive_total",
 			Help: "Total wrapper metric pushes received by result.",
@@ -384,7 +394,7 @@ func (r *Receiver) parseAndStamp(body io.Reader, identity map[string]string) (ma
 	}
 	out := make(map[string]*dto.MetricFamily, len(families))
 	for name, fam := range families {
-		if !hasAllowedPrefix(name) {
+		if !r.hasAllowedPrefix(name) {
 			r.seriesDroppedTotal.WithLabelValues("reserved_name").Add(float64(len(fam.GetMetric())))
 			continue
 		}
@@ -396,9 +406,10 @@ func (r *Receiver) parseAndStamp(body io.Reader, identity map[string]string) (ma
 	return out, nil
 }
 
-// hasAllowedPrefix reports whether name starts with one of allowedPrefixes.
-func hasAllowedPrefix(name string) bool {
-	for _, p := range allowedPrefixes {
+// hasAllowedPrefix reports whether name starts with one of the receiver's
+// configured allowed prefixes.
+func (r *Receiver) hasAllowedPrefix(name string) bool {
+	for _, p := range r.allowedPrefixes {
 		if strings.HasPrefix(name, p) {
 			return true
 		}

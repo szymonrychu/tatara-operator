@@ -87,7 +87,7 @@ func run(ctx context.Context) error {
 	lifecycleMetrics := obs.NewLifecycleMetrics(ctrlmetrics.Registry)
 	// Push-receiver for short-lived wrapper pods: aggregates their pushed
 	// series and re-exposes them on the operator's own /metrics registry.
-	pushReceiver := pushmetrics.New(cfg.PushMetricsTTL)
+	pushReceiver := pushmetrics.New(cfg.PushMetricsTTL, cfg.PushMetricsAllowedPrefixes)
 	ctrlmetrics.Registry.MustRegister(pushReceiver)
 	seqAlloc, err := addReconcilers(mgr, cfg, operatorMetrics, lifecycleMetrics, pushReceiver)
 	if err != nil {

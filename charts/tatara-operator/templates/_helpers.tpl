@@ -94,6 +94,7 @@ CHAT_IMAGE: {{ .Values.chatImage | quote }}
 GRAFANA_MCP_IMAGE: {{ .Values.grafanaMcpImage | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 TASK_RETENTION_HOURS: {{ .Values.taskRetentionHours | quote }}
+PUSH_METRICS_ALLOWED_PREFIXES: {{ .Values.pushMetricsAllowedPrefixes | quote }}
 AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
 AGENT_CPU_LIMIT: {{ .Values.agentCpuLimit | quote }}
 AGENT_MEMORY_REQUEST: {{ .Values.agentMemoryRequest | quote }}

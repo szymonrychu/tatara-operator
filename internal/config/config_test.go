@@ -326,6 +326,38 @@ func TestLoad_MalformedPushMetricsTTL(t *testing.T) {
 	}
 }
 
+// TestLoad_PushMetricsAllowedPrefixes asserts the comma-separated allowlist is
+// parsed (trimmed, empties dropped) and defaults to nil when unset so the
+// receiver keeps its built-in default.
+func TestLoad_PushMetricsAllowedPrefixes(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PushMetricsAllowedPrefixes != nil {
+		t.Fatalf("unset PUSH_METRICS_ALLOWED_PREFIXES = %v, want nil", cfg.PushMetricsAllowedPrefixes)
+	}
+
+	t.Setenv("PUSH_METRICS_ALLOWED_PREFIXES", " wrapper_, agent_ ,, memory_ ")
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"wrapper_", "agent_", "memory_"}
+	if len(cfg.PushMetricsAllowedPrefixes) != len(want) {
+		t.Fatalf("prefixes = %v, want %v", cfg.PushMetricsAllowedPrefixes, want)
+	}
+	for i, p := range want {
+		if cfg.PushMetricsAllowedPrefixes[i] != p {
+			t.Fatalf("prefixes[%d] = %q, want %q", i, cfg.PushMetricsAllowedPrefixes[i], p)
+		}
+	}
+}
+
 // TestLoad_TaskRetentionDefault asserts the terminal-Task GC retention defaults
 // to a week when TASK_RETENTION_HOURS is unset.
 func TestLoad_TaskRetentionDefault(t *testing.T) {
