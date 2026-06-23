@@ -33,6 +33,14 @@ const (
 	// read by both implementPrompt (inject the handover block) and agent.BuildPod
 	// (skip CONVERSATION_SESSION_ID so the two paths are mutually exclusive).
 	AnnPendingHandoverResume = "tatara.dev/pending-handover-resume"
+	// AnnParentConversationKey is stamped on a brainstorm proposal Task with the
+	// S3 conversation key of the brainstorm that produced it (issue #114 decision
+	// 3). AnnForkFromConversationKey is stamped on the resulting issueLifecycle
+	// Task (correlated by repo+issue number) and injected into its first pod as
+	// CONVERSATION_FORK_FROM_KEY so the wrapper forks (copies) the brainstorm
+	// conversation onto the issue's own key.
+	AnnParentConversationKey   = "tatara.dev/parent-conversation-key"
+	AnnForkFromConversationKey = "tatara.dev/fork-from-conversation-key"
 )
 
 // LifecycleEntryAnnotation carries the entry LifecycleState for a newly

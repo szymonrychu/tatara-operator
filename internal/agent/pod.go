@@ -470,6 +470,13 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		if task.Status.SessionID != "" && !compacting {
 			env = append(env, corev1.EnvVar{Name: "CONVERSATION_SESSION_ID", Value: task.Status.SessionID})
 		}
+		// Fork source (issue #114 decision 3): on the first run of a
+		// brainstorm-derived issue, the wrapper copies this parent conversation
+		// onto the issue's own key and resumes it. Ignored once the issue has its
+		// own conversation (CONVERSATION_SESSION_ID set, normal resume wins).
+		if fk := task.Annotations[tatarav1alpha1.AnnForkFromConversationKey]; fk != "" {
+			env = append(env, corev1.EnvVar{Name: "CONVERSATION_FORK_FROM_KEY", Value: fk})
+		}
 		if cfg.S3SecretName != "" {
 			env = append(env,
 				secretEnv("AWS_ACCESS_KEY_ID", cfg.S3SecretName, "AWS_ACCESS_KEY_ID"),

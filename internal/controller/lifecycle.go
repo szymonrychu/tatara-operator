@@ -624,10 +624,78 @@ func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alph
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); err != nil {
 		return ctrl.Result{}, fmt.Errorf("triage: get repo: %w", err)
 	}
+	// Best-effort: on the first Triage of a brainstorm-derived issue, set the
+	// fork-from-conversation annotation so the pod forks the brainstorm
+	// conversation (issue #114 decision 3). Non-fatal so a fork-setup hiccup never
+	// blocks triage.
+	if err := r.maybeSetupConversationFork(ctx, task); err != nil {
+		log.FromContext(ctx).Info("triage: conversation fork setup failed (non-fatal)",
+			"resource_id", task.Name, "err", err.Error())
+	}
 	// Pass the already-fetched repo URL into buildTriagePromptFor so resolveTriageReader
 	// inside it can reuse the URL without another Get (finding 7).
 	prompt := r.buildTriagePromptFor(ctx, project, task, repo.Spec.URL)
 	return r.driveAgentRun(ctx, project, &repo, task, prompt)
+}
+
+// maybeSetupConversationFork, on the first Triage of a brainstorm-derived issue,
+// correlates this issueLifecycle Task to the proposal Task that opened the issue
+// (matching repo + issue number) and copies the proposal's parent-conversation
+// key onto this Task as the fork-from annotation, so the first pod forks the
+// brainstorm conversation (issue #114 decision 3). No-op when S3 is off, when
+// the Task already carries a fork pointer or its own conversation, when it has no
+// issue number, or when no matching proposal with a parent key is found.
+func (r *TaskReconciler) maybeSetupConversationFork(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if r.PodConfig.S3Bucket == "" {
+		return nil
+	}
+	if task.Spec.Source == nil || task.Spec.Source.Number == 0 {
+		return nil
+	}
+	if task.Annotations[annForkFromConversationKey] != "" ||
+		task.Status.SessionID != "" || task.Status.ConversationObjectKey != "" {
+		return nil
+	}
+	var tasks tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
+		return err
+	}
+	parentKey := ""
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProposedIssue == nil || t.Spec.Source == nil {
+			continue
+		}
+		if t.Spec.RepositoryRef != task.Spec.RepositoryRef || t.Spec.Source.Number != task.Spec.Source.Number {
+			continue
+		}
+		if k := t.Annotations[annParentConversationKey]; k != "" {
+			parentKey = k
+			break
+		}
+	}
+	if parentKey == "" {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		if fresh.Annotations[annForkFromConversationKey] != "" {
+			return nil
+		}
+		fresh.Annotations[annForkFromConversationKey] = parentKey
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Annotations = fresh.Annotations
+		task.ResourceVersion = fresh.ResourceVersion
+		return nil
+	})
 }
 
 // buildTriagePromptFor fetches issue content and comments via ReaderFor (if wired) and

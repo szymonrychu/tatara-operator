@@ -807,6 +807,22 @@ func TestBuildPod_S3CompactionSkipsFullResume(t *testing.T) {
 	require.True(t, hasKey, "object key still emitted so the compacted session is persisted")
 }
 
+func TestBuildPod_S3ForkFromKey(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	cfg.S3Bucket = "tatara-conversations"
+	task.Annotations = map[string]string{tatarav1alpha1.AnnForkFromConversationKey: "demo/task-brainstorm.jsonl"}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "CONVERSATION_FORK_FROM_KEY")
+	require.True(t, ok, "CONVERSATION_FORK_FROM_KEY must be set when the fork annotation is present")
+	require.Equal(t, "demo/task-brainstorm.jsonl", got)
+
+	// Absent annotation -> no fork env.
+	_, _, task2, _ := sampleInputs()
+	c2 := agent.BuildPod(proj, repo, task2, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	_, ok = envValue(c2, "CONVERSATION_FORK_FROM_KEY")
+	require.False(t, ok, "no fork env without the annotation")
+}
+
 func TestBuildPod_S3NoCredsWhenSecretEmpty(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	cfg.S3Bucket = "tatara-conversations" // no S3SecretName -> default cred chain (IRSA)

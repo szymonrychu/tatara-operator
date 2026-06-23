@@ -48,7 +48,9 @@ const (
 	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
 	annTurnLastActivity      = tatarav1alpha1.AnnTurnLastActivity
 	annPlanningSince         = tatarav1alpha1.AnnPlanningSince
-	annPendingHandoverResume = tatarav1alpha1.AnnPendingHandoverResume
+	annPendingHandoverResume   = tatarav1alpha1.AnnPendingHandoverResume
+	annParentConversationKey   = tatarav1alpha1.AnnParentConversationKey
+	annForkFromConversationKey = tatarav1alpha1.AnnForkFromConversationKey
 	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
 	annBootCrashAttempts     = "tatara.dev/boot-crash-attempts"
 )

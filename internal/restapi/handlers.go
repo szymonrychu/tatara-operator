@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -373,6 +374,36 @@ type proposeIssueReq struct {
 	SystemicID    string `json:"systemicId,omitempty"`
 }
 
+// inflightBrainstormConversationKey returns the deterministic S3 conversation
+// key of the project's in-flight brainstorm Task (the one whose agent is calling
+// propose_issue), so a proposal it spawns can carry the parent key for
+// conversation forking (issue #114 decision 3). Brainstorm is project-level (one
+// in flight per cycle); the newest non-terminal one wins. Returns "" when none
+// is in flight (then no fork pointer is stamped and the issue starts fresh).
+func (s *Server) inflightBrainstormConversationKey(ctx context.Context, project string) string {
+	var tasks tatarav1alpha1.TaskList
+	if err := s.c.List(ctx, &tasks, client.InNamespace(s.ns)); err != nil {
+		return ""
+	}
+	var newest *tatarav1alpha1.Task
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProjectRef != project || t.Spec.Kind != "brainstorm" {
+			continue
+		}
+		if t.Status.Phase == "Succeeded" || t.Status.Phase == "Failed" {
+			continue
+		}
+		if newest == nil || t.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = t
+		}
+	}
+	if newest == nil {
+		return ""
+	}
+	return agent.ConversationKey(newest)
+}
+
 func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	var req proposeIssueReq
 	if err := decodeJSON(r, w, &req); err != nil {
@@ -409,10 +440,19 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "repository does not belong to project")
 		return
 	}
+	// Conversation forking (issue #114 decision 3): stamp the proposing
+	// brainstorm's conversation key on the proposal so the eventual issueLifecycle
+	// Task (correlated by repo+number) can fork it. The key is deterministic
+	// (available before the brainstorm's first turn-complete records Status).
+	var annotations map[string]string
+	if parentKey := s.inflightBrainstormConversationKey(r.Context(), projName); parentKey != "" {
+		annotations = map[string]string{tatarav1alpha1.AnnParentConversationKey: parentKey}
+	}
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "task-",
 			Namespace:    s.ns,
+			Annotations:  annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(&proj, tatarav1alpha1.GroupVersion.WithKind("Project")),
 			},
