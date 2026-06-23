@@ -369,3 +369,72 @@ func TestIssueScanAdoptsParkedTaskInsteadOfDuplicating(t *testing.T) {
 		t.Fatalf("adopted task must stamp LastActivityAt + DeadlineAt")
 	}
 }
+
+// TestIssueScanBotCommentDoesNotRespawnTask asserts the end-to-end B3 guard: a
+// terminal (Parked) issueLifecycle task whose issue updatedAt advanced ONLY because
+// of a bot comment must NOT be adopted/respawned (no Triage flip, no QE). A second
+// run after a HUMAN comment lands DOES re-enter it.
+func TestIssueScanBotCommentDoesNotRespawnTask(t *testing.T) {
+	ctx := context.Background()
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 2}}
+	proj, repoA := seedScanProject(t, "b3-botcomment", cron)
+	// seedScanProject sets BotLogin "tatara-bot".
+
+	created := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	pre := &tatarav1alpha1.Task{}
+	pre.GenerateName = "scan-"
+	pre.Namespace = testNS
+	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 8}, "issueScan", "issueLifecycle")
+	pre.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef: "b3-botcomment", RepositoryRef: repoA.Name, Goal: "g", Kind: "issueLifecycle",
+	}
+	if err := k8sClient.Create(ctx, pre); err != nil {
+		t.Fatalf("pre-create: %v", err)
+	}
+	pre.CreationTimestamp = created
+	pre.Status.Phase = "Succeeded"
+	pre.Status.LifecycleState = "Parked"
+	if err := k8sClient.Status().Update(ctx, pre); err != nil {
+		t.Fatalf("pre status: %v", err)
+	}
+
+	// Bot-only comment after creation; issue updatedAt advanced.
+	botOnly := &fakeReader{
+		issues:   []scm.IssueRef{{Repo: "o/r", Number: 8, UpdatedAt: time.Now()}},
+		comments: []scm.IssueComment{{Author: "tatara-bot", CreatedAt: time.Now()}},
+	}
+	r := newScanReconciler(botOnly)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.issueScan(ctx, proj, botOnly, []tatarav1alpha1.Repository{*repoA},
+		[]tatarav1alpha1.Task{*pre}, cron.IssueScan)
+
+	if qes := listScanQEs(t, "b3-botcomment"); len(qes) != 0 {
+		t.Fatalf("bot-only comment: want 0 QEs, got %d", len(qes))
+	}
+	got := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if got.Status.LifecycleState != "Parked" {
+		t.Fatalf("bot-only comment: task must stay Parked, got %q", got.Status.LifecycleState)
+	}
+
+	// Now a human comments: the task is adopted -> Triage.
+	withHuman := &fakeReader{
+		issues:   []scm.IssueRef{{Repo: "o/r", Number: 8, UpdatedAt: time.Now()}},
+		comments: []scm.IssueComment{{Author: "szymon", CreatedAt: time.Now()}},
+	}
+	r2 := newScanReconciler(withHuman)
+	r2.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	// Re-list existing (the Parked task is still Parked).
+	r2.issueScan(ctx, proj, withHuman, []tatarav1alpha1.Repository{*repoA},
+		[]tatarav1alpha1.Task{*got}, cron.IssueScan)
+
+	got2 := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got2); err != nil {
+		t.Fatalf("get task 2: %v", err)
+	}
+	if got2.Status.LifecycleState != "Triage" {
+		t.Fatalf("human comment: task must be adopted to Triage, got %q", got2.Status.LifecycleState)
+	}
+}

@@ -689,9 +689,10 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	}
 	// Dedup BEFORE cap so a stale-but-in-flight item does not waste the cap slot.
 	managed := managedPhaseLabels(proj.Spec.Scm)
+	gate := r.humanActivityGate(ctx, reader, bot)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing, managed, nil) {
+		if isDeduped(c, existing, managed, gate) {
 			r.Metrics.ScanItem("mrScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
@@ -874,9 +875,10 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 
 	// Dedup BEFORE enqueue so a stale-but-in-flight item is not re-created.
 	managed := managedPhaseLabels(proj.Spec.Scm)
+	gate := r.humanActivityGate(ctx, reader, botLogin)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing, managed, nil) {
+		if isDeduped(c, existing, managed, gate) {
 			r.Metrics.ScanItem("issueScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
@@ -1452,6 +1454,26 @@ func humanCommentAfter(ctx context.Context, reader scm.SCMReader, owner, name st
 		}
 	}
 	return false
+}
+
+// humanActivityGate returns the isDeduped human-activity predicate for a scan
+// cycle: reports whether the candidate's issue saw a non-bot comment strictly
+// after `since`. Fail-open (true) when the repo slug cannot be split or the
+// reader/botLogin are unavailable, matching humanCommentAfter and the
+// reactivation gate. PR candidates have no issue comment timeline, so the
+// predicate returns the legacy updatedAt comparison for them (isDeduped never
+// reaches the gate for PRs, but keep it correct if called).
+func (r *ProjectReconciler) humanActivityGate(ctx context.Context, reader scm.SCMReader, botLogin string) func(c candidate, since time.Time) bool {
+	return func(c candidate, since time.Time) bool {
+		if c.isPR {
+			return c.updatedAt.After(since)
+		}
+		owner, name, ok := strings.Cut(c.repo, "/")
+		if !ok || reader == nil || botLogin == "" {
+			return true
+		}
+		return humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, since)
+	}
 }
 
 // botCommentedOnIssue reports whether botLogin already authored a comment on the
