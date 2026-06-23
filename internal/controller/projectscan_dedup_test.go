@@ -46,7 +46,7 @@ func TestDedupPR(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isDeduped(tc.cand, existing, managed); got != tc.want {
+			if got := isDeduped(tc.cand, existing, managed, nil); got != tc.want {
 				t.Fatalf("isDeduped = %v, want %v", got, tc.want)
 			}
 		})
@@ -64,13 +64,13 @@ func TestDedupIssue(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	older := candidate{repo: "o/r", number: 7, updatedAt: created.Add(-time.Hour)}
 	newer := candidate{repo: "o/r", number: 7, updatedAt: created.Add(time.Hour)}
-	if !isDeduped(candidate{repo: "o/r", number: 6}, existing, managed) {
+	if !isDeduped(candidate{repo: "o/r", number: 6}, existing, managed, nil) {
 		t.Fatalf("in-flight issue #6 should be deduped")
 	}
-	if !isDeduped(older, existing, managed) {
+	if !isDeduped(older, existing, managed, nil) {
 		t.Fatalf("terminal issue with no new activity should be deduped")
 	}
-	if isDeduped(newer, existing, managed) {
+	if isDeduped(newer, existing, managed, nil) {
 		t.Fatalf("terminal issue with newer activity should be eligible")
 	}
 }
@@ -83,7 +83,7 @@ func TestDedupTerminalTaskWithActiveLabelIsDeduped(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	// issue has tatara-implementation label -> managed label present -> deduped
 	c := candidate{repo: "o/r", number: 5, labels: []string{"tatara-implementation"}, updatedAt: created.Add(time.Hour)}
-	if !isDeduped(c, existing, managed) {
+	if !isDeduped(c, existing, managed, nil) {
 		t.Fatalf("terminal task + active managed label should be deduped (orphan; backstop handles)")
 	}
 }
@@ -96,7 +96,7 @@ func TestDedupTerminalTaskNoLabelNewActivityEligible(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	// no managed label, new activity -> eligible for fresh triage
 	c := candidate{repo: "o/r", number: 5, labels: []string{}, updatedAt: created.Add(time.Hour)}
-	if isDeduped(c, existing, managed) {
+	if isDeduped(c, existing, managed, nil) {
 		t.Fatalf("terminal task + no managed label + new activity should be eligible")
 	}
 }
@@ -109,7 +109,7 @@ func TestDedupTerminalTaskNoLabelNoNewActivityDeduped(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	// no managed label, updatedAt == creation -> deduped
 	c := candidate{repo: "o/r", number: 5, labels: []string{}, updatedAt: created.Time}
-	if !isDeduped(c, existing, managed) {
+	if !isDeduped(c, existing, managed, nil) {
 		t.Fatalf("terminal task + no managed label + no new activity should be deduped")
 	}
 }
@@ -118,7 +118,7 @@ func TestDedupNonTerminalTaskAlwaysDeduped(t *testing.T) {
 	existing := []tatarav1alpha1.Task{mkCronTask("o/r", 5, "issueLifecycle", "", "Planning")}
 	managed := managedPhaseLabels(nil)
 	c := candidate{repo: "o/r", number: 5, labels: []string{"tatara-implementation"}, updatedAt: time.Now()}
-	if !isDeduped(c, existing, managed) {
+	if !isDeduped(c, existing, managed, nil) {
 		t.Fatalf("non-terminal task should always be deduped")
 	}
 }
@@ -131,7 +131,7 @@ func TestDedupDeclinedLabelIsDeduped(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	// declined is in managedPhaseLabels -> suppressed
 	c := candidate{repo: "o/r", number: 5, labels: []string{"tatara-declined"}, updatedAt: created.Add(time.Hour)}
-	if !isDeduped(c, existing, managed) {
+	if !isDeduped(c, existing, managed, nil) {
 		t.Fatalf("terminal task + tatara-declined label should be deduped")
 	}
 }
@@ -144,7 +144,7 @@ func TestDedupPRHeadShaUnchanged(t *testing.T) {
 	managed := managedPhaseLabels(nil)
 	// PR same headSHA -> deduped
 	c := candidate{repo: "o/r", number: 5, headSHA: "sha1", isPR: true, updatedAt: created.Add(time.Hour)}
-	if !isDeduped(c, existing, managed) {
+	if !isDeduped(c, existing, managed, nil) {
 		t.Fatalf("PR terminal task at same headSHA should be deduped")
 	}
 }
@@ -227,5 +227,35 @@ func TestHasLiveOrAdoptableTask(t *testing.T) {
 				t.Fatalf("hasLiveOrAdoptableTask returned=%v, want adoptable=%v", got != nil, tc.wantName)
 			}
 		})
+	}
+}
+
+func TestIsDeduped_BotCommentDoesNotFreeKey(t *testing.T) {
+	created := metav1.Now()
+	terminal := mkCronTask("o/r", 7, "issueLifecycle", "", "Succeeded")
+	terminal.Status.LifecycleState = "Parked"
+	terminal.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{terminal}
+	managed := managedPhaseLabels(nil)
+
+	// Candidate updatedAt advanced past creation (as a bot comment would do).
+	c := candidate{repo: "o/r", number: 7, updatedAt: created.Add(time.Hour)}
+
+	// Legacy nil predicate: updatedAt advanced -> NOT deduped (eligible). Unchanged behavior.
+	if isDeduped(c, existing, managed, nil) {
+		t.Fatalf("nil predicate: updatedAt advanced should be eligible (legacy behavior)")
+	}
+
+	// Human-activity predicate that reports NO human comment since the Task creation
+	// (i.e. only the bot commented): the key must stay HELD -> deduped.
+	noHuman := func(_ candidate, _ time.Time) bool { return false }
+	if !isDeduped(c, existing, managed, noHuman) {
+		t.Fatalf("bot-only activity must keep the dedup key held (deduped)")
+	}
+
+	// Human comment present after creation -> key freed -> eligible.
+	yesHuman := func(_ candidate, _ time.Time) bool { return true }
+	if isDeduped(c, existing, managed, yesHuman) {
+		t.Fatalf("human activity must free the dedup key (eligible)")
 	}
 }

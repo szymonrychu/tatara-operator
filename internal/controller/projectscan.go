@@ -184,8 +184,15 @@ func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatara
 //     handled by the live Task above; terminal+label => orphan the backstop
 //     resumes; declined => no action). No managed label -> legacy/untracked, fall
 //     back to activity-vs-creation so a stale terminal Task is not re-triaged
-//     unless the issue saw new activity.
-func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string) bool {
+//     unless the issue saw new HUMAN activity.
+//
+// humanActivity gates the no-managed-label terminal path: it reports whether the
+// issue saw human activity strictly after `since` (the terminal Task's creation).
+// nil means use the legacy candidate.updatedAt comparison (pure callers/tests).
+// Production callers pass a closure built from the SCM reader + botLogin so the
+// operator's OWN park/discuss comments (which advance updatedAt) never free the
+// dedup key and respawn a duplicate (scm-author-vs-actor-egress-gate pattern).
+func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string, humanActivity func(c candidate, since time.Time) bool) bool {
 	repoLabel := sanitizeRepoLabel(c.repo)
 	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
@@ -206,7 +213,11 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string) bo
 		if hasAnyLabel(c.labels, managed) {
 			return true
 		}
-		if !c.updatedAt.After(t.CreationTimestamp.Time) {
+		if humanActivity != nil {
+			if !humanActivity(c, t.CreationTimestamp.Time) {
+				return true
+			}
+		} else if !c.updatedAt.After(t.CreationTimestamp.Time) {
 			return true
 		}
 	}
@@ -680,7 +691,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing, managed) {
+		if isDeduped(c, existing, managed, nil) {
 			r.Metrics.ScanItem("mrScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
@@ -865,7 +876,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	managed := managedPhaseLabels(proj.Spec.Scm)
 	var eligible []candidate
 	for _, c := range cands {
-		if isDeduped(c, existing, managed) {
+		if isDeduped(c, existing, managed, nil) {
 			r.Metrics.ScanItem("issueScan", "skipped_dedup")
 		} else {
 			eligible = append(eligible, c)
