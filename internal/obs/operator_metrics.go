@@ -46,6 +46,7 @@ type OperatorMetrics struct {
 	taskTerminalTotal         *prometheus.CounterVec
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
+	memoryRetrievalProbe      *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -229,6 +230,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_lightrag_query_errors_total",
 			Help: "Failed attempts to read document counts from a project's lightrag.",
 		}),
+		// Unauthenticated route-presence probe of each project's tatara-memory
+		// retrieval surface. result is "present" (route served any non-404 status,
+		// e.g. a 401 auth rejection that still proves the route exists), "absent"
+		// (404 -> drifted/stale binary), or "error" (transport failure -> down).
+		memoryRetrievalProbe: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_memory_retrieval_probe_total",
+			Help: "Unauthenticated route-presence probes of a project's tatara-memory retrieval surface by route and result.",
+		}, []string{"route", "result"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -271,6 +280,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.taskTerminalTotal,
 		m.lightragDocuments,
 		m.lightragQueryErrors,
+		m.memoryRetrievalProbe,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -339,6 +349,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			m.restapiRequestsTotal.WithLabelValues(endpoint, result)
 		}
 		m.restapiRequestDuration.WithLabelValues(endpoint)
+	}
+	// Pre-seed the memory retrieval-probe series so the route x result matrix
+	// exists at a zero baseline before the first probe (alertable from startup).
+	// The route labels must mirror memoryProbeRoutes in the controller package.
+	for _, route := range []string{"/queries", "/code-graph/stats"} {
+		for _, result := range []string{"present", "absent", "error"} {
+			m.memoryRetrievalProbe.WithLabelValues(route, result)
+		}
 	}
 	return m
 }
@@ -595,6 +613,12 @@ func (m *OperatorMetrics) SetLightragDocuments(project, status string, n int) {
 // best-effort read of a project's lightrag document counts failed.
 func (m *OperatorMetrics) LightragQueryError() {
 	m.lightragQueryErrors.Inc()
+}
+
+// MemoryRetrievalProbe increments operator_memory_retrieval_probe_total for a
+// probed route and result ("present", "absent", or "error").
+func (m *OperatorMetrics) MemoryRetrievalProbe(route, result string) {
+	m.memoryRetrievalProbe.WithLabelValues(route, result).Inc()
 }
 
 // TaskTerminal increments operator_task_terminal_total for a Task reaching a

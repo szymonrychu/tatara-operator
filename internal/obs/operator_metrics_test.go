@@ -858,3 +858,64 @@ func TestSetLightragDocuments(t *testing.T) {
 		t.Fatalf("operator_lightrag_query_errors_total = %v, want 2", got)
 	}
 }
+
+func TestMemoryRetrievalProbe(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.MemoryRetrievalProbe("/queries", "present")
+	m.MemoryRetrievalProbe("/queries", "absent")
+	m.MemoryRetrievalProbe("/queries", "absent")
+	m.MemoryRetrievalProbe("/code-graph/stats", "error")
+
+	if got := testutil.ToFloat64(m.memoryRetrievalProbe.WithLabelValues("/queries", "present")); got != 1 {
+		t.Fatalf("probe{/queries,present} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.memoryRetrievalProbe.WithLabelValues("/queries", "absent")); got != 2 {
+		t.Fatalf("probe{/queries,absent} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.memoryRetrievalProbe.WithLabelValues("/code-graph/stats", "error")); got != 1 {
+		t.Fatalf("probe{/code-graph/stats,error} = %v, want 1", got)
+	}
+}
+
+// The probe matrix (route x result) must be pre-seeded so every series exists at
+// a zero baseline before the first probe, for alerts on a sudden absent/error spike.
+func TestMemoryRetrievalProbe_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	type key struct{ route, result string }
+	want := map[key]bool{}
+	for _, route := range []string{"/queries", "/code-graph/stats"} {
+		for _, result := range []string{"present", "absent", "error"} {
+			want[key{route, result}] = false
+		}
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_memory_retrieval_probe_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			var route, result string
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "route" {
+					route = lp.GetValue()
+				}
+				if lp.GetName() == "result" {
+					result = lp.GetValue()
+				}
+			}
+			want[key{route, result}] = true
+		}
+	}
+	for k, seen := range want {
+		if !seen {
+			t.Errorf("operator_memory_retrieval_probe_total{route=%q,result=%q} not pre-seeded", k.route, k.result)
+		}
+	}
+}
