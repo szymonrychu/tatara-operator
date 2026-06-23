@@ -94,6 +94,28 @@ func TestBuildTaskFromQueuedEvent(t *testing.T) {
 	}
 }
 
+func TestBuildTaskFromQueuedEvent_SystemicGroup(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe1", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{Payload: tatarav1alpha1.QueuedEventPayload{
+			Kind: "issueLifecycle", RepositoryRef: "r", Goal: "g", GenerateName: "scan-",
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{
+				SystemicID: "abc", SameRepoSiblings: []int{12, 15}, CrossRepo: []string{"o/r2#3 - x"},
+			},
+		}},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Spec.SystemicGroup == nil || task.Spec.SystemicGroup.SystemicID != "abc" ||
+		len(task.Spec.SystemicGroup.SameRepoSiblings) != 2 || len(task.Spec.SystemicGroup.CrossRepo) != 1 {
+		t.Fatalf("SystemicGroup not mapped: %+v", task.Spec.SystemicGroup)
+	}
+}
+
 func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()

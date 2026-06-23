@@ -35,6 +35,8 @@ type QueuedEventPayload struct {
 	// Provider + PodRepo feed agent.StampPodName on the rebuilt Task.
 	Provider string `json:"provider,omitempty"`
 	PodRepo  string `json:"podRepo,omitempty"`
+	// +optional
+	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
 }
 
 type QueuedEventSpec struct {

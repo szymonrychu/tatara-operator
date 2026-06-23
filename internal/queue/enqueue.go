@@ -166,6 +166,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 			Goal:          p.Goal,
 			Kind:          p.Kind,
 			Source:        p.Source,
+			SystemicGroup: p.SystemicGroup,
 		},
 	}
 	agent.StampPodName(task, proj.Name, p.Provider, p.PodRepo)

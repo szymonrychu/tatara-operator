@@ -7,6 +7,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// SystemicGroup describes the systemic-improvement group a lead issue owns.
+type SystemicGroup struct {
+	SystemicID       string   `json:"systemicId"`
+	SameRepoSiblings []int    `json:"sameRepoSiblings,omitempty"` // sibling issue numbers in THIS repo, closed by the lead PR
+	CrossRepo        []string `json:"crossRepo,omitempty"`        // "owner/repo#N - title" references, context only
+}
+
 // ProposedIssueSpec is a tatara-proposed issue awaiting human approval.
 type ProposedIssueSpec struct {
 	RepositoryRef string `json:"repositoryRef"`
@@ -174,6 +181,11 @@ type TaskSpec struct {
 	// existing Tasks are unaffected.
 	// +optional
 	ReposInScope []string `json:"reposInScope,omitempty"`
+	// SystemicGroup, when set, marks this Task as the lead for a brainstorm
+	// systemic group: it resolves SameRepoSiblings in one combined PR and is
+	// aware of CrossRepo siblings (reference only).
+	// +optional
+	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
 }
 
 // TaskTerminal reports whether t has reached a terminal state, accounting for
