@@ -87,9 +87,14 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA:0:7}"
           VERSION="$(git describe --tags --always --dirty)"
+          # 'g' prefix (git-describe convention) keeps the prerelease a valid
+          # semver alphanumeric identifier. A bare short SHA that is all digits
+          # with a leading zero (e.g. 0707870) is an invalid numeric prerelease
+          # identifier and helm package rejects it ("version segment starts with 0").
+          CHART_VERSION="0.0.0-g${SHORT_SHA}"
           helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
           for dir in charts/*/; do
             NAME="$(basename "$dir")"
-            helm package "$dir" --version "0.0.0-${SHORT_SHA}" --app-version "${VERSION}"
-            helm push "${NAME}-0.0.0-${SHORT_SHA}.tgz" oci://harbor.szymonrichert.pl/charts
+            helm package "$dir" --version "${CHART_VERSION}" --app-version "${VERSION}"
+            helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
           done
