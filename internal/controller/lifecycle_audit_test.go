@@ -153,11 +153,87 @@ func TestRecordGiveup_Refused(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 
-	if v := testutil.ToFloat64(lm.GiveupTotal("refused")); v != 1 {
-		t.Errorf("giveup{refused} = %v, want 1", v)
+	if v := testutil.ToFloat64(lm.GiveupTotal("refused-declined")); v != 1 {
+		t.Errorf("giveup{refused-declined} = %v, want 1", v)
 	}
 	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
 		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	}
+}
+
+// TestRecordGiveup_AlreadyDone verifies an already_done outcome parks via the
+// codified-terminal path with giveup reason "refused-already-done" and
+// LifecycleState park reason "refused-already-done".
+func TestRecordGiveup_AlreadyDone(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "audit-giveup-alreadydone"
+	proj := "audit-gad-proj"
+	repo := "audit-gad-repo"
+	sec := "audit-gad-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#405",
+		URL: "https://github.com/o/r/issues/405", Number: 405,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
+		Action: "already_done", Reason: "fix already committed on the shared branch in PR #101",
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &noChangeRecordingSCMWriter{}
+	r, lm, _ := newAuditReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	if v := testutil.ToFloat64(lm.GiveupTotal("refused-already-done")); v != 1 {
+		t.Errorf("giveup{refused-already-done} = %v, want 1", v)
+	}
+	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
+		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	}
+}
+
+// TestRecordGiveup_RefusedDeclinedLabel verifies the declined codified path
+// now records giveup label "refused-declined" (split from the old "refused").
+func TestRecordGiveup_RefusedDeclinedLabel(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "audit-giveup-refdecl"
+	proj := "audit-grd-proj"
+	repo := "audit-grd-repo"
+	sec := "audit-grd-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#406",
+		URL: "https://github.com/o/r/issues/406", Number: 406,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
+		Action: "declined", Reason: "out of scope, tracked elsewhere",
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &noChangeRecordingSCMWriter{}
+	r, lm, _ := newAuditReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	if v := testutil.ToFloat64(lm.GiveupTotal("refused-declined")); v != 1 {
+		t.Errorf("giveup{refused-declined} = %v, want 1", v)
 	}
 }
 

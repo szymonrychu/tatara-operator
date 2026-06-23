@@ -1505,12 +1505,23 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		const emptyRetryCap = 2
 
 		outcome := fresh.Status.ImplementOutcome
-		if outcome != nil && outcome.Action == "declined" && strings.TrimSpace(outcome.Reason) != "" {
-			// CODIFIED REFUSAL: agent explicitly declined via decline_implementation.
-			// Post the reason as an issue comment, apply the declined label,
-			// park with reason "refused", clear ImplementOutcome, reset retries.
-			l.Info("implement: agent declared decline; parking as refused",
-				"action", "lifecycle_implement_refused", "resource_id", task.Name)
+		codifiedTerminal := outcome != nil &&
+			(outcome.Action == "declined" || outcome.Action == "already_done") &&
+			strings.TrimSpace(outcome.Reason) != ""
+		if codifiedTerminal {
+			// Per-action park reason + giveup metric label.
+			parkReason := "refused"
+			giveupReason := "refused-declined"
+			if outcome.Action == "already_done" {
+				parkReason = "refused-already-done"
+				giveupReason = "refused-already-done"
+			}
+			// CODIFIED TERMINAL: agent explicitly declared outcome via decline_implementation
+			// or already_done. Post the reason as an issue comment, apply the declined label,
+			// park with action-specific reason, clear ImplementOutcome, reset retries.
+			l.Info("implement: agent declared codified terminal outcome; parking",
+				"action", "lifecycle_implement_codified_terminal", "resource_id", task.Name,
+				"impl_action", outcome.Action, "park_reason", parkReason)
 			// Capture the Project from scmContext so we can pass it to ensurePhaseLabel
 			// without a redundant Get (finding 15).
 			if refusalProj, _, writer, token, provider, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
@@ -1518,7 +1529,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 					cerr := writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, outcome.Reason)
 					r.recordSCM(provider, "comment", cerr)
 					if cerr != nil {
-						l.Error(cerr, "implement: post refusal comment (non-fatal)", "resource_id", task.Name)
+						l.Error(cerr, "implement: post outcome comment (non-fatal)", "resource_id", task.Name)
 					}
 				}
 				// Use the Project returned by scmContext (no redundant Get, finding 15).
@@ -1526,13 +1537,13 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 					l.Error(err, "implement: apply declined label (non-fatal)", "resource_id", task.Name)
 				}
 			} else {
-				l.Error(scmErr, "implement: scm context for refusal comment (non-fatal)", "resource_id", task.Name)
+				l.Error(scmErr, "implement: scm context for outcome comment (non-fatal)", "resource_id", task.Name)
 			}
-			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused"); err != nil {
+			if err := r.setLifecycleState(ctx, fresh, "Parked", parkReason); err != nil {
 				return ctrl.Result{}, err
 			}
 			if r.LifecycleMetrics != nil {
-				r.LifecycleMetrics.RecordGiveup("refused")
+				r.LifecycleMetrics.RecordGiveup(giveupReason)
 			}
 			if err := r.clearImplementOutcome(ctx, fresh); err != nil {
 				return ctrl.Result{}, err
