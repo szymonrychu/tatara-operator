@@ -10,8 +10,8 @@ func TestBrainstormGoalDropsCommentPathAddsEarlyExit(t *testing.T) {
 	if strings.Contains(g, "comment_on_issue") {
 		t.Fatal("brainstorm goal must NOT instruct comment_on_issue (path-2 dropped)")
 	}
-	if !strings.Contains(g, "skip_brainstorm") {
-		t.Fatal("brainstorm goal must instruct skip_brainstorm early-exit")
+	if !strings.Contains(g, "skip_research") {
+		t.Fatal("brainstorm goal must instruct skip_research early-exit")
 	}
 	if !strings.Contains(g, "propose_issue") {
 		t.Fatal("brainstorm goal must keep propose_issue path")

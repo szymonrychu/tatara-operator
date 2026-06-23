@@ -109,6 +109,12 @@ type Config struct {
 	// Defaults to DefaultTaskRetention and is clamped up to MinTaskRetention so GC
 	// can never delete a Task that still anchors a dedup/cooldown window.
 	TaskRetention time.Duration
+	// SerenaURL, when non-empty, is the in-cluster URL of the Serena
+	// code-intelligence MCP server. Read from TATARA_SERENA_URL. Empty by default
+	// (Phase 1: code path wired, no server deployed). Passed through to PodConfig
+	// so BuildPod can inject it as TATARA_SERENA_URL into agent pods.
+	SerenaURL string
+
 	// CallbackHMACSecret, when non-empty, activates HMAC-SHA256 verification on
 	// the /internal/turn-complete callback endpoint. Set from
 	// CALLBACK_HMAC_SECRET (the operator reads the raw value via SecretKeyRef so
@@ -293,6 +299,7 @@ func Load() (Config, error) {
 		TaskRetention:            taskRetention,
 		CallbackHMACSecret:       os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:   os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
+		SerenaURL:                os.Getenv("TATARA_SERENA_URL"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

@@ -2,6 +2,10 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] feat/deep-architectural-research P1: brainstorm goal variant (tatara-deep-architectural-research skill named, skip_research token, ADR/RFC intent), skip_brainstorm->skip_research rename, brainstorm-outcome contract lock tests, Serena MCP env-gate (TATARA_SERENA_URL), archfitness SCM-isolation fitness function. Branch committed; await wrapper + cli sister PRs before deploy.
+- [ ] Phase 2: deploy Serena MCP server + wire TATARA_SERENA_URL value (helmfile); external-research MCP servers (arXiv/OpenAlex) + architectural-research egress.
+- [ ] Phase 3: SCMProvider port extraction (strangler) once the archfitness fitness function trips on a real introduced coupling.
+
 - [x] S3 conversation persistence (issue #114): cross-pod conversation resume via S3 (Task.Status.ConversationObjectKey/SessionID + BuildPod CONVERSATION_* env + turn-complete recording), 25% resume-vs-compaction hybrid (HandoverThresholdPercent default 50->25, mutually exclusive with full replay), brainstorm conversation forked per issue (copy-object), review/test agent for ALL MRs incl. user-authored (reviewText + PR-head read-only checkout), and reaper S3 GC when a batch fully closes (internal/objstore + operator_conversation_gc_total). Off until s3Bucket set. Branch tatara/fix-114-...; awaiting deploy (helmfile wiring + pin bump).
 - [x] Project-level brainstorm (one Task per project per cycle, not per-repo): summed backlog, project-scoped in-flight guard, deterministic primary repo, updated goal prompt listing all repos. CRD MaxOpenProposals default 3->5 (project-wide). PR feat/project-level-brainstorm; awaiting deploy.
 

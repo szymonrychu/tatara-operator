@@ -141,6 +141,7 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		Tolerations:            cfg.Scheduling.Tolerations,
 		Affinity:               cfg.Scheduling.Affinity,
 		CallbackHMACSecretName: cfg.CallbackHMACSecretName,
+		SerenaURL:              cfg.SerenaURL,
 		S3Endpoint:             cfg.S3Endpoint,
 		S3Bucket:               cfg.S3Bucket,
 		S3Region:               cfg.S3Region,

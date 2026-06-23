@@ -39,7 +39,7 @@ func TestBrainstormGoalProject_ContainsDedupInstructions(t *testing.T) {
 	}
 
 	// Dedup-first: must instruct agent to check existing issues first.
-	for _, kw := range []string{"duplicate", "propose_issue", "skip_brainstorm"} {
+	for _, kw := range []string{"duplicate", "propose_issue", "skip_research"} {
 		if !strings.Contains(g, kw) {
 			t.Fatalf("goal missing dedup keyword %q: %s", kw, g)
 		}
