@@ -143,6 +143,14 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 
 	var prURLs []string
 	var lastSkipStatus int
+	// inScope is the declarative cross-repo scope (CR names). When a repo in this
+	// set produces no branch (422 no commits) we warn on the issue instead of
+	// skipping silently (Defect A1).
+	inScope := make(map[string]bool, len(task.Spec.ReposInScope))
+	for _, name := range task.Spec.ReposInScope {
+		inScope[name] = true
+	}
+	var inScopeNoBranch []string
 	for _, repo := range ordered {
 		body := baseBody
 		// Append "Closes #N" for the primary repo of an issue-linked lifecycle task
@@ -169,9 +177,16 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 				// empty-implement / 'refused' branch.
 				skipReason := openChangeSkipReason(he)
 				if skipReason == "no-change" {
-					l.Info("writeback: implement produced no changes (branch has no commits)",
-						"action", "writeback_no_change", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
-					r.Metrics.WritebackOutcome("no_change")
+					if inScope[repo.Name] {
+						l.Info("writeback: in-scope repo produced no commits; will warn on issue",
+							"action", "writeback_in_scope_no_branch", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
+						inScopeNoBranch = append(inScopeNoBranch, repo.Name)
+						r.Metrics.WritebackOutcome("in_scope_no_branch")
+					} else {
+						l.Info("writeback: implement produced no changes (branch has no commits)",
+							"action", "writeback_no_change", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
+						r.Metrics.WritebackOutcome("no_change")
+					}
 				} else if skipReason == "already-exists" {
 					if recovered, rerr := r.recoverExistingPRURL(ctx, token, provider, repo.Spec.URL, sourceBranch); rerr == nil && recovered != "" {
 						l.Info("writeback: pr/mr already exists, recovered url",
@@ -209,6 +224,21 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			if perr := r.persistPrimaryPRURL(ctx, task, prURLs[0]); perr != nil {
 				return ctrl.Result{}, perr
 			}
+		}
+	}
+
+	// Warn on the source issue for any in-scope repo that yielded no branch.
+	// Best-effort and non-fatal: other repos' MRs still open (no atomicity, KISS).
+	if len(inScopeNoBranch) > 0 && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
+		warnBody := "WARNING: this issue was declared to span repos that produced no change. " +
+			"The following in-scope repo(s) had no commits on branch `" + sourceBranch + "` and got no PR/MR: " +
+			strings.Join(inScopeNoBranch, ", ") + ". " +
+			"If those repos genuinely need no change this is expected; otherwise the cross-repo edit was lost - re-run or fix manually."
+		werr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, warnBody)
+		r.recordSCM(provider, "comment", werr)
+		if werr != nil {
+			l.Error(werr, "writeback: in-scope no-branch warning comment (non-fatal)",
+				"action", "writeback_in_scope_warn_failed", "issue_ref", task.Spec.Source.IssueRef, "repos", strings.Join(inScopeNoBranch, ","))
 		}
 	}
 

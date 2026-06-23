@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1019,4 +1020,49 @@ func TestWriteback_NoGoalEchoInPRCommentWhenEmptyResult(t *testing.T) {
 	require.Len(t, fw.commentArgs, 1)
 	require.Contains(t, fw.commentArgs[0], "pull/9")
 	require.NotContains(t, fw.commentArgs[0], task.Spec.Goal, "must not echo the issue body/goal in the PR comment")
+}
+
+func TestWriteback_InScopeRepoNoBranchWarns(t *testing.T) {
+	// In-scope repo produced no commits (422 No commits) -> must warn on the issue,
+	// not skip silently.
+	fw := &fakeWriter{openErr: &scm.HTTPError{Status: 422, Body: "No commits between main and tatara/task-x", Path: "/pulls"}}
+	r := newWriteBackReconciler(t, fw)
+	task := seedWritebackPending(t, "wb-inscope", "wb-scm-inscope", "wb-proj-inscope", "wb-repo-inscope")
+
+	// Mark the single repo in scope.
+	task.Spec.ReposInScope = []string{"wb-repo-inscope"}
+	require.NoError(t, k8sClient.Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	var warned bool
+	for _, c := range fw.commentArgs {
+		if strings.Contains(c, "o/r#7|") && strings.Contains(c, "wb-repo-inscope") && strings.Contains(strings.ToLower(c), "warning") {
+			warned = true
+		}
+	}
+	require.True(t, warned, "in-scope repo with no branch must produce a WARNING comment; got %v", fw.commentArgs)
+}
+
+func TestWriteback_OutOfScopeRepoNoBranchSilent(t *testing.T) {
+	// Repo with no commits but NOT in scope -> keep today's silent no_change skip
+	// (no warning comment beyond the existing report-only result comment).
+	fw := &fakeWriter{openErr: &scm.HTTPError{Status: 422, Body: "No commits between main and tatara/task-x", Path: "/pulls"}}
+	r := newWriteBackReconciler(t, fw)
+	task := seedWritebackPending(t, "wb-outscope", "wb-scm-outscope", "wb-proj-outscope", "wb-repo-outscope")
+	// ReposInScope left nil.
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	for _, c := range fw.commentArgs {
+		if strings.Contains(strings.ToLower(c), "warning") {
+			t.Fatalf("out-of-scope no-branch repo must not warn; got comment %q", c)
+		}
+	}
 }
