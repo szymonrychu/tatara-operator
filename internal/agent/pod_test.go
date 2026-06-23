@@ -823,6 +823,32 @@ func TestBuildPod_S3ForkFromKey(t *testing.T) {
 	require.False(t, ok, "no fork env without the annotation")
 }
 
+func TestBuildPod_ReviewChecksOutPRHeadAndDoesNotPush(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	task.Spec.Kind = "review"
+	task.Spec.Source = &tatarav1alpha1.TaskSource{Number: 77, IsPR: true}
+	task.Annotations = map[string]string{tatarav1alpha1.AnnReviewHeadBranch: "feature/user-pr"}
+
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	tb, _ := envValue(c, "TASK_BRANCH")
+	require.Equal(t, "", tb, "review must not push: TASK_BRANCH empty")
+	cb, ok := envValue(c, "CHECKOUT_BRANCH")
+	require.True(t, ok)
+	require.Equal(t, "feature/user-pr", cb, "review checks out the PR head")
+}
+
+func TestBuildPod_ReviewWithoutHeadBranchFallsBackToTaskBranch(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	task.Spec.Kind = "review"
+	task.Spec.Source = &tatarav1alpha1.TaskSource{Number: 77, IsPR: true}
+	// No AnnReviewHeadBranch -> behaves as before (synthetic task branch, no checkout override).
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	tb, _ := envValue(c, "TASK_BRANCH")
+	require.NotEmpty(t, tb, "without a head branch the review keeps the default task branch")
+	_, ok := envValue(c, "CHECKOUT_BRANCH")
+	require.False(t, ok, "no CHECKOUT_BRANCH without a head branch")
+}
+
 func TestBuildPod_S3NoCredsWhenSecretEmpty(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	cfg.S3Bucket = "tatara-conversations" // no S3SecretName -> default cred chain (IRSA)

@@ -224,15 +224,16 @@ func lastTerminalNoLabelTask(c candidate, existing []tatarav1alpha1.Task, manage
 // for selection + dedup. number/repo identify it; labels drive priority;
 // updatedAt drives stale-first ordering. body is used for PR "Closes #N" parsing.
 type candidate struct {
-	repo      string
-	number    int
-	author    string
-	headSHA   string
-	body      string
-	labels    []string
-	updatedAt time.Time
-	isPR      bool
-	title     string
+	repo       string
+	number     int
+	author     string
+	headSHA    string
+	headBranch string
+	body       string
+	labels     []string
+	updatedAt  time.Time
+	isPR       bool
+	title      string
 }
 
 func hasLabel(labels []string, want string) bool {
@@ -261,8 +262,9 @@ func candidatesFromPRs(prs []scm.PRRef) []candidate {
 	for _, p := range prs {
 		out = append(out, candidate{
 			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
-			body: p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
-			title: firstLine(p.Body),
+			headBranch: p.HeadBranch,
+			body:       p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
+			title:      firstLine(p.Body),
 		})
 	}
 	return out
@@ -704,8 +706,14 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				created++
 			}
 		} else {
-			goal := fmt.Sprintf("Triage review PR %s#%d", c.repo, c.number)
-			ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, nil)
+			goal := fmt.Sprintf("Review and test PR %s#%d", c.repo, c.number)
+			// Carry the PR head branch so the review pod checks it out read-only and
+			// can run/test the change (issue #114 decision 4).
+			var reviewAnn map[string]string
+			if c.headBranch != "" {
+				reviewAnn = map[string]string{tatarav1alpha1.AnnReviewHeadBranch: c.headBranch}
+			}
+			ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, reviewAnn)
 			if err != nil {
 				l.Error(err, "scan: enqueue mrScan task", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")

@@ -57,6 +57,26 @@ func lifecyclePhaseGuidance(state string) string {
 		state, state, durable)
 }
 
+// reviewText is the turn-0 prompt for a kind=review Task (MR/PR review, issue
+// #114 decision 4). The PR head is checked out in the workspace so the agent can
+// review AND test it; it MUST submit a verdict via review_verdict and never
+// pushes (the review pod has no push branch).
+func reviewText(goal, project, task string) string {
+	return fmt.Sprintf(
+		"You are working on Task `%s` in Project `%s`. "+
+			"Use the tatara MCP tools with task=`%s` (and project=`%s`).\n\n"+
+			"%s\n\n"+
+			"This is an MR/PR REVIEW. The pull request's head branch is already checked out "+
+			"in the workspace under `/workspace/<owner>/<repo>`, so you can read the diff AND "+
+			"actually run it. Your job:\n"+
+			"1. Review the change for correctness, security, and quality.\n"+
+			"2. TEST it: build it and run the repo's tests/linters where present; note what you ran and the result.\n"+
+			"3. Submit your verdict with the `review_verdict` MCP tool - this is REQUIRED before you finish.\n\n"+
+			"Do NOT commit, push, or open a PR: the workspace is transient and read-only for review, and nothing "+
+			"you change on disk is kept. Communicate only through the review verdict.",
+		task, project, task, project, goal)
+}
+
 // nextPendingSubtask returns the lowest-order Pending subtask, if any.
 func nextPendingSubtask(subs []tatarav1alpha1.Subtask) (*tatarav1alpha1.Subtask, bool) {
 	pending := make([]tatarav1alpha1.Subtask, 0, len(subs))

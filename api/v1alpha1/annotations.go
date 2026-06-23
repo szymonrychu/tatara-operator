@@ -41,6 +41,10 @@ const (
 	// conversation onto the issue's own key.
 	AnnParentConversationKey   = "tatara.dev/parent-conversation-key"
 	AnnForkFromConversationKey = "tatara.dev/fork-from-conversation-key"
+	// AnnReviewHeadBranch carries the PR/MR head (source) branch on a review Task
+	// so its pod checks out the PR head read-only and can run/test it (issue #114
+	// decision 4). The review agent never pushes (its TASK_BRANCH stays empty).
+	AnnReviewHeadBranch = "tatara.dev/review-head-branch"
 )
 
 // LifecycleEntryAnnotation carries the entry LifecycleState for a newly

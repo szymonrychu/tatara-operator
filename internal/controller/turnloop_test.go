@@ -125,6 +125,23 @@ func TestLifecycleTriageText_ApprovalInstructions(t *testing.T) {
 	}
 }
 
+func TestReviewText_ReviewAndTestAndVerdict(t *testing.T) {
+	txt := reviewText("Review and test PR o/r#5", "proj1", "task-rev")
+	low := strings.ToLower(txt)
+	if !strings.Contains(low, "review") || !strings.Contains(low, "test") {
+		t.Errorf("review prompt must mention review AND test: %q", txt)
+	}
+	if !strings.Contains(txt, "review_verdict") {
+		t.Errorf("review prompt must require the review_verdict tool: %q", txt)
+	}
+	if !strings.Contains(low, "do not commit") && !strings.Contains(low, "not push") {
+		t.Errorf("review prompt must say not to push/commit: %q", txt)
+	}
+	if !strings.Contains(txt, "task-rev") || !strings.Contains(txt, "proj1") {
+		t.Errorf("review prompt missing task/project: %q", txt)
+	}
+}
+
 func TestLifecyclePhaseGuidance_CommentPhaseNotRestored(t *testing.T) {
 	g := lifecyclePhaseGuidance("Triage")
 	if !strings.Contains(g, "Lifecycle phase: Triage") {

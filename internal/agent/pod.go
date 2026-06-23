@@ -384,6 +384,18 @@ func ConversationKey(task *tatarav1alpha1.Task) string {
 // TATARA_REPOS is set to all repos sorted by name (deterministic, no primary).
 func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, repos []tatarav1alpha1.Repository, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
 	env := []corev1.EnvVar{}
+	// Branch wiring. Normal tasks push to TASK_BRANCH. An MR review (issue #114
+	// decision 4) instead checks out the PR head READ-ONLY via CHECKOUT_BRANCH and
+	// leaves TASK_BRANCH empty so the wrapper never pushes (and cannot clobber the
+	// user's PR).
+	taskBranchVal := TaskBranch(task)
+	checkoutBranchVal := ""
+	if task.Spec.Kind == "review" {
+		if hb := task.Annotations[tatarav1alpha1.AnnReviewHeadBranch]; hb != "" {
+			taskBranchVal = ""
+			checkoutBranchVal = hb
+		}
+	}
 	if repo != nil {
 		env = append(env,
 			corev1.EnvVar{Name: "REPO_URL", Value: repo.Spec.URL},
@@ -410,8 +422,9 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},
 		// Work branch the wrapper checks out and pushes; the operator opens the
-		// PR from this same branch (see TaskBranch).
-		{Name: "TASK_BRANCH", Value: TaskBranch(task)},
+		// PR from this same branch (see TaskBranch). Empty for review tasks, which
+		// check out the PR head via CHECKOUT_BRANCH and never push.
+		{Name: "TASK_BRANCH", Value: taskBranchVal},
 		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
 		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
 		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},
@@ -430,6 +443,10 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
 	}...)
+	// Review tasks check out the PR head read-only (no push); see taskBranchVal.
+	if checkoutBranchVal != "" {
+		env = append(env, corev1.EnvVar{Name: "CHECKOUT_BRANCH", Value: checkoutBranchVal})
+	}
 	// Inject callback HMAC secret when configured so the wrapper can sign its
 	// turn-complete callbacks (finding 1/r3). Delivered via SecretKeyRef (NOT a
 	// literal env value) so the secret never lands in the Pod spec / etcd object

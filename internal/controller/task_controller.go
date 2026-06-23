@@ -216,7 +216,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		repoPtr = &repo
 	}
 
+	// Review tasks (MR/PR review, issue #114 decision 4) get a review/test prompt
+	// instead of the implement-oriented plan prompt.
 	planText := planTurnText(task.Spec.Goal, taskBranch(&task), project.Name, task.Name)
+	if task.Spec.Kind == "review" {
+		planText = reviewText(task.Spec.Goal, project.Name, task.Name)
+	}
 	res, err := r.driveAgentRun(ctx, &project, repoPtr, &task, planText)
 	if err != nil {
 		r.Metrics.ReconcileResult("Task", "error")
