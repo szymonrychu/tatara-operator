@@ -542,6 +542,30 @@ func TestImplementOutcome_TaskNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestImplementOutcome_AlreadyDoneWrites(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"already_done","reason":"already committed on the shared branch"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ImplementOutcome)
+	require.Equal(t, "already_done", out.Status.ImplementOutcome.Action)
+	require.Equal(t, "already committed on the shared branch", out.Status.ImplementOutcome.Reason)
+}
+
+func TestImplementOutcome_AlreadyDoneEmptyReason(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
+	body := strings.NewReader(`{"action":"already_done","reason":"   "}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 // --- POST /tasks/{t}/brainstorm-outcome ---
 
 func TestBrainstormOutcomeRecordsNone(t *testing.T) {

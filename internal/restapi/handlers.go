@@ -880,12 +880,13 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "action required")
 		return
 	}
-	if req.Action != "declined" {
-		writeError(w, http.StatusBadRequest, "action must be declined")
+	validImplementActions := map[string]bool{"declined": true, "already_done": true}
+	if !validImplementActions[req.Action] {
+		writeError(w, http.StatusBadRequest, "action must be one of declined, already_done")
 		return
 	}
 	if strings.TrimSpace(req.Reason) == "" {
-		writeError(w, http.StatusBadRequest, "reason required when action is declined")
+		writeError(w, http.StatusBadRequest, "reason required (non-empty) for action "+req.Action)
 		return
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
