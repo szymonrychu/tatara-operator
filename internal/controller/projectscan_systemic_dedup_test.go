@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -79,5 +83,52 @@ func TestElectSystemicLeads(t *testing.T) {
 	r2lead := got["o/r2#9"]
 	if !r2lead.isLead || r2lead.leadNumber != 9 {
 		t.Fatalf("o/r2#9 should be its repo's lead: %+v", r2lead)
+	}
+}
+
+// TestIssueScan_SystemicDedup_CollapsesSiblings verifies that when two issues in
+// the same repo share a tatara/systemic-<id> label, only the lead (lowest number)
+// gets a QE and the sibling is skipped with a metric increment.
+func TestIssueScan_SystemicDedup_CollapsesSiblings(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, _ := seedScanProject(t, "systemic-dedup-same", cron)
+	repos := []tatarav1alpha1.Repository{
+		mkScanRepo(t, "systemic-dedup-same", "systemic-dedup-same-r", "https://github.com/o/r.git"),
+	}
+	// Two issues with the same systemic label in the same repo; #12 is lead (lowest).
+	reader := &fakeReader{issues: []scm.IssueRef{
+		{Repo: "o/r", Number: 15, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(200, 0), Title: "C"},
+		{Repo: "o/r", Number: 12, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(100, 0), Title: "A"},
+	}}
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+
+	qes := listScanQEs(t, "systemic-dedup-same")
+	if len(qes) != 1 {
+		t.Fatalf("want 1 QE (lead only), got %d", len(qes))
+	}
+	if qes[0].Spec.Payload.Source == nil || qes[0].Spec.Payload.Source.Number != 12 {
+		t.Fatalf("want QE for lead #12, got source=%+v", qes[0].Spec.Payload.Source)
+	}
+	// Lead QE must carry SystemicGroup.
+	sg := qes[0].Spec.Payload.SystemicGroup
+	if sg == nil || sg.SystemicID != "abc" {
+		t.Fatalf("lead QE must carry SystemicGroup with SystemicID=abc, got %+v", sg)
+	}
+	if len(sg.SameRepoSiblings) != 1 || sg.SameRepoSiblings[0] != 15 {
+		t.Fatalf("lead QE SameRepoSiblings want [15], got %v", sg.SameRepoSiblings)
+	}
+	// Sibling #15 must be counted as skipped_systemic_sibling.
+	sibCount := counterValue(t, reg, "tatara_scan_items_total", map[string]string{"activity": "issueScan", "outcome": "skipped_systemic_sibling"})
+	if sibCount < 1 {
+		t.Fatalf("skipped_systemic_sibling counter = %v, want >= 1", sibCount)
+	}
+	// SystemicSiblingCollapsed counter.
+	collapsedCount := counterValue(t, reg, "tatara_systemic_siblings_collapsed_total", map[string]string{"project": "systemic-dedup-same"})
+	if collapsedCount < 1 {
+		t.Fatalf("tatara_systemic_siblings_collapsed_total = %v, want >= 1", collapsedCount)
 	}
 }

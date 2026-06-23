@@ -427,7 +427,7 @@ func scanSourceFor(provider string, c candidate) *tatarav1alpha1.TaskSource {
 	return src
 }
 
-func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, labelCand, srcCand candidate, activity, kind, goal string, extraAnnotations map[string]string) (bool, error) {
+func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, labelCand, srcCand candidate, activity, kind, goal string, extraAnnotations map[string]string, systemicGroup *tatarav1alpha1.SystemicGroup) (bool, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
@@ -451,6 +451,7 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 		GenerateName:  "scan-",
 		Provider:      provider,
 		PodRepo:       repo.Name,
+		SystemicGroup: systemicGroup,
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
@@ -795,7 +796,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			}
 			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
-			ok2, err := r.createScanTask(ctx, proj, &repo, labelCand, srcCand, "mrScan", "issueLifecycle", goal, ann)
+			ok2, err := r.createScanTask(ctx, proj, &repo, labelCand, srcCand, "mrScan", "issueLifecycle", goal, ann, nil)
 			if err != nil {
 				l.Error(err, "scan: enqueue mrScan issueLifecycle event", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
@@ -813,7 +814,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if c.headBranch != "" {
 				reviewAnn = map[string]string{tatarav1alpha1.AnnReviewHeadBranch: c.headBranch}
 			}
-			ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, reviewAnn)
+			ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "mrScan", "review", goal, reviewAnn, nil)
 			if err != nil {
 				l.Error(err, "scan: enqueue mrScan task", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
@@ -945,8 +946,28 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			eligible = append(eligible, c)
 		}
 	}
+	// Systemic-group dedup: for issues carrying a tatara/systemic-<id> label and
+	// having at least one sibling in the group, elect one lead per (sid, repo).
+	// Non-lead siblings get a marker comment and no agent.
+	systemicLeads := electSystemicLeads(eligible)
 	created := 0
 	for _, c := range eligible {
+		key := fmt.Sprintf("%s#%d", c.repo, c.number)
+		if d, ok := systemicLeads[key]; ok && !d.isLead {
+			// Collapsed sibling: no implementation agent. Mark idempotently and skip.
+			if w, token, werr := r.scanWriter(ctx, proj); werr == nil {
+				if cerr := commentSiblingMarker(ctx, reader, w, token, c.repo, c.number, d.leadNumber); cerr != nil {
+					l.Error(cerr, "issueScan: systemic sibling marker comment", "action", "systemic_sibling_mark",
+						"resource_id", proj.Name, "issue", key, "lead", d.leadNumber)
+				}
+			}
+			r.Metrics.SystemicSiblingCollapsed(proj.Name)
+			r.Metrics.ScanItem("issueScan", "skipped_systemic_sibling")
+			l.Info("issueScan: collapsed systemic sibling (no separate agent)",
+				"action", "systemic_dedup", "resource_id", proj.Name,
+				"issue", key, "systemic_id", d.sid, "lead", d.leadNumber)
+			continue
+		}
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
 			r.Metrics.ScanItem("issueScan", "skipped_norepo")
@@ -1010,7 +1031,14 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			}
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
-		ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil)
+		var sg *tatarav1alpha1.SystemicGroup
+		if d, ok := systemicLeads[key]; ok && d.isLead && len(d.sameRepoSiblings) > 0 {
+			sg = &tatarav1alpha1.SystemicGroup{SystemicID: d.sid, SameRepoSiblings: d.sameRepoSiblings, CrossRepo: d.crossRepo}
+			r.Metrics.SystemicGroupLed(proj.Name)
+			l.Info("issueScan: systemic group lead", "action", "systemic_dedup", "resource_id", proj.Name,
+				"issue", key, "systemic_id", d.sid, "same_repo_siblings", len(d.sameRepoSiblings), "cross_repo", len(d.crossRepo))
+		}
+		ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil, sg)
 		if err != nil {
 			l.Error(err, "scan: enqueue issueScan event", "resource_id", proj.Name, "repo", repo.Name)
 			r.Metrics.ScanItem("issueScan", "create_error")
@@ -1796,7 +1824,7 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			}
 			cand := candidate{repo: slug, number: iss.Number, labels: iss.Labels, updatedAt: iss.UpdatedAt, title: iss.Title}
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: entry}
-			ok2, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann)
+			ok2, cerr := r.createScanTask(ctx, proj, &repo, cand, cand, "backstop", "issueLifecycle", goal, ann, nil)
 			if cerr != nil {
 				l.Error(cerr, "backstop: create recovery task", "action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)
 				continue
