@@ -581,6 +581,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
 
+	// Tool profile: gates the MCP tool surface the agent sees. Placed here,
+	// with the other operator-set variables, so the operator-set profile is
+	// authoritative -- a stray ExtraEnvs duplicate that comes after it is
+	// ignored (first occurrence wins in a Pod env list).
+	env = append(env, corev1.EnvVar{Name: "TATARA_TOOL_PROFILE", Value: toolProfileForKind(task.Spec.Kind)})
+
 	// Operator-supplied extra envs are appended LAST, after every variable the
 	// operator itself sets, so a stray extra named like a required variable
 	// (e.g. TATARA_TASK) cannot silently shadow it -- the later duplicate in a
@@ -740,6 +746,30 @@ func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 		return nil
 	}
 	return &corev1.PodSecurityContext{FSGroup: cfg.FSGroup}
+}
+
+// toolProfileForKind maps a Task Kind to the TATARA_TOOL_PROFILE value that
+// the cli MCP server uses to gate the agent's tool surface. Returns "" for
+// unknown/empty kinds (fail-open: the cli serves the full tool set).
+func toolProfileForKind(kind string) string {
+	switch kind {
+	case "implement":
+		return "implement"
+	case "review":
+		return "review"
+	case "triageIssue":
+		return "triage"
+	case "brainstorm": // healthCheck shares Kind=brainstorm
+		return "brainstorm"
+	case "issueLifecycle":
+		return "lifecycle"
+	case "incident":
+		return "incident"
+	case "selfImprove":
+		return "selfImprove"
+	default:
+		return "" // fail-open
+	}
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list
