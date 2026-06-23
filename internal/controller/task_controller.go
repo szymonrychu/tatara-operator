@@ -251,7 +251,12 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 		return ctrl.Result{}, err
 	}
 	if exhausted {
-		return r.terminate(ctx, task, "Failed", "PodLost", "wrapper pod lost; recreation budget exhausted")
+		const detail = "wrapper pod lost; recreation budget exhausted"
+		res, terr := r.terminate(ctx, task, "Failed", "PodLost", detail)
+		if terr == nil {
+			r.commentTerminalDiagnostics(ctx, task, "PodLost", detail)
+		}
+		return res, terr
 	}
 
 	// Set Planning on first spawn. RetryOnConflict: lifecycle handlers write
@@ -656,35 +661,58 @@ func (r *TaskReconciler) captureBootCrashDiagnostics(ctx context.Context, task *
 	return nil
 }
 
-// commentBootCrashDiagnostics posts the boot-crash cause once to the Task's
-// linked issue, so a human (or the loop) can read WHY the wrapper never booted
-// even after the terminal Task CR is garbage-collected (#81). Best-effort: a
-// missing SCM wiring / source, or a comment failure, is logged and ignored -
-// the terminal condition message and structured log still carry the cause.
-func (r *TaskReconciler) commentBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, diag string) {
+// postTerminalComment posts a single human-readable cause to the Task's linked
+// issue, so a human (or the loop) can read WHY the run ended even after the
+// terminal Task CR is garbage-collected (#81). It is the shared plumbing behind
+// the boot-crash comment (#115) and the generic terminal-Failed comment (#116).
+// Best-effort: a missing SCM wiring / source, a project-scoped task (no repo),
+// or a comment failure is logged and ignored - the terminal condition message
+// and structured log still carry the cause.
+func (r *TaskReconciler) postTerminalComment(ctx context.Context, task *tatarav1alpha1.Task, body string) {
 	if r.SCMFor == nil || task.Spec.Source == nil || task.Spec.Source.IssueRef == "" {
 		return
 	}
 	l := log.FromContext(ctx)
 	_, _, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
-		l.Error(err, "boot-crash: scm context for diagnostics comment (non-fatal)", "resource_id", task.Name)
+		l.Error(err, "terminal-diagnostics: scm context for comment (non-fatal)", "resource_id", task.Name)
 		return
 	}
+	cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, body)
+	r.recordSCM(provider, "comment", cerr)
+	if cerr != nil {
+		l.Error(cerr, "terminal-diagnostics: post comment (non-fatal)",
+			"resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
+		return
+	}
+	l.Info("terminal diagnostics commented on issue",
+		"action", "task_terminal_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
+}
+
+// commentBootCrashDiagnostics posts the boot-crash cause once to the Task's
+// linked issue (the detail captured from pod.Status), formatted for the boot
+// path. Delegates the SCM plumbing to postTerminalComment.
+func (r *TaskReconciler) commentBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, diag string) {
 	body := fmt.Sprintf("Wrapper pod failed to boot (`%s`) and the run was terminated after %d boot attempts.",
 		reason, maxPodRecreations)
 	if diag != "" {
 		body += "\n\nLast captured cause from `pod.Status`:\n\n```\n" + diag + "\n```"
 	}
-	cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, body)
-	r.recordSCM(provider, "comment", cerr)
-	if cerr != nil {
-		l.Error(cerr, "boot-crash: post diagnostics comment (non-fatal)",
-			"resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
-		return
+	r.postTerminalComment(ctx, task, body)
+}
+
+// commentTerminalDiagnostics posts the cause of a terminal Failed run to the
+// Task's linked issue, generalizing the boot-crash comment (#115) to the other
+// terminal-Failed reasons surfaced from a reconcile - AgentUnreachable,
+// TurnTimeout, PodLost (#116) - so each leaves a durable cause on the issue
+// (#81). Callers invoke it once, only after terminate has committed Failed, so a
+// terminate retry cannot double-post (the boot-crash ordering).
+func (r *TaskReconciler) commentTerminalDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, detail string) {
+	body := fmt.Sprintf("Task run terminated (`Failed` / `%s`).", reason)
+	if detail != "" {
+		body += "\n\n" + detail
 	}
-	l.Info("boot-crash diagnostics commented on issue",
-		"action", "agent_boot_crash_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
+	r.postTerminalComment(ctx, task, body)
 }
 
 // handleAgentUnreachable handles a SubmitTurn error: when it is an agent
@@ -720,8 +748,11 @@ func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatar
 		r.Metrics.AgentUnreachableTermination()
 		l.Info("agent unreachable past boot deadline; failing task",
 			"task", task.Name, "since", started.Format(time.RFC3339), "deadline", agentBootDeadline.String())
-		res, terr := r.terminate(ctx, task, "Failed", "AgentUnreachable",
-			fmt.Sprintf("wrapper agent unreachable for over %s", agentBootDeadline))
+		detail := fmt.Sprintf("wrapper agent unreachable for over %s", agentBootDeadline)
+		res, terr := r.terminate(ctx, task, "Failed", "AgentUnreachable", detail)
+		if terr == nil {
+			r.commentTerminalDiagnostics(ctx, task, "AgentUnreachable", detail)
+		}
 		return res, terr, true
 	}
 
@@ -807,8 +838,12 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	if task.Annotations[annTurnComplete] == "" {
 		if r.isTurnTimedOut(project, task) {
 			r.Metrics.TurnTimeout("reconcile")
-			return r.terminate(ctx, task, "Failed", "TurnTimeout",
-				fmt.Sprintf("turn %s exceeded timeout", current))
+			detail := fmt.Sprintf("turn %s exceeded timeout", current)
+			res, terr := r.terminate(ctx, task, "Failed", "TurnTimeout", detail)
+			if terr == nil {
+				r.commentTerminalDiagnostics(ctx, task, "TurnTimeout", detail)
+			}
+			return res, terr
 		}
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
