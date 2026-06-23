@@ -48,6 +48,8 @@ type OperatorMetrics struct {
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
 	memoryRetrievalProbe      *prometheus.CounterVec
+	systemicSiblingsCollapsed *prometheus.CounterVec
+	systemicGroupsLed         *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -243,6 +245,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_retrieval_probe_total",
 			Help: "Unauthenticated route-presence probes of a project's tatara-memory retrieval surface by route and result.",
 		}, []string{"route", "result"}),
+		systemicSiblingsCollapsed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_systemic_siblings_collapsed_total",
+			Help: "Systemic-group sibling issues collapsed (no separate agent spawned), by project.",
+		}, []string{"project"}),
+		systemicGroupsLed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_systemic_groups_led_total",
+			Help: "Systemic-group leads elected (lead issue gets a combined-PR agent), by project.",
+		}, []string{"project"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -287,6 +297,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.lightragDocuments,
 		m.lightragQueryErrors,
 		m.memoryRetrievalProbe,
+		m.systemicSiblingsCollapsed,
+		m.systemicGroupsLed,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -641,4 +653,16 @@ func (m *OperatorMetrics) MemoryRetrievalProbe(route, result string) {
 // the per-reason fault counters do not all cover.
 func (m *OperatorMetrics) TaskTerminal(kind, phase, reason string) {
 	m.taskTerminalTotal.WithLabelValues(kind, phase, reason).Inc()
+}
+
+// SystemicSiblingCollapsed increments tatara_systemic_siblings_collapsed_total:
+// a sibling issue in a systemic group was collapsed (no separate agent spawned).
+func (m *OperatorMetrics) SystemicSiblingCollapsed(project string) {
+	m.systemicSiblingsCollapsed.WithLabelValues(project).Inc()
+}
+
+// SystemicGroupLed increments tatara_systemic_groups_led_total: a lead issue in a
+// systemic group was elected and its combined-PR agent was enqueued.
+func (m *OperatorMetrics) SystemicGroupLed(project string) {
+	m.systemicGroupsLed.WithLabelValues(project).Inc()
 }

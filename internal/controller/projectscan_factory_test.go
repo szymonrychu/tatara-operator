@@ -37,7 +37,7 @@ func TestCreateScanTask(t *testing.T) {
 
 	r := newScanReconciler(nil)
 	c := candidate{repo: "o/r", number: 5, headSHA: "abc", isPR: true}
-	ok, err := r.createScanTask(ctx, proj, repo, c, c, "mrScan", "review", "review PR o/r#5", nil)
+	ok, err := r.createScanTask(ctx, proj, repo, c, c, "mrScan", "review", "review PR o/r#5", nil, nil)
 	if err != nil {
 		t.Fatalf("createScanTask: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestCreateScanTaskGitLabMR(t *testing.T) {
 
 	// MR candidate: ref must use '!' so write-back lands on the MR.
 	mr := candidate{repo: "g/p", number: 42, isPR: true}
-	ok, err := r.createScanTask(ctx, proj, repo, mr, mr, "mrScan", "review", "review MR g/p!42", nil)
+	ok, err := r.createScanTask(ctx, proj, repo, mr, mr, "mrScan", "review", "review MR g/p!42", nil, nil)
 	if err != nil {
 		t.Fatalf("createScanTask MR: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestCreateScanTaskGitLabMR(t *testing.T) {
 
 	// Issue candidate on GitLab keeps '#'.
 	iss := candidate{repo: "g/p", number: 7, isPR: false}
-	ok2, err := r.createScanTask(ctx, proj, repo, iss, iss, "issueScan", "issueLifecycle", "triage issue g/p#7", nil)
+	ok2, err := r.createScanTask(ctx, proj, repo, iss, iss, "issueScan", "issueLifecycle", "triage issue g/p#7", nil, nil)
 	if err != nil {
 		t.Fatalf("createScanTask issue: %v", err)
 	}

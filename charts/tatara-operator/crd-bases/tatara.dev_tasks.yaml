@@ -143,6 +143,25 @@ spec:
                 - issueRef
                 - provider
                 type: object
+              systemicGroup:
+                description: |-
+                  SystemicGroup, when set, marks this Task as the lead for a brainstorm
+                  systemic group: it resolves SameRepoSiblings in one combined PR and is
+                  aware of CrossRepo siblings (reference only).
+                properties:
+                  crossRepo:
+                    items:
+                      type: string
+                    type: array
+                  sameRepoSiblings:
+                    items:
+                      type: integer
+                    type: array
+                  systemicId:
+                    type: string
+                required:
+                - systemicId
+                type: object
             required:
             - goal
             - projectRef

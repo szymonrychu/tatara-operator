@@ -119,6 +119,23 @@ spec:
                     - issueRef
                     - provider
                     type: object
+                  systemicGroup:
+                    description: SystemicGroup describes the systemic-improvement
+                      group a lead issue owns.
+                    properties:
+                      crossRepo:
+                        items:
+                          type: string
+                        type: array
+                      sameRepoSiblings:
+                        items:
+                          type: integer
+                        type: array
+                      systemicId:
+                        type: string
+                    required:
+                    - systemicId
+                    type: object
                 required:
                 - kind
                 type: object

@@ -2221,3 +2221,23 @@ func TestReconcileLifecycle_DrainPartialFailureKeepsRemaining(t *testing.T) {
 		t.Fatalf("PendingComments = %#v, want %#v", reloaded.Status.PendingComments, want)
 	}
 }
+
+func TestImplementPrompt_SystemicGroup(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t"},
+		Spec: tatarav1alpha1.TaskSpec{
+			Goal: "Triage issue o/r1#12", ProjectRef: "p",
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{
+				SystemicID: "abc", SameRepoSiblings: []int{15},
+				CrossRepo: []string{"o/r2#9 - B"},
+			},
+		},
+	}
+	got := implementPrompt(task)
+	if !strings.Contains(got, "Closes #15") {
+		t.Fatalf("prompt must instruct closing same-repo sibling: %s", got)
+	}
+	if !strings.Contains(got, "o/r2#9") {
+		t.Fatalf("prompt must reference cross-repo sibling: %s", got)
+	}
+}

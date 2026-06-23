@@ -1365,6 +1365,19 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 			".** Edit and push every repo you change; each repo with a change gets its own PR/MR. " +
 			"If a listed repo genuinely needs no change, say so explicitly in your result summary."
 	}
+	if g := task.Spec.SystemicGroup; g != nil && len(g.SameRepoSiblings) > 0 {
+		closes := make([]string, 0, len(g.SameRepoSiblings))
+		for _, n := range g.SameRepoSiblings {
+			closes = append(closes, fmt.Sprintf("Closes #%d", n))
+		}
+		base += "\n\n**You lead systemic improvement group " + g.SystemicID +
+			".** Resolve these sibling issues in this same repo within ONE combined PR and " +
+			"close them from the PR body: " + strings.Join(closes, ", ") + "."
+	}
+	if g := task.Spec.SystemicGroup; g != nil && len(g.CrossRepo) > 0 {
+		base += "\n\nRelated work in OTHER repos (reference for context, do NOT edit them here; " +
+			"each is led by its own agent): " + strings.Join(g.CrossRepo, "; ") + "."
+	}
 	base += lifecyclePhaseGuidance("Implement")
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
