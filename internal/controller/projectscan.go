@@ -1521,6 +1521,36 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 	return false
 }
 
+// hasLiveOrAdoptableTask returns the single issueLifecycle Task for (slug, number)
+// that should be ADOPTED rather than duplicated: any matching issueLifecycle Task
+// whose LifecycleState is neither "Done" nor "Stopped". This covers the in-flight
+// states (Triage/Conversation/Implement/MRCI/Merge/MainCI), the unstarted state
+// (empty LifecycleState), AND the Parked state that the false-refusal duplicate
+// storm produces. Done (deliberately closed) and Stopped (idle, owned by the
+// reactivation pass) are excluded so genuinely-finished issues are not resurrected.
+// A Parked sibling is preferred over a Done/Stopped one. Returns nil when no
+// adoptable Task exists. Pure (snapshot only); caller adopts via an inline status
+// reset to Triage, reusing the deterministic pod/branch.
+func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number int) *tatarav1alpha1.Task {
+	repoLabel := sanitizeRepoLabel(slug)
+	numLabel := strconv.Itoa(number)
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceKind] != "issueLifecycle" {
+			continue
+		}
+		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+			continue
+		}
+		switch t.Status.LifecycleState {
+		case "Done", "Stopped":
+			continue
+		}
+		return t
+	}
+	return nil
+}
+
 // recoverOrphans starts the correct lifecycle Task for each OPEN issue that
 // carries an active phase label but has no live Task (a missed/never-started or
 // stalled handler). It RE-LISTS existing Tasks so it sees Tasks mrScan/issueScan

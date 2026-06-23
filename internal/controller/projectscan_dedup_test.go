@@ -148,3 +148,84 @@ func TestDedupPRHeadShaUnchanged(t *testing.T) {
 		t.Fatalf("PR terminal task at same headSHA should be deduped")
 	}
 }
+
+func mkLifecycleKindTask(repo string, number int, lifecycleState string) tatarav1alpha1.Task {
+	tk := tatarav1alpha1.Task{}
+	tk.Labels = scanTaskLabels(candidate{repo: repo, number: number}, "issueScan", "issueLifecycle")
+	tk.Status.LifecycleState = lifecycleState
+	return tk
+}
+
+func TestHasLiveOrAdoptableTask(t *testing.T) {
+	cases := []struct {
+		name     string
+		existing []tatarav1alpha1.Task
+		wantName bool // true => a Task is returned (adoptable)
+	}{
+		{
+			name:     "no tasks -> nil",
+			existing: nil,
+			wantName: false,
+		},
+		{
+			name:     "Parked lifecycle task -> adopt",
+			existing: []tatarav1alpha1.Task{mkLifecycleKindTask("o/r", 8, "Parked")},
+			wantName: true,
+		},
+		{
+			name:     "Triage (in-flight) -> adopt",
+			existing: []tatarav1alpha1.Task{mkLifecycleKindTask("o/r", 8, "Triage")},
+			wantName: true,
+		},
+		{
+			name:     "Conversation -> adopt",
+			existing: []tatarav1alpha1.Task{mkLifecycleKindTask("o/r", 8, "Conversation")},
+			wantName: true,
+		},
+		{
+			name:     "Done -> NOT adoptable",
+			existing: []tatarav1alpha1.Task{mkLifecycleKindTask("o/r", 8, "Done")},
+			wantName: false,
+		},
+		{
+			name:     "Stopped -> NOT adoptable",
+			existing: []tatarav1alpha1.Task{mkLifecycleKindTask("o/r", 8, "Stopped")},
+			wantName: false,
+		},
+		{
+			name: "wrong number -> nil",
+			existing: []tatarav1alpha1.Task{
+				mkLifecycleKindTask("o/r", 9, "Parked"),
+			},
+			wantName: false,
+		},
+		{
+			name: "review-kind task for same number is ignored",
+			existing: []tatarav1alpha1.Task{
+				func() tatarav1alpha1.Task {
+					tk := tatarav1alpha1.Task{}
+					tk.Labels = scanTaskLabels(candidate{repo: "o/r", number: 8}, "mrScan", "review")
+					tk.Status.LifecycleState = "Parked"
+					return tk
+				}(),
+			},
+			wantName: false,
+		},
+		{
+			name: "Parked preferred over a Done sibling",
+			existing: []tatarav1alpha1.Task{
+				mkLifecycleKindTask("o/r", 8, "Done"),
+				mkLifecycleKindTask("o/r", 8, "Parked"),
+			},
+			wantName: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasLiveOrAdoptableTask(tc.existing, "o/r", 8)
+			if (got != nil) != tc.wantName {
+				t.Fatalf("hasLiveOrAdoptableTask returned=%v, want adoptable=%v", got != nil, tc.wantName)
+			}
+		})
+	}
+}
