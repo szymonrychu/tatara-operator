@@ -41,19 +41,29 @@ const (
 	// (e.g. a duplicate lifecycle Task whose pod name collided with the live one).
 	planningStallDeadline = 4 * agentBootDeadline
 
-	annCurrentTurn           = tatarav1alpha1.AnnCurrentTurn
-	annCurrentSubtask        = tatarav1alpha1.AnnCurrentSubtask
-	annTurnComplete          = tatarav1alpha1.AnnTurnComplete
-	annPodRecreations        = tatarav1alpha1.AnnPodRecreations
-	annTurnStartedAt         = tatarav1alpha1.AnnTurnStartedAt
-	annTurnLastActivity      = tatarav1alpha1.AnnTurnLastActivity
-	annPlanningSince         = tatarav1alpha1.AnnPlanningSince
+	annCurrentTurn             = tatarav1alpha1.AnnCurrentTurn
+	annCurrentSubtask          = tatarav1alpha1.AnnCurrentSubtask
+	annTurnComplete            = tatarav1alpha1.AnnTurnComplete
+	annPodRecreations          = tatarav1alpha1.AnnPodRecreations
+	annTurnStartedAt           = tatarav1alpha1.AnnTurnStartedAt
+	annTurnLastActivity        = tatarav1alpha1.AnnTurnLastActivity
+	annPlanningSince           = tatarav1alpha1.AnnPlanningSince
 	annPendingHandoverResume   = tatarav1alpha1.AnnPendingHandoverResume
 	annParentConversationKey   = tatarav1alpha1.AnnParentConversationKey
 	annForkFromConversationKey = tatarav1alpha1.AnnForkFromConversationKey
-	annAgentUnreachableSince = "tatara.dev/agent-unreachable-since"
-	annBootCrashAttempts     = "tatara.dev/boot-crash-attempts"
+	annAgentUnreachableSince   = "tatara.dev/agent-unreachable-since"
+	annBootCrashAttempts       = "tatara.dev/boot-crash-attempts"
+	// annBootCrashDiagnostics holds the most recent boot-crash cause captured from
+	// pod.Status (failing container, exit code, log tail). resetAgentRun preserves
+	// it (like annBootCrashAttempts) so the cause survives the per-attempt pod
+	// delete/recreate and can be surfaced at exhaustion; setLifecycleState and
+	// recordTurn clear it so it never leaks into the next state / run.
+	annBootCrashDiagnostics = "tatara.dev/boot-crash-diagnostics"
 )
+
+// bootCrashDetailCap bounds the captured diagnostic so it fits comfortably in an
+// annotation and a condition message. The kubelet log tail dominates the length.
+const bootCrashDetailCap = 1024
 
 // TaskReconciler spawns one wrapper session per Task and drives it turn by
 // turn over the Task's Subtasks.
@@ -455,6 +465,66 @@ func bootCrashReason(pod *corev1.Pod) string {
 	return ""
 }
 
+// bootCrashDetail extracts a bounded, human-readable diagnostic from a
+// not-yet-Ready Pod's status: the failing container name, its exit code, the
+// terminated/waiting reason, and the kubelet-captured log tail (populated by
+// terminationMessagePolicy=FallbackToLogsOnError on a non-zero exit). It reads
+// only fields already on pod.Status, so no logs API or pods/log RBAC is needed.
+// Returns "" when no container status explains the failure.
+func bootCrashDetail(pod *corev1.Pod) string {
+	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+
+	// Prefer a terminated container (carries the exit code + log tail).
+	for _, cs := range statuses {
+		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
+			return containerCrashDetail(cs.Name, t, nil)
+		}
+	}
+	// Otherwise a waiting container with a reason (CrashLoopBackOff carries its
+	// tail on LastTerminationState; ImagePullBackOff/CreateContainerError do not).
+	for _, cs := range statuses {
+		if w := cs.State.Waiting; w != nil && w.Reason != "" {
+			return containerCrashDetail(cs.Name, cs.LastTerminationState.Terminated, w)
+		}
+	}
+	// No container status pinpoints it (e.g. a bare PodFailed): fall back to the
+	// pod-level reason/message.
+	if d := strings.TrimSpace(pod.Status.Reason + " " + pod.Status.Message); d != "" {
+		return truncateDetail(d)
+	}
+	return ""
+}
+
+// containerCrashDetail formats a single container's failure into a compact,
+// bounded "key=value" string (container, waiting, exit, reason, log).
+func containerCrashDetail(name string, term *corev1.ContainerStateTerminated, wait *corev1.ContainerStateWaiting) string {
+	parts := []string{"container=" + name}
+	if wait != nil && wait.Reason != "" {
+		parts = append(parts, "waiting="+wait.Reason)
+	}
+	if term != nil {
+		parts = append(parts, fmt.Sprintf("exit=%d", term.ExitCode))
+		if term.Reason != "" {
+			parts = append(parts, "reason="+term.Reason)
+		}
+		if msg := strings.TrimSpace(term.Message); msg != "" {
+			parts = append(parts, "log="+msg)
+		}
+	}
+	return truncateDetail(strings.Join(parts, " "))
+}
+
+// truncateDetail trims and caps a diagnostic at bootCrashDetailCap.
+func truncateDetail(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > bootCrashDetailCap {
+		return s[:bootCrashDetailCap] + "...(truncated)"
+	}
+	return s
+}
+
 // bootDeadlineExceeded reports whether a not-yet-Ready pod has exceeded
 // agentBootDeadline without becoming Ready. The deadline is anchored to
 // pod.Status.StartTime (when the container runtime started the pod) so that
@@ -492,20 +562,39 @@ func (r *TaskReconciler) handleBootCrash(ctx context.Context, task *tatarav1alph
 		reason = "BootTimeout"
 	}
 
+	// Capture the crash cause from pod.Status BEFORE resetAgentRun / terminate
+	// delete the pod, persisting it across respawns (last-write-wins) so the
+	// terminal condition + issue comment can explain WHY the boot failed.
+	if detail := bootCrashDetail(pod); detail != "" {
+		if err := r.captureBootCrashDiagnostics(ctx, task, detail); err != nil {
+			return ctrl.Result{}, err, true
+		}
+	}
+	diag := task.Annotations[annBootCrashDiagnostics]
+
 	l := log.FromContext(ctx)
 	attempts := r.bootCrashAttempts(task) + 1
 	if attempts > maxPodRecreations {
 		r.Metrics.AgentBootCrash(reason, "failed")
 		l.Info("agent pod boot failed; recreation budget exhausted, failing task",
-			"action", "agent_boot_crash_exhausted", "resource_id", task.Name, "reason", reason, "attempts", maxPodRecreations)
-		res, terr := r.terminate(ctx, task, "Failed", "BootCrashLoop",
-			fmt.Sprintf("wrapper pod failed to boot (%s) after %d attempts", reason, maxPodRecreations))
+			"action", "agent_boot_crash_exhausted", "resource_id", task.Name, "reason", reason,
+			"attempts", maxPodRecreations, "diagnostics", diag)
+		msg := fmt.Sprintf("wrapper pod failed to boot (%s) after %d attempts", reason, maxPodRecreations)
+		if diag != "" {
+			msg = fmt.Sprintf("wrapper pod failed to boot (%s: %s) after %d attempts", reason, diag, maxPodRecreations)
+		}
+		res, terr := r.terminate(ctx, task, "Failed", "BootCrashLoop", msg)
+		// Post the cause once to the linked issue (survives terminal-CRD GC, #81).
+		// Only after terminate commits Failed, so a terminate retry cannot double-post.
+		if terr == nil {
+			r.commentBootCrashDiagnostics(ctx, task, reason, diag)
+		}
 		return res, terr, true
 	}
 
 	r.Metrics.AgentBootCrash(reason, "respawn")
 	l.Info("agent pod boot failed; respawning",
-		"action", "agent_boot_crash", "resource_id", task.Name, "reason", reason, "attempt", attempts)
+		"action", "agent_boot_crash", "resource_id", task.Name, "reason", reason, "attempt", attempts, "diagnostics", diag)
 	if err := r.bumpBootCrashAttempts(ctx, task); err != nil {
 		return ctrl.Result{}, err, true
 	}
@@ -536,6 +625,66 @@ func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatara
 		fresh.Annotations[annBootCrashAttempts] = strconv.Itoa(n + 1)
 		return r.Update(ctx, fresh)
 	})
+}
+
+// captureBootCrashDiagnostics records the most recent boot-crash cause in the
+// annBootCrashDiagnostics annotation (last-write-wins) so it survives the
+// per-attempt pod delete in resetAgentRun and reaches the terminal condition /
+// issue comment at exhaustion. It also updates the in-memory task so the caller
+// reads the fresh value without a re-Get.
+func (r *TaskReconciler) captureBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, detail string) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations[annBootCrashDiagnostics] == detail {
+			return nil // idempotent: this exact cause is already recorded
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[annBootCrashDiagnostics] = detail
+		return r.Update(ctx, fresh)
+	}); err != nil {
+		return err
+	}
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
+	task.Annotations[annBootCrashDiagnostics] = detail
+	return nil
+}
+
+// commentBootCrashDiagnostics posts the boot-crash cause once to the Task's
+// linked issue, so a human (or the loop) can read WHY the wrapper never booted
+// even after the terminal Task CR is garbage-collected (#81). Best-effort: a
+// missing SCM wiring / source, or a comment failure, is logged and ignored -
+// the terminal condition message and structured log still carry the cause.
+func (r *TaskReconciler) commentBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, diag string) {
+	if r.SCMFor == nil || task.Spec.Source == nil || task.Spec.Source.IssueRef == "" {
+		return
+	}
+	l := log.FromContext(ctx)
+	_, _, writer, token, provider, err := r.scmContext(ctx, task)
+	if err != nil {
+		l.Error(err, "boot-crash: scm context for diagnostics comment (non-fatal)", "resource_id", task.Name)
+		return
+	}
+	body := fmt.Sprintf("Wrapper pod failed to boot (`%s`) and the run was terminated after %d boot attempts.",
+		reason, maxPodRecreations)
+	if diag != "" {
+		body += "\n\nLast captured cause from `pod.Status`:\n\n```\n" + diag + "\n```"
+	}
+	cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, body)
+	r.recordSCM(provider, "comment", cerr)
+	if cerr != nil {
+		l.Error(cerr, "boot-crash: post diagnostics comment (non-fatal)",
+			"resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
+		return
+	}
+	l.Info("boot-crash diagnostics commented on issue",
+		"action", "agent_boot_crash_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
 }
 
 // handleAgentUnreachable handles a SubmitTurn error: when it is an agent
@@ -671,10 +820,11 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		}
 	}
 
-	// Check maxTurns cap before picking next subtask.
-	if task.Status.TurnsCompleted >= turnCap(project, task) {
+	// Check maxTurns cap before picking next subtask. Implementation kinds run
+	// uncapped (capped=false), so the cap branch is skipped entirely.
+	if limit, capped := turnCap(project, task); capped && task.Status.TurnsCompleted >= limit {
 		return r.terminate(ctx, task, "Succeeded", "MaxTurnsReached",
-			fmt.Sprintf("reached turn cap %d", turnCap(project, task)))
+			fmt.Sprintf("reached turn cap %d", limit))
 	}
 
 	// Pick the next Pending Subtask. Uses the field index when available
@@ -761,15 +911,22 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	return res, nil
 }
 
-// turnCap returns the maximum turns allowed for this Task.
-func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
+// turnCap returns the maximum turns allowed for this Task and whether a cap
+// applies at all. An explicit task.Spec.MaxTurns always wins. Otherwise the
+// implementation kinds (implement, issueLifecycle) run uncapped - long but
+// healthy coding runs must not be cut off; per-turn timeout and
+// maxPodRecreations remain the runaway bounds. All other kinds keep the cap.
+func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (int, bool) {
 	if task.Spec.MaxTurns > 0 {
-		return task.Spec.MaxTurns
+		return task.Spec.MaxTurns, true
+	}
+	if task.Spec.Kind == "implement" || task.Spec.Kind == "issueLifecycle" {
+		return 0, false
 	}
 	if project.Spec.Agent.MaxTurnsPerTask > 0 {
-		return project.Spec.Agent.MaxTurnsPerTask
+		return project.Spec.Agent.MaxTurnsPerTask, true
 	}
-	return 50
+	return 50, true
 }
 
 // recordTurn writes the in-flight turn id + executing subtask onto the Task,
@@ -796,6 +953,7 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 		delete(fresh.Annotations, annTurnComplete)
 		delete(fresh.Annotations, annAgentUnreachableSince)
 		delete(fresh.Annotations, annBootCrashAttempts)
+		delete(fresh.Annotations, annBootCrashDiagnostics)
 		return r.Update(ctx, fresh)
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
@@ -880,12 +1038,23 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	l := log.FromContext(ctx)
 	baseURL := agent.BaseURL(task, task.Namespace)
 	if err := r.Session.DeleteSession(ctx, baseURL); err != nil {
-		// Best-effort: the pod is about to be deleted anyway.
-		l.Error(err, "terminate: delete session (non-fatal)", "resource_id", task.Name)
-		apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-			Type: "SessionDeleteFailed", Status: metav1.ConditionTrue,
-			Reason: "DeleteError", Message: err.Error(),
-		})
+		// Best-effort: the pod is about to be deleted anyway. Classify the error
+		// before recording a failure condition. An UnreachableError means the
+		// wrapper pod is already gone (reaped on a prior turn, evicted, or the
+		// Service has no endpoints). For a DELETE whose goal is to make the session
+		// not exist, a gone pod IS the desired terminal state, so that is a clean
+		// teardown, not a failure. Only a reachable-but-refused wrapper (HTTPError)
+		// or a timeout leaves the session possibly still alive and worth surfacing.
+		var unreachable *agent.UnreachableError
+		if errors.As(err, &unreachable) {
+			l.Info("terminate: session already gone", "action", "task_terminate", "resource_id", task.Name)
+		} else {
+			l.Error(err, "terminate: delete session (non-fatal)", "resource_id", task.Name)
+			apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+				Type: "SessionDeleteFailed", Status: metav1.ConditionTrue,
+				Reason: "DeleteError", Message: err.Error(),
+			})
+		}
 	}
 
 	if err := r.deleteWrapper(ctx, task); err != nil {

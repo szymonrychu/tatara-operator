@@ -70,6 +70,20 @@ type ProjectReconciler struct {
 	// overrides the in-cluster Service DNS (tests point it at httptest).
 	LightragHTTP    *http.Client
 	LightragBaseURL func(project string) string
+
+	// MemoryHTTP is the client used by updateMemoryRetrievalProbe to probe each
+	// Ready project's tatara-memory retrieval surface. Nil falls back to a
+	// short-timeout default; tests inject an httptest-backed client. MemoryBaseURL,
+	// when set, overrides the in-cluster Service DNS (tests point it at httptest).
+	MemoryHTTP    *http.Client
+	MemoryBaseURL func(project string) string
+
+	// memoryUnhealthyCycles tracks, per project, the number of consecutive
+	// updateMemoryRetrievalProbe cycles whose retrieval surface probed unhealthy.
+	// reconcileMemory folds a sustained run (>= memoryRetrievalUnhealthyThreshold)
+	// into the MemoryReady condition. Read/written only on the serialised reconcile
+	// path (MaxConcurrentReconciles=1); no mutex required.
+	memoryUnhealthyCycles map[string]int
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -186,6 +200,7 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 	r.updateMemoryStackCounts(ctx)
 	r.updateLifecycleStateCounts(ctx)
 	r.updateLightragDocCounts(ctx)
+	r.updateMemoryRetrievalProbe(ctx)
 	r.lastGaugeRecompute = time.Now()
 }
 

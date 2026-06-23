@@ -260,19 +260,22 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		return fmt.Errorf("setLifecycleState: %w", err)
 	}
 
-	// Clear annBootCrashAttempts on any lifecycle-state transition. The boot-crash
-	// budget must accumulate across respawns WITHIN a single lifecycle state (handled
-	// by bumpBootCrashAttempts / handleBootCrash), but must NOT carry over into the
-	// next state. A fresh Implement/Triage/etc. entry that boot-crashes before any
-	// turn starts must get its own maxPodRecreations budget, not an already-spent one.
-	// recordTurn also clears this annotation (on a successful turn landing), so the
-	// within-state respawn path is unaffected.
-	// Fast-path: skip the retry loop entirely when the annotation is absent on the
-	// in-memory task (the common case). If a concurrent write added it between the
-	// status update above and here, the boot-crash budget carries over by one
-	// reconcile, which is benign (the budget resets on the NEXT transition). This
-	// avoids an extra Get+retry on every transition (finding 18).
-	if _, hasAnnotation := task.Annotations[annBootCrashAttempts]; hasAnnotation {
+	// Clear the boot-crash annotations (attempts budget + captured diagnostics) on
+	// any lifecycle-state transition. The budget must accumulate across respawns
+	// WITHIN a single lifecycle state (handled by bumpBootCrashAttempts /
+	// handleBootCrash), but must NOT carry over into the next state. A fresh
+	// Implement/Triage/etc. entry that boot-crashes before any turn starts must get
+	// its own maxPodRecreations budget, not an already-spent one, and must not
+	// inherit a stale crash cause. recordTurn also clears both (on a successful turn
+	// landing), so the within-state respawn path is unaffected.
+	// Fast-path: skip the retry loop entirely when both annotations are absent on
+	// the in-memory task (the common case). If a concurrent write added one between
+	// the status update above and here, it carries over by one reconcile, which is
+	// benign (it resets on the NEXT transition). This avoids an extra Get+retry on
+	// every transition (finding 18).
+	_, hasAttempts := task.Annotations[annBootCrashAttempts]
+	_, hasDiag := task.Annotations[annBootCrashDiagnostics]
+	if hasAttempts || hasDiag {
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fresh2 := &tatarav1alpha1.Task{}
 			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
@@ -281,14 +284,17 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 			if fresh2.Annotations == nil {
 				return nil
 			}
-			if _, ok := fresh2.Annotations[annBootCrashAttempts]; !ok {
+			_, a := fresh2.Annotations[annBootCrashAttempts]
+			_, d := fresh2.Annotations[annBootCrashDiagnostics]
+			if !a && !d {
 				return nil
 			}
 			delete(fresh2.Annotations, annBootCrashAttempts)
+			delete(fresh2.Annotations, annBootCrashDiagnostics)
 			return r.Update(ctx, fresh2)
 		}); err != nil {
 			// Non-fatal: log and continue. The state transition itself already succeeded.
-			log.FromContext(ctx).Error(err, "setLifecycleState: clear boot-crash annotation (non-fatal)",
+			log.FromContext(ctx).Error(err, "setLifecycleState: clear boot-crash annotations (non-fatal)",
 				"resource_id", task.Name, "to", to)
 		}
 	}

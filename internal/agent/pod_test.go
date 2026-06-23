@@ -170,6 +170,15 @@ func TestBuildPod_PortAndReadiness(t *testing.T) {
 	require.Equal(t, "/readyz", c.ReadinessProbe.HTTPGet.Path)
 }
 
+// TestBuildPod_TerminationMessagePolicy asserts the wrapper container opts into
+// FallbackToLogsOnError so the kubelet captures the crash output tail into
+// ContainerStatus.State.Terminated.Message for boot-crash diagnostics.
+func TestBuildPod_TerminationMessagePolicy(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	require.Equal(t, corev1.TerminationMessageFallbackToLogsOnError, c.TerminationMessagePolicy)
+}
+
 func TestBuildService_MatchesPod(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	svc := agent.BuildService(proj, repo, task, cfg)

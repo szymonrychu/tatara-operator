@@ -264,7 +264,7 @@ func candidatesFromPRs(prs []scm.PRRef) []candidate {
 			repo: p.Repo, number: p.Number, author: p.Author, headSHA: p.HeadSHA,
 			headBranch: p.HeadBranch,
 			body:       p.Body, labels: p.Labels, updatedAt: p.UpdatedAt, isPR: true,
-			title:      firstLine(p.Body),
+			title: firstLine(p.Body),
 		})
 	}
 	return out
