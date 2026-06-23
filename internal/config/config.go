@@ -59,6 +59,11 @@ type Config struct {
 	S3KeyPrefix      string
 	S3ForcePathStyle bool
 	S3SecretName     string
+	// S3ConversationRetention is the grace after a conversation's whole batch
+	// (brainstorm + sibling issues) goes terminal before the reaper deletes its
+	// S3 objects. Kept well under TaskRetention so conversations GC before their
+	// Tasks (which carry the keys) are reaped. Zero disables conversation GC.
+	S3ConversationRetention time.Duration
 	// Agent wrapper Pod resource + securityContext scalars (rule 6: camelCase
 	// chart value -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). Empty
 	// resource strings mean no constraint. AgentRunAsUser/AgentFSGroup are
@@ -124,6 +129,11 @@ type Config struct {
 // loop relies on (the longest is the 1h incident-alert cooldown) and preserves a
 // week of Task history for human debugging.
 const DefaultTaskRetention = 168 * time.Hour
+
+// DefaultConversationRetention is the default grace after a conversation's batch
+// fully closes before the reaper deletes its S3 objects (issue #114 decision 5).
+// Well under DefaultTaskRetention so conversations GC before their Tasks.
+const DefaultConversationRetention = 72 * time.Hour
 
 // MinTaskRetention is the hard lower bound on TaskRetention. Terminal-Task GC
 // must never delete a Task that still anchors a dedup/cooldown window; the
@@ -216,6 +226,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	conversationRetention, err := getHoursDefault("S3_CONVERSATION_RETENTION_HOURS", DefaultConversationRetention)
+	if err != nil {
+		return Config{}, err
+	}
 	s3ForcePathStyle, err := getBoolDefault("S3_FORCE_PATH_STYLE", false)
 	if err != nil {
 		return Config{}, err
@@ -257,6 +271,7 @@ func Load() (Config, error) {
 		S3KeyPrefix:              os.Getenv("S3_KEY_PREFIX"),
 		S3ForcePathStyle:         s3ForcePathStyle,
 		S3SecretName:             os.Getenv("S3_SECRET_NAME"),
+		S3ConversationRetention:  conversationRetention,
 		AgentCPURequest:          os.Getenv("AGENT_CPU_REQUEST"),
 		AgentCPULimit:            os.Getenv("AGENT_CPU_LIMIT"),
 		AgentMemoryRequest:       os.Getenv("AGENT_MEMORY_REQUEST"),

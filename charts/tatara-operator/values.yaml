@@ -88,6 +88,11 @@ s3Region: ""
 s3KeyPrefix: ""
 s3ForcePathStyle: false
 s3SecretName: ""
+# s3ConversationRetentionHours is the grace after a conversation's whole batch
+# (brainstorm + sibling issues) goes terminal before the reaper deletes its S3
+# objects (issue #114 decision 5). Kept under taskRetentionHours so conversations
+# GC before their Tasks (which carry the keys) are reaped.
+s3ConversationRetentionHours: 72
 
 # Agent wrapper Pod resource requests/limits + securityContext (rule 6: camelCase
 # scalar -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). These bound the

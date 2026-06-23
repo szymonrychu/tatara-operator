@@ -52,6 +52,11 @@ func (s *CallbackServer) ReapOrphans(ctx context.Context) {
 		tasks[taskList.Items[i].Name] = &taskList.Items[i]
 	}
 
+	// Garbage-collect S3 conversation objects for fully-closed batches BEFORE the
+	// task GC below, so the conversations are deleted while their Tasks (which
+	// carry the keys) still exist (issue #114 decision 5).
+	s.gcConversations(ctx, taskList.Items)
+
 	// Garbage-collect terminal Tasks past the retention window, reusing the list
 	// already fetched above (no extra API call). Subtasks cascade via owner ref.
 	s.gcTerminalTasks(ctx, taskList.Items)
@@ -189,6 +194,114 @@ func (s *CallbackServer) reapWrapper(ctx context.Context, name string) error {
 		s.Metrics.ReapDeleteError("service")
 	}
 	return nil
+}
+
+// gcConversations deletes S3 conversation objects whose whole batch has gone
+// terminal past the conversation-retention grace (issue #114 decision 5: delete
+// a conversation when all sibling issues are closed).
+//
+// Batching: conversation-bearing Tasks (issueLifecycle, review, brainstorm) are
+// grouped by batch id = the fork-from-conversation key when set, else the Task's
+// own conversation key. A brainstorm Task's own key equals the fork key of the
+// issues forked from it, so the brainstorm and all its sibling issues land in
+// one batch; a solo issue/PR is its own singleton batch. A batch is deleted only
+// when EVERY member is terminal and the newest went terminal more than the grace
+// ago (so a quick reopen-after-close keeps the thread). Deletes are idempotent
+// (Exists-then-Delete), so re-running until the Tasks are reaped is a no-op.
+//
+// The grace is kept under TaskRetention so this runs before gcTerminalTasks
+// removes the Tasks that carry the keys; a brainstorm batch whose sibling close
+// times span more than (TaskRetention - grace) can still orphan a key if an
+// early sibling's Task is reaped first - a small, documented leak.
+func (s *CallbackServer) gcConversations(ctx context.Context, tasks []tatarav1alpha1.Task) {
+	if s.ConvStore == nil || s.ConversationRetention <= 0 {
+		return
+	}
+	l := log.FromContext(ctx)
+
+	type batch struct {
+		keys             map[string]struct{}
+		allTermPastGrace bool
+	}
+	batches := map[string]*batch{}
+	for i := range tasks {
+		tk := &tasks[i]
+		switch tk.Spec.Kind {
+		case "issueLifecycle", "review", "brainstorm":
+		default:
+			continue
+		}
+		ownKey := conversationKeyForGC(tk)
+		if ownKey == "" {
+			continue
+		}
+		forkKey := tk.Annotations[annForkFromConversationKey]
+		batchID := forkKey
+		if batchID == "" {
+			batchID = ownKey
+		}
+		b := batches[batchID]
+		if b == nil {
+			b = &batch{keys: map[string]struct{}{}, allTermPastGrace: true}
+			batches[batchID] = b
+		}
+		b.keys[ownKey] = struct{}{}
+		if forkKey != "" {
+			b.keys[forkKey] = struct{}{}
+		}
+		if !terminalConversationPastGrace(tk, s.ConversationRetention) {
+			b.allTermPastGrace = false
+		}
+	}
+
+	for _, b := range batches {
+		if !b.allTermPastGrace {
+			continue
+		}
+		for key := range b.keys {
+			if ctx.Err() != nil {
+				return
+			}
+			exists, err := s.ConvStore.Exists(ctx, key)
+			if err != nil {
+				l.Error(err, "reaper: probe conversation object", "action", "gc_conversation", "key", key)
+				s.Metrics.ConversationGC("error")
+				continue
+			}
+			if !exists {
+				continue
+			}
+			if err := s.ConvStore.Delete(ctx, key); err != nil {
+				l.Error(err, "reaper: delete conversation object", "action", "gc_conversation", "key", key)
+				s.Metrics.ConversationGC("error")
+				continue
+			}
+			l.Info("garbage-collected conversation object", "action", "gc_conversation", "key", key)
+			s.Metrics.ConversationGC("deleted")
+		}
+	}
+}
+
+// conversationKeyForGC returns the Task's recorded conversation key, falling back
+// to the deterministic derivation when none was recorded yet.
+func conversationKeyForGC(tk *tatarav1alpha1.Task) string {
+	if tk.Status.ConversationObjectKey != "" {
+		return tk.Status.ConversationObjectKey
+	}
+	return agent.ConversationKey(tk)
+}
+
+// terminalConversationPastGrace reports whether tk is terminal and its last
+// activity (fallback: creation) is older than grace.
+func terminalConversationPastGrace(tk *tatarav1alpha1.Task, grace time.Duration) bool {
+	if !tatarav1alpha1.TaskTerminal(tk) {
+		return false
+	}
+	ts := tk.CreationTimestamp.Time
+	if tk.Status.LastActivityAt != nil {
+		ts = tk.Status.LastActivityAt.Time
+	}
+	return time.Since(ts) > grace
 }
 
 // gcTerminalTasks deletes Tasks that are terminal (TaskTerminal: Succeeded/Failed

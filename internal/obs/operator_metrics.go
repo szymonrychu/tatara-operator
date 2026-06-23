@@ -28,6 +28,7 @@ type OperatorMetrics struct {
 	orphanReapedTotal         *prometheus.CounterVec
 	reapDeleteErrorTotal      *prometheus.CounterVec
 	tasksGCTotal              *prometheus.CounterVec
+	conversationGCTotal       *prometheus.CounterVec
 	turnSubmitTotal           *prometheus.CounterVec
 	turnSubmitDuration        *prometheus.HistogramVec
 	agentHTTPTotal            *prometheus.CounterVec
@@ -144,6 +145,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_tasks_gc_total",
 			Help: "Terminal Tasks garbage-collected by the reaper past the retention window, by Task kind.",
 		}, []string{"kind"}),
+		conversationGCTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_conversation_gc_total",
+			Help: "S3 conversation objects garbage-collected by the reaper when a batch fully closed, by result.",
+		}, []string{"result"}),
 		turnSubmitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_turn_submit_total",
 			Help: "Total turn submissions to agent wrappers by kind and result.",
@@ -253,6 +258,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.orphanReapedTotal,
 		m.reapDeleteErrorTotal,
 		m.tasksGCTotal,
+		m.conversationGCTotal,
 		m.turnSubmitTotal,
 		m.turnSubmitDuration,
 		m.agentHTTPTotal,
@@ -481,6 +487,12 @@ func (m *OperatorMetrics) ReapDeleteError(kind string) {
 // kind garbage-collected past the retention window.
 func (m *OperatorMetrics) TasksGC(kind string) {
 	m.tasksGCTotal.WithLabelValues(kind).Inc()
+}
+
+// ConversationGC increments operator_conversation_gc_total for an S3 conversation
+// object the reaper deleted (result "deleted") or failed to delete ("error").
+func (m *OperatorMetrics) ConversationGC(result string) {
+	m.conversationGCTotal.WithLabelValues(result).Inc()
 }
 
 // TurnSubmit increments operator_turn_submit_total for the task kind and result

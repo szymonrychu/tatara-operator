@@ -67,6 +67,19 @@ type CallbackServer struct {
 	// config.TaskRetention, already clamped to config.MinTaskRetention. Zero or
 	// negative disables the GC pass (e.g. tests that do not exercise it).
 	TaskRetention time.Duration
+	// ConvStore deletes S3 conversation objects for the conversation GC pass
+	// (issue #114 decision 5). Nil disables conversation GC (S3 not configured).
+	ConvStore conversationGC
+	// ConversationRetention is the grace after a conversation's whole batch goes
+	// terminal before its S3 objects are deleted. Zero disables conversation GC.
+	ConversationRetention time.Duration
+}
+
+// conversationGC is the minimal S3 surface the conversation GC pass needs;
+// implemented by internal/objstore.Client and faked in tests.
+type conversationGC interface {
+	Exists(ctx context.Context, key string) (bool, error)
+	Delete(ctx context.Context, key string) error
 }
 
 type turnCompletePayload struct {

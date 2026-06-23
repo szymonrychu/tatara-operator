@@ -113,4 +113,5 @@ S3_REGION: {{ .Values.s3Region | quote }}
 S3_KEY_PREFIX: {{ .Values.s3KeyPrefix | quote }}
 S3_FORCE_PATH_STYLE: {{ .Values.s3ForcePathStyle | quote }}
 S3_SECRET_NAME: {{ .Values.s3SecretName | quote }}
+S3_CONVERSATION_RETENTION_HOURS: {{ .Values.s3ConversationRetentionHours | quote }}
 {{- end -}}

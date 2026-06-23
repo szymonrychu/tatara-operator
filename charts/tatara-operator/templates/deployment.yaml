@@ -52,6 +52,14 @@ spec:
                 name: {{ include "tatara-operator.fullname" . }}
             - secretRef:
                 name: {{ default (include "tatara-operator.fullname" .) .Values.existingSecret }}
+            {{- if .Values.s3SecretName }}
+            # S3 credentials (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) for the
+            # reaper's conversation GC (issue #114 decision 5). The same Secret the
+            # wrapper pods reference; the operator's S3 client reads it via the AWS
+            # default credential chain.
+            - secretRef:
+                name: {{ .Values.s3SecretName }}
+            {{- end }}
           {{- if .Values.callbackHmacSecretName }}
           env:
             # Raw HMAC value for verifying inbound /internal/turn-complete
