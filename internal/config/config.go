@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -103,6 +104,12 @@ type Config struct {
 	// re-exposed on the operator's /metrics after the pod's last push, before
 	// they age out. Backstop for pods that exit without best-effort cleanup.
 	PushMetricsTTL time.Duration
+	// PushMetricsAllowedPrefixes is the metric-name prefix allowlist the
+	// push-receiver enforces (PUSH_METRICS_ALLOWED_PREFIXES, comma-separated).
+	// Nil/empty leaves the receiver on its built-in default (wrapper_,agent_);
+	// widening it (e.g. memory_,ingest_) lets new short-lived-pod producers push
+	// their families without a receiver code change.
+	PushMetricsAllowedPrefixes []string
 	// TaskRetention is how long a terminal (Succeeded/Failed/Done/Stopped/Parked)
 	// Task is kept before the reaper garbage-collects it (its Subtasks cascade via
 	// owner reference). Loaded from TASK_RETENTION_HOURS as an integer hour count.
@@ -181,6 +188,23 @@ func getHoursDefault(key string, def time.Duration) (time.Duration, error) {
 	return time.Duration(n) * time.Hour, nil
 }
 
+// getCSVList parses key as a comma-separated list, trimming whitespace and
+// dropping empty entries. Returns nil when unset or all-empty so callers fall
+// back to their own default.
+func getCSVList(key string) []string {
+	v := os.Getenv(key)
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func getBoolDefault(key string, def bool) (bool, error) {
 	v := os.Getenv(key)
 	if v == "" {
@@ -249,57 +273,58 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{
-		HTTPAddr:                 getDefault("HTTP_ADDR", ":8080"),
-		MetricsAddr:              getDefault("METRICS_ADDR", ":9090"),
-		HealthAddr:               getDefault("HEALTH_ADDR", ":8081"),
-		InternalAddr:             getDefault("INTERNAL_ADDR", ":8082"),
-		CallbackURL:              os.Getenv("CALLBACK_URL"),
-		OIDCIssuer:               os.Getenv("OIDC_ISSUER"),
-		OIDCAudience:             os.Getenv("OIDC_AUDIENCE"),
-		OperatorURL:              getDefault("OPERATOR_URL", "http://tatara-operator.tatara.svc:8080"),
-		MemoryImage:              os.Getenv("MEMORY_IMAGE"),
-		LightragImage:            os.Getenv("LIGHTRAG_IMAGE"),
-		GrafanaMCPImage:          os.Getenv("GRAFANA_MCP_IMAGE"),
-		Neo4jImage:               os.Getenv("NEO4J_IMAGE"),
-		OpenAISecretName:         os.Getenv("OPENAI_SECRET_NAME"),
-		SemanticModel:            getDefault("SEMANTIC_MODEL", "gpt-4o-mini"),
-		IngesterImage:            os.Getenv("INGESTER_IMAGE"),
-		ExternalWebhookBase:      os.Getenv("EXTERNAL_WEBHOOK_BASE"),
-		OperatorOIDCClientID:     os.Getenv("OPERATOR_OIDC_CLIENT_ID"),
-		OperatorOIDCClientSecret: os.Getenv("OPERATOR_OIDC_CLIENT_SECRET"),
-		OperatorOIDCSecretName:   os.Getenv("OPERATOR_OIDC_SECRET_NAME"),
-		AnthropicSecretName:      os.Getenv("ANTHROPIC_SECRET_NAME"),
-		CLIOIDCSecretName:        os.Getenv("CLI_OIDC_SECRET_NAME"),
-		ImagePullSecret:          os.Getenv("IMAGE_PULL_SECRET"),
-		S3Endpoint:               os.Getenv("S3_ENDPOINT"),
-		S3Bucket:                 os.Getenv("S3_BUCKET"),
-		S3Region:                 os.Getenv("S3_REGION"),
-		S3KeyPrefix:              os.Getenv("S3_KEY_PREFIX"),
-		S3ForcePathStyle:         s3ForcePathStyle,
-		S3SecretName:             os.Getenv("S3_SECRET_NAME"),
-		S3ConversationRetention:  conversationRetention,
-		AgentCPURequest:          os.Getenv("AGENT_CPU_REQUEST"),
-		AgentCPULimit:            os.Getenv("AGENT_CPU_LIMIT"),
-		AgentMemoryRequest:       os.Getenv("AGENT_MEMORY_REQUEST"),
-		AgentMemoryLimit:         os.Getenv("AGENT_MEMORY_LIMIT"),
-		AgentRunAsNonRoot:        agentRunAsNonRoot,
-		AgentRunAsUser:           agentRunAsUser,
-		AgentFSGroup:             agentFSGroup,
-		AgentScheduling:          os.Getenv("AGENT_SCHEDULING"),
-		Namespace:                getDefault("NAMESPACE", "tatara"),
-		LogLevel:                 getDefault("LOG_LEVEL", "info"),
-		IngressHost:              os.Getenv("INGRESS_HOST"),
-		IngressClassName:         os.Getenv("INGRESS_CLASS_NAME"),
-		IngressRewriteTarget:     os.Getenv("INGRESS_REWRITE_TARGET"),
-		MemoryPathPrefix:         getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
-		ChatPathPrefix:           getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
-		ChatImage:                os.Getenv("CHAT_IMAGE"),
-		LeaderElection:           leaderElection,
-		PushMetricsTTL:           pushMetricsTTL,
-		TaskRetention:            taskRetention,
-		CallbackHMACSecret:       os.Getenv("CALLBACK_HMAC_SECRET"),
-		CallbackHMACSecretName:   os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
-		SerenaURL:                os.Getenv("TATARA_SERENA_URL"),
+		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
+		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
+		HealthAddr:                 getDefault("HEALTH_ADDR", ":8081"),
+		InternalAddr:               getDefault("INTERNAL_ADDR", ":8082"),
+		CallbackURL:                os.Getenv("CALLBACK_URL"),
+		OIDCIssuer:                 os.Getenv("OIDC_ISSUER"),
+		OIDCAudience:               os.Getenv("OIDC_AUDIENCE"),
+		OperatorURL:                getDefault("OPERATOR_URL", "http://tatara-operator.tatara.svc:8080"),
+		MemoryImage:                os.Getenv("MEMORY_IMAGE"),
+		LightragImage:              os.Getenv("LIGHTRAG_IMAGE"),
+		GrafanaMCPImage:            os.Getenv("GRAFANA_MCP_IMAGE"),
+		Neo4jImage:                 os.Getenv("NEO4J_IMAGE"),
+		OpenAISecretName:           os.Getenv("OPENAI_SECRET_NAME"),
+		SemanticModel:              getDefault("SEMANTIC_MODEL", "gpt-4o-mini"),
+		IngesterImage:              os.Getenv("INGESTER_IMAGE"),
+		ExternalWebhookBase:        os.Getenv("EXTERNAL_WEBHOOK_BASE"),
+		OperatorOIDCClientID:       os.Getenv("OPERATOR_OIDC_CLIENT_ID"),
+		OperatorOIDCClientSecret:   os.Getenv("OPERATOR_OIDC_CLIENT_SECRET"),
+		OperatorOIDCSecretName:     os.Getenv("OPERATOR_OIDC_SECRET_NAME"),
+		AnthropicSecretName:        os.Getenv("ANTHROPIC_SECRET_NAME"),
+		CLIOIDCSecretName:          os.Getenv("CLI_OIDC_SECRET_NAME"),
+		ImagePullSecret:            os.Getenv("IMAGE_PULL_SECRET"),
+		S3Endpoint:                 os.Getenv("S3_ENDPOINT"),
+		S3Bucket:                   os.Getenv("S3_BUCKET"),
+		S3Region:                   os.Getenv("S3_REGION"),
+		S3KeyPrefix:                os.Getenv("S3_KEY_PREFIX"),
+		S3ForcePathStyle:           s3ForcePathStyle,
+		S3SecretName:               os.Getenv("S3_SECRET_NAME"),
+		S3ConversationRetention:    conversationRetention,
+		AgentCPURequest:            os.Getenv("AGENT_CPU_REQUEST"),
+		AgentCPULimit:              os.Getenv("AGENT_CPU_LIMIT"),
+		AgentMemoryRequest:         os.Getenv("AGENT_MEMORY_REQUEST"),
+		AgentMemoryLimit:           os.Getenv("AGENT_MEMORY_LIMIT"),
+		AgentRunAsNonRoot:          agentRunAsNonRoot,
+		AgentRunAsUser:             agentRunAsUser,
+		AgentFSGroup:               agentFSGroup,
+		AgentScheduling:            os.Getenv("AGENT_SCHEDULING"),
+		Namespace:                  getDefault("NAMESPACE", "tatara"),
+		LogLevel:                   getDefault("LOG_LEVEL", "info"),
+		IngressHost:                os.Getenv("INGRESS_HOST"),
+		IngressClassName:           os.Getenv("INGRESS_CLASS_NAME"),
+		IngressRewriteTarget:       os.Getenv("INGRESS_REWRITE_TARGET"),
+		MemoryPathPrefix:           getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
+		ChatPathPrefix:             getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
+		ChatImage:                  os.Getenv("CHAT_IMAGE"),
+		LeaderElection:             leaderElection,
+		PushMetricsTTL:             pushMetricsTTL,
+		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
+		TaskRetention:              taskRetention,
+		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
+		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
+		SerenaURL:                  os.Getenv("TATARA_SERENA_URL"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

@@ -75,6 +75,14 @@ leaderElection: true
 # anchoring a dedup/cooldown window (the longest is the 1h incident cooldown).
 taskRetentionHours: 168
 
+# pushMetricsAllowedPrefixes is the comma-separated metric-name prefix allowlist
+# the push-receiver enforces on short-lived-pod metric pushes. Series whose name
+# matches no prefix are dropped (operator_push_series_dropped_total{reason=
+# "reserved_name"}). wrapper_/agent_ cover the agent wrapper pods; memory_ admits
+# the scheduled retrieval-quality eval (tatara-memory) and ingest_ the repo
+# ingester, so those short-lived Jobs can push without a receiver code change.
+pushMetricsAllowedPrefixes: "wrapper_,agent_,memory_,ingest_"
+
 # S3 conversation persistence (issue #114): the wrapper stores/restores each
 # issue's Claude conversation transcript in an S3-compatible bucket so a fresh
 # pod resumes the prior conversation. Cluster-agnostic (rule 14): all values are
