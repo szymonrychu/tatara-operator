@@ -281,6 +281,7 @@ spec:
                   action:
                     enum:
                     - declined
+                    - already_done
                     type: string
                   reason:
                     type: string

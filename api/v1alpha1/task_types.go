@@ -60,7 +60,7 @@ type IssueOutcome struct {
 // ImplementOutcome is the agent's declared outcome for an implement task when
 // it opens no PR (e.g. a deliberate refusal). Mirrors IssueOutcome.
 type ImplementOutcome struct {
-	// +kubebuilder:validation:Enum=declined
+	// +kubebuilder:validation:Enum=declined;already_done
 	Action string `json:"action"`
 	Reason string `json:"reason"` // required; why no implementation
 }
