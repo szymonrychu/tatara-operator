@@ -539,7 +539,14 @@ func (c *GitLab) RequestChanges(ctx context.Context, repoURL, token string, numb
 		}
 	}
 	if err := glDo(ctx, c.base(), http.MethodPost, base+"/award_emoji", token, map[string]string{"name": "thumbsdown"}, nil); err != nil {
-		return err
+		// GitLab returns 404 ("Award Emoji Name has already been taken") when the
+		// thumbsdown was already awarded on a prior request-changes pass. Benign
+		// idempotency (mirrors the unapprove 404 above): proceed to the note.
+		// Other failures still abort.
+		var he *HTTPError
+		if !errors.As(err, &he) || he.Status != http.StatusNotFound {
+			return err
+		}
 	}
 	if body == "" {
 		body = "Requesting changes."

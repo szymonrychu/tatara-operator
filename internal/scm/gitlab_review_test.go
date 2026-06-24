@@ -100,3 +100,48 @@ func TestGitLabApprovePropagatesNon401(t *testing.T) {
 		t.Fatal("Approve must propagate a non-401 error from /approve")
 	}
 }
+
+// TestGitLabRequestChangesTolerates404AwardEmoji verifies RequestChanges does not
+// abort when the award_emoji call 404s. GitLab returns 404 ("Award Emoji Name has
+// already been taken") when the thumbsdown was already awarded on a prior pass;
+// it is benign and the note must still land.
+func TestGitLabRequestChangesTolerates404AwardEmoji(t *testing.T) {
+	var notePosted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/award_emoji"):
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"404 Award Emoji Name has already been taken Not Found"}`))
+		case strings.HasSuffix(r.URL.Path, "/notes"):
+			notePosted = true
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	if err := c.RequestChanges(context.Background(), "https://gitlab.com/g/p", "tok", 7, "fix it"); err != nil {
+		t.Fatalf("RequestChanges should tolerate a 404 already-awarded from award_emoji: %v", err)
+	}
+	if !notePosted {
+		t.Fatal("after a tolerated 404 award_emoji, the note must still post")
+	}
+}
+
+// TestGitLabRequestChangesPropagatesNon404AwardEmoji verifies a non-404 award_emoji
+// error still aborts.
+func TestGitLabRequestChangesPropagatesNon404AwardEmoji(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/award_emoji") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	if err := c.RequestChanges(context.Background(), "https://gitlab.com/g/p", "tok", 7, "fix it"); err == nil {
+		t.Fatal("RequestChanges must propagate a non-404 award_emoji error")
+	}
+}
