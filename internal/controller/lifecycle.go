@@ -237,6 +237,13 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		}
 		from = fresh.Status.LifecycleState
 		fresh.Status.LifecycleState = to
+		// Persist the park reason on every Parked transition; clear it otherwise
+		// so stale reasons do not linger after re-activation.
+		if to == "Parked" {
+			fresh.Status.ParkReason = reason
+		} else {
+			fresh.Status.ParkReason = ""
+		}
 		// On every Implement entry, reset the empty-run retry budget so each
 		// attempt gets a clean counter. ImplementOutcome is only cleared on FRESH
 		// triage-initiated entries; CI-failure/merge-conflict re-entries leave a
