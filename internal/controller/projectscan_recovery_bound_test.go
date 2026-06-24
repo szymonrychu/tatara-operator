@@ -75,6 +75,49 @@ func TestPriorTerminalAttempts_CountsLabelLessTasks(t *testing.T) {
 	require.Equal(t, 2, priorTerminalAttempts(existing, "o/r", 50))
 }
 
+// mkIssueTask builds a terminal ISSUE-slot lifecycle task (IsPR=false). On
+// GitLab issue #N and MR !N share no numbering space, so a terminal issue task
+// whose Number equals a PR number must NOT be counted toward that PR's recovery
+// budget. Spec.Source identity carries the slot via IsPR.
+func mkIssueTask(repo string, num int, lc string) tatarav1alpha1.Task {
+	return tatarav1alpha1.Task{
+		Spec: tatarav1alpha1.TaskSpec{
+			Kind: "issueLifecycle",
+			Source: &tatarav1alpha1.TaskSource{
+				IssueRef: repo + "#" + strconv.Itoa(num),
+				Number:   num,
+				IsPR:     false,
+			},
+		},
+		Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
+	}
+}
+
+// TestPriorTerminalAttempts_IgnoresIssueSlotSameNumber is the GitLab slot-leak
+// regression: a terminal ISSUE task whose number equals the PR number must NOT
+// inflate the PR's recovery-attempt count, or closeExhaustedPR can fire on a
+// still-recoverable bot MR. Only PR-slot terminal tasks count.
+func TestPriorTerminalAttempts_IgnoresIssueSlotSameNumber(t *testing.T) {
+	existing := []tatarav1alpha1.Task{
+		mkIssueTask("o/r", 50, "Parked"), // issue !50, terminal: must NOT count toward MR !50
+		mkIssueTask("o/r", 50, "Done"),   // issue !50, terminal: must NOT count
+		mkIssueTask("o/r", 50, "Stopped"),
+	}
+	require.Equal(t, 0, priorTerminalAttempts(existing, "o/r", 50),
+		"terminal issue-slot tasks must not be counted toward a same-numbered PR's recovery cap")
+
+	// Mixed: 1 PR-slot terminal + 3 issue-slot terminal at the same number ->
+	// count must be 1 (issue tasks excluded), well under maxRecoveryAttempts.
+	mixed := []tatarav1alpha1.Task{
+		mkPRTask("o/r", 50, "Parked"),
+		mkIssueTask("o/r", 50, "Done"),
+		mkIssueTask("o/r", 50, "Stopped"),
+		mkIssueTask("o/r", 50, "Parked"),
+	}
+	require.Equal(t, 1, priorTerminalAttempts(mixed, "o/r", 50),
+		"only PR-slot terminal tasks count; issue-slot tasks at the same number are excluded")
+}
+
 func TestRecoveryBoundThreshold(t *testing.T) {
 	require.Equal(t, 3, maxRecoveryAttempts)
 }

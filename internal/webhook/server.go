@@ -352,20 +352,21 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// Phase 1 stopped writing the source-repo/source-number labels, so the dedup
 	// identity is matched in-Go against dedupRef (the reconstructed issue ref) and
 	// Spec.Source.DedupNumber/Number, NOT a server-side label selector that would
-	// drop every post-deploy Task. LabelSourceKind is still written, so we keep it
-	// as a coarse pre-filter to narrow the list. The dedupRef equality handles the
-	// bot-PR arm too: dedupRef is rewritten to the linked issue's ref ("o/r#7"), so
-	// it matches the issueScan task that already owns that issue slot.
+	// drop every post-deploy Task. The dedupRef equality handles the bot-PR arm
+	// too: dedupRef is rewritten to the linked issue's ref ("o/r#7"), so it matches
+	// the issueScan/mrScan task that already owns that issue slot.
 	// Phase 2: dedup is matched by spec/ledger identity via TaskMatchesItem.
-	// The apiserver pre-filter narrows to issueLifecycle Tasks; in-Go matching
-	// then applies full identity + slot checks. O(tasks) per the Full-removal
-	// decision (label-selector dedup is gone; deterministic-name idempotency
-	// handles the truly-concurrent hot path).
+	// List ALL Tasks in the namespace (no LabelSourceKind pre-filter): a bot-PR
+	// "Closes #N" delivery must dedup against an existing issueScan/mrScan Task for
+	// issue #N, and those scan tasks carry LabelSourceKind=mrScan/issueScan (not
+	// "issueLifecycle"), so narrowing to issueLifecycle would hide them and let a
+	// duplicate slip through. in-Go matching then applies full identity + slot
+	// checks. O(tasks) per the Full-removal decision (label-selector dedup is gone;
+	// deterministic-name idempotency handles the truly-concurrent hot path).
 	dedupRepo := tatarav1.RepoFromIssueRef(dedupRef)
 	var existing tatarav1.TaskList
 	listOpts := []client.ListOption{
 		client.InNamespace(s.cfg.Namespace),
-		client.MatchingLabels{tatarav1.LabelSourceKind: "issueLifecycle"},
 	}
 	if err := s.cfg.Client.List(ctx, &existing, listOpts...); err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")

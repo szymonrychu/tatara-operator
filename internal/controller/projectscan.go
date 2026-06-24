@@ -44,20 +44,46 @@ func isLifecycleTerminal(state string) bool {
 // a human (the last park comment already explains why).
 const maxRecoveryAttempts = 3
 
+// taskIsPRSlot reports whether the Task targets PR number prNumber in the PR
+// slot (as opposed to issue #prNumber). On GitLab issue #N and MR !N are
+// distinct objects sharing a number, so identity-by-number is not enough: the
+// recovery-attempt count must only include PR-slot tasks. Resolution order:
+// Spec.Source (IsPR + Number) for Phase-1+ tasks, then any ledger entry with
+// Kind==pr and Number==prNumber, then the legacy LabelIsPR for pre-Phase-1
+// Tasks (number carried by the source-number label / Spec.Source.Number).
+func taskIsPRSlot(t *tatarav1alpha1.Task, prNumber int) bool {
+	if s := t.Spec.Source; s != nil {
+		if s.IsPR && s.Number == prNumber {
+			return true
+		}
+	}
+	for _, wi := range t.Status.WorkItems {
+		if wi.Kind == tatarav1alpha1.WorkItemPR && wi.Number == prNumber {
+			return true
+		}
+	}
+	// Legacy fallback for pre-Phase-1 Tasks with no Spec.Source.
+	if t.Spec.Source == nil && t.Labels[tatarav1alpha1.LabelIsPR] == "true" {
+		return true
+	}
+	return false
+}
+
 // priorTerminalAttempts counts terminal (Done/Stopped/Parked) tasks that already
 // targeted this exact PR, so mrScan can stop re-adopting an unfixable PR.
 func priorTerminalAttempts(existing []tatarav1alpha1.Task, repoSlug string, prNumber int) int {
 	n := 0
 	for i := range existing {
 		t := &existing[i]
-		// Phase 2: match on spec/ledger identity only; taskMatchesItem carries the
-		// legacy label fallback for Tasks created before Phase 1. The IsPR/Number
-		// narrowing guard that was here is subsumed by taskMatchesItem which already
-		// checks DedupNumber||Number against prNumber - no need to also check IsPR:
-		// an issue-slot task for the same number would match, but issue tasks are
-		// never terminal-lifecycle-terminal for a PR number that doesn't match their
-		// own identity, so the count is still correct.
+		// Phase 2: match on spec/ledger identity (with legacy label fallback for
+		// pre-Phase-1 Tasks), THEN require the PR slot. taskMatchesItem alone is
+		// number-only and would let a terminal issue task for issue #N inflate the
+		// recovery count of MR !N on GitLab (distinct objects, same number). The
+		// taskIsPRSlot gate restores the IsPR discrimination the old guard provided.
 		if !taskMatchesItem(t, repoSlug, prNumber) {
+			continue
+		}
+		if !taskIsPRSlot(t, prNumber) {
 			continue
 		}
 		if isLifecycleTerminal(t.Status.LifecycleState) {

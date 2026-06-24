@@ -144,10 +144,22 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 					return ferr
 				}
 				if len(fresh.Status.WorkItems) > 0 {
-					return nil // another replica already seeded
+					// Another replica already seeded; adopt its state so the
+					// downstream reconcile starts from the current resourceVersion.
+					task = *fresh
+					return nil
 				}
 				seedLedgerFromSpec(fresh)
-				return r.Status().Update(ctx, fresh)
+				if uerr := r.Status().Update(ctx, fresh); uerr != nil {
+					return uerr
+				}
+				// Status().Update bumped fresh's resourceVersion on a SEPARATE fetch;
+				// the local `task` still holds the stale RV. Adopt fresh so the rest
+				// of this reconcile (lifecycle / writeback Status().Update) operates
+				// on the current RV instead of 409-conflicting on every first
+				// reconcile during rollout (~1148 in-flight Tasks).
+				task = *fresh
+				return nil
 			}); err != nil {
 				l.Error(err, "task: seed ledger from spec (non-fatal)",
 					"action", "ledger_seed", "resource_id", task.Name)
