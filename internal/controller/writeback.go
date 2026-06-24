@@ -74,14 +74,13 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		// implement and other future kinds that open a change.
 	}
 
-	// Project-scoped kinds (incident; healthCheck rides on Kind=brainstorm,
-	// handled above) carry an empty RepositoryRef and never open a PR/MR: the
-	// agent files any evidence via propose_issue, which spawns a child implement
-	// Task. Falling through to writeBackOpenChange would Get a Repository by the
-	// empty RepositoryRef (`Repository "" not found`), so WritebackPending never
-	// clears and the reconcile error-loops after the task already terminated
-	// Succeeded (the incident-qe-bw5hw incident). This guard also fences any
-	// future project-scoped kind that is added to the enum/map but not the switch.
+	// Defensive fence for project-scoped kinds. The known ones (brainstorm,
+	// incident, healthCheck) are handled by explicit cases above; this catches any
+	// FUTURE project-scoped kind added to the enum/map but not given a case.
+	// Such a kind carries an empty RepositoryRef and never opens a PR/MR, so
+	// falling through to writeBackOpenChange would Get a Repository by the empty
+	// RepositoryRef (`Repository "" not found`) and error-loop after the task
+	// already terminated Succeeded (the incident-qe-bw5hw incident class).
 	if tatarav1alpha1.IsProjectScopedKind(task.Spec.Kind) {
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "ProjectScopedComplete", task.Spec.Kind+" is project-scoped; no PR to open")
 	}

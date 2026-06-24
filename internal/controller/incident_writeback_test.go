@@ -41,7 +41,11 @@ func TestDoWriteBackIncidentDoesNotOpenPR(t *testing.T) {
 	cond := findCond(got.Status.Conditions, "WritebackPending")
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionFalse, cond.Status, "WritebackPending must be cleared")
-	require.Equal(t, "ProjectScopedComplete", cond.Reason)
+	// incident is handled by doWriteBack's explicit `case "incident", "healthCheck"`,
+	// which (no proposal child) clears as NoWriteback. The post-switch
+	// IsProjectScopedKind guard (ProjectScopedComplete) is only a fence for a
+	// future project-scoped kind that lacks an explicit case.
+	require.Equal(t, "NoWriteback", cond.Reason)
 }
 
 // TestIsProjectScopedKind locks the project-scoped kind set: these never carry a
