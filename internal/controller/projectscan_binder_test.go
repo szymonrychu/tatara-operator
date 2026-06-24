@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -59,6 +60,7 @@ func TestIssueScanDedupBlocksRunningTask(t *testing.T) {
 	pre.Spec = tatarav1alpha1.TaskSpec{
 		ProjectRef: "binder-lane-lifecycle", RepositoryRef: repoA.Name,
 		Goal: "g", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#1", Number: 1},
 	}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
@@ -98,6 +100,12 @@ func TestIssueScanDedupLifecycleTerminals(t *testing.T) {
 		tk.Status.Phase = phase
 		tk.Status.LifecycleState = lifecycleState
 		tk.CreationTimestamp = created
+		// Phase 1: source set so taskMatchesItem can find this task.
+		tk.Spec.Source = &tatarav1alpha1.TaskSource{
+			Provider: "github",
+			IssueRef: "o/r#" + strconv.Itoa(number),
+			Number:   number,
+		}
 		return tk
 	}
 
@@ -256,12 +264,20 @@ func TestMRScanBotPRClosesIssueKeyedOnLinkedIssue(t *testing.T) {
 	if len(qes) != 1 {
 		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
-	// source-number label should be the linked issue number (17), not the PR number (42)
-	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "17" {
-		t.Errorf("source-number label = %q, want 17 (linked issue)", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	// source-number label is no longer written (Phase 1: ledger replaces label-based dedup).
+	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "" {
+		t.Errorf("source-number label must not be written (Phase 1), got %q", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	}
+	// Linked issue number is recorded as Source.DedupNumber (dedup key for taskMatchesItem).
+	src := qes[0].Spec.Payload.Source
+	if src == nil || src.DedupNumber != 17 {
+		n := 0
+		if src != nil {
+			n = src.DedupNumber
+		}
+		t.Errorf("Payload.Source.DedupNumber = %d, want 17 (linked issue)", n)
 	}
 	// PR number is in Payload.Source.Number (set at create time, not via Status).
-	src := qes[0].Spec.Payload.Source
 	if src == nil || src.Number != 42 {
 		n := 0
 		if src != nil {
@@ -293,9 +309,18 @@ func TestMRScanBotPRNoClosesKeyedOnPRNumber(t *testing.T) {
 	if len(qes) != 1 {
 		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
-	// source-number label should be the PR number (55) when no Closes #N
-	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "55" {
-		t.Errorf("source-number label = %q, want 55 (PR number)", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	// source-number label is no longer written (Phase 1: ledger replaces label-based dedup).
+	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "" {
+		t.Errorf("source-number label must not be written (Phase 1), got %q", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	}
+	// DedupNumber is zero when no linked issue (dedup uses Source.Number directly).
+	src := qes[0].Spec.Payload.Source
+	if src == nil || src.DedupNumber != 0 {
+		n := -1
+		if src != nil {
+			n = src.DedupNumber
+		}
+		t.Errorf("Payload.Source.DedupNumber = %d, want 0 (no linked issue)", n)
 	}
 }
 
@@ -317,6 +342,7 @@ func TestIssueScanAdoptsParkedTaskInsteadOfDuplicating(t *testing.T) {
 	pre.Spec = tatarav1alpha1.TaskSpec{
 		ProjectRef: "adopt-parked", RepositoryRef: repoA.Name,
 		Goal: "g", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#8", Number: 8},
 	}
 	if err := k8sClient.Create(ctx, pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
@@ -387,6 +413,7 @@ func TestIssueScanBotCommentDoesNotRespawnTask(t *testing.T) {
 	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 8}, "issueScan", "issueLifecycle")
 	pre.Spec = tatarav1alpha1.TaskSpec{
 		ProjectRef: "b3-botcomment", RepositoryRef: repoA.Name, Goal: "g", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#8", Number: 8},
 	}
 	if err := k8sClient.Create(ctx, pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
@@ -476,6 +503,7 @@ func TestIssueScanAdoptionDoesNotLoopWithoutNewHumanComment(t *testing.T) {
 	pre.Spec = tatarav1alpha1.TaskSpec{
 		ProjectRef: "adopt-noloop", RepositoryRef: repoA.Name,
 		Goal: "g", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#77", Number: 77},
 	}
 	if err := k8sClient.Create(ctx, pre); err != nil {
 		t.Fatalf("pre-create: %v", err)

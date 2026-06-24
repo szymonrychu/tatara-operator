@@ -397,9 +397,9 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// LifecycleState atomically from it, without a separate post-create
 	// Status().Update that may be lost.
 	ann := map[string]string{}
-	// Dedup labels: set for issueLifecycle tasks so the webhook-born Task uses
-	// the same dedup key as a cron mrScan/issueScan Task for the same work item,
-	// preventing duplicate lifecycle Tasks.
+	// Lifecycle entry annotation + observability labels for issueLifecycle tasks.
+	// The three source dedup labels (source-repo, source-number, head-sha) are no
+	// longer written: dedup is driven by Spec.Source and Status.WorkItems.
 	var labels map[string]string
 	if kind == "issueLifecycle" {
 		if ev.IsPR {
@@ -408,11 +408,9 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
 		}
 		labels = map[string]string{
-			tatarav1.LabelSourceRepo:   dedupSlug,
-			tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
-			tatarav1.LabelSourceKind:   kind,
-			tatarav1.LabelActivity:     "webhook",
-			tatarav1.LabelIsPR:         isPRStr,
+			tatarav1.LabelSourceKind: kind,
+			tatarav1.LabelActivity:   "webhook",
+			tatarav1.LabelIsPR:       isPRStr,
 		}
 	}
 
@@ -444,6 +442,14 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			IsPR:        ev.IsPR,
 			Number:      ev.Number,
 			Title:       ev.Title,
+			DedupNumber: func() int {
+				// For bot-PR "Closes #N": DedupNumber = N (linked issue).
+				// Zero for non-bot-PR (dedup falls back to Source.Number).
+				if dedupNumber != ev.Number {
+					return dedupNumber
+				}
+				return 0
+			}(),
 		},
 		Provider: provider,
 		PodRepo:  repo.Name,
@@ -612,18 +618,17 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 		return
 	}
 
-	// Dedup labels matching the issueScan convention.
-	repoSlug, _ := issueRefRepoSlug(ev.IssueRef)
+	// Observability labels for the new lifecycle task.
+	// The three source dedup labels (source-repo, source-number, head-sha) are no
+	// longer written: dedup is driven by Spec.Source and Status.WorkItems.
 	commentIsPRStr := "false"
 	if ev.IsPR {
 		commentIsPRStr = "true"
 	}
 	labels := map[string]string{
-		tatarav1.LabelSourceRepo:   repoSlug,
-		tatarav1.LabelSourceNumber: strconv.Itoa(ev.Number),
-		tatarav1.LabelSourceKind:   "issueLifecycle",
-		tatarav1.LabelActivity:     "webhook",
-		tatarav1.LabelIsPR:         commentIsPRStr,
+		tatarav1.LabelSourceKind: "issueLifecycle",
+		tatarav1.LabelActivity:   "webhook",
+		tatarav1.LabelIsPR:       commentIsPRStr,
 	}
 	ann := map[string]string{tatarav1.LifecycleEntryAnnotation: "Triage"}
 

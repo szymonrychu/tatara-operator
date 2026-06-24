@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -10,21 +11,33 @@ import (
 
 func mkCronTask(repo string, number int, kind, headSHA, phase string) tatarav1alpha1.Task {
 	tk := tatarav1alpha1.Task{}
-	tk.Labels = scanTaskLabels(candidate{repo: repo, number: number, headSHA: headSHA}, "mrScan", kind)
+	// Set the 3 legacy source dedup labels directly (Phase 1: writes stopped,
+	// reads kept for backward-compat with tasks created before the ledger).
+	labels := scanTaskLabels(candidate{repo: repo, number: number, headSHA: headSHA}, "mrScan", kind)
+	labels[labelSourceRepo] = sanitizeRepoLabel(repo)
+	labels[labelSourceNumber] = strconv.Itoa(number)
+	if headSHA != "" {
+		labels[labelHeadSHA] = headSHA
+	}
+	tk.Labels = labels
 	tk.Status.Phase = phase
 	return tk
 }
 
 func TestScanTaskLabels(t *testing.T) {
 	got := scanTaskLabels(candidate{repo: "o/r", number: 5, headSHA: "abc"}, "mrScan", "review")
-	if got["tatara.io/source-repo"] != "o.r" {
-		t.Fatalf("source-repo = %q (want sanitized o.r)", got["tatara.io/source-repo"])
+	// The three source dedup labels are no longer written (Phase 1).
+	for _, key := range []string{"tatara.io/source-repo", "tatara.io/source-number", "tatara.io/head-sha"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("scanTaskLabels must not write %q; got %+v", key, got)
+		}
 	}
-	if got["tatara.io/source-number"] != "5" || got["tatara.io/source-kind"] != "review" {
-		t.Fatalf("labels = %+v", got)
+	// Kind and activity labels are still expected.
+	if got["tatara.io/source-kind"] != "review" {
+		t.Fatalf("source-kind = %q (want review); labels = %+v", got["tatara.io/source-kind"], got)
 	}
-	if got["tatara.io/head-sha"] != "abc" || got["tatara.io/activity"] != "mrScan" {
-		t.Fatalf("labels = %+v", got)
+	if got["tatara.io/activity"] != "mrScan" {
+		t.Fatalf("activity = %q (want mrScan); labels = %+v", got["tatara.io/activity"], got)
 	}
 }
 
@@ -153,6 +166,12 @@ func mkLifecycleKindTask(repo string, number int, lifecycleState string) tatarav
 	tk := tatarav1alpha1.Task{}
 	tk.Labels = scanTaskLabels(candidate{repo: repo, number: number}, "issueScan", "issueLifecycle")
 	tk.Status.LifecycleState = lifecycleState
+	// Phase 1: source set so taskMatchesItem can find this task (labels no longer written).
+	tk.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider: "github",
+		IssueRef: repo + "#" + strconv.Itoa(number),
+		Number:   number,
+	}
 	return tk
 }
 

@@ -92,19 +92,15 @@ func sanitizeRepoLabel(repo string) string {
 	return strings.ReplaceAll(repo, "/", ".")
 }
 
-// scanTaskLabels builds the operator-stamped dedup labels for a cron Task.
-// head-sha is omitted for non-PR candidates.
+// scanTaskLabels builds the operator-stamped labels for a cron Task.
+// The three source dedup labels (source-repo, source-number, head-sha) are no
+// longer written here: dedup is driven by Spec.Source and Status.WorkItems.
+// Kind and activity labels are retained for observability and non-dedup filtering.
 func scanTaskLabels(c candidate, activity, kind string) map[string]string {
-	l := map[string]string{
-		labelSourceRepo:   sanitizeRepoLabel(c.repo),
-		labelSourceNumber: strconv.Itoa(c.number),
-		labelSourceKind:   kind,
-		labelActivity:     activity,
+	return map[string]string{
+		labelSourceKind: kind,
+		labelActivity:   activity,
 	}
-	if c.headSHA != "" {
-		l[labelHeadSHA] = c.headSHA
-	}
-	return l
 }
 
 // findConvTaskToReactivate returns the first Conversation or Stopped lifecycle
@@ -120,7 +116,9 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 1: match by legacy labels OR spec/ledger identity.
+		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
+		if !labelsMatch && !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		state := t.Status.LifecycleState
@@ -197,7 +195,10 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string, hu
 	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 1: match by legacy labels (old tasks) OR spec/ledger identity (new tasks
+		// that no longer carry source-repo/source-number). Phase 2 removes label reads.
+		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
+		if !labelsMatch && !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
@@ -245,7 +246,9 @@ func lastTerminalNoLabelTask(c candidate, existing []tatarav1alpha1.Task, manage
 	var latest *tatarav1alpha1.Task
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 1: match by legacy labels OR spec/ledger identity.
+		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
+		if !labelsMatch && !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
@@ -433,6 +436,12 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 		provider = proj.Spec.Scm.Provider
 	}
 	src := scanSourceFor(provider, srcCand)
+	// When the dedup identity (labelCand) differs from the PR identity (srcCand), the
+	// linked issue number is the dedup key. Persist it as DedupNumber so taskMatchesItem
+	// can find this task via spec/ledger without relying on the old source-number label.
+	if labelCand.number != srcCand.number {
+		src.DedupNumber = labelCand.number
+	}
 	// Dedup key is based on labelCand (the issue/PR that determines the task's identity).
 	// For bot-PR MRCI entries, labelCand.number is the linked issue (not the PR#),
 	// ensuring that mrScan and issueScan share the same dedup key for the same issue.
@@ -1722,7 +1731,9 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 	numLabel := strconv.Itoa(number)
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 1: match by legacy labels OR spec/ledger identity.
+		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
+		if !labelsMatch && !taskMatchesItem(t, slug, number) {
 			continue
 		}
 		if tatarav1alpha1.TaskTerminal(t) {
@@ -1751,7 +1762,9 @@ func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number 
 		if t.Labels[labelSourceKind] != "issueLifecycle" {
 			continue
 		}
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 1: match by legacy labels OR spec/ledger identity.
+		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
+		if !labelsMatch && !taskMatchesItem(t, slug, number) {
 			continue
 		}
 		switch t.Status.LifecycleState {

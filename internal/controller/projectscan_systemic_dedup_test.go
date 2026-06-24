@@ -148,7 +148,8 @@ func TestIssueScan_SystemicDedup_LeadInFlightStillCollapsesSibling(t *testing.T)
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
 	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 12}, "issueScan", "issueLifecycle")
-	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "systemic-dedup-inflight", RepositoryRef: repo.Name, Goal: "g", Kind: "issueLifecycle"}
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "systemic-dedup-inflight", RepositoryRef: repo.Name, Goal: "g", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#12", Number: 12}}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}

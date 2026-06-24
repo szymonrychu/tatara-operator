@@ -62,7 +62,13 @@ func TestCreateScanTask(t *testing.T) {
 	if got.Spec.Kind != "review" || got.Spec.RepositoryRef != "factory-repo" {
 		t.Fatalf("QE spec = %+v", got.Spec)
 	}
-	if got.Spec.Payload.Labels[labelSourceRepo] != "o.r" || got.Spec.Payload.Labels[labelSourceNumber] != "5" || got.Spec.Payload.Labels[labelHeadSHA] != "abc" || got.Spec.Payload.Labels[labelActivity] != "mrScan" {
+	// Phase 1: source-repo, source-number, head-sha labels no longer written.
+	for _, key := range []string{labelSourceRepo, labelSourceNumber, labelHeadSHA} {
+		if v := got.Spec.Payload.Labels[key]; v != "" {
+			t.Fatalf("QE payload label %q must not be written (Phase 1), got %q", key, v)
+		}
+	}
+	if got.Spec.Payload.Labels[labelActivity] != "mrScan" {
 		t.Fatalf("QE payload labels = %+v", got.Spec.Payload.Labels)
 	}
 	src := got.Spec.Payload.Source
