@@ -1226,6 +1226,78 @@ func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav
 	return r.setLifecycleState(ctx, task, "Conversation", reason)
 }
 
+// observeProposalLabelReadback checks the task's source issue for a human-applied
+// approved or declined label and reflects the result onto the role:proposed ledger
+// entry. This is the P4 "read label changes back" path: when a human relabels a
+// brainstorm proposal issue, the operator writes it onto the ledger entry so the
+// backlog cap and any tooling that reads the ledger see the updated state.
+// Returns the observed state ("approved"|"declined"|"") and any error.
+// Non-fatal errors are logged by the caller; nil reader or no source is a no-op.
+func (r *TaskReconciler) observeProposalLabelReadback(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (string, error) {
+	if r.ReaderFor == nil || task.Spec.Source == nil || task.Spec.Source.IssueRef == "" || task.Spec.Source.IsPR {
+		return "", nil
+	}
+	// Only tasks that have a role:proposed ledger entry are subject to readback.
+	hasProposedEntry := false
+	for _, wi := range task.Status.WorkItems {
+		if wi.Role == tatarav1alpha1.RoleProposed {
+			hasProposedEntry = true
+			break
+		}
+	}
+	if !hasProposedEntry {
+		return "", nil
+	}
+
+	provider := task.Spec.Source.Provider
+	if provider == "" && project.Spec.Scm != nil {
+		provider = project.Spec.Scm.Provider
+	}
+	token, err := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef)
+	if err != nil {
+		return "", fmt.Errorf("observe label: token: %w", err)
+	}
+	reader, err := r.ReaderFor(provider, token)
+	if err != nil {
+		return "", fmt.Errorf("observe label: reader: %w", err)
+	}
+	_, repo, _, _, _, sctxErr := r.scmContext(ctx, task)
+	if sctxErr != nil {
+		return "", fmt.Errorf("observe label: scm context: %w", sctxErr)
+	}
+	owner, name, oerr := scm.OwnerRepo(repo.Spec.URL)
+	if oerr != nil {
+		return "", fmt.Errorf("observe label: repo url: %w", oerr)
+	}
+	issues, lerr := reader.ListOpenIssues(ctx, owner, name)
+	if lerr != nil {
+		return "", fmt.Errorf("observe label: list: %w", lerr)
+	}
+	issueRef := task.Spec.Source.IssueRef
+	_, approvedLabel, _, declinedLabel := lifecycleLabels(project.Spec.Scm)
+	for _, iss := range issues {
+		if fmt.Sprintf("%s#%d", iss.Repo, iss.Number) != issueRef {
+			continue
+		}
+		for _, lb := range iss.Labels {
+			switch lb {
+			case approvedLabel:
+				if uErr := r.upsertProposedEntryState(ctx, task, issueRef, tatarav1alpha1.WIApproved); uErr != nil {
+					return "approved", fmt.Errorf("observe label: upsert approved: %w", uErr)
+				}
+				return "approved", nil
+			case declinedLabel:
+				if uErr := r.upsertProposedEntryState(ctx, task, issueRef, tatarav1alpha1.WIDeclined); uErr != nil {
+					return "declined", fmt.Errorf("observe label: upsert declined: %w", uErr)
+				}
+				return "declined", nil
+			}
+		}
+		break // issue found, no approved/declined label
+	}
+	return "", nil
+}
+
 // handleConversation manages the idle wait state. No pod is ever spawned here.
 // If the deadline has passed the task transitions to Stopped (idle-stop, resumable).
 // If DeadlineAt is nil (safety net for tasks whose deadline was never set), set it
@@ -1233,6 +1305,17 @@ func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav
 // and requeue so the normal deadline path runs on the next reconcile.
 // Otherwise it requeues until the deadline.
 func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	l := log.FromContext(ctx)
+
+	// P4 label readback: if the source issue has been relabeled by a human
+	// (tatara-approved or tatara-declined) since the last reconcile, reflect the
+	// state onto the role:proposed ledger entry. This is best-effort: a readback
+	// failure does not block the conversation deadline path.
+	if _, rbErr := r.observeProposalLabelReadback(ctx, project, task); rbErr != nil {
+		l.Info("conversation: proposal label readback failed (non-fatal)",
+			"action", "conversation_label_readback", "resource_id", task.Name, "err", rbErr.Error())
+	}
+
 	if task.Status.DeadlineAt == nil {
 		// Safety net: set deadline once rather than returning false from
 		// deadlinePassed forever and requeuing without bound. Delegates to the

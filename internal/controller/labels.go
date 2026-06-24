@@ -6,6 +6,8 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -138,7 +140,68 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		l.Info("lifecycle label set", "action", "scm_set_label",
 			"resource_id", task.Name, "issue_ref", issueRef, "label", desired)
 	}
+
+	// P4 hybrid projection: reflect the new label as the matching role:proposed
+	// ledger entry state. No-op when the task has no role:proposed entry (e.g.
+	// human-opened issues that never went through the brainstorm proposal path).
+	if wiState := lifecycleLabelToWIState(proj.Spec.Scm, desired); wiState != "" {
+		if upsertErr := r.upsertProposedEntryState(ctx, task, issueRef, wiState); upsertErr != nil {
+			l.Info("set label: ledger entry update failed (non-fatal)",
+				"action", "scm_set_label_ledger", "resource_id", task.Name,
+				"issue_ref", issueRef, "wi_state", wiState, "err", upsertErr.Error())
+		}
+	}
 	return nil
+}
+
+// lifecycleLabelToWIState maps a managed SCM phase label to its equivalent
+// work-item state for the role:proposed ledger entry. Returns "" for labels
+// that have no ledger counterpart (e.g. tatara-idea, tatara-rejected).
+func lifecycleLabelToWIState(s *tatarav1alpha1.ScmSpec, label string) string {
+	bs, approved, impl, declined := lifecycleLabels(s)
+	switch label {
+	case bs:
+		return tatarav1alpha1.WIProposed
+	case approved:
+		return tatarav1alpha1.WIApproved
+	case impl:
+		return tatarav1alpha1.WIImplemented
+	case declined:
+		return tatarav1alpha1.WIDeclined
+	}
+	return ""
+}
+
+// upsertProposedEntryState updates the role:proposed WorkItemRef whose
+// (Repo, Number) matches the given issueRef to the given state, then persists
+// the change under RetryOnConflict. No-op when no matching entry exists.
+func (r *TaskReconciler) upsertProposedEntryState(ctx context.Context, task *tatarav1alpha1.Task, issueRef, newState string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.Task
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), &fresh); gerr != nil {
+			return gerr
+		}
+		changed := false
+		for i := range fresh.Status.WorkItems {
+			wi := &fresh.Status.WorkItems[i]
+			if wi.Role != tatarav1alpha1.RoleProposed {
+				continue
+			}
+			if fmt.Sprintf("%s#%d", wi.Repo, wi.Number) != issueRef {
+				continue
+			}
+			if wi.State == newState {
+				return nil // already set, nothing to write
+			}
+			wi.State = newState
+			changed = true
+			break
+		}
+		if !changed {
+			return nil
+		}
+		return r.Status().Update(ctx, &fresh)
+	})
 }
 
 // hasHumanComment reports whether the task's source issue has at least one
