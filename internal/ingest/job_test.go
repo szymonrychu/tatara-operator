@@ -58,6 +58,30 @@ func TestBuildJob_IncrementalBackoffLimitIsZero(t *testing.T) {
 	}
 }
 
+// TestBuildJob_IngestModeLabel verifies the Job and its Pod template carry the
+// ingest-mode label the controller reads back to attribute the ingest metric:
+// "incremental" when since is set, "full" otherwise.
+func TestBuildJob_IngestModeLabel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		since string
+		want  string
+	}{
+		{"incremental", "abc123", IngestModeIncremental},
+		{"full", "", IngestModeFull},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			job := BuildJob(testProject(), testRepository(), tc.since, testBaseURL, testConfig())
+			if got := job.Labels[LabelIngestMode]; got != tc.want {
+				t.Errorf("Job %s = %q, want %q", LabelIngestMode, got, tc.want)
+			}
+			if got := job.Spec.Template.Labels[LabelIngestMode]; got != tc.want {
+				t.Errorf("Pod template %s = %q, want %q", LabelIngestMode, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildJob_TTLSecondsAfterFinished(t *testing.T) {
 	job := BuildJob(testProject(), testRepository(), "", testBaseURL, testConfig())
 	if job.Spec.TTLSecondsAfterFinished == nil {

@@ -442,6 +442,15 @@ func (r *RepositoryReconciler) ensureResultConfigMap(ctx context.Context, repo *
 func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tataradevv1alpha1.Repository, job *batchv1.Job) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
+	// Attribute the ingest-job metric by mode so alerting pages only on terminal
+	// full-ingest failures. A Job created before this label existed (in-flight at
+	// rollout) reads as full: an unclassifiable ingest failure is treated as the
+	// alerting case rather than silently dropped.
+	mode := job.Labels[ingest.LabelIngestMode]
+	if mode == "" {
+		mode = ingest.IngestModeFull
+	}
+
 	// Record duration for all finished jobs (success and failure). Failed jobs
 	// do not have CompletionTime set by Kubernetes; prefer the LastTransitionTime
 	// of the JobFailed condition (set by K8s when it marks the job failed) to
@@ -467,7 +476,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 	}
 
 	if jobSucceeded(job) {
-		r.Metrics.IngestJobResult("success")
+		r.Metrics.IngestJobResult("success", mode)
 		sha, err := r.readResultSHA(ctx, repo)
 		if err != nil {
 			r.Metrics.ReconcileResult("Repository", "error")
@@ -521,7 +530,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 		return ctrl.Result{}, nil
 	}
 
-	r.Metrics.IngestJobResult("failure")
+	r.Metrics.IngestJobResult("failure", mode)
 	failTime := metav1.NewTime(time.Now())
 	var newFailureCount int
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {

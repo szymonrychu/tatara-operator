@@ -92,12 +92,12 @@ spec:
             summary: "Tasks terminated for an unreachable wrapper"
             description: "operator_agent_unreachable_termination_total increased in 15m: a Task was killed because its wrapper agent stayed unreachable past the boot deadline."
         - alert: TataraIngestJobFailing
-          expr: increase(operator_ingest_job_total{result="failure"}[1h]) > 0
+          expr: increase(operator_ingest_job_total{result="failure", mode="full"}[1h]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "memory ingest Jobs are failing"
-            description: "operator_ingest_job_total{result=\"failure\"} increased in 1h: per-project memory ingestion is failing, so the recall corpus is going stale."
+            summary: "memory full re-ingest Jobs are failing"
+            description: "operator_ingest_job_total{result=\"failure\", mode=\"full\"} increased in 1h: a full re-ingest failed (a first/scheduled full ingest, or the incremental-to-full self-heal fallback after repeated incremental failures), so the recall corpus is genuinely going stale. Benign incremental failures that self-heal via the full-ingest fallback are excluded by the mode=\"full\" selector."
         - alert: TataraLifecycleGiveups
           expr: increase(tatara_lifecycle_giveup_total[1h]) > 0
           labels:

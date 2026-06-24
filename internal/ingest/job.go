@@ -100,6 +100,19 @@ func ResultConfigMapName(repo *tataradevv1alpha1.Repository) string {
 	return repo.Name + "-ingest-result"
 }
 
+// LabelIngestMode is the Job label recording whether an ingest Job is
+// incremental (--since) or a full re-ingest. The controller reads it back off
+// the finished Job to attribute operator_ingest_job_total by mode, so alerting
+// can page only on terminal full-ingest failures (a failed incremental ingest
+// self-heals via the full-ingest fallback).
+const LabelIngestMode = "tatara.dev/ingest-mode"
+
+// IngestModeIncremental and IngestModeFull are the two values of LabelIngestMode.
+const (
+	IngestModeIncremental = "incremental"
+	IngestModeFull        = "full"
+)
+
 const (
 	workspaceVolume = "workspace"
 	workspaceMount  = "/workspace"
@@ -125,8 +138,10 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 	// instead of burning 3 pod runs before escalating (hard rule 13, finding 4).
 	// Full ingests keep BackoffLimit=2 (transient clone/network failures can self-heal).
 	backoff := int32(2)
+	mode := IngestModeFull
 	if since != "" {
 		backoff = 0
+		mode = IngestModeIncremental
 	}
 	ttl := int32(600)
 	controller := true
@@ -181,6 +196,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 				"app.kubernetes.io/component": "ingest",
 				"tatara.dev/managed-by":       "tatara-operator",
 				"tatara.dev/repository":       repo.Name,
+				LabelIngestMode:               mode,
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: tataradevv1alpha1.GroupVersion.String(),
@@ -200,6 +216,7 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 						"app.kubernetes.io/component": "ingest",
 						"tatara.dev/managed-by":       "tatara-operator",
 						"tatara.dev/repository":       repo.Name,
+						LabelIngestMode:               mode,
 					},
 				},
 				Spec: corev1.PodSpec{
