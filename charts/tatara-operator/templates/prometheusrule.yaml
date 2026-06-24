@@ -106,12 +106,27 @@ spec:
             summary: "issueLifecycle Tasks are giving up"
             description: "tatara_lifecycle_giveup_total increased in 1h (reason label carries why): the loop abandoned work on an issue/PR."
         - alert: TataraSCMWriteErrors
-          expr: increase(operator_scm_writes_total{result="error"}[15m]) > 0
+          expr: increase(operator_scm_writes_total{kind="write",result="error"}[15m]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "SCM write-backs are failing"
-            description: "operator_scm_writes_total{result=\"error\"} increased in 15m: comments, PRs, labels, or board updates failed to write back to the SCM."
+            description: "operator_scm_writes_total{kind=\"write\",result=\"error\"} increased in 15m: comments, PRs, labels, or board updates failed to write back to the SCM. Break down operator_scm_request_errors_by_status_total by status to tell token (401/403) from rate-limit (429) from network."
+        - alert: TataraSCMWriteFailureRatioHigh
+          expr: |
+            (
+                sum(increase(operator_scm_writes_total{kind="write",result="error"}[15m]))
+              /
+                sum(increase(operator_scm_writes_total{kind="write",result=~"ok|error"}[15m]))
+            ) > 0.30
+            and
+                sum(increase(operator_scm_writes_total{kind="write",result=~"ok|error"}[15m])) >= 3
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "SCM write failure ratio high"
+            description: "More than 30% of SCM write-backs (comments/labels/approvals/PRs/board) errored over 15m, with at least 3 writes attempted. Denominator excludes kind=\"read\" traffic and blocked (deliberate hard-gate refusals), so this tracks genuine write failures. Break down operator_scm_request_errors_by_status_total by status: 401/403 => token in the project ScmSecretRef, 429 => rate limit, network/5xx => egress or provider outage."
         - alert: TataraPushMetricsRejected
           expr: increase(operator_push_receive_total{result="rejected"}[15m]) > 0
           labels:

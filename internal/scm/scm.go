@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -186,6 +187,21 @@ func (e *HTTPError) Error() string {
 		body = body[:httpErrorBodyLimit] + "...[truncated]"
 	}
 	return fmt.Sprintf("scm: %s -> %d: %s", e.Path, e.Status, body)
+}
+
+// ErrorStatus classifies an SCM error into a metrics label: the HTTP status code
+// (e.g. "401", "403", "429", "500") when the call reached the server and got a
+// non-2xx, or "network" for connect/DNS/timeout failures that never got a reply.
+// Returns "" for a nil error.
+func ErrorStatus(err error) string {
+	if err == nil {
+		return ""
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return strconv.Itoa(he.Status)
+	}
+	return "network"
 }
 
 // GitHub implements Client for GitHub.

@@ -649,6 +649,9 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.metrics != nil {
 		s.metrics.SCMWrite(provider, "comment", result)
+		if commentErr != nil {
+			s.metrics.SCMRequestErrorByStatus(provider, "comment", scm.ErrorStatus(commentErr))
+		}
 	}
 	if commentErr != nil {
 		s.log.ErrorContext(r.Context(), "restapi: commentOnIssue scm write failed",

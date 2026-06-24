@@ -1,6 +1,8 @@
 package scm
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -50,4 +52,11 @@ func TestHTTPErrorShortBodyUnchanged(t *testing.T) {
 	msg := e.Error()
 	require.Contains(t, msg, "not found")
 	require.Contains(t, msg, "404")
+}
+
+func TestErrorStatus(t *testing.T) {
+	require.Equal(t, "", ErrorStatus(nil))
+	require.Equal(t, "401", ErrorStatus(&HTTPError{Status: 401, Path: "/x"}))
+	require.Equal(t, "429", ErrorStatus(fmt.Errorf("wrapped: %w", &HTTPError{Status: 429, Path: "/x"})))
+	require.Equal(t, "network", ErrorStatus(errors.New("dial tcp: connection refused")))
 }
