@@ -2,8 +2,11 @@ package v1alpha1
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -74,5 +77,36 @@ func TestNewFields_JSONRoundTrip(t *testing.T) {
 				t.Fatalf("json %s does not contain %s", b, tc.want)
 			}
 		})
+	}
+}
+
+func TestTaskFields_WorkItemsRoundTrip(t *testing.T) {
+	now := metav1.Now()
+	in := &Task{
+		Spec: TaskSpec{
+			ProjectRef: "p",
+			Goal:       "g",
+			Source: &TaskSource{
+				Provider:    "github",
+				IssueRef:    "o/r#1",
+				DedupNumber: 5,
+			},
+		},
+		Status: TaskStatus{
+			ParkReason: "triage-failed",
+			WorkItems: []WorkItemRef{
+				{Provider: "github", Repo: "o/r", Number: 1, Kind: WorkItemIssue, Role: RoleSource, State: WIOpen},
+				{Provider: "github", Repo: "o/r", Number: 7, Kind: WorkItemPR, Role: RoleOpenedPR, State: WIOpen, HeadSHA: "abc123", LastRefreshedAt: &now},
+			},
+		},
+	}
+	out := in.DeepCopy()
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("DeepCopy not equal:\n in=%+v\nout=%+v", in.Status, out.Status)
+	}
+	// Modify original; copy must be independent.
+	in.Status.WorkItems[0].State = WIClosed
+	if out.Status.WorkItems[0].State != WIOpen {
+		t.Error("DeepCopy shares WorkItems slice with original")
 	}
 }

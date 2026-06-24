@@ -121,6 +121,13 @@ spec:
                 properties:
                   authorLogin:
                     type: string
+                  dedupNumber:
+                    description: |-
+                      DedupNumber is the linked-issue number for bot-PR tasks. When a bot MR
+                      carries "Closes #N" in its body, this field holds N so the dedup logic can
+                      match the task against the issue slot (not the PR number). Zero means the
+                      task targets the item identified by Number (the PR/issue number itself).
+                    type: integer
                   isPR:
                     type: boolean
                   issueRef:
@@ -367,6 +374,12 @@ spec:
                   deterministic task branch is reused; if a post-merge re-implement does not
                   advance it, writeBackOpenChange opens a duplicate of the merged change).
                 type: string
+              parkReason:
+                description: |-
+                  ParkReason is the reason string passed to the last Parked transition.
+                  Cleared when the Task transitions out of Parked. Carried for context and
+                  observability; does NOT gate re-activation.
+                type: string
               pendingComments:
                 description: |-
                   PendingComments are free-form comments queued by the agent via the
@@ -458,6 +471,43 @@ spec:
                 type: string
               turnsCompleted:
                 type: integer
+              workItems:
+                description: |-
+                  WorkItems is the work-item ledger: every SCM artifact (issues, PRs,
+                  proposals) this Task spans. Carried as the single source of truth for
+                  dedup, stall recovery, and prompt-building. Seeded lazily from Spec.Source
+                  on first reconcile; maintained by the operator as the agent drives actions
+                  via MCP tools.
+                items:
+                  description: WorkItemRef is one SCM artifact tracked by a Task's
+                    work-item ledger.
+                  properties:
+                    headSHA:
+                      type: string
+                    kind:
+                      type: string
+                    lastRefreshedAt:
+                      format: date-time
+                      type: string
+                    number:
+                      type: integer
+                    provider:
+                      type: string
+                    repo:
+                      type: string
+                    role:
+                      type: string
+                    state:
+                      type: string
+                    title:
+                      type: string
+                  required:
+                  - kind
+                  - provider
+                  - repo
+                  - role
+                  type: object
+                type: array
             type: object
         type: object
     served: true

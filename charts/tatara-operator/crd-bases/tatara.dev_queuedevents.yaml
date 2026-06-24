@@ -97,6 +97,13 @@ spec:
                     properties:
                       authorLogin:
                         type: string
+                      dedupNumber:
+                        description: |-
+                          DedupNumber is the linked-issue number for bot-PR tasks. When a bot MR
+                          carries "Closes #N" in its body, this field holds N so the dedup logic can
+                          match the task against the issue slot (not the PR number). Zero means the
+                          task targets the item identified by Number (the PR/issue number itself).
+                        type: integer
                       isPR:
                         type: boolean
                       issueRef:
