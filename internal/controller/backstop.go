@@ -128,3 +128,69 @@ func isWITerminal(state string) bool {
 		state == tatarav1alpha1.WIDeclined ||
 		state == tatarav1alpha1.WIImplemented
 }
+
+// backstopDecision is the Tier-2 action classification returned by backstopAction.
+type backstopDecision int
+
+const (
+	// bsActionNone: no agent action required (pure state sync or live pod present).
+	bsActionNone backstopDecision = iota
+	// bsActionCloseObsolete: all source/closes issues are closed and an open MR
+	// remains - close the MR with a superseded note without starting an agent.
+	bsActionCloseObsolete
+	// bsActionReactivate: open MR + at least one open source/closes issue + no live
+	// pod - reactivate with a new MRCI task.
+	bsActionReactivate
+)
+
+// backstopAction is Tier-2 of the cron backstop. It classifies what agent action
+// (if any) is needed for a Task after Tier-1 state refresh. The ordering is:
+// close-obsolete first, then reactivate, then none.
+//
+// "No live pod" is approximated by Status.PodName == "" because the sweep runs
+// after the reconciler's own reconcile loop and pod-liveness is checked there;
+// a non-empty PodName means the controller believes the pod is still running.
+func backstopAction(task *tatarav1alpha1.Task) backstopDecision {
+	// Find any open-MR ledger entry.
+	hasOpenPR := false
+	for _, wi := range task.Status.WorkItems {
+		if wi.Kind == tatarav1alpha1.WorkItemPR && wi.State == tatarav1alpha1.WIOpen {
+			hasOpenPR = true
+			break
+		}
+	}
+	if !hasOpenPR {
+		return bsActionNone
+	}
+
+	// An active pod means the task is already making progress; no backstop needed.
+	if task.Status.PodName != "" {
+		return bsActionNone
+	}
+
+	// Close-obsolete first: if every source/closes issue is closed/merged.
+	hasOpenSourceIssue := false
+	hasAnySourceOrCloses := false
+	for _, wi := range task.Status.WorkItems {
+		if wi.Kind != tatarav1alpha1.WorkItemIssue {
+			continue
+		}
+		if wi.Role != tatarav1alpha1.RoleSource && wi.Role != tatarav1alpha1.RoleCloses {
+			continue
+		}
+		hasAnySourceOrCloses = true
+		if wi.State == tatarav1alpha1.WIOpen {
+			hasOpenSourceIssue = true
+			break
+		}
+	}
+
+	// If we have source/closes issues and all are closed -> obsolete.
+	if hasAnySourceOrCloses && !hasOpenSourceIssue {
+		return bsActionCloseObsolete
+	}
+
+	// Open MR + no live pod + at least one open source issue (or no source issues
+	// recorded yet) -> reactivate.
+	return bsActionReactivate
+}

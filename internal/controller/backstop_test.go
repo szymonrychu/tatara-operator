@@ -181,3 +181,74 @@ func TestRefreshLedger_AlreadyTerminalSkipped(t *testing.T) {
 	changed := refreshLedger(context.Background(), reader, task)
 	require.False(t, changed, "already-terminal entry must not generate a change")
 }
+
+// ---- Task 11: backstopAction tests ------------------------------------
+
+// TestBackstopAction_None_NoOpenPR: no open PR in ledger -> None.
+func TestBackstopAction_None_NoOpenPR(t *testing.T) {
+	task := makeTaskWithLedger([]tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	})
+	task.Status.PodName = ""
+
+	dec := backstopAction(task)
+	require.Equal(t, bsActionNone, dec)
+}
+
+// TestBackstopAction_None_LivePod: open MR in ledger but a live pod is present -> None.
+func TestBackstopAction_None_LivePod(t *testing.T) {
+	task := makeTaskWithLedger([]tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+		{Provider: "github", Repo: "o/r", Number: 50, Kind: tatarav1alpha1.WorkItemPR,
+			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen},
+	})
+	task.Status.PodName = "agent-pod-xyz" // live pod
+
+	dec := backstopAction(task)
+	require.Equal(t, bsActionNone, dec)
+}
+
+// TestBackstopAction_CloseObsolete: all source/closes issues are closed and
+// there is an open MR -> CloseObsolete.
+func TestBackstopAction_CloseObsolete(t *testing.T) {
+	task := makeTaskWithLedger([]tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIClosed},
+		{Provider: "github", Repo: "o/r", Number: 8, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleCloses, State: tatarav1alpha1.WIClosed},
+		{Provider: "github", Repo: "o/r", Number: 50, Kind: tatarav1alpha1.WorkItemPR,
+			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen},
+	})
+	task.Status.PodName = ""
+
+	dec := backstopAction(task)
+	require.Equal(t, bsActionCloseObsolete, dec)
+}
+
+// TestBackstopAction_Reactivate: open source issue + open MR + no live pod -> Reactivate.
+func TestBackstopAction_Reactivate(t *testing.T) {
+	task := makeTaskWithLedger([]tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+		{Provider: "github", Repo: "o/r", Number: 50, Kind: tatarav1alpha1.WorkItemPR,
+			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen},
+	})
+	task.Status.PodName = ""
+
+	dec := backstopAction(task)
+	require.Equal(t, bsActionReactivate, dec)
+}
+
+// TestBackstopAction_PureRefresh: no open MR in ledger, issue still open -> None.
+func TestBackstopAction_PureRefresh(t *testing.T) {
+	task := makeTaskWithLedger([]tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	})
+	task.Status.PodName = ""
+
+	dec := backstopAction(task)
+	require.Equal(t, bsActionNone, dec)
+}
