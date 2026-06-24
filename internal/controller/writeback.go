@@ -277,12 +277,28 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	// RetryOnConflict ensures this idempotency key lands even when a concurrent
 	// lifecycle reconcile has bumped the resource version.
 	prURLsMsg := strings.Join(prURLs, " ")
+	// Derive the primary PR's repo slug and number for the ledger entry.
+	primaryPRSlug, _, _ := repoSlugFromURL(primaryRepo.Spec.URL, provider)
+	primaryPRNumber := parsePRNumber(prURLs[0])
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
 			return gerr
 		}
 		fresh.Status.PrURL = prURLs[0]
+		// Project the PR-open action onto the ledger: upsert a role:openedPR entry
+		// with state:open. The real HeadSHA is filled later by the backstop refresh
+		// (Phase 3); we do not have it here without an extra SCM round-trip.
+		if primaryPRSlug != "" && primaryPRNumber > 0 {
+			UpsertWorkItem(fresh, tatarav1alpha1.WorkItemRef{
+				Provider: provider,
+				Repo:     primaryPRSlug,
+				Number:   primaryPRNumber,
+				Kind:     tatarav1alpha1.WorkItemPR,
+				Role:     tatarav1alpha1.RoleOpenedPR,
+				State:    tatarav1alpha1.WIOpen,
+			})
+		}
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               "WritebackPending",
 			Status:             metav1.ConditionFalse,

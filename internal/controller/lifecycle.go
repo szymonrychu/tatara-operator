@@ -2248,6 +2248,8 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	r.recordSCM(provider, "merge", mergeErr)
 	if mergeErr == nil {
 		// Success: record SHA and advance.
+		// Derive repo slug once outside the closure for the ledger upsert.
+		mergeRepoSlug, _, _ := repoSlugFromURL(repo.Spec.URL, provider)
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			fresh := &tatarav1alpha1.Task{}
 			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
@@ -2255,6 +2257,19 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 			}
 			fresh.Status.MergeCommitSHA = sha
 			fresh.Status.MergedHeadSHA = mergedHead
+			// Project the merge event onto the ledger: flip the openedPR entry to
+			// state:merged so the backstop and dedup helpers see live state.
+			if mergeRepoSlug != "" && number > 0 {
+				UpsertWorkItem(fresh, tatarav1alpha1.WorkItemRef{
+					Provider: provider,
+					Repo:     mergeRepoSlug,
+					Number:   number,
+					Kind:     tatarav1alpha1.WorkItemPR,
+					Role:     tatarav1alpha1.RoleOpenedPR,
+					State:    tatarav1alpha1.WIMerged,
+					HeadSHA:  mergedHead,
+				})
+			}
 			return r.Status().Update(ctx, fresh)
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("merge: record sha: %w", err)
@@ -2390,6 +2405,17 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 				}
 			}
 		}
+		// Project the issue-close event onto the ledger: set all source/closes
+		// issue entries to state:closed so dedup and backstop see live state.
+		// Best-effort: a conflict here does not stall the lifecycle transition.
+		_ = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh2 := &tatarav1alpha1.Task{}
+			if ferr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh2); ferr != nil {
+				return ferr
+			}
+			closeSourceIssueLedger(fresh2)
+			return r.Status().Update(ctx, fresh2)
+		})
 		if err := r.setLifecycleState(ctx, task, "Done", "mainci-success"); err != nil {
 			return ctrl.Result{}, err
 		}

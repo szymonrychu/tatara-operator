@@ -188,6 +188,19 @@ func proposalBacklogFromTasks(tasks []tatarav1alpha1.Task) int {
 	return standalone + len(groups)
 }
 
+// closeSourceIssueLedger sets State:closed on all role:source and role:closes
+// issue entries in the task's work-item ledger. Called when the source issue is
+// closed on merge (handleMainCI success path). Pure function; no client calls.
+func closeSourceIssueLedger(t *tatarav1alpha1.Task) {
+	for i := range t.Status.WorkItems {
+		wi := &t.Status.WorkItems[i]
+		if wi.Kind == tatarav1alpha1.WorkItemIssue &&
+			(wi.Role == tatarav1alpha1.RoleSource || wi.Role == tatarav1alpha1.RoleCloses) {
+			wi.State = tatarav1alpha1.WIClosed
+		}
+	}
+}
+
 func kindForIsPR(isPR bool) string {
 	if isPR {
 		return tatarav1alpha1.WorkItemPR
