@@ -189,9 +189,46 @@ func TestSCMWritesTotal(t *testing.T) {
 	m := NewOperatorMetrics(reg)
 	m.SCMWrite("github", "merge", "ok")
 	m.SCMWrite("github", "merge", "ok")
-	got := testutil.ToFloat64(m.scmWritesTotal.WithLabelValues("github", "merge", "ok"))
+	got := testutil.ToFloat64(m.scmWritesTotal.WithLabelValues("github", "merge", "write", "ok"))
 	if got != 2 {
-		t.Fatalf("github/merge/ok = %v, want 2", got)
+		t.Fatalf("github/merge/write/ok = %v, want 2", got)
+	}
+}
+
+func TestSCMVerbKind(t *testing.T) {
+	cases := map[string]string{
+		"merge":            "write",
+		"comment":          "write",
+		"create_issue":     "write",
+		"list_open_issues": "read",
+		"list_open_prs":    "read",
+		"get_pr_state":     "read",
+	}
+	for verb, want := range cases {
+		if got := SCMVerbKind(verb); got != want {
+			t.Errorf("SCMVerbKind(%q) = %q, want %q", verb, got, want)
+		}
+	}
+}
+
+func TestSCMWriteKindLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SCMWrite("github", "list_open_prs", "ok")
+	if got := testutil.ToFloat64(m.scmWritesTotal.WithLabelValues("github", "list_open_prs", "read", "ok")); got != 1 {
+		t.Fatalf("read verb labelled kind=read = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.SCMWriteCounter("github", "list_open_prs", "ok")); got != 1 {
+		t.Fatalf("SCMWriteCounter helper = %v, want 1", got)
+	}
+}
+
+func TestSCMRequestErrorByStatus(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SCMRequestErrorByStatus("github", "comment", "401")
+	if got := testutil.ToFloat64(m.scmReqErrorsByStatus.WithLabelValues("github", "comment", "401")); got != 1 {
+		t.Fatalf("github/comment/401 = %v, want 1", got)
 	}
 }
 

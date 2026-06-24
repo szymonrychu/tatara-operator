@@ -636,24 +636,23 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		Body:   body,
 		Labels: labels,
 	})
+	r.recordSCM(proj.Spec.Scm.Provider, "create_issue", err)
 	if err != nil {
-		r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "error")
 		return ctrl.Result{}, fmt.Errorf("proposal: create issue: %w", err)
 	}
-	r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "create_issue", "ok")
 
 	if proj.Spec.Scm.Board != nil {
 		board := boardRefFromSpec(proj.Spec.Scm)
 		if err := writer.AddBoardItem(ctx, token, board, ref.URL); err != nil {
 			l.Error(err, "proposal: add board item (non-fatal)")
-			r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_add", "error")
+			r.recordSCM(proj.Spec.Scm.Provider, "board_add", err)
 		} else {
-			r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_add", "ok")
+			r.recordSCM(proj.Spec.Scm.Provider, "board_add", nil)
 			if err := writer.SetBoardColumn(ctx, token, board, ref.URL, "Proposed"); err != nil {
 				l.Error(err, "proposal: set board column (non-fatal)")
-				r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_column", "error")
+				r.recordSCM(proj.Spec.Scm.Provider, "board_column", err)
 			} else {
-				r.Metrics.SCMWrite(proj.Spec.Scm.Provider, "board_column", "ok")
+				r.recordSCM(proj.Spec.Scm.Provider, "board_column", nil)
 			}
 		}
 	}
@@ -841,6 +840,9 @@ func (r *TaskReconciler) recordSCM(provider, verb string, err error) {
 		result = "error"
 	}
 	r.Metrics.SCMWrite(provider, verb, result)
+	if err != nil {
+		r.Metrics.SCMRequestErrorByStatus(provider, verb, scm.ErrorStatus(err))
+	}
 }
 
 // writeBackReview reads Status.ReviewVerdict and posts exactly one verb set.

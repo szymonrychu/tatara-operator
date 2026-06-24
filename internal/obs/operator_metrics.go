@@ -14,6 +14,7 @@ type OperatorMetrics struct {
 	memoryProvisionDuration   prometheus.Histogram
 	memoryStacks              *prometheus.GaugeVec
 	scmWritesTotal            *prometheus.CounterVec
+	scmReqErrorsByStatus      *prometheus.CounterVec
 	scanItemsTotal            *prometheus.CounterVec
 	scanTasksCreatedTotal     *prometheus.CounterVec
 	scanDurationSeconds       *prometheus.HistogramVec
@@ -89,8 +90,12 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"phase"}),
 		scmWritesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_scm_writes_total",
-			Help: "Total SCM write operations by provider, verb, and result.",
-		}, []string{"provider", "verb", "result"}),
+			Help: "Total SCM operations by provider, verb, kind (read|write), and result (ok|error|blocked).",
+		}, []string{"provider", "verb", "kind", "result"}),
+		scmReqErrorsByStatus: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_scm_request_errors_by_status_total",
+			Help: "SCM operations that errored, by provider, verb, and classified status (HTTP code, or \"network\" for connect/timeout failures).",
+		}, []string{"provider", "verb", "status"}),
 		scanItemsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_scan_items_total",
 			Help: "Total scan candidates by activity and outcome.",
@@ -263,6 +268,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryProvisionDuration,
 		m.memoryStacks,
 		m.scmWritesTotal,
+		m.scmReqErrorsByStatus,
 		m.scanItemsTotal,
 		m.scanTasksCreatedTotal,
 		m.scanDurationSeconds,
@@ -491,15 +497,40 @@ func (m *OperatorMetrics) SetTasksInflight(n float64) {
 	m.tasksInflight.Set(n)
 }
 
+// scmReadVerbs are SCM verbs that only read; every other verb is a write. Used
+// to label operator_scm_writes_total with kind so the write-failure ratio alert
+// is not diluted by read traffic that shares the same credentials.
+var scmReadVerbs = map[string]bool{
+	"list_open_issues":     true,
+	"list_open_prs":        true,
+	"get_pr_state":         true,
+	"get_commit_ci_status": true,
+}
+
+// SCMVerbKind returns "read" or "write" for an SCM verb.
+func SCMVerbKind(verb string) string {
+	if scmReadVerbs[verb] {
+		return "read"
+	}
+	return "write"
+}
+
 // SCMWrite increments operator_scm_writes_total for the given provider, verb,
-// and result ("ok" or "error").
+// and result ("ok", "error", or "blocked"). The kind label (read|write) is
+// derived from the verb.
 func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
-	m.scmWritesTotal.WithLabelValues(provider, verb, result).Inc()
+	m.scmWritesTotal.WithLabelValues(provider, verb, SCMVerbKind(verb), result).Inc()
+}
+
+// SCMRequestErrorByStatus increments operator_scm_request_errors_by_status_total,
+// recording the classified status (HTTP code or "network") behind an SCM error.
+func (m *OperatorMetrics) SCMRequestErrorByStatus(provider, verb, status string) {
+	m.scmReqErrorsByStatus.WithLabelValues(provider, verb, status).Inc()
 }
 
 // SCMWriteCounter returns the counter for (provider, verb, result) for test assertions.
 func (m *OperatorMetrics) SCMWriteCounter(provider, verb, result string) prometheus.Counter {
-	return m.scmWritesTotal.WithLabelValues(provider, verb, result)
+	return m.scmWritesTotal.WithLabelValues(provider, verb, SCMVerbKind(verb), result)
 }
 
 // SetOpenProposals sets operator_open_proposals for a repo slug.
