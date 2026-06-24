@@ -112,6 +112,12 @@ type TaskSource struct {
 	// branch slug (TaskBranch) and the no-agent PR-title fallback.
 	// +optional
 	Title string `json:"title,omitempty"`
+	// DedupNumber is the linked-issue number for bot-PR tasks. When a bot MR
+	// carries "Closes #N" in its body, this field holds N so the dedup logic can
+	// match the task against the issue slot (not the PR number). Zero means the
+	// task targets the item identified by Number (the PR/issue number itself).
+	// +optional
+	DedupNumber int `json:"dedupNumber,omitempty"`
 }
 
 // repoScopedKinds are task kinds that require a non-empty RepositoryRef.
@@ -309,6 +315,18 @@ type TaskStatus struct {
 	// then clears them. Does not change the lifecycle state.
 	// +optional
 	PendingInterjections []string `json:"pendingInterjections,omitempty"`
+	// WorkItems is the work-item ledger: every SCM artifact (issues, PRs,
+	// proposals) this Task spans. Carried as the single source of truth for
+	// dedup, stall recovery, and prompt-building. Seeded lazily from Spec.Source
+	// on first reconcile; maintained by the operator as the agent drives actions
+	// via MCP tools.
+	// +optional
+	WorkItems []WorkItemRef `json:"workItems,omitempty"`
+	// ParkReason is the reason string passed to the last Parked transition.
+	// Cleared when the Task transitions out of Parked. Carried for context and
+	// observability; does NOT gate re-activation.
+	// +optional
+	ParkReason string `json:"parkReason,omitempty"`
 }
 
 // +kubebuilder:object:root=true

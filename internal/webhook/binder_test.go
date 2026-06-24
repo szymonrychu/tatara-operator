@@ -206,9 +206,9 @@ func TestBotPRWebhook_EntryAnnotationMRCIAndSpecSource(t *testing.T) {
 // ----- FIX 4: bot-PR webhook dedup key uses linked issue number -----
 
 // TestBotPRWebhook_DedupKeyLinkedIssue asserts that when a bot-PR webhook body
-// contains "Closes #7", the created Task's tatara.io/source-number dedup label
-// is "7" (the linked issue number), matching what mrScan would produce for the
-// same PR body, preventing duplicate lifecycle Tasks.
+// contains "Closes #7", the created Task has Source.DedupNumber=7 (the linked
+// issue number), so the ledger-based dedup can match the PR task against the
+// issue slot and prevent a duplicate issueLifecycle task.
 func TestBotPRWebhook_DedupKeyLinkedIssue(t *testing.T) {
 	const secretVal = "whsec"
 	proj := newProjectWithScm(t, "tatara-bot", "labeledOrMentioned")
@@ -246,8 +246,12 @@ func TestBotPRWebhook_DedupKeyLinkedIssue(t *testing.T) {
 	}
 	require.Len(t, matching, 1)
 	qe := matching[0]
-	require.Equal(t, "7", qe.Spec.Payload.Labels["tatara.io/source-number"],
-		"bot-PR with Closes #7 must have source-number=7 (linked issue), matching mrScan's dedup key")
+	require.NotNil(t, qe.Spec.Payload.Source, "Payload.Source must be set")
+	require.Equal(t, 7, qe.Spec.Payload.Source.DedupNumber,
+		"bot-PR with Closes #7 must have Source.DedupNumber=7 (linked issue) for ledger-based dedup")
+	// source-number label is no longer written (ledger replaces label-based dedup).
+	require.Equal(t, "", qe.Spec.Payload.Labels["tatara.io/source-number"],
+		"source-number label must not be written (Phase 1: ledger replaces label dedup)")
 }
 
 // TestHumanPRWebhookStillCreatesReview asserts that human-authored PRs still

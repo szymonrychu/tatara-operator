@@ -35,9 +35,9 @@ func TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger(t *testing.T) {
 			Name:      "r3f12-done-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -101,9 +101,9 @@ func TestR3Finding1And2_ParkedLifecycleTask_AllowsRetrigger(t *testing.T) {
 			Name:      "r3f12-parked-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -169,9 +169,9 @@ func TestR3Finding1And2_ActiveLifecycleTask_StillDeduped(t *testing.T) {
 			Name:      "r3f12-active-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -379,4 +379,66 @@ func TestR3Finding6_RealIssueComment_RoutedToCommentHandler(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "r3f6-task"}, &got2))
 	require.Len(t, got2.Status.PendingInterjections, 1,
 		"labeled event must NOT be routed to comment handler (interjection count must stay at 1)")
+}
+
+// --- Phase 1 (ledger): dedup must match label-less new tasks via Spec.Source ---
+
+// TestPhase1_LabelLessActiveTask_StillDeduped is the migration regression for
+// the handleWorkItem dedup read. A NEW issueLifecycle Task carries only the
+// Phase-1 labels (kind/activity/isPR) and NO source-repo/source-number labels.
+// A re-fired issues.labeled event for the same issue must still be deduped
+// against it. Before the fix, the dedup List pre-filtered on the dropped
+// source-repo/source-number labels, returned empty, and a duplicate Task was
+// created.
+func TestPhase1_LabelLessActiveTask_StillDeduped(t *testing.T) {
+	const secretVal = "whsec-p1dedup" //gitleaks:allow
+	proj := projectWithBot("p1dedupproj", "p1dedupproj-scm", "tatara", "tatara-bot")
+	repo := repository("p1deduprepo", "p1dedupproj", "https://github.com/o/r.git", "main")
+
+	activeTask := &tatarav1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "p1dedup-active-task",
+			Namespace: ns,
+			// Phase-1 shape: NO source-repo/source-number labels.
+			Labels: map[string]string{
+				tatarav1.LabelSourceKind: "issueLifecycle",
+				tatarav1.LabelActivity:   "webhook",
+				tatarav1.LabelIsPR:       "false",
+			},
+		},
+		Spec: tatarav1.TaskSpec{
+			ProjectRef:    "p1dedupproj",
+			RepositoryRef: "p1deduprepo",
+			Kind:          "issueLifecycle",
+			Goal:          "active goal",
+			Source: &tatarav1.TaskSource{
+				Provider: "github",
+				IssueRef: "o/r#7",
+				Number:   7,
+			},
+		},
+		Status: tatarav1.TaskStatus{LifecycleState: "Implement"},
+	}
+
+	c := seedClient(t, proj, secret("p1dedupproj-scm", secretVal), repo)
+	require.NoError(t, c.Create(context.Background(), activeTask))
+	require.NoError(t, c.Status().Update(context.Background(), activeTask))
+
+	h, reg := newServer(t, c)
+
+	body := []byte(`{"action":"labeled","sender":{"login":"alice"},"label":{"name":"tatara"},"issue":{"number":7,"title":"fix","body":"goal","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issues")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "p1dedupproj", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var tasks tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
+	require.Len(t, tasks.Items, 1, "label-less active task must still block duplicate trigger")
+
+	dupCount := counterValue(t, reg, "operator_webhook_events_total",
+		map[string]string{"provider": "github", "kind": "issue", "action": "labeled", "result": "duplicate"})
+	require.Equal(t, 1.0, dupCount, "label-less active task must produce result=duplicate")
 }

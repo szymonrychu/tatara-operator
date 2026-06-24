@@ -131,6 +131,42 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("get task: %w", err)
 	}
 
+	// Lazy-seed the work-item ledger from Spec.Source when WorkItems is empty.
+	// This provides backward-compat for in-flight Tasks created before the ledger
+	// was introduced: first reconcile populates Status.WorkItems so Phase-2 dedup
+	// (ledger-based) can operate without labels on old Tasks too.
+	if len(task.Status.WorkItems) == 0 && task.Spec.Source != nil {
+		seedLedgerFromSpec(&task)
+		if len(task.Status.WorkItems) > 0 {
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				fresh := &tatarav1alpha1.Task{}
+				if ferr := r.Get(ctx, req.NamespacedName, fresh); ferr != nil {
+					return ferr
+				}
+				if len(fresh.Status.WorkItems) > 0 {
+					// Another replica already seeded; adopt its state so the
+					// downstream reconcile starts from the current resourceVersion.
+					task = *fresh
+					return nil
+				}
+				seedLedgerFromSpec(fresh)
+				if uerr := r.Status().Update(ctx, fresh); uerr != nil {
+					return uerr
+				}
+				// Status().Update bumped fresh's resourceVersion on a SEPARATE fetch;
+				// the local `task` still holds the stale RV. Adopt fresh so the rest
+				// of this reconcile (lifecycle / writeback Status().Update) operates
+				// on the current RV instead of 409-conflicting on every first
+				// reconcile during rollout (~1148 in-flight Tasks).
+				task = *fresh
+				return nil
+			}); err != nil {
+				l.Error(err, "task: seed ledger from spec (non-fatal)",
+					"action", "ledger_seed", "resource_id", task.Name)
+			}
+		}
+	}
+
 	if task.Spec.Kind == "issueLifecycle" {
 		return r.reconcileLifecycle(ctx, &task)
 	}

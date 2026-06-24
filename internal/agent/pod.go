@@ -13,6 +13,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
@@ -543,24 +544,66 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_SERENA_URL", Value: cfg.SerenaURL})
 	}
 
-	if len(repos) > 0 {
+	// Work-item context: inject a human-readable ledger summary into the pod so the
+	// agent knows upfront which issues/MRs it spans, without re-deriving from SCM.
+	// Only emitted when WorkItems is non-empty to avoid a no-op env var on old Tasks.
+	if ctx := tatarav1alpha1.WorkItemsContext(task); ctx != "" {
+		env = append(env, corev1.EnvVar{Name: "TATARA_WORK_ITEMS", Value: ctx})
+	}
+
+	// Filter repos to the ledger-derived clone scope when the ledger is non-empty.
+	// Spec.ReposInScope (declarative cross-repo Repository CR names) is unioned in
+	// so a cross-repo task whose secondary repos are not yet in the ledger (they
+	// only enter WorkItems via the Phase-3 backstop AFTER PRs exist) still clones
+	// them. When the ledger is empty, fall back to the full project repo list for
+	// backward-compatibility (pre-ledger Tasks carry no WorkItems).
+	scopedRepos := repos
+	if inScope := tatarav1alpha1.TaskReposInScope(task); len(inScope) > 0 {
+		scopeSet := make(map[string]struct{}, len(inScope))
+		for _, s := range inScope {
+			scopeSet[s] = struct{}{}
+		}
+		// Declarative cross-repo scope is expressed as Repository CR names, a
+		// different namespace from the owner/repo ledger slugs, so match it by Name.
+		nameSet := make(map[string]struct{}, len(task.Spec.ReposInScope))
+		for _, n := range task.Spec.ReposInScope {
+			nameSet[n] = struct{}{}
+		}
+		var filtered []tatarav1alpha1.Repository
+		for i := range repos {
+			if _, ok := nameSet[repos[i].Name]; ok {
+				filtered = append(filtered, repos[i])
+				continue
+			}
+			if slug, err := scm.RepoSlugFromURL(repos[i].Spec.URL); err == nil {
+				if _, ok := scopeSet[slug]; ok {
+					filtered = append(filtered, repos[i])
+				}
+			}
+		}
+		if len(filtered) > 0 {
+			scopedRepos = filtered
+		}
+	}
+
+	if len(scopedRepos) > 0 {
 		var entries []repoEntry
 		if repo != nil {
 			// Primary repo first, then the rest.
 			entries = []repoEntry{{Name: repo.Name, URL: repo.Spec.URL, Branch: repo.Spec.DefaultBranch}}
-			for i := range repos {
-				if repos[i].Name != repo.Name {
+			for i := range scopedRepos {
+				if scopedRepos[i].Name != repo.Name {
 					entries = append(entries, repoEntry{
-						Name:   repos[i].Name,
-						URL:    repos[i].Spec.URL,
-						Branch: repos[i].Spec.DefaultBranch,
+						Name:   scopedRepos[i].Name,
+						URL:    scopedRepos[i].Spec.URL,
+						Branch: scopedRepos[i].Spec.DefaultBranch,
 					})
 				}
 			}
 		} else {
 			// Project-scoped (no primary): sort all repos by name for determinism.
-			sorted := make([]tatarav1alpha1.Repository, len(repos))
-			copy(sorted, repos)
+			sorted := make([]tatarav1alpha1.Repository, len(scopedRepos))
+			copy(sorted, scopedRepos)
 			// Sort by Name (stable deterministic order, same algorithm as brainstorm/healthCheck).
 			for i := 1; i < len(sorted); i++ {
 				for j := i; j > 0 && sorted[j].Name < sorted[j-1].Name; j-- {

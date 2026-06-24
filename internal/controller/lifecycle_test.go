@@ -1847,6 +1847,58 @@ func TestLifecycleMerge_AllowedOK_TransitionsToMainCIWithSHA(t *testing.T) {
 	}
 }
 
+// TestLifecycleMerge_LedgerOpenedPRFlipsMerged drives the REAL handleMerge path
+// (not the pure UpsertWorkItem helper) and asserts the role:openedPR ledger entry
+// is flipped to state:merged with the right repo slug/number at the RetryOnConflict
+// persistence site - exercising repoSlugFromURL, the mergeRepoSlug/number guards,
+// and the placement before setLifecycleState.
+func TestLifecycleMerge_LedgerOpenedPRFlipsMerged(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMerge{
+		prState:  scm.PRState{Author: "bot", CIStatus: "success"},
+		mergeSHA: "mergedsha1",
+	}
+	r, name := seedMergeTask(t, "ledger", fw, time.Hour)
+
+	// Seed an openedPR ledger entry (number 42 matches seedMergeTask PRNumber) plus
+	// a source issue entry to assert the source stays untouched by the merge.
+	task := fetchTask(t, name)
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 42, Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen},
+		{Provider: "github", Repo: "o/r", Number: 9, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed workitems: %v", err)
+	}
+
+	if _, err := r.reconcileLifecycle(ctx, fetchTask(t, name)); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, name)
+	var pr, src *tatarav1alpha1.WorkItemRef
+	for i := range got.Status.WorkItems {
+		switch got.Status.WorkItems[i].Role {
+		case tatarav1alpha1.RoleOpenedPR:
+			pr = &got.Status.WorkItems[i]
+		case tatarav1alpha1.RoleSource:
+			src = &got.Status.WorkItems[i]
+		}
+	}
+	if pr == nil {
+		t.Fatal("openedPR ledger entry missing after merge")
+	}
+	if pr.State != tatarav1alpha1.WIMerged {
+		t.Errorf("openedPR state = %q, want merged", pr.State)
+	}
+	if pr.Repo != "o/r" || pr.Number != 42 {
+		t.Errorf("openedPR ledger entry = {%s, %d}, want {o/r, 42}", pr.Repo, pr.Number)
+	}
+	if src == nil || src.State != tatarav1alpha1.WIOpen {
+		t.Error("source issue entry must remain open after merge")
+	}
+}
+
 // TestLifecycleMerge_405ConflictSpawnsResolveAttempt_ErrNil is the explicit
 // live-loop guard: a 405 from Merge must NOT return an error to controller-runtime
 // (which would trigger exponential backoff), and must transition to Implement with
@@ -2074,6 +2126,51 @@ func TestLifecycleMainCI_SuccessClosesDoneIdempotent(t *testing.T) {
 	got := fetchTask(t, name)
 	if got.Status.LifecycleState != "Done" {
 		t.Errorf("LifecycleState = %q, want Done on MainCI success", got.Status.LifecycleState)
+	}
+}
+
+// TestLifecycleMainCI_LedgerCloseProjection drives the REAL handleMainCI success
+// path and asserts the source issue ledger entry flips to state:closed while a
+// cross-repo sibling role:closes entry stays open for the backstop. Exercises the
+// best-effort closeSourceIssueLedger projection at its persistence site, not the
+// pure helper.
+func TestLifecycleMainCI_LedgerCloseProjection(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMainCI{ciStatus: "success"}
+	r, name := seedMainCITask(t, "ledgerclose", fw, time.Hour)
+
+	task := fetchTask(t, name)
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 11, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+		{Provider: "github", Repo: "o/sibling", Number: 8, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleCloses, State: tatarav1alpha1.WIOpen},
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed workitems: %v", err)
+	}
+
+	if _, err := r.reconcileLifecycle(ctx, fetchTask(t, name)); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "Done" {
+		t.Fatalf("LifecycleState = %q, want Done", got.Status.LifecycleState)
+	}
+	var src, sib *tatarav1alpha1.WorkItemRef
+	for i := range got.Status.WorkItems {
+		wi := &got.Status.WorkItems[i]
+		if wi.Repo == "o/r" && wi.Number == 11 {
+			src = wi
+		}
+		if wi.Repo == "o/sibling" && wi.Number == 8 {
+			sib = wi
+		}
+	}
+	if src == nil || src.State != tatarav1alpha1.WIClosed {
+		t.Errorf("source issue entry must be closed; got %+v", src)
+	}
+	if sib == nil || sib.State != tatarav1alpha1.WIOpen {
+		t.Errorf("cross-repo sibling must stay open for the backstop; got %+v", sib)
 	}
 }
 

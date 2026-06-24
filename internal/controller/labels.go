@@ -3,9 +3,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -138,7 +142,149 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		l.Info("lifecycle label set", "action", "scm_set_label",
 			"resource_id", task.Name, "issue_ref", issueRef, "label", desired)
 	}
+
+	// P4 hybrid projection. This is also the role:proposed PRODUCER: for a
+	// tatara-authored proposal issue carrying a lifecycle phase label, the operator
+	// mints a role:proposed ledger entry (with the real issue number) on the
+	// issueLifecycle Task if none exists, then reflects the label as its State.
+	// Without this producer no role:proposed entry is ever created, so the backlog
+	// cap, the label readback, and this projection are all dead on real Tasks.
+	// Only bot-authored proposals are ledgered: a human-reported issue that the
+	// operator labels (e.g. tatara-approved on triage) is NOT a proposal and must
+	// not get a spurious role:proposed entry. No-op for non-proposal labels
+	// (implementation/legacy idea/rejected map to "").
+	if wiState := lifecycleLabelToWIState(proj.Spec.Scm, desired); wiState != "" {
+		if isBotAuthoredProposal(proj, task) {
+			if seedErr := r.seedProposedEntry(ctx, task, issueRef, wiState); seedErr != nil {
+				l.Info("set label: seed proposed ledger entry failed (non-fatal)",
+					"action", "scm_set_label_ledger_seed", "resource_id", task.Name,
+					"issue_ref", issueRef, "wi_state", wiState, "err", seedErr.Error())
+			}
+		}
+		if upsertErr := r.upsertProposedEntryState(ctx, task, issueRef, wiState); upsertErr != nil {
+			l.Info("set label: ledger entry update failed (non-fatal)",
+				"action", "scm_set_label_ledger", "resource_id", task.Name,
+				"issue_ref", issueRef, "wi_state", wiState, "err", upsertErr.Error())
+		}
+	}
 	return nil
+}
+
+// isBotAuthoredProposal reports whether the task's source issue is a
+// tatara-authored brainstorm proposal: a non-PR issue whose AuthorLogin equals
+// the configured BotLogin. Proposals filed by createProposal carry the bot
+// login; human-reported issues do not. This gates the role:proposed producer so
+// human bug reports never get ledgered as proposals.
+func isBotAuthoredProposal(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
+	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" || task.Spec.Source == nil {
+		return false
+	}
+	s := task.Spec.Source
+	return !s.IsPR && s.IssueRef != "" && s.AuthorLogin == proj.Spec.Scm.BotLogin
+}
+
+// seedProposedEntry appends a role:proposed WorkItemRef for issueRef (parsed
+// repo/number) in the given state when no role:proposed entry exists on the
+// Task. Idempotent: a no-op once any role:proposed entry is present. Persisted
+// under RetryOnConflict. The subsequent upsertProposedEntryState then sets the
+// State precisely (this seeds at `state`, but a later projection may move it).
+func (r *TaskReconciler) seedProposedEntry(ctx context.Context, task *tatarav1alpha1.Task, issueRef, state string) error {
+	repo, number := parseIssueRef(issueRef)
+	if repo == "" || number == 0 {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.Task
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), &fresh); gerr != nil {
+			return gerr
+		}
+		for _, wi := range fresh.Status.WorkItems {
+			if wi.Role == tatarav1alpha1.RoleProposed {
+				return nil // already produced
+			}
+		}
+		provider := ""
+		title := ""
+		if fresh.Spec.Source != nil {
+			provider = fresh.Spec.Source.Provider
+			title = fresh.Spec.Source.Title
+		}
+		UpsertWorkItem(&fresh, tatarav1alpha1.WorkItemRef{
+			Provider: provider,
+			Repo:     repo,
+			Number:   number,
+			Kind:     tatarav1alpha1.WorkItemIssue,
+			Role:     tatarav1alpha1.RoleProposed,
+			State:    state,
+			Title:    title,
+		})
+		return r.Status().Update(ctx, &fresh)
+	})
+}
+
+// parseIssueRef splits an "owner/repo#N" issue reference into (repo, number).
+// Returns ("", 0) on parse failure.
+func parseIssueRef(issueRef string) (string, int) {
+	i := strings.LastIndexByte(issueRef, '#')
+	if i <= 0 || i == len(issueRef)-1 {
+		return "", 0
+	}
+	repo := issueRef[:i]
+	n, err := strconv.Atoi(issueRef[i+1:])
+	if err != nil || n <= 0 {
+		return "", 0
+	}
+	return repo, n
+}
+
+// lifecycleLabelToWIState maps a managed SCM phase label to its equivalent
+// work-item state for the role:proposed ledger entry. Returns "" for labels
+// that have no ledger counterpart (e.g. tatara-idea, tatara-rejected).
+func lifecycleLabelToWIState(s *tatarav1alpha1.ScmSpec, label string) string {
+	bs, approved, impl, declined := lifecycleLabels(s)
+	switch label {
+	case bs:
+		return tatarav1alpha1.WIProposed
+	case approved:
+		return tatarav1alpha1.WIApproved
+	case impl:
+		return tatarav1alpha1.WIImplemented
+	case declined:
+		return tatarav1alpha1.WIDeclined
+	}
+	return ""
+}
+
+// upsertProposedEntryState updates the role:proposed WorkItemRef whose
+// (Repo, Number) matches the given issueRef to the given state, then persists
+// the change under RetryOnConflict. No-op when no matching entry exists.
+func (r *TaskReconciler) upsertProposedEntryState(ctx context.Context, task *tatarav1alpha1.Task, issueRef, newState string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.Task
+		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), &fresh); gerr != nil {
+			return gerr
+		}
+		changed := false
+		for i := range fresh.Status.WorkItems {
+			wi := &fresh.Status.WorkItems[i]
+			if wi.Role != tatarav1alpha1.RoleProposed {
+				continue
+			}
+			if fmt.Sprintf("%s#%d", wi.Repo, wi.Number) != issueRef {
+				continue
+			}
+			if wi.State == newState {
+				return nil // already set, nothing to write
+			}
+			wi.State = newState
+			changed = true
+			break
+		}
+		if !changed {
+			return nil
+		}
+		return r.Status().Update(ctx, &fresh)
+	})
 }
 
 // hasHumanComment reports whether the task's source issue has at least one

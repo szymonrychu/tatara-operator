@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -45,17 +44,58 @@ func isLifecycleTerminal(state string) bool {
 // a human (the last park comment already explains why).
 const maxRecoveryAttempts = 3
 
+// taskIsPRSlot reports whether the Task targets PR number prNumber in the PR
+// slot (as opposed to issue #prNumber). On GitLab issue #N and MR !N are
+// distinct objects sharing a number, so identity-by-number is not enough: the
+// recovery-attempt count must only include PR-slot tasks. Resolution order:
+// Spec.Source (IsPR + Number) for Phase-1+ tasks, then any ledger entry with
+// Kind==pr and Number==prNumber, then the legacy LabelIsPR for pre-Phase-1
+// Tasks (number carried by the source-number label / Spec.Source.Number).
+func taskIsPRSlot(t *tatarav1alpha1.Task, prNumber int) bool {
+	if s := t.Spec.Source; s != nil {
+		if s.IsPR && s.Number == prNumber {
+			return true
+		}
+	}
+	for _, wi := range t.Status.WorkItems {
+		if wi.Kind == tatarav1alpha1.WorkItemPR && wi.Number == prNumber {
+			return true
+		}
+	}
+	// Legacy fallback for pre-Phase-1 Tasks with no Spec.Source.
+	if t.Spec.Source == nil && t.Labels[tatarav1alpha1.LabelIsPR] == "true" {
+		return true
+	}
+	return false
+}
+
 // priorTerminalAttempts counts terminal (Done/Stopped/Parked) tasks that already
 // targeted this exact PR, so mrScan can stop re-adopting an unfixable PR.
 func priorTerminalAttempts(existing []tatarav1alpha1.Task, repoSlug string, prNumber int) int {
-	want := sanitizeRepoLabel(repoSlug)
+	return priorTerminalAttemptsExcluding(existing, repoSlug, prNumber, "")
+}
+
+// priorTerminalAttemptsExcluding is priorTerminalAttempts with one Task name
+// excluded from the count. The backstop sweep passes the name of the stranded
+// Task it is recovering: that Task is itself typically Parked (terminal) and
+// appears in `existing`, so without exclusion it would count toward its own
+// recovery bound and close an otherwise-reactivatable PR one attempt early.
+func priorTerminalAttemptsExcluding(existing []tatarav1alpha1.Task, repoSlug string, prNumber int, excludeName string) int {
 	n := 0
 	for i := range existing {
 		t := &existing[i]
-		if t.Spec.Source == nil || !t.Spec.Source.IsPR || t.Spec.Source.Number != prNumber {
+		if excludeName != "" && t.Name == excludeName {
 			continue
 		}
-		if t.Labels[labelSourceRepo] != want {
+		// Phase 2: match on spec/ledger identity (with legacy label fallback for
+		// pre-Phase-1 Tasks), THEN require the PR slot. taskMatchesItem alone is
+		// number-only and would let a terminal issue task for issue #N inflate the
+		// recovery count of MR !N on GitLab (distinct objects, same number). The
+		// taskIsPRSlot gate restores the IsPR discrimination the old guard provided.
+		if !taskMatchesItem(t, repoSlug, prNumber) {
+			continue
+		}
+		if !taskIsPRSlot(t, prNumber) {
 			continue
 		}
 		if isLifecycleTerminal(t.Status.LifecycleState) {
@@ -80,31 +120,37 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 
 // label key aliases for readability within this package.
 const (
-	labelSourceRepo   = tatarav1alpha1.LabelSourceRepo
-	labelSourceNumber = tatarav1alpha1.LabelSourceNumber
-	labelSourceKind   = tatarav1alpha1.LabelSourceKind
-	labelHeadSHA      = tatarav1alpha1.LabelHeadSHA
-	labelActivity     = tatarav1alpha1.LabelActivity
+	labelSourceKind = tatarav1alpha1.LabelSourceKind
+	labelActivity   = tatarav1alpha1.LabelActivity
 )
+
+// headSHAForTask returns the head SHA for a task. It reads the first
+// role:openedPR ledger entry's HeadSHA; falls back to Status.MergedHeadSHA
+// for tasks whose PR was merged before the ledger entry was written. Returns ""
+// when neither is set.
+func headSHAForTask(t *tatarav1alpha1.Task) string {
+	for _, wi := range t.Status.WorkItems {
+		if wi.Role == tatarav1alpha1.RoleOpenedPR && wi.HeadSHA != "" {
+			return wi.HeadSHA
+		}
+	}
+	return t.Status.MergedHeadSHA
+}
 
 // sanitizeRepoLabel makes a repo slug DNS-label-safe by replacing '/' with '.'.
 func sanitizeRepoLabel(repo string) string {
 	return strings.ReplaceAll(repo, "/", ".")
 }
 
-// scanTaskLabels builds the operator-stamped dedup labels for a cron Task.
-// head-sha is omitted for non-PR candidates.
+// scanTaskLabels builds the operator-stamped labels for a cron Task.
+// The three source dedup labels (source-repo, source-number, head-sha) are no
+// longer written here: dedup is driven by Spec.Source and Status.WorkItems.
+// Kind and activity labels are retained for observability and non-dedup filtering.
 func scanTaskLabels(c candidate, activity, kind string) map[string]string {
-	l := map[string]string{
-		labelSourceRepo:   sanitizeRepoLabel(c.repo),
-		labelSourceNumber: strconv.Itoa(c.number),
-		labelSourceKind:   kind,
-		labelActivity:     activity,
+	return map[string]string{
+		labelSourceKind: kind,
+		labelActivity:   activity,
 	}
-	if c.headSHA != "" {
-		l[labelHeadSHA] = c.headSHA
-	}
-	return l
 }
 
 // findConvTaskToReactivate returns the first Conversation or Stopped lifecycle
@@ -116,11 +162,10 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 	if c.isPR {
 		return nil
 	}
-	repoLabel := sanitizeRepoLabel(c.repo)
-	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		state := t.Status.LifecycleState
@@ -193,18 +238,31 @@ func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatara
 // operator's OWN park/discuss comments (which advance updatedAt) never free the
 // dedup key and respawn a duplicate (scm-author-vs-actor-egress-gate pattern).
 func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string, humanActivity func(c candidate, since time.Time) bool) bool {
-	repoLabel := sanitizeRepoLabel(c.repo)
-	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 2: match on spec/ledger identity only; legacy label reads removed.
+		// For old Tasks without a ledger, taskMatchesItem falls back to
+		// Spec.Source (which Phase 1 always set at Task creation), and to any
+		// legacy label that happens to match via the OR in the helper.
+		// The label fallback in taskMatchesItem's Spec.Source block covers the
+		// ~1148 existing Tasks that never carried a ledger.
+		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
 			return true
 		}
 		if c.isPR {
-			if t.Labels[labelHeadSHA] == c.headSHA && c.headSHA != "" {
+			// Same-head terminal dedup: read the headSHA from the ledger
+			// (role:openedPR entry) or Status.MergedHeadSHA. Legacy Tasks carry
+			// the head-sha label; headSHAForTask returns "" for them and the
+			// label path below covers the backward-compat case.
+			sha := headSHAForTask(t)
+			if sha == "" {
+				// Fall back to legacy label for Tasks created before Phase 1.
+				sha = t.Labels["tatara.io/head-sha"]
+			}
+			if sha == c.headSHA && c.headSHA != "" {
 				return true
 			}
 			continue
@@ -240,12 +298,11 @@ func lastTerminalNoLabelTask(c candidate, existing []tatarav1alpha1.Task, manage
 	if c.isPR || hasAnyLabel(c.labels, managed) {
 		return nil
 	}
-	repoLabel := sanitizeRepoLabel(c.repo)
-	numLabel := strconv.Itoa(c.number)
 	var latest *tatarav1alpha1.Task
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
@@ -433,6 +490,12 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 		provider = proj.Spec.Scm.Provider
 	}
 	src := scanSourceFor(provider, srcCand)
+	// When the dedup identity (labelCand) differs from the PR identity (srcCand), the
+	// linked issue number is the dedup key. Persist it as DedupNumber so taskMatchesItem
+	// can find this task via spec/ledger without relying on the old source-number label.
+	if labelCand.number != srcCand.number {
+		src.DedupNumber = labelCand.number
+	}
 	// Dedup key is based on labelCand (the issue/PR that determines the task's identity).
 	// For bot-PR MRCI entries, labelCand.number is the linked issue (not the PR#),
 	// ensuring that mrScan and issueScan share the same dedup key for the same issue.
@@ -1092,14 +1155,24 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	// Single pass: resolve slug, set primaryRepo, accumulate backlog, collect slugs.
 	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildRepoStateContext below. SetOpenProposals is called for every
-	// repo queried up to the cap (best-effort: repos beyond the cap short-circuit
-	// and their gauges are not refreshed this cycle).
+	// for reuse by buildRepoStateContext below. SetOpenProposals is refreshed for
+	// every repo queried so the per-repo gauge never goes stale.
+	//
+	// Cap source (P4, migration-safe): the proposal backlog is the MAX of the
+	// ledger count (proposalBacklogFromTasks over role:proposed entries) and the
+	// per-repo SCM-issue count. During the migration window some open proposals are
+	// ledgered (role:proposed) while others live only as SCM brainstorming issues;
+	// taking the max means the cap can only over-count (safe, throttles) and never
+	// under-count (which would silently flood). The SCM count must always run -
+	// gating it on a project-wide "any task has a ledger" flag was wrong: a Task
+	// with only a role:source seed has a ledger but contributes nothing to the
+	// proposal count, so that gate zeroed the SCM backlog and bypassed the cap.
 	issuesBySlug := make(map[string][]scm.IssueRef)
 	var primaryRepo *tatarav1alpha1.Repository
 	var slugs []string
-	total := 0
-	atCap := false
+	ledgerTotal := proposalBacklogFromTasks(existing)
+	scmTotal := 0
+	scmAtCap := false
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
 		slug := repoSlug(rp)
@@ -1110,11 +1183,10 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			primaryRepo = rp
 		}
 		slugs = append(slugs, slug)
-		if atCap {
-			// Already over cap; skip SCM calls but still collect slugs for the goal.
-			// SetOpenProposals is NOT called for repos past this short-circuit: their
-			// per-repo open-proposal gauges retain the value from the previous cycle
-			// (best-effort; documented intentional trade-off to avoid unnecessary SCM calls).
+		if scmAtCap {
+			// SCM backlog already at cap; skip the issue list for remaining repos
+			// (best-effort: their per-repo gauge keeps last cycle's value). Still
+			// collect slugs for the goal text.
 			continue
 		}
 		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
@@ -1129,11 +1201,16 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		issuesBySlug[slug] = iss
 		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
 		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		total += backlog
-		if total >= maxProp {
-			atCap = true
+		scmTotal += backlog
+		if scmTotal >= maxProp {
+			scmAtCap = true
 		}
 	}
+	total := scmTotal
+	if ledgerTotal > total {
+		total = ledgerTotal
+	}
+	atCap := total >= maxProp
 	if primaryRepo == nil {
 		l.Info("brainstorm: no valid repos", "resource_id", proj.Name)
 		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
@@ -1201,11 +1278,16 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 
 	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
 
-	// Aggregate proposal backlog across all repos; short-circuit once >= maxProp.
-	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildRepoStateContext below.
+	// Aggregate proposal backlog across all repos. Cap source (P4, migration-safe):
+	// MAX of the ledger count (proposalBacklogFromTasks) and the per-repo SCM-issue
+	// count - identical rule to brainstorm (see the brainstorm comment for why the
+	// project-wide ledger gate was wrong). Issues are fetched once per repo and
+	// cached in issuesBySlug for reuse by buildRepoStateContext below. The SCM count
+	// + SetOpenProposals always run so the gauge never goes stale.
 	issuesBySlug := make(map[string][]scm.IssueRef)
-	total := 0
+	ledgerTotal := proposalBacklogFromTasks(existing)
+	scmTotal := 0
+	scmAtCap := false
 	var slugs []string
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
@@ -1214,6 +1296,9 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 			continue
 		}
 		slugs = append(slugs, slug)
+		if scmAtCap {
+			continue
+		}
 		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
 		if err != nil {
 			continue
@@ -1226,14 +1311,21 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		issuesBySlug[slug] = iss
 		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
 		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		total += backlog
-		if total >= maxProp {
-			r.Metrics.ScanItem("healthCheck", "skipped_cap")
-			l.Info("healthCheck: project backlog at cap; skipping cycle",
-				"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
-			r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-			return
+		scmTotal += backlog
+		if scmTotal >= maxProp {
+			scmAtCap = true
 		}
+	}
+	total := scmTotal
+	if ledgerTotal > total {
+		total = ledgerTotal
+	}
+	if total >= maxProp {
+		r.Metrics.ScanItem("healthCheck", "skipped_cap")
+		l.Info("healthCheck: project backlog at cap; skipping cycle",
+			"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
+		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		return
 	}
 
 	if len(slugs) == 0 {
@@ -1718,11 +1810,10 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 // lifecycle Task per (repo, issue) regardless of whether that Task is currently
 // running an agent.
 func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
-	repoLabel := sanitizeRepoLabel(slug)
-	numLabel := strconv.Itoa(number)
 	for i := range existing {
 		t := &existing[i]
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, slug, number) {
 			continue
 		}
 		if tatarav1alpha1.TaskTerminal(t) {
@@ -1744,14 +1835,13 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 // adoptable Task exists. Pure (snapshot only); caller adopts via an inline status
 // reset to Triage, reusing the deterministic pod/branch.
 func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number int) *tatarav1alpha1.Task {
-	repoLabel := sanitizeRepoLabel(slug)
-	numLabel := strconv.Itoa(number)
 	for i := range existing {
 		t := &existing[i]
 		if t.Labels[labelSourceKind] != "issueLifecycle" {
 			continue
 		}
-		if t.Labels[labelSourceRepo] != repoLabel || t.Labels[labelSourceNumber] != numLabel {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, slug, number) {
 			continue
 		}
 		switch t.Status.LifecycleState {
@@ -1934,6 +2024,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				consider(now.Add(backlogRequeue))
 			}
 			r.recoverOrphans(ctx, proj, reader, repos, issueCache)
+			r.backstopSweep(ctx, proj, reader, repos)
 		} else {
 			consider(next)
 		}

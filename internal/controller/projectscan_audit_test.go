@@ -95,10 +95,13 @@ func TestMRScanCreatedTaskVisibleToIssueScan(t *testing.T) {
 	r.issueScan(context.Background(), proj, reader, repos, freshExisting, cron.IssueScan)
 
 	// Only 1 QE for issue#42 (from mrScan). issueScan must NOT create a duplicate.
+	// Phase 1: source-number label no longer written; use Source.DedupNumber for bot-PR QEs
+	// and Source.Number for issueScan QEs (both reference issue#42).
 	qes := listScanQEs(t, projName)
 	issue42QEs := 0
 	for _, qe := range qes {
-		if qe.Spec.Payload.Labels[labelSourceNumber] == "42" {
+		src := qe.Spec.Payload.Source
+		if src != nil && (src.DedupNumber == 42 || src.Number == 42) {
 			issue42QEs++
 		}
 	}

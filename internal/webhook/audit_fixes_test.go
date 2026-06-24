@@ -345,9 +345,9 @@ func TestR2Finding1_BotPRClosingIssue_DedupsWithIssueTask(t *testing.T) {
 			Name:      "r2f1-issue7-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -478,9 +478,9 @@ func TestR2Finding2_StoppedTerminalTask_ReactivatedOnComment(t *testing.T) {
 			Name:      "r2f2-stopped-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{

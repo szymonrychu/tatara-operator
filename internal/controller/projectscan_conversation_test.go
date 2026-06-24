@@ -26,10 +26,11 @@ func seedConvTask(t *testing.T, projName, repoName, taskName, state string, acti
 			Name:      taskName,
 			Namespace: testNS,
 			Labels: map[string]string{
-				labelSourceRepo:   "o.r",
-				labelSourceNumber: "10",
-				labelSourceKind:   "issueLifecycle",
-				labelActivity:     "issueScan",
+				// Use string literals; the LabelSource* consts are deleted in Phase 2.
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "10",
+				labelSourceKind:           "issueLifecycle",
+				labelActivity:             "issueScan",
 			},
 		},
 		Spec: tatarav1alpha1.TaskSpec{

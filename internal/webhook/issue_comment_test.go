@@ -36,9 +36,9 @@ func lifecycleTask(name, projectRef, repoRef string, issueNumber int, state stri
 			Name:      name,
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -232,9 +232,9 @@ func parkedLifecycleTask(name, projectRef, repoRef string) *tatarav1.Task {
 				tatarav1.AnnPodRecreations: "1",
 			},
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "9",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "9",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -423,4 +423,56 @@ func TestIssueCommentNoOwningTaskCreatesFresh(t *testing.T) {
 	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
 	require.Len(t, qel.Items, 1, "no owning task -> fresh Triage QueuedEvent created")
 	require.Equal(t, "Triage", qel.Items[0].Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
+}
+
+// parkedLifecycleTaskPhase1 builds the SAME Parked issueLifecycle Task for issue
+// 9 as parkedLifecycleTask, but carrying ONLY the Phase-1 labels (kind/activity/
+// isPR) and NO source-repo/source-number labels - the exact shape every real
+// creation path now produces. The reactivation reads must find it via
+// Spec.Source.IssueRef, not via the dropped source-repo label selector.
+func parkedLifecycleTaskPhase1(name, projectRef, repoRef string) *tatarav1.Task {
+	task := parkedLifecycleTask(name, projectRef, repoRef)
+	task.Labels = map[string]string{
+		tatarav1.LabelSourceKind: "issueLifecycle",
+		tatarav1.LabelActivity:   "webhook",
+		tatarav1.LabelIsPR:       "false",
+	}
+	return task
+}
+
+// TestIssueCommentReactivatesParkedOwningTask_Phase1Labels is the migration
+// regression: a Parked owning Task created with the NEW label-less shape (no
+// source-repo/source-number) must still be reactivated by a human comment. Before
+// the fix, taskListOpts pre-filtered on LabelSourceRepo at the apiserver, so the
+// fake client dropped this Task before the in-Go IssueRef check ran and a
+// duplicate Triage QueuedEvent was created instead.
+func TestIssueCommentReactivatesParkedOwningTask_Phase1Labels(t *testing.T) {
+	const secretVal = "whsec-p1lbl"
+	proj := projectWithBot("projp1lbl", "projp1lbl-scm", "tatara", "tatara-bot")
+	repo := repository("repop1lbl", "projp1lbl", "https://github.com/o/r.git", "main")
+	task := parkedLifecycleTaskPhase1("taskp1lbl", "projp1lbl", "repop1lbl")
+
+	c := seedClient(t, proj, secret("projp1lbl-scm", secretVal), repo)
+	require.NoError(t, c.Create(context.Background(), task))
+	require.NoError(t, c.Status().Update(context.Background(), task))
+
+	h, _ := newServer(t, c)
+
+	body := []byte(issueCommentBodyIssue9)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issue_comment")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
+
+	w := post(t, h, "projp1lbl", hdr, body)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	// No fresh QueuedEvent: the existing label-less Parked Task must be reactivated.
+	var qel tatarav1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
+	require.Empty(t, qel.Items, "label-less Parked task must be reactivated, not duplicated")
+
+	var got tatarav1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskp1lbl"}, &got))
+	require.Equal(t, "Triage", got.Status.LifecycleState, "label-less Parked task must transition to Triage")
+	require.Equal(t, "", got.Status.Phase, "Phase must be cleared on reactivation")
 }

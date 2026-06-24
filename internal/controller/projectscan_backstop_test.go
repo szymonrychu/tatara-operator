@@ -124,6 +124,7 @@ func TestBackstopSkipsIssueWithLiveTask(t *testing.T) {
 		RepositoryRef: repo.Name,
 		Goal:          "g",
 		Kind:          "issueLifecycle",
+		Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
 	}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
@@ -169,6 +170,7 @@ func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
 		RepositoryRef: repo.Name,
 		Goal:          "g",
 		Kind:          "issueLifecycle",
+		Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
 	}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
@@ -282,6 +284,7 @@ func TestRunScans_BackstopFiredAfterIssueScan(t *testing.T) {
 	pre.Spec = tatarav1alpha1.TaskSpec{
 		ProjectRef: "backstop-wired", RepositoryRef: repo.Name,
 		Goal: "old triage", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#20", Number: 20},
 	}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)

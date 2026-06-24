@@ -209,7 +209,8 @@ func TestIssueScan_ActiveTaskHoldsLane(t *testing.T) {
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
 	pre.Labels = scanTaskLabels(candidate{repo: "o/a", number: 1}, "issueScan", "issueLifecycle")
-	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "fanout-hold", RepositoryRef: repoA.Name, Goal: "g", Kind: "issueLifecycle"}
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "fanout-hold", RepositoryRef: repoA.Name, Goal: "g", Kind: "issueLifecycle",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/a#1", Number: 1}}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
@@ -439,7 +440,8 @@ func TestRunScans_DedupBeforeCap(t *testing.T) {
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
 	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 10}, "issueScan", "triageIssue")
-	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "dedupbefore-proj", RepositoryRef: repo.Name, Goal: "g", Kind: "triageIssue"}
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "dedupbefore-proj", RepositoryRef: repo.Name, Goal: "g", Kind: "triageIssue",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#10", Number: 10}}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
@@ -492,7 +494,8 @@ func TestRunScans_DedupSkipsInFlight(t *testing.T) {
 	pre.GenerateName = "scan-"
 	pre.Namespace = testNS
 	pre.Labels = scanTaskLabels(candidate{repo: "o/r", number: 10}, "issueScan", "triageIssue")
-	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "dedup-proj", RepositoryRef: repo.Name, Goal: "g", Kind: "triageIssue"}
+	pre.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "dedup-proj", RepositoryRef: repo.Name, Goal: "g", Kind: "triageIssue",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#10", Number: 10}}
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
