@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -57,24 +56,10 @@ func taskMatchesItem(t *tatarav1alpha1.Task, repo string, number int) bool {
 
 // reposInScope returns a sorted, deduplicated list of "owner/repo" slugs this
 // Task spans, derived from the ledger entries and the Spec.Source IssueRef.
+// Delegates to tatarav1alpha1.TaskReposInScope so the controller and agent
+// packages share one implementation.
 func reposInScope(t *tatarav1alpha1.Task) []string {
-	seen := map[string]struct{}{}
-	if s := t.Spec.Source; s != nil {
-		if r := repoFromIssueRef(s.IssueRef); r != "" {
-			seen[r] = struct{}{}
-		}
-	}
-	for _, wi := range t.Status.WorkItems {
-		if wi.Repo != "" {
-			seen[wi.Repo] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for r := range seen {
-		out = append(out, r)
-	}
-	sort.Strings(out)
-	return out
+	return tatarav1alpha1.TaskReposInScope(t)
 }
 
 // seedLedgerFromSpec populates Status.WorkItems from Spec.Source, SystemicGroup,

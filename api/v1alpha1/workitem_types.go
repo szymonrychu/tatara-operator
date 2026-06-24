@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,6 +74,52 @@ func TaskMatchesItem(t *Task, repo string, number int) bool {
 		return true
 	}
 	return false
+}
+
+// TaskReposInScope returns a sorted, deduplicated list of "owner/repo" slugs this
+// Task spans, derived from the ledger entries and the Spec.Source IssueRef.
+// This is the authoritative clone-scope helper shared by the agent and controller.
+func TaskReposInScope(t *Task) []string {
+	seen := map[string]struct{}{}
+	if s := t.Spec.Source; s != nil {
+		if r := RepoFromIssueRef(s.IssueRef); r != "" {
+			seen[r] = struct{}{}
+		}
+	}
+	for _, wi := range t.Status.WorkItems {
+		if wi.Repo != "" {
+			seen[wi.Repo] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WorkItemsContext formats a human-readable summary of the task's work-item
+// ledger for inclusion in the agent prompt or TATARA_WORK_ITEMS env. Returns ""
+// when WorkItems is empty.
+func WorkItemsContext(t *Task) string {
+	if len(t.Status.WorkItems) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("## Spanned work items\n")
+	for _, wi := range t.Status.WorkItems {
+		ref := fmt.Sprintf("%s#%d", wi.Repo, wi.Number)
+		if wi.Kind == WorkItemPR {
+			ref = fmt.Sprintf("%s!%d", wi.Repo, wi.Number)
+		}
+		line := fmt.Sprintf("- [%s] %s (role:%s, state:%s)", wi.Kind, ref, wi.Role, wi.State)
+		if wi.Title != "" {
+			line += " - " + wi.Title
+		}
+		sb.WriteString(line + "\n")
+	}
+	return sb.String()
 }
 
 // WorkItemRef is one SCM artifact tracked by a Task's work-item ledger.

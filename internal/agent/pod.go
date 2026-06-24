@@ -543,24 +543,53 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_SERENA_URL", Value: cfg.SerenaURL})
 	}
 
-	if len(repos) > 0 {
+	// Work-item context: inject a human-readable ledger summary into the pod so the
+	// agent knows upfront which issues/MRs it spans, without re-deriving from SCM.
+	// Only emitted when WorkItems is non-empty to avoid a no-op env var on old Tasks.
+	if ctx := tatarav1alpha1.WorkItemsContext(task); ctx != "" {
+		env = append(env, corev1.EnvVar{Name: "TATARA_WORK_ITEMS", Value: ctx})
+	}
+
+	// Filter repos to the ledger-derived clone scope when the ledger is non-empty.
+	// When WorkItems is empty, fall back to the full project repo list for
+	// backward-compatibility (pre-ledger Tasks carry no WorkItems).
+	scopedRepos := repos
+	if inScope := tatarav1alpha1.TaskReposInScope(task); len(inScope) > 0 {
+		scopeSet := make(map[string]struct{}, len(inScope))
+		for _, s := range inScope {
+			scopeSet[s] = struct{}{}
+		}
+		var filtered []tatarav1alpha1.Repository
+		for i := range repos {
+			if slug := repoURLSlug(repos[i].Spec.URL); slug != "" {
+				if _, ok := scopeSet[slug]; ok {
+					filtered = append(filtered, repos[i])
+				}
+			}
+		}
+		if len(filtered) > 0 {
+			scopedRepos = filtered
+		}
+	}
+
+	if len(scopedRepos) > 0 {
 		var entries []repoEntry
 		if repo != nil {
 			// Primary repo first, then the rest.
 			entries = []repoEntry{{Name: repo.Name, URL: repo.Spec.URL, Branch: repo.Spec.DefaultBranch}}
-			for i := range repos {
-				if repos[i].Name != repo.Name {
+			for i := range scopedRepos {
+				if scopedRepos[i].Name != repo.Name {
 					entries = append(entries, repoEntry{
-						Name:   repos[i].Name,
-						URL:    repos[i].Spec.URL,
-						Branch: repos[i].Spec.DefaultBranch,
+						Name:   scopedRepos[i].Name,
+						URL:    scopedRepos[i].Spec.URL,
+						Branch: scopedRepos[i].Spec.DefaultBranch,
 					})
 				}
 			}
 		} else {
 			// Project-scoped (no primary): sort all repos by name for determinism.
-			sorted := make([]tatarav1alpha1.Repository, len(repos))
-			copy(sorted, repos)
+			sorted := make([]tatarav1alpha1.Repository, len(scopedRepos))
+			copy(sorted, scopedRepos)
 			// Sort by Name (stable deterministic order, same algorithm as brainstorm/healthCheck).
 			for i := 1; i < len(sorted); i++ {
 				for j := i; j > 0 && sorted[j].Name < sorted[j-1].Name; j-- {
@@ -770,6 +799,30 @@ func toolProfileForKind(kind string) string {
 	default:
 		return "" // fail-open
 	}
+}
+
+// repoURLSlug extracts the "owner/repo" slug from a repo URL like
+// "https://github.com/owner/repo.git". Returns "" when the URL is unparseable.
+// Used to match a Repository.Spec.URL against a ledger WorkItemRef.Repo slug.
+func repoURLSlug(repoURL string) string {
+	// Strip scheme+host: find the third '/' and take what follows.
+	idx := strings.Index(repoURL, "://")
+	if idx < 0 {
+		return ""
+	}
+	rest := repoURL[idx+3:] // "github.com/owner/repo.git"
+	slashIdx := strings.IndexByte(rest, '/')
+	if slashIdx < 0 {
+		return ""
+	}
+	path := rest[slashIdx+1:] // "owner/repo.git"
+	// Strip .git suffix.
+	path = strings.TrimSuffix(path, ".git")
+	// Expect exactly one slash remaining (owner/repo).
+	if !strings.Contains(path, "/") {
+		return ""
+	}
+	return path
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list
