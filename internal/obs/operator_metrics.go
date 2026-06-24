@@ -126,8 +126,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"source"}),
 		ingestJobTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_ingest_job_total",
-			Help: "Finished ingest Jobs by terminal result.",
-		}, []string{"result"}),
+			Help: "Finished ingest Jobs by terminal result and ingest mode (incremental|full).",
+		}, []string{"result", "mode"}),
 		agentUnreachableTermTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "operator_agent_unreachable_termination_total",
 			Help: "Tasks terminated because the wrapper agent stayed unreachable past the boot deadline.",
@@ -340,7 +340,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
 	for _, result := range []string{"success", "failure"} {
-		m.ingestJobTotal.WithLabelValues(result)
+		for _, mode := range []string{"incremental", "full"} {
+			m.ingestJobTotal.WithLabelValues(result, mode)
+		}
 	}
 	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
@@ -386,9 +388,13 @@ func (m *OperatorMetrics) TurnTimeout(source string) {
 }
 
 // IngestJobResult increments operator_ingest_job_total for a finished Job's
-// terminal result ("success" or "failure").
-func (m *OperatorMetrics) IngestJobResult(result string) {
-	m.ingestJobTotal.WithLabelValues(result).Inc()
+// terminal result ("success" or "failure") and ingest mode ("incremental" or
+// "full"). The mode lets alerting page only on terminal full-ingest failures: a
+// failed incremental ingest self-heals by falling back to a full ingest, so it
+// is benign on its own, whereas a failed full ingest means the corpus is
+// genuinely going stale.
+func (m *OperatorMetrics) IngestJobResult(result, mode string) {
+	m.ingestJobTotal.WithLabelValues(result, mode).Inc()
 }
 
 // AgentUnreachableTermination increments

@@ -253,14 +253,18 @@ func TestTurnTimeoutTotal(t *testing.T) {
 func TestIngestJobResultTotal(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
-	m.IngestJobResult("success")
-	m.IngestJobResult("failure")
-	m.IngestJobResult("failure")
-	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("success")); got != 1 {
-		t.Fatalf("ingest_job success = %v, want 1", got)
+	m.IngestJobResult("success", "full")
+	m.IngestJobResult("failure", "full")
+	m.IngestJobResult("failure", "incremental")
+	m.IngestJobResult("failure", "incremental")
+	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("success", "full")); got != 1 {
+		t.Fatalf("ingest_job success/full = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("failure")); got != 2 {
-		t.Fatalf("ingest_job failure = %v, want 2", got)
+	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("failure", "full")); got != 1 {
+		t.Fatalf("ingest_job failure/full = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.ingestJobTotal.WithLabelValues("failure", "incremental")); got != 2 {
+		t.Fatalf("ingest_job failure/incremental = %v, want 2", got)
 	}
 }
 
