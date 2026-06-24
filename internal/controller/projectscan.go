@@ -1158,11 +1158,20 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	// for reuse by buildRepoStateContext below. SetOpenProposals is called for every
 	// repo queried up to the cap (best-effort: repos beyond the cap short-circuit
 	// and their gauges are not refreshed this cycle).
+	//
+	// Ledger-first cap check (P4): when any existing Task has a non-empty WorkItems
+	// ledger, use proposalBacklogFromTasks to count open proposals instead of
+	// per-repo SCM calls. SCM-issue count is the fallback only when the ledger is
+	// not yet seeded (pre-migration Tasks with no WorkItems).
 	issuesBySlug := make(map[string][]scm.IssueRef)
 	var primaryRepo *tatarav1alpha1.Repository
 	var slugs []string
 	total := 0
 	atCap := false
+	if anyTaskHasLedger(existing) {
+		total = proposalBacklogFromTasks(existing)
+		atCap = total >= maxProp
+	}
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
 		slug := repoSlug(rp)
@@ -1190,11 +1199,14 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			continue
 		}
 		issuesBySlug[slug] = iss
-		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
-		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		total += backlog
-		if total >= maxProp {
-			atCap = true
+		if !anyTaskHasLedger(existing) {
+			// SCM fallback: no ledger data available.
+			backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
+			r.Metrics.SetOpenProposals(slug, float64(backlog))
+			total += backlog
+			if total >= maxProp {
+				atCap = true
+			}
 		}
 	}
 	if primaryRepo == nil {
@@ -1267,8 +1279,21 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	// Aggregate proposal backlog across all repos; short-circuit once >= maxProp.
 	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
 	// for reuse by buildRepoStateContext below.
+	//
+	// Ledger-first cap check (P4): when any existing Task has a non-empty WorkItems
+	// ledger, use proposalBacklogFromTasks instead of per-repo SCM calls.
 	issuesBySlug := make(map[string][]scm.IssueRef)
 	total := 0
+	if anyTaskHasLedger(existing) {
+		total = proposalBacklogFromTasks(existing)
+		if total >= maxProp {
+			r.Metrics.ScanItem("healthCheck", "skipped_cap")
+			l.Info("healthCheck: project backlog at cap; skipping cycle",
+				"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
+			r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+			return
+		}
+	}
 	var slugs []string
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
@@ -1287,15 +1312,18 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 			continue
 		}
 		issuesBySlug[slug] = iss
-		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
-		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		total += backlog
-		if total >= maxProp {
-			r.Metrics.ScanItem("healthCheck", "skipped_cap")
-			l.Info("healthCheck: project backlog at cap; skipping cycle",
-				"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
-			r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-			return
+		if !anyTaskHasLedger(existing) {
+			// SCM fallback: no ledger data available.
+			backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
+			r.Metrics.SetOpenProposals(slug, float64(backlog))
+			total += backlog
+			if total >= maxProp {
+				r.Metrics.ScanItem("healthCheck", "skipped_cap")
+				l.Info("healthCheck: project backlog at cap; skipping cycle",
+					"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
+				r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+				return
+			}
 		}
 	}
 

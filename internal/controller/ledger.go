@@ -153,6 +153,53 @@ func seedLedgerFromSpec(t *tatarav1alpha1.Task) {
 	}
 }
 
+// anyTaskHasLedger reports whether any Task in the list has a non-empty
+// Status.WorkItems ledger. Used to select between the ledger-based and the
+// SCM-issue-count paths for proposal backpressure.
+func anyTaskHasLedger(tasks []tatarav1alpha1.Task) bool {
+	for i := range tasks {
+		if len(tasks[i].Status.WorkItems) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// proposalBacklogFromTasks counts open, undecided brainstorm proposals across a
+// set of Tasks by inspecting each Task's role:proposed ledger entries. Entries
+// in state "proposed" are counted; "approved", "declined", and "implemented"
+// are terminal and skipped. Tasks belonging to a systemic group (non-nil
+// Spec.SystemicGroup with a non-empty SystemicID) count as one entry per
+// unique SystemicID regardless of how many Tasks share that ID; Tasks without
+// a systemic group each contribute one standalone count.
+//
+// Only Tasks that have at least one role:proposed entry in state "proposed" are
+// included; Tasks with an empty WorkItems ledger return 0 (the caller falls
+// back to the SCM-issue count for those).
+func proposalBacklogFromTasks(tasks []tatarav1alpha1.Task) int {
+	groups := map[string]bool{}
+	standalone := 0
+	for i := range tasks {
+		t := &tasks[i]
+		hasOpen := false
+		for _, wi := range t.Status.WorkItems {
+			if wi.Role == tatarav1alpha1.RoleProposed && wi.State == tatarav1alpha1.WIProposed {
+				hasOpen = true
+				break
+			}
+		}
+		if !hasOpen {
+			continue
+		}
+		if sg := t.Spec.SystemicGroup; sg != nil && sg.SystemicID != "" {
+			groups[sg.SystemicID] = true
+		} else {
+			standalone++
+		}
+	}
+	return standalone + len(groups)
+}
+
 func kindForIsPR(isPR bool) string {
 	if isPR {
 		return tatarav1alpha1.WorkItemPR
