@@ -60,6 +60,16 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		}
 		r.Metrics.BrainstormOutcome("no_yield")
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "BrainstormComplete", reason)
+	case "incident", "healthCheck":
+		// Project-scoped orchestration kinds. They open no PR and file no issue
+		// of their own; the agent calls propose_issue which spawns a separate
+		// repo-scoped child Task that opens the issue. RepositoryRef is empty by
+		// contract (projectScopedKinds), so writeBackOpenChange would resolve a
+		// repo by empty name and error-loop. Clear WritebackPending as a no-op.
+		if r.brainstormHasProposal(ctx, task) {
+			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "ProposalFiled", "project-scoped task filed via propose_issue; no PR to open")
+		}
+		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "NoWriteback", "project-scoped task finished with no proposal (false positive or degraded)")
 	default:
 		// implement and other future kinds that open a change.
 	}

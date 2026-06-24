@@ -70,6 +70,7 @@ spec:
                 - brainstorm
                 - issueLifecycle
                 - incident
+                - healthCheck
                 type: string
               maxTurns:
                 type: integer
