@@ -19,10 +19,11 @@ import (
 // Kind/activity/is-pr labels are still written.
 func TestScanTaskLabels_NoSourceDedupeLabels(t *testing.T) {
 	got := scanTaskLabels(candidate{repo: "o/r", number: 5, headSHA: "abc"}, "mrScan", "review")
+	// Use string literals: the consts are deleted in Phase 2 Task 9.
 	for _, badKey := range []string{
-		tatarav1alpha1.LabelSourceRepo,
-		tatarav1alpha1.LabelSourceNumber,
-		tatarav1alpha1.LabelHeadSHA,
+		"tatara.io/source-repo",
+		"tatara.io/source-number",
+		"tatara.io/head-sha",
 	} {
 		if _, ok := got[badKey]; ok {
 			t.Errorf("scanTaskLabels must not write %q any more; got %+v", badKey, got)

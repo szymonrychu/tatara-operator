@@ -11,13 +11,14 @@ import (
 
 func mkCronTask(repo string, number int, kind, headSHA, phase string) tatarav1alpha1.Task {
 	tk := tatarav1alpha1.Task{}
-	// Set the 3 legacy source dedup labels directly (Phase 1: writes stopped,
-	// reads kept for backward-compat with tasks created before the ledger).
+	// Set the 3 legacy source dedup labels directly using string literals
+	// (Phase 2: the LabelSource* consts are deleted; string literals keep the
+	// backward-compat fallback testable without re-introducing the consts).
 	labels := scanTaskLabels(candidate{repo: repo, number: number, headSHA: headSHA}, "mrScan", kind)
-	labels[labelSourceRepo] = sanitizeRepoLabel(repo)
-	labels[labelSourceNumber] = strconv.Itoa(number)
+	labels["tatara.io/source-repo"] = sanitizeRepoLabel(repo)
+	labels["tatara.io/source-number"] = strconv.Itoa(number)
 	if headSHA != "" {
-		labels[labelHeadSHA] = headSHA
+		labels["tatara.io/head-sha"] = headSHA
 	}
 	tk.Labels = labels
 	tk.Status.Phase = phase

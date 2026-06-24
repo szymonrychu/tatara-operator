@@ -36,9 +36,9 @@ func lifecycleTask(name, projectRef, repoRef string, issueNumber int, state stri
 			Name:      name,
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -232,9 +232,9 @@ func parkedLifecycleTask(name, projectRef, repoRef string) *tatarav1.Task {
 				tatarav1.AnnPodRecreations: "1",
 			},
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "9",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "9",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{

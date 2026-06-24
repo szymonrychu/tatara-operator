@@ -32,8 +32,8 @@ func convTask(repoSlug string, num int, state string, lastAct time.Time) tatarav
 	return tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				labelSourceRepo:   sanitizeRepoLabel(repoSlug),
-				labelSourceNumber: strconv.Itoa(num),
+				"tatara.io/source-repo":   sanitizeRepoLabel(repoSlug),
+				"tatara.io/source-number": strconv.Itoa(num),
 			},
 		},
 		Status: tatarav1alpha1.TaskStatus{

@@ -18,7 +18,7 @@ func mkPRTask(repo string, pr int, lc string) tatarav1alpha1.Task {
 	// Phase 2: IssueRef added so taskMatchesItem can resolve the repo; the
 	// LabelSourceRepo is kept for backward-compat (legacy-label fallback path).
 	return tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel(repo)}},
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"tatara.io/source-repo": sanitizeRepoLabel(repo)}},
 		Spec: tatarav1alpha1.TaskSpec{
 			Kind: "issueLifecycle",
 			Source: &tatarav1alpha1.TaskSource{

@@ -128,10 +128,11 @@ func TestP2Dedup_NoSourceDedupeLabelsWritten(t *testing.T) {
 	require.Len(t, qel.Items, 1)
 
 	labels := qel.Items[0].Spec.Payload.Labels
+	// Use string literals; the LabelSource* consts are deleted in Phase 2 Task 9.
 	for _, forbidden := range []string{
-		tatarav1.LabelSourceRepo,
-		tatarav1.LabelSourceNumber,
-		tatarav1.LabelHeadSHA,
+		"tatara.io/source-repo",
+		"tatara.io/source-number",
+		"tatara.io/head-sha",
 	} {
 		if _, ok := labels[forbidden]; ok {
 			t.Errorf("created task must not carry label %q; labels = %v", forbidden, labels)

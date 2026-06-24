@@ -35,9 +35,9 @@ func TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger(t *testing.T) {
 			Name:      "r3f12-done-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -101,9 +101,9 @@ func TestR3Finding1And2_ParkedLifecycleTask_AllowsRetrigger(t *testing.T) {
 			Name:      "r3f12-parked-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{
@@ -169,9 +169,9 @@ func TestR3Finding1And2_ActiveLifecycleTask_StillDeduped(t *testing.T) {
 			Name:      "r3f12-active-task",
 			Namespace: ns,
 			Labels: map[string]string{
-				tatarav1.LabelSourceRepo:   "o.r",
-				tatarav1.LabelSourceNumber: "7",
-				tatarav1.LabelSourceKind:   "issueLifecycle",
+				"tatara.io/source-repo":   "o.r",
+				"tatara.io/source-number": "7",
+				tatarav1.LabelSourceKind:  "issueLifecycle",
 			},
 		},
 		Spec: tatarav1.TaskSpec{

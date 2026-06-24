@@ -61,9 +61,9 @@ func TestIssueComment_HumanOnUntrackedIssue_CreatesTriageTask(t *testing.T) {
 
 	// The 3 source dedup labels are no longer written (ledger replaces them);
 	// kind and activity labels are still set.
-	require.Equal(t, "", qe.Spec.Payload.Labels[tatarav1.LabelSourceRepo],
+	require.Equal(t, "", qe.Spec.Payload.Labels["tatara.io/source-repo"],
 		"source-repo label must not be written (ledger-based dedup)")
-	require.Equal(t, "", qe.Spec.Payload.Labels[tatarav1.LabelSourceNumber],
+	require.Equal(t, "", qe.Spec.Payload.Labels["tatara.io/source-number"],
 		"source-number label must not be written (ledger-based dedup)")
 	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Labels[tatarav1.LabelSourceKind])
 }
@@ -121,7 +121,7 @@ func TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask(t *testing.T) {
 	require.Equal(t, "o/r#11", qe.Spec.Payload.Source.IssueRef)
 	require.True(t, qe.Spec.Payload.Source.IsPR, "task must be IsPR for an MR comment")
 	require.Equal(t, "Triage", qe.Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
-	require.Equal(t, "", qe.Spec.Payload.Labels[tatarav1.LabelSourceNumber],
+	require.Equal(t, "", qe.Spec.Payload.Labels["tatara.io/source-number"],
 		"source-number label must not be written (ledger-based dedup)")
 }
 

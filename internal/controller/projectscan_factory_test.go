@@ -63,7 +63,7 @@ func TestCreateScanTask(t *testing.T) {
 		t.Fatalf("QE spec = %+v", got.Spec)
 	}
 	// Phase 1: source-repo, source-number, head-sha labels no longer written.
-	for _, key := range []string{labelSourceRepo, labelSourceNumber, labelHeadSHA} {
+	for _, key := range []string{"tatara.io/source-repo", "tatara.io/source-number", "tatara.io/head-sha"} {
 		if v := got.Spec.Payload.Labels[key]; v != "" {
 			t.Fatalf("QE payload label %q must not be written (Phase 1), got %q", key, v)
 		}

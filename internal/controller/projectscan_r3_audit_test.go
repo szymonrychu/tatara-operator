@@ -42,10 +42,10 @@ func TestMRScan_BotPR_NoDuplicateAdoption(t *testing.T) {
 			Name:      "r3-live-task-10",
 			Namespace: testNS,
 			Labels: map[string]string{
-				labelSourceRepo:   sanitizeRepoLabel("o/r"),
-				labelSourceNumber: "10",
-				labelSourceKind:   "issueLifecycle",
-				labelActivity:     "mrScan",
+				"tatara.io/source-repo":   sanitizeRepoLabel("o/r"),
+				"tatara.io/source-number": "10",
+				labelSourceKind:           "issueLifecycle",
+				labelActivity:             "mrScan",
 			},
 		},
 		Spec:   tatarav1alpha1.TaskSpec{Kind: "issueLifecycle", ProjectRef: projName},
@@ -58,7 +58,7 @@ func TestMRScan_BotPR_NoDuplicateAdoption(t *testing.T) {
 	// No new task must be created (dedup on issue#10 must fire).
 	tasks := listScanTasks(t, projName)
 	for _, tk := range tasks {
-		if tk.Labels[labelSourceNumber] == "10" || tk.Labels[labelSourceNumber] == "5" {
+		if tk.Labels["tatara.io/source-number"] == "10" || tk.Labels["tatara.io/source-number"] == "5" {
 			t.Fatalf("unexpected task created for deduped bot PR (issue#10 already live): %s", tk.Name)
 		}
 	}
@@ -85,10 +85,10 @@ func TestMRScan_BotPR_DedupMetricFires(t *testing.T) {
 	liveTask := tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: map[string]string{
-				labelSourceRepo:   sanitizeRepoLabel("o/r"),
-				labelSourceNumber: "20",
-				labelSourceKind:   "issueLifecycle",
-				labelActivity:     "mrScan",
+				"tatara.io/source-repo":   sanitizeRepoLabel("o/r"),
+				"tatara.io/source-number": "20",
+				labelSourceKind:           "issueLifecycle",
+				labelActivity:             "mrScan",
 			},
 		},
 		Spec:   tatarav1alpha1.TaskSpec{Kind: "issueLifecycle", ProjectRef: projName},

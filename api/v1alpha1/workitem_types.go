@@ -65,10 +65,11 @@ func TaskMatchesItem(t *Task, repo string, number int) bool {
 		}
 	}
 	// Legacy fallback: Tasks created before Phase 1 carry source-repo/source-number
-	// labels but no Spec.Source.
+	// labels but no Spec.Source. Use the raw string values; the consts are deleted
+	// in Phase 2 Task 9 to prevent new code from re-using them.
 	repoSlug := strings.ReplaceAll(repo, "/", ".")
 	numStr := fmt.Sprintf("%d", number)
-	if t.Labels[LabelSourceRepo] == repoSlug && t.Labels[LabelSourceNumber] == numStr {
+	if t.Labels["tatara.io/source-repo"] == repoSlug && t.Labels["tatara.io/source-number"] == numStr {
 		return true
 	}
 	return false

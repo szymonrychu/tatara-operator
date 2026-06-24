@@ -265,8 +265,8 @@ func TestMRScanBotPRClosesIssueKeyedOnLinkedIssue(t *testing.T) {
 		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
 	// source-number label is no longer written (Phase 1: ledger replaces label-based dedup).
-	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "" {
-		t.Errorf("source-number label must not be written (Phase 1), got %q", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	if qes[0].Spec.Payload.Labels["tatara.io/source-number"] != "" {
+		t.Errorf("source-number label must not be written (Phase 1), got %q", qes[0].Spec.Payload.Labels["tatara.io/source-number"])
 	}
 	// Linked issue number is recorded as Source.DedupNumber (dedup key for taskMatchesItem).
 	src := qes[0].Spec.Payload.Source
@@ -310,8 +310,8 @@ func TestMRScanBotPRNoClosesKeyedOnPRNumber(t *testing.T) {
 		t.Fatalf("want 1 QE, got %d", len(qes))
 	}
 	// source-number label is no longer written (Phase 1: ledger replaces label-based dedup).
-	if qes[0].Spec.Payload.Labels[labelSourceNumber] != "" {
-		t.Errorf("source-number label must not be written (Phase 1), got %q", qes[0].Spec.Payload.Labels[labelSourceNumber])
+	if qes[0].Spec.Payload.Labels["tatara.io/source-number"] != "" {
+		t.Errorf("source-number label must not be written (Phase 1), got %q", qes[0].Spec.Payload.Labels["tatara.io/source-number"])
 	}
 	// DedupNumber is zero when no linked issue (dedup uses Source.Number directly).
 	src := qes[0].Spec.Payload.Source

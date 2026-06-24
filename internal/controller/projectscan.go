@@ -82,11 +82,8 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 
 // label key aliases for readability within this package.
 const (
-	labelSourceRepo   = tatarav1alpha1.LabelSourceRepo
-	labelSourceNumber = tatarav1alpha1.LabelSourceNumber
-	labelSourceKind   = tatarav1alpha1.LabelSourceKind
-	labelHeadSHA      = tatarav1alpha1.LabelHeadSHA
-	labelActivity     = tatarav1alpha1.LabelActivity
+	labelSourceKind = tatarav1alpha1.LabelSourceKind
+	labelActivity   = tatarav1alpha1.LabelActivity
 )
 
 // headSHAForTask returns the head SHA for a task. It reads the first
@@ -225,7 +222,7 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string, hu
 			sha := headSHAForTask(t)
 			if sha == "" {
 				// Fall back to legacy label for Tasks created before Phase 1.
-				sha = t.Labels[labelHeadSHA]
+				sha = t.Labels["tatara.io/head-sha"]
 			}
 			if sha == c.headSHA && c.headSHA != "" {
 				return true
