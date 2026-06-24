@@ -9,9 +9,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // seedBackstopSweepProject creates a Project + Repository for sweep tests.
@@ -58,7 +60,14 @@ func makeStrandedTask(t *testing.T, projName, repoName string, prNumber, issueNu
 		{Provider: "github", Repo: "o/r", Number: prNumber, Kind: tatarav1alpha1.WorkItemPR,
 			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen, HeadSHA: "sha1"},
 	}
-	task.Status.PodName = ""
+	// Production-realistic: a stranded task that already opened an MR has a
+	// non-empty PodName (stamped once, never cleared on park) and is itself Parked
+	// (terminal lifecycle). The pod object does NOT exist (long gone). The sweep
+	// must treat this as not-live via an actual pod Get, not short-circuit on
+	// PodName presence, and must EXCLUDE itself from priorTerminalAttempts.
+	task.Status.PodName = agent.PodName(task)
+	task.Status.LifecycleState = "Parked"
+	task.Status.ParkReason = "BootCrashLoop"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("status update stranded task: %v", err)
 	}
@@ -208,9 +217,15 @@ func TestBackstopSweep_CloseObsoleteTask(t *testing.T) {
 	repos := []tatarav1alpha1.Repository{repo}
 	r.backstopSweep(context.Background(), proj, reader, repos)
 
-	// ClosePR must have been called.
+	// ClosePR must have been called with a superseded note (NOT the exhausted-
+	// recovery "after N attempts" body), and the recovery-exhausted label must NOT
+	// be stamped on an obsoleted PR.
 	require.True(t, fw.closePRCalled, "expected ClosePR for obsolete MR")
 	require.Equal(t, 52, fw.closePRNumber)
+	require.Contains(t, fw.closePRBody, "superseded", "obsolete close must post a superseded note")
+	require.Contains(t, fw.closePRBody, "no longer needed", "obsolete body must explain source issues are resolved")
+	require.NotContains(t, fw.closePRBody, "recovery", "obsolete close must NOT use the recovery-exhausted framing")
+	require.NotEqual(t, labelRecoveryExhausted, fw.addLabelLabel, "obsolete close must NOT stamp recovery-exhausted label")
 
 	// No new QE created.
 	qes := listScanQEs(t, "sweep-obsolete")
@@ -289,6 +304,8 @@ func TestRunScans_BackstopSweepFiredAfterIssueScan(t *testing.T) {
 		{Provider: "github", Repo: "o/r", Number: 60, Kind: tatarav1alpha1.WorkItemPR,
 			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen, HeadSHA: "sha3"},
 	}
+	strandedTask.Status.PodName = agent.PodName(strandedTask)
+	strandedTask.Status.LifecycleState = "Parked"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), strandedTask))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), strandedTask) })
 
@@ -308,4 +325,140 @@ func TestRunScans_BackstopSweepFiredAfterIssueScan(t *testing.T) {
 	require.Len(t, qes, 1, "want 1 MRCI QE from backstopSweep wired into runScans")
 	ann := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
 	require.Equal(t, "MRCI", ann)
+}
+
+// TestBackstopSweep_Idempotent: running the sweep twice in a row against the same
+// stranded task must NOT create a duplicate QE. The second sweep finds the
+// reactivation task already in flight; createScanTask's dedup suppresses the
+// duplicate. Duplicate-task creation is the exact false-refusal/duplication class
+// this platform has been burned by.
+func TestBackstopSweep_Idempotent(t *testing.T) {
+	proj, repo := seedBackstopSweepProject(t, "sweep-idem")
+	makeStrandedTask(t, "sweep-idem", repo.Name, 53, 12)
+
+	reader := &backstopFakeReader{
+		openIssues: map[string][]scm.IssueRef{"o/r": {{Repo: "o/r", Number: 12}}},
+		openPRs:    map[string][]scm.PRRef{"o/r": {{Repo: "o/r", Number: 53, HeadSHA: "sha1"}}},
+	}
+
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	repos := []tatarav1alpha1.Repository{repo}
+
+	r.backstopSweep(context.Background(), proj, reader, repos)
+	require.Len(t, listScanQEs(t, "sweep-idem"), 1, "first sweep creates one QE")
+
+	r.backstopSweep(context.Background(), proj, reader, repos)
+	require.Len(t, listScanQEs(t, "sweep-idem"), 1, "second sweep must NOT duplicate the QE")
+}
+
+// TestBackstopSweep_SharesDedupKeyWithMrScan: mrScan and backstopSweep run in the
+// same tick (runScans order). For a bot MR whose body links a tracker issue
+// (issueNum != PRnum), both paths must compute the SAME createScanTask dedup key
+// (issueLifecycle\x00<repo>#<issueNum>) so only ONE reactivation QE is created -
+// never two agents on one MR. The backstop must key on the linked issue (derived
+// from its ledger), not the PR number.
+func TestBackstopSweep_SharesDedupKeyWithMrScan(t *testing.T) {
+	proj, repo := seedBackstopSweepProject(t, "sweep-xdedup")
+
+	// Stranded bot MR #70 closing issue #13. Ledger carries both. makeStrandedTask
+	// seeds the PR ledger HeadSHA="sha1".
+	makeStrandedTask(t, "sweep-xdedup", repo.Name, 70, 13)
+
+	// Bot-authored open PR #70 whose body links issue #13 ("Closes #13"). The head
+	// SHA has ADVANCED ("sha2" != the stranded task's "sha1") so mrScan's same-head
+	// terminal dedup does NOT suppress it and mrScan creates its own MRCI QE keyed
+	// on the linked issue #13. The backstop must key on #13 too (not PR #70), else
+	// both fire and two QEs (two agents) land on one MR.
+	reader := &backstopFakeReader{
+		openIssues: map[string][]scm.IssueRef{"o/r": {{Repo: "o/r", Number: 13}}},
+		openPRs: map[string][]scm.PRRef{"o/r": {{
+			Repo: "o/r", Number: 70, Author: "tatara-bot", HeadSHA: "sha2", Body: "Closes #13",
+		}}},
+	}
+
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	repos := []tatarav1alpha1.Repository{repo}
+
+	// mrScan first (as runScans orders it), then backstopSweep in the same tick.
+	existing, err := r.existingScanTasks(context.Background(), proj)
+	require.NoError(t, err)
+	r.mrScan(context.Background(), proj, reader, repos, existing, tatarav1alpha1.CronActivity{})
+	r.backstopSweep(context.Background(), proj, reader, repos)
+
+	// Exactly ONE reactivation QE for the linked issue, not two.
+	qes := listScanQEs(t, "sweep-xdedup")
+	require.Len(t, qes, 1, "mrScan + backstop must share a dedup key -> single QE for one MR")
+}
+
+// TestBackstopSweep_NoActionOnFetchError: a transient ListOpenPRs error for the
+// PR's repo must NOT drive any Tier-2 action. This guards the migration hazard:
+// ~1148 lazily-seeded tasks default openedPR to WIOpen, and a single list error
+// must not let never-confirmed seed-open state spawn spurious Reactivate/Close.
+func TestBackstopSweep_NoActionOnFetchError(t *testing.T) {
+	proj, repo := seedBackstopSweepProject(t, "sweep-fetcherr")
+	fw := &fullFakeSCMWriter{}
+	makeStrandedTask(t, "sweep-fetcherr", repo.Name, 54, 14)
+
+	// Issue list succeeds (issue #14 shows closed) but the PR list ERRORS, so the
+	// PR repo is never confirmed. Without the gate this would look like
+	// close-obsolete (all source issues closed + open PR) and close a live MR.
+	reader := &backstopFakeReader{
+		openIssues: map[string][]scm.IssueRef{"o/r": {}},
+		prListErr:  map[string]bool{"o/r": true},
+	}
+
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+	repos := []tatarav1alpha1.Repository{repo}
+
+	r.backstopSweep(context.Background(), proj, reader, repos)
+
+	require.False(t, fw.closePRCalled, "must NOT close a PR whose repo fetch failed")
+	require.Empty(t, listScanQEs(t, "sweep-fetcherr"), "must NOT reactivate on unconfirmed seed-open state")
+}
+
+// TestBackstopSweep_Tier1PersistsRefresh: when Tier-1 refresh changes ledger state
+// it must be written back to the CR. Flip issue #15 to closed in SCM; after the
+// sweep, Re-Get the Task and assert Status.WorkItems[issue].State==WIClosed and
+// LastRefreshedAt is set, proving the RetryOnConflict Status().Update round-trips.
+func TestBackstopSweep_Tier1PersistsRefresh(t *testing.T) {
+	proj, repo := seedBackstopSweepProject(t, "sweep-persist")
+
+	// Issue-only task (no PR): pure Tier-1 drift, no Tier-2 action.
+	task := &tatarav1alpha1.Task{}
+	task.GenerateName = "sweep-"
+	task.Namespace = testNS
+	task.Labels = map[string]string{labelSourceKind: "issueLifecycle", labelActivity: "issueScan"}
+	task.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef:    "sweep-persist",
+		RepositoryRef: repo.Name,
+		Goal:          "triage",
+		Kind:          "issueLifecycle",
+		Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#15", Number: 15, IsPR: false},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), task))
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 15, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), task) })
+
+	reader := &backstopFakeReader{
+		openIssues: map[string][]scm.IssueRef{"o/r": {}}, // issue #15 now closed
+		openPRs:    map[string][]scm.PRRef{},
+	}
+
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.backstopSweep(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo})
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKeyFromObject(task), &got))
+	require.Len(t, got.Status.WorkItems, 1)
+	require.Equal(t, tatarav1alpha1.WIClosed, got.Status.WorkItems[0].State, "refreshed State must persist to the CR")
+	require.NotNil(t, got.Status.WorkItems[0].LastRefreshedAt, "LastRefreshedAt must persist to the CR")
 }

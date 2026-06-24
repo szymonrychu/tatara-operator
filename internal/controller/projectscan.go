@@ -72,9 +72,21 @@ func taskIsPRSlot(t *tatarav1alpha1.Task, prNumber int) bool {
 // priorTerminalAttempts counts terminal (Done/Stopped/Parked) tasks that already
 // targeted this exact PR, so mrScan can stop re-adopting an unfixable PR.
 func priorTerminalAttempts(existing []tatarav1alpha1.Task, repoSlug string, prNumber int) int {
+	return priorTerminalAttemptsExcluding(existing, repoSlug, prNumber, "")
+}
+
+// priorTerminalAttemptsExcluding is priorTerminalAttempts with one Task name
+// excluded from the count. The backstop sweep passes the name of the stranded
+// Task it is recovering: that Task is itself typically Parked (terminal) and
+// appears in `existing`, so without exclusion it would count toward its own
+// recovery bound and close an otherwise-reactivatable PR one attempt early.
+func priorTerminalAttemptsExcluding(existing []tatarav1alpha1.Task, repoSlug string, prNumber int, excludeName string) int {
 	n := 0
 	for i := range existing {
 		t := &existing[i]
+		if excludeName != "" && t.Name == excludeName {
+			continue
+		}
 		// Phase 2: match on spec/ledger identity (with legacy label fallback for
 		// pre-Phase-1 Tasks), THEN require the PR slot. taskMatchesItem alone is
 		// number-only and would let a terminal issue task for issue #N inflate the

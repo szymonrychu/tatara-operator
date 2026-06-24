@@ -492,6 +492,7 @@ type fullFakeSCMWriter struct {
 	mergeMethod   string
 	closePRCalled bool
 	closePRNumber int
+	closePRBody   string
 	// triageIssue path
 	closeIssueCalled bool
 	closeIssueNumber int
@@ -539,9 +540,10 @@ func (f *fullFakeSCMWriter) Merge(_ context.Context, _, _ string, number int, me
 	f.mergeMethod = method
 	return "", nil
 }
-func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, _ string) error {
+func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, body string) error {
 	f.closePRCalled = true
 	f.closePRNumber = number
+	f.closePRBody = body
 	return nil
 }
 func (f *fullFakeSCMWriter) AddLabel(_ context.Context, _, issueRef, label string) error {
