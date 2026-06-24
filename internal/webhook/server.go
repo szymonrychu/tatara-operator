@@ -356,11 +356,13 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// as a coarse pre-filter to narrow the list. The dedupRef equality handles the
 	// bot-PR arm too: dedupRef is rewritten to the linked issue's ref ("o/r#7"), so
 	// it matches the issueScan task that already owns that issue slot.
+	// Phase 2: dedup is matched by spec/ledger identity via TaskMatchesItem.
+	// The apiserver pre-filter narrows to issueLifecycle Tasks; in-Go matching
+	// then applies full identity + slot checks. O(tasks) per the Full-removal
+	// decision (label-selector dedup is gone; deterministic-name idempotency
+	// handles the truly-concurrent hot path).
+	dedupRepo := tatarav1.RepoFromIssueRef(dedupRef)
 	var existing tatarav1.TaskList
-	isPRStr := "false"
-	if dedupIsPR {
-		isPRStr = "true"
-	}
 	listOpts := []client.ListOption{
 		client.InNamespace(s.cfg.Namespace),
 		client.MatchingLabels{tatarav1.LabelSourceKind: "issueLifecycle"},
@@ -372,25 +374,24 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	for i := range existing.Items {
 		t := &existing.Items[i]
-		if t.Spec.Source == nil || tatarav1.TaskTerminal(t) {
+		if tatarav1.TaskTerminal(t) {
 			continue
 		}
-		// Identity match: the existing task must own the same dedup slot. For a
-		// plain issue this is Spec.Source.IssueRef == ev.IssueRef; for a bot PR
-		// "Closes #N" both dedupRef and the existing issueScan task resolve to the
-		// linked issue ref "o/r#N".
-		if t.Spec.Source.IssueRef != dedupRef {
+		// Identity match via spec/ledger (covers DedupNumber, ledger entries, and
+		// the legacy label fallback for pre-Phase-1 Tasks).
+		if !tatarav1.TaskMatchesItem(t, dedupRepo, dedupNumber) {
 			continue
 		}
-		// LabelIsPR (still written) disambiguates issue #N from PR #N in the same
-		// repo, both of which share the "o/r#N" IssueRef. Tasks without the label
-		// (scan-created or pre-label) default to "false" (issue slot). A PR-slot
-		// event must not be blocked by an issue-slot task and vice versa.
-		existingIsPR := t.Labels[tatarav1.LabelIsPR]
-		if existingIsPR == "" {
-			existingIsPR = "false" // backward-compatible default
+		// Slot check: distinguish issue #N from PR #N in the same repo.
+		// Prefer Spec.Source.IsPR when set; fall back to LabelIsPR for pre-Phase-1
+		// Tasks that have no Spec.Source.
+		existingIsPR := false
+		if t.Spec.Source != nil {
+			existingIsPR = t.Spec.Source.IsPR
+		} else if t.Labels[tatarav1.LabelIsPR] == "true" {
+			existingIsPR = true
 		}
-		if existingIsPR != isPRStr {
+		if existingIsPR != dedupIsPR {
 			continue // different slot; not a duplicate
 		}
 		s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
@@ -415,10 +416,14 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		} else {
 			ann[tatarav1.LifecycleEntryAnnotation] = "Implement"
 		}
+		isPRLabel := "false"
+		if dedupIsPR {
+			isPRLabel = "true"
+		}
 		labels = map[string]string{
 			tatarav1.LabelSourceKind: kind,
 			tatarav1.LabelActivity:   "webhook",
-			tatarav1.LabelIsPR:       isPRStr,
+			tatarav1.LabelIsPR:       isPRLabel,
 		}
 	}
 

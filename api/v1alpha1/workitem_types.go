@@ -1,6 +1,11 @@
 package v1alpha1
 
-import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+import (
+	"fmt"
+	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 // Work-item role constants.
 const (
@@ -27,6 +32,47 @@ const (
 	WIClosed      = "closed"
 	WIMerged      = "merged"
 )
+
+// RepoFromIssueRef extracts the "owner/repo" part from an IssueRef like
+// "owner/repo#N" or "owner/repo!N". Returns "" when the ref is unparseable.
+func RepoFromIssueRef(issueRef string) string {
+	idx := strings.LastIndexAny(issueRef, "#!")
+	if idx <= 0 {
+		return ""
+	}
+	return issueRef[:idx]
+}
+
+// TaskMatchesItem reports whether the Task's seed identity (Spec.Source:
+// repo from IssueRef, number = DedupNumber if set else Number) OR any ledger
+// entry matches the given (repo, number). For Tasks created before the ledger
+// (no Spec.Source) it falls back to the legacy source-repo/source-number labels
+// so the ~1148 existing Tasks remain matched during the rollout period.
+func TaskMatchesItem(t *Task, repo string, number int) bool {
+	if s := t.Spec.Source; s != nil {
+		srcRepo := RepoFromIssueRef(s.IssueRef)
+		dedupNum := s.DedupNumber
+		if dedupNum == 0 {
+			dedupNum = s.Number
+		}
+		if srcRepo == repo && dedupNum == number {
+			return true
+		}
+	}
+	for _, wi := range t.Status.WorkItems {
+		if wi.Repo == repo && wi.Number == number {
+			return true
+		}
+	}
+	// Legacy fallback: Tasks created before Phase 1 carry source-repo/source-number
+	// labels but no Spec.Source.
+	repoSlug := strings.ReplaceAll(repo, "/", ".")
+	numStr := fmt.Sprintf("%d", number)
+	if t.Labels[LabelSourceRepo] == repoSlug && t.Labels[LabelSourceNumber] == numStr {
+		return true
+	}
+	return false
+}
 
 // WorkItemRef is one SCM artifact tracked by a Task's work-item ledger.
 type WorkItemRef struct {

@@ -8,14 +8,10 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
-// repoFromIssueRef extracts the "owner/repo" part from an IssueRef like
-// "owner/repo#N" or "owner/repo!N". Returns "" when the ref is unparseable.
+// repoFromIssueRef delegates to the api package so the two call sites share
+// one implementation.
 func repoFromIssueRef(issueRef string) string {
-	idx := strings.LastIndexAny(issueRef, "#!")
-	if idx <= 0 {
-		return ""
-	}
-	return issueRef[:idx]
+	return tatarav1alpha1.RepoFromIssueRef(issueRef)
 }
 
 // UpsertWorkItem upserts ref into task.Status.WorkItems. Idempotent by
@@ -53,37 +49,10 @@ func UpsertWorkItem(task *tatarav1alpha1.Task, ref tatarav1alpha1.WorkItemRef) {
 	task.Status.WorkItems = append(task.Status.WorkItems, ref)
 }
 
-// taskMatchesItem reports whether the Task's seed identity (Spec.Source:
-// repo from IssueRef, number = DedupNumber if set else Number) OR any ledger
-// entry matches the given (repo, number). For Tasks created before the ledger
-// (no Spec.Source) it falls back to the legacy source-repo/source-number labels
-// so the ~1148 existing Tasks remain matched during the rollout period.
+// taskMatchesItem delegates to tatarav1alpha1.TaskMatchesItem so controller
+// and webhook share one implementation. See api/v1alpha1/workitem_types.go.
 func taskMatchesItem(t *tatarav1alpha1.Task, repo string, number int) bool {
-	if s := t.Spec.Source; s != nil {
-		srcRepo := repoFromIssueRef(s.IssueRef)
-		dedupNum := s.DedupNumber
-		if dedupNum == 0 {
-			dedupNum = s.Number
-		}
-		if srcRepo == repo && dedupNum == number {
-			return true
-		}
-	}
-	for _, wi := range t.Status.WorkItems {
-		if wi.Repo == repo && wi.Number == number {
-			return true
-		}
-	}
-	// Legacy fallback: Tasks created before Phase 1 carry source-repo/source-number
-	// labels but no Spec.Source. Import the constant via the api package directly
-	// rather than keeping a package-level alias here.
-	repoSlug := strings.ReplaceAll(repo, "/", ".")
-	numStr := fmt.Sprintf("%d", number)
-	if t.Labels[tatarav1alpha1.LabelSourceRepo] == repoSlug &&
-		t.Labels[tatarav1alpha1.LabelSourceNumber] == numStr {
-		return true
-	}
-	return false
+	return tatarav1alpha1.TaskMatchesItem(t, repo, number)
 }
 
 // reposInScope returns a sorted, deduplicated list of "owner/repo" slugs this
