@@ -136,6 +136,12 @@ var projectScopedKinds = map[string]bool{
 	"incident":    true,
 }
 
+// IsProjectScopedKind reports whether a task kind is project-scoped (operates on
+// the whole Project, carries an empty RepositoryRef, and never opens a PR/MR).
+func IsProjectScopedKind(kind string) bool {
+	return projectScopedKinds[kind]
+}
+
 // ValidateTaskSpec validates the RepositoryRef contract for a TaskSpec:
 //   - repo-scoped kinds require a non-empty RepositoryRef.
 //   - project-scoped kinds require an empty RepositoryRef.
