@@ -14,6 +14,18 @@ const (
 	triageCommentCharBudget = 8000 // max chars of comment thread
 )
 
+// platformProblemGuidance is appended to every agent turn-0 directive. A
+// platform/tooling failure (MCP error, missing access, a tatara tool failing)
+// is self-reported via report_internal_issue, never filed as a tracker issue.
+const platformProblemGuidance = "\n\n## Platform problems\n" +
+	"If you are BLOCKED by a platform or tooling failure - an MCP server returning an error " +
+	"(e.g. grafana 401/unreachable), missing access or credentials, a tatara tool failing, or a " +
+	"required dependency you cannot reach - call `report_internal_issue` with the concrete details " +
+	"(which tool, the exact error, what you were attempting). That self-report is the ONLY correct " +
+	"channel for platform/tooling failures: it raises operator telemetry and an alert. Do NOT open, " +
+	"propose, or comment on a tracker issue asking a human to fix the platform, and do NOT treat a " +
+	"blocked tool as a reason to file your normal output - report it and stop."
+
 // planTurnText is the turn-0 prompt: the goal plus the instruction to
 // decompose the work into Subtasks via the subtask MCP tool, and the
 // branch directive so the agent knows where to push its work.
@@ -32,7 +44,7 @@ func planTurnText(goal, branch, project, task string) string {
 			"Your changes are committed and pushed to the git branch `%s` automatically at the end of each "+
 			"turn (the branch is created from the default branch for you). NEVER commit or push to the "+
 			"default branch directly.",
-		task, project, task, project, goal, branch, task, branch)
+		task, project, task, project, goal, branch, task, branch) + platformProblemGuidance
 }
 
 // lifecyclePhaseGuidance returns a "## Lifecycle phase" block telling the agent
@@ -54,7 +66,7 @@ func lifecyclePhaseGuidance(state string) string {
 			"This issue is handled as a multi-phase conversation and you are currently in the %s phase. "+
 			"The workspace is transient: it is rebuilt by git clone+checkout on every run and nothing on disk carries over between runs by itself. "+
 			"%s",
-		state, state, durable)
+		state, state, durable) + platformProblemGuidance
 }
 
 // reviewText is the turn-0 prompt for a kind=review Task (MR/PR review, issue
@@ -74,7 +86,7 @@ func reviewText(goal, project, task string) string {
 			"3. Submit your verdict with the `review_verdict` MCP tool - this is REQUIRED before you finish.\n\n"+
 			"Do NOT commit, push, or open a PR: the workspace is transient and read-only for review, and nothing "+
 			"you change on disk is kept. Communicate only through the review verdict.",
-		task, project, task, project, goal)
+		task, project, task, project, goal) + platformProblemGuidance
 }
 
 // nextPendingSubtask returns the lowest-order Pending subtask, if any.
