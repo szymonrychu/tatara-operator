@@ -17,3 +17,17 @@ func TestGoalProject(t *testing.T) {
 		t.Fatalf("incident goal must forbid remediation:\n%s", g)
 	}
 }
+
+func TestGoalProjectSelfReportsPlatformProblems(t *testing.T) {
+	g := GoalProject("groupKey=abc status=firing commonLabels={alertname=HighCPU}", []string{"szymonrychu/tatara"})
+	if !strings.Contains(g, "report_internal_issue") {
+		t.Error("incident goal must instruct self-report via report_internal_issue")
+	}
+	if !strings.Contains(g, "platform or tooling failure") {
+		t.Error("incident goal missing platform-problem block")
+	}
+	// regression: the old mis-routing sentence must be gone
+	if strings.Contains(g, "still file the issue") {
+		t.Error("incident goal must NOT tell the agent to file an issue when grafana MCP is unreachable")
+	}
+}
