@@ -2,6 +2,7 @@ package controller
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -233,6 +234,43 @@ func TestSeedLedgerFromSpec_SystemicGroup(t *testing.T) {
 	}
 	if roleCount[tatarav1alpha1.RoleCloses] != 3 {
 		t.Errorf("want 3 closes, got %d", roleCount[tatarav1alpha1.RoleCloses])
+	}
+
+	// The seeded systemic siblings must surface in the rendered work-item context
+	// the agent receives, tying the "include the systemic siblings" criterion to a
+	// concrete assertion rather than trusting the seed wiring transitively.
+	wctx := tatarav1alpha1.WorkItemsContext(task)
+	if !strings.Contains(wctx, "o/r1#1") {
+		t.Errorf("context missing source ref o/r1#1: %q", wctx)
+	}
+	if !strings.Contains(wctx, "o/r1#3") || !strings.Contains(wctx, "o/r1#5") {
+		t.Errorf("context missing same-repo siblings: %q", wctx)
+	}
+	if !strings.Contains(wctx, "o/r2#9") {
+		t.Errorf("context missing cross-repo sibling: %q", wctx)
+	}
+}
+
+// TestWorkItemsContext_GitHubPRUsesHashSeparator: a GitHub PR work item renders
+// as repo#N (not the GitLab repo!N), while a GitLab MR renders as repo!N.
+func TestWorkItemsContext_GitHubPRUsesHashSeparator(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			WorkItems: []tatarav1alpha1.WorkItemRef{
+				{Provider: "github", Repo: "o/r", Number: 10, Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen},
+				{Provider: "gitlab", Repo: "g/p", Number: 20, Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen},
+			},
+		},
+	}
+	wctx := tatarav1alpha1.WorkItemsContext(task)
+	if !strings.Contains(wctx, "o/r#10") {
+		t.Errorf("GitHub PR must render as o/r#10: %q", wctx)
+	}
+	if strings.Contains(wctx, "o/r!10") {
+		t.Errorf("GitHub PR must NOT use the GitLab ! separator: %q", wctx)
+	}
+	if !strings.Contains(wctx, "g/p!20") {
+		t.Errorf("GitLab MR must render as g/p!20: %q", wctx)
 	}
 }
 

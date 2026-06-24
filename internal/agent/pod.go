@@ -13,6 +13,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
@@ -551,7 +552,10 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	}
 
 	// Filter repos to the ledger-derived clone scope when the ledger is non-empty.
-	// When WorkItems is empty, fall back to the full project repo list for
+	// Spec.ReposInScope (declarative cross-repo Repository CR names) is unioned in
+	// so a cross-repo task whose secondary repos are not yet in the ledger (they
+	// only enter WorkItems via the Phase-3 backstop AFTER PRs exist) still clones
+	// them. When the ledger is empty, fall back to the full project repo list for
 	// backward-compatibility (pre-ledger Tasks carry no WorkItems).
 	scopedRepos := repos
 	if inScope := tatarav1alpha1.TaskReposInScope(task); len(inScope) > 0 {
@@ -559,9 +563,19 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		for _, s := range inScope {
 			scopeSet[s] = struct{}{}
 		}
+		// Declarative cross-repo scope is expressed as Repository CR names, a
+		// different namespace from the owner/repo ledger slugs, so match it by Name.
+		nameSet := make(map[string]struct{}, len(task.Spec.ReposInScope))
+		for _, n := range task.Spec.ReposInScope {
+			nameSet[n] = struct{}{}
+		}
 		var filtered []tatarav1alpha1.Repository
 		for i := range repos {
-			if slug := repoURLSlug(repos[i].Spec.URL); slug != "" {
+			if _, ok := nameSet[repos[i].Name]; ok {
+				filtered = append(filtered, repos[i])
+				continue
+			}
+			if slug, err := scm.RepoSlugFromURL(repos[i].Spec.URL); err == nil {
 				if _, ok := scopeSet[slug]; ok {
 					filtered = append(filtered, repos[i])
 				}
@@ -799,30 +813,6 @@ func toolProfileForKind(kind string) string {
 	default:
 		return "" // fail-open
 	}
-}
-
-// repoURLSlug extracts the "owner/repo" slug from a repo URL like
-// "https://github.com/owner/repo.git". Returns "" when the URL is unparseable.
-// Used to match a Repository.Spec.URL against a ledger WorkItemRef.Repo slug.
-func repoURLSlug(repoURL string) string {
-	// Strip scheme+host: find the third '/' and take what follows.
-	idx := strings.Index(repoURL, "://")
-	if idx < 0 {
-		return ""
-	}
-	rest := repoURL[idx+3:] // "github.com/owner/repo.git"
-	slashIdx := strings.IndexByte(rest, '/')
-	if slashIdx < 0 {
-		return ""
-	}
-	path := rest[slashIdx+1:] // "owner/repo.git"
-	// Strip .git suffix.
-	path = strings.TrimSuffix(path, ".git")
-	// Expect exactly one slash remaining (owner/repo).
-	if !strings.Contains(path, "/") {
-		return ""
-	}
-	return path
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list

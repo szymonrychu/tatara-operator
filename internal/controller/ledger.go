@@ -173,13 +173,28 @@ func proposalBacklogFromTasks(tasks []tatarav1alpha1.Task) int {
 	return standalone + len(groups)
 }
 
-// closeSourceIssueLedger sets State:closed on all role:source and role:closes
-// issue entries in the task's work-item ledger. Called when the source issue is
-// closed on merge (handleMainCI success path). Pure function; no client calls.
+// closeSourceIssueLedger sets State:closed ONLY on the primary source issue
+// entry the operator actually closed on merge: the ledger entry whose Repo and
+// Number match Spec.Source (repo from IssueRef, Spec.Source.Number). Sibling
+// role:closes entries (same-repo SameRepoSiblings and cross-repo CrossRepo) are
+// NOT auto-closed by the merge - the PR body only carries "Closes #SourceNumber",
+// and the Closes keyword never auto-closes cross-repo issues - so they are left
+// WIOpen for the Phase-3 backstop to reconcile from live SCM. Closing them here
+// would make the ledger (the dedup/backstop source of truth) report a still-open
+// sibling as resolved. Pure function; no client calls.
 func closeSourceIssueLedger(t *tatarav1alpha1.Task) {
+	s := t.Spec.Source
+	if s == nil {
+		return
+	}
+	srcRepo := repoFromIssueRef(s.IssueRef)
+	if srcRepo == "" {
+		return
+	}
 	for i := range t.Status.WorkItems {
 		wi := &t.Status.WorkItems[i]
 		if wi.Kind == tatarav1alpha1.WorkItemIssue &&
+			wi.Repo == srcRepo && wi.Number == s.Number &&
 			(wi.Role == tatarav1alpha1.RoleSource || wi.Role == tatarav1alpha1.RoleCloses) {
 			wi.State = tatarav1alpha1.WIClosed
 		}

@@ -109,8 +109,10 @@ func WorkItemsContext(t *Task) string {
 	var sb strings.Builder
 	sb.WriteString("## Spanned work items\n")
 	for _, wi := range t.Status.WorkItems {
+		// Issues are repo#N everywhere. PR/MR refs follow provider convention:
+		// GitLab MRs are repo!N, GitHub PRs are repo#N.
 		ref := fmt.Sprintf("%s#%d", wi.Repo, wi.Number)
-		if wi.Kind == WorkItemPR {
+		if wi.Kind == WorkItemPR && wi.Provider == "gitlab" {
 			ref = fmt.Sprintf("%s!%d", wi.Repo, wi.Number)
 		}
 		line := fmt.Sprintf("- [%s] %s (role:%s, state:%s)", wi.Kind, ref, wi.Role, wi.State)

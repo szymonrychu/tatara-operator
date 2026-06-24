@@ -87,6 +87,40 @@ func TestBuildPod_LedgerCloneScope_EmptyLedger(t *testing.T) {
 	require.Len(t, repos, 2, "empty ledger must fall back to all repos")
 }
 
+// TestBuildPod_LedgerCloneScope_NoSilentFallbackOnUnparseableURL: when at least
+// one repo matches the ledger scope, a sibling repo whose URL cannot be parsed to
+// the ledger slug (e.g. an SSH form) must be EXCLUDED, not trigger a silent
+// fall-back to the full unfiltered project list.
+func TestBuildPod_LedgerCloneScope_NoSilentFallbackOnUnparseableURL(t *testing.T) {
+	proj, primaryRepo, task, cfg := sampleInputs()
+	primaryRepo.Spec.URL = "https://github.com/acme/repo1.git"
+
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "acme/repo1", Number: 5, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	}
+
+	// Sibling repo with an SSH-form URL that the canonical parser rejects.
+	sshRepo := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "ssh-repo"},
+		Spec:       tatarav1alpha1.RepositorySpec{URL: "git@github.com:acme/sshonly.git", DefaultBranch: "main"},
+	}
+	allRepos := []tatarav1alpha1.Repository{*primaryRepo, *sshRepo}
+
+	pod := agent.BuildPod(proj, primaryRepo, task, allRepos, testMemoryEndpoint, cfg)
+	c := pod.Spec.Containers[0]
+
+	reposVal, ok := envValue(c, "TATARA_REPOS")
+	require.True(t, ok)
+	var repos []map[string]string
+	require.NoError(t, json.Unmarshal([]byte(reposVal), &repos))
+	names := make([]string, 0, len(repos))
+	for _, r := range repos {
+		names = append(names, r["name"])
+	}
+	require.Contains(t, names, "repo1")
+	require.NotContains(t, names, "ssh-repo", "unparseable sibling must be excluded, not trigger a full-list fallback")
+}
+
 // TestBuildPod_WorkItemContext: when the Task has open WorkItems, TATARA_WORK_ITEMS
 // env must be set to a non-empty context string containing open issue/MR refs.
 func TestBuildPod_WorkItemContext(t *testing.T) {
@@ -123,6 +157,49 @@ func TestBuildPod_WorkItemContext_EmptyWhenNoItems(t *testing.T) {
 
 	_, ok := envValue(c, "TATARA_WORK_ITEMS")
 	require.False(t, ok, "TATARA_WORK_ITEMS must be absent when WorkItems empty")
+}
+
+// TestBuildPod_ReposInScopeUnioned: a cross-repo task declares Spec.ReposInScope
+// (Repository CR names) for repos NOT yet in the ledger (they only enter WorkItems
+// via the Phase-3 backstop after PRs exist). Those repos must still be cloned, so
+// the cross-repo edit is not silently lost.
+func TestBuildPod_ReposInScopeUnioned(t *testing.T) {
+	proj, primaryRepo, task, cfg := sampleInputs()
+	primaryRepo.Spec.URL = "https://github.com/acme/repo1.git"
+
+	// Ledger spans only the source repo (secondary repos not yet seeded).
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "acme/repo1", Number: 5, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	}
+	// Declarative cross-repo scope names a Repository CR (by NAME, not slug).
+	task.Spec.ReposInScope = []string{"repoB"}
+
+	repoB := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "repoB"},
+		Spec:       tatarav1alpha1.RepositorySpec{URL: "https://github.com/acme/other.git", DefaultBranch: "main"},
+	}
+	extraRepo := &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "extra-repo"},
+		Spec:       tatarav1alpha1.RepositorySpec{URL: "https://github.com/acme/extra.git", DefaultBranch: "main"},
+	}
+
+	allRepos := []tatarav1alpha1.Repository{*primaryRepo, *repoB, *extraRepo}
+
+	pod := agent.BuildPod(proj, primaryRepo, task, allRepos, testMemoryEndpoint, cfg)
+	c := pod.Spec.Containers[0]
+
+	reposVal, ok := envValue(c, "TATARA_REPOS")
+	require.True(t, ok, "TATARA_REPOS must be present")
+
+	var repos []map[string]string
+	require.NoError(t, json.Unmarshal([]byte(reposVal), &repos))
+	names := make([]string, 0, len(repos))
+	for _, r := range repos {
+		names = append(names, r["name"])
+	}
+	require.Contains(t, names, "repo1", "primary repo must be in TATARA_REPOS")
+	require.Contains(t, names, "repoB", "ReposInScope repo must be cloned even when absent from the ledger")
+	require.NotContains(t, names, "extra-repo", "repo neither in ledger nor in ReposInScope must be excluded")
 }
 
 // TestTaskReposInScope_Dedup: TaskReposInScope returns sorted, deduplicated slugs.

@@ -142,6 +142,11 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	}
 
 	var prURLs []string
+	// prRepos[i] is the Repository that produced prURLs[i]; kept parallel so the
+	// openedPR ledger entry derives its slug from the SAME repo as the PR number,
+	// even when the primary repo is skipped (422 no-change) and prURLs[0] is a
+	// secondary repo's PR.
+	var prRepos []tatarav1alpha1.Repository
 	var lastSkipStatus int
 	// inScope is the declarative cross-repo scope (CR names). When a repo in this
 	// set produces no branch (422 no commits) we warn on the issue instead of
@@ -192,6 +197,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 						l.Info("writeback: pr/mr already exists, recovered url",
 							"action", "writeback_pr_recovered", "repo", repo.Name, "task", task.Name, "pr_url", recovered)
 						prURLs = append(prURLs, recovered)
+						prRepos = append(prRepos, repo)
 						// Persist the primary PR URL after recovery so a later transient
 						// failure on another repo does not lose this URL.
 						if len(prURLs) == 1 {
@@ -217,6 +223,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		l.Info("writeback: pr/mr opened", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
 		r.Metrics.WritebackOutcome("opened")
 		prURLs = append(prURLs, prURL)
+		prRepos = append(prRepos, repo)
 		// Persist the primary PR URL immediately after the first successful OpenChange
 		// so a transient failure on a later repo does not lose the already-opened URL.
 		// A requeue then finds PrURL set and skips re-opening.
@@ -277,8 +284,11 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	// RetryOnConflict ensures this idempotency key lands even when a concurrent
 	// lifecycle reconcile has bumped the resource version.
 	prURLsMsg := strings.Join(prURLs, " ")
-	// Derive the primary PR's repo slug and number for the ledger entry.
-	primaryPRSlug, _, _ := repoSlugFromURL(primaryRepo.Spec.URL, provider)
+	// Derive the openedPR ledger entry's repo slug from the SAME repo that produced
+	// prURLs[0]; when the primary repo is skipped (422 no-change) prURLs[0] belongs
+	// to a secondary repo, so using primaryRepo.Spec.URL would record a corrupt
+	// {primary-slug, secondary-number} entry the backstop/dedup can never match.
+	primaryPRSlug, _, _ := repoSlugFromURL(prRepos[0].Spec.URL, provider)
 	primaryPRNumber := parsePRNumber(prURLs[0])
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
@@ -1024,14 +1034,22 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 }
 
 // repoSlugFromURL derives the provider-correct repo slug (owner/name for
-// GitHub, group/proj path for GitLab) that CloseIssue expects.
+// GitHub, group/proj path for GitLab) that CloseIssue expects. It delegates to
+// the canonical scm.RepoSlugFromURL so the controller (ledger seed/projection)
+// and the agent (clone-scope filter) always derive identical slugs for the same
+// URL; the provider argument is honoured when explicitly "gitlab"/"github" and
+// otherwise inferred from the URL host, matching providerForRemote.
 func repoSlugFromURL(repoURL, provider string) (string, string, error) {
 	if provider == "gitlab" {
 		proj, err := scm.GitLabProjectPath(repoURL)
 		return proj, "", err
 	}
-	owner, name, err := scm.OwnerRepo(repoURL)
-	return owner + "/" + name, "", err
+	if provider == "github" {
+		owner, name, err := scm.OwnerRepo(repoURL)
+		return owner + "/" + name, "", err
+	}
+	slug, err := scm.RepoSlugFromURL(repoURL)
+	return slug, "", err
 }
 
 // selfImproveBotAuthored reports whether the selfImprove PR/MR is actually
