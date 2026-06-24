@@ -153,18 +153,6 @@ func seedLedgerFromSpec(t *tatarav1alpha1.Task) {
 	}
 }
 
-// anyTaskHasLedger reports whether any Task in the list has a non-empty
-// Status.WorkItems ledger. Used to select between the ledger-based and the
-// SCM-issue-count paths for proposal backpressure.
-func anyTaskHasLedger(tasks []tatarav1alpha1.Task) bool {
-	for i := range tasks {
-		if len(tasks[i].Status.WorkItems) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
 // proposalBacklogFromTasks counts open, undecided brainstorm proposals across a
 // set of Tasks by inspecting each Task's role:proposed ledger entries. Entries
 // in state "proposed" are counted; "approved", "declined", and "implemented"

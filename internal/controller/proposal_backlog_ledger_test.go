@@ -26,12 +26,8 @@ func mkProposedTask(repo, systemicID string, titles ...string) tatarav1alpha1.Ta
 		}
 		t.Status.WorkItems = append(t.Status.WorkItems, entry)
 	}
-	// Store systemicID on each entry for grouping; repurpose the Provider field
-	// since WorkItemRef has no systemicID field. The real impl keys on Spec.SystemicGroup
-	// via the Title convention used by createProposal, OR we use a dedicated approach.
-	// Per the spec the grouping key is the tatara/systemic-<id> label on SCM issues
-	// mapped to entries' associated Task.Spec.SystemicGroup.SystemicID.
-	// For the ledger variant, grouping is per SystemicGroup.SystemicID on the TASK.
+	// Grouping keys on Task.Spec.SystemicGroup.SystemicID: all Tasks sharing one
+	// SystemicID count as a single proposal in the backlog.
 	if systemicID != "" {
 		t.Spec.SystemicGroup = &tatarav1alpha1.SystemicGroup{SystemicID: systemicID}
 	}
@@ -135,6 +131,38 @@ func TestProposalBacklogFromTasks_SCMFallbackWhenNoLedger(t *testing.T) {
 	got := proposalBacklogFromTasks([]tatarav1alpha1.Task{t2})
 	if got != 0 {
 		t.Fatalf("want 0 for task with no WorkItems, got %d", got)
+	}
+}
+
+func TestProposalBacklogFromTasks_EmptySlice(t *testing.T) {
+	if got := proposalBacklogFromTasks(nil); got != 0 {
+		t.Fatalf("want 0 for empty slice, got %d", got)
+	}
+}
+
+func TestProposalBacklogFromTasks_GroupWithOneOpenSiblingCountsOnce(t *testing.T) {
+	// A systemic group whose ONLY open (WIProposed) entry lives in one Task while
+	// the sibling Tasks in the same group are terminal still counts exactly 1.
+	openTask := mkProposedTask("o/a", "grp", "improve A")
+	terminalB := mkProposedTaskState("o/b", tatarav1alpha1.WIImplemented)
+	terminalB.Spec.SystemicGroup = &tatarav1alpha1.SystemicGroup{SystemicID: "grp"}
+	got := proposalBacklogFromTasks([]tatarav1alpha1.Task{openTask, terminalB})
+	if got != 1 {
+		t.Fatalf("want 1 for a group with one open + one terminal sibling, got %d", got)
+	}
+}
+
+func TestProposalBacklogFromTasks_TaskWithOpenAndTerminalEntriesCountsOnce(t *testing.T) {
+	// A single standalone Task carrying both an open and a terminal role:proposed
+	// entry counts once.
+	var task tatarav1alpha1.Task
+	task.Spec.Kind = "issueLifecycle"
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Repo: "o/r", Number: 1, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleProposed, State: tatarav1alpha1.WIProposed},
+		{Repo: "o/r", Number: 2, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleProposed, State: tatarav1alpha1.WIDeclined},
+	}
+	if got := proposalBacklogFromTasks([]tatarav1alpha1.Task{task}); got != 1 {
+		t.Fatalf("want 1 for a task with one open + one terminal proposed entry, got %d", got)
 	}
 }
 

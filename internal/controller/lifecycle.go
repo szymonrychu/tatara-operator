@@ -1237,15 +1237,18 @@ func (r *TaskReconciler) observeProposalLabelReadback(ctx context.Context, proje
 	if r.ReaderFor == nil || task.Spec.Source == nil || task.Spec.Source.IssueRef == "" || task.Spec.Source.IsPR {
 		return "", nil
 	}
-	// Only tasks that have a role:proposed ledger entry are subject to readback.
-	hasProposedEntry := false
+	// Only tasks with an UNDECIDED role:proposed entry (still WIProposed) are
+	// subject to readback. Once a proposal is approved/declined the decision is
+	// terminal, so skipping the SCM ListOpenIssues for already-decided proposals
+	// avoids a redundant repo-wide issue list on every idle-conversation reconcile.
+	hasUndecidedProposed := false
 	for _, wi := range task.Status.WorkItems {
-		if wi.Role == tatarav1alpha1.RoleProposed {
-			hasProposedEntry = true
+		if wi.Role == tatarav1alpha1.RoleProposed && wi.State == tatarav1alpha1.WIProposed {
+			hasUndecidedProposed = true
 			break
 		}
 	}
-	if !hasProposedEntry {
+	if !hasUndecidedProposed {
 		return "", nil
 	}
 
@@ -1309,11 +1312,32 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatara
 
 	// P4 label readback: if the source issue has been relabeled by a human
 	// (tatara-approved or tatara-declined) since the last reconcile, reflect the
-	// state onto the role:proposed ledger entry. This is best-effort: a readback
-	// failure does not block the conversation deadline path.
-	if _, rbErr := r.observeProposalLabelReadback(ctx, project, task); rbErr != nil {
+	// state onto the role:proposed ledger entry AND drive the decision:
+	//   approved -> transition to Implement (mirrors the triage approve path),
+	//   declined -> park with "human-declined".
+	// A readback ERROR is best-effort and does not block the idle path. A clean
+	// approved/declined observation supersedes the idle deadline path (return).
+	state, rbErr := r.observeProposalLabelReadback(ctx, project, task)
+	if rbErr != nil {
 		l.Info("conversation: proposal label readback failed (non-fatal)",
 			"action", "conversation_label_readback", "resource_id", task.Name, "err", rbErr.Error())
+	} else {
+		switch state {
+		case tatarav1alpha1.WIApproved:
+			if err := r.setLifecycleState(ctx, task, "Implement", "human-approved"); err != nil {
+				return ctrl.Result{}, fmt.Errorf("conversation: approve readback to implement: %w", err)
+			}
+			l.Info("conversation: human-approved proposal; driving implementation",
+				"action", "conversation_label_approved", "resource_id", task.Name)
+			return ctrl.Result{}, nil
+		case tatarav1alpha1.WIDeclined:
+			if err := r.setLifecycleState(ctx, task, "Parked", "human-declined"); err != nil {
+				return ctrl.Result{}, fmt.Errorf("conversation: decline readback to park: %w", err)
+			}
+			l.Info("conversation: human-declined proposal; parking",
+				"action", "conversation_label_declined", "resource_id", task.Name)
+			return ctrl.Result{}, nil
+		}
 	}
 
 	if task.Status.DeadlineAt == nil {

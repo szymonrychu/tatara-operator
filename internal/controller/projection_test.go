@@ -116,19 +116,32 @@ func TestSetLifecycleLabel_DeclinedUpsertProposedEntry(t *testing.T) {
 	t.Fatal("role:proposed entry for o/r#42 not found")
 }
 
-// TestSetLifecycleLabel_BrainstormingKeepsProposedState verifies that setting
-// tatara-brainstorming (back to proposed state) keeps WIProposed.
-func TestSetLifecycleLabel_BrainstormingKeepsProposedState(t *testing.T) {
-	r, task, _ := seedProjectionTask(t, "bs-keep")
+// TestSetLifecycleLabel_BrainstormingMapsToProposed verifies the actual mapping:
+// an entry seeded in WIApproved is moved BACK to WIProposed when the issue is
+// relabeled tatara-brainstorming. This exercises the changed-state path of
+// upsertProposedEntryState, not just the seeded value.
+func TestSetLifecycleLabel_BrainstormingMapsToProposed(t *testing.T) {
+	r, task, _ := seedProjectionTask(t, "bs-map")
+	ctx := context.Background()
+	// Seed the entry in WIApproved first.
+	var seeded tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &seeded))
+	for i := range seeded.Status.WorkItems {
+		if seeded.Status.WorkItems[i].Role == tatarav1alpha1.RoleProposed {
+			seeded.Status.WorkItems[i].State = tatarav1alpha1.WIApproved
+		}
+	}
+	require.NoError(t, k8sClient.Status().Update(ctx, &seeded))
+
 	var proj tatarav1alpha1.Project
-	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
-	require.NoError(t, r.setLifecycleLabel(context.Background(), &proj, task, "tatara-brainstorming"))
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
+	require.NoError(t, r.setLifecycleLabel(ctx, &proj, &seeded, "tatara-brainstorming"))
 
 	var updated tatarav1alpha1.Task
-	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
 	for _, wi := range updated.Status.WorkItems {
 		if wi.Role == tatarav1alpha1.RoleProposed && wi.Repo == "o/r" && wi.Number == 42 {
-			require.Equal(t, tatarav1alpha1.WIProposed, wi.State, "role:proposed entry must stay WIProposed for brainstorming label")
+			require.Equal(t, tatarav1alpha1.WIProposed, wi.State, "brainstorming label must map WIApproved -> WIProposed")
 			return
 		}
 	}
@@ -147,9 +160,9 @@ func (r *observeLabelReader) ListOpenIssues(_ context.Context, _, _ string) ([]s
 }
 
 // TestObserveHumanDeclinedLabel verifies that when the issue now carries
-// tatara-declined (set by a human), handleConversation (or reconcileLifecycle)
-// reflects this back to the role:proposed ledger entry and transitions the task
-// to Parked with the "human-declined" reason.
+// tatara-declined (set by a human), reconcileLifecycle reflects this back to the
+// role:proposed ledger entry (State=WIDeclined) and parks the task with the
+// "human-declined" reason.
 func TestObserveHumanDeclinedLabel(t *testing.T) {
 	ctx := context.Background()
 	// Seed task with a role:proposed entry in WIProposed state, in Conversation state
@@ -179,13 +192,16 @@ func TestObserveHumanDeclinedLabel(t *testing.T) {
 
 	var updated tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
+	require.Equal(t, "Parked", updated.Status.LifecycleState, "declined readback must park the task")
+	require.Equal(t, "human-declined", updated.Status.ParkReason, "park reason must be human-declined")
+	found := false
 	for _, wi := range updated.Status.WorkItems {
 		if wi.Role == tatarav1alpha1.RoleProposed && wi.Repo == "o/r" && wi.Number == 42 {
 			require.Equal(t, tatarav1alpha1.WIDeclined, wi.State, "role:proposed entry must be WIDeclined after human relabel")
-			return
+			found = true
 		}
 	}
-	t.Fatal("role:proposed entry for o/r#42 not found or not updated to declined")
+	require.True(t, found, "role:proposed entry for o/r#42 not found or not updated to declined")
 }
 
 // TestObserveHumanApprovedLabel verifies that when the issue carries
@@ -216,11 +232,13 @@ func TestObserveHumanApprovedLabel(t *testing.T) {
 
 	var updated tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
+	require.Equal(t, "Implement", updated.Status.LifecycleState, "approved readback must drive the task to Implement")
+	found := false
 	for _, wi := range updated.Status.WorkItems {
 		if wi.Role == tatarav1alpha1.RoleProposed && wi.Repo == "o/r" && wi.Number == 42 {
 			require.Equal(t, tatarav1alpha1.WIApproved, wi.State, "role:proposed entry must be WIApproved after human approval")
-			return
+			found = true
 		}
 	}
-	t.Fatal("role:proposed entry for o/r#42 not found or not updated to approved")
+	require.True(t, found, "role:proposed entry for o/r#42 not found or not updated to approved")
 }
