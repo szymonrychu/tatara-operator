@@ -8,6 +8,7 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 - [x] S3 conversation persistence (issue #114): cross-pod conversation resume via S3 (Task.Status.ConversationObjectKey/SessionID + BuildPod CONVERSATION_* env + turn-complete recording), 25% resume-vs-compaction hybrid (HandoverThresholdPercent default 50->25, mutually exclusive with full replay), brainstorm conversation forked per issue (copy-object), review/test agent for ALL MRs incl. user-authored (reviewText + PR-head read-only checkout), and reaper S3 GC when a batch fully closes (internal/objstore + operator_conversation_gc_total). Off until s3Bucket set. Branch tatara/fix-114-...; awaiting deploy (helmfile wiring + pin bump).
 - [x] Project-level brainstorm (one Task per project per cycle, not per-repo): summed backlog, project-scoped in-flight guard, deterministic primary repo, updated goal prompt listing all repos. CRD MaxOpenProposals default 3->5 (project-wide). PR feat/project-level-brainstorm; awaiting deploy.
+- [x] Systemic-group implementation dedup (lead-per-repo): one brainstorm of N connected issues (shared systemicId) spawns one agent per (systemicId, repo), resolving same-repo siblings in one combined PR + marking non-leads with an idempotent comment. SystemicGroup on Task/payload, electSystemicLeads, issueScan collapse gate, 2 metrics. PR #124; awaiting deploy (tatara-helmfile dual pin). Plan docs/superpowers/plans/2026-06-23-systemic-impl-dedup.md.
 
 ## Agent-loop follow-ups (found during 2026-06-08 dogfood)
 

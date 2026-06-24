@@ -70,3 +70,32 @@ func TestEndpointAndMCPURL(t *testing.T) {
 		t.Fatalf("mcp url: %s", MCPURL("acme", "tatara"))
 	}
 }
+
+func TestValidateImage_RejectsBelowFloor(t *testing.T) {
+	cases := []struct {
+		image   string
+		wantErr bool
+	}{
+		// parseable semver below 0.16.0 -> must error
+		{"grafana/mcp-grafana:0.11.4", true},
+		{"grafana/mcp-grafana:0.15.2", true},
+		{"grafana/mcp-grafana:v0.1.0", true},
+		// at or above floor -> ok
+		{"grafana/mcp-grafana:0.16.0", false},
+		{"grafana/mcp-grafana:0.17.0", false},
+		{"grafana/mcp-grafana:v0.16.0", false},
+		// unparseable / digest -> fail-open (don't block)
+		{"grafana/mcp-grafana:latest", false},
+		{"grafana/mcp-grafana@sha256:abc123", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		err := ValidateImage(tc.image)
+		if tc.wantErr && err == nil {
+			t.Errorf("image %q: expected error (below _FILE floor), got nil", tc.image)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("image %q: unexpected error: %v", tc.image, err)
+		}
+	}
+}

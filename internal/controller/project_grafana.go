@@ -37,6 +37,12 @@ func (r *ProjectReconciler) reconcileGrafanaMCP(ctx context.Context, p *tatarade
 		return 0, nil
 	}
 
+	if err := grafanamcp.ValidateImage(r.GrafanaConfig.Image); err != nil {
+		p.Status.Grafana = &tataradevv1alpha1.GrafanaStatus{Phase: "Failed", Endpoint: grafanamcp.Endpoint(p.Name, ns)}
+		l.Error(err, "grafana-mcp image rejected", "action", "grafana_image_validate", "resource_id", p.Name, "image", r.GrafanaConfig.Image)
+		return 0, err
+	}
+
 	objs := []client.Object{
 		grafanamcp.Deployment(p, r.GrafanaConfig),
 		grafanamcp.Service(p, r.GrafanaConfig),
