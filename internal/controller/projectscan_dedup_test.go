@@ -249,6 +249,143 @@ func TestHasLiveOrAdoptableTask(t *testing.T) {
 	}
 }
 
+// --- Phase 2: Task 6 tests - spec/ledger-only identity (no labels) ---
+
+// mkSpecTask builds a Task with ONLY Spec.Source and optional Status.WorkItems.
+// No legacy labels. Used to verify that Phase 2 dedup does NOT read labels.
+func mkSpecTask(repo string, number int, isPR bool, headSHA, lifecycleState, phase string) tatarav1alpha1.Task {
+	tk := tatarav1alpha1.Task{}
+	tk.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider: "github",
+		IssueRef: repo + "#" + strconv.Itoa(number),
+		Number:   number,
+		IsPR:     isPR,
+	}
+	tk.Status.Phase = phase
+	tk.Status.LifecycleState = lifecycleState
+	if headSHA != "" {
+		// Seed the openedPR work-item so headSHAForTask can find it.
+		tk.Status.WorkItems = []tatarav1alpha1.WorkItemRef{{
+			Provider: "github",
+			Repo:     repo,
+			Number:   number,
+			Kind:     tatarav1alpha1.WorkItemPR,
+			Role:     tatarav1alpha1.RoleOpenedPR,
+			State:    tatarav1alpha1.WIOpen,
+			HeadSHA:  headSHA,
+		}}
+	}
+	return tk
+}
+
+// mkSpecTaskWithDedupNumber creates a bot-PR task where DedupNumber is the
+// linked issue number (dedup key), not the PR number.
+func mkSpecTaskWithDedupNumber(repo string, prNumber, dedupNumber int, phase string) tatarav1alpha1.Task {
+	tk := tatarav1alpha1.Task{}
+	tk.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider:    "github",
+		IssueRef:    repo + "#" + strconv.Itoa(prNumber),
+		Number:      prNumber,
+		IsPR:        true,
+		DedupNumber: dedupNumber,
+	}
+	tk.Status.Phase = phase
+	return tk
+}
+
+func TestIsDeduped_SpecOnly_NonTerminalSuppresses(t *testing.T) {
+	// A non-terminal task matched by spec identity must dedup the candidate.
+	existing := []tatarav1alpha1.Task{
+		mkSpecTask("o/r", 5, false, "", "Triage", ""),
+	}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 5}
+	if !isDeduped(c, existing, managed, nil) {
+		t.Fatal("non-terminal spec-only task must dedup the candidate")
+	}
+}
+
+func TestIsDeduped_SpecOnly_TerminalNewActivityEligible(t *testing.T) {
+	// Terminal task with newer activity must NOT block re-triage.
+	created := metav1.Now()
+	tk := mkSpecTask("o/r", 5, false, "", "Done", "Succeeded")
+	tk.CreationTimestamp = created
+	existing := []tatarav1alpha1.Task{tk}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 5, updatedAt: created.Add(time.Hour)}
+	if isDeduped(c, existing, managed, nil) {
+		t.Fatal("terminal spec-only task + newer activity should be eligible")
+	}
+}
+
+func TestIsDeduped_SpecOnly_PR_SameHeadSHA_FromLedger(t *testing.T) {
+	// Terminal PR task with matching head SHA from the ledger (openedPR entry) must dedup.
+	tk := mkSpecTask("o/r", 10, true, "sha-abc", "Done", "Succeeded")
+	existing := []tatarav1alpha1.Task{tk}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 10, headSHA: "sha-abc", isPR: true}
+	if !isDeduped(c, existing, managed, nil) {
+		t.Fatal("terminal PR task at same headSHA (from ledger) must dedup")
+	}
+}
+
+func TestIsDeduped_SpecOnly_PR_DifferentHeadSHA_Eligible(t *testing.T) {
+	// Terminal PR task with DIFFERENT head SHA must NOT block a new commit.
+	tk := mkSpecTask("o/r", 10, true, "sha-old", "Done", "Succeeded")
+	existing := []tatarav1alpha1.Task{tk}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 10, headSHA: "sha-new", isPR: true}
+	if isDeduped(c, existing, managed, nil) {
+		t.Fatal("terminal PR task at different headSHA must be eligible")
+	}
+}
+
+func TestIsDeduped_SpecOnly_BotPR_DedupNumber_MatchesIssueSlot(t *testing.T) {
+	// A bot-PR task with DedupNumber=7 must dedup an issue-slot candidate for issue #7.
+	tk := mkSpecTaskWithDedupNumber("o/r", 42, 7, "")
+	tk.Status.Phase = "Running"
+	existing := []tatarav1alpha1.Task{tk}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 7} // issue-slot candidate
+	if !isDeduped(c, existing, managed, nil) {
+		t.Fatal("bot-PR task with DedupNumber=7 must dedup issue-slot candidate #7")
+	}
+}
+
+func TestIsDeduped_NoLabels_DifferentRepo_NotDeduped(t *testing.T) {
+	// A task for a different repo must not block a candidate for a different repo.
+	existing := []tatarav1alpha1.Task{
+		mkSpecTask("other/repo", 5, false, "", "Triage", ""),
+	}
+	managed := managedPhaseLabels(nil)
+	c := candidate{repo: "o/r", number: 5}
+	if isDeduped(c, existing, managed, nil) {
+		t.Fatal("task for a different repo must not dedup a different-repo candidate")
+	}
+}
+
+func TestHeadSHAForTask_FromLedger(t *testing.T) {
+	tk := mkSpecTask("o/r", 10, true, "sha-xyz", "", "")
+	if got := headSHAForTask(&tk); got != "sha-xyz" {
+		t.Fatalf("headSHAForTask = %q, want sha-xyz", got)
+	}
+}
+
+func TestHeadSHAForTask_NoLedger_Empty(t *testing.T) {
+	tk := tatarav1alpha1.Task{}
+	if got := headSHAForTask(&tk); got != "" {
+		t.Fatalf("headSHAForTask on empty task = %q, want empty", got)
+	}
+}
+
+func TestHeadSHAForTask_FallbackMergedHeadSHA(t *testing.T) {
+	tk := tatarav1alpha1.Task{}
+	tk.Status.MergedHeadSHA = "sha-merged"
+	if got := headSHAForTask(&tk); got != "sha-merged" {
+		t.Fatalf("headSHAForTask fallback = %q, want sha-merged", got)
+	}
+}
+
 func TestIsDeduped_BotCommentDoesNotFreeKey(t *testing.T) {
 	created := metav1.Now()
 	terminal := mkCronTask("o/r", 7, "issueLifecycle", "", "Succeeded")

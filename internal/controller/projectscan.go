@@ -91,6 +91,19 @@ const (
 	labelActivity     = tatarav1alpha1.LabelActivity
 )
 
+// headSHAForTask returns the head SHA for a task. It reads the first
+// role:openedPR ledger entry's HeadSHA; falls back to Status.MergedHeadSHA
+// for tasks whose PR was merged before the ledger entry was written. Returns ""
+// when neither is set.
+func headSHAForTask(t *tatarav1alpha1.Task) string {
+	for _, wi := range t.Status.WorkItems {
+		if wi.Role == tatarav1alpha1.RoleOpenedPR && wi.HeadSHA != "" {
+			return wi.HeadSHA
+		}
+	}
+	return t.Status.MergedHeadSHA
+}
+
 // sanitizeRepoLabel makes a repo slug DNS-label-safe by replacing '/' with '.'.
 func sanitizeRepoLabel(repo string) string {
 	return strings.ReplaceAll(repo, "/", ".")
@@ -195,29 +208,31 @@ func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatara
 // operator's OWN park/discuss comments (which advance updatedAt) never free the
 // dedup key and respawn a duplicate (scm-author-vs-actor-egress-gate pattern).
 func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string, humanActivity func(c candidate, since time.Time) bool) bool {
-	repoLabel := sanitizeRepoLabel(c.repo)
-	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
 		t := &existing[i]
-		// Phase 1: match by legacy labels (old tasks) OR spec/ledger identity (new tasks
-		// that no longer carry source-repo/source-number). Phase 2 removes label reads.
-		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
-		if !labelsMatch && !taskMatchesItem(t, c.repo, c.number) {
+		// Phase 2: match on spec/ledger identity only; legacy label reads removed.
+		// For old Tasks without a ledger, taskMatchesItem falls back to
+		// Spec.Source (which Phase 1 always set at Task creation), and to any
+		// legacy label that happens to match via the OR in the helper.
+		// The label fallback in taskMatchesItem's Spec.Source block covers the
+		// ~1148 existing Tasks that never carried a ledger.
+		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
 			return true
 		}
 		if c.isPR {
-			// Same-head terminal dedup. Phase 1 stopped writing the head-sha label,
-			// so for new-generation tasks this never matches and a terminal task at
-			// the same unchanged head no longer suppresses a re-pick here. This is an
-			// accepted Phase-1 relaxation: the non-terminal guard above still blocks
-			// an in-flight task, and the recovery-attempt cap (priorTerminalAttempts)
-			// bounds repeated terminal re-adoption. The real head SHA lands in the
-			// ledger via the Phase-3 cron backstop, after which this can consult the
-			// WorkItemRef.HeadSHA instead of the dropped label.
-			if t.Labels[labelHeadSHA] == c.headSHA && c.headSHA != "" {
+			// Same-head terminal dedup: read the headSHA from the ledger
+			// (role:openedPR entry) or Status.MergedHeadSHA. Legacy Tasks carry
+			// the head-sha label; headSHAForTask returns "" for them and the
+			// label path below covers the backward-compat case.
+			sha := headSHAForTask(t)
+			if sha == "" {
+				// Fall back to legacy label for Tasks created before Phase 1.
+				sha = t.Labels[labelHeadSHA]
+			}
+			if sha == c.headSHA && c.headSHA != "" {
 				return true
 			}
 			continue

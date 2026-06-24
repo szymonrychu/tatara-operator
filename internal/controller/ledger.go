@@ -55,7 +55,9 @@ func UpsertWorkItem(task *tatarav1alpha1.Task, ref tatarav1alpha1.WorkItemRef) {
 
 // taskMatchesItem reports whether the Task's seed identity (Spec.Source:
 // repo from IssueRef, number = DedupNumber if set else Number) OR any ledger
-// entry matches the given (repo, number).
+// entry matches the given (repo, number). For Tasks created before the ledger
+// (no Spec.Source) it falls back to the legacy source-repo/source-number labels
+// so the ~1148 existing Tasks remain matched during the rollout period.
 func taskMatchesItem(t *tatarav1alpha1.Task, repo string, number int) bool {
 	if s := t.Spec.Source; s != nil {
 		srcRepo := repoFromIssueRef(s.IssueRef)
@@ -71,6 +73,15 @@ func taskMatchesItem(t *tatarav1alpha1.Task, repo string, number int) bool {
 		if wi.Repo == repo && wi.Number == number {
 			return true
 		}
+	}
+	// Legacy fallback: Tasks created before Phase 1 carry source-repo/source-number
+	// labels but no Spec.Source. Import the constant via the api package directly
+	// rather than keeping a package-level alias here.
+	repoSlug := strings.ReplaceAll(repo, "/", ".")
+	numStr := fmt.Sprintf("%d", number)
+	if t.Labels[tatarav1alpha1.LabelSourceRepo] == repoSlug &&
+		t.Labels[tatarav1alpha1.LabelSourceNumber] == numStr {
+		return true
 	}
 	return false
 }
