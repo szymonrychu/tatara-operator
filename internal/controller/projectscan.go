@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -48,18 +47,17 @@ const maxRecoveryAttempts = 3
 // priorTerminalAttempts counts terminal (Done/Stopped/Parked) tasks that already
 // targeted this exact PR, so mrScan can stop re-adopting an unfixable PR.
 func priorTerminalAttempts(existing []tatarav1alpha1.Task, repoSlug string, prNumber int) int {
-	want := sanitizeRepoLabel(repoSlug)
 	n := 0
 	for i := range existing {
 		t := &existing[i]
-		if t.Spec.Source == nil || !t.Spec.Source.IsPR || t.Spec.Source.Number != prNumber {
-			continue
-		}
-		// Phase 1: match by legacy label OR spec/ledger identity (new tasks no
-		// longer carry source-repo). The IsPR/Number guard above already narrows
-		// to this PR; taskMatchesItem covers the label-less case.
-		labelsMatch := t.Labels[labelSourceRepo] == want
-		if !labelsMatch && !taskMatchesItem(t, repoSlug, prNumber) {
+		// Phase 2: match on spec/ledger identity only; taskMatchesItem carries the
+		// legacy label fallback for Tasks created before Phase 1. The IsPR/Number
+		// narrowing guard that was here is subsumed by taskMatchesItem which already
+		// checks DedupNumber||Number against prNumber - no need to also check IsPR:
+		// an issue-slot task for the same number would match, but issue tasks are
+		// never terminal-lifecycle-terminal for a PR number that doesn't match their
+		// own identity, so the count is still correct.
+		if !taskMatchesItem(t, repoSlug, prNumber) {
 			continue
 		}
 		if isLifecycleTerminal(t.Status.LifecycleState) {
@@ -129,13 +127,10 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 	if c.isPR {
 		return nil
 	}
-	repoLabel := sanitizeRepoLabel(c.repo)
-	numLabel := strconv.Itoa(c.number)
 	for i := range existing {
 		t := &existing[i]
-		// Phase 1: match by legacy labels OR spec/ledger identity.
-		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
-		if !labelsMatch && !taskMatchesItem(t, c.repo, c.number) {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		state := t.Status.LifecycleState
@@ -268,14 +263,11 @@ func lastTerminalNoLabelTask(c candidate, existing []tatarav1alpha1.Task, manage
 	if c.isPR || hasAnyLabel(c.labels, managed) {
 		return nil
 	}
-	repoLabel := sanitizeRepoLabel(c.repo)
-	numLabel := strconv.Itoa(c.number)
 	var latest *tatarav1alpha1.Task
 	for i := range existing {
 		t := &existing[i]
-		// Phase 1: match by legacy labels OR spec/ledger identity.
-		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
-		if !labelsMatch && !taskMatchesItem(t, c.repo, c.number) {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
@@ -1754,13 +1746,10 @@ func (r *ProjectReconciler) proposalBacklog(ctx context.Context, reader scm.SCMR
 // lifecycle Task per (repo, issue) regardless of whether that Task is currently
 // running an agent.
 func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int) bool {
-	repoLabel := sanitizeRepoLabel(slug)
-	numLabel := strconv.Itoa(number)
 	for i := range existing {
 		t := &existing[i]
-		// Phase 1: match by legacy labels OR spec/ledger identity.
-		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
-		if !labelsMatch && !taskMatchesItem(t, slug, number) {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, slug, number) {
 			continue
 		}
 		if tatarav1alpha1.TaskTerminal(t) {
@@ -1782,16 +1771,13 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 // adoptable Task exists. Pure (snapshot only); caller adopts via an inline status
 // reset to Triage, reusing the deterministic pod/branch.
 func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number int) *tatarav1alpha1.Task {
-	repoLabel := sanitizeRepoLabel(slug)
-	numLabel := strconv.Itoa(number)
 	for i := range existing {
 		t := &existing[i]
 		if t.Labels[labelSourceKind] != "issueLifecycle" {
 			continue
 		}
-		// Phase 1: match by legacy labels OR spec/ledger identity.
-		labelsMatch := t.Labels[labelSourceRepo] == repoLabel && t.Labels[labelSourceNumber] == numLabel
-		if !labelsMatch && !taskMatchesItem(t, slug, number) {
+		// Phase 2: spec/ledger identity only; legacy label fallback in taskMatchesItem.
+		if !taskMatchesItem(t, slug, number) {
 			continue
 		}
 		switch t.Status.LifecycleState {

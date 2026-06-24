@@ -15,11 +15,17 @@ import (
 )
 
 func mkPRTask(repo string, pr int, lc string) tatarav1alpha1.Task {
+	// Phase 2: IssueRef added so taskMatchesItem can resolve the repo; the
+	// LabelSourceRepo is kept for backward-compat (legacy-label fallback path).
 	return tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{labelSourceRepo: sanitizeRepoLabel(repo)}},
 		Spec: tatarav1alpha1.TaskSpec{
-			Kind:   "issueLifecycle",
-			Source: &tatarav1alpha1.TaskSource{Number: pr, IsPR: true},
+			Kind: "issueLifecycle",
+			Source: &tatarav1alpha1.TaskSource{
+				IssueRef: repo + "#" + strconv.Itoa(pr),
+				Number:   pr,
+				IsPR:     true,
+			},
 		},
 		Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
 	}

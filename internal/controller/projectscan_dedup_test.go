@@ -415,3 +415,64 @@ func TestIsDeduped_BotCommentDoesNotFreeKey(t *testing.T) {
 		t.Fatalf("human activity must free the dedup key (eligible)")
 	}
 }
+
+// --- Phase 2: Task 7 tests - priorTerminalAttempts + hasLiveLifecycleTaskForIssue (no labels) ---
+
+func TestPriorTerminalAttempts_SpecOnly(t *testing.T) {
+	// Build a terminal PR task with ONLY Spec.Source (no legacy labels).
+	terminal := mkSpecTask("o/r", 5, true, "", "Parked", "Succeeded")
+	inFlight := mkSpecTask("o/r", 5, true, "", "Implement", "")
+	wrongPR := mkSpecTask("o/r", 99, true, "", "Parked", "Succeeded")
+	wrongRepo := mkSpecTask("other/r", 5, true, "", "Parked", "Succeeded")
+
+	cases := []struct {
+		name     string
+		existing []tatarav1alpha1.Task
+		repo     string
+		prNum    int
+		want     int
+	}{
+		{"terminal spec task counts", []tatarav1alpha1.Task{terminal}, "o/r", 5, 1},
+		{"in-flight not terminal -> 0", []tatarav1alpha1.Task{inFlight}, "o/r", 5, 0},
+		{"wrong PR number -> 0", []tatarav1alpha1.Task{wrongPR}, "o/r", 5, 0},
+		{"wrong repo -> 0", []tatarav1alpha1.Task{wrongRepo}, "o/r", 5, 0},
+		{"multiple terminal -> count all", []tatarav1alpha1.Task{terminal, terminal}, "o/r", 5, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := priorTerminalAttempts(tc.existing, tc.repo, tc.prNum)
+			if got != tc.want {
+				t.Fatalf("priorTerminalAttempts = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasLiveLifecycleTaskForIssue_SpecOnly(t *testing.T) {
+	live := mkSpecTask("o/r", 7, false, "", "Implement", "")
+	terminal := mkSpecTask("o/r", 7, false, "", "Done", "Succeeded")
+	wrongNum := mkSpecTask("o/r", 99, false, "", "Implement", "")
+	wrongRepo := mkSpecTask("other/r", 7, false, "", "Implement", "")
+
+	cases := []struct {
+		name     string
+		existing []tatarav1alpha1.Task
+		slug     string
+		number   int
+		want     bool
+	}{
+		{"live task -> true", []tatarav1alpha1.Task{live}, "o/r", 7, true},
+		{"terminal task -> false", []tatarav1alpha1.Task{terminal}, "o/r", 7, false},
+		{"wrong number -> false", []tatarav1alpha1.Task{wrongNum}, "o/r", 7, false},
+		{"wrong repo -> false", []tatarav1alpha1.Task{wrongRepo}, "o/r", 7, false},
+		{"no tasks -> false", nil, "o/r", 7, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasLiveLifecycleTaskForIssue(tc.existing, tc.slug, tc.number)
+			if got != tc.want {
+				t.Fatalf("hasLiveLifecycleTaskForIssue = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
