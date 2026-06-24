@@ -156,7 +156,11 @@ func seedLedgerFromSpec(t *tatarav1alpha1.Task) {
 		}
 	}
 
-	// Existing PR if already opened.
+	// Existing PR if already opened. HeadSHA is left empty at seed time: the only
+	// value available here is Status.HeadBranch (a branch name, not a commit SHA),
+	// and storing it would let any HeadSHA consumer compare a branch string to a
+	// real SHA and silently never match. UpsertWorkItem skips empty fields on
+	// refresh, so the Phase-3 cron backstop populates the real SHA later.
 	if t.Status.PRNumber > 0 {
 		UpsertWorkItem(t, tatarav1alpha1.WorkItemRef{
 			Provider: s.Provider,
@@ -165,7 +169,6 @@ func seedLedgerFromSpec(t *tatarav1alpha1.Task) {
 			Kind:     tatarav1alpha1.WorkItemPR,
 			Role:     tatarav1alpha1.RoleOpenedPR,
 			State:    tatarav1alpha1.WIOpen,
-			HeadSHA:  t.Status.HeadBranch, // best available at seed time
 		})
 	}
 }
@@ -181,9 +184,11 @@ func kindForIsPR(isPR bool) string {
 // (as emitted by electSystemicLeads) into (repo, number). Returns ("", 0) on
 // parse failure.
 func parseCrossRepoRef(ref string) (string, int) {
-	// Format: "owner/repo#N - title"
-	idx := strings.LastIndex(ref, "#")
-	if idx < 0 {
+	// Format: "owner/repo#N - title". Split on the FIRST '#': the repo slug
+	// "owner/repo" never contains '#', and a title may, so LastIndex would pick
+	// the wrong separator and drop the entry.
+	idx := strings.IndexByte(ref, '#')
+	if idx <= 0 {
 		return "", 0
 	}
 	repo := ref[:idx]

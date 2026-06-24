@@ -324,7 +324,6 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// the pre-create scan correctly detects the existing task and the task name hash
 	// equals the issueScan task name (AlreadyExists fires on concurrent creates).
 	// For a plain issue: dedupNumber = ev.Number, dedupRef = ev.IssueRef (unchanged).
-	dedupSlug, _ := issueRefRepoSlug(ev.IssueRef)
 	dedupNumber := ev.Number
 	dedupRef := ev.IssueRef
 	// dedupIsPR tracks whether the dedup slot is for a PR (true) or an issue
@@ -349,10 +348,14 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// Dedupe: creating an issue with the label fires both issues.opened and
 	// issues.labeled for the same issue. Skip if a non-terminal Task already
 	// exists for the dedup key (re-labeling after completion still re-triggers).
-	// Use MatchingLabels so the cache filters Tasks to the dedup key before the
-	// in-Go scan, avoiding an O(all-tasks) walk per webhook. The IssueRef equality
-	// check is omitted for the bot-PR arm: the existing task carries the linked
-	// issue's IssueRef ("o/r#7") not the PR ref ("o/r#21").
+	//
+	// Phase 1 stopped writing the source-repo/source-number labels, so the dedup
+	// identity is matched in-Go against dedupRef (the reconstructed issue ref) and
+	// Spec.Source.DedupNumber/Number, NOT a server-side label selector that would
+	// drop every post-deploy Task. LabelSourceKind is still written, so we keep it
+	// as a coarse pre-filter to narrow the list. The dedupRef equality handles the
+	// bot-PR arm too: dedupRef is rewritten to the linked issue's ref ("o/r#7"), so
+	// it matches the issueScan task that already owns that issue slot.
 	var existing tatarav1.TaskList
 	isPRStr := "false"
 	if dedupIsPR {
@@ -360,10 +363,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	listOpts := []client.ListOption{
 		client.InNamespace(s.cfg.Namespace),
-		client.MatchingLabels{
-			tatarav1.LabelSourceRepo:   dedupSlug,
-			tatarav1.LabelSourceNumber: strconv.Itoa(dedupNumber),
-		},
+		client.MatchingLabels{tatarav1.LabelSourceKind: "issueLifecycle"},
 	}
 	if err := s.cfg.Client.List(ctx, &existing, listOpts...); err != nil {
 		s.count(provider, ev.Kind, ev.Action, "error")
@@ -372,24 +372,32 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	for i := range existing.Items {
 		t := &existing.Items[i]
-		if t.Spec.Source != nil && !tatarav1.TaskTerminal(t) {
-			// LabelIsPR disambiguates issue #N from PR #N in the same repo. Tasks
-			// without the label (scan-created or pre-label) default to "false"
-			// (issue slot). A PR-slot event must not be blocked by an issue-slot
-			// task and vice versa.
-			existingIsPR := t.Labels[tatarav1.LabelIsPR]
-			if existingIsPR == "" {
-				existingIsPR = "false" // backward-compatible default
-			}
-			if existingIsPR != isPRStr {
-				continue // different slot; not a duplicate
-			}
-			s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
-				"project", proj.Name, "issue_ref", ev.IssueRef, "dedup_ref", dedupRef, "task", t.Name)
-			s.count(provider, ev.Kind, ev.Action, "duplicate")
-			w.WriteHeader(http.StatusAccepted)
-			return
+		if t.Spec.Source == nil || tatarav1.TaskTerminal(t) {
+			continue
 		}
+		// Identity match: the existing task must own the same dedup slot. For a
+		// plain issue this is Spec.Source.IssueRef == ev.IssueRef; for a bot PR
+		// "Closes #N" both dedupRef and the existing issueScan task resolve to the
+		// linked issue ref "o/r#N".
+		if t.Spec.Source.IssueRef != dedupRef {
+			continue
+		}
+		// LabelIsPR (still written) disambiguates issue #N from PR #N in the same
+		// repo, both of which share the "o/r#N" IssueRef. Tasks without the label
+		// (scan-created or pre-label) default to "false" (issue slot). A PR-slot
+		// event must not be blocked by an issue-slot task and vice versa.
+		existingIsPR := t.Labels[tatarav1.LabelIsPR]
+		if existingIsPR == "" {
+			existingIsPR = "false" // backward-compatible default
+		}
+		if existingIsPR != isPRStr {
+			continue // different slot; not a duplicate
+		}
+		s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
+			"project", proj.Name, "issue_ref", ev.IssueRef, "dedup_ref", dedupRef, "task", t.Name)
+		s.count(provider, ev.Kind, ev.Action, "duplicate")
+		w.WriteHeader(http.StatusAccepted)
+		return
 	}
 
 	// Determine the lifecycle entry state for issueLifecycle tasks. This is set
@@ -680,7 +688,7 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 // issue ref within the project. Returns (task, true) when found.
 func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
 	var tasks tatarav1.TaskList
-	opts := s.taskListOpts(issueRef)
+	opts := s.taskListOpts()
 	if err := s.cfg.Client.List(ctx, &tasks, opts...); err != nil {
 		return nil, false
 	}
@@ -716,7 +724,7 @@ func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef st
 // Returns (task, true) when found.
 func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
 	var tasks tatarav1.TaskList
-	opts := s.taskListOpts(issueRef)
+	opts := s.taskListOpts()
 	if err := s.cfg.Client.List(ctx, &tasks, opts...); err != nil {
 		return nil, false
 	}
@@ -735,17 +743,16 @@ func (s *Server) findReactivatableTask(ctx context.Context, projectName, issueRe
 	return nil, false
 }
 
-// taskListOpts builds list options that pre-filter Tasks by the dedup labels
-// derived from issueRef. Falls back to namespace-only if the ref is unparseable.
-func (s *Server) taskListOpts(issueRef string) []client.ListOption {
-	repoSlug, ok := issueRefRepoSlug(issueRef)
-	if !ok {
-		return []client.ListOption{client.InNamespace(s.cfg.Namespace)}
-	}
+// taskListOpts builds list options for the lifecycle-task reads. It pre-filters
+// only on LabelSourceKind (still written by every issueLifecycle create) so the
+// apiserver narrows the list cheaply; the dedup identity is then matched in-Go
+// by Spec.Source.IssueRef in the callers. The source-repo label is NOT used as a
+// selector: Phase 1 stopped writing it, so an equality filter on it would drop
+// every post-deploy Task before the IssueRef check runs.
+func (s *Server) taskListOpts() []client.ListOption {
 	return []client.ListOption{
 		client.InNamespace(s.cfg.Namespace),
 		client.MatchingLabels{
-			tatarav1.LabelSourceRepo: repoSlug,
 			tatarav1.LabelSourceKind: "issueLifecycle",
 		},
 	}
@@ -906,18 +913,6 @@ func projectRepoSlugs(ctx context.Context, c client.Client, ns, project string) 
 
 func mentionsBot(body, bot string) bool {
 	return bot != "" && strings.Contains(body, "@"+bot)
-}
-
-// issueRefRepoSlug strips the trailing separator ('#' or '!') and numeric id
-// from an IssueRef of the form "owner/repo#N" (GitHub) or "group/proj!N"
-// (GitLab MR), returning the repo path with '/' replaced by '.'.
-// Returns ("", false) when neither separator is present or the ref is malformed.
-func issueRefRepoSlug(issueRef string) (string, bool) {
-	idx := strings.LastIndexAny(issueRef, "#!")
-	if idx < 0 {
-		return "", false
-	}
-	return strings.ReplaceAll(issueRef[:idx], "/", "."), true
 }
 
 // issueLifecycleTaskName returns a deterministic Kubernetes-safe Task name for

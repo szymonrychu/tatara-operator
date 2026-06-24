@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
@@ -24,6 +25,23 @@ func mkPRTask(repo string, pr int, lc string) tatarav1alpha1.Task {
 	}
 }
 
+// mkPRTaskLabelless builds a terminal PR task in the Phase-1 shape: NO
+// source-repo label, identity carried only by Spec.Source (IssueRef + Number).
+// priorTerminalAttempts must count it via taskMatchesItem.
+func mkPRTaskLabelless(repo string, pr int, lc string) tatarav1alpha1.Task {
+	return tatarav1alpha1.Task{
+		Spec: tatarav1alpha1.TaskSpec{
+			Kind: "issueLifecycle",
+			Source: &tatarav1alpha1.TaskSource{
+				IssueRef: repo + "#" + strconv.Itoa(pr),
+				Number:   pr,
+				IsPR:     true,
+			},
+		},
+		Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
+	}
+}
+
 func TestPriorTerminalAttempts_CountsTerminalPRTasks(t *testing.T) {
 	existing := []tatarav1alpha1.Task{
 		mkPRTask("o/r", 50, "Parked"),
@@ -34,6 +52,21 @@ func TestPriorTerminalAttempts_CountsTerminalPRTasks(t *testing.T) {
 	}
 	require.Equal(t, 2, priorTerminalAttempts(existing, "o/r", 50))
 	require.Equal(t, 0, priorTerminalAttempts(existing, "o/r", 99))
+}
+
+// TestPriorTerminalAttempts_CountsLabelLessTasks is the migration regression:
+// new-generation terminal PR tasks carry no source-repo label and must still be
+// counted via Spec.Source identity, else the recovery cap never trips and mrScan
+// re-adopts an unfixable bot PR unboundedly.
+func TestPriorTerminalAttempts_CountsLabelLessTasks(t *testing.T) {
+	existing := []tatarav1alpha1.Task{
+		mkPRTaskLabelless("o/r", 50, "Parked"),
+		mkPRTaskLabelless("o/r", 50, "Stopped"),
+		mkPRTaskLabelless("o/r", 50, "Implement"), // non-terminal: not counted
+		mkPRTaskLabelless("o/r", 51, "Parked"),    // different PR: not counted
+		mkPRTaskLabelless("o/x", 50, "Parked"),    // different repo: not counted
+	}
+	require.Equal(t, 2, priorTerminalAttempts(existing, "o/r", 50))
 }
 
 func TestRecoveryBoundThreshold(t *testing.T) {

@@ -55,7 +55,11 @@ func priorTerminalAttempts(existing []tatarav1alpha1.Task, repoSlug string, prNu
 		if t.Spec.Source == nil || !t.Spec.Source.IsPR || t.Spec.Source.Number != prNumber {
 			continue
 		}
-		if t.Labels[labelSourceRepo] != want {
+		// Phase 1: match by legacy label OR spec/ledger identity (new tasks no
+		// longer carry source-repo). The IsPR/Number guard above already narrows
+		// to this PR; taskMatchesItem covers the label-less case.
+		labelsMatch := t.Labels[labelSourceRepo] == want
+		if !labelsMatch && !taskMatchesItem(t, repoSlug, prNumber) {
 			continue
 		}
 		if isLifecycleTerminal(t.Status.LifecycleState) {
@@ -205,6 +209,14 @@ func isDeduped(c candidate, existing []tatarav1alpha1.Task, managed []string, hu
 			return true
 		}
 		if c.isPR {
+			// Same-head terminal dedup. Phase 1 stopped writing the head-sha label,
+			// so for new-generation tasks this never matches and a terminal task at
+			// the same unchanged head no longer suppresses a re-pick here. This is an
+			// accepted Phase-1 relaxation: the non-terminal guard above still blocks
+			// an in-flight task, and the recovery-attempt cap (priorTerminalAttempts)
+			// bounds repeated terminal re-adoption. The real head SHA lands in the
+			// ledger via the Phase-3 cron backstop, after which this can consult the
+			// WorkItemRef.HeadSHA instead of the dropped label.
 			if t.Labels[labelHeadSHA] == c.headSHA && c.headSHA != "" {
 				return true
 			}

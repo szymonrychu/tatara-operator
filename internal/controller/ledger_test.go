@@ -235,3 +235,58 @@ func TestSeedLedgerFromSpec_SystemicGroup(t *testing.T) {
 		t.Errorf("want 3 closes, got %d", roleCount[tatarav1alpha1.RoleCloses])
 	}
 }
+
+func TestParseCrossRepoRef(t *testing.T) {
+	tests := []struct {
+		name     string
+		ref      string
+		wantRepo string
+		wantNum  int
+	}{
+		{"happy", "o/r2#9 - B", "o/r2", 9},
+		{"no title", "o/r2#9", "o/r2", 9},
+		{"title contains hash", "o/r2#9 - fix #11 regression", "o/r2", 9},
+		{"no separator", "o/r2 plain", "", 0},
+		{"non-numeric", "o/r2#x - y", "", 0},
+		{"leading hash", "#9 - y", "", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, num := parseCrossRepoRef(tc.ref)
+			if repo != tc.wantRepo || num != tc.wantNum {
+				t.Errorf("parseCrossRepoRef(%q) = (%q,%d) want (%q,%d)", tc.ref, repo, num, tc.wantRepo, tc.wantNum)
+			}
+		})
+	}
+}
+
+// TestSeedLedgerFromSpec_OpenedPREntry asserts the openedPR entry shape: Kind=pr,
+// Role=openedPR, and an EMPTY HeadSHA (a branch name must not masquerade as a SHA
+// at seed time; the real SHA lands via the Phase-3 cron backstop).
+func TestSeedLedgerFromSpec_OpenedPREntry(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Spec: tatarav1alpha1.TaskSpec{
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5},
+		},
+		Status: tatarav1alpha1.TaskStatus{PRNumber: 42, HeadBranch: "tatara/issue-5"},
+	}
+	seedLedgerFromSpec(task)
+	var pr *tatarav1alpha1.WorkItemRef
+	for i := range task.Status.WorkItems {
+		if task.Status.WorkItems[i].Kind == tatarav1alpha1.WorkItemPR {
+			pr = &task.Status.WorkItems[i]
+		}
+	}
+	if pr == nil {
+		t.Fatalf("no openedPR entry seeded: %+v", task.Status.WorkItems)
+	}
+	if pr.Number != 42 {
+		t.Errorf("want openedPR number 42, got %d", pr.Number)
+	}
+	if pr.Role != tatarav1alpha1.RoleOpenedPR {
+		t.Errorf("want role %s, got %s", tatarav1alpha1.RoleOpenedPR, pr.Role)
+	}
+	if pr.HeadSHA != "" {
+		t.Errorf("openedPR HeadSHA must be empty at seed time (no branch name), got %q", pr.HeadSHA)
+	}
+}
