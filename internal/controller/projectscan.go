@@ -1983,6 +1983,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				consider(now.Add(backlogRequeue))
 			}
 			r.recoverOrphans(ctx, proj, reader, repos, issueCache)
+			r.backstopSweep(ctx, proj, reader, repos)
 		} else {
 			consider(next)
 		}
