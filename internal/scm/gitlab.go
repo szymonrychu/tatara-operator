@@ -506,7 +506,15 @@ func (c *GitLab) Approve(ctx context.Context, repoURL, token string, number int,
 	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/approve"
 	if err := glDo(ctx, c.base(), http.MethodPost, path, token, nil, nil); err != nil {
-		return err
+		// GitLab returns 401 from /approve when the caller has ALREADY approved the
+		// MR (idempotency-via-error). For the review bot the approval already
+		// stands, so this is benign: mirror RequestChanges tolerating the 404 from
+		// /unapprove and fall through to the optional note. Any other status aborts
+		// (a genuine auth failure also breaks reads/comments and surfaces there).
+		var he *HTTPError
+		if !errors.As(err, &he) || he.Status != http.StatusUnauthorized {
+			return err
+		}
 	}
 	if body == "" {
 		return nil

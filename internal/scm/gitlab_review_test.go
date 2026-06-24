@@ -56,3 +56,47 @@ func TestGitLabRequestChangesPropagatesNon404Unapprove(t *testing.T) {
 		t.Fatal("RequestChanges must propagate a non-404 unapprove error")
 	}
 }
+
+// TestGitLabApproveTolerates401AlreadyApproved verifies Approve does not abort
+// when the approve call 401s. GitLab returns 401 from /merge_requests/:iid/approve
+// when the caller has already approved the MR (idempotency-via-error); the
+// approval already stands, so the verb is benign and the optional note must land.
+func TestGitLabApproveTolerates401AlreadyApproved(t *testing.T) {
+	var notePosted bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/approve"):
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"401 Unauthorized"}`))
+		case strings.HasSuffix(r.URL.Path, "/notes"):
+			notePosted = true
+			w.WriteHeader(http.StatusCreated)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	if err := c.Approve(context.Background(), "https://gitlab.com/g/p", "tok", 7, "lgtm"); err != nil {
+		t.Fatalf("Approve should tolerate a 401 already-approved from /approve: %v", err)
+	}
+	if !notePosted {
+		t.Fatal("after a tolerated 401 approve, the note must still post")
+	}
+}
+
+// TestGitLabApprovePropagatesNon401 verifies a non-401 approve error still aborts.
+func TestGitLabApprovePropagatesNon401(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/approve") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	if err := c.Approve(context.Background(), "https://gitlab.com/g/p", "tok", 7, "lgtm"); err == nil {
+		t.Fatal("Approve must propagate a non-401 error from /approve")
+	}
+}
