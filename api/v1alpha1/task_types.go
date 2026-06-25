@@ -26,6 +26,10 @@ type ProposedIssueSpec struct {
 	// and a sibling footer; the group counts as one against maxOpenProposals.
 	// +optional
 	SystemicID string `json:"systemicId,omitempty"`
+	// Incident is true when this proposal was filed by an incident-investigation
+	// agent; createProposal then adds the incident label to the tracker issue.
+	// +optional
+	Incident bool `json:"incident,omitempty"`
 }
 
 // Suggestion is one inline code suggestion on a PR/MR.
@@ -198,6 +202,11 @@ type TaskSpec struct {
 	// aware of CrossRepo siblings (reference only).
 	// +optional
 	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
+	// AlertRule names the Grafana alert rule that produced an incident Task
+	// (commonLabels.alertname, falling back to groupKey). Descriptive only; the
+	// dedup key is the tatara.dev/alert-group hash label.
+	// +optional
+	AlertRule string `json:"alertRule,omitempty"`
 }
 
 // TaskTerminal reports whether t has reached a terminal state, accounting for

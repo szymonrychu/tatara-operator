@@ -52,6 +52,12 @@ spec:
           spec:
             description: TaskSpec defines the desired state of a Task.
             properties:
+              alertRule:
+                description: |-
+                  AlertRule names the Grafana alert rule that produced an incident Task
+                  (commonLabels.alertname, falling back to groupKey). Descriptive only; the
+                  dedup key is the tatara.dev/alert-group hash label.
+                type: string
               approvalRequired:
                 description: |-
                   ApprovalRequired is reserved for future use; no production code path reads
@@ -82,6 +88,11 @@ spec:
                 properties:
                   body:
                     type: string
+                  incident:
+                    description: |-
+                      Incident is true when this proposal was filed by an incident-investigation
+                      agent; createProposal then adds the incident label to the tracker issue.
+                    type: boolean
                   kind:
                     enum:
                     - bug
