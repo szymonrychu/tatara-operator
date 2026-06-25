@@ -69,6 +69,15 @@ func renderAlertContext(a GrafanaAlert) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// alertRuleName is the human-readable rule identity for an incident Task:
+// the alertname common label, falling back to the raw group key.
+func alertRuleName(a GrafanaAlert) string {
+	if n := a.CommonLabels["alertname"]; n != "" {
+		return n
+	}
+	return a.GroupKey
+}
+
 // alertGroupHash is the dedup key for an alert group (16 hex chars of sha256(groupKey)).
 func alertGroupHash(a GrafanaAlert) string {
 	h := sha256.Sum256([]byte(a.GroupKey))

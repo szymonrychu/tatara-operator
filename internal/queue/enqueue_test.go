@@ -116,6 +116,24 @@ func TestBuildTaskFromQueuedEvent_SystemicGroup(t *testing.T) {
 	}
 }
 
+func TestBuildTaskFromQueuedEvent_CopiesAlertRule(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-x", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", AlertRule: "HighCPU", GenerateName: "incident-"},
+		},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if task.Spec.AlertRule != "HighCPU" {
+		t.Fatalf("want AlertRule=HighCPU, got %q", task.Spec.AlertRule)
+	}
+}
+
 func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()

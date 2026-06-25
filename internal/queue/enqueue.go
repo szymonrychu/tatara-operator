@@ -165,6 +165,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 			RepositoryRef: p.RepositoryRef,
 			Goal:          p.Goal,
 			Kind:          p.Kind,
+			AlertRule:     p.AlertRule,
 			Source:        p.Source,
 			SystemicGroup: p.SystemicGroup,
 		},
