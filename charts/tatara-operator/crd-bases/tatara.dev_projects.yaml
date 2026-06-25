@@ -5475,6 +5475,11 @@ spec:
                         default: Status
                         type: string
                     type: object
+                  botEmail:
+                    description: |-
+                      BotEmail is the git commit author email for agent commits (the bot's
+                      noreply/commit email). When empty the wrapper's default identity stands.
+                    type: string
                   botLogin:
                     type: string
                   brainstormingLabel:
@@ -5600,6 +5605,12 @@ spec:
                     default: tatara-implementation
                     description: ImplementationLabel marks an issue whose implementation
                       is in flight.
+                    type: string
+                  incidentLabel:
+                    description: |-
+                      IncidentLabel marks a proposal issue that originated from an incident
+                      investigation. Additive: applied alongside BrainstormingLabel, never
+                      swept by the phase-label reconciler. Defaults to "tatara-incident".
                     type: string
                   maintainerLogins:
                     description: |-

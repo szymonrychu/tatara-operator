@@ -404,6 +404,32 @@ func (s *Server) inflightBrainstormConversationKey(ctx context.Context, project 
 	return agent.ConversationKey(newest)
 }
 
+// inflightIncidentTask reports whether the project has a non-terminal incident
+// Task. Agent identity is shared OIDC, so an incident-investigation agent is
+// inferred from the project's in-flight incident work (same project-level
+// inference inflightBrainstormConversationKey uses).
+func (s *Server) inflightIncidentTask(ctx context.Context, project string) bool {
+	var tasks tatarav1alpha1.TaskList
+	if err := s.c.List(ctx, &tasks, client.InNamespace(s.ns)); err != nil {
+		return false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProjectRef != project || t.Spec.Kind != "incident" {
+			continue
+		}
+		// Incident tasks leave Phase empty for life and signal completion via
+		// LifecycleState; use the canonical terminal predicate (matches the
+		// dedup gate in internal/queue) so a parked/stopped incident is not
+		// mistaken for in-flight work.
+		if tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	var req proposeIssueReq
 	if err := decodeJSON(r, w, &req); err != nil {
@@ -466,6 +492,7 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 			ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
 				RepositoryRef: req.RepositoryRef, Title: req.Title, Body: req.Body, Kind: req.Kind,
 				SystemicID: req.SystemicID,
+				Incident:   s.inflightIncidentTask(r.Context(), projName),
 			},
 		},
 	}

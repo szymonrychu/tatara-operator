@@ -245,6 +245,10 @@ type ScmSpec struct {
 	Provider string `json:"provider"`
 	Owner    string `json:"owner"`
 	BotLogin string `json:"botLogin"`
+	// BotEmail is the git commit author email for agent commits (the bot's
+	// noreply/commit email). When empty the wrapper's default identity stands.
+	// +optional
+	BotEmail string `json:"botEmail,omitempty"`
 	// MaintainerLogins are the human maintainer accounts. They are the unified
 	// trusted-insider AND approver set (issue #102): together with BotLogin they
 	// form the "trusted insider" set used for issue #56 autoapprove, and - when
@@ -296,6 +300,11 @@ type ScmSpec struct {
 	// +kubebuilder:default="tatara-brainstorming"
 	// +optional
 	BrainstormingLabel string `json:"brainstormingLabel,omitempty"`
+	// IncidentLabel marks a proposal issue that originated from an incident
+	// investigation. Additive: applied alongside BrainstormingLabel, never
+	// swept by the phase-label reconciler. Defaults to "tatara-incident".
+	// +optional
+	IncidentLabel string `json:"incidentLabel,omitempty"`
 	// ImplementationLabel marks an issue whose implementation is in flight.
 	// +kubebuilder:default="tatara-implementation"
 	// +optional

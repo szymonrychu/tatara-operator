@@ -625,6 +625,9 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 
 	brainstorming, _, _, _ := lifecycleLabels(proj.Spec.Scm)
 	labels := []string{brainstorming}
+	if task.Spec.ProposedIssue.Incident {
+		labels = append(labels, incidentLabel(proj.Spec.Scm))
+	}
 	body := task.Spec.ProposedIssue.Body
 	if sid := task.Spec.ProposedIssue.SystemicID; sid != "" {
 		labels = append(labels, "tatara/systemic-"+sid)

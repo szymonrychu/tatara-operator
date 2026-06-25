@@ -64,6 +64,10 @@ spec:
                   rebuilds the Task from it verbatim on admission. Producers keep ownership of
                   label/goal/source construction so the dispatcher stays generic.
                 properties:
+                  alertRule:
+                    description: AlertRule is carried from the incident webhook onto
+                      the built Task.
+                    type: string
                   annotations:
                     additionalProperties:
                       type: string

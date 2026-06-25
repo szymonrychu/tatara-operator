@@ -37,6 +37,9 @@ type QueuedEventPayload struct {
 	PodRepo  string `json:"podRepo,omitempty"`
 	// +optional
 	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
+	// AlertRule is carried from the incident webhook onto the built Task.
+	// +optional
+	AlertRule string `json:"alertRule,omitempty"`
 }
 
 type QueuedEventSpec struct {

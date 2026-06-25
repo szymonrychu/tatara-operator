@@ -51,6 +51,15 @@ func legacyLabels(s *tatarav1alpha1.ScmSpec) (idea, rejected string) {
 	return
 }
 
+// incidentLabel returns the additive label for incident-originated proposals.
+// It is NOT a managed phase label (never swept by setLifecycleLabel).
+func incidentLabel(s *tatarav1alpha1.ScmSpec) string {
+	if s != nil && s.IncidentLabel != "" {
+		return s.IncidentLabel
+	}
+	return "tatara-incident"
+}
+
 // managedPhaseLabels returns every label the operator owns (new + legacy), so
 // setLifecycleLabel removes all-but-desired and dedup recognizes legacy issues.
 func managedPhaseLabels(s *tatarav1alpha1.ScmSpec) []string {

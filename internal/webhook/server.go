@@ -890,6 +890,7 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 		Kind:         "incident",
 		Goal:         goal,
 		GenerateName: "incident-",
+		AlertRule:    alertRuleName(alert),
 		Labels:       map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
 		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}

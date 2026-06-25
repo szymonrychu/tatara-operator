@@ -32,6 +32,17 @@ func TestRenderAlertContext(t *testing.T) {
 	}
 }
 
+func TestAlertRuleName_AlertnameThenGroupKey(t *testing.T) {
+	a := GrafanaAlert{CommonLabels: map[string]string{"alertname": "HighCPU"}, GroupKey: "gk"}
+	if got := alertRuleName(a); got != "HighCPU" {
+		t.Fatalf("want HighCPU, got %q", got)
+	}
+	b := GrafanaAlert{GroupKey: "gk-only"}
+	if got := alertRuleName(b); got != "gk-only" {
+		t.Fatalf("fallback: want gk-only, got %q", got)
+	}
+}
+
 func TestAlertGroupHash_StableAndDistinct(t *testing.T) {
 	a, _ := parseGrafanaAlert([]byte(grafanaFiring))
 	b, _ := parseGrafanaAlert([]byte(grafanaResolved))

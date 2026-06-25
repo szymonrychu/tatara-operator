@@ -4,10 +4,12 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -114,6 +116,68 @@ func TestBuildTaskFromQueuedEvent_SystemicGroup(t *testing.T) {
 		len(task.Spec.SystemicGroup.SameRepoSiblings) != 2 || len(task.Spec.SystemicGroup.CrossRepo) != 1 {
 		t.Fatalf("SystemicGroup not mapped: %+v", task.Spec.SystemicGroup)
 	}
+}
+
+func TestBuildTaskFromQueuedEvent_CopiesAlertRule(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-x", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", AlertRule: "HighCPU", GenerateName: "incident-"},
+		},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if task.Spec.AlertRule != "HighCPU" {
+		t.Fatalf("want AlertRule=HighCPU, got %q", task.Spec.AlertRule)
+	}
+}
+
+func TestEnqueueEvent_DedupGatedByTaskTerminalState(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}, &tatarav1alpha1.Task{}).
+		Build()
+	seq := &SeqSource{Client: c, Namespace: "tatara"}
+	proj := testProj("p", "tatara")
+	require.NoError(t, c.Create(context.Background(), proj))
+	pay := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
+
+	// First firing creates a QueuedEvent.
+	_, created1, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassAlert, false, "rulehash", pay)
+	require.NoError(t, err)
+	require.True(t, created1)
+
+	// List the created QueuedEvent.
+	var qel tatarav1alpha1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace("tatara")))
+	require.Len(t, qel.Items, 1)
+	qe := &qel.Items[0]
+
+	// Simulate consumption: build the Task (carries the dedup label) and mark it
+	// non-terminal (Running), then delete the QueuedEvent so only the Task gates.
+	task, err := BuildTaskFromQueuedEvent(qe, proj, c.Scheme())
+	require.NoError(t, err)
+	require.NoError(t, c.Create(context.Background(), task))
+	task.Status.Phase = "Running"
+	require.NoError(t, c.Status().Update(context.Background(), task))
+	require.NoError(t, c.Delete(context.Background(), qe))
+
+	// Second firing: non-terminal Task with same dedup key -> NO new event.
+	_, created2, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassAlert, false, "rulehash", pay)
+	require.NoError(t, err)
+	require.False(t, created2, "dedup while incident Task non-terminal")
+
+	// Mark the Task terminal; third firing -> fresh event created.
+	task.Status.Phase = "Succeeded"
+	require.NoError(t, c.Status().Update(context.Background(), task))
+	_, created3, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassAlert, false, "rulehash", pay)
+	require.NoError(t, err)
+	require.True(t, created3, "re-investigate once prior incident Task is terminal")
 }
 
 func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
