@@ -85,6 +85,18 @@ func sliceContains(ss []string, want string) bool {
 	return false
 }
 
+func TestIncidentLabel_DefaultAndOverride(t *testing.T) {
+	if got := incidentLabel(nil); got != "tatara-incident" {
+		t.Fatalf("nil scm: want tatara-incident, got %q", got)
+	}
+	if got := incidentLabel(&tatarav1alpha1.ScmSpec{}); got != "tatara-incident" {
+		t.Fatalf("empty: want tatara-incident, got %q", got)
+	}
+	if got := incidentLabel(&tatarav1alpha1.ScmSpec{IncidentLabel: "oncall"}); got != "oncall" {
+		t.Fatalf("override: want oncall, got %q", got)
+	}
+}
+
 func TestLifecycleLabelsFourDefaults(t *testing.T) {
 	b, a, i, d := lifecycleLabels(nil)
 	if b != "tatara-brainstorming" || a != "tatara-approved" || i != "tatara-implementation" || d != "tatara-declined" {
