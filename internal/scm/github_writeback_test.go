@@ -65,6 +65,49 @@ func TestGitHubOpenChangeErrorStatus(t *testing.T) {
 	require.Equal(t, 422, he.Status)
 }
 
+func TestGitHubRemoveLabel(t *testing.T) {
+	var hits int
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		require.Equal(t, http.MethodDelete, r.Method)
+		require.Equal(t, "/repos/o/r/issues/7/labels/tatara-rejected", r.URL.Path)
+		require.Equal(t, "Bearer ghtok", r.Header.Get("Authorization"))
+		w.WriteHeader(http.StatusOK)
+	})
+	require.NoError(t, c.RemoveLabel(context.Background(), "ghtok", "o/r#7", "tatara-rejected"))
+	require.Equal(t, 1, hits)
+}
+
+// A label that is not on the issue makes GitHub answer 404 "Label does not
+// exist". RemoveLabel is best-effort sibling cleanup, so that 404 is a benign
+// no-op and must not surface as an error (otherwise it inflates the SCM write
+// error ratio). URL-encoding of slashed phase labels is exercised too.
+func TestGitHubRemoveLabelAbsentIsNoop(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodDelete, r.Method)
+		require.Equal(t, "/repos/o/r/issues/7/labels/tatara%2Fapproved", r.URL.EscapedPath())
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Label does not exist"}`))
+	})
+	require.NoError(t, c.RemoveLabel(context.Background(), "ghtok", "o/r#7", "tatara/approved"))
+}
+
+// Genuine RemoveLabel failures (auth, permission, server, etc.) still surface
+// so the write-failure metric reflects real outages.
+func TestGitHubRemoveLabelRealErrorSurfaces(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
+		c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"message":"nope"}`))
+		})
+		err := c.RemoveLabel(context.Background(), "ghtok", "o/r#7", "tatara-rejected")
+		require.Error(t, err)
+		var he *HTTPError
+		require.ErrorAs(t, err, &he)
+		require.Equal(t, status, he.Status)
+	}
+}
+
 func TestGitHubParse(t *testing.T) {
 	tests := []struct {
 		name      string

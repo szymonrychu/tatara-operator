@@ -376,13 +376,25 @@ func (c *GitHub) AddLabel(ctx context.Context, token, issueRef, label string) er
 // RemoveLabel removes a single label from an issue/PR.
 // The label name is URL-encoded so slashes in tatara/* phase labels hit the
 // correct DELETE /repos/{owner}/{repo}/issues/{n}/labels/{name} route.
+// Removing a label that is not on the issue is a no-op: GitHub answers 404
+// "Label does not exist". We swallow that 404 so best-effort sibling-label
+// cleanup stays idempotent and benign 404s are not counted as SCM write
+// errors (mirrors GitLab.RemoveLabel's idempotent PUT remove_labels=). Real
+// failures (401/403/5xx/network) still surface.
 func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
 	owner, repo, number, err := ghIssueRef(issueRef)
 	if err != nil {
 		return err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, url.PathEscape(label))
-	return ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
+	if err := ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil); err != nil {
+		var he *HTTPError
+		if errors.As(err, &he) && he.Status == http.StatusNotFound {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // ghCheckRun is the decoded shape of one GitHub check-run entry.
