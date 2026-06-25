@@ -66,7 +66,24 @@ type IssueRef struct {
 	Author    string    `json:"author,omitempty"` // issue author login; drives the author-tiered autoapprove gate
 	Labels    []string  `json:"labels,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
-	IsPR      bool      `json:"isPr"` // GitHub /issues returns PRs; filter these out
+	IsPR      bool      `json:"isPr"`            // GitHub /issues returns PRs; filter these out
+	State     string    `json:"state,omitempty"` // open | closed
+	ClosedAt  time.Time `json:"closedAt,omitempty"`
+}
+
+// CommitRef is one default-branch commit, for refiner implemented-detection.
+type CommitRef struct {
+	SHA     string    `json:"sha"`
+	Message string    `json:"message"`
+	Author  string    `json:"author,omitempty"`
+	Date    time.Time `json:"date"`
+}
+
+// EditIssueReq is a PATCH: only non-nil fields are sent.
+type EditIssueReq struct {
+	Title  *string
+	Body   *string
+	Labels *[]string
 }
 
 // BoardItem is one project-board item listed for cron issue-triage.
@@ -128,6 +145,9 @@ type SCMWriter interface {
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
 	CloseIssue(ctx context.Context, token, repo string, number int, comment string) error
+	// EditIssue updates an issue with only the non-nil fields in req.
+	// A 404 (issue gone) is treated as benign and returns nil.
+	EditIssue(ctx context.Context, token, repo string, number int, req EditIssueReq) error
 }
 
 // IssueComment is one human comment on an issue, ordered oldest-first.
@@ -161,6 +181,10 @@ type SCMReader interface {
 	// For GitLab owner carries the full project path; repo is unused. Paired
 	// with GetCommitCIStatus to report per-repo main-branch CI health.
 	GetDefaultBranchHeadSHA(ctx context.Context, owner, repo string) (string, error)
+	// ListClosedIssues returns issues closed at/after since (PRs filtered out).
+	ListClosedIssues(ctx context.Context, owner, repo string, since time.Time) ([]IssueRef, error)
+	// ListCommits returns recent default-branch commits since the given time.
+	ListCommits(ctx context.Context, owner, repo string, since time.Time) ([]CommitRef, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;

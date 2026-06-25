@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -81,6 +82,9 @@ func (f *fakeWriter) SetBoardColumn(_ context.Context, _ string, _ scm.BoardRef,
 	return nil
 }
 func (f *fakeWriter) CloseIssue(_ context.Context, _, _ string, _ int, _ string) error { return nil }
+func (f *fakeWriter) EditIssue(_ context.Context, _, _ string, _ int, _ scm.EditIssueReq) error {
+	return nil
+}
 
 // buildRouterWithSCM builds a chi router with an SCMFor factory injected into the Server.
 func buildRouterWithSCM(t *testing.T, writer scm.SCMWriter, objs ...client.Object) *chi.Mux {
@@ -378,6 +382,12 @@ func (f *fakeReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueC
 }
 func (f *fakeReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
+}
+func (f *fakeReader) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReader) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
 }
 
 // buildRouterWithReader injects both an SCMFor writer and a ReaderFor reader.

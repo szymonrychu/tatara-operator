@@ -102,3 +102,27 @@ func TestGitHubIssueNumber(t *testing.T) {
 	_, _, _, err = ghIssueRef("garbage")
 	require.Error(t, err)
 }
+
+func TestGitHubEditIssue_PatchesOnlyProvided(t *testing.T) {
+	var gotBody map[string]any
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPatch, r.Method)
+		require.Equal(t, "/repos/o/r/issues/7", r.URL.Path)
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"number":7}`))
+	})
+	title := "new title"
+	require.NoError(t, c.EditIssue(context.Background(), "t", "o/r", 7, EditIssueReq{Title: &title}))
+	require.Equal(t, "new title", gotBody["title"])
+	_, bodyPresent := gotBody["body"]
+	require.False(t, bodyPresent, "body must NOT be sent when Body is nil")
+}
+
+func TestGitHubEditIssue_404Benign(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	body := "x"
+	require.NoError(t, c.EditIssue(context.Background(), "t", "o/r", 7, EditIssueReq{Body: &body}))
+}

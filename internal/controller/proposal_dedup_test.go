@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -85,6 +86,12 @@ func (f *fakeProposalReader) GetIssue(_ context.Context, _, _ string, _ int) (sc
 }
 func (f *fakeProposalReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
+}
+func (f *fakeProposalReader) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeProposalReader) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
 }
 
 // seedProposalTask creates the minimum objects for createProposal: a secret,

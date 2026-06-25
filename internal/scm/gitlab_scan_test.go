@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGitLabListOpenPRs(t *testing.T) {
@@ -238,5 +239,51 @@ func TestGitLabCloseIssue(t *testing.T) {
 	}
 	if !paths[closeKey] {
 		t.Fatalf("missing PUT close; got %+v", paths)
+	}
+}
+
+func TestGitLabListClosedIssues_FiltersSince(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/issues" {
+			t.Errorf("unexpected path: %q", glTestPath(r))
+		}
+		if r.URL.Query().Get("state") != "closed" {
+			t.Errorf("want state=closed, got %q", r.URL.Query().Get("state"))
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"iid": 5, "title": "done", "state": "closed", "closed_at": "2026-06-20T00:00:00Z", "author": map[string]any{"username": "bot"}},
+		})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	got, err := c.ListClosedIssues(context.Background(), "g", "p", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Number != 5 || got[0].State != "closed" {
+		t.Fatalf("want 1 closed issue #5, got %+v", got)
+	}
+}
+
+func TestGitLabListCommits_SinceDefaultBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/repository/commits" {
+			t.Errorf("unexpected path: %q", glTestPath(r))
+		}
+		if r.URL.Query().Get("since") == "" {
+			t.Errorf("want since param set")
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"id": "abc123", "message": "feat: do the thing", "author_name": "bot", "created_at": "2026-06-20T00:00:00Z"},
+		})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL, token: "tok"}
+	got, err := c.ListCommits(context.Background(), "g", "p", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA != "abc123" {
+		t.Fatalf("want commit abc123, got %+v", got)
 	}
 }

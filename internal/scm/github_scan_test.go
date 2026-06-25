@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGitHubListOpenPRs(t *testing.T) {
@@ -334,4 +335,45 @@ func contains(s, sub string) bool {
 			}
 			return false
 		}())
+}
+
+func TestGitHubListClosedIssues_FiltersSinceAndPRs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") != "closed" {
+			t.Errorf("want state=closed, got %q", r.URL.Query().Get("state"))
+		}
+		_, _ = w.Write([]byte(`[
+			{"number":5,"title":"done thing","state":"closed","closed_at":"2026-06-20T00:00:00Z","user":{"login":"szymonrychu-bot"}},
+			{"number":6,"title":"a pr","state":"closed","closed_at":"2026-06-20T00:00:00Z","pull_request":{"url":"x"},"user":{"login":"x"}}
+		]`))
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL, token: "t"}
+	got, err := c.ListClosedIssues(context.Background(), "o", "r", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Number != 5 || got[0].State != "closed" {
+		t.Fatalf("want 1 closed non-PR issue #5, got %+v", got)
+	}
+}
+
+func TestGitHubListCommits_SinceDefaultBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("since") == "" {
+			t.Errorf("want since param set")
+		}
+		_, _ = w.Write([]byte(`[
+			{"sha":"abc123","commit":{"message":"feat: do the thing (closes #5)","author":{"name":"szymonrychu-bot","date":"2026-06-20T00:00:00Z"}}}
+		]`))
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL, token: "t"}
+	got, err := c.ListCommits(context.Background(), "o", "r", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA != "abc123" || !contains(got[0].Message, "do the thing") {
+		t.Fatalf("want commit abc123, got %+v", got)
+	}
 }

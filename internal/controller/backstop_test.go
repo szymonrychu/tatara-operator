@@ -58,6 +58,12 @@ func (f *backstopFakeReader) GetIssue(context.Context, string, string, int) (scm
 func (f *backstopFakeReader) GetDefaultBranchHeadSHA(context.Context, string, string) (string, error) {
 	return "", nil
 }
+func (f *backstopFakeReader) ListClosedIssues(context.Context, string, string, time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *backstopFakeReader) ListCommits(context.Context, string, string, time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
+}
 
 // ---- helpers -----------------------------------------------------------
 

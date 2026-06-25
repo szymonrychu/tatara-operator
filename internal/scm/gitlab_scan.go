@@ -2,11 +2,13 @@ package scm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,6 +32,8 @@ type glIssueItem struct {
 	} `json:"author"`
 	Labels    []string  `json:"labels"`
 	UpdatedAt time.Time `json:"updated_at"`
+	State     string    `json:"state"`
+	ClosedAt  time.Time `json:"closed_at"`
 }
 
 // glProjectID builds the GitLab project identifier from a (owner, repo) pair.
@@ -75,7 +79,52 @@ func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	out := make([]IssueRef, 0, len(raw))
 	for _, i := range raw {
 		out = append(out, IssueRef{
-			Repo: proj, Number: i.IID, Title: i.Title, Author: i.Author.Username, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false,
+			Repo: proj, Number: i.IID, Title: i.Title, Author: i.Author.Username, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false, State: "open",
+		})
+	}
+	return out, nil
+}
+
+// ListClosedIssues lists recently-closed issues for the project path owner/repo.
+func (c *GitLab) ListClosedIssues(ctx context.Context, owner, repo string, since time.Time) ([]IssueRef, error) {
+	proj := glProjectID(owner, repo)
+	path := "/projects/" + url.PathEscape(proj) + "/issues?state=closed&updated_after=" + url.QueryEscape(since.UTC().Format(time.RFC3339)) + "&per_page=100"
+	raw, err := glDoPaged[glIssueItem](ctx, c.base(), path, c.token)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueRef, 0, len(raw))
+	for _, i := range raw {
+		out = append(out, IssueRef{
+			Repo: proj, Number: i.IID, Title: i.Title, Author: i.Author.Username, Labels: i.Labels,
+			UpdatedAt: i.UpdatedAt, IsPR: false, State: "closed", ClosedAt: i.ClosedAt,
+		})
+	}
+	return out, nil
+}
+
+type glCommitItem struct {
+	ID         string    `json:"id"`
+	Message    string    `json:"message"`
+	AuthorName string    `json:"author_name"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// ListCommits returns recent default-branch commits for the project path owner/repo since the given time.
+func (c *GitLab) ListCommits(ctx context.Context, owner, repo string, since time.Time) ([]CommitRef, error) {
+	proj := glProjectID(owner, repo)
+	path := "/projects/" + url.PathEscape(proj) + "/repository/commits?since=" + url.QueryEscape(since.UTC().Format(time.RFC3339)) + "&per_page=100"
+	raw, err := glDoPaged[glCommitItem](ctx, c.base(), path, c.token)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CommitRef, 0, len(raw))
+	for _, c := range raw {
+		out = append(out, CommitRef{
+			SHA:     c.ID,
+			Message: c.Message,
+			Author:  c.AuthorName,
+			Date:    c.CreatedAt,
 		})
 	}
 	return out, nil
@@ -173,4 +222,32 @@ func (c *GitLab) CloseIssue(ctx context.Context, token, repo string, number int,
 	}
 	ipath := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number)
 	return glDo(ctx, c.base(), http.MethodPut, ipath, token, map[string]string{"state_event": "close"}, nil)
+}
+
+// EditIssue updates an issue with only the non-nil fields in req (PUT semantics on GitLab).
+// A 404 (issue gone) is treated as benign and returns nil.
+func (c *GitLab) EditIssue(ctx context.Context, token, repo string, number int, req EditIssueReq) error {
+	proj := repo
+	body := map[string]any{}
+	if req.Title != nil {
+		body["title"] = *req.Title
+	}
+	if req.Body != nil {
+		body["body"] = *req.Body
+	}
+	if req.Labels != nil {
+		labels := make([]string, 0, len(*req.Labels))
+		labels = append(labels, *req.Labels...)
+		body["labels"] = strings.Join(labels, ",")
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	ipath := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number)
+	err := glDo(ctx, c.base(), http.MethodPut, ipath, token, body, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
