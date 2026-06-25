@@ -32,13 +32,22 @@ operate on a deduped, scoped, current backlog instead of a noisy one.
   tracker (issues). The operator's work-item-ledger reconcile detects the
   issue-state changes and updates/closes/creates the corresponding Task CRs. The
   agent never writes Task CRs directly (single writer = operator).
-- **Scope: open + recent-closed.** All open issues across the project's repos,
-  plus issues closed within the lookback window (default 30 days, configurable),
-  so the refiner can detect "already implemented" against recently-resolved work.
-  PRs excluded (issues only).
-- **Splits: direct create.** Child issues are created directly (autonomous), not
-  through the `propose_issue` approval-labeled path; the parent is already in the
-  system, so a split is decomposition, not a new proposal.
+- **Scope: open + recent-closed issues + recent commit history.** All open
+  issues across the project's repos, plus issues closed within the lookback
+  window (default 30 days, configurable), PLUS recent commit history on each
+  repo's default branch within the same window. The commit history is a SECOND
+  evidence source for "already implemented": an issue is implemented when a
+  merged PR / closed sibling OR a commit message/diff shows its scope was already
+  delivered (catches work landed by direct commit, by another agent on a shared
+  branch, or by a squash that did not close the issue). PRs excluded (issues
+  only); commits are read-only context.
+- **Splits AND followups: direct create.** The refiner creates issues directly
+  (autonomous), not through the `propose_issue` approval path. Two creation
+  cases: (a) SPLIT - decompose a too-broad parent into child issues; (b) FOLLOWUP
+  - file a NEW issue for work the refiner surfaces while reconciling (a gap, a
+  missing piece, a half-done implementation spotted in the commit history, a
+  discovered regression or tech-debt). Both use the same `create_issue` tool; the
+  body links the originating issue/commit and states why it was filed.
 
 ## Components
 
@@ -70,19 +79,26 @@ operate on a deduped, scoped, current backlog instead of a noisy one.
 
 - `internal/refine/goal.go` (new), mirroring `internal/incident/goal.go`:
   `GoalProject(repoSlugs []string, lookbackDays int) string` producing the agent
-  goal: load the project issue inventory via `list_issues`; for each cluster of
-  related issues across repos, decide and act -
-  - already-implemented (a `task_list` work-item shows a merged PR closing it, or
-    a closed sibling already did it) -> `close_issue` with a comment citing the
-    implementing PR/issue;
+  goal: load the project issue inventory via `list_issues` AND the recent commit
+  history via `list_commits`; for each cluster of related issues across repos,
+  decide and act -
+  - already-implemented (a `task_list` work-item shows a merged PR closing it, a
+    closed sibling already did it, OR a commit in `list_commits` delivered its
+    scope) -> `close_issue` with a comment citing the implementing PR / issue /
+    commit SHA;
   - duplicate -> `close_issue` the dup with a comment "duplicate of <repo>#N",
     keep the canonical;
   - overlap / scope drift -> `edit_issue` to tighten title/body/labels;
-  - too broad -> `create_issue` child issues (linking the parent in the body) +
-    `edit_issue` the parent to the residual scope (or close it if fully split).
-  The goal instructs: judge implemented-ness from `task_list` + closed siblings,
-  never touch PRs, log reasoning in each comment, be idempotent (skip issues
-  already resolved/linked).
+  - too broad -> `create_issue` child (split) issues (linking the parent in the
+    body) + `edit_issue` the parent to the residual scope (or close it if fully
+    split);
+  - newly-surfaced work -> `create_issue` a FOLLOWUP issue (a gap, a half-done
+    implementation seen in the commit history, a discovered regression / tech-
+    debt), body linking the originating issue/commit and stating why.
+  The goal instructs: judge implemented-ness from `task_list` + closed siblings +
+  commit history, never touch PRs, log reasoning in each comment, be idempotent
+  (skip issues already resolved/linked; do not re-file a followup that already
+  exists - check the loaded inventory first).
 - Dispatch via the same QueuedEvent path as brainstorm/incident
   (`createScanTask`/`EnqueueEvent`), `Kind: "refine"`, project-scoped
   (`RepositoryRef: ""`), goal from `refine.GoalProject`, dedup `refine-<project>`.
@@ -95,14 +111,20 @@ operate on a deduped, scoped, current backlog instead of a noisy one.
     NEW. Pointer fields = only set what's provided (PATCH semantics). GitHub
     `PATCH /issues/:n`, GitLab `PUT /issues/:iid`.
   - `CreateIssue` - ALREADY EXISTS, reuse for splits.
-- SCM reader: a cross-repo issue list. `ListIssues(ctx, token, repo, state,
-  since)` likely exists per-repo (projectscan uses candidate listing); if not,
-  add it; the restapi aggregates across the project's repos.
+- SCM reader: a cross-repo issue list - `ListOpenIssues` exists; add
+  `ListClosedIssues(ctx, owner, repo, since)`. Plus a commit-history reader:
+  `ListCommits(ctx, owner, repo, since time.Time) ([]CommitRef, error)` (NEW) on
+  the default branch, returning `CommitRef{SHA, Message, Author string; Date
+  time.Time}`. GitHub `GET /repos/:o/:r/commits?since=<RFC3339>`, GitLab `GET
+  /projects/:enc/repository/commits?since=<RFC3339>`. The restapi aggregates both
+  issues and commits across the project's repos.
 - restapi (`internal/restapi/handlers.go`) - new endpoints, all gated by the
   existing project/bot-authorship/egress checks:
   - `GET /projects/{p}/issues?state=open|all&closedSinceDays=N` -> aggregate
     open + recently-closed issues across the project's repos (repo, number,
     title, body, state, author, labels, closedAt, linked-PR if known).
+  - `GET /projects/{p}/commits?sinceDays=N` -> aggregate recent default-branch
+    commits across the project's repos ({repo, sha, message, author, date}).
   - `POST /projects/{p}/issues/{repo}/{number}/close` {comment}.
   - `PATCH /projects/{p}/issues/{repo}/{number}` {title?, body?, labels?}.
   - `POST /projects/{p}/issues/{repo}` {title, body, labels} (direct create for
@@ -112,17 +134,20 @@ operate on a deduped, scoped, current backlog instead of a noisy one.
 ### 4. cli: `refine` tool profile + new MCP tools
 
 - `internal/mcp/profiles.go`: add a `refine` profile granting:
-  `list_issues`, `close_issue`, `edit_issue`, `create_issue`, `comment_on_issue`,
-  `task_list`, `task_get`, `repo_list`, `report_internal_issue`, plus the memory
-  + code-graph read groups (so it can judge implemented-ness against the graph).
-  NOT granted: `propose_issue` (splits use direct `create_issue`),
-  `task_update`/`subtask_*` (operator-propagated; agent never writes Tasks).
+  `list_issues`, `list_commits`, `close_issue`, `edit_issue`, `create_issue`,
+  `comment_on_issue`, `task_list`, `task_get`, `repo_list`,
+  `report_internal_issue`, plus the memory + code-graph read groups (so it can
+  judge implemented-ness against the graph). NOT granted: `propose_issue`
+  (splits/followups use direct `create_issue`), `task_update`/`subtask_*`
+  (operator-propagated; agent never writes Tasks).
 - `internal/mcp/tools.go`: new tools wrapping the restapi endpoints:
-  - `list_issues` {state?, closedSinceDays?} -> the aggregated inventory.
+  - `list_issues` {state?, closedSinceDays?} -> the aggregated issue inventory.
+  - `list_commits` {sinceDays?} -> aggregated recent commit history across repos.
   - `close_issue` {repo, number, comment} (comment REQUIRED - every close
     explains itself).
   - `edit_issue` {repo, number, title?, body?, labels?}.
-  - `create_issue` {repo, title, body, labels?} -> created issue ref.
+  - `create_issue` {repo, title, body, labels?} -> created issue ref (used for
+    both splits and followups).
 
 ### 5. Operator: ledger propagation
 

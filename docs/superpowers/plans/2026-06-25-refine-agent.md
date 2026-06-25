@@ -12,7 +12,7 @@
 
 - Newest stable Go; KISS; no tech-debt; no stubs. JSON slog. Metrics on every action.
 - TDD: failing test first per unit.
-- Names (exact): Task kind `refine`; tool profile `refine`; `ProjectStatus.LastRefine *metav1.Time`; `RefineActivity` with `ClosedLookbackDays int` (default 30) under `ScmCron.Refine`; SCM `EditIssue(ctx, token, repo string, number int, req EditIssueReq) error` with `EditIssueReq{Title, Body *string; Labels *[]string}`; SCM `ListClosedIssues(ctx, owner, repo string, since time.Time) ([]IssueRef, error)`; `IssueRef.State string` + `IssueRef.ClosedAt time.Time`; restapi routes `GET /projects/{p}/issues`, `POST /projects/{p}/issues/{repo}/{number}/close`, `PATCH /projects/{p}/issues/{repo}/{number}`, `POST /projects/{p}/issues/{repo}`; cli tools `list_issues`, `close_issue`, `edit_issue`, `create_issue`.
+- Names (exact): Task kind `refine`; tool profile `refine`; `ProjectStatus.LastRefine *metav1.Time`; `RefineActivity` with `ClosedLookbackDays int` (default 30) under `ScmCron.Refine`; SCM `EditIssue(ctx, token, repo string, number int, req EditIssueReq) error` with `EditIssueReq{Title, Body *string; Labels *[]string}`; SCM `ListClosedIssues(ctx, owner, repo string, since time.Time) ([]IssueRef, error)`; SCM `ListCommits(ctx, owner, repo string, since time.Time) ([]CommitRef, error)` with `CommitRef{SHA, Message, Author string; Date time.Time}`; `IssueRef.State string` + `IssueRef.ClosedAt time.Time`; restapi routes `GET /projects/{p}/issues`, `GET /projects/{p}/commits`, `POST /projects/{p}/issues/{repo}/{number}/close`, `PATCH /projects/{p}/issues/{repo}/{number}`, `POST /projects/{p}/issues/{repo}`; cli tools `list_issues`, `list_commits`, `close_issue`, `edit_issue`, `create_issue`.
 - After any `api/v1alpha1` field add: `mise exec -- make manifests generate`, commit regenerated CRDs.
 - Operator test run: `KUBEBUILDER_ASSETS=$(mise exec -- go run sigs.k8s.io/controller-runtime/tools/setup-envtest@latest use 1.31.0 -p path) mise exec -- go test ./... -race -count=1`.
 - cli test run: `cd tatara-cli && mise exec -- go test ./... -race -count=1`.
@@ -236,6 +236,72 @@ git add internal/scm/
 git commit -m "feat(scm): EditIssue (PATCH only-provided, 404 benign) for github+gitlab"
 ```
 
+### Task A4: SCM ListCommits (commit-history reader)
+
+**Files:**
+- Modify: `internal/scm/scm.go` (CommitRef + SCMReader interface), `internal/scm/github_scan.go`, `internal/scm/gitlab_scan.go`
+- Test: `internal/scm/github_scan_test.go`, `internal/scm/gitlab_scan_test.go`
+
+**Interfaces:**
+- Produces: `CommitRef{SHA, Message, Author string; Date time.Time}`; `SCMReader.ListCommits(ctx, owner, repo string, since time.Time) ([]CommitRef, error)`.
+
+- [ ] **Step 1: Write the failing test**
+
+In `github_scan_test.go`:
+```go
+func TestGitHubListCommits_SinceDefaultBranch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("since") == "" {
+			t.Errorf("want since param set")
+		}
+		_, _ = w.Write([]byte(`[
+			{"sha":"abc123","commit":{"message":"feat: do the thing (closes #5)","author":{"name":"szymonrychu-bot","date":"2026-06-20T00:00:00Z"}}}
+		]`))
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL, token: "t"}
+	got, err := c.ListCommits(context.Background(), "o", "r", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].SHA != "abc123" || !strings.Contains(got[0].Message, "do the thing") {
+		t.Fatalf("want commit abc123, got %+v", got)
+	}
+}
+```
+Add the GitLab analogue in `gitlab_scan_test.go` (`GET /projects/:enc/repository/commits?since=<RFC3339>`, fields `id`/`message`/`author_name`/`created_at`).
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `mise exec -- go test ./internal/scm/ -run ListCommits`
+Expected: FAIL (`ListCommits` undefined).
+
+- [ ] **Step 3: Implement**
+
+In `scm.go`:
+```go
+// CommitRef is one default-branch commit, for refiner implemented-detection.
+type CommitRef struct {
+	SHA     string    `json:"sha"`
+	Message string    `json:"message"`
+	Author  string    `json:"author,omitempty"`
+	Date    time.Time `json:"date"`
+}
+```
+Add to `SCMReader`: `ListCommits(ctx context.Context, owner, repo string, since time.Time) ([]CommitRef, error)`.
+Implement in github_scan.go (`GET {apiBase}/repos/{owner}/{repo}/commits?since={RFC3339}`, map `sha`, `commit.message`, `commit.author.name`/`date`) and gitlab_scan.go (`GET {apiBase}/projects/{enc}/repository/commits?since={RFC3339}`, map `id`->SHA, `message`, `author_name`, `created_at`). Reuse the same authed-GET + JSON-decode helpers the `ListOpenIssues`/`ListClosedIssues` impls use.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `mise exec -- go test ./internal/scm/ -run ListCommits`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+```bash
+git add internal/scm/
+git commit -m "feat(scm): ListCommits default-branch history reader"
+```
+
 ---
 
 ## Component B: operator restapi issue endpoints
@@ -321,6 +387,46 @@ git add internal/restapi/
 git commit -m "feat(restapi): close/edit/create project issue endpoints for the refiner"
 ```
 
+### Task B3: GET /projects/{p}/commits (aggregate recent commit history)
+
+**Files:**
+- Modify: `internal/restapi/handlers.go`, route registration
+- Test: `internal/restapi/issues_handler_test.go`
+
+**Interfaces:**
+- Consumes: `SCMReader.ListCommits`.
+- Produces: `GET /projects/{p}/commits?sinceDays=N` -> JSON `{"commits":[{repo,sha,message,author,date}]}` aggregated across all project repos.
+
+- [ ] **Step 1: Write the failing test**
+```go
+func TestListProjectCommits_AggregatesAcrossRepos(t *testing.T) {
+	// Seed Project + 2 Repositories + a fake reader returning commits per repo.
+	// GET /projects/{p}/commits?sinceDays=30 -> commits from both repos, each
+	// carrying its repo slug; sinceDays default 30 when omitted.
+}
+```
+Adapt to the restapi test harness (same fake reader as B1).
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `mise exec -- go test ./internal/restapi/ -run TestListProjectCommits`
+Expected: FAIL (route 404).
+
+- [ ] **Step 3: Implement**
+
+Add `func (s *Server) listProjectCommits(w, r)`: resolve project, list its Repositories, for each call `ListCommits(since)` where `since = now - sinceDays days` (default 30), tag each `CommitRef` with its repo, marshal `{"commits":[...]}`. Register `r.Get("/projects/{p}/commits", s.listProjectCommits)`.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `mise exec -- go test ./internal/restapi/ -run TestListProjectCommits`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+```bash
+git add internal/restapi/
+git commit -m "feat(restapi): GET /projects/{p}/commits aggregates recent history across repos"
+```
+
 ---
 
 ## Component C: operator refine goal + dispatch + cron barrier
@@ -337,7 +443,7 @@ git commit -m "feat(restapi): close/edit/create project issue endpoints for the 
 ```go
 func TestGoalProject_MentionsActionsAndScope(t *testing.T) {
 	g := refine.GoalProject([]string{"szymonrychu/tatara-operator", "szymonrychu/tatara-cli"}, 30)
-	for _, want := range []string{"list_issues", "close_issue", "edit_issue", "create_issue", "duplicate", "already", "30", "tatara-operator", "tatara-cli"} {
+	for _, want := range []string{"list_issues", "list_commits", "close_issue", "edit_issue", "create_issue", "duplicate", "already", "followup", "commit", "30", "tatara-operator", "tatara-cli"} {
 		if !strings.Contains(g, want) {
 			t.Fatalf("goal missing %q", want)
 		}
@@ -352,7 +458,7 @@ Expected: FAIL (package/function undefined).
 
 - [ ] **Step 3: Implement**
 
-`GoalProject` returns a goal instructing the agent to: call `list_issues` (open + closed within `lookbackDays` days) across the listed repos; cluster related issues across repos; for each: close already-implemented (cite the implementing PR from `task_list` or a closed sibling) via `close_issue` with an explanatory comment; close duplicates via `close_issue` ("duplicate of <repo>#N"), keep the canonical; tighten scope drift via `edit_issue`; split too-broad issues via `create_issue` child issues linking the parent + `edit_issue` the parent to residual scope (or close it). Rules: judge implemented-ness from `task_list` + closed siblings; never touch PRs; every close/edit explains itself in a comment; be idempotent (skip issues already linked/resolved). Embed the repo list + lookback number.
+`GoalProject` returns a goal instructing the agent to: call `list_issues` (open + closed within `lookbackDays` days) AND `list_commits` (recent default-branch history within the same window) across the listed repos; cluster related issues across repos; for each: close already-implemented (cite the implementing PR from `task_list`, a closed sibling, OR a commit SHA from `list_commits`) via `close_issue` with an explanatory comment; close duplicates via `close_issue` ("duplicate of <repo>#N"), keep the canonical; tighten scope drift via `edit_issue`; split too-broad issues via `create_issue` child issues linking the parent + `edit_issue` the parent to residual scope (or close it); file FOLLOWUP issues via `create_issue` for newly-surfaced work (a gap, a half-done implementation seen in the commit history, discovered tech-debt/regression), body linking the originating issue/commit. Rules: judge implemented-ness from `task_list` + closed siblings + commit history; never touch PRs; every close/edit explains itself in a comment; be idempotent (skip issues already linked/resolved; check the loaded inventory before filing a followup so duplicates are not created). Embed the repo list + lookback number.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -506,7 +612,7 @@ git add -A && git commit -m "chore(refine): operator suite green" --allow-empty
 - Test: `internal/mcp/profiles_test.go`
 
 **Interfaces:**
-- Produces: `toolProfileForKind("refine") == "refine"`; the `refine` profile grants `list_issues`, `close_issue`, `edit_issue`, `create_issue`, `comment_on_issue`, `task_list`, `task_get`, `repo_list`, `report_internal_issue`, + memory + code-graph read groups; EXCLUDES `propose_issue`, `task_update`, `subtask_*`.
+- Produces: `toolProfileForKind("refine") == "refine"`; the `refine` profile grants `list_issues`, `list_commits`, `close_issue`, `edit_issue`, `create_issue`, `comment_on_issue`, `task_list`, `task_get`, `repo_list`, `report_internal_issue`, + memory + code-graph read groups; EXCLUDES `propose_issue`, `task_update`, `subtask_*`.
 
 - [ ] **Step 1: Write the failing test**
 ```go
@@ -515,7 +621,7 @@ func TestProfile_Refine(t *testing.T) {
 		t.Fatal("refine kind must map to refine profile")
 	}
 	tools := profileTools("refine") // the function the package uses to resolve a profile's tool set
-	must := []string{"list_issues", "close_issue", "edit_issue", "create_issue", "comment_on_issue", "task_list", "repo_list"}
+	must := []string{"list_issues", "list_commits", "close_issue", "edit_issue", "create_issue", "comment_on_issue", "task_list", "repo_list"}
 	for _, m := range must {
 		if !contains(tools, m) {
 			t.Fatalf("refine profile missing %q", m)
@@ -550,7 +656,7 @@ git add internal/mcp/profiles.go internal/mcp/profiles_test.go
 git commit -m "feat(mcp): refine tool profile"
 ```
 
-### Task E2: the 4 new MCP tools
+### Task E2: the 5 new MCP tools
 
 **Files:**
 - Modify: `internal/mcp/tools.go` (tool registration + handlers), the operator-API client used by the handlers
@@ -558,7 +664,7 @@ git commit -m "feat(mcp): refine tool profile"
 
 **Interfaces:**
 - Consumes: the restapi endpoints from Component B.
-- Produces: tools `list_issues` {state?, closedSinceDays?}, `close_issue` {repo, number, comment}, `edit_issue` {repo, number, title?, body?, labels?}, `create_issue` {repo, title, body, labels?}.
+- Produces: tools `list_issues` {state?, closedSinceDays?}, `list_commits` {sinceDays?}, `close_issue` {repo, number, comment}, `edit_issue` {repo, number, title?, body?, labels?}, `create_issue` {repo, title, body, labels?}.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -568,18 +674,19 @@ func TestTool_CloseIssue_CallsCloseEndpoint(t *testing.T) {
 	// fake operator API asserts POST /projects/{p}/issues/{repo}/{number}/close {comment}
 	// invoke the close_issue tool with {repo,number,comment} -> backend hit, success surfaced.
 }
-// + TestTool_ListIssues, TestTool_EditIssue, TestTool_CreateIssue analogues.
+// + TestTool_ListIssues, TestTool_ListCommits, TestTool_EditIssue, TestTool_CreateIssue analogues.
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `mise exec -- go test ./internal/mcp/ -run "TestTool_(ListIssues|CloseIssue|EditIssue|CreateIssue)"`
+Run: `mise exec -- go test ./internal/mcp/ -run "TestTool_(ListIssues|ListCommits|CloseIssue|EditIssue|CreateIssue)"`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Register the 4 tools via the `op(...)` pattern in tools.go with JSON schemas:
+Register the 5 tools via the `op(...)` pattern in tools.go with JSON schemas:
 - `list_issues`: `{"properties":{"state":{"enum":["open","all"]},"closedSinceDays":{"type":"integer"}}}` -> `GET /projects/{p}/issues?...`.
+- `list_commits`: `{"properties":{"sinceDays":{"type":"integer"}}}` -> `GET /projects/{p}/commits?sinceDays=N`.
 - `close_issue`: `{"properties":{"repo":{"type":"string"},"number":{"type":"integer"},"comment":{"type":"string"}},"required":["repo","number","comment"]}` -> `POST .../close`.
 - `edit_issue`: `{"properties":{"repo","number","title","body","labels":{"type":"array"}},"required":["repo","number"]}` -> `PATCH .../{number}`.
 - `create_issue`: `{"properties":{"repo","title","body","labels"},"required":["repo","title","body"]}` -> `POST /projects/{p}/issues/{repo}`.
@@ -587,7 +694,7 @@ Each handler resolves the project from the cli's task context (same way existing
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `mise exec -- go test ./internal/mcp/ -run "TestTool_(ListIssues|CloseIssue|EditIssue|CreateIssue)"`
+Run: `mise exec -- go test ./internal/mcp/ -run "TestTool_(ListIssues|ListCommits|CloseIssue|EditIssue|CreateIssue)"`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -629,6 +736,6 @@ Expected: both green.
 
 ## Self-Review
 
-1. **Spec coverage:** kind+barrier (A1, C2), goal (C1), SCM EditIssue + closed lister (A2, A3), restapi list/close/edit/create (B1, B2), cli profile + tools (E1, E2), ledger propagation (D1), metrics/logging (folded into B2/C2 handler impls + the spec's metric names), scope open+recent-closed (A2 + B1 `closedSinceDays`), splits direct-create (B2 create + E2 `create_issue`, propose_issue excluded E1), fully-autonomous (no approval gate in any handler), one-per-cycle (C2 dedup), failed-refine-releases (C2). All spec sections covered.
+1. **Spec coverage:** kind+barrier (A1, C2), goal (C1), SCM EditIssue + closed lister + ListCommits (A2, A3, A4), restapi list-issues/list-commits/close/edit/create (B1, B2, B3), cli profile + tools (E1, E2), ledger propagation (D1), metrics/logging (folded into B2/C2 handler impls + the spec's metric names), scope open+recent-closed+commit-history (A2/A4 + B1 `closedSinceDays` + B3 `sinceDays`), splits AND followups via direct-create (B2 create + E2 `create_issue`, propose_issue excluded E1, goal C1 covers both cases), commit-history implemented-detection (A4 + B3 + E2 `list_commits` + goal C1), fully-autonomous (no approval gate in any handler), one-per-cycle (C2 dedup), failed-refine-releases (C2). All spec sections covered.
 2. **Placeholder scan:** test-helper names flagged "adapt to actual harness" are the only soft spots; each names the concrete sibling pattern to copy. D1 is conditional (test-first; implement only if the existing ledger doesn't already cover it) - explicitly structured, not a placeholder.
 3. **Type consistency:** `EditIssueReq{Title,Body *string;Labels *[]string}`, `EditIssue(ctx,token,repo,number,req)`, `ListClosedIssues(ctx,owner,repo,since)`, `IssueRef.State/ClosedAt`, kind/profile `refine`, `LastRefine`, `RefineActivity.ClosedLookbackDays`, routes + tool names consistent across A-F and the spec's Global Constraints.
