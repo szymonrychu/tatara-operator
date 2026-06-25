@@ -5585,6 +5585,17 @@ spec:
                             pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                         type: object
+                      refine:
+                        description: |-
+                          Refine configures the project-refiner pre-step. No schedule: refine fires
+                          off the existing scan cadence as a mandatory barrier before scans/brainstorm.
+                        properties:
+                          closedLookbackDays:
+                            description: |-
+                              ClosedLookbackDays bounds how far back closed issues are loaded for
+                              already-implemented detection. Default 30 when zero.
+                            type: integer
+                        type: object
                     type: object
                   declinedLabel:
                     default: tatara-declined
@@ -5757,6 +5768,11 @@ spec:
                 format: date-time
                 type: string
               lastMRScan:
+                format: date-time
+                type: string
+              lastRefine:
+                description: LastRefine is the last time the project's refine pre-step
+                  completed.
                 format: date-time
                 type: string
               memory:

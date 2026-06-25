@@ -138,6 +138,7 @@ var projectScopedKinds = map[string]bool{
 	"brainstorm":  true,
 	"healthCheck": true,
 	"incident":    true,
+	"refine":      true,
 }
 
 // IsProjectScopedKind reports whether a task kind is project-scoped (operates on
@@ -178,7 +179,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`

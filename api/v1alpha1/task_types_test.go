@@ -227,6 +227,20 @@ func TestTaskSpec_ValidateRepositoryRef(t *testing.T) {
 	}
 }
 
+// TestValidateTaskSpec_Refine verifies that "refine" is project-scoped:
+// empty RepositoryRef is valid; a non-empty one must be rejected.
+func TestValidateTaskSpec_Refine(t *testing.T) {
+	if err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{Kind: "refine"}); err != nil {
+		t.Fatalf("refine with empty repositoryRef must be valid (project-scoped): %v", err)
+	}
+	if err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{Kind: "refine", RepositoryRef: "r"}); err == nil {
+		t.Fatalf("refine with a repositoryRef must be rejected (project-scoped)")
+	}
+	if !v1alpha1.IsProjectScopedKind("refine") {
+		t.Fatalf("refine must be project-scoped")
+	}
+}
+
 // TestValidateTaskSpec_Incident verifies that "incident" is project-scoped:
 // empty RepositoryRef is valid; a non-empty one must be rejected.
 func TestValidateTaskSpec_Incident(t *testing.T) {
