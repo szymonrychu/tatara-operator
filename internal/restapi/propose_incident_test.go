@@ -106,6 +106,25 @@ func TestProposeIssue_StampsIncidentWhenIncidentInflight(t *testing.T) {
 	require.True(t, task.Spec.ProposedIssue.Incident, "incident-inflight proposal must set ProposedIssue.Incident=true")
 }
 
+func TestProposeIssue_NoIncidentWhenIncidentTaskParked(t *testing.T) {
+	proj := incidentProject("parked-proj")
+	repo := incidentRepo("parked-repo", "parked-proj")
+	// Incident tasks leave Phase empty for their whole life and signal
+	// completion via LifecycleState (Done/Stopped/Parked). A parked incident
+	// task is terminal and must NOT stamp a later proposal as an incident.
+	incTask := inflightIncidentTask("inc-task-parked", "parked-proj")
+	incTask.Status.LifecycleState = "Parked"
+
+	r, fc := buildIncidentTestRouter(t, proj, repo, incTask)
+	rec := postProposeIncident(t, r, "parked-proj", "parked-repo")
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	task := newestProposalTask(t, fc, "parked-proj")
+	if task.Spec.ProposedIssue != nil && task.Spec.ProposedIssue.Incident {
+		t.Fatalf("parked (terminal) incident task must NOT set Incident")
+	}
+}
+
 func TestProposeIssue_NoIncidentWhenOnlyBrainstormInflight(t *testing.T) {
 	proj := incidentProject("bs-proj")
 	repo := incidentRepo("bs-repo", "bs-proj")

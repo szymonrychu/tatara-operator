@@ -418,7 +418,11 @@ func (s *Server) inflightIncidentTask(ctx context.Context, project string) bool 
 		if t.Spec.ProjectRef != project || t.Spec.Kind != "incident" {
 			continue
 		}
-		if t.Status.Phase == "Succeeded" || t.Status.Phase == "Failed" {
+		// Incident tasks leave Phase empty for life and signal completion via
+		// LifecycleState; use the canonical terminal predicate (matches the
+		// dedup gate in internal/queue) so a parked/stopped incident is not
+		// mistaken for in-flight work.
+		if tatarav1alpha1.TaskTerminal(t) {
 			continue
 		}
 		return true
