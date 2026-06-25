@@ -44,6 +44,33 @@ func TestBuildPod_NoGrafanaMCPURL_WhenExplicitlyDisabled(t *testing.T) {
 	}
 }
 
+func TestPodEnv_SetsBotGitIdentity(t *testing.T) {
+	p := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "gitid"}}
+	p.Spec.Scm = &tatarav1alpha1.ScmSpec{
+		BotLogin: "szymonrychu-bot",
+		BotEmail: "143486966+szymonrychu-bot@users.noreply.github.com",
+	}
+	m := podEnvMap(t, p)
+	if m["GIT_USER_NAME"] != "szymonrychu-bot" {
+		t.Fatalf("GIT_USER_NAME=%q", m["GIT_USER_NAME"])
+	}
+	if m["GIT_USER_EMAIL"] != "143486966+szymonrychu-bot@users.noreply.github.com" {
+		t.Fatalf("GIT_USER_EMAIL=%q", m["GIT_USER_EMAIL"])
+	}
+}
+
+func TestPodEnv_OmitsGitEmailWhenUnset(t *testing.T) {
+	p := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "gitid2"}}
+	p.Spec.Scm = &tatarav1alpha1.ScmSpec{
+		BotLogin: "szymonrychu-bot",
+		BotEmail: "",
+	}
+	m := podEnvMap(t, p)
+	if _, ok := m["GIT_USER_EMAIL"]; ok {
+		t.Fatal("GIT_USER_EMAIL must be omitted when BotEmail empty")
+	}
+}
+
 func incidentTask(groupHash string) *tatarav1alpha1.Task {
 	t := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{

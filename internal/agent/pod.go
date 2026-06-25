@@ -624,6 +624,19 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_REPOS", Value: string(buf)})
 	}
 
+	// Bot git identity: attribute agent commits to the configured bot account
+	// (not the generic tatara-agent default). The wrapper reads GIT_USER_NAME
+	// and GIT_USER_EMAIL via bootstrap/repo.go. Only set when non-empty so a
+	// Project without BotEmail keeps the wrapper default.
+	if project.Spec.Scm != nil {
+		if project.Spec.Scm.BotLogin != "" {
+			env = append(env, corev1.EnvVar{Name: "GIT_USER_NAME", Value: project.Spec.Scm.BotLogin})
+		}
+		if project.Spec.Scm.BotEmail != "" {
+			env = append(env, corev1.EnvVar{Name: "GIT_USER_EMAIL", Value: project.Spec.Scm.BotEmail})
+		}
+	}
+
 	// Tool profile: gates the MCP tool surface the agent sees. Placed here,
 	// with the other operator-set variables, so the operator-set profile is
 	// authoritative -- a stray ExtraEnvs duplicate that comes after it is
