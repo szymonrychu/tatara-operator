@@ -356,6 +356,15 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 			continue // younger than the retention window
 		}
 		age := time.Since(tk.CreationTimestamp.Time)
+		// Clean per-issue token and turn series before deletion so Prometheus does
+		// not accumulate stale series forever (bounded cardinality). Skip project-
+		// scoped tasks (empty issue) to avoid clearing shared label-value buckets.
+		if s.Metrics != nil {
+			project, repo, kind, issue := taskTokenLabels(tk)
+			if issue != "" {
+				s.Metrics.DeleteTaskSeries(project, repo, kind, issue)
+			}
+		}
 		del := tk.DeepCopy()
 		if err := s.Client.Delete(ctx, del, &client.DeleteOptions{PropagationPolicy: &policy}); err != nil && !apierrors.IsNotFound(err) {
 			l.Error(err, "reaper: gc terminal task", "action", "gc_task",

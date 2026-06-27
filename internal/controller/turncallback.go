@@ -254,6 +254,7 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 	if recorded && s.Metrics != nil {
 		project, repo, kind, issue := taskTokenLabels(task)
 		s.Metrics.AddTaskTokens(project, repo, kind, issue, inputTotal, u.OutputTokens)
+		s.Metrics.AddTaskTurn(project, repo, kind, issue)
 	}
 	return nil
 }

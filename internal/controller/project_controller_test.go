@@ -185,4 +185,297 @@ func TestGaugeRecomputeThrottled(t *testing.T) {
 	}
 }
 
+// gatherIssueState reads tatara_issue_state for the given issue from reg.
+// Returns the gauge value if the series exists, or -1 when absent.
+func gatherIssueState(t *testing.T, reg *prometheus.Registry, issue, state, incident string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "tatara_issue_state" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			var gotIssue, gotState, gotIncident string
+			for _, lp := range m.GetLabel() {
+				switch lp.GetName() {
+				case "issue":
+					gotIssue = lp.GetValue()
+				case "state":
+					gotState = lp.GetValue()
+				case "incident":
+					gotIncident = lp.GetValue()
+				}
+			}
+			if gotIssue == issue && gotState == state && gotIncident == incident {
+				return m.GetGauge().GetValue()
+			}
+		}
+	}
+	return -1
+}
+
+// TestUpdateIssueStateCounts_EmitsPerIssue verifies that a non-terminal
+// issueLifecycle Task with an issue-scoped Source emits a gauge series.
+func TestUpdateIssueStateCounts_EmitsPerIssue(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, reg := newProjectReconcilerWithReg()
+
+	task := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-1", Namespace: testNS},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef:    "isc-proj",
+			RepositoryRef: "isc-repo",
+			Kind:          "issueLifecycle",
+			Goal:          "test",
+			Source: &tataradevv1alpha1.TaskSource{
+				Provider: "github",
+				IssueRef: "acme/repo#42",
+				Number:   42,
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Status.LifecycleState = "Implement"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set lifecycle state: %v", err)
+	}
+
+	r.updateIssueStateCounts(ctx)
+
+	if got := gatherIssueState(t, reg, "acme/repo#42", "implementing", "false"); got != 1 {
+		t.Fatalf("tatara_issue_state{issue=acme/repo#42,state=implementing,incident=false} = %v, want 1", got)
+	}
+}
+
+// TestUpdateIssueStateCounts_MapsConversationToAwaitingApproval verifies the
+// LifecycleState=Conversation -> state="awaiting-approval" mapping.
+func TestUpdateIssueStateCounts_MapsConversationToAwaitingApproval(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, reg := newProjectReconcilerWithReg()
+
+	task := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-conv", Namespace: testNS},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef:    "isc-proj-conv",
+			RepositoryRef: "isc-repo-conv",
+			Kind:          "issueLifecycle",
+			Goal:          "test",
+			Source: &tataradevv1alpha1.TaskSource{
+				Provider: "github",
+				IssueRef: "acme/repo#99",
+				Number:   99,
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Status.LifecycleState = "Conversation"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set lifecycle state: %v", err)
+	}
+
+	r.updateIssueStateCounts(ctx)
+
+	if got := gatherIssueState(t, reg, "acme/repo#99", "awaiting-approval", "false"); got != 1 {
+		t.Fatalf("tatara_issue_state{state=awaiting-approval} = %v, want 1", got)
+	}
+}
+
+// TestUpdateIssueStateCounts_IncidentLabel verifies that a Task bearing the
+// tatara.io/incident label emits incident="true".
+func TestUpdateIssueStateCounts_IncidentLabel(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, reg := newProjectReconcilerWithReg()
+
+	task := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "isc-task-inc",
+			Namespace: testNS,
+			Labels:    map[string]string{labelIncident: "true"},
+		},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef:    "isc-proj-inc",
+			RepositoryRef: "isc-repo-inc",
+			Kind:          "issueLifecycle",
+			Goal:          "test",
+			Source: &tataradevv1alpha1.TaskSource{
+				Provider: "github",
+				IssueRef: "acme/repo#101",
+				Number:   101,
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Status.LifecycleState = "Triage"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set lifecycle state: %v", err)
+	}
+
+	r.updateIssueStateCounts(ctx)
+
+	if got := gatherIssueState(t, reg, "acme/repo#101", "triage", "true"); got != 1 {
+		t.Fatalf("tatara_issue_state{issue=acme/repo#101,incident=true} = %v, want 1", got)
+	}
+}
+
+// TestUpdateIssueStateCounts_SkipsTerminalAndEmptyIssue verifies that terminal
+// Tasks and project-scoped Tasks (empty issue) produce no gauge series.
+func TestUpdateIssueStateCounts_SkipsTerminalAndEmptyIssue(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, reg := newProjectReconcilerWithReg()
+
+	// Terminal lifecycle Task (Done).
+	done := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-done", Namespace: testNS},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef:    "isc-skip-proj",
+			RepositoryRef: "isc-skip-repo",
+			Kind:          "issueLifecycle",
+			Goal:          "test",
+			Source:        &tataradevv1alpha1.TaskSource{Provider: "github", IssueRef: "acme/repo#200", Number: 200},
+		},
+	}
+	if err := k8sClient.Create(ctx, done); err != nil {
+		t.Fatalf("create done task: %v", err)
+	}
+	done.Status.LifecycleState = "Done"
+	if err := k8sClient.Status().Update(ctx, done); err != nil {
+		t.Fatalf("set lifecycle state Done: %v", err)
+	}
+
+	// Project-scoped incident Task (no Source -> empty issue).
+	incident := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-prj", Namespace: testNS},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef: "isc-skip-proj",
+			Kind:       "incident",
+			Goal:       "test",
+		},
+	}
+	if err := k8sClient.Create(ctx, incident); err != nil {
+		t.Fatalf("create incident task: %v", err)
+	}
+
+	r.updateIssueStateCounts(ctx)
+
+	// Neither task must produce a series.
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "tatara_issue_state" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "issue" {
+					v := lp.GetValue()
+					if v == "acme/repo#200" || v == "" {
+						t.Errorf("unexpected tatara_issue_state series with issue=%q (terminal or empty-issue task must be excluded)", v)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestUpdateIssueStateCounts_ResetsClosedIssue verifies that an issue that
+// was emitted on pass 1 but whose Task is terminal on pass 2 vanishes after
+// the second pass (Reset+Set-only-live semantics).
+func TestUpdateIssueStateCounts_ResetsClosedIssue(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, reg := newProjectReconcilerWithReg()
+
+	task := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-close", Namespace: testNS},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef:    "isc-close-proj",
+			RepositoryRef: "isc-close-repo",
+			Kind:          "issueLifecycle",
+			Goal:          "test",
+			Source:        &tataradevv1alpha1.TaskSource{Provider: "github", IssueRef: "acme/repo#300", Number: 300},
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Status.LifecycleState = "Triage"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set lifecycle state Triage: %v", err)
+	}
+
+	// Pass 1: issue is live.
+	r.updateIssueStateCounts(ctx)
+	if got := gatherIssueState(t, reg, "acme/repo#300", "triage", "false"); got != 1 {
+		t.Fatalf("pass 1: tatara_issue_state = %v, want 1", got)
+	}
+
+	// Transition to terminal (Done).
+	task = &tataradevv1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "isc-task-close"}, task); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	task.Status.LifecycleState = "Done"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set lifecycle state Done: %v", err)
+	}
+
+	// Pass 2: issue is terminal -> no series.
+	r.updateIssueStateCounts(ctx)
+	if got := gatherIssueState(t, reg, "acme/repo#300", "triage", "false"); got != -1 {
+		t.Fatalf("pass 2: tatara_issue_state for done issue = %v, want absent (-1)", got)
+	}
+}
+
+// TestIssueStateFor covers the pure state-mapping table for all LifecycleState
+// and Phase/Kind combos, including terminal (must return "") and review tasks.
+func TestIssueStateFor(t *testing.T) {
+	cases := []struct {
+		name      string
+		kind      string
+		lifecycle string
+		phase     string
+		want      string
+	}{
+		{"lifecycle Triage", "issueLifecycle", "Triage", "", "triage"},
+		{"lifecycle Conversation", "issueLifecycle", "Conversation", "", "awaiting-approval"},
+		{"lifecycle Implement", "issueLifecycle", "Implement", "", "implementing"},
+		{"lifecycle MRCI", "issueLifecycle", "MRCI", "", "mr-ci"},
+		{"lifecycle Merge", "issueLifecycle", "Merge", "", "merging"},
+		{"lifecycle MainCI", "issueLifecycle", "MainCI", "", "main-ci"},
+		{"lifecycle Done (terminal)", "issueLifecycle", "Done", "", ""},
+		{"lifecycle Stopped (terminal)", "issueLifecycle", "Stopped", "", ""},
+		{"lifecycle Parked (terminal)", "issueLifecycle", "Parked", "", ""},
+		{"lifecycle empty state", "issueLifecycle", "", "", ""},
+		{"review Planning", "review", "", "Planning", "reviewing"},
+		{"review Running", "review", "", "Running", "reviewing"},
+		{"review Succeeded (terminal)", "review", "", "Succeeded", ""},
+		{"review Failed (terminal)", "review", "", "Failed", ""},
+		{"other kind", "brainstorm", "", "", ""},
+		{"incident kind", "incident", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &tataradevv1alpha1.Task{}
+			task.Spec.Kind = tc.kind
+			task.Status.LifecycleState = tc.lifecycle
+			task.Status.Phase = tc.phase
+			got := issueStateFor(task)
+			if got != tc.want {
+				t.Errorf("issueStateFor{kind=%q, lifecycle=%q, phase=%q} = %q, want %q",
+					tc.kind, tc.lifecycle, tc.phase, got, tc.want)
+			}
+		})
+	}
+}
+
 var _ = client.IgnoreNotFound

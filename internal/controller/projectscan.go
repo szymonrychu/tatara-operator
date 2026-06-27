@@ -123,6 +123,10 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 const (
 	labelSourceKind = tatarav1alpha1.LabelSourceKind
 	labelActivity   = tatarav1alpha1.LabelActivity
+	// labelIncident is stamped on issueLifecycle Tasks whose source issue carries
+	// the incident SCM label, so tatara_issue_state can distinguish
+	// incident-derived issues from regular improvements without SCM round-trips.
+	labelIncident = "tatara.io/incident"
 )
 
 // headSHAForTask returns the head SHA for a task. It reads the first
@@ -505,12 +509,20 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 	// produce a different hash and break cross-scan dedup on GitLab.
 	labelIssueRef := fmt.Sprintf("%s#%d", labelCand.repo, labelCand.number)
 	dedupKey := kind + "\x00" + labelIssueRef
+	taskLabels := scanTaskLabels(labelCand, activity, kind)
+	// Stamp the incident flag when the source issue carries the incident SCM label
+	// (tatara-incident by default, overridable via Spec.Scm.IncidentLabel). This
+	// lets tatara_issue_state distinguish incident-derived issues from regular
+	// improvements without per-recompute SCM reads.
+	if proj.Spec.Scm != nil && hasLabel(labelCand.labels, incidentLabel(proj.Spec.Scm)) {
+		taskLabels[labelIncident] = "true"
+	}
 	payload := tatarav1alpha1.QueuedEventPayload{
 		Kind:          kind,
 		RepositoryRef: repo.Name,
 		Goal:          goal,
 		Source:        src,
-		Labels:        scanTaskLabels(labelCand, activity, kind),
+		Labels:        taskLabels,
 		Annotations:   extraAnnotations,
 		GenerateName:  "scan-",
 		Provider:      provider,

@@ -213,6 +213,7 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 	}
 	r.updateMemoryStackCounts(ctx)
 	r.updateLifecycleStateCounts(ctx)
+	r.updateIssueStateCounts(ctx)
 	r.updateLightragDocCounts(ctx)
 	r.updateMemoryRetrievalProbe(ctx)
 	r.updateToolSurfaceProbe(ctx)
@@ -372,6 +373,74 @@ func (r *ProjectReconciler) updateLifecycleStateCounts(ctx context.Context) {
 	}
 	for _, state := range lifecycleStates {
 		r.LifecycleMetrics.SetLifecycleState(state, float64(counts[state]))
+	}
+}
+
+// issueStateFor returns the tatara_issue_state "state" label for a live,
+// non-terminal Task, or "" when the Task should not appear in the gauge (terminal,
+// no supported lifecycle entry, or unsupported kind). It is a pure helper so it
+// can be unit-tested independently of the reconciler.
+func issueStateFor(t *tataradevv1alpha1.Task) string {
+	if tataradevv1alpha1.TaskTerminal(t) {
+		return ""
+	}
+	switch t.Spec.Kind {
+	case "issueLifecycle":
+		switch t.Status.LifecycleState {
+		case "Triage":
+			return "triage"
+		case "Conversation":
+			return "awaiting-approval"
+		case "Implement":
+			return "implementing"
+		case "MRCI":
+			return "mr-ci"
+		case "Merge":
+			return "merging"
+		case "MainCI":
+			return "main-ci"
+		}
+	case "review":
+		if t.Status.Phase == "Planning" || t.Status.Phase == "Running" {
+			return "reviewing"
+		}
+	}
+	return ""
+}
+
+// updateIssueStateCounts recomputes tatara_issue_state from authoritative cluster
+// state by listing all non-terminal, issue-scoped Tasks and setting one gauge
+// series per live issue. A Reset() before each pass ensures stale (closed or
+// terminal) issues are not retained. This mirrors updateLifecycleStateCounts but
+// tracks per-issue state rather than aggregate counts, enabling the dashboard to
+// list every open issue with its current state, token usage, and turn count.
+func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {
+	if r.Metrics == nil {
+		return
+	}
+	var list tataradevv1alpha1.TaskList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	r.Metrics.ResetIssueState()
+	for i := range list.Items {
+		t := &list.Items[i]
+		if tataradevv1alpha1.TaskTerminal(t) {
+			continue
+		}
+		project, repo, kind, issue := taskTokenLabels(t)
+		if issue == "" {
+			continue
+		}
+		state := issueStateFor(t)
+		if state == "" {
+			continue
+		}
+		incident := "false"
+		if t.Labels[labelIncident] == "true" {
+			incident = "true"
+		}
+		r.Metrics.SetIssueState(project, repo, issue, kind, state, incident)
 	}
 }
 

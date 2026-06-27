@@ -922,6 +922,136 @@ func TestMemoryRetrievalProbe(t *testing.T) {
 
 // The probe matrix (route x result) must be pre-seeded so every series exists at
 // a zero baseline before the first probe, for alerts on a sudden absent/error spike.
+func TestAddTaskTurn_Increments(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AddTaskTurn("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#42")
+	m.AddTaskTurn("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#42")
+
+	got := testutil.ToFloat64(m.taskTurnsTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#42"))
+	if got != 2 {
+		t.Fatalf("taskTurnsTotal = %v, want 2", got)
+	}
+}
+
+func TestAddTaskTurn_IsolatesIssueLabels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AddTaskTurn("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#1")
+	m.AddTaskTurn("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#2")
+
+	got1 := testutil.ToFloat64(m.taskTurnsTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#1"))
+	got2 := testutil.ToFloat64(m.taskTurnsTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#2"))
+	if got1 != 1 || got2 != 1 {
+		t.Fatalf("issue#1=%v issue#2=%v, want both 1", got1, got2)
+	}
+}
+
+func TestSetIssueState_SetsOne(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetIssueState("tatara", "tatara-operator", "szymonrychu/tatara-operator#5", "issueLifecycle", "implementing", "false")
+
+	got := testutil.ToFloat64(m.taskIssueState.WithLabelValues("tatara", "tatara-operator", "szymonrychu/tatara-operator#5", "issueLifecycle", "implementing", "false"))
+	if got != 1 {
+		t.Fatalf("tatara_issue_state = %v, want 1", got)
+	}
+}
+
+func TestResetIssueState_ClearsStale(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetIssueState("tatara", "repo", "repo#10", "issueLifecycle", "implementing", "false")
+	m.SetIssueState("tatara", "repo", "repo#20", "issueLifecycle", "triage", "false")
+
+	m.ResetIssueState()
+	m.SetIssueState("tatara", "repo", "repo#10", "issueLifecycle", "implementing", "false")
+
+	// repo#10 is still set; repo#20 must be gone after Reset.
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	issue20Found := false
+	for _, mf := range mfs {
+		if mf.GetName() != "tatara_issue_state" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "issue" && lp.GetValue() == "repo#20" {
+					issue20Found = true
+				}
+			}
+		}
+	}
+	if issue20Found {
+		t.Fatal("repo#20 series must be absent after Reset+Set-only-10, but was still present")
+	}
+}
+
+func TestDeleteTaskSeries_RemovesTokenAndTurn(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	// Add tokens and a turn for an issue-scoped task.
+	m.AddTaskTokens("tatara", "op", "issueLifecycle", "op#7", 100, 50)
+	m.AddTaskTurn("tatara", "op", "issueLifecycle", "op#7")
+
+	// Also add a project-scoped (empty issue) series that must NOT be deleted.
+	m.AddTaskTokens("tatara", "", "brainstorm", "", 200, 0)
+
+	m.DeleteTaskSeries("tatara", "op", "issueLifecycle", "op#7")
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	issue7TokenFound := false
+	issue7TurnFound := false
+	brainstormFound := false
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "operator_task_tokens_total":
+			for _, metric := range mf.GetMetric() {
+				var iss string
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "issue" {
+						iss = lp.GetValue()
+					}
+				}
+				if iss == "op#7" {
+					issue7TokenFound = true
+				}
+				if iss == "" {
+					brainstormFound = true
+				}
+			}
+		case "operator_task_turns_total":
+			for _, metric := range mf.GetMetric() {
+				for _, lp := range metric.GetLabel() {
+					if lp.GetName() == "issue" && lp.GetValue() == "op#7" {
+						issue7TurnFound = true
+					}
+				}
+			}
+		}
+	}
+	if issue7TokenFound {
+		t.Error("operator_task_tokens_total{issue=op#7} must be absent after DeleteTaskSeries")
+	}
+	if issue7TurnFound {
+		t.Error("operator_task_turns_total{issue=op#7} must be absent after DeleteTaskSeries")
+	}
+	if !brainstormFound {
+		t.Error("operator_task_tokens_total{issue=} (brainstorm) must not be deleted")
+	}
+}
+
 func TestMemoryRetrievalProbe_PreSeeded(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	NewOperatorMetrics(reg)
