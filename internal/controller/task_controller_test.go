@@ -489,6 +489,52 @@ func TestTaskReconcile_AgentUnreachable_RequeuesWithoutError(t *testing.T) {
 	}
 }
 
+// TestTaskReconcile_WrapperHTTP503_RequeuesWithoutError verifies that a wrapper
+// HTTP 503 ("session not ready"/"session dead") on submit is treated as the
+// same transient wrapper-not-ready condition as a connection-refused boot-race:
+// the reconcile requeues without an error (no exponential backoff) and the turn
+// is NOT counted as result="error" but as result="transient" with
+// outcome="http_503", so the turn-submit failure-ratio alert is not inflated
+// (issue #164).
+func TestTaskReconcile_WrapperHTTP503_RequeuesWithoutError(t *testing.T) {
+	mkTaskProject(t, "p-503", 3)
+	mkTaskRepository(t, "r-503", "p-503")
+	mkTask(t, "t-503", "p-503", "r-503")
+	setProjectMemoryReady(t, "p-503", "http://mem-p-503.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r, reg := newTaskReconcilerReg(fs)
+	if _, err := reconcileTask(t, r, "t-503"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-503")
+	// Endpoint-readiness propagation lag: Service still routes to a pod whose
+	// session just went Booting/Dead, so the wrapper 503s rather than refusing.
+	fs.submitErr = &agent.HTTPError{Status: 503, Body: "session not ready"}
+
+	res, err := reconcileTask(t, r, "t-503")
+	if err != nil {
+		t.Fatalf("wrapper 503 must not error the reconcile (would trigger exponential backoff): %v", err)
+	}
+	if res.RequeueAfter != agentBootRequeue {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, agentBootRequeue)
+	}
+	if _, ok := fs.lastSubmit(); ok {
+		t.Error("no turn should be recorded when the submit fails")
+	}
+	if got := counterValue(t, reg, "operator_agent_boot_race_requeue_total", nil); got != 1 {
+		t.Errorf("operator_agent_boot_race_requeue_total = %v, want 1", got)
+	}
+	if v := counterValue(t, reg, "operator_turn_submit_total",
+		map[string]string{"result": "transient", "outcome": "http_503"}); v < 1 {
+		t.Errorf("operator_turn_submit_total{result=transient,outcome=http_503} = %v, want >= 1", v)
+	}
+	if v := counterValue(t, reg, "operator_turn_submit_total",
+		map[string]string{"result": "error"}); v != 0 {
+		t.Errorf("operator_turn_submit_total{result=error} = %v, want 0 (transient 503 must not inflate the failure ratio)", v)
+	}
+}
+
 func TestTaskReconcile_AgentUnreachable_StampStableAcrossRequeues(t *testing.T) {
 	mkTaskProject(t, "p-unrstable", 3)
 	mkTaskRepository(t, "r-unrstable", "p-unrstable")
