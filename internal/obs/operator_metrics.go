@@ -566,8 +566,18 @@ func (m *OperatorMetrics) ConversationGC(result string) {
 	m.conversationGCTotal.WithLabelValues(result).Inc()
 }
 
-// TurnSubmit increments operator_turn_submit_total for the task kind and result
-// ("ok" or "error"), and records the SubmitTurn call latency in seconds.
+// TurnSubmit increments operator_turn_submit_total for the task kind and result,
+// and records the SubmitTurn call latency in seconds. result is one of:
+//   - "ok": the turn dispatched.
+//   - "unreachable": wrapper boot-race (pod Ready but turn server still cold);
+//     self-heals on a later reconcile.
+//   - "busy": wrapper returned 409 session-busy back-pressure; retried on a later
+//     reconcile.
+//   - "error": a genuine dispatch failure (5xx, timeout, decode) that backs off.
+//
+// Only "error" is a real loss; the turn-submit-failure-ratio alert keys on it so
+// the self-healing transients ("unreachable", "busy") stay observable without
+// tripping it.
 func (m *OperatorMetrics) TurnSubmit(kind, result string, seconds float64) {
 	m.turnSubmitTotal.WithLabelValues(kind, result).Inc()
 	m.turnSubmitDuration.WithLabelValues(kind).Observe(seconds)

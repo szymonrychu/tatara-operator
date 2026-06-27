@@ -798,6 +798,36 @@ func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatar
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
 }
 
+// handleTurnSubmitError records the turn-submit failure with a result label that
+// separates self-healing transients from genuine dispatch loss, then maps the
+// error to a reconcile result. The turn-submit-failure-ratio alert keys on
+// result="error", so only a real failure may carry that label:
+//   - boot-race (UnreachableError): result="unreachable"; handleAgentUnreachable
+//     requeues until the wrapper accepts turns (or fails the Task past the boot
+//     deadline, which AgentUnreachableTermination tracks separately). No turn lost.
+//   - session-busy (HTTPError 409): result="busy"; the wrapper already has a turn
+//     in flight (deliberate back-pressure), so this is not loss - requeue and the
+//     turn dispatches on a later reconcile, with no noisy Reconciler error log.
+//   - anything else (5xx, timeout, decode): result="error"; a genuine failure that
+//     must back off the reconcile.
+//
+// what prefixes the wrapped error on the genuine-failure path.
+func (r *TaskReconciler) handleTurnSubmitError(ctx context.Context, task *tatarav1alpha1.Task, err error, elapsed float64, what string) (ctrl.Result, error) {
+	if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
+		r.Metrics.TurnSubmit(task.Spec.Kind, "unreachable", elapsed)
+		return res, herr
+	}
+	var httpErr *agent.HTTPError
+	if errors.As(err, &httpErr) && httpErr.Status == 409 {
+		r.Metrics.TurnSubmit(task.Spec.Kind, "busy", elapsed)
+		log.FromContext(ctx).Info("wrapper session busy; requeuing",
+			"action", "agent_turn_submit", "resource_id", task.Name, "requeueAfter", pollRequeue.String())
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	}
+	r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
+	return ctrl.Result{}, fmt.Errorf("%s: %w", what, err)
+}
+
 // stampUnreachableSince records the first time the agent was found unreachable
 // for the current run, so handleAgentUnreachable can enforce agentBootDeadline.
 // An existing VALID timestamp is preserved (the deadline is anchored to the
@@ -838,11 +868,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		id, err := r.Session.SubmitTurn(ctx, baseURL, planText, cbURL)
 		elapsed := time.Since(t0).Seconds()
 		if err != nil {
-			r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
-			if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
-				return res, herr
-			}
-			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
+			return r.handleTurnSubmitError(ctx, task, err, elapsed, "submit plan turn")
 		}
 		r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
 		l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
@@ -929,11 +955,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task), task.Name), cbURL)
 	elapsed := time.Since(t0).Seconds()
 	if err != nil {
-		r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
-		if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
-			return res, herr
-		}
-		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
+		return r.handleTurnSubmitError(ctx, task, err, elapsed, "submit subtask turn")
 	}
 	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
 	l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
