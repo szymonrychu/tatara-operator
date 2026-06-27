@@ -159,8 +159,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"result"}),
 		turnSubmitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_turn_submit_total",
-			Help: "Total turn submissions to agent wrappers by kind and result.",
-		}, []string{"kind", "result"}),
+			Help: "Total turn submissions to agent wrappers by kind, result and outcome. result is ok, error (hard failure -> reconcile backoff) or transient (a handled wrapper-not-ready requeue: boot-race or HTTP 503/425, NOT a failure). outcome is the specific cause (ok/unreachable/http_503/http_409/http_425/http_error/timeout/error); fine-grained transport reasons live in operator_agent_http_total. Alert on result=error to exclude benign readiness races (issue #164).",
+		}, []string{"kind", "result", "outcome"}),
 		turnSubmitDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "operator_turn_submit_duration_seconds",
 			Help:    "Wall-clock duration of SubmitTurn calls to agent wrappers.",
@@ -566,10 +566,12 @@ func (m *OperatorMetrics) ConversationGC(result string) {
 	m.conversationGCTotal.WithLabelValues(result).Inc()
 }
 
-// TurnSubmit increments operator_turn_submit_total for the task kind and result
-// ("ok" or "error"), and records the SubmitTurn call latency in seconds.
-func (m *OperatorMetrics) TurnSubmit(kind, result string, seconds float64) {
-	m.turnSubmitTotal.WithLabelValues(kind, result).Inc()
+// TurnSubmit increments operator_turn_submit_total for the task kind, result
+// ("ok", "error", or "transient" for a handled wrapper-not-ready requeue) and
+// outcome (the specific cause, e.g. ok/unreachable/http_503/http_error), and
+// records the SubmitTurn call latency in seconds.
+func (m *OperatorMetrics) TurnSubmit(kind, result, outcome string, seconds float64) {
+	m.turnSubmitTotal.WithLabelValues(kind, result, outcome).Inc()
 	m.turnSubmitDuration.WithLabelValues(kind).Observe(seconds)
 }
 

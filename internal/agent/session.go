@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"time"
 )
 
@@ -75,4 +76,71 @@ func isUnreachable(err error) bool {
 		return false
 	}
 	return true
+}
+
+// isTransientWrapperStatus reports whether a wrapper HTTP status means "not
+// ready yet" rather than a hard failure: the same transient condition as a
+// connection-refused boot-race, only the Service happened to still route to a
+// pod whose session just went Booting/Dead. 503 = session not ready / dead
+// (crash-recovery mid-task); 425 = too early (server up, session still
+// initialising). Callers requeue these under agentBootDeadline instead of
+// tripping reconcile backoff. 409 ("session busy") is deliberately NOT here:
+// the wrapper flips Busy->Ready before firing its turn-complete callback, so a
+// 409 on submit is unexpected and must surface as a real error.
+func isTransientWrapperStatus(status int) bool {
+	return status == http.StatusServiceUnavailable || status == http.StatusTooEarly
+}
+
+// IsTransientWrapper reports whether err from a SubmitTurn call is the transient
+// "wrapper not ready yet" condition - either a transport-level UnreachableError
+// (the turn server is still booting) or an HTTPError with a transient status
+// (503/425). Both mean the same thing and should be requeued under
+// agentBootDeadline, not surfaced as hard reconcile errors. Which one occurs is
+// decided only by endpoint-readiness propagation timing, so they are handled
+// identically.
+func IsTransientWrapper(err error) bool {
+	var unreachable *UnreachableError
+	if errors.As(err, &unreachable) {
+		return true
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return isTransientWrapperStatus(he.Status)
+	}
+	return false
+}
+
+// SubmitOutcome maps a SubmitTurn error to a low-cardinality outcome label for
+// the operator_turn_submit_total metric and failure logs. It returns "ok" for a
+// nil error, then one of: unreachable, http_503, http_409, http_425,
+// http_error (other non-2xx), timeout (context deadline/cancel), or error (any
+// other transport/decode failure). The fine-grained transport breakdown lives
+// in operator_agent_http_total{method,outcome}; this label exists so the
+// turn-submit failure ratio can separate transient wrapper-not-ready outcomes
+// from genuine hard failures.
+func SubmitOutcome(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var unreachable *UnreachableError
+	if errors.As(err, &unreachable) {
+		return "unreachable"
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		switch he.Status {
+		case http.StatusServiceUnavailable:
+			return "http_503"
+		case http.StatusConflict:
+			return "http_409"
+		case http.StatusTooEarly:
+			return "http_425"
+		default:
+			return "http_error"
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return "timeout"
+	}
+	return "error"
 }
