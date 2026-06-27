@@ -174,6 +174,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		LifecycleMetrics:    lifecycleMetrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
+		OperatorURL:         cfg.OperatorURL,
 		GrafanaConfig: grafanamcp.Config{
 			Namespace:       cfg.Namespace,
 			Image:           cfg.GrafanaMCPImage,

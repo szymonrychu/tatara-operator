@@ -84,6 +84,18 @@ type ProjectReconciler struct {
 	// into the MemoryReady condition. Read/written only on the serialised reconcile
 	// path (MaxConcurrentReconciles=1); no mutex required.
 	memoryUnhealthyCycles map[string]int
+
+	// ToolSurfaceHTTP is the client used by updateToolSurfaceProbe to probe the
+	// operator-write and chat tool backends. Nil falls back to a short-timeout
+	// default; tests inject an httptest-backed client.
+	ToolSurfaceHTTP *http.Client
+	// OperatorURL is the in-cluster REST base URL of the operator-write surface
+	// (the TATARA_OPERATOR_URL agent pods receive); updateToolSurfaceProbe probes
+	// a representative read here. Empty disables the operator-backend probe.
+	OperatorURL string
+	// ChatBaseURL, when set, overrides the in-cluster chat Service DNS used by
+	// updateToolSurfaceProbe (tests point it at httptest).
+	ChatBaseURL func(project string) string
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -203,6 +215,7 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 	r.updateLifecycleStateCounts(ctx)
 	r.updateLightragDocCounts(ctx)
 	r.updateMemoryRetrievalProbe(ctx)
+	r.updateToolSurfaceProbe(ctx)
 	r.lastGaugeRecompute = time.Now()
 }
 
