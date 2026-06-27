@@ -465,3 +465,254 @@ func TestHandleBootCrashPodMissing(t *testing.T) {
 		t.Fatal("missing pod must not be handled as a boot crash (ensurePod recreates it)")
 	}
 }
+
+// seedSlowBootTask creates a task in Planning with a PodRunning wrapper whose
+// StartTime is stamped >agentBootDeadline ago (bootDeadlineExceeded=true).
+// A finalizer on the pod prevents actual deletion so resetAgentRun's Delete
+// merely sets DeletionTimestamp, simulating the grace-period window.
+// t.Cleanup removes the finalizer so envtest can GC the pod.
+func seedSlowBootTask(t *testing.T, name string) (*TaskReconciler, *tatarav1alpha1.Task) {
+	t.Helper()
+	r := newTaskReconciler(newFakeSession())
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	task := &tatarav1alpha1.Task{}
+	task.Name = name
+	task.Namespace = testNS
+	task.Spec.ProjectRef = name + "-proj"
+	task.Spec.RepositoryRef = name + "-repo"
+	task.Spec.Goal = "g"
+	if err := k8sClient.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Status.Phase = "Planning"
+	task.Status.PodName = agent.PodName(task)
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("set planning: %v", err)
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       agent.PodName(task),
+			Namespace:  testNS,
+			Finalizers: []string{"test.tatara.dev/hold"},
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "wrapper", Image: "wrapper:1"}}},
+	}
+	if err := k8sClient.Create(context.Background(), pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.StartTime = &metav1.Time{Time: time.Now().Add(-6 * time.Minute)}
+	if err := k8sClient.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("set pod status: %v", err)
+	}
+	t.Cleanup(func() {
+		p := &corev1.Pod{}
+		if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, p); err == nil {
+			p.Finalizers = nil
+			_ = k8sClient.Update(context.Background(), p)
+		}
+	})
+	return r, getTask(t, name)
+}
+
+// TestBootCrashBudgetRegressions covers the per-pod-UID dedup gates that prevent
+// rapid Owns(Pod) reconciles on the same stale/terminating pod from exhausting
+// the boot-crash budget in a single burst (the production incident where three
+// BootTimeout respawns + exhaustion fired in ~2.5s against a single slow pod).
+func TestBootCrashBudgetRegressions(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+
+	t.Run("regression_burst_counts_one_attempt_for_lingering_pod", func(t *testing.T) {
+		r, _ := seedSlowBootTask(t, "bc-reg-burst")
+		// Four rapid calls simulate the Owns(Pod) burst. Call 1 bumps + respawns
+		// (finalizer holds the pod -> DeletionTimestamp set). Calls 2-4 must be
+		// no-ops: the same pod must count at most once against the budget.
+		for i := 0; i < 4; i++ {
+			task := getTask(t, "bc-reg-burst")
+			_, _, _ = r.handleBootCrash(ctx, task)
+		}
+		got := getTask(t, "bc-reg-burst")
+		if n := got.Annotations[annBootCrashAttempts]; n != "1" {
+			t.Fatalf("boot-crash attempts = %q, want 1: same stale pod must not exhaust the budget", n)
+		}
+		if got.Status.Phase == "Failed" {
+			t.Fatal("task must not be Failed: a single slow boot must not exhaust the budget in one burst")
+		}
+	})
+
+	t.Run("skips_bump_when_pod_uid_already_counted", func(t *testing.T) {
+		_, _, task := seedBootCrashTask(t, "bc-reg-uidskip", corev1.PodFailed)
+		pod := &corev1.Pod{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, pod); err != nil {
+			t.Fatalf("get pod: %v", err)
+		}
+		// Pre-stamp the pod's UID as already counted.
+		task.Annotations = map[string]string{
+			annBootCrashAttempts:   "1",
+			annBootCrashLastPodUID: string(pod.UID),
+		}
+		if err := k8sClient.Update(ctx, task); err != nil {
+			t.Fatalf("pre-set annotations: %v", err)
+		}
+		task = getTask(t, "bc-reg-uidskip")
+
+		r := newTaskReconciler(newFakeSession())
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+		res, err, handled := r.handleBootCrash(ctx, task)
+		if err != nil {
+			t.Fatalf("handleBootCrash: %v", err)
+		}
+		if !handled {
+			t.Fatal("must be handled (pod is PodFailed)")
+		}
+		if res.RequeueAfter != agentBootRequeue {
+			t.Fatalf("requeueAfter = %v, want %v", res.RequeueAfter, agentBootRequeue)
+		}
+		got := getTask(t, "bc-reg-uidskip")
+		if n := got.Annotations[annBootCrashAttempts]; n != "1" {
+			t.Fatalf("attempts = %q, want 1: UID already counted, must not bump again", n)
+		}
+		if got.Status.Phase == "Failed" {
+			t.Fatal("task must not be Failed")
+		}
+	})
+
+	t.Run("counts_new_pod_after_prior_uid", func(t *testing.T) {
+		_, _, task := seedBootCrashTask(t, "bc-reg-newuid", corev1.PodFailed)
+		pod := &corev1.Pod{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, pod); err != nil {
+			t.Fatalf("get pod: %v", err)
+		}
+		// Stale UID from a prior pod; current pod has a different UID.
+		task.Annotations = map[string]string{
+			annBootCrashAttempts:   "1",
+			annBootCrashLastPodUID: "stale-uid-prior-pod",
+		}
+		if err := k8sClient.Update(ctx, task); err != nil {
+			t.Fatalf("pre-set annotations: %v", err)
+		}
+		task = getTask(t, "bc-reg-newuid")
+
+		r := newTaskReconciler(newFakeSession())
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+		_, err, handled := r.handleBootCrash(ctx, task)
+		if err != nil {
+			t.Fatalf("handleBootCrash: %v", err)
+		}
+		if !handled {
+			t.Fatal("must be handled")
+		}
+		got := getTask(t, "bc-reg-newuid")
+		if n := got.Annotations[annBootCrashAttempts]; n != "2" {
+			t.Fatalf("attempts = %q, want 2: new pod UID must be counted", n)
+		}
+		if got.Annotations[annBootCrashLastPodUID] != string(pod.UID) {
+			t.Fatalf("last-pod-uid = %q, want %q", got.Annotations[annBootCrashLastPodUID], string(pod.UID))
+		}
+	})
+
+	t.Run("deletion_timestamp_pod_not_counted", func(t *testing.T) {
+		r, task := seedSlowBootTask(t, "bc-reg-dtgate")
+		// Manually delete the pod to set DeletionTimestamp (finalizer holds the pod).
+		pod := &corev1.Pod{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, pod); err != nil {
+			t.Fatalf("get pod: %v", err)
+		}
+		if err := k8sClient.Delete(ctx, pod); err != nil {
+			t.Fatalf("delete pod to set DT: %v", err)
+		}
+		task = getTask(t, "bc-reg-dtgate")
+
+		res, err, handled := r.handleBootCrash(ctx, task)
+		if err != nil {
+			t.Fatalf("handleBootCrash: %v", err)
+		}
+		if !handled {
+			t.Fatal("DT gate must return handled=true so caller waits for replacement")
+		}
+		if res.RequeueAfter != agentBootRequeue {
+			t.Fatalf("requeueAfter = %v, want %v", res.RequeueAfter, agentBootRequeue)
+		}
+		got := getTask(t, "bc-reg-dtgate")
+		if n := got.Annotations[annBootCrashAttempts]; n != "" {
+			t.Fatalf("attempts = %q, want empty: terminating pod must not increment budget", n)
+		}
+	})
+
+	t.Run("recordTurn_clears_last_pod_uid", func(t *testing.T) {
+		_, _, task := seedBootCrashTask(t, "bc-reg-reclr", corev1.PodRunning)
+		task.Annotations = map[string]string{
+			annBootCrashAttempts:   "1",
+			annBootCrashLastPodUID: "some-uid",
+		}
+		if err := k8sClient.Update(ctx, task); err != nil {
+			t.Fatalf("pre-set annotations: %v", err)
+		}
+		task = getTask(t, "bc-reg-reclr")
+
+		r := newTaskReconciler(newFakeSession())
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+		if _, err := r.recordTurn(ctx, task, "turn-1", ""); err != nil {
+			t.Fatalf("recordTurn: %v", err)
+		}
+		got := getTask(t, "bc-reg-reclr")
+		if _, ok := got.Annotations[annBootCrashAttempts]; ok {
+			t.Error("annBootCrashAttempts must be cleared by recordTurn")
+		}
+		if _, ok := got.Annotations[annBootCrashLastPodUID]; ok {
+			t.Error("annBootCrashLastPodUID must be cleared by recordTurn")
+		}
+	})
+
+	t.Run("setLifecycleState_clears_last_pod_uid", func(t *testing.T) {
+		_, _, task := seedBootCrashTask(t, "bc-reg-lsclr", corev1.PodRunning)
+		task.Annotations = map[string]string{
+			annBootCrashAttempts:   "1",
+			annBootCrashLastPodUID: "some-uid",
+		}
+		if err := k8sClient.Update(ctx, task); err != nil {
+			t.Fatalf("pre-set annotations: %v", err)
+		}
+		task = getTask(t, "bc-reg-lsclr")
+
+		r := newTaskReconciler(newFakeSession())
+		r.LifecycleMetrics = obs.NewLifecycleMetrics(prometheus.NewRegistry())
+		if err := r.setLifecycleState(ctx, task, "Triage", "initial"); err != nil {
+			t.Fatalf("setLifecycleState: %v", err)
+		}
+		got := getTask(t, "bc-reg-lsclr")
+		if _, ok := got.Annotations[annBootCrashAttempts]; ok {
+			t.Error("annBootCrashAttempts must be cleared by setLifecycleState")
+		}
+		if _, ok := got.Annotations[annBootCrashLastPodUID]; ok {
+			t.Error("annBootCrashLastPodUID must be cleared by setLifecycleState")
+		}
+	})
+
+	t.Run("bump_is_idempotent_per_pod_uid", func(t *testing.T) {
+		_, _, task := seedBootCrashTask(t, "bc-reg-bumpidem", corev1.PodFailed)
+		r := newTaskReconciler(newFakeSession())
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+		// Two bumps for the SAME pod UID (the cache-lag race) must count once.
+		if err := r.bumpBootCrashAttempts(ctx, task, "pod-uid-x"); err != nil {
+			t.Fatalf("bump 1: %v", err)
+		}
+		if err := r.bumpBootCrashAttempts(ctx, getTask(t, "bc-reg-bumpidem"), "pod-uid-x"); err != nil {
+			t.Fatalf("bump 2: %v", err)
+		}
+		got := getTask(t, "bc-reg-bumpidem")
+		if n := got.Annotations[annBootCrashAttempts]; n != "1" {
+			t.Fatalf("attempts = %q, want 1: same pod UID must bump at most once", n)
+		}
+		// A distinct pod UID still advances the budget.
+		if err := r.bumpBootCrashAttempts(ctx, got, "pod-uid-y"); err != nil {
+			t.Fatalf("bump 3: %v", err)
+		}
+		if n := getTask(t, "bc-reg-bumpidem").Annotations[annBootCrashAttempts]; n != "2" {
+			t.Fatalf("attempts = %q, want 2: distinct pod UID must count", n)
+		}
+	})
+}

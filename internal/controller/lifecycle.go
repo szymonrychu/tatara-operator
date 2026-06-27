@@ -298,6 +298,7 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 			}
 			delete(fresh2.Annotations, annBootCrashAttempts)
 			delete(fresh2.Annotations, annBootCrashDiagnostics)
+			delete(fresh2.Annotations, annBootCrashLastPodUID)
 			return r.Update(ctx, fresh2)
 		}); err != nil {
 			// Non-fatal: log and continue. The state transition itself already succeeded.
