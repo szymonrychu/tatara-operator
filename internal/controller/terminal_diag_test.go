@@ -70,7 +70,7 @@ func TestHandleAgentUnreachableCommentsTerminalDiagnostics(t *testing.T) {
 	task.Status.Phase = "Running"
 	require.NoError(t, k8sClient.Status().Update(ctx, task))
 
-	_, err, handled := r.handleAgentUnreachable(ctx, getTask(t, "td-unreachable"),
+	_, err, handled := r.handleTransientWrapper(ctx, getTask(t, "td-unreachable"),
 		&agent.UnreachableError{Err: errors.New("connection refused")})
 	require.NoError(t, err)
 	require.True(t, handled)

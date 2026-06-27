@@ -751,21 +751,24 @@ func (r *TaskReconciler) commentTerminalDiagnostics(ctx context.Context, task *t
 	r.postTerminalComment(ctx, task, body)
 }
 
-// handleAgentUnreachable handles a SubmitTurn error: when it is an agent
-// UnreachableError (the wrapper pod's turn server is still booting even though
-// the pod is Ready), it returns a short fixed requeue so the reconcile does
-// NOT return an error - returning an error would trip controller-runtime's
-// exponential backoff and idle the task for minutes. handled=false means the
-// error is not a boot-race and the caller surfaces it as a real failure.
+// handleTransientWrapper handles a SubmitTurn error that means "the wrapper is
+// not ready yet" rather than a hard failure: either an agent UnreachableError
+// (the turn server is still booting even though the pod is Ready) or a wrapper
+// HTTPError with a transient status (503 session not ready/dead, 425 too early
+// - see agent.IsTransientWrapper). Both stem from endpoint-readiness
+// propagation lag and are the same condition, so it returns a short fixed
+// requeue and does NOT return an error - returning an error would trip
+// controller-runtime's exponential backoff and idle the task for minutes.
+// handled=false means the error is not a transient wrapper condition and the
+// caller surfaces it as a real failure.
 //
-// To bound a pod that is permanently unreachable (Ready but never accepting
-// turns), the first boot-race stamps annAgentUnreachableSince; once the agent
-// has been unreachable for longer than agentBootDeadline the Task is
+// To bound a pod that never starts accepting turns (Ready but always
+// unreachable/503), the first occurrence stamps annAgentUnreachableSince; once
+// the wrapper has been not-ready for longer than agentBootDeadline the Task is
 // terminated instead of requeued forever. The marker is cleared on the next
 // successful turn submit (recordTurn) and on each lifecycle state reset.
-func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatarav1alpha1.Task, err error) (ctrl.Result, error, bool) {
-	var unreachable *agent.UnreachableError
-	if !errors.As(err, &unreachable) {
+func (r *TaskReconciler) handleTransientWrapper(ctx context.Context, task *tatarav1alpha1.Task, err error) (ctrl.Result, error, bool) {
+	if !agent.IsTransientWrapper(err) {
 		return ctrl.Result{}, nil, false
 	}
 	l := log.FromContext(ctx)
@@ -782,8 +785,9 @@ func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatar
 		}
 	case time.Now().After(started.Add(agentBootDeadline)):
 		r.Metrics.AgentUnreachableTermination()
-		l.Info("agent unreachable past boot deadline; failing task",
-			"task", task.Name, "since", started.Format(time.RFC3339), "deadline", agentBootDeadline.String())
+		l.Info("wrapper not ready past boot deadline; failing task",
+			"task", task.Name, "since", started.Format(time.RFC3339),
+			"deadline", agentBootDeadline.String(), "outcome", agent.SubmitOutcome(err))
 		detail := fmt.Sprintf("wrapper agent unreachable for over %s", agentBootDeadline)
 		res, terr := r.terminate(ctx, task, "Failed", "AgentUnreachable", detail)
 		if terr == nil {
@@ -793,13 +797,37 @@ func (r *TaskReconciler) handleAgentUnreachable(ctx context.Context, task *tatar
 	}
 
 	r.Metrics.AgentBootRaceRequeue()
-	l.Info("agent not yet accepting turns; requeuing",
-		"task", task.Name, "requeueAfter", agentBootRequeue.String())
+	l.Info("wrapper not yet accepting turns; requeuing",
+		"task", task.Name, "requeueAfter", agentBootRequeue.String(),
+		"outcome", agent.SubmitOutcome(err))
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
 }
 
-// stampUnreachableSince records the first time the agent was found unreachable
-// for the current run, so handleAgentUnreachable can enforce agentBootDeadline.
+// handleTurnSubmitFailure records the operator_turn_submit_total metric for a
+// failed SubmitTurn and decides how the reconcile proceeds. A transient
+// wrapper-not-ready error (boot-race or HTTP 503/425) is routed through
+// handleTransientWrapper - it requeues without a reconcile error and is counted
+// as result="transient" so the turn-submit failure-ratio alert (which keys on
+// result="error") is not inflated by benign readiness races (issue #164). A
+// hard failure is counted as result="error", logged at the failure site with
+// the wrapper status/body (via err) and context, and returned wrapped so
+// controller-runtime applies backoff. phase is "plan" or "subtask"; subtask is
+// the subtask name ("" for the plan turn). outcome carries the specific cause.
+func (r *TaskReconciler) handleTurnSubmitFailure(ctx context.Context, task *tatarav1alpha1.Task, err error, elapsed float64, phase, subtask string) (ctrl.Result, error) {
+	outcome := agent.SubmitOutcome(err)
+	if res, herr, handled := r.handleTransientWrapper(ctx, task, err); handled {
+		r.Metrics.TurnSubmit(task.Spec.Kind, "transient", outcome, elapsed)
+		return res, herr
+	}
+	r.Metrics.TurnSubmit(task.Spec.Kind, "error", outcome, elapsed)
+	log.FromContext(ctx).Error(err, "turn submit failed",
+		"action", "agent_turn_submit", "resource_id", task.Name,
+		"subtask", subtask, "phase", phase, "outcome", outcome)
+	return ctrl.Result{}, fmt.Errorf("submit %s turn: %w", phase, err)
+}
+
+// stampUnreachableSince records the first time the wrapper was found not ready
+// for the current run, so handleTransientWrapper can enforce agentBootDeadline.
 // An existing VALID timestamp is preserved (the deadline is anchored to the
 // earliest sighting); an absent or unparseable value is overwritten with now.
 func (r *TaskReconciler) stampUnreachableSince(ctx context.Context, task *tatarav1alpha1.Task) error {
@@ -838,13 +866,9 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		id, err := r.Session.SubmitTurn(ctx, baseURL, planText, cbURL)
 		elapsed := time.Since(t0).Seconds()
 		if err != nil {
-			r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
-			if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
-				return res, herr
-			}
-			return ctrl.Result{}, fmt.Errorf("submit plan turn: %w", err)
+			return r.handleTurnSubmitFailure(ctx, task, err, elapsed, "plan", "")
 		}
-		r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
+		r.Metrics.TurnSubmit(task.Spec.Kind, "ok", "ok", elapsed)
 		l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
 			"turn_id", id, "subtask", "", "duration_ms", int64(elapsed*1000))
 		res, err := r.recordTurn(ctx, task, id, "")
@@ -929,13 +953,9 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 	id, err := r.Session.SubmitTurn(ctx, baseURL, turnText(*next, taskBranch(task), task.Name), cbURL)
 	elapsed := time.Since(t0).Seconds()
 	if err != nil {
-		r.Metrics.TurnSubmit(task.Spec.Kind, "error", elapsed)
-		if res, herr, handled := r.handleAgentUnreachable(ctx, task, err); handled {
-			return res, herr
-		}
-		return ctrl.Result{}, fmt.Errorf("submit subtask turn: %w", err)
+		return r.handleTurnSubmitFailure(ctx, task, err, elapsed, "subtask", next.Name)
 	}
-	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", elapsed)
+	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", "ok", elapsed)
 	l.Info("turn submitted", "action", "agent_turn_submit", "resource_id", task.Name,
 		"turn_id", id, "subtask", next.Name, "duration_ms", int64(elapsed*1000))
 	// Persist the new turn id BEFORE flipping phases so that if either
