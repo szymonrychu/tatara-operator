@@ -210,3 +210,5 @@ func TestFinishTriage_HumanFiled_Discuss_ListCommentsError_PostsComment(t *testi
 	require.Equal(t, 1, posted,
 		"ListIssueComments error must fail open and POST the discuss comment; got: %v", w.commentBodies)
 }
+
+func (w *commentCapturingWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error { return nil }

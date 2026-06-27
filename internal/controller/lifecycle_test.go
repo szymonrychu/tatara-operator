@@ -2344,3 +2344,7 @@ func TestImplementPrompt_SystemicGroup(t *testing.T) {
 		t.Fatalf("prompt must reference cross-repo sibling: %s", got)
 	}
 }
+
+func (f *lifecycleFakeSCMWriterMainCI) EnsureLabel(_ context.Context, _, _, _, _ string) error {
+	return nil
+}

@@ -470,3 +470,5 @@ func TestCommentOnIssue_PostsWhenBotNotYetCommented(t *testing.T) {
 	defer writer.mu.Unlock()
 	require.Len(t, writer.comments, 1)
 }
+
+func (f *fakeWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error { return nil }

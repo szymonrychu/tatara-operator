@@ -692,3 +692,9 @@ func TestCommentDrain_SuccessUsesRequeueAfter(t *testing.T) {
 		t.Error("comment drain success must return RequeueAfter, not bare Requeue:true")
 	}
 }
+
+func (w *closeCountingWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error { return nil }
+
+func (w *mainCICloseCountingWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error {
+	return nil
+}

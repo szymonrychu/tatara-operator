@@ -707,6 +707,54 @@ func (r *ProjectReconciler) projectReposForScan(ctx context.Context, proj *tatar
 	return out, nil
 }
 
+// labelsColoredAnnotation marks a Project whose managed labels have been colored,
+// so the one-shot ensure does not re-issue SCM calls every reconcile.
+const labelsColoredAnnotation = "tatara.dev/labels-colored"
+
+// ensureLabelColors best-effort creates/updates the managed tatara labels with
+// their colors across the project's repos, once per project (gated by the
+// annotation). Failures are logged and tolerated; it never blocks reconcile.
+func (r *ProjectReconciler) ensureLabelColors(ctx context.Context, proj *tatarav1alpha1.Project) {
+	if proj.Spec.Scm == nil || proj.Annotations[labelsColoredAnnotation] == "true" {
+		return
+	}
+	l := log.FromContext(ctx)
+	writer, token, err := r.scanWriter(ctx, proj)
+	if err != nil {
+		l.Info("ensure label colors: scm writer unavailable (retry next reconcile)",
+			"action", "ensure_label_colors", "resource_id", proj.Name, "err", err.Error())
+		return
+	}
+	repos, err := r.projectReposForScan(ctx, proj)
+	if err != nil {
+		return
+	}
+	colors := managedLabelColors(proj.Spec.Scm)
+	allOK := true
+	for i := range repos {
+		for name, color := range colors {
+			if e := writer.EnsureLabel(ctx, repos[i].Spec.URL, token, name, color); e != nil {
+				allOK = false
+				l.Info("ensure label colors: EnsureLabel failed (non-fatal)",
+					"action", "ensure_label_colors", "resource_id", proj.Name,
+					"repo", repos[i].Name, "label", name, "err", e.Error())
+			}
+		}
+	}
+	if !allOK {
+		return // retry next reconcile
+	}
+	patch := client.MergeFrom(proj.DeepCopy())
+	if proj.Annotations == nil {
+		proj.Annotations = map[string]string{}
+	}
+	proj.Annotations[labelsColoredAnnotation] = "true"
+	if e := r.Patch(ctx, proj, patch); e != nil {
+		l.Info("ensure label colors: annotation patch failed (non-fatal)",
+			"action", "ensure_label_colors", "resource_id", proj.Name, "err", e.Error())
+	}
+}
+
 // existingScanTasks lists Project-owned Tasks carrying the dedup activity label.
 func (r *ProjectReconciler) existingScanTasks(ctx context.Context, proj *tatarav1alpha1.Project) ([]tatarav1alpha1.Task, error) {
 	var list tatarav1alpha1.TaskList

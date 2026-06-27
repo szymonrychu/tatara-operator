@@ -397,6 +397,29 @@ func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string)
 	return nil
 }
 
+// EnsureLabel creates the repo label with the given color, or updates its color
+// if it already exists (POST -> 422 already-exists -> PATCH color). color is 6
+// hex digits without a leading '#'.
+func (c *GitHub) EnsureLabel(ctx context.Context, repoURL, token, name, color string) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	err = ghDo(ctx, c.base(), http.MethodPost,
+		fmt.Sprintf("/repos/%s/%s/labels", owner, repo), token,
+		map[string]string{"name": name, "color": color}, nil)
+	if err == nil {
+		return nil
+	}
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity {
+		return ghDo(ctx, c.base(), http.MethodPatch,
+			fmt.Sprintf("/repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name)), token,
+			map[string]string{"color": color}, nil)
+	}
+	return err
+}
+
 // ghCheckRun is the decoded shape of one GitHub check-run entry.
 type ghCheckRun struct {
 	Status     string `json:"status"`
