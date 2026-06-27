@@ -535,6 +535,55 @@ func TestTaskReconcile_WrapperHTTP503_RequeuesWithoutError(t *testing.T) {
 	}
 }
 
+// TestTaskReconcile_WrapperHTTP409_RequeuesWithoutError verifies that a wrapper
+// HTTP 409 ("session busy") on submit is treated as transient backpressure (the
+// session is processing a prior turn) rather than a dispatch failure: the
+// reconcile requeues on busyRequeue without an error (no exponential backoff),
+// no turn is recorded, and the submit is counted as result="transient" with
+// outcome="http_409" - NOT result="error" - so the turn-submit failure-ratio
+// alert is not inflated by expected contention (issue #168).
+func TestTaskReconcile_WrapperHTTP409_RequeuesWithoutError(t *testing.T) {
+	mkTaskProject(t, "p-409", 3)
+	mkTaskRepository(t, "r-409", "p-409")
+	mkTask(t, "t-409", "p-409", "r-409")
+	setProjectMemoryReady(t, "p-409", "http://mem-p-409.tatara.svc:8080")
+
+	fs := newFakeSession()
+	r, reg := newTaskReconcilerReg(fs)
+	if _, err := reconcileTask(t, r, "t-409"); err != nil {
+		t.Fatalf("reconcile spawn: %v", err)
+	}
+	markPodReady(t, "wrapper-t-409")
+	// The session already has a turn in flight (the operator's view raced the
+	// wrapper's session release), so the wrapper refuses the submit with 409.
+	fs.submitErr = &agent.HTTPError{Status: 409, Body: "session busy"}
+
+	res, err := reconcileTask(t, r, "t-409")
+	if err != nil {
+		t.Fatalf("wrapper 409 must not error the reconcile (would trigger exponential backoff): %v", err)
+	}
+	if res.RequeueAfter != busyRequeue {
+		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, busyRequeue)
+	}
+	if _, ok := fs.lastSubmit(); ok {
+		t.Error("no turn should be recorded when the submit fails")
+	}
+	if tk := getTask(t, "t-409"); tk.Annotations[annCurrentTurn] != "" {
+		t.Errorf("current-turn annotation should be empty, got %q", tk.Annotations[annCurrentTurn])
+	}
+	if got := counterValue(t, reg, "operator_agent_session_busy_requeue_total", nil); got != 1 {
+		t.Errorf("operator_agent_session_busy_requeue_total = %v, want 1", got)
+	}
+	if v := counterValue(t, reg, "operator_turn_submit_total",
+		map[string]string{"result": "transient", "outcome": "http_409"}); v < 1 {
+		t.Errorf("operator_turn_submit_total{result=transient,outcome=http_409} = %v, want >= 1", v)
+	}
+	if v := counterValue(t, reg, "operator_turn_submit_total",
+		map[string]string{"result": "error"}); v != 0 {
+		t.Errorf("operator_turn_submit_total{result=error} = %v, want 0 (session-busy 409 must not inflate the failure ratio)", v)
+	}
+}
+
 func TestTaskReconcile_AgentUnreachable_StampStableAcrossRequeues(t *testing.T) {
 	mkTaskProject(t, "p-unrstable", 3)
 	mkTaskRepository(t, "r-unrstable", "p-unrstable")

@@ -21,6 +21,7 @@ type OperatorMetrics struct {
 	issueOutcomeTotal         *prometheus.CounterVec
 	tasksInflightKind         *prometheus.GaugeVec
 	agentBootRaceRequeue      prometheus.Counter
+	agentSessionBusyRequeue   prometheus.Counter
 	openProposals             *prometheus.GaugeVec
 	turnTimeoutTotal          *prometheus.CounterVec
 	ingestJobTotal            *prometheus.CounterVec
@@ -121,6 +122,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_agent_boot_race_requeue_total",
 			Help: "Times a turn submit hit a still-booting wrapper and was requeued instead of erroring.",
 		}),
+		agentSessionBusyRequeue: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "operator_agent_session_busy_requeue_total",
+			Help: "Times a turn submit hit a wrapper 409 \"session busy\" and was requeued as transient backpressure instead of erroring (issue #168).",
+		}),
 		openProposals: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_open_proposals",
 			Help: "Open, unapproved agent-proposed issues per repo.",
@@ -159,7 +164,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"result"}),
 		turnSubmitTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_turn_submit_total",
-			Help: "Total turn submissions to agent wrappers by kind, result and outcome. result is ok, error (hard failure -> reconcile backoff) or transient (a handled wrapper-not-ready requeue: boot-race or HTTP 503/425, NOT a failure). outcome is the specific cause (ok/unreachable/http_503/http_409/http_425/http_error/timeout/error); fine-grained transport reasons live in operator_agent_http_total. Alert on result=error to exclude benign readiness races (issue #164).",
+			Help: "Total turn submissions to agent wrappers by kind, result and outcome. result is ok, error (hard failure -> reconcile backoff) or transient (a handled requeue, NOT a failure: a wrapper-not-ready boot-race or HTTP 503/425, or a 409 \"session busy\" backpressure requeue). outcome is the specific cause (ok/unreachable/http_503/http_409/http_425/http_error/timeout/error); fine-grained transport reasons live in operator_agent_http_total. Alert on result=error to exclude benign readiness races and session-busy backpressure (issues #164, #168).",
 		}, []string{"kind", "result", "outcome"}),
 		turnSubmitDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "operator_turn_submit_duration_seconds",
@@ -275,6 +280,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.issueOutcomeTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
+		m.agentSessionBusyRequeue,
 		m.openProposals,
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
@@ -439,6 +445,13 @@ func (m *OperatorMetrics) IssueOutcomeTotal(action string) prometheus.Counter {
 // turn submit reached a still-booting wrapper and was requeued (not errored).
 func (m *OperatorMetrics) AgentBootRaceRequeue() {
 	m.agentBootRaceRequeue.Inc()
+}
+
+// AgentSessionBusyRequeue increments operator_agent_session_busy_requeue_total: a
+// turn submit hit a wrapper 409 "session busy" and was requeued as transient
+// backpressure instead of erroring (issue #168).
+func (m *OperatorMetrics) AgentSessionBusyRequeue() {
+	m.agentSessionBusyRequeue.Inc()
 }
 
 // AgentBootCrash increments operator_agent_boot_crash_total for a wrapper Pod
