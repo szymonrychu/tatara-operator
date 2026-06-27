@@ -356,6 +356,12 @@ func (r *TaskReconciler) resetAgentRun(ctx context.Context, task *tatarav1alpha1
 			return err
 		}
 		fresh.Status.Phase = ""
+		// A fresh agent run starts with a fresh writeback-skip budget: clear the
+		// issue-166 4xx-skip attempt counter so a re-entered Implement (e.g. after a
+		// Conversation nudge once the offending repo URL/token is fixed) is not
+		// wrongly capped by stale attempts. For one-shot non-lifecycle tasks this is
+		// never reached, so their loop cap still persists across re-entry.
+		fresh.Status.WritebackSkip4xxAttempts = 0
 		// Clear WritebackPending.
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               "WritebackPending",
