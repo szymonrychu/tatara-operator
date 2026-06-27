@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -16,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -76,6 +78,10 @@ type RepositoryReconciler struct {
 	Scheme       *runtime.Scheme
 	Metrics      *obs.OperatorMetrics
 	IngestConfig ingest.Config
+	// Recorder emits Kubernetes Events on the Repository (e.g. why an ingest
+	// failed) so the cause survives the short-lived Job pod's GC. May be nil in
+	// tests, in which case Event emission is skipped.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=repositories,verbs=get;list;watch;create;update;patch;delete
@@ -83,6 +89,8 @@ type RepositoryReconciler struct {
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile launches and tracks the ingest Job for a Repository per the
 // re-ingest trigger contract.
@@ -116,8 +124,13 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return r.handleFinishedJob(ctx, &repo, &job)
 		case apierrors.IsNotFound(err):
 			// Job vanished (TTL/manual delete); clear and re-evaluate.
-			repo.Status.JobName = ""
-			if err := r.Status().Update(ctx, &repo); err != nil {
+			if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+				if fresh.Status.JobName == "" {
+					return false
+				}
+				fresh.Status.JobName = ""
+				return true
+			}); err != nil {
 				r.Metrics.ReconcileResult("Repository", "error")
 				return ctrl.Result{}, fmt.Errorf("clear stale jobName: %w", err)
 			}
@@ -134,14 +147,16 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
-		meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-			Type:               "MemoryNotReady",
-			Status:             metav1.ConditionTrue,
-			Reason:             "MemoryProvisioning",
-			Message:            "waiting for project " + project.Name + " memory stack to become Ready",
-			ObservedGeneration: repo.Generation,
-		})
-		if err := r.Status().Update(ctx, &repo); err != nil {
+		if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+				Type:               "MemoryNotReady",
+				Status:             metav1.ConditionTrue,
+				Reason:             "MemoryProvisioning",
+				Message:            "waiting for project " + project.Name + " memory stack to become Ready",
+				ObservedGeneration: fresh.Generation,
+			})
+			return true
+		}); err != nil {
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("set MemoryNotReady condition: %w", err)
 		}
@@ -154,17 +169,17 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// Memory is Ready: clear the provisioning condition if it lingers from an
 	// earlier not-ready reconcile. Persist immediately when it flips, so it clears
 	// even on reconciles that launch no ingest (already-ingested repos).
-	if meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-		Type:               "MemoryNotReady",
-		Status:             metav1.ConditionFalse,
-		Reason:             "MemoryReady",
-		Message:            "project memory stack is Ready",
-		ObservedGeneration: repo.Generation,
-	}) {
-		if err := r.Status().Update(ctx, &repo); err != nil {
-			r.Metrics.ReconcileResult("Repository", "error")
-			return ctrl.Result{}, fmt.Errorf("clear MemoryNotReady condition: %w", err)
-		}
+	if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+		return meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "MemoryNotReady",
+			Status:             metav1.ConditionFalse,
+			Reason:             "MemoryReady",
+			Message:            "project memory stack is Ready",
+			ObservedGeneration: fresh.Generation,
+		})
+	}); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("clear MemoryNotReady condition: %w", err)
 	}
 
 	since, want := r.ingestDecision(&repo)
@@ -173,17 +188,22 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// in a failing state, clear any stale IngestBackoff condition so it does
 		// not misreport health.
 		if repo.Status.IngestFailureCount == 0 {
-			if meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-				Type:               "IngestBackoff",
-				Status:             metav1.ConditionFalse,
-				Reason:             "IngestIdle",
-				Message:            "no ingest pending and no recent failures",
-				ObservedGeneration: repo.Generation,
-			}) {
-				if err := r.Status().Update(ctx, &repo); err != nil {
-					r.Metrics.ReconcileResult("Repository", "error")
-					return ctrl.Result{}, fmt.Errorf("clear stale IngestBackoff condition: %w", err)
+			if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+				// Re-check on the fresh object: a concurrent failure write may have
+				// raised the count, in which case the backoff condition is not stale.
+				if fresh.Status.IngestFailureCount != 0 {
+					return false
 				}
+				return meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+					Type:               "IngestBackoff",
+					Status:             metav1.ConditionFalse,
+					Reason:             "IngestIdle",
+					Message:            "no ingest pending and no recent failures",
+					ObservedGeneration: fresh.Generation,
+				})
+			}); err != nil {
+				r.Metrics.ReconcileResult("Repository", "error")
+				return ctrl.Result{}, fmt.Errorf("clear stale IngestBackoff condition: %w", err)
 			}
 		}
 		res, err := r.scheduleNextReingest(ctx, &repo)
@@ -202,15 +222,18 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		retryAt := repo.Status.LastIngestFailureTime.Add(backoff)
 		if time.Now().Before(retryAt) {
 			remaining := time.Until(retryAt)
-			meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-				Type:   "IngestBackoff",
-				Status: metav1.ConditionTrue,
-				Reason: "IngestFailing",
-				Message: fmt.Sprintf("ingest has failed %d time(s); next retry in %s",
-					repo.Status.IngestFailureCount, remaining.Round(time.Second)),
-				ObservedGeneration: repo.Generation,
-			})
-			if err := r.Status().Update(ctx, &repo); err != nil {
+			failCount := repo.Status.IngestFailureCount
+			if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+				meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+					Type:   "IngestBackoff",
+					Status: metav1.ConditionTrue,
+					Reason: "IngestFailing",
+					Message: fmt.Sprintf("ingest has failed %d time(s); next retry in %s",
+						failCount, remaining.Round(time.Second)),
+					ObservedGeneration: fresh.Generation,
+				})
+				return true
+			}); err != nil {
 				r.Metrics.ReconcileResult("Repository", "error")
 				return ctrl.Result{}, fmt.Errorf("set IngestBackoff condition: %w", err)
 			}
@@ -224,15 +247,6 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	// Clear any lingering IngestBackoff condition before launching.
-	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-		Type:               "IngestBackoff",
-		Status:             metav1.ConditionFalse,
-		Reason:             "IngestRetrying",
-		Message:            "backoff elapsed, launching ingest job",
-		ObservedGeneration: repo.Generation,
-	})
-
 	if err := r.ensureResultConfigMap(ctx, &repo); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("ensure result configmap: %w", err)
@@ -244,16 +258,26 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("create ingest job: %w", err)
 	}
 
-	repo.Status.JobName = job.Name
-	repo.Status.Phase = "Ingesting"
-	meta.SetStatusCondition(&repo.Status.Conditions, metav1.Condition{
-		Type:               "Ingested",
-		Status:             metav1.ConditionFalse,
-		Reason:             "IngestStarted",
-		Message:            "ingest job " + job.Name + " launched",
-		ObservedGeneration: repo.Generation,
-	})
-	if err := r.Status().Update(ctx, &repo); err != nil {
+	if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+		// Clear any lingering IngestBackoff condition before recording the launch.
+		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "IngestBackoff",
+			Status:             metav1.ConditionFalse,
+			Reason:             "IngestRetrying",
+			Message:            "backoff elapsed, launching ingest job",
+			ObservedGeneration: fresh.Generation,
+		})
+		fresh.Status.JobName = job.Name
+		fresh.Status.Phase = "Ingesting"
+		meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "Ingested",
+			Status:             metav1.ConditionFalse,
+			Reason:             "IngestStarted",
+			Message:            "ingest job " + job.Name + " launched",
+			ObservedGeneration: fresh.Generation,
+		})
+		return true
+	}); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
 	}
@@ -438,6 +462,35 @@ func (r *RepositoryReconciler) ensureResultConfigMap(ctx context.Context, repo *
 	return nil
 }
 
+// patchStatus applies mutate to a freshly fetched copy of repo and writes the
+// status subresource, retrying on conflict. mutate reports whether it changed
+// anything; when it returns false the write is skipped. On success the persisted
+// object is copied back into repo so later reads in the same Reconcile observe
+// the applied change. This is the conflict-safe analogue of a bare
+// r.Status().Update on the object fetched at the top of Reconcile: Repository
+// status is also written by handleFinishedJob, the REST API handlers, and the
+// webhook server, any of which can advance the resourceVersion between that Get
+// and the write (the source of the IngestBackoff 409-conflict reconcile-error
+// storm). It matches the retry.RetryOnConflict + fresh-Get convention used by the
+// rest of this file.
+func (r *RepositoryReconciler) patchStatus(ctx context.Context, repo *tataradevv1alpha1.Repository, mutate func(*tataradevv1alpha1.Repository) bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tataradevv1alpha1.Repository{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
+			return err
+		}
+		if !mutate(fresh) {
+			*repo = *fresh
+			return nil
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*repo = *fresh
+		return nil
+	})
+}
+
 // handleFinishedJob applies a terminal ingest Job's outcome to the Repository
 // status: on success it reads the resolved HEAD SHA from the result ConfigMap
 // and records lastIngestedCommit/lastIngestTime/phase=Ingested; on failure it
@@ -536,6 +589,15 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 
 	r.Metrics.IngestJobResult("failure", mode)
 	failTime := metav1.NewTime(time.Now())
+	// Capture WHY the ingest failed from the failed pod's terminated-container
+	// state (the FallbackToLogsOnError termination message) before it is GC'd, so
+	// the cause lands in the status condition, the log line, and an Event rather
+	// than only "Job failed".
+	reason := r.failedPodReason(ctx, job)
+	condMsg := "ingest job " + job.Name + " failed"
+	if reason != "" {
+		condMsg += ": " + reason
+	}
 	var newFailureCount int
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tataradevv1alpha1.Repository{}
@@ -550,7 +612,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 			Type:               "Ingested",
 			Status:             metav1.ConditionFalse,
 			Reason:             "IngestFailed",
-			Message:            "ingest job " + job.Name + " failed",
+			Message:            condMsg,
 			ObservedGeneration: fresh.Generation,
 		})
 		if updateErr := r.Status().Update(ctx, fresh); updateErr != nil {
@@ -564,9 +626,81 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 	}
 	l.Info("ingest failed",
 		"action", "ingest_failed", "resource_id", repo.Name, "job", job.Name,
-		"failure_count", newFailureCount)
+		"failure_count", newFailureCount, "reason", reason)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(repo, nil, corev1.EventTypeWarning, "IngestFailed", "Ingest", "%s", condMsg)
+	}
 	r.Metrics.ReconcileResult("Repository", "error")
 	return ctrl.Result{RequeueAfter: ingestBackoff(newFailureCount)}, nil
+}
+
+// failedPodReason returns a short, human-readable reason for why the most recent
+// pod of a failed ingest Job terminated: the Kubernetes termination reason, the
+// exit code, and the captured termination message (the tail of the container log,
+// surfaced because the ingest containers run with
+// TerminationMessagePolicy=FallbackToLogsOnError). It scans the init container
+// (clone) first, then the ingest container, returning the first non-zero exit.
+// Returns "" when no failed pod or terminated container is found - the short-lived
+// Job pods are GC'd with the Job (TTL 600s), after which the in-pod cause is no
+// longer observable and the caller falls back to a generic message.
+func (r *RepositoryReconciler) failedPodReason(ctx context.Context, job *batchv1.Job) string {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(job.Namespace),
+		client.MatchingLabels{"batch.kubernetes.io/job-name": job.Name}); err != nil {
+		return ""
+	}
+	var pod *corev1.Pod
+	for i := range pods.Items {
+		if p := &pods.Items[i]; pod == nil || podStartedAfter(p, pod) {
+			pod = p
+		}
+	}
+	if pod == nil {
+		return ""
+	}
+	statuses := append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...)
+	for i := range statuses {
+		t := statuses[i].State.Terminated
+		if t == nil || t.ExitCode == 0 {
+			continue
+		}
+		return formatTermination(t)
+	}
+	return ""
+}
+
+// podStartedAfter reports whether pod a started later than pod b, so the most
+// recent attempt of a multi-pod Job (full ingest, BackoffLimit=2) is chosen.
+func podStartedAfter(a, b *corev1.Pod) bool {
+	if a.Status.StartTime == nil {
+		return false
+	}
+	if b.Status.StartTime == nil {
+		return true
+	}
+	return a.Status.StartTime.After(b.Status.StartTime.Time)
+}
+
+// formatTermination renders a terminated container state into a single line,
+// truncating the captured log tail so it stays bounded in the status condition
+// and Event.
+func formatTermination(t *corev1.ContainerStateTerminated) string {
+	const maxMsg = 512
+	msg := strings.TrimSpace(t.Message)
+	if len(msg) > maxMsg {
+		msg = msg[:maxMsg] + "..."
+	}
+	switch {
+	case t.Reason != "" && msg != "":
+		return fmt.Sprintf("%s (exit %d): %s", t.Reason, t.ExitCode, msg)
+	case msg != "":
+		return fmt.Sprintf("exit %d: %s", t.ExitCode, msg)
+	case t.Reason != "":
+		return fmt.Sprintf("%s (exit %d)", t.Reason, t.ExitCode)
+	default:
+		return fmt.Sprintf("exit %d", t.ExitCode)
+	}
 }
 
 // jobSucceeded reports whether the Job has a Complete=True condition.
@@ -606,6 +740,9 @@ func jobActive(job *batchv1.Job) bool {
 // SetupWithManager registers the reconciler, watching Repositories and the
 // Jobs they own.
 func (r *RepositoryReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.Recorder == nil {
+		r.Recorder = mgr.GetEventRecorder("repository-controller")
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tataradevv1alpha1.Repository{}).
 		Owns(&batchv1.Job{}).

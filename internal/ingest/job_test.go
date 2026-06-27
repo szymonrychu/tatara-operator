@@ -58,6 +58,27 @@ func TestBuildJob_IncrementalBackoffLimitIsZero(t *testing.T) {
 	}
 }
 
+// TestBuildJob_TerminationMessagePolicy verifies both the clone init container and
+// the ingest container use FallbackToLogsOnError, so Kubernetes captures the tail
+// of a non-zero-exit container's log into the Pod's terminated-state Message. The
+// controller reads that back to record WHY an ingest failed before the GC'd Job
+// pod's logs are gone.
+func TestBuildJob_TerminationMessagePolicy(t *testing.T) {
+	for _, since := range []string{"", "abc123"} {
+		job := BuildJob(testProject(), testRepository(), since, testBaseURL, testConfig())
+		init := job.Spec.Template.Spec.InitContainers[0]
+		if init.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+			t.Errorf("since=%q clone TerminationMessagePolicy = %q, want FallbackToLogsOnError",
+				since, init.TerminationMessagePolicy)
+		}
+		main := job.Spec.Template.Spec.Containers[0]
+		if main.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+			t.Errorf("since=%q ingest TerminationMessagePolicy = %q, want FallbackToLogsOnError",
+				since, main.TerminationMessagePolicy)
+		}
+	}
+}
+
 // TestBuildJob_IngestModeLabel verifies the Job and its Pod template carry the
 // ingest-mode label the controller reads back to attribute the ingest metric:
 // "incremental" when since is set, "full" otherwise.
