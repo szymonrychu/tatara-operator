@@ -51,6 +51,8 @@ type OperatorMetrics struct {
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
 	memoryRetrievalProbe      *prometheus.CounterVec
+	toolSurfaceProbe          *prometheus.CounterVec
+	toolSurfaceProbeDuration  *prometheus.HistogramVec
 	systemicSiblingsCollapsed *prometheus.CounterVec
 	systemicGroupsLed         *prometheus.CounterVec
 }
@@ -266,6 +268,26 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_retrieval_probe_total",
 			Help: "Unauthenticated route-presence probes of a project's tatara-memory retrieval surface by route and result.",
 		}, []string{"route", "result"}),
+		// Synthetic probe of the operator-write and chat tool-backend surfaces from
+		// the in-cluster agent vantage (the sibling of memoryRetrievalProbe, which
+		// covers tatara-memory). result is "ok" (2xx), "present" (401/403 or other
+		// 4xx: route + auth gate served, no token to assert handler health),
+		// "absent" (404 -> route drift / stale binary), "error" (5xx -> handler
+		// broken), or "unreachable" (transport failure -> process down). vantage is
+		// "in-cluster" today; the label is reserved so an external-ingress vantage
+		// can be added later without a series reset.
+		toolSurfaceProbe: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_tool_surface_probe_total",
+			Help: "Synthetic probes of the operator-write and chat tool backends by backend, vantage, and result.",
+		}, []string{"backend", "vantage", "result"}),
+		toolSurfaceProbeDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "operator_tool_surface_probe_duration_seconds",
+			Help: "Wall-clock duration of a single tool-surface probe by backend and vantage.",
+			// Network call bounded by toolSurfaceProbeTimeout (3s); the 0.05->25.6s
+			// range (matching the agent/turn HTTP histograms) captures a timeout in
+			// a real bucket rather than +Inf.
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
+		}, []string{"backend", "vantage"}),
 		systemicSiblingsCollapsed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_systemic_siblings_collapsed_total",
 			Help: "Systemic-group sibling issues collapsed (no separate agent spawned), by project.",
@@ -321,6 +343,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.lightragDocuments,
 		m.lightragQueryErrors,
 		m.memoryRetrievalProbe,
+		m.toolSurfaceProbe,
+		m.toolSurfaceProbeDuration,
 		m.systemicSiblingsCollapsed,
 		m.systemicGroupsLed,
 	)
@@ -406,6 +430,16 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		for _, result := range []string{"present", "absent", "error"} {
 			m.memoryRetrievalProbe.WithLabelValues(route, result)
 		}
+	}
+	// Pre-seed the tool-surface probe series so the backend x result matrix
+	// exists at a zero baseline before the first probe (alertable from startup).
+	// The backend labels must mirror the probes in updateToolSurfaceProbe and the
+	// result labels the classifier in probeToolSurfaceRoute.
+	for _, backend := range []string{"operator", "chat"} {
+		for _, result := range []string{"ok", "present", "absent", "error", "unreachable"} {
+			m.toolSurfaceProbe.WithLabelValues(backend, "in-cluster", result)
+		}
+		m.toolSurfaceProbeDuration.WithLabelValues(backend, "in-cluster")
 	}
 	return m
 }
@@ -729,6 +763,15 @@ func (m *OperatorMetrics) LightragQueryError() {
 // probed route and result ("present", "absent", or "error").
 func (m *OperatorMetrics) MemoryRetrievalProbe(route, result string) {
 	m.memoryRetrievalProbe.WithLabelValues(route, result).Inc()
+}
+
+// ToolSurfaceProbe increments operator_tool_surface_probe_total for one probe of
+// (backend, vantage) with the classified result, and records the probe latency
+// in operator_tool_surface_probe_duration_seconds. result is one of "ok",
+// "present", "absent", "error", "unreachable".
+func (m *OperatorMetrics) ToolSurfaceProbe(backend, vantage, result string, seconds float64) {
+	m.toolSurfaceProbe.WithLabelValues(backend, vantage, result).Inc()
+	m.toolSurfaceProbeDuration.WithLabelValues(backend, vantage).Observe(seconds)
 }
 
 // TaskTerminal increments operator_task_terminal_total for a Task reaching a
