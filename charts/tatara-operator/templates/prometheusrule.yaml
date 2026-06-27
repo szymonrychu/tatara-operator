@@ -141,6 +141,13 @@ spec:
           annotations:
             summary: "wrapper metric pushes are being rejected"
             description: "operator_push_receive_total{result=\"rejected\"} increased in 15m: ephemeral wrapper/ingest pod metrics are being lost at the push receiver, a self-observability blind spot."
+        - alert: TataraPushMetricsDropped
+          expr: increase(operator_push_series_dropped_total{reason="reserved_name"}[15m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "pushed metric families are being dropped for an unallowed name prefix"
+            description: "operator_push_series_dropped_total{reason=\"reserved_name\"} increased in 15m: a short-lived pod pushed a metric family whose name matches no prefix in the push allowlist (operator chart value pushMetricsAllowedPrefixes / PUSH_METRICS_ALLOWED_PREFIXES), so it was silently dropped before reaching Prometheus. This is allowlist drift (issue #129): a wrapper or ingester added a metric family whose prefix is not admitted. The receiver logs the dropped family names at WARN (action=\"push_series_dropped\") on each affected push; add their prefix to pushMetricsAllowedPrefixes."
         - alert: TataraReaperDeleteErrors
           expr: increase(operator_reap_delete_error_total[1h]) > 0
           labels:

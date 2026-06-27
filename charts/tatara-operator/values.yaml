@@ -78,10 +78,15 @@ taskRetentionHours: 168
 # pushMetricsAllowedPrefixes is the comma-separated metric-name prefix allowlist
 # the push-receiver enforces on short-lived-pod metric pushes. Series whose name
 # matches no prefix are dropped (operator_push_series_dropped_total{reason=
-# "reserved_name"}). wrapper_/agent_ cover the agent wrapper pods; memory_ admits
-# the scheduled retrieval-quality eval (tatara-memory) and ingest_ the repo
-# ingester, so those short-lived Jobs can push without a receiver code change.
-pushMetricsAllowedPrefixes: "wrapper_,agent_,memory_,ingest_"
+# "reserved_name"}, alerted by TataraPushMetricsDropped). These are the REAL
+# names the ephemeral producers push: the wrapper pods emit ccw_* and
+# tatara_wrapper_* (issue #129); the repo ingester emits ingest_* plus
+# analyzer_*/semantic_*/scip_*/llm_*. wrapper_/agent_ are kept as reserved
+# prefixes for future agent series. memory_ is intentionally absent: the memory
+# service is scraped, not pushed (it emits lightrag_*/code_graph_*/
+# tatara_memory_*), so memory_ matched nothing. Keep this in sync as new pushed
+# families appear; TataraPushMetricsDropped fires if a prefix is missed.
+pushMetricsAllowedPrefixes: "wrapper_,agent_,ccw_,tatara_wrapper_,ingest_,analyzer_,semantic_,scip_,llm_"
 
 # S3 conversation persistence (issue #114): the wrapper stores/restores each
 # issue's Claude conversation transcript in an S3-compatible bucket so a fresh
