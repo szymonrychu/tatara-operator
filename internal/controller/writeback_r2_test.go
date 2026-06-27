@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -182,6 +183,12 @@ func (r *fakePRReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.Issu
 func (r *fakePRReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
 }
+func (r *fakePRReader) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (r *fakePRReader) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
+}
 
 // TestWriteback_422AlreadyExists_RecoversPRURL verifies finding 2: when OpenChange
 // returns 422 "A pull request already exists", the controller recovers the
@@ -259,6 +266,12 @@ func (r *gitlabProjectPathReader) GetIssue(_ context.Context, _, _ string, _ int
 }
 func (r *gitlabProjectPathReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
+}
+func (r *gitlabProjectPathReader) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (r *gitlabProjectPathReader) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
 }
 
 // TestFindOpenIssueByTitle_GitLabProjectPath verifies finding 3: for GitLab

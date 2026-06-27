@@ -10,6 +10,7 @@ import (
 	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
+	"github.com/szymonrychu/tatara-operator/internal/refine"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1932,6 +1933,112 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 	}
 }
 
+// createRefineTask enqueues a project-scoped refine QueuedEvent.
+// Returns created=true when a new event was enqueued.
+func (r *ProjectReconciler) createRefineTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string) (bool, error) {
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	dedupKey := "refine-" + proj.Name
+	payload := tatarav1alpha1.QueuedEventPayload{
+		Kind:         "refine",
+		Goal:         goal,
+		Labels:       map[string]string{labelActivity: "refine"},
+		GenerateName: "refine-",
+		Provider:     provider,
+		PodRepo:      "",
+	}
+	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "scan: enqueue refine event failed; skipping", "action", "scan_enqueue_failed", "project", proj.Name)
+		return false, nil
+	}
+	if created {
+		r.Metrics.ScanTaskCreated("refine", "refine")
+	}
+	return created, nil
+}
+
+// inflightRefineTask returns the first non-terminal refine Task for the project,
+// or nil when no such task exists.
+func (r *ProjectReconciler) inflightRefineTask(ctx context.Context, proj *tatarav1alpha1.Project) (*tatarav1alpha1.Task, error) {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "refine" {
+			continue
+		}
+		if !tatarav1alpha1.TaskTerminal(t) {
+			return t, nil
+		}
+	}
+	return nil, nil
+}
+
+// latestTerminalRefineTask returns the most recently created terminal refine
+// Task for the project, or nil if none exist.
+func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *tatarav1alpha1.Project) (*tatarav1alpha1.Task, error) {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		return nil, err
+	}
+	var latest *tatarav1alpha1.Task
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "refine" {
+			continue
+		}
+		if !tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		if latest == nil || t.CreationTimestamp.After(latest.CreationTimestamp.Time) {
+			latest = t
+		}
+	}
+	return latest, nil
+}
+
+// refineNeededThisCycle reports whether the project needs a refine run this
+// cycle. Returns true when LastRefine is nil or was set before the earliest
+// due-activity base time (meaning the refine stamp predates the current cycle).
+func (r *ProjectReconciler) refineNeededThisCycle(proj *tatarav1alpha1.Project, earliestDueBase time.Time) bool {
+	if proj.Status.LastRefine == nil {
+		return true
+	}
+	return proj.Status.LastRefine.Before(&metav1.Time{Time: earliestDueBase})
+}
+
+// stampRefine records LastRefine on the project status.
+func (r *ProjectReconciler) stampRefine(ctx context.Context, proj *tatarav1alpha1.Project) error {
+	now := metav1.Now()
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Project{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
+			return err
+		}
+		fresh.Status.LastRefine = &now
+		proj.Status.LastRefine = &now
+		return r.Status().Update(ctx, fresh)
+	})
+}
+
+// projectRepoSlugs returns owner/repo slugs for all repositories in the project.
+func (r *ProjectReconciler) projectRepoSlugs(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository) []string {
+	var slugs []string
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		slugs = append(slugs, owner+"/"+name)
+	}
+	return slugs
+}
+
 // runScans runs each due activity and returns the soonest next-fire as a
 // requeue duration. Cron parsing/SCM/create failures are logged and skipped per
 // activity so one bad activity never blocks the others or crashes the reconciler.
@@ -1970,6 +2077,56 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	existing, err := r.existingScanTasks(ctx, proj)
 	if err != nil {
 		return 0, err
+	}
+
+	// refine barrier: before any due scan, ensure the project refiner has run
+	// this cycle.  Opt-in: only active when ClosedLookbackDays > 0.
+	// "This cycle" = LastRefine is nil or precedes the base time of at least one
+	// due scan.  The barrier defers all scans until a terminal refine Task exists;
+	// both Succeeded and Failed release the gate so a broken refine never wedges
+	// the platform.
+	if cronSpec.Refine.ClosedLookbackDays > 0 {
+		// Compute the earliest base among all due activities to decide whether
+		// this cycle still needs a refine.
+		var earliestBase time.Time
+		for _, act := range []string{"mrScan", "issueScan", "brainstorm", "healthCheck"} {
+			base, due, _, ok := r.activityDue(proj, act)
+			if ok && due {
+				if earliestBase.IsZero() || base.Before(earliestBase) {
+					earliestBase = base
+				}
+			}
+		}
+		if !earliestBase.IsZero() && r.refineNeededThisCycle(proj, earliestBase) {
+			// Check for a terminal refine Task (Succeeded or Failed).
+			terminal, terr := r.latestTerminalRefineTask(ctx, proj)
+			if terr != nil {
+				l.Error(terr, "scan: check terminal refine task", "action", "scan_refine_error", "resource_id", proj.Name)
+			}
+			if terminal != nil {
+				// Stamp LastRefine and fall through to scans.
+				if serr := r.stampRefine(ctx, proj); serr != nil {
+					l.Error(serr, "scan: stamp LastRefine failed", "action", "scan_stamp_error", "resource_id", proj.Name, "activity", "refine")
+				}
+			} else {
+				// Check or create an in-flight refine task.
+				inflight, ierr := r.inflightRefineTask(ctx, proj)
+				if ierr != nil {
+					l.Error(ierr, "scan: check inflight refine task", "action", "scan_refine_error", "resource_id", proj.Name)
+				}
+				if inflight == nil {
+					slugs := r.projectRepoSlugs(ctx, proj, repos)
+					lookback := cronSpec.Refine.ClosedLookbackDays
+					if lookback <= 0 {
+						lookback = 30
+					}
+					goal := refine.GoalProject(slugs, lookback)
+					_, _ = r.createRefineTask(ctx, proj, goal)
+				}
+				// Defer scans until refine is terminal.
+				return requeueRefineBarrier, nil
+			}
+		}
 	}
 
 	// mrScan

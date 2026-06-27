@@ -227,6 +227,14 @@ type HealthCheckActivity struct {
 	Sources []string `json:"sources,omitempty"`
 }
 
+// RefineActivity configures the cron-cycle refiner pre-step.
+type RefineActivity struct {
+	// ClosedLookbackDays bounds how far back closed issues are loaded for
+	// already-implemented detection. Default 30 when zero.
+	// +optional
+	ClosedLookbackDays int `json:"closedLookbackDays,omitempty"`
+}
+
 // ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
@@ -237,6 +245,10 @@ type ScmCron struct {
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
 	// +optional
 	HealthCheck HealthCheckActivity `json:"healthCheck,omitempty"`
+	// Refine configures the project-refiner pre-step. No schedule: refine fires
+	// off the existing scan cadence as a mandatory barrier before scans/brainstorm.
+	// +optional
+	Refine RefineActivity `json:"refine,omitempty"`
 }
 
 // ScmSpec binds a Project to one SCM provider and its board/merge policy.
@@ -419,6 +431,9 @@ type ProjectStatus struct {
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
 	// +optional
 	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
+	// LastRefine is the last time the project's refine pre-step completed.
+	// +optional
+	LastRefine *metav1.Time `json:"lastRefine,omitempty"`
 }
 
 // +kubebuilder:object:root=true

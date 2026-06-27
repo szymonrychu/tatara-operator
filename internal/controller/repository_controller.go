@@ -36,6 +36,10 @@ const maxScheduleRequeue = 6 * time.Hour
 // no Task (lanes full), so freed lanes refill without waiting for the next cron fire.
 const backlogRequeue = 60 * time.Second
 
+// requeueRefineBarrier is the requeue used when scans are deferred waiting for
+// a refine Task to reach a terminal state.
+const requeueRefineBarrier = 30 * time.Second
+
 // ingestBackoff constants for exponential back-off between failed Job re-creations.
 const (
 	baseIngestBackoff = 30 * time.Second

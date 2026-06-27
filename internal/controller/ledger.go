@@ -1,10 +1,13 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // repoFromIssueRef delegates to the api package so the two call sites share
@@ -199,6 +202,47 @@ func closeSourceIssueLedger(t *tatarav1alpha1.Task) {
 			wi.State = tatarav1alpha1.WIClosed
 		}
 	}
+}
+
+// markWorkItemsClosed marks all WorkItem entries matching (repo, number) as
+// closed across every Task in the namespace. Called by closeProjectIssue after
+// a successful SCM close so the Task ledger reflects the new issue state without
+// waiting for the next issueScan cycle.
+func (r *ProjectReconciler) markWorkItemsClosed(ctx context.Context, ns, repo string, number int) error {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(ns)); err != nil {
+		return fmt.Errorf("markWorkItemsClosed: list tasks: %w", err)
+	}
+	for i := range list.Items {
+		task := &list.Items[i]
+		updated := false
+		for j := range task.Status.WorkItems {
+			wi := &task.Status.WorkItems[j]
+			if wi.Repo == repo && wi.Number == number && wi.State != "closed" {
+				wi.State = "closed"
+				updated = true
+			}
+		}
+		if !updated {
+			continue
+		}
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if ferr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); ferr != nil {
+				return ferr
+			}
+			for j := range fresh.Status.WorkItems {
+				wi := &fresh.Status.WorkItems[j]
+				if wi.Repo == repo && wi.Number == number {
+					wi.State = "closed"
+				}
+			}
+			return r.Status().Update(ctx, fresh)
+		}); err != nil {
+			return fmt.Errorf("markWorkItemsClosed: update task %s: %w", task.Name, err)
+		}
+	}
+	return nil
 }
 
 func kindForIsPR(isPR bool) string {

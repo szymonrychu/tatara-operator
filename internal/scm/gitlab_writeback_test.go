@@ -126,3 +126,27 @@ func TestGitLabBangRef(t *testing.T) {
 	_, _, err = glBangRef("g/p!notanumber")
 	require.Error(t, err)
 }
+
+func TestGitLabEditIssue_PUTsOnlyProvided(t *testing.T) {
+	var gotBody map[string]any
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPut, r.Method)
+		require.Equal(t, "/projects/g%2Fp/issues/7", glTestPath(r))
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"iid":7}`))
+	})
+	title := "new title"
+	require.NoError(t, c.EditIssue(context.Background(), "t", "g/p", 7, EditIssueReq{Title: &title}))
+	require.Equal(t, "new title", gotBody["title"])
+	_, bodyPresent := gotBody["body"]
+	require.False(t, bodyPresent, "body must NOT be sent when Body is nil")
+}
+
+func TestGitLabEditIssue_404Benign(t *testing.T) {
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	body := "x"
+	require.NoError(t, c.EditIssue(context.Background(), "t", "g/p", 7, EditIssueReq{Body: &body}))
+}

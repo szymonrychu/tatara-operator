@@ -1291,3 +1291,489 @@ func (s *Server) patchSubtask(w http.ResponseWriter, r *http.Request) {
 			"duration_ms", elapsed.Milliseconds())...)
 	writeJSON(w, http.StatusOK, toSubtaskDTO(st))
 }
+
+// --- Refine agent: issue + commit aggregation and mutation endpoints ---
+
+// issueDTO is the wire type for GET /projects/{p}/issues.
+type issueDTO struct {
+	Repo     string    `json:"repo"`
+	Number   int       `json:"number"`
+	Title    string    `json:"title"`
+	Body     string    `json:"body,omitempty"`
+	Author   string    `json:"author,omitempty"`
+	Labels   []string  `json:"labels,omitempty"`
+	State    string    `json:"state,omitempty"`
+	ClosedAt time.Time `json:"closedAt,omitempty"`
+	IsPR     bool      `json:"isPr,omitempty"`
+}
+
+// commitDTO is the wire type for GET /projects/{p}/commits.
+type commitDTO struct {
+	Repo    string    `json:"repo"`
+	SHA     string    `json:"sha"`
+	Message string    `json:"message"`
+	Author  string    `json:"author,omitempty"`
+	Date    time.Time `json:"date"`
+}
+
+// projectSCMWriterAndToken resolves the SCMWriter and bot token for project p.
+// Returns (nil, "", error-written-to-w) on any failure so callers can return immediately.
+func (s *Server) projectSCMWriterAndToken(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project) (scm.SCMWriter, string, bool) {
+	if s.scmFor == nil {
+		writeError(w, http.StatusNotImplemented, "scm writer not configured")
+		return nil, "", false
+	}
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	if provider == "" {
+		writeError(w, http.StatusConflict, "project has no scm provider configured")
+		return nil, "", false
+	}
+	writer, err := s.scmFor(provider)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return nil, "", false
+	}
+	var sec corev1.Secret
+	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
+		writeClientErr(w, err)
+		return nil, "", false
+	}
+	token := string(sec.Data["token"])
+	if token == "" {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return nil, "", false
+	}
+	return writer, token, true
+}
+
+// projectSCMReader resolves a token-bound SCMReader for project p.
+func (s *Server) projectSCMReader(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project) (scm.SCMReader, string, bool) {
+	if s.readerFor == nil {
+		writeError(w, http.StatusNotImplemented, "scm reader not configured")
+		return nil, "", false
+	}
+	provider := ""
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	if provider == "" {
+		writeError(w, http.StatusConflict, "project has no scm provider configured")
+		return nil, "", false
+	}
+	var sec corev1.Secret
+	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
+		writeClientErr(w, err)
+		return nil, "", false
+	}
+	token := string(sec.Data["token"])
+	reader, err := s.readerFor(provider, token)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return nil, "", false
+	}
+	return reader, token, true
+}
+
+// projectRepos returns all repositories belonging to project projName.
+func (s *Server) projectRepos(ctx context.Context, projName string) ([]tatarav1alpha1.Repository, error) {
+	var list tatarav1alpha1.RepositoryList
+	if err := s.c.List(ctx, &list, client.InNamespace(s.ns)); err != nil {
+		return nil, err
+	}
+	var out []tatarav1alpha1.Repository
+	for i := range list.Items {
+		if list.Items[i].Spec.ProjectRef == projName {
+			out = append(out, list.Items[i])
+		}
+	}
+	return out, nil
+}
+
+// repoSlugInProject checks whether the given slug ("owner/repo") matches a repo
+// in the project and returns the repo's clone URL.  Returns ("", false) if not found.
+func repoSlugInProject(repos []tatarav1alpha1.Repository, slug string) (string, bool) {
+	for i := range repos {
+		o, n, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		if o+"/"+n == slug {
+			return repos[i].Spec.URL, true
+		}
+	}
+	return "", false
+}
+
+// listProjectIssues handles GET /projects/{p}/issues.
+// Query params: closedSinceDays (int, default 30).
+func (s *Server) listProjectIssues(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForProject(w, r, &proj) {
+		return
+	}
+	reader, _, ok := s.projectSCMReader(w, r, &proj)
+	if !ok {
+		return
+	}
+	repos, err := s.projectRepos(r.Context(), projName)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+
+	closedSinceDays := 30
+	if v := r.URL.Query().Get("closedSinceDays"); v != "" {
+		if n, err2 := parseInt(v); err2 == nil && n > 0 {
+			closedSinceDays = n
+		}
+	}
+	since := time.Now().Add(-time.Duration(closedSinceDays) * 24 * time.Hour)
+
+	var issues []issueDTO
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		open, err := reader.ListOpenIssues(r.Context(), owner, name)
+		if err != nil {
+			s.log.ErrorContext(r.Context(), "restapi: listProjectIssues ListOpenIssues failed",
+				append(reqLogFields(r), "repo", repos[i].Name, "err", err)...)
+			continue
+		}
+		for _, iss := range open {
+			if iss.IsPR {
+				continue
+			}
+			issues = append(issues, issueDTO{
+				Repo: iss.Repo, Number: iss.Number, Title: iss.Title,
+				Author: iss.Author, Labels: iss.Labels, State: iss.State, IsPR: false,
+			})
+		}
+		closed, err := reader.ListClosedIssues(r.Context(), owner, name, since)
+		if err != nil {
+			s.log.ErrorContext(r.Context(), "restapi: listProjectIssues ListClosedIssues failed",
+				append(reqLogFields(r), "repo", repos[i].Name, "err", err)...)
+			continue
+		}
+		for _, iss := range closed {
+			if iss.IsPR {
+				continue
+			}
+			issues = append(issues, issueDTO{
+				Repo: iss.Repo, Number: iss.Number, Title: iss.Title,
+				Author: iss.Author, Labels: iss.Labels, State: iss.State,
+				ClosedAt: iss.ClosedAt, IsPR: false,
+			})
+		}
+	}
+	if issues == nil {
+		issues = []issueDTO{}
+	}
+	s.log.InfoContext(r.Context(), "restapi: listProjectIssues",
+		append(reqLogFields(r), "action", "list_project_issues", "resource_id", projName, "count", len(issues))...)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("list_project_issues", "ok", 0)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"issues": issues})
+}
+
+type closeIssueReq struct {
+	Comment string `json:"comment"`
+}
+
+// closeProjectIssue handles POST /projects/{p}/issues/{owner}/{repo}/{number}/close.
+func (s *Server) closeProjectIssue(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	repoSlug := chi.URLParam(r, "owner") + "/" + chi.URLParam(r, "repo")
+	number, err := parseInt(chi.URLParam(r, "number"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid issue number")
+		return
+	}
+	var req closeIssueReq
+	if err2 := decodeJSON(r, w, &req); err2 != nil {
+		writeDecodeError(w, r, err2)
+		return
+	}
+	if req.Comment == "" {
+		writeError(w, http.StatusBadRequest, "comment required")
+		return
+	}
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForProject(w, r, &proj) {
+		return
+	}
+	repos, err := s.projectRepos(r.Context(), projName)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	_, ok := repoSlugInProject(repos, repoSlug)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "repo not found in project")
+		return
+	}
+	writer, token, ok := s.projectSCMWriterAndToken(w, r, &proj)
+	if !ok {
+		return
+	}
+	start := time.Now()
+	if err := writer.CloseIssue(r.Context(), token, repoSlug, number, req.Comment); err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest("close_project_issue", "error", time.Since(start).Seconds())
+		}
+		writeClientErr(w, err)
+		return
+	}
+	// Best-effort: propagate the close to any Task work-item ledger entries so
+	// issueScan dedup sees the updated state without waiting for the next cycle.
+	if serr := markWorkItemsClosedViaClient(r.Context(), s.c, s.ns, repoSlug, number); serr != nil {
+		s.log.WarnContext(r.Context(), "restapi: closeProjectIssue: ledger propagation failed (best-effort)",
+			"action", "ledger_close_error", "resource_id", repoSlug+"#"+chi.URLParam(r, "number"), "error", serr)
+	}
+	elapsed := time.Since(start)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("close_project_issue", "ok", elapsed.Seconds())
+	}
+	s.log.InfoContext(r.Context(), "restapi: closeProjectIssue",
+		append(reqLogFields(r), "action", "refine_close", "resource_id", repoSlug+"#"+chi.URLParam(r, "number"), "duration_ms", elapsed.Milliseconds())...)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type editIssueReq struct {
+	Title  *string   `json:"title,omitempty"`
+	Body   *string   `json:"body,omitempty"`
+	Labels *[]string `json:"labels,omitempty"`
+}
+
+// editProjectIssue handles PATCH /projects/{p}/issues/{owner}/{repo}/{number}.
+func (s *Server) editProjectIssue(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	repoSlug := chi.URLParam(r, "owner") + "/" + chi.URLParam(r, "repo")
+	number, err := parseInt(chi.URLParam(r, "number"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid issue number")
+		return
+	}
+	var req editIssueReq
+	if err2 := decodeJSON(r, w, &req); err2 != nil {
+		writeDecodeError(w, r, err2)
+		return
+	}
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForProject(w, r, &proj) {
+		return
+	}
+	repos, err := s.projectRepos(r.Context(), projName)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	_, ok := repoSlugInProject(repos, repoSlug)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "repo not found in project")
+		return
+	}
+	writer, token, ok := s.projectSCMWriterAndToken(w, r, &proj)
+	if !ok {
+		return
+	}
+	editReq := scm.EditIssueReq{Title: req.Title, Body: req.Body, Labels: req.Labels}
+	start := time.Now()
+	if err := writer.EditIssue(r.Context(), token, repoSlug, number, editReq); err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest("edit_project_issue", "error", time.Since(start).Seconds())
+		}
+		writeClientErr(w, err)
+		return
+	}
+	elapsed := time.Since(start)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("edit_project_issue", "ok", elapsed.Seconds())
+	}
+	s.log.InfoContext(r.Context(), "restapi: editProjectIssue",
+		append(reqLogFields(r), "action", "refine_edit", "resource_id", repoSlug+"#"+chi.URLParam(r, "number"), "duration_ms", elapsed.Milliseconds())...)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type createProjectIssueReq struct {
+	Title  string   `json:"title"`
+	Body   string   `json:"body"`
+	Labels []string `json:"labels,omitempty"`
+}
+
+// createProjectIssue handles POST /projects/{p}/issues/{owner}/{repo}.
+func (s *Server) createProjectIssue(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	repoSlug := chi.URLParam(r, "owner") + "/" + chi.URLParam(r, "repo")
+	var req createProjectIssueReq
+	if err := decodeJSON(r, w, &req); err != nil {
+		writeDecodeError(w, r, err)
+		return
+	}
+	if req.Title == "" || req.Body == "" {
+		writeError(w, http.StatusBadRequest, "title and body required")
+		return
+	}
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForProject(w, r, &proj) {
+		return
+	}
+	repos, err := s.projectRepos(r.Context(), projName)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	repoURL, ok := repoSlugInProject(repos, repoSlug)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "repo not found in project")
+		return
+	}
+	writer, token, ok := s.projectSCMWriterAndToken(w, r, &proj)
+	if !ok {
+		return
+	}
+	issueReq := scm.IssueReq{Title: req.Title, Body: req.Body, Labels: req.Labels}
+	start := time.Now()
+	created, err := writer.CreateIssue(r.Context(), repoURL, token, issueReq)
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest("create_project_issue", "error", time.Since(start).Seconds())
+		}
+		writeClientErr(w, err)
+		return
+	}
+	elapsed := time.Since(start)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("create_project_issue", "ok", elapsed.Seconds())
+	}
+	s.log.InfoContext(r.Context(), "restapi: createProjectIssue",
+		append(reqLogFields(r), "action", "refine_create", "resource_id", created.Ref, "duration_ms", elapsed.Milliseconds())...)
+	writeJSON(w, http.StatusCreated, created)
+}
+
+// listProjectCommits handles GET /projects/{p}/commits.
+// Query params: sinceDays (int, default 30).
+func (s *Server) listProjectCommits(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeForProject(w, r, &proj) {
+		return
+	}
+	reader, _, ok := s.projectSCMReader(w, r, &proj)
+	if !ok {
+		return
+	}
+	repos, err := s.projectRepos(r.Context(), projName)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+
+	sinceDays := 30
+	if v := r.URL.Query().Get("sinceDays"); v != "" {
+		if n, err2 := parseInt(v); err2 == nil && n > 0 {
+			sinceDays = n
+		}
+	}
+	since := time.Now().Add(-time.Duration(sinceDays) * 24 * time.Hour)
+
+	var commits []commitDTO
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		repoCommits, err := reader.ListCommits(r.Context(), owner, name, since)
+		if err != nil {
+			s.log.ErrorContext(r.Context(), "restapi: listProjectCommits ListCommits failed",
+				append(reqLogFields(r), "repo", repos[i].Name, "err", err)...)
+			continue
+		}
+		for _, c := range repoCommits {
+			commits = append(commits, commitDTO{
+				Repo: owner + "/" + name, SHA: c.SHA, Message: c.Message,
+				Author: c.Author, Date: c.Date,
+			})
+		}
+	}
+	if commits == nil {
+		commits = []commitDTO{}
+	}
+	s.log.InfoContext(r.Context(), "restapi: listProjectCommits",
+		append(reqLogFields(r), "action", "list_project_commits", "resource_id", projName, "count", len(commits))...)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("list_project_commits", "ok", 0)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"commits": commits})
+}
+
+// parseInt parses a decimal integer from s.
+func parseInt(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
+}
+
+// markWorkItemsClosedViaClient marks all WorkItem entries matching (repo, number)
+// as closed in every Task in ns. Best-effort: conflict retries are not applied
+// because this is a secondary propagation path (issueScan self-heals on the next
+// cycle if this fails).
+func markWorkItemsClosedViaClient(ctx context.Context, c client.Client, ns, repo string, number int) error {
+	var list tatarav1alpha1.TaskList
+	if err := c.List(ctx, &list, client.InNamespace(ns)); err != nil {
+		return fmt.Errorf("markWorkItemsClosedViaClient: list tasks: %w", err)
+	}
+	for i := range list.Items {
+		task := &list.Items[i]
+		updated := false
+		for j := range task.Status.WorkItems {
+			wi := &task.Status.WorkItems[j]
+			if wi.Repo == repo && wi.Number == number && wi.State != "closed" {
+				wi.State = "closed"
+				updated = true
+			}
+		}
+		if !updated {
+			continue
+		}
+		// Read-modify-write once; ignore conflict (next cycle self-heals).
+		fresh := &tatarav1alpha1.Task{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			continue
+		}
+		for j := range fresh.Status.WorkItems {
+			wi := &fresh.Status.WorkItems[j]
+			if wi.Repo == repo && wi.Number == number {
+				wi.State = "closed"
+			}
+		}
+		_ = c.Status().Update(ctx, fresh)
+	}
+	return nil
+}

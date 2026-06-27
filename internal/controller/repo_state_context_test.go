@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -59,6 +60,12 @@ func (fakeRdr) GetIssue(context.Context, string, string, int) (scm.IssueContent,
 }
 func (fakeRdr) GetDefaultBranchHeadSHA(context.Context, string, string) (string, error) {
 	return "", nil
+}
+func (fakeRdr) ListClosedIssues(context.Context, string, string, time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (fakeRdr) ListCommits(context.Context, string, string, time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
 }
 
 func TestBuildRepoStateContext_Blocks(t *testing.T) {

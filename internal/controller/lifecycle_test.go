@@ -2061,6 +2061,12 @@ func (f *fakeReaderMainCI) GetIssue(_ context.Context, _, _ string, _ int) (scm.
 func (f *fakeReaderMainCI) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
 }
+func (f *fakeReaderMainCI) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderMainCI) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
+}
 
 func seedMainCITask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMainCI, deadlineOffset time.Duration) (*TaskReconciler, string) {
 	t.Helper()

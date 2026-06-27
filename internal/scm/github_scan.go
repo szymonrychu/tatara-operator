@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -31,6 +32,8 @@ type ghIssueItem struct {
 	} `json:"user"`
 	Labels      []ghLabel `json:"labels"`
 	UpdatedAt   time.Time `json:"updated_at"`
+	State       string    `json:"state"`
+	ClosedAt    time.Time `json:"closed_at"`
 	PullRequest *struct {
 		URL string `json:"url"`
 	} `json:"pull_request"`
@@ -75,7 +78,58 @@ func (c *GitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	for _, i := range raw {
 		out = append(out, IssueRef{
 			Repo: slug, Number: i.Number, Title: i.Title, Author: i.User.Login, Labels: ghLabelNames(i.Labels),
-			UpdatedAt: i.UpdatedAt, IsPR: i.PullRequest != nil,
+			UpdatedAt: i.UpdatedAt, IsPR: i.PullRequest != nil, State: "open",
+		})
+	}
+	return out, nil
+}
+
+// ListClosedIssues lists recently-closed issues for owner/repo. PRs are excluded.
+func (c *GitHub) ListClosedIssues(ctx context.Context, owner, repo string, since time.Time) ([]IssueRef, error) {
+	path := fmt.Sprintf("/repos/%s/%s/issues?state=closed&since=%s&per_page=100", owner, repo, since.UTC().Format(time.RFC3339))
+	raw, err := ghDoPaged[ghIssueItem](ctx, c.base(), path, c.token)
+	if err != nil {
+		return nil, err
+	}
+	slug := owner + "/" + repo
+	out := make([]IssueRef, 0, len(raw))
+	for _, i := range raw {
+		if i.PullRequest != nil {
+			continue
+		}
+		out = append(out, IssueRef{
+			Repo: slug, Number: i.Number, Title: i.Title, Author: i.User.Login, Labels: ghLabelNames(i.Labels),
+			UpdatedAt: i.UpdatedAt, IsPR: false, State: "closed", ClosedAt: i.ClosedAt,
+		})
+	}
+	return out, nil
+}
+
+type ghCommitItem struct {
+	SHA    string `json:"sha"`
+	Commit struct {
+		Message string `json:"message"`
+		Author  struct {
+			Name string    `json:"name"`
+			Date time.Time `json:"date"`
+		} `json:"author"`
+	} `json:"commit"`
+}
+
+// ListCommits returns recent default-branch commits for owner/repo since the given time.
+func (c *GitHub) ListCommits(ctx context.Context, owner, repo string, since time.Time) ([]CommitRef, error) {
+	path := fmt.Sprintf("/repos/%s/%s/commits?since=%s&per_page=100", owner, repo, since.UTC().Format(time.RFC3339))
+	raw, err := ghDoPaged[ghCommitItem](ctx, c.base(), path, c.token)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]CommitRef, 0, len(raw))
+	for _, c := range raw {
+		out = append(out, CommitRef{
+			SHA:     c.SHA,
+			Message: c.Commit.Message,
+			Author:  c.Commit.Author.Name,
+			Date:    c.Commit.Author.Date,
 		})
 	}
 	return out, nil
@@ -184,6 +238,35 @@ func (c *GitHub) CloseIssue(ctx context.Context, token, repo string, number int,
 	}
 	ipath := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, name, number)
 	return ghDo(ctx, c.base(), http.MethodPatch, ipath, token, map[string]string{"state": "closed"}, nil)
+}
+
+// EditIssue updates an issue with only the non-nil fields in req (PATCH semantics).
+// A 404 (issue gone) is treated as benign and returns nil.
+func (c *GitHub) EditIssue(ctx context.Context, token, repo string, number int, req EditIssueReq) error {
+	owner, name, err := ghOwnerRepoFromSlug(repo)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{}
+	if req.Title != nil {
+		body["title"] = *req.Title
+	}
+	if req.Body != nil {
+		body["body"] = *req.Body
+	}
+	if req.Labels != nil {
+		body["labels"] = *req.Labels
+	}
+	if len(body) == 0 {
+		return nil
+	}
+	ipath := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, name, number)
+	err = ghDo(ctx, c.base(), http.MethodPatch, ipath, token, body, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 // ghIssueComment is the JSON shape of a GitHub issue comment.

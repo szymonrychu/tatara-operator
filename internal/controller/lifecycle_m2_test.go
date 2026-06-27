@@ -45,6 +45,12 @@ func (f *fakeReaderComments) GetIssue(_ context.Context, _, _ string, _ int) (sc
 func (f *fakeReaderComments) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
 }
+func (f *fakeReaderComments) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderComments) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
+}
 
 // fakeReaderWithIssue is a fake SCMReader that returns scripted issue content and comments.
 type fakeReaderWithIssue struct {
@@ -73,6 +79,12 @@ func (f *fakeReaderWithIssue) GetIssue(_ context.Context, _, _ string, _ int) (s
 }
 func (f *fakeReaderWithIssue) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil
+}
+func (f *fakeReaderWithIssue) ListClosedIssues(_ context.Context, _, _ string, _ time.Time) ([]scm.IssueRef, error) {
+	return nil, nil
+}
+func (f *fakeReaderWithIssue) ListCommits(_ context.Context, _, _ string, _ time.Time) ([]scm.CommitRef, error) {
+	return nil, nil
 }
 
 // TestBuildTriagePrompt_NoComments verifies the prompt equals the plain
