@@ -1235,6 +1235,24 @@ type subtaskPatchReq struct {
 	TurnID *string `json:"turnId,omitempty"`
 }
 
+// validSubtaskPhases enumerates the canonical SubtaskStatus.Phase values, matching
+// the +kubebuilder:validation:Enum on api/v1alpha1.SubtaskStatus. Writing any other
+// value is rejected by the CRD status schema with an opaque admission error, so we
+// normalize and validate at the REST boundary instead.
+var validSubtaskPhases = []string{"Pending", "Running", "Done", "Failed"}
+
+// canonicalSubtaskPhase maps a caller-supplied phase to its canonical enum value
+// case-insensitively (so "done" becomes "Done"), returning ok=false for any value
+// that is not a recognized phase.
+func canonicalSubtaskPhase(phase string) (string, bool) {
+	for _, p := range validSubtaskPhases {
+		if strings.EqualFold(phase, p) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
 func authorizeForSubtask(w http.ResponseWriter, r *http.Request) bool {
 	claims, ok := auth.ClaimsFromContext(r.Context())
 	if !ok {
@@ -1255,6 +1273,18 @@ func (s *Server) patchSubtask(w http.ResponseWriter, r *http.Request) {
 	}
 	if !authorizeForSubtask(w, r) {
 		return
+	}
+	// Normalize the phase to its canonical enum value case-insensitively so a
+	// lowercase "done" no longer reaches the CRD status schema as an invalid
+	// value (which surfaces as an opaque admission rejection). Reject genuinely
+	// unknown phases here with a clear 400 instead.
+	if req.Phase != nil {
+		canonical, ok := canonicalSubtaskPhase(*req.Phase)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "phase must be one of Pending, Running, Done, Failed")
+			return
+		}
+		req.Phase = &canonical
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "s")}
 	var st tatarav1alpha1.Subtask
