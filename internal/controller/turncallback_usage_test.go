@@ -10,6 +10,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"k8s.io/apimachinery/pkg/types"
 )
 
@@ -123,6 +126,74 @@ func TestTurnComplete_WithoutUsage_LeavesTokensUnchanged(t *testing.T) {
 	}
 	if tk.Status.CumulativeTokens != 500 {
 		t.Errorf("CumulativeTokens = %d, want 500 (unchanged)", tk.Status.CumulativeTokens)
+	}
+}
+
+// TestRecordUsage_EmitsTurn verifies that a successful turn callback (usage
+// recorded) increments operator_task_turns_total by 1.
+func TestRecordUsage_EmitsTurn(t *testing.T) {
+	mkTaskProject(t, "p-turnc1", 3)
+	mkTaskRepository(t, "r-turnc1", "p-turnc1")
+	mkTask(t, "t-turnc1", "p-turnc1", "r-turnc1")
+	annotate(t, "t-turnc1", map[string]string{annCurrentTurn: "turn-tc1"})
+
+	reg := prometheus.NewRegistry()
+	cb := &CallbackServer{
+		Client:    k8sClient,
+		Metrics:   obs.NewOperatorMetrics(reg),
+		Namespace: testNS,
+	}
+	body, _ := json.Marshal(map[string]any{
+		"turnId": "turn-tc1", "state": "completed", "finalText": "done",
+		"usage": map[string]any{"input_tokens": 100, "output_tokens": 50},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	// mkTask sets Spec.ProjectRef="p-turnc1", RepositoryRef="r-turnc1", Source=nil and
+	// leaves Kind unset, so the CRD default (+kubebuilder:default="implement") applies.
+	// taskTokenLabels then yields project="p-turnc1", repo="r-turnc1", kind="implement", issue="".
+	got := testutil.ToFloat64(cb.Metrics.TaskTurnsCounter("p-turnc1", "r-turnc1", "implement", ""))
+	if got != 1 {
+		t.Fatalf("operator_task_turns_total after successful callback = %v, want 1", got)
+	}
+}
+
+// TestRecordUsage_StaleCallback_NoTurn verifies that the stale-turn guard
+// prevents AddTaskTurn when the task's annCurrentTurn does not match the
+// callback's turnID (simulating a duplicate/stale callback).
+func TestRecordUsage_StaleCallback_NoTurn(t *testing.T) {
+	mkTaskProject(t, "p-turnc2", 3)
+	mkTaskRepository(t, "r-turnc2", "p-turnc2")
+	mkTask(t, "t-turnc2", "p-turnc2", "r-turnc2")
+	// The task is on "actual-turn"; the callback will claim "wrong-turn".
+	annotate(t, "t-turnc2", map[string]string{annCurrentTurn: "actual-turn"})
+
+	reg := prometheus.NewRegistry()
+	cb := &CallbackServer{
+		Client:    k8sClient,
+		Metrics:   obs.NewOperatorMetrics(reg),
+		Namespace: testNS,
+	}
+	// Resolve via "actual-turn" so we have the Task object.
+	task, err := cb.resolveTaskByTurn(context.Background(), "actual-turn")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// recordUsage with wrong turnID: the inner guard will see annCurrentTurn != "wrong-turn"
+	// and leave recorded=false, so AddTaskTurn must not be called.
+	usage, _ := json.Marshal(map[string]any{"input_tokens": 200, "output_tokens": 80})
+	if err := cb.recordUsage(context.Background(), task, json.RawMessage(usage), "wrong-turn"); err != nil {
+		t.Fatalf("recordUsage: %v", err)
+	}
+
+	got := testutil.ToFloat64(cb.Metrics.TaskTurnsCounter("p-turnc2", "r-turnc2", "implement", ""))
+	if got != 0 {
+		t.Fatalf("operator_task_turns_total with stale turnID = %v, want 0", got)
 	}
 }
 

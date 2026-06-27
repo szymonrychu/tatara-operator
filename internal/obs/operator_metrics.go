@@ -47,6 +47,8 @@ type OperatorMetrics struct {
 	queueDepth                *prometheus.GaugeVec
 	queueInflight             *prometheus.GaugeVec
 	taskTokensTotal           *prometheus.CounterVec
+	taskTurnsTotal            *prometheus.CounterVec
+	taskIssueState            *prometheus.GaugeVec
 	taskTerminalTotal         *prometheus.CounterVec
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
@@ -248,6 +250,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_task_tokens_total",
 			Help: "Agent token usage by project, repo, Task kind, issue, and type (input|output).",
 		}, []string{"project", "repo", "kind", "issue", "type"}),
+		taskTurnsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_turns_total",
+			Help: "Agent turns completed by project, repo, Task kind, and issue.",
+		}, []string{"project", "repo", "kind", "issue"}),
+		taskIssueState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_issue_state",
+			Help: "Current state of open issues tracked by an agent Task, by project, repo, issue, kind, state, and incident flag. Value is always 1; stale series are removed on each recompute.",
+		}, []string{"project", "repo", "issue", "kind", "state", "incident"}),
 		taskTerminalTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_terminal_total",
 			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
@@ -339,6 +349,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.queueDepth,
 		m.queueInflight,
 		m.taskTokensTotal,
+		m.taskTurnsTotal,
+		m.taskIssueState,
 		m.taskTerminalTotal,
 		m.lightragDocuments,
 		m.lightragQueryErrors,
@@ -745,6 +757,41 @@ func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue string, input
 	if output > 0 {
 		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, "output").Add(float64(output))
 	}
+}
+
+// TaskTurnsCounter returns the counter for (project,repo,kind,issue) for test assertions.
+func (m *OperatorMetrics) TaskTurnsCounter(project, repo, kind, issue string) prometheus.Counter {
+	return m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue)
+}
+
+// AddTaskTurn increments operator_task_turns_total by 1 for a completed agent
+// turn. Called at the same site as AddTaskTokens (once per turn-complete
+// callback), guarded by the same stale/duplicate-callback recorded flag.
+func (m *OperatorMetrics) AddTaskTurn(project, repo, kind, issue string) {
+	m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue).Inc()
+}
+
+// SetIssueState sets tatara_issue_state{...}=1 for a live issue. Labels:
+// project, repo, issue, kind (joins token/turn counters), state, incident.
+func (m *OperatorMetrics) SetIssueState(project, repo, issue, kind, state, incident string) {
+	m.taskIssueState.WithLabelValues(project, repo, issue, kind, state, incident).Set(1)
+}
+
+// ResetIssueState clears all tatara_issue_state series. Called at the start of
+// each updateIssueStateCounts pass so stale (closed/terminal) issues vanish.
+func (m *OperatorMetrics) ResetIssueState() {
+	m.taskIssueState.Reset()
+}
+
+// DeleteTaskSeries removes the operator_task_tokens_total and
+// operator_task_turns_total series for a specific issue-scoped Task when it is
+// garbage-collected. Bounds counter cardinality to live + recently-live issues.
+// Skip when issue=="" (project-scoped tasks share that label value and must not
+// be cleared on any individual task's GC).
+func (m *OperatorMetrics) DeleteTaskSeries(project, repo, kind, issue string) {
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, "input")
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, "output")
+	m.taskTurnsTotal.DeleteLabelValues(project, repo, kind, issue)
 }
 
 // SetLightragDocuments sets operator_lightrag_documents for a project and
