@@ -26,6 +26,16 @@ on:
         type: boolean
         required: false
         default: true
+      build-needs-cgo:
+        description: >-
+          Install the full build-essential C toolchain (not just `make`) in the
+          build and smoke jobs, for repos whose `make build` is CGO_ENABLED=1
+          (e.g. tatara-memory-repo-ingester). Default false installs make only,
+          which is enough for a CGO_ENABLED=0 build. The test job always
+          installs build-essential because `go test -race` needs cgo.
+        type: boolean
+        required: false
+        default: false
       has-chart:
         description: Package and push the repo's helm chart(s) on push to main.
         type: boolean
@@ -111,10 +121,18 @@ jobs:
     needs: [secscan, lint, test]
     steps:
       - uses: actions/checkout@v4
-      # build is CGO_ENABLED=0, so it needs `make` to drive the Makefile but
-      # not a full C toolchain.
+      # A CGO_ENABLED=0 build only needs `make` to drive the Makefile, not a
+      # full C toolchain; a CGO_ENABLED=1 build (build-needs-cgo) needs gcc.
       - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends make
+        env:
+          BUILD_NEEDS_CGO: ${{ inputs.build-needs-cgo }}
+        run: |
+          sudo apt-get update
+          if [ "${BUILD_NEEDS_CGO}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends build-essential
+          else
+            sudo apt-get install -y --no-install-recommends make
+          fi
       - uses: jdx/mise-action@v2
         with:
           cache: true
@@ -126,8 +144,17 @@ jobs:
     needs: [build]
     steps:
       - uses: actions/checkout@v4
+      # smoke rebuilds the binary, so it needs the same toolchain as build.
       - name: build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends make
+        env:
+          BUILD_NEEDS_CGO: ${{ inputs.build-needs-cgo }}
+        run: |
+          sudo apt-get update
+          if [ "${BUILD_NEEDS_CGO}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends build-essential
+          else
+            sudo apt-get install -y --no-install-recommends make
+          fi
       - uses: jdx/mise-action@v2
         with:
           cache: true
