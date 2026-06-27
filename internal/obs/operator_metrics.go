@@ -557,7 +557,11 @@ func (m *OperatorMetrics) TasksGC(kind string) {
 }
 
 // ConversationGC increments operator_conversation_gc_total for an S3 conversation
-// object the reaper deleted (result "deleted") or failed to delete ("error").
+// object the reaper deleted (result "deleted"), failed to delete/probe for a
+// genuine per-object reason ("error"), or skipped because the object store was
+// store-wide unreachable ("unavailable", recorded once per skipped pass; issue
+// #149) - the last is intentionally separate from "error" so a quieter,
+// dedicated alert can key off it without the per-object errors.
 func (m *OperatorMetrics) ConversationGC(result string) {
 	m.conversationGCTotal.WithLabelValues(result).Inc()
 }

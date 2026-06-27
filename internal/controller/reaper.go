@@ -13,6 +13,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/objstore"
 )
 
 // ReapOrphans deletes wrapper Pods (and their fronting Services) whose owning
@@ -254,6 +255,20 @@ func (s *CallbackServer) gcConversations(ctx context.Context, tasks []tatarav1al
 		}
 	}
 
+	// skipUnreachable short-circuits the whole pass on a store-wide / connection-
+	// level failure (issue #149): without this, one object-store outage produces
+	// one ERROR per backlog key (dozens) every reaper cycle and trips the
+	// ">20 ERROR/5m" log-burst alert even though the operator is healthy and the
+	// cause is a transient external dependency. We log ONE non-ERROR line and
+	// record result="unavailable" so a dedicated, quieter alert can key off it;
+	// the next reaper cycle retries once the store recovers.
+	skipUnreachable := func(err error) {
+		l.Info("reaper: conversation GC skipped: object store unreachable",
+			"action", "gc_conversation", "error", err.Error())
+		s.Metrics.ConversationGC("unavailable")
+	}
+
+batchLoop:
 	for _, b := range batches {
 		if !b.allTermPastGrace {
 			continue
@@ -264,6 +279,10 @@ func (s *CallbackServer) gcConversations(ctx context.Context, tasks []tatarav1al
 			}
 			exists, err := s.ConvStore.Exists(ctx, key)
 			if err != nil {
+				if objstore.IsUnavailable(err) {
+					skipUnreachable(err)
+					break batchLoop
+				}
 				l.Error(err, "reaper: probe conversation object", "action", "gc_conversation", "key", key)
 				s.Metrics.ConversationGC("error")
 				continue
@@ -272,6 +291,10 @@ func (s *CallbackServer) gcConversations(ctx context.Context, tasks []tatarav1al
 				continue
 			}
 			if err := s.ConvStore.Delete(ctx, key); err != nil {
+				if objstore.IsUnavailable(err) {
+					skipUnreachable(err)
+					break batchLoop
+				}
 				l.Error(err, "reaper: delete conversation object", "action", "gc_conversation", "key", key)
 				s.Metrics.ConversationGC("error")
 				continue
