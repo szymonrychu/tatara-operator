@@ -633,6 +633,9 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		labels = append(labels, "tatara/systemic-"+sid)
 		body += fmt.Sprintf("\n\nPart of systemic improvement %s spanning: %s", sid, systemicRepoList(ctx, r, proj))
 	}
+	if cc := approverMentions(proj, &repo); cc != "" {
+		body += "\n\n" + cc
+	}
 	body += "\n\n" + tataraAuthoredMarker
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 		Title:  proposalTitle,
