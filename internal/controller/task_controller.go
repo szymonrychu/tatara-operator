@@ -65,6 +65,12 @@ const (
 	// delete/recreate and can be surfaced at exhaustion; setLifecycleState and
 	// recordTurn clear it so it never leaks into the next state / run.
 	annBootCrashDiagnostics = "tatara.dev/boot-crash-diagnostics"
+	// annBootCrashLastPodUID records the pod.UID whose boot crash last incremented
+	// annBootCrashAttempts, so rapid Owns(Pod) reconciles on the same stale/
+	// terminating pod cannot bump the budget more than once per distinct pod
+	// instance. resetAgentRun preserves it (like annBootCrashAttempts) across
+	// respawns; recordTurn and setLifecycleState clear it with the attempt counter.
+	annBootCrashLastPodUID = "tatara.dev/boot-crash-last-pod-uid"
 )
 
 // bootCrashDetailCap bounds the captured diagnostic so it fits comfortably in an
@@ -601,12 +607,29 @@ func (r *TaskReconciler) handleBootCrash(ctx context.Context, task *tatarav1alph
 		// errors: keep waiting. Either way this is not a boot crash to act on.
 		return ctrl.Result{}, nil, false
 	}
+
+	// Gate 1: a pod with DeletionTimestamp is already being torn down by a prior
+	// respawn (resetAgentRun issued the Delete; the finalizer grace period keeps
+	// the object visible). Do not count this dying instance again; wait for
+	// ensurePodAndService to create the replacement.
+	if pod.DeletionTimestamp != nil {
+		return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
+	}
+
 	reason := bootCrashReason(pod)
 	if reason == "" {
 		if !bootDeadlineExceeded(pod) {
 			return ctrl.Result{}, nil, false
 		}
 		reason = "BootTimeout"
+	}
+
+	// Gate 2: count at most one boot-crash attempt per distinct pod instance.
+	// If this exact pod UID already incremented the budget, its respawn was already
+	// issued; requeue and wait for the replacement rather than bumping again. This
+	// gives a genuinely slow boot its full maxPodRecreations x agentBootDeadline.
+	if task.Annotations[annBootCrashLastPodUID] == string(pod.UID) {
+		return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
 	}
 
 	// Capture the crash cause from pod.Status BEFORE resetAgentRun / terminate
@@ -642,7 +665,7 @@ func (r *TaskReconciler) handleBootCrash(ctx context.Context, task *tatarav1alph
 	r.Metrics.AgentBootCrash(reason, "respawn")
 	l.Info("agent pod boot failed; respawning",
 		"action", "agent_boot_crash", "resource_id", task.Name, "reason", reason, "attempt", attempts, "diagnostics", diag)
-	if err := r.bumpBootCrashAttempts(ctx, task); err != nil {
+	if err := r.bumpBootCrashAttempts(ctx, task, pod.UID); err != nil {
 		return ctrl.Result{}, err, true
 	}
 	if err := r.resetAgentRun(ctx, task); err != nil {
@@ -659,7 +682,7 @@ func (r *TaskReconciler) bootCrashAttempts(task *tatarav1alpha1.Task) int {
 	return n
 }
 
-func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatarav1alpha1.Task) error {
+func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatarav1alpha1.Task, podUID types.UID) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
@@ -668,8 +691,17 @@ func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatara
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
+		// Authoritative per-pod idempotency: the handleBootCrash gate reads the
+		// cache, so under cache lag two reconciles can both pass it. Re-check
+		// against the freshly-read Task here so the same pod instance bumps the
+		// budget at most once even when a conflict-retry observes the
+		// catching-up cache.
+		if fresh.Annotations[annBootCrashLastPodUID] == string(podUID) {
+			return nil
+		}
 		n, _ := strconv.Atoi(fresh.Annotations[annBootCrashAttempts])
 		fresh.Annotations[annBootCrashAttempts] = strconv.Itoa(n + 1)
+		fresh.Annotations[annBootCrashLastPodUID] = string(podUID)
 		return r.Update(ctx, fresh)
 	})
 }
@@ -1071,6 +1103,7 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 		delete(fresh.Annotations, annAgentUnreachableSince)
 		delete(fresh.Annotations, annBootCrashAttempts)
 		delete(fresh.Annotations, annBootCrashDiagnostics)
+		delete(fresh.Annotations, annBootCrashLastPodUID)
 		return r.Update(ctx, fresh)
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
