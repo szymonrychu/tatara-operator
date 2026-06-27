@@ -167,6 +167,17 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// no leader dependency and no in-memory state.
 	seq := &queue.SeqSource{Client: mgr.GetClient(), Namespace: cfg.Namespace}
 
+	// Memory-audience token source for the operator's authenticated retrieval
+	// probe (updateMemoryRetrievalProbe). Mints via the same shared OIDC client as
+	// the wrapper token below, for the "tatara-memory" audience; the source caches
+	// across the per-cycle probes.
+	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
+		ClientID:     cfg.OperatorOIDCClientID,
+		ClientSecret: cfg.OperatorOIDCClientSecret,
+		Audience:     "tatara-memory",
+	})
+
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
@@ -174,6 +185,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		LifecycleMetrics:    lifecycleMetrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
+		MemoryToken:         memoryTokens.Token,
 		OperatorURL:         cfg.OperatorURL,
 		GrafanaConfig: grafanamcp.Config{
 			Namespace:       cfg.Namespace,
