@@ -108,6 +108,13 @@ spec:
                           match the task against the issue slot (not the PR number). Zero means the
                           task targets the item identified by Number (the PR/issue number itself).
                         type: integer
+                      headSHA:
+                        description: |-
+                          HeadSHA is the PR/MR head commit SHA captured at enqueue. It seeds the
+                          review Task's role:reviewed ledger entry so same-head re-review dedup works
+                          on the very next scan cycle, without waiting for the cron backstop to fill
+                          it. Empty for issues.
+                        type: string
                       isPR:
                         type: boolean
                       issueRef:

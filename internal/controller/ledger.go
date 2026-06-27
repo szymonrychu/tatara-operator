@@ -93,6 +93,11 @@ func seedLedgerFromSpec(t *tatarav1alpha1.Task) {
 		Role:     role,
 		State:    tatarav1alpha1.WIOpen,
 		Title:    s.Title,
+		// For a PR/MR under review, Spec.Source.HeadSHA is the real head commit
+		// captured at enqueue (empty for issues). Seeding it here lets same-head
+		// re-review dedup match on the very next scan cycle, before the cron
+		// backstop refreshes the ledger. UpsertWorkItem skips empty fields.
+		HeadSHA: s.HeadSHA,
 	})
 
 	// SystemicGroup siblings.
