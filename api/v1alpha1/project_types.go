@@ -1,9 +1,13 @@
 package v1alpha1
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/szymonrychu/tatara-operator/internal/budget"
 )
 
 // MemorySpec configures the per-Project memory stack footprint. Defaults are
@@ -366,6 +370,135 @@ type ProjectSpec struct {
 	Grafana *GrafanaSpec `json:"grafana,omitempty"`
 	// +optional
 	Queue *QueueSpec `json:"queue,omitempty"`
+	// TokenBudget configures the token-budget admission gate (issue #189). Nil
+	// inherits the operator-wide defaults verbatim; a present block is the
+	// project's explicit budget config (its Enabled field is authoritative).
+	// +optional
+	TokenBudget *TokenBudgetSpec `json:"tokenBudget,omitempty"`
+}
+
+// TokenBudgetSpec configures the per-Project token-budget admission gate (issue
+// #189): pause proactive work (normal pool) at ProactivePercent and incident
+// work (alert pool) at EmergencyPercent of the window usage. Off by default.
+type TokenBudgetSpec struct {
+	// Enabled turns the gate on for this project. When the block is present this
+	// field is authoritative (it is NOT inherited from the operator-wide default).
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// Mode selects how usage is measured: customWindow meters the operator's own
+	// per-turn token accounting against TokenLimit within a cron-anchored reset
+	// window; claudeSubscription gates on the wrapper-reported Claude 5h/weekly
+	// usage percentages.
+	// +kubebuilder:validation:Enum=customWindow;claudeSubscription
+	// +kubebuilder:default=customWindow
+	// +optional
+	Mode string `json:"mode,omitempty"`
+	// ProactivePercent pauses the normal pool (brainstorm, implement, review, ...)
+	// at this percentage of the window. Default 50.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +kubebuilder:default=50
+	// +optional
+	ProactivePercent int `json:"proactivePercent,omitempty"`
+	// EmergencyPercent pauses the alert pool (incidents) at this percentage of the
+	// window. Ordered >= ProactivePercent at evaluation. Default 80.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +kubebuilder:default=80
+	// +optional
+	EmergencyPercent int `json:"emergencyPercent,omitempty"`
+	// ResetSchedule is a 5-field cron (robfig ParseStandard) marking each window
+	// reset boundary (customWindow mode). Empty disables the custom window.
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
+	// +optional
+	ResetSchedule string `json:"resetSchedule,omitempty"`
+	// WindowDuration is the declared window length as a Go duration (e.g. "5h",
+	// "168h"). It bounds the reset-boundary search; pair it with ResetSchedule.
+	// +optional
+	WindowDuration string `json:"windowDuration,omitempty"`
+	// TokenLimit is the absolute total-token budget per window (customWindow mode).
+	// +optional
+	TokenLimit int64 `json:"tokenLimit,omitempty"`
+}
+
+// BudgetConfig resolves the project's token-budget configuration, layering the
+// per-Project spec over the operator-wide defaults: a nil spec inherits the
+// defaults verbatim, while a present spec overrides each field it sets (zero-
+// valued scalars fall back to the default) and its Enabled field is taken
+// literally. The result is what budget.Evaluate consumes.
+func (p *Project) BudgetConfig(defaults budget.Config) budget.Config {
+	cfg := defaults
+	s := p.Spec.TokenBudget
+	if s == nil {
+		return cfg
+	}
+	cfg.Enabled = s.Enabled
+	if s.Mode != "" {
+		cfg.Mode = budget.Mode(s.Mode)
+	}
+	if s.ProactivePercent > 0 {
+		cfg.ProactivePercent = s.ProactivePercent
+	}
+	if s.EmergencyPercent > 0 {
+		cfg.EmergencyPercent = s.EmergencyPercent
+	}
+	if s.ResetSchedule != "" {
+		cfg.ResetSchedule = s.ResetSchedule
+	}
+	if s.WindowDuration != "" {
+		if d, err := time.ParseDuration(s.WindowDuration); err == nil {
+			cfg.WindowDuration = d
+		}
+	}
+	if s.TokenLimit > 0 {
+		cfg.TokenLimit = s.TokenLimit
+	}
+	return cfg
+}
+
+// BudgetWindowState maps the persisted custom-window accumulator (Project
+// status) into a budget.WindowState; the zero value when unset.
+func (p *Project) BudgetWindowState() budget.WindowState {
+	st := p.Status.TokenBudget
+	if st == nil {
+		return budget.WindowState{}
+	}
+	ws := budget.WindowState{WindowTokens: st.WindowTokens}
+	if st.WindowStart != nil {
+		ws.WindowStart = st.WindowStart.Time
+	}
+	return ws
+}
+
+// SetBudgetWindowState writes a rolled custom-window accumulator back onto the
+// Project status, allocating the status block on first use.
+func (p *Project) SetBudgetWindowState(ws budget.WindowState) {
+	if p.Status.TokenBudget == nil {
+		p.Status.TokenBudget = &TokenBudgetStatus{}
+	}
+	t := metav1.NewTime(ws.WindowStart)
+	p.Status.TokenBudget.WindowStart = &t
+	p.Status.TokenBudget.WindowTokens = ws.WindowTokens
+}
+
+// BudgetSubscription maps the persisted Claude-subscription snapshot (Project
+// status) into a budget.Subscription; the zero value when unset.
+func (p *Project) BudgetSubscription() budget.Subscription {
+	st := p.Status.TokenBudget
+	if st == nil {
+		return budget.Subscription{}
+	}
+	sub := budget.Subscription{
+		FiveHourPercent: float64(st.FiveHourPercent),
+		WeeklyPercent:   float64(st.WeeklyPercent),
+	}
+	if st.FiveHourReset != nil {
+		sub.FiveHourReset = st.FiveHourReset.Time
+	}
+	if st.WeeklyReset != nil {
+		sub.WeeklyReset = st.WeeklyReset.Time
+	}
+	return sub
 }
 
 // QueueSpec configures the in-operator agent-work admission queue.
@@ -434,6 +567,32 @@ type ProjectStatus struct {
 	// LastRefine is the last time the project's refine pre-step completed.
 	// +optional
 	LastRefine *metav1.Time `json:"lastRefine,omitempty"`
+	// TokenBudget carries the token-budget accumulator/snapshot (issue #189).
+	// +optional
+	TokenBudget *TokenBudgetStatus `json:"tokenBudget,omitempty"`
+}
+
+// TokenBudgetStatus carries the observed token-budget state for a Project
+// (issue #189): the custom-window accumulator and the latest Claude-subscription
+// snapshot reported by the wrapper.
+type TokenBudgetStatus struct {
+	// WindowStart is when the current custom-window opened (the most recent reset
+	// boundary). WindowTokens is the total tokens spent in it so far.
+	// +optional
+	WindowStart *metav1.Time `json:"windowStart,omitempty"`
+	// +optional
+	WindowTokens int64 `json:"windowTokens,omitempty"`
+	// FiveHourPercent / WeeklyPercent are the wrapper-reported Claude usage
+	// percentages (whole percent, 0..100) for the rolling 5h and weekly windows.
+	// A nil reset means "not reported" and the gate ignores that window.
+	// +optional
+	FiveHourPercent int `json:"fiveHourPercent,omitempty"`
+	// +optional
+	FiveHourReset *metav1.Time `json:"fiveHourReset,omitempty"`
+	// +optional
+	WeeklyPercent int `json:"weeklyPercent,omitempty"`
+	// +optional
+	WeeklyReset *metav1.Time `json:"weeklyReset,omitempty"`
 }
 
 // +kubebuilder:object:root=true
