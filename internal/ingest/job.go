@@ -227,11 +227,19 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 						Name:         workspaceVolume,
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
+					// Both containers use TerminationMessagePolicy=FallbackToLogsOnError so
+					// that when the clone or ingester exits non-zero Kubernetes captures the
+					// tail of its log into the Pod's terminated-state Message. The controller
+					// reads that back (handleFinishedJob) to record WHY the ingest failed -
+					// these short-lived Job pods are GC'd with the Job (TTL 600s) before
+					// promtail scrapes them, so the captured message is the only retained
+					// evidence of the in-pod cause.
 					InitContainers: []corev1.Container{{
-						Name:    "clone",
-						Image:   cfg.IngesterImage,
-						Command: []string{"/bin/sh", "-c"},
-						Args:    []string{cloneCmd},
+						Name:                     "clone",
+						Image:                    cfg.IngesterImage,
+						Command:                  []string{"/bin/sh", "-c"},
+						Args:                     []string{cloneCmd},
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 						Env: []corev1.EnvVar{
 							{
 								Name: "SCM_TOKEN",
@@ -253,10 +261,11 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 						VolumeMounts: []corev1.VolumeMount{{Name: workspaceVolume, MountPath: workspaceMount}},
 					}},
 					Containers: []corev1.Container{{
-						Name:    "ingest",
-						Image:   cfg.IngesterImage,
-						Command: []string{"/bin/sh", "-c"},
-						Args:    []string{mainScript},
+						Name:                     "ingest",
+						Image:                    cfg.IngesterImage,
+						Command:                  []string{"/bin/sh", "-c"},
+						Args:                     []string{mainScript},
+						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 						Env: append([]corev1.EnvVar{
 							{Name: "GIT_REPO_DIR", Value: repoDir},
 							{Name: "BASE_URL", Value: baseURL},
