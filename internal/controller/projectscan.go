@@ -130,12 +130,15 @@ const (
 )
 
 // headSHAForTask returns the head SHA for a task. It reads the first
-// role:openedPR ledger entry's HeadSHA; falls back to Status.MergedHeadSHA
-// for tasks whose PR was merged before the ledger entry was written. Returns ""
-// when neither is set.
+// role:openedPR (bot-opened PR) or role:reviewed (human PR under review) ledger
+// entry's HeadSHA; falls back to Status.MergedHeadSHA for tasks whose PR was
+// merged before the ledger entry was written. Returns "" when none is set.
+// role:reviewed is essential: review Tasks never carry a role:openedPR entry, so
+// omitting it makes same-head re-review dedup silently fail and the bot
+// re-reviews the same MR every scan cycle.
 func headSHAForTask(t *tatarav1alpha1.Task) string {
 	for _, wi := range t.Status.WorkItems {
-		if wi.Role == tatarav1alpha1.RoleOpenedPR && wi.HeadSHA != "" {
+		if (wi.Role == tatarav1alpha1.RoleOpenedPR || wi.Role == tatarav1alpha1.RoleReviewed) && wi.HeadSHA != "" {
 			return wi.HeadSHA
 		}
 	}
@@ -336,6 +339,35 @@ type candidate struct {
 	title      string
 }
 
+// prInReactionScope reports whether a human-authored PR/MR candidate is in the
+// project's PR reaction scope. When prReactionScope=="labeledOrMentioned" the PR
+// must carry the project trigger label OR @-mention the bot to be reviewed; this
+// stops the bot from re-reviewing unlabeled, un-mentioned MRs every scan cycle
+// (the !1090 token-burn loop). Any other (empty/unset) scope reviews all PRs,
+// preserving the default behavior. Bot-authored PRs never reach here (they take
+// the issueLifecycle/MRCI recovery path).
+func prInReactionScope(proj *tatarav1alpha1.Project, c candidate, bot string) bool {
+	scope := ""
+	if proj.Spec.Scm != nil {
+		scope = proj.Spec.Scm.PRReactionScope
+	}
+	if scope != "labeledOrMentioned" {
+		return true
+	}
+	if hasLabel(c.labels, proj.Spec.TriggerLabel) {
+		return true
+	}
+	return mentionsBot(c.body, bot)
+}
+
+// mentionsBot reports whether text @-mentions the bot login.
+func mentionsBot(text, bot string) bool {
+	if bot == "" || text == "" {
+		return false
+	}
+	return strings.Contains(text, "@"+bot)
+}
+
 func hasLabel(labels []string, want string) bool {
 	if want == "" {
 		return false
@@ -485,6 +517,9 @@ func scanSourceFor(provider string, c candidate) *tatarav1alpha1.TaskSource {
 	}
 	if c.author != "" {
 		src.AuthorLogin = c.author
+	}
+	if c.isPR {
+		src.HeadSHA = c.headSHA
 	}
 	return src
 }
@@ -931,6 +966,12 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				created++
 			}
 		} else {
+			if !prInReactionScope(proj, c, bot) {
+				r.Metrics.ScanItem("mrScan", "skipped_scope")
+				l.Info("mrScan: skipping PR out of reaction scope (unlabeled + un-mentioned under labeledOrMentioned)",
+					"action", "scan_pr_out_of_scope", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+				continue
+			}
 			goal := fmt.Sprintf("Review and test PR %s#%d", c.repo, c.number)
 			// Carry the PR head branch so the review pod checks it out read-only and
 			// can run/test the change (issue #114 decision 4).
