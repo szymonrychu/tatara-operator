@@ -27,7 +27,12 @@ func TestRunnableStartStop(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
+	// serveHTTP bounds graceful shutdown by its own 10s shutdownCtx, so the stop
+	// must be allowed at least that long plus scheduling headroom; a tight 2s
+	// deadline flaked on loaded -race CI runners ("runnable did not stop on
+	// context cancel"). A genuine never-stops regression still fails here, well
+	// under the package test timeout.
+	case <-time.After(15 * time.Second):
 		t.Fatal("runnable did not stop on context cancel")
 	}
 
