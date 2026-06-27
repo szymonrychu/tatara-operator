@@ -31,6 +31,12 @@ const (
 	pollRequeue       = 30 * time.Second
 	agentBootRequeue  = 5 * time.Second
 	agentBootDeadline = 5 * time.Minute
+	// busyRequeue paces re-submission after a wrapper 409 "session busy": the
+	// session is processing a prior turn, so requeue on a short bounded interval
+	// (backpressure) instead of erroring and tight-looping on reconcile backoff
+	// (issue #168). A session stuck busy forever is bounded by the turn-timeout /
+	// planning-stall watchdogs, not this interval.
+	busyRequeue       = 15 * time.Second
 	maxPodRecreations = 3
 	turnTimeoutGrace  = 60 * time.Second
 	// planningStallDeadline bounds how long a Task may sit in Planning without
@@ -815,6 +821,26 @@ func (r *TaskReconciler) handleTransientWrapper(ctx context.Context, task *tatar
 // the subtask name ("" for the plan turn). outcome carries the specific cause.
 func (r *TaskReconciler) handleTurnSubmitFailure(ctx context.Context, task *tatarav1alpha1.Task, err error, elapsed float64, phase, subtask string) (ctrl.Result, error) {
 	outcome := agent.SubmitOutcome(err)
+	// A wrapper 409 "session busy" is expected backpressure, not a dispatch
+	// failure: the session already has a turn in flight (the operator's view of
+	// the in-flight turn raced the wrapper's session release). Requeue on a short
+	// bounded interval and count it as result="transient" so the turn-submit
+	// failure-ratio alert (which keys on result="error") is not inflated by
+	// expected contention; returning an error here would tight-loop on
+	// controller-runtime backoff (the retry storm in issue #168). It is NOT routed
+	// through handleTransientWrapper because a busy session is running a prior
+	// turn, not failing to boot, so it must not be bounded by agentBootDeadline; a
+	// session stuck busy forever is caught by the turn-timeout / planning-stall
+	// watchdogs instead.
+	if agent.IsSessionBusy(err) {
+		r.Metrics.TurnSubmit(task.Spec.Kind, "transient", outcome, elapsed)
+		r.Metrics.AgentSessionBusyRequeue()
+		log.FromContext(ctx).Info("wrapper session busy; requeuing turn submit",
+			"action", "agent_turn_submit", "resource_id", task.Name,
+			"subtask", subtask, "phase", phase,
+			"requeueAfter", busyRequeue.String(), "outcome", outcome)
+		return ctrl.Result{RequeueAfter: busyRequeue}, nil
+	}
 	if res, herr, handled := r.handleTransientWrapper(ctx, task, err); handled {
 		r.Metrics.TurnSubmit(task.Spec.Kind, "transient", outcome, elapsed)
 		return res, herr

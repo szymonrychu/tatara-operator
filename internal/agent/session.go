@@ -84,11 +84,30 @@ func isUnreachable(err error) bool {
 // pod whose session just went Booting/Dead. 503 = session not ready / dead
 // (crash-recovery mid-task); 425 = too early (server up, session still
 // initialising). Callers requeue these under agentBootDeadline instead of
-// tripping reconcile backoff. 409 ("session busy") is deliberately NOT here:
-// the wrapper flips Busy->Ready before firing its turn-complete callback, so a
-// 409 on submit is unexpected and must surface as a real error.
+// tripping reconcile backoff. 409 ("session busy") is deliberately NOT here: it
+// is handled separately as transient backpressure (see IsSessionBusy) on a short
+// bounded requeue, and unlike a boot-race it is NOT bounded by agentBootDeadline
+// because the session is actively running a prior turn, not failing to boot.
 func isTransientWrapperStatus(status int) bool {
 	return status == http.StatusServiceUnavailable || status == http.StatusTooEarly
+}
+
+// IsSessionBusy reports whether err from a SubmitTurn call is the wrapper's HTTP
+// 409 "session busy" response: the session already has a turn in flight, so the
+// submit was refused. This is expected, transient backpressure - the operator's
+// view of the in-flight turn raced the wrapper's session release - not a dispatch
+// failure. Callers requeue on a short bounded interval and count it as
+// result="transient", rather than returning a hard reconcile error that would
+// tight-loop on controller-runtime backoff (issue #168). Unlike
+// IsTransientWrapper, a busy session is running a prior turn (not failing to
+// boot), so it is NOT subject to agentBootDeadline termination; a session stuck
+// busy forever is caught by the turn-timeout / planning-stall watchdogs instead.
+func IsSessionBusy(err error) bool {
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return he.Status == http.StatusConflict
+	}
+	return false
 }
 
 // IsTransientWrapper reports whether err from a SubmitTurn call is the transient

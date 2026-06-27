@@ -36,6 +36,31 @@ func TestIsTransientWrapper(t *testing.T) {
 	}
 }
 
+// TestIsSessionBusy checks that only a wrapper HTTP 409 ("session busy")
+// classifies as transient backpressure, while other statuses, transport-level
+// errors and unrelated errors do not (issue #168).
+func TestIsSessionBusy(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"http_409", &agent.HTTPError{Status: 409}, true},
+		{"wrapped_409", fmt.Errorf("submit plan turn: %w", &agent.HTTPError{Status: 409}), true},
+		{"http_503", &agent.HTTPError{Status: 503}, false},
+		{"http_425", &agent.HTTPError{Status: 425}, false},
+		{"http_500", &agent.HTTPError{Status: 500}, false},
+		{"unreachable", &agent.UnreachableError{Err: errors.New("connection refused")}, false},
+		{"other", errors.New("boom"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, agent.IsSessionBusy(tc.err))
+		})
+	}
+}
+
 // TestSubmitOutcome checks the low-cardinality outcome label mapping used by the
 // operator_turn_submit_total metric and the failure log.
 func TestSubmitOutcome(t *testing.T) {
