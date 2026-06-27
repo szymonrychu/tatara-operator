@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -305,41 +306,140 @@ func ghDoWithHeaders(ctx context.Context, fullURL, token string, out any) (linkH
 	return link, nil
 }
 
+// ghMaxRetries bounds in-process retries of a rate-limited write request.
+// ghMaxBackoff caps how long a single retry will wait; if GitHub asks for a
+// longer wait we fail fast and let the reconcile requeue (controller-runtime
+// backs off) rather than blocking a worker goroutine.
+const (
+	ghMaxRetries = 3
+	ghMaxBackoff = 16 * time.Second
+)
+
+// ghRetrySleep waits for d or until ctx is done. It is a package var so tests
+// can stub the wait instead of sleeping for real.
+var ghRetrySleep = func(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// ghIsRateLimited reports whether a >=400 response is a GitHub rate-limit
+// rejection (primary or secondary). GitHub answers rate limits with 429 or 403;
+// a plain 403 (permission denied) carries none of the rate-limit signals and is
+// NOT treated as one, so genuine auth failures still surface immediately.
+func ghIsRateLimited(resp *http.Response, body string) bool {
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusForbidden:
+		if resp.Header.Get("Retry-After") != "" {
+			return true
+		}
+		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+			return true
+		}
+		return strings.Contains(strings.ToLower(body), "rate limit")
+	default:
+		return false
+	}
+}
+
+// ghRateLimitDelay decides whether a >=400 response is a retryable rate-limit
+// rejection and, if so, how long to wait before retrying. Only rate-limit
+// responses are retryable: GitHub rejects them unprocessed, so re-sending is
+// side-effect-free even for non-idempotent writes (a 5xx, by contrast, may have
+// been applied server-side and is never retried here). The wait honors
+// Retry-After (seconds), else X-RateLimit-Reset (epoch) when remaining is 0,
+// else exponential backoff (1s<<attempt) with jitter to de-correlate a burst.
+func ghRateLimitDelay(resp *http.Response, body string, attempt int) (time.Duration, bool) {
+	if !ghIsRateLimited(resp, body) {
+		return 0, false
+	}
+	if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
+		if secs, err := strconv.Atoi(ra); err == nil && secs >= 0 {
+			return time.Duration(secs) * time.Second, true
+		}
+	}
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		if reset := strings.TrimSpace(resp.Header.Get("X-RateLimit-Reset")); reset != "" {
+			if epoch, err := strconv.ParseInt(reset, 10, 64); err == nil {
+				if d := time.Until(time.Unix(epoch, 0)); d > 0 {
+					return d, true
+				}
+			}
+		}
+	}
+	base := time.Second << attempt
+	return base + ghJitter(base), true
+}
+
+// ghJitter returns a random duration in [0, base/2] so concurrent retries
+// scatter instead of re-colliding in lockstep.
+func ghJitter(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	return rand.N(base/2 + 1)
+}
+
 func ghDo(ctx context.Context, base, method, path, token string, in, out any) error {
-	var rdr io.Reader
+	var body []byte
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
 			return fmt.Errorf("github: encode body: %w", err)
 		}
-		rdr = bytes.NewReader(b)
+		body = b
 	}
-	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
-	if err != nil {
-		return fmt.Errorf("github: build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	if rdr != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := scmHTTPClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("github: do request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
-	}
-	if out == nil {
-		_, _ = io.Copy(io.Discard, resp.Body)
+	for attempt := 0; ; attempt++ {
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
+		if err != nil {
+			return fmt.Errorf("github: build request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		if rdr != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := scmHTTPClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("github: do request: %w", err)
+		}
+		if resp.StatusCode >= 400 {
+			buf, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if delay, retry := ghRateLimitDelay(resp, string(buf), attempt); retry && attempt < ghMaxRetries && delay <= ghMaxBackoff {
+				slog.WarnContext(ctx, "github: rate-limited, backing off before retry",
+					"provider", "github", "method", method, "path", path,
+					"status", resp.StatusCode, "attempt", attempt+1, "delay_ms", delay.Milliseconds())
+				if serr := ghRetrySleep(ctx, delay); serr != nil {
+					return serr
+				}
+				continue
+			}
+			return &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
+		}
+		if out == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return nil
+		}
+		derr := json.NewDecoder(resp.Body).Decode(out)
+		_ = resp.Body.Close()
+		if derr != nil && derr != io.EOF {
+			return fmt.Errorf("github: decode response: %w", derr)
+		}
 		return nil
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-		return fmt.Errorf("github: decode response: %w", err)
-	}
-	return nil
 }
 
 // CreateIssue opens an issue and returns its ref + url.
@@ -381,7 +481,12 @@ func (c *GitHub) AddLabel(ctx context.Context, token, issueRef, label string) er
 // "Label does not exist". We swallow that 404 so best-effort sibling-label
 // cleanup stays idempotent and benign 404s are not counted as SCM write
 // errors (mirrors GitLab.RemoveLabel's idempotent PUT remove_labels=). Real
-// failures (401/403/5xx/network) still surface.
+// failures (401/403/5xx/network) still surface AND are logged at WARN: this is
+// best-effort sibling cleanup whose error the caller (setLifecycleLabel)
+// tolerates, so without a log here the only trace of a failure is the
+// operator_scm_writes_total error increment - which is what made the #161
+// remove_label burst undiagnosable. WARN (not ERROR) keeps it out of the
+// level="ERROR" log-burst alert while staying queryable in Loki.
 func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
 	owner, repo, number, err := ghIssueRef(issueRef)
 	if err != nil {
@@ -398,6 +503,9 @@ func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string)
 				"provider", "github", "issue_ref", issueRef, "label", label)
 			return nil
 		}
+		slog.WarnContext(ctx, "github: remove label failed",
+			"provider", "github", "issue_ref", issueRef, "label", label,
+			"status", ErrorStatus(err), "err", err.Error())
 		return err
 	}
 	return nil
