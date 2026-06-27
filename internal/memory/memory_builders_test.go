@@ -66,6 +66,24 @@ func TestMemoryDeployment_ImagePullSecrets(t *testing.T) {
 	require.Empty(t, dNoIPS.Spec.Template.Spec.ImagePullSecrets)
 }
 
+func TestMemoryDeployment_StartupProbe(t *testing.T) {
+	p := testProject("acme")
+	c := memory.MemoryDeployment(p, testCfg()).Spec.Template.Spec.Containers[0]
+
+	// A startupProbe must gate liveness so the multi-stage blocking startup
+	// (up to 60s waitForDB + OIDC discovery + migrations) cannot be
+	// liveness-killed mid-boot into an unrecoverable CrashLoopBackOff.
+	require.NotNil(t, c.StartupProbe, "startupProbe missing - liveness can kill a slow boot")
+	require.Equal(t, "/healthz", c.StartupProbe.HTTPGet.Path)
+
+	// Budget must exceed the app's worst-case 60s DB wait.
+	budget := c.StartupProbe.PeriodSeconds * c.StartupProbe.FailureThreshold
+	require.GreaterOrEqual(t, budget, int32(90), "startup budget must clear the 60s waitForDB plus OIDC/migrations")
+
+	require.NotNil(t, c.LivenessProbe)
+	require.Equal(t, "/healthz", c.LivenessProbe.HTTPGet.Path)
+}
+
 func TestMemoryConfigMap(t *testing.T) {
 	p := testProject("acme")
 	cm := memory.MemoryConfigMap(p, testCfg())

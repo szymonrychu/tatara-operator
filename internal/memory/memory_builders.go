@@ -63,6 +63,19 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 							// uses LLM labels instead of silently falling back to member names.
 							secretEnv("OPENAI_API_KEY", cfg.OpenAISecretName, "LLM_BINDING_API_KEY"),
 						},
+						// tatara-memory does a multi-stage blocking startup before its
+						// HTTP listener (hence /healthz) comes up: waitForDB retries the
+						// postgres ping for up to 60s, then OIDC discovery, then schema
+						// migrations. That worst-case budget exceeds the liveness probe's
+						// ~35s kill window, so without a startupProbe a slow-dependency
+						// boot is liveness-killed mid-startup into an unrecoverable
+						// CrashLoopBackOff. The startupProbe gives startup 100s
+						// (5s * 20) and gates liveness until /healthz first answers 200.
+						StartupProbe: &corev1.Probe{
+							ProbeHandler:     corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
+							PeriodSeconds:    5,
+							FailureThreshold: 20,
+						},
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler:        corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("http")}},
 							InitialDelaySeconds: 5,
