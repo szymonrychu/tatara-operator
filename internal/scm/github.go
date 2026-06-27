@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -390,6 +391,11 @@ func (c *GitHub) RemoveLabel(ctx context.Context, token, issueRef, label string)
 	if err := ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil); err != nil {
 		var he *HTTPError
 		if errors.As(err, &he) && he.Status == http.StatusNotFound {
+			// "Label does not exist": the label was already absent, so the
+			// DELETE is a benign no-op. Log at DEBUG so an investigation has a
+			// signal without inflating WARN/ERROR or the write-failure metric.
+			slog.DebugContext(ctx, "remove label no-op: label not present",
+				"provider", "github", "issue_ref", issueRef, "label", label)
 			return nil
 		}
 		return err

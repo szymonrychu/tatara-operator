@@ -111,7 +111,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "SCM write-backs are failing"
-            description: "operator_scm_writes_total{kind=\"write\",result=\"error\"} increased in 15m: comments, PRs, labels, or board updates failed to write back to the SCM. Break down operator_scm_request_errors_by_status_total by status to tell token (401/403) from rate-limit (429) from network."
+            description: "operator_scm_writes_total{kind=\"write\",result=\"error\"} increased in 15m: a comment, PR, label, or board update failed to write back to the SCM. Break down operator_scm_request_errors_by_status_total by (verb, status) to localize which write failed: token (401/403), rate-limit (429), or network. A burst confined to verb=\"remove_label\" status=\"404\" is benign lifecycle-label churn (the label was already absent), swallowed since issue #159 and no longer counted as an error."
         - alert: TataraSCMWriteFailureRatioHigh
           expr: |
             (
@@ -126,7 +126,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "SCM write failure ratio high"
-            description: "More than 30% of SCM write-backs (comments/labels/approvals/PRs/board) errored over 15m, with at least 3 writes attempted. Denominator excludes kind=\"read\" traffic and blocked (deliberate hard-gate refusals), so this tracks genuine write failures. Break down operator_scm_request_errors_by_status_total by status: 401/403 => token in the project ScmSecretRef, 429 => rate limit, network/5xx => egress or provider outage."
+            description: "More than 30% of SCM write-backs (comments/labels/approvals/PRs/board) errored over 15m, with at least 3 writes attempted. Denominator excludes kind=\"read\" traffic and blocked (deliberate hard-gate refusals), so this tracks genuine write failures. Break down operator_scm_request_errors_by_status_total by (verb, status) first to see which write is failing: 401/403 => token in the project ScmSecretRef, 429 => rate limit, network/5xx => egress or provider outage. A burst confined to verb=\"remove_label\" status=\"404\" is benign lifecycle-label churn (the label was already absent), swallowed since issue #159 and no longer counted as an error."
         - alert: TataraPushMetricsRejected
           expr: increase(operator_push_receive_total{result="rejected"}[15m]) > 0
           labels:
