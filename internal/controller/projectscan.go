@@ -953,6 +953,20 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			srcCand := candidate{
 				repo: c.repo, number: c.number, author: c.author, isPR: true, title: c.title,
 			}
+			// Bot-last-word backstop (issue #188): a bot-authored PR whose prior
+			// lifecycle Task went terminal (e.g. Parked after an MRCI deadline, which
+			// posts a comment) is otherwise re-created every cron cycle until recovery
+			// is exhausted and the PR is wrongly closed. When tatara posted the most
+			// recent comment on the MR and no human has replied, skip re-creation: the
+			// terminal Task remains and a human comment reactivates it via the webhook.
+			// The live MRCI polling path is unaffected (hasLiveLifecycleTaskForIssue
+			// above already skips while a Task is in flight).
+			if botHadLastWord(ctx, reader, srcCand, bot) {
+				r.Metrics.ScanItem("mrScan", "skipped_bot_last_word")
+				l.Info("mrScan: skipped bot PR re-creation, bot had the last word (awaiting human reply)",
+					"action", "scan_mr", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
+				continue
+			}
 			goal := fmt.Sprintf("Review issueLifecycle PR %s#%d", c.repo, c.number)
 			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
 			ok2, err := r.createScanTask(ctx, proj, &repo, labelCand, srcCand, "mrScan", "issueLifecycle", goal, ann, nil)
@@ -1197,6 +1211,19 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 					"last_terminal_task", lt.Name)
 				continue
 			}
+		}
+		// Bot-last-word backstop (issue #188): even when no terminal Task gates this
+		// candidate (e.g. the prior lifecycle Task was GC'd, so neither the adoption
+		// nor the fresh-creation gate above fires), do not spawn a fresh agent when
+		// tatara authored the most recent comment and no human has replied -
+		// re-triaging would only re-post and complete, looping every cron cycle. A
+		// human reply (a newer non-bot comment) clears the gate on the next scan.
+		if botHadLastWord(ctx, reader, c, botLogin) {
+			r.Metrics.ScanItem("issueScan", "skipped_bot_last_word")
+			l.Info("issueScan: skipped fresh task creation, bot had the last word (awaiting human reply)",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			continue
 		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
 		var sg *tatarav1alpha1.SystemicGroup
@@ -1779,6 +1806,56 @@ func (r *ProjectReconciler) humanActivityGate(ctx context.Context, reader scm.SC
 		}
 		return humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, since)
 	}
+}
+
+// botIsLastCommenter reports whether the newest comment (by CreatedAt) is
+// authored by botLogin - tatara already had the last word and no one has spoken
+// since. Newest-by-time is robust to SCM list ordering. No comments -> false.
+func botIsLastCommenter(comments []scm.IssueComment, botLogin string) bool {
+	newest := -1
+	for i := range comments {
+		if newest == -1 || comments[i].CreatedAt.After(comments[newest].CreatedAt) {
+			newest = i
+		}
+	}
+	return newest >= 0 && comments[newest].Author == botLogin
+}
+
+// botHadLastWord reports whether tatara authored the most recent comment on the
+// candidate's issue/PR/MR conversation, i.e. the bot already responded and no
+// human has replied since. It is the scan-time loop guard for issue #188: a scan
+// must not re-spawn an agent when the only new activity is the bot's own comment.
+// PR/MR timelines are read via PRCommentLister (GitLab MRs have a distinct notes
+// endpoint; GitHub PR comments are issue comments) with a fallback to
+// ListIssueComments for readers lacking the capability. Empty botLogin, an
+// unsplittable repo, a nil reader, or a read error -> false (fail-open: do not
+// suppress scheduling, matching humanCommentAfter and preserving missed-webhook
+// recovery).
+func botHadLastWord(ctx context.Context, reader scm.SCMReader, c candidate, botLogin string) bool {
+	if botLogin == "" || reader == nil {
+		return false
+	}
+	owner, name, ok := strings.Cut(c.repo, "/")
+	if !ok {
+		return false
+	}
+	var (
+		comments []scm.IssueComment
+		err      error
+	)
+	if c.isPR {
+		if pl, okPL := reader.(scm.PRCommentLister); okPL {
+			comments, err = pl.ListPRComments(ctx, owner, name, c.number)
+		} else {
+			comments, err = reader.ListIssueComments(ctx, owner, name, c.number)
+		}
+	} else {
+		comments, err = reader.ListIssueComments(ctx, owner, name, c.number)
+	}
+	if err != nil {
+		return false
+	}
+	return botIsLastCommenter(comments, botLogin)
 }
 
 // botCommentedOnIssue reports whether botLogin already authored a comment on the

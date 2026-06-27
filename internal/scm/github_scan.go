@@ -295,6 +295,13 @@ func (c *GitHub) ListIssueComments(ctx context.Context, owner, repo string, numb
 	return out, nil
 }
 
+// ListPRComments returns the conversation comments on a PR, oldest-first. On
+// GitHub a pull request IS an issue, so its conversation comments are issue
+// comments and this delegates to ListIssueComments.
+func (c *GitHub) ListPRComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	return c.ListIssueComments(ctx, owner, repo, number)
+}
+
 // GetIssue returns the title and body of an issue.
 func (c *GitHub) GetIssue(ctx context.Context, owner, repo string, number int) (IssueContent, error) {
 	var raw ghIssueItem

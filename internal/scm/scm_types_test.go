@@ -39,6 +39,11 @@ func TestProvidersSatisfySCMReader(t *testing.T) {
 	var _ SCMReader = (*GitLab)(nil)
 }
 
+func TestProvidersSatisfyPRCommentLister(t *testing.T) {
+	var _ PRCommentLister = (*GitHub)(nil)
+	var _ PRCommentLister = (*GitLab)(nil)
+}
+
 func TestProvidersSatisfyCloseIssue(t *testing.T) {
 	var w SCMWriter = (*GitHub)(nil)
 	_ = w

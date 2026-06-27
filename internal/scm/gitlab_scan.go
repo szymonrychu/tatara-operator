@@ -187,11 +187,13 @@ func (c *GitLab) GetDefaultBranchHeadSHA(ctx context.Context, owner, _ /*repo*/ 
 	return branch.Commit.ID, nil
 }
 
-// ListIssueComments returns non-system notes on issue number, oldest-first. All
-// pages are fetched. The (owner, repo) pair is resolved to a project id by
-// glProjectID, accepting both the split and full-path calling conventions.
-func (c *GitLab) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
-	path := "/projects/" + url.PathEscape(glProjectID(owner, repo)) + "/issues/" + strconv.Itoa(number) + "/notes?per_page=100"
+// glListNotes returns non-system notes on a GitLab issue or merge request,
+// oldest-first. resource is "issues" or "merge_requests" - the two live in
+// separate IID namespaces with separate notes endpoints. All pages are fetched.
+// The (owner, repo) pair is resolved to a project id by glProjectID, accepting
+// both the split and full-path calling conventions.
+func (c *GitLab) glListNotes(ctx context.Context, resource, owner, repo string, number int) ([]IssueComment, error) {
+	path := "/projects/" + url.PathEscape(glProjectID(owner, repo)) + "/" + resource + "/" + strconv.Itoa(number) + "/notes?per_page=100"
 	raw, err := glDoPaged[glNote](ctx, c.base(), path, c.token)
 	if err != nil {
 		return nil, err
@@ -207,6 +209,19 @@ func (c *GitLab) ListIssueComments(ctx context.Context, owner, repo string, numb
 	// ordering within the fetched set regardless of server-side default.
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// ListIssueComments returns non-system notes on issue number, oldest-first.
+func (c *GitLab) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	return c.glListNotes(ctx, "issues", owner, repo, number)
+}
+
+// ListPRComments returns non-system notes on merge-request number, oldest-first.
+// GitLab merge requests have their own IID namespace and notes endpoint, so the
+// bot-last-word gate must read /merge_requests/:iid/notes rather than the issues
+// endpoint (which would resolve a different IID or 404).
+func (c *GitLab) ListPRComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error) {
+	return c.glListNotes(ctx, "merge_requests", owner, repo, number)
 }
 
 // CloseIssue posts a note then PUTs the issue state_event=close. Unlike the
