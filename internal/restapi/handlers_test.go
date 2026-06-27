@@ -236,6 +236,34 @@ func TestPatchSubtask_NotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+// TestPatchSubtask_NormalizesPhaseCase covers the issue #174 minor bug: a
+// lowercase "done" phase used to be written straight to the CRD status and
+// rejected by its enum schema. It must now be canonicalized to "Done".
+func TestPatchSubtask_NormalizesPhaseCase(t *testing.T) {
+	r := buildRouter(t, subtask("s1", "t1", 1))
+	body := strings.NewReader(`{"phase":"done"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/subtasks/s1", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.SubtaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.Equal(t, "Done", out.Status.Phase)
+}
+
+// TestPatchSubtask_RejectsInvalidPhase ensures an unrecognized phase returns a
+// clear 400 at the REST boundary rather than an opaque CRD admission 500.
+func TestPatchSubtask_RejectsInvalidPhase(t *testing.T) {
+	r := buildRouter(t, subtask("s1", "t1", 1))
+	body := strings.NewReader(`{"phase":"finished"}`)
+	req := httptest.NewRequest(http.MethodPatch, "/subtasks/s1", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 // --- Task 11: propose_issue / review_verdict / pr_outcome ---
 
 func TestProposeIssue(t *testing.T) {
