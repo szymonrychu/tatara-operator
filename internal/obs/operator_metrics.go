@@ -57,6 +57,8 @@ type OperatorMetrics struct {
 	toolSurfaceProbeDuration  *prometheus.HistogramVec
 	systemicSiblingsCollapsed *prometheus.CounterVec
 	systemicGroupsLed         *prometheus.CounterVec
+	repositoryIngestFailing   *prometheus.GaugeVec
+	repositoryLastIngestTime  *prometheus.GaugeVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -143,6 +145,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_ingest_job_total",
 			Help: "Finished ingest Jobs by terminal result and ingest mode (incremental|full).",
 		}, []string{"result", "mode"}),
+		repositoryIngestFailing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_repository_ingest_failing",
+			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0), else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138).",
+		}, []string{"repo"}),
+		repositoryLastIngestTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_repository_last_ingest_timestamp_seconds",
+			Help: "Unix timestamp (seconds) of a Repository's last successful ingest (status LastIngestTime). Compute staleness in PromQL as time() - this (issue #138).",
+		}, []string{"repo"}),
 		agentUnreachableTermTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "operator_agent_unreachable_termination_total",
 			Help: "Tasks terminated because the wrapper agent stayed unreachable past the boot deadline.",
@@ -327,6 +337,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.openProposals,
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
+		m.repositoryIngestFailing,
+		m.repositoryLastIngestTime,
 		m.agentUnreachableTermTotal,
 		m.agentBootCrashTotal,
 		m.orphanReapedTotal,
@@ -470,6 +482,35 @@ func (m *OperatorMetrics) TurnTimeout(source string) {
 // genuinely going stale.
 func (m *OperatorMetrics) IngestJobResult(result, mode string) {
 	m.ingestJobTotal.WithLabelValues(result, mode).Inc()
+}
+
+// SetRepositoryIngestFailing sets operator_repository_ingest_failing for a repo
+// to 1 when its ingest is currently failing, else 0. Unlike the monotonic
+// operator_ingest_job_total counter, this reflects the CURRENT ingest health and
+// clears as soon as a re-ingest succeeds, so alerting on it does not keep firing
+// for an hour after a self-healed transient burst (issue #138).
+func (m *OperatorMetrics) SetRepositoryIngestFailing(repo string, failing bool) {
+	v := 0.0
+	if failing {
+		v = 1.0
+	}
+	m.repositoryIngestFailing.WithLabelValues(repo).Set(v)
+}
+
+// SetRepositoryLastIngestTimestamp sets operator_repository_last_ingest_timestamp_seconds
+// for a repo to the Unix seconds of its last successful ingest.
+func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(repo string, unixSeconds float64) {
+	m.repositoryLastIngestTime.WithLabelValues(repo).Set(unixSeconds)
+}
+
+// RepositoryIngestFailingGauge returns the gauge for a repo, for test assertions.
+func (m *OperatorMetrics) RepositoryIngestFailingGauge(repo string) prometheus.Gauge {
+	return m.repositoryIngestFailing.WithLabelValues(repo)
+}
+
+// RepositoryLastIngestTimestampGauge returns the gauge for a repo, for test assertions.
+func (m *OperatorMetrics) RepositoryLastIngestTimestampGauge(repo string) prometheus.Gauge {
+	return m.repositoryLastIngestTime.WithLabelValues(repo)
 }
 
 // AgentUnreachableTermination increments

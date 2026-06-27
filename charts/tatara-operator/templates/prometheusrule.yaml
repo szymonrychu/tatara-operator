@@ -92,12 +92,21 @@ spec:
             summary: "Tasks terminated for an unreachable wrapper"
             description: "operator_agent_unreachable_termination_total increased in 15m: a Task was killed because its wrapper agent stayed unreachable past the boot deadline."
         - alert: TataraIngestJobFailing
-          expr: increase(operator_ingest_job_total{result="failure", mode="full"}[1h]) > 0
+          expr: operator_repository_ingest_failing > 0
+          for: 15m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "memory full re-ingest Jobs are failing"
-            description: "operator_ingest_job_total{result=\"failure\", mode=\"full\"} increased in 1h: a full re-ingest failed (a first/scheduled full ingest, or the incremental-to-full self-heal fallback after repeated incremental failures), so the recall corpus is genuinely going stale. Benign incremental failures that self-heal via the full-ingest fallback are excluded by the mode=\"full\" selector."
+            summary: "memory re-ingest is failing for a repo"
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 15m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138)."
+        - alert: TataraIngestStale
+          expr: (time() - operator_repository_last_ingest_timestamp_seconds) > {{ .Values.prometheusRule.ingestStaleAfterSeconds }}
+          for: 30m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a repo has not been re-ingested recently"
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} last ingested {{ "{{" }} $value | humanizeDuration {{ "}}" }} ago, past the {{ .Values.prometheusRule.ingestStaleAfterSeconds }}s staleness budget: the recall corpus is going stale even though no ingest Job is actively failing (e.g. the re-ingest cron is not landing). Tune via prometheusRule.ingestStaleAfterSeconds."
         - alert: TataraLifecycleGiveups
           expr: increase(tatara_lifecycle_giveup_total[1h]) > 0
           labels:
