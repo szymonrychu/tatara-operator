@@ -46,6 +46,14 @@ on:
         type: boolean
         required: false
         default: false
+      chart-validate-render-args:
+        description: >-
+          Extra `helm template` flags for a second chart-validate render that
+          exercises opt-in templates the defaults never hit (e.g. tatara-chat's
+          ingress / networkPolicy paths). Empty runs only the default render.
+        type: string
+        required: false
+        default: ''
       image-build-arg:
         description: >-
           Optional single extra `key=value` docker build-arg forwarded to
@@ -146,6 +154,7 @@ jobs:
       - name: build deps, lint and render chart
         env:
           CHART_NEEDS_CNPG: ${{ inputs.chart-needs-cnpg }}
+          CHART_RENDER_ARGS: ${{ inputs.chart-validate-render-args }}
         run: |
           NAME="$(basename "$(ls -d charts/*/)")"
           if [ "${CHART_NEEDS_CNPG}" = "true" ]; then
@@ -157,6 +166,13 @@ jobs:
           helm dependency build "charts/$NAME"
           helm lint "charts/$NAME"
           helm template release "charts/$NAME" >/dev/null
+          if [ -n "${CHART_RENDER_ARGS}" ]; then
+            # Second render exercising opt-in templates the defaults never hit
+            # (e.g. ingress / networkPolicy), so a break there is caught before
+            # main. Word-splitting of the flags is intentional.
+            # shellcheck disable=SC2086
+            helm template release "charts/$NAME" ${CHART_RENDER_ARGS} >/dev/null
+          fi
 
   image:
     needs: [build, smoke, chart-validate]
