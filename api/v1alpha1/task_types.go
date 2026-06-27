@@ -112,6 +112,12 @@ type TaskSource struct {
 	IsPR bool `json:"isPR,omitempty"`
 	// +optional
 	Number int `json:"number,omitempty"`
+	// HeadSHA is the PR/MR head commit SHA captured at enqueue. It seeds the
+	// review Task's role:reviewed ledger entry so same-head re-review dedup works
+	// on the very next scan cycle, without waiting for the cron backstop to fill
+	// it. Empty for issues.
+	// +optional
+	HeadSHA string `json:"headSHA,omitempty"`
 	// Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
 	// branch slug (TaskBranch) and the no-agent PR-title fallback.
 	// +optional

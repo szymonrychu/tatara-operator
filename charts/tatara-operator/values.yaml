@@ -196,11 +196,15 @@ serviceMonitor:
 # infra helmfile sets whatever label the cluster Prometheus ruleSelector matches
 # on (the chart bakes none, per the cluster-agnostic rule). severityLabel is
 # stamped on every alert; tasksInflightThreshold tunes the concurrency-cap
-# deadman threshold. Alertmanager routing stays cluster-side.
+# deadman threshold; turnSubmitP95LatencyThreshold (seconds) tunes the SubmitTurn
+# p95 latency alert (the operator_turn_submit_duration_seconds histogram tops out
+# at 25.6s, so keep this well under that ceiling). Alertmanager routing stays
+# cluster-side.
 prometheusRule:
   enabled: true
   severityLabel: "warning"
   tasksInflightThreshold: 8
+  turnSubmitP95LatencyThreshold: 5
   additionalLabels: {}
 
 # dashboard ships the "Tatara Loop" Grafana dashboard as a ConfigMap labelled

@@ -163,4 +163,21 @@ spec:
           annotations:
             summary: "a project is paused on its token budget"
             description: "operator_admission_blocked_total{reason=\"token_budget\"} has been increasing for 15m (the project and pool class are in the series labels): the token-budget gate is holding proactive work (class=\"normal\") - or, at the emergency threshold, incident work (class=\"alert\") - until the usage window resets (issue #189). Expected when a window is genuinely exhausted; investigate if unexpected (a mis-set tokenBudget percent/limit/schedule, or runaway token spend). Current usage vs the 50%/80% thresholds is on operator_token_budget_used_ratio."
+        # ---- Class C: latency / saturation (the one histogram_quantile alert; traffic-gated so idle windows stay NaN-safe) ----
+        # histogram_quantile over an all-zero bucket rate returns NaN; an un-gated quantile rule false-fires on
+        # every idle window (issue #143). The "and sum(rate(..._count[15m])) > 0" gate means the quantile only
+        # produces a series when turns are actually being submitted, so idle windows yield no series, never a NaN.
+        - alert: TataraTurnSubmitLatencyHigh
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(operator_turn_submit_duration_seconds_bucket[15m])) by (le)
+            ) > {{ .Values.prometheusRule.turnSubmitP95LatencyThreshold }}
+            and
+            sum(rate(operator_turn_submit_duration_seconds_count[15m])) > 0
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "tatara-operator SubmitTurn p95 latency is high"
+            description: "SubmitTurn p95 latency is {{ "{{" }} $value {{ "}}" }}s (> {{ .Values.prometheusRule.turnSubmitP95LatencyThreshold }}s) over 15m, evaluated only while turns are actively being submitted (the quantile is gated on sum(rate(operator_turn_submit_duration_seconds_count[15m])) > 0, so idle windows yield no series instead of a NaN that would false-fire, issue #143). Dispatching agent turns is slow: wrappers may be unreachable or saturated. The histogram tops out at 25.6s (ExponentialBuckets(0.05,2,10)), so a true p95 can never exceed that ceiling and this threshold is kept well under it."
 {{- end }}
