@@ -286,8 +286,15 @@ type ScmSpec struct {
 	// +kubebuilder:default="afterApproval"
 	// +optional
 	MergePolicy string `json:"mergePolicy,omitempty"`
+	// PRReactionScope gates which PRs/MRs the mrScan review path reacts to.
+	// Empty (the default) reviews every open human PR/MR (historical open
+	// behavior). "labeledOrMentioned" restricts reviews to PRs carrying the
+	// project TriggerLabel or @-mentioning the bot, so unlabeled, un-mentioned
+	// MRs are not re-reviewed every scan cycle. "all" is an explicit synonym for
+	// the open behavior. The default is intentionally NOT "labeledOrMentioned":
+	// a defaulted value is indistinguishable from an explicit one, so defaulting
+	// it would silently gate every project; opt in explicitly instead.
 	// +kubebuilder:validation:Enum=labeledOrMentioned;all
-	// +kubebuilder:default="labeledOrMentioned"
 	// +optional
 	PRReactionScope string `json:"prReactionScope,omitempty"`
 	// ApprovalLabel is DEPRECATED and no longer used: approval is now driven by
