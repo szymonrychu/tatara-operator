@@ -60,6 +60,37 @@ func incidentLabel(s *tatarav1alpha1.ScmSpec) string {
 	return "tatara-incident"
 }
 
+// approverMentions returns a "cc: @a @b (for review)" line @mentioning the
+// project's approvers so they are notified of a newly-opened tatara issue.
+// Empty when the project has no approvers.
+func approverMentions(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository) string {
+	logins := tatarav1alpha1.EffectiveMaintainerLogins(proj, repo)
+	if len(logins) == 0 {
+		return ""
+	}
+	parts := make([]string, len(logins))
+	for i, l := range logins {
+		parts[i] = "@" + l
+	}
+	return "cc: " + strings.Join(parts, " ") + " (for review)"
+}
+
+// managedLabelColors maps each managed tatara label (resolving any custom names
+// from ScmSpec) to its hex color (6 digits, no '#'), for EnsureLabel.
+func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
+	b, a, i, d := lifecycleLabels(s)
+	idea, rej := legacyLabels(s)
+	return map[string]string{
+		b:                "1d76db", // brainstorming - blue
+		a:                "0e8a16", // approved - green
+		i:                "fbca04", // implementation - yellow
+		d:                "9e9e9e", // declined - gray
+		incidentLabel(s): "d73a4a", // incident - red
+		idea:             "c5def5", // idea - light blue
+		rej:              "5a5a5a", // rejected - dark gray
+	}
+}
+
 // managedPhaseLabels returns every label the operator owns (new + legacy), so
 // setLifecycleLabel removes all-but-desired and dedup recognizes legacy issues.
 func managedPhaseLabels(s *tatarav1alpha1.ScmSpec) []string {

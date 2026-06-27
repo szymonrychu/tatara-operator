@@ -412,6 +412,30 @@ func (c *GitLab) AddLabel(ctx context.Context, token, issueRef, label string) er
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"add_labels": label}, nil)
 }
 
+// EnsureLabel creates the project label with the given color, or updates its
+// color if it already exists (POST -> 409 conflict -> PUT new_color). color is 6
+// hex digits without '#'; GitLab wants the leading '#', added here.
+func (c *GitLab) EnsureLabel(ctx context.Context, repoURL, token, name, color string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	hexColor := "#" + color
+	err = glDo(ctx, c.base(), http.MethodPost,
+		"/projects/"+url.PathEscape(proj)+"/labels", token,
+		map[string]string{"name": name, "color": hexColor}, nil)
+	if err == nil {
+		return nil
+	}
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusConflict {
+		return glDo(ctx, c.base(), http.MethodPut,
+			"/projects/"+url.PathEscape(proj)+"/labels/"+url.PathEscape(name), token,
+			map[string]string{"new_color": hexColor}, nil)
+	}
+	return err
+}
+
 // RemoveLabel removes a label from an issue identified by group/proj#iid.
 func (c *GitLab) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
 	proj, iid, err := glHashRef(issueRef)

@@ -148,6 +148,9 @@ type SCMWriter interface {
 	// EditIssue updates an issue with only the non-nil fields in req.
 	// A 404 (issue gone) is treated as benign and returns nil.
 	EditIssue(ctx context.Context, token, repo string, number int, req EditIssueReq) error
+	// EnsureLabel ensures a label exists on the repo with the given hex color
+	// (6 hex digits, no '#'), creating it or updating its color. Idempotent.
+	EnsureLabel(ctx context.Context, repoURL, token, name, color string) error
 }
 
 // IssueComment is one human comment on an issue, ordered oldest-first.

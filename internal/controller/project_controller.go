@@ -149,6 +149,8 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.maybeRecomputeGauges(ctx)
 
+	r.ensureLabelColors(ctx, &project)
+
 	scanRequeue, scanErr := r.runScans(ctx, &project)
 	if scanErr != nil {
 		r.Metrics.ReconcileResult("Project", "error")

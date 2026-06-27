@@ -14,10 +14,12 @@ import (
 type labelCapturingWriter struct {
 	scm.SCMWriter
 	lastLabels []string
+	lastBody   string
 }
 
 func (w *labelCapturingWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
 	w.lastLabels = req.Labels
+	w.lastBody = req.Body
 	return scm.CreatedIssue{Ref: "o/r#99", URL: "https://github.com/o/r/issues/99"}, nil
 }
 
