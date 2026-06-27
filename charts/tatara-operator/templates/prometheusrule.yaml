@@ -127,6 +127,13 @@ spec:
           annotations:
             summary: "SCM write failure ratio high"
             description: "More than 30% of SCM write-backs (comments/labels/approvals/PRs/board) errored over 15m, with at least 3 writes attempted. Denominator excludes kind=\"read\" traffic and blocked (deliberate hard-gate refusals), so this tracks genuine write failures. Break down operator_scm_request_errors_by_status_total by (verb, status) first to see which write is failing: 401/403 => token in the project ScmSecretRef, 429 => rate limit, network/5xx => egress or provider outage. A burst confined to verb=\"remove_label\" status=\"404\" is benign lifecycle-label churn (the label was already absent), swallowed since issue #159 and no longer counted as an error."
+        - alert: TataraWritebackGaveUp4xx
+          expr: increase(operator_writeback_outcome_total{result="skip_4xx_capped"}[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a Task permanently abandoned writeback on a repeated 4xx"
+            description: "operator_writeback_outcome_total{result=\"skip_4xx_capped\"} increased in 1h: a Succeeded task's writeback hit a permanent 4xx on every project repo for the full skip-4xx attempt budget and gave up (issue #166), so no PR was opened and the loop was stopped. Break down operator_writeback_skip_4xx_total by (status, reason) to name the failure mode without the leader pod's logs: status=\"404\"/\"403\" reason=\"other\" => a wrong/renamed repo URL or a token lacking access; reason=\"already_exists\" => an MR exists but its URL could not be recovered. The offending repo + 4xx body are in the writeback_skip_4xx log line on the leader pod."
         - alert: TataraPushMetricsRejected
           expr: increase(operator_push_receive_total{result="rejected"}[15m]) > 0
           labels:

@@ -27,6 +27,16 @@ import (
 // scm.SCMWriter; SCMFor returns it and tests fake it.
 type Writer = scm.SCMWriter
 
+// writebackSkip4xxCap bounds how many times a Succeeded task re-sweeps every
+// project repo when OpenChange returns a permanent 4xx on all of them and opens
+// no PR. After the cap the gate records a terminal WritebackFailed condition and
+// stops re-attempting, instead of churning the SCM API every reconcile (issue
+// #166: the un-triageable 4xx-skip loop). A 4xx is a permanent failure, so a
+// couple of attempts cover a transient 403/429 then give up for good. In the
+// healthy case the clear sticks after one sweep and the counter never nears the
+// cap; the cap only fires when WritebackPending keeps getting re-armed.
+const writebackSkip4xxCap = 3
+
 // doWriteBack opens a PR/MR for each Project repo that has the task branch,
 // comments the primary issue with all PR links, and records them on the Task
 // status. It is called when WritebackPending is True and prURL is not yet set.
@@ -101,6 +111,21 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 
 	l := log.FromContext(ctx)
 
+	// issue #166: a Succeeded task whose writeback gets a permanent 4xx on every
+	// project repo must not re-sweep the SCM forever. Once the skip-4xx attempt
+	// budget is spent, stop: record a terminal WritebackFailed condition and clear
+	// the pending gate without opening a single SCM connection. This is the hard
+	// loop-breaker that survives a lost/re-armed WritebackPending condition,
+	// because the monotonic counter cannot be flipped back the way the gate flag
+	// can.
+	if task.Status.WritebackSkip4xxAttempts >= writebackSkip4xxCap {
+		l.Info("writeback: 4xx-skip attempt cap reached; not re-sweeping repos",
+			"action", "writeback_skip_4xx_capped", "task", task.Name,
+			"attempts", task.Status.WritebackSkip4xxAttempts, "cap", writebackSkip4xxCap)
+		r.Metrics.WritebackOutcome("skip_4xx_capped")
+		return ctrl.Result{}, r.failWritebackSkip4xx(ctx, task)
+	}
+
 	var proj tatarav1alpha1.Project
 	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil {
 		return ctrl.Result{}, fmt.Errorf("writeback: get project: %w", err)
@@ -169,6 +194,11 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	// secondary repo's PR.
 	var prRepos []tatarav1alpha1.Repository
 	var lastSkipStatus int
+	// sawSkip4xx records whether any repo was skipped on a genuine permanent 4xx
+	// (404/403/non-recoverable-422), as opposed to a 422 "no commits" (empty
+	// implement) or "already exists" recovery. Only genuine skips arm the
+	// 4xx-skip loop cap (issue #166); an empty implement must not.
+	var sawSkip4xx bool
 	// inScope is the declarative cross-repo scope (CR names). When a repo in this
 	// set produces no branch (422 no commits) we warn on the issue instead of
 	// skipping silently (Defect A1).
@@ -231,10 +261,14 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 					l.Info("writeback: skipping repo (4xx - already exists, could not recover)",
 						"action", "writeback_skip_4xx", "repo", repo.Name, "task", task.Name, "status", he.Status, "path", he.Path, "body", he.Body)
 					r.Metrics.WritebackOutcome("skip_4xx")
+					r.Metrics.WritebackSkip4xx(strconv.Itoa(he.Status), "already_exists")
+					sawSkip4xx = true
 				} else {
 					l.Info("writeback: skipping repo (4xx)",
 						"action", "writeback_skip_4xx", "repo", repo.Name, "task", task.Name, "status", he.Status, "path", he.Path, "body", he.Body)
 					r.Metrics.WritebackOutcome("skip_4xx")
+					r.Metrics.WritebackSkip4xx(strconv.Itoa(he.Status), "other")
+					sawSkip4xx = true
 				}
 				lastSkipStatus = he.Status
 				continue
@@ -298,6 +332,13 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			msg = fmt.Sprintf("PR/MR could not be opened or already exists: %d", lastSkipStatus)
 		}
 		r.Metrics.WritebackOutcome("no_pr")
+		// issue #166: when no PR opened because a repo returned a genuine permanent
+		// 4xx (not a benign 422 "no commits"), count the attempt so the gate above
+		// caps the re-sweep loop. Empty-implement (all 422 no-change) keeps the
+		// plain terminal clear and never arms the cap.
+		if sawSkip4xx {
+			return ctrl.Result{}, r.recordSkip4xxAttempt(ctx, task, lastSkipStatus)
+		}
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "WritebackSkipped", msg)
 	}
 
@@ -317,6 +358,9 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			return gerr
 		}
 		fresh.Status.PrURL = prURLs[0]
+		// A PR opened: clear any accumulated skip-4xx attempts so a later, unrelated
+		// writeback starts with a fresh budget (issue #166).
+		fresh.Status.WritebackSkip4xxAttempts = 0
 		// Project the PR-open action onto the ledger: upsert a role:openedPR entry
 		// with state:open. The real HeadSHA is filled later by the backstop refresh
 		// (Phase 3); we do not have it here without an extra SCM round-trip.
@@ -399,6 +443,71 @@ func (r *TaskReconciler) clearWritebackPending(ctx context.Context, task *tatara
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
 		log.FromContext(ctx).Error(err, "writeback: clear WritebackPending", "task", task.Name)
+		return err
+	}
+	return nil
+}
+
+// recordSkip4xxAttempt increments the per-task skip-4xx attempt counter and
+// clears WritebackPending. It bounds the un-triageable 4xx-skip loop (issue
+// #166): the next writeback entry reads the counter and, once it reaches
+// writebackSkip4xxCap, refuses to re-sweep the SCM (see failWritebackSkip4xx).
+// The increment and the clear share one RetryOnConflict status write so the
+// counter advances atomically with the gate clear. status is the last 4xx code
+// seen, recorded in the condition message for triage.
+func (r *TaskReconciler) recordSkip4xxAttempt(ctx context.Context, task *tatarav1alpha1.Task, status int) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.WritebackSkip4xxAttempts++
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:   "WritebackPending",
+			Status: metav1.ConditionFalse,
+			Reason: "WritebackSkipped4xx",
+			Message: fmt.Sprintf("no PR opened; all repos returned 4xx (last status %d); attempt %d/%d",
+				status, fresh.Status.WritebackSkip4xxAttempts, writebackSkip4xxCap),
+			ObservedGeneration: fresh.Generation,
+		})
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		log.FromContext(ctx).Error(err, "writeback: record skip-4xx attempt", "task", task.Name)
+		return err
+	}
+	return nil
+}
+
+// failWritebackSkip4xx records the terminal WritebackFailed condition for a task
+// that exhausted its skip-4xx attempt budget and clears WritebackPending. It
+// performs no SCM I/O. WritebackFailed is a distinct, sticky condition (nothing
+// removes it) so the give-up stays visible in `kubectl describe` even if
+// WritebackPending is later re-armed by a stray Succeeded transition.
+func (r *TaskReconciler) failWritebackSkip4xx(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		msg := fmt.Sprintf("writeback gave up after %d skip-4xx attempts: every project repo returned a permanent 4xx and no PR was opened",
+			fresh.Status.WritebackSkip4xxAttempts)
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "WritebackFailed",
+			Status:             metav1.ConditionTrue,
+			Reason:             "Skip4xxCapReached",
+			Message:            msg,
+			ObservedGeneration: fresh.Generation,
+		})
+		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+			Type:               "WritebackPending",
+			Status:             metav1.ConditionFalse,
+			Reason:             "WritebackFailed",
+			Message:            msg,
+			ObservedGeneration: fresh.Generation,
+		})
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		log.FromContext(ctx).Error(err, "writeback: record terminal WritebackFailed", "task", task.Name)
 		return err
 	}
 	return nil

@@ -521,6 +521,15 @@ spec:
                   - role
                   type: object
                 type: array
+              writebackSkip4xxAttempts:
+                description: |-
+                  WritebackSkip4xxAttempts counts consecutive writeback sweeps that opened
+                  no PR because every project repo returned a permanent 4xx from OpenChange
+                  (issue #166: the un-triageable 4xx-skip loop). Bounded loop-breaker: once
+                  it reaches writebackSkip4xxCap the writeback gate stops re-sweeping the SCM
+                  and records a terminal WritebackFailed condition instead of churning the
+                  SCM API every reconcile. Reset to 0 when a PR opens.
+                type: integer
             type: object
         type: object
     served: true

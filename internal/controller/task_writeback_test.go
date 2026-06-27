@@ -255,7 +255,8 @@ func TestTaskWriteBackIdempotent(t *testing.T) {
 }
 
 // TestTaskWriteBackAlreadyExists tests that a 4xx HTTPError from OpenChange
-// clears WritebackPending with a neutral reason and does not requeue.
+// clears WritebackPending with a neutral (non-requeue) reason, records the
+// skip-4xx attempt for the issue-166 loop cap, and does not requeue.
 func TestTaskWriteBackAlreadyExists(t *testing.T) {
 	task := seedWritebackPending(t, "wb-task4", "wb-scm4", "wb-proj4", "wb-repo4")
 
@@ -273,12 +274,14 @@ func TestTaskWriteBackAlreadyExists(t *testing.T) {
 		types.NamespacedName{Namespace: testNS, Name: task.Name},
 		&got,
 	))
-	// WritebackPending must be cleared with neutral reason, not an error reason.
+	// WritebackPending must be cleared (False) with the skip-4xx reason, not an
+	// error/requeue reason; the attempt counter advances so the loop is bounded.
 	cond := findCond(got.Status.Conditions, "WritebackPending")
 	require.NotNil(t, cond)
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
-	require.Equal(t, "WritebackSkipped", cond.Reason)
+	require.Equal(t, "WritebackSkipped4xx", cond.Reason)
 	require.Contains(t, cond.Message, "422")
+	require.Equal(t, 1, got.Status.WritebackSkip4xxAttempts)
 }
 
 // fakeWriterPerRepo returns a configurable PR URL per repoURL, and an HTTPError

@@ -320,6 +320,14 @@ type TaskStatus struct {
 	// silently parked as a benign no-change. Reset to 0 when a run opens a PR.
 	// +optional
 	ImplementEmptyRetries int `json:"implementEmptyRetries,omitempty"`
+	// WritebackSkip4xxAttempts counts consecutive writeback sweeps that opened
+	// no PR because every project repo returned a permanent 4xx from OpenChange
+	// (issue #166: the un-triageable 4xx-skip loop). Bounded loop-breaker: once
+	// it reaches writebackSkip4xxCap the writeback gate stops re-sweeping the SCM
+	// and records a terminal WritebackFailed condition instead of churning the
+	// SCM API every reconcile. Reset to 0 when a PR opens.
+	// +optional
+	WritebackSkip4xxAttempts int `json:"writebackSkip4xxAttempts,omitempty"`
 	// PendingComments are free-form comments queued by the agent via the
 	// comment MCP tool, posted to the task's linked issue on the next
 	// reconcile and then cleared. Does not change the lifecycle state.

@@ -37,6 +37,7 @@ type OperatorMetrics struct {
 	agentHTTPDuration         *prometheus.HistogramVec
 	authTotal                 *prometheus.CounterVec
 	writebackOutcomeTotal     *prometheus.CounterVec
+	writebackSkip4xxTotal     *prometheus.CounterVec
 	brainstormOutcomeTotal    *prometheus.CounterVec
 	webhookDuration           *prometheus.HistogramVec
 	restapiRequestsTotal      *prometheus.CounterVec
@@ -186,8 +187,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"result"}),
 		writebackOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_writeback_outcome_total",
-			Help: "Writeback terminal outcomes by result.",
+			Help: "Writeback terminal outcomes by result (no_change, in_scope_no_branch, skip_4xx, no_pr, skip_4xx_capped, opened).",
 		}, []string{"result"}),
+		// Self-diagnosing companion to writeback_outcome_total{result="skip_4xx"}
+		// (issue #166): the un-triageable 4xx-skip loop emitted a metric that could
+		// not name the failure. status is the 4xx HTTP code, reason the skip
+		// classification. Bounded cardinality (a handful of 4xx codes x few reasons);
+		// deliberately no repo label - the repo slug lives in the writeback_skip_4xx
+		// log line, and a per-repo series would be unbounded across all projects.
+		writebackSkip4xxTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_writeback_skip_4xx_total",
+			Help: "Writeback repo-skips on a permanent 4xx from OpenChange, by HTTP status and reason (already_exists|other). Lets the skip-4xx alert annotation name the failure mode without needing the leader pod's logs (issue #166).",
+		}, []string{"status", "reason"}),
 		// Per-run brainstorm yield. The brainstorm Task itself never opens a PR, so
 		// a dedicated counter (rather than overloading writeback_outcome) keeps the
 		// "a PR/MR write was attempted" semantics of writeback_outcome clean.
@@ -296,6 +307,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentHTTPDuration,
 		m.authTotal,
 		m.writebackOutcomeTotal,
+		m.writebackSkip4xxTotal,
 		m.brainstormOutcomeTotal,
 		m.webhookDuration,
 		m.restapiRequestsTotal,
@@ -359,8 +371,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
 	}
-	for _, result := range []string{"no_change", "skip_4xx", "no_pr", "opened"} {
+	for _, result := range []string{"no_change", "in_scope_no_branch", "skip_4xx", "no_pr", "skip_4xx_capped", "opened"} {
 		m.writebackOutcomeTotal.WithLabelValues(result)
+	}
+	// Pre-seed the realistic skip-4xx (status, reason) combos so the diagnosing
+	// series exist at a zero baseline from startup (issue #166).
+	for _, sr := range [][2]string{{"403", "other"}, {"404", "other"}, {"422", "already_exists"}, {"422", "other"}} {
+		m.writebackSkip4xxTotal.WithLabelValues(sr[0], sr[1])
 	}
 	for _, result := range []string{"proposed", "no_yield"} {
 		m.brainstormOutcomeTotal.WithLabelValues(result)
@@ -609,7 +626,8 @@ func (m *OperatorMetrics) AuthCounter(result string) prometheus.Counter {
 }
 
 // WritebackOutcome increments operator_writeback_outcome_total for the given
-// terminal result ("no_change", "skip_4xx", "no_pr", "opened").
+// terminal result ("no_change", "in_scope_no_branch", "skip_4xx", "no_pr",
+// "skip_4xx_capped", "opened").
 func (m *OperatorMetrics) WritebackOutcome(result string) {
 	m.writebackOutcomeTotal.WithLabelValues(result).Inc()
 }
@@ -617,6 +635,18 @@ func (m *OperatorMetrics) WritebackOutcome(result string) {
 // WritebackOutcomeCounter returns the counter for (result) for test assertions.
 func (m *OperatorMetrics) WritebackOutcomeCounter(result string) prometheus.Counter {
 	return m.writebackOutcomeTotal.WithLabelValues(result)
+}
+
+// WritebackSkip4xx increments operator_writeback_skip_4xx_total for a repo-skip
+// on a permanent 4xx. status is the HTTP status code (e.g. "404"); reason is the
+// skip classification ("already_exists" or "other"). Issue #166.
+func (m *OperatorMetrics) WritebackSkip4xx(status, reason string) {
+	m.writebackSkip4xxTotal.WithLabelValues(status, reason).Inc()
+}
+
+// WritebackSkip4xxCounter returns the counter for (status, reason) for test assertions.
+func (m *OperatorMetrics) WritebackSkip4xxCounter(status, reason string) prometheus.Counter {
+	return m.writebackSkip4xxTotal.WithLabelValues(status, reason)
 }
 
 // BrainstormOutcome increments operator_brainstorm_outcome_total for the given
