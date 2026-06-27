@@ -37,8 +37,9 @@ type Writer = scm.SCMWriter
 // cap; the cap only fires when WritebackPending keeps getting re-armed.
 const writebackSkip4xxCap = 3
 
-// doWriteBack opens a PR/MR for each Project repo that has the task branch,
-// comments the primary issue with all PR links, and records them on the Task
+// doWriteBack opens a PR/MR on each Project repo the task changed - repos with no
+// task branch return a benign 422 (no-branch) and are skipped as a no-op - then
+// comments the primary issue with all PR links and records them on the Task
 // status. It is called when WritebackPending is True and prURL is not yet set.
 // Permanent SCM errors (4xx) per repo are logged and skipped; transient errors
 // are returned for requeue.
@@ -98,10 +99,12 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 	return r.writeBackOpenChange(ctx, task)
 }
 
-// writeBackOpenChange opens a PR/MR for each Project repo that has the task
-// branch, comments the primary issue with all PR links, and records them on
-// the Task status. Shared by the default (implement/brainstorm) path and the
-// triageIssue-implement path.
+// writeBackOpenChange attempts a PR/MR on every Project repo and opens one on
+// each repo that has the task branch; repos the task did not change return a
+// benign 422 (no task branch, classified no-branch) and are skipped without
+// counting as a permanent failure. It comments the primary issue with all PR
+// links and records them on the Task status. Shared by the default
+// (implement/brainstorm) path and the triageIssue-implement path.
 func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
 	// Idempotency guard: if PrURL is already set this function ran successfully on
 	// a previous reconcile. Clear WritebackPending and return without re-opening.
@@ -232,12 +235,21 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 				// existing PR URL so the lifecycle path is not mis-routed into the
 				// empty-implement / 'refused' branch.
 				skipReason := openChangeSkipReason(he)
-				if skipReason == "no-change" {
+				if skipReason == "no-change" || skipReason == "no-branch" {
 					if inScope[repo.Name] {
-						l.Info("writeback: in-scope repo produced no commits; will warn on issue",
-							"action", "writeback_in_scope_no_branch", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
+						l.Info("writeback: in-scope repo produced no change; will warn on issue",
+							"action", "writeback_in_scope_no_branch", "repo", repo.Name, "task", task.Name, "branch", sourceBranch, "reason", skipReason)
 						inScopeNoBranch = append(inScopeNoBranch, repo.Name)
 						r.Metrics.WritebackOutcome("in_scope_no_branch")
+					} else if skipReason == "no-branch" {
+						// issue #178: the task never pushed sourceBranch to this repo
+						// (GitHub 422 {field:head, code:invalid}); it simply did not change
+						// this repo. This is a benign cross-repo fan-out no-op, NOT a
+						// permanent failure - record it distinctly so skip_4xx stays a pure
+						// permanent-failure signal and the 4xx-skip cap (issue #166) is not armed.
+						l.Info("writeback: repo not touched by task (no task branch); skipping",
+							"action", "writeback_no_branch", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
+						r.Metrics.WritebackOutcome("no_branch")
 					} else {
 						l.Info("writeback: implement produced no changes (branch has no commits)",
 							"action", "writeback_no_change", "repo", repo.Name, "task", task.Name, "branch", sourceBranch)
@@ -293,7 +305,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	// Best-effort and non-fatal: other repos' MRs still open (no atomicity, KISS).
 	if len(inScopeNoBranch) > 0 && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 		warnBody := "WARNING: this issue was declared to span repos that produced no change. " +
-			"The following in-scope repo(s) had no commits on branch `" + sourceBranch + "` and got no PR/MR: " +
+			"The following in-scope repo(s) produced no change on branch `" + sourceBranch + "` (no commits, or the branch was never pushed) and got no PR/MR: " +
 			strings.Join(inScopeNoBranch, ", ") + ". " +
 			"If those repos genuinely need no change this is expected; otherwise the cross-repo edit was lost - re-run or fix manually."
 		werr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, warnBody)
@@ -1276,6 +1288,10 @@ func (r *TaskReconciler) scmToken(ctx context.Context, ns, ref string) (string, 
 
 // openChangeSkipReason classifies a 4xx OpenChange failure.
 // "no-change": 422 "No commits between" - implement produced no commits.
+// "no-branch": 422 {field:head, code:invalid} - the task branch does not exist in
+// this repo, i.e. the task never changed it. Benign cross-repo fan-out no-op, not
+// a permanent failure (issue #178), distinct from "No commits between" where the
+// branch exists but is empty.
 // "already-exists": 422 "A pull request already exists" - PR was opened on a
 // prior reconcile but PrURL status update failed; caller should recover the URL.
 // "skip-4xx": any other 4xx permanent failure.
@@ -1285,6 +1301,9 @@ func openChangeSkipReason(he *scm.HTTPError) string {
 	}
 	if he.Status == 422 && strings.Contains(he.Body, "A pull request already exists") {
 		return "already-exists"
+	}
+	if he.Status == 422 && strings.Contains(he.Body, `"field":"head"`) && strings.Contains(he.Body, `"code":"invalid"`) {
+		return "no-branch"
 	}
 	return "skip-4xx"
 }

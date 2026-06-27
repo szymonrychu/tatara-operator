@@ -626,8 +626,8 @@ func (m *OperatorMetrics) AuthCounter(result string) prometheus.Counter {
 }
 
 // WritebackOutcome increments operator_writeback_outcome_total for the given
-// terminal result ("no_change", "in_scope_no_branch", "skip_4xx", "no_pr",
-// "skip_4xx_capped", "opened").
+// terminal result ("no_change", "no_branch", "in_scope_no_branch", "skip_4xx",
+// "no_pr", "skip_4xx_capped", "opened").
 func (m *OperatorMetrics) WritebackOutcome(result string) {
 	m.writebackOutcomeTotal.WithLabelValues(result).Inc()
 }
