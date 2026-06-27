@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/budget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,10 @@ type DispatcherReconciler struct {
 	client.Client
 	Scheme  *runtime.Scheme
 	Metrics *obs.OperatorMetrics
+	// BudgetDefaults is the operator-wide token-budget config (issue #189). Each
+	// Project layers its spec.tokenBudget over this. The zero value is disabled,
+	// so the admission gate is inert until configured.
+	BudgetDefaults budget.Config
 }
 
 func taskByName(tasks []tatarav1alpha1.Task, name string) *tatarav1alpha1.Task {
@@ -82,16 +87,35 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 // Returns requeue=true when a stale terminal Task was deleted so Reconcile can
 // signal a prompt re-attempt via ctrl.Result{RequeueAfter: time.Second}.
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
-	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task) (requeue bool, err error) {
+	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task, d budget.Decision) (requeue bool, err error) {
 
 	admitPool := func(class string, cap int) error {
-		inflight := r.poolInflight(qes, tasks, class)
 		queued := make([]*tatarav1alpha1.QueuedEvent, 0)
 		for i := range qes {
 			if qes[i].Spec.Class == class && isQueued(qes[i].Status.State) {
 				queued = append(queued, &qes[i])
 			}
 		}
+		// Token-budget gate (issue #189): hold this pool's work when window usage
+		// has reached the pool's threshold. The normal pool (proactive/reactive
+		// work) pauses at the proactive threshold; the alert pool (incidents) only
+		// at the higher emergency threshold, so incidents keep flowing while
+		// proactive work is paused. A disabled budget yields the zero Decision, so
+		// neither flag is set and admission is unchanged.
+		blocked := (class == tatarav1alpha1.QueueClassNormal && d.ProactiveBlocked) ||
+			(class == tatarav1alpha1.QueueClassAlert && d.EmergencyBlocked)
+		if blocked {
+			if len(queued) > 0 {
+				if r.Metrics != nil {
+					r.Metrics.AdmissionBlocked(proj.Name, class, "token_budget")
+				}
+				log.FromContext(ctx).Info("queue: admission held by token budget",
+					"action", "admission_blocked", "class", class, "reason", "token_budget",
+					"used_percent", d.UsedPercent, "queued", len(queued))
+			}
+			return nil
+		}
+		inflight := r.poolInflight(qes, tasks, class)
 		sort.Slice(queued, func(i, j int) bool { return queued[i].Spec.Seq < queued[j].Spec.Seq })
 		for _, q := range queued {
 			if inflight >= cap {
@@ -219,7 +243,12 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	requeue, err := r.admit(ctx, &proj, qes, tasks)
+	// Token-budget decision for this admit pass (issue #189): computed once from
+	// the project's resolved config + persisted window/snapshot state, used both
+	// to gate admission and to drive the boundary-aware requeue below.
+	budgetCfg := proj.BudgetConfig(r.BudgetDefaults)
+	decision := budget.Evaluate(budgetCfg, proj.BudgetWindowState(), proj.BudgetSubscription(), time.Now())
+	requeue, err := r.admit(ctx, &proj, qes, tasks, decision)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -239,6 +268,15 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.Metrics.SetQueueDepth(proj.Name, class, depth)
 			r.Metrics.SetQueueInflight(proj.Name, class, r.poolInflight(qes, tasks, class))
 		}
+		// Token-budget gauges (issue #189): track usage against both thresholds so
+		// a dashboard plots used vs proactive/emergency per project. Only emitted
+		// when the budget is enabled, so disabled projects create no series.
+		if budgetCfg.Enabled {
+			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "used", decision.UsedPercent/100)
+			pro, emg := budget.ResolvePercents(budgetCfg)
+			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "proactive", float64(pro)/100)
+			r.Metrics.SetTokenBudgetUsedRatio(proj.Name, "emergency", float64(emg)/100)
+		}
 	}
 	// Backstop: if any pool has waiting (Queued/empty-state) work and is at capacity,
 	// requeue to catch missed Task-terminal watch events.
@@ -257,13 +295,62 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			}
 		}
 	}
+	// Budget-hold backstop: when a pool is paused on the token budget and still has
+	// Queued work, re-check near the next window reset (the cron boundary, capped)
+	// so the held work resumes promptly once the window rolls, even if no new
+	// QueuedEvent arrives to re-trigger the dispatcher (issue #189).
+	budgetHeld := (decision.ProactiveBlocked && poolHasQueued(qes, tatarav1alpha1.QueueClassNormal)) ||
+		(decision.EmergencyBlocked && poolHasQueued(qes, tatarav1alpha1.QueueClassAlert))
 	if requeue {
 		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+	if budgetHeld {
+		return ctrl.Result{RequeueAfter: budgetRequeueAfter(budgetCfg, time.Now())}, nil
 	}
 	if waiting {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// poolHasQueued reports whether the pool of the given class has any Queued
+// (not-yet-admitted) QueuedEvent.
+func poolHasQueued(qes []tatarav1alpha1.QueuedEvent, class string) bool {
+	for i := range qes {
+		if qes[i].Spec.Class == class && isQueued(qes[i].Status.State) {
+			return true
+		}
+	}
+	return false
+}
+
+// budgetRequeueAfter returns how long to wait before re-checking a budget-held
+// pool: the time to the next custom-window reset boundary (from the cron, plus a
+// small slack and capped at 5m to bound staleness), or a 60s fallback when there
+// is no parseable schedule (e.g. claudeSubscription mode, where the snapshot's
+// own reset time drives unblocking).
+func budgetRequeueAfter(cfg budget.Config, now time.Time) time.Duration {
+	const fallback = 60 * time.Second
+	const maxWait = 5 * time.Minute
+	if cfg.ResetSchedule == "" {
+		return fallback
+	}
+	sched, err := budget.ParseSchedule(cfg.ResetSchedule)
+	if err != nil {
+		return fallback
+	}
+	next := sched.Next(now)
+	if next.IsZero() {
+		return fallback
+	}
+	wait := next.Sub(now) + time.Second
+	if wait <= 0 {
+		return fallback
+	}
+	if wait > maxWait {
+		return maxWait
+	}
+	return wait
 }
 
 func queuedAutonomousCount(qes []tatarav1alpha1.QueuedEvent) int {
