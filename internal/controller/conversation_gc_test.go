@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +25,43 @@ func (f *fakeConvGC) Delete(_ context.Context, k string) error {
 	delete(f.objects, k)
 	f.deleted = append(f.deleted, k)
 	return nil
+}
+
+// unreachableConvGC fails every probe with a store-wide error and counts the
+// probes, so a test can assert the GC pass short-circuits instead of looping.
+type unreachableConvGC struct {
+	err         error
+	existsCalls int
+	deleted     []string
+}
+
+func (u *unreachableConvGC) Exists(_ context.Context, _ string) (bool, error) {
+	u.existsCalls++
+	return false, u.err
+}
+func (u *unreachableConvGC) Delete(_ context.Context, k string) error {
+	u.deleted = append(u.deleted, k)
+	return nil
+}
+
+// convGCMetric reads operator_conversation_gc_total{result=<result>} from reg.
+func convGCMetric(t *testing.T, reg *prometheus.Registry, result string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_conversation_gc_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "result" && lp.GetValue() == result {
+					return m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func convGCServer(store conversationGC) *CallbackServer {
@@ -123,4 +162,32 @@ func TestGCConversations_SoloIssueDeletedWhenTerminal(t *testing.T) {
 
 	convGCServer(store).gcConversations(context.Background(), listConvTasks(t))
 	require.False(t, store.objects["demo/r/issue-5.jsonl"], "a closed solo issue's conversation is deleted")
+}
+
+// Issue #149: a store-wide / connection-level failure must short-circuit the
+// whole pass after the first probe - one "unavailable" metric, no per-object
+// "error" churn, and the remaining backlog keys are never probed - so one
+// object-store outage cannot become a burst of duplicate ERROR lines.
+func TestGCConversations_SkipsPassWhenStoreUnreachable(t *testing.T) {
+	store := &unreachableConvGC{
+		err: fmt.Errorf("objstore exists k: connect: %w", syscall.ECONNREFUSED),
+	}
+	mkConvTask(t, "gc-unreach-a", "issueLifecycle", "demo/r/issue-150-a.jsonl", "", true)
+	mkConvTask(t, "gc-unreach-b", "issueLifecycle", "demo/r/issue-150-b.jsonl", "", true)
+	mkConvTask(t, "gc-unreach-c", "issueLifecycle", "demo/r/issue-150-c.jsonl", "", true)
+
+	reg := prometheus.NewRegistry()
+	s := &CallbackServer{
+		Client:                k8sClient,
+		Metrics:               obs.NewOperatorMetrics(reg),
+		Namespace:             testNS,
+		ConvStore:             store,
+		ConversationRetention: time.Hour,
+	}
+	s.gcConversations(context.Background(), listConvTasks(t))
+
+	require.Equal(t, 1, store.existsCalls, "pass must short-circuit after the first unreachable probe")
+	require.Empty(t, store.deleted, "nothing may be deleted while the store is unreachable")
+	require.Equal(t, 1.0, convGCMetric(t, reg, "unavailable"), "exactly one unavailable result recorded")
+	require.Equal(t, 0.0, convGCMetric(t, reg, "error"), "no per-object error may be recorded")
 }
