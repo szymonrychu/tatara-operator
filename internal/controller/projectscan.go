@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"time"
@@ -117,6 +118,52 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return parsed.Next(base), true
+}
+
+// activityScheduleAndLast returns the cron schedule string and last-scan stamp
+// for one activity. Callers are post-guard (Spec.Scm and Cron are non-nil).
+func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (string, *metav1.Time) {
+	c := proj.Spec.Scm.Cron
+	switch activity {
+	case "mrScan":
+		return c.MRScan.Schedule, proj.Status.LastMRScan
+	case "issueScan":
+		return c.IssueScan.Schedule, proj.Status.LastIssueScan
+	case "brainstorm":
+		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
+	case "healthCheck":
+		return c.HealthCheck.Schedule, proj.Status.LastHealthCheck
+	}
+	return "", nil
+}
+
+// scanOffset returns a deterministic offset in [0, period) for a
+// (project, repo, activity) triple. Per-repo scan fires are phase-shifted by
+// this offset so they spread across the cron interval instead of all firing at
+// the same boundary (the synchronized hourly fan-out of issue #181). It is a
+// pure hash of the identifiers, so it is stable across operator restarts and
+// pods (no randomness, no wall clock).
+func scanOffset(project, repo, activity string, period time.Duration) time.Duration {
+	if period <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(project + "\x00" + repo + "\x00" + activity))
+	return time.Duration(uint64(h.Sum32()) % uint64(period))
+}
+
+// cronPeriod returns the nominal interval between two consecutive fires of a
+// parsed cron, used to bound per-repo scan offsets. base anchors the
+// computation so it is deterministic.
+func cronPeriod(sched cron.Schedule, base time.Time) time.Duration {
+	f1 := sched.Next(base)
+	return sched.Next(f1).Sub(f1)
+}
+
+// repoNextFire returns a repo's next phase-shifted fire strictly after `after`,
+// given the base cron schedule and the repo's deterministic offset.
+func repoNextFire(sched cron.Schedule, offset time.Duration, after time.Time) time.Time {
+	return sched.Next(after.Add(-offset)).Add(offset)
 }
 
 // label key aliases for readability within this package.
@@ -773,22 +820,7 @@ func (r *ProjectReconciler) existingScanTasks(ctx context.Context, proj *tatarav
 // activityDue computes (base, due, next, ok) for one activity. base is
 // Last*Scan|creationTimestamp; ok=false on empty/bad cron.
 func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity string) (time.Time, bool, time.Time, bool) {
-	schedule := ""
-	var last *metav1.Time
-	switch activity {
-	case "mrScan":
-		schedule = proj.Spec.Scm.Cron.MRScan.Schedule
-		last = proj.Status.LastMRScan
-	case "issueScan":
-		schedule = proj.Spec.Scm.Cron.IssueScan.Schedule
-		last = proj.Status.LastIssueScan
-	case "brainstorm":
-		schedule = proj.Spec.Scm.Cron.Brainstorm.Schedule
-		last = proj.Status.LastBrainstorm
-	case "healthCheck":
-		schedule = proj.Spec.Scm.Cron.HealthCheck.Schedule
-		last = proj.Status.LastHealthCheck
-	}
+	schedule, last := activityScheduleAndLast(proj, activity)
 	base := proj.CreationTimestamp.Time
 	if last != nil {
 		base = last.Time
@@ -798,6 +830,46 @@ func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity s
 		return base, false, time.Time{}, false
 	}
 	return base, !time.Now().Before(next), next, true
+}
+
+// reposDueForScan returns the repos whose deterministic phase-shifted fire for
+// `activity` has occurred since the last project-level scan stamp, plus the
+// soonest upcoming per-repo fire (for requeue). ok=false when the schedule is
+// empty or malformed. Spreading per-repo fires across the cron interval is the
+// fix for the synchronized top-of-hour fan-out that backs up the queue
+// (issue #181): the shared project-level stamp still advances on each fire, so
+// the (stamp, now] window covers every repo's slot exactly once per period.
+func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activity string, repos []tatarav1alpha1.Repository, now time.Time) ([]tatarav1alpha1.Repository, time.Time, bool) {
+	schedule, last := activityScheduleAndLast(proj, activity)
+	if schedule == "" {
+		return nil, time.Time{}, false
+	}
+	sched, err := cron.ParseStandard(schedule)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	base := proj.CreationTimestamp.Time
+	if last != nil {
+		base = last.Time
+	}
+	period := cronPeriod(sched, base)
+	var due []tatarav1alpha1.Repository
+	var soonest time.Time
+	for i := range repos {
+		off := scanOffset(proj.Name, repos[i].Name, activity, period)
+		if fire := repoNextFire(sched, off, base); !now.Before(fire) {
+			due = append(due, repos[i])
+		}
+		if nf := repoNextFire(sched, off, now); soonest.IsZero() || nf.Before(soonest) {
+			soonest = nf
+		}
+	}
+	// No repos (or all offsets coincided): fall back to the unshifted next fire
+	// so an empty project still requeues to the next period instead of busy-looping.
+	if soonest.IsZero() {
+		soonest = sched.Next(now)
+	}
+	return due, soonest, true
 }
 
 // stampScan records the per-activity Last*Scan and persists status.
@@ -2177,30 +2249,30 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		}
 	}
 
-	// mrScan
-	if _, due, next, ok := r.activityDue(proj, "mrScan"); ok {
-		if due {
-			backlog := r.mrScan(ctx, proj, reader, repos, existing, cronSpec.MRScan)
+	// mrScan: per-repo deterministic jitter (issue #181) spreads each repo's fire
+	// across the cron interval instead of firing all repos at the boundary.
+	if dueRepos, soonest, ok := r.reposDueForScan(proj, "mrScan", repos, now); ok {
+		if len(dueRepos) > 0 {
+			backlog := r.mrScan(ctx, proj, reader, dueRepos, existing, cronSpec.MRScan)
 			// Only advance the stamp when there is no backlog. When backlog=true the
-			// 60s short requeue must re-fire the activity; if we stamp now, activityDue
-			// computes next-fire from the fresh stamp and returns due=false for any
-			// non-sub-minute cron, making the backlog drain requeue a no-op (finding 3).
+			// 60s short requeue must re-fire; if we stamp now, the (stamp, now] window
+			// closes and the backlog drain requeue becomes a no-op (finding 3).
 			if !backlog {
 				if serr := r.stampScan(ctx, proj, "mrScan"); serr != nil {
 					l.Error(serr, "scan: persist mrScan stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "mrScan")
 					r.Metrics.ScanItem("mrScan", "stamp_error")
 				}
-				// Recompute next-fire from now so the post-stamp schedule produces a
-				// positive RequeueAfter (the pre-fire next is in the past).
-				if next2, ok2 := activityNextFire(cronSpec.MRScan.Schedule, now); ok2 {
+				// Recompute the soonest per-repo fire from the fresh stamp so the
+				// requeue lands on the next repo's slot, not in the past.
+				if _, next2, ok2 := r.reposDueForScan(proj, "mrScan", repos, now); ok2 {
 					consider(next2)
 				}
 			} else {
 				consider(now.Add(backlogRequeue))
 			}
 		} else {
-			consider(next)
+			consider(soonest)
 		}
 	} else if cronSpec.MRScan.Schedule != "" {
 		l.Error(fmt.Errorf("invalid cron %q", cronSpec.MRScan.Schedule), "scan: invalid mrScan cron, disabling",
@@ -2212,9 +2284,13 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if fresh, ferr := r.existingScanTasks(ctx, proj); ferr == nil {
 		existing = fresh
 	}
-	if _, due, next, ok := r.activityDue(proj, "issueScan"); ok {
-		if due {
-			backlog, issueCache := r.issueScan(ctx, proj, reader, repos, existing, cronSpec.IssueScan)
+	if dueRepos, soonest, ok := r.reposDueForScan(proj, "issueScan", repos, now); ok {
+		if len(dueRepos) > 0 {
+			// recoverOrphans + backstopSweep keep their once-per-cycle cadence: gate
+			// them on the unshifted project boundary (true only on the first per-repo
+			// fire of the period) so per-repo jitter does not multiply the sweeps.
+			_, periodDue, _, _ := r.activityDue(proj, "issueScan")
+			backlog, issueCache := r.issueScan(ctx, proj, reader, dueRepos, existing, cronSpec.IssueScan)
 			// Only advance the stamp when there is no backlog (mirrors mrScan fix, finding 3).
 			if !backlog {
 				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
@@ -2222,16 +2298,18 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "issueScan")
 					r.Metrics.ScanItem("issueScan", "stamp_error")
 				}
-				if next2, ok2 := activityNextFire(cronSpec.IssueScan.Schedule, now); ok2 {
+				if _, next2, ok2 := r.reposDueForScan(proj, "issueScan", repos, now); ok2 {
 					consider(next2)
 				}
 			} else {
 				consider(now.Add(backlogRequeue))
 			}
-			r.recoverOrphans(ctx, proj, reader, repos, issueCache)
-			r.backstopSweep(ctx, proj, reader, repos)
+			if periodDue {
+				r.recoverOrphans(ctx, proj, reader, repos, issueCache)
+				r.backstopSweep(ctx, proj, reader, repos)
+			}
 		} else {
-			consider(next)
+			consider(soonest)
 		}
 	} else if cronSpec.IssueScan.Schedule != "" {
 		l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
