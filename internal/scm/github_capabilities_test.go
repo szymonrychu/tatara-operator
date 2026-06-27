@@ -94,6 +94,37 @@ func TestGitHubIssueAuthor(t *testing.T) {
 			t.Fatalf("path = %q, want %q", gotPath, want)
 		}
 	})
+	t.Run("RemoveLabel404Benign", func(t *testing.T) {
+		// GitHub answers DELETE .../labels/{name} with 404 "Label does not
+		// exist" when the label is not currently applied. That is a benign
+		// no-op and must not surface as a write error (it inflated the SCM
+		// write-failure ratio alert before the swallow, see issue #159).
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Label does not exist"}`))
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		if err := c.RemoveLabel(context.Background(), "tok", "o/r#7", "tatara-brainstorming"); err != nil {
+			t.Fatalf("RemoveLabel must swallow a 404: %v", err)
+		}
+	})
+	t.Run("RemoveLabelPropagatesNon404", func(t *testing.T) {
+		// A real failure (here 500) is not the benign already-absent case and
+		// must propagate so it is counted and surfaced.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+		c := &GitHub{apiBase: srv.URL}
+		err := c.RemoveLabel(context.Background(), "tok", "o/r#7", "tatara-brainstorming")
+		if err == nil {
+			t.Fatal("RemoveLabel must propagate a non-404 error")
+		}
+		if got := ErrorStatus(err); got != "500" {
+			t.Fatalf("ErrorStatus = %q, want %q", got, "500")
+		}
+	})
 }
 
 func TestGitHubGetPRState(t *testing.T) {
