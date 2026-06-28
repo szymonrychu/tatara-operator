@@ -164,6 +164,14 @@ spec:
           annotations:
             summary: "the orphan reaper cannot delete pods"
             description: "operator_reap_delete_error_total increased in 1h: the backstop reaper failed to delete orphan wrapper pods/services, the zombie-pod-leak signal."
+        - alert: TataraTokenBudgetBlocked
+          expr: increase(operator_admission_blocked_total{reason="token_budget"}[30m]) > 0
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a project is paused on its token budget"
+            description: "operator_admission_blocked_total{reason=\"token_budget\"} has been increasing for 15m (the project and pool class are in the series labels): the token-budget gate is holding proactive work (class=\"normal\") - or, at the emergency threshold, incident work (class=\"alert\") - until the usage window resets (issue #189). Expected when a window is genuinely exhausted; investigate if unexpected (a mis-set tokenBudget percent/limit/schedule, or runaway token spend). Current usage vs the 50%/80% thresholds is on operator_token_budget_used_ratio."
         # ---- Class C: latency / saturation (the one histogram_quantile alert; traffic-gated so idle windows stay NaN-safe) ----
         # histogram_quantile over an all-zero bucket rate returns NaN; an un-gated quantile rule false-fires on
         # every idle window (issue #143). The "and sum(rate(..._count[15m])) > 0" gate means the quantile only

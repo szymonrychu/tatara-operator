@@ -52,6 +52,43 @@ operator records the pointer and drives the policy:
 The whole feature is **off and fully backwards-compatible until `s3Bucket` is
 set** (no S3 env is injected, so pods behave exactly as before).
 
+## Token budget (issue #189)
+
+The operator can pause agent work when token usage approaches a limit within a
+reset window, so a runaway spend or an exhausted subscription window stops
+proactive work (and, at a higher emergency threshold, incident work) until the
+window rolls. The two thresholds map onto the admission queue's two pools: the
+normal pool (brainstorm, implement, review, ...) is held at the **proactive
+percent** (default 50%); the alert pool (incidents) only at the **emergency
+percent** (default 80%), so incidents keep flowing while proactive work is
+paused.
+
+Two modes:
+
+- **customWindow** (API per-token billing) - fully operator-side. The operator
+  meters its own per-turn token accounting (the same accounting behind
+  `operator_task_tokens_total`) against an absolute `tokenLimit` within a
+  cron-anchored reset window: `resetSchedule` (a 5-field cron) marks each window
+  reset, `windowDuration` is the declared window length (it bounds the
+  reset-boundary search). The accumulator lives on `Project.Status.TokenBudget`
+  and rolls to zero at each boundary.
+- **claudeSubscription** (Claude-code 5h + weekly limits) - report-through-agents.
+  The wrapper reports the latest Claude usage snapshot (5h / weekly percent +
+  reset) in the turn-complete callback; the operator gates on the larger of the
+  two still-active windows. Inert until the wrapper reports a snapshot with a
+  future-dated reset (so it never blocks until that wrapper support lands).
+
+Config layers a per-Project `spec.tokenBudget` block over operator-wide env
+defaults (`tokenBudget*` chart values -> `TOKEN_BUDGET_*`): a project with no
+block inherits the fleet defaults, a block overrides per project and its
+`enabled` is authoritative. Observability: `operator_token_budget_used_ratio`
+{project, scope=used|proactive|emergency} and
+`operator_admission_blocked_total{project,class,reason="token_budget"}`, both on
+the Tatara Loop dashboard, with a `TataraTokenBudgetBlocked` alert.
+
+The whole feature is **off and fully backwards-compatible until enabled** (the
+zero config is disabled, so the admit path is byte-for-byte unchanged).
+
 ## Layout
 
 ```

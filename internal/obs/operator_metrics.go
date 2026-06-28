@@ -57,6 +57,8 @@ type OperatorMetrics struct {
 	toolSurfaceProbeDuration  *prometheus.HistogramVec
 	systemicSiblingsCollapsed *prometheus.CounterVec
 	systemicGroupsLed         *prometheus.CounterVec
+	tokenBudgetUsedRatio      *prometheus.GaugeVec
+	admissionBlockedTotal     *prometheus.CounterVec
 	repositoryIngestFailing   *prometheus.GaugeVec
 	repositoryLastIngestTime  *prometheus.GaugeVec
 }
@@ -320,6 +322,23 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "tatara_systemic_groups_led_total",
 			Help: "Systemic-group leads elected (lead issue gets a combined-PR agent), by project.",
 		}, []string{"project"}),
+		// Token-budget admission gate (issue #189). scope is "used" (the project's
+		// current per-window usage ratio 0..1), "proactive" (the proactive-pause
+		// threshold ratio), or "emergency" (the incident-pause threshold ratio), so
+		// a dashboard can plot used against both thresholds per project. Cardinality
+		// is bounded by live projects x 3 scopes; set live (not pre-seeded) like the
+		// other per-project series (queue_depth).
+		tokenBudgetUsedRatio: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_token_budget_used_ratio",
+			Help: "Token-budget usage as a fraction of the window limit, by project and scope (used|proactive|emergency); used is current usage, proactive/emergency are the active pause thresholds.",
+		}, []string{"project", "scope"}),
+		// Work the admission gate held back rather than admitting. reason is
+		// "token_budget" today; class is the pool (normal|alert). Bounded by live
+		// projects x classes x reasons; set live (not pre-seeded).
+		admissionBlockedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_admission_blocked_total",
+			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), and reason (token_budget).",
+		}, []string{"project", "class", "reason"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -375,6 +394,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.toolSurfaceProbeDuration,
 		m.systemicSiblingsCollapsed,
 		m.systemicGroupsLed,
+		m.tokenBudgetUsedRatio,
+		m.admissionBlockedTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -888,4 +909,24 @@ func (m *OperatorMetrics) SystemicSiblingCollapsed(project string) {
 // systemic group was elected and its combined-PR agent was enqueued.
 func (m *OperatorMetrics) SystemicGroupLed(project string) {
 	m.systemicGroupsLed.WithLabelValues(project).Inc()
+}
+
+// SetTokenBudgetUsedRatio sets operator_token_budget_used_ratio for a project and
+// scope ("used", "proactive", or "emergency") to ratio (a fraction of the window
+// limit, 0..1+).
+func (m *OperatorMetrics) SetTokenBudgetUsedRatio(project, scope string, ratio float64) {
+	m.tokenBudgetUsedRatio.WithLabelValues(project, scope).Set(ratio)
+}
+
+// AdmissionBlocked increments operator_admission_blocked_total: the dispatcher
+// declined to admit a pool's work for the given project, pool class
+// ("normal"|"alert"), and reason ("token_budget").
+func (m *OperatorMetrics) AdmissionBlocked(project, class, reason string) {
+	m.admissionBlockedTotal.WithLabelValues(project, class, reason).Inc()
+}
+
+// AdmissionBlockedCounter returns the counter for (project, class, reason) for
+// test assertions.
+func (m *OperatorMetrics) AdmissionBlockedCounter(project, class, reason string) prometheus.Counter {
+	return m.admissionBlockedTotal.WithLabelValues(project, class, reason)
 }

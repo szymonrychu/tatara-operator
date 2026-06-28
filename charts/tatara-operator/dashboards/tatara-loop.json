@@ -760,6 +760,93 @@
         "overrides": []
       },
       "options": {}
+    },
+    {
+      "type": "row",
+      "title": "Token budget (issue #189)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 69
+      },
+      "panel": {},
+      "id": 22
+    },
+    {
+      "type": "timeseries",
+      "title": "Token budget used ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "operator_token_budget_used_ratio{project=~\"$project\"}",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{project}} {{scope}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 23,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Per-project token-budget window usage (scope=used) plotted against the proactive (default 50%) and emergency (default 80%) pause thresholds (scope=proactive/emergency). Only enabled projects emit series."
+    },
+    {
+      "type": "timeseries",
+      "title": "Admission blocked (token budget)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (project, class) (rate(operator_admission_blocked_total{reason=\"token_budget\"}[$__rate_interval]))",
+          "refId": "A",
+          "editorMode": "code",
+          "legendFormat": "{{project}} {{class}}",
+          "format": "time_series"
+        }
+      ],
+      "id": 24,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Rate at which the dispatcher held a pool's work on the token budget, by project and pool class (normal=proactive work, alert=incidents)."
     }
   ],
   "annotations": {

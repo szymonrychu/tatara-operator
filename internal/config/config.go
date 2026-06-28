@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/budget"
 )
 
 // Config holds the env-scalar configuration for the operator. Each field is
@@ -137,6 +138,36 @@ type Config struct {
 	// Pod spec / etcd object in plaintext, matching every other agent secret
 	// (anthropic, scm, cli-oidc). Empty = HMAC injection disabled (finding 1/r3).
 	CallbackHMACSecretName string
+
+	// Token-budget admission gate operator-wide defaults (issue #189). These set
+	// the fleet-wide baseline; a Project's spec.tokenBudget overrides them per
+	// project. Off by default (TokenBudgetEnabled=false) so the gate is inert
+	// until explicitly enabled. camelCase chart value -> SCREAMING_SNAKE ConfigMap
+	// key -> consumed here via envFrom (rule 6). Read out as a budget.Config via
+	// BudgetDefaults().
+	TokenBudgetEnabled          bool
+	TokenBudgetMode             string
+	TokenBudgetProactivePercent int
+	TokenBudgetEmergencyPercent int
+	TokenBudgetResetSchedule    string
+	TokenBudgetWindowDuration   time.Duration
+	TokenBudgetTokenLimit       int64
+}
+
+// BudgetDefaults returns the operator-wide token-budget configuration as a
+// budget.Config. A Project with no spec.tokenBudget inherits this verbatim; a
+// Project that sets the block overrides these per project (see
+// Project.BudgetConfig).
+func (c Config) BudgetDefaults() budget.Config {
+	return budget.Config{
+		Enabled:          c.TokenBudgetEnabled,
+		Mode:             budget.Mode(c.TokenBudgetMode),
+		ProactivePercent: c.TokenBudgetProactivePercent,
+		EmergencyPercent: c.TokenBudgetEmergencyPercent,
+		ResetSchedule:    c.TokenBudgetResetSchedule,
+		WindowDuration:   c.TokenBudgetWindowDuration,
+		TokenLimit:       c.TokenBudgetTokenLimit,
+	}
 }
 
 // DefaultTaskRetention is the default age after which a terminal Task is
@@ -233,6 +264,34 @@ func getInt64Ptr(key string) (*int64, error) {
 	return &n, nil
 }
 
+// getIntDefault parses key as an int, returning def when unset and an error when
+// present but not a valid integer.
+func getIntDefault(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q is not a valid integer: %w", key, v, err)
+	}
+	return n, nil
+}
+
+// getInt64Default parses key as an int64, returning def when unset and an error
+// when present but not a valid integer.
+func getInt64Default(key string, def int64) (int64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q is not a valid integer: %w", key, v, err)
+	}
+	return n, nil
+}
+
 // Load reads the operator configuration from the environment, applying
 // defaults for the listener addresses and log level. OIDC issuer and
 // audience are required.
@@ -271,6 +330,26 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	agentFSGroup, err := getInt64Ptr("AGENT_FS_GROUP")
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetEnabled, err := getBoolDefault("TOKEN_BUDGET_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetProactive, err := getIntDefault("TOKEN_BUDGET_PROACTIVE_PERCENT", budget.DefaultProactivePercent)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetEmergency, err := getIntDefault("TOKEN_BUDGET_EMERGENCY_PERCENT", budget.DefaultEmergencyPercent)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetWindow, err := getDurationDefault("TOKEN_BUDGET_WINDOW", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	tokenBudgetLimit, err := getInt64Default("TOKEN_BUDGET_TOKEN_LIMIT", 0)
 	if err != nil {
 		return Config{}, err
 	}
@@ -327,6 +406,14 @@ func Load() (Config, error) {
 		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 		SerenaURL:                  os.Getenv("TATARA_SERENA_URL"),
+
+		TokenBudgetEnabled:          tokenBudgetEnabled,
+		TokenBudgetMode:             getDefault("TOKEN_BUDGET_MODE", string(budget.ModeCustomWindow)),
+		TokenBudgetProactivePercent: tokenBudgetProactive,
+		TokenBudgetEmergencyPercent: tokenBudgetEmergency,
+		TokenBudgetResetSchedule:    os.Getenv("TOKEN_BUDGET_RESET_SCHEDULE"),
+		TokenBudgetWindowDuration:   tokenBudgetWindow,
+		TokenBudgetTokenLimit:       tokenBudgetLimit,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")
@@ -349,5 +436,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("config: AGENT_SCHEDULING: %w", err)
 	}
 	cfg.Scheduling = scheduling
+	// Fail fast on a bad operator-wide token-budget default so a misconfigured
+	// fleet baseline surfaces at startup rather than silently disabling the gate.
+	// Validate is a no-op when the budget is disabled (issue #189).
+	if err := cfg.BudgetDefaults().Validate(); err != nil {
+		return Config{}, fmt.Errorf("config: TOKEN_BUDGET: %w", err)
+	}
 	return cfg, nil
 }

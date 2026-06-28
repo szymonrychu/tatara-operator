@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/budget"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,7 +56,7 @@ func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,7 +95,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// First admit: creates Task, marks Admitted.
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	got := refreshQE(t, ctx, qe)
@@ -113,7 +114,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// Second admit: Task already exists (AlreadyExists), must not create a second one.
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
 
