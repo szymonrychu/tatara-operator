@@ -86,7 +86,7 @@ func reviewText(goal, project, task string) string {
 			"3. Submit your verdict with the `review_verdict` MCP tool - this is REQUIRED before you finish.\n\n"+
 			"Do NOT commit, push, or open a PR: the workspace is transient and read-only for review, and nothing "+
 			"you change on disk is kept. Communicate only through the review verdict.",
-		task, project, task, project, goal) + platformProblemGuidance
+		task, project, task, project, goal) + "\n\n" + skillsDirective("review") + platformProblemGuidance
 }
 
 // nextPendingSubtask returns the lowest-order Pending subtask, if any.
@@ -169,6 +169,49 @@ func buildTriagePrompt(task *tatarav1alpha1.Task, title, body string, comments [
 		thread = thread[len(thread)-triageCommentCharBudget:]
 	}
 	return base + thread
+}
+
+// requiredSkillsForKind returns the skill names an agent must invoke this turn.
+// Returns nil for kinds with no required skills (fail-open).
+func requiredSkillsForKind(kind string) []string {
+	switch kind {
+	case "implement":
+		return []string{"tatara-implement-workflow", "test-driven-development"}
+	case "review":
+		return []string{"tatara-review-checklist"}
+	case "triageIssue":
+		return []string{"tatara-triage-judgment"}
+	case "brainstorm":
+		return []string{"tatara-brainstorm-guardrails"}
+	case "issueLifecycle":
+		return []string{"tatara-implement-workflow", "tatara-review-checklist"}
+	case "incident":
+		return []string{"tatara-incident-investigation", "systematic-debugging"}
+	case "selfImprove":
+		return []string{"tatara-deep-architectural-research"}
+	default:
+		return nil
+	}
+}
+
+// isReferenceKind reports whether kind uses advisory "Consult" wording (REFERENCE
+// skills per Phase-2 contract) rather than mandatory "Required/Invoke" wording.
+func isReferenceKind(kind string) bool {
+	return kind == "brainstorm" || kind == "triageIssue"
+}
+
+// skillsDirective builds the required-skills line for the given kind. Returns ""
+// when no skills are mapped (empty kind, unknown kind, etc.).
+func skillsDirective(kind string) string {
+	skills := requiredSkillsForKind(kind)
+	if len(skills) == 0 {
+		return ""
+	}
+	names := strings.Join(skills, ", ")
+	if isReferenceKind(kind) {
+		return "Consult these skills this turn: " + names + "."
+	}
+	return "Required skills this turn: " + names + ". Invoke each before acting."
 }
 
 // turnText is the prompt for executing one Subtask.

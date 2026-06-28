@@ -637,11 +637,20 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		}
 	}
 
-	// Tool profile: gates the MCP tool surface the agent sees. Placed here,
-	// with the other operator-set variables, so the operator-set profile is
-	// authoritative -- a stray ExtraEnvs duplicate that comes after it is
-	// ignored (first occurrence wins in a Pod env list).
+	// Tool and skill profiles: gate the MCP tool surface and the skill set the
+	// agent sees. Placed here, before ExtraEnvs, so the operator-set values are
+	// authoritative -- a stray ExtraEnvs duplicate that comes after is ignored
+	// (first occurrence wins in a Pod env list).
 	env = append(env, corev1.EnvVar{Name: "TATARA_TOOL_PROFILE", Value: toolProfileForKind(task.Spec.Kind)})
+	skillsRef := "main"
+	if project.Spec.Agent.SkillsRef != "" {
+		skillsRef = project.Spec.Agent.SkillsRef
+	}
+	env = append(env,
+		corev1.EnvVar{Name: "TATARA_SKILL_PROFILE", Value: skillProfileForKind(task.Spec.Kind)},
+		corev1.EnvVar{Name: "TATARA_SKILLS_REPO", Value: skillsRepoDefault},
+		corev1.EnvVar{Name: "TATARA_SKILLS_REF", Value: skillsRef},
+	)
 
 	// Operator-supplied extra envs are appended LAST, after every variable the
 	// operator itself sets, so a stray extra named like a required variable
@@ -816,6 +825,33 @@ func toolProfileForKind(kind string) string {
 	case "triageIssue":
 		return "triage"
 	case "brainstorm": // healthCheck shares Kind=brainstorm
+		return "brainstorm"
+	case "issueLifecycle":
+		return "lifecycle"
+	case "incident":
+		return "incident"
+	case "selfImprove":
+		return "selfImprove"
+	default:
+		return "" // fail-open
+	}
+}
+
+// skillsRepoDefault is the canonical clone URL for the tatara-agent-skills repo.
+const skillsRepoDefault = "https://github.com/szymonrychu/tatara-agent-skills"
+
+// skillProfileForKind maps a Task Kind to the TATARA_SKILL_PROFILE value that
+// the wrapper uses to filter which skills to install at boot. Returns "" for
+// unknown/empty kinds (fail-open: the wrapper installs all skills).
+func skillProfileForKind(kind string) string {
+	switch kind {
+	case "implement":
+		return "implement"
+	case "review":
+		return "review"
+	case "triageIssue":
+		return "triage"
+	case "brainstorm":
 		return "brainstorm"
 	case "issueLifecycle":
 		return "lifecycle"

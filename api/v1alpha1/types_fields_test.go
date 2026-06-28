@@ -66,6 +66,13 @@ func TestNewFields_JSONRoundTrip(t *testing.T) {
 			},
 			want: `"systemicId":"abc123"`,
 		},
+		{
+			name: "AgentSpec.SkillsRef json key skillsRef",
+			marshal: func() ([]byte, error) {
+				return json.Marshal(AgentSpec{SkillsRef: "v1.2.3"})
+			},
+			want: `"skillsRef":"v1.2.3"`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

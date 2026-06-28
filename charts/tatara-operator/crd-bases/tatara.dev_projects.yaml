@@ -5362,6 +5362,11 @@ spec:
                   permissionMode:
                     default: bypassPermissions
                     type: string
+                  skillsRef:
+                    description: |-
+                      SkillsRef is the git ref (branch, tag, or SHA) of the tatara-agent-skills
+                      repo to clone at boot. Empty defaults to "main".
+                    type: string
                   turnTimeoutSeconds:
                     default: 1800
                     description: |-
