@@ -1,0 +1,325 @@
+name: ci-shared
+
+# Reusable CI for every tatara Go service. Each repo keeps a thin caller
+# `ci.yml` that `uses:` this workflow and passes its per-repo inputs, so the
+# whole job graph (secscan / lint / test / build / smoke / image / chart) and
+# every cross-cutting tool-version pin live in exactly one place. See
+# tatara-operator#130 for the rationale.
+
+on:
+  workflow_call:
+    inputs:
+      runner-label:
+        description: Self-hosted ARC runner label for every job (the repo name).
+        type: string
+        required: true
+      smoke-binary:
+        description: >-
+          Path to the freshly built binary to run `--help` against in the smoke
+          job (e.g. ./bin/tatara). Empty disables the smoke job entirely
+          (tatara-operator has none).
+        type: string
+        required: false
+        default: ''
+      smoke-allow-failure:
+        description: When true the smoke `--help` may exit non-zero (`|| true`).
+        type: boolean
+        required: false
+        default: true
+      build-needs-cgo:
+        description: >-
+          Install the full build-essential C toolchain (not just `make`) in the
+          build and smoke jobs, for repos whose `make build` is CGO_ENABLED=1
+          (e.g. tatara-memory-repo-ingester). Default false installs make only,
+          which is enough for a CGO_ENABLED=0 build. The test job always
+          installs build-essential because `go test -race` needs cgo.
+        type: boolean
+        required: false
+        default: false
+      has-chart:
+        description: Package and push the repo's helm chart(s) on push to main.
+        type: boolean
+        required: false
+        default: false
+      chart-needs-cnpg:
+        description: >-
+          Register the classic cloudnative-pg helm repo and run
+          `helm dependency build` before packaging (charts with a cnpg
+          dependency, e.g. tatara-chat).
+        type: boolean
+        required: false
+        default: false
+      chart-validate:
+        description: >-
+          Run the extra chart-validate job (dependency build, lint, template
+          render) for repos whose chart is worth rendering in CI.
+        type: boolean
+        required: false
+        default: false
+      chart-validate-render-args:
+        description: >-
+          Extra `helm template` flags for a second chart-validate render that
+          exercises opt-in templates the defaults never hit (e.g. tatara-chat's
+          ingress / networkPolicy paths). Empty runs only the default render.
+        type: string
+        required: false
+        default: ''
+      image-build-arg:
+        description: >-
+          Optional single extra `key=value` docker build-arg forwarded to
+          buildctl (e.g. TATARA_CLI_VERSION=<sha> for the wrapper). Empty adds
+          none.
+        type: string
+        required: false
+        default: ''
+
+# Single source of truth for the tool versions that used to be copy-pasted
+# inline in every repo. Bump here once.
+env:
+  GITLEAKS_VERSION: '8.30.1'
+  BUILDKIT_VERSION: '0.18.2'
+
+jobs:
+  secscan:
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: gitleaks
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xzf - gitleaks
+          ./gitleaks detect --source . --no-git --redact --verbose
+
+  lint:
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v4
+      # build-essential gives golangci-lint a C toolchain for any cgo package
+      # and `make` for Makefile-backed pre-commit hooks (e.g. rbac-check).
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: pre-commit
+        run: pre-commit run --all-files
+
+  test:
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v4
+      # `make test` runs `go test -race`, which needs cgo (a C toolchain).
+      - name: build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise run test
+
+  build:
+    runs-on: ${{ inputs.runner-label }}
+    needs: [secscan, lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      # A CGO_ENABLED=0 build only needs `make` to drive the Makefile, not a
+      # full C toolchain; a CGO_ENABLED=1 build (build-needs-cgo) needs gcc.
+      - name: build tools
+        env:
+          BUILD_NEEDS_CGO: ${{ inputs.build-needs-cgo }}
+        run: |
+          sudo apt-get update
+          if [ "${BUILD_NEEDS_CGO}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends build-essential
+          else
+            sudo apt-get install -y --no-install-recommends make
+          fi
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - run: mise run build
+
+  smoke:
+    if: ${{ inputs.smoke-binary != '' }}
+    runs-on: ${{ inputs.runner-label }}
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+      # smoke rebuilds the binary, so it needs the same toolchain as build.
+      - name: build tools
+        env:
+          BUILD_NEEDS_CGO: ${{ inputs.build-needs-cgo }}
+        run: |
+          sudo apt-get update
+          if [ "${BUILD_NEEDS_CGO}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends build-essential
+          else
+            sudo apt-get install -y --no-install-recommends make
+          fi
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: smoke
+        env:
+          SMOKE_BINARY: ${{ inputs.smoke-binary }}
+          SMOKE_ALLOW_FAILURE: ${{ inputs.smoke-allow-failure }}
+        run: |
+          mise run build
+          if [ "${SMOKE_ALLOW_FAILURE}" = "true" ]; then
+            "${SMOKE_BINARY}" --help || true
+          else
+            "${SMOKE_BINARY}" --help
+          fi
+
+  chart-validate:
+    if: ${{ inputs.chart-validate }}
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: build deps, lint and render chart
+        env:
+          CHART_NEEDS_CNPG: ${{ inputs.chart-needs-cnpg }}
+          CHART_RENDER_ARGS: ${{ inputs.chart-validate-render-args }}
+        run: |
+          NAME="$(basename "$(ls -d charts/*/)")"
+          if [ "${CHART_NEEDS_CNPG}" = "true" ]; then
+            # helm dependency build needs the classic (non-OCI) cnpg repo
+            # registered locally, else it errors "no repository definition
+            # for https://cloudnative-pg.github.io/charts".
+            helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+          fi
+          helm dependency build "charts/$NAME"
+          helm lint "charts/$NAME"
+          helm template release "charts/$NAME" >/dev/null
+          if [ -n "${CHART_RENDER_ARGS}" ]; then
+            # Second render exercising opt-in templates the defaults never hit
+            # (e.g. ingress / networkPolicy), so a break there is caught before
+            # main. Word-splitting of the flags is intentional.
+            # shellcheck disable=SC2086
+            helm template release "charts/$NAME" ${CHART_RENDER_ARGS} >/dev/null
+          fi
+
+  image:
+    needs: [build, smoke, chart-validate]
+    # Only publish on push to main, and only when the build passed. smoke and
+    # chart-validate are optional jobs, so tolerate them being skipped but fail
+    # closed if they ran and failed. `always()` is required so a skipped
+    # optional dependency does not skip this job.
+    if: >-
+      ${{ always() && github.event_name == 'push'
+          && needs.build.result == 'success'
+          && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped')
+          && (needs.chart-validate.result == 'success' || needs.chart-validate.result == 'skipped') }}
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: install buildctl
+        run: |
+          curl -sSfL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local bin/buildctl
+      - name: build and push image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          REPO: ${{ github.event.repository.name }}
+          IMAGE_BUILD_ARG: ${{ inputs.image-build-arg }}
+        run: |
+          # Build this repo's image via the shared rootless buildkitd daemon and
+          # push to harbor. Runs on the ARC runner (in-cluster, namespace
+          # arc-runners). Talks gRPC to the buildkitd Service; buildkitd writes
+          # all layers/cache to its Ceph PVC (--root), OFF the control-plane etcd
+          # NVMe. No in-cluster Job, no transient cluster secrets: harbor push
+          # auth is a per-build docker config on THIS runner, the private-repo
+          # clone token is a buildkit frontend secret.
+          set -euo pipefail
+          BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          VERSION="$(git describe --tags --always --dirty)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          DEST="harbor.szymonrichert.pl/containers/${REPO}"
+
+          : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
+          : "${HARBOR_USERNAME:?HARBOR_USERNAME required}"
+          : "${HARBOR_PASSWORD:?HARBOR_PASSWORD required}"
+
+          # Per-build docker config on the runner only (never an in-cluster
+          # secret). buildctl reads $DOCKER_CONFIG and forwards harbor auth to
+          # buildkitd for push.
+          DOCKER_CONFIG="$(mktemp -d)"
+          export DOCKER_CONFIG
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          auth="$(printf '%s:%s' "$HARBOR_USERNAME" "$HARBOR_PASSWORD" | base64 -w0)"
+          cat >"${DOCKER_CONFIG}/config.json" <<EOF
+          {"auths":{"harbor.szymonrichert.pl":{"auth":"${auth}"}}}
+          EOF
+
+          # Optional extra build-arg (e.g. the wrapper bakes TATARA_CLI_VERSION).
+          # Not a secret, so it is a plain build-arg.
+          extra=()
+          if [ -n "${IMAGE_BUILD_ARG:-}" ]; then
+            extra+=(--opt "build-arg:${IMAGE_BUILD_ARG}")
+          fi
+
+          # Remote git context (buildkitd clones the private repo, like kaniko
+          # did). MUST be https:// (NOT git://): buildkit's GIT_AUTH_TOKEN
+          # basic-auth extraheader only engages over https, and github.com no
+          # longer serves the git:// protocol. GIT_AUTH_TOKEN is the buildkit
+          # git-source frontend secret for the private clone; it is NOT a
+          # build-arg, so it never lands in a layer.
+          buildctl --addr "$BUILDKITD_ADDR" build \
+            --frontend dockerfile.v0 \
+            --opt context="https://github.com/szymonrychu/${REPO}.git#${GITHUB_SHA}" \
+            --opt filename=Dockerfile \
+            --opt build-arg:VERSION="${VERSION}" \
+            --opt build-arg:COMMIT="${SHORT_SHA}" \
+            --opt build-arg:DATE="${BUILD_DATE}" \
+            "${extra[@]}" \
+            --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
+            --output "type=image,\"name=${DEST}:${SHORT_SHA},${DEST}:${VERSION}\",push=true"
+
+          echo "buildkit: pushed ${DEST}:${SHORT_SHA} and ${DEST}:${VERSION}"
+
+  chart:
+    needs: [image]
+    if: >-
+      ${{ always() && github.event_name == 'push' && inputs.has-chart
+          && needs.image.result == 'success' }}
+    runs-on: ${{ inputs.runner-label }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: package and push charts
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          CHART_NEEDS_CNPG: ${{ inputs.chart-needs-cnpg }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          VERSION="$(git describe --tags --always --dirty)"
+          # 'g' prefix (git-describe convention) keeps the prerelease a valid
+          # semver alphanumeric identifier. A bare short SHA that is all digits
+          # with a leading zero (e.g. 0707870) is an invalid numeric prerelease
+          # identifier and helm package rejects it ("version segment starts with
+          # 0").
+          CHART_VERSION="0.0.0-g${SHORT_SHA}"
+          helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
+          if [ "${CHART_NEEDS_CNPG}" = "true" ]; then
+            helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
+          fi
+          for dir in charts/*/; do
+            NAME="$(basename "$dir")"
+            if [ "${CHART_NEEDS_CNPG}" = "true" ]; then
+              helm dependency build "$dir"
+            fi
+            helm package "$dir" --version "${CHART_VERSION}" --app-version "${VERSION}"
+            helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
+          done

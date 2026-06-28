@@ -106,6 +106,12 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
 	}
 
+	// Publish the live per-repo ingest-health gauges every reconcile so alerting
+	// can key on the CURRENT condition (recovery-aware) instead of the monotonic
+	// operator_ingest_job_total counter, which kept TataraIngestJobFailing firing
+	// for an hour after a self-healed incremental burst (issue #138).
+	r.publishIngestHealth(&repo)
+
 	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
 		return ctrl.Result{}, nil
 	}
@@ -287,6 +293,22 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		"incremental", since != "")
 	r.Metrics.ReconcileResult("Repository", "success")
 	return ctrl.Result{}, nil
+}
+
+// publishIngestHealth exports the live per-repo ingest-health gauges from the
+// Repository status. operator_repository_ingest_failing is the current-state,
+// recovery-aware signal alerting keys on instead of the monotonic
+// operator_ingest_job_total counter; it is 1 while the repo is Failed or has
+// unresolved consecutive failures and clears the moment a re-ingest succeeds
+// (issue #138). A disabled repo never reports failing. The last-ingest timestamp
+// lets PromQL compute staleness as time() - the gauge.
+func (r *RepositoryReconciler) publishIngestHealth(repo *tataradevv1alpha1.Repository) {
+	enabled := tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true)
+	failing := enabled && (repo.Status.Phase == "Failed" || repo.Status.IngestFailureCount > 0)
+	r.Metrics.SetRepositoryIngestFailing(repo.Name, failing)
+	if repo.Status.LastIngestTime != nil {
+		r.Metrics.SetRepositoryLastIngestTimestamp(repo.Name, float64(repo.Status.LastIngestTime.Unix()))
+	}
 }
 
 // ingestDecision returns (sinceSHA, wantIngest). Full ingest (empty since)

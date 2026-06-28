@@ -887,13 +887,7 @@ func (tr triageReader) botHasLastWord(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	newest := -1
-	for i := range comments {
-		if newest == -1 || comments[i].CreatedAt.After(comments[newest].CreatedAt) {
-			newest = i
-		}
-	}
-	return newest >= 0 && comments[newest].Author == tr.botLogin, nil
+	return botIsLastCommenter(comments, tr.botLogin), nil
 }
 
 // finishTriage consumes Status.IssueOutcome after a completed Triage agent run.

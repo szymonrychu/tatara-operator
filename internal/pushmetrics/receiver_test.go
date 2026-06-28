@@ -3,6 +3,7 @@
 package pushmetrics
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -88,8 +89,9 @@ func TestConfigurablePrefixes(t *testing.T) {
 	}
 }
 
-// The default allowlist (New called with nil) stays wrapper_/agent_, so a
-// memory_ family is dropped until a deploy widens PUSH_METRICS_ALLOWED_PREFIXES.
+// memory_ is intentionally NOT in the default allowlist: the memory service is
+// scraped, not pushed (issue #129), so a memory_ family is dropped under the
+// default allowlist (New called with nil).
 func TestDefaultPrefixesRejectMemory(t *testing.T) {
 	r := New(time.Minute, nil)
 	if code := push(t, r, "run_id=d1", "# TYPE memory_eval_mrr gauge\nmemory_eval_mrr 0.5\n"); code != http.StatusNoContent {
@@ -97,6 +99,35 @@ func TestDefaultPrefixesRejectMemory(t *testing.T) {
 	}
 	if got := testutil.CollectAndCount(r, "memory_eval_mrr"); got != 0 {
 		t.Fatalf("memory_eval_mrr series: got %d, want 0 (dropped under default allowlist)", got)
+	}
+}
+
+// Issue #129: the default allowlist must admit the REAL families the ephemeral
+// producers push, or 100% of them are silently dropped. The wrapper pods push
+// ccw_*/tatara_wrapper_*; the repo ingester pushes ingest_*/analyzer_*/
+// semantic_*/scip_*/llm_*. Each must pass through under the default allowlist.
+func TestDefaultPrefixesAdmitPushedFamilies(t *testing.T) {
+	pushed := []string{
+		"ccw_turns_total",
+		"tatara_wrapper_internal_issue_total",
+		"ingest_runs_total",
+		"analyzer_parse_errors_total",
+		"semantic_chunks_total",
+		"scip_symbols_total",
+		"llm_tokens_total",
+	}
+	for i, name := range pushed {
+		r := New(time.Minute, nil)
+		body := fmt.Sprintf("# TYPE %s counter\n%s 1\n", name, name)
+		if code := push(t, r, fmt.Sprintf("run_id=p%d", i), body); code != http.StatusNoContent {
+			t.Fatalf("%s push: got %d, want 204", name, code)
+		}
+		if got := testutil.CollectAndCount(r, name); got != 1 {
+			t.Fatalf("%s series: got %d, want 1 (admitted under default allowlist)", name, got)
+		}
+		if got := testutil.ToFloat64(r.seriesDroppedTotal.WithLabelValues("reserved_name")); got != 0 {
+			t.Fatalf("%s wrongly counted as reserved_name: %v", name, got)
+		}
 	}
 }
 

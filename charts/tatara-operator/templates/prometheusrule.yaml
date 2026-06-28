@@ -92,12 +92,21 @@ spec:
             summary: "Tasks terminated for an unreachable wrapper"
             description: "operator_agent_unreachable_termination_total increased in 15m: a Task was killed because its wrapper agent stayed unreachable past the boot deadline."
         - alert: TataraIngestJobFailing
-          expr: increase(operator_ingest_job_total{result="failure", mode="full"}[1h]) > 0
+          expr: operator_repository_ingest_failing > 0
+          for: 15m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "memory full re-ingest Jobs are failing"
-            description: "operator_ingest_job_total{result=\"failure\", mode=\"full\"} increased in 1h: a full re-ingest failed (a first/scheduled full ingest, or the incremental-to-full self-heal fallback after repeated incremental failures), so the recall corpus is genuinely going stale. Benign incremental failures that self-heal via the full-ingest fallback are excluded by the mode=\"full\" selector."
+            summary: "memory re-ingest is failing for a repo"
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 15m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138)."
+        - alert: TataraIngestStale
+          expr: (time() - operator_repository_last_ingest_timestamp_seconds) > {{ .Values.prometheusRule.ingestStaleAfterSeconds }}
+          for: 30m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a repo has not been re-ingested recently"
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} last ingested {{ "{{" }} $value | humanizeDuration {{ "}}" }} ago, past the {{ .Values.prometheusRule.ingestStaleAfterSeconds }}s staleness budget: the recall corpus is going stale even though no ingest Job is actively failing (e.g. the re-ingest cron is not landing). Tune via prometheusRule.ingestStaleAfterSeconds."
         - alert: TataraLifecycleGiveups
           expr: increase(tatara_lifecycle_giveup_total[1h]) > 0
           labels:
@@ -141,6 +150,13 @@ spec:
           annotations:
             summary: "wrapper metric pushes are being rejected"
             description: "operator_push_receive_total{result=\"rejected\"} increased in 15m: ephemeral wrapper/ingest pod metrics are being lost at the push receiver, a self-observability blind spot."
+        - alert: TataraPushMetricsDropped
+          expr: increase(operator_push_series_dropped_total{reason="reserved_name"}[15m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "pushed metric families are being dropped for an unallowed name prefix"
+            description: "operator_push_series_dropped_total{reason=\"reserved_name\"} increased in 15m: a short-lived pod pushed a metric family whose name matches no prefix in the push allowlist (operator chart value pushMetricsAllowedPrefixes / PUSH_METRICS_ALLOWED_PREFIXES), so it was silently dropped before reaching Prometheus. This is allowlist drift (issue #129): a wrapper or ingester added a metric family whose prefix is not admitted. The receiver logs the dropped family names at WARN (action=\"push_series_dropped\") on each affected push; add their prefix to pushMetricsAllowedPrefixes."
         - alert: TataraReaperDeleteErrors
           expr: increase(operator_reap_delete_error_total[1h]) > 0
           labels:
@@ -148,4 +164,21 @@ spec:
           annotations:
             summary: "the orphan reaper cannot delete pods"
             description: "operator_reap_delete_error_total increased in 1h: the backstop reaper failed to delete orphan wrapper pods/services, the zombie-pod-leak signal."
+        # ---- Class C: latency / saturation (the one histogram_quantile alert; traffic-gated so idle windows stay NaN-safe) ----
+        # histogram_quantile over an all-zero bucket rate returns NaN; an un-gated quantile rule false-fires on
+        # every idle window (issue #143). The "and sum(rate(..._count[15m])) > 0" gate means the quantile only
+        # produces a series when turns are actually being submitted, so idle windows yield no series, never a NaN.
+        - alert: TataraTurnSubmitLatencyHigh
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(operator_turn_submit_duration_seconds_bucket[15m])) by (le)
+            ) > {{ .Values.prometheusRule.turnSubmitP95LatencyThreshold }}
+            and
+            sum(rate(operator_turn_submit_duration_seconds_count[15m])) > 0
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "tatara-operator SubmitTurn p95 latency is high"
+            description: "SubmitTurn p95 latency is {{ "{{" }} $value {{ "}}" }}s (> {{ .Values.prometheusRule.turnSubmitP95LatencyThreshold }}s) over 15m, evaluated only while turns are actively being submitted (the quantile is gated on sum(rate(operator_turn_submit_duration_seconds_count[15m])) > 0, so idle windows yield no series instead of a NaN that would false-fire, issue #143). Dispatching agent turns is slow: wrappers may be unreachable or saturated. The histogram tops out at 25.6s (ExponentialBuckets(0.05,2,10)), so a true p95 can never exceed that ceiling and this threshold is kept well under it."
 {{- end }}

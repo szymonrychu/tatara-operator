@@ -106,9 +106,11 @@ type Config struct {
 	PushMetricsTTL time.Duration
 	// PushMetricsAllowedPrefixes is the metric-name prefix allowlist the
 	// push-receiver enforces (PUSH_METRICS_ALLOWED_PREFIXES, comma-separated).
-	// Nil/empty leaves the receiver on its built-in default (wrapper_,agent_);
-	// widening it (e.g. memory_,ingest_) lets new short-lived-pod producers push
-	// their families without a receiver code change.
+	// Nil/empty leaves the receiver on pushmetrics.DefaultAllowedPrefixes; the
+	// chart default carries the real names the ephemeral producers push (ccw_,
+	// tatara_wrapper_ from the wrapper; ingest_,analyzer_,semantic_,scip_,llm_
+	// from the ingester - issue #129). Widen it as new pushed families appear so
+	// they reach Prometheus without a receiver code change.
 	PushMetricsAllowedPrefixes []string
 	// TaskRetention is how long a terminal (Succeeded/Failed/Done/Stopped/Parked)
 	// Task is kept before the reaper garbage-collects it (its Subtasks cascade via

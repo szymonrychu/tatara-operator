@@ -47,6 +47,8 @@ type OperatorMetrics struct {
 	queueDepth                *prometheus.GaugeVec
 	queueInflight             *prometheus.GaugeVec
 	taskTokensTotal           *prometheus.CounterVec
+	taskTurnsTotal            *prometheus.CounterVec
+	taskIssueState            *prometheus.GaugeVec
 	taskTerminalTotal         *prometheus.CounterVec
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
@@ -55,6 +57,8 @@ type OperatorMetrics struct {
 	toolSurfaceProbeDuration  *prometheus.HistogramVec
 	systemicSiblingsCollapsed *prometheus.CounterVec
 	systemicGroupsLed         *prometheus.CounterVec
+	repositoryIngestFailing   *prometheus.GaugeVec
+	repositoryLastIngestTime  *prometheus.GaugeVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -141,6 +145,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_ingest_job_total",
 			Help: "Finished ingest Jobs by terminal result and ingest mode (incremental|full).",
 		}, []string{"result", "mode"}),
+		repositoryIngestFailing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_repository_ingest_failing",
+			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0), else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138).",
+		}, []string{"repo"}),
+		repositoryLastIngestTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_repository_last_ingest_timestamp_seconds",
+			Help: "Unix timestamp (seconds) of a Repository's last successful ingest (status LastIngestTime). Compute staleness in PromQL as time() - this (issue #138).",
+		}, []string{"repo"}),
 		agentUnreachableTermTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "operator_agent_unreachable_termination_total",
 			Help: "Tasks terminated because the wrapper agent stayed unreachable past the boot deadline.",
@@ -248,6 +260,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_task_tokens_total",
 			Help: "Agent token usage by project, repo, Task kind, issue, and type (input|output).",
 		}, []string{"project", "repo", "kind", "issue", "type"}),
+		taskTurnsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_turns_total",
+			Help: "Agent turns completed by project, repo, Task kind, and issue.",
+		}, []string{"project", "repo", "kind", "issue"}),
+		taskIssueState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_issue_state",
+			Help: "Current state of open issues tracked by an agent Task, by project, repo, issue, kind, state, and incident flag. Value is always 1; stale series are removed on each recompute.",
+		}, []string{"project", "repo", "issue", "kind", "state", "incident"}),
 		taskTerminalTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_terminal_total",
 			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
@@ -260,13 +280,17 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_lightrag_query_errors_total",
 			Help: "Failed attempts to read document counts from a project's lightrag.",
 		}),
-		// Unauthenticated route-presence probe of each project's tatara-memory
-		// retrieval surface. result is "present" (route served any non-404 status,
-		// e.g. a 401 auth rejection that still proves the route exists), "absent"
-		// (404 -> drifted/stale binary), or "error" (transport failure -> down).
+		// Authenticated functional probe of each project's tatara-memory retrieval
+		// surface (the contract agents consume). result is "present" (HTTP 2xx +
+		// well-formed JSON body -> healthy), "absent" (404 -> drifted/stale binary),
+		// "unauthorized" (401/403 -> a valid memory-audience token was rejected:
+		// auth/contract drift), "degraded" (auth ok but 5xx or a malformed/empty
+		// body -> broken handler/backend), or "error" (transport failure or token
+		// mint failure -> probe could not complete). All but "present" count
+		// unhealthy for the cycle.
 		memoryRetrievalProbe: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_memory_retrieval_probe_total",
-			Help: "Unauthenticated route-presence probes of a project's tatara-memory retrieval surface by route and result.",
+			Help: "Authenticated functional probes of a project's tatara-memory retrieval surface by route and result.",
 		}, []string{"route", "result"}),
 		// Synthetic probe of the operator-write and chat tool-backend surfaces from
 		// the in-cluster agent vantage (the sibling of memoryRetrievalProbe, which
@@ -317,6 +341,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.openProposals,
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
+		m.repositoryIngestFailing,
+		m.repositoryLastIngestTime,
 		m.agentUnreachableTermTotal,
 		m.agentBootCrashTotal,
 		m.orphanReapedTotal,
@@ -339,6 +365,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.queueDepth,
 		m.queueInflight,
 		m.taskTokensTotal,
+		m.taskTurnsTotal,
+		m.taskIssueState,
 		m.taskTerminalTotal,
 		m.lightragDocuments,
 		m.lightragQueryErrors,
@@ -425,9 +453,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	// Pre-seed the memory retrieval-probe series so the route x result matrix
 	// exists at a zero baseline before the first probe (alertable from startup).
-	// The route labels must mirror memoryProbeRoutes in the controller package.
+	// The route labels must mirror memoryProbeRoutes and the result labels the
+	// classifier in probeMemoryRoute, both in the controller package.
 	for _, route := range []string{"/queries", "/code-graph/stats"} {
-		for _, result := range []string{"present", "absent", "error"} {
+		for _, result := range []string{"present", "absent", "error", "unauthorized", "degraded"} {
 			m.memoryRetrievalProbe.WithLabelValues(route, result)
 		}
 	}
@@ -458,6 +487,35 @@ func (m *OperatorMetrics) TurnTimeout(source string) {
 // genuinely going stale.
 func (m *OperatorMetrics) IngestJobResult(result, mode string) {
 	m.ingestJobTotal.WithLabelValues(result, mode).Inc()
+}
+
+// SetRepositoryIngestFailing sets operator_repository_ingest_failing for a repo
+// to 1 when its ingest is currently failing, else 0. Unlike the monotonic
+// operator_ingest_job_total counter, this reflects the CURRENT ingest health and
+// clears as soon as a re-ingest succeeds, so alerting on it does not keep firing
+// for an hour after a self-healed transient burst (issue #138).
+func (m *OperatorMetrics) SetRepositoryIngestFailing(repo string, failing bool) {
+	v := 0.0
+	if failing {
+		v = 1.0
+	}
+	m.repositoryIngestFailing.WithLabelValues(repo).Set(v)
+}
+
+// SetRepositoryLastIngestTimestamp sets operator_repository_last_ingest_timestamp_seconds
+// for a repo to the Unix seconds of its last successful ingest.
+func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(repo string, unixSeconds float64) {
+	m.repositoryLastIngestTime.WithLabelValues(repo).Set(unixSeconds)
+}
+
+// RepositoryIngestFailingGauge returns the gauge for a repo, for test assertions.
+func (m *OperatorMetrics) RepositoryIngestFailingGauge(repo string) prometheus.Gauge {
+	return m.repositoryIngestFailing.WithLabelValues(repo)
+}
+
+// RepositoryLastIngestTimestampGauge returns the gauge for a repo, for test assertions.
+func (m *OperatorMetrics) RepositoryLastIngestTimestampGauge(repo string) prometheus.Gauge {
+	return m.repositoryLastIngestTime.WithLabelValues(repo)
 }
 
 // AgentUnreachableTermination increments
@@ -747,6 +805,41 @@ func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue string, input
 	}
 }
 
+// TaskTurnsCounter returns the counter for (project,repo,kind,issue) for test assertions.
+func (m *OperatorMetrics) TaskTurnsCounter(project, repo, kind, issue string) prometheus.Counter {
+	return m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue)
+}
+
+// AddTaskTurn increments operator_task_turns_total by 1 for a completed agent
+// turn. Called at the same site as AddTaskTokens (once per turn-complete
+// callback), guarded by the same stale/duplicate-callback recorded flag.
+func (m *OperatorMetrics) AddTaskTurn(project, repo, kind, issue string) {
+	m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue).Inc()
+}
+
+// SetIssueState sets tatara_issue_state{...}=1 for a live issue. Labels:
+// project, repo, issue, kind (joins token/turn counters), state, incident.
+func (m *OperatorMetrics) SetIssueState(project, repo, issue, kind, state, incident string) {
+	m.taskIssueState.WithLabelValues(project, repo, issue, kind, state, incident).Set(1)
+}
+
+// ResetIssueState clears all tatara_issue_state series. Called at the start of
+// each updateIssueStateCounts pass so stale (closed/terminal) issues vanish.
+func (m *OperatorMetrics) ResetIssueState() {
+	m.taskIssueState.Reset()
+}
+
+// DeleteTaskSeries removes the operator_task_tokens_total and
+// operator_task_turns_total series for a specific issue-scoped Task when it is
+// garbage-collected. Bounds counter cardinality to live + recently-live issues.
+// Skip when issue=="" (project-scoped tasks share that label value and must not
+// be cleared on any individual task's GC).
+func (m *OperatorMetrics) DeleteTaskSeries(project, repo, kind, issue string) {
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, "input")
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, "output")
+	m.taskTurnsTotal.DeleteLabelValues(project, repo, kind, issue)
+}
+
 // SetLightragDocuments sets operator_lightrag_documents for a project and
 // ingestion status (e.g. PROCESSED, PENDING, PROCESSING, FAILED) to n.
 func (m *OperatorMetrics) SetLightragDocuments(project, status string, n int) {
@@ -760,7 +853,8 @@ func (m *OperatorMetrics) LightragQueryError() {
 }
 
 // MemoryRetrievalProbe increments operator_memory_retrieval_probe_total for a
-// probed route and result ("present", "absent", or "error").
+// probed route and result ("present", "absent", "error", "unauthorized", or
+// "degraded").
 func (m *OperatorMetrics) MemoryRetrievalProbe(route, result string) {
 	m.memoryRetrievalProbe.WithLabelValues(route, result).Inc()
 }

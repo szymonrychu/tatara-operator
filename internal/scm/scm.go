@@ -190,6 +190,19 @@ type SCMReader interface {
 	ListCommits(ctx context.Context, owner, repo string, since time.Time) ([]CommitRef, error)
 }
 
+// PRCommentLister is an optional SCMReader capability: list the conversation
+// comments/notes on a pull/merge request, oldest-first. It is separate from
+// SCMReader because the providers diverge - on GitHub a PR is an issue so its
+// conversation comments are issue comments, while GitLab merge requests live in a
+// distinct IID namespace with their own /merge_requests/:iid/notes endpoint, so
+// reusing ListIssueComments for an MR would read the wrong (or no) notes. The
+// scan-time bot-last-word gate (issue #188) uses this for PR/MR candidates and
+// falls back to ListIssueComments for readers that do not implement it (the
+// GitHub-compatible default). Both concrete readers implement it.
+type PRCommentLister interface {
+	ListPRComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error)
+}
+
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;
 // OpenChange and Comment are implemented in M5.
 type Client interface {

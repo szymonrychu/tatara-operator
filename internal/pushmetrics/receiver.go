@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -46,8 +47,16 @@ const maxBodyBytes = 1 << 20 // 1 MiB
 // operator_push_series_dropped_total{reason="reserved_name"} so it cannot
 // collide with operator-owned collectors on the shared registry. The deployed
 // set is configurable (PUSH_METRICS_ALLOWED_PREFIXES) so new short-lived-pod
-// producers (eval, ingest) can push their own families without a code change.
-var DefaultAllowedPrefixes = []string{"wrapper_", "agent_"}
+// producers can push their own families without a code change. This fallback is
+// kept in sync with the chart default (pushMetricsAllowedPrefixes): it covers
+// the real names the wrapper pods push (ccw_*, tatara_wrapper_*) and the repo
+// ingester pushes (ingest_*, analyzer_*, semantic_*, scip_*, llm_*), per issue
+// #129; wrapper_/agent_ remain reserved for future agent series.
+var DefaultAllowedPrefixes = []string{
+	"wrapper_", "agent_",
+	"ccw_", "tatara_wrapper_",
+	"ingest_", "analyzer_", "semantic_", "scip_", "llm_",
+}
 
 // run holds one wrapper run's last pushed snapshot plus the time of that push.
 type run struct {
@@ -393,15 +402,32 @@ func (r *Receiver) parseAndStamp(body io.Reader, identity map[string]string) (ma
 		return nil, err
 	}
 	out := make(map[string]*dto.MetricFamily, len(families))
+	var dropped []string
 	for name, fam := range families {
 		if !r.hasAllowedPrefix(name) {
 			r.seriesDroppedTotal.WithLabelValues("reserved_name").Add(float64(len(fam.GetMetric())))
+			dropped = append(dropped, name)
 			continue
 		}
 		for _, m := range fam.GetMetric() {
 			m.Label = stampLabels(m.GetLabel(), identity)
 		}
 		out[name] = fam
+	}
+	// Issue #129: a silent drop here means a pushed metric family never reaches
+	// Prometheus. The counter feeds TataraPushMetricsDropped; this WARN (once per
+	// push) names the offending families so an operator can fix the allowlist
+	// without reproducing the push.
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		slog.Warn("dropped pushed metric families: name prefix not in allowlist",
+			slog.String("action", "push_series_dropped"),
+			slog.String("reason", "reserved_name"),
+			slog.String("run_id", identity[labelRunID]),
+			slog.Int("dropped_families", len(dropped)),
+			slog.String("families", strings.Join(dropped, ",")),
+			slog.String("allowed_prefixes", strings.Join(r.allowedPrefixes, ",")),
+		)
 	}
 	return out, nil
 }
