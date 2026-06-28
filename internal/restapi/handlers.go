@@ -1584,9 +1584,12 @@ func (s *Server) closeProjectIssue(w http.ResponseWriter, r *http.Request) {
 }
 
 type editIssueReq struct {
-	Title  *string   `json:"title,omitempty"`
-	Body   *string   `json:"body,omitempty"`
-	Labels *[]string `json:"labels,omitempty"`
+	Title *string `json:"title,omitempty"`
+	Body  *string `json:"body,omitempty"`
+	// No Labels field: edit_issue (the refine agent's only mutation tool besides
+	// close) must never set labels. Labels drive the lifecycle (incl. the trigger
+	// label), so allowing a label delta here would let the refiner self-escalate.
+	// Label/phase state stays operator/maintainer controlled.
 }
 
 // editProjectIssue handles PATCH /projects/{p}/issues/{owner}/{repo}/{number}.
@@ -1625,7 +1628,7 @@ func (s *Server) editProjectIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	editReq := scm.EditIssueReq{Title: req.Title, Body: req.Body, Labels: req.Labels}
+	editReq := scm.EditIssueReq{Title: req.Title, Body: req.Body}
 	start := time.Now()
 	if err := writer.EditIssue(r.Context(), token, repoSlug, number, editReq); err != nil {
 		if s.metrics != nil {

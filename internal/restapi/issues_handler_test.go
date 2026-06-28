@@ -251,6 +251,25 @@ func TestEditProjectIssue_PatchesProvided(t *testing.T) {
 	require.Equal(t, "narrowed scope", *writer.editedReq.Body)
 }
 
+func TestEditProjectIssue_IgnoresLabels(t *testing.T) {
+	writer := &issuesFakeWriter{}
+	r := buildRouterWithSCMIssues(t, &issuesFakeReader{}, writer,
+		issueProject("p4l"),
+		issueRepo("r4l", "p4l", "https://github.com/o/r4l.git"),
+		issueSecret("p4l-scm"),
+	)
+
+	// edit_issue has no labels field: a label delta would let the refiner apply
+	// the trigger label and self-escalate. The strict decoder rejects the unknown
+	// field, so a labels-bearing edit is refused outright and never reaches SCM.
+	// Label/phase state stays operator/maintainer controlled.
+	body := `{"title":"narrowed","labels":["tatara"]}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPatch, "/projects/p4l/issues/o/r4l/7", strings.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code, "a labels-bearing edit must be rejected")
+	require.Equal(t, "", writer.editedRepo, "EditIssue must not be called when labels are present")
+}
+
 func TestCreateProjectIssue_Splits(t *testing.T) {
 	writer := &issuesFakeWriter{}
 	r := buildRouterWithSCMIssues(t, &issuesFakeReader{}, writer,
