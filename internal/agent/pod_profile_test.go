@@ -23,6 +23,7 @@ func TestToolProfileForKind(t *testing.T) {
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"selfImprove", "selfImprove"},
+		{"refine", "refine"},
 		{"", ""},            // unknown/empty -> fail-open
 		{"unknown", ""},     // unknown kind -> fail-open
 		{"healthCheck", ""}, // not a real Kind; brainstorm shares Kind=brainstorm
@@ -38,9 +39,13 @@ func TestToolProfileForKind(t *testing.T) {
 // enum maps to a non-empty profile, so a future new kind fails this test until
 // it is added to toolProfileForKind. The enum is:
 //
-//	implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident
+//	implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine
 //
 // (from +kubebuilder:validation:Enum on TaskSpec.Kind)
+//
+// healthCheck is omitted from the loop below: it is a vestigial enum alias and
+// runtime healthCheck tasks set Kind=brainstorm, so toolProfileForKind
+// ("healthCheck") is intentionally "" (fail-open never reached at runtime).
 func TestToolProfileForKind_AllCRDKinds(t *testing.T) {
 	// The CRD enum is the single source of truth; update here when it changes.
 	crdKinds := []string{
@@ -51,6 +56,7 @@ func TestToolProfileForKind_AllCRDKinds(t *testing.T) {
 		"brainstorm",
 		"issueLifecycle",
 		"incident",
+		"refine",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {
@@ -74,6 +80,7 @@ func TestBuildPod_ToolProfileEnv(t *testing.T) {
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"selfImprove", "selfImprove"},
+		{"refine", "refine"},
 		{"", ""},        // unset -> empty (fail-open)
 		{"unknown", ""}, // unknown -> empty (fail-open)
 	}
