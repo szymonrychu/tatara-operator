@@ -330,6 +330,12 @@ spec:
                   task is commented + parked with reason "implement-empty" instead of
                   silently parked as a benign no-change. Reset to 0 when a run opens a PR.
                 type: integer
+              implementGiveUps:
+                description: |-
+                  ImplementGiveUps counts implementation attempts that gave up for this
+                  issue's durable lifecycle Task (transition Implement->Parked with a
+                  recoverable reason). Bounds the auto-reroll backstop. +optional
+                type: integer
               implementOutcome:
                 description: |-
                   ImplementOutcome is the agent's declared outcome for an implement task when
