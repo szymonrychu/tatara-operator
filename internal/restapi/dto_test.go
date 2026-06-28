@@ -91,3 +91,22 @@ func TestToSubtaskDTO(t *testing.T) {
 	require.Equal(t, "turn-9", d.Status.TurnID)
 	_ = time.Now()
 }
+
+func TestToTaskDTO_GiveUpFields(t *testing.T) {
+	task := tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-gu"},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "demo", RepositoryRef: "repo", Goal: "fix",
+			Kind: "issueLifecycle",
+		},
+		Status: tatarav1alpha1.TaskStatus{
+			LifecycleState:   "Parked",
+			ParkReason:       "implement-failed",
+			ImplementGiveUps: 2,
+		},
+	}
+	d := toTaskDTO(task)
+	require.Equal(t, "Parked", d.Status.LifecycleState)
+	require.Equal(t, "implement-failed", d.Status.ParkReason)
+	require.Equal(t, 2, d.Status.ImplementGiveUps)
+}
