@@ -237,6 +237,9 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		}
 		from = fresh.Status.LifecycleState
 		fresh.Status.LifecycleState = to
+		if from == "Implement" && to == "Parked" && tatarav1alpha1.IsRecoverableGiveup(reason) {
+			fresh.Status.ImplementGiveUps++
+		}
 		// Persist the park reason on every Parked transition; clear it otherwise
 		// so stale reasons do not linger after re-activation.
 		if to == "Parked" {

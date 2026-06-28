@@ -229,6 +229,17 @@ func TaskTerminal(t *Task) bool {
 	return ls == "Done" || ls == "Stopped" || ls == "Parked"
 }
 
+// IsRecoverableGiveup reports whether a Parked reason represents an
+// implementation that gave up and may be re-rolled (vs a deliberate decline).
+func IsRecoverableGiveup(reason string) bool {
+	switch reason {
+	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline":
+		return true
+	default:
+		return false
+	}
+}
+
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
 	// +kubebuilder:validation:Enum=Planning;Running;Succeeded;Failed
@@ -326,6 +337,10 @@ type TaskStatus struct {
 	// silently parked as a benign no-change. Reset to 0 when a run opens a PR.
 	// +optional
 	ImplementEmptyRetries int `json:"implementEmptyRetries,omitempty"`
+	// ImplementGiveUps counts implementation attempts that gave up for this
+	// issue's durable lifecycle Task (transition Implement->Parked with a
+	// recoverable reason). Bounds the auto-reroll backstop. +optional
+	ImplementGiveUps int `json:"implementGiveUps,omitempty"`
 	// WritebackSkip4xxAttempts counts consecutive writeback sweeps that opened
 	// no PR because every project repo returned a permanent 4xx from OpenChange
 	// (issue #166: the un-triageable 4xx-skip loop). Bounded loop-breaker: once

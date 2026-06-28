@@ -309,3 +309,18 @@ func TestImplementOutcomeDeepCopy(t *testing.T) {
 		t.Error("mutating copy's ImplementOutcome mutated original (shallow copy)")
 	}
 }
+
+func TestIsRecoverableGiveup(t *testing.T) {
+	rec := []string{"implement-failed", "maxIterations", "refused-no-explanation", "deadline"}
+	for _, r := range rec {
+		if !v1alpha1.IsRecoverableGiveup(r) {
+			t.Errorf("%q should be recoverable", r)
+		}
+	}
+	notRec := []string{"refused-declined", "already_done", "human-declined", "triage-failed", "implement-done", ""}
+	for _, r := range notRec {
+		if v1alpha1.IsRecoverableGiveup(r) {
+			t.Errorf("%q should NOT be recoverable", r)
+		}
+	}
+}

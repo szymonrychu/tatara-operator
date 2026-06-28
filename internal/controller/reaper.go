@@ -355,6 +355,17 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 		if tk.CreationTimestamp.After(cutoff) {
 			continue // younger than the retention window
 		}
+		// Spare a recoverable give-up task while its issue is still open: the
+		// ImplementGiveUps counter must outlive the retention window so
+		// recoverOrphans can reroll it (under cap) or keep it blocked without
+		// restarting the count from zero (at cap). recoverOrphans transitions a
+		// give-up task whose issue has closed to Done ("issue-closed"), so a
+		// still-Parked recoverable give-up here means the issue is open.
+		if tk.Status.LifecycleState == "Parked" &&
+			tatarav1alpha1.IsRecoverableGiveup(tk.Status.ParkReason) &&
+			tk.Status.ImplementGiveUps > 0 {
+			continue
+		}
 		age := time.Since(tk.CreationTimestamp.Time)
 		// Clean per-issue token and turn series before deletion so Prometheus does
 		// not accumulate stale series forever (bounded cardinality). Skip project-
