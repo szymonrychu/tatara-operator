@@ -227,6 +227,18 @@ func TestBrainstormActivity_MaxOpenProposalsField(t *testing.T) {
 	}
 }
 
+func TestBrainstormActivity_StaleProposalDaysField(t *testing.T) {
+	b := v1alpha1.BrainstormActivity{StaleProposalDays: 14}
+	if b.StaleProposalDays != 14 {
+		t.Fatalf("StaleProposalDays = %d, want 14", b.StaleProposalDays)
+	}
+	// Zero value (unset) must remain the disabled sentinel.
+	var z v1alpha1.BrainstormActivity
+	if z.StaleProposalDays != 0 {
+		t.Fatalf("StaleProposalDays zero value = %d, want 0 (reaper disabled)", z.StaleProposalDays)
+	}
+}
+
 // TestMemorySpec_DefaultFieldsExist guards Finding 7: the MemorySpec fields
 // that carry +kubebuilder:default markers exist and accept the default values
 // so the CRD schema and the Go struct stay in sync.

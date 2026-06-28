@@ -436,6 +436,49 @@ func hasAnyLabel(labels, want []string) bool {
 	return false
 }
 
+// isStaleUnengagedProposal reports whether an open issue is a bot-authored
+// brainstorm proposal that has gone stale with no human engagement and no work
+// in flight, making it safe for the staleness reaper to auto-close. It is a pure
+// in-memory predicate (no SCM): the single SCM read (a comment scan) runs only
+// for candidates this returns true for. Gates are ordered to bail fast and are
+// all conjunctive:
+//  1. not a PR;
+//  2. bot-authored (empty author never matches);
+//  3. carries the brainstorming phase label and NONE of approved/implementation/
+//     declined (an advanced or already-declined proposal is not reaped);
+//  4. window>0 and a known, non-zero UpdatedAt older than the window (a zero
+//     UpdatedAt means "unknown age" and is never treated as infinitely old);
+//  5. no live (non-terminal) Task references the issue;
+//  6. no matching Task carries an unmerged change (HARD invariant: only a
+//     merged-and-green lifecycle may close an issue; defence-in-depth over gate 3).
+func isStaleUnengagedProposal(iss scm.IssueRef, existing []tatarav1alpha1.Task, brainstorming, approved, implementation, declined, botLogin string, window time.Duration) bool {
+	if iss.IsPR {
+		return false
+	}
+	if iss.Author == "" || iss.Author != botLogin {
+		return false
+	}
+	if !hasLabel(iss.Labels, brainstorming) || hasAnyLabel(iss.Labels, []string{approved, implementation, declined}) {
+		return false
+	}
+	if window <= 0 || iss.UpdatedAt.IsZero() || time.Since(iss.UpdatedAt) <= window {
+		return false
+	}
+	for i := range existing {
+		t := &existing[i]
+		if !taskMatchesItem(t, iss.Repo, iss.Number) {
+			continue
+		}
+		if !tatarav1alpha1.TaskTerminal(t) {
+			return false
+		}
+		if hasUnmergedChange(t) {
+			return false
+		}
+	}
+	return true
+}
+
 func candidatesFromPRs(prs []scm.PRRef) []candidate {
 	out := make([]candidate, 0, len(prs))
 	for _, p := range prs {
@@ -1297,6 +1340,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
 			continue
 		}
+		if r.reapEligible(proj, scm.IssueRef{Repo: c.repo, Number: c.number, Author: c.author, Labels: c.labels, UpdatedAt: c.updatedAt, IsPR: c.isPR}, existing) {
+			r.Metrics.ScanItem("issueScan", "skipped_stale_reapable")
+			l.Info("issueScan: skipped fresh task creation, proposal stale+unengaged (reaper will close)",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			continue
+		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
 		var sg *tatarav1alpha1.SystemicGroup
 		if d, ok := systemicLeads[key]; ok && d.isLead && len(d.sameRepoSiblings) > 0 {
@@ -2104,6 +2154,132 @@ func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number 
 	return nil
 }
 
+// reapStaleProposals is the opt-in dead-letter sink the brainstorm lifecycle
+// lacks: it auto-closes bot-authored proposals that have sat with no human
+// engagement and no work in flight past act.StaleProposalDays, so dead proposals
+// stop inflating the MaxOpenProposals backlog (which blocks new brainstorm
+// cycles). It is the ONLY automatic "proposal a human never engaged -> close"
+// path; triage, isDeduped, handleConversation and the discuss silence gate are
+// untouched.
+//
+// It reuses the issueCache issueScan already returned this cycle (zero extra
+// ListOpenIssues). The single SCM read - a comment scan via humanCommentAfter -
+// runs ONLY for candidates that already passed the cheap in-memory predicate,
+// and is FAIL-CLOSED: humanCommentAfter returns true on a read error, so a
+// failed read skips the close (never auto-close a proposal a human may have
+// discussed). A successful close swaps the brainstorming label for declined
+// (the close-arm "exactly one managed label" contract) and records
+// IssueOutcome("stale-close") AFTER CloseIssue succeeds (idempotent on retry).
+// staleProposalWindow returns the reaper staleness window and whether the
+// stale-proposal reaper is enabled for this project (opt-in: StaleProposalDays>0).
+func staleProposalWindow(proj *tatarav1alpha1.Project) (time.Duration, bool) {
+	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
+		return 0, false
+	}
+	d := proj.Spec.Scm.Cron.Brainstorm.StaleProposalDays
+	if d <= 0 {
+		return 0, false
+	}
+	return time.Duration(d) * 24 * time.Hour, true
+}
+
+// reapEligible reports whether the issue is a stale, unengaged proposal the
+// reaper will close, so issueScan/recoverOrphans must NOT create a fresh
+// lifecycle task for it: such a task would race the same-cycle reaper, leaving
+// it to close an issue that owns a live task. Cheap label/time-only check; no
+// SCM call (the reaper does the authoritative human-comment check before close).
+// This gate is intentionally BROADER than the reaper's close condition: it does
+// not read comments, so an issue past the window with an old human comment is
+// gated from triage but not closed by the reaper (humanCommentAfter blocks it).
+// That is benign - a >window-stale issue's last human comment is itself older
+// than the window, so re-triaging would only re-post into a long-cold thread,
+// which the bot-last-word gate already suppresses. It self-corrects the moment a
+// human comment bumps UpdatedAt back inside the window.
+func (r *ProjectReconciler) reapEligible(proj *tatarav1alpha1.Project, iss scm.IssueRef, existing []tatarav1alpha1.Task) bool {
+	window, on := staleProposalWindow(proj)
+	if !on {
+		return false
+	}
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	brs, app, impl, dec := lifecycleLabels(proj.Spec.Scm)
+	return isStaleUnengagedProposal(iss, existing, brs, app, impl, dec, botLogin, window)
+}
+
+func (r *ProjectReconciler) reapStaleProposals(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issueCache map[string][]scm.IssueRef, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
+	if act.StaleProposalDays <= 0 {
+		return
+	}
+	l := log.FromContext(ctx)
+	// Re-list tasks so a lifecycle Task created earlier this cycle (issueScan or
+	// recoverOrphans) is visible to the live-task gate in isStaleUnengagedProposal.
+	// Those paths now skip reap-eligible issues, but re-listing keeps the close
+	// invariant - never close an issue that owns a live Task - robust against any
+	// other path that may create one. Fail-safe: keep the passed snapshot on error.
+	if fresh, ferr := r.existingScanTasks(ctx, proj); ferr == nil {
+		existing = fresh
+	} else {
+		l.Error(ferr, "reap: re-list tasks failed; using passed snapshot",
+			"action", "scan_stale_proposal_close", "resource_id", proj.Name)
+	}
+	window := time.Duration(act.StaleProposalDays) * 24 * time.Hour
+	brainstorming, approved, implementation, declined := lifecycleLabels(proj.Spec.Scm)
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	for slug, issues := range issueCache {
+		for _, iss := range issues {
+			if !isStaleUnengagedProposal(iss, existing, brainstorming, approved, implementation, declined, botLogin, window) {
+				continue
+			}
+			owner, name, ok := strings.Cut(slug, "/")
+			if !ok {
+				continue
+			}
+			// Fail-closed: humanCommentAfter returns true on any human comment OR a
+			// read error, and a true result skips the close. Passing the zero time
+			// means "any human comment ever".
+			if humanCommentAfter(ctx, reader, owner, name, iss.Number, botLogin, time.Time{}) {
+				continue
+			}
+			w, token, err := r.scanWriter(ctx, proj)
+			if err != nil {
+				l.Error(err, "reap: scanWriter for stale proposal close (leaving open)",
+					"action", "scan_stale_proposal_close", "resource_id", proj.Name)
+				r.Metrics.ScanItem("backstop", "stale_reap_error")
+				return
+			}
+			issueRef := fmt.Sprintf("%s#%d", iss.Repo, iss.Number)
+			repoSlug := iss.Repo
+			if aerr := w.AddLabel(ctx, token, issueRef, declined); aerr != nil {
+				l.Error(aerr, "reap: add declined label failed (leaving proposal open)",
+					"action", "scan_stale_proposal_close", "resource_id", proj.Name, "issue", issueRef)
+				r.Metrics.ScanItem("backstop", "stale_reap_error")
+				continue
+			}
+			if rerr := w.RemoveLabel(ctx, token, issueRef, brainstorming); rerr != nil {
+				l.Info("reap: remove brainstorming label failed (non-fatal)",
+					"action", "scan_stale_proposal_close", "resource_id", proj.Name, "issue", issueRef, "err", rerr.Error())
+			}
+			note := fmt.Sprintf("tatara: auto-closing this proposal - it has had no human engagement for %d days "+
+				"and no work is in flight. Reopen or re-file to revive.", act.StaleProposalDays)
+			if cerr := w.CloseIssue(ctx, token, repoSlug, iss.Number, note); cerr != nil {
+				l.Error(cerr, "reap: close stale proposal failed (leaving open)",
+					"action", "scan_stale_proposal_close", "resource_id", proj.Name, "issue", issueRef)
+				r.Metrics.ScanItem("backstop", "stale_reap_error")
+				continue
+			}
+			r.Metrics.IssueOutcome("stale-close")
+			l.Info("stale proposal auto-closed",
+				"action", "scan_stale_proposal_close", "resource_id", proj.Name,
+				"issue", issueRef, "updated_at", iss.UpdatedAt, "window_days", act.StaleProposalDays)
+		}
+	}
+}
+
 // recoverOrphans starts the correct lifecycle Task for each OPEN issue that
 // carries an active phase label but has no live Task (a missed/never-started or
 // stalled handler). It RE-LISTS existing Tasks so it sees Tasks mrScan/issueScan
@@ -2160,6 +2336,15 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 				continue
 			}
 			if hasLiveLifecycleTaskForIssue(existing, slug, iss.Number) {
+				continue
+			}
+			if r.reapEligible(proj, iss, existing) {
+				// Stale, unengaged proposal the reaper will close this cycle; do
+				// not recover it (a fresh task would race the reaper's close).
+				r.Metrics.ScanItem("backstop", "skipped_stale_reapable")
+				l.Info("backstop: skipped recovery, proposal stale+unengaged (reaper will close)",
+					"action", "backstop_recover", "resource_id", proj.Name,
+					"issue", fmt.Sprintf("%s#%d", slug, iss.Number))
 				continue
 			}
 			repo, ok := r.matchRepoForSlug(repos, slug)
@@ -2437,6 +2622,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 			if periodDue {
 				r.recoverOrphans(ctx, proj, reader, repos, issueCache)
 				r.backstopSweep(ctx, proj, reader, repos)
+				r.reapStaleProposals(ctx, proj, reader, issueCache, existing, cronSpec.Brainstorm)
 			}
 		} else {
 			consider(soonest)
