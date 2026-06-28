@@ -109,8 +109,14 @@ type ChangeSummary struct {
 	// Significance is the agent's declared change significance, the lever the
 	// push-CD cascade uses to cut the next semver tag (major resets minor+patch,
 	// minor resets patch, patch increments). REQUIRED on the change_summary MCP
-	// tool and at the REST layer (D2): an agent cannot open a PR without it. The
-	// writeback gate refuses to open a change when this is empty.
+	// tool and re-validated at the REST /change-summary endpoint (D2): a compliant
+	// agent that summarizes its change cannot omit it. Enforcement lives at those
+	// two layers, NOT in writeback - writeBackOpenChange still opens the PR when
+	// this is empty (a change with no change_summary at all keeps the legacy
+	// close+Done path, pushCDEligible=false), but applySemverAutoMerge stamps the
+	// semver:<level> label and enables native auto-merge only when it is present.
+	// An empty value therefore opens an unlabeled, non-cascading PR (logged WARN
+	// at writeback so the legacy path stays visible).
 	// +kubebuilder:validation:Enum=major;minor;patch
 	// +optional
 	Significance string `json:"significance,omitempty"`

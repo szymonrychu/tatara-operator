@@ -13,6 +13,8 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 var (
@@ -41,6 +43,13 @@ const (
 // package, registers the tatara.dev scheme and core types, creates the test
 // namespace, and tears the control plane down at the end.
 func TestMain(m *testing.M) {
+	// Install a logger for the whole package run. controller-runtime panics if
+	// log.SetLogger is not called within 30s of the first log.FromContext use; as
+	// the suite grew past ~30s of wall time this fired intermittently from the
+	// scan paths (a flaky red unrelated to any test's assertions). Setting it once
+	// in TestMain removes the timing dependency.
+	logf.SetLogger(zap.New(zap.UseDevMode(true)))
+
 	code := func() int {
 		var err error
 		for attempt := 1; ; attempt++ {

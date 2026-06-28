@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -249,7 +250,10 @@ func (r *TaskReconciler) reconcileDeploying(ctx context.Context, project *tatara
 		l.Error(perr, "deploy: read helmfile pin state (requeue)", "resource_id", task.Name, "sha", run.HeadSHA)
 		return ctrl.Result{RequeueAfter: deployPollRequeue}, nil
 	}
-	carriesVersion := pinCarriesVersion(pinState, version)
+	// Scope the trigger-task gate to THIS component's own pin (name = the merged
+	// repo). A different component's apply carrying a coincidentally-equal version
+	// string must not resolve / fail this Task's cascade.
+	carriesVersion := pinCarriesArtifactVersion(pinState, name, version)
 
 	switch run.Conclusion {
 	case "success":
@@ -288,7 +292,10 @@ func (r *TaskReconciler) resolveDeployedSweep(ctx context.Context, project *tata
 		if e.State == DeployStateApplied {
 			continue
 		}
-		if e.Version == "" || !pinCarriesVersion(pinState, e.Version) {
+		// Scope to the entry's OWN artifact pin: a sibling component sharing the
+		// same version string (or a substring like v1.4.1 inside v1.4.10) must not
+		// prematurely resolve this Task and close its issue with a bogus version.
+		if e.Version == "" || !pinCarriesArtifactVersion(pinState, e.Artifact, e.Version) {
 			continue
 		}
 		var t tatarav1alpha1.Task
@@ -483,21 +490,118 @@ func (r *TaskReconciler) helmfileRepoSlug(ctx context.Context, project *tatarav1
 	return "", "", false
 }
 
+// releaseArtifact maps a tatara-helmfile release name to the component artifact
+// (repo) whose version its chart `version:` line pins. Chart-version pin lines
+// carry no artifact token themselves (just `version: X.Y.Z`), so they are
+// attributed to the artifact of the enclosing `- name: <release>` block during
+// the apply sweep. Keep in lockstep with parentMap's helmfile chart pins.
+var releaseArtifact = map[string]string{
+	"tatara-operator":        "tatara-operator",
+	"project-tatara":         "tatara-operator",
+	"project-infrastructure": "tatara-operator",
+	"tatara-chat":            "tatara-chat",
+}
+
+// helmfileReleaseRe matches a `- name: <release>` line in helmfile.yaml.gotmpl so
+// the chart `version:` pin that follows can be attributed to the right component.
+var helmfileReleaseRe = regexp.MustCompile(`^\s*-\s*name:\s*(\S+)\s*$`)
+
+// isVersionByte reports whether b can be part of a semver token (digit or dot),
+// used as the token boundary so v1.4.1 does not match inside v1.4.10.
+func isVersionByte(b byte) bool {
+	return (b >= '0' && b <= '9') || b == '.'
+}
+
+// tokenMatch reports whether tok occurs in s as a whole version token: the
+// characters immediately before and after the match must not be semver bytes.
+// This is the substring fix - v1.4.1 no longer matches v1.4.10 (trailing '0' is a
+// version byte) while v1.4.0 still matches `tag: "v1.4.0"` (trailing '"' is not).
+func tokenMatch(s, tok string) bool {
+	if tok == "" {
+		return false
+	}
+	for idx := 0; ; {
+		i := strings.Index(s[idx:], tok)
+		if i < 0 {
+			return false
+		}
+		i += idx
+		var before, after byte = ' ', ' '
+		if i > 0 {
+			before = s[i-1]
+		}
+		if i+len(tok) < len(s) {
+			after = s[i+len(tok)]
+		}
+		if !isVersionByte(before) && !isVersionByte(after) {
+			return true
+		}
+		idx = i + 1
+	}
+}
+
+// lineCarriesVersion reports whether line carries version as a whole token, in
+// either the v-prefixed (image tag) or bare (chart version) form.
+func lineCarriesVersion(line, version, bare string) bool {
+	if tokenMatch(line, version) {
+		return true
+	}
+	return bare != version && tokenMatch(line, bare)
+}
+
 // pinCarriesVersion reports whether the applied helmfile pin state references a
-// component version. Image pins carry the v-prefixed tag (`tag: "vX.Y.Z"`) while
-// chart pins carry the bare `version: X.Y.Z`, so both forms are checked: the
-// v-prefixed tag and its bare form. The bare check is a substring heuristic
-// (v1, trusted-claim model); a future significance-verification pass can tighten
-// it to an exact pin-key match.
+// component version anywhere (artifact-agnostic). Image pins carry the
+// v-prefixed tag (`tag: "vX.Y.Z"`) while chart pins carry the bare
+// `version: X.Y.Z`, so both forms are token-matched. Prefer
+// pinCarriesArtifactVersion where the artifact is known: the artifact-agnostic
+// form can be tripped by a sibling component sharing the same version string.
 func pinCarriesVersion(pinState, version string) bool {
 	if version == "" {
 		return false
 	}
-	if strings.Contains(pinState, version) {
-		return true
+	bare := strings.TrimPrefix(version, "v")
+	for _, line := range strings.Split(pinState, "\n") {
+		if lineCarriesVersion(line, version, bare) {
+			return true
+		}
 	}
-	if bare := strings.TrimPrefix(version, "v"); bare != version {
-		return strings.Contains(pinState, bare)
+	return false
+}
+
+// pinCarriesArtifactVersion reports whether the applied helmfile pin state
+// carries version on a pin line that belongs to artifact (the component repo
+// name). This scopes the apply-outcome match to the entry's OWN pin so a sibling
+// component sharing the same version string (plausible while every repo is seeded
+// near low semvers) cannot prematurely resolve the wrong Task. Two attribution
+// rules cover every parentMap pin shape:
+//
+//   - image pins embed the artifact in the image path: a line containing
+//     "/<artifact>:" with the version as a whole token (e.g.
+//     ".../tatara-memory:v1.4.0"). The trailing ':' keeps tatara-memory from
+//     matching tatara-memory-repo-ingester.
+//   - chart-version pins carry no artifact token, so they are attributed to the
+//     artifact of the enclosing helmfile `- name: <release>` block (the operator
+//     chart's bare version equals its image version, so the chart line alone
+//     confirms the operator cascade without needing the artifact-token-less
+//     `tag:` line in values/tatara-operator/common.yaml).
+func pinCarriesArtifactVersion(pinState, artifact, version string) bool {
+	if version == "" || artifact == "" {
+		return false
+	}
+	bare := strings.TrimPrefix(version, "v")
+	imageToken := "/" + artifact + ":"
+	currentRelease := ""
+	for _, line := range strings.Split(pinState, "\n") {
+		if m := helmfileReleaseRe.FindStringSubmatch(line); m != nil {
+			currentRelease = m[1]
+			continue
+		}
+		if strings.Contains(line, imageToken) && lineCarriesVersion(line, version, bare) {
+			return true
+		}
+		if releaseArtifact[currentRelease] == artifact && lineCarriesVersion(line, version, bare) {
+			return true
+		}
 	}
 	return false
 }

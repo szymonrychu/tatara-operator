@@ -217,11 +217,20 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// Append "Closes #N" for the primary repo of an issue-linked lifecycle task
 		// so the MR auto-closes the issue on merge.  Never emit this on secondary
 		// repos (cross-repo leak) or for non-lifecycle / PR-entry tasks.
+		//
+		// push-CD: a pushCDEligible task (declared significance) rides the deploy
+		// cascade, and deploy-supervision closes the issue on a CONFIRMED helmfile
+		// apply with the deployed version (D9). Emitting "Closes #N" here would let
+		// native auto-merge close the issue at MERGE time - before apply - and an
+		// apply-failure/timeout reroll would then re-enter Implement with the issue
+		// already (wrongly) closed. Suppress it and let deploy-supervision own the
+		// close.
 		if repo.Name == primaryRepo.Name &&
 			task.Spec.Kind == "issueLifecycle" &&
 			task.Spec.Source != nil &&
 			!task.Spec.Source.IsPR &&
-			task.Spec.Source.Number > 0 {
+			task.Spec.Source.Number > 0 &&
+			!pushCDEligible(task) {
 			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
 		}
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
@@ -291,6 +300,19 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		}
 		l.Info("writeback: pr/mr opened", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
 		r.Metrics.WritebackOutcome("opened")
+		// push-CD visibility: an implement/lifecycle code change SHOULD declare a
+		// significance (required at the change_summary MCP tool + REST endpoint).
+		// When it is absent the PR opens unlabeled and skips the cascade (legacy
+		// close+Done path). That is allowed by design (pushCDEligible=false) but a
+		// human-merged unlabeled bot PR has no semver:<level> label for the
+		// component release workflow to read, so surface it loudly rather than let
+		// the legacy path go silent.
+		if (task.Spec.Kind == "implement" || task.Spec.Kind == "issueLifecycle") &&
+			(task.Status.ChangeSummary == nil || task.Status.ChangeSummary.Significance == "") {
+			l.Info("writeback: code-change PR opened without declared significance; no semver label / no auto-merge (legacy path)",
+				"action", "writeback_no_significance", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
+			r.Metrics.WritebackOutcome("opened_no_significance")
+		}
 		// push-CD: stamp the declared significance label and enable native
 		// auto-merge on the freshly-opened bot PR (D5). Best-effort, never fatal.
 		r.applySemverAutoMerge(ctx, &proj, repo, writer, token, provider, prURL, task.Status.ChangeSummary)
@@ -474,9 +496,14 @@ func (r *TaskReconciler) applySemverAutoMerge(ctx context.Context, proj *tatarav
 			}
 		}
 	}
-	// D5 auto-merge gate (b): a configured bot login is the authorship condition
-	// (the PR is bot-authored, we just opened it). Human-authored PRs never reach
-	// this path; cd-release tag-cut keys on the label, so it stays author-agnostic.
+	// D5 auto-merge gate (b): PR author == bot. We do NOT re-fetch the PR to read
+	// its author here because this code path opened the PR itself, moments ago,
+	// with the bot's SCM token - so author == proj.Spec.Scm.BotLogin holds by
+	// construction (the same identity the writeBackSelfImprove st.Author ==
+	// BotLogin check verifies for externally-discovered PRs). The only remaining
+	// condition is that a bot login is actually configured; absent it, withhold
+	// auto-merge. Human-authored PRs never reach this path, and cd-release tag-cut
+	// keys on the label not the author, so it stays author-agnostic downstream.
 	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
 		l.Info("writeback: auto-merge withheld - no project bot login",
 			"action", "scm_auto_merge_withheld", "repo", repo.Name, "pr_url", prURL)

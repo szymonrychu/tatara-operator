@@ -61,6 +61,44 @@ func TestPinCarriesVersion(t *testing.T) {
 	require.True(t, pinCarriesVersion(chartState, "v1.4.0"), "chart pin (bare) matches the bare form")
 	require.False(t, pinCarriesVersion(imgState, "v1.5.0"), "absent version does not match")
 	require.False(t, pinCarriesVersion(imgState, ""), "empty version never matches")
+
+	// Substring-boundary: v1.4.1 must NOT match inside v1.4.10 (the trailing digit
+	// is a version byte, so the token boundary rejects it).
+	require.False(t, pinCarriesVersion("  tag: \"v1.4.10\"\n", "v1.4.1"), "v1.4.1 must not substring-match v1.4.10")
+	require.True(t, pinCarriesVersion("  tag: \"v1.4.10\"\n", "v1.4.10"), "exact v1.4.10 still matches")
+	require.False(t, pinCarriesVersion("  version: 1.4.10\n", "v1.4.1"), "bare 1.4.1 must not substring-match 1.4.10")
+}
+
+func TestPinCarriesArtifactVersion(t *testing.T) {
+	// memory and ingester both pinned in the same file at the same version: the
+	// artifact scope keeps each match on its OWN image line.
+	defaultYaml := "memoryImage: \"harbor.szymonrichert.pl/containers/tatara-memory:v1.4.0\"\n" +
+		"ingesterImage: \"harbor.szymonrichert.pl/containers/tatara-memory-repo-ingester:v1.4.0\"\n"
+	require.True(t, pinCarriesArtifactVersion(defaultYaml, "tatara-memory", "v1.4.0"), "memory matches its own image pin")
+	require.True(t, pinCarriesArtifactVersion(defaultYaml, "tatara-memory-repo-ingester", "v1.4.0"), "ingester matches its own image pin")
+
+	// Cross-artifact collision: a state carrying ONLY the ingester pin at v1.4.0
+	// must not resolve a memory entry at v1.4.0 (the prefix-collision bug).
+	ingesterOnly := "ingesterImage: \"harbor.szymonrichert.pl/containers/tatara-memory-repo-ingester:v1.4.0\"\n"
+	require.False(t, pinCarriesArtifactVersion(ingesterOnly, "tatara-memory", "v1.4.0"), "memory must NOT match the ingester pin line")
+
+	// Chart-version pin attributed via the enclosing helmfile release block.
+	helmfile := "releases:\n" +
+		"  - name: tatara-operator\n    chart: x\n    version: 2.0.0\n" +
+		"  - name: tatara-chat\n    chart: y\n    version: 2.0.0\n"
+	require.True(t, pinCarriesArtifactVersion(helmfile, "tatara-operator", "v2.0.0"), "operator chart matches via its release block (bare form)")
+	require.True(t, pinCarriesArtifactVersion(helmfile, "tatara-chat", "v2.0.0"), "chat chart matches via its release block")
+	// project-tatara/project-infrastructure releases are also the operator artifact.
+	hfProj := "  - name: project-tatara\n    version: 3.1.0\n"
+	require.True(t, pinCarriesArtifactVersion(hfProj, "tatara-operator", "v3.1.0"), "operator project chart release attributes to the operator artifact")
+
+	// Substring boundary holds in the artifact-scoped form too.
+	require.False(t, pinCarriesArtifactVersion(
+		"memoryImage: \"harbor.szymonrichert.pl/containers/tatara-memory:v1.4.10\"\n",
+		"tatara-memory", "v1.4.1"), "v1.4.1 must not substring-match v1.4.10 on the memory line")
+
+	require.False(t, pinCarriesArtifactVersion(defaultYaml, "", "v1.4.0"), "empty artifact never matches")
+	require.False(t, pinCarriesArtifactVersion(defaultYaml, "tatara-memory", ""), "empty version never matches")
 }
 
 // TestPoolInflight_ExcludesDeploying covers the lane-exclusion seam: a pod-less
@@ -212,7 +250,10 @@ func TestReconcileDeploying_LearnsVersionAndResolves(t *testing.T) {
 		tag: "v1.4.0", tagFound: true,
 		run:      scm.WorkflowRun{HeadSHA: "feedface00", Status: "completed", Conclusion: "success", HTMLURL: "https://run/1"},
 		runFound: true,
-		files:    map[string]string{"helmfile.yaml.gotmpl": "  version: 1.4.0\n", "values/tatara-operator/common.yaml": "  tag: \"v1.4.0\"\n"},
+		files: map[string]string{
+			"helmfile.yaml.gotmpl":               "releases:\n  - name: tatara-operator\n    chart: harbor/tatara-operator\n    version: 1.4.0\n",
+			"values/tatara-operator/common.yaml": "  tag: \"v1.4.0\"\n",
+		},
 	}
 	r := newDeployReconciler(fw, rd)
 
@@ -252,7 +293,10 @@ func TestReconcileDeploying_DedupSweep(t *testing.T) {
 		tag: "v2.0.0", tagFound: true,
 		run:      scm.WorkflowRun{HeadSHA: "applied99", Status: "completed", Conclusion: "success", HTMLURL: "https://run/2"},
 		runFound: true,
-		files:    map[string]string{"values/tatara-operator/common.yaml": "  tag: \"v2.0.0\"\n"},
+		files: map[string]string{
+			"helmfile.yaml.gotmpl":               "releases:\n  - name: tatara-operator\n    version: 2.0.0\n",
+			"values/tatara-operator/common.yaml": "  tag: \"v2.0.0\"\n",
+		},
 	}
 	r := newDeployReconciler(fw, rd)
 
@@ -317,7 +361,10 @@ func TestReconcileDeploying_ApplyFailureReroll(t *testing.T) {
 		tag: "v1.1.0", tagFound: true,
 		run:      scm.WorkflowRun{HeadSHA: "badsha", Status: "completed", Conclusion: "failure", HTMLURL: "https://run/fail"},
 		runFound: true,
-		files:    map[string]string{"values/tatara-operator/common.yaml": "  tag: \"v1.1.0\"\n"},
+		files: map[string]string{
+			"helmfile.yaml.gotmpl":               "releases:\n  - name: tatara-operator\n    version: 1.1.0\n",
+			"values/tatara-operator/common.yaml": "  tag: \"v1.1.0\"\n",
+		},
 	}
 	r := newDeployReconciler(fw, rd)
 
