@@ -2,6 +2,7 @@ package scm
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -54,6 +55,17 @@ func TestGitLabEnsureLabel_CreateThenPutOnConflict(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodPut:
 			put = true
+			// Mirror GitLab's edit-label endpoint: it only accepts
+			// new_name, color, description, priority, archived. An
+			// unrecognized key (e.g. new_color) leaves zero valid
+			// params and GitLab rejects with 400.
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if _, ok := body["color"]; !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"new_name, color, description, priority, archived are missing, at least one parameter must be provided"}`))
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -69,6 +81,6 @@ func TestGitLabEnsureLabel_CreateThenPutOnConflict(t *testing.T) {
 		t.Fatalf("existing -> put: %v", err)
 	}
 	if !put {
-		t.Fatal("expected PUT new_color on 409 conflict")
+		t.Fatal("expected PUT to update color on 409 conflict")
 	}
 }
