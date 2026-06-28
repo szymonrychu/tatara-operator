@@ -404,14 +404,16 @@ func (s *Server) inflightBrainstormConversationKey(ctx context.Context, project 
 	return agent.ConversationKey(newest)
 }
 
-// inflightIncidentTask reports whether the project has a non-terminal incident
-// Task. Agent identity is shared OIDC, so an incident-investigation agent is
-// inferred from the project's in-flight incident work (same project-level
-// inference inflightBrainstormConversationKey uses).
-func (s *Server) inflightIncidentTask(ctx context.Context, project string) bool {
+// inflightIncidentTask returns the project's first non-terminal incident Task,
+// or nil when none is in flight. Agent identity is shared OIDC, so an
+// incident-investigation agent is inferred from the project's in-flight incident
+// work (same project-level inference inflightBrainstormConversationKey uses).
+// Returning the Task (not a bool) lets the caller carry its alert-group dedup
+// identity onto the proposal.
+func (s *Server) inflightIncidentTask(ctx context.Context, project string) *tatarav1alpha1.Task {
 	var tasks tatarav1alpha1.TaskList
 	if err := s.c.List(ctx, &tasks, client.InNamespace(s.ns)); err != nil {
-		return false
+		return nil
 	}
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
@@ -425,9 +427,22 @@ func (s *Server) inflightIncidentTask(ctx context.Context, project string) bool 
 		if tatarav1alpha1.TaskTerminal(t) {
 			continue
 		}
-		return true
+		return t
 	}
-	return false
+	return nil
+}
+
+// incidentAlertGroup returns the alert-group dedup identity of an in-flight
+// incident task: its tatara.dev/alert-group hash label, falling back to the
+// descriptive AlertRule name. Empty when t is nil (non-incident proposal).
+func incidentAlertGroup(t *tatarav1alpha1.Task) string {
+	if t == nil {
+		return ""
+	}
+	if g := t.Labels[tatarav1alpha1.LabelAlertGroup]; g != "" {
+		return g
+	}
+	return t.Spec.AlertRule
 }
 
 func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
@@ -474,6 +489,9 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 	if parentKey := s.inflightBrainstormConversationKey(r.Context(), projName); parentKey != "" {
 		annotations = map[string]string{tatarav1alpha1.AnnParentConversationKey: parentKey}
 	}
+	// An incident-investigation agent's proposal carries the in-flight incident
+	// Task's alert-group identity so createProposal can dedup recurring alerts.
+	incidentTask := s.inflightIncidentTask(r.Context(), projName)
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "task-",
@@ -492,7 +510,8 @@ func (s *Server) proposeIssue(w http.ResponseWriter, r *http.Request) {
 			ProposedIssue: &tatarav1alpha1.ProposedIssueSpec{
 				RepositoryRef: req.RepositoryRef, Title: req.Title, Body: req.Body, Kind: req.Kind,
 				SystemicID: req.SystemicID,
-				Incident:   s.inflightIncidentTask(r.Context(), projName),
+				Incident:   incidentTask != nil,
+				AlertGroup: incidentAlertGroup(incidentTask),
 			},
 		},
 	}

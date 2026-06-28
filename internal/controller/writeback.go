@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -726,20 +728,52 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		return ctrl.Result{}, fmt.Errorf("proposal: scm token: %w", err)
 	}
 
-	// (C) Title-level idempotency: skip CreateIssue if an open issue with the
-	// same title already exists. Matching on exact title among tatara-authored
-	// issues is safe because the title is deterministic (brainstorm generates it).
-	// Body/marker check is skipped: if a human opened an issue with the exact
-	// same title it is still safer to track it than to create a duplicate.
+	// Dedup before CreateIssue, skipping it and wiring Spec.Source to the existing
+	// issue when a match is found.
+	// (C) Brainstorm proposals dedup by exact title: the title is deterministic
+	// (brainstorm generates it). Matching on exact title among tatara-authored
+	// issues is safe; the body/marker check is skipped because tracking a
+	// human's identically-titled issue is still safer than creating a duplicate.
+	// (C') Incident proposals carry agent free-text titles that exact-title dedup
+	// cannot catch, so they dedup by the tatara/alert-group-<hash> label instead:
+	// a recurring alert tracks onto its existing open issue rather than spawning a
+	// near-duplicate investigation.
 	proposalTitle := task.Spec.ProposedIssue.Title
+	incidentDedup := task.Spec.ProposedIssue.Incident && task.Spec.ProposedIssue.AlertGroup != ""
 	if r.ReaderFor != nil {
-		if existing, found, rerr := r.findOpenIssueByTitle(ctx, proj, repo.Spec.URL, token, proposalTitle); rerr != nil {
+		var (
+			existing scm.IssueRef
+			found    bool
+			rerr     error
+		)
+		if incidentDedup {
+			existing, found, rerr = r.findOpenIssueByLabel(ctx, proj, repo.Spec.URL, token, alertGroupLabel(task.Spec.ProposedIssue.AlertGroup))
+		} else {
+			existing, found, rerr = r.findOpenIssueByTitle(ctx, proj, repo.Spec.URL, token, proposalTitle)
+		}
+		if rerr != nil {
 			l.Error(rerr, "proposal: list open issues for dedup check (non-fatal, proceeding with create)")
 		} else if found {
-			l.Info("proposal skipped: duplicate exists",
-				"action", "scm_propose_skip_duplicate",
-				"resource_id", task.Name,
-				"existing_number", existing.Number)
+			if incidentDedup {
+				l.Info("proposal skipped: alert-group duplicate exists",
+					"action", "scm_propose_skip_alert_group",
+					"resource_id", task.Name,
+					"alert_group", task.Spec.ProposedIssue.AlertGroup,
+					"existing_number", existing.Number)
+				// (2A) Post a recurrence note so the re-fire stays visible on the
+				// tracked issue (the comment's own timestamp records when).
+				issueRef := fmt.Sprintf("%s#%d", existing.Repo, existing.Number)
+				cerr := writer.Comment(ctx, token, issueRef, alertGroupRefireComment(task.Spec.ProposedIssue.AlertGroup))
+				r.recordSCM(proj.Spec.Scm.Provider, "comment", cerr)
+				if cerr != nil {
+					l.Error(cerr, "proposal: alert-group re-fire comment (non-fatal)", "issue_ref", issueRef)
+				}
+			} else {
+				l.Info("proposal skipped: duplicate exists",
+					"action", "scm_propose_skip_duplicate",
+					"resource_id", task.Name,
+					"existing_number", existing.Number)
+			}
 			return r.recordExistingProposal(ctx, proj, task, existing, repo.Spec.URL)
 		}
 	}
@@ -748,6 +782,10 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	labels := []string{brainstorming}
 	if task.Spec.ProposedIssue.Incident {
 		labels = append(labels, incidentLabel(proj.Spec.Scm))
+		// Stamp the alert-group identity so future re-fires dedup onto this issue.
+		if ag := task.Spec.ProposedIssue.AlertGroup; ag != "" {
+			labels = append(labels, alertGroupLabel(ag))
+		}
 	}
 	body := task.Spec.ProposedIssue.Body
 	if sid := task.Spec.ProposedIssue.SystemicID; sid != "" {
@@ -878,38 +916,45 @@ func (r *TaskReconciler) recordExistingProposal(ctx context.Context, proj *tatar
 	return r.completeProposal(ctx, task, issueURL)
 }
 
-// findOpenIssueByTitle lists open issues for the repo and returns the first
-// one whose Title matches proposalTitle exactly. Returns (zero, false, nil)
-// when no match is found, (zero, false, err) on list failure.
-func (r *TaskReconciler) findOpenIssueByTitle(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token, proposalTitle string) (scm.IssueRef, bool, error) {
+// listOpenProposalIssues lists the repo's open issues using the provider-correct
+// project path. For GitLab it derives the full project path (supports subgroups);
+// owner+"/"+repo would produce "owner/" when OwnerRepo errors on subgroup URLs,
+// which 404s. For GitHub owner/repo is the correct two-segment slug. Shared by
+// the title and alert-group dedup paths.
+func (r *TaskReconciler) listOpenProposalIssues(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token string) ([]scm.IssueRef, error) {
 	reader, err := r.ReaderFor(proj.Spec.Scm.Provider, token)
 	if err != nil {
-		return scm.IssueRef{}, false, fmt.Errorf("proposal: reader for %s: %w", proj.Spec.Scm.Provider, err)
+		return nil, fmt.Errorf("proposal: reader for %s: %w", proj.Spec.Scm.Provider, err)
 	}
-	// Derive the provider-correct project path.
-	// For GitLab, use the full project path (supports subgroups) derived from the
-	// repo URL. owner+"/"+repo produces "owner/" when OwnerRepo errors (GitLab
-	// subgroup URLs) which 404s, so we use GitLabProjectPath directly.
-	// For GitHub, owner+"/"+repo is the correct two-segment slug.
 	var owner, repo string
 	if proj.Spec.Scm != nil && proj.Spec.Scm.Provider == "gitlab" {
 		glPath, gerr := scm.GitLabProjectPath(repoURL)
 		if gerr != nil {
-			return scm.IssueRef{}, false, fmt.Errorf("proposal: gitlab project path: %w", gerr)
+			return nil, fmt.Errorf("proposal: gitlab project path: %w", gerr)
 		}
 		// ListOpenIssues for GitLab expects owner=full-project-path, repo="".
 		owner = glPath
-		repo = ""
 	} else {
 		owner, repo, err = scm.OwnerRepo(repoURL)
 		if err != nil {
-			return scm.IssueRef{}, false, fmt.Errorf("proposal: owner/repo from url: %w", err)
+			return nil, fmt.Errorf("proposal: owner/repo from url: %w", err)
 		}
 	}
 	issues, err := reader.ListOpenIssues(ctx, owner, repo)
 	r.recordSCM(proj.Spec.Scm.Provider, "list_open_issues", err)
 	if err != nil {
-		return scm.IssueRef{}, false, fmt.Errorf("proposal: list open issues: %w", err)
+		return nil, fmt.Errorf("proposal: list open issues: %w", err)
+	}
+	return issues, nil
+}
+
+// findOpenIssueByTitle lists open issues for the repo and returns the first
+// one whose Title matches proposalTitle exactly. Returns (zero, false, nil)
+// when no match is found, (zero, false, err) on list failure.
+func (r *TaskReconciler) findOpenIssueByTitle(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token, proposalTitle string) (scm.IssueRef, bool, error) {
+	issues, err := r.listOpenProposalIssues(ctx, proj, repoURL, token)
+	if err != nil {
+		return scm.IssueRef{}, false, err
 	}
 	for _, iss := range issues {
 		if !iss.IsPR && iss.Title == proposalTitle {
@@ -917,6 +962,44 @@ func (r *TaskReconciler) findOpenIssueByTitle(ctx context.Context, proj *tatarav
 		}
 	}
 	return scm.IssueRef{}, false, nil
+}
+
+// findOpenIssueByLabel lists open issues for the repo and returns the first
+// non-PR issue carrying label. Returns (zero, false, nil) when none match,
+// (zero, false, err) on list failure. Used by the incident alert-group dedup
+// path, whose agent free-text titles defeat findOpenIssueByTitle.
+func (r *TaskReconciler) findOpenIssueByLabel(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token, label string) (scm.IssueRef, bool, error) {
+	issues, err := r.listOpenProposalIssues(ctx, proj, repoURL, token)
+	if err != nil {
+		return scm.IssueRef{}, false, err
+	}
+	for _, iss := range issues {
+		if iss.IsPR {
+			continue
+		}
+		for _, lbl := range iss.Labels {
+			if lbl == label {
+				return iss, true, nil
+			}
+		}
+	}
+	return scm.IssueRef{}, false, nil
+}
+
+// alertGroupLabel maps an incident proposal's alert-group identity to a stable,
+// label-safe tracker label. The identity is hashed to 16 hex chars so any value
+// (the alert-group hash or the alertname fallback) yields a valid label that is
+// identical across re-fires of the same alert.
+func alertGroupLabel(alertGroup string) string {
+	sum := sha256.Sum256([]byte(alertGroup))
+	return "tatara/alert-group-" + hex.EncodeToString(sum[:])[:16]
+}
+
+// alertGroupRefireComment is the short recurrence note posted to the existing
+// incident issue when its alert re-fires, so the recurrence stays visible
+// without opening a duplicate investigation.
+func alertGroupRefireComment(alertGroup string) string {
+	return fmt.Sprintf("Alert re-fired (alert-group `%s`). This condition is already tracked by this open incident issue, so no duplicate investigation was opened.", alertGroup)
 }
 
 func boardRefFromSpec(s *tatarav1alpha1.ScmSpec) scm.BoardRef {

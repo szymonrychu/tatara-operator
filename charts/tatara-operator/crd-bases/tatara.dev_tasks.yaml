@@ -87,6 +87,16 @@ spec:
                 description: ProposedIssueSpec is a tatara-proposed issue awaiting
                   human approval.
                 properties:
+                  alertGroup:
+                    description: |-
+                      AlertGroup is the per-alert-group dedup identity of the incident that filed
+                      this proposal: the tatara.dev/alert-group hash label of the in-flight
+                      incident Task, falling back to its descriptive AlertRule name. createProposal
+                      stamps tatara/alert-group-<hash> on the created incident issue and dedups
+                      future incident proposals by it, so a recurring alert tracks onto its
+                      existing open issue instead of spawning a near-duplicate. Empty for
+                      non-incident proposals.
+                    type: string
                   body:
                     type: string
                   incident:

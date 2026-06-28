@@ -142,3 +142,58 @@ func TestProposeIssue_NoIncidentWhenOnlyBrainstormInflight(t *testing.T) {
 		t.Fatalf("brainstorm-only proposal must NOT set Incident")
 	}
 }
+
+func TestProposeIssue_StampsAlertGroupFromLabel(t *testing.T) {
+	proj := incidentProject("ag-proj")
+	repo := incidentRepo("ag-repo", "ag-proj")
+	incTask := inflightIncidentTask("ag-task-1", "ag-proj")
+	// The webhook stamps the per-alert-group dedup hash on the incident Task.
+	incTask.Labels = map[string]string{tatarav1alpha1.LabelAlertGroup: "deadbeefcafe1234"}
+	incTask.Spec.AlertRule = "OperatorQueueDepthBacklog"
+
+	r, fc := buildIncidentTestRouter(t, proj, repo, incTask)
+	rec := postProposeIncident(t, r, "ag-proj", "ag-repo")
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	task := newestProposalTask(t, fc, "ag-proj")
+	require.NotNil(t, task.Spec.ProposedIssue)
+	require.True(t, task.Spec.ProposedIssue.Incident)
+	require.Equal(t, "deadbeefcafe1234", task.Spec.ProposedIssue.AlertGroup,
+		"AlertGroup must come from the alert-group label, not the AlertRule fallback")
+}
+
+func TestProposeIssue_AlertGroupFallsBackToAlertRule(t *testing.T) {
+	proj := incidentProject("agf-proj")
+	repo := incidentRepo("agf-repo", "agf-proj")
+	incTask := inflightIncidentTask("agf-task-1", "agf-proj")
+	// No alert-group label: fall back to the descriptive alertname.
+	incTask.Spec.AlertRule = "OperatorQueueDepthBacklog"
+
+	r, fc := buildIncidentTestRouter(t, proj, repo, incTask)
+	rec := postProposeIncident(t, r, "agf-proj", "agf-repo")
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	task := newestProposalTask(t, fc, "agf-proj")
+	require.NotNil(t, task.Spec.ProposedIssue)
+	require.True(t, task.Spec.ProposedIssue.Incident)
+	require.Equal(t, "OperatorQueueDepthBacklog", task.Spec.ProposedIssue.AlertGroup,
+		"AlertGroup must fall back to AlertRule when the label is absent")
+}
+
+func TestProposeIssue_NoAlertGroupForBrainstorm(t *testing.T) {
+	proj := incidentProject("agn-proj")
+	repo := incidentRepo("agn-repo", "agn-proj")
+	bsTask := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "agn-bs-1", Namespace: incidentTestNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "agn-proj", Kind: "brainstorm", Goal: "brainstorm"},
+	}
+
+	r, fc := buildIncidentTestRouter(t, proj, repo, bsTask)
+	rec := postProposeIncident(t, r, "agn-proj", "agn-repo")
+	require.Equal(t, http.StatusCreated, rec.Code, "body: %s", rec.Body.String())
+
+	task := newestProposalTask(t, fc, "agn-proj")
+	require.NotNil(t, task.Spec.ProposedIssue)
+	require.Empty(t, task.Spec.ProposedIssue.AlertGroup,
+		"non-incident proposal must not carry an alert-group identity")
+}
