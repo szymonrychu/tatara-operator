@@ -280,13 +280,17 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_lightrag_query_errors_total",
 			Help: "Failed attempts to read document counts from a project's lightrag.",
 		}),
-		// Unauthenticated route-presence probe of each project's tatara-memory
-		// retrieval surface. result is "present" (route served any non-404 status,
-		// e.g. a 401 auth rejection that still proves the route exists), "absent"
-		// (404 -> drifted/stale binary), or "error" (transport failure -> down).
+		// Authenticated functional probe of each project's tatara-memory retrieval
+		// surface (the contract agents consume). result is "present" (HTTP 2xx +
+		// well-formed JSON body -> healthy), "absent" (404 -> drifted/stale binary),
+		// "unauthorized" (401/403 -> a valid memory-audience token was rejected:
+		// auth/contract drift), "degraded" (auth ok but 5xx or a malformed/empty
+		// body -> broken handler/backend), or "error" (transport failure or token
+		// mint failure -> probe could not complete). All but "present" count
+		// unhealthy for the cycle.
 		memoryRetrievalProbe: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_memory_retrieval_probe_total",
-			Help: "Unauthenticated route-presence probes of a project's tatara-memory retrieval surface by route and result.",
+			Help: "Authenticated functional probes of a project's tatara-memory retrieval surface by route and result.",
 		}, []string{"route", "result"}),
 		// Synthetic probe of the operator-write and chat tool-backend surfaces from
 		// the in-cluster agent vantage (the sibling of memoryRetrievalProbe, which
@@ -449,9 +453,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	// Pre-seed the memory retrieval-probe series so the route x result matrix
 	// exists at a zero baseline before the first probe (alertable from startup).
-	// The route labels must mirror memoryProbeRoutes in the controller package.
+	// The route labels must mirror memoryProbeRoutes and the result labels the
+	// classifier in probeMemoryRoute, both in the controller package.
 	for _, route := range []string{"/queries", "/code-graph/stats"} {
-		for _, result := range []string{"present", "absent", "error"} {
+		for _, result := range []string{"present", "absent", "error", "unauthorized", "degraded"} {
 			m.memoryRetrievalProbe.WithLabelValues(route, result)
 		}
 	}
@@ -848,7 +853,8 @@ func (m *OperatorMetrics) LightragQueryError() {
 }
 
 // MemoryRetrievalProbe increments operator_memory_retrieval_probe_total for a
-// probed route and result ("present", "absent", or "error").
+// probed route and result ("present", "absent", "error", "unauthorized", or
+// "degraded").
 func (m *OperatorMetrics) MemoryRetrievalProbe(route, result string) {
 	m.memoryRetrievalProbe.WithLabelValues(route, result).Inc()
 }

@@ -78,6 +78,15 @@ type ProjectReconciler struct {
 	MemoryHTTP    *http.Client
 	MemoryBaseURL func(project string) string
 
+	// MemoryToken mints a memory-audience bearer token for the authenticated
+	// retrieval probe (updateMemoryRetrievalProbe). Wired in wire.go to a cached
+	// client-credentials TokenSource; tests inject a stub. When nil the probe
+	// sends no token, so tatara-memory's auth gate answers 401 and every route is
+	// classified "unauthorized" (unhealthy): an operator that cannot authenticate
+	// to memory has no basis to report MemoryReady, so the gap surfaces rather
+	// than hides.
+	MemoryToken func(ctx context.Context) (string, error)
+
 	// memoryUnhealthyCycles tracks, per project, the number of consecutive
 	// updateMemoryRetrievalProbe cycles whose retrieval surface probed unhealthy.
 	// reconcileMemory folds a sustained run (>= memoryRetrievalUnhealthyThreshold)

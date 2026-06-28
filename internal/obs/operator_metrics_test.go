@@ -1094,7 +1094,7 @@ func TestMemoryRetrievalProbe_PreSeeded(t *testing.T) {
 	type key struct{ route, result string }
 	want := map[key]bool{}
 	for _, route := range []string{"/queries", "/code-graph/stats"} {
-		for _, result := range []string{"present", "absent", "error"} {
+		for _, result := range []string{"present", "absent", "error", "unauthorized", "degraded"} {
 			want[key{route, result}] = false
 		}
 	}

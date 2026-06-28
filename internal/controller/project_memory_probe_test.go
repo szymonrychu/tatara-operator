@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -14,33 +15,86 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestProbeMemoryRoute_Classification verifies the route-presence classifier:
-// 404 is "absent" (route missing -> drifted/stale binary), a transport failure
-// is "error" (process down), and any other served status -> "present" (the
-// route exists; a 401 auth rejection still proves presence).
+// stubMemoryToken returns a MemoryToken func that always yields tok.
+func stubMemoryToken(tok string) func(context.Context) (string, error) {
+	return func(context.Context) (string, error) { return tok, nil }
+}
+
+// TestProbeMemoryRoute_Classification verifies the authenticated functional
+// classifier: a 2xx with a well-formed JSON body is "present" (healthy), a 2xx
+// with an empty/garbage body is "degraded", 401/403 is "unauthorized" (a valid
+// token was rejected), 404 is "absent" (route gone), and any other non-2xx
+// (5xx/4xx contract drift) is "degraded".
 func TestProbeMemoryRoute_Classification(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
+		body   string
 		want   string
 	}{
-		{"unauthenticated-401", http.StatusUnauthorized, "present"},
-		{"bad-request-400", http.StatusBadRequest, "present"},
-		{"ok-200", http.StatusOK, "present"},
-		{"server-error-500", http.StatusInternalServerError, "present"},
-		{"not-found-404", http.StatusNotFound, "absent"},
+		{"ok-json-object", http.StatusOK, `{"matches":[]}`, "present"},
+		{"ok-json-null-matches", http.StatusOK, `{"matches":null}`, "present"},
+		{"ok-empty-body", http.StatusOK, "", "degraded"},
+		{"ok-garbage-body", http.StatusOK, "not json", "degraded"},
+		{"ok-bare-null", http.StatusOK, "null", "degraded"},
+		{"unauthenticated-401", http.StatusUnauthorized, "missing bearer token", "unauthorized"},
+		{"forbidden-403", http.StatusForbidden, "forbidden", "unauthorized"},
+		{"bad-request-400", http.StatusBadRequest, `{"error":"bad"}`, "degraded"},
+		{"server-error-500", http.StatusInternalServerError, "internal error", "degraded"},
+		{"bad-gateway-502", http.StatusBadGateway, "upstream error", "degraded"},
+		{"service-unavailable-503", http.StatusServiceUnavailable, "not ready", "degraded"},
+		{"not-found-404", http.StatusNotFound, "404 page not found", "absent"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
+				if tc.body != "" {
+					_, _ = w.Write([]byte(tc.body))
+				}
 			}))
 			defer srv.Close()
-			got := probeMemoryRoute(context.Background(), srv.Client(), http.MethodPost, srv.URL+"/queries")
+			got := probeMemoryRoute(context.Background(), srv.Client(), http.MethodPost, srv.URL+"/queries", memoryProbeQueryBody, "tok")
 			if got != tc.want {
-				t.Fatalf("status %d classified %q, want %q", tc.status, got, tc.want)
+				t.Fatalf("status %d body %q classified %q, want %q", tc.status, tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestProbeMemoryRoute_AttachesTokenAndBody verifies the probe sends the bearer
+// token and request body, and that a missing token reads as "unauthorized".
+func TestProbeMemoryRoute_AttachesTokenAndBody(t *testing.T) {
+	var gotAuth, gotBody, gotCT string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		gotCT = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		if gotAuth == "" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"matches":[]}`))
+	}))
+	defer srv.Close()
+
+	if got := probeMemoryRoute(context.Background(), srv.Client(), http.MethodPost, srv.URL+"/queries", memoryProbeQueryBody, "tok"); got != "present" {
+		t.Fatalf("authenticated probe = %q, want present", got)
+	}
+	if gotAuth != "Bearer tok" {
+		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer tok")
+	}
+	if gotBody != memoryProbeQueryBody {
+		t.Fatalf("request body = %q, want %q", gotBody, memoryProbeQueryBody)
+	}
+	if gotCT != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", gotCT)
+	}
+
+	// No token -> server answers 401 -> classified unauthorized.
+	if got := probeMemoryRoute(context.Background(), srv.Client(), http.MethodPost, srv.URL+"/queries", memoryProbeQueryBody, ""); got != "unauthorized" {
+		t.Fatalf("tokenless probe = %q, want unauthorized", got)
 	}
 }
 
@@ -50,7 +104,7 @@ func TestProbeMemoryRoute_TransportFailureIsError(t *testing.T) {
 	url := srv.URL
 	client := srv.Client()
 	srv.Close()
-	if got := probeMemoryRoute(context.Background(), client, http.MethodGet, url+"/code-graph/stats"); got != "error" {
+	if got := probeMemoryRoute(context.Background(), client, http.MethodGet, url+"/code-graph/stats", "", "tok"); got != "error" {
 		t.Fatalf("transport failure classified %q, want error", got)
 	}
 }
@@ -98,11 +152,12 @@ func gatherProbeCounter(t *testing.T, reg *prometheus.Registry, route, result st
 
 // TestUpdateMemoryRetrievalProbe_UnhealthyIncrementsHealthyClears drives the poll
 // loop against a toggleable server: consecutive unhealthy (404) cycles increment
-// the per-project run, a healthy (401) cycle clears it, the result is metered,
-// and a no-longer-Ready project is pruned from the map.
+// the per-project run, a healthy (2xx + JSON) cycle clears it, the result is
+// metered, and a no-longer-Ready project is pruned from the map.
 func TestUpdateMemoryRetrievalProbe_UnhealthyIncrementsHealthyClears(t *testing.T) {
 	ctx := logfIntoTestCtx()
 	r, reg := newMemoryReconcilerWithReg()
+	r.MemoryToken = stubMemoryToken("tok")
 
 	mkMemoryProject(t, "probe-orch")
 	setMemoryPhaseReady(t, "probe-orch")
@@ -113,7 +168,7 @@ func TestUpdateMemoryRetrievalProbe_UnhealthyIncrementsHealthyClears(t *testing.
 			w.WriteHeader(http.StatusNotFound) // route absent -> drifted binary
 			return
 		}
-		w.WriteHeader(http.StatusUnauthorized) // route present, auth rejected
+		_, _ = w.Write([]byte(`{"matches":[]}`)) // 2xx + well-formed body -> present
 	}))
 	defer srv.Close()
 	r.MemoryHTTP = srv.Client()
@@ -150,17 +205,80 @@ func TestUpdateMemoryRetrievalProbe_UnhealthyIncrementsHealthyClears(t *testing.
 	}
 }
 
+// TestUpdateMemoryRetrievalProbe_UnauthorizedWhenTokenRejected covers the
+// auth-contract drift class: an authenticated request whose token memory rejects
+// with 401 is metered "unauthorized" and counts unhealthy (the old presence-only
+// probe read this same 401 as healthy).
+func TestUpdateMemoryRetrievalProbe_UnauthorizedWhenTokenRejected(t *testing.T) {
+	ctx := logfIntoTestCtx()
+	r, reg := newMemoryReconcilerWithReg()
+	r.MemoryToken = stubMemoryToken("tok")
+
+	mkMemoryProject(t, "probe-401")
+	setMemoryPhaseReady(t, "probe-401")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized) // route + auth present, token rejected
+	}))
+	defer srv.Close()
+	r.MemoryHTTP = srv.Client()
+	r.MemoryBaseURL = func(string) string { return srv.URL }
+
+	r.updateMemoryRetrievalProbe(ctx)
+	if got := r.memoryUnhealthyCycles["probe-401"]; got != 1 {
+		t.Fatalf("401 cycle: cycles = %d, want 1 (unhealthy)", got)
+	}
+	if got := gatherProbeCounter(t, reg, "/queries", "unauthorized"); got < 1 {
+		t.Fatalf("probe{/queries,unauthorized} = %v, want >= 1", got)
+	}
+}
+
+// TestUpdateMemoryRetrievalProbe_TokenMintFailureIsUnhealthy verifies a token
+// mint failure meters every route "error", counts the cycle unhealthy, and does
+// not even reach the memory server.
+func TestUpdateMemoryRetrievalProbe_TokenMintFailureIsUnhealthy(t *testing.T) {
+	ctx := logfIntoTestCtx()
+	r, reg := newMemoryReconcilerWithReg()
+	r.MemoryToken = func(context.Context) (string, error) {
+		return "", context.DeadlineExceeded
+	}
+
+	mkMemoryProject(t, "probe-mint-fail")
+	setMemoryPhaseReady(t, "probe-mint-fail")
+
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte(`{"matches":[]}`))
+	}))
+	defer srv.Close()
+	r.MemoryHTTP = srv.Client()
+	r.MemoryBaseURL = func(string) string { return srv.URL }
+
+	r.updateMemoryRetrievalProbe(ctx)
+	if got := r.memoryUnhealthyCycles["probe-mint-fail"]; got != 1 {
+		t.Fatalf("mint failure: cycles = %d, want 1 (unhealthy)", got)
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("memory server hit %d times on mint failure, want 0", got)
+	}
+	if got := gatherProbeCounter(t, reg, "/queries", "error"); got < 1 {
+		t.Fatalf("probe{/queries,error} = %v, want >= 1", got)
+	}
+}
+
 // TestUpdateMemoryRetrievalProbe_SkipsNonReady verifies a Provisioning stack is
 // never probed (the replica gate is the precondition).
 func TestUpdateMemoryRetrievalProbe_SkipsNonReady(t *testing.T) {
 	ctx := logfIntoTestCtx()
 	r := newMemoryReconciler()
+	r.MemoryToken = stubMemoryToken("tok")
 
 	mkMemoryProject(t, "probe-provisioning")
 	// Leave status.memory unset (no phase) -> not Ready.
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"matches":[]}`))
 	}))
 	defer srv.Close()
 	r.MemoryHTTP = srv.Client()
