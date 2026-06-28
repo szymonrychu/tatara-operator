@@ -27,7 +27,7 @@ CHART_DIR="charts/tatara-operator"
 # crd-reader (cluster-scoped) allowlist: exactly one pair.
 CRDREADER_PAIRS="apiextensions.k8s.io|customresourcedefinitions"
 
-# Namespaced-Role allowlist: the 13 group|resource pairs that belong in the
+# Namespaced-Role allowlist: the group|resource pairs that belong in the
 # namespaced Role. Empty apiGroup is the literal empty string "".
 KNOWN_NAMESPACED='
 tatara.dev|projects
@@ -51,6 +51,8 @@ apps|deployments
 apps|statefulsets
 postgresql.cnpg.io|clusters
 postgresql.cnpg.io|clusters/status
+monitoring.coreos.com|servicemonitors
+monitoring.coreos.com|prometheusrules
 networking.k8s.io|ingresses
 coordination.k8s.io|leases
 '
