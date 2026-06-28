@@ -305,6 +305,33 @@ func TestIngestJobResultTotal(t *testing.T) {
 	}
 }
 
+func TestSetRepositoryIngestFailing(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetRepositoryIngestFailing("repo-a", true)
+	m.SetRepositoryIngestFailing("repo-b", false)
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("repo-a")); got != 1 {
+		t.Fatalf("ingest_failing{repo-a} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("repo-b")); got != 0 {
+		t.Fatalf("ingest_failing{repo-b} = %v, want 0", got)
+	}
+	// Recovery: setting back to false must clear the gauge (no monotonicity).
+	m.SetRepositoryIngestFailing("repo-a", false)
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("repo-a")); got != 0 {
+		t.Fatalf("ingest_failing{repo-a} after recovery = %v, want 0", got)
+	}
+}
+
+func TestSetRepositoryLastIngestTimestamp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetRepositoryLastIngestTimestamp("repo-a", 1750000000)
+	if got := testutil.ToFloat64(m.RepositoryLastIngestTimestampGauge("repo-a")); got != 1750000000 {
+		t.Fatalf("last_ingest_timestamp{repo-a} = %v, want 1750000000", got)
+	}
+}
+
 func TestAgentUnreachableTermination(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
@@ -320,20 +347,24 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 	// Touch counters/vecs that require a label-value observation to appear.
 	m.OrphanReaped("test")
 	m.ReapDeleteError("pod")
+	m.SetRepositoryIngestFailing("touch", false)
+	m.SetRepositoryLastIngestTimestamp("touch", 1)
 	mfs, _ := reg.Gather()
 	want := map[string]bool{
-		"operator_reconcile_total":                     false,
-		"operator_ingest_job_duration_seconds":         false,
-		"operator_turn_duration_seconds":               false,
-		"operator_webhook_events_total":                false,
-		"operator_tasks_inflight":                      false,
-		"operator_memory_provision_duration_seconds":   false,
-		"operator_memory_stacks":                       false,
-		"operator_turn_timeout_total":                  false,
-		"operator_ingest_job_total":                    false,
-		"operator_agent_unreachable_termination_total": false,
-		"operator_orphan_reaped_total":                 false,
-		"operator_reap_delete_error_total":             false,
+		"operator_reconcile_total":                          false,
+		"operator_ingest_job_duration_seconds":              false,
+		"operator_turn_duration_seconds":                    false,
+		"operator_webhook_events_total":                     false,
+		"operator_tasks_inflight":                           false,
+		"operator_memory_provision_duration_seconds":        false,
+		"operator_memory_stacks":                            false,
+		"operator_turn_timeout_total":                       false,
+		"operator_ingest_job_total":                         false,
+		"operator_repository_ingest_failing":                false,
+		"operator_repository_last_ingest_timestamp_seconds": false,
+		"operator_agent_unreachable_termination_total":      false,
+		"operator_orphan_reaped_total":                      false,
+		"operator_reap_delete_error_total":                  false,
 	}
 	for _, mf := range mfs {
 		if _, ok := want[mf.GetName()]; ok {
@@ -1063,7 +1094,7 @@ func TestMemoryRetrievalProbe_PreSeeded(t *testing.T) {
 	type key struct{ route, result string }
 	want := map[key]bool{}
 	for _, route := range []string{"/queries", "/code-graph/stats"} {
-		for _, result := range []string{"present", "absent", "error"} {
+		for _, result := range []string{"present", "absent", "error", "unauthorized", "degraded"} {
 			want[key{route, result}] = false
 		}
 	}

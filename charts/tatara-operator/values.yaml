@@ -198,13 +198,16 @@ serviceMonitor:
 # stamped on every alert; tasksInflightThreshold tunes the concurrency-cap
 # deadman threshold; turnSubmitP95LatencyThreshold (seconds) tunes the SubmitTurn
 # p95 latency alert (the operator_turn_submit_duration_seconds histogram tops out
-# at 25.6s, so keep this well under that ceiling). Alertmanager routing stays
-# cluster-side.
+# at 25.6s, so keep this well under that ceiling). ingestStaleAfterSeconds is the
+# TataraIngestStale budget: how long since a repo's last successful ingest before
+# its recall corpus is considered stale (default 93600s = 26h, comfortably over
+# the daily reingest cron). Alertmanager routing stays cluster-side.
 prometheusRule:
   enabled: true
   severityLabel: "warning"
   tasksInflightThreshold: 8
   turnSubmitP95LatencyThreshold: 5
+  ingestStaleAfterSeconds: 93600
   additionalLabels: {}
 
 # dashboard ships the "Tatara Loop" Grafana dashboard as a ConfigMap labelled
