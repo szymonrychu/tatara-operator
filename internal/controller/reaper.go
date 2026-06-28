@@ -355,6 +355,13 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 		if tk.CreationTimestamp.After(cutoff) {
 			continue // younger than the retention window
 		}
+		// Spare an under-cap recoverable give-up task: the ImplementGiveUps counter
+		// must outlive the retention window so recoverOrphans can reroll it.
+		if tk.Status.LifecycleState == "Parked" &&
+			tatarav1alpha1.IsRecoverableGiveup(tk.Status.ParkReason) &&
+			tk.Status.ImplementGiveUps > 0 && tk.Status.ImplementGiveUps < maxImplGiveUps {
+			continue
+		}
 		age := time.Since(tk.CreationTimestamp.Time)
 		// Clean per-issue token and turn series before deletion so Prometheus does
 		// not accumulate stale series forever (bounded cardinality). Skip project-
