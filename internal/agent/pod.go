@@ -835,6 +835,8 @@ func toolProfileForKind(kind string) string {
 		return "incident"
 	case "selfImprove":
 		return "selfImprove"
+	case "refine":
+		return "refine"
 	default:
 		return "" // fail-open
 	}
@@ -862,6 +864,8 @@ func skillProfileForKind(kind string) string {
 		return "incident"
 	case "selfImprove":
 		return "selfImprove"
+	case "refine":
+		return "refine"
 	default:
 		return "" // fail-open
 	}

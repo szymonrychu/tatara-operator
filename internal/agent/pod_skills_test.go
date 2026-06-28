@@ -23,8 +23,8 @@ func TestSkillProfileForKind(t *testing.T) {
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"selfImprove", "selfImprove"},
+		{"refine", "refine"},
 		{"healthCheck", ""}, // healthCheck uses Kind=brainstorm at the task level; unknown here -> fail-open
-		{"refine", ""},      // refine -> fail-open
 		{"", ""},            // empty -> fail-open
 		{"unknown", ""},     // unknown -> fail-open
 	}
@@ -46,6 +46,7 @@ func TestSkillProfileForKind_AllCRDKinds(t *testing.T) {
 		"brainstorm",
 		"issueLifecycle",
 		"incident",
+		"refine",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {
@@ -118,6 +119,7 @@ func TestBuildPod_SkillProfileEnv(t *testing.T) {
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"selfImprove", "selfImprove"},
+		{"refine", "refine"},
 		{"", ""},        // unknown -> fail-open
 		{"unknown", ""}, // unknown -> fail-open
 	}
