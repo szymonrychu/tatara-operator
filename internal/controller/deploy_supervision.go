@@ -30,6 +30,10 @@ const (
 	// backstop threshold (1.5x budget): fire only after the deadline + a recovery
 	// attempt have lapsed.
 	deployStalledFactor = 1.5
+	// deployParkReason is the ParkReason set when a deploy cascade exhausts its
+	// bounded auto-reroll budget and is parked recoverable for a human. cdScan
+	// counts Parked tasks carrying it as currently-failed cascades.
+	deployParkReason = "deploy-timeout"
 )
 
 // deployPinFiles are the tatara-helmfile files where component version pins land
@@ -373,7 +377,6 @@ func (r *TaskReconciler) resolveDeployedTask(ctx context.Context, project *tatar
 // ImplementGiveUps cap.
 func (r *TaskReconciler) rerollDeploy(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, metricReason, contextMsg string) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
-	r.Metrics.CDCascadeFailed(metricReason)
 	_ = r.deployLedger(task.Namespace).SetState(ctx, project.Name, task.Name, DeployStateFailed)
 
 	// Exhausted auto-recovery: park recoverable for a human, comment the cause.
@@ -384,11 +387,11 @@ func (r *TaskReconciler) rerollDeploy(ctx context.Context, project *tatarav1alph
 		writer, token, provider := r.deployWriter(ctx, project, task)
 		if writer != nil {
 			msg := "Deploy cascade recovery is exhausted after repeated attempts; leaving this for a human. " + contextMsg
-			if perr := r.parkWithComment(ctx, task, writer, token, "deploy-timeout", msg); perr != nil {
+			if perr := r.parkWithComment(ctx, task, writer, token, deployParkReason, msg); perr != nil {
 				return ctrl.Result{}, perr
 			}
 		} else {
-			if perr := r.setLifecycleState(ctx, task, "Parked", "deploy-timeout"); perr != nil {
+			if perr := r.setLifecycleState(ctx, task, "Parked", deployParkReason); perr != nil {
 				return ctrl.Result{}, perr
 			}
 		}
@@ -630,9 +633,23 @@ func (r *TaskReconciler) helmfilePinState(ctx context.Context, dw scm.DeployWatc
 func (r *ProjectReconciler) cdScan(ctx context.Context, proj *tatarav1alpha1.Project, existing []tatarav1alpha1.Task) {
 	l := log.FromContext(ctx)
 	now := time.Now()
+	// CD-health gauges (G5): count cascades currently in a durable failed/stalled
+	// state and publish them at the end of the scan. Derived from authoritative
+	// Task state (not per-event counters) so max()>0 means "broken right now" and
+	// the gauge self-clears once a reroll or a human resolves the cascade.
+	var failed, stalled int
 	for i := range existing {
 		t := &existing[i]
-		if t.Spec.ProjectRef != proj.Name || !tatarav1alpha1.TaskDeploying(t) {
+		if t.Spec.ProjectRef != proj.Name {
+			continue
+		}
+		// Durable failed: parked recoverable after the bounded auto-reroll budget was
+		// spent (rerollDeploy exhausted branch parks with reason deployParkReason).
+		if t.Status.LifecycleState == "Parked" && t.Status.ParkReason == deployParkReason {
+			failed++
+			continue
+		}
+		if !tatarav1alpha1.TaskDeploying(t) {
 			continue
 		}
 		dl := t.Status.DeployDeadline
@@ -644,8 +661,10 @@ func (r *ProjectReconciler) cdScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		if now.Before(stallThreshold) {
 			continue
 		}
-		r.Metrics.CDCascadeStalled()
 		if t.Status.ImplementGiveUps >= maxImplGiveUps {
+			// Stalled with no auto-recovery left: stays Deploying, awaits a human. This
+			// is the durable stalled state the cdScan backstop surfaces.
+			stalled++
 			l.Info("cdScan: deploy cascade stalled but auto-reroll budget spent; leaving for a human",
 				"action", "cd_scan_exhausted", "resource_id", t.Name, "artifact", t.Status.DeployArtifact)
 			continue
@@ -665,6 +684,8 @@ func (r *ProjectReconciler) cdScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		l.Info("cdScan: rerolled stalled deploy cascade",
 			"action", "cd_scan_reroll", "resource_id", t.Name, "artifact", t.Status.DeployArtifact)
 	}
+	r.Metrics.SetCDCascadeFailed(proj.Name, float64(failed))
+	r.Metrics.SetCDCascadeStalled(proj.Name, float64(stalled))
 }
 
 // setTaskImplementContext writes the re-entry prompt onto a Task (ProjectReconciler

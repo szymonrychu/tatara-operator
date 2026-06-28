@@ -65,8 +65,8 @@ type OperatorMetrics struct {
 	reviewOutcomeTotal        *prometheus.CounterVec
 	reviewFindingsTotal       *prometheus.CounterVec
 	implementCITotal          *prometheus.CounterVec
-	cdCascadeFailedTotal      *prometheus.CounterVec
-	cdCascadeStalledTotal     prometheus.Counter
+	cdCascadeFailed           *prometheus.GaugeVec
+	cdCascadeStalled          *prometheus.GaugeVec
 	cdResolvedTotal           prometheus.Counter
 }
 
@@ -362,17 +362,20 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_implement_ci_total",
 			Help: "PR CI conclusions (pass|fail) for any PR-producing Task kind reaching handleMRCI, by kind and model.",
 		}, []string{"project", "repo", "kind", "model", "result"}),
-		// push-CD deploy-supervision: a cascade stage failed (red apply, failed
-		// build, unmergeable bump) and the Task was rerolled to fix it; reason names
-		// the failing stage. Drives the tatara-observability cascade-failed alert.
-		cdCascadeFailedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+		// push-CD deploy-supervision CD-health gauges (G5). These reflect the CURRENT
+		// number of cascades in a failed / stalled state, derived from authoritative
+		// Task state each cdScan (not per-event counters), so max()>0 means "a cascade
+		// is broken right now" and the value self-clears once bounded recovery (reroll)
+		// or a human resolves it. A monotonic counter could never decrement, so the
+		// tatara-observability critical page would never clear after a reroll recovered.
+		cdCascadeFailed: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "tatara_cd_cascade_failed",
-			Help: "push-CD deploy cascades that failed a stage and were rerolled, by reason (apply_failed|deploy_timeout|build_failed).",
-		}, []string{"reason"}),
-		cdCascadeStalledTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Help: "push-CD deploy cascades currently in a FAILED state (parked recoverable after the bounded auto-reroll budget was spent), by project. >0 means merged code is not reaching the cluster and a human is needed.",
+		}, []string{"project"}),
+		cdCascadeStalled: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "tatara_cd_cascade_stalled",
-			Help: "push-CD deploy cascades the cdScan backstop found stalled past 1.5x the deploy budget and rerolled.",
-		}),
+			Help: "push-CD deploy cascades currently STALLED past 1.5x the Deploying deadline with the auto-reroll budget spent (cdScan backstop, no live driver), by project.",
+		}, []string{"project"}),
 		cdResolvedTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "tatara_cd_resolved_total",
 			Help: "push-CD Deploying Tasks resolved Done after a confirmed tatara-helmfile apply.",
@@ -438,8 +441,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.reviewOutcomeTotal,
 		m.reviewFindingsTotal,
 		m.implementCITotal,
-		m.cdCascadeFailedTotal,
-		m.cdCascadeStalledTotal,
+		m.cdCascadeFailed,
+		m.cdCascadeStalled,
 		m.cdResolvedTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
@@ -596,20 +599,33 @@ func (m *OperatorMetrics) ScanItem(activity, outcome string) {
 	m.scanItemsTotal.WithLabelValues(activity, outcome).Inc()
 }
 
-// CDCascadeFailed increments tatara_cd_cascade_failed for a failing stage reason.
-func (m *OperatorMetrics) CDCascadeFailed(reason string) {
+// SetCDCascadeFailed sets tatara_cd_cascade_failed{project} to the current count
+// of cascades in a durable failed state. Called once per cdScan with the count
+// derived from authoritative Task state, so the gauge self-clears on recovery.
+func (m *OperatorMetrics) SetCDCascadeFailed(project string, n float64) {
 	if m == nil {
 		return
 	}
-	m.cdCascadeFailedTotal.WithLabelValues(reason).Inc()
+	m.cdCascadeFailed.WithLabelValues(project).Set(n)
 }
 
-// CDCascadeStalled increments tatara_cd_cascade_stalled (cdScan backstop reroll).
-func (m *OperatorMetrics) CDCascadeStalled() {
+// SetCDCascadeStalled sets tatara_cd_cascade_stalled{project} to the current count
+// of cascades the cdScan backstop found stalled with the auto-reroll budget spent.
+func (m *OperatorMetrics) SetCDCascadeStalled(project string, n float64) {
 	if m == nil {
 		return
 	}
-	m.cdCascadeStalledTotal.Inc()
+	m.cdCascadeStalled.WithLabelValues(project).Set(n)
+}
+
+// CDCascadeFailedGauge / CDCascadeStalledGauge return the per-project gauges for
+// test assertions.
+func (m *OperatorMetrics) CDCascadeFailedGauge(project string) prometheus.Gauge {
+	return m.cdCascadeFailed.WithLabelValues(project)
+}
+
+func (m *OperatorMetrics) CDCascadeStalledGauge(project string) prometheus.Gauge {
+	return m.cdCascadeStalled.WithLabelValues(project)
 }
 
 // CDResolved increments tatara_cd_resolved_total (Deploying Task reached applied).

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -404,4 +405,82 @@ func TestCDScan_SkipsWithinThreshold(t *testing.T) {
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
 
 	require.Equal(t, tatarav1alpha1.LifecycleStateDeploying, getTask(t, task.Name).Status.LifecycleState)
+}
+
+// TestCDScan_StalledGaugeBudgetSpent: a Deploying Task past 1.5x its budget whose
+// auto-reroll budget is spent is left for a human and reflected as a current
+// stalled cascade (gauge == 1, not rerolled).
+func TestCDScan_StalledGaugeBudgetSpent(t *testing.T) {
+	proj := seedDeployScene(t, "cdscanstall", "tatara-operator")
+	task := seedDeployingTask(t, "dep-cdscanstall", proj.Name, "dep-comp-cdscanstall", "szymonrychu/tatara-operator#7",
+		time.Now().Add(-2000*time.Second), "v1.0.0")
+	// Spend the auto-reroll budget so cdScan leaves it for a human (stalled).
+	cur := getTask(t, task.Name)
+	cur.Status.ImplementGiveUps = maxImplGiveUps
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cur))
+
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: m}
+	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
+
+	// Not rerolled: stays Deploying, budget untouched.
+	got := getTask(t, task.Name)
+	require.Equal(t, tatarav1alpha1.LifecycleStateDeploying, got.Status.LifecycleState)
+	require.Equal(t, maxImplGiveUps, got.Status.ImplementGiveUps)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
+	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
+}
+
+// TestCDScan_FailedGaugeReflectsParkedDeployTimeout: a Task parked recoverable
+// after the deploy reroll budget was spent counts as a current failed cascade
+// (gauge == 1). A task parked for an unrelated reason does not.
+func TestCDScan_FailedGaugeReflectsParkedDeployTimeout(t *testing.T) {
+	proj := seedDeployScene(t, "cdscanfail", "tatara-operator")
+	failed := seedDeployingTask(t, "dep-cdscanfail", proj.Name, "dep-comp-cdscanfail", "szymonrychu/tatara-operator#7",
+		time.Now().Add(-2000*time.Second), "v1.0.0")
+	fcur := getTask(t, failed.Name)
+	fcur.Status.Phase = ""
+	fcur.Status.LifecycleState = "Parked"
+	fcur.Status.ParkReason = "deploy-timeout"
+	require.NoError(t, k8sClient.Status().Update(context.Background(), fcur))
+
+	other := seedDeployingTask(t, "dep-cdscanfail-other", proj.Name, "dep-comp-cdscanfail", "szymonrychu/tatara-operator#8",
+		time.Now().Add(-2000*time.Second), "v1.0.0")
+	ocur := getTask(t, other.Name)
+	ocur.Status.Phase = ""
+	ocur.Status.LifecycleState = "Parked"
+	ocur.Status.ParkReason = "implement-failed"
+	require.NoError(t, k8sClient.Status().Update(context.Background(), ocur))
+
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: m}
+	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, failed.Name), *getTask(t, other.Name)})
+
+	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
+	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
+}
+
+// TestCDScan_GaugesSelfClearOnRecovery: once the durable failed/stalled tasks are
+// gone, a subsequent scan sets both gauges back to 0 (counters could not, which
+// was the G5 gap).
+func TestCDScan_GaugesSelfClearOnRecovery(t *testing.T) {
+	proj := seedDeployScene(t, "cdscanclear", "tatara-operator")
+	task := seedDeployingTask(t, "dep-cdscanclear", proj.Name, "dep-comp-cdscanclear", "szymonrychu/tatara-operator#7",
+		time.Now().Add(-2000*time.Second), "v1.0.0")
+	cur := getTask(t, task.Name)
+	cur.Status.ImplementGiveUps = maxImplGiveUps
+	require.NoError(t, k8sClient.Status().Update(context.Background(), cur))
+
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: m}
+	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
+	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
+
+	// Cascade recovered: the task is no longer Deploying. Re-scan clears the gauge.
+	recovered := getTask(t, task.Name)
+	recovered.Status.Phase = ""
+	recovered.Status.LifecycleState = "Done"
+	require.NoError(t, k8sClient.Status().Update(context.Background(), recovered))
+	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
+	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
 }
