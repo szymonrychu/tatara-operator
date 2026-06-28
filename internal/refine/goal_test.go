@@ -38,3 +38,16 @@ func TestGoalProject_GroomsExistingBacklogOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestGoalProject_GaveUpCategory(t *testing.T) {
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+
+	for _, want := range []string{
+		"gave up", "implementGiveUps", "Parked",
+		"close", "refined scope", "escalate", "never act on a live",
+	} {
+		if !strings.Contains(g, want) {
+			t.Fatalf("goal missing gave-up guidance %q", want)
+		}
+	}
+}
