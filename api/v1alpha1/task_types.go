@@ -30,6 +30,15 @@ type ProposedIssueSpec struct {
 	// agent; createProposal then adds the incident label to the tracker issue.
 	// +optional
 	Incident bool `json:"incident,omitempty"`
+	// AlertGroup is the per-alert-group dedup identity of the incident that filed
+	// this proposal: the tatara.dev/alert-group hash label of the in-flight
+	// incident Task, falling back to its descriptive AlertRule name. createProposal
+	// stamps tatara/alert-group-<hash> on the created incident issue and dedups
+	// future incident proposals by it, so a recurring alert tracks onto its
+	// existing open issue instead of spawning a near-duplicate. Empty for
+	// non-incident proposals.
+	// +optional
+	AlertGroup string `json:"alertGroup,omitempty"`
 }
 
 // Suggestion is one inline code suggestion on a PR/MR.
