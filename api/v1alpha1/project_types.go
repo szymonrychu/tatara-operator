@@ -286,6 +286,12 @@ type ScmCron struct {
 	MRScan CronActivity `json:"mrScan,omitempty"`
 	// +optional
 	IssueScan CronActivity `json:"issueScan,omitempty"`
+	// CDScan is the push-CD deploy-supervision backstop cron: it sweeps Deploying
+	// Tasks whose cascade has stalled past 1.5x the deploy budget with no live
+	// watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
+	// Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+	// +optional
+	CDScan CronActivity `json:"cdScan,omitempty"`
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
 	// +optional
@@ -626,6 +632,9 @@ type ProjectStatus struct {
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
 	// +optional
 	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
+	// LastCDScan is the last time the push-CD deploy-supervision backstop ran.
+	// +optional
+	LastCDScan *metav1.Time `json:"lastCDScan,omitempty"`
 	// LastRefine is the last time the project's refine pre-step completed.
 	// +optional
 	LastRefine *metav1.Time `json:"lastRefine,omitempty"`

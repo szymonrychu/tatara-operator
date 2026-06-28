@@ -451,6 +451,12 @@ spec:
               lifecycleIterations:
                 type: integer
               lifecycleState:
+                description: |-
+                  Deploying is the pod-less post-merge deploy-supervision lifecycle state: the
+                  issueLifecycle Task's PR auto-merged + main CI (incl. the release tag-cut +
+                  propagation) went green, and the operator now drives the push-CD cascade to a
+                  tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
+                  occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
                 enum:
                 - Triage
                 - Conversation
@@ -458,6 +464,7 @@ spec:
                 - MRCI
                 - Merge
                 - MainCI
+                - Deploying
                 - Done
                 - Stopped
                 - Parked

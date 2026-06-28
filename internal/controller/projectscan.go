@@ -133,6 +133,8 @@ func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (str
 		return c.MRScan.Schedule, proj.Status.LastMRScan
 	case "issueScan":
 		return c.IssueScan.Schedule, proj.Status.LastIssueScan
+	case "cdScan":
+		return c.CDScan.Schedule, proj.Status.LastCDScan
 	case "brainstorm":
 		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
 	case "healthCheck":
@@ -1033,6 +1035,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "issueScan":
 			fresh.Status.LastIssueScan = &now
 			proj.Status.LastIssueScan = &now
+		case "cdScan":
+			fresh.Status.LastCDScan = &now
+			proj.Status.LastCDScan = &now
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
@@ -2826,6 +2831,29 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	} else if cronSpec.IssueScan.Schedule != "" {
 		l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
 			"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "issueScan")
+	}
+
+	// cdScan: push-CD deploy-supervision backstop (project-scoped, like brainstorm).
+	// Sweeps Deploying Tasks stalled past 1.5x the deploy budget and rerolls them.
+	if cronSpec.CDScan.Schedule != "" {
+		if _, due, next, ok := r.activityDue(proj, "cdScan"); ok {
+			if due {
+				r.cdScan(ctx, proj, existing)
+				if serr := r.stampScan(ctx, proj, "cdScan"); serr != nil {
+					l.Error(serr, "scan: persist cdScan stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "cdScan")
+					r.Metrics.ScanItem("cdScan", "stamp_error")
+				}
+				if next2, ok2 := activityNextFire(cronSpec.CDScan.Schedule, now); ok2 {
+					consider(next2)
+				}
+			} else {
+				consider(next)
+			}
+		} else {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.CDScan.Schedule), "scan: invalid cdScan cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "cdScan")
+		}
 	}
 
 	// brainstorm (opt-in), gated by the refine pre-scan barrier: a due

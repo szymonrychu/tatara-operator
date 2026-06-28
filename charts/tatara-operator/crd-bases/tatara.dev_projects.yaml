@@ -5605,6 +5605,25 @@ spec:
                               "unset" is never indistinguishable from an active value.
                             type: integer
                         type: object
+                      cdScan:
+                        description: |-
+                          CDScan is the push-CD deploy-supervision backstop cron: it sweeps Deploying
+                          Tasks whose cascade has stalled past 1.5x the deploy budget with no live
+                          watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
+                          Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+                        properties:
+                          maxPerRepo:
+                            default: 1
+                            description: MaxPerRepo caps the number of in-progress
+                              Tasks per repo (one lane per repo).
+                            minimum: 1
+                            type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables this activity.
+                            pattern: ^$|^(\S+\s+){4}\S+$
+                            type: string
+                        type: object
                       healthCheck:
                         description: |-
                           HealthCheckActivity schedules the opt-in periodic project-health-check scan:
@@ -5902,6 +5921,11 @@ spec:
                     type: string
                 type: object
               lastBrainstorm:
+                format: date-time
+                type: string
+              lastCDScan:
+                description: LastCDScan is the last time the push-CD deploy-supervision
+                  backstop ran.
                 format: date-time
                 type: string
               lastHealthCheck:

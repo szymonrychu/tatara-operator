@@ -65,6 +65,9 @@ type OperatorMetrics struct {
 	reviewOutcomeTotal        *prometheus.CounterVec
 	reviewFindingsTotal       *prometheus.CounterVec
 	implementCITotal          *prometheus.CounterVec
+	cdCascadeFailedTotal      *prometheus.CounterVec
+	cdCascadeStalledTotal     prometheus.Counter
+	cdResolvedTotal           prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -359,6 +362,21 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_implement_ci_total",
 			Help: "PR CI conclusions (pass|fail) for any PR-producing Task kind reaching handleMRCI, by kind and model.",
 		}, []string{"project", "repo", "kind", "model", "result"}),
+		// push-CD deploy-supervision: a cascade stage failed (red apply, failed
+		// build, unmergeable bump) and the Task was rerolled to fix it; reason names
+		// the failing stage. Drives the tatara-observability cascade-failed alert.
+		cdCascadeFailedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tatara_cd_cascade_failed",
+			Help: "push-CD deploy cascades that failed a stage and were rerolled, by reason (apply_failed|deploy_timeout|build_failed).",
+		}, []string{"reason"}),
+		cdCascadeStalledTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tatara_cd_cascade_stalled",
+			Help: "push-CD deploy cascades the cdScan backstop found stalled past 1.5x the deploy budget and rerolled.",
+		}),
+		cdResolvedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tatara_cd_resolved_total",
+			Help: "push-CD Deploying Tasks resolved Done after a confirmed tatara-helmfile apply.",
+		}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -420,6 +438,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.reviewOutcomeTotal,
 		m.reviewFindingsTotal,
 		m.implementCITotal,
+		m.cdCascadeFailedTotal,
+		m.cdCascadeStalledTotal,
+		m.cdResolvedTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -573,6 +594,30 @@ func (m *OperatorMetrics) AgentUnreachableTermination() {
 // ScanItem increments tatara_scan_items_total for an activity + outcome.
 func (m *OperatorMetrics) ScanItem(activity, outcome string) {
 	m.scanItemsTotal.WithLabelValues(activity, outcome).Inc()
+}
+
+// CDCascadeFailed increments tatara_cd_cascade_failed for a failing stage reason.
+func (m *OperatorMetrics) CDCascadeFailed(reason string) {
+	if m == nil {
+		return
+	}
+	m.cdCascadeFailedTotal.WithLabelValues(reason).Inc()
+}
+
+// CDCascadeStalled increments tatara_cd_cascade_stalled (cdScan backstop reroll).
+func (m *OperatorMetrics) CDCascadeStalled() {
+	if m == nil {
+		return
+	}
+	m.cdCascadeStalledTotal.Inc()
+}
+
+// CDResolved increments tatara_cd_resolved_total (Deploying Task reached applied).
+func (m *OperatorMetrics) CDResolved() {
+	if m == nil {
+		return
+	}
+	m.cdResolvedTotal.Inc()
 }
 
 // ScanTaskCreated increments tatara_scan_tasks_created_total for an activity + kind.

@@ -56,7 +56,12 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 			continue
 		}
 		t := taskByName(tasks, q.Status.TaskRef)
-		if t != nil && !tatarav1alpha1.TaskTerminal(t) {
+		// Exclude Deploying Tasks (pod-less push-CD deploy-supervision): they are
+		// non-terminal but run no agent pod, so counting them against the pool
+		// re-creates the lane-starvation trap
+		// (operator-laneoccupancy-starves-recovery-2026-06-15). They re-acquire a
+		// lane only when rerolled to fix a cascade failure (back to a podful state).
+		if t != nil && !tatarav1alpha1.TaskTerminal(t) && !tatarav1alpha1.TaskDeploying(t) {
 			n++
 		}
 	}
@@ -67,7 +72,7 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 		if _, queued := t.Labels[queue.LabelQueuedEvent]; queued {
 			continue
 		}
-		if tatarav1alpha1.TaskTerminal(t) {
+		if tatarav1alpha1.TaskTerminal(t) || tatarav1alpha1.TaskDeploying(t) {
 			continue
 		}
 		taskClass := tatarav1alpha1.QueueClassNormal

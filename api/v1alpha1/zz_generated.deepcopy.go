@@ -444,6 +444,10 @@ func (in *ProjectStatus) DeepCopyInto(out *ProjectStatus) {
 		in, out := &in.LastHealthCheck, &out.LastHealthCheck
 		*out = (*in).DeepCopy()
 	}
+	if in.LastCDScan != nil {
+		in, out := &in.LastCDScan, &out.LastCDScan
+		*out = (*in).DeepCopy()
+	}
 	if in.LastRefine != nil {
 		in, out := &in.LastRefine, &out.LastRefine
 		*out = (*in).DeepCopy()
@@ -804,6 +808,7 @@ func (in *ScmCron) DeepCopyInto(out *ScmCron) {
 	*out = *in
 	out.MRScan = in.MRScan
 	out.IssueScan = in.IssueScan
+	out.CDScan = in.CDScan
 	in.Brainstorm.DeepCopyInto(&out.Brainstorm)
 	in.HealthCheck.DeepCopyInto(&out.HealthCheck)
 	out.Refine = in.Refine

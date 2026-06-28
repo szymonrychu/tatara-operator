@@ -249,6 +249,12 @@ const (
 	// (operator-laneoccupancy-starves-recovery-2026-06-15). It re-acquires a lane
 	// only to spawn a fix agent.
 	PhaseDeploying = "Deploying"
+	// LifecycleStateDeploying is the issueLifecycle counterpart of PhaseDeploying:
+	// the durable per-issue Task carries it in Status.LifecycleState while the
+	// operator drives the post-merge deploy cascade. It is set together with
+	// Status.Phase=PhaseDeploying. It is NOT a terminal lifecycle state (TaskTerminal
+	// stays false) so conversation-GC / reaper / lane logic treat it as live.
+	LifecycleStateDeploying = "Deploying"
 )
 
 // TaskTerminal reports whether t has reached a terminal state, accounting for
@@ -332,7 +338,12 @@ type TaskStatus struct {
 
 	// Lifecycle fields (issueLifecycle kind only; empty on all other kinds).
 
-	// +kubebuilder:validation:Enum=Triage;Conversation;Implement;MRCI;Merge;MainCI;Done;Stopped;Parked
+	// Deploying is the pod-less post-merge deploy-supervision lifecycle state: the
+	// issueLifecycle Task's PR auto-merged + main CI (incl. the release tag-cut +
+	// propagation) went green, and the operator now drives the push-CD cascade to a
+	// tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
+	// occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
+	// +kubebuilder:validation:Enum=Triage;Conversation;Implement;MRCI;Merge;MainCI;Deploying;Done;Stopped;Parked
 	// +optional
 	LifecycleState string `json:"lifecycleState,omitempty"`
 	// +optional
