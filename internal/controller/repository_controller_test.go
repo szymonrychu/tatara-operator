@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -103,6 +104,56 @@ func waitRepoJob(t *testing.T, repoName string) string {
 	}
 	t.Fatalf("repo %s never set status.jobName", repoName)
 	return ""
+}
+
+func TestPublishIngestHealth(t *testing.T) {
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r := &RepositoryReconciler{Metrics: m}
+
+	mkRepoObj := func(name, phase string, failCount int, enabled bool, last *metav1.Time) *tataradevv1alpha1.Repository {
+		rp := &tataradevv1alpha1.Repository{}
+		rp.Name = name
+		rp.Spec.IngestEnabled = boolPtrRC(enabled)
+		rp.Status.Phase = phase
+		rp.Status.IngestFailureCount = failCount
+		rp.Status.LastIngestTime = last
+		return rp
+	}
+
+	// Failed phase -> failing 1.
+	r.publishIngestHealth(mkRepoObj("r-failed", "Failed", 0, true, nil))
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-failed")); got != 1 {
+		t.Errorf("failed phase: failing = %v, want 1", got)
+	}
+	// Mid-retry (Ingesting but unresolved consecutive failures) -> failing 1.
+	r.publishIngestHealth(mkRepoObj("r-retry", "Ingesting", 2, true, nil))
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-retry")); got != 1 {
+		t.Errorf("retrying: failing = %v, want 1", got)
+	}
+	// Healthy (Ingested, no failures) -> failing 0 and timestamp published.
+	ts := metav1.Unix(1750000000, 0)
+	r.publishIngestHealth(mkRepoObj("r-ok", "Ingested", 0, true, &ts))
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-ok")); got != 0 {
+		t.Errorf("healthy: failing = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(m.RepositoryLastIngestTimestampGauge("r-ok")); got != 1750000000 {
+		t.Errorf("healthy: last_ingest_ts = %v, want 1750000000", got)
+	}
+	// Recovery on the SAME repo: the gauge must clear, not stay latched - this is
+	// the whole point of the current-state signal vs the monotonic counter (#138).
+	r.publishIngestHealth(mkRepoObj("r-heal", "Failed", 3, true, nil))
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-heal")); got != 1 {
+		t.Fatalf("pre-recovery: failing = %v, want 1", got)
+	}
+	r.publishIngestHealth(mkRepoObj("r-heal", "Ingested", 0, true, &ts))
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-heal")); got != 0 {
+		t.Errorf("post-recovery: failing = %v, want 0 (must clear)", got)
+	}
+	// A disabled repo never reports failing even if its status looks failed.
+	r.publishIngestHealth(mkRepoObj("r-disabled", "Failed", 5, false, nil))
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-disabled")); got != 0 {
+		t.Errorf("disabled: failing = %v, want 0", got)
+	}
 }
 
 func TestRepoReconcile_FullIngestLaunchesJob(t *testing.T) {
