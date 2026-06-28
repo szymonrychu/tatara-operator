@@ -1340,6 +1340,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
 			continue
 		}
+		if r.reapEligible(proj, scm.IssueRef{Repo: c.repo, Number: c.number, Author: c.author, Labels: c.labels, UpdatedAt: c.updatedAt, IsPR: c.isPR}, existing) {
+			r.Metrics.ScanItem("issueScan", "skipped_stale_reapable")
+			l.Info("issueScan: skipped fresh task creation, proposal stale+unengaged (reaper will close)",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			continue
+		}
 		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
 		var sg *tatarav1alpha1.SystemicGroup
 		if d, ok := systemicLeads[key]; ok && d.isLead && len(d.sameRepoSiblings) > 0 {
@@ -2163,11 +2170,53 @@ func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number 
 // discussed). A successful close swaps the brainstorming label for declined
 // (the close-arm "exactly one managed label" contract) and records
 // IssueOutcome("stale-close") AFTER CloseIssue succeeds (idempotent on retry).
+// staleProposalWindow returns the reaper staleness window and whether the
+// stale-proposal reaper is enabled for this project (opt-in: StaleProposalDays>0).
+func staleProposalWindow(proj *tatarav1alpha1.Project) (time.Duration, bool) {
+	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
+		return 0, false
+	}
+	d := proj.Spec.Scm.Cron.Brainstorm.StaleProposalDays
+	if d <= 0 {
+		return 0, false
+	}
+	return time.Duration(d) * 24 * time.Hour, true
+}
+
+// reapEligible reports whether the issue is a stale, unengaged proposal the
+// reaper will close, so issueScan/recoverOrphans must NOT create a fresh
+// lifecycle task for it: such a task would race the same-cycle reaper, leaving
+// it to close an issue that owns a live task. Cheap label/time-only check; no
+// SCM call (the reaper does the authoritative human-comment check before close).
+func (r *ProjectReconciler) reapEligible(proj *tatarav1alpha1.Project, iss scm.IssueRef, existing []tatarav1alpha1.Task) bool {
+	window, on := staleProposalWindow(proj)
+	if !on {
+		return false
+	}
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	brs, app, impl, dec := lifecycleLabels(proj.Spec.Scm)
+	return isStaleUnengagedProposal(iss, existing, brs, app, impl, dec, botLogin, window)
+}
+
 func (r *ProjectReconciler) reapStaleProposals(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issueCache map[string][]scm.IssueRef, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
 	if act.StaleProposalDays <= 0 {
 		return
 	}
 	l := log.FromContext(ctx)
+	// Re-list tasks so a lifecycle Task created earlier this cycle (issueScan or
+	// recoverOrphans) is visible to the live-task gate in isStaleUnengagedProposal.
+	// Those paths now skip reap-eligible issues, but re-listing keeps the close
+	// invariant - never close an issue that owns a live Task - robust against any
+	// other path that may create one. Fail-safe: keep the passed snapshot on error.
+	if fresh, ferr := r.existingScanTasks(ctx, proj); ferr == nil {
+		existing = fresh
+	} else {
+		l.Error(ferr, "reap: re-list tasks failed; using passed snapshot",
+			"action", "scan_stale_proposal_close", "resource_id", proj.Name)
+	}
 	window := time.Duration(act.StaleProposalDays) * 24 * time.Hour
 	brainstorming, approved, implementation, declined := lifecycleLabels(proj.Spec.Scm)
 	botLogin := ""
@@ -2280,6 +2329,11 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 				continue
 			}
 			if hasLiveLifecycleTaskForIssue(existing, slug, iss.Number) {
+				continue
+			}
+			if r.reapEligible(proj, iss, existing) {
+				// Stale, unengaged proposal the reaper will close this cycle; do
+				// not recover it (a fresh task would race the reaper's close).
 				continue
 			}
 			repo, ok := r.matchRepoForSlug(repos, slug)
