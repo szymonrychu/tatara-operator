@@ -103,5 +103,8 @@ func TestMemoryService(t *testing.T) {
 	require.Equal(t, "mem-acme", svc.Name)
 	require.Equal(t, int32(8080), svc.Spec.Ports[0].Port)
 	require.Equal(t, "mem-acme", svc.Spec.Selector["app.kubernetes.io/instance"])
+	// The component metadata label lets the ServiceMonitor target only this
+	// Service (neo4j/lightrag share the pin-set labels and a "http" port).
+	require.Equal(t, "memory", svc.Labels["app.kubernetes.io/component"])
 	require.Len(t, svc.OwnerReferences, 1)
 }

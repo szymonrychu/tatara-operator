@@ -43,6 +43,8 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		MemoryPathPrefix:     cfg.MemoryPathPrefix,
 		ChatPathPrefix:       cfg.ChatPathPrefix,
 		ChatImage:            cfg.ChatImage,
+		MonitorEnabled:       cfg.MemoryMonitoringEnabled,
+		MonitorLabels:        cfg.MemoryMonitorLabels,
 	}
 }
 

@@ -43,6 +43,17 @@ type Config struct {
 	MemoryPathPrefix     string
 	ChatPathPrefix       string
 	ChatImage            string
+	// MonitorEnabled gates emission of the per-Project memory-stack
+	// ServiceMonitor + PrometheusRule. Default true; set false on a cluster
+	// without the prometheus-operator CRDs so the memory reconcile does not fail
+	// applying an unknown kind.
+	MonitorEnabled bool
+	// MonitorLabels are extra labels stamped onto the memory-stack ServiceMonitor
+	// and PrometheusRule so the cluster Prometheus serviceMonitorSelector /
+	// ruleSelector discovers them (e.g. release: prometheus). Empty by default so
+	// the chart stays cluster-agnostic (rule 14); the deploying helmfile sets the
+	// label the cluster actually matches on.
+	MonitorLabels map[string]string
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.
@@ -111,6 +122,19 @@ func objectMeta(p *tatarav1alpha1.Project, cfg Config, name string) metav1.Objec
 		Labels:          labels(p.Name),
 		OwnerReferences: []metav1.OwnerReference{ownerRef(p)},
 	}
+}
+
+// monitorObjectMeta is objectMeta plus the cluster-selector labels stamped on
+// the monitoring objects (ServiceMonitor / PrometheusRule) so the cluster
+// Prometheus serviceMonitorSelector / ruleSelector match them. The extra labels
+// are merged on top of the shared pin-set labels. objectMeta returns a fresh
+// label map per call, so mutating it here is safe.
+func monitorObjectMeta(p *tatarav1alpha1.Project, cfg Config, name string) metav1.ObjectMeta {
+	m := objectMeta(p, cfg, name)
+	for k, v := range cfg.MonitorLabels {
+		m.Labels[k] = v
+	}
+	return m
 }
 
 // imagePullSecrets returns a one-element slice when cfg.ImagePullSecret is set,

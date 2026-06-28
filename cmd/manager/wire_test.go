@@ -191,14 +191,16 @@ func TestCallbackRunnableNeedLeaderElection(t *testing.T) {
 
 func TestMemoryConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
-		Namespace:        "tatara",
-		MemoryImage:      "harbor.example/tatara-memory:0.2.0",
-		LightragImage:    "harbor.example/lightrag:1.0.0",
-		Neo4jImage:       "neo4j:2026.04.0",
-		OpenAISecretName: "openai-shared",
-		OIDCIssuer:       "https://keycloak.example/realms/tatara",
-		OIDCAudience:     "tatara",
-		ImagePullSecret:  "regcred",
+		Namespace:               "tatara",
+		MemoryImage:             "harbor.example/tatara-memory:0.2.0",
+		LightragImage:           "harbor.example/lightrag:1.0.0",
+		Neo4jImage:              "neo4j:2026.04.0",
+		OpenAISecretName:        "openai-shared",
+		OIDCIssuer:              "https://keycloak.example/realms/tatara",
+		OIDCAudience:            "tatara",
+		ImagePullSecret:         "regcred",
+		MemoryMonitoringEnabled: true,
+		MemoryMonitorLabels:     map[string]string{"release": "prometheus"},
 	}
 	mc := memoryConfigFromConfig(cfg)
 	if mc.Namespace != "tatara" || mc.MemoryImage != cfg.MemoryImage ||
@@ -211,5 +213,11 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 	}
 	if mc.ImagePullSecret != "regcred" {
 		t.Fatalf("ImagePullSecret = %q, want regcred", mc.ImagePullSecret)
+	}
+	if !mc.MonitorEnabled {
+		t.Fatalf("MonitorEnabled = false, want true (mapped from MemoryMonitoringEnabled)")
+	}
+	if mc.MonitorLabels["release"] != "prometheus" {
+		t.Fatalf("MonitorLabels = %v, want release=prometheus", mc.MonitorLabels)
 	}
 }

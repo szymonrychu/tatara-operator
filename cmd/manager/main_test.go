@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -97,4 +98,22 @@ func TestNewScheme_RegistersCNPGCluster(t *testing.T) {
 	if _, ok := obj.(*cnpgv1.Cluster); !ok {
 		t.Fatalf("scheme returned %T, want *cnpgv1.Cluster", obj)
 	}
+}
+
+// The per-Project memory ServiceMonitor + PrometheusRule are server-side-applied
+// as typed objects, so their GVK must be registered or the apply fails at
+// runtime (issue #200).
+func TestNewScheme_RegistersMonitoringKinds(t *testing.T) {
+	s := newScheme()
+	for _, kind := range []string{"ServiceMonitor", "PrometheusRule"} {
+		gvk := schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: kind}
+		if !s.Recognizes(gvk) {
+			t.Fatalf("scheme does not recognize %v", gvk)
+		}
+	}
+	if _, err := s.New(schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor"}); err != nil {
+		t.Fatalf("scheme.New(ServiceMonitor): %v", err)
+	}
+	// Reference the imported package so the typed dependency is exercised.
+	var _ monitoringv1.ServiceMonitor
 }

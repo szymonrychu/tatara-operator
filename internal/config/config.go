@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -25,18 +26,27 @@ import (
 // M6 MUST set this to the operator's callback Service DNS and expose
 // INTERNAL_ADDR on that Service.
 type Config struct {
-	HTTPAddr                 string
-	MetricsAddr              string
-	HealthAddr               string
-	InternalAddr             string
-	CallbackURL              string
-	OIDCIssuer               string
-	OIDCAudience             string
-	OperatorURL              string
-	MemoryImage              string
-	LightragImage            string
-	GrafanaMCPImage          string
-	Neo4jImage               string
+	HTTPAddr        string
+	MetricsAddr     string
+	HealthAddr      string
+	InternalAddr    string
+	CallbackURL     string
+	OIDCIssuer      string
+	OIDCAudience    string
+	OperatorURL     string
+	MemoryImage     string
+	LightragImage   string
+	GrafanaMCPImage string
+	Neo4jImage      string
+	// MemoryMonitoringEnabled (MEMORY_MONITORING_ENABLED, default true) gates the
+	// ServiceMonitor + PrometheusRule the operator emits per provisioned memory
+	// stack. Set false on a cluster without the prometheus-operator CRDs.
+	MemoryMonitoringEnabled bool
+	// MemoryMonitorLabels (MEMORY_MONITOR_LABELS, JSON object, default empty) are
+	// extra labels stamped on that ServiceMonitor + PrometheusRule so the cluster
+	// Prometheus serviceMonitorSelector / ruleSelector match them. Empty keeps the
+	// chart cluster-agnostic (rule 14); the deploying helmfile sets the label.
+	MemoryMonitorLabels      map[string]string
 	OpenAISecretName         string
 	SemanticModel            string
 	IngesterImage            string
@@ -250,6 +260,22 @@ func getBoolDefault(key string, def bool) (bool, error) {
 	return b, nil
 }
 
+// getJSONStringMap parses key as a JSON object of string->string, returning nil
+// when unset or "{}" and an error when present but not a valid JSON object (so a
+// malformed label map fails startup loudly rather than silently dropping the
+// cluster's ruleSelector label).
+func getJSONStringMap(key string) (map[string]string, error) {
+	v := os.Getenv(key)
+	if v == "" || v == "{}" {
+		return nil, nil
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal([]byte(v), &m); err != nil {
+		return nil, fmt.Errorf("config: %s=%q is not a valid JSON object: %w", key, v, err)
+	}
+	return m, nil
+}
+
 // getInt64Ptr parses key into a *int64, returning nil when unset and an error
 // when present but not a valid integer (so a typo fails startup loudly).
 func getInt64Ptr(key string) (*int64, error) {
@@ -297,6 +323,14 @@ func getInt64Default(key string, def int64) (int64, error) {
 // audience are required.
 func Load() (Config, error) {
 	leaderElection, err := getBoolDefault("LEADER_ELECTION", true)
+	if err != nil {
+		return Config{}, err
+	}
+	memoryMonitoringEnabled, err := getBoolDefault("MEMORY_MONITORING_ENABLED", true)
+	if err != nil {
+		return Config{}, err
+	}
+	memoryMonitorLabels, err := getJSONStringMap("MEMORY_MONITOR_LABELS")
 	if err != nil {
 		return Config{}, err
 	}
@@ -400,6 +434,8 @@ func Load() (Config, error) {
 		ChatPathPrefix:             getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
 		ChatImage:                  os.Getenv("CHAT_IMAGE"),
 		LeaderElection:             leaderElection,
+		MemoryMonitoringEnabled:    memoryMonitoringEnabled,
+		MemoryMonitorLabels:        memoryMonitorLabels,
 		PushMetricsTTL:             pushMetricsTTL,
 		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
 		TaskRetention:              taskRetention,

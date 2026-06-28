@@ -93,12 +93,18 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 	}
 }
 
-// MemoryService exposes tatara-memory on 8080 (ClusterIP).
+// MemoryService exposes tatara-memory on 8080 (ClusterIP). It carries the
+// app.kubernetes.io/component=memory metadata label so the per-Project
+// ServiceMonitor can target only this Service: neo4j and lightrag share the
+// pin-set labels and also expose a port named "http", so without the component
+// label a ServiceMonitor would also scrape their non-metrics ports.
 func MemoryService(p *tatarav1alpha1.Project, cfg Config) *corev1.Service {
 	n := NamesFor(p.Name)
+	meta := objectMeta(p, cfg, n.Memory)
+	meta.Labels["app.kubernetes.io/component"] = "memory"
 	return &corev1.Service{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
-		ObjectMeta: objectMeta(p, cfg, n.Memory),
+		ObjectMeta: meta,
 		Spec: corev1.ServiceSpec{
 			Type:     corev1.ServiceTypeClusterIP,
 			Selector: selectorLabels(p.Name, "memory"),
