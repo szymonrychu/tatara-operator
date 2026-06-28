@@ -1,0 +1,150 @@
+name: release
+
+# Semver push-CD release pipeline (design:
+# docs/superpowers/specs/2026-06-28-semver-push-cd-design.md, section 7).
+# On push to main: cut the next semver tag from the merged PR's `semver:*`
+# label, publish the image (:vX.Y.Z and :SHORT_SHA) and BOTH charts (bare
+# X.Y.Z), then propagate the new version into the tatara-helmfile pins via a
+# bot PR. The bump is gated on BOTH charts publishing so the partial-publish
+# wedge (operator-ci-partial-chart-publish-2026-06-25) cannot ship a half
+# release into the helmfile. ci.yml still runs the required PR/push checks
+# (lint/test/build) and the SHORT_SHA traceability image in parallel; this
+# workflow owns only the semver tag/publish/propagate.
+
+on:
+  push:
+    branches: [main]
+
+# Serialize operator releases so concurrent merges to main do not race the tag
+# cut or clobber each other's cd/deploy-train commit (mirrors apply.yaml).
+concurrency:
+  group: cd-release-tatara-operator
+  cancel-in-progress: false
+
+env:
+  BUILDKIT_VERSION: '0.18.2'
+
+jobs:
+  tag:
+    runs-on: tatara-operator
+    outputs:
+      version: ${{ steps.cut.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: cut next semver tag from merged PR label
+        id: cut
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: tag
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+
+  publish:
+    needs: [tag]
+    runs-on: tatara-operator
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v2
+        with:
+          cache: true
+      - name: install buildctl
+        run: |
+          curl -sSfL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local bin/buildctl
+      - name: build and push image at semver
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          REPO: ${{ github.event.repository.name }}
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          # Build at the computed semver and push BOTH the :vX.Y.Z tag (what the
+          # helmfile pin moves to) and the :SHORT_SHA tag (rollback/debug
+          # traceability) - the DUAL scheme from the design. Same rootless
+          # buildkitd / harbor-auth pattern as ci-shared.yml's image job.
+          set -euo pipefail
+          BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          DEST="harbor.szymonrichert.pl/containers/${REPO}"
+
+          : "${VERSION:?cd-release tag did not emit a version}"
+          : "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
+          : "${HARBOR_USERNAME:?HARBOR_USERNAME required}"
+          : "${HARBOR_PASSWORD:?HARBOR_PASSWORD required}"
+
+          DOCKER_CONFIG="$(mktemp -d)"
+          export DOCKER_CONFIG
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          auth="$(printf '%s:%s' "$HARBOR_USERNAME" "$HARBOR_PASSWORD" | base64 -w0)"
+          cat >"${DOCKER_CONFIG}/config.json" <<EOF
+          {"auths":{"harbor.szymonrichert.pl":{"auth":"${auth}"}}}
+          EOF
+
+          buildctl --addr "$BUILDKITD_ADDR" build \
+            --frontend dockerfile.v0 \
+            --opt context="https://github.com/szymonrychu/${REPO}.git#${GITHUB_SHA}" \
+            --opt filename=Dockerfile \
+            --opt build-arg:VERSION="${VERSION}" \
+            --opt build-arg:COMMIT="${SHORT_SHA}" \
+            --opt build-arg:DATE="${BUILD_DATE}" \
+            --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
+            --output "type=image,\"name=${DEST}:${VERSION},${DEST}:${SHORT_SHA}\",push=true"
+
+          echo "buildkit: pushed ${DEST}:${VERSION} and ${DEST}:${SHORT_SHA}"
+      - name: package and push BOTH charts at semver
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          VERSION: ${{ needs.tag.outputs.version }}
+        run: |
+          # Charts publish at the bare semver X.Y.Z (drops the legacy 0.0.0-g
+          # scheme). app-version carries the v-prefixed image version. After
+          # pushing, pull both back to PROVE the partial-publish wedge did not
+          # leave one chart missing before the bump step can run.
+          set -euo pipefail
+          : "${VERSION:?missing version}"
+          CHART_VERSION="${VERSION#v}"
+          helm registry login harbor.szymonrichert.pl -u "$HARBOR_USERNAME" -p "$HARBOR_PASSWORD"
+          for dir in charts/*/; do
+            NAME="$(basename "$dir")"
+            helm package "$dir" --version "${CHART_VERSION}" --app-version "${VERSION}"
+            helm push "${NAME}-${CHART_VERSION}.tgz" oci://harbor.szymonrichert.pl/charts
+          done
+          verify="$(mktemp -d)"
+          trap 'rm -rf "$verify"' EXIT
+          for NAME in tatara-operator tatara-project; do
+            helm pull "oci://harbor.szymonrichert.pl/charts/${NAME}" \
+              --version "${CHART_VERSION}" -d "$verify"
+          done
+          echo "charts: published and verified tatara-operator + tatara-project @ ${CHART_VERSION}"
+
+  bump:
+    needs: [tag, publish]
+    runs-on: tatara-operator
+    steps:
+      - uses: actions/checkout@v4
+      - name: propagate version into tatara-helmfile pins
+        uses: szymonrychu/tatara-helmfile/.github/actions/cd-release@main
+        with:
+          mode: bump
+          token: ${{ secrets.TATARA_CD_TOKEN }}
+          parent_repo: szymonrychu/tatara-helmfile
+          new_value: ${{ needs.tag.outputs.version }}
+          pr_label: semver:patch
+          # All 4 pins rewritten atomically in ONE deploy-train commit. The 3
+          # chart-version pins (the tatara-operator release plus both
+          # tatara-project releases project-tatara/project-infrastructure) take
+          # the bare X.Y.Z; the image tag takes vX.Y.Z. Match by release NAME,
+          # never a global replace, or tatara-chat's pin is clobbered.
+          pins: |
+            [
+              {"file":"helmfile.yaml.gotmpl","pattern":"(- name: tatara-operator\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
+              {"file":"helmfile.yaml.gotmpl","pattern":"(- name: project-tatara\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
+              {"file":"helmfile.yaml.gotmpl","pattern":"(- name: project-infrastructure\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
+              {"file":"values/tatara-operator/common.yaml","pattern":"^(\\s*tag: )\".*\"$","value_template":"\\1\"{{image_version}}\""}
+            ]
