@@ -203,6 +203,9 @@ func podNameSuffix(task *tatarav1alpha1.Task) string {
 		}
 		return "incident"
 	}
+	if task.Spec.Kind == "refine" {
+		return "refine"
+	}
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
 			return fmt.Sprintf("mr-%d", s.Number)
