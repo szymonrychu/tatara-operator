@@ -6,6 +6,15 @@ import (
 	"strings"
 )
 
+// toolingNoteGuidance is the same literal used in the controller package's
+// turnloop.go. Duplicated here to avoid an import cycle. Keep byte-identical.
+const toolingNoteGuidance = "\n\n## Tooling you needed\n" +
+	"If you used mise to install a CLI tool, runtime, or linter that was NOT already in the " +
+	"target repo's .mise.toml to do this analysis, add a '## Tooling' section to the issue you " +
+	"propose listing each tool (name@version + one-line why), so the implementation agent adds it " +
+	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
+	"you are proposing."
+
 // GoalProject returns a goal instructing a refine agent to groom the existing
 // issue backlog across the listed repos within the lookback window.
 //
@@ -69,5 +78,5 @@ For every OPEN issue you examine, decide ONE action:
 ## Termination
 
 When you have examined every OPEN issue returned by list_issues and taken an action or explicitly skipped (with a reason), you are done. Do not call submit_turn or exit_plan_mode; your work is complete when the issue list is exhausted.
-`, repoList, lookbackDays, lookbackDays, lookbackDays, repoList)
+`, repoList, lookbackDays, lookbackDays, lookbackDays, repoList) + toolingNoteGuidance
 }

@@ -39,6 +39,16 @@ func TestGoalProject_GroomsExistingBacklogOnly(t *testing.T) {
 	}
 }
 
+func TestGoalProject_ContainsToolingNoteGuidance(t *testing.T) {
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+	if !strings.Contains(g, "## Tooling you needed") {
+		t.Fatal("refine goal must contain tooling-note guidance so proposer folds mise tools into the issue")
+	}
+	if !strings.Contains(g, ".mise.toml") {
+		t.Fatal("refine goal tooling-note guidance must mention .mise.toml")
+	}
+}
+
 func TestGoalProject_GaveUpCategory(t *testing.T) {
 	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
 

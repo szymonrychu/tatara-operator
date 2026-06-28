@@ -1701,7 +1701,7 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string)
 		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY emit one " +
 		"propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` string you generate. " +
 		"State which path and scope you chose before executing."
-	return appendGuidance(goal+platformProblemGuidance, guidance)
+	return appendGuidance(goal+platformProblemGuidance+toolingNoteGuidance, guidance)
 }
 
 // healthCheckGoalProject returns the turn-0 goal for a project-level health-check
@@ -1745,7 +1745,7 @@ func healthCheckGoalProject(slugs []string, repoStateCtx string, guidance string
 		"ACTION RULE: a one-repo finding emits exactly ONE propose_issue. A genuinely systemic " +
 		"health gap MAY emit one propose_issue per affected repository (bounded: at most 6), all sharing " +
 		"a single `systemicId` string you generate. State which path and scope you chose before executing."
-	return appendGuidance(goal+platformProblemGuidance, guidance)
+	return appendGuidance(goal+platformProblemGuidance+toolingNoteGuidance, guidance)
 }
 
 // gatherRepoCIState fetches open PRs, per-PR CI (bounded to the first 20 PRs),

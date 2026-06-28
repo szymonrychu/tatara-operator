@@ -1513,6 +1513,7 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 	if task.Annotations[annPendingHandoverResume] == "true" && task.Status.Handover != "" {
 		base += "\n\n## Resume from handover\n" + task.Status.Handover
 	}
+	base += toolingConsumeGuidance
 	return base
 }
 

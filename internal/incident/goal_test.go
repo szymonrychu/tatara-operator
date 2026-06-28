@@ -31,3 +31,13 @@ func TestGoalProjectSelfReportsPlatformProblems(t *testing.T) {
 		t.Error("incident goal must NOT tell the agent to file an issue when grafana MCP is unreachable")
 	}
 }
+
+func TestGoalProjectContainsToolingNoteGuidance(t *testing.T) {
+	g := GoalProject("groupKey=abc status=firing commonLabels={alertname=HighCPU}", []string{"szymonrychu/tatara"})
+	if !strings.Contains(g, "## Tooling you needed") {
+		t.Error("incident goal must contain tooling-note guidance so proposer folds mise tools into the issue")
+	}
+	if !strings.Contains(g, ".mise.toml") {
+		t.Error("incident goal tooling-note guidance must mention .mise.toml")
+	}
+}

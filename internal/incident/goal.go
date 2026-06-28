@@ -17,6 +17,15 @@ const platformProblemGuidance = "\n\n## Platform problems\n" +
 	"propose, or comment on a tracker issue asking a human to fix the platform, and do NOT treat a " +
 	"blocked tool as a reason to file your normal output - report it and stop."
 
+// toolingNoteGuidance is the same literal used in the controller package's
+// turnloop.go. Duplicated here to avoid an import cycle. Keep byte-identical.
+const toolingNoteGuidance = "\n\n## Tooling you needed\n" +
+	"If you used mise to install a CLI tool, runtime, or linter that was NOT already in the " +
+	"target repo's .mise.toml to do this analysis, add a '## Tooling' section to the issue you " +
+	"propose listing each tool (name@version + one-line why), so the implementation agent adds it " +
+	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
+	"you are proposing."
+
 // GoalProject returns the turn-0 goal for a project-scoped incident Task fired
 // by a Grafana alert. The agent investigates live (read-only) via the Grafana
 // MCP server, then files exactly one evidence issue via propose_issue, choosing
@@ -38,5 +47,5 @@ func GoalProject(alertCtx string, slugs []string) string {
 		"do NOT open an issue.\n\n" +
 		"This is a READ-ONLY investigation. Do NOT take any remediation, write, or corrective action on any " +
 		"system. Your only output is the issue (or the false-positive note)." +
-		platformProblemGuidance
+		platformProblemGuidance + toolingNoteGuidance
 }

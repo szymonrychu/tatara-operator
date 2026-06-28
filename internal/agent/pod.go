@@ -655,6 +655,16 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		corev1.EnvVar{Name: "TATARA_SKILLS_REF", Value: skillsRef},
 	)
 
+	// TATARA_WORKSPACE_FULL_CLONE signals the wrapper to clone every project
+	// repo with full history and all branches. Set only for project-scoped kinds
+	// (repo==nil: brainstorm/healthCheck/incident/refine); left empty for
+	// repo-scoped kinds so the wrapper's default shallow clone is preserved.
+	fullCloneVal := ""
+	if repo == nil {
+		fullCloneVal = "true"
+	}
+	env = append(env, corev1.EnvVar{Name: "TATARA_WORKSPACE_FULL_CLONE", Value: fullCloneVal})
+
 	// Operator-supplied extra envs are appended LAST, after every variable the
 	// operator itself sets, so a stray extra named like a required variable
 	// (e.g. TATARA_TASK) cannot silently shadow it -- the later duplicate in a
