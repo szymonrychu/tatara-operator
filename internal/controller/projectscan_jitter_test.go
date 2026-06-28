@@ -59,11 +59,11 @@ func TestRepoNextFireShifted(t *testing.T) {
 	// With a 15m offset the fire after 10:00 lands at 10:15, and the fire after
 	// 10:15 lands at the next period's slot 11:15.
 	base := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
-	if got := repoNextFire(sched, 15*time.Minute, base); !got.Equal(base.Add(15*time.Minute)) {
+	if got := repoNextFire(sched, 15*time.Minute, base); !got.Equal(base.Add(15 * time.Minute)) {
 		t.Fatalf("repoNextFire after 10:00 = %v, want 10:15", got)
 	}
 	at1015 := base.Add(15 * time.Minute)
-	if got := repoNextFire(sched, 15*time.Minute, at1015); !got.Equal(base.Add(time.Hour+15*time.Minute)) {
+	if got := repoNextFire(sched, 15*time.Minute, at1015); !got.Equal(base.Add(time.Hour + 15*time.Minute)) {
 		t.Fatalf("repoNextFire after 10:15 = %v, want 11:15", got)
 	}
 }
