@@ -209,6 +209,14 @@ type BrainstormActivity struct {
 	// +kubebuilder:default=5
 	// +optional
 	MaxOpenProposals int `json:"maxOpenProposals,omitempty"`
+	// StaleProposalDays opts in the staleness reaper: a positive value auto-closes
+	// bot-authored proposals that have had no human engagement (no human comment,
+	// no live work) for at least that many days, clearing dead proposals out of the
+	// MaxOpenProposals backlog. A value <=0 (the unset default) disables the reaper
+	// entirely - this is an explicit opt-in sentinel, NOT a kubebuilder default, so
+	// "unset" is never indistinguishable from an active value.
+	// +optional
+	StaleProposalDays int `json:"staleProposalDays,omitempty"`
 	// +kubebuilder:validation:items:Enum=docs;memory;internet
 	// +optional
 	Sources []string `json:"sources,omitempty"`
