@@ -391,6 +391,14 @@ func (r *ProjectReconciler) updateLifecycleStateCounts(ctx context.Context) {
 // no supported lifecycle entry, or unsupported kind). It is a pure helper so it
 // can be unit-tested independently of the reconciler.
 func issueStateFor(t *tataradevv1alpha1.Task) string {
+	// blocked: at-cap give-up must appear in the metric even though TaskTerminal
+	// classifies Parked as terminal. Check this before the terminal guard.
+	if t.Spec.Kind == "issueLifecycle" &&
+		t.Status.LifecycleState == "Parked" &&
+		tataradevv1alpha1.IsRecoverableGiveup(t.Status.ParkReason) &&
+		t.Status.ImplementGiveUps >= maxImplGiveUps {
+		return "blocked"
+	}
 	if tataradevv1alpha1.TaskTerminal(t) {
 		return ""
 	}
@@ -435,9 +443,6 @@ func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {
 	r.Metrics.ResetIssueState()
 	for i := range list.Items {
 		t := &list.Items[i]
-		if tataradevv1alpha1.TaskTerminal(t) {
-			continue
-		}
 		project, repo, kind, issue := taskTokenLabels(t)
 		if issue == "" {
 			continue

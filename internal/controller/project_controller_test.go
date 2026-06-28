@@ -436,6 +436,78 @@ func TestUpdateIssueStateCounts_ResetsClosedIssue(t *testing.T) {
 	}
 }
 
+// TestIssueStateFor_Blocked verifies that an issueLifecycle Task in Parked with
+// a recoverable ParkReason and ImplementGiveUps >= maxImplGiveUps returns "blocked"
+// so the metric surface reflects the at-cap state.
+func TestIssueStateFor_Blocked(t *testing.T) {
+	// At cap with recoverable reason -> blocked.
+	task := &tataradevv1alpha1.Task{}
+	task.Spec.Kind = "issueLifecycle"
+	task.Status.LifecycleState = "Parked"
+	task.Status.ParkReason = "implement-failed"
+	task.Status.ImplementGiveUps = maxImplGiveUps
+	if got := issueStateFor(task); got != "blocked" {
+		t.Errorf("issueStateFor at-cap give-up = %q, want blocked", got)
+	}
+
+	// Under cap (giveUps=1) -> empty (still terminal, reaper spares it).
+	task2 := &tataradevv1alpha1.Task{}
+	task2.Spec.Kind = "issueLifecycle"
+	task2.Status.LifecycleState = "Parked"
+	task2.Status.ParkReason = "maxIterations"
+	task2.Status.ImplementGiveUps = 1
+	if got := issueStateFor(task2); got != "" {
+		t.Errorf("issueStateFor under-cap give-up = %q, want empty (not yet blocked)", got)
+	}
+
+	// Non-recoverable reason at giveUps=3 -> empty (normal terminal).
+	task3 := &tataradevv1alpha1.Task{}
+	task3.Spec.Kind = "issueLifecycle"
+	task3.Status.LifecycleState = "Parked"
+	task3.Status.ParkReason = "refused-declined"
+	task3.Status.ImplementGiveUps = maxImplGiveUps
+	if got := issueStateFor(task3); got != "" {
+		t.Errorf("issueStateFor non-recoverable parked = %q, want empty (not blocked)", got)
+	}
+}
+
+// TestUpdateIssueStateCounts_BlockedEmitsSeries verifies that an at-cap give-up
+// Parked task emits a tatara_issue_state series with state="blocked".
+func TestUpdateIssueStateCounts_BlockedEmitsSeries(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, reg := newProjectReconcilerWithReg()
+
+	task := &tataradevv1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "isc-task-blocked", Namespace: testNS},
+		Spec: tataradevv1alpha1.TaskSpec{
+			ProjectRef:    "isc-blocked-proj",
+			RepositoryRef: "isc-blocked-repo",
+			Kind:          "issueLifecycle",
+			Goal:          "test",
+			Source: &tataradevv1alpha1.TaskSource{
+				Provider: "github",
+				IssueRef: "acme/repo#999",
+				Number:   999,
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	task.Status.LifecycleState = "Parked"
+	task.Status.ParkReason = "implement-failed"
+	task.Status.ImplementGiveUps = maxImplGiveUps
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+
+	r.updateIssueStateCounts(ctx)
+
+	if got := gatherIssueState(t, reg, "acme/repo#999", "blocked", "false"); got != 1 {
+		t.Fatalf("tatara_issue_state{issue=acme/repo#999,state=blocked} = %v, want 1", got)
+	}
+}
+
 // TestIssueStateFor covers the pure state-mapping table for all LifecycleState
 // and Phase/Kind combos, including terminal (must return "") and review tasks.
 func TestIssueStateFor(t *testing.T) {
