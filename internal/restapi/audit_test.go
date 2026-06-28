@@ -152,7 +152,7 @@ func TestImplementOutcome_RetryOnConflict_HappyPath(t *testing.T) {
 func TestChangeSummary_RetryOnConflict_HappyPath(t *testing.T) {
 	r := buildRouter(t, task("t-cs-retry", "alpha"))
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t-cs-retry/change-summary",
-		strings.NewReader(`{"prTitle":"feat(auth): implement OAuth2 login flow","prBody":"y","deliveredScope":"z"}`))
+		strings.NewReader(`{"prTitle":"feat(auth): implement OAuth2 login flow","prBody":"y","deliveredScope":"z","changeSignificance":"patch"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

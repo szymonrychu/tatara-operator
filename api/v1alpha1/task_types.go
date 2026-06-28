@@ -106,6 +106,14 @@ type ChangeSummary struct {
 	RemainingScope string `json:"remainingScope,omitempty"`
 	// +optional
 	MostProblematic string `json:"mostProblematic,omitempty"` // most problematic part of the change; from the cli most_problematic field
+	// Significance is the agent's declared change significance, the lever the
+	// push-CD cascade uses to cut the next semver tag (major resets minor+patch,
+	// minor resets patch, patch increments). REQUIRED on the change_summary MCP
+	// tool and at the REST layer (D2): an agent cannot open a PR without it. The
+	// writeback gate refuses to open a change when this is empty.
+	// +kubebuilder:validation:Enum=major;minor;patch
+	// +optional
+	Significance string `json:"significance,omitempty"`
 }
 
 // TaskSource records the SCM work-item that originated a webhook-born Task.
@@ -225,24 +233,53 @@ type TaskSpec struct {
 	AlertRule string `json:"alertRule,omitempty"`
 }
 
+// Task Phase string literals. Phases are bare strings on Status.Phase (there is
+// no single central enum); these consts name the ones the push-CD cascade and
+// terminal/active predicates key on so callers stop hand-typing them.
+const (
+	PhasePlanning  = "Planning"
+	PhaseRunning   = "Running"
+	PhaseSucceeded = "Succeeded"
+	PhaseFailed    = "Failed"
+	// PhaseDeploying is the pod-less post-merge phase: the implement PR has
+	// auto-merged and the operator (not an agent pod) drives the deploy cascade
+	// to tatara-helmfile-applied. It is non-terminal (TaskTerminal is false) and
+	// MUST be excluded from per-repo lane occupancy: no pod runs, so counting it
+	// against the lane re-creates the lane-starvation trap
+	// (operator-laneoccupancy-starves-recovery-2026-06-15). It re-acquires a lane
+	// only to spawn a fix agent.
+	PhaseDeploying = "Deploying"
+)
+
 // TaskTerminal reports whether t has reached a terminal state, accounting for
 // the dual Phase / LifecycleState design: issueLifecycle tasks leave Phase
 // empty for their whole life and signal completion via LifecycleState. Any
 // predicate that must treat finished lifecycle tasks as terminal MUST call
 // this helper instead of testing Phase alone.
+//
+// PhaseDeploying is deliberately NOT terminal: a Task in Deploying is alive but
+// pod-less (the operator polls the cascade), so conversation-GC / reaper / lane
+// logic must treat it as live-but-podless, not finished.
 func TaskTerminal(t *Task) bool {
-	if t.Status.Phase == "Succeeded" || t.Status.Phase == "Failed" {
+	if t.Status.Phase == PhaseSucceeded || t.Status.Phase == PhaseFailed {
 		return true
 	}
 	ls := t.Status.LifecycleState
 	return ls == "Done" || ls == "Stopped" || ls == "Parked"
 }
 
+// TaskDeploying reports whether t is in the pod-less Deploying phase. Lane
+// occupancy, reaper, and conversation-GC use this to treat it as a live work
+// item that holds no execution lane (no agent pod runs during Deploying).
+func TaskDeploying(t *Task) bool {
+	return t.Status.Phase == PhaseDeploying
+}
+
 // IsRecoverableGiveup reports whether a Parked reason represents an
 // implementation that gave up and may be re-rolled (vs a deliberate decline).
 func IsRecoverableGiveup(reason string) bool {
 	switch reason {
-	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline":
+	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout":
 		return true
 	default:
 		return false
@@ -251,11 +288,12 @@ func IsRecoverableGiveup(reason string) bool {
 
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
-	// +kubebuilder:validation:Enum=Planning;Running;Succeeded;Failed
+	// +kubebuilder:validation:Enum=Planning;Running;Succeeded;Failed;Deploying
 	// NOTE: Pending and AwaitingApproval are intentionally absent: no code path
 	// ever writes them (approval is now driven by the SCM conversation flow and
 	// projected onto labels, not a Phase transition). They are removed here to
 	// keep the CRD enum honest and prevent confusion with LifecycleState.
+	// Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// +optional
@@ -398,6 +436,30 @@ type TaskStatus struct {
 	// observability; does NOT gate re-activation.
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
+
+	// Deploy-supervision fields (PhaseDeploying only; empty otherwise). The
+	// implement Task does not go terminal at PR-merge: it enters Deploying and
+	// the operator drives the push-CD cascade to a tatara-helmfile apply, then
+	// resolves Done + closes the originating issue.
+
+	// DeployDeadline is the wall-clock deadline for the deploy cascade
+	// (now + Project deployBudgetSeconds, single-hop override applied per
+	// artifact). On exceed, the Task parks recoverable with reason deploy-timeout.
+	// +optional
+	DeployDeadline *metav1.Time `json:"deployDeadline,omitempty"`
+	// CascadeStage tracks how far this Task's artifact has propagated toward the
+	// terminal tatara-helmfile apply.
+	// +kubebuilder:validation:Enum=tagged;parent-pr-open;parent-merged;helmfile-applied
+	// +optional
+	CascadeStage string `json:"cascadeStage,omitempty"`
+	// DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
+	// driving toward the cluster.
+	// +optional
+	DeployedVersion string `json:"deployedVersion,omitempty"`
+	// DeployArtifact is the deploy-ledger artifact identity (repo@vX.Y.Z) this
+	// Task records, the key the apply-outcome sweep matches against applied pins.
+	// +optional
+	DeployArtifact string `json:"deployArtifact,omitempty"`
 }
 
 // +kubebuilder:object:root=true

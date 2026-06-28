@@ -423,6 +423,20 @@ type ProjectSpec struct {
 	// project's explicit budget config (its Enabled field is authoritative).
 	// +optional
 	TokenBudget *TokenBudgetSpec `json:"tokenBudget,omitempty"`
+	// DeployBudgetSeconds is the Deploying-phase deadline budget for a push-CD
+	// cascade along the LONGEST path to a tatara-helmfile apply (2 tag-cut hops,
+	// e.g. cli -> wrapper -> helmfile): 1.2x the summed per-stage p95 durations.
+	// On exceed, a Deploying Task parks recoverable with reason deploy-timeout.
+	// +kubebuilder:default=3300
+	// +optional
+	DeployBudgetSeconds int `json:"deployBudgetSeconds,omitempty"`
+	// DeploySingleHopBudgetSeconds is the tighter deadline budget for artifacts
+	// one hop from tatara-helmfile (operator, memory, ingester, chat): no
+	// intermediate parent rebuild. Deploy-supervision picks this over
+	// DeployBudgetSeconds for single-hop artifacts.
+	// +kubebuilder:default=2100
+	// +optional
+	DeploySingleHopBudgetSeconds int `json:"deploySingleHopBudgetSeconds,omitempty"`
 }
 
 // TokenBudgetSpec configures the per-Project token-budget admission gate (issue

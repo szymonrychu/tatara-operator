@@ -1126,7 +1126,16 @@ type changeSummaryReq struct {
 	DeliveredScope  string `json:"deliveredScope,omitempty"`
 	RemainingScope  string `json:"remainingScope,omitempty"`
 	MostProblematic string `json:"mostProblematic,omitempty"` // from cli most_problematic field
+	// ChangeSignificance is the push-CD semver lever (major|minor|patch). REQUIRED
+	// (D2): the cli marks change_significance required and this REST layer rejects
+	// a missing/invalid value, so a PR cannot be opened without a declared
+	// significance. The wire key MUST stay exactly changeSignificance: decodeJSON
+	// uses DisallowUnknownFields, so it is the frozen seam the cli posts.
+	ChangeSignificance string `json:"changeSignificance,omitempty"`
 }
+
+// validChangeSignificance is the closed set of push-CD significance levels.
+var validChangeSignificance = map[string]bool{"major": true, "minor": true, "patch": true}
 
 func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 	var req changeSummaryReq
@@ -1139,6 +1148,10 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "weak pr title: "+guidance)
 			return
 		}
+	}
+	if !validChangeSignificance[req.ChangeSignificance] {
+		writeError(w, http.StatusBadRequest, "change significance must be one of major|minor|patch")
+		return
 	}
 	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
 	var t tatarav1alpha1.Task
@@ -1160,6 +1173,7 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 			DeliveredScope:  req.DeliveredScope,
 			RemainingScope:  req.RemainingScope,
 			MostProblematic: req.MostProblematic,
+			Significance:    req.ChangeSignificance,
 		}
 		return s.c.Status().Update(r.Context(), &t)
 	}); err != nil {

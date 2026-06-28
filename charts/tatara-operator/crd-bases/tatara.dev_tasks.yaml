@@ -221,6 +221,16 @@ spec:
                 - action
                 - reason
                 type: object
+              cascadeStage:
+                description: |-
+                  CascadeStage tracks how far this Task's artifact has propagated toward the
+                  terminal tatara-helmfile apply.
+                enum:
+                - tagged
+                - parent-pr-open
+                - parent-merged
+                - helmfile-applied
+                type: string
               changeSummary:
                 description: |-
                   ChangeSummary holds the scope report submitted by the agent at the end of an
@@ -235,6 +245,18 @@ spec:
                   prTitle:
                     type: string
                   remainingScope:
+                    type: string
+                  significance:
+                    description: |-
+                      Significance is the agent's declared change significance, the lever the
+                      push-CD cascade uses to cut the next semver tag (major resets minor+patch,
+                      minor resets patch, patch increments). REQUIRED on the change_summary MCP
+                      tool and at the REST layer (D2): an agent cannot open a PR without it. The
+                      writeback gate refuses to open a change when this is empty.
+                    enum:
+                    - major
+                    - minor
+                    - patch
                     type: string
                 type: object
               conditions:
@@ -333,6 +355,23 @@ spec:
                 type: integer
               deadlineAt:
                 format: date-time
+                type: string
+              deployArtifact:
+                description: |-
+                  DeployArtifact is the deploy-ledger artifact identity (repo@vX.Y.Z) this
+                  Task records, the key the apply-outcome sweep matches against applied pins.
+                type: string
+              deployDeadline:
+                description: |-
+                  DeployDeadline is the wall-clock deadline for the deploy cascade
+                  (now + Project deployBudgetSeconds, single-hop override applied per
+                  artifact). On exceed, the Task parks recoverable with reason deploy-timeout.
+                format: date-time
+                type: string
+              deployedVersion:
+                description: |-
+                  DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
+                  driving toward the cluster.
                 type: string
               discoveredIssues:
                 items:
@@ -463,11 +502,13 @@ spec:
                   ever writes them (approval is now driven by the SCM conversation flow and
                   projected onto labels, not a Phase transition). They are removed here to
                   keep the CRD enum honest and prevent confusion with LifecycleState.
+                  Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
                 enum:
                 - Planning
                 - Running
                 - Succeeded
                 - Failed
+                - Deploying
                 type: string
               podName:
                 type: string
