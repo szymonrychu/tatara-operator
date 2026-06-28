@@ -26,6 +26,25 @@ const platformProblemGuidance = "\n\n## Platform problems\n" +
 	"propose, or comment on a tracker issue asking a human to fix the platform, and do NOT treat a " +
 	"blocked tool as a reason to file your normal output - report it and stop."
 
+// toolingNoteGuidance is appended to proposer-agent prompts (brainstorm,
+// healthCheck, refine, incident). It instructs the agent to fold any mise
+// tooling it needed into the issue it files, so the implementer can add it to
+// the repo's .mise.toml.
+const toolingNoteGuidance = "\n\n## Tooling you needed\n" +
+	"If you used mise to install a CLI tool, runtime, or linter that was NOT already in the " +
+	"target repo's .mise.toml to do this analysis, add a '## Tooling' section to the issue you " +
+	"propose listing each tool (name@version + one-line why), so the implementation agent adds it " +
+	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
+	"you are proposing."
+
+// toolingConsumeGuidance is appended to implementer-agent prompts. It
+// instructs the agent to pick up any '## Tooling' section from the issue body
+// and add each tool to the repo's .mise.toml as part of the implementation.
+const toolingConsumeGuidance = "\n\n## Tooling from the issue\n" +
+	"If the issue body has a '## Tooling' section listing tools, add each to the appropriate " +
+	"repo's root .mise.toml (pinned version) as part of your implementation, so future runs " +
+	"have it preinstalled."
+
 // planTurnText is the turn-0 prompt: the goal plus the instruction to
 // decompose the work into Subtasks via the subtask MCP tool, and the
 // branch directive so the agent knows where to push its work.
@@ -44,7 +63,7 @@ func planTurnText(goal, branch, project, task string) string {
 			"Your changes are committed and pushed to the git branch `%s` automatically at the end of each "+
 			"turn (the branch is created from the default branch for you). NEVER commit or push to the "+
 			"default branch directly.",
-		task, project, task, project, goal, branch, task, branch) + platformProblemGuidance
+		task, project, task, project, goal, branch, task, branch) + platformProblemGuidance + toolingConsumeGuidance
 }
 
 // lifecyclePhaseGuidance returns a "## Lifecycle phase" block telling the agent
