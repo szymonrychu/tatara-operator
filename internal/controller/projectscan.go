@@ -2188,6 +2188,13 @@ func staleProposalWindow(proj *tatarav1alpha1.Project) (time.Duration, bool) {
 // lifecycle task for it: such a task would race the same-cycle reaper, leaving
 // it to close an issue that owns a live task. Cheap label/time-only check; no
 // SCM call (the reaper does the authoritative human-comment check before close).
+// This gate is intentionally BROADER than the reaper's close condition: it does
+// not read comments, so an issue past the window with an old human comment is
+// gated from triage but not closed by the reaper (humanCommentAfter blocks it).
+// That is benign - a >window-stale issue's last human comment is itself older
+// than the window, so re-triaging would only re-post into a long-cold thread,
+// which the bot-last-word gate already suppresses. It self-corrects the moment a
+// human comment bumps UpdatedAt back inside the window.
 func (r *ProjectReconciler) reapEligible(proj *tatarav1alpha1.Project, iss scm.IssueRef, existing []tatarav1alpha1.Task) bool {
 	window, on := staleProposalWindow(proj)
 	if !on {
@@ -2334,6 +2341,10 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			if r.reapEligible(proj, iss, existing) {
 				// Stale, unengaged proposal the reaper will close this cycle; do
 				// not recover it (a fresh task would race the reaper's close).
+				r.Metrics.ScanItem("backstop", "skipped_stale_reapable")
+				l.Info("backstop: skipped recovery, proposal stale+unengaged (reaper will close)",
+					"action", "backstop_recover", "resource_id", proj.Name,
+					"issue", fmt.Sprintf("%s#%d", slug, iss.Number))
 				continue
 			}
 			repo, ok := r.matchRepoForSlug(repos, slug)
