@@ -99,6 +99,16 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 	if ing := memory.Ingress(p, cfg); ing != nil {
 		objs = append(objs, ing)
 	}
+	// ServiceMonitor + PrometheusRule are gated behind MonitorEnabled: a cluster
+	// without the prometheus-operator CRDs must not have the whole memory
+	// reconcile fail on an unknown kind. When enabled they make the stack
+	// scraped (up{job=~".*tatara-memory.*"}=1) and load the memory alerts.
+	if cfg.MonitorEnabled {
+		objs = append(objs,
+			memory.MemoryServiceMonitor(p, cfg),
+			memory.MemoryPrometheusRule(p, cfg),
+		)
+	}
 	for _, obj := range objs {
 		// client.Apply (the Patch variant) is deprecated in controller-runtime
 		// v0.24.1 with no stated removal version. Migration to the typed

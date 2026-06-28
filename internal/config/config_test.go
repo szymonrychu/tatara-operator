@@ -109,6 +109,57 @@ func TestLoad_RequiresOperatorOIDCSecretName(t *testing.T) {
 	}
 }
 
+// TestLoad_MemoryMonitoringDefaults asserts the per-Project memory monitoring
+// defaults: emission on, no cluster-selector labels (chart stays
+// cluster-agnostic, rule 14).
+func TestLoad_MemoryMonitoringDefaults(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.MemoryMonitoringEnabled {
+		t.Fatal("MemoryMonitoringEnabled must default true")
+	}
+	if len(cfg.MemoryMonitorLabels) != 0 {
+		t.Fatalf("MemoryMonitorLabels must default empty, got %v", cfg.MemoryMonitorLabels)
+	}
+}
+
+// TestLoad_MemoryMonitorLabelsFromEnv asserts the JSON-object label map parses,
+// and that the enable flag can be turned off.
+func TestLoad_MemoryMonitorLabelsFromEnv(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("MEMORY_MONITORING_ENABLED", "false")
+	t.Setenv("MEMORY_MONITOR_LABELS", `{"release":"prometheus"}`)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MemoryMonitoringEnabled {
+		t.Fatal("MemoryMonitoringEnabled = true, want false from env")
+	}
+	if cfg.MemoryMonitorLabels["release"] != "prometheus" {
+		t.Fatalf("MemoryMonitorLabels = %v, want release=prometheus", cfg.MemoryMonitorLabels)
+	}
+}
+
+// TestLoad_MemoryMonitorLabelsInvalid asserts a malformed JSON object fails
+// startup loudly rather than silently dropping the cluster's ruleSelector label.
+func TestLoad_MemoryMonitorLabelsInvalid(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("MEMORY_MONITOR_LABELS", `not-json`)
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for malformed MEMORY_MONITOR_LABELS, got nil")
+	}
+}
+
 // TestLoad_AgentSchedulingDefaultEmpty asserts the scheduling document defaults
 // to empty (chart stays cluster-agnostic, rule 14).
 func TestLoad_S3DefaultsOff(t *testing.T) {

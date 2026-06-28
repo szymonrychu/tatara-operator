@@ -92,6 +92,9 @@ MEMORY_PATH_PREFIX: {{ .Values.memoryPathPrefix | quote }}
 CHAT_PATH_PREFIX: {{ .Values.chatPathPrefix | quote }}
 CHAT_IMAGE: {{ .Values.chatImage | quote }}
 GRAFANA_MCP_IMAGE: {{ .Values.grafanaMcpImage | quote }}
+{{/* Per-Project memory-stack ServiceMonitor + PrometheusRule (issue #200). additionalLabels is a JSON object (rule 6), empty default keeps the chart cluster-agnostic (rule 14). */}}
+MEMORY_MONITORING_ENABLED: {{ .Values.memoryMonitoring.enabled | quote }}
+MEMORY_MONITOR_LABELS: {{ .Values.memoryMonitoring.additionalLabels | toJson | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 TASK_RETENTION_HOURS: {{ .Values.taskRetentionHours | quote }}
 PUSH_METRICS_ALLOWED_PREFIXES: {{ .Values.pushMetricsAllowedPrefixes | quote }}

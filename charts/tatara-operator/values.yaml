@@ -30,6 +30,19 @@ openaiSecretName: ""
 ingesterImage: ""
 # grafana-mcp image for the optional per-project Grafana incident-response feature.
 grafanaMcpImage: ""
+# memoryMonitoring controls the ServiceMonitor + PrometheusRule the operator
+# emits per provisioned memory stack (issue #200). Consumed by the operator at
+# runtime (it provisions native objects per Project), not chart-rendered, so the
+# values flow via the ConfigMap: enabled -> MEMORY_MONITORING_ENABLED scalar;
+# additionalLabels -> MEMORY_MONITOR_LABELS as a JSON object (rule 6, same as
+# agentScheduling). enabled gates emission so a cluster without the
+# prometheus-operator CRDs is not handed an unknown kind. additionalLabels is
+# the cluster-specific knob: the deploying helmfile sets whatever label the
+# cluster Prometheus serviceMonitorSelector / ruleSelector matches on (e.g.
+# release: prometheus); the chart bakes none (rule 14).
+memoryMonitoring:
+  enabled: true
+  additionalLabels: {}
 externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"
 # operatorOidcSecretName overrides the Secret that holds OPERATOR_OIDC_CLIENT_SECRET.
