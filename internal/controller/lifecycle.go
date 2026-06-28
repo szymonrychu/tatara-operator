@@ -1493,6 +1493,9 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 		base += "\n\nRelated work in OTHER repos (reference for context, do NOT edit them here; " +
 			"each is led by its own agent): " + strings.Join(g.CrossRepo, "; ") + "."
 	}
+	if d := skillsDirective("issueLifecycle"); d != "" {
+		base += "\n\n" + d
+	}
 	base += lifecyclePhaseGuidance("Implement")
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext

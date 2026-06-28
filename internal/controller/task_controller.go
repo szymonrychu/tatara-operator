@@ -278,7 +278,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// instead of the implement-oriented plan prompt.
 	planText := planTurnText(task.Spec.Goal, taskBranch(&task), project.Name, task.Name)
 	if task.Spec.Kind == "review" {
+		// reviewText already injects the required-skills directive for review.
 		planText = reviewText(task.Spec.Goal, project.Name, task.Name)
+	} else if d := skillsDirective(task.Spec.Kind); d != "" {
+		planText += "\n\n" + d
 	}
 	res, err := r.driveAgentRun(ctx, &project, repoPtr, &task, planText)
 	if err != nil {

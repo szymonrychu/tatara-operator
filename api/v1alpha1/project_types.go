@@ -137,6 +137,10 @@ type AgentSpec struct {
 	// +kubebuilder:default="xhigh"
 	// +optional
 	Effort string `json:"effort,omitempty"`
+	// SkillsRef is the git ref (branch, tag, or SHA) of the tatara-agent-skills
+	// repo to clone at boot. Empty defaults to "main".
+	// +optional
+	SkillsRef string `json:"skillsRef,omitempty"`
 	// Hooks are optional lifecycle commands the wrapper runs at fixed points
 	// (clone, conversation start/restart, turn finished, conversation finished).
 	// +optional
