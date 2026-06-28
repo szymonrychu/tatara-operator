@@ -46,6 +46,10 @@ func isLifecycleTerminal(state string) bool {
 // a human (the last park comment already explains why).
 const maxRecoveryAttempts = 3
 
+// maxImplGiveUps bounds how many times recoverOrphans rerolls an implementation
+// that gave up before stopping and escalating to a human.
+const maxImplGiveUps = 3
+
 // taskIsPRSlot reports whether the Task targets PR number prNumber in the PR
 // slot (as opposed to issue #prNumber). On GitLab issue #N and MR !N are
 // distinct objects sharing a number, so identity-by-number is not enough: the
@@ -250,12 +254,17 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 }
 
 // adoptLifecycleTask re-enters an existing issueLifecycle Task to Triage in place
-// of creating a duplicate. It mirrors the reactivation pass: clear the terminal run
-// state (Phase, ImplementEmptyRetries) and re-arm the lifecycle (LifecycleState=Triage,
-// LastActivityAt=now, DeadlineAt=now+idle). The Task's pod name and branch are derived
-// deterministically from its labels/source, so the next TaskReconciler reconcile reuses
-// the same pod/branch. RetryOnConflict handles racing reconcile writes.
+// of creating a duplicate. Delegates to adoptLifecycleTaskAt with entry="Triage".
 func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
+	return r.adoptLifecycleTaskAt(ctx, proj, task, "Triage")
+}
+
+// adoptLifecycleTaskAt re-enters an existing issueLifecycle Task to the given
+// entry state (Triage or Implement) in place of creating a duplicate. It clears
+// the terminal run state (Phase, ImplementEmptyRetries, ParkReason) and re-arms
+// the lifecycle clocks, but preserves ImplementGiveUps across the reset so the
+// counter survives rerolls. RetryOnConflict handles racing reconcile writes.
+func (r *ProjectReconciler) adoptLifecycleTaskAt(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, entry string) error {
 	now := metav1.Now()
 	idleMinutes := 60
 	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
@@ -267,13 +276,35 @@ func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatara
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
 		}
-		fresh.Status.LifecycleState = "Triage"
+		giveUps := fresh.Status.ImplementGiveUps // preserve counter across reset
+		fresh.Status.LifecycleState = entry
 		fresh.Status.Phase = ""
 		fresh.Status.ImplementEmptyRetries = 0
+		fresh.Status.ParkReason = ""
 		fresh.Status.LastActivityAt = &now
 		fresh.Status.DeadlineAt = &deadline
+		fresh.Status.ImplementGiveUps = giveUps
 		return r.Status().Update(ctx, fresh)
 	})
+}
+
+// matchingTerminalParkedLifecycleTask finds the first terminal Parked
+// issueLifecycle Task for (slug, number) whose ParkReason is recoverable.
+// Used by recoverOrphans to detect give-up candidates eligible for reroll.
+func matchingTerminalParkedLifecycleTask(existing []tatarav1alpha1.Task, slug string, number int) *tatarav1alpha1.Task {
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceKind] != "issueLifecycle" {
+			continue
+		}
+		if !taskMatchesItem(t, slug, number) {
+			continue
+		}
+		if t.Status.LifecycleState == "Parked" && tatarav1alpha1.IsRecoverableGiveup(t.Status.ParkReason) {
+			return t
+		}
+	}
+	return nil
 }
 
 // isDeduped reports whether a candidate already has a Task that should suppress
@@ -2337,6 +2368,32 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			}
 			if hasLiveLifecycleTaskForIssue(existing, slug, iss.Number) {
 				continue
+			}
+			// Give-up reroll: if a terminal Parked task with a recoverable reason
+			// exists for this (slug, number) and we are in an Implement entry, adopt
+			// it in-place rather than spawning a duplicate. At-cap: skip entirely.
+			if entry == "Implement" {
+				if parked := matchingTerminalParkedLifecycleTask(existing, slug, iss.Number); parked != nil {
+					if parked.Status.ImplementGiveUps >= maxImplGiveUps {
+						r.Metrics.ScanItem("backstop", "skipped_giveup_cap")
+						l.Info("backstop: skipped give-up reroll (at cap)",
+							"action", "backstop_giveup_cap", "resource_id", proj.Name,
+							"issue", fmt.Sprintf("%s#%d", slug, iss.Number),
+							"giveUps", parked.Status.ImplementGiveUps)
+						continue
+					}
+					if aerr := r.adoptLifecycleTaskAt(ctx, proj, parked, "Implement"); aerr != nil {
+						l.Error(aerr, "backstop: adopt give-up task", "action", "backstop_recover_error",
+							"resource_id", proj.Name, "task", parked.Name)
+						continue
+					}
+					l.Info("backstop: rerolled gave-up implementation", "action", "backstop_recover",
+						"resource_id", proj.Name,
+						"issue", fmt.Sprintf("%s#%d", slug, iss.Number),
+						"giveUps", parked.Status.ImplementGiveUps)
+					r.Metrics.ScanItem("backstop", "recovered")
+					continue
+				}
 			}
 			if r.reapEligible(proj, iss, existing) {
 				// Stale, unengaged proposal the reaper will close this cycle; do
