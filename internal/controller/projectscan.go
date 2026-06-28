@@ -262,8 +262,10 @@ func (r *ProjectReconciler) adoptLifecycleTask(ctx context.Context, proj *tatara
 // adoptLifecycleTaskAt re-enters an existing issueLifecycle Task to the given
 // entry state (Triage or Implement) in place of creating a duplicate. It clears
 // the terminal run state (Phase, ImplementEmptyRetries, ParkReason) and re-arms
-// the lifecycle clocks, but preserves ImplementGiveUps across the reset so the
-// counter survives rerolls. RetryOnConflict handles racing reconcile writes.
+// the lifecycle clocks. ImplementGiveUps is PRESERVED on an Implement re-entry
+// (an auto-reroll consumes attempts toward the cap) but RESET on a Triage
+// re-entry (a human re-engaging a blocked issue is a fresh start, not another
+// auto-attempt). RetryOnConflict handles racing reconcile writes.
 func (r *ProjectReconciler) adoptLifecycleTaskAt(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, entry string) error {
 	now := metav1.Now()
 	idleMinutes := 60
@@ -276,14 +278,16 @@ func (r *ProjectReconciler) adoptLifecycleTaskAt(ctx context.Context, proj *tata
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
 		}
-		giveUps := fresh.Status.ImplementGiveUps // preserve counter across reset
 		fresh.Status.LifecycleState = entry
 		fresh.Status.Phase = ""
 		fresh.Status.ImplementEmptyRetries = 0
 		fresh.Status.ParkReason = ""
 		fresh.Status.LastActivityAt = &now
 		fresh.Status.DeadlineAt = &deadline
-		fresh.Status.ImplementGiveUps = giveUps
+		if entry == "Triage" {
+			// Human re-engagement: clear the auto-reroll attempt count.
+			fresh.Status.ImplementGiveUps = 0
+		}
 		return r.Status().Update(ctx, fresh)
 	})
 }
@@ -2330,6 +2334,11 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 	}
 	brainstorming, approved, implementation, _ := lifecycleLabels(proj.Spec.Scm)
 	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
+	// Open-issue index for the closed-issue give-up sweep below: only repos whose
+	// issues were listed this cycle are eligible (a list error must not be read as
+	// "all issues closed").
+	issuesBySlug := make(map[string][]scm.IssueRef)
+	listedSlugs := make(map[string]bool)
 	for i := range repos {
 		owner, name, oerr := scm.OwnerRepo(repos[i].Spec.URL)
 		if oerr != nil {
@@ -2348,6 +2357,8 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 				continue
 			}
 		}
+		issuesBySlug[slug] = issues
+		listedSlugs[slug] = true
 		for _, iss := range issues {
 			if iss.IsPR {
 				continue
@@ -2423,6 +2434,58 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			r.Metrics.ScanItem("backstop", "recovered")
 		}
 	}
+	// Closed-issue sweep: the reaper spares recoverable give-up tasks while their
+	// issue is open. Once the issue is closed (by refine, a maintainer, or merge),
+	// transition the task to Done so the reaper can reclaim it and the blocked
+	// metric stops for a closed issue. Only repos listed this cycle are judged.
+	for i := range existing {
+		tk := &existing[i]
+		if tk.Status.LifecycleState != "Parked" ||
+			!tatarav1alpha1.IsRecoverableGiveup(tk.Status.ParkReason) ||
+			tk.Status.ImplementGiveUps == 0 || tk.Spec.Source == nil {
+			continue
+		}
+		slug := repoFromIssueRef(tk.Spec.Source.IssueRef)
+		if slug == "" || !listedSlugs[slug] {
+			continue // repo not listed this cycle; cannot judge open vs closed
+		}
+		open := false
+		for _, iss := range issuesBySlug[slug] {
+			if !iss.IsPR && taskMatchesItem(tk, slug, iss.Number) {
+				open = true
+				break
+			}
+		}
+		if open {
+			continue
+		}
+		if derr := r.markLifecycleDone(ctx, tk, "issue-closed"); derr != nil {
+			l.Error(derr, "backstop: mark give-up task Done (issue closed)",
+				"action", "backstop_recover_error", "resource_id", proj.Name, "task", tk.Name)
+			continue
+		}
+		r.Metrics.ScanItem("backstop", "giveup_issue_closed")
+		l.Info("backstop: give-up issue closed; task marked Done for GC",
+			"action", "backstop_recover", "resource_id", proj.Name, "task", tk.Name)
+	}
+}
+
+// markLifecycleDone transitions a lifecycle Task to Done with the given reason,
+// used by the closed-issue sweep so the reaper can reclaim a spared give-up task
+// once its issue is closed. Idempotent: a no-op when already Done.
+func (r *ProjectReconciler) markLifecycleDone(ctx context.Context, task *tatarav1alpha1.Task, reason string) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return err
+		}
+		if fresh.Status.LifecycleState == "Done" {
+			return nil
+		}
+		fresh.Status.LifecycleState = "Done"
+		fresh.Status.ParkReason = reason
+		return r.Status().Update(ctx, fresh)
+	})
 }
 
 // createRefineTask enqueues a project-scoped refine QueuedEvent.

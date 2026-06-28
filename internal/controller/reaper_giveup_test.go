@@ -49,17 +49,20 @@ func TestReapGC_GiveUp_UnderCap_Spared(t *testing.T) {
 	}
 }
 
-// TestReapGC_GiveUp_AtCap_GCed verifies that a Parked task at the give-up cap
-// is garbage-collected normally.
-func TestReapGC_GiveUp_AtCap_GCed(t *testing.T) {
+// TestReapGC_GiveUp_AtCap_Spared verifies that a Parked task AT the give-up cap
+// is still spared from time-based GC: while its issue is open the counter must
+// persist so recoverOrphans keeps it blocked (not restart from zero). The
+// closed-issue sweep transitions it to Done once the issue closes, after which
+// it GCs normally.
+func TestReapGC_GiveUp_AtCap_Spared(t *testing.T) {
 	mkTaskProject(t, "p-gc-gu-cap", 3)
 	mkTaskRepository(t, "r-gc-gu-cap", "p-gc-gu-cap")
 	mkParkedLifecycleTask(t, "t-gc-gu-cap", "p-gc-gu-cap", "r-gc-gu-cap", maxImplGiveUps, "maxIterations")
 
 	gcServer(prometheus.NewRegistry(), time.Nanosecond).ReapOrphans(context.Background())
 
-	if taskExists(t, "t-gc-gu-cap") {
-		t.Error("expected at-cap give-up task to be GC-ed normally")
+	if !taskExists(t, "t-gc-gu-cap") {
+		t.Error("expected at-cap give-up task to be spared while its issue is open")
 	}
 }
 

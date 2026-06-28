@@ -175,3 +175,50 @@ func TestRecoverOrphans_GiveUp_NonRecoverable_CreatesQE(t *testing.T) {
 		t.Fatalf("want 1 QE (non-recoverable, normal create), got %d", len(qes))
 	}
 }
+
+// TestRecoverOrphans_GiveUp_IssueClosed_MarkedDone verifies the closed-issue
+// sweep: a spared recoverable give-up task whose issue is no longer open (the
+// repo was listed but the number is absent) is transitioned to Done so the
+// reaper can reclaim it.
+func TestRecoverOrphans_GiveUp_IssueClosed_MarkedDone(t *testing.T) {
+	proj, repo := seedBackstopProject(t, "gu-closed")
+	parked := mkGiveUpTask(t, "gu-closed", repo.Name, "o/r", 15, 2, "implement-failed")
+
+	// o/r is listed but its open set does NOT contain #15 -> issue is closed.
+	reader := &perRepoFakeReader{
+		issuesByRepo: map[string][]scm.IssueRef{"o/r": {}},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	r.recoverOrphans(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, nil)
+
+	got := getGiveUpTask(t, parked.Name)
+	if got.Status.LifecycleState != "Done" {
+		t.Errorf("LifecycleState = %q, want Done (issue closed)", got.Status.LifecycleState)
+	}
+	if got.Status.ParkReason != "issue-closed" {
+		t.Errorf("ParkReason = %q, want issue-closed", got.Status.ParkReason)
+	}
+}
+
+// TestAdoptLifecycleTask_TriageResetsGiveUps verifies that a human re-engaging a
+// blocked issue (Triage re-entry) resets the give-up counter to zero, while an
+// Implement re-entry preserves it (covered by the reroll test).
+func TestAdoptLifecycleTask_TriageResetsGiveUps(t *testing.T) {
+	proj, repo := seedBackstopProject(t, "gu-triage")
+	parked := mkGiveUpTask(t, "gu-triage", repo.Name, "o/r", 16, maxImplGiveUps, "maxIterations")
+
+	r := newScanReconciler(&perRepoFakeReader{})
+	if err := r.adoptLifecycleTask(context.Background(), proj, parked); err != nil {
+		t.Fatalf("adoptLifecycleTask: %v", err)
+	}
+
+	got := getGiveUpTask(t, parked.Name)
+	if got.Status.LifecycleState != "Triage" {
+		t.Errorf("LifecycleState = %q, want Triage", got.Status.LifecycleState)
+	}
+	if got.Status.ImplementGiveUps != 0 {
+		t.Errorf("ImplementGiveUps = %d, want 0 (reset on human Triage revival)", got.Status.ImplementGiveUps)
+	}
+}

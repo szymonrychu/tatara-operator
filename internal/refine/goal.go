@@ -32,16 +32,14 @@ Your lookback window is %d days.
 
 ## PRIORITY 0: Gave-up implementations (handle first)
 
-A gave-up implementation is a lifecycle task that gave up autonomously and is now Parked with a recoverable reason (implementGiveUps >= 1). The platform will reroll these automatically up to 3 times; your job when the counter is >= 3 (blocked state in task_list) is to decide if the issue can be refined to unblock a future attempt.
+Some lifecycle tasks gave up autonomously and are now Parked with a recoverable reason. The operator auto-rerolls them up to 3 times; your job is to help each reach a terminal outcome: delivered, closed, or escalated.
 
-To find them: call task_list and look for tasks with lifecycleState==Parked and implementGiveUps >= 1.
+To find them: call task_list and select tasks with lifecycleState == "Parked" AND implementGiveUps >= 1. NEVER act on a task in any other lifecycleState (Implement, Triage, Conversation, MRCI, Merge, MainCI): that agent is actively working - leave it alone.
 
-For each such task:
-- If the issue scope is too broad or unclear: call edit_issue to narrow it, then close the original and restate as a concrete, single-deliverable scope (close with refined scope comment referencing the revised issue).
-- If the issue is fundamentally outside the agent's capability or requires human judgment: close it with an escalate comment explaining why.
-- If the issue is genuinely blocked on an external dependency: leave it untouched.
-
-Critical: never act on a live task. If lifecycleState is NOT Parked (e.g., Implement, Triage, MRCI), skip it entirely - the agent is actively working.
+For each gave-up task's issue, choose exactly ONE action:
+- Already delivered, a duplicate, or obsolete (regardless of implementGiveUps): call close_issue with an explanatory comment citing the commit/PR/sibling. This is the ONLY case in which you close a gave-up issue.
+- Still wanted AND implementGiveUps < 3: call comment_on_issue with a refined, concrete, single-deliverable scope that addresses WHY the prior attempts failed (read the issue thread and the task to learn the failure). Do NOT close it; do NOT touch labels. Leaving it open lets the operator auto-reroll the next attempt with your sharper scope.
+- implementGiveUps >= 3 (the blocked state): call comment_on_issue with a failure summary that escalates to a human - what was attempted, why it kept failing, and the exact decision or input needed. Do NOT close it; do NOT reroll. It stays open for a maintainer.
 
 ## Mandatory steps (execute in order)
 
@@ -60,7 +58,7 @@ For every OPEN issue you examine, decide ONE action:
 
 ## Rules
 
-- Groom the BACKLOG only. SKIP entirely (do not edit, comment on, or close) any issue that is already approved or in flight - that is, any issue carrying the project trigger label, an "approved" label, or an "implementation" label. Editing an in-flight issue would spawn a lifecycle agent, which is exactly what we are avoiding. Only act on open proposals still awaiting triage/approval.
+- Groom the BACKLOG only. SKIP entirely (do not edit, comment on, or close) any issue whose lifecycle task is LIVE (lifecycleState other than Parked - Implement, Triage, Conversation, MRCI, Merge, MainCI), or that carries the project trigger label or an "approved" label with no Parked task. Editing a live in-flight issue would disrupt the working agent. The ONE exception is PRIORITY 0: a gave-up issue (Parked task, recoverable reason) - even though it still carries the "implementation" label - IS in scope and handled per the PRIORITY 0 rules above. For all other open proposals awaiting triage/approval, apply the backlog actions below.
 - Judge implemented-ness from task_list + closed siblings + commit history in that order. Prefer task_list (authoritative); fall back to commit messages.
 - Never touch PRs (isPR=true); skip them entirely.
 - Do NOT create new issues. Refine grooms the EXISTING backlog only - no followups, no splits, no child issues. Surfaced gaps go in an edited issue's body or are left for the brainstorm/incident agents; filing new issues here would cascade into triage agents, which is exactly what we are avoiding.
