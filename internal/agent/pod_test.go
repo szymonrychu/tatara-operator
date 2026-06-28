@@ -273,6 +273,12 @@ func TestBuildPodName(t *testing.T) {
 			source: nil,
 			want:   "tatara-tatara-gh-tatara-operator-healthcheck",
 		},
+		{
+			name:    "project-scoped refine",
+			project: "tatara", provider: "github", repoRef: "", kind: "refine",
+			source: nil,
+			want:   "tatara-tatara-gh-refine",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
