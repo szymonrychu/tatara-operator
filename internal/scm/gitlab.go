@@ -413,7 +413,7 @@ func (c *GitLab) AddLabel(ctx context.Context, token, issueRef, label string) er
 }
 
 // EnsureLabel creates the project label with the given color, or updates its
-// color if it already exists (POST -> 409 conflict -> PUT new_color). color is 6
+// color if it already exists (POST -> 409 conflict -> PUT color). color is 6
 // hex digits without '#'; GitLab wants the leading '#', added here.
 func (c *GitLab) EnsureLabel(ctx context.Context, repoURL, token, name, color string) error {
 	proj, err := glProjectPath(repoURL)
@@ -431,7 +431,7 @@ func (c *GitLab) EnsureLabel(ctx context.Context, repoURL, token, name, color st
 	if errors.As(err, &he) && he.Status == http.StatusConflict {
 		return glDo(ctx, c.base(), http.MethodPut,
 			"/projects/"+url.PathEscape(proj)+"/labels/"+url.PathEscape(name), token,
-			map[string]string{"new_color": hexColor}, nil)
+			map[string]string{"color": hexColor}, nil)
 	}
 	return err
 }
