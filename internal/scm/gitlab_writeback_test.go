@@ -3,6 +3,7 @@ package scm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -149,4 +150,40 @@ func TestGitLabEditIssue_404Benign(t *testing.T) {
 	})
 	body := "x"
 	require.NoError(t, c.EditIssue(context.Background(), "t", "g/p", 7, EditIssueReq{Body: &body}))
+}
+
+func TestGitLabEnableAutoMerge(t *testing.T) {
+	var gotPath, gotBody string
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{}`))
+	})
+	err := c.EnableAutoMerge(context.Background(), "https://gitlab.com/g/p.git", "gltok",
+		"https://gitlab.com/g/p/-/merge_requests/5", "squash")
+	require.NoError(t, err)
+	require.Equal(t, "/projects/g%2Fp/merge_requests/5/merge", gotPath)
+	require.Contains(t, gotBody, "merge_when_pipeline_succeeds")
+}
+
+func TestGLIIDFromURL(t *testing.T) {
+	for _, tt := range []struct {
+		url  string
+		want int
+		err  bool
+	}{
+		{"https://gitlab.com/g/p/-/merge_requests/5", 5, false},
+		{"https://gitlab.com/g/p/-/merge_requests/5/", 5, false},
+		{"https://gitlab.com/g/p/-/merge_requests/5?tab=x", 5, false},
+		{"https://gitlab.com/g/p/-/merge_requests/notanint", 0, true},
+	} {
+		got, err := glIIDFromURL(tt.url)
+		if tt.err {
+			require.Error(t, err, tt.url)
+			continue
+		}
+		require.NoError(t, err, tt.url)
+		require.Equal(t, tt.want, got, tt.url)
+	}
 }

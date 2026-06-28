@@ -3,8 +3,10 @@ package scm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -168,4 +170,44 @@ func TestGitHubEditIssue_404Benign(t *testing.T) {
 	})
 	body := "x"
 	require.NoError(t, c.EditIssue(context.Background(), "t", "o/r", 7, EditIssueReq{Body: &body}))
+}
+
+func TestGitHubEnableAutoMerge(t *testing.T) {
+	var gotGraphQL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case strings.Contains(string(body), "resource(url:"):
+			_, _ = w.Write([]byte(`{"data":{"resource":{"id":"PR_node_123"}}}`))
+		case strings.Contains(string(body), "enablePullRequestAutoMerge"):
+			gotGraphQL = string(body)
+			_, _ = w.Write([]byte(`{"data":{"enablePullRequestAutoMerge":{"clientMutationId":null}}}`))
+		default:
+			t.Fatalf("unexpected graphql body: %s", body)
+		}
+	}))
+	defer srv.Close()
+
+	c := &GitHub{graphQLBase: srv.URL}
+	err := c.EnableAutoMerge(context.Background(), "https://github.com/o/r.git", "ghtok",
+		"https://github.com/o/r/pull/7", "squash")
+	require.NoError(t, err)
+	require.Contains(t, gotGraphQL, "PR_node_123")
+	require.Contains(t, gotGraphQL, "SQUASH")
+}
+
+func TestGitHubEnableAutoMergeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "resource(url:") {
+			_, _ = w.Write([]byte(`{"data":{"resource":{"id":"PR_node_123"}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"errors":[{"message":"Auto merge is not allowed"}]}`))
+	}))
+	defer srv.Close()
+	c := &GitHub{graphQLBase: srv.URL}
+	err := c.EnableAutoMerge(context.Background(), "https://github.com/o/r.git", "t",
+		"https://github.com/o/r/pull/7", "squash")
+	require.Error(t, err)
 }

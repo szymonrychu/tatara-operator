@@ -142,6 +142,10 @@ type SCMWriter interface {
 	RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error
 	Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error
 	Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error)
+	// EnableAutoMerge turns on the forge's native auto-merge for the PR/MR at
+	// prURL so it merges itself once required checks pass. Best-effort: a forge
+	// that disallows auto-merge returns an error callers treat as non-fatal.
+	EnableAutoMerge(ctx context.Context, repoURL, token, prURL, method string) error
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
