@@ -5689,6 +5689,61 @@ spec:
                 type: object
               scmSecretRef:
                 type: string
+              tokenBudget:
+                description: |-
+                  TokenBudget configures the token-budget admission gate (issue #189). Nil
+                  inherits the operator-wide defaults verbatim; a present block is the
+                  project's explicit budget config (its Enabled field is authoritative).
+                properties:
+                  emergencyPercent:
+                    default: 80
+                    description: |-
+                      EmergencyPercent pauses the alert pool (incidents) at this percentage of the
+                      window. Ordered >= ProactivePercent at evaluation. Default 80.
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  enabled:
+                    description: |-
+                      Enabled turns the gate on for this project. When the block is present this
+                      field is authoritative (it is NOT inherited from the operator-wide default).
+                    type: boolean
+                  mode:
+                    default: customWindow
+                    description: |-
+                      Mode selects how usage is measured: customWindow meters the operator's own
+                      per-turn token accounting against TokenLimit within a cron-anchored reset
+                      window; claudeSubscription gates on the wrapper-reported Claude 5h/weekly
+                      usage percentages.
+                    enum:
+                    - customWindow
+                    - claudeSubscription
+                    type: string
+                  proactivePercent:
+                    default: 50
+                    description: |-
+                      ProactivePercent pauses the normal pool (brainstorm, implement, review, ...)
+                      at this percentage of the window. Default 50.
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  resetSchedule:
+                    description: |-
+                      ResetSchedule is a 5-field cron (robfig ParseStandard) marking each window
+                      reset boundary (customWindow mode). Empty disables the custom window.
+                    pattern: ^$|^(\S+\s+){4}\S+$
+                    type: string
+                  tokenLimit:
+                    description: TokenLimit is the absolute total-token budget per
+                      window (customWindow mode).
+                    format: int64
+                    type: integer
+                  windowDuration:
+                    description: |-
+                      WindowDuration is the declared window length as a Go duration (e.g. "5h",
+                      "168h"). It bounds the reset-boundary search; pair it with ResetSchedule.
+                    type: string
+                type: object
               triggerLabel:
                 default: tatara
                 type: string
@@ -5794,6 +5849,34 @@ spec:
                     type: string
                   phase:
                     type: string
+                type: object
+              tokenBudget:
+                description: 'TokenBudget carries the token-budget accumulator/snapshot
+                  (issue #189).'
+                properties:
+                  fiveHourPercent:
+                    description: |-
+                      FiveHourPercent / WeeklyPercent are the wrapper-reported Claude usage
+                      percentages (whole percent, 0..100) for the rolling 5h and weekly windows.
+                      A nil reset means "not reported" and the gate ignores that window.
+                    type: integer
+                  fiveHourReset:
+                    format: date-time
+                    type: string
+                  weeklyPercent:
+                    type: integer
+                  weeklyReset:
+                    format: date-time
+                    type: string
+                  windowStart:
+                    description: |-
+                      WindowStart is when the current custom-window opened (the most recent reset
+                      boundary). WindowTokens is the total tokens spent in it so far.
+                    format: date-time
+                    type: string
+                  windowTokens:
+                    format: int64
+                    type: integer
                 type: object
               webhookURL:
                 type: string

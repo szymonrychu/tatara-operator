@@ -187,7 +187,7 @@ func TestRecordUsage_StaleCallback_NoTurn(t *testing.T) {
 	// recordUsage with wrong turnID: the inner guard will see annCurrentTurn != "wrong-turn"
 	// and leave recorded=false, so AddTaskTurn must not be called.
 	usage, _ := json.Marshal(map[string]any{"input_tokens": 200, "output_tokens": 80})
-	if err := cb.recordUsage(context.Background(), task, json.RawMessage(usage), "wrong-turn"); err != nil {
+	if _, _, err := cb.recordUsage(context.Background(), task, json.RawMessage(usage), "wrong-turn"); err != nil {
 		t.Fatalf("recordUsage: %v", err)
 	}
 

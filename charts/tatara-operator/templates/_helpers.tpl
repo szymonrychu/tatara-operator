@@ -115,4 +115,12 @@ S3_KEY_PREFIX: {{ .Values.s3KeyPrefix | quote }}
 S3_FORCE_PATH_STYLE: {{ .Values.s3ForcePathStyle | quote }}
 S3_SECRET_NAME: {{ .Values.s3SecretName | quote }}
 S3_CONVERSATION_RETENTION_HOURS: {{ .Values.s3ConversationRetentionHours | quote }}
+{{/* Token-budget admission gate (issue #189): off until tokenBudgetEnabled. */}}
+TOKEN_BUDGET_ENABLED: {{ .Values.tokenBudgetEnabled | quote }}
+TOKEN_BUDGET_MODE: {{ .Values.tokenBudgetMode | quote }}
+TOKEN_BUDGET_PROACTIVE_PERCENT: {{ .Values.tokenBudgetProactivePercent | quote }}
+TOKEN_BUDGET_EMERGENCY_PERCENT: {{ .Values.tokenBudgetEmergencyPercent | quote }}
+TOKEN_BUDGET_RESET_SCHEDULE: {{ .Values.tokenBudgetResetSchedule | quote }}
+TOKEN_BUDGET_WINDOW: {{ .Values.tokenBudgetWindow | quote }}
+TOKEN_BUDGET_TOKEN_LIMIT: {{ .Values.tokenBudgetTokenLimit | quote }}
 {{- end -}}

@@ -107,6 +107,30 @@ s3SecretName: ""
 # GC before their Tasks (which carry the keys) are reaped.
 s3ConversationRetentionHours: 72
 
+# Token-budget admission gate (issue #189): pause proactive work (brainstorm,
+# implement, review) at tokenBudgetProactivePercent and incident work at
+# tokenBudgetEmergencyPercent of the per-window usage, resuming when the window
+# resets. These are the fleet-wide DEFAULTS; a Project's spec.tokenBudget
+# overrides them per project. OFF until tokenBudgetEnabled is true, so the gate
+# is inert and backwards-compatible by default. Cluster-agnostic (rule 14): the
+# schedule/limit are empty here and supplied per-environment by the helmfile.
+# tokenBudgetMode: "customWindow" meters the operator's own per-turn token
+# accounting against tokenBudgetTokenLimit within a cron-anchored reset window
+# (set tokenBudgetResetSchedule + tokenBudgetWindow); "claudeSubscription" gates
+# on the wrapper-reported Claude 5h/weekly usage percentages instead.
+tokenBudgetEnabled: false
+tokenBudgetMode: "customWindow"
+tokenBudgetProactivePercent: 50
+tokenBudgetEmergencyPercent: 80
+# tokenBudgetResetSchedule is a 5-field cron marking each window reset boundary;
+# tokenBudgetWindow is the declared window length as a Go duration (e.g. "5h",
+# "168h") and bounds the reset search. Both are customWindow-mode inputs.
+tokenBudgetResetSchedule: ""
+tokenBudgetWindow: ""
+# tokenBudgetTokenLimit is the absolute total-token budget per window
+# (customWindow mode); 0 leaves the custom window inert.
+tokenBudgetTokenLimit: 0
+
 # Agent wrapper Pod resource requests/limits + securityContext (rule 6: camelCase
 # scalar -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). These bound the
 # otherwise-unbounded agent pods. Resources/runAsNonRoot are chart-appropriate

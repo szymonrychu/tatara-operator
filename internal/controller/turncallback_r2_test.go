@@ -31,7 +31,7 @@ func TestRecordUsage_StaleCallbackDoesNotDoubleCount(t *testing.T) {
 	// First: normal usage update for the live turn.
 	task := getTask(t, "t-ru1")
 	rawUsage, _ := json.Marshal(map[string]any{"output_tokens": 50})
-	if err := cb.recordUsage(context.Background(), task, rawUsage, "turn-ru1"); err != nil {
+	if _, _, err := cb.recordUsage(context.Background(), task, rawUsage, "turn-ru1"); err != nil {
 		t.Fatalf("recordUsage first call: %v", err)
 	}
 	if tk := getTask(t, "t-ru1"); tk.Status.CumulativeTokens != 50 {
@@ -43,7 +43,7 @@ func TestRecordUsage_StaleCallbackDoesNotDoubleCount(t *testing.T) {
 
 	// Duplicate/retry for the OLD turn must be a no-op.
 	task2 := getTask(t, "t-ru1")
-	if err := cb.recordUsage(context.Background(), task2, rawUsage, "turn-ru1"); err != nil {
+	if _, _, err := cb.recordUsage(context.Background(), task2, rawUsage, "turn-ru1"); err != nil {
 		t.Fatalf("recordUsage stale call: %v", err)
 	}
 	if tk := getTask(t, "t-ru1"); tk.Status.CumulativeTokens != 50 {
@@ -64,7 +64,7 @@ func TestRecordUsage_TerminalTaskIsNoop(t *testing.T) {
 	cb := newCallbackServer()
 	task := getTask(t, "t-ru2")
 	rawUsage, _ := json.Marshal(map[string]any{"output_tokens": 100})
-	if err := cb.recordUsage(context.Background(), task, rawUsage, "turn-ru2"); err != nil {
+	if _, _, err := cb.recordUsage(context.Background(), task, rawUsage, "turn-ru2"); err != nil {
 		t.Fatalf("recordUsage: %v", err)
 	}
 	if tk := getTask(t, "t-ru2"); tk.Status.CumulativeTokens != 999 {

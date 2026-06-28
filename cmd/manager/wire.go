@@ -204,9 +204,10 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	}
 
 	if err := (&controller.DispatcherReconciler{
-		Client:  mgr.GetClient(),
-		Scheme:  mgr.GetScheme(),
-		Metrics: metrics,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Metrics:        metrics,
+		BudgetDefaults: cfg.BudgetDefaults(),
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup DispatcherReconciler: %w", err)
 	}
@@ -250,6 +251,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		PushMetrics:    pushReceiver.PushHandler(),
 		CallbackSecret: cfg.CallbackHMACSecret,
 		TaskRetention:  cfg.TaskRetention,
+		BudgetDefaults: cfg.BudgetDefaults(),
 	}
 	// Conversation GC (issue #114 decision 5): wire the operator's S3 client when a
 	// bucket is configured so the reaper can delete fully-closed batches' objects.
