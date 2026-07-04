@@ -356,14 +356,14 @@ func TestTurnComplete_EmitsTaskTokens(t *testing.T) {
 		t.Fatalf("set kind/source: %v", err)
 	}
 	annotate(t, "t-tok", map[string]string{
-		annCurrentTurn:    "turn-1",
+		annCurrentTurn:    "turn-emit-tok",
 		annCurrentSubtask: "t-tok-s1",
 	})
 
 	reg := prometheus.NewRegistry()
 	cb := &CallbackServer{Client: k8sClient, Metrics: obs.NewOperatorMetrics(reg), Namespace: testNS}
 	body, _ := json.Marshal(map[string]any{
-		"turnId": "turn-1", "state": "completed",
+		"turnId": "turn-emit-tok", "state": "completed",
 		"finalText": "done", "stopReason": "end_turn",
 		"usage": map[string]any{"input_tokens": 1200, "output_tokens": 300},
 	})
