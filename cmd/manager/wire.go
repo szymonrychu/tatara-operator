@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/szymonrychu/tatara-operator/internal/accountusage"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/config"
@@ -21,7 +23,9 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // memoryConfigFromConfig maps operator config to the per-project memory stack
@@ -153,6 +157,25 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 	}
 }
 
+// secretTokenSource returns a func() (string, error) that reads the named data
+// key from the named Secret on every call via reader (the manager's uncached
+// API reader, so a rotated OAuth token is picked up without a cache watch).
+// Used by the account-usage client, which needs a fresh Anthropic OAuth token
+// on each poll rather than one captured at startup.
+func secretTokenSource(reader client.Reader, namespace, secretName, key string) func() (string, error) {
+	return func() (string, error) {
+		var sec corev1.Secret
+		if err := reader.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: secretName}, &sec); err != nil {
+			return "", fmt.Errorf("accountusage: get secret %s/%s: %w", namespace, secretName, err)
+		}
+		v, ok := sec.Data[key]
+		if !ok {
+			return "", fmt.Errorf("accountusage: secret %s/%s missing key %q", namespace, secretName, key)
+		}
+		return string(v), nil
+	}
+}
+
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable. It returns the
 // shared SeqSource so callers can pass it to addWebhookServer.
@@ -205,11 +228,49 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
 
+	// Fleet-wide Claude account usage poller (claudeSubscription mode). The
+	// store is nil-safe on the reconciler side, but is always built here so the
+	// gate has live data as soon as the poller (a leader-elected Runnable)
+	// completes its first poll. The mirror ConfigMap restores the last-known
+	// snapshot across a restart/re-election; it is marked unhealthy until the
+	// first live poll replaces it, so a stale restore never masks a real outage.
+	usageStore := &accountusage.Store{}
+	usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
+	if snap, err := usageMirror.Load(context.Background()); err == nil {
+		snap.Healthy = false
+		usageStore.Set(snap)
+	}
+	usageClient := accountusage.NewClient(accountusage.ClientConfig{
+		BaseURL:     cfg.UsageBaseURL,
+		TokenSource: secretTokenSource(mgr.GetAPIReader(), cfg.Namespace, cfg.AnthropicSecretName, "oauth-token"),
+		UserAgent:   cfg.UsageUserAgent,
+		AuthMode:    cfg.UsageAuthMode,
+	})
+	usagePoller := &accountusage.Poller{
+		Fetcher:          usageClient,
+		Store:            usageStore,
+		Interval:         cfg.UsagePollInterval,
+		FailureThreshold: 3,
+		Now:              time.Now,
+	}
+	usagePoller.SetOnUpdate(func(s accountusage.Snapshot) {
+		_ = usageMirror.Save(context.Background(), s)
+		metrics.SetAccountUsage("five_hour", s.FiveHour.Percent)
+		metrics.SetAccountUsage("seven_day", s.Weekly.Percent)
+		metrics.SetAccountUsage("seven_day_opus", s.Opus.Percent)
+		metrics.SetAccountUsage("seven_day_sonnet", s.Sonnet.Percent)
+		metrics.SetAccountUsagePollHealth(s.Healthy)
+	})
+	if err := mgr.Add(usagePoller); err != nil {
+		return nil, fmt.Errorf("add usage poller: %w", err)
+	}
+
 	if err := (&controller.DispatcherReconciler{
 		Client:         mgr.GetClient(),
 		Scheme:         mgr.GetScheme(),
 		Metrics:        metrics,
 		BudgetDefaults: cfg.BudgetDefaults(),
+		Usage:          usageStore,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup DispatcherReconciler: %w", err)
 	}

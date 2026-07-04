@@ -162,6 +162,17 @@ type Config struct {
 	TokenBudgetResetSchedule    string
 	TokenBudgetWindowDuration   time.Duration
 	TokenBudgetTokenLimit       int64
+
+	// Claude account usage poller (claudeSubscription mode). UsageAuthMode
+	// selects the /api/oauth/usage auth header ("bearer" default or
+	// "x-api-key", per the Task 0 spike). UsagePollInterval is clamped up to
+	// the Poller's 180s floor. UsageUserAgent is sent as the request's
+	// User-Agent. UsageBaseURL overrides the Anthropic API base (empty =
+	// production default).
+	UsageAuthMode     string
+	UsagePollInterval time.Duration
+	UsageUserAgent    string
+	UsageBaseURL      string
 }
 
 // BudgetDefaults returns the operator-wide token-budget configuration as a
@@ -387,6 +398,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	usagePollInterval, err := getDurationDefault("USAGE_POLL_INTERVAL", 180*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
@@ -450,6 +465,11 @@ func Load() (Config, error) {
 		TokenBudgetResetSchedule:    os.Getenv("TOKEN_BUDGET_RESET_SCHEDULE"),
 		TokenBudgetWindowDuration:   tokenBudgetWindow,
 		TokenBudgetTokenLimit:       tokenBudgetLimit,
+
+		UsageAuthMode:     getDefault("USAGE_AUTH_MODE", "bearer"),
+		UsagePollInterval: usagePollInterval,
+		UsageUserAgent:    getDefault("USAGE_USER_AGENT", "claude-code/1.0.0"),
+		UsageBaseURL:      os.Getenv("USAGE_BASE_URL"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

@@ -25,6 +25,12 @@ type Poller struct {
 
 func (p *Poller) NeedLeaderElection() bool { return true }
 
+// SetOnUpdate installs the post-poll hook (ConfigMap mirror + metrics, Task
+// A9), called with the freshly-fetched Snapshot after each successful poll.
+func (p *Poller) SetOnUpdate(fn func(Snapshot)) {
+	p.onUpdate = fn
+}
+
 func (p *Poller) Start(ctx context.Context) error {
 	if p.Interval < 180*time.Second {
 		p.Interval = 180 * time.Second
