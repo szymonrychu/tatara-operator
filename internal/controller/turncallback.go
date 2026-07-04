@@ -274,6 +274,10 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		}
 		fresh.Status.LastTurnInputTokens = inputTotal
 		fresh.Status.CumulativeTokens += u.OutputTokens
+		fresh.Status.CumulativeInput += u.InputTokens
+		fresh.Status.CumulativeOutput += u.OutputTokens
+		fresh.Status.CumulativeCacheRead += u.CacheReadInputTokens
+		fresh.Status.CumulativeCacheCreation += u.CacheCreationInputTokens
 		if err := s.Client.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -286,8 +290,9 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 	// only when the status write actually landed (the guards above skip duplicate
 	// or stale callbacks), so the metric is not double-counted.
 	if recorded && s.Metrics != nil {
-		project, repo, kind, issue := taskTokenLabels(task)
-		s.Metrics.AddTaskTokens(project, repo, kind, issue, inputTotal, u.OutputTokens)
+		project, repo, kind, issue, model := taskTokenLabels(task)
+		s.Metrics.AddTaskTokens(project, repo, kind, issue, model,
+			u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens)
 		s.Metrics.AddTaskTurn(project, repo, kind, issue)
 	}
 	return inputTotal + u.OutputTokens, recorded, nil
@@ -432,7 +437,7 @@ func (s *CallbackServer) recordConversation(ctx context.Context, task *tatarav1a
 // metrics. issue is set only for issue-scoped tasks (Spec.Source present),
 // preferring the IssueRef and falling back to the numeric Number, and is left
 // empty otherwise to bound series cardinality.
-func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue string) {
+func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, model string) {
 	project = task.Spec.ProjectRef
 	repo = task.Spec.RepositoryRef
 	kind = task.Spec.Kind
@@ -444,6 +449,7 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue stri
 			issue = strconv.Itoa(task.Spec.Source.Number)
 		}
 	}
+	model = task.Status.ResolvedModel
 	return
 }
 

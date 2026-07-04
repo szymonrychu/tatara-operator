@@ -438,6 +438,8 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 		if err := r.Create(ctx, pod); err != nil {
 			return false, fmt.Errorf("create wrapper pod: %w", err)
 		}
+		model := agent.ModelForKind(project, task.Spec.Kind)
+		_ = r.stampResolvedModel(ctx, task, model)
 	case err != nil:
 		return false, fmt.Errorf("get wrapper pod: %w", err)
 	}
@@ -464,6 +466,27 @@ func (r *TaskReconciler) podRecreations(task *tatarav1alpha1.Task) int {
 // current-turn id is set and its completion callback has not yet arrived.
 func taskHasInflightTurn(task *tatarav1alpha1.Task) bool {
 	return task.Annotations[annCurrentTurn] != "" && task.Annotations[annTurnComplete] == ""
+}
+
+// stampResolvedModel records the MODEL env resolved for this Task's agent pod
+// onto Task.Status.ResolvedModel, so the token/terminal metrics can price by
+// the model that actually ran. Best-effort: callers must not fail pod
+// creation on a stamp error (the metric label degrades to "", fail-open).
+func (r *TaskReconciler) stampResolvedModel(ctx context.Context, task *tatarav1alpha1.Task, model string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
+			return fmt.Errorf("stampResolvedModel: %w", err)
+		}
+		if fresh.Status.ResolvedModel == model {
+			return nil
+		}
+		fresh.Status.ResolvedModel = model
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return fmt.Errorf("stampResolvedModel: %w", err)
+		}
+		return nil
+	})
 }
 
 func (r *TaskReconciler) bumpRecreations(ctx context.Context, task *tatarav1alpha1.Task) error {

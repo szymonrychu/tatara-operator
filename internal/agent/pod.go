@@ -901,6 +901,12 @@ func modelForKind(project *tatarav1alpha1.Project, kind string) string {
 	return project.Spec.Agent.Model
 }
 
+// ModelForKind exports modelForKind for controller callers that need to stamp
+// the resolved model on Task.Status at pod-creation.
+func ModelForKind(project *tatarav1alpha1.Project, kind string) string {
+	return modelForKind(project, kind)
+}
+
 // effortForKind resolves the EFFORT env for a Task Kind: a non-empty per-kind
 // override in AgentSpec.EffortByKind wins, else the project-wide Agent.Effort.
 func effortForKind(project *tatarav1alpha1.Project, kind string) string {

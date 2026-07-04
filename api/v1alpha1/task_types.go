@@ -315,10 +315,27 @@ type TaskStatus struct {
 	// advance it, writeBackOpenChange opens a duplicate of the merged change).
 	// +optional
 	MergedHeadSHA string `json:"mergedHeadSHA,omitempty"`
+	// ResolvedModel is the MODEL env resolved for this Task's agent pod at spawn
+	// (modelForKind: per-kind override else project-wide). Stamped once at
+	// pod-creation; read by the token/terminal metrics so $ is priced by the
+	// model that actually ran. +optional
+	ResolvedModel string `json:"resolvedModel,omitempty"`
 	// +optional
 	CumulativeTokens int64 `json:"cumulativeTokens,omitempty"`
 	// +optional
 	LastTurnInputTokens int64 `json:"lastTurnInputTokens,omitempty"`
+	// CumulativeInput is the running total of uncached input tokens
+	// (turnUsage.InputTokens) across all turns of this Task. +optional
+	CumulativeInput int64 `json:"cumulativeInput,omitempty"`
+	// CumulativeOutput is the running total of output tokens across all turns
+	// of this Task. +optional
+	CumulativeOutput int64 `json:"cumulativeOutput,omitempty"`
+	// CumulativeCacheRead is the running total of cache-read input tokens
+	// across all turns of this Task. +optional
+	CumulativeCacheRead int64 `json:"cumulativeCacheRead,omitempty"`
+	// CumulativeCacheCreation is the running total of cache-creation input
+	// tokens across all turns of this Task. +optional
+	CumulativeCacheCreation int64 `json:"cumulativeCacheCreation,omitempty"`
 	// +optional
 	LifecycleIterations int `json:"lifecycleIterations,omitempty"`
 	// +optional
