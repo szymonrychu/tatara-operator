@@ -23,6 +23,9 @@ type fakeReader struct {
 	board    []scm.BoardItem
 	prErr    error
 	comments []scm.IssueComment
+	// commentCalls counts ListIssueComments invocations, for tests asserting the
+	// per-cycle comment cache dedupes repeated gate reads of the same issue.
+	commentCalls int
 }
 
 func (f *fakeReader) ListOpenPRs(context.Context, string, string) ([]scm.PRRef, error) {
@@ -38,6 +41,7 @@ func (f *fakeReader) GetCommitCIStatus(context.Context, string, string, string) 
 	return "", nil
 }
 func (f *fakeReader) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
+	f.commentCalls++
 	return f.comments, nil
 }
 func (f *fakeReader) GetIssue(context.Context, string, string, int) (scm.IssueContent, error) {

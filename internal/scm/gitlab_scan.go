@@ -31,6 +31,7 @@ type glIssueItem struct {
 		Username string `json:"username"`
 	} `json:"author"`
 	Labels    []string  `json:"labels"`
+	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	State     string    `json:"state"`
 	ClosedAt  time.Time `json:"closed_at"`
@@ -79,7 +80,8 @@ func (c *GitLab) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	out := make([]IssueRef, 0, len(raw))
 	for _, i := range raw {
 		out = append(out, IssueRef{
-			Repo: proj, Number: i.IID, Title: i.Title, Author: i.Author.Username, Labels: i.Labels, UpdatedAt: i.UpdatedAt, IsPR: false, State: "open",
+			Repo: proj, Number: i.IID, Title: i.Title, Author: i.Author.Username, Labels: i.Labels,
+			CreatedAt: i.CreatedAt, UpdatedAt: i.UpdatedAt, IsPR: false, State: "open",
 		})
 	}
 	return out, nil

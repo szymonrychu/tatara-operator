@@ -65,6 +65,7 @@ type IssueRef struct {
 	Title     string    `json:"title,omitempty"`
 	Author    string    `json:"author,omitempty"` // issue author login; drives the author-tiered autoapprove gate
 	Labels    []string  `json:"labels,omitempty"`
+	CreatedAt time.Time `json:"createdAt,omitempty"` // issue creation time; detects a non-comment edit/reaction (UpdatedAt after CreatedAt)
 	UpdatedAt time.Time `json:"updatedAt"`
 	IsPR      bool      `json:"isPr"`            // GitHub /issues returns PRs; filter these out
 	State     string    `json:"state,omitempty"` // open | closed

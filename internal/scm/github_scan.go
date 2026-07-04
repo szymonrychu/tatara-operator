@@ -31,6 +31,7 @@ type ghIssueItem struct {
 		Login string `json:"login"`
 	} `json:"user"`
 	Labels      []ghLabel `json:"labels"`
+	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 	State       string    `json:"state"`
 	ClosedAt    time.Time `json:"closed_at"`
@@ -78,7 +79,7 @@ func (c *GitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]Issu
 	for _, i := range raw {
 		out = append(out, IssueRef{
 			Repo: slug, Number: i.Number, Title: i.Title, Author: i.User.Login, Labels: ghLabelNames(i.Labels),
-			UpdatedAt: i.UpdatedAt, IsPR: i.PullRequest != nil, State: "open",
+			CreatedAt: i.CreatedAt, UpdatedAt: i.UpdatedAt, IsPR: i.PullRequest != nil, State: "open",
 		})
 	}
 	return out, nil
