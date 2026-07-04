@@ -470,6 +470,7 @@ type TokenBudgetSpec struct {
 	// SpawnCeilingByKind gates each Task kind independently in claudeSubscription
 	// mode: work of kind K is held once account usage reaches the given percent.
 	// Keys are Task kinds; kinds absent here fall through to proactive/emergency.
+	// +kubebuilder:validation:MaxProperties=9
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] >= 0 && self[k] <= 100)",message="spawnCeilingByKind values must be 0..100"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine'])",message="spawnCeilingByKind keys must be valid Task kinds"
 	// +optional

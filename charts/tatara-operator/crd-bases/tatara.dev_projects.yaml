@@ -5817,6 +5817,7 @@ spec:
                       SpawnCeilingByKind gates each Task kind independently in claudeSubscription
                       mode: work of kind K is held once account usage reaches the given percent.
                       Keys are Task kinds; kinds absent here fall through to proactive/emergency.
+                    maxProperties: 9
                     type: object
                     x-kubernetes-validations:
                     - message: spawnCeilingByKind values must be 0..100
