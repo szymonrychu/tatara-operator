@@ -27,7 +27,7 @@ func TestHandleMRCI_FailureRecordsImplementCIFail(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 
-	got := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-fail", "lc-mrcir-ci-fail", "claude-opus-4-8", "fail"))
+	got := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-fail", "lc-mrcir-ci-fail", "issueLifecycle", "claude-opus-4-8", "fail"))
 	if got != 1 {
 		t.Errorf("operator_implement_ci_total{result=fail} = %v, want 1", got)
 	}
@@ -47,7 +47,7 @@ func TestHandleMRCI_SuccessRecordsImplementCIPass(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 
-	got := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-pass", "lc-mrcir-ci-pass", "claude-opus-4-8", "pass"))
+	got := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-pass", "lc-mrcir-ci-pass", "issueLifecycle", "claude-opus-4-8", "pass"))
 	if got != 1 {
 		t.Errorf("operator_implement_ci_total{result=pass} = %v, want 1", got)
 	}
@@ -67,8 +67,8 @@ func TestHandleMRCI_PendingRecordsNoImplementCI(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 
-	gotPass := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-pending", "lc-mrcir-ci-pending", "claude-opus-4-8", "pass"))
-	gotFail := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-pending", "lc-mrcir-ci-pending", "claude-opus-4-8", "fail"))
+	gotPass := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-pending", "lc-mrcir-ci-pending", "issueLifecycle", "claude-opus-4-8", "pass"))
+	gotFail := testutil.ToFloat64(r.Metrics.ImplementCICounter("lc-mrcip-ci-pending", "lc-mrcir-ci-pending", "issueLifecycle", "claude-opus-4-8", "fail"))
 	if gotPass != 0 || gotFail != 0 {
 		t.Errorf("pending CI must not record implement CI metric, got pass=%v fail=%v", gotPass, gotFail)
 	}

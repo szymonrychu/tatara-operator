@@ -357,8 +357,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"project", "repo", "model"}),
 		implementCITotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_implement_ci_total",
-			Help: "Implement-task PR CI conclusions (pass|fail), by model.",
-		}, []string{"project", "repo", "model", "result"}),
+			Help: "PR CI conclusions (pass|fail) for any PR-producing Task kind reaching handleMRCI, by kind and model.",
+		}, []string{"project", "repo", "kind", "model", "result"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -1021,15 +1021,15 @@ func (m *OperatorMetrics) ReviewFindingsCounter(project, repo, model string) pro
 	return m.reviewFindingsTotal.WithLabelValues(project, repo, model)
 }
 
-// RecordImplementCI increments operator_implement_ci_total for an
-// implement-task PR CI conclusion ("pass" or "fail"), keyed by the model that
-// ran the implement Task (G4 quality-proxy signal).
-func (m *OperatorMetrics) RecordImplementCI(project, repo, model, result string) {
-	m.implementCITotal.WithLabelValues(project, repo, model, result).Inc()
+// RecordImplementCI increments operator_implement_ci_total for a PR CI
+// conclusion ("pass" or "fail") on a Task of the given kind, keyed by the
+// model that ran the Task (G4 quality-proxy signal).
+func (m *OperatorMetrics) RecordImplementCI(project, repo, kind, model, result string) {
+	m.implementCITotal.WithLabelValues(project, repo, kind, model, result).Inc()
 }
 
-// ImplementCICounter returns the counter for (project, repo, model, result)
-// for test assertions.
-func (m *OperatorMetrics) ImplementCICounter(project, repo, model, result string) prometheus.Counter {
-	return m.implementCITotal.WithLabelValues(project, repo, model, result)
+// ImplementCICounter returns the counter for (project, repo, kind, model,
+// result) for test assertions.
+func (m *OperatorMetrics) ImplementCICounter(project, repo, kind, model, result string) prometheus.Counter {
+	return m.implementCITotal.WithLabelValues(project, repo, kind, model, result)
 }

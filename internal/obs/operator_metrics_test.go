@@ -1164,7 +1164,7 @@ func TestQualityMetrics_Emit(t *testing.T) {
 	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "approved")
 	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "changes_requested")
 	m.AddReviewFindings("tatara", "op", "claude-sonnet-5", 3)
-	m.RecordImplementCI("tatara", "op", "claude-opus-4-8", "fail")
+	m.RecordImplementCI("tatara", "op", "issueLifecycle", "claude-opus-4-8", "fail")
 
 	if got := testutil.ToFloat64(m.reviewOutcomeTotal.WithLabelValues("tatara", "op", "claude-sonnet-5", "approved")); got != 1 {
 		t.Fatalf("reviewOutcomeTotal approved = %v, want 1", got)
@@ -1175,7 +1175,7 @@ func TestQualityMetrics_Emit(t *testing.T) {
 	if got := testutil.ToFloat64(m.reviewFindingsTotal.WithLabelValues("tatara", "op", "claude-sonnet-5")); got != 3 {
 		t.Fatalf("reviewFindingsTotal = %v, want 3", got)
 	}
-	if got := testutil.ToFloat64(m.implementCITotal.WithLabelValues("tatara", "op", "claude-opus-4-8", "fail")); got != 1 {
+	if got := testutil.ToFloat64(m.implementCITotal.WithLabelValues("tatara", "op", "issueLifecycle", "claude-opus-4-8", "fail")); got != 1 {
 		t.Fatalf("implementCITotal fail = %v, want 1", got)
 	}
 

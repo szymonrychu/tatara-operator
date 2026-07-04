@@ -2036,8 +2036,8 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 			return ctrl.Result{}, err
 		}
 		if r.Metrics != nil {
-			project, repo, _, _, model := taskTokenLabels(task)
-			r.Metrics.RecordImplementCI(project, repo, model, "pass")
+			project, repo, kind, _, model := taskTokenLabels(task)
+			r.Metrics.RecordImplementCI(project, repo, kind, model, "pass")
 		}
 		return ctrl.Result{}, nil
 
@@ -2056,8 +2056,8 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 			return ctrl.Result{}, err
 		}
 		if r.Metrics != nil {
-			project, repo, _, _, model := taskTokenLabels(task)
-			r.Metrics.RecordImplementCI(project, repo, model, "fail")
+			project, repo, kind, _, model := taskTokenLabels(task)
+			r.Metrics.RecordImplementCI(project, repo, kind, model, "fail")
 		}
 		return ctrl.Result{}, nil
 
