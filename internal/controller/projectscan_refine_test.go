@@ -279,6 +279,53 @@ func TestRefineBarrier_DoesNotGateIssueScanOrMRScan(t *testing.T) {
 	}
 }
 
+// TestLatestTerminalRefineTask_ScopedToCycle: a terminal refine Task from a
+// past cycle (created before the current cycle's due-base) must NOT satisfy
+// the barrier for a later cycle - only a Task created at/after `since`
+// counts. Regression test: before the fix, latestTerminalRefineTask ignored
+// `since` entirely, so a single terminal refine Task kept re-satisfying the
+// barrier for every brainstorm tick until TaskRetention (7d) GC'd it, instead
+// of grooming once per cycle.
+func TestLatestTerminalRefineTask_ScopedToCycle(t *testing.T) {
+	proj := seedRefineProject(t, "refine-cycle-scope")
+	r := newScanReconciler(&fakeReader{})
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	ctx := context.Background()
+
+	task := &tatarav1alpha1.Task{}
+	task.GenerateName = "refine-"
+	task.Namespace = testNS
+	task.Spec = tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "refine", Goal: "g"}
+	if err := k8sClient.Create(ctx, task); err != nil {
+		t.Fatalf("create refine task: %v", err)
+	}
+	task.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("mark refine succeeded: %v", err)
+	}
+	createdAt := task.CreationTimestamp.Time
+
+	// Cycle whose due-base precedes the task's creation: the task belongs to
+	// this cycle and satisfies the barrier.
+	sameCycle, err := r.latestTerminalRefineTask(ctx, proj, createdAt.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("latestTerminalRefineTask (same cycle): %v", err)
+	}
+	if sameCycle == nil {
+		t.Fatalf("want terminal task to satisfy a barrier whose base precedes its creation")
+	}
+
+	// A later cycle's due-base is after the task's creation: the stale task
+	// must NOT satisfy this cycle's barrier.
+	laterCycle, err := r.latestTerminalRefineTask(ctx, proj, createdAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("latestTerminalRefineTask (later cycle): %v", err)
+	}
+	if laterCycle != nil {
+		t.Fatalf("want stale terminal task NOT to satisfy a later cycle's barrier, got %s", laterCycle.Name)
+	}
+}
+
 // listIssueQEs returns QueuedEvents for the project whose activity == issueScan.
 func listIssueQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
 	t.Helper()

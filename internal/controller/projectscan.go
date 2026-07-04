@@ -2654,8 +2654,12 @@ func (r *ProjectReconciler) inflightRefineTask(ctx context.Context, proj *tatara
 }
 
 // latestTerminalRefineTask returns the most recently created terminal refine
-// Task for the project, or nil if none exist.
-func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *tatarav1alpha1.Project) (*tatarav1alpha1.Task, error) {
+// Task for the project that was created at/after since (the current cycle's
+// due-base), or nil if none exist. Scoping to since prevents a terminal
+// refine Task from a past cycle (still around because TaskRetention has not
+// GC'd it yet) from satisfying the barrier for every cycle until it expires;
+// each brainstorm cycle must be satisfied by a refine Task from that cycle.
+func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *tatarav1alpha1.Project, since time.Time) (*tatarav1alpha1.Task, error) {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
 		return nil, err
@@ -2667,6 +2671,9 @@ func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		if t.CreationTimestamp.Time.Before(since) {
 			continue
 		}
 		if latest == nil || t.CreationTimestamp.After(latest.CreationTimestamp.Time) {
@@ -2833,7 +2840,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 			if due {
 				proceed := true
 				if r.refineNeededThisCycle(proj, base) {
-					terminal, terr := r.latestTerminalRefineTask(ctx, proj)
+					terminal, terr := r.latestTerminalRefineTask(ctx, proj, base)
 					if terr != nil {
 						l.Error(terr, "scan: check terminal refine task", "action", "scan_refine_error", "resource_id", proj.Name)
 					}
