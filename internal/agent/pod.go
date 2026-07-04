@@ -342,7 +342,7 @@ func branchKind(t *tatarav1alpha1.Task) string {
 		return "fix"
 	case "implement":
 		return "feat"
-	default: // review, brainstorm, healthCheck, selfImprove, triageIssue
+	default: // review, brainstorm (incl. healthCheck activity), selfImprove, triageIssue
 		return "chore"
 	}
 }
@@ -436,7 +436,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// per-turn token/cost series so fleet spend attributes to a Task kind
 		// and repo. Same values the operator uses for operator_task_tokens_total
 		// (taskTokenLabels), so the two token families align. Empty repo for
-		// project-scoped kinds (brainstorm/refine/incident/healthCheck).
+		// project-scoped kinds (brainstorm/refine/incident; healthCheck is an
+		// activity label on a brainstorm task, not its own Kind).
 		{Name: "TATARA_KIND", Value: task.Spec.Kind},
 		{Name: "TATARA_REPO", Value: task.Spec.RepositoryRef},
 		// Work branch the wrapper checks out and pushes; the operator opens the
@@ -664,7 +665,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 
 	// TATARA_WORKSPACE_FULL_CLONE signals the wrapper to clone every project
 	// repo with full history and all branches. Set only for project-scoped kinds
-	// (repo==nil: brainstorm/healthCheck/incident/refine); left empty for
+	// (repo==nil: brainstorm/incident/refine; healthCheck is an activity
+	// label on brainstorm, not its own Kind); left empty for
 	// repo-scoped kinds so the wrapper's default shallow clone is preserved.
 	fullCloneVal := ""
 	if repo == nil {
