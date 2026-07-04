@@ -833,6 +833,11 @@ func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue, model string
 	}
 }
 
+// TaskTokensCounter returns the counter for (project,repo,kind,issue,model,type) for test assertions.
+func (m *OperatorMetrics) TaskTokensCounter(project, repo, kind, issue, model, typ string) prometheus.Counter {
+	return m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, typ)
+}
+
 // TaskTurnsCounter returns the counter for (project,repo,kind,issue) for test assertions.
 func (m *OperatorMetrics) TaskTurnsCounter(project, repo, kind, issue string) prometheus.Counter {
 	return m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue)

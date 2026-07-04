@@ -219,5 +219,64 @@ func setTaskCumulativeTokens(t *testing.T, name string, n int64) {
 	}
 }
 
+// setTaskResolvedModel is a test helper that stamps Status.ResolvedModel on a task.
+func setTaskResolvedModel(t *testing.T, name, model string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Status.ResolvedModel = model
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("setTaskResolvedModel %s: %v", name, err)
+	}
+}
+
+// TestRecordUsage_EmitsAllTokenClasses verifies recordUsage emits uncached
+// input, output, cache_read, and cache_creation as separate
+// operator_task_tokens_total series under the task's resolved model.
+func TestRecordUsage_EmitsAllTokenClasses(t *testing.T) {
+	mkTaskProject(t, "p-usage-emit", 3)
+	mkTaskRepository(t, "r-usage-emit", "p-usage-emit")
+	mkTask(t, "t-usage-emit", "p-usage-emit", "r-usage-emit")
+	setTaskResolvedModel(t, "t-usage-emit", "claude-opus-4-8")
+	annotate(t, "t-usage-emit", map[string]string{annCurrentTurn: "turn-usage-emit"})
+
+	reg := prometheus.NewRegistry()
+	cb := &CallbackServer{
+		Client:    k8sClient,
+		Metrics:   obs.NewOperatorMetrics(reg),
+		Namespace: testNS,
+	}
+	body, _ := json.Marshal(map[string]any{
+		"turnId":    "turn-usage-emit",
+		"state":     "completed",
+		"finalText": "done",
+		"usage": map[string]any{
+			"input_tokens":                1000,
+			"output_tokens":               200,
+			"cache_read_input_tokens":     500,
+			"cache_creation_input_tokens": 80,
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	const proj, repo, kind, issue, model = "p-usage-emit", "r-usage-emit", "implement", "", "claude-opus-4-8"
+	if got := testutil.ToFloat64(cb.Metrics.TaskTokensCounter(proj, repo, kind, issue, model, "input")); got != 1000 {
+		t.Errorf("input = %v, want 1000 (uncached)", got)
+	}
+	if got := testutil.ToFloat64(cb.Metrics.TaskTokensCounter(proj, repo, kind, issue, model, "output")); got != 200 {
+		t.Errorf("output = %v, want 200", got)
+	}
+	if got := testutil.ToFloat64(cb.Metrics.TaskTokensCounter(proj, repo, kind, issue, model, "cache_read")); got != 500 {
+		t.Errorf("cache_read = %v, want 500", got)
+	}
+	if got := testutil.ToFloat64(cb.Metrics.TaskTokensCounter(proj, repo, kind, issue, model, "cache_creation")); got != 80 {
+		t.Errorf("cache_creation = %v, want 80", got)
+	}
+}
+
 // ensure types import is used.
 var _ = types.NamespacedName{}

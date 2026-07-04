@@ -291,7 +291,8 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 	// or stale callbacks), so the metric is not double-counted.
 	if recorded && s.Metrics != nil {
 		project, repo, kind, issue, model := taskTokenLabels(task)
-		s.Metrics.AddTaskTokens(project, repo, kind, issue, model, inputTotal, u.OutputTokens, 0, 0)
+		s.Metrics.AddTaskTokens(project, repo, kind, issue, model,
+			u.InputTokens, u.OutputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens)
 		s.Metrics.AddTaskTurn(project, repo, kind, issue)
 	}
 	return inputTotal + u.OutputTokens, recorded, nil
