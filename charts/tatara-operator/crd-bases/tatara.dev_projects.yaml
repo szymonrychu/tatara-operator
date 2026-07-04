@@ -5947,16 +5947,22 @@ spec:
                 properties:
                   fiveHourPercent:
                     description: |-
-                      FiveHourPercent / WeeklyPercent are the wrapper-reported Claude usage
+                      FiveHourPercent / WeeklyPercent were the wrapper-reported Claude usage
                       percentages (whole percent, 0..100) for the rolling 5h and weekly windows.
-                      A nil reset means "not reported" and the gate ignores that window.
+                      Deprecated: no longer written (Task A8). Subscription state now lives only
+                      in the fleet-wide account-usage store (poller-fed, issue #189 follow-up).
+                      Retained on the CRD for backward compatibility with already-persisted
+                      status; the gate no longer reads them.
                     type: integer
                   fiveHourReset:
+                    description: 'Deprecated: see FiveHourPercent.'
                     format: date-time
                     type: string
                   weeklyPercent:
+                    description: 'Deprecated: see FiveHourPercent.'
                     type: integer
                   weeklyReset:
+                    description: 'Deprecated: see FiveHourPercent.'
                     format: date-time
                     type: string
                   windowStart:
