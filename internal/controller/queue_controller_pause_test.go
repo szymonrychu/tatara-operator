@@ -87,7 +87,7 @@ func TestAdmit_MaxConcurrentTasksZero_PausesBothPools(t *testing.T) {
 			assertQEAdmitted(t, ctx, nQE, tc.wantNormal)
 			assertQEAdmitted(t, ctx, aQE, tc.wantAlert)
 
-			pausedMetric := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "project_paused"))
+			pausedMetric := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "", "project_paused"))
 			if tc.maxConcurrentTasks == 0 {
 				if pausedMetric != 1 {
 					t.Fatalf("admission_blocked{normal,project_paused} = %v, want 1", pausedMetric)

@@ -119,7 +119,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				continue
 			}
 			if r.Metrics != nil {
-				r.Metrics.AdmissionBlocked(proj.Name, q.Spec.Class, "project_paused")
+				r.Metrics.AdmissionBlocked(proj.Name, q.Spec.Class, "", "project_paused")
 			}
 			log.FromContext(ctx).Info("queue: admission held, project paused",
 				"action", "project_paused_skip", "project", proj.Name, "repo", q.Spec.RepositoryRef,
@@ -146,7 +146,7 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		if blocked {
 			if len(queued) > 0 {
 				if r.Metrics != nil {
-					r.Metrics.AdmissionBlocked(proj.Name, class, "token_budget")
+					r.Metrics.AdmissionBlocked(proj.Name, class, "", "token_budget")
 				}
 				log.FromContext(ctx).Info("queue: admission held by token budget",
 					"action", "admission_blocked", "class", class, "reason", "token_budget",
@@ -161,6 +161,9 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				break
 			}
 			if blockKind != nil && blockKind(q.Spec.Kind) {
+				if r.Metrics != nil {
+					r.Metrics.AdmissionBlocked(proj.Name, class, q.Spec.Kind, "kind_ceiling")
+				}
 				continue // held on its per-kind account-usage ceiling; leave Queued
 			}
 			task, err := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)

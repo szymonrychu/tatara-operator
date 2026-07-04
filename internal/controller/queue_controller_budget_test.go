@@ -106,10 +106,10 @@ func TestAdmit_BudgetBlocked_EmitsMetric(t *testing.T) {
 	}
 	assertQEAdmitted(t, ctx, nQE, false)
 	assertQEAdmitted(t, ctx, aQE, true)
-	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "token_budget")); got != 1 {
+	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "", "token_budget")); got != 1 {
 		t.Fatalf("admission_blocked{normal} = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassAlert, "token_budget")); got != 0 {
+	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassAlert, "", "token_budget")); got != 0 {
 		t.Fatalf("admission_blocked{alert} = %v, want 0", got)
 	}
 }
