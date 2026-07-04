@@ -414,8 +414,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		)
 	}
 	env = append(env, []corev1.EnvVar{
-		{Name: "MODEL", Value: project.Spec.Agent.Model},
-		{Name: "EFFORT", Value: project.Spec.Agent.Effort},
+		{Name: "MODEL", Value: modelForKind(project, task.Spec.Kind)},
+		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind)},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
 		{Name: "DEFAULT_CALLBACK_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/turn-complete"},
@@ -432,6 +432,13 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},
+		// Metric identity (component 6): the wrapper stamps these onto its
+		// per-turn token/cost series so fleet spend attributes to a Task kind
+		// and repo. Same values the operator uses for operator_task_tokens_total
+		// (taskTokenLabels), so the two token families align. Empty repo for
+		// project-scoped kinds (brainstorm/refine/incident/healthCheck).
+		{Name: "TATARA_KIND", Value: task.Spec.Kind},
+		{Name: "TATARA_REPO", Value: task.Spec.RepositoryRef},
 		// Work branch the wrapper checks out and pushes; the operator opens the
 		// PR from this same branch (see TaskBranch). Empty for review tasks, which
 		// check out the PR head via CHECKOUT_BRANCH and never push.
@@ -879,6 +886,26 @@ func skillProfileForKind(kind string) string {
 	default:
 		return "" // fail-open
 	}
+}
+
+// modelForKind resolves the MODEL env for a Task Kind: a non-empty per-kind
+// override in AgentSpec.ModelByKind wins, else the project-wide Agent.Model.
+// Follows the toolProfileForKind/skillProfileForKind per-kind branch pattern.
+// A nil map or empty override value falls through to the project-wide model.
+func modelForKind(project *tatarav1alpha1.Project, kind string) string {
+	if v := project.Spec.Agent.ModelByKind[kind]; v != "" {
+		return v
+	}
+	return project.Spec.Agent.Model
+}
+
+// effortForKind resolves the EFFORT env for a Task Kind: a non-empty per-kind
+// override in AgentSpec.EffortByKind wins, else the project-wide Agent.Effort.
+func effortForKind(project *tatarav1alpha1.Project, kind string) string {
+	if v := project.Spec.Agent.EffortByKind[kind]; v != "" {
+		return v
+	}
+	return project.Spec.Agent.Effort
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list

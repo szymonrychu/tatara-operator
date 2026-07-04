@@ -239,6 +239,17 @@ func TestBrainstormActivity_StaleProposalDaysField(t *testing.T) {
 	}
 }
 
+func TestAgentSpec_MaxTaskTokensField(t *testing.T) {
+	a := v1alpha1.AgentSpec{MaxTaskTokens: 3_000_000}
+	if a.MaxTaskTokens != 3_000_000 {
+		t.Fatalf("MaxTaskTokens = %d, want 3000000", a.MaxTaskTokens)
+	}
+	var z v1alpha1.AgentSpec
+	if z.MaxTaskTokens != 0 {
+		t.Fatalf("MaxTaskTokens zero value = %d, want 0 (backstop disabled)", z.MaxTaskTokens)
+	}
+}
+
 // TestMemorySpec_DefaultFieldsExist guards Finding 7: the MemorySpec fields
 // that carry +kubebuilder:default markers exist and accept the default values
 // so the CRD schema and the Go struct stay in sync.

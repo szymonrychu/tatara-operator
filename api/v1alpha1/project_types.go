@@ -137,6 +137,27 @@ type AgentSpec struct {
 	// +kubebuilder:default="xhigh"
 	// +optional
 	Effort string `json:"effort,omitempty"`
+	// MaxTaskTokens is a per-Task cumulative output-token ceiling for the
+	// otherwise turn-uncapped implementation kinds (implement, issueLifecycle): a
+	// runaway backstop, not a cost lever. 0 disables it (the default); opt in via
+	// the Project values. When Status.CumulativeTokens crosses it the Task is
+	// failed with reason TokenBudgetExceeded. TUNE from the component-6 per-kind
+	// token telemetry once a healthy-run distribution is known.
+	// +optional
+	MaxTaskTokens int64 `json:"maxTaskTokens,omitempty"`
+	// ModelByKind overrides the project-wide Model per Task Kind. Keys are the
+	// Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
+	// implement, incident, issueLifecycle, selfImprove); healthCheck shares
+	// Kind=brainstorm so inherits the brainstorm entry. A missing or empty entry
+	// falls back to Model. Values are authoritative model IDs (claude-opus-4-8,
+	// claude-sonnet-5).
+	// +optional
+	ModelByKind map[string]string `json:"modelByKind,omitempty"`
+	// EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
+	// ModelByKind; a missing or empty entry falls back to Effort. Values are the
+	// effort enum (low|medium|high|xhigh|max).
+	// +optional
+	EffortByKind map[string]string `json:"effortByKind,omitempty"`
 	// SkillsRef is the git ref (branch, tag, or SHA) of the tatara-agent-skills
 	// repo to clone at boot. Empty defaults to "main".
 	// +optional

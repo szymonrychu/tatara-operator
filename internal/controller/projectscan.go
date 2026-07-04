@@ -514,6 +514,23 @@ func isStaleUnengagedProposal(iss scm.IssueRef, existing []tatarav1alpha1.Task, 
 	return true
 }
 
+// isBotBrainstormProposal reports whether the candidate is a bot-authored, open
+// (non-PR) brainstorming proposal still in the proposal phase: it carries the
+// brainstorming label and NONE of approved/implementation/declined. It is the
+// label-only half of the source-of-churn gate - such a proposal must not spawn a
+// fresh triage Task every scan cycle until a human engages it. Mirrors
+// isStaleUnengagedProposal's author+label gates without the time / task-liveness
+// checks (the reaper owns staleness; this owns "never engaged").
+func isBotBrainstormProposal(c candidate, brainstorming, approved, implementation, declined, botLogin string) bool {
+	if c.isPR {
+		return false
+	}
+	if c.author == "" || c.author != botLogin {
+		return false
+	}
+	return hasLabel(c.labels, brainstorming) && !hasAnyLabel(c.labels, []string{approved, implementation, declined})
+}
+
 func candidatesFromPRs(prs []scm.PRRef) []candidate {
 	out := make([]candidate, 0, len(prs))
 	for _, p := range prs {
@@ -1266,6 +1283,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 
 	// Dedup BEFORE enqueue so a stale-but-in-flight item is not re-created.
 	managed := managedPhaseLabels(proj.Spec.Scm)
+	brainstorming, approved, implementation, declined := lifecycleLabels(proj.Spec.Scm)
 	gate := r.humanActivityGate(ctx, reader, botLogin)
 	var eligible []candidate
 	for _, c := range cands {
@@ -1374,6 +1392,23 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 				"action", "scan_issue", "resource_id", proj.Name,
 				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
 			continue
+		}
+		// Source-of-churn gate (token conservation, component 5): a bot-authored
+		// brainstorming proposal no human has engaged must not be re-triaged every
+		// scan cycle. The reaper (staleProposalDays) only closes it once it is ALSO
+		// stale; this stops the churn from the first cycle. Any human comment (zero
+		// `since` = ever) clears it. Fail-open when SCM/botLogin/owner-split is
+		// unavailable, matching botHadLastWord and the reactivation gate.
+		if isBotBrainstormProposal(c, brainstorming, approved, implementation, declined, botLogin) {
+			owner, name, cut := strings.Cut(c.repo, "/")
+			if cut && reader != nil && botLogin != "" &&
+				!humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, time.Time{}) {
+				r.Metrics.ScanItem("issueScan", "skipped_brainstorm_no_human")
+				l.Info("issueScan: skipped fresh task creation, brainstorming proposal awaiting human engagement",
+					"action", "scan_issue", "resource_id", proj.Name,
+					"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+				continue
+			}
 		}
 		if r.reapEligible(proj, scm.IssueRef{Repo: c.repo, Number: c.number, Author: c.author, Labels: c.labels, UpdatedAt: c.updatedAt, IsPR: c.isPR}, existing) {
 			r.Metrics.ScanItem("issueScan", "skipped_stale_reapable")

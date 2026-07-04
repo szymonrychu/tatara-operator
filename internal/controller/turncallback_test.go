@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/types"
 
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
@@ -339,5 +340,65 @@ func TestPollOnce_ExpiresTurnTimeout(t *testing.T) {
 	cond := findCond(tk.Status.Conditions, "Ready")
 	if cond == nil || cond.Reason != "TurnTimeout" {
 		t.Errorf("expected Ready/TurnTimeout condition, got %+v", cond)
+	}
+}
+
+func TestTurnComplete_EmitsTaskTokens(t *testing.T) {
+	mkTaskProject(t, "p-tok", 3)
+	mkTaskRepository(t, "r-tok", "p-tok")
+	mkTask(t, "t-tok", "p-tok", "r-tok")
+	mkSubtask(t, "t-tok-s1", "t-tok", 1)
+	// Set a Kind + issue source so the emitted series carries real labels.
+	tk := getTask(t, "t-tok")
+	tk.Spec.Kind = "implement"
+	tk.Spec.Source = &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "szymonrychu/tatara-operator#7"}
+	if err := k8sClient.Update(context.Background(), tk); err != nil {
+		t.Fatalf("set kind/source: %v", err)
+	}
+	annotate(t, "t-tok", map[string]string{
+		annCurrentTurn:    "turn-emit-tok",
+		annCurrentSubtask: "t-tok-s1",
+	})
+
+	reg := prometheus.NewRegistry()
+	cb := &CallbackServer{Client: k8sClient, Metrics: obs.NewOperatorMetrics(reg), Namespace: testNS}
+	body, _ := json.Marshal(map[string]any{
+		"turnId": "turn-emit-tok", "state": "completed",
+		"finalText": "done", "stopReason": "end_turn",
+		"usage": map[string]any{"input_tokens": 1200, "output_tokens": 300},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var input float64
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_task_tokens_total" {
+			continue
+		}
+		for _, mc := range mf.GetMetric() {
+			lbl := map[string]string{}
+			for _, lp := range mc.GetLabel() {
+				lbl[lp.GetName()] = lp.GetValue()
+			}
+			if lbl["kind"] == "implement" && lbl["type"] == "input" && lbl["repo"] == "r-tok" {
+				input = mc.GetCounter().GetValue()
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("operator_task_tokens_total{kind=implement,type=input,repo=r-tok} not emitted")
+	}
+	if input != 1200 {
+		t.Errorf("input tokens = %v, want 1200", input)
 	}
 }

@@ -2348,3 +2348,28 @@ func TestImplementPrompt_SystemicGroup(t *testing.T) {
 func (f *lifecycleFakeSCMWriterMainCI) EnsureLabel(_ context.Context, _, _, _, _ string) error {
 	return nil
 }
+
+// TestImplementPrompt_GuidanceAppearsExactlyOnce guards the token-conservation
+// double-append fix: the Implement turn-0 prompt must carry platformProblemGuidance
+// and toolingConsumeGuidance exactly once each (planTurnText already appends both;
+// lifecyclePhaseGuidance and the old explicit re-append duplicated them).
+func TestImplementPrompt_GuidanceAppearsExactlyOnce(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "task-dedupe", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "proj", RepositoryRef: "repo",
+			Goal: "fix the bug", Kind: "issueLifecycle",
+		},
+	}
+	got := implementPrompt(task)
+	if n := strings.Count(got, "## Platform problems"); n != 1 {
+		t.Errorf("platformProblemGuidance appears %d times, want 1:\n%s", n, got)
+	}
+	if n := strings.Count(got, toolingConsumeSubstr); n != 1 {
+		t.Errorf("toolingConsumeGuidance (%q) appears %d times, want 1:\n%s", toolingConsumeSubstr, n, got)
+	}
+	// The phase block must still be present (fix must not delete it).
+	if !strings.Contains(got, "## Lifecycle phase: Implement") {
+		t.Errorf("implementPrompt missing lifecycle phase block:\n%s", got)
+	}
+}

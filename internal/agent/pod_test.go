@@ -873,3 +873,36 @@ func TestBuildPod_S3NoCredsWhenSecretEmpty(t *testing.T) {
 	_, ok = envValue(c, "S3_BUCKET")
 	require.True(t, ok, "S3 config still injected for the IRSA path")
 }
+
+func TestBuildPod_MetricIdentityEnv(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	task.Spec.Kind = "review"
+	task.Spec.RepositoryRef = "repo1"
+
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+
+	kind, ok := envValue(c, "TATARA_KIND")
+	require.True(t, ok, "TATARA_KIND must be set")
+	require.Equal(t, "review", kind)
+
+	r, ok := envValue(c, "TATARA_REPO")
+	require.True(t, ok, "TATARA_REPO must be set")
+	require.Equal(t, "repo1", r)
+}
+
+func TestBuildPod_MetricIdentityEnv_ProjectScopedEmptyRepo(t *testing.T) {
+	proj, _, task, cfg := sampleInputs()
+	task.Spec.Kind = "brainstorm"
+	task.Spec.RepositoryRef = ""
+
+	// Project-scoped kind: repo == nil, RepositoryRef empty.
+	c := agent.BuildPod(proj, nil, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+
+	kind, ok := envValue(c, "TATARA_KIND")
+	require.True(t, ok)
+	require.Equal(t, "brainstorm", kind)
+
+	r, ok := envValue(c, "TATARA_REPO")
+	require.True(t, ok, "TATARA_REPO must be present even when empty")
+	require.Equal(t, "", r)
+}

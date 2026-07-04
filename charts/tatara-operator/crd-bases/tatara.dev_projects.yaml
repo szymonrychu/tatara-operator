@@ -62,6 +62,14 @@ spec:
                     - xhigh
                     - max
                     type: string
+                  effortByKind:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
+                      ModelByKind; a missing or empty entry falls back to Effort. Values are the
+                      effort enum (low|medium|high|xhigh|max).
+                    type: object
                   extraEnvs:
                     description: |-
                       ExtraEnvs are appended to the wrapper container's env, after the operator's
@@ -5354,11 +5362,32 @@ spec:
                     default: 10
                     minimum: 3
                     type: integer
+                  maxTaskTokens:
+                    description: |-
+                      MaxTaskTokens is a per-Task cumulative output-token ceiling for the
+                      otherwise turn-uncapped implementation kinds (implement, issueLifecycle): a
+                      runaway backstop, not a cost lever. 0 disables it (the default); opt in via
+                      the Project values. When Status.CumulativeTokens crosses it the Task is
+                      failed with reason TokenBudgetExceeded. TUNE from the component-6 per-kind
+                      token telemetry once a healthy-run distribution is known.
+                    format: int64
+                    type: integer
                   maxTurnsPerTask:
                     default: 50
                     type: integer
                   model:
                     type: string
+                  modelByKind:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      ModelByKind overrides the project-wide Model per Task Kind. Keys are the
+                      Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
+                      implement, incident, issueLifecycle, selfImprove); healthCheck shares
+                      Kind=brainstorm so inherits the brainstorm entry. A missing or empty entry
+                      falls back to Model. Values are authoritative model IDs (claude-opus-4-8,
+                      claude-sonnet-5).
+                    type: object
                   permissionMode:
                     default: bypassPermissions
                     type: string
