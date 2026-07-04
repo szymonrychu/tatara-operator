@@ -40,6 +40,21 @@ type DispatcherReconciler struct {
 	Usage *accountusage.Store
 }
 
+// RBAC note (Task A10, no-op): the accountusage poller/mirror (cmd/manager)
+// needs get on the OAuth Secret and get;create;update on ConfigMaps in the
+// operator namespace. No new +kubebuilder:rbac markers are added here because
+// access is already granted: project_controller.go already carries a
+// namespaced "" /secrets marker (get;list;watch;create;update;patch;delete)
+// and repository_controller.go already carries a namespaced "" /configmaps
+// marker (get;list;watch;create;update;patch;delete); both are coalesced into
+// the SAME namespaced Role in charts/tatara-operator/templates/rbac.yaml,
+// scoped to the operator's own namespace (Release.Namespace). That Role is
+// the hand-maintained source of truth the chart renders (see
+// hack/check-rbac-drift.sh); `make rbac-check` confirms the +kubebuilder
+// markers still mirror it with zero drift, so no chart or marker change is
+// required for the poller/mirror to read the OAuth Secret and manage the
+// account-usage ConfigMap.
+
 // blockKindFunc returns a predicate that reports whether a queued event of a
 // given kind must be held on the account usage gate. Subscription mode reads the
 // fleet-wide store; other modes never per-kind block.
