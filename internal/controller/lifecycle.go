@@ -1499,7 +1499,7 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 	if d := skillsDirective("issueLifecycle"); d != "" {
 		base += "\n\n" + d
 	}
-	base += lifecyclePhaseGuidance("Implement")
+	base += lifecyclePhaseBlock("Implement")
 	if task.Status.ImplementContext != "" {
 		base += "\n\n## Re-entry context\n" + task.Status.ImplementContext
 	}
@@ -1513,7 +1513,6 @@ func implementPrompt(task *tatarav1alpha1.Task) string {
 	if task.Annotations[annPendingHandoverResume] == "true" && task.Status.Handover != "" {
 		base += "\n\n## Resume from handover\n" + task.Status.Handover
 	}
-	base += toolingConsumeGuidance
 	return base
 }
 

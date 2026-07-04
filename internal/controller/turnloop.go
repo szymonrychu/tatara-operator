@@ -74,7 +74,7 @@ func planTurnText(goal, branch, project, task string) string {
 //     issue/MR conversation (comments, the issue_outcome decision) is durable.
 //   - implementation phases (Implement, MRCI, Merge, MainCI): changes committed
 //     and pushed to the task branch are restored on the next run.
-func lifecyclePhaseGuidance(state string) string {
+func lifecyclePhaseBlock(state string) string {
 	durable := "Only what you post to the issue/MR conversation (comments, the issue_outcome decision) survives to the next run. Any file edits you make in this workspace are discarded and will NOT be restored."
 	switch state {
 	case "Implement", "MRCI", "Merge", "MainCI":
@@ -85,7 +85,13 @@ func lifecyclePhaseGuidance(state string) string {
 			"This issue is handled as a multi-phase conversation and you are currently in the %s phase. "+
 			"The workspace is transient: it is rebuilt by git clone+checkout on every run and nothing on disk carries over between runs by itself. "+
 			"%s",
-		state, state, durable) + platformProblemGuidance
+		state, state, durable)
+}
+
+// lifecyclePhaseGuidance is lifecyclePhaseBlock plus platformProblemGuidance, for
+// callers (lifecycleTriageText) that do not already carry the platform guidance.
+func lifecyclePhaseGuidance(state string) string {
+	return lifecyclePhaseBlock(state) + platformProblemGuidance
 }
 
 // reviewText is the turn-0 prompt for a kind=review Task (MR/PR review, issue
