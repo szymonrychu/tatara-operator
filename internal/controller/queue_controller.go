@@ -89,6 +89,28 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
 	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task, d budget.Decision) (requeue bool, err error) {
 
+	// Full project pause (issue: maxConcurrentTasks=0 must create NO agent work
+	// at all, not fall back to the QueueCapacity hard floor of 3). This is the
+	// sole chokepoint where a QueuedEvent becomes a Task (both normal and alert
+	// pools), so gating here fully holds the project: no scan/lifecycle/
+	// brainstorm/incident Task is ever created while paused. The >0
+	// concurrency-cap semantics below are unchanged.
+	if proj.Spec.MaxConcurrentTasks == 0 {
+		for i := range qes {
+			q := &qes[i]
+			if !isQueued(q.Status.State) {
+				continue
+			}
+			if r.Metrics != nil {
+				r.Metrics.AdmissionBlocked(proj.Name, q.Spec.Class, "project_paused")
+			}
+			log.FromContext(ctx).Info("queue: admission held, project paused",
+				"action", "project_paused_skip", "project", proj.Name, "repo", q.Spec.RepositoryRef,
+				"resource_id", q.Name, "class", q.Spec.Class, "kind", q.Spec.Kind, "reason", "max_concurrent_tasks_zero")
+		}
+		return false, nil
+	}
+
 	admitPool := func(class string, cap int) error {
 		queued := make([]*tatarav1alpha1.QueuedEvent, 0)
 		for i := range qes {
