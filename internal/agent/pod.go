@@ -881,6 +881,26 @@ func skillProfileForKind(kind string) string {
 	}
 }
 
+// modelForKind resolves the MODEL env for a Task Kind: a non-empty per-kind
+// override in AgentSpec.ModelByKind wins, else the project-wide Agent.Model.
+// Follows the toolProfileForKind/skillProfileForKind per-kind branch pattern.
+// A nil map or empty override value falls through to the project-wide model.
+func modelForKind(project *tatarav1alpha1.Project, kind string) string {
+	if v := project.Spec.Agent.ModelByKind[kind]; v != "" {
+		return v
+	}
+	return project.Spec.Agent.Model
+}
+
+// effortForKind resolves the EFFORT env for a Task Kind: a non-empty per-kind
+// override in AgentSpec.EffortByKind wins, else the project-wide Agent.Effort.
+func effortForKind(project *tatarav1alpha1.Project, kind string) string {
+	if v := project.Spec.Agent.EffortByKind[kind]; v != "" {
+		return v
+	}
+	return project.Spec.Agent.Effort
+}
+
 // hasInternetSource reports whether the comma-joined brainstorm sources list
 // includes "internet", gating the egress NetworkPolicy pod label.
 func hasInternetSource(csv string) bool {
