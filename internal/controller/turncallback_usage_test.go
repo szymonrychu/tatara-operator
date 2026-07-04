@@ -53,6 +53,18 @@ func TestTurnComplete_WithUsage(t *testing.T) {
 	if tk.Status.CumulativeTokens != 200 {
 		t.Errorf("CumulativeTokens = %d, want 200", tk.Status.CumulativeTokens)
 	}
+	if tk.Status.CumulativeInput != 1000 {
+		t.Errorf("CumulativeInput = %d, want 1000", tk.Status.CumulativeInput)
+	}
+	if tk.Status.CumulativeOutput != 200 {
+		t.Errorf("CumulativeOutput = %d, want 200", tk.Status.CumulativeOutput)
+	}
+	if tk.Status.CumulativeCacheRead != 500 {
+		t.Errorf("CumulativeCacheRead = %d, want 500", tk.Status.CumulativeCacheRead)
+	}
+	if tk.Status.CumulativeCacheCreation != 0 {
+		t.Errorf("CumulativeCacheCreation = %d, want 0", tk.Status.CumulativeCacheCreation)
+	}
 }
 
 // TestTurnComplete_WithUsage_Accumulates verifies that CumulativeTokens is

@@ -274,6 +274,10 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		}
 		fresh.Status.LastTurnInputTokens = inputTotal
 		fresh.Status.CumulativeTokens += u.OutputTokens
+		fresh.Status.CumulativeInput += u.InputTokens
+		fresh.Status.CumulativeOutput += u.OutputTokens
+		fresh.Status.CumulativeCacheRead += u.CacheReadInputTokens
+		fresh.Status.CumulativeCacheCreation += u.CacheCreationInputTokens
 		if err := s.Client.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
