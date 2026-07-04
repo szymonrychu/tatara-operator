@@ -173,11 +173,25 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 	return readyInstances, neo4jReady, lightragAvail, memoryAvail, nil
 }
 
-// memoryPhase returns "Ready" when cnpg has at least the wanted ready
-// instances AND neo4j, lightrag and memory each report at least one ready /
-// available replica; otherwise "Provisioning".
+// memoryQuorum is the minimum number of cnpg instances that must be Ready for
+// the cluster to be treated as serving: a strict majority (wantInstances/2 + 1),
+// floored at 1. For a single-instance cluster (the default) quorum is 1; for a
+// 3-node HA cluster it is 2, so losing one replica still leaves a healthy
+// primary plus quorum rather than flipping the whole stack to Provisioning.
+func memoryQuorum(wantInstances int) int {
+	if wantInstances < 1 {
+		return 1
+	}
+	return wantInstances/2 + 1
+}
+
+// memoryPhase returns "Ready" when cnpg has a serving quorum of Ready instances
+// (memoryQuorum) AND neo4j, lightrag and memory each report at least one ready /
+// available replica; otherwise "Provisioning". Gating on a quorum rather than on
+// every instance keeps a degraded-but-primary-serving HA cluster available: a
+// single replica loss must not take memory fully not-ready (issue #215).
 func memoryPhase(readyInstances, wantInstances int, neo4jReady, lightragAvail, memoryAvail int32) string {
-	if readyInstances >= wantInstances && neo4jReady >= 1 && lightragAvail >= 1 && memoryAvail >= 1 {
+	if readyInstances >= memoryQuorum(wantInstances) && neo4jReady >= 1 && lightragAvail >= 1 && memoryAvail >= 1 {
 		return "Ready"
 	}
 	return "Provisioning"
