@@ -1055,6 +1055,21 @@ func (r *TaskReconciler) recordSCM(provider, verb string, err error) {
 	}
 }
 
+// recordReviewQuality records the G4 quality-proxy signal for a review
+// verdict that was just written back successfully: the verdict itself
+// (operator_review_outcome_total) and its finding count
+// (operator_review_findings_total), keyed by the model that ran the review.
+// Finding count is len(Suggestions) - the only per-review count field on
+// ReviewVerdict; AddReviewFindings is a no-op when it is 0.
+func (r *TaskReconciler) recordReviewQuality(task *tatarav1alpha1.Task, verdict string, findingCount int) {
+	if r.Metrics == nil {
+		return
+	}
+	project, repo, _, _, model := taskTokenLabels(task)
+	r.Metrics.RecordReviewOutcome(project, repo, model, verdict)
+	r.Metrics.AddReviewFindings(project, repo, model, findingCount)
+}
+
 // writeBackReview reads Status.ReviewVerdict and posts exactly one verb set.
 // Never calls OpenChange.
 func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error) {
@@ -1074,6 +1089,9 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 		err = writer.Approve(ctx, repo.Spec.URL, token, number, v.Body)
 		r.recordSCM(provider, "approve", err)
 		verbSent = err == nil
+		if err == nil {
+			r.recordReviewQuality(task, "approved", len(v.Suggestions))
+		}
 	case "request_changes":
 		err = writer.RequestChanges(ctx, repo.Spec.URL, token, number, v.Body)
 		r.recordSCM(provider, "request_changes", err)
@@ -1081,6 +1099,9 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 		if err == nil && len(v.Suggestions) > 0 {
 			serr := writer.Suggest(ctx, repo.Spec.URL, token, number, toSCMSuggestions(v.Suggestions))
 			r.recordSCM(provider, "suggest", serr)
+		}
+		if err == nil {
+			r.recordReviewQuality(task, "changes_requested", len(v.Suggestions))
 		}
 	case "comment":
 		// Build the comment target from repo URL + PR number (same addressing as

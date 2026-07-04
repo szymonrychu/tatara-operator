@@ -1156,3 +1156,46 @@ func TestMemoryRetrievalProbe_PreSeeded(t *testing.T) {
 		}
 	}
 }
+
+func TestQualityMetrics_Emit(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "approved")
+	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "changes_requested")
+	m.AddReviewFindings("tatara", "op", "claude-sonnet-5", 3)
+	m.RecordImplementCI("tatara", "op", "issueLifecycle", "claude-opus-4-8", "fail")
+
+	if got := testutil.ToFloat64(m.reviewOutcomeTotal.WithLabelValues("tatara", "op", "claude-sonnet-5", "approved")); got != 1 {
+		t.Fatalf("reviewOutcomeTotal approved = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.reviewOutcomeTotal.WithLabelValues("tatara", "op", "claude-sonnet-5", "changes_requested")); got != 1 {
+		t.Fatalf("reviewOutcomeTotal changes_requested = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.reviewFindingsTotal.WithLabelValues("tatara", "op", "claude-sonnet-5")); got != 3 {
+		t.Fatalf("reviewFindingsTotal = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(m.implementCITotal.WithLabelValues("tatara", "op", "issueLifecycle", "claude-opus-4-8", "fail")); got != 1 {
+		t.Fatalf("implementCITotal fail = %v, want 1", got)
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	wantNames := map[string]bool{
+		"operator_review_outcome_total":  false,
+		"operator_review_findings_total": false,
+		"operator_implement_ci_total":    false,
+	}
+	for _, mf := range mfs {
+		if _, ok := wantNames[mf.GetName()]; ok {
+			wantNames[mf.GetName()] = true
+		}
+	}
+	for name, seen := range wantNames {
+		if !seen {
+			t.Errorf("%s not registered/gathered", name)
+		}
+	}
+}

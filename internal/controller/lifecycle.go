@@ -2035,6 +2035,10 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		if err := r.setLifecycleState(ctx, task, "Merge", "mrci-success"); err != nil {
 			return ctrl.Result{}, err
 		}
+		if r.Metrics != nil {
+			project, repo, kind, _, model := taskTokenLabels(task)
+			r.Metrics.RecordImplementCI(project, repo, kind, model, "pass")
+		}
 		return ctrl.Result{}, nil
 
 	case "failure":
@@ -2050,6 +2054,10 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "mrci-failure"); err != nil {
 			return ctrl.Result{}, err
+		}
+		if r.Metrics != nil {
+			project, repo, kind, _, model := taskTokenLabels(task)
+			r.Metrics.RecordImplementCI(project, repo, kind, model, "fail")
 		}
 		return ctrl.Result{}, nil
 

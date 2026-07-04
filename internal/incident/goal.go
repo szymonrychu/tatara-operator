@@ -49,3 +49,15 @@ func GoalProject(alertCtx string, slugs []string) string {
 		"system. Your only output is the issue (or the false-positive note)." +
 		platformProblemGuidance + toolingNoteGuidance
 }
+
+// GoalTierRevert returns the turn-0 goal for an incident Task fired by a
+// tier-quality alert (a model downgraded for `kind` has regressed). The agent
+// proposes reverting that kind's model/effort tier in tatara-helmfile via a
+// single, unmerged MR.
+func GoalTierRevert(project, kind, model string) string {
+	return "A quality-proxy alert is FIRING: kind \"" + kind + "\" on model \"" + model +
+		"\" has regressed in project \"" + project + "\". Propose reverting this kind's tier: in " +
+		"tatara-helmfile values/project-" + project + "/common.yaml, set agent.modelByKind[" + kind +
+		"] back to claude-opus-4-8 and raise agent.effortByKind[" + kind + "] (to high). Open ONE MR " +
+		"against tatara-helmfile with only that change and a short rationale citing the alert. Do NOT merge."
+}

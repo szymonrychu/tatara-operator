@@ -62,6 +62,9 @@ type OperatorMetrics struct {
 	admissionBlockedTotal     *prometheus.CounterVec
 	repositoryIngestFailing   *prometheus.GaugeVec
 	repositoryLastIngestTime  *prometheus.GaugeVec
+	reviewOutcomeTotal        *prometheus.CounterVec
+	reviewFindingsTotal       *prometheus.CounterVec
+	implementCITotal          *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -344,6 +347,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_admission_blocked_total",
 			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), and reason (token_budget).",
 		}, []string{"project", "class", "reason"}),
+		reviewOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_review_outcome_total",
+			Help: "Review tasks by verdict (approved|changes_requested), keyed by the model that ran the review.",
+		}, []string{"project", "repo", "model", "verdict"}),
+		reviewFindingsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_review_findings_total",
+			Help: "Sum of review findings (suggestions/comments) per review, by model.",
+		}, []string{"project", "repo", "model"}),
+		implementCITotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_implement_ci_total",
+			Help: "PR CI conclusions (pass|fail) for any PR-producing Task kind reaching handleMRCI, by kind and model.",
+		}, []string{"project", "repo", "kind", "model", "result"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -402,6 +417,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.systemicGroupsLed,
 		m.tokenBudgetUsedRatio,
 		m.admissionBlockedTotal,
+		m.reviewOutcomeTotal,
+		m.reviewFindingsTotal,
+		m.implementCITotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -974,4 +992,44 @@ func (m *OperatorMetrics) AdmissionBlocked(project, class, reason string) {
 // test assertions.
 func (m *OperatorMetrics) AdmissionBlockedCounter(project, class, reason string) prometheus.Counter {
 	return m.admissionBlockedTotal.WithLabelValues(project, class, reason)
+}
+
+// RecordReviewOutcome increments operator_review_outcome_total for a review
+// Task's verdict ("approved" or "changes_requested"), keyed by the model that
+// ran the review (G4 quality-proxy signal).
+func (m *OperatorMetrics) RecordReviewOutcome(project, repo, model, verdict string) {
+	m.reviewOutcomeTotal.WithLabelValues(project, repo, model, verdict).Inc()
+}
+
+// AddReviewFindings adds n to operator_review_findings_total for the model
+// that ran a review. Skipped when n <= 0 so the series only ever moves forward.
+func (m *OperatorMetrics) AddReviewFindings(project, repo, model string, n int) {
+	if n > 0 {
+		m.reviewFindingsTotal.WithLabelValues(project, repo, model).Add(float64(n))
+	}
+}
+
+// ReviewOutcomeCounter returns the counter for (project, repo, model, verdict)
+// for test assertions.
+func (m *OperatorMetrics) ReviewOutcomeCounter(project, repo, model, verdict string) prometheus.Counter {
+	return m.reviewOutcomeTotal.WithLabelValues(project, repo, model, verdict)
+}
+
+// ReviewFindingsCounter returns the counter for (project, repo, model) for
+// test assertions.
+func (m *OperatorMetrics) ReviewFindingsCounter(project, repo, model string) prometheus.Counter {
+	return m.reviewFindingsTotal.WithLabelValues(project, repo, model)
+}
+
+// RecordImplementCI increments operator_implement_ci_total for a PR CI
+// conclusion ("pass" or "fail") on a Task of the given kind, keyed by the
+// model that ran the Task (G4 quality-proxy signal).
+func (m *OperatorMetrics) RecordImplementCI(project, repo, kind, model, result string) {
+	m.implementCITotal.WithLabelValues(project, repo, kind, model, result).Inc()
+}
+
+// ImplementCICounter returns the counter for (project, repo, kind, model,
+// result) for test assertions.
+func (m *OperatorMetrics) ImplementCICounter(project, repo, kind, model, result string) prometheus.Counter {
+	return m.implementCITotal.WithLabelValues(project, repo, kind, model, result)
 }
