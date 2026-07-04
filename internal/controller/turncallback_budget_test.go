@@ -44,10 +44,10 @@ func TestUpdateProjectBudget_WindowAccumulatesAndRolls(t *testing.T) {
 	ctx := context.Background()
 
 	// Two recorded turns in the same window accumulate.
-	if err := cb.updateProjectBudget(ctx, task, 100, true, nil); err != nil {
+	if err := cb.updateProjectBudget(ctx, task, 100, true); err != nil {
 		t.Fatalf("updateProjectBudget 1: %v", err)
 	}
-	if err := cb.updateProjectBudget(ctx, task, 250, true, nil); err != nil {
+	if err := cb.updateProjectBudget(ctx, task, 250, true); err != nil {
 		t.Fatalf("updateProjectBudget 2: %v", err)
 	}
 	if p := getProject(t, "p-tb-acc"); p.Status.TokenBudget == nil || p.Status.TokenBudget.WindowTokens != 350 {
@@ -55,7 +55,7 @@ func TestUpdateProjectBudget_WindowAccumulatesAndRolls(t *testing.T) {
 	}
 
 	// A non-recorded (stale/duplicate) callback must NOT accumulate.
-	if err := cb.updateProjectBudget(ctx, task, 999, false, nil); err != nil {
+	if err := cb.updateProjectBudget(ctx, task, 999, false); err != nil {
 		t.Fatalf("updateProjectBudget stale: %v", err)
 	}
 	if p := getProject(t, "p-tb-acc"); p.Status.TokenBudget.WindowTokens != 350 {
@@ -70,42 +70,11 @@ func TestUpdateProjectBudget_WindowAccumulatesAndRolls(t *testing.T) {
 	if err := k8sClient.Status().Update(ctx, p); err != nil {
 		t.Fatalf("seed past window: %v", err)
 	}
-	if err := cb.updateProjectBudget(ctx, task, 100, true, nil); err != nil {
+	if err := cb.updateProjectBudget(ctx, task, 100, true); err != nil {
 		t.Fatalf("updateProjectBudget roll: %v", err)
 	}
 	if p := getProject(t, "p-tb-acc"); p.Status.TokenBudget.WindowTokens != 100 {
 		t.Fatalf("after roll WindowTokens = %d, want 100", p.Status.TokenBudget.WindowTokens)
-	}
-}
-
-func TestUpdateProjectBudget_PersistsRateLimitSnapshot(t *testing.T) {
-	task := mkBudgetProject(t, "p-tb-sub", tatarav1alpha1.TokenBudgetSpec{
-		Enabled: true,
-		Mode:    "claudeSubscription",
-	})
-	cb := newCallbackServer()
-	ctx := context.Background()
-
-	fiveReset := time.Now().Add(2 * time.Hour).Unix()
-	weekReset := time.Now().Add(72 * time.Hour).Unix()
-	rl := &turnRateLimit{
-		FiveHourPercent: 30, FiveHourResetUnix: fiveReset,
-		WeeklyPercent: 70, WeeklyResetUnix: weekReset,
-	}
-	// No usage this turn (recorded=false), but the snapshot still persists.
-	if err := cb.updateProjectBudget(ctx, task, 0, false, rl); err != nil {
-		t.Fatalf("updateProjectBudget rl: %v", err)
-	}
-	p := getProject(t, "p-tb-sub")
-	st := p.Status.TokenBudget
-	if st == nil || st.FiveHourPercent != 30 || st.WeeklyPercent != 70 {
-		t.Fatalf("snapshot not persisted: %+v", st)
-	}
-	if st.FiveHourReset == nil || st.FiveHourReset.Unix() != fiveReset {
-		t.Fatalf("FiveHourReset = %v, want unix %d", st.FiveHourReset, fiveReset)
-	}
-	if st.WeeklyReset == nil || st.WeeklyReset.Unix() != weekReset {
-		t.Fatalf("WeeklyReset = %v, want unix %d", st.WeeklyReset, weekReset)
 	}
 }
 
@@ -118,7 +87,7 @@ func TestUpdateProjectBudget_DisabledIsNoop(t *testing.T) {
 		TokenLimit:     1000,
 	})
 	cb := newCallbackServer()
-	if err := cb.updateProjectBudget(context.Background(), task, 500, true, nil); err != nil {
+	if err := cb.updateProjectBudget(context.Background(), task, 500, true); err != nil {
 		t.Fatalf("updateProjectBudget disabled: %v", err)
 	}
 	if p := getProject(t, "p-tb-off"); p.Status.TokenBudget != nil {

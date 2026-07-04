@@ -653,15 +653,21 @@ type TokenBudgetStatus struct {
 	WindowStart *metav1.Time `json:"windowStart,omitempty"`
 	// +optional
 	WindowTokens int64 `json:"windowTokens,omitempty"`
-	// FiveHourPercent / WeeklyPercent are the wrapper-reported Claude usage
+	// FiveHourPercent / WeeklyPercent were the wrapper-reported Claude usage
 	// percentages (whole percent, 0..100) for the rolling 5h and weekly windows.
-	// A nil reset means "not reported" and the gate ignores that window.
+	// Deprecated: no longer written (Task A8). Subscription state now lives only
+	// in the fleet-wide account-usage store (poller-fed, issue #189 follow-up).
+	// Retained on the CRD for backward compatibility with already-persisted
+	// status; the gate no longer reads them.
 	// +optional
 	FiveHourPercent int `json:"fiveHourPercent,omitempty"`
+	// Deprecated: see FiveHourPercent.
 	// +optional
 	FiveHourReset *metav1.Time `json:"fiveHourReset,omitempty"`
+	// Deprecated: see FiveHourPercent.
 	// +optional
 	WeeklyPercent int `json:"weeklyPercent,omitempty"`
+	// Deprecated: see FiveHourPercent.
 	// +optional
 	WeeklyReset *metav1.Time `json:"weeklyReset,omitempty"`
 }
