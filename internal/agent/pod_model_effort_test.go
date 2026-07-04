@@ -46,6 +46,20 @@ func TestModelForKind_NilAndEmptyOverride(t *testing.T) {
 	}
 }
 
+func TestModelForKind_Exported(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Spec.Agent.Model = "claude-opus-4-8"
+	proj.Spec.Agent.ModelByKind = map[string]string{"review": "claude-sonnet-5"}
+	if got, want := ModelForKind(proj, "review"), modelForKind(proj, "review"); got != want {
+		t.Fatalf("ModelForKind(review) = %q, want %q", got, want)
+	}
+	nilProj := &tatarav1alpha1.Project{}
+	nilProj.Spec.Agent.Model = "claude-haiku-4-5"
+	if got, want := ModelForKind(nilProj, "implement"), modelForKind(nilProj, "implement"); got != want {
+		t.Fatalf("ModelForKind(implement, nil map) = %q, want %q", got, want)
+	}
+}
+
 func TestEffortForKind(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Spec.Agent.Effort = "high"

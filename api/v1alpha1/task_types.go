@@ -315,6 +315,11 @@ type TaskStatus struct {
 	// advance it, writeBackOpenChange opens a duplicate of the merged change).
 	// +optional
 	MergedHeadSHA string `json:"mergedHeadSHA,omitempty"`
+	// ResolvedModel is the MODEL env resolved for this Task's agent pod at spawn
+	// (modelForKind: per-kind override else project-wide). Stamped once at
+	// pod-creation; read by the token/terminal metrics so $ is priced by the
+	// model that actually ran. +optional
+	ResolvedModel string `json:"resolvedModel,omitempty"`
 	// +optional
 	CumulativeTokens int64 `json:"cumulativeTokens,omitempty"`
 	// +optional
