@@ -917,6 +917,32 @@ func TestTaskTerminal(t *testing.T) {
 	}
 }
 
+func TestAddTerminalTokens(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AddTerminalTokens("tatara", "tatara-operator", "churned", "claude-opus-4-8", 2000, 500, 800, 100)
+
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "input")); got != 2000 {
+		t.Fatalf("input = %v, want 2000", got)
+	}
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "output")); got != 500 {
+		t.Fatalf("output = %v, want 500", got)
+	}
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "cache_read")); got != 800 {
+		t.Fatalf("cache_read = %v, want 800", got)
+	}
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "cache_creation")); got != 100 {
+		t.Fatalf("cache_creation = %v, want 100", got)
+	}
+
+	// Zero classes must not create a series.
+	m.AddTerminalTokens("tatara", "tatara-operator", "delivered", "claude-sonnet-5", 0, 0, 0, 0)
+	if got := testutil.CollectAndCount(m.taskTerminalTokensTotal); got != 4 {
+		t.Fatalf("terminal token series count = %d, want 4 (no zero-class series)", got)
+	}
+}
+
 func TestSetLightragDocuments(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)

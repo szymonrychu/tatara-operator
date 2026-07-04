@@ -223,12 +223,40 @@ func (r *TaskReconciler) deleteWrapper(ctx context.Context, task *tatarav1alpha1
 // INFO and increments tatara_lifecycle_transition_total{from,to}. On a
 // transition into a terminal lifecycle state (Done/Stopped/Parked) it also
 // tears down the wrapper Pod+Service so idle agent sessions do not accumulate.
+// terminalOutcome classifies a Task's terminal lifecycle transition into
+// delivered/churned/abandoned for operator_task_terminal_tokens_total.
+// Done is always delivered. Parked is churned when the task gave up and may
+// be re-rolled (a recoverable-giveup reason, or a nonzero ImplementGiveUps
+// count from a PRIOR give-up on this task's durable lifecycle history even if
+// the current reason is not itself recoverable), else abandoned (a
+// deliberate decline/duplicate/etc. with no delivery). Stopped and any other
+// terminal state are abandoned.
+func terminalOutcome(to, reason string, implementGiveUps int) string {
+	switch to {
+	case "Done":
+		return "delivered"
+	case "Parked":
+		if implementGiveUps > 0 || tatarav1alpha1.IsRecoverableGiveup(reason) {
+			return "churned"
+		}
+		return "abandoned"
+	default: // "Stopped" and any other terminal
+		return "abandoned"
+	}
+}
+
 func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1alpha1.Task, to, reason string) error {
 	l := log.FromContext(ctx)
 	// `from` is always overwritten inside the closure (finding 13: the outer
 	// task.Status.LifecycleState initializer was dead code since RetryOnConflict
 	// always runs the closure at least once and sets `from = fresh.Status...`).
 	var from string
+	// Captured from the fresh Task inside the closure for the terminal-tokens
+	// emission below (reading these, not task.Status, avoids a stale in-memory
+	// snapshot - see the emission comment further down).
+	var cumIn, cumOut, cumCR, cumCC int64
+	var stampedModel string
+	var giveUps int
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
@@ -265,9 +293,23 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
+		cumIn, cumOut, cumCR, cumCC = fresh.Status.CumulativeInput, fresh.Status.CumulativeOutput, fresh.Status.CumulativeCacheRead, fresh.Status.CumulativeCacheCreation
+		stampedModel = fresh.Status.ResolvedModel
+		giveUps = fresh.Status.ImplementGiveUps
 		return nil
 	}); err != nil {
 		return fmt.Errorf("setLifecycleState: %w", err)
+	}
+
+	// Emit the task's whole cumulative spend to operator_task_terminal_tokens_total
+	// once, on the transition INTO a terminal lifecycle state. Reading the
+	// closure-captured cumulatives (not task.Status) avoids a stale in-memory
+	// snapshot; guarding on !isLifecycleTerminal(from) prevents a double-emit
+	// when setLifecycleState is re-called with an already-terminal `from`.
+	if r.Metrics != nil && !isLifecycleTerminal(from) && isLifecycleTerminal(to) {
+		r.Metrics.AddTerminalTokens(task.Spec.ProjectRef, task.Spec.RepositoryRef,
+			terminalOutcome(to, reason, giveUps), stampedModel,
+			cumIn, cumOut, cumCR, cumCC)
 	}
 
 	// Clear the boot-crash annotations (attempts budget + captured diagnostics) on

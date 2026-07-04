@@ -50,6 +50,7 @@ type OperatorMetrics struct {
 	taskTurnsTotal            *prometheus.CounterVec
 	taskIssueState            *prometheus.GaugeVec
 	taskTerminalTotal         *prometheus.CounterVec
+	taskTerminalTokensTotal   *prometheus.CounterVec
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
 	memoryRetrievalProbe      *prometheus.CounterVec
@@ -274,6 +275,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_task_terminal_total",
 			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
 		}, []string{"kind", "phase", "reason"}),
+		taskTerminalTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_terminal_tokens_total",
+			Help: "Cumulative agent token usage of terminated Tasks by project, repo, terminal outcome (delivered|churned|abandoned), model, and type (input|output|cache_read|cache_creation). No issue label - churn is outcome-keyed, not issue-keyed.",
+		}, []string{"project", "repo", "outcome", "model", "type"}),
 		lightragDocuments: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_lightrag_documents",
 			Help: "Documents in each per-project lightrag memory corpus by ingestion status.",
@@ -387,6 +392,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.taskTurnsTotal,
 		m.taskIssueState,
 		m.taskTerminalTotal,
+		m.taskTerminalTokensTotal,
 		m.lightragDocuments,
 		m.lightragQueryErrors,
 		m.memoryRetrievalProbe,
@@ -831,6 +837,31 @@ func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue, model string
 	if cacheCreation > 0 {
 		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_creation").Add(float64(cacheCreation))
 	}
+}
+
+// AddTerminalTokens increments operator_task_terminal_tokens_total by a
+// terminated Task's cumulative per-class token totals, labelled by project,
+// repo, the task's classified terminal outcome (delivered|churned|abandoned),
+// and the model that ran. No issue label: churn is outcome-keyed, not
+// issue-keyed, to bound cardinality. Zero or negative deltas are skipped.
+func (m *OperatorMetrics) AddTerminalTokens(project, repo, outcome, model string, input, output, cacheRead, cacheCreation int64) {
+	if input > 0 {
+		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "input").Add(float64(input))
+	}
+	if output > 0 {
+		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "output").Add(float64(output))
+	}
+	if cacheRead > 0 {
+		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "cache_read").Add(float64(cacheRead))
+	}
+	if cacheCreation > 0 {
+		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "cache_creation").Add(float64(cacheCreation))
+	}
+}
+
+// TaskTerminalTokensCounter returns the counter for (project,repo,outcome,model,type) for test assertions.
+func (m *OperatorMetrics) TaskTerminalTokensCounter(project, repo, outcome, model, typ string) prometheus.Counter {
+	return m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, typ)
 }
 
 // TaskTokensCounter returns the counter for (project,repo,kind,issue,model,type) for test assertions.
