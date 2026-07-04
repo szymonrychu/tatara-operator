@@ -5403,9 +5403,10 @@ spec:
                         triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
                         refine'
                       rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])
-                    - message: modelByKind values must be a claude model ID matching
-                        ^claude-[a-z0-9.-]+$
-                      rule: self.all(k, self[k].startsWith('claude-'))
+                    - message: modelByKind values must be a claude model ID (start
+                        with 'claude-', max 64 chars)
+                      rule: self.all(k, self[k].startsWith('claude-') && self[k].size()
+                        <= 64)
                   permissionMode:
                     default: bypassPermissions
                     type: string
