@@ -68,6 +68,7 @@ type OperatorMetrics struct {
 	accountUsageUtil          *prometheus.GaugeVec
 	accountUsageReset         *prometheus.GaugeVec
 	accountUsagePollHealth    prometheus.Gauge
+	accountUsagePollFailures  prometheus.Counter
 	accountOveragePercent     prometheus.Gauge
 	accountOverageUsed        prometheus.Gauge
 	accountOverageLimit       prometheus.Gauge
@@ -381,6 +382,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "tatara_account_usage_poll_health",
 			Help: "1 when the usage poll is healthy, 0 when stale.",
 		}),
+		// Per-fetch failure counter (issue #189). Increments on every failed poll;
+		// the poll-health gauge only flips to 0 once consecutive failures reach the
+		// staleness threshold, so this exposes transient blips the gauge hides.
+		accountUsagePollFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tatara_account_usage_poll_failures_total",
+			Help: "Total Claude account usage poll fetch failures.",
+		}),
 		// Monthly overage (read-only, never gates admission; non-goal per spec).
 		accountOveragePercent: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "tatara_account_overage_percent",
@@ -458,6 +466,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.accountUsageUtil,
 		m.accountUsageReset,
 		m.accountUsagePollHealth,
+		m.accountUsagePollFailures,
 		m.accountOveragePercent,
 		m.accountOverageUsed,
 		m.accountOverageLimit,
@@ -1056,6 +1065,13 @@ func (m *OperatorMetrics) SetAccountUsagePollHealth(healthy bool) {
 		v = 1.0
 	}
 	m.accountUsagePollHealth.Set(v)
+}
+
+// IncAccountUsagePollFailure increments tatara_account_usage_poll_failures_total:
+// a single Claude account usage poll fetch failed. The poll-health gauge only
+// flips to 0 once consecutive failures reach the staleness threshold.
+func (m *OperatorMetrics) IncAccountUsagePollFailure() {
+	m.accountUsagePollFailures.Inc()
 }
 
 // SetAccountOverage sets the monthly overage read-only gauges (never gates

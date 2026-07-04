@@ -38,6 +38,11 @@ type DispatcherReconciler struct {
 	// Usage is the fleet-wide Claude account usage snapshot (claudeSubscription
 	// mode). Nil-safe: a nil store yields an empty snapshot (nothing per-kind held).
 	Usage *accountusage.Store
+	// UsagePollInterval is the account-usage poll cadence (claudeSubscription
+	// mode). It is the requeue delay after a per-kind/pool account-usage hold so
+	// held work re-evaluates once the next poll refreshes the store; a zero value
+	// falls back to 60s (see usageRequeueAfter).
+	UsagePollInterval time.Duration
 }
 
 // RBAC note (Task A10, no-op): the accountusage poller/mirror (cmd/manager)
@@ -66,6 +71,21 @@ func (r *DispatcherReconciler) blockKindFunc(proj *tatarav1alpha1.Project, cfg b
 	return func(kind string) bool {
 		return budget.KindBlocked(cfg, sub, kind, now)
 	}
+}
+
+// ceilingKey resolves which SpawnCeilingByKind entry governs a queued event,
+// mirroring modelForKind/effortForKind precedence (internal/agent/pod.go): a
+// non-empty LabelActivity value that is itself a configured ceiling key wins, so
+// healthCheck work (enqueued as Kind=brainstorm + activity=healthCheck) is
+// governed by the healthCheck ceiling rather than brainstorm's. Otherwise the
+// event's Spec.Kind is used.
+func ceilingKey(cfg budget.Config, q *tatarav1alpha1.QueuedEvent) string {
+	if act := q.Spec.Payload.Labels[tatarav1alpha1.LabelActivity]; act != "" {
+		if _, ok := cfg.SpawnCeilingByKind[act]; ok {
+			return act
+		}
+	}
+	return q.Spec.Kind
 }
 
 func taskByName(tasks []tatarav1alpha1.Task, name string) *tatarav1alpha1.Task {
@@ -119,7 +139,8 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 // Returns requeue=true when a stale terminal Task was deleted so Reconcile can
 // signal a prompt re-attempt via ctrl.Result{RequeueAfter: time.Second}.
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
-	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task, d budget.Decision, blockKind func(string) bool) (requeue bool, err error) {
+	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task,
+	d budget.Decision, cfg budget.Config, sub budget.Subscription, now time.Time) (requeue bool, heldOnUsage bool, err error) {
 
 	// Full project pause (issue: maxConcurrentTasks=0 must create NO agent work
 	// at all, not fall back to the QueueCapacity hard floor of 3). This is the
@@ -140,8 +161,15 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				"action", "project_paused_skip", "project", proj.Name, "repo", q.Spec.RepositoryRef,
 				"resource_id", q.Name, "class", q.Spec.Class, "kind", q.Spec.Kind, "reason", "max_concurrent_tasks_zero")
 		}
-		return false, nil
+		return false, false, nil
 	}
+
+	// claudeSubscription mode decides the account-usage hold PER EVENT (below):
+	// the pool-class Decision is fleet-percent-derived and would freeze whole
+	// pools at the coarse proactive/emergency thresholds, pre-empting the per-kind
+	// spawn ceilings that are the point of subscription mode. customWindow (and
+	// disabled) mode keeps the wholesale per-pool short-circuit unchanged.
+	subscription := cfg.Enabled && cfg.Mode == budget.ModeClaudeSubscription
 
 	admitPool := func(class string, cap int) error {
 		queued := make([]*tatarav1alpha1.QueuedEvent, 0)
@@ -156,9 +184,9 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		// at the higher emergency threshold, so incidents keep flowing while
 		// proactive work is paused. A disabled budget yields the zero Decision, so
 		// neither flag is set and admission is unchanged.
-		blocked := (class == tatarav1alpha1.QueueClassNormal && d.ProactiveBlocked) ||
+		poolBlocked := (class == tatarav1alpha1.QueueClassNormal && d.ProactiveBlocked) ||
 			(class == tatarav1alpha1.QueueClassAlert && d.EmergencyBlocked)
-		if blocked {
+		if !subscription && poolBlocked {
 			if len(queued) > 0 {
 				if r.Metrics != nil {
 					r.Metrics.AdmissionBlocked(proj.Name, class, "", "token_budget")
@@ -175,11 +203,30 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 			if inflight >= cap {
 				break
 			}
-			if blockKind != nil && blockKind(q.Spec.Kind) {
-				if r.Metrics != nil {
-					r.Metrics.AdmissionBlocked(proj.Name, class, q.Spec.Kind, "kind_ceiling")
+			// claudeSubscription account-usage hold, decided per event: a kind with
+			// a configured spawn ceiling is governed ONLY by that ceiling (so
+			// incident:98 admits until ~98% while brainstorm:40 is already held); a
+			// kind without one falls through to the pool-class proactive/emergency
+			// decision. No-op in customWindow mode (handled by the short-circuit
+			// above), so subscription==false leaves admission unchanged.
+			if subscription {
+				key := ceilingKey(cfg, q)
+				held := poolBlocked
+				reason := "token_budget"
+				if _, hasCeiling := cfg.SpawnCeilingByKind[key]; hasCeiling {
+					held = budget.KindBlocked(cfg, sub, key, now)
+					reason = "kind_ceiling"
 				}
-				continue // held on its per-kind account-usage ceiling; leave Queued
+				if held {
+					heldOnUsage = true
+					if r.Metrics != nil {
+						r.Metrics.AdmissionBlocked(proj.Name, class, q.Spec.Kind, reason)
+					}
+					log.FromContext(ctx).Info("queue: admission held by account usage",
+						"action", "admission_blocked", "class", class, "kind", q.Spec.Kind,
+						"reason", reason, "used_percent", d.UsedPercent)
+					continue // leave Queued; requeued to re-evaluate after next poll
+				}
 			}
 			task, err := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
 			if err != nil {
@@ -231,12 +278,12 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 	}
 
 	if err := admitPool(tatarav1alpha1.QueueClassAlert, proj.AlertCapacity()); err != nil {
-		return false, err
+		return false, heldOnUsage, err
 	}
 	if err := admitPool(tatarav1alpha1.QueueClassNormal, proj.QueueCapacity()); err != nil {
-		return false, err
+		return false, heldOnUsage, err
 	}
-	return requeue, nil
+	return requeue, heldOnUsage, nil
 }
 
 // reconcileDone GC-deletes Admitted events whose Task is terminal or gone
@@ -308,11 +355,19 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// to gate admission and to drive the boundary-aware requeue below.
 	budgetCfg := proj.BudgetConfig(r.BudgetDefaults)
 	sub := proj.BudgetSubscription()
+	// claudeSubscription mode reads the fleet store's last-known snapshot even when
+	// the poll has gone stale (Store.Healthy=false). The spec's "fall back to
+	// customWindow when stale" is deliberately NOT implemented (F7): a
+	// claudeSubscription Project has no customWindow inputs (TokenLimit/
+	// ResetSchedule) to fall back to. Staleness is instead governed by
+	// budget.active() - each window fails open once its own reset passes - made
+	// visible by tatara_account_usage_poll_health (F3), with the wrapper's OTel 429
+	// floor as the hard backstop. See MEMORY.md 2026-07-04.
 	if budgetCfg.Mode == budget.ModeClaudeSubscription && r.Usage != nil {
 		sub = r.Usage.Get().Subscription()
 	}
 	decision := budget.Evaluate(budgetCfg, proj.BudgetWindowState(), sub, time.Now())
-	requeue, err := r.admit(ctx, &proj, qes, tasks, decision, r.blockKindFunc(&proj, budgetCfg, time.Now()))
+	requeue, heldOnUsage, err := r.admit(ctx, &proj, qes, tasks, decision, budgetCfg, sub, time.Now())
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -371,6 +426,13 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if budgetHeld {
 		return ctrl.Result{RequeueAfter: budgetRequeueAfter(budgetCfg, time.Now())}, nil
 	}
+	// Account-usage-held backstop (claudeSubscription mode): the fleet Store is not
+	// a watched resource, so a per-kind or pool-class hold would never resume until
+	// an unrelated QueuedEvent re-triggered the dispatcher. Requeue so the gate
+	// re-evaluates once the next poll refreshes the store (F2).
+	if heldOnUsage {
+		return ctrl.Result{RequeueAfter: r.usageRequeueAfter()}, nil
+	}
 	if waiting {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -415,6 +477,17 @@ func budgetRequeueAfter(cfg budget.Config, now time.Time) time.Duration {
 		return maxWait
 	}
 	return wait
+}
+
+// usageRequeueAfter is the delay before re-checking work held on the account-
+// usage gate (claudeSubscription mode): the configured poll interval when known,
+// else a 60s fallback. Held work resumes on the reconcile this schedules once the
+// next poll has refreshed the fleet store (F2).
+func (r *DispatcherReconciler) usageRequeueAfter() time.Duration {
+	if r.UsagePollInterval > 0 {
+		return r.UsagePollInterval
+	}
+	return 60 * time.Second
 }
 
 func queuedAutonomousCount(qes []tatarav1alpha1.QueuedEvent) int {

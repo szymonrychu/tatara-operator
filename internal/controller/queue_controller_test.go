@@ -58,7 +58,7 @@ func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,7 +97,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// First admit: creates Task, marks Admitted.
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	got := refreshQE(t, ctx, qe)
@@ -116,7 +116,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// Second admit: Task already exists (AlreadyExists), must not create a second one.
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
 

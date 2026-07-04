@@ -236,7 +236,11 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// first live poll replaces it, so a stale restore never masks a real outage.
 	usageStore := &accountusage.Store{}
 	usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
-	if snap, err := usageMirror.Load(context.Background()); err == nil {
+	if snap, err := usageMirror.Load(context.Background()); err != nil {
+		// Load already swallows a missing ConfigMap to a nil error, so a non-nil err
+		// is a real read/decode failure that must not be dropped silently (rule 12).
+		slog.Warn("accountusage mirror load failed", "action", "usage_mirror_load", "error", err)
+	} else {
 		snap.Healthy = false
 		usageStore.Set(snap)
 	}
@@ -249,28 +253,30 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	usagePoller := &accountusage.Poller{
 		Fetcher:          usageClient,
 		Store:            usageStore,
+		Metrics:          metrics,
 		Interval:         cfg.UsagePollInterval,
 		FailureThreshold: 3,
 		Now:              time.Now,
 	}
+	// onUpdate mirrors the snapshot to the ConfigMap only; all account-usage
+	// metrics (utilization, reset, overage, poll-health, failures) are produced by
+	// the poller itself so failures and staleness stay observable (F3).
 	usagePoller.SetOnUpdate(func(s accountusage.Snapshot) {
-		_ = usageMirror.Save(context.Background(), s)
-		metrics.SetAccountUsage("five_hour", s.FiveHour.Percent)
-		metrics.SetAccountUsage("seven_day", s.Weekly.Percent)
-		metrics.SetAccountUsage("seven_day_opus", s.Opus.Percent)
-		metrics.SetAccountUsage("seven_day_sonnet", s.Sonnet.Percent)
-		metrics.SetAccountUsagePollHealth(s.Healthy)
+		if err := usageMirror.Save(context.Background(), s); err != nil {
+			slog.Warn("accountusage mirror save failed", "action", "usage_mirror_save", "error", err)
+		}
 	})
 	if err := mgr.Add(usagePoller); err != nil {
 		return nil, fmt.Errorf("add usage poller: %w", err)
 	}
 
 	if err := (&controller.DispatcherReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		Metrics:        metrics,
-		BudgetDefaults: cfg.BudgetDefaults(),
-		Usage:          usageStore,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Metrics:           metrics,
+		BudgetDefaults:    cfg.BudgetDefaults(),
+		Usage:             usageStore,
+		UsagePollInterval: cfg.UsagePollInterval,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup DispatcherReconciler: %w", err)
 	}
