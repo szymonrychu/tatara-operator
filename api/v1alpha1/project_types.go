@@ -147,20 +147,22 @@ type AgentSpec struct {
 	MaxTaskTokens int64 `json:"maxTaskTokens,omitempty"`
 	// ModelByKind overrides the project-wide Model per Task Kind. Keys are the
 	// Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
-	// implement, incident, issueLifecycle, selfImprove); healthCheck shares
-	// Kind=brainstorm so inherits the brainstorm entry. A missing or empty entry
-	// falls back to Model. Values are authoritative model IDs (claude-opus-4-8,
-	// claude-sonnet-5).
-	// +kubebuilder:validation:MaxProperties=8
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])",message="modelByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine"
+	// implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
+	// pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
+	// key first (falling back to the brainstorm entry when absent), letting
+	// healthCheck's recurring classification work be tiered separately from
+	// brainstorm's creative work. A missing or empty entry falls back to Model.
+	// Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
+	// +kubebuilder:validation:MaxProperties=9
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])",message="modelByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].startsWith('claude-') && self[k].size() <= 64)",message="modelByKind values must be a claude model ID (start with 'claude-', max 64 chars)"
 	// +optional
 	ModelByKind map[string]string `json:"modelByKind,omitempty"`
 	// EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
-	// ModelByKind; a missing or empty entry falls back to Effort. Values are the
-	// effort enum (low|medium|high|xhigh|max).
-	// +kubebuilder:validation:MaxProperties=8
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])",message="effortByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine"
+	// ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
+	// entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
+	// +kubebuilder:validation:MaxProperties=9
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])",message="effortByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] in ['low','medium','high','xhigh','max'])",message="effortByKind values must be one of: low, medium, high, xhigh, max"
 	// +optional
 	EffortByKind map[string]string `json:"effortByKind,omitempty"`

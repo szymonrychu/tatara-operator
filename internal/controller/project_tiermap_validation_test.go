@@ -94,3 +94,25 @@ func TestProjectTierMapValidation_AcceptsValidTierMap(t *testing.T) {
 		t.Fatalf("expected valid tier map to be accepted, got error: %v", err)
 	}
 }
+
+// TestProjectTierMapValidation_AcceptsHealthCheckKey asserts the apiserver
+// admits the "healthCheck" pseudo-key in modelByKind/effortByKind, letting
+// healthCheck (which shares Kind=brainstorm) be tiered separately from
+// brainstorm proper.
+func TestProjectTierMapValidation_AcceptsHealthCheckKey(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier-healthcheck", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "tier-healthcheck-scm",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"},
+			Agent: tatarav1alpha1.AgentSpec{
+				ModelByKind:  map[string]string{"healthCheck": "claude-sonnet-5", "brainstorm": "claude-opus-4-8"},
+				EffortByKind: map[string]string{"healthCheck": "medium", "brainstorm": "high"},
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("expected healthCheck key to be accepted, got error: %v", err)
+	}
+}

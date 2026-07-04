@@ -414,8 +414,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		)
 	}
 	env = append(env, []corev1.EnvVar{
-		{Name: "MODEL", Value: modelForKind(project, task.Spec.Kind)},
-		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind)},
+		{Name: "MODEL", Value: modelForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
+		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
 		{Name: "DEFAULT_CALLBACK_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/turn-complete"},
@@ -890,11 +890,19 @@ func skillProfileForKind(kind string) string {
 	}
 }
 
-// modelForKind resolves the MODEL env for a Task Kind: a non-empty per-kind
-// override in AgentSpec.ModelByKind wins, else the project-wide Agent.Model.
-// Follows the toolProfileForKind/skillProfileForKind per-kind branch pattern.
-// A nil map or empty override value falls through to the project-wide model.
-func modelForKind(project *tatarav1alpha1.Project, kind string) string {
+// modelForKind resolves the MODEL env for a Task Kind+activity: healthCheck
+// shares Kind=brainstorm but is recurring classification work, a prime Sonnet
+// candidate, so a healthCheck-activity task first checks the "healthCheck"
+// pseudo-key in AgentSpec.ModelByKind, then falls back to the kind entry
+// (brainstorm), then the project-wide Agent.Model. Non-healthCheck tasks skip
+// straight to the kind entry. Follows the toolProfileForKind/skillProfileForKind
+// per-kind branch pattern. A nil map or empty override value falls through.
+func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+	if activity == "healthCheck" {
+		if v := project.Spec.Agent.ModelByKind["healthCheck"]; v != "" {
+			return v
+		}
+	}
 	if v := project.Spec.Agent.ModelByKind[kind]; v != "" {
 		return v
 	}
@@ -903,13 +911,18 @@ func modelForKind(project *tatarav1alpha1.Project, kind string) string {
 
 // ModelForKind exports modelForKind for controller callers that need to stamp
 // the resolved model on Task.Status at pod-creation.
-func ModelForKind(project *tatarav1alpha1.Project, kind string) string {
-	return modelForKind(project, kind)
+func ModelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+	return modelForKind(project, kind, activity)
 }
 
-// effortForKind resolves the EFFORT env for a Task Kind: a non-empty per-kind
-// override in AgentSpec.EffortByKind wins, else the project-wide Agent.Effort.
-func effortForKind(project *tatarav1alpha1.Project, kind string) string {
+// effortForKind resolves the EFFORT env for a Task Kind+activity, keying on
+// the same "healthCheck" pseudo-key precedence as modelForKind.
+func effortForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+	if activity == "healthCheck" {
+		if v := project.Spec.Agent.EffortByKind["healthCheck"]; v != "" {
+			return v
+		}
+	}
 	if v := project.Spec.Agent.EffortByKind[kind]; v != "" {
 		return v
 	}

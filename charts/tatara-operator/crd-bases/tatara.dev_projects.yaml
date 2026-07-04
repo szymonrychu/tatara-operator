@@ -67,15 +67,15 @@ spec:
                       type: string
                     description: |-
                       EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
-                      ModelByKind; a missing or empty entry falls back to Effort. Values are the
-                      effort enum (low|medium|high|xhigh|max).
-                    maxProperties: 8
+                      ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
+                      entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
+                    maxProperties: 9
                     type: object
                     x-kubernetes-validations:
                     - message: 'effortByKind keys must be one of: implement, review,
                         triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
-                        refine'
-                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])
+                        refine, healthCheck'
+                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])
                     - message: 'effortByKind values must be one of: low, medium, high,
                         xhigh, max'
                       rule: self.all(k, self[k] in ['low','medium','high','xhigh','max'])
@@ -5392,17 +5392,19 @@ spec:
                     description: |-
                       ModelByKind overrides the project-wide Model per Task Kind. Keys are the
                       Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
-                      implement, incident, issueLifecycle, selfImprove); healthCheck shares
-                      Kind=brainstorm so inherits the brainstorm entry. A missing or empty entry
-                      falls back to Model. Values are authoritative model IDs (claude-opus-4-8,
-                      claude-sonnet-5).
-                    maxProperties: 8
+                      implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
+                      pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
+                      key first (falling back to the brainstorm entry when absent), letting
+                      healthCheck's recurring classification work be tiered separately from
+                      brainstorm's creative work. A missing or empty entry falls back to Model.
+                      Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
+                    maxProperties: 9
                     type: object
                     x-kubernetes-validations:
                     - message: 'modelByKind keys must be one of: implement, review,
                         triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
-                        refine'
-                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])
+                        refine, healthCheck'
+                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])
                     - message: modelByKind values must be a claude model ID (start
                         with 'claude-', max 64 chars)
                       rule: self.all(k, self[k].startsWith('claude-') && self[k].size()
