@@ -151,11 +151,17 @@ type AgentSpec struct {
 	// Kind=brainstorm so inherits the brainstorm entry. A missing or empty entry
 	// falls back to Model. Values are authoritative model IDs (claude-opus-4-8,
 	// claude-sonnet-5).
+	// +kubebuilder:validation:MaxProperties=8
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])",message="modelByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].startsWith('claude-'))",message="modelByKind values must be a claude model ID matching ^claude-[a-z0-9.-]+$"
 	// +optional
 	ModelByKind map[string]string `json:"modelByKind,omitempty"`
 	// EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
 	// ModelByKind; a missing or empty entry falls back to Effort. Values are the
 	// effort enum (low|medium|high|xhigh|max).
+	// +kubebuilder:validation:MaxProperties=8
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])",message="effortByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] in ['low','medium','high','xhigh','max'])",message="effortByKind values must be one of: low, medium, high, xhigh, max"
 	// +optional
 	EffortByKind map[string]string `json:"effortByKind,omitempty"`
 	// SkillsRef is the git ref (branch, tag, or SHA) of the tatara-agent-skills

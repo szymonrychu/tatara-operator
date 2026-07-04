@@ -69,7 +69,16 @@ spec:
                       EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
                       ModelByKind; a missing or empty entry falls back to Effort. Values are the
                       effort enum (low|medium|high|xhigh|max).
+                    maxProperties: 8
                     type: object
+                    x-kubernetes-validations:
+                    - message: 'effortByKind keys must be one of: implement, review,
+                        triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
+                        refine'
+                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])
+                    - message: 'effortByKind values must be one of: low, medium, high,
+                        xhigh, max'
+                      rule: self.all(k, self[k] in ['low','medium','high','xhigh','max'])
                   extraEnvs:
                     description: |-
                       ExtraEnvs are appended to the wrapper container's env, after the operator's
@@ -5387,7 +5396,16 @@ spec:
                       Kind=brainstorm so inherits the brainstorm entry. A missing or empty entry
                       falls back to Model. Values are authoritative model IDs (claude-opus-4-8,
                       claude-sonnet-5).
+                    maxProperties: 8
                     type: object
+                    x-kubernetes-validations:
+                    - message: 'modelByKind keys must be one of: implement, review,
+                        triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
+                        refine'
+                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine'])
+                    - message: modelByKind values must be a claude model ID matching
+                        ^claude-[a-z0-9.-]+$
+                      rule: self.all(k, self[k].startsWith('claude-'))
                   permissionMode:
                     default: bypassPermissions
                     type: string
