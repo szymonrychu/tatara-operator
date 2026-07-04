@@ -371,9 +371,9 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 		// not accumulate stale series forever (bounded cardinality). Skip project-
 		// scoped tasks (empty issue) to avoid clearing shared label-value buckets.
 		if s.Metrics != nil {
-			project, repo, kind, issue := taskTokenLabels(tk)
+			project, repo, kind, issue, model := taskTokenLabels(tk)
 			if issue != "" {
-				s.Metrics.DeleteTaskSeries(project, repo, kind, issue)
+				s.Metrics.DeleteTaskSeries(project, repo, kind, issue, model)
 			}
 		}
 		del := tk.DeepCopy()

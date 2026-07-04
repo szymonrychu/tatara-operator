@@ -290,8 +290,8 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 	// only when the status write actually landed (the guards above skip duplicate
 	// or stale callbacks), so the metric is not double-counted.
 	if recorded && s.Metrics != nil {
-		project, repo, kind, issue := taskTokenLabels(task)
-		s.Metrics.AddTaskTokens(project, repo, kind, issue, inputTotal, u.OutputTokens)
+		project, repo, kind, issue, model := taskTokenLabels(task)
+		s.Metrics.AddTaskTokens(project, repo, kind, issue, model, inputTotal, u.OutputTokens, 0, 0)
 		s.Metrics.AddTaskTurn(project, repo, kind, issue)
 	}
 	return inputTotal + u.OutputTokens, recorded, nil
@@ -436,7 +436,7 @@ func (s *CallbackServer) recordConversation(ctx context.Context, task *tatarav1a
 // metrics. issue is set only for issue-scoped tasks (Spec.Source present),
 // preferring the IssueRef and falling back to the numeric Number, and is left
 // empty otherwise to bound series cardinality.
-func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue string) {
+func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, model string) {
 	project = task.Spec.ProjectRef
 	repo = task.Spec.RepositoryRef
 	kind = task.Spec.Kind
@@ -448,6 +448,7 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue stri
 			issue = strconv.Itoa(task.Spec.Source.Number)
 		}
 	}
+	model = task.Status.ResolvedModel
 	return
 }
 

@@ -260,8 +260,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"project", "class"}),
 		taskTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_tokens_total",
-			Help: "Agent token usage by project, repo, Task kind, issue, and type (input|output).",
-		}, []string{"project", "repo", "kind", "issue", "type"}),
+			Help: "Agent token usage by project, repo, Task kind, issue, model, and type (input|output|cache_read|cache_creation).",
+		}, []string{"project", "repo", "kind", "issue", "model", "type"}),
 		taskTurnsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_turns_total",
 			Help: "Agent turns completed by project, repo, Task kind, and issue.",
@@ -813,16 +813,23 @@ func (m *OperatorMetrics) SetQueueInflight(project, class string, n int) {
 	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
 }
 
-// AddTaskTokens increments operator_task_tokens_total by the input/output token
+// AddTaskTokens increments operator_task_tokens_total by the per-class token
 // deltas a single agent turn consumed, labelled by the Task's project, repo,
-// kind, and issue. issue is "" for non-issue-scoped tasks to bound cardinality.
-// Zero or negative deltas are skipped so the series only ever moves forward.
-func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue string, input, output int64) {
+// kind, issue, and the model that ran. issue is "" for non-issue-scoped tasks
+// to bound cardinality; model is "" when unstamped (fail-open). Zero or
+// negative deltas are skipped so each series only ever moves forward.
+func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue, model string, input, output, cacheRead, cacheCreation int64) {
 	if input > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, "input").Add(float64(input))
+		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "input").Add(float64(input))
 	}
 	if output > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, "output").Add(float64(output))
+		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "output").Add(float64(output))
+	}
+	if cacheRead > 0 {
+		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_read").Add(float64(cacheRead))
+	}
+	if cacheCreation > 0 {
+		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_creation").Add(float64(cacheCreation))
 	}
 }
 
@@ -855,9 +862,11 @@ func (m *OperatorMetrics) ResetIssueState() {
 // garbage-collected. Bounds counter cardinality to live + recently-live issues.
 // Skip when issue=="" (project-scoped tasks share that label value and must not
 // be cleared on any individual task's GC).
-func (m *OperatorMetrics) DeleteTaskSeries(project, repo, kind, issue string) {
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, "input")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, "output")
+func (m *OperatorMetrics) DeleteTaskSeries(project, repo, kind, issue, model string) {
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "input")
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "output")
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "cache_read")
+	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "cache_creation")
 	m.taskTurnsTotal.DeleteLabelValues(project, repo, kind, issue)
 }
 

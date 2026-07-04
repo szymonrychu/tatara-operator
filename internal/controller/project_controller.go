@@ -443,7 +443,7 @@ func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {
 	r.Metrics.ResetIssueState()
 	for i := range list.Items {
 		t := &list.Items[i]
-		project, repo, kind, issue := taskTokenLabels(t)
+		project, repo, kind, issue, _ := taskTokenLabels(t)
 		if issue == "" {
 			continue
 		}
