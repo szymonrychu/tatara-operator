@@ -1009,6 +1009,18 @@ func (m *OperatorMetrics) AddReviewFindings(project, repo, model string, n int) 
 	}
 }
 
+// ReviewOutcomeCounter returns the counter for (project, repo, model, verdict)
+// for test assertions.
+func (m *OperatorMetrics) ReviewOutcomeCounter(project, repo, model, verdict string) prometheus.Counter {
+	return m.reviewOutcomeTotal.WithLabelValues(project, repo, model, verdict)
+}
+
+// ReviewFindingsCounter returns the counter for (project, repo, model) for
+// test assertions.
+func (m *OperatorMetrics) ReviewFindingsCounter(project, repo, model string) prometheus.Counter {
+	return m.reviewFindingsTotal.WithLabelValues(project, repo, model)
+}
+
 // RecordImplementCI increments operator_implement_ci_total for an
 // implement-task PR CI conclusion ("pass" or "fail"), keyed by the model that
 // ran the implement Task (G4 quality-proxy signal).
