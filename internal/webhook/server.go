@@ -885,7 +885,12 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) (bool, error) {
 	slugs := projectRepoSlugs(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name)
 	alertCtx := renderAlertContext(alert)
-	goal := incident.GoalProject(alertCtx, slugs)
+	var goal string
+	if alert.CommonLabels["tatara_tier_quality"] == "true" {
+		goal = incident.GoalTierRevert(proj.Name, alert.CommonLabels["kind"], alert.CommonLabels["model"])
+	} else {
+		goal = incident.GoalProject(alertCtx, slugs)
+	}
 	payload := tatarav1.QueuedEventPayload{
 		Kind:         "incident",
 		Goal:         goal,
