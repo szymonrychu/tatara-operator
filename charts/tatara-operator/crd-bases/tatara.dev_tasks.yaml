@@ -304,6 +304,30 @@ spec:
                   configured and the first run has reported it (or a forked key is set for a
                   brainstorm-derived issue).
                 type: string
+              cumulativeCacheCreation:
+                description: |-
+                  CumulativeCacheCreation is the running total of cache-creation input
+                  tokens across all turns of this Task. +optional
+                format: int64
+                type: integer
+              cumulativeCacheRead:
+                description: |-
+                  CumulativeCacheRead is the running total of cache-read input tokens
+                  across all turns of this Task. +optional
+                format: int64
+                type: integer
+              cumulativeInput:
+                description: |-
+                  CumulativeInput is the running total of uncached input tokens
+                  (turnUsage.InputTokens) across all turns of this Task. +optional
+                format: int64
+                type: integer
+              cumulativeOutput:
+                description: |-
+                  CumulativeOutput is the running total of output tokens across all turns
+                  of this Task. +optional
+                format: int64
+                type: integer
               cumulativeTokens:
                 format: int64
                 type: integer
@@ -464,6 +488,13 @@ spec:
                 - action
                 type: object
               prURL:
+                type: string
+              resolvedModel:
+                description: |-
+                  ResolvedModel is the MODEL env resolved for this Task's agent pod at spawn
+                  (modelForKind: per-kind override else project-wide). Stamped once at
+                  pod-creation; read by the token/terminal metrics so $ is priced by the
+                  model that actually ran. +optional
                 type: string
               resultSummary:
                 type: string
