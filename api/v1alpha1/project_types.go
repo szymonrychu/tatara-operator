@@ -137,6 +137,14 @@ type AgentSpec struct {
 	// +kubebuilder:default="xhigh"
 	// +optional
 	Effort string `json:"effort,omitempty"`
+	// MaxTaskTokens is a per-Task cumulative output-token ceiling for the
+	// otherwise turn-uncapped implementation kinds (implement, issueLifecycle): a
+	// runaway backstop, not a cost lever. 0 disables it (the default); opt in via
+	// the Project values. When Status.CumulativeTokens crosses it the Task is
+	// failed with reason TokenBudgetExceeded. TUNE from the component-6 per-kind
+	// token telemetry once a healthy-run distribution is known.
+	// +optional
+	MaxTaskTokens int64 `json:"maxTaskTokens,omitempty"`
 	// ModelByKind overrides the project-wide Model per Task Kind. Keys are the
 	// Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
 	// implement, incident, issueLifecycle, selfImprove); healthCheck shares

@@ -983,6 +983,16 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 			fmt.Sprintf("reached turn cap %d", limit))
 	}
 
+	// Per-Task token runaway backstop (token conservation, component 5): the
+	// uncapped implementation kinds fail cleanly when they cross the per-Task
+	// output-token ceiling, so a looping agent cannot burn unbounded tokens. The
+	// terminate path records operator_task_terminal_total{reason=TokenBudgetExceeded}.
+	if taskTokenBudgetExceeded(project, task) {
+		return r.terminate(ctx, task, "Failed", "TokenBudgetExceeded",
+			fmt.Sprintf("cumulative tokens %d reached the per-task budget %d",
+				task.Status.CumulativeTokens, project.Spec.Agent.MaxTaskTokens))
+	}
+
 	// Pick the next Pending Subtask. Uses the field index when available
 	// (production cached client), falls back to full scan for direct clients (tests).
 	var subs tatarav1alpha1.SubtaskList
@@ -1079,6 +1089,21 @@ func turnCap(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (int, b
 		return project.Spec.Agent.MaxTurnsPerTask, true
 	}
 	return 50, true
+}
+
+// taskTokenBudgetExceeded reports whether an uncapped implementation Task has
+// burned past its per-Task output-token backstop. Only implement/issueLifecycle
+// are gated (they run turn-uncapped per turnCap); every other kind keeps the turn
+// cap and is never token-gated here. A zero MaxTaskTokens disables the backstop.
+func taskTokenBudgetExceeded(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
+	if task.Spec.Kind != "implement" && task.Spec.Kind != "issueLifecycle" {
+		return false
+	}
+	limit := project.Spec.Agent.MaxTaskTokens
+	if limit <= 0 {
+		return false
+	}
+	return task.Status.CumulativeTokens >= limit
 }
 
 // recordTurn writes the in-flight turn id + executing subtask onto the Task,
