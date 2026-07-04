@@ -432,6 +432,13 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Task identity: lets the agent address MCP tools without repeating args.
 		{Name: "TATARA_TASK", Value: task.Name},
 		{Name: "TATARA_PROJECT", Value: project.Name},
+		// Metric identity (component 6): the wrapper stamps these onto its
+		// per-turn token/cost series so fleet spend attributes to a Task kind
+		// and repo. Same values the operator uses for operator_task_tokens_total
+		// (taskTokenLabels), so the two token families align. Empty repo for
+		// project-scoped kinds (brainstorm/refine/incident/healthCheck).
+		{Name: "TATARA_KIND", Value: task.Spec.Kind},
+		{Name: "TATARA_REPO", Value: task.Spec.RepositoryRef},
 		// Work branch the wrapper checks out and pushes; the operator opens the
 		// PR from this same branch (see TaskBranch). Empty for review tasks, which
 		// check out the PR head via CHECKOUT_BRANCH and never push.
