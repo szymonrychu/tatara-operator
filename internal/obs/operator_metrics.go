@@ -1027,3 +1027,9 @@ func (m *OperatorMetrics) ReviewFindingsCounter(project, repo, model string) pro
 func (m *OperatorMetrics) RecordImplementCI(project, repo, model, result string) {
 	m.implementCITotal.WithLabelValues(project, repo, model, result).Inc()
 }
+
+// ImplementCICounter returns the counter for (project, repo, model, result)
+// for test assertions.
+func (m *OperatorMetrics) ImplementCICounter(project, repo, model, result string) prometheus.Counter {
+	return m.implementCITotal.WithLabelValues(project, repo, model, result)
+}
