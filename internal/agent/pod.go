@@ -414,8 +414,8 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		)
 	}
 	env = append(env, []corev1.EnvVar{
-		{Name: "MODEL", Value: project.Spec.Agent.Model},
-		{Name: "EFFORT", Value: project.Spec.Agent.Effort},
+		{Name: "MODEL", Value: modelForKind(project, task.Spec.Kind)},
+		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind)},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
 		{Name: "DEFAULT_CALLBACK_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/turn-complete"},
