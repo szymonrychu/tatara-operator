@@ -416,6 +416,7 @@ type candidate struct {
 	headBranch string
 	body       string
 	labels     []string
+	createdAt  time.Time
 	updatedAt  time.Time
 	isPR       bool
 	title      string
@@ -553,7 +554,8 @@ func candidatesFromIssues(iss []scm.IssueRef) []candidate {
 			continue
 		}
 		out = append(out, candidate{
-			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels, updatedAt: i.UpdatedAt, isPR: false,
+			repo: i.Repo, number: i.Number, author: i.Author, labels: i.Labels,
+			createdAt: i.CreatedAt, updatedAt: i.UpdatedAt, isPR: false,
 			title: i.Title,
 		})
 	}
@@ -1251,8 +1253,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
 	}
+	// cc memoizes ListIssueComments for the rest of this scan cycle: the
+	// reactivation, dedup, adoption, fresh-creation, bot-last-word and
+	// brainstorm-churn gates below each independently ask about the same issue's
+	// comments, and without this cache each one refetches over the SCM API.
+	cc := newIssueCommentCache(reader)
 	for _, c := range cands {
-		task := findConvTaskToReactivate(ctx, c, existing, reader, botLogin)
+		task := findConvTaskToReactivate(ctx, c, existing, cc, botLogin)
 		if task == nil {
 			continue
 		}
@@ -1284,7 +1291,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// Dedup BEFORE enqueue so a stale-but-in-flight item is not re-created.
 	managed := managedPhaseLabels(proj.Spec.Scm)
 	brainstorming, approved, implementation, declined := lifecycleLabels(proj.Spec.Scm)
-	gate := r.humanActivityGate(ctx, reader, botLogin)
+	gate := r.humanActivityGate(ctx, cc, botLogin)
 	var eligible []candidate
 	for _, c := range cands {
 		if isDeduped(c, existing, managed, gate) {
@@ -1339,7 +1346,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			if adopt.Status.LastActivityAt != nil {
 				owner, name, cut := strings.Cut(c.repo, "/")
 				if cut && reader != nil && botLogin != "" &&
-					!humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, adopt.Status.LastActivityAt.Time) {
+					!humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, adopt.Status.LastActivityAt.Time) {
 					r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
 					l.Info("issueScan: skipped adoption, no human activity since last activity",
 						"action", "adopt_lifecycle", "resource_id", adopt.Name,
@@ -1371,7 +1378,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		if lt := lastTerminalNoLabelTask(c, existing, managed); lt != nil {
 			owner, name, cut := strings.Cut(c.repo, "/")
 			if cut && reader != nil && botLogin != "" &&
-				!humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, lt.CreationTimestamp.Time) {
+				!humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, lt.CreationTimestamp.Time) {
 				r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
 				l.Info("issueScan: skipped fresh task creation, no human activity since last terminal task",
 					"action", "scan_issue", "resource_id", proj.Name,
@@ -1386,7 +1393,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		// tatara authored the most recent comment and no human has replied -
 		// re-triaging would only re-post and complete, looping every cron cycle. A
 		// human reply (a newer non-bot comment) clears the gate on the next scan.
-		if botHadLastWord(ctx, reader, c, botLogin) {
+		if botHadLastWord(ctx, cc, c, botLogin) {
 			r.Metrics.ScanItem("issueScan", "skipped_bot_last_word")
 			l.Info("issueScan: skipped fresh task creation, bot had the last word (awaiting human reply)",
 				"action", "scan_issue", "resource_id", proj.Name,
@@ -1397,12 +1404,14 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		// brainstorming proposal no human has engaged must not be re-triaged every
 		// scan cycle. The reaper (staleProposalDays) only closes it once it is ALSO
 		// stale; this stops the churn from the first cycle. Any human comment (zero
-		// `since` = ever) clears it. Fail-open when SCM/botLogin/owner-split is
+		// `since` = ever), or a non-comment edit/reaction (humanEditOrReactionSignal -
+		// scm.SCMReader exposes no reactions API, so UpdatedAt-after-CreatedAt is the
+		// fallback signal), clears it. Fail-open when SCM/botLogin/owner-split is
 		// unavailable, matching botHadLastWord and the reactivation gate.
 		if isBotBrainstormProposal(c, brainstorming, approved, implementation, declined, botLogin) {
 			owner, name, cut := strings.Cut(c.repo, "/")
 			if cut && reader != nil && botLogin != "" &&
-				!humanCommentAfter(ctx, reader, owner, name, c.number, botLogin, time.Time{}) {
+				!humanBrainstormEngagement(ctx, cc, owner, name, c, botLogin) {
 				r.Metrics.ScanItem("issueScan", "skipped_brainstorm_no_human")
 				l.Info("issueScan: skipped fresh task creation, brainstorming proposal awaiting human engagement",
 					"action", "scan_issue", "resource_id", proj.Name,
@@ -1972,12 +1981,91 @@ func humanCommentAfter(ctx context.Context, reader scm.SCMReader, owner, name st
 	if err != nil {
 		return true
 	}
+	return humanCommentInSlice(comments, botLogin, since)
+}
+
+// humanCommentInSlice is the pure predicate half of humanCommentAfter, split out
+// so callers holding an already-fetched (e.g. cached) comment slice can reuse it
+// without a second SCM read.
+func humanCommentInSlice(comments []scm.IssueComment, botLogin string, since time.Time) bool {
 	for _, c := range comments {
 		if c.Author != "" && c.Author != botLogin && c.CreatedAt.After(since) {
 			return true
 		}
 	}
 	return false
+}
+
+// issueCommentCache memoizes ListIssueComments per (owner,name,number) for the
+// lifetime of one scan cycle. Several gates in issueScan (adoption,
+// fresh-creation, bot-last-word, brainstorm-churn) each independently ask "has a
+// human commented on this issue"; without memoization every one of them fetches
+// comments over the SCM API for the same issue in the same cycle. Embeds the real
+// reader so it satisfies scm.SCMReader for every other method unchanged, and
+// implements scm.PRCommentLister as an uncached passthrough (PR/MR conversation
+// reads are outside the doubling this cache targets).
+type issueCommentCache struct {
+	scm.SCMReader
+	m map[string][]scm.IssueComment
+}
+
+func newIssueCommentCache(reader scm.SCMReader) *issueCommentCache {
+	return &issueCommentCache{SCMReader: reader, m: make(map[string][]scm.IssueComment)}
+}
+
+func (cc *issueCommentCache) ListIssueComments(ctx context.Context, owner, name string, number int) ([]scm.IssueComment, error) {
+	key := fmt.Sprintf("%s/%s#%d", owner, name, number)
+	if v, ok := cc.m[key]; ok {
+		return v, nil
+	}
+	comments, err := cc.SCMReader.ListIssueComments(ctx, owner, name, number)
+	if err != nil {
+		// Not cached: a transient read error should not poison the rest of the
+		// cycle's gates with a permanent miss.
+		return nil, err
+	}
+	cc.m[key] = comments
+	return comments, nil
+}
+
+func (cc *issueCommentCache) ListPRComments(ctx context.Context, owner, name string, number int) ([]scm.IssueComment, error) {
+	if pl, ok := cc.SCMReader.(scm.PRCommentLister); ok {
+		return pl.ListPRComments(ctx, owner, name, number)
+	}
+	return cc.ListIssueComments(ctx, owner, name, number)
+}
+
+// humanEditOrReactionSignal reports non-comment human engagement with a bot
+// brainstorm proposal: the issue's UpdatedAt moved past both CreatedAt and the
+// newest known comment, meaning something other than a tracked comment touched
+// it (a title/body edit, a label change, or - on providers where it bumps
+// UpdatedAt - a reaction/award-emoji). scm.SCMReader exposes no reactions API, so
+// this timestamp heuristic is the documented fallback for that signal. A zero
+// CreatedAt (older/incomplete SCM data) never counts as engagement.
+func humanEditOrReactionSignal(c candidate, comments []scm.IssueComment) bool {
+	if c.createdAt.IsZero() || !c.updatedAt.After(c.createdAt) {
+		return false
+	}
+	newest := c.createdAt
+	for _, cm := range comments {
+		if cm.CreatedAt.After(newest) {
+			newest = cm.CreatedAt
+		}
+	}
+	return c.updatedAt.After(newest)
+}
+
+// humanBrainstormEngagement reports whether a bot-authored brainstorm proposal
+// has seen any human engagement: a human comment (ever), or the edit/reaction
+// fallback in humanEditOrReactionSignal. Comments are fetched via cc so this
+// shares the single per-cycle read with the other gates. Fail-open (true) on a
+// comment-fetch error, matching humanCommentAfter.
+func humanBrainstormEngagement(ctx context.Context, cc *issueCommentCache, owner, name string, c candidate, botLogin string) bool {
+	comments, err := cc.ListIssueComments(ctx, owner, name, c.number)
+	if err != nil {
+		return true
+	}
+	return humanCommentInSlice(comments, botLogin, time.Time{}) || humanEditOrReactionSignal(c, comments)
 }
 
 // humanActivityGate returns the isDeduped human-activity predicate for a scan

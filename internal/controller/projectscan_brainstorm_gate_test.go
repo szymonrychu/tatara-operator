@@ -76,3 +76,38 @@ func TestIssueScan_TriagesBrainstormProposalWithHumanActivity(t *testing.T) {
 	qes := listScanQEs(t, "bsgate-human")
 	require.Len(t, qes, 1, "issueScan must triage a bot brainstorming proposal once a human has engaged")
 }
+
+// TestIssueScan_TriagesBrainstormProposalOnEditOrReaction: a proposal a human
+// edited or reacted to (issue UpdatedAt moved past CreatedAt, no comment at all)
+// must NOT be starved by the comment-only gate.
+func TestIssueScan_TriagesBrainstormProposalOnEditOrReaction(t *testing.T) {
+	proj, repo := seedBackstopProject(t, "bsgate-edit")
+	edited := scm.IssueRef{
+		Repo: "o/r", Number: 7, Author: "tatara-bot", Labels: []string{"tatara-brainstorming"},
+		CreatedAt: time.Now().Add(-3 * time.Hour), UpdatedAt: time.Now().Add(-1 * time.Hour),
+	}
+	// fakeReader.ListIssueComments returns nil -> no comment was ever posted.
+	reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r": {edited}}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, nil, proj.Spec.Scm.Cron.IssueScan)
+
+	qes := listScanQEs(t, "bsgate-edit")
+	require.Len(t, qes, 1, "issueScan must triage a bot brainstorming proposal edited/reacted to after creation")
+}
+
+// TestIssueScan_BrainstormGateMemoizesCommentFetch: the adoption/fresh-creation/
+// bot-last-word/brainstorm-churn gates in one issueScan pass over a single fresh
+// proposal must share one ListIssueComments call, not one per gate.
+func TestIssueScan_BrainstormGateMemoizesCommentFetch(t *testing.T) {
+	proj, repo := seedBackstopProject(t, "bsgate-memo")
+	reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r": {freshBrainstormIssue()}}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, nil, proj.Spec.Scm.Cron.IssueScan)
+
+	require.LessOrEqual(t, reader.commentCalls, 1,
+		"issueScan must fetch comments at most once per issue per cycle, got %d calls", reader.commentCalls)
+}
