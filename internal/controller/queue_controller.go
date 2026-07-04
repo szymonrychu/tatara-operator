@@ -6,6 +6,7 @@ import (
 	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/accountusage"
 	"github.com/szymonrychu/tatara-operator/internal/budget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
@@ -34,6 +35,22 @@ type DispatcherReconciler struct {
 	// Project layers its spec.tokenBudget over this. The zero value is disabled,
 	// so the admission gate is inert until configured.
 	BudgetDefaults budget.Config
+	// Usage is the fleet-wide Claude account usage snapshot (claudeSubscription
+	// mode). Nil-safe: a nil store yields an empty snapshot (nothing per-kind held).
+	Usage *accountusage.Store
+}
+
+// blockKindFunc returns a predicate that reports whether a queued event of a
+// given kind must be held on the account usage gate. Subscription mode reads the
+// fleet-wide store; other modes never per-kind block.
+func (r *DispatcherReconciler) blockKindFunc(proj *tatarav1alpha1.Project, cfg budget.Config, now time.Time) func(string) bool {
+	var sub budget.Subscription
+	if r.Usage != nil {
+		sub = r.Usage.Get().Subscription()
+	}
+	return func(kind string) bool {
+		return budget.KindBlocked(cfg, sub, kind, now)
+	}
 }
 
 func taskByName(tasks []tatarav1alpha1.Task, name string) *tatarav1alpha1.Task {
@@ -87,7 +104,7 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 // Returns requeue=true when a stale terminal Task was deleted so Reconcile can
 // signal a prompt re-attempt via ctrl.Result{RequeueAfter: time.Second}.
 func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.Project,
-	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task, d budget.Decision) (requeue bool, err error) {
+	qes []tatarav1alpha1.QueuedEvent, tasks []tatarav1alpha1.Task, d budget.Decision, blockKind func(string) bool) (requeue bool, err error) {
 
 	// Full project pause (issue: maxConcurrentTasks=0 must create NO agent work
 	// at all, not fall back to the QueueCapacity hard floor of 3). This is the
@@ -142,6 +159,9 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		for _, q := range queued {
 			if inflight >= cap {
 				break
+			}
+			if blockKind != nil && blockKind(q.Spec.Kind) {
+				continue // held on its per-kind account-usage ceiling; leave Queued
 			}
 			task, err := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
 			if err != nil {
@@ -269,8 +289,12 @@ func (r *DispatcherReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// the project's resolved config + persisted window/snapshot state, used both
 	// to gate admission and to drive the boundary-aware requeue below.
 	budgetCfg := proj.BudgetConfig(r.BudgetDefaults)
-	decision := budget.Evaluate(budgetCfg, proj.BudgetWindowState(), proj.BudgetSubscription(), time.Now())
-	requeue, err := r.admit(ctx, &proj, qes, tasks, decision)
+	sub := proj.BudgetSubscription()
+	if budgetCfg.Mode == budget.ModeClaudeSubscription && r.Usage != nil {
+		sub = r.Usage.Get().Subscription()
+	}
+	decision := budget.Evaluate(budgetCfg, proj.BudgetWindowState(), sub, time.Now())
+	requeue, err := r.admit(ctx, &proj, qes, tasks, decision, r.blockKindFunc(&proj, budgetCfg, time.Now()))
 	if err != nil {
 		return ctrl.Result{}, err
 	}

@@ -84,7 +84,7 @@ func TestAdmit_BudgetGate_DirectDecisions(t *testing.T) {
 			proj, nQE, aQE := mkBudgetPools(t, ctx, name, nil)
 			r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 			qes, tasks := listQEsTasks(t, ctx, proj.Name)
-			if _, err := r.admit(ctx, proj, qes, tasks, tc.d); err != nil {
+			if _, err := r.admit(ctx, proj, qes, tasks, tc.d, nil); err != nil {
 				t.Fatal(err)
 			}
 			assertQEAdmitted(t, ctx, nQE, tc.wantNormal)
@@ -101,7 +101,7 @@ func TestAdmit_BudgetBlocked_EmitsMetric(t *testing.T) {
 	proj, nQE, aQE := mkBudgetPools(t, ctx, "p-gate-metric", nil)
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{ProactiveBlocked: true, UsedPercent: 60}); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{ProactiveBlocked: true, UsedPercent: 60}, nil); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, nQE, false)
@@ -152,7 +152,7 @@ func TestAdmit_BudgetWindowEvaluation(t *testing.T) {
 			cfg := proj.BudgetConfig(r.BudgetDefaults)
 			d := budget.Evaluate(cfg, proj.BudgetWindowState(), proj.BudgetSubscription(), time.Now())
 			qes, tasks := listQEsTasks(t, ctx, proj.Name)
-			if _, err := r.admit(ctx, proj, qes, tasks, d); err != nil {
+			if _, err := r.admit(ctx, proj, qes, tasks, d, nil); err != nil {
 				t.Fatal(err)
 			}
 			assertQEAdmitted(t, ctx, nQE, tc.wantNormal)

@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/accountusage"
 	"github.com/szymonrychu/tatara-operator/internal/budget"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -56,7 +58,7 @@ func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -95,7 +97,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// First admit: creates Task, marks Admitted.
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
 		t.Fatalf("first admit: %v", err)
 	}
 	got := refreshQE(t, ctx, qe)
@@ -114,7 +116,7 @@ func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 
 	// Second admit: Task already exists (AlreadyExists), must not create a second one.
 	qes, tasks = listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
 		t.Fatalf("second admit: %v", err)
 	}
 
@@ -461,5 +463,24 @@ func TestPoolInflight_CountsAdmittedNonTerminal(t *testing.T) {
 	}
 	if got := r.poolInflight(qes, tasks, tatarav1alpha1.QueueClassAlert); got != 1 {
 		t.Fatalf("alert inflight = %d, want 1", got)
+	}
+}
+
+func TestDispatcherBlockKindUsesStoreInSubscriptionMode(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	store := &accountusage.Store{}
+	store.Set(accountusage.Snapshot{FiveHour: accountusage.Window{Percent: 60, Reset: future}, Healthy: true})
+	r := &DispatcherReconciler{Usage: store}
+	proj := &tatarav1alpha1.Project{Spec: tatarav1alpha1.ProjectSpec{TokenBudget: &tatarav1alpha1.TokenBudgetSpec{
+		Enabled: true, Mode: "claudeSubscription",
+		SpawnCeilingByKind: map[string]int32{"brainstorm": 40, "incident": 98},
+	}}}
+	cfg := proj.BudgetConfig(r.BudgetDefaults)
+	block := r.blockKindFunc(proj, cfg, time.Now())
+	if !block("brainstorm") { // 60 >= 40
+		t.Fatal("brainstorm must be held at 60%")
+	}
+	if block("incident") { // 60 < 98
+		t.Fatal("incident must not be held at 60%")
 	}
 }

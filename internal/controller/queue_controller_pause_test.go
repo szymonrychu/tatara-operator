@@ -81,7 +81,7 @@ func TestAdmit_MaxConcurrentTasksZero_PausesBothPools(t *testing.T) {
 			metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
 			r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics}
 			qes, tasks := listQEsTasks(t, ctx, proj.Name)
-			if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
+			if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
 				t.Fatal(err)
 			}
 			assertQEAdmitted(t, ctx, nQE, tc.wantNormal)
@@ -120,7 +120,7 @@ func TestAdmit_MaxConcurrentTasksZero_NoTaskCreated(t *testing.T) {
 
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}); err != nil {
+	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	_, tasks = listQEsTasks(t, ctx, proj.Name)
@@ -155,7 +155,7 @@ func TestScanCycle_MaxConcurrentTasksZero_NoTaskCreated(t *testing.T) {
 
 	dr := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
 	allQEs, allTasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := dr.admit(ctx, proj, allQEs, allTasks, budget.Decision{}); err != nil {
+	if _, err := dr.admit(ctx, proj, allQEs, allTasks, budget.Decision{}, nil); err != nil {
 		t.Fatal(err)
 	}
 
