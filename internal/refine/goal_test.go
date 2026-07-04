@@ -72,3 +72,19 @@ func TestGoalProject_GaveUpCategory(t *testing.T) {
 		t.Fatalf("goal must instruct NOT to close under-cap/at-cap gave-up issues")
 	}
 }
+
+func TestGoalProject_GroomsHandoffs(t *testing.T) {
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+
+	for _, want := range []string{"list_handoffs", "delete_handoff"} {
+		if !strings.Contains(g, want) {
+			t.Fatalf("goal missing handoff-groom tool %q", want)
+		}
+	}
+	low := strings.ToLower(g)
+	for _, want := range []string{"handoff", "stale", "keep"} {
+		if !strings.Contains(low, want) {
+			t.Fatalf("goal missing handoff-groom guidance %q", want)
+		}
+	}
+}
