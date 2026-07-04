@@ -225,8 +225,10 @@ func TestMemoryPhase_Transitions(t *testing.T) {
 		{"pg-only", 1, 1, 0, 0, 0, "Provisioning"},
 		{"all-but-memory", 1, 1, 1, 1, 0, "Provisioning"},
 		{"all-ready", 1, 1, 1, 1, 1, "Ready"},
-		{"ha-pg-partial", 1, 3, 1, 1, 1, "Provisioning"},
-		{"ha-pg-ready", 3, 3, 1, 1, 1, "Ready"},
+		{"single-pg-down", 0, 1, 1, 1, 1, "Provisioning"},
+		{"ha-pg-below-quorum", 1, 3, 1, 1, 1, "Provisioning"},
+		{"ha-pg-quorum", 2, 3, 1, 1, 1, "Ready"},
+		{"ha-pg-full", 3, 3, 1, 1, 1, "Ready"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -235,6 +237,25 @@ func TestMemoryPhase_Transitions(t *testing.T) {
 				t.Fatalf("memoryPhase = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestMemoryQuorum(t *testing.T) {
+	cases := []struct {
+		wantInstances int
+		quorum        int
+	}{
+		{0, 1}, // defensive: an unset count still requires one ready instance
+		{1, 1},
+		{2, 2},
+		{3, 2},
+		{4, 3},
+		{5, 3},
+	}
+	for _, tc := range cases {
+		if got := memoryQuorum(tc.wantInstances); got != tc.quorum {
+			t.Fatalf("memoryQuorum(%d) = %d, want %d", tc.wantInstances, got, tc.quorum)
+		}
 	}
 }
 

@@ -80,19 +80,28 @@ func TestMemoryR3F1_PgInstancesSingleSourceOfTruth(t *testing.T) {
 				t.Fatalf("memory.PgInstances = %d, want %d", got, tc.want)
 			}
 
-			// The readiness check in memoryPhase uses the same value.
-			// Verify that with readyInstances == got, the phase is Ready (all others healthy).
+			// The readiness check in memoryPhase derives its threshold from the same
+			// value via a serving quorum (memoryQuorum). With all instances ready the
+			// phase is Ready (all others healthy).
 			phase := memoryPhase(got, got, 1, 1, 1)
 			if phase != "Ready" {
 				t.Fatalf("memoryPhase with readyInstances==wantInstances=%d and all others ready = %q, want Ready", got, phase)
 			}
 
-			// And with readyInstances == got-1, it must still be Provisioning.
-			if got > 1 {
+			// Losing one instance must stay Ready as long as a quorum survives: a
+			// 3-node HA cluster serving from primary + 1 replica is available (issue #215).
+			if got-1 >= memoryQuorum(got) {
 				phase2 := memoryPhase(got-1, got, 1, 1, 1)
-				if phase2 != "Provisioning" {
-					t.Fatalf("memoryPhase with readyInstances=%d wantInstances=%d = %q, want Provisioning", got-1, got, phase2)
+				if phase2 != "Ready" {
+					t.Fatalf("memoryPhase with readyInstances=%d wantInstances=%d = %q, want Ready (quorum %d)", got-1, got, phase2, memoryQuorum(got))
 				}
+			}
+
+			// Dropping below quorum flips to Provisioning.
+			belowQuorum := memoryQuorum(got) - 1
+			phase3 := memoryPhase(belowQuorum, got, 1, 1, 1)
+			if phase3 != "Provisioning" {
+				t.Fatalf("memoryPhase with readyInstances=%d (below quorum %d) wantInstances=%d = %q, want Provisioning", belowQuorum, memoryQuorum(got), got, phase3)
 			}
 		})
 	}
