@@ -1404,10 +1404,19 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		// brainstorming proposal no human has engaged must not be re-triaged every
 		// scan cycle. The reaper (staleProposalDays) only closes it once it is ALSO
 		// stale; this stops the churn from the first cycle. Any human comment (zero
-		// `since` = ever), or a non-comment edit/reaction (humanEditOrReactionSignal -
-		// scm.SCMReader exposes no reactions API, so UpdatedAt-after-CreatedAt is the
-		// fallback signal), clears it. Fail-open when SCM/botLogin/owner-split is
+		// `since` = ever) clears it. Fail-open when SCM/botLogin/owner-split is
 		// unavailable, matching botHadLastWord and the reactivation gate.
+		//
+		// A prior version also treated issue UpdatedAt-after-CreatedAt (with no
+		// comment) as human engagement, as a fallback for edits/reactions the SCM
+		// reader cannot see directly. That heuristic is author-blind: bot-side
+		// mutations bump UpdatedAt too (e.g. setLifecycleLabel reasserting the
+		// brainstorming label when a triage reverts to awaiting-approval, see
+		// lifecycle.go's "triage-await-approval" arm), so a proposal nobody
+		// touched could read as human-engaged and get re-triaged - the exact churn
+		// this gate exists to suppress. Comments are the only reader-visible
+		// signal that reliably distinguishes a human actor, so that is the whole
+		// gate now.
 		if isBotBrainstormProposal(c, brainstorming, approved, implementation, declined, botLogin) {
 			owner, name, cut := strings.Cut(c.repo, "/")
 			if cut && reader != nil && botLogin != "" &&
@@ -2035,37 +2044,19 @@ func (cc *issueCommentCache) ListPRComments(ctx context.Context, owner, name str
 	return cc.ListIssueComments(ctx, owner, name, number)
 }
 
-// humanEditOrReactionSignal reports non-comment human engagement with a bot
-// brainstorm proposal: the issue's UpdatedAt moved past both CreatedAt and the
-// newest known comment, meaning something other than a tracked comment touched
-// it (a title/body edit, a label change, or - on providers where it bumps
-// UpdatedAt - a reaction/award-emoji). scm.SCMReader exposes no reactions API, so
-// this timestamp heuristic is the documented fallback for that signal. A zero
-// CreatedAt (older/incomplete SCM data) never counts as engagement.
-func humanEditOrReactionSignal(c candidate, comments []scm.IssueComment) bool {
-	if c.createdAt.IsZero() || !c.updatedAt.After(c.createdAt) {
-		return false
-	}
-	newest := c.createdAt
-	for _, cm := range comments {
-		if cm.CreatedAt.After(newest) {
-			newest = cm.CreatedAt
-		}
-	}
-	return c.updatedAt.After(newest)
-}
-
 // humanBrainstormEngagement reports whether a bot-authored brainstorm proposal
-// has seen any human engagement: a human comment (ever), or the edit/reaction
-// fallback in humanEditOrReactionSignal. Comments are fetched via cc so this
-// shares the single per-cycle read with the other gates. Fail-open (true) on a
-// comment-fetch error, matching humanCommentAfter.
+// has seen any human engagement: a human comment, ever. Comments are the only
+// reader-visible signal that reliably distinguishes a human actor from a bot
+// write-back (see the caller's comment for why an UpdatedAt-based fallback was
+// removed). Comments are fetched via cc so this shares the single per-cycle
+// read with the other gates. Fail-open (true) on a comment-fetch error,
+// matching humanCommentAfter.
 func humanBrainstormEngagement(ctx context.Context, cc *issueCommentCache, owner, name string, c candidate, botLogin string) bool {
 	comments, err := cc.ListIssueComments(ctx, owner, name, c.number)
 	if err != nil {
 		return true
 	}
-	return humanCommentInSlice(comments, botLogin, time.Time{}) || humanEditOrReactionSignal(c, comments)
+	return humanCommentInSlice(comments, botLogin, time.Time{})
 }
 
 // humanActivityGate returns the isDeduped human-activity predicate for a scan

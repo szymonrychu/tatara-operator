@@ -77,10 +77,12 @@ func TestIssueScan_TriagesBrainstormProposalWithHumanActivity(t *testing.T) {
 	require.Len(t, qes, 1, "issueScan must triage a bot brainstorming proposal once a human has engaged")
 }
 
-// TestIssueScan_TriagesBrainstormProposalOnEditOrReaction: a proposal a human
-// edited or reacted to (issue UpdatedAt moved past CreatedAt, no comment at all)
-// must NOT be starved by the comment-only gate.
-func TestIssueScan_TriagesBrainstormProposalOnEditOrReaction(t *testing.T) {
+// TestIssueScan_SkipsBrainstormProposalOnBotOnlyUpdate: a proposal whose
+// UpdatedAt moved past CreatedAt with no comment at all (e.g. a bot-side label
+// reassert, not a human edit/reaction) must NOT be treated as human engagement.
+// UpdatedAt is author-blind - it moves on bot writes too - so it is not used as
+// an engagement signal; only comments are.
+func TestIssueScan_SkipsBrainstormProposalOnBotOnlyUpdate(t *testing.T) {
 	proj, repo := seedBackstopProject(t, "bsgate-edit")
 	edited := scm.IssueRef{
 		Repo: "o/r", Number: 7, Author: "tatara-bot", Labels: []string{"tatara-brainstorming"},
@@ -94,7 +96,7 @@ func TestIssueScan_TriagesBrainstormProposalOnEditOrReaction(t *testing.T) {
 	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, nil, proj.Spec.Scm.Cron.IssueScan)
 
 	qes := listScanQEs(t, "bsgate-edit")
-	require.Len(t, qes, 1, "issueScan must triage a bot brainstorming proposal edited/reacted to after creation")
+	require.Empty(t, qes, "issueScan must not treat a bot-only UpdatedAt bump as human engagement")
 }
 
 // TestIssueScan_BrainstormGateMemoizesCommentFetch: the adoption/fresh-creation/
