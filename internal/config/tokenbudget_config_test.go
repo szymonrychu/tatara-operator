@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestBudgetDefaultsOff(t *testing.T) {
 		ProactivePercent: budget.DefaultProactivePercent,
 		EmergencyPercent: budget.DefaultEmergencyPercent,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("defaults:\n got  %+v\n want %+v", got, want)
 	}
 }
@@ -58,7 +59,7 @@ func TestBudgetDefaultsFromEnv(t *testing.T) {
 		WindowDuration:   5 * time.Hour,
 		TokenLimit:       1000000,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("from env:\n got  %+v\n want %+v", got, want)
 	}
 }

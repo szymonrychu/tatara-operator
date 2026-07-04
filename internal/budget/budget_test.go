@@ -199,3 +199,38 @@ func TestValidate(t *testing.T) {
 		}
 	}
 }
+
+func TestKindBlocked(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	sub := Subscription{FiveHourPercent: 42, FiveHourReset: future, WeeklyPercent: 10, WeeklyReset: future}
+	base := Config{Enabled: true, Mode: ModeClaudeSubscription,
+		SpawnCeilingByKind: map[string]int{"brainstorm": 40, "incident": 98}}
+	cases := []struct {
+		name    string
+		cfg     Config
+		kind    string
+		blocked bool
+	}{
+		{"brainstorm over ceiling", base, "brainstorm", true}, // 42 >= 40
+		{"incident under ceiling", base, "incident", false},   // 42 < 98
+		{"kind without ceiling not blocked", base, "implement", false},
+		{"disabled never blocks", Config{Mode: ModeClaudeSubscription, SpawnCeilingByKind: base.SpawnCeilingByKind}, "brainstorm", false},
+		{"customWindow mode never per-kind blocks", Config{Enabled: true, Mode: ModeCustomWindow, SpawnCeilingByKind: base.SpawnCeilingByKind}, "brainstorm", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := KindBlocked(tc.cfg, sub, tc.kind, time.Now()); got != tc.blocked {
+				t.Fatalf("KindBlocked=%v want %v", got, tc.blocked)
+			}
+		})
+	}
+}
+
+func TestKindBlockedIgnoresExpiredWindow(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	sub := Subscription{FiveHourPercent: 99, FiveHourReset: past} // expired -> ignored
+	cfg := Config{Enabled: true, Mode: ModeClaudeSubscription, SpawnCeilingByKind: map[string]int{"brainstorm": 40}}
+	if KindBlocked(cfg, sub, "brainstorm", time.Now()) {
+		t.Fatal("expired window must not block")
+	}
+}

@@ -50,6 +50,12 @@ type Config struct {
 	ResetSchedule  string        // 5-field cron marking each window reset boundary
 	WindowDuration time.Duration // declared window length; bounds the reset search
 	TokenLimit     int64         // absolute total-token budget per window
+
+	// SpawnCeilingByKind gates each Task kind independently in claudeSubscription
+	// mode: work of kind K is held once account usage reaches SpawnCeilingByKind[K]
+	// percent. Kinds absent from the map are not per-kind gated (they fall through
+	// to the pool-class proactive/emergency thresholds). Ignored in customWindow mode.
+	SpawnCeilingByKind map[string]int
 }
 
 // WindowState is the persisted custom-window accumulator (carried on Project
@@ -70,6 +76,14 @@ type Subscription struct {
 	FiveHourReset   time.Time
 	WeeklyPercent   float64
 	WeeklyReset     time.Time
+
+	// Carried for metrics only; not used by the gate in v1.
+	OpusPercent    float64
+	OpusReset      time.Time
+	SonnetPercent  float64
+	SonnetReset    time.Time
+	OverageEnabled bool
+	OveragePercent float64
 }
 
 // Decision is the result of evaluating a project's budget at a point in time.
@@ -170,6 +184,21 @@ func subscriptionUsedPercent(sub Subscription, now time.Time) float64 {
 		pct = sub.WeeklyPercent
 	}
 	return pct
+}
+
+// KindBlocked reports whether work of the given kind must be held, given the
+// account subscription usage. It applies only in claudeSubscription mode with a
+// configured per-kind ceiling; every other case returns false so the caller's
+// pool-class Decision remains authoritative.
+func KindBlocked(cfg Config, sub Subscription, kind string, now time.Time) bool {
+	if !cfg.Enabled || cfg.Mode != ModeClaudeSubscription {
+		return false
+	}
+	ceiling, ok := cfg.SpawnCeilingByKind[kind]
+	if !ok || ceiling <= 0 {
+		return false
+	}
+	return subscriptionUsedPercent(sub, now) >= float64(ceiling)
 }
 
 // active reports whether a reported snapshot window is still current: a known
