@@ -580,28 +580,29 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	}, nil
 }
 
+// ghRunCIStatus maps one GitHub check-run to the shared "" | pending |
+// success | failure vocabulary: any non-completed run is pending regardless
+// of conclusion; a completed run is a failure unless its conclusion is
+// success/neutral/skipped.
+func ghRunCIStatus(run ghCheckRun) string {
+	if run.Status != "completed" {
+		return "pending"
+	}
+	if run.Conclusion != "success" && run.Conclusion != "neutral" && run.Conclusion != "skipped" {
+		return "failure"
+	}
+	return "success"
+}
+
 func deriveGHCIStatus(runs []ghCheckRun) string {
 	if len(runs) == 0 {
 		return ""
 	}
-	failure, pending := false, false
-	for _, run := range runs {
-		if run.Status != "completed" {
-			pending = true
-			continue
-		}
-		if run.Conclusion != "success" && run.Conclusion != "neutral" && run.Conclusion != "skipped" {
-			failure = true
-		}
+	statuses := make([]string, len(runs))
+	for i, run := range runs {
+		statuses[i] = ghRunCIStatus(run)
 	}
-	switch {
-	case failure:
-		return "failure"
-	case pending:
-		return "pending"
-	default:
-		return "success"
-	}
+	return foldCIStatuses(statuses...)
 }
 
 func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, event, body string, comments []map[string]any) error {
@@ -773,17 +774,30 @@ func (c *GitHub) commitCIStatus(ctx context.Context, owner, repo, sha, token str
 	return foldCIStatuses(checkStatus, combinedStatus), nil
 }
 
-// foldCIStatuses merges two CI status strings with the precedence rule:
-// failure > pending > success > "" (none).
-func foldCIStatuses(a, b string) string {
-	if a == "failure" || b == "failure" {
+// foldCIStatuses merges any number of CI status strings with the precedence
+// rule: failure > pending > success > "" (none). Shared by all three CI
+// aggregation sites (GitHub check-runs, GitHub check-runs+combined-status,
+// GitLab commit-statuses) so the priority rule is defined exactly once.
+func foldCIStatuses(statuses ...string) string {
+	failure, pending, success := false, false, false
+	for _, s := range statuses {
+		switch s {
+		case "failure":
+			failure = true
+		case "pending":
+			pending = true
+		case "success":
+			success = true
+		}
+	}
+	switch {
+	case failure:
 		return "failure"
-	}
-	if a == "pending" || b == "pending" {
+	case pending:
 		return "pending"
-	}
-	if a == "success" || b == "success" {
+	case success:
 		return "success"
+	default:
+		return ""
 	}
-	return ""
 }

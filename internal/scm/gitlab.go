@@ -772,22 +772,10 @@ func (c *GitLab) commitCIStatus(ctx context.Context, owner, sha, token string) (
 	if len(statuses) == 0 {
 		return "", nil
 	}
-	// Aggregate: failure > pending > success.
-	failure, pending := false, false
-	for _, s := range statuses {
-		switch glCIStatus(s.Status) {
-		case "failure":
-			failure = true
-		case "pending":
-			pending = true
-		}
+	// Aggregate through the shared failure > pending > success > "" reducer.
+	mapped := make([]string, len(statuses))
+	for i, s := range statuses {
+		mapped[i] = glCIStatus(s.Status)
 	}
-	switch {
-	case failure:
-		return "failure", nil
-	case pending:
-		return "pending", nil
-	default:
-		return "success", nil
-	}
+	return foldCIStatuses(mapped...), nil
 }
