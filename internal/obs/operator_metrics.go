@@ -2,6 +2,25 @@ package obs
 
 import "github.com/prometheus/client_golang/prometheus"
 
+// seedLabels walks the cartesian product of dims and calls set with each
+// combination, in the same nested-loop order the pre-seed blocks used before
+// this helper existed (leftmost dim outermost).
+func seedLabels(set func(labels ...string), dims ...[]string) {
+	seedLabelsRec(set, make([]string, 0, len(dims)), dims)
+}
+
+func seedLabelsRec(set func(labels ...string), prefix []string, dims [][]string) {
+	if len(dims) == 0 {
+		set(prefix...)
+		return
+	}
+	for _, v := range dims[0] {
+		next := make([]string, len(prefix), len(prefix)+1)
+		copy(next, prefix)
+		seedLabelsRec(set, append(next, v), dims[1:])
+	}
+}
+
 // OperatorMetrics holds the reconciler-facing Prometheus collectors for the
 // tatara-operator. Construct one with NewOperatorMetrics and pass it to the
 // reconcilers.
@@ -517,30 +536,25 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
-	for _, kind := range []string{"Project", "Repository"} {
-		for _, result := range []string{"success", "error"} {
-			m.reconcileTotal.WithLabelValues(kind, result)
-		}
-	}
+	seedLabels(func(l ...string) { m.reconcileTotal.WithLabelValues(l...) },
+		[]string{"Project", "Repository"},
+		[]string{"success", "error"},
+	)
 	// Finding 28: pre-seed all (kind,action) pairs the webhook handler emits so
 	// dashboards/alerts see a zero baseline rather than gaps before the first event.
-	for _, provider := range []string{"github", "gitlab"} {
-		for _, kind := range []string{"push", "issue", "mr", "other"} {
-			for _, action := range []string{"other", "labeled", "opened", "closed", "synchronize", "create"} {
-				for _, result := range []string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"} {
-					m.webhookEvents.WithLabelValues(provider, kind, action, result)
-				}
-			}
-		}
-	}
+	seedLabels(func(l ...string) { m.webhookEvents.WithLabelValues(l...) },
+		[]string{"github", "gitlab"},
+		[]string{"push", "issue", "mr", "other"},
+		[]string{"other", "labeled", "opened", "closed", "synchronize", "create"},
+		[]string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"},
+	)
 	for _, phase := range []string{"Provisioning", "Ready", "Failed"} {
 		m.memoryStacks.WithLabelValues(phase)
 	}
-	for _, activity := range []string{"mrScan", "issueScan", "brainstorm"} {
-		for _, outcome := range []string{"scanned", "picked", "skipped_dedup", "skipped_cap"} {
-			m.scanItemsTotal.WithLabelValues(activity, outcome)
-		}
-	}
+	seedLabels(func(l ...string) { m.scanItemsTotal.WithLabelValues(l...) },
+		[]string{"mrScan", "issueScan", "brainstorm"},
+		[]string{"scanned", "picked", "skipped_dedup", "skipped_cap"},
+	)
 	for _, action := range []string{"implement", "close", "discuss", "close-withheld"} {
 		m.issueOutcomeTotal.WithLabelValues(action)
 	}
@@ -554,11 +568,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, source := range []string{"reconcile", "poll_backstop", "planning_watchdog"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
-	for _, result := range []string{"success", "failure"} {
-		for _, mode := range []string{"incremental", "full"} {
-			m.ingestJobTotal.WithLabelValues(result, mode)
-		}
-	}
+	seedLabels(func(l ...string) { m.ingestJobTotal.WithLabelValues(l...) },
+		[]string{"success", "failure"},
+		[]string{"incremental", "full"},
+	)
 	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
 	}
@@ -574,11 +587,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.brainstormOutcomeTotal.WithLabelValues(result)
 	}
 	// Pre-seed webhook duration by provider/result so the series exist from startup.
-	for _, provider := range []string{"github", "gitlab"} {
-		for _, result := range []string{"ok", "error"} {
-			m.webhookDuration.WithLabelValues(provider, result)
-		}
-	}
+	seedLabels(func(l ...string) { m.webhookDuration.WithLabelValues(l...) },
+		[]string{"github", "gitlab"},
+		[]string{"ok", "error"},
+	)
 	// Pre-seed REST API metrics for common endpoints.
 	for _, endpoint := range []string{
 		"patch_task", "create_subtask", "patch_subtask", "propose_issue",
@@ -594,11 +606,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	// exists at a zero baseline before the first probe (alertable from startup).
 	// The route labels must mirror memoryProbeRoutes and the result labels the
 	// classifier in probeMemoryRoute, both in the controller package.
-	for _, route := range []string{"/queries", "/code-graph/stats"} {
-		for _, result := range []string{"present", "absent", "error", "unauthorized", "degraded"} {
-			m.memoryRetrievalProbe.WithLabelValues(route, result)
-		}
-	}
+	seedLabels(func(l ...string) { m.memoryRetrievalProbe.WithLabelValues(l...) },
+		[]string{"/queries", "/code-graph/stats"},
+		[]string{"present", "absent", "error", "unauthorized", "degraded"},
+	)
 	// Pre-seed the tool-surface probe series so the backend x result matrix
 	// exists at a zero baseline before the first probe (alertable from startup).
 	// The backend labels must mirror the probes in updateToolSurfaceProbe and the
@@ -980,24 +991,24 @@ func (m *OperatorMetrics) SetQueueInflight(project, class string, n int) {
 	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
 }
 
+// addPositive adds delta to the vec's counter for the given labels, but only
+// when delta is positive, so each series only ever moves forward.
+func addPositive(vec *prometheus.CounterVec, delta int64, labels ...string) {
+	if delta > 0 {
+		vec.WithLabelValues(labels...).Add(float64(delta))
+	}
+}
+
 // AddTaskTokens increments operator_task_tokens_total by the per-class token
 // deltas a single agent turn consumed, labelled by the Task's project, repo,
 // kind, issue, and the model that ran. issue is "" for non-issue-scoped tasks
 // to bound cardinality; model is "" when unstamped (fail-open). Zero or
 // negative deltas are skipped so each series only ever moves forward.
 func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue, model string, input, output, cacheRead, cacheCreation int64) {
-	if input > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "input").Add(float64(input))
-	}
-	if output > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "output").Add(float64(output))
-	}
-	if cacheRead > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_read").Add(float64(cacheRead))
-	}
-	if cacheCreation > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_creation").Add(float64(cacheCreation))
-	}
+	addPositive(m.taskTokensTotal, input, project, repo, kind, issue, model, "input")
+	addPositive(m.taskTokensTotal, output, project, repo, kind, issue, model, "output")
+	addPositive(m.taskTokensTotal, cacheRead, project, repo, kind, issue, model, "cache_read")
+	addPositive(m.taskTokensTotal, cacheCreation, project, repo, kind, issue, model, "cache_creation")
 }
 
 // AddTerminalTokens increments operator_task_terminal_tokens_total by a
@@ -1006,18 +1017,10 @@ func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue, model string
 // and the model that ran. No issue label: churn is outcome-keyed, not
 // issue-keyed, to bound cardinality. Zero or negative deltas are skipped.
 func (m *OperatorMetrics) AddTerminalTokens(project, repo, outcome, model string, input, output, cacheRead, cacheCreation int64) {
-	if input > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "input").Add(float64(input))
-	}
-	if output > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "output").Add(float64(output))
-	}
-	if cacheRead > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "cache_read").Add(float64(cacheRead))
-	}
-	if cacheCreation > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "cache_creation").Add(float64(cacheCreation))
-	}
+	addPositive(m.taskTerminalTokensTotal, input, project, repo, outcome, model, "input")
+	addPositive(m.taskTerminalTokensTotal, output, project, repo, outcome, model, "output")
+	addPositive(m.taskTerminalTokensTotal, cacheRead, project, repo, outcome, model, "cache_read")
+	addPositive(m.taskTerminalTokensTotal, cacheCreation, project, repo, outcome, model, "cache_creation")
 }
 
 // TaskTerminalTokensCounter returns the counter for (project,repo,outcome,model,type) for test assertions.

@@ -1244,3 +1244,60 @@ func TestQualityMetrics_Emit(t *testing.T) {
 		}
 	}
 }
+
+// TestWritebackSkip4xx_PreSeeded pins the writeback_skip_4xx pre-seed as a
+// hand-written curated-pairs literal (issue #166), not a cartesian product:
+// exactly the 4 realistic (status, reason) combos must be pre-seeded, and
+// combos that were never actually observed (403/already_exists,
+// 404/already_exists) must NOT appear as a byproduct of a future refactor.
+func TestWritebackSkip4xx_PreSeeded(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	type key struct{ status, reason string }
+	want := map[key]bool{
+		{"403", "other"}:          false,
+		{"404", "other"}:          false,
+		{"422", "already_exists"}: false,
+		{"422", "other"}:          false,
+	}
+	mustNotExist := map[key]bool{
+		{"403", "already_exists"}: true,
+		{"404", "already_exists"}: true,
+	}
+	seen := map[key]bool{}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_writeback_skip_4xx_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			var k key
+			for _, lp := range metric.GetLabel() {
+				switch lp.GetName() {
+				case "status":
+					k.status = lp.GetValue()
+				case "reason":
+					k.reason = lp.GetValue()
+				}
+			}
+			seen[k] = true
+		}
+	}
+	for k := range want {
+		if !seen[k] {
+			t.Errorf("operator_writeback_skip_4xx_total{status=%q,reason=%q} not pre-seeded", k.status, k.reason)
+		}
+	}
+	for k := range mustNotExist {
+		if seen[k] {
+			t.Errorf("operator_writeback_skip_4xx_total{status=%q,reason=%q} unexpectedly pre-seeded", k.status, k.reason)
+		}
+	}
+	if len(seen) != len(want) {
+		t.Errorf("operator_writeback_skip_4xx_total pre-seeded %d combos, want exactly %d (curated pairs, not cartesian)", len(seen), len(want))
+	}
+}
