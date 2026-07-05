@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +13,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// isPermanentTargetGone reports whether err is an SCM HTTPError meaning the
+// target resource is permanently unreachable: 410 Gone (GitHub "This issue was
+// deleted") or 404 Not Found. Retrying a write against such a target is futile,
+// so a lifecycle reconcile must treat it as terminal (log + skip) instead of
+// returning the error and letting controller-runtime requeue the same doomed
+// write forever (issue #263: a deleted issue drove an unbounded add_label retry
+// loop that amplified operator_scm_writes_total{result="error"} and fired the
+// SCM write-failure-ratio alert). Transient 4xx (429/403 rate limits) and 5xx
+// stay retryable and are NOT matched here.
+func isPermanentTargetGone(err error) bool {
+	var he *scm.HTTPError
+	if errors.As(err, &he) {
+		return he.Status == 404 || he.Status == 410
+	}
+	return false
+}
 
 // lifecycleLabels returns the four managed phase labels (brainstorming/approved/
 // implementation/declined), applying defaults when a field is empty.
@@ -204,6 +222,17 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	if !known || !current[desired] {
 		if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
 			r.recordSCM(provider, "add_label", aerr)
+			// issue #263: the target issue is permanently gone (410 deleted / 404
+			// not found). Requeuing this write can never succeed, so classify it as
+			// terminal - log it, do not add/remove any further label, and return nil
+			// so the reconcile stops instead of retry-looping the doomed AddLabel
+			// (which amplified the SCM write-error ratio and fired the alert).
+			if isPermanentTargetGone(aerr) {
+				l.Info("set label: target issue permanently gone; skipping label without requeue",
+					"action", "scm_set_label_target_gone", "resource_id", task.Name,
+					"issue_ref", issueRef, "label", desired, "status", scm.ErrorStatus(aerr))
+				return nil
+			}
 			return fmt.Errorf("set label add %q: %w", desired, aerr)
 		}
 		r.recordSCM(provider, "add_label", nil)
