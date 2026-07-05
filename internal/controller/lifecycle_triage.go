@@ -161,6 +161,32 @@ type triageReader struct {
 	approvers []string
 	issueNum  int
 	resolved  bool // false = ReaderFor unavailable; callers treat as "not authored"
+
+	// comments/commentsFetched memoize the ListIssueComments result across the
+	// hasHumanReply/botHasLastWord checks within one finishTriage call, so a
+	// tatara-authored issue with a human reply fetches the comment list once
+	// instead of twice. Memoized ONLY on success: an error is never cached, so a
+	// transient failure on the first check still lets the second check attempt
+	// its own live fetch (preserving the existing fail-open retry).
+	comments        []scm.IssueComment
+	commentsFetched bool
+}
+
+// listComments returns the memoized comment list if a prior call on this
+// triageReader already succeeded, otherwise issues a live ListIssueComments
+// call. A failed attempt is never cached, so the next caller (in the same
+// finishTriage invocation) gets its own live retry.
+func (tr *triageReader) listComments(ctx context.Context) ([]scm.IssueComment, error) {
+	if tr.commentsFetched {
+		return tr.comments, nil
+	}
+	comments, err := tr.reader.ListIssueComments(ctx, tr.owner, tr.repoName, tr.issueNum)
+	if err != nil {
+		return nil, err
+	}
+	tr.comments = comments
+	tr.commentsFetched = true
+	return comments, nil
 }
 
 // resolveTriageReader resolves the SCM reader and repo coordinates once for
@@ -222,7 +248,7 @@ func (r *TaskReconciler) resolveTriageReaderURL(ctx context.Context, project *ta
 
 // isTataraAuthored uses the pre-resolved triageReader to check the tatara-authored
 // marker without an additional token/reader/repo fetch (finding 6).
-func (tr triageReader) isTataraAuthored(ctx context.Context) (bool, error) {
+func (tr *triageReader) isTataraAuthored(ctx context.Context) (bool, error) {
 	if !tr.resolved {
 		return false, nil
 	}
@@ -237,11 +263,11 @@ func (tr triageReader) isTataraAuthored(ctx context.Context) (bool, error) {
 // that releases the self-approve hold, without an additional token/reader/repo
 // fetch (finding 6). When an approver allowlist is configured (issue #102) only
 // a comment from an approver counts; otherwise any non-bot comment does.
-func (tr triageReader) hasHumanReply(ctx context.Context) (bool, error) {
+func (tr *triageReader) hasHumanReply(ctx context.Context) (bool, error) {
 	if !tr.resolved {
 		return false, nil
 	}
-	comments, err := tr.reader.ListIssueComments(ctx, tr.owner, tr.repoName, tr.issueNum)
+	comments, err := tr.listComments(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -262,11 +288,11 @@ func (tr triageReader) hasHumanReply(ctx context.Context) (bool, error) {
 // robust to SCM list ordering. No comments -> false (the bot has not spoken).
 // Used to suppress repeated hold comments once the bot has responded and no human
 // has replied since.
-func (tr triageReader) botHasLastWord(ctx context.Context) (bool, error) {
+func (tr *triageReader) botHasLastWord(ctx context.Context) (bool, error) {
 	if !tr.resolved {
 		return false, nil
 	}
-	comments, err := tr.reader.ListIssueComments(ctx, tr.owner, tr.repoName, tr.issueNum)
+	comments, err := tr.listComments(ctx)
 	if err != nil {
 		return false, err
 	}
