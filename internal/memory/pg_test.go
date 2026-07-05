@@ -45,6 +45,9 @@ func TestPGCluster_DefaultsAndShape(t *testing.T) {
 	require.Equal(t, 1, c.Spec.Instances)
 	require.Equal(t, "10Gi", c.Spec.StorageConfiguration.Size)
 
+	require.NotNil(t, c.Spec.WalStorage)
+	require.Equal(t, "2Gi", c.Spec.WalStorage.Size)
+
 	require.NotNil(t, c.Spec.Bootstrap)
 	require.NotNil(t, c.Spec.Bootstrap.InitDB)
 	require.Equal(t, "tatara_memory", c.Spec.Bootstrap.InitDB.Database)
@@ -68,8 +71,10 @@ func TestPGCluster_ImagePullSecrets(t *testing.T) {
 
 func TestPGCluster_SpecOverrides(t *testing.T) {
 	p := testProject("acme")
-	p.Spec.Memory = &tatarav1alpha1.MemorySpec{PgInstances: 3, PgStorage: "50Gi"}
+	p.Spec.Memory = &tatarav1alpha1.MemorySpec{PgInstances: 3, PgStorage: "50Gi", PgWalStorage: "10Gi"}
 	c := memory.PGCluster(p, testCfg())
 	require.Equal(t, 3, c.Spec.Instances)
 	require.Equal(t, "50Gi", c.Spec.StorageConfiguration.Size)
+	require.NotNil(t, c.Spec.WalStorage)
+	require.Equal(t, "10Gi", c.Spec.WalStorage.Size)
 }

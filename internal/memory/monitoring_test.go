@@ -57,6 +57,30 @@ func TestMemoryServiceMonitor_MatchesMemoryService(t *testing.T) {
 	}
 }
 
+func TestPGPodMonitor(t *testing.T) {
+	p := testProject("acme")
+	pm := memory.PGPodMonitor(p, testMonitorCfg())
+
+	require.Equal(t, "mem-acme-pg", pm.Name)
+	require.Equal(t, "tatara", pm.Namespace)
+	require.Equal(t, "PodMonitor", pm.Kind)
+	require.Equal(t, "monitoring.coreos.com/v1", pm.APIVersion)
+	require.Len(t, pm.OwnerReferences, 1)
+	require.True(t, *pm.OwnerReferences[0].Controller)
+
+	// The cluster podMonitorSelector label must be stamped so Prometheus discovers it.
+	require.Equal(t, "prometheus", pm.Labels["release"])
+
+	// Selector targets the cnpg pods of THIS cluster (cnpg.io/cluster=<cluster>).
+	require.Equal(t, "mem-acme-pg", pm.Spec.Selector.MatchLabels["cnpg.io/cluster"])
+	require.Equal(t, []string{"tatara"}, pm.Spec.NamespaceSelector.MatchNames)
+
+	require.Len(t, pm.Spec.PodMetricsEndpoints, 1)
+	require.NotNil(t, pm.Spec.PodMetricsEndpoints[0].Port)
+	require.Equal(t, "metrics", *pm.Spec.PodMetricsEndpoints[0].Port)
+	require.Equal(t, "/metrics", pm.Spec.PodMetricsEndpoints[0].Path)
+}
+
 func TestMemoryPrometheusRule(t *testing.T) {
 	p := testProject("acme")
 	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())

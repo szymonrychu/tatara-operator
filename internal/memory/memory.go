@@ -19,6 +19,7 @@ import (
 const (
 	defaultPgInstances  = 1
 	defaultPgStorage    = "10Gi"
+	defaultPgWalStorage = "2Gi"
 	defaultNeo4jStorage = "10Gi"
 )
 
@@ -162,6 +163,15 @@ func pgStorage(p *tatarav1alpha1.Project) string {
 		return p.Spec.Memory.PgStorage
 	}
 	return defaultPgStorage
+}
+
+// pgWalStorage resolves the dedicated postgres WAL volume size from spec,
+// defaulting.
+func pgWalStorage(p *tatarav1alpha1.Project) string {
+	if p.Spec.Memory != nil && p.Spec.Memory.PgWalStorage != "" {
+		return p.Spec.Memory.PgWalStorage
+	}
+	return defaultPgWalStorage
 }
 
 // neo4jStorage resolves the neo4j storage size from spec, defaulting.
