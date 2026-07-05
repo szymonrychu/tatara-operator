@@ -124,11 +124,16 @@ func toWindow(w *usageWindow) Window {
 	return out
 }
 
-// normalizeUtil coerces a utilization reported as a 0..1 fraction into 0..100.
-// Confirm the actual scale in the Task 0 spike; this handles either.
+// normalizeUtil returns the utilization as a 0..100 percent. The 2026-07-05
+// in-cluster spike confirmed /api/oauth/usage already reports whole-number
+// percentages (e.g. five_hour=2.0, seven_day=36.0), NOT a 0..1 fraction, so no
+// scaling is applied; values are clamped to [0,100] as a defensive bound.
 func normalizeUtil(v float64) float64 {
-	if v > 0 && v <= 1 {
-		return v * 100
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
 	}
 	return v
 }

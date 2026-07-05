@@ -78,12 +78,20 @@ func TestFetchNon200IsError(t *testing.T) {
 	}
 }
 
-func TestNormalizeUtilizationFraction(t *testing.T) {
-	// utilization may be reported 0..1 (fraction) instead of 0..100; normalize.
-	if got := normalizeUtil(0.42); got != 42.0 {
-		t.Fatalf("fraction normalize: %v", got)
-	}
-	if got := normalizeUtil(42.0); got != 42.0 {
+func TestNormalizeUtilizationIsPercentPassthroughClamped(t *testing.T) {
+	// The 2026-07-05 spike confirmed /api/oauth/usage reports whole-number
+	// percentages (five_hour=2.0, seven_day=36.0), NOT 0..1 fractions, so a small
+	// value like 0.42 means 0.42%, not 42%. Passthrough, clamped to [0,100].
+	if got := normalizeUtil(0.42); got != 0.42 {
 		t.Fatalf("percent passthrough: %v", got)
+	}
+	if got := normalizeUtil(36.0); got != 36.0 {
+		t.Fatalf("percent passthrough: %v", got)
+	}
+	if got := normalizeUtil(-5); got != 0 {
+		t.Fatalf("clamp low: %v", got)
+	}
+	if got := normalizeUtil(150); got != 100 {
+		t.Fatalf("clamp high: %v", got)
 	}
 }
