@@ -239,6 +239,12 @@ jobs:
           set -euo pipefail
           BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
           SHORT_SHA="${GITHUB_SHA:0:7}"
+          # VERSION stamps the binary (build-arg below) only - this job pushes
+          # ONLY the :SHORT_SHA tag. release.yml owns :vX.Y.Z (cut from the
+          # merged PR's semver label). On a push to main the semver tag job may
+          # already have cut and pushed vX.Y.Z before this job runs, so
+          # git describe resolves VERSION to that exact tag; pushing it here
+          # would 412 against Harbor's tag immutability (issue #229 / #228).
           VERSION="$(git describe --tags --always --dirty)"
           BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           DEST="harbor.szymonrichert.pl/containers/${REPO}"
@@ -280,9 +286,9 @@ jobs:
             --opt build-arg:DATE="${BUILD_DATE}" \
             "${extra[@]}" \
             --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
-            --output "type=image,\"name=${DEST}:${SHORT_SHA},${DEST}:${VERSION}\",push=true"
+            --output "type=image,\"name=${DEST}:${SHORT_SHA}\",push=true"
 
-          echo "buildkit: pushed ${DEST}:${SHORT_SHA} and ${DEST}:${VERSION}"
+          echo "buildkit: pushed ${DEST}:${SHORT_SHA}"
 
   chart:
     needs: [image]
