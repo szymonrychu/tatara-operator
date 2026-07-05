@@ -48,20 +48,6 @@ func TestTaskActive_ExcludesTerminalLifecycle(t *testing.T) {
 	}
 }
 
-// TestQueuedAutonomousCount verifies queuedAutonomousCount counts only
-// Autonomous+Queued events (not Admitted, not Done, not non-autonomous).
-func TestQueuedAutonomousCount(t *testing.T) {
-	qes := []tatarav1alpha1.QueuedEvent{
-		{Spec: tatarav1alpha1.QueuedEventSpec{Autonomous: true}, Status: tatarav1alpha1.QueuedEventStatus{State: tatarav1alpha1.QueueStateQueued}},
-		{Spec: tatarav1alpha1.QueuedEventSpec{Autonomous: true}, Status: tatarav1alpha1.QueuedEventStatus{State: tatarav1alpha1.QueueStateAdmitted}},
-		{Spec: tatarav1alpha1.QueuedEventSpec{Autonomous: false}, Status: tatarav1alpha1.QueuedEventStatus{State: tatarav1alpha1.QueueStateQueued}},
-		{Spec: tatarav1alpha1.QueuedEventSpec{Autonomous: true}, Status: tatarav1alpha1.QueuedEventStatus{State: tatarav1alpha1.QueueStateDone}},
-	}
-	if got := queuedAutonomousCount(qes); got != 1 {
-		t.Fatalf("queuedAutonomousCount = %d, want 1", got)
-	}
-}
-
 // TestRunScans_AutonomousCapFull_StillEnqueues: the old QueuedAutonomousCap budget
 // gate is removed; pre-seeding N autonomous Queued events no longer blocks new
 // issueScan enqueues. runScans must create QEs for all eligible issues.
