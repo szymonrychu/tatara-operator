@@ -2,10 +2,36 @@ package obs
 
 import "github.com/prometheus/client_golang/prometheus"
 
+// seedLabels walks the cartesian product of dims and calls set with each
+// combination, in the same nested-loop order the pre-seed blocks used before
+// this helper existed (leftmost dim outermost).
+func seedLabels(set func(labels ...string), dims ...[]string) {
+	seedLabelsRec(set, make([]string, 0, len(dims)), dims)
+}
+
+func seedLabelsRec(set func(labels ...string), prefix []string, dims [][]string) {
+	if len(dims) == 0 {
+		set(prefix...)
+		return
+	}
+	for _, v := range dims[0] {
+		next := make([]string, len(prefix), len(prefix)+1)
+		copy(next, prefix)
+		seedLabelsRec(set, append(next, v), dims[1:])
+	}
+}
+
 // OperatorMetrics holds the reconciler-facing Prometheus collectors for the
 // tatara-operator. Construct one with NewOperatorMetrics and pass it to the
-// reconcilers.
+// reconcilers. SCM, queue, Task-lifecycle, and account-usage collectors live
+// in their own domain structs (scm_metrics.go, queue_metrics.go,
+// task_metrics.go, accountusage_metrics.go), embedded here so their fields
+// and methods are still reached as m.field / m.Method.
 type OperatorMetrics struct {
+	*scmMetrics
+	*queueMetrics
+	*taskMetrics
+	*accountUsageMetrics
 	reconcileTotal            *prometheus.CounterVec
 	ingestJobDuration         prometheus.Histogram
 	turnDuration              prometheus.Histogram
@@ -13,8 +39,6 @@ type OperatorMetrics struct {
 	tasksInflight             prometheus.Gauge
 	memoryProvisionDuration   prometheus.Histogram
 	memoryStacks              *prometheus.GaugeVec
-	scmWritesTotal            *prometheus.CounterVec
-	scmReqErrorsByStatus      *prometheus.CounterVec
 	scanItemsTotal            *prometheus.CounterVec
 	scanTasksCreatedTotal     *prometheus.CounterVec
 	scanDurationSeconds       *prometheus.HistogramVec
@@ -44,14 +68,6 @@ type OperatorMetrics struct {
 	restapiRequestDuration    *prometheus.HistogramVec
 	memoryHealthReadErrors    prometheus.Counter
 	memoryStorageShrinkGuard  *prometheus.CounterVec
-	queueAdmittedTotal        *prometheus.CounterVec
-	queueDepth                *prometheus.GaugeVec
-	queueInflight             *prometheus.GaugeVec
-	taskTokensTotal           *prometheus.CounterVec
-	taskTurnsTotal            *prometheus.CounterVec
-	taskIssueState            *prometheus.GaugeVec
-	taskTerminalTotal         *prometheus.CounterVec
-	taskTerminalTokensTotal   *prometheus.CounterVec
 	lightragDocuments         *prometheus.GaugeVec
 	lightragQueryErrors       prometheus.Counter
 	memoryRetrievalProbe      *prometheus.CounterVec
@@ -67,13 +83,6 @@ type OperatorMetrics struct {
 	reviewOutcomeTotal        *prometheus.CounterVec
 	reviewFindingsTotal       *prometheus.CounterVec
 	implementCITotal          *prometheus.CounterVec
-	accountUsageUtil          *prometheus.GaugeVec
-	accountUsageReset         *prometheus.GaugeVec
-	accountUsagePollHealth    prometheus.Gauge
-	accountUsagePollFailures  prometheus.Counter
-	accountOveragePercent     prometheus.Gauge
-	accountOverageUsed        prometheus.Gauge
-	accountOverageLimit       prometheus.Gauge
 	cdCascadeFailed           *prometheus.GaugeVec
 	cdCascadeStalled          *prometheus.GaugeVec
 	cdResolvedTotal           prometheus.Counter
@@ -83,6 +92,10 @@ type OperatorMetrics struct {
 // bundle. Names and labels are pinned by the shared-contracts pin set.
 func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	m := &OperatorMetrics{
+		scmMetrics:          newSCMMetrics(reg),
+		queueMetrics:        newQueueMetrics(reg),
+		taskMetrics:         newTaskMetrics(reg),
+		accountUsageMetrics: newAccountUsageMetrics(reg),
 		reconcileTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_reconcile_total",
 			Help: "Total reconcile outcomes by kind and result.",
@@ -114,14 +127,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_stacks",
 			Help: "Number of per-project memory stacks by phase.",
 		}, []string{"phase"}),
-		scmWritesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_scm_writes_total",
-			Help: "Total SCM operations by provider, verb, kind (read|write), and result (ok|error|blocked).",
-		}, []string{"provider", "verb", "kind", "result"}),
-		scmReqErrorsByStatus: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_scm_request_errors_by_status_total",
-			Help: "SCM operations that errored, by provider, verb, and classified status (HTTP code, or \"network\" for connect/timeout failures).",
-		}, []string{"provider", "verb", "status"}),
 		scanItemsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tatara_scan_items_total",
 			Help: "Total scan candidates by activity and outcome.",
@@ -269,38 +274,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_storage_shrink_guarded_total",
 			Help: "Total reconciles where rendered cnpg storage was raised to the provisioned size to avoid a shrink rejection, by project.",
 		}, []string{"project"}),
-		queueAdmittedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_queue_admitted_total",
-			Help: "Total QueuedEvents admitted to a Task, by pool class and event kind.",
-		}, []string{"class", "kind"}),
-		queueDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "operator_queue_depth",
-			Help: "Number of Queued (not yet admitted) QueuedEvents per project and pool class.",
-		}, []string{"project", "class"}),
-		queueInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "operator_queue_inflight",
-			Help: "Number of admitted in-flight QueuedEvents per project and pool class.",
-		}, []string{"project", "class"}),
-		taskTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_task_tokens_total",
-			Help: "Agent token usage by project, repo, Task kind, issue, model, and type (input|output|cache_read|cache_creation).",
-		}, []string{"project", "repo", "kind", "issue", "model", "type"}),
-		taskTurnsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_task_turns_total",
-			Help: "Agent turns completed by project, repo, Task kind, and issue.",
-		}, []string{"project", "repo", "kind", "issue"}),
-		taskIssueState: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "tatara_issue_state",
-			Help: "Current state of open issues tracked by an agent Task, by project, repo, issue, kind, state, and incident flag. Value is always 1; stale series are removed on each recompute.",
-		}, []string{"project", "repo", "issue", "kind", "state", "incident"}),
-		taskTerminalTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_task_terminal_total",
-			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
-		}, []string{"kind", "phase", "reason"}),
-		taskTerminalTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_task_terminal_tokens_total",
-			Help: "Cumulative agent token usage of terminated Tasks by project, repo, terminal outcome (delivered|churned|abandoned), model, and type (input|output|cache_read|cache_creation). No issue label - churn is outcome-keyed, not issue-keyed.",
-		}, []string{"project", "repo", "outcome", "model", "type"}),
 		lightragDocuments: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_lightrag_documents",
 			Help: "Documents in each per-project lightrag memory corpus by ingestion status.",
@@ -389,40 +362,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_implement_ci_total",
 			Help: "PR CI conclusions (pass|fail) for any PR-producing Task kind reaching handleMRCI, by kind and model.",
 		}, []string{"project", "repo", "kind", "model", "result"}),
-		// Claude account usage windows (claudeSubscription mode), keyed by window
-		// name (five_hour|seven_day|seven_day_opus|seven_day_sonnet).
-		accountUsageUtil: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "tatara_account_usage_utilization",
-			Help: "Claude account usage utilization percent (0..100) by window.",
-		}, []string{"window"}),
-		accountUsageReset: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "tatara_account_usage_resets_at_seconds",
-			Help: "Unix time each usage window resets.",
-		}, []string{"window"}),
-		accountUsagePollHealth: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "tatara_account_usage_poll_health",
-			Help: "1 when the usage poll is healthy, 0 when stale.",
-		}),
-		// Per-fetch failure counter (issue #189). Increments on every failed poll;
-		// the poll-health gauge only flips to 0 once consecutive failures reach the
-		// staleness threshold, so this exposes transient blips the gauge hides.
-		accountUsagePollFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "tatara_account_usage_poll_failures_total",
-			Help: "Total Claude account usage poll fetch failures.",
-		}),
-		// Monthly overage (read-only, never gates admission; non-goal per spec).
-		accountOveragePercent: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "tatara_account_overage_percent",
-			Help: "Monthly overage utilization percent (0..100+), read-only.",
-		}),
-		accountOverageUsed: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "tatara_account_overage_used",
-			Help: "Monthly overage amount used, read-only.",
-		}),
-		accountOverageLimit: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "tatara_account_overage_limit",
-			Help: "Monthly overage limit, read-only.",
-		}),
 		// push-CD deploy-supervision CD-health gauges (G5). These reflect the CURRENT
 		// number of cascades in a failed / stalled state, derived from authoritative
 		// Task state each cdScan (not per-event counters), so max()>0 means "a cascade
@@ -450,8 +389,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tasksInflight,
 		m.memoryProvisionDuration,
 		m.memoryStacks,
-		m.scmWritesTotal,
-		m.scmReqErrorsByStatus,
 		m.scanItemsTotal,
 		m.scanTasksCreatedTotal,
 		m.scanDurationSeconds,
@@ -483,14 +420,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.restapiRequestDuration,
 		m.memoryHealthReadErrors,
 		m.memoryStorageShrinkGuard,
-		m.queueAdmittedTotal,
-		m.queueDepth,
-		m.queueInflight,
-		m.taskTokensTotal,
-		m.taskTurnsTotal,
-		m.taskIssueState,
-		m.taskTerminalTotal,
-		m.taskTerminalTokensTotal,
 		m.lightragDocuments,
 		m.lightragQueryErrors,
 		m.memoryRetrievalProbe,
@@ -504,43 +433,31 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.reviewOutcomeTotal,
 		m.reviewFindingsTotal,
 		m.implementCITotal,
-		m.accountUsageUtil,
-		m.accountUsageReset,
-		m.accountUsagePollHealth,
-		m.accountUsagePollFailures,
-		m.accountOveragePercent,
-		m.accountOverageUsed,
-		m.accountOverageLimit,
 		m.cdCascadeFailed,
 		m.cdCascadeStalled,
 		m.cdResolvedTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
-	for _, kind := range []string{"Project", "Repository"} {
-		for _, result := range []string{"success", "error"} {
-			m.reconcileTotal.WithLabelValues(kind, result)
-		}
-	}
+	seedLabels(func(l ...string) { m.reconcileTotal.WithLabelValues(l...) },
+		[]string{"Project", "Repository"},
+		[]string{"success", "error"},
+	)
 	// Finding 28: pre-seed all (kind,action) pairs the webhook handler emits so
 	// dashboards/alerts see a zero baseline rather than gaps before the first event.
-	for _, provider := range []string{"github", "gitlab"} {
-		for _, kind := range []string{"push", "issue", "mr", "other"} {
-			for _, action := range []string{"other", "labeled", "opened", "closed", "synchronize", "create"} {
-				for _, result := range []string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"} {
-					m.webhookEvents.WithLabelValues(provider, kind, action, result)
-				}
-			}
-		}
-	}
+	seedLabels(func(l ...string) { m.webhookEvents.WithLabelValues(l...) },
+		[]string{"github", "gitlab"},
+		[]string{"push", "issue", "mr", "other"},
+		[]string{"other", "labeled", "opened", "closed", "synchronize", "create"},
+		[]string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"},
+	)
 	for _, phase := range []string{"Provisioning", "Ready", "Failed"} {
 		m.memoryStacks.WithLabelValues(phase)
 	}
-	for _, activity := range []string{"mrScan", "issueScan", "brainstorm"} {
-		for _, outcome := range []string{"scanned", "picked", "skipped_dedup", "skipped_cap"} {
-			m.scanItemsTotal.WithLabelValues(activity, outcome)
-		}
-	}
+	seedLabels(func(l ...string) { m.scanItemsTotal.WithLabelValues(l...) },
+		[]string{"mrScan", "issueScan", "brainstorm"},
+		[]string{"scanned", "picked", "skipped_dedup", "skipped_cap"},
+	)
 	for _, action := range []string{"implement", "close", "discuss", "close-withheld"} {
 		m.issueOutcomeTotal.WithLabelValues(action)
 	}
@@ -554,11 +471,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, source := range []string{"reconcile", "poll_backstop", "planning_watchdog"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
-	for _, result := range []string{"success", "failure"} {
-		for _, mode := range []string{"incremental", "full"} {
-			m.ingestJobTotal.WithLabelValues(result, mode)
-		}
-	}
+	seedLabels(func(l ...string) { m.ingestJobTotal.WithLabelValues(l...) },
+		[]string{"success", "failure"},
+		[]string{"incremental", "full"},
+	)
 	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
 	}
@@ -574,11 +490,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.brainstormOutcomeTotal.WithLabelValues(result)
 	}
 	// Pre-seed webhook duration by provider/result so the series exist from startup.
-	for _, provider := range []string{"github", "gitlab"} {
-		for _, result := range []string{"ok", "error"} {
-			m.webhookDuration.WithLabelValues(provider, result)
-		}
-	}
+	seedLabels(func(l ...string) { m.webhookDuration.WithLabelValues(l...) },
+		[]string{"github", "gitlab"},
+		[]string{"ok", "error"},
+	)
 	// Pre-seed REST API metrics for common endpoints.
 	for _, endpoint := range []string{
 		"patch_task", "create_subtask", "patch_subtask", "propose_issue",
@@ -594,11 +509,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	// exists at a zero baseline before the first probe (alertable from startup).
 	// The route labels must mirror memoryProbeRoutes and the result labels the
 	// classifier in probeMemoryRoute, both in the controller package.
-	for _, route := range []string{"/queries", "/code-graph/stats"} {
-		for _, result := range []string{"present", "absent", "error", "unauthorized", "degraded"} {
-			m.memoryRetrievalProbe.WithLabelValues(route, result)
-		}
-	}
+	seedLabels(func(l ...string) { m.memoryRetrievalProbe.WithLabelValues(l...) },
+		[]string{"/queries", "/code-graph/stats"},
+		[]string{"present", "absent", "error", "unauthorized", "degraded"},
+	)
 	// Pre-seed the tool-surface probe series so the backend x result matrix
 	// exists at a zero baseline before the first probe (alertable from startup).
 	// The backend labels must mirror the probes in updateToolSurfaceProbe and the
@@ -795,42 +709,6 @@ func (m *OperatorMetrics) SetTasksInflight(n float64) {
 	m.tasksInflight.Set(n)
 }
 
-// scmReadVerbs are SCM verbs that only read; every other verb is a write. Used
-// to label operator_scm_writes_total with kind so the write-failure ratio alert
-// is not diluted by read traffic that shares the same credentials.
-var scmReadVerbs = map[string]bool{
-	"list_open_issues":     true,
-	"list_open_prs":        true,
-	"get_pr_state":         true,
-	"get_commit_ci_status": true,
-}
-
-// SCMVerbKind returns "read" or "write" for an SCM verb.
-func SCMVerbKind(verb string) string {
-	if scmReadVerbs[verb] {
-		return "read"
-	}
-	return "write"
-}
-
-// SCMWrite increments operator_scm_writes_total for the given provider, verb,
-// and result ("ok", "error", or "blocked"). The kind label (read|write) is
-// derived from the verb.
-func (m *OperatorMetrics) SCMWrite(provider, verb, result string) {
-	m.scmWritesTotal.WithLabelValues(provider, verb, SCMVerbKind(verb), result).Inc()
-}
-
-// SCMRequestErrorByStatus increments operator_scm_request_errors_by_status_total,
-// recording the classified status (HTTP code or "network") behind an SCM error.
-func (m *OperatorMetrics) SCMRequestErrorByStatus(provider, verb, status string) {
-	m.scmReqErrorsByStatus.WithLabelValues(provider, verb, status).Inc()
-}
-
-// SCMWriteCounter returns the counter for (provider, verb, result) for test assertions.
-func (m *OperatorMetrics) SCMWriteCounter(provider, verb, result string) prometheus.Counter {
-	return m.scmWritesTotal.WithLabelValues(provider, verb, SCMVerbKind(verb), result)
-}
-
 // SetOpenProposals sets operator_open_proposals for a repo slug.
 func (m *OperatorMetrics) SetOpenProposals(repo string, n float64) {
 	m.openProposals.WithLabelValues(repo).Set(n)
@@ -965,108 +843,6 @@ func (m *OperatorMetrics) MemoryStorageShrinkGuardedCounter(project string) prom
 	return m.memoryStorageShrinkGuard.WithLabelValues(project)
 }
 
-// QueueAdmitted increments operator_queue_admitted_total for the pool class and event kind.
-func (m *OperatorMetrics) QueueAdmitted(class, kind string) {
-	m.queueAdmittedTotal.WithLabelValues(class, kind).Inc()
-}
-
-// SetQueueDepth sets operator_queue_depth for a project and pool class to n (Queued-state count).
-func (m *OperatorMetrics) SetQueueDepth(project, class string, n int) {
-	m.queueDepth.WithLabelValues(project, class).Set(float64(n))
-}
-
-// SetQueueInflight sets operator_queue_inflight for a project and pool class to n (in-flight admitted count).
-func (m *OperatorMetrics) SetQueueInflight(project, class string, n int) {
-	m.queueInflight.WithLabelValues(project, class).Set(float64(n))
-}
-
-// AddTaskTokens increments operator_task_tokens_total by the per-class token
-// deltas a single agent turn consumed, labelled by the Task's project, repo,
-// kind, issue, and the model that ran. issue is "" for non-issue-scoped tasks
-// to bound cardinality; model is "" when unstamped (fail-open). Zero or
-// negative deltas are skipped so each series only ever moves forward.
-func (m *OperatorMetrics) AddTaskTokens(project, repo, kind, issue, model string, input, output, cacheRead, cacheCreation int64) {
-	if input > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "input").Add(float64(input))
-	}
-	if output > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "output").Add(float64(output))
-	}
-	if cacheRead > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_read").Add(float64(cacheRead))
-	}
-	if cacheCreation > 0 {
-		m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, "cache_creation").Add(float64(cacheCreation))
-	}
-}
-
-// AddTerminalTokens increments operator_task_terminal_tokens_total by a
-// terminated Task's cumulative per-class token totals, labelled by project,
-// repo, the task's classified terminal outcome (delivered|churned|abandoned),
-// and the model that ran. No issue label: churn is outcome-keyed, not
-// issue-keyed, to bound cardinality. Zero or negative deltas are skipped.
-func (m *OperatorMetrics) AddTerminalTokens(project, repo, outcome, model string, input, output, cacheRead, cacheCreation int64) {
-	if input > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "input").Add(float64(input))
-	}
-	if output > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "output").Add(float64(output))
-	}
-	if cacheRead > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "cache_read").Add(float64(cacheRead))
-	}
-	if cacheCreation > 0 {
-		m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, "cache_creation").Add(float64(cacheCreation))
-	}
-}
-
-// TaskTerminalTokensCounter returns the counter for (project,repo,outcome,model,type) for test assertions.
-func (m *OperatorMetrics) TaskTerminalTokensCounter(project, repo, outcome, model, typ string) prometheus.Counter {
-	return m.taskTerminalTokensTotal.WithLabelValues(project, repo, outcome, model, typ)
-}
-
-// TaskTokensCounter returns the counter for (project,repo,kind,issue,model,type) for test assertions.
-func (m *OperatorMetrics) TaskTokensCounter(project, repo, kind, issue, model, typ string) prometheus.Counter {
-	return m.taskTokensTotal.WithLabelValues(project, repo, kind, issue, model, typ)
-}
-
-// TaskTurnsCounter returns the counter for (project,repo,kind,issue) for test assertions.
-func (m *OperatorMetrics) TaskTurnsCounter(project, repo, kind, issue string) prometheus.Counter {
-	return m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue)
-}
-
-// AddTaskTurn increments operator_task_turns_total by 1 for a completed agent
-// turn. Called at the same site as AddTaskTokens (once per turn-complete
-// callback), guarded by the same stale/duplicate-callback recorded flag.
-func (m *OperatorMetrics) AddTaskTurn(project, repo, kind, issue string) {
-	m.taskTurnsTotal.WithLabelValues(project, repo, kind, issue).Inc()
-}
-
-// SetIssueState sets tatara_issue_state{...}=1 for a live issue. Labels:
-// project, repo, issue, kind (joins token/turn counters), state, incident.
-func (m *OperatorMetrics) SetIssueState(project, repo, issue, kind, state, incident string) {
-	m.taskIssueState.WithLabelValues(project, repo, issue, kind, state, incident).Set(1)
-}
-
-// ResetIssueState clears all tatara_issue_state series. Called at the start of
-// each updateIssueStateCounts pass so stale (closed/terminal) issues vanish.
-func (m *OperatorMetrics) ResetIssueState() {
-	m.taskIssueState.Reset()
-}
-
-// DeleteTaskSeries removes the operator_task_tokens_total and
-// operator_task_turns_total series for a specific issue-scoped Task when it is
-// garbage-collected. Bounds counter cardinality to live + recently-live issues.
-// Skip when issue=="" (project-scoped tasks share that label value and must not
-// be cleared on any individual task's GC).
-func (m *OperatorMetrics) DeleteTaskSeries(project, repo, kind, issue, model string) {
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "input")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "output")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "cache_read")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "cache_creation")
-	m.taskTurnsTotal.DeleteLabelValues(project, repo, kind, issue)
-}
-
 // SetLightragDocuments sets operator_lightrag_documents for a project and
 // ingestion status (e.g. PROCESSED, PENDING, PROCESSING, FAILED) to n.
 func (m *OperatorMetrics) SetLightragDocuments(project, status string, n int) {
@@ -1093,16 +869,6 @@ func (m *OperatorMetrics) MemoryRetrievalProbe(route, result string) {
 func (m *OperatorMetrics) ToolSurfaceProbe(backend, vantage, result string, seconds float64) {
 	m.toolSurfaceProbe.WithLabelValues(backend, vantage, result).Inc()
 	m.toolSurfaceProbeDuration.WithLabelValues(backend, vantage).Observe(seconds)
-}
-
-// TaskTerminal increments operator_task_terminal_total for a Task reaching a
-// terminal phase ("Succeeded" or "Failed") with the given kind and the condition
-// reason recorded on the terminal transition. This is the uniform loop
-// success/failure denominator: every terminal transition is metered here exactly
-// once, including failure paths (PodLost, TurnTimeout, PlanningStalled, ...) that
-// the per-reason fault counters do not all cover.
-func (m *OperatorMetrics) TaskTerminal(kind, phase, reason string) {
-	m.taskTerminalTotal.WithLabelValues(kind, phase, reason).Inc()
 }
 
 // SystemicSiblingCollapsed increments tatara_systemic_siblings_collapsed_total:
@@ -1149,43 +915,6 @@ func (m *OperatorMetrics) MemoryGateBypass(project, kind string) {
 // assertions.
 func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) prometheus.Counter {
 	return m.memoryGateBypassTotal.WithLabelValues(project, kind)
-}
-
-// SetAccountUsage sets tatara_account_usage_utilization for a usage window
-// (five_hour|seven_day|seven_day_opus|seven_day_sonnet) to a percent (0..100).
-func (m *OperatorMetrics) SetAccountUsage(window string, percent float64) {
-	m.accountUsageUtil.WithLabelValues(window).Set(percent)
-}
-
-// SetAccountUsageReset sets tatara_account_usage_resets_at_seconds for a usage
-// window to the Unix time it resets.
-func (m *OperatorMetrics) SetAccountUsageReset(window string, unix float64) {
-	m.accountUsageReset.WithLabelValues(window).Set(unix)
-}
-
-// SetAccountUsagePollHealth sets tatara_account_usage_poll_health to 1 when the
-// usage poll is healthy, 0 when stale.
-func (m *OperatorMetrics) SetAccountUsagePollHealth(healthy bool) {
-	v := 0.0
-	if healthy {
-		v = 1.0
-	}
-	m.accountUsagePollHealth.Set(v)
-}
-
-// IncAccountUsagePollFailure increments tatara_account_usage_poll_failures_total:
-// a single Claude account usage poll fetch failed. The poll-health gauge only
-// flips to 0 once consecutive failures reach the staleness threshold.
-func (m *OperatorMetrics) IncAccountUsagePollFailure() {
-	m.accountUsagePollFailures.Inc()
-}
-
-// SetAccountOverage sets the monthly overage read-only gauges (never gates
-// admission).
-func (m *OperatorMetrics) SetAccountOverage(percent, used, limit float64) {
-	m.accountOveragePercent.Set(percent)
-	m.accountOverageUsed.Set(used)
-	m.accountOverageLimit.Set(limit)
 }
 
 // RecordReviewOutcome increments operator_review_outcome_total for a review
