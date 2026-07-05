@@ -128,6 +128,67 @@ func TestLoad_MemoryMonitoringDefaults(t *testing.T) {
 	}
 }
 
+// TestLoad_IdlePodReapAfter covers the issue #237 idle-backstop knob: the
+// default, an explicit override, the min-floor clamp for a short positive value,
+// and disabling via zero.
+func TestLoad_IdlePodReapAfter(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+		t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+		t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	}
+	t.Run("default", func(t *testing.T) {
+		base(t)
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdlePodReapAfter != config.DefaultIdlePodReap {
+			t.Fatalf("IdlePodReapAfter = %v, want default %v", cfg.IdlePodReapAfter, config.DefaultIdlePodReap)
+		}
+	})
+	t.Run("explicit", func(t *testing.T) {
+		base(t)
+		t.Setenv("IDLE_POD_REAP_MINUTES", "45")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdlePodReapAfter != 45*time.Minute {
+			t.Fatalf("IdlePodReapAfter = %v, want 45m", cfg.IdlePodReapAfter)
+		}
+	})
+	t.Run("clamped to floor", func(t *testing.T) {
+		base(t)
+		t.Setenv("IDLE_POD_REAP_MINUTES", "1")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdlePodReapAfter != config.MinIdlePodReap {
+			t.Fatalf("IdlePodReapAfter = %v, want clamped %v", cfg.IdlePodReapAfter, config.MinIdlePodReap)
+		}
+	})
+	t.Run("disabled by zero", func(t *testing.T) {
+		base(t)
+		t.Setenv("IDLE_POD_REAP_MINUTES", "0")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdlePodReapAfter != 0 {
+			t.Fatalf("IdlePodReapAfter = %v, want 0 (disabled)", cfg.IdlePodReapAfter)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		base(t)
+		t.Setenv("IDLE_POD_REAP_MINUTES", "notanumber")
+		if _, err := config.Load(); err == nil {
+			t.Fatal("expected error for non-integer IDLE_POD_REAP_MINUTES, got nil")
+		}
+	})
+}
+
 // TestLoad_MemoryMonitorLabelsFromEnv asserts the JSON-object label map parses,
 // and that the enable flag can be turned off.
 func TestLoad_MemoryMonitorLabelsFromEnv(t *testing.T) {

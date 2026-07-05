@@ -68,6 +68,11 @@ type CallbackServer struct {
 	// config.TaskRetention, already clamped to config.MinTaskRetention. Zero or
 	// negative disables the GC pass (e.g. tests that do not exercise it).
 	TaskRetention time.Duration
+	// IdlePodReapAfter is how long an agent pod may sit with no live turn before
+	// the reaper deletes it as a leaked wrapper (issue #237). Set from
+	// config.IdlePodReapAfter, already clamped to config.MinIdlePodReap. Zero or
+	// negative disables the idle backstop (e.g. tests that do not exercise it).
+	IdlePodReapAfter time.Duration
 	// ConvStore deletes S3 conversation objects for the conversation GC pass
 	// (issue #114 decision 5). Nil disables conversation GC (S3 not configured).
 	ConvStore conversationGC

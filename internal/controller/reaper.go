@@ -171,7 +171,44 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	if isLifecycleTerminal(task.Status.LifecycleState) {
 		return fmt.Sprintf("task lifecycle %s", task.Status.LifecycleState), true
 	}
+	// Idle backstop (issue #237): a non-terminal Task whose pod holds no live turn
+	// and whose last turn activity is older than IdlePodReapAfter is a leaked
+	// wrapper. Its turn timed out or completed and the wrapper parked idle in
+	// epoll, but the operator never submitted a next turn or tore it down - e.g. a
+	// memory outage trapped the lifecycle reconcile in the spawn gate before it
+	// could process the completed turn. The in-flight case is owned by the
+	// turn-timeout path (driveTurns/PollOnce), so reap only when NO turn is in
+	// flight. Conversation persistence lets a still-live Task re-spawn a fresh pod
+	// and resume, so reaping is safe.
+	if s.IdlePodReapAfter > 0 && !taskHasInflightTurn(task) {
+		if time.Since(podLastActivity(pod, task)) > s.IdlePodReapAfter {
+			return "idle no live turn", true
+		}
+	}
 	return "", false
+}
+
+// podLastActivity returns the most recent moment this pod's Task showed agent
+// activity: the freshest of the turn-started, turn-last-activity, and
+// turn-complete annotations, floored at the pod's creation time. Absent or
+// unparseable annotations are ignored. The idle backstop measures how long a pod
+// has sat with no live turn from this instant.
+func podLastActivity(pod *corev1.Pod, task *tatarav1alpha1.Task) time.Time {
+	latest := pod.CreationTimestamp.Time
+	for _, ann := range []string{annTurnStartedAt, annTurnLastActivity, annTurnComplete} {
+		v := task.Annotations[ann]
+		if v == "" {
+			continue
+		}
+		ts, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			continue
+		}
+		if ts.After(latest) {
+			latest = ts
+		}
+	}
+	return latest
 }
 
 // reapWrapper best-effort deletes a wrapper Pod and its same-named Service by

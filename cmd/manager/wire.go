@@ -383,14 +383,15 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	}
 
 	cbServer := &controller.CallbackServer{
-		Client:         mgr.GetClient(),
-		Metrics:        metrics,
-		Session:        agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
-		Namespace:      cfg.Namespace,
-		PushMetrics:    pushReceiver.PushHandler(),
-		CallbackSecret: cfg.CallbackHMACSecret,
-		TaskRetention:  cfg.TaskRetention,
-		BudgetDefaults: cfg.BudgetDefaults(),
+		Client:           mgr.GetClient(),
+		Metrics:          metrics,
+		Session:          agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
+		Namespace:        cfg.Namespace,
+		PushMetrics:      pushReceiver.PushHandler(),
+		CallbackSecret:   cfg.CallbackHMACSecret,
+		TaskRetention:    cfg.TaskRetention,
+		IdlePodReapAfter: cfg.IdlePodReapAfter,
+		BudgetDefaults:   cfg.BudgetDefaults(),
 	}
 	// Conversation GC (issue #114 decision 5): wire the operator's S3 client when a
 	// bucket is configured so the reaper can delete fully-closed batches' objects.
