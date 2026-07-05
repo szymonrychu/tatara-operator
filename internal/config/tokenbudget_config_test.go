@@ -36,6 +36,33 @@ func TestBudgetDefaultsOff(t *testing.T) {
 	}
 }
 
+func TestUsagePollerDefaultsOff(t *testing.T) {
+	setRequired(t)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.UsageEnabled {
+		t.Fatal("UsageEnabled must default false so the operator ships inert (no poll before the auth spike)")
+	}
+	if cfg.UsageAuthMode != "bearer" {
+		t.Fatalf("UsageAuthMode default = %q, want bearer", cfg.UsageAuthMode)
+	}
+}
+
+func TestUsagePollerEnabledFromEnv(t *testing.T) {
+	setRequired(t)
+	t.Setenv("USAGE_ENABLED", "true")
+	t.Setenv("USAGE_AUTH_MODE", "x-api-key")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.UsageEnabled || cfg.UsageAuthMode != "x-api-key" {
+		t.Fatalf("UsageEnabled=%v UsageAuthMode=%q", cfg.UsageEnabled, cfg.UsageAuthMode)
+	}
+}
+
 func TestBudgetDefaultsFromEnv(t *testing.T) {
 	setRequired(t)
 	t.Setenv("TOKEN_BUDGET_ENABLED", "true")

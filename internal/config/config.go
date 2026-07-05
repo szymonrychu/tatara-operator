@@ -168,7 +168,10 @@ type Config struct {
 	// "x-api-key", per the Task 0 spike). UsagePollInterval is clamped up to
 	// the Poller's 180s floor. UsageUserAgent is sent as the request's
 	// User-Agent. UsageBaseURL overrides the Anthropic API base (empty =
-	// production default).
+	// production default). UsageEnabled activates the poller: off by default so
+	// the operator ships inert until the Task 0 auth spike confirms the header;
+	// when off, the claudeSubscription gate reads an empty store (fail-open).
+	UsageEnabled      bool
 	UsageAuthMode     string
 	UsagePollInterval time.Duration
 	UsageUserAgent    string
@@ -382,6 +385,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	usageEnabled, err := getBoolDefault("USAGE_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	tokenBudgetProactive, err := getIntDefault("TOKEN_BUDGET_PROACTIVE_PERCENT", budget.DefaultProactivePercent)
 	if err != nil {
 		return Config{}, err
@@ -466,6 +473,7 @@ func Load() (Config, error) {
 		TokenBudgetWindowDuration:   tokenBudgetWindow,
 		TokenBudgetTokenLimit:       tokenBudgetLimit,
 
+		UsageEnabled:      usageEnabled,
 		UsageAuthMode:     getDefault("USAGE_AUTH_MODE", "bearer"),
 		UsagePollInterval: usagePollInterval,
 		UsageUserAgent:    getDefault("USAGE_USER_AGENT", "claude-code/1.0.0"),

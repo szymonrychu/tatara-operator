@@ -235,39 +235,48 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// snapshot across a restart/re-election; it is marked unhealthy until the
 	// first live poll replaces it, so a stale restore never masks a real outage.
 	usageStore := &accountusage.Store{}
-	usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
-	if snap, err := usageMirror.Load(context.Background()); err != nil {
-		// Load already swallows a missing ConfigMap to a nil error, so a non-nil err
-		// is a real read/decode failure that must not be dropped silently (rule 12).
-		slog.Warn("accountusage mirror load failed", "action", "usage_mirror_load", "error", err)
-	} else {
-		snap.Healthy = false
-		usageStore.Set(snap)
-	}
-	usageClient := accountusage.NewClient(accountusage.ClientConfig{
-		BaseURL:     cfg.UsageBaseURL,
-		TokenSource: secretTokenSource(mgr.GetAPIReader(), cfg.Namespace, cfg.AnthropicSecretName, "oauth-token"),
-		UserAgent:   cfg.UsageUserAgent,
-		AuthMode:    cfg.UsageAuthMode,
-	})
-	usagePoller := &accountusage.Poller{
-		Fetcher:          usageClient,
-		Store:            usageStore,
-		Metrics:          metrics,
-		Interval:         cfg.UsagePollInterval,
-		FailureThreshold: 3,
-		Now:              time.Now,
-	}
-	// onUpdate mirrors the snapshot to the ConfigMap only; all account-usage
-	// metrics (utilization, reset, overage, poll-health, failures) are produced by
-	// the poller itself so failures and staleness stay observable (F3).
-	usagePoller.SetOnUpdate(func(s accountusage.Snapshot) {
-		if err := usageMirror.Save(context.Background(), s); err != nil {
-			slog.Warn("accountusage mirror save failed", "action", "usage_mirror_save", "error", err)
+	// The poller is gated: off by default so deploying the operator does NOT start
+	// polling the undocumented /api/oauth/usage with a possibly-wrong auth header
+	// (the Task 0 spike confirms bearer vs x-api-key). When off, usageStore stays
+	// empty and the claudeSubscription gate reads 0% = fail-open (nothing held).
+	if cfg.UsageEnabled {
+		usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
+		if snap, err := usageMirror.Load(context.Background()); err != nil {
+			// Load already swallows a missing ConfigMap to a nil error, so a non-nil err
+			// is a real read/decode failure that must not be dropped silently (rule 12).
+			slog.Warn("accountusage mirror load failed", "action", "usage_mirror_load", "error", err)
+		} else {
+			snap.Healthy = false
+			usageStore.Set(snap)
 		}
-	})
-	if err := mgr.Add(usagePoller); err != nil {
-		return nil, fmt.Errorf("add usage poller: %w", err)
+		usageClient := accountusage.NewClient(accountusage.ClientConfig{
+			BaseURL:     cfg.UsageBaseURL,
+			TokenSource: secretTokenSource(mgr.GetAPIReader(), cfg.Namespace, cfg.AnthropicSecretName, "oauth-token"),
+			UserAgent:   cfg.UsageUserAgent,
+			AuthMode:    cfg.UsageAuthMode,
+		})
+		usagePoller := &accountusage.Poller{
+			Fetcher:          usageClient,
+			Store:            usageStore,
+			Metrics:          metrics,
+			Interval:         cfg.UsagePollInterval,
+			FailureThreshold: 3,
+			Now:              time.Now,
+		}
+		// onUpdate mirrors the snapshot to the ConfigMap only; all account-usage
+		// metrics (utilization, reset, overage, poll-health, failures) are produced by
+		// the poller itself so failures and staleness stay observable (F3).
+		usagePoller.SetOnUpdate(func(s accountusage.Snapshot) {
+			if err := usageMirror.Save(context.Background(), s); err != nil {
+				slog.Warn("accountusage mirror save failed", "action", "usage_mirror_save", "error", err)
+			}
+		})
+		if err := mgr.Add(usagePoller); err != nil {
+			return nil, fmt.Errorf("add usage poller: %w", err)
+		}
+	} else {
+		slog.Info("account-usage poller disabled (USAGE_ENABLED=false); claudeSubscription gate reads an empty store, fail-open",
+			"action", "usage_poller_disabled")
 	}
 
 	if err := (&controller.DispatcherReconciler{
