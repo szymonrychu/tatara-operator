@@ -58,7 +58,7 @@ func writeClientErr(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "internal error")
 }
 
-// authorizeForTask gates a mutating task handler on the caller carrying a valid
+// authorizeCaller gates a mutating handler on the caller carrying a valid
 // OIDC bearer token (a non-empty, verifier-validated Subject) for the operator
 // audience. The auth middleware has already verified the issuer, audience and
 // signature before this runs; this is the in-handler assertion that a verified
@@ -75,25 +75,10 @@ func writeClientErr(w http.ResponseWriter, err error) {
 // ServiceAccount, or a token-exchange that stamps the Pod/Task into the sub),
 // tracked in MEMORY/ROADMAP. When no Claims are present (middleware absent, e.g.
 // tests) the check is skipped. Returns false and writes a 403 on failure.
-func authorizeForTask(w http.ResponseWriter, r *http.Request, t *tatarav1alpha1.Task) bool {
-	_ = t
+func authorizeCaller(w http.ResponseWriter, r *http.Request) bool {
 	claims, ok := auth.ClaimsFromContext(r.Context())
 	if !ok {
 		// No auth middleware in this path; skip enforcement.
-		return true
-	}
-	if claims.Subject != "" {
-		return true
-	}
-	writeError(w, http.StatusForbidden, "caller has no verified identity")
-	return false
-}
-
-// authorizeForProject mirrors authorizeForTask for project-scoped mutating
-// endpoints (e.g. commentOnIssue). Same verified-subject presence assertion.
-func authorizeForProject(w http.ResponseWriter, r *http.Request, _ *tatarav1alpha1.Project) bool {
-	claims, ok := auth.ClaimsFromContext(r.Context())
-	if !ok {
 		return true
 	}
 	if claims.Subject != "" {
@@ -237,7 +222,7 @@ func (s *Server) patchTask(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	// Reject writes to already-terminal tasks; late/replayed agent writes must not
@@ -584,7 +569,7 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForProject(w, r, &proj) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 
@@ -745,7 +730,7 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	if t.Spec.Kind != "review" {
@@ -809,7 +794,7 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	if t.Spec.Kind != "selfImprove" {
@@ -876,7 +861,7 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	if t.Spec.Kind != "triageIssue" && t.Spec.Kind != "issueLifecycle" {
@@ -944,7 +929,7 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	if t.Spec.Kind != "issueLifecycle" {
@@ -1006,7 +991,7 @@ func (s *Server) brainstormOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	if t.Spec.Kind != "brainstorm" {
@@ -1061,7 +1046,7 @@ func (s *Server) postComment(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	// Only issueLifecycle Tasks have the reconcile drain that posts queued
@@ -1159,7 +1144,7 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	start := time.Now()
@@ -1231,7 +1216,7 @@ func (s *Server) handover(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForTask(w, r, &t) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	start := time.Now()
@@ -1286,25 +1271,13 @@ func canonicalSubtaskPhase(phase string) (string, bool) {
 	return "", false
 }
 
-func authorizeForSubtask(w http.ResponseWriter, r *http.Request) bool {
-	claims, ok := auth.ClaimsFromContext(r.Context())
-	if !ok {
-		return true
-	}
-	if claims.Subject != "" {
-		return true
-	}
-	writeError(w, http.StatusForbidden, "caller has no verified identity")
-	return false
-}
-
 func (s *Server) patchSubtask(w http.ResponseWriter, r *http.Request) {
 	var req subtaskPatchReq
 	if err := decodeJSON(r, w, &req); err != nil {
 		writeDecodeError(w, r, err)
 		return
 	}
-	if !authorizeForSubtask(w, r) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	// Normalize the phase to its canonical enum value case-insensitively so a
@@ -1479,7 +1452,7 @@ func (s *Server) listProjectIssues(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForProject(w, r, &proj) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	reader, _, ok := s.projectSCMReader(w, r, &proj)
@@ -1576,7 +1549,7 @@ func (s *Server) closeProjectIssue(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForProject(w, r, &proj) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	repos, err := s.projectRepos(r.Context(), projName)
@@ -1644,7 +1617,7 @@ func (s *Server) editProjectIssue(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForProject(w, r, &proj) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	repos, err := s.projectRepos(r.Context(), projName)
@@ -1703,7 +1676,7 @@ func (s *Server) createProjectIssue(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForProject(w, r, &proj) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	repos, err := s.projectRepos(r.Context(), projName)
@@ -1748,7 +1721,7 @@ func (s *Server) listProjectCommits(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if !authorizeForProject(w, r, &proj) {
+	if !authorizeCaller(w, r) {
 		return
 	}
 	reader, _, ok := s.projectSCMReader(w, r, &proj)
