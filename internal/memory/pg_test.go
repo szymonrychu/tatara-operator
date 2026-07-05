@@ -3,6 +3,7 @@ package memory_test
 import (
 	"testing"
 
+	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
@@ -58,6 +59,93 @@ func TestPGCluster_DefaultsAndShape(t *testing.T) {
 	require.Equal(t, "tatara_memory", c.Spec.Bootstrap.InitDB.Owner)
 	require.Contains(t, c.Spec.Bootstrap.InitDB.PostInitApplicationSQL,
 		"CREATE EXTENSION IF NOT EXISTS vector")
+}
+
+func pgClusterWithStorage(pgdata, wal string) *cnpgv1.Cluster {
+	c := &cnpgv1.Cluster{}
+	c.Spec.StorageConfiguration.Size = pgdata
+	if wal != "" {
+		c.Spec.WalStorage = &cnpgv1.StorageConfiguration{Size: wal}
+	}
+	return c
+}
+
+func TestClampPGStorageToExisting(t *testing.T) {
+	t.Run("nil existing leaves desired untouched", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		raised, err := memory.ClampPGStorageToExisting(desired, nil)
+		require.NoError(t, err)
+		require.False(t, raised)
+		require.Equal(t, "10Gi", desired.Spec.StorageConfiguration.Size)
+		require.Equal(t, "2Gi", desired.Spec.WalStorage.Size)
+	})
+
+	t.Run("shrink is clamped up to provisioned size", func(t *testing.T) {
+		// The issue #248 case: default 10Gi rendered against a provisioned 20Gi.
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		existing := pgClusterWithStorage("20Gi", "5Gi")
+		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
+		require.Equal(t, "5Gi", desired.Spec.WalStorage.Size)
+	})
+
+	t.Run("equal sizes are not raised", func(t *testing.T) {
+		desired := pgClusterWithStorage("20Gi", "5Gi")
+		existing := pgClusterWithStorage("20Gi", "5Gi")
+		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.NoError(t, err)
+		require.False(t, raised)
+		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
+	})
+
+	t.Run("growth request is honored, not clamped down", func(t *testing.T) {
+		desired := pgClusterWithStorage("50Gi", "10Gi")
+		existing := pgClusterWithStorage("20Gi", "5Gi")
+		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.NoError(t, err)
+		require.False(t, raised)
+		require.Equal(t, "50Gi", desired.Spec.StorageConfiguration.Size)
+		require.Equal(t, "10Gi", desired.Spec.WalStorage.Size)
+	})
+
+	t.Run("only WAL shrinks", func(t *testing.T) {
+		desired := pgClusterWithStorage("20Gi", "2Gi")
+		existing := pgClusterWithStorage("20Gi", "8Gi")
+		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
+		require.Equal(t, "8Gi", desired.Spec.WalStorage.Size)
+	})
+
+	t.Run("different-unit sizes compare by magnitude", func(t *testing.T) {
+		// 10240Mi == 10Gi; provisioned 20Gi must still win.
+		desired := pgClusterWithStorage("10240Mi", "2Gi")
+		existing := pgClusterWithStorage("20Gi", "2Gi")
+		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
+	})
+
+	t.Run("existing without WAL leaves desired WAL untouched", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		existing := pgClusterWithStorage("20Gi", "")
+		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
+		require.Equal(t, "2Gi", desired.Spec.WalStorage.Size)
+	})
+
+	t.Run("unparseable existing size is an error", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		existing := pgClusterWithStorage("garbage", "2Gi")
+		_, err := memory.ClampPGStorageToExisting(desired, existing)
+		require.Error(t, err)
+	})
 }
 
 func TestPGCluster_ImagePullSecrets(t *testing.T) {

@@ -43,6 +43,7 @@ type OperatorMetrics struct {
 	restapiRequestsTotal      *prometheus.CounterVec
 	restapiRequestDuration    *prometheus.HistogramVec
 	memoryHealthReadErrors    prometheus.Counter
+	memoryStorageShrinkGuard  *prometheus.CounterVec
 	queueAdmittedTotal        *prometheus.CounterVec
 	queueDepth                *prometheus.GaugeVec
 	queueInflight             *prometheus.GaugeVec
@@ -261,6 +262,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_health_read_errors_total",
 			Help: "Total transient errors reading memory-stack health (not real stack failures).",
 		}),
+		// Counts every reconcile where the rendered cnpg storage was clamped up to
+		// the provisioned volume to avoid a cnpg shrink rejection (issue #248). A
+		// nonzero value means a Project spec is asking for less storage than is live.
+		memoryStorageShrinkGuard: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_memory_storage_shrink_guarded_total",
+			Help: "Total reconciles where rendered cnpg storage was raised to the provisioned size to avoid a shrink rejection, by project.",
+		}, []string{"project"}),
 		queueAdmittedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_queue_admitted_total",
 			Help: "Total QueuedEvents admitted to a Task, by pool class and event kind.",
@@ -474,6 +482,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.restapiRequestsTotal,
 		m.restapiRequestDuration,
 		m.memoryHealthReadErrors,
+		m.memoryStorageShrinkGuard,
 		m.queueAdmittedTotal,
 		m.queueDepth,
 		m.queueInflight,
@@ -942,6 +951,18 @@ func (m *OperatorMetrics) RESTRequestsCounter(endpoint, result string) prometheu
 // Called when memoryStackHealth returns a transient non-NotFound error. Finding 13.
 func (m *OperatorMetrics) MemoryHealthReadError() {
 	m.memoryHealthReadErrors.Inc()
+}
+
+// MemoryStorageShrinkGuarded increments operator_memory_storage_shrink_guarded_total
+// for a project. Called when the rendered cnpg storage was clamped up to the
+// provisioned volume to avoid a cnpg shrink rejection (issue #248).
+func (m *OperatorMetrics) MemoryStorageShrinkGuarded(project string) {
+	m.memoryStorageShrinkGuard.WithLabelValues(project).Inc()
+}
+
+// MemoryStorageShrinkGuardedCounter returns the counter for (project) for test assertions.
+func (m *OperatorMetrics) MemoryStorageShrinkGuardedCounter(project string) prometheus.Counter {
+	return m.memoryStorageShrinkGuard.WithLabelValues(project)
 }
 
 // QueueAdmitted increments operator_queue_admitted_total for the pool class and event kind.

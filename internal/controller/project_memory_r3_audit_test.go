@@ -19,17 +19,22 @@ import (
 )
 
 // clusterGetErrorClient wraps k8sClient and returns a synthetic non-NotFound
-// error on the first Get for a cnpg Cluster object, so the transient
-// memoryStackHealth error path is exercised without requiring a broken API server.
+// error on the memoryStackHealth Get for a cnpg Cluster object, so the transient
+// health error path is exercised without requiring a broken API server. A
+// reconcile reads the Cluster twice: first the shrink-guard read in
+// applyMemoryStack (which fails open on error), then the health read. The error
+// is injected on the second read so it lands on the health path under test.
 type clusterGetErrorClient struct {
 	client.Client
-	done bool
+	clusterGets int
 }
 
 func (c *clusterGetErrorClient) Get(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
-	if _, ok := obj.(*cnpgv1.Cluster); ok && !c.done {
-		c.done = true
-		return fmt.Errorf("synthetic transient API error")
+	if _, ok := obj.(*cnpgv1.Cluster); ok {
+		c.clusterGets++
+		if c.clusterGets == 2 {
+			return fmt.Errorf("synthetic transient API error")
+		}
 	}
 	return c.Client.Get(ctx, key, obj, opts...)
 }
