@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/szymonrychu/tatara-operator/internal/accountusage"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
 	"github.com/szymonrychu/tatara-operator/internal/config"
@@ -21,7 +23,9 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // memoryConfigFromConfig maps operator config to the per-project memory stack
@@ -153,6 +157,25 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 	}
 }
 
+// secretTokenSource returns a func() (string, error) that reads the named data
+// key from the named Secret on every call via reader (the manager's uncached
+// API reader, so a rotated OAuth token is picked up without a cache watch).
+// Used by the account-usage client, which needs a fresh Anthropic OAuth token
+// on each poll rather than one captured at startup.
+func secretTokenSource(reader client.Reader, namespace, secretName, key string) func() (string, error) {
+	return func() (string, error) {
+		var sec corev1.Secret
+		if err := reader.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: secretName}, &sec); err != nil {
+			return "", fmt.Errorf("accountusage: get secret %s/%s: %w", namespace, secretName, err)
+		}
+		v, ok := sec.Data[key]
+		if !ok {
+			return "", fmt.Errorf("accountusage: secret %s/%s missing key %q", namespace, secretName, key)
+		}
+		return string(v), nil
+	}
+}
+
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable. It returns the
 // shared SeqSource so callers can pass it to addWebhookServer.
@@ -205,11 +228,64 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
 
+	// Fleet-wide Claude account usage poller (claudeSubscription mode). The
+	// store is nil-safe on the reconciler side, but is always built here so the
+	// gate has live data as soon as the poller (a leader-elected Runnable)
+	// completes its first poll. The mirror ConfigMap restores the last-known
+	// snapshot across a restart/re-election; it is marked unhealthy until the
+	// first live poll replaces it, so a stale restore never masks a real outage.
+	usageStore := &accountusage.Store{}
+	// The poller is gated: off by default so deploying the operator does NOT start
+	// polling the undocumented /api/oauth/usage with a possibly-wrong auth header
+	// (the Task 0 spike confirms bearer vs x-api-key). When off, usageStore stays
+	// empty and the claudeSubscription gate reads 0% = fail-open (nothing held).
+	if cfg.UsageEnabled {
+		usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
+		if snap, err := usageMirror.Load(context.Background()); err != nil {
+			// Load already swallows a missing ConfigMap to a nil error, so a non-nil err
+			// is a real read/decode failure that must not be dropped silently (rule 12).
+			slog.Warn("accountusage mirror load failed", "action", "usage_mirror_load", "error", err)
+		} else {
+			snap.Healthy = false
+			usageStore.Set(snap)
+		}
+		usageClient := accountusage.NewClient(accountusage.ClientConfig{
+			BaseURL:     cfg.UsageBaseURL,
+			TokenSource: secretTokenSource(mgr.GetAPIReader(), cfg.Namespace, cfg.AnthropicSecretName, "oauth-token"),
+			UserAgent:   cfg.UsageUserAgent,
+			AuthMode:    cfg.UsageAuthMode,
+		})
+		usagePoller := &accountusage.Poller{
+			Fetcher:          usageClient,
+			Store:            usageStore,
+			Metrics:          metrics,
+			Interval:         cfg.UsagePollInterval,
+			FailureThreshold: 3,
+			Now:              time.Now,
+		}
+		// onUpdate mirrors the snapshot to the ConfigMap only; all account-usage
+		// metrics (utilization, reset, overage, poll-health, failures) are produced by
+		// the poller itself so failures and staleness stay observable (F3).
+		usagePoller.SetOnUpdate(func(s accountusage.Snapshot) {
+			if err := usageMirror.Save(context.Background(), s); err != nil {
+				slog.Warn("accountusage mirror save failed", "action", "usage_mirror_save", "error", err)
+			}
+		})
+		if err := mgr.Add(usagePoller); err != nil {
+			return nil, fmt.Errorf("add usage poller: %w", err)
+		}
+	} else {
+		slog.Info("account-usage poller disabled (USAGE_ENABLED=false); claudeSubscription gate reads an empty store, fail-open",
+			"action", "usage_poller_disabled")
+	}
+
 	if err := (&controller.DispatcherReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		Metrics:        metrics,
-		BudgetDefaults: cfg.BudgetDefaults(),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Metrics:           metrics,
+		BudgetDefaults:    cfg.BudgetDefaults(),
+		Usage:             usageStore,
+		UsagePollInterval: cfg.UsagePollInterval,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup DispatcherReconciler: %w", err)
 	}

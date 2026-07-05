@@ -779,6 +779,51 @@ func TestWebhookDuration_PreSeeded(t *testing.T) {
 	}
 }
 
+func TestSetAccountUsageGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetAccountUsage("five_hour", 42.5)
+	m.SetAccountUsagePollHealth(true)
+	if v := testutil.ToFloat64(m.accountUsageUtil.WithLabelValues("five_hour")); v != 42.5 {
+		t.Fatalf("gauge=%v", v)
+	}
+	if v := testutil.ToFloat64(m.accountUsagePollHealth); v != 1 {
+		t.Fatalf("poll_health=%v, want 1", v)
+	}
+}
+
+func TestSetAccountUsageResetAndOverage(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetAccountUsageReset("weekly", 1750000000)
+	if v := testutil.ToFloat64(m.accountUsageReset.WithLabelValues("weekly")); v != 1750000000 {
+		t.Fatalf("reset=%v", v)
+	}
+	m.SetAccountOverage(12.5, 125, 1000)
+	if v := testutil.ToFloat64(m.accountOveragePercent); v != 12.5 {
+		t.Fatalf("overage percent=%v", v)
+	}
+	if v := testutil.ToFloat64(m.accountOverageUsed); v != 125 {
+		t.Fatalf("overage used=%v", v)
+	}
+	if v := testutil.ToFloat64(m.accountOverageLimit); v != 1000 {
+		t.Fatalf("overage limit=%v", v)
+	}
+}
+
+func TestAdmissionBlocked_KindLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.AdmissionBlocked("tatara", "normal", "review", "kind_ceiling")
+	m.AdmissionBlocked("tatara", "normal", "", "project_paused")
+	if got := testutil.ToFloat64(m.AdmissionBlockedCounter("tatara", "normal", "review", "kind_ceiling")); got != 1 {
+		t.Fatalf("admission_blocked{kind=review} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.AdmissionBlockedCounter("tatara", "normal", "", "project_paused")); got != 1 {
+		t.Fatalf("admission_blocked{kind=} = %v, want 1", got)
+	}
+}
+
 func hasMetric(mfs []*dto.MetricFamily, name string) bool {
 	for _, mf := range mfs {
 		if mf.GetName() == name {

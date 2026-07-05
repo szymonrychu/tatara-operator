@@ -5818,6 +5818,18 @@ spec:
                     - customWindow
                     - claudeSubscription
                     type: string
+                  monitorOverage:
+                    description: |-
+                      MonitorOverage surfaces the pay-as-you-go overage pool on dashboards. It is
+                      read-only and never gates spawning.
+                    type: boolean
+                  pollIntervalSeconds:
+                    description: |-
+                      PollIntervalSeconds is how often the operator polls Claude account usage
+                      (claudeSubscription mode). Floor 180 (enforced operator-side too).
+                    format: int32
+                    minimum: 180
+                    type: integer
                   proactivePercent:
                     default: 50
                     description: |-
@@ -5832,6 +5844,21 @@ spec:
                       reset boundary (customWindow mode). Empty disables the custom window.
                     pattern: ^$|^(\S+\s+){4}\S+$
                     type: string
+                  spawnCeilingByKind:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: |-
+                      SpawnCeilingByKind gates each Task kind independently in claudeSubscription
+                      mode: work of kind K is held once account usage reaches the given percent.
+                      Keys are Task kinds; kinds absent here fall through to proactive/emergency.
+                    maxProperties: 9
+                    type: object
+                    x-kubernetes-validations:
+                    - message: spawnCeilingByKind values must be 0..100
+                      rule: self.all(k, self[k] >= 0 && self[k] <= 100)
+                    - message: spawnCeilingByKind keys must be valid Task kinds
+                      rule: self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine'])
                   tokenLimit:
                     description: TokenLimit is the absolute total-token budget per
                       window (customWindow mode).
@@ -5960,16 +5987,22 @@ spec:
                 properties:
                   fiveHourPercent:
                     description: |-
-                      FiveHourPercent / WeeklyPercent are the wrapper-reported Claude usage
+                      FiveHourPercent / WeeklyPercent were the wrapper-reported Claude usage
                       percentages (whole percent, 0..100) for the rolling 5h and weekly windows.
-                      A nil reset means "not reported" and the gate ignores that window.
+                      Deprecated: no longer written (Task A8). Subscription state now lives only
+                      in the fleet-wide account-usage store (poller-fed, issue #189 follow-up).
+                      Retained on the CRD for backward compatibility with already-persisted
+                      status; the gate no longer reads them.
                     type: integer
                   fiveHourReset:
+                    description: 'Deprecated: see FiveHourPercent.'
                     format: date-time
                     type: string
                   weeklyPercent:
+                    description: 'Deprecated: see FiveHourPercent.'
                     type: integer
                   weeklyReset:
+                    description: 'Deprecated: see FiveHourPercent.'
                     format: date-time
                     type: string
                   windowStart:

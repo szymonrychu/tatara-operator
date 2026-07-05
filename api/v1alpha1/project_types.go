@@ -487,6 +487,23 @@ type TokenBudgetSpec struct {
 	// TokenLimit is the absolute total-token budget per window (customWindow mode).
 	// +optional
 	TokenLimit int64 `json:"tokenLimit,omitempty"`
+	// SpawnCeilingByKind gates each Task kind independently in claudeSubscription
+	// mode: work of kind K is held once account usage reaches the given percent.
+	// Keys are Task kinds; kinds absent here fall through to proactive/emergency.
+	// +kubebuilder:validation:MaxProperties=9
+	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] >= 0 && self[k] <= 100)",message="spawnCeilingByKind values must be 0..100"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine'])",message="spawnCeilingByKind keys must be valid Task kinds"
+	// +optional
+	SpawnCeilingByKind map[string]int32 `json:"spawnCeilingByKind,omitempty"`
+	// PollIntervalSeconds is how often the operator polls Claude account usage
+	// (claudeSubscription mode). Floor 180 (enforced operator-side too).
+	// +kubebuilder:validation:Minimum=180
+	// +optional
+	PollIntervalSeconds *int32 `json:"pollIntervalSeconds,omitempty"`
+	// MonitorOverage surfaces the pay-as-you-go overage pool on dashboards. It is
+	// read-only and never gates spawning.
+	// +optional
+	MonitorOverage *bool `json:"monitorOverage,omitempty"`
 }
 
 // BudgetConfig resolves the project's token-budget configuration, layering the
@@ -520,6 +537,12 @@ func (p *Project) BudgetConfig(defaults budget.Config) budget.Config {
 	}
 	if s.TokenLimit > 0 {
 		cfg.TokenLimit = s.TokenLimit
+	}
+	if len(s.SpawnCeilingByKind) > 0 {
+		cfg.SpawnCeilingByKind = make(map[string]int, len(s.SpawnCeilingByKind))
+		for k, v := range s.SpawnCeilingByKind {
+			cfg.SpawnCeilingByKind[k] = int(v)
+		}
 	}
 	return cfg
 }
@@ -653,15 +676,21 @@ type TokenBudgetStatus struct {
 	WindowStart *metav1.Time `json:"windowStart,omitempty"`
 	// +optional
 	WindowTokens int64 `json:"windowTokens,omitempty"`
-	// FiveHourPercent / WeeklyPercent are the wrapper-reported Claude usage
+	// FiveHourPercent / WeeklyPercent were the wrapper-reported Claude usage
 	// percentages (whole percent, 0..100) for the rolling 5h and weekly windows.
-	// A nil reset means "not reported" and the gate ignores that window.
+	// Deprecated: no longer written (Task A8). Subscription state now lives only
+	// in the fleet-wide account-usage store (poller-fed, issue #189 follow-up).
+	// Retained on the CRD for backward compatibility with already-persisted
+	// status; the gate no longer reads them.
 	// +optional
 	FiveHourPercent int `json:"fiveHourPercent,omitempty"`
+	// Deprecated: see FiveHourPercent.
 	// +optional
 	FiveHourReset *metav1.Time `json:"fiveHourReset,omitempty"`
+	// Deprecated: see FiveHourPercent.
 	// +optional
 	WeeklyPercent int `json:"weeklyPercent,omitempty"`
+	// Deprecated: see FiveHourPercent.
 	// +optional
 	WeeklyReset *metav1.Time `json:"weeklyReset,omitempty"`
 }

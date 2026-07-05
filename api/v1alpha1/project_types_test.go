@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/budget"
 )
 
 func boolPtrPT(v bool) *bool { return &v }
@@ -291,5 +292,16 @@ func TestQueueDefaults(t *testing.T) {
 	p3 := &v1alpha1.Project{}
 	if p3.QueueCapacity() != 3 || p3.QueuedAutonomousCap() != 3 || p3.AlertCapacity() != 1 {
 		t.Fatalf("hard floors wrong: %d/%d/%d", p3.QueueCapacity(), p3.QueuedAutonomousCap(), p3.AlertCapacity())
+	}
+}
+
+func TestBudgetConfigCopiesSpawnCeilingByKind(t *testing.T) {
+	p := &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{TokenBudget: &v1alpha1.TokenBudgetSpec{
+		Enabled: true, Mode: "claudeSubscription",
+		SpawnCeilingByKind: map[string]int32{"brainstorm": 40, "incident": 98},
+	}}}
+	cfg := p.BudgetConfig(budget.Config{})
+	if cfg.SpawnCeilingByKind["brainstorm"] != 40 || cfg.SpawnCeilingByKind["incident"] != 98 {
+		t.Fatalf("ceilings not copied: %+v", cfg.SpawnCeilingByKind)
 	}
 }

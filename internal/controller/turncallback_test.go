@@ -104,6 +104,39 @@ func TestTurnComplete_NoConversationPointerWhenSessionEmpty(t *testing.T) {
 	}
 }
 
+// TestTurnComplete_IgnoresRateLimitField asserts that a turn-complete payload
+// carrying the now-retired wrapper `rateLimit` snapshot (issue #189) decodes
+// without error and leaves Status.TokenBudget subscription fields untouched;
+// subscription state now lives only in the fleet-wide account-usage store
+// (Task A8, superseded by the poller in Task A9).
+func TestTurnComplete_IgnoresRateLimitField(t *testing.T) {
+	task := mkBudgetProject(t, "p-tb-rl", tatarav1alpha1.TokenBudgetSpec{
+		Enabled: true,
+		Mode:    "claudeSubscription",
+	})
+	annotate(t, task.Name, map[string]string{annCurrentTurn: "turn-rl1"})
+
+	cb := newCallbackServer()
+	body, _ := json.Marshal(map[string]any{
+		"turnId": "turn-rl1", "state": "completed",
+		"rateLimit": map[string]any{
+			"fiveHourPercent": 61, "fiveHourResetUnix": time.Now().Add(time.Hour).Unix(),
+			"weeklyPercent": 40, "weeklyResetUnix": time.Now().Add(72 * time.Hour).Unix(),
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+	p := getProject(t, "p-tb-rl")
+	if p.Status.TokenBudget != nil && p.Status.TokenBudget.FiveHourPercent != 0 {
+		t.Fatalf("Status.TokenBudget.FiveHourPercent = %d, want 0 (rateLimit must be ignored)",
+			p.Status.TokenBudget.FiveHourPercent)
+	}
+}
+
 func TestTurnComplete_UnknownTurn404(t *testing.T) {
 	cb := newCallbackServer()
 	body, _ := json.Marshal(map[string]any{"turnId": "nope", "state": "completed"})

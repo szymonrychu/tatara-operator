@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -21,7 +22,7 @@ func TestBudgetConfigNilSpecInheritsDefaults(t *testing.T) {
 	}
 	p := &Project{}
 	got := p.BudgetConfig(defaults)
-	if got != defaults {
+	if !reflect.DeepEqual(got, defaults) {
 		t.Fatalf("nil spec must inherit defaults verbatim:\n got  %+v\n want %+v", got, defaults)
 	}
 }
@@ -55,7 +56,7 @@ func TestBudgetConfigSpecOverridesAndDurationParse(t *testing.T) {
 		WindowDuration:   168 * time.Hour,
 		TokenLimit:       5000,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("override mismatch:\n got  %+v\n want %+v", got, want)
 	}
 }
@@ -78,7 +79,7 @@ func TestBudgetConfigZeroFieldsFallBackToDefaults(t *testing.T) {
 	got := p.BudgetConfig(defaults)
 	want := defaults
 	want.Enabled = true
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("fallback mismatch:\n got  %+v\n want %+v", got, want)
 	}
 }

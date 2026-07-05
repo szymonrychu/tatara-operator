@@ -162,6 +162,20 @@ type Config struct {
 	TokenBudgetResetSchedule    string
 	TokenBudgetWindowDuration   time.Duration
 	TokenBudgetTokenLimit       int64
+
+	// Claude account usage poller (claudeSubscription mode). UsageAuthMode
+	// selects the /api/oauth/usage auth header ("bearer" default or
+	// "x-api-key", per the Task 0 spike). UsagePollInterval is clamped up to
+	// the Poller's 180s floor. UsageUserAgent is sent as the request's
+	// User-Agent. UsageBaseURL overrides the Anthropic API base (empty =
+	// production default). UsageEnabled activates the poller: off by default so
+	// the operator ships inert until the Task 0 auth spike confirms the header;
+	// when off, the claudeSubscription gate reads an empty store (fail-open).
+	UsageEnabled      bool
+	UsageAuthMode     string
+	UsagePollInterval time.Duration
+	UsageUserAgent    string
+	UsageBaseURL      string
 }
 
 // BudgetDefaults returns the operator-wide token-budget configuration as a
@@ -371,6 +385,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	usageEnabled, err := getBoolDefault("USAGE_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	tokenBudgetProactive, err := getIntDefault("TOKEN_BUDGET_PROACTIVE_PERCENT", budget.DefaultProactivePercent)
 	if err != nil {
 		return Config{}, err
@@ -384,6 +402,10 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	tokenBudgetLimit, err := getInt64Default("TOKEN_BUDGET_TOKEN_LIMIT", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	usagePollInterval, err := getDurationDefault("USAGE_POLL_INTERVAL", 180*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
@@ -450,6 +472,12 @@ func Load() (Config, error) {
 		TokenBudgetResetSchedule:    os.Getenv("TOKEN_BUDGET_RESET_SCHEDULE"),
 		TokenBudgetWindowDuration:   tokenBudgetWindow,
 		TokenBudgetTokenLimit:       tokenBudgetLimit,
+
+		UsageEnabled:      usageEnabled,
+		UsageAuthMode:     getDefault("USAGE_AUTH_MODE", "bearer"),
+		UsagePollInterval: usagePollInterval,
+		UsageUserAgent:    getDefault("USAGE_USER_AGENT", "claude-code/1.0.0"),
+		UsageBaseURL:      os.Getenv("USAGE_BASE_URL"),
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

@@ -65,6 +65,13 @@ type OperatorMetrics struct {
 	reviewOutcomeTotal        *prometheus.CounterVec
 	reviewFindingsTotal       *prometheus.CounterVec
 	implementCITotal          *prometheus.CounterVec
+	accountUsageUtil          *prometheus.GaugeVec
+	accountUsageReset         *prometheus.GaugeVec
+	accountUsagePollHealth    prometheus.Gauge
+	accountUsagePollFailures  prometheus.Counter
+	accountOveragePercent     prometheus.Gauge
+	accountOverageUsed        prometheus.Gauge
+	accountOverageLimit       prometheus.Gauge
 	cdCascadeFailed           *prometheus.GaugeVec
 	cdCascadeStalled          *prometheus.GaugeVec
 	cdResolvedTotal           prometheus.Counter
@@ -344,12 +351,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help: "Token-budget usage as a fraction of the window limit, by project and scope (used|proactive|emergency); used is current usage, proactive/emergency are the active pause thresholds.",
 		}, []string{"project", "scope"}),
 		// Work the admission gate held back rather than admitting. reason is
-		// "token_budget" today; class is the pool (normal|alert). Bounded by live
-		// projects x classes x reasons; set live (not pre-seeded).
+		// "token_budget"|"project_paused"|"kind_ceiling"; class is the pool
+		// (normal|alert); kind is the Task kind for a per-kind account-usage hold,
+		// "" for pool-class blocks (project_paused, token_budget). Bounded by live
+		// projects x classes x kinds x reasons; set live (not pre-seeded).
 		admissionBlockedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_admission_blocked_total",
-			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), and reason (token_budget).",
-		}, []string{"project", "class", "reason"}),
+			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling).",
+		}, []string{"project", "class", "kind", "reason"}),
 		reviewOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_review_outcome_total",
 			Help: "Review tasks by verdict (approved|changes_requested), keyed by the model that ran the review.",
@@ -362,6 +371,40 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_implement_ci_total",
 			Help: "PR CI conclusions (pass|fail) for any PR-producing Task kind reaching handleMRCI, by kind and model.",
 		}, []string{"project", "repo", "kind", "model", "result"}),
+		// Claude account usage windows (claudeSubscription mode), keyed by window
+		// name (five_hour|seven_day|seven_day_opus|seven_day_sonnet).
+		accountUsageUtil: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_account_usage_utilization",
+			Help: "Claude account usage utilization percent (0..100) by window.",
+		}, []string{"window"}),
+		accountUsageReset: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "tatara_account_usage_resets_at_seconds",
+			Help: "Unix time each usage window resets.",
+		}, []string{"window"}),
+		accountUsagePollHealth: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "tatara_account_usage_poll_health",
+			Help: "1 when the usage poll is healthy, 0 when stale.",
+		}),
+		// Per-fetch failure counter (issue #189). Increments on every failed poll;
+		// the poll-health gauge only flips to 0 once consecutive failures reach the
+		// staleness threshold, so this exposes transient blips the gauge hides.
+		accountUsagePollFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tatara_account_usage_poll_failures_total",
+			Help: "Total Claude account usage poll fetch failures.",
+		}),
+		// Monthly overage (read-only, never gates admission; non-goal per spec).
+		accountOveragePercent: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "tatara_account_overage_percent",
+			Help: "Monthly overage utilization percent (0..100+), read-only.",
+		}),
+		accountOverageUsed: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "tatara_account_overage_used",
+			Help: "Monthly overage amount used, read-only.",
+		}),
+		accountOverageLimit: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "tatara_account_overage_limit",
+			Help: "Monthly overage limit, read-only.",
+		}),
 		// push-CD deploy-supervision CD-health gauges (G5). These reflect the CURRENT
 		// number of cascades in a failed / stalled state, derived from authoritative
 		// Task state each cdScan (not per-event counters), so max()>0 means "a cascade
@@ -441,6 +484,13 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.reviewOutcomeTotal,
 		m.reviewFindingsTotal,
 		m.implementCITotal,
+		m.accountUsageUtil,
+		m.accountUsageReset,
+		m.accountUsagePollHealth,
+		m.accountUsagePollFailures,
+		m.accountOveragePercent,
+		m.accountOverageUsed,
+		m.accountOverageLimit,
 		m.cdCascadeFailed,
 		m.cdCascadeStalled,
 		m.cdResolvedTotal,
@@ -1044,15 +1094,53 @@ func (m *OperatorMetrics) SetTokenBudgetUsedRatio(project, scope string, ratio f
 
 // AdmissionBlocked increments operator_admission_blocked_total: the dispatcher
 // declined to admit a pool's work for the given project, pool class
-// ("normal"|"alert"), and reason ("token_budget").
-func (m *OperatorMetrics) AdmissionBlocked(project, class, reason string) {
-	m.admissionBlockedTotal.WithLabelValues(project, class, reason).Inc()
+// ("normal"|"alert"), Task kind (empty for pool-class blocks that are not tied
+// to one kind), and reason ("token_budget"|"project_paused"|"kind_ceiling").
+func (m *OperatorMetrics) AdmissionBlocked(project, class, kind, reason string) {
+	m.admissionBlockedTotal.WithLabelValues(project, class, kind, reason).Inc()
 }
 
-// AdmissionBlockedCounter returns the counter for (project, class, reason) for
-// test assertions.
-func (m *OperatorMetrics) AdmissionBlockedCounter(project, class, reason string) prometheus.Counter {
-	return m.admissionBlockedTotal.WithLabelValues(project, class, reason)
+// AdmissionBlockedCounter returns the counter for (project, class, kind,
+// reason) for test assertions.
+func (m *OperatorMetrics) AdmissionBlockedCounter(project, class, kind, reason string) prometheus.Counter {
+	return m.admissionBlockedTotal.WithLabelValues(project, class, kind, reason)
+}
+
+// SetAccountUsage sets tatara_account_usage_utilization for a usage window
+// (five_hour|seven_day|seven_day_opus|seven_day_sonnet) to a percent (0..100).
+func (m *OperatorMetrics) SetAccountUsage(window string, percent float64) {
+	m.accountUsageUtil.WithLabelValues(window).Set(percent)
+}
+
+// SetAccountUsageReset sets tatara_account_usage_resets_at_seconds for a usage
+// window to the Unix time it resets.
+func (m *OperatorMetrics) SetAccountUsageReset(window string, unix float64) {
+	m.accountUsageReset.WithLabelValues(window).Set(unix)
+}
+
+// SetAccountUsagePollHealth sets tatara_account_usage_poll_health to 1 when the
+// usage poll is healthy, 0 when stale.
+func (m *OperatorMetrics) SetAccountUsagePollHealth(healthy bool) {
+	v := 0.0
+	if healthy {
+		v = 1.0
+	}
+	m.accountUsagePollHealth.Set(v)
+}
+
+// IncAccountUsagePollFailure increments tatara_account_usage_poll_failures_total:
+// a single Claude account usage poll fetch failed. The poll-health gauge only
+// flips to 0 once consecutive failures reach the staleness threshold.
+func (m *OperatorMetrics) IncAccountUsagePollFailure() {
+	m.accountUsagePollFailures.Inc()
+}
+
+// SetAccountOverage sets the monthly overage read-only gauges (never gates
+// admission).
+func (m *OperatorMetrics) SetAccountOverage(percent, used, limit float64) {
+	m.accountOveragePercent.Set(percent)
+	m.accountOverageUsed.Set(used)
+	m.accountOverageLimit.Set(limit)
 }
 
 // RecordReviewOutcome increments operator_review_outcome_total for a review

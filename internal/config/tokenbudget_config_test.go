@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -30,8 +31,35 @@ func TestBudgetDefaultsOff(t *testing.T) {
 		ProactivePercent: budget.DefaultProactivePercent,
 		EmergencyPercent: budget.DefaultEmergencyPercent,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("defaults:\n got  %+v\n want %+v", got, want)
+	}
+}
+
+func TestUsagePollerDefaultsOff(t *testing.T) {
+	setRequired(t)
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.UsageEnabled {
+		t.Fatal("UsageEnabled must default false so the operator ships inert (no poll before the auth spike)")
+	}
+	if cfg.UsageAuthMode != "bearer" {
+		t.Fatalf("UsageAuthMode default = %q, want bearer", cfg.UsageAuthMode)
+	}
+}
+
+func TestUsagePollerEnabledFromEnv(t *testing.T) {
+	setRequired(t)
+	t.Setenv("USAGE_ENABLED", "true")
+	t.Setenv("USAGE_AUTH_MODE", "x-api-key")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.UsageEnabled || cfg.UsageAuthMode != "x-api-key" {
+		t.Fatalf("UsageEnabled=%v UsageAuthMode=%q", cfg.UsageEnabled, cfg.UsageAuthMode)
 	}
 }
 
@@ -58,7 +86,7 @@ func TestBudgetDefaultsFromEnv(t *testing.T) {
 		WindowDuration:   5 * time.Hour,
 		TokenLimit:       1000000,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("from env:\n got  %+v\n want %+v", got, want)
 	}
 }

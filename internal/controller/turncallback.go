@@ -105,23 +105,12 @@ type turnCompletePayload struct {
 	// next-phase pod.
 	SessionID             string `json:"sessionId,omitempty"`
 	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
-	// RateLimit is the optional Claude usage snapshot the wrapper reports for the
-	// claudeSubscription budget mode (issue #189), absent until the wrapper is
-	// updated (subtask 7). Nil leaves the persisted snapshot untouched.
-	RateLimit *turnRateLimit `json:"rateLimit,omitempty"`
-}
-
-// turnRateLimit mirrors the optional Claude rate-limit snapshot the wrapper posts
-// in the turn-complete payload (issue #189). Percent fields are whole percent
-// 0..100 (used fraction of the window); *ResetUnix are epoch seconds of each
-// window's reset, 0 when unknown. The operator persists the latest snapshot onto
-// Project.Status.TokenBudget and the dispatcher gates claudeSubscription mode on
-// it.
-type turnRateLimit struct {
-	FiveHourPercent   int   `json:"fiveHourPercent"`
-	FiveHourResetUnix int64 `json:"fiveHourResetUnix"`
-	WeeklyPercent     int   `json:"weeklyPercent"`
-	WeeklyResetUnix   int64 `json:"weeklyResetUnix"`
+	// rateLimit was the per-turn Claude usage snapshot the wrapper reported for
+	// the claudeSubscription budget mode (issue #189). Retired: subscription
+	// state now lives only in the fleet-wide account-usage poller/store (issue
+	// #189 follow-up). The field is deliberately not declared here so an
+	// incoming "rateLimit" key from an older wrapper is silently ignored by
+	// json.Unmarshal (wire compatibility) instead of being persisted.
 }
 
 // turnUsage mirrors the usage object the wrapper posts in the turn-complete
@@ -221,9 +210,11 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 	if err := s.recordConversation(r.Context(), task, p.SessionID, p.ConversationObjectKey); err != nil {
 		l.Error(err, "record conversation pointer (non-fatal)", "turn_id", p.TurnID)
 	}
-	// Roll the project's token-budget window and persist any Claude usage snapshot
-	// (issue #189). Best-effort: a budget bookkeeping failure never fails the turn.
-	if err := s.updateProjectBudget(r.Context(), task, tokenDelta, usageRecorded, p.RateLimit); err != nil {
+	// Roll the project's custom-window token accumulator (issue #189). Best-effort:
+	// a budget bookkeeping failure never fails the turn. The claudeSubscription
+	// snapshot is no longer sourced here; it comes from the fleet-wide
+	// account-usage poller (issue #189 follow-up).
+	if err := s.updateProjectBudget(r.Context(), task, tokenDelta, usageRecorded); err != nil {
 		l.Error(err, "update project token budget (non-fatal)", "turn_id", p.TurnID)
 	}
 	l.Info("recorded turn result", "action", "turn_complete", "turn_id", p.TurnID, "state", p.State)
@@ -298,21 +289,25 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 	return inputTotal + u.OutputTokens, recorded, nil
 }
 
-// updateProjectBudget rolls the project's custom-window token accumulator and/or
-// persists the latest Claude usage snapshot onto Project.Status.TokenBudget
+// updateProjectBudget rolls the project's custom-window token accumulator
 // (issue #189), then refreshes the used-ratio gauge. It is a no-op unless the
-// project's resolved budget is enabled. Best-effort and idempotent: the window
-// roll runs only when this turn's usage actually landed (recorded) so a
-// stale/duplicate callback never double-counts; the snapshot is latest-wins. One
-// status write carries both changes, and only when something changed (churn
-// guard, mirroring recordConversation). A missing Project is tolerated.
-func (s *CallbackServer) updateProjectBudget(ctx context.Context, task *tatarav1alpha1.Task, tokenDelta int64, recorded bool, rl *turnRateLimit) error {
+// project's resolved budget is enabled in customWindow mode. Best-effort and
+// idempotent: the window roll runs only when this turn's usage actually landed
+// (recorded) so a stale/duplicate callback never double-counts. A missing
+// Project is tolerated.
+//
+// claudeSubscription mode is deliberately NOT evaluated here: that snapshot now
+// lives only in the fleet-wide account-usage store (poller-fed, issue #189
+// follow-up), which the dispatcher admission gate reads directly. Deriving a
+// ratio from the per-project Status.TokenBudget subscription fields here would
+// race that store with stale/never-updated data (Task A8).
+func (s *CallbackServer) updateProjectBudget(ctx context.Context, task *tatarav1alpha1.Task, tokenDelta int64, recorded bool) error {
 	projName := task.Spec.ProjectRef
 	if projName == "" {
 		return nil
 	}
-	if (!recorded || tokenDelta <= 0) && rl == nil {
-		return nil // nothing to accumulate or snapshot
+	if !recorded || tokenDelta <= 0 {
+		return nil // nothing to accumulate
 	}
 	now := time.Now()
 	var ratio float64
@@ -323,24 +318,18 @@ func (s *CallbackServer) updateProjectBudget(ctx context.Context, task *tatarav1
 			return client.IgnoreNotFound(err)
 		}
 		cfg := proj.BudgetConfig(s.BudgetDefaults)
-		if !cfg.Enabled {
+		if !cfg.Enabled || cfg.Mode != budget.ModeCustomWindow {
 			enabled = false
 			return nil
 		}
 		enabled = true
-		changed := false
-		if recorded && tokenDelta > 0 && cfg.Mode == budget.ModeCustomWindow {
-			before := proj.BudgetWindowState()
-			after := budget.Roll(cfg, before, now, tokenDelta)
-			if after.WindowTokens != before.WindowTokens || !after.WindowStart.Equal(before.WindowStart) {
-				proj.SetBudgetWindowState(after)
-				changed = true
-			}
+		before := proj.BudgetWindowState()
+		after := budget.Roll(cfg, before, now, tokenDelta)
+		changed := after.WindowTokens != before.WindowTokens || !after.WindowStart.Equal(before.WindowStart)
+		if changed {
+			proj.SetBudgetWindowState(after)
 		}
-		if rl != nil && applyRateLimit(proj, rl) {
-			changed = true
-		}
-		ratio = budget.Evaluate(cfg, proj.BudgetWindowState(), proj.BudgetSubscription(), now).UsedPercent / 100
+		ratio = budget.Evaluate(cfg, proj.BudgetWindowState(), budget.Subscription{}, now).UsedPercent / 100
 		if !changed {
 			return nil
 		}
@@ -352,51 +341,6 @@ func (s *CallbackServer) updateProjectBudget(ctx context.Context, task *tatarav1
 		s.Metrics.SetTokenBudgetUsedRatio(projName, "used", ratio)
 	}
 	return nil
-}
-
-// applyRateLimit writes the wrapper-reported Claude snapshot onto the project's
-// TokenBudget status, allocating it on first use. Returns true when a field
-// changed (latest-wins, churn guard).
-func applyRateLimit(proj *tatarav1alpha1.Project, rl *turnRateLimit) bool {
-	if proj.Status.TokenBudget == nil {
-		proj.Status.TokenBudget = &tatarav1alpha1.TokenBudgetStatus{}
-	}
-	st := proj.Status.TokenBudget
-	changed := false
-	if st.FiveHourPercent != rl.FiveHourPercent {
-		st.FiveHourPercent = rl.FiveHourPercent
-		changed = true
-	}
-	if five := unixToTimePtr(rl.FiveHourResetUnix); !timePtrEqual(st.FiveHourReset, five) {
-		st.FiveHourReset = five
-		changed = true
-	}
-	if st.WeeklyPercent != rl.WeeklyPercent {
-		st.WeeklyPercent = rl.WeeklyPercent
-		changed = true
-	}
-	if week := unixToTimePtr(rl.WeeklyResetUnix); !timePtrEqual(st.WeeklyReset, week) {
-		st.WeeklyReset = week
-		changed = true
-	}
-	return changed
-}
-
-// unixToTimePtr converts epoch seconds to a *metav1.Time, returning nil for a
-// non-positive (unknown) timestamp so the gate ignores that window.
-func unixToTimePtr(sec int64) *metav1.Time {
-	if sec <= 0 {
-		return nil
-	}
-	t := metav1.Unix(sec, 0)
-	return &t
-}
-
-func timePtrEqual(a, b *metav1.Time) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return a.Time.Equal(b.Time)
 }
 
 // recordConversation persists the conversation pointer (SessionID +

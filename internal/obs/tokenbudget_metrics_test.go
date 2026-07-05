@@ -32,14 +32,14 @@ func TestAdmissionBlocked(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.AdmissionBlocked("proj-a", "normal", "token_budget")
-	m.AdmissionBlocked("proj-a", "normal", "token_budget")
-	m.AdmissionBlocked("proj-a", "alert", "token_budget")
+	m.AdmissionBlocked("proj-a", "normal", "", "token_budget")
+	m.AdmissionBlocked("proj-a", "normal", "", "token_budget")
+	m.AdmissionBlocked("proj-a", "alert", "", "token_budget")
 
-	if got := testutil.ToFloat64(m.AdmissionBlockedCounter("proj-a", "normal", "token_budget")); got != 2 {
+	if got := testutil.ToFloat64(m.AdmissionBlockedCounter("proj-a", "normal", "", "token_budget")); got != 2 {
 		t.Fatalf("normal/token_budget = %v, want 2", got)
 	}
-	if got := testutil.ToFloat64(m.AdmissionBlockedCounter("proj-a", "alert", "token_budget")); got != 1 {
+	if got := testutil.ToFloat64(m.AdmissionBlockedCounter("proj-a", "alert", "", "token_budget")); got != 1 {
 		t.Fatalf("alert/token_budget = %v, want 1", got)
 	}
 }
@@ -51,7 +51,7 @@ func TestTokenBudgetMetricsGathered(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 	m.SetTokenBudgetUsedRatio("proj-a", "used", 0.1)
-	m.AdmissionBlocked("proj-a", "normal", "token_budget")
+	m.AdmissionBlocked("proj-a", "normal", "", "token_budget")
 
 	mfs, err := reg.Gather()
 	if err != nil {

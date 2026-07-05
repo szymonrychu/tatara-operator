@@ -84,7 +84,7 @@ func TestAdmit_BudgetGate_DirectDecisions(t *testing.T) {
 			proj, nQE, aQE := mkBudgetPools(t, ctx, name, nil)
 			r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 			qes, tasks := listQEsTasks(t, ctx, proj.Name)
-			if _, err := r.admit(ctx, proj, qes, tasks, tc.d); err != nil {
+			if _, _, err := r.admit(ctx, proj, qes, tasks, tc.d, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 				t.Fatal(err)
 			}
 			assertQEAdmitted(t, ctx, nQE, tc.wantNormal)
@@ -101,15 +101,15 @@ func TestAdmit_BudgetBlocked_EmitsMetric(t *testing.T) {
 	proj, nQE, aQE := mkBudgetPools(t, ctx, "p-gate-metric", nil)
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics}
 	qes, tasks := listQEsTasks(t, ctx, proj.Name)
-	if _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{ProactiveBlocked: true, UsedPercent: 60}); err != nil {
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{ProactiveBlocked: true, UsedPercent: 60}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	assertQEAdmitted(t, ctx, nQE, false)
 	assertQEAdmitted(t, ctx, aQE, true)
-	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "token_budget")); got != 1 {
+	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "", "token_budget")); got != 1 {
 		t.Fatalf("admission_blocked{normal} = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassAlert, "token_budget")); got != 0 {
+	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassAlert, "", "token_budget")); got != 0 {
 		t.Fatalf("admission_blocked{alert} = %v, want 0", got)
 	}
 }
@@ -152,7 +152,7 @@ func TestAdmit_BudgetWindowEvaluation(t *testing.T) {
 			cfg := proj.BudgetConfig(r.BudgetDefaults)
 			d := budget.Evaluate(cfg, proj.BudgetWindowState(), proj.BudgetSubscription(), time.Now())
 			qes, tasks := listQEsTasks(t, ctx, proj.Name)
-			if _, err := r.admit(ctx, proj, qes, tasks, d); err != nil {
+			if _, _, err := r.admit(ctx, proj, qes, tasks, d, cfg, proj.BudgetSubscription(), time.Now()); err != nil {
 				t.Fatal(err)
 			}
 			assertQEAdmitted(t, ctx, nQE, tc.wantNormal)
