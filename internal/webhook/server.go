@@ -275,13 +275,13 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		} else {
 			kind = "review"
 		}
-		if scope == "labeledOrMentioned" && !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && !mentionsBot(ev.Body, bot) {
+		if scope == "labeledOrMentioned" && !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && !mentionsBot(ev.Body, bot) && !tatarav1.IsTrustedAuthor(&proj, nil, ev.AuthorLogin) {
 			s.count(provider, ev.Kind, ev.Action, "ignored")
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 	} else {
-		if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) {
+		if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && (ev.AuthorLogin == bot || !tatarav1.IsTrustedAuthor(&proj, nil, ev.AuthorLogin)) {
 			s.count(provider, ev.Kind, ev.Action, "ignored")
 			w.WriteHeader(http.StatusAccepted)
 			return
