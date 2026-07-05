@@ -11,6 +11,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -172,6 +173,33 @@ func pgWalStorage(p *tatarav1alpha1.Project) string {
 		return p.Spec.Memory.PgWalStorage
 	}
 	return defaultPgWalStorage
+}
+
+// pgMaxSlotWalKeepSize is the value for postgres' max_slot_wal_keep_size: the
+// cap on how much WAL a replication slot may force the primary to retain for a
+// lagging standby. It is derived as half the dedicated WAL volume.
+//
+// The ~3.5h mem-tatara-pg outage (issue #240) was a stuck/lagging replica
+// holding a replication slot open, forcing the primary to retain WAL until the
+// volume filled. A full WAL volume makes the primary unable to write WAL, cnpg
+// marks it unhealthy and fails over - but every candidate standby's volume was
+// equally full, so the failover thrashed for hours with no writable primary and
+// the memory API stayed NotReady. Bounding slot retention converts that
+// cluster-fatal disk-full into a bounded, self-healing degradation: once a
+// slot's retained WAL exceeds this cap postgres invalidates the slot (that one
+// standby must re-sync) rather than filling the disk. Half the volume leaves
+// headroom for active/checkpoint WAL and any archive backlog. Falls back to
+// half the 2Gi default when the configured size cannot be parsed.
+func pgMaxSlotWalKeepSize(p *tatarav1alpha1.Project) string {
+	q, err := resource.ParseQuantity(pgWalStorage(p))
+	if err != nil {
+		q = resource.MustParse(defaultPgWalStorage)
+	}
+	mb := q.Value() / (2 * 1024 * 1024)
+	if mb < 1 {
+		mb = 1
+	}
+	return fmt.Sprintf("%dMB", mb)
 }
 
 // neo4jStorage resolves the neo4j storage size from spec, defaulting.

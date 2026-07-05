@@ -48,6 +48,10 @@ func TestPGCluster_DefaultsAndShape(t *testing.T) {
 	require.NotNil(t, c.Spec.WalStorage)
 	require.Equal(t, "2Gi", c.Spec.WalStorage.Size)
 
+	// WAL retention is bounded to half the 2Gi WAL volume so a lagging replica's
+	// slot cannot fill the disk and stall failover (issue #240).
+	require.Equal(t, "1024MB", c.Spec.PostgresConfiguration.Parameters["max_slot_wal_keep_size"])
+
 	require.NotNil(t, c.Spec.Bootstrap)
 	require.NotNil(t, c.Spec.Bootstrap.InitDB)
 	require.Equal(t, "tatara_memory", c.Spec.Bootstrap.InitDB.Database)
@@ -77,4 +81,6 @@ func TestPGCluster_SpecOverrides(t *testing.T) {
 	require.Equal(t, "50Gi", c.Spec.StorageConfiguration.Size)
 	require.NotNil(t, c.Spec.WalStorage)
 	require.Equal(t, "10Gi", c.Spec.WalStorage.Size)
+	// max_slot_wal_keep_size tracks the WAL volume: half of 10Gi.
+	require.Equal(t, "5120MB", c.Spec.PostgresConfiguration.Parameters["max_slot_wal_keep_size"])
 }

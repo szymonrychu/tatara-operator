@@ -54,6 +54,20 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 			WalStorage: &cnpgv1.StorageConfiguration{
 				Size: pgWalStorage(p),
 			},
+			// Bound how much WAL a replication slot can pin on the primary. A
+			// lagging/stuck standby holding a slot open forces the primary to
+			// retain WAL until the WAL volume fills; the primary can then no
+			// longer write WAL and cnpg fails over, but with every standby's
+			// volume equally full the failover thrashes with no writable primary
+			// (the ~3.5h mem-tatara-pg outage, issue #240). max_slot_wal_keep_size
+			// caps that retention: past the cap postgres invalidates the slot
+			// (that standby re-syncs) instead of filling the disk. Derived as
+			// half the WAL volume in pgMaxSlotWalKeepSize.
+			PostgresConfiguration: cnpgv1.PostgresConfiguration{
+				Parameters: map[string]string{
+					"max_slot_wal_keep_size": pgMaxSlotWalKeepSize(p),
+				},
+			},
 			Bootstrap: &cnpgv1.BootstrapConfiguration{
 				InitDB: &cnpgv1.BootstrapInitDB{
 					Database: "tatara_memory",
