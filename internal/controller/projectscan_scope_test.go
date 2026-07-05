@@ -11,6 +11,33 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
+func TestPrInReactionScope(t *testing.T) {
+	proj := &tatarav1alpha1.Project{Spec: tatarav1alpha1.ProjectSpec{
+		TriggerLabel: "tatara",
+		Scm: &tatarav1alpha1.ScmSpec{
+			PRReactionScope:  "labeledOrMentioned",
+			BotLogin:         "szymonrychu-bot",
+			MaintainerLogins: []string{"szymonrychu"},
+		},
+	}}
+	cases := []struct {
+		name string
+		c    candidate
+		want bool
+	}{
+		{"trusted author bypasses scope", candidate{author: "szymonrychu"}, true},
+		{"third party unlabeled skipped", candidate{author: "x"}, false},
+		{"third party labeled passes", candidate{author: "x", labels: []string{"tatara"}}, true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := prInReactionScope(proj, nil, tt.c, "szymonrychu-bot"); got != tt.want {
+				t.Errorf("got %v want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // seedScanProjectWithScope creates a project+repo pair with the given
 // prReactionScope and trigger label.
 func seedScanProjectWithScope(t *testing.T, name, scope, triggerLabel string) (*tatarav1alpha1.Project, *tatarav1alpha1.Repository) {
