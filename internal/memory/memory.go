@@ -93,6 +93,19 @@ func Endpoint(project, namespace string) string {
 	return fmt.Sprintf("http://mem-%s.%s.svc:8080", project, namespace)
 }
 
+// ChatServiceName is the shared tatara-chat Service. Unlike memory (mem-<project>,
+// one stack per Project), chat is deployed once per cluster as a single
+// tatara-chat release, so every Project's agents, ingress backend, and the
+// tool-surface probe all address this one Service.
+const ChatServiceName = "tatara-chat"
+
+// ChatEndpoint is the canonical in-cluster URL of the shared chat Service (the
+// value agent pods receive as TATARA_CHAT_URL and the tool-surface probe dials).
+// Sibling of Endpoint, but not project-scoped: chat is a single shared service.
+func ChatEndpoint(namespace string) string {
+	return fmt.Sprintf("http://%s.%s.svc:8080", ChatServiceName, namespace)
+}
+
 // labels returns the four pin-set labels carried by every object.
 func labels(project string) map[string]string {
 	return map[string]string{

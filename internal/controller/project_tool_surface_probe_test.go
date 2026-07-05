@@ -34,9 +34,12 @@ func TestProbeToolSurfaceRoute_Classification(t *testing.T) {
 				w.WriteHeader(tc.status)
 			}))
 			defer srv.Close()
-			got := probeToolSurfaceRoute(context.Background(), srv.Client(), http.MethodGet, srv.URL+"/projects")
+			got, err := probeToolSurfaceRoute(context.Background(), srv.Client(), http.MethodGet, srv.URL+"/projects")
 			if got != tc.want {
 				t.Fatalf("status %d classified %q, want %q", tc.status, got, tc.want)
+			}
+			if err != nil {
+				t.Fatalf("status %d returned non-nil error %v (HTTP responses classify without error)", tc.status, err)
 			}
 		})
 	}
@@ -47,8 +50,12 @@ func TestProbeToolSurfaceRoute_TransportFailureIsUnreachable(t *testing.T) {
 	url := srv.URL
 	client := srv.Client()
 	srv.Close()
-	if got := probeToolSurfaceRoute(context.Background(), client, http.MethodGet, url+"/readyz"); got != "unreachable" {
+	got, err := probeToolSurfaceRoute(context.Background(), client, http.MethodGet, url+"/readyz")
+	if got != "unreachable" {
 		t.Fatalf("transport failure classified %q, want unreachable", got)
+	}
+	if err == nil {
+		t.Fatal("transport failure returned nil error, want the dial error for the log line")
 	}
 }
 
@@ -127,8 +134,8 @@ func TestUpdateToolSurfaceProbe_OperatorAndChat(t *testing.T) {
 
 	r.ToolSurfaceHTTP = opSrv.Client()
 	r.OperatorURL = opSrv.URL
-	var probed []string
-	r.ChatBaseURL = func(p string) string { probed = append(probed, p); return chatSrv.URL }
+	chatProbes := 0
+	r.ChatBaseURL = func() string { chatProbes++; return chatSrv.URL }
 
 	r.updateToolSurfaceProbe(ctx)
 
@@ -141,14 +148,9 @@ func TestUpdateToolSurfaceProbe_OperatorAndChat(t *testing.T) {
 	if got := gatherToolSurfaceDurationCount(t, reg, "operator"); got < 1 {
 		t.Fatalf("operator latency samples = %d, want >= 1", got)
 	}
-	found := false
-	for _, p := range probed {
-		if p == "ts-ready" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("Ready project ts-ready was not chat-probed; probed=%v", probed)
+	// chat is a single shared service: probed exactly once, not once per Project.
+	if chatProbes != 1 {
+		t.Fatalf("chat probed %d times, want exactly 1 (shared service, no per-project fan-out)", chatProbes)
 	}
 }
 
@@ -166,7 +168,7 @@ func TestUpdateToolSurfaceProbe_SkipsChatWhenDisabled(t *testing.T) {
 	r.ToolSurfaceHTTP = opSrv.Client()
 	r.OperatorURL = opSrv.URL
 	probedChat := false
-	r.ChatBaseURL = func(string) string { probedChat = true; return "http://unused" }
+	r.ChatBaseURL = func() string { probedChat = true; return "http://unused" }
 
 	r.updateToolSurfaceProbe(ctx)
 
@@ -183,29 +185,35 @@ func TestUpdateToolSurfaceProbe_SkipsChatWhenDisabled(t *testing.T) {
 	}
 }
 
-// TestUpdateToolSurfaceProbe_SkipsNonReadyChat verifies a non-Ready project's
-// chat is never probed (mirrors the memory probe's replica gate).
-func TestUpdateToolSurfaceProbe_SkipsNonReadyChat(t *testing.T) {
+// TestUpdateToolSurfaceProbe_ChatProbedOnceRegardlessOfProjects verifies chat is
+// probed exactly once per cycle when enabled: it is a single shared service, so
+// its probing is decoupled from Project count and readiness (no per-project
+// fan-out, which was the bug that reported the shared chat service unreachable).
+func TestUpdateToolSurfaceProbe_ChatProbedOnceRegardlessOfProjects(t *testing.T) {
 	ctx := logfIntoTestCtx()
-	r, _ := newMemoryReconcilerWithReg()
+	r, reg := newMemoryReconcilerWithReg()
 	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
 
-	mkMemoryProject(t, "ts-provisioning") // leave status.memory unset -> not Ready
+	// A mix of non-Ready and Ready projects must not change chat probing.
+	mkMemoryProject(t, "ts-once-prov") // leave status.memory unset -> not Ready
+	mkMemoryProject(t, "ts-once-ready")
+	setMemoryPhaseReady(t, "ts-once-ready")
 
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer chatSrv.Close()
 	r.ToolSurfaceHTTP = chatSrv.Client()
-	var probed []string
-	r.ChatBaseURL = func(p string) string { probed = append(probed, p); return chatSrv.URL }
+	chatProbes := 0
+	r.ChatBaseURL = func() string { chatProbes++; return chatSrv.URL }
 
 	r.updateToolSurfaceProbe(ctx)
 
-	for _, p := range probed {
-		if p == "ts-provisioning" {
-			t.Fatal("a non-Ready project's chat was probed")
-		}
+	if chatProbes != 1 {
+		t.Fatalf("chat probed %d times, want exactly 1 regardless of Project count/readiness", chatProbes)
+	}
+	if got := gatherToolSurfaceCounter(t, reg, "chat", "ok"); got != 1 {
+		t.Fatalf("probe{chat,ok} = %v, want 1", got)
 	}
 }
 

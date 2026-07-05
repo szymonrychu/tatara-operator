@@ -110,7 +110,7 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
 		"TATARA_MEMORY_URL":    "http://mem-demo.tatara.svc:8080",
 		"TATARA_OPERATOR_URL":  "http://tatara-operator.tatara.svc:8080",
-		"TATARA_CHAT_URL":      "http://chat-demo.tatara.svc:8080",
+		"TATARA_CHAT_URL":      "http://tatara-chat.tatara.svc:8080",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)
@@ -477,7 +477,7 @@ func TestBuildPod_ChatURL(t *testing.T) {
 	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
 	got, ok := envValue(c, "TATARA_CHAT_URL")
 	require.True(t, ok, "TATARA_CHAT_URL missing from pod env")
-	require.Equal(t, "http://chat-demo.tatara.svc:8080", got)
+	require.Equal(t, "http://tatara-chat.tatara.svc:8080", got)
 }
 
 // TestValidatePodSecurityContext rejects RunAsNonRoot=true without RunAsUser.
