@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -152,6 +153,53 @@ func TestSetLifecycleLabel_NeverTouchesTriggerOrPriority(t *testing.T) {
 	require.NoError(t, r.setLifecycleLabel(context.Background(), &proj, task, "tatara-rejected"))
 	require.Equal(t, []string{"tatara-rejected"}, w.added)
 	require.Equal(t, []string{"tatara-idea"}, w.removed)
+}
+
+// errAddLabelWriter is an SCMWriter whose AddLabel always fails with a fixed
+// error, exercising setLifecycleLabel's AddLabel-failure branch.
+type errAddLabelWriter struct {
+	scm.SCMWriter
+	err error
+}
+
+func (w *errAddLabelWriter) AddLabel(_ context.Context, _, _, _ string) error { return w.err }
+
+// TestSetLifecycleLabel_TargetGone_TerminalNoRequeue verifies that when AddLabel
+// fails because the source issue is permanently gone (404/410), setLifecycleLabel
+// returns nil (terminal, no requeue) so the reconcile stops instead of retry-
+// looping the doomed write and amplifying operator_scm_writes_total{result=error}
+// (alert #263). Transient/server errors (500/429) still return an error so
+// controller-runtime requeues.
+func TestSetLifecycleLabel_TargetGone_TerminalNoRequeue(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		wantErr bool
+	}{
+		{"410 gone -> terminal", 410, false},
+		{"404 not found -> terminal", 404, false},
+		{"500 server -> retryable", 500, true},
+		{"429 rate limit -> retryable", 429, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, task, _ := seedLabelTask(t, "gone-"+strconv.Itoa(tc.status), nil)
+			var proj tatarav1alpha1.Project
+			require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
+			w := &errAddLabelWriter{err: &scm.HTTPError{Status: tc.status, Path: "/issues/7/labels", Body: "This issue was deleted"}}
+			// commentReader.ListOpenIssues returns nil -> known=false -> AddLabel is called.
+			r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+				Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+				SCMFor:    func(string) (scm.SCMWriter, error) { return w, nil },
+				ReaderFor: func(_, _ string) (scm.SCMReader, error) { return &commentReader{}, nil }}
+			err := r.setLifecycleLabel(context.Background(), &proj, task, "tatara-approved")
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
 
 type commentReader struct {

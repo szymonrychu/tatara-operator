@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 
@@ -12,6 +14,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// isPermanentTargetGone reports whether err is an SCM HTTPError whose status
+// means the write target is permanently gone: 404 Not Found or 410 Gone (e.g.
+// GitHub responds 410 "This issue was deleted"). These are terminal - retrying
+// the same write can never succeed - so the caller stops instead of requeuing.
+// Transient statuses (429/403 rate limits, 5xx) are NOT target-gone and stay
+// retryable. This mirrors the terminal-4xx skip already applied to OpenChange.
+func isPermanentTargetGone(err error) bool {
+	var he *scm.HTTPError
+	if !errors.As(err, &he) {
+		return false
+	}
+	return he.Status == http.StatusNotFound || he.Status == http.StatusGone
+}
 
 // lifecycleLabels returns the four managed phase labels (brainstorming/approved/
 // implementation/declined), applying defaults when a field is empty.
@@ -204,6 +220,19 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	if !known || !current[desired] {
 		if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
 			r.recordSCM(provider, "add_label", aerr)
+			// Target permanently gone (source issue deleted -> 404/410): retrying
+			// this write can never succeed. Stop the reconcile (return nil) instead
+			// of propagating a retryable error that controller-runtime requeues
+			// forever - that unbounded retry loop amplified operator_scm_writes_total
+			// {result="error"} and held alert #263 firing. The single SCM error is
+			// still recorded above (honest), mirroring the OpenChange writeback_skip_4xx
+			// terminal-4xx skip.
+			if isPermanentTargetGone(aerr) {
+				l.Info("set label: add target gone, terminal (no requeue)",
+					"action", "scm_set_label_target_gone", "resource_id", task.Name,
+					"issue_ref", issueRef, "label", desired, "err", aerr.Error())
+				return nil
+			}
 			return fmt.Errorf("set label add %q: %w", desired, aerr)
 		}
 		r.recordSCM(provider, "add_label", nil)
