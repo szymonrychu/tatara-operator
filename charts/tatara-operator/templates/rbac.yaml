@@ -46,11 +46,12 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Per-Project memory monitoring (issue #200): the operator server-side-applies
   # a ServiceMonitor + PrometheusRule per provisioned memory stack so the stack
-  # is scraped and its alerts load. Gated by memoryMonitoring.enabled; the verbs
-  # are harmless on a cluster without the prometheus-operator CRDs (no objects
-  # are applied when disabled).
+  # is scraped and its alerts load, and a PodMonitor for the CNPG postgres cluster
+  # (mem-<project>-pg) so the postgres instance metrics are scraped. Gated by
+  # memoryMonitoring.enabled; the verbs are harmless on a cluster without the
+  # prometheus-operator CRDs (no objects are applied when disabled).
   - apiGroups: ["monitoring.coreos.com"]
-    resources: ["servicemonitors", "prometheusrules"]
+    resources: ["servicemonitors", "prometheusrules", "podmonitors"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Per-project Ingress (external exposure of memory + chat paths).
   - apiGroups: ["networking.k8s.io"]
