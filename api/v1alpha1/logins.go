@@ -53,6 +53,24 @@ func IsAllowedReporter(proj *Project, repo *Repository, login string) bool {
 	return containsLogin(reporters, login)
 }
 
+// IsTrustedAuthor reports whether login is an explicitly trusted insider (the
+// bot, a maintainer, or a listed reporter) for the project/repo. Unlike
+// IsAllowedReporter it does NOT treat an empty reporter list as open: it
+// requires explicit membership, so it can gate label/reaction-scope bypass
+// without opening those gates to third parties when the lists are empty.
+func IsTrustedAuthor(proj *Project, repo *Repository, login string) bool {
+	if login == "" {
+		return false
+	}
+	if proj != nil && proj.Spec.Scm != nil && login == proj.Spec.Scm.BotLogin {
+		return true
+	}
+	if containsLogin(EffectiveMaintainerLogins(proj, repo), login) {
+		return true
+	}
+	return containsLogin(EffectiveReporterLogins(proj, repo), login)
+}
+
 func containsLogin(list []string, login string) bool {
 	for _, x := range list {
 		if x == login {

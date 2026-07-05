@@ -49,6 +49,35 @@ func TestEffectiveMaintainerLogins_RepoOverride(t *testing.T) {
 	}
 }
 
+func TestIsTrustedAuthor(t *testing.T) {
+	proj := &Project{Spec: ProjectSpec{Scm: &ScmSpec{
+		BotLogin:         "szymonrychu-bot",
+		MaintainerLogins: []string{"szymonrychu"},
+		ReporterLogins:   []string{"szymonrychu"},
+	}}}
+	open := &Project{Spec: ProjectSpec{Scm: &ScmSpec{BotLogin: "szymonrychu-bot"}}}
+	tests := []struct {
+		name  string
+		proj  *Project
+		login string
+		want  bool
+	}{
+		{"bot", proj, "szymonrychu-bot", true},
+		{"maintainer", proj, "szymonrychu", true},
+		{"third party", proj, "randouser", false},
+		{"empty login", proj, "", false},
+		{"empty lists do not open", open, "randouser", false},
+		{"bot with empty lists", open, "szymonrychu-bot", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsTrustedAuthor(tt.proj, nil, tt.login); got != tt.want {
+				t.Errorf("IsTrustedAuthor(%q)=%v want %v", tt.login, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsAllowedReporter(t *testing.T) {
 	cases := []struct {
 		name      string
