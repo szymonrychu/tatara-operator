@@ -315,16 +315,6 @@ func (r *Receiver) PushHandler() http.Handler {
 	return http.HandlerFunc(r.handlePush)
 }
 
-// Handler returns an http.ServeMux with a single route /internal/metrics/push.
-// Prefer PushHandler() when mounting on an existing mux.
-//
-// Deprecated: use PushHandler() and mount at the desired path on the outer mux.
-func (r *Receiver) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/metrics/push", r.handlePush)
-	return mux
-}
-
 // isMaxBytesError reports whether err signals that http.MaxBytesReader hit its
 // limit. Uses errors.As against *http.MaxBytesError (Go 1.21+).
 func isMaxBytesError(err error) bool {

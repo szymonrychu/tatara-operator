@@ -433,14 +433,9 @@ func (r *RepositoryReconciler) scheduleNextReingest(ctx context.Context, repo *t
 
 	// Persist the dedup guard only after the trigger is safely written.
 	scheduled := metav1.NewTime(now)
-	repo.Status.LastScheduledReingest = &scheduled
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tataradevv1alpha1.Repository{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
-			return err
-		}
+	if err := r.patchStatus(ctx, repo, func(fresh *tataradevv1alpha1.Repository) bool {
 		fresh.Status.LastScheduledReingest = &scheduled
-		return r.Status().Update(ctx, fresh)
+		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update lastScheduledReingest: %w", err)
 	}
@@ -562,11 +557,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 			return ctrl.Result{}, fmt.Errorf("read ingest result sha: %w", err)
 		}
 		ingestTime := metav1.Now()
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tataradevv1alpha1.Repository{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
-				return err
-			}
+		if err := r.patchStatus(ctx, repo, func(fresh *tataradevv1alpha1.Repository) bool {
 			fresh.Status.LastIngestedCommit = sha
 			fresh.Status.LastIngestTime = &ingestTime
 			fresh.Status.Phase = "Ingested"
@@ -580,12 +571,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 				Message:            "ingested at " + sha,
 				ObservedGeneration: fresh.Generation,
 			})
-			if updateErr := r.Status().Update(ctx, fresh); updateErr != nil {
-				return updateErr
-			}
-			// Refresh repo for the annotation clear below.
-			*repo = *fresh
-			return nil
+			return true
 		}); err != nil {
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
@@ -621,11 +607,7 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 		condMsg += ": " + reason
 	}
 	var newFailureCount int
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tataradevv1alpha1.Repository{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(repo), fresh); err != nil {
-			return err
-		}
+	if err := r.patchStatus(ctx, repo, func(fresh *tataradevv1alpha1.Repository) bool {
 		fresh.Status.Phase = "Failed"
 		fresh.Status.JobName = ""
 		fresh.Status.IngestFailureCount++
@@ -637,11 +619,8 @@ func (r *RepositoryReconciler) handleFinishedJob(ctx context.Context, repo *tata
 			Message:            condMsg,
 			ObservedGeneration: fresh.Generation,
 		})
-		if updateErr := r.Status().Update(ctx, fresh); updateErr != nil {
-			return updateErr
-		}
 		newFailureCount = fresh.Status.IngestFailureCount
-		return nil
+		return true
 	}); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("update repository status: %w", err)
