@@ -3,7 +3,9 @@ name: release
 # Semver push-CD release pipeline (design:
 # docs/superpowers/specs/2026-06-28-semver-push-cd-design.md, section 7).
 # On push to main: cut the next semver tag from the merged PR's `semver:*`
-# label, publish the image (:vX.Y.Z and :SHORT_SHA) and BOTH charts (bare
+# label, publish the image (:vX.Y.Z only - ci-shared.yml's image job already
+# pushed :SHORT_SHA for this commit, and Harbor's containers project has tag
+# immutability, so re-pushing :SHORT_SHA here 412s) and BOTH charts (bare
 # X.Y.Z), then propagate the new version into the tatara-helmfile pins via a
 # bot PR. The bump is gated on BOTH charts publishing so the partial-publish
 # wedge (operator-ci-partial-chart-publish-2026-06-25) cannot ship a half
@@ -62,10 +64,12 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           VERSION: ${{ needs.tag.outputs.version }}
         run: |
-          # Build at the computed semver and push BOTH the :vX.Y.Z tag (what the
-          # helmfile pin moves to) and the :SHORT_SHA tag (rollback/debug
-          # traceability) - the DUAL scheme from the design. Same rootless
-          # buildkitd / harbor-auth pattern as ci-shared.yml's image job.
+          # Build at the computed semver and push ONLY the :vX.Y.Z tag (what
+          # the helmfile pin moves to). ci-shared.yml's image job already
+          # pushed :SHORT_SHA for this commit, and Harbor's containers project
+          # has tag immutability, so re-pushing :SHORT_SHA here 412s. Same
+          # rootless buildkitd / harbor-auth pattern as ci-shared.yml's image
+          # job.
           set -euo pipefail
           BUILDKITD_ADDR="tcp://buildkitd.arc-runners:1234"
           SHORT_SHA="${GITHUB_SHA:0:7}"
@@ -93,9 +97,9 @@ jobs:
             --opt build-arg:COMMIT="${SHORT_SHA}" \
             --opt build-arg:DATE="${BUILD_DATE}" \
             --secret id=GIT_AUTH_TOKEN,env=GITHUB_TOKEN \
-            --output "type=image,\"name=${DEST}:${VERSION},${DEST}:${SHORT_SHA}\",push=true"
+            --output "type=image,\"name=${DEST}:${VERSION}\",push=true"
 
-          echo "buildkit: pushed ${DEST}:${VERSION} and ${DEST}:${SHORT_SHA}"
+          echo "buildkit: pushed ${DEST}:${VERSION}"
       - name: package and push BOTH charts at semver
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
