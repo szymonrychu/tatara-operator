@@ -5,9 +5,38 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
+
+// TestApplySemverAutoMerge_GitLabEnsuresLabel guards the provider-agnostic
+// EnsureLabel call: the label color must still be ensured for provider=="gitlab"
+// even though the PR-label AddLabel step is GitHub-only. Without this, the S21
+// helper extraction could silently pull EnsureLabel inside the github gate and
+// regress GitLab label-color maintenance unnoticed.
+func TestApplySemverAutoMerge_GitLabEnsuresLabel(t *testing.T) {
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	proj := &tatarav1alpha1.Project{
+		Spec: tatarav1alpha1.ProjectSpec{
+			Scm: &tatarav1alpha1.ScmSpec{Provider: "gitlab", BotLogin: "tatara-bot"},
+		},
+	}
+	repo := tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "gl-repo"},
+		Spec:       tatarav1alpha1.RepositorySpec{URL: "https://gitlab.com/o/r.git"},
+	}
+	cs := &tatarav1alpha1.ChangeSummary{Significance: "minor"}
+
+	r.applySemverAutoMerge(context.Background(), proj, repo, fw, "tok", "gitlab",
+		"https://gitlab.com/o/r/-/merge_requests/7", cs)
+
+	require.True(t, fw.ensureLabelCalled, "EnsureLabel must fire for provider=gitlab")
+	require.Equal(t, "semver:minor", fw.ensureLabelName)
+	require.Equal(t, "d93f0b", fw.ensureLabelColor)
+	require.False(t, fw.addLabelCalled, "AddLabel is GitHub-only; must NOT fire for gitlab")
+}
 
 // TestWriteBackOpenChange_SemverLabelAndAutoMerge covers the push-CD writeback
 // hook: after a bot PR opens, the operator stamps the declared significance

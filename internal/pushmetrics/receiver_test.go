@@ -31,7 +31,7 @@ func push(t *testing.T, r *Receiver, query, body string) int {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?"+query, strings.NewReader(body))
 	rec := httptest.NewRecorder()
-	r.Handler().ServeHTTP(rec, req)
+	r.PushHandler().ServeHTTP(rec, req)
 	return rec.Code
 }
 
@@ -217,7 +217,7 @@ func TestDeleteRemovesSeries(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodDelete, "/internal/metrics/push?run_id=run-1", nil)
 	rec := httptest.NewRecorder()
-	r.Handler().ServeHTTP(rec, req)
+	r.PushHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: got %d, want 204", rec.Code)
 	}
@@ -371,7 +371,7 @@ func TestDelete_CountedInReceiveTotal(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodDelete, "/internal/metrics/push?run_id=run-del", nil)
 	rec := httptest.NewRecorder()
-	r.Handler().ServeHTTP(rec, req)
+	r.PushHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("delete: got %d, want 204", rec.Code)
 	}
@@ -497,7 +497,7 @@ func TestOversizeBody_Rejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/internal/metrics/push?run_id=big",
 		strings.NewReader(big))
 	rec := httptest.NewRecorder()
-	r.Handler().ServeHTTP(rec, req)
+	r.PushHandler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize body: got %d, want 413", rec.Code)
 	}

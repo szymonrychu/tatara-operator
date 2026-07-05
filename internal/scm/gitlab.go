@@ -317,30 +317,10 @@ func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 
 // glDoWithHeaders performs a single GET and returns (X-Next-Page header, error).
 func glDoWithHeaders(ctx context.Context, base, path, token string, out any) (nextPage string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
-	if err != nil {
-		return "", fmt.Errorf("gitlab: build request: %w", err)
-	}
-	req.Header.Set("PRIVATE-TOKEN", token)
-	req.Header.Set("Accept", "application/json")
-	resp, err := scmHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("gitlab: do request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	next := resp.Header.Get("X-Next-Page")
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
-	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-			return "", fmt.Errorf("gitlab: decode response: %w", err)
-		}
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
-	}
-	return next, nil
+	return doPagedGET(ctx, base+path, "gitlab", path, map[string]string{
+		"PRIVATE-TOKEN": token,
+		"Accept":        "application/json",
+	}, "X-Next-Page", out)
 }
 
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {
@@ -421,19 +401,19 @@ func (c *GitLab) EnsureLabel(ctx context.Context, repoURL, token, name, color st
 		return err
 	}
 	hexColor := "#" + color
-	err = glDo(ctx, c.base(), http.MethodPost,
-		"/projects/"+url.PathEscape(proj)+"/labels", token,
-		map[string]string{"name": name, "color": hexColor}, nil)
-	if err == nil {
-		return nil
-	}
-	var he *HTTPError
-	if errors.As(err, &he) && he.Status == http.StatusConflict {
-		return glDo(ctx, c.base(), http.MethodPut,
-			"/projects/"+url.PathEscape(proj)+"/labels/"+url.PathEscape(name), token,
-			map[string]string{"color": hexColor}, nil)
-	}
-	return err
+	return createOrUpdateOnConflict(
+		func() error {
+			return glDo(ctx, c.base(), http.MethodPost,
+				"/projects/"+url.PathEscape(proj)+"/labels", token,
+				map[string]string{"name": name, "color": hexColor}, nil)
+		},
+		http.StatusConflict,
+		func() error {
+			return glDo(ctx, c.base(), http.MethodPut,
+				"/projects/"+url.PathEscape(proj)+"/labels/"+url.PathEscape(name), token,
+				map[string]string{"color": hexColor}, nil)
+		},
+	)
 }
 
 // RemoveLabel removes a label from an issue identified by group/proj#iid.
@@ -681,15 +661,16 @@ func (c *GitLab) mrNote(ctx context.Context, base, proj string, number int, toke
 	return glDo(ctx, base, http.MethodPost, path, token, map[string]string{"body": body}, nil)
 }
 
-// glHashRef parses group/proj#iid into project path + iid (issue refs use '#').
-func glHashRef(ref string) (string, int, error) {
-	at := strings.LastIndex(ref, "#")
+// glParseRef parses group/proj<sep>iid into project path + iid; kind names
+// the ref kind ("issue" or "mr") for the error text.
+func glParseRef(ref string, sep byte, kind string) (string, int, error) {
+	at := strings.LastIndexByte(ref, sep)
 	if at < 0 {
-		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+		return "", 0, fmt.Errorf("gitlab: malformed %s ref %q", kind, ref)
 	}
 	proj, iidStr := ref[:at], ref[at+1:]
 	if proj == "" {
-		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+		return "", 0, fmt.Errorf("gitlab: malformed %s ref %q", kind, ref)
 	}
 	iid, err := strconv.Atoi(iidStr)
 	if err != nil {
@@ -698,22 +679,11 @@ func glHashRef(ref string) (string, int, error) {
 	return proj, iid, nil
 }
 
+// glHashRef parses group/proj#iid into project path + iid (issue refs use '#').
+func glHashRef(ref string) (string, int, error) { return glParseRef(ref, '#', "issue") }
+
 // glBangRef parses group/proj!iid into project path + iid (MR refs use '!').
-func glBangRef(ref string) (string, int, error) {
-	at := strings.LastIndex(ref, "!")
-	if at < 0 {
-		return "", 0, fmt.Errorf("gitlab: malformed mr ref %q", ref)
-	}
-	proj, iidStr := ref[:at], ref[at+1:]
-	if proj == "" {
-		return "", 0, fmt.Errorf("gitlab: malformed mr ref %q", ref)
-	}
-	iid, err := strconv.Atoi(iidStr)
-	if err != nil {
-		return "", 0, fmt.Errorf("gitlab: malformed iid in %q: %w", ref, err)
-	}
-	return proj, iid, nil
-}
+func glBangRef(ref string) (string, int, error) { return glParseRef(ref, '!', "mr") }
 
 // glIssueURLRef parses a GitLab issue web URL (.../g/p/-/issues/4) into a
 // project path + iid for board label updates.
@@ -782,22 +752,10 @@ func (c *GitLab) commitCIStatus(ctx context.Context, owner, sha, token string) (
 	if len(statuses) == 0 {
 		return "", nil
 	}
-	// Aggregate: failure > pending > success.
-	failure, pending := false, false
-	for _, s := range statuses {
-		switch glCIStatus(s.Status) {
-		case "failure":
-			failure = true
-		case "pending":
-			pending = true
-		}
+	// Aggregate through the shared failure > pending > success > "" reducer.
+	mapped := make([]string, len(statuses))
+	for i, s := range statuses {
+		mapped[i] = glCIStatus(s.Status)
 	}
-	switch {
-	case failure:
-		return "failure", nil
-	case pending:
-		return "pending", nil
-	default:
-		return "success", nil
-	}
+	return foldCIStatuses(mapped...), nil
 }

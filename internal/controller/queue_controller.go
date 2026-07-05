@@ -60,19 +60,6 @@ type DispatcherReconciler struct {
 // required for the poller/mirror to read the OAuth Secret and manage the
 // account-usage ConfigMap.
 
-// blockKindFunc returns a predicate that reports whether a queued event of a
-// given kind must be held on the account usage gate. Subscription mode reads the
-// fleet-wide store; other modes never per-kind block.
-func (r *DispatcherReconciler) blockKindFunc(proj *tatarav1alpha1.Project, cfg budget.Config, now time.Time) func(string) bool {
-	var sub budget.Subscription
-	if r.Usage != nil {
-		sub = r.Usage.Get().Subscription()
-	}
-	return func(kind string) bool {
-		return budget.KindBlocked(cfg, sub, kind, now)
-	}
-}
-
 // ceilingKey resolves which SpawnCeilingByKind entry governs a queued event,
 // mirroring modelForKind/effortForKind precedence (internal/agent/pod.go): a
 // non-empty LabelActivity value that is itself a configured ceiling key wins, so
@@ -502,16 +489,6 @@ func (r *DispatcherReconciler) usageRequeueAfter() time.Duration {
 		return r.UsagePollInterval
 	}
 	return 60 * time.Second
-}
-
-func queuedAutonomousCount(qes []tatarav1alpha1.QueuedEvent) int {
-	n := 0
-	for i := range qes {
-		if qes[i].Spec.Autonomous && isQueued(qes[i].Status.State) {
-			n++
-		}
-	}
-	return n
 }
 
 func filterQEsByProject(in []tatarav1alpha1.QueuedEvent, project string) []tatarav1alpha1.QueuedEvent {

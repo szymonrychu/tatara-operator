@@ -89,19 +89,16 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	body, err := readBody(r)
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
-			s.count("unknown", "other", "other", "too_large")
-			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			s.reject(w, http.StatusRequestEntityTooLarge, "request body too large", "unknown", "other", "other", "too_large")
 			return
 		}
-		s.count("unknown", "other", "other", "bad_request")
-		http.Error(w, "read body", http.StatusBadRequest)
+		s.reject(w, http.StatusBadRequest, "read body", "unknown", "other", "other", "bad_request")
 		return
 	}
 
 	provider, err := scm.Select(r.Header)
 	if err != nil {
-		s.count("unknown", "other", "other", "bad_request")
-		http.Error(w, "unrecognized provider", http.StatusBadRequest)
+		s.reject(w, http.StatusBadRequest, "unrecognized provider", "unknown", "other", "other", "bad_request")
 		return
 	}
 	providerName = provider.Provider()
@@ -109,12 +106,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	var proj tatarav1.Project
 	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, projectName), &proj); err != nil {
 		if apierrors.IsNotFound(err) {
-			s.count(providerName, "other", "other", "unknown_project")
-			http.Error(w, "unknown project", http.StatusNotFound)
+			s.reject(w, http.StatusNotFound, "unknown project", providerName, "other", "other", "unknown_project")
 			return
 		}
-		s.count(providerName, "other", "other", "error")
-		http.Error(w, "lookup project", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "lookup project", providerName, "other", "other", "error")
 		return
 	}
 
@@ -122,22 +117,19 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	// to a GitLab-configured project (or vice versa) would otherwise fail with a
 	// confusing bad_signature 401 rather than a clear provider_mismatch 400.
 	if proj.Spec.Scm != nil && proj.Spec.Scm.Provider != "" && proj.Spec.Scm.Provider != providerName {
-		s.count(providerName, "other", "other", "provider_mismatch")
-		http.Error(w, "provider mismatch", http.StatusBadRequest)
+		s.reject(w, http.StatusBadRequest, "provider mismatch", providerName, "other", "other", "provider_mismatch")
 		return
 	}
 
 	webhookSecret, err := s.webhookSecret(ctx, proj.Spec.ScmSecretRef)
 	if err != nil {
-		s.count(providerName, "other", "other", "error")
-		http.Error(w, "secret", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "secret", providerName, "other", "other", "error")
 		return
 	}
 
 	ev, err := provider.DetectAndVerify(r.Header, body, webhookSecret)
 	if err != nil {
-		s.count(providerName, "other", "other", "bad_signature")
-		http.Error(w, "verification failed", http.StatusUnauthorized)
+		s.reject(w, http.StatusUnauthorized, "verification failed", providerName, "other", "other", "bad_signature")
 		return
 	}
 
@@ -148,16 +140,14 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	case "issue", "mr":
 		s.handleWorkItem(ctx, w, providerName, proj, ev)
 	default:
-		s.count(providerName, "other", ev.Action, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, providerName, "other", ev.Action, "ignored")
 	}
 }
 
 func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider, projectName string, ev scm.WebhookEvent) {
 	var repos tatarav1.RepositoryList
 	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
-		s.count(provider, "push", ev.Action, "error")
-		http.Error(w, "list repositories", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, "push", ev.Action, "error")
 		return
 	}
 	for i := range repos.Items {
@@ -173,18 +163,15 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 		}
 		repo.Annotations[tatarav1.ReingestRequestedAnnotation] = time.Now().UTC().Format(time.RFC3339)
 		if err := s.cfg.Client.Update(ctx, repo); err != nil {
-			s.count(provider, "push", ev.Action, "error")
-			http.Error(w, "annotate repository", http.StatusInternalServerError)
+			s.reject(w, http.StatusInternalServerError, "annotate repository", provider, "push", ev.Action, "error")
 			return
 		}
 		s.log.InfoContext(ctx, "webhook push re-ingest requested",
 			"provider", provider, "project", projectName, "repository", repo.Name, "branch", ev.Branch)
-		s.count(provider, "push", ev.Action, "accepted")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, "push", ev.Action, "accepted")
 		return
 	}
-	s.count(provider, "push", ev.Action, "ignored")
-	w.WriteHeader(http.StatusAccepted)
+	s.accept(w, provider, "push", ev.Action, "ignored")
 }
 
 // matchRepo returns the Project's Repository whose URL maps to the given remote,
@@ -235,14 +222,12 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 				return s.cfg.Client.Status().Update(ctx, fresh)
 			})
 			if updateErr != nil {
-				s.count(provider, ev.Kind, ev.Action, "error")
-				http.Error(w, "update task", http.StatusInternalServerError)
+				s.reject(w, http.StatusInternalServerError, "update task", provider, ev.Kind, ev.Action, "error")
 				return
 			}
 			s.log.InfoContext(ctx, "triggerLabel on Conversation task: set Implement",
 				"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
-			s.count(provider, ev.Kind, ev.Action, "accepted")
-			w.WriteHeader(http.StatusAccepted)
+			s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 			return
 		}
 	}
@@ -283,29 +268,25 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 			kind = "review"
 		}
 		if scope == "labeledOrMentioned" && !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && !mentionsBot(ev.Body, bot) && !trusted {
-			s.count(provider, ev.Kind, ev.Action, "ignored")
-			w.WriteHeader(http.StatusAccepted)
+			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 			return
 		}
 	} else {
 		if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && (ev.AuthorLogin == bot || !trusted) {
-			s.count(provider, ev.Kind, ev.Action, "ignored")
-			w.WriteHeader(http.StatusAccepted)
+			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 			return
 		}
 	}
 
 	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
 	if err != nil {
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "list repositories", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 	if repo == nil {
 		s.log.InfoContext(ctx, "work item labeled but no matching repository",
 			"project", proj.Name, "remote", ev.Repo, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "no_repo")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "no_repo")
 		return
 	}
 
@@ -318,8 +299,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		!tatarav1.IsAllowedReporter(&proj, repo, ev.AuthorLogin) {
 		s.log.InfoContext(ctx, "issue intake: author not an allowed reporter; ignoring",
 			"project", proj.Name, "repository", repo.Name, "issue_ref", ev.IssueRef, "author", ev.AuthorLogin)
-		s.count(provider, ev.Kind, ev.Action, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
 
@@ -376,8 +356,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		client.InNamespace(s.cfg.Namespace),
 	}
 	if err := s.cfg.Client.List(ctx, &existing, listOpts...); err != nil {
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "list tasks", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "list tasks", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 	for i := range existing.Items {
@@ -404,8 +383,7 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 		s.log.InfoContext(ctx, "work item already has an active task; skipping duplicate",
 			"project", proj.Name, "issue_ref", ev.IssueRef, "dedup_ref", dedupRef, "task", t.Name)
-		s.count(provider, ev.Kind, ev.Action, "duplicate")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "duplicate")
 		return
 	}
 
@@ -482,22 +460,19 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	}
 	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, &proj, tatarav1.QueueClassNormal, false, taskName, payload)
 	if err != nil {
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "create task", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "create task", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 	if !created {
 		s.log.InfoContext(ctx, "work item already queued (concurrent delivery); treating as duplicate",
 			"project", proj.Name, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "duplicate")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "duplicate")
 		return
 	}
 	s.log.InfoContext(ctx, "work item enqueued",
 		"project", proj.Name, "repository", repo.Name,
 		"task", taskName, "issue_ref", ev.IssueRef, "kind", kind)
-	s.count(provider, ev.Kind, ev.Action, "task_created")
-	w.WriteHeader(http.StatusAccepted)
+	s.accept(w, provider, ev.Kind, ev.Action, "task_created")
 }
 
 // handleIssueComment reacts to an issue_comment (action=created) webhook on an
@@ -520,8 +495,7 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 	if botLogin != "" && ev.ActorLogin == botLogin {
 		s.log.InfoContext(ctx, "issue_comment: bot-authored comment ignored",
 			"project", proj.Name, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
 
@@ -535,8 +509,7 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 	if !tatarav1.IsAllowedReporter(&proj, commentRepo, ev.ActorLogin) {
 		s.log.InfoContext(ctx, "issue_comment: author not an allowed reporter; ignoring",
 			"project", proj.Name, "issue_ref", ev.IssueRef, "author", ev.ActorLogin)
-		s.count(provider, ev.Kind, ev.Action, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
 
@@ -571,14 +544,12 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 			return s.cfg.Client.Status().Update(ctx, fresh)
 		}); updateErr != nil {
 			s.log.ErrorContext(ctx, "issue_comment: queue interjection", "error", updateErr, "task", task.Name)
-			s.count(provider, ev.Kind, ev.Action, "error")
-			http.Error(w, "update task", http.StatusInternalServerError)
+			s.reject(w, http.StatusInternalServerError, "update task", provider, ev.Kind, ev.Action, "error")
 			return
 		}
 		s.log.InfoContext(ctx, "issue_comment: queued interjection for in-flight turn",
 			"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "accepted")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 		return
 	}
 
@@ -609,15 +580,13 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		return s.cfg.Client.Status().Update(ctx, fresh)
 	}); updateErr != nil {
 		s.log.ErrorContext(ctx, "issue_comment: update task status", "error", updateErr, "task", task.Name)
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "update task", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "update task", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 	s.log.InfoContext(ctx, "issue_comment: lifecycle task updated",
 		"project", proj.Name, "task", task.Name,
 		"issue_ref", ev.IssueRef)
-	s.count(provider, ev.Kind, ev.Action, "accepted")
-	w.WriteHeader(http.StatusAccepted)
+	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
 // createLifecycleTaskAtTriage creates a new issueLifecycle Task at Triage for an
@@ -627,15 +596,13 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	// Find the matching Repository for the event's repo URL.
 	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
 	if err != nil {
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "list repositories", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 	if repo == nil {
 		s.log.InfoContext(ctx, "issue_comment: no matching repository for untracked issue",
 			"project", proj.Name, "remote", ev.Repo, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
 
@@ -679,22 +646,19 @@ func (s *Server) createLifecycleTaskAtTriage(ctx context.Context, w http.Respons
 	}
 	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, &proj, tatarav1.QueueClassNormal, false, lifecycleName, payload)
 	if err != nil {
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "create task", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "create task", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 	if !created {
 		s.log.InfoContext(ctx, "issue_comment: lifecycle task already queued (concurrent create); treating as duplicate",
 			"project", proj.Name, "issue_ref", ev.IssueRef)
-		s.count(provider, ev.Kind, ev.Action, "duplicate")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, provider, ev.Kind, ev.Action, "duplicate")
 		return
 	}
 	// CommentBody is folded into Goal above so the triage agent sees the triggering comment.
 	s.log.InfoContext(ctx, "issue_comment: created lifecycle task at Triage for untracked issue",
 		"project", proj.Name, "repository", repo.Name, "task", lifecycleName, "issue_ref", ev.IssueRef)
-	s.count(provider, ev.Kind, ev.Action, "task_created")
-	w.WriteHeader(http.StatusAccepted)
+	s.accept(w, provider, ev.Kind, ev.Action, "task_created")
 }
 
 // findLifecycleTask finds a non-terminal issueLifecycle Task for the given
@@ -802,8 +766,7 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 		return s.cfg.Client.Status().Update(ctx, fresh)
 	}); statusErr != nil {
 		s.log.ErrorContext(ctx, "reactivate: update task status", "error", statusErr, "task", task.Name)
-		s.count(provider, ev.Kind, ev.Action, "error")
-		http.Error(w, "reactivate task", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "reactivate task", provider, ev.Kind, ev.Action, "error")
 		return
 	}
 
@@ -832,8 +795,7 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 	}
 	s.log.InfoContext(ctx, "issue_comment: reactivated parked lifecycle task",
 		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
-	s.count(provider, ev.Kind, ev.Action, "accepted")
-	w.WriteHeader(http.StatusAccepted)
+	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
 func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
@@ -860,8 +822,7 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 	}
 	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if subtle.ConstantTimeCompare([]byte(bearer), []byte(secret)) != 1 {
-		s.count("grafana", "alert", "other", "bad_signature")
-		http.Error(w, "verification failed", http.StatusUnauthorized)
+		s.reject(w, http.StatusUnauthorized, "verification failed", "grafana", "alert", "other", "bad_signature")
 		return
 	}
 	alert, err := parseGrafanaAlert(body)
@@ -870,15 +831,13 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if alert.Status != "firing" {
-		s.count("grafana", "alert", alert.Status, "ignored")
-		w.WriteHeader(http.StatusAccepted)
+		s.accept(w, "grafana", "alert", alert.Status, "ignored")
 		return
 	}
 	groupHash := alertGroupHash(alert)
 	created, err := s.createIncidentTask(ctx, &proj, alert, groupHash)
 	if err != nil {
-		s.count("grafana", "alert", "firing", "error")
-		http.Error(w, "create task", http.StatusInternalServerError)
+		s.reject(w, http.StatusInternalServerError, "create task", "grafana", "alert", "firing", "error")
 		return
 	}
 	if !created {
@@ -1005,6 +964,20 @@ func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) 
 // the request-start time; it is non-zero only when called from handle().
 func (s *Server) count(provider, kind, action, result string) {
 	s.cfg.Metrics.WebhookEvent(provider, kind, action, result)
+}
+
+// accept counts the event and writes a 202 Accepted response. Used at the ~20
+// call sites that count a result and always respond StatusAccepted.
+func (s *Server) accept(w http.ResponseWriter, provider, kind, action, result string) {
+	s.count(provider, kind, action, result)
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// reject counts the event and writes an http.Error response. Used at the ~21
+// call sites that count a result and always respond with a non-2xx status.
+func (s *Server) reject(w http.ResponseWriter, status int, msg, provider, kind, action, result string) {
+	s.count(provider, kind, action, result)
+	http.Error(w, msg, status)
 }
 
 func objKey(ns, name string) client.ObjectKey {

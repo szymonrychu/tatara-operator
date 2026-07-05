@@ -419,6 +419,16 @@ func (r *TaskReconciler) rerollDeploy(ctx context.Context, project *tatarav1alph
 	return ctrl.Result{}, nil
 }
 
+// clearCascadeStatusFields resets the Deploying-phase cascade fields shared by
+// clearDeployState and setTaskImplementContext.
+func clearCascadeStatusFields(s *tatarav1alpha1.TaskStatus) {
+	s.Phase = ""
+	s.DeployDeadline = nil
+	s.CascadeStage = ""
+	s.DeployedVersion = ""
+	s.DeployArtifact = ""
+}
+
 // clearDeployState clears the Deploying phase + deploy-supervision status fields.
 // When bumpGiveup is set it also increments the auto-reroll attempt counter so a
 // Deploying->Implement reroll consumes the shared ImplementGiveUps budget.
@@ -428,11 +438,7 @@ func (r *TaskReconciler) clearDeployState(ctx context.Context, task *tatarav1alp
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
 		}
-		fresh.Status.Phase = ""
-		fresh.Status.DeployDeadline = nil
-		fresh.Status.CascadeStage = ""
-		fresh.Status.DeployedVersion = ""
-		fresh.Status.DeployArtifact = ""
+		clearCascadeStatusFields(&fresh.Status)
 		if bumpGiveup {
 			fresh.Status.ImplementGiveUps++
 		}
@@ -698,11 +704,7 @@ func (r *ProjectReconciler) setTaskImplementContext(ctx context.Context, task *t
 			return err
 		}
 		fresh.Status.ImplementContext = msg
-		fresh.Status.Phase = ""
-		fresh.Status.DeployDeadline = nil
-		fresh.Status.CascadeStage = ""
-		fresh.Status.DeployedVersion = ""
-		fresh.Status.DeployArtifact = ""
+		clearCascadeStatusFields(&fresh.Status)
 		fresh.Status.ImplementGiveUps++
 		return r.Status().Update(ctx, fresh)
 	})

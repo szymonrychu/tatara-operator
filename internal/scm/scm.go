@@ -2,8 +2,10 @@ package scm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -264,6 +266,23 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("scm: %s -> %d: %s", e.Path, e.Status, body)
 }
 
+// createOrUpdateOnConflict runs create; if create fails with an *HTTPError
+// whose Status equals conflictStatus, it runs update instead and returns its
+// result. Any other create error, or any update error, is returned as-is.
+// Path/color/body construction stays in each provider's create/update
+// closures - do not fold that in here.
+func createOrUpdateOnConflict(create func() error, conflictStatus int, update func() error) error {
+	err := create()
+	if err == nil {
+		return nil
+	}
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == conflictStatus {
+		return update()
+	}
+	return err
+}
+
 // ErrorStatus classifies an SCM error into a metrics label: the HTTP status code
 // (e.g. "401", "403", "429", "500") when the call reached the server and got a
 // non-2xx, or "network" for connect/DNS/timeout failures that never got a reply.
@@ -300,6 +319,45 @@ func (*GitLab) Provider() string { return "gitlab" }
 
 // reClosesIssue matches "Closes #N" (case-insensitive) in a PR body.
 var reClosesIssue = regexp.MustCompile(`(?i)closes\s+#(\d+)`)
+
+// doPagedGET performs a single GET to fullURL, decodes a non-error JSON body
+// into out, and returns the value of peekHeader (the pagination cursor
+// header: "Link" for GitHub, "X-Next-Page" for GitLab). headers carries both
+// the auth header and the Accept header - callers supply their own values so
+// this stays provider-agnostic. errPrefix ("github"/"gitlab") preserves each
+// provider's existing wrapped-error text verbatim. errPath is the value
+// stored on HTTPError.Path on a 4xx/5xx response; GitHub's call site passes
+// the same fullURL it always has, GitLab's passes the relative path it
+// always has - this helper does not unify that difference. The pagination
+// loop (page-advance, self-reference, and page-count guards) lives in the
+// callers and is untouched by this extraction.
+func doPagedGET(ctx context.Context, fullURL, errPrefix, errPath string, headers map[string]string, peekHeader string, out any) (peeked string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("%s: build request: %w", errPrefix, err)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := scmHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("%s: do request: %w", errPrefix, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	peeked = resp.Header.Get(peekHeader)
+	if resp.StatusCode >= 400 {
+		buf, _ := io.ReadAll(resp.Body)
+		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: errPath}
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
+			return "", fmt.Errorf("%s: decode response: %w", errPrefix, err)
+		}
+	} else {
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	return peeked, nil
+}
 
 // LinkedIssueNumber parses the first "Closes #N" reference from a PR body.
 // Returns (n, true) on match, (0, false) otherwise. Shared by the webhook

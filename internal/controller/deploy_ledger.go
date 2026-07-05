@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/szymonrychu/tatara-operator/internal/slug"
 )
 
 // ledgerRetry mirrors queue.seqRetry: a richer backoff than retry.DefaultRetry
@@ -76,23 +78,7 @@ func deployLedgerName(project string) string {
 // single '-', trims leading/trailing '-', and caps the result so the
 // "deploy-ledger-" prefix (14 chars) keeps the name within the 63-char limit.
 func sanitizeDNS1123Label(s string) string {
-	s = strings.ToLower(s)
-	var b strings.Builder
-	prevDash := false
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevDash = false
-		} else if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 49 {
-		out = strings.Trim(out[:49], "-")
-	}
-	return out
+	return slug.SanitizeDNS1123(s, 49)
 }
 
 // mutate runs fn against the current entries under a CAS loop and persists the
