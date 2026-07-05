@@ -21,6 +21,13 @@ type MemorySpec struct {
 	// +kubebuilder:default="10Gi"
 	// +optional
 	PgStorage string `json:"pgStorage,omitempty"`
+	// PgWalStorage sizes the dedicated CloudNativePG WAL volume. WAL is kept on
+	// its own PVC (separate from PGDATA) so a WAL burst - or WAL retained for a
+	// lagging/re-syncing standby - cannot fill the data volume and take writes
+	// down (issue #238).
+	// +kubebuilder:default="2Gi"
+	// +optional
+	PgWalStorage string `json:"pgWalStorage,omitempty"`
 	// +kubebuilder:default="10Gi"
 	// +optional
 	Neo4jStorage string `json:"neo4jStorage,omitempty"`

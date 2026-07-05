@@ -69,6 +69,47 @@ func MemoryServiceMonitor(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.S
 	}
 }
 
+// PGPodMonitor scrapes the CloudNativePG postgres pods' metrics endpoint (the
+// container port named "metrics", 9187) so cnpg_* metrics - WAL volume usage,
+// replication lag, database size, ready instances - land in Prometheus. Without
+// it the postgres cluster is an observability blind spot: the disk saturation
+// and replication divergence behind issue #238 stayed invisible until the
+// memory API began returning 5xx. cnpg's own spec.monitoring.enablePodMonitor
+// is deprecated in cnpg v1.29.1 ("create a PodMonitor manually"), so the
+// PodMonitor is built natively here, mirroring MemoryServiceMonitor.
+//
+// The selector matches cnpg's per-pod label cnpg.io/cluster=<cluster>; jobLabel
+// is left default (no alert rule keys off the cnpg job label). monitorObjectMeta
+// stamps the cluster ruleSelector/podMonitorSelector labels so the PodMonitor is
+// discovered rather than silently dropped.
+func PGPodMonitor(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.PodMonitor {
+	n := NamesFor(p.Name)
+	metricsPort := "metrics"
+	return &monitoringv1.PodMonitor{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: monitoringv1.SchemeGroupVersion.String(),
+			Kind:       monitoringv1.PodMonitorsKind,
+		},
+		ObjectMeta: monitorObjectMeta(p, cfg, n.PGCluster),
+		Spec: monitoringv1.PodMonitorSpec{
+			NamespaceSelector: monitoringv1.NamespaceSelector{
+				MatchNames: []string{cfg.Namespace},
+			},
+			Selector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"cnpg.io/cluster": n.PGCluster,
+				},
+			},
+			PodMetricsEndpoints: []monitoringv1.PodMetricsEndpoint{{
+				Port:          &metricsPort,
+				Path:          "/metrics",
+				Interval:      memoryScrapeInterval,
+				ScrapeTimeout: memoryScrapeTimeout,
+			}},
+		},
+	}
+}
+
 // MemoryPrometheusRule builds the per-Project PrometheusRule carrying the
 // tatara-memory alert groups (ported from tatara-memory#58). The cluster
 // ruleSelector label is stamped via monitorObjectMeta so the rules are actually

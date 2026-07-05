@@ -5495,6 +5495,14 @@ spec:
                   pgStorage:
                     default: 10Gi
                     type: string
+                  pgWalStorage:
+                    default: 2Gi
+                    description: |-
+                      PgWalStorage sizes the dedicated CloudNativePG WAL volume. WAL is kept on
+                      its own PVC (separate from PGDATA) so a WAL burst - or WAL retained for a
+                      lagging/re-syncing standby - cannot fill the data volume and take writes
+                      down (issue #238).
+                    type: string
                 type: object
               queue:
                 description: QueueSpec configures the in-operator agent-work admission

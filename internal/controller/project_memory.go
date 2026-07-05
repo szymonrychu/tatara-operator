@@ -106,6 +106,7 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 	if cfg.MonitorEnabled {
 		objs = append(objs,
 			memory.MemoryServiceMonitor(p, cfg),
+			memory.PGPodMonitor(p, cfg),
 			memory.MemoryPrometheusRule(p, cfg),
 		)
 	}

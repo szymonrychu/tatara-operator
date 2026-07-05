@@ -43,6 +43,17 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 			StorageConfiguration: cnpgv1.StorageConfiguration{
 				Size: pgStorage(p),
 			},
+			// WAL lives on its own PVC, separate from PGDATA. Without this a WAL
+			// burst - or WAL retained for a lagging/re-syncing standby - fills the
+			// single shared data volume, Postgres can no longer write WAL, and the
+			// write path (/memories:bulk) starts returning 503 while reads on
+			// replicas keep working (issue #238). A dedicated WAL volume isolates
+			// that growth and is resized independently. cnpg permits adding
+			// walStorage to a cluster that never had it; only disabling or shrinking
+			// it later is rejected.
+			WalStorage: &cnpgv1.StorageConfiguration{
+				Size: pgWalStorage(p),
+			},
 			Bootstrap: &cnpgv1.BootstrapConfiguration{
 				InitDB: &cnpgv1.BootstrapInitDB{
 					Database: "tatara_memory",
