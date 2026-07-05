@@ -1352,6 +1352,28 @@ type commitDTO struct {
 	Date    time.Time `json:"date"`
 }
 
+// resolveProjectSCMProviderToken resolves the project's SCM provider name and
+// raw bot token from its ScmSecretRef. It does not check for an empty token -
+// callers that must reject an empty token do so themselves, since Reader and
+// Writer disagree on whether that is an error (Finding: do not add Reader's
+// empty-token check to Writer's caller as a byproduct of this shared helper).
+func (s *Server) resolveProjectSCMProviderToken(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project) (provider, token string, ok bool) {
+	if proj.Spec.Scm != nil {
+		provider = proj.Spec.Scm.Provider
+	}
+	if provider == "" {
+		writeError(w, http.StatusConflict, "project has no scm provider configured")
+		return "", "", false
+	}
+	var sec corev1.Secret
+	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
+		writeClientErr(w, err)
+		return "", "", false
+	}
+	token = string(sec.Data["token"])
+	return provider, token, true
+}
+
 // projectSCMWriterAndToken resolves the SCMWriter and bot token for project p.
 // Returns (nil, "", error-written-to-w) on any failure so callers can return immediately.
 func (s *Server) projectSCMWriterAndToken(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project) (scm.SCMWriter, string, bool) {
@@ -1359,12 +1381,8 @@ func (s *Server) projectSCMWriterAndToken(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotImplemented, "scm writer not configured")
 		return nil, "", false
 	}
-	provider := ""
-	if proj.Spec.Scm != nil {
-		provider = proj.Spec.Scm.Provider
-	}
-	if provider == "" {
-		writeError(w, http.StatusConflict, "project has no scm provider configured")
+	provider, token, ok := s.resolveProjectSCMProviderToken(w, r, proj)
+	if !ok {
 		return nil, "", false
 	}
 	writer, err := s.scmFor(provider)
@@ -1372,12 +1390,6 @@ func (s *Server) projectSCMWriterAndToken(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return nil, "", false
 	}
-	var sec corev1.Secret
-	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
-		writeClientErr(w, err)
-		return nil, "", false
-	}
-	token := string(sec.Data["token"])
 	if token == "" {
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return nil, "", false
@@ -1391,20 +1403,10 @@ func (s *Server) projectSCMReader(w http.ResponseWriter, r *http.Request, proj *
 		writeError(w, http.StatusNotImplemented, "scm reader not configured")
 		return nil, "", false
 	}
-	provider := ""
-	if proj.Spec.Scm != nil {
-		provider = proj.Spec.Scm.Provider
-	}
-	if provider == "" {
-		writeError(w, http.StatusConflict, "project has no scm provider configured")
+	provider, token, ok := s.resolveProjectSCMProviderToken(w, r, proj)
+	if !ok {
 		return nil, "", false
 	}
-	var sec corev1.Secret
-	if err := s.c.Get(r.Context(), types.NamespacedName{Namespace: s.ns, Name: proj.Spec.ScmSecretRef}, &sec); err != nil {
-		writeClientErr(w, err)
-		return nil, "", false
-	}
-	token := string(sec.Data["token"])
 	reader, err := s.readerFor(provider, token)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal error")
