@@ -708,6 +708,82 @@ type reviewVerdictReq struct {
 	Suggestions []tatarav1alpha1.Suggestion `json:"suggestions,omitempty"`
 }
 
+// mutateTaskStatusParams bundles the per-handler pieces of the shared
+// Get+authorize+kind-guard+RetryOnConflict(single Get+one-field mutate+
+// Status().Update)+metrics+log+writeJSON(toTaskDTO) skeleton that
+// reviewVerdict, prOutcome, implementOutcome, brainstormOutcome and
+// issueOutcome all share byte-for-byte. Not used by patchTask (terminal-phase
+// guard, not Kind), changeSummary/handover (no guard), postComment (custom
+// mutate-with-sentinel-error contract) or patchSubtask (no pre-fetch, no
+// authorize-with-object, no Kind concept) - those remain hand-written.
+type mutateTaskStatusParams struct {
+	// metricName is the RecordRESTRequest label (e.g. "review_verdict").
+	metricName string
+	// logMsg is the InfoContext message (e.g. "restapi: reviewVerdict").
+	logMsg string
+	// logAction is the structured "action" log field (e.g. "review_verdict").
+	logAction string
+	// kindOK reports whether t.Spec.Kind satisfies this handler's guard.
+	kindOK func(kind string) bool
+	// kindErrMsg is the 409 body written when kindOK returns false.
+	kindErrMsg string
+	// mutate applies this handler's one-field status write to the freshly
+	// re-Get'd task inside the RetryOnConflict closure.
+	mutate func(t *tatarav1alpha1.Task)
+	// extraLogFields are inserted between resource_id and duration_ms.
+	extraLogFields []any
+	// onSuccess runs (only when s.metrics != nil, before RecordRESTRequest)
+	// so issueOutcome's IssueOutcome(action) metric survives verbatim.
+	onSuccess func(t *tatarav1alpha1.Task)
+}
+
+// mutateTaskStatus implements the shared skeleton described in
+// mutateTaskStatusParams for the 5 handlers that share it exactly.
+func (s *Server) mutateTaskStatus(w http.ResponseWriter, r *http.Request, p mutateTaskStatusParams) {
+	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
+	var t tatarav1alpha1.Task
+	if err := s.c.Get(r.Context(), key, &t); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeCaller(w, r) {
+		return
+	}
+	if !p.kindOK(t.Spec.Kind) {
+		writeError(w, http.StatusConflict, p.kindErrMsg)
+		return
+	}
+	start := time.Now()
+	// Task.Spec.Kind is immutable; the single pre-loop check above is sufficient.
+	// The in-loop and post-loop re-checks are removed (Finding 14: TOCTOU scaffolding
+	// on an immutable field adds dead branches without protecting against a real race).
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
+			return gerr
+		}
+		p.mutate(&t)
+		return s.c.Status().Update(r.Context(), &t)
+	}); err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest(p.metricName, "error", time.Since(start).Seconds())
+		}
+		writeClientErr(w, err)
+		return
+	}
+	elapsed := time.Since(start)
+	if s.metrics != nil {
+		if p.onSuccess != nil {
+			p.onSuccess(&t)
+		}
+		s.metrics.RecordRESTRequest(p.metricName, "ok", elapsed.Seconds())
+	}
+	logFields := append(reqLogFields(r), "action", p.logAction, "resource_id", key.Name)
+	logFields = append(logFields, p.extraLogFields...)
+	logFields = append(logFields, "duration_ms", elapsed.Milliseconds())
+	s.log.InfoContext(r.Context(), p.logMsg, logFields...)
+	writeJSON(w, http.StatusOK, toTaskDTO(t))
+}
+
 func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 	var req reviewVerdictReq
 	if err := decodeJSON(r, w, &req); err != nil {
@@ -724,47 +800,17 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decision must be one of approve, request_changes, comment")
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	if t.Spec.Kind != "review" {
-		writeError(w, http.StatusConflict, "review verdict only applies to a review task")
-		return
-	}
-	start := time.Now()
-	// Task.Spec.Kind is immutable; the single pre-loop check above is sufficient.
-	// The in-loop and post-loop re-checks are removed (Finding 14: TOCTOU scaffolding
-	// on an immutable field adds dead branches without protecting against a real race).
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("review_verdict", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("review_verdict", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: reviewVerdict",
-		append(reqLogFields(r),
-			"action", "review_verdict",
-			"resource_id", key.Name,
-			"decision", req.Decision,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "review_verdict",
+		logMsg:     "restapi: reviewVerdict",
+		logAction:  "review_verdict",
+		kindOK:     func(kind string) bool { return kind == "review" },
+		kindErrMsg: "review verdict only applies to a review task",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
+		},
+		extraLogFields: []any{"decision", req.Decision},
+	})
 }
 
 type prOutcomeReq struct {
@@ -788,45 +834,17 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "action must be one of merge, close")
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	if t.Spec.Kind != "selfImprove" {
-		writeError(w, http.StatusConflict, "pr outcome only applies to a selfImprove task")
-		return
-	}
-	start := time.Now()
-	// Task.Spec.Kind is immutable; single pre-loop check above is sufficient (Finding 14).
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("pr_outcome", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("pr_outcome", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: prOutcome",
-		append(reqLogFields(r),
-			"action", "pr_outcome",
-			"resource_id", key.Name,
-			"pr_action", req.Action,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "pr_outcome",
+		logMsg:     "restapi: prOutcome",
+		logAction:  "pr_outcome",
+		kindOK:     func(kind string) bool { return kind == "selfImprove" },
+		kindErrMsg: "pr outcome only applies to a selfImprove task",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
+		},
+		extraLogFields: []any{"pr_action", req.Action},
+	})
 }
 
 type issueOutcomeReq struct {
@@ -855,46 +873,20 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "comment required when action is close or discuss")
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	if t.Spec.Kind != "triageIssue" && t.Spec.Kind != "issueLifecycle" {
-		writeError(w, http.StatusConflict, "issue outcome only applies to a triageIssue or issueLifecycle task")
-		return
-	}
-	start := time.Now()
-	// Task.Spec.Kind is immutable; single pre-loop check above is sufficient (Finding 14).
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment, Plan: req.Plan}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("issue_outcome", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.IssueOutcome(req.Action)
-		s.metrics.RecordRESTRequest("issue_outcome", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: issueOutcome",
-		append(reqLogFields(r),
-			"action", "issue_outcome",
-			"resource_id", key.Name,
-			"issue_action", req.Action,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "issue_outcome",
+		logMsg:     "restapi: issueOutcome",
+		logAction:  "issue_outcome",
+		kindOK:     func(kind string) bool { return kind == "triageIssue" || kind == "issueLifecycle" },
+		kindErrMsg: "issue outcome only applies to a triageIssue or issueLifecycle task",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment, Plan: req.Plan}
+		},
+		extraLogFields: []any{"issue_action", req.Action},
+		onSuccess: func(t *tatarav1alpha1.Task) {
+			s.metrics.IssueOutcome(req.Action)
+		},
+	})
 }
 
 // --- POST /tasks/{t}/implement-outcome ---
@@ -923,45 +915,17 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "reason required (non-empty) for action "+req.Action)
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	if t.Spec.Kind != "issueLifecycle" {
-		writeError(w, http.StatusConflict, "implement outcome only applies to an issueLifecycle task")
-		return
-	}
-	start := time.Now()
-	// Task.Spec.Kind is immutable; single pre-loop check above is sufficient (Finding 14).
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{Action: req.Action, Reason: req.Reason}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("implement_outcome", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("implement_outcome", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: implementOutcome",
-		append(reqLogFields(r),
-			"action", "implement_outcome",
-			"resource_id", key.Name,
-			"impl_action", req.Action,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "implement_outcome",
+		logMsg:     "restapi: implementOutcome",
+		logAction:  "implement_outcome",
+		kindOK:     func(kind string) bool { return kind == "issueLifecycle" },
+		kindErrMsg: "implement outcome only applies to an issueLifecycle task",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{Action: req.Action, Reason: req.Reason}
+		},
+		extraLogFields: []any{"impl_action", req.Action},
+	})
 }
 
 // --- POST /tasks/{t}/brainstorm-outcome ---
@@ -985,43 +949,16 @@ func (s *Server) brainstormOutcome(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "reason required")
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	if t.Spec.Kind != "brainstorm" {
-		writeError(w, http.StatusConflict, "brainstorm outcome only applies to a brainstorm task")
-		return
-	}
-	start := time.Now()
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.BrainstormOutcome = &tatarav1alpha1.BrainstormOutcome{Action: req.Action, Reason: req.Reason}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("brainstorm_outcome", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("brainstorm_outcome", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: brainstormOutcome",
-		append(reqLogFields(r),
-			"action", "brainstorm_outcome",
-			"resource_id", key.Name,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "brainstorm_outcome",
+		logMsg:     "restapi: brainstormOutcome",
+		logAction:  "brainstorm_outcome",
+		kindOK:     func(kind string) bool { return kind == "brainstorm" },
+		kindErrMsg: "brainstorm outcome only applies to a brainstorm task",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.BrainstormOutcome = &tatarav1alpha1.BrainstormOutcome{Action: req.Action, Reason: req.Reason}
+		},
+	})
 }
 
 // --- POST /tasks/{t}/comment ---
