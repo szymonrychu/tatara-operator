@@ -681,15 +681,16 @@ func (c *GitLab) mrNote(ctx context.Context, base, proj string, number int, toke
 	return glDo(ctx, base, http.MethodPost, path, token, map[string]string{"body": body}, nil)
 }
 
-// glHashRef parses group/proj#iid into project path + iid (issue refs use '#').
-func glHashRef(ref string) (string, int, error) {
-	at := strings.LastIndex(ref, "#")
+// glParseRef parses group/proj<sep>iid into project path + iid; kind names
+// the ref kind ("issue" or "mr") for the error text.
+func glParseRef(ref string, sep byte, kind string) (string, int, error) {
+	at := strings.LastIndexByte(ref, sep)
 	if at < 0 {
-		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+		return "", 0, fmt.Errorf("gitlab: malformed %s ref %q", kind, ref)
 	}
 	proj, iidStr := ref[:at], ref[at+1:]
 	if proj == "" {
-		return "", 0, fmt.Errorf("gitlab: malformed issue ref %q", ref)
+		return "", 0, fmt.Errorf("gitlab: malformed %s ref %q", kind, ref)
 	}
 	iid, err := strconv.Atoi(iidStr)
 	if err != nil {
@@ -698,22 +699,11 @@ func glHashRef(ref string) (string, int, error) {
 	return proj, iid, nil
 }
 
+// glHashRef parses group/proj#iid into project path + iid (issue refs use '#').
+func glHashRef(ref string) (string, int, error) { return glParseRef(ref, '#', "issue") }
+
 // glBangRef parses group/proj!iid into project path + iid (MR refs use '!').
-func glBangRef(ref string) (string, int, error) {
-	at := strings.LastIndex(ref, "!")
-	if at < 0 {
-		return "", 0, fmt.Errorf("gitlab: malformed mr ref %q", ref)
-	}
-	proj, iidStr := ref[:at], ref[at+1:]
-	if proj == "" {
-		return "", 0, fmt.Errorf("gitlab: malformed mr ref %q", ref)
-	}
-	iid, err := strconv.Atoi(iidStr)
-	if err != nil {
-		return "", 0, fmt.Errorf("gitlab: malformed iid in %q: %w", ref, err)
-	}
-	return proj, iid, nil
-}
+func glBangRef(ref string) (string, int, error) { return glParseRef(ref, '!', "mr") }
 
 // glIssueURLRef parses a GitLab issue web URL (.../g/p/-/issues/4) into a
 // project path + iid for board label updates.
