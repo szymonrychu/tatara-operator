@@ -53,6 +53,7 @@ postgresql.cnpg.io|clusters
 postgresql.cnpg.io|clusters/status
 monitoring.coreos.com|servicemonitors
 monitoring.coreos.com|prometheusrules
+monitoring.coreos.com|podmonitors
 networking.k8s.io|ingresses
 coordination.k8s.io|leases
 '
