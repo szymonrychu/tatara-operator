@@ -431,7 +431,10 @@ type candidate struct {
 // (the !1090 token-burn loop). Any other (empty/unset) scope reviews all PRs,
 // preserving the default behavior. Bot-authored PRs never reach here (they take
 // the issueLifecycle/MRCI recovery path).
-func prInReactionScope(proj *tatarav1alpha1.Project, c candidate, bot string) bool {
+func prInReactionScope(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, c candidate, bot string) bool {
+	if tatarav1alpha1.IsTrustedAuthor(proj, repo, c.author) {
+		return true
+	}
 	scope := ""
 	if proj.Spec.Scm != nil {
 		scope = proj.Spec.Scm.PRReactionScope
@@ -1154,7 +1157,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				created++
 			}
 		} else {
-			if !prInReactionScope(proj, c, bot) {
+			if !prInReactionScope(proj, &repo, c, bot) {
 				r.Metrics.ScanItem("mrScan", "skipped_scope")
 				l.Info("mrScan: skipping PR out of reaction scope (unlabeled + un-mentioned under labeledOrMentioned)",
 					"action", "scan_pr_out_of_scope", "resource_id", proj.Name, "repo", c.repo, "pr", c.number)
