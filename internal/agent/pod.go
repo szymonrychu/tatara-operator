@@ -806,30 +806,34 @@ func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 	return &corev1.PodSecurityContext{FSGroup: cfg.FSGroup}
 }
 
+// kindProfiles maps a Task Kind to its per-kind profile value, shared by both
+// TATARA_TOOL_PROFILE (toolProfileForKind) and TATARA_SKILL_PROFILE
+// (skillProfileForKind): the cli MCP server and the wrapper key on the exact
+// same Kind->profile mapping. A missing key returns "" (fail-open: the cli
+// serves the full tool set, the wrapper installs all skills). healthCheck
+// shares Kind=brainstorm, so it is not a distinct entry.
+var kindProfiles = map[string]string{
+	"implement":      "implement",
+	"review":         "review",
+	"triageIssue":    "triage",
+	"brainstorm":     "brainstorm",
+	"issueLifecycle": "lifecycle",
+	"incident":       "incident",
+	"selfImprove":    "selfImprove",
+	"refine":         "refine",
+}
+
+// profileForKind looks up kind in kindProfiles, returning "" (fail-open) for
+// an unknown/empty kind.
+func profileForKind(kind string) string {
+	return kindProfiles[kind]
+}
+
 // toolProfileForKind maps a Task Kind to the TATARA_TOOL_PROFILE value that
 // the cli MCP server uses to gate the agent's tool surface. Returns "" for
 // unknown/empty kinds (fail-open: the cli serves the full tool set).
 func toolProfileForKind(kind string) string {
-	switch kind {
-	case "implement":
-		return "implement"
-	case "review":
-		return "review"
-	case "triageIssue":
-		return "triage"
-	case "brainstorm": // healthCheck shares Kind=brainstorm
-		return "brainstorm"
-	case "issueLifecycle":
-		return "lifecycle"
-	case "incident":
-		return "incident"
-	case "selfImprove":
-		return "selfImprove"
-	case "refine":
-		return "refine"
-	default:
-		return "" // fail-open
-	}
+	return profileForKind(kind)
 }
 
 // skillsRepoDefault is the canonical clone URL for the tatara-agent-skills repo.
@@ -839,45 +843,32 @@ const skillsRepoDefault = "https://github.com/szymonrychu/tatara-agent-skills"
 // the wrapper uses to filter which skills to install at boot. Returns "" for
 // unknown/empty kinds (fail-open: the wrapper installs all skills).
 func skillProfileForKind(kind string) string {
-	switch kind {
-	case "implement":
-		return "implement"
-	case "review":
-		return "review"
-	case "triageIssue":
-		return "triage"
-	case "brainstorm":
-		return "brainstorm"
-	case "issueLifecycle":
-		return "lifecycle"
-	case "incident":
-		return "incident"
-	case "selfImprove":
-		return "selfImprove"
-	case "refine":
-		return "refine"
-	default:
-		return "" // fail-open
-	}
+	return profileForKind(kind)
 }
 
-// modelForKind resolves the MODEL env for a Task Kind+activity: healthCheck
-// shares Kind=brainstorm but is recurring classification work, a prime Sonnet
-// candidate, so a healthCheck-activity task first checks the "healthCheck"
-// pseudo-key in AgentSpec.ModelByKind, then falls back to the kind entry
-// (brainstorm), then the project-wide Agent.Model. Non-healthCheck tasks skip
-// straight to the kind entry. Follows the toolProfileForKind/skillProfileForKind
-// per-kind branch pattern. A nil map or empty override value falls through.
-func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+// resolveByKind resolves a per-kind override for a Task Kind+activity:
+// healthCheck shares Kind=brainstorm but is recurring classification work, a
+// prime Sonnet candidate, so a healthCheck-activity task first checks the
+// "healthCheck" pseudo-key in byKind, then falls back to the kind entry (e.g.
+// brainstorm), then fallback. Non-healthCheck tasks skip straight to the kind
+// entry. A nil map or empty override value falls through. Shared by
+// modelForKind/effortForKind so the precedence is defined exactly once.
+func resolveByKind(byKind map[string]string, kind, activity, fallback string) string {
 	if activity == "healthCheck" {
-		if v := project.Spec.Agent.ModelByKind["healthCheck"]; v != "" {
+		if v := byKind["healthCheck"]; v != "" {
 			return v
 		}
 	}
-	if v := project.Spec.Agent.ModelByKind[kind]; v != "" {
+	if v := byKind[kind]; v != "" {
 		return v
 	}
-	return project.Spec.Agent.Model
+	return fallback
+}
+
+// modelForKind resolves the MODEL env for a Task Kind+activity. See
+// resolveByKind for the healthCheck pseudo-key precedence.
+func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+	return resolveByKind(project.Spec.Agent.ModelByKind, kind, activity, project.Spec.Agent.Model)
 }
 
 // ModelForKind exports modelForKind for controller callers that need to stamp
@@ -889,15 +880,7 @@ func ModelForKind(project *tatarav1alpha1.Project, kind, activity string) string
 // effortForKind resolves the EFFORT env for a Task Kind+activity, keying on
 // the same "healthCheck" pseudo-key precedence as modelForKind.
 func effortForKind(project *tatarav1alpha1.Project, kind, activity string) string {
-	if activity == "healthCheck" {
-		if v := project.Spec.Agent.EffortByKind["healthCheck"]; v != "" {
-			return v
-		}
-	}
-	if v := project.Spec.Agent.EffortByKind[kind]; v != "" {
-		return v
-	}
-	return project.Spec.Agent.Effort
+	return resolveByKind(project.Spec.Agent.EffortByKind, kind, activity, project.Spec.Agent.Effort)
 }
 
 // hasInternetSource reports whether the comma-joined brainstorm sources list
