@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -152,6 +153,55 @@ func TestSetLifecycleLabel_NeverTouchesTriggerOrPriority(t *testing.T) {
 	require.NoError(t, r.setLifecycleLabel(context.Background(), &proj, task, "tatara-rejected"))
 	require.Equal(t, []string{"tatara-rejected"}, w.added)
 	require.Equal(t, []string{"tatara-idea"}, w.removed)
+}
+
+// errAddLabelWriter fails AddLabel with a fixed error; RemoveLabel is a no-op.
+// Used to exercise setLifecycleLabel's terminal-vs-retryable classification.
+type errAddLabelWriter struct {
+	scm.SCMWriter
+	addErr error
+}
+
+func (w *errAddLabelWriter) AddLabel(_ context.Context, _, _, _ string) error { return w.addErr }
+func (w *errAddLabelWriter) RemoveLabel(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
+// TestSetLifecycleLabel_TargetGone_TerminalNoRequeue: a permanent target-gone
+// AddLabel failure (410 Gone / 404 Not Found - the source issue was deleted) is
+// classified terminal. setLifecycleLabel returns nil so controller-runtime does
+// NOT requeue the doomed write (issue #263: the unbounded add_label retry loop
+// that amplified the SCM write-error ratio and fired the alert). A transient 5xx
+// stays retryable (error returned -> requeue).
+func TestSetLifecycleLabel_TargetGone_TerminalNoRequeue(t *testing.T) {
+	tests := []struct {
+		name       string
+		addErr     error
+		wantErr    bool
+	}{
+		{"410 gone -> terminal", &scm.HTTPError{Status: 410, Path: "/repos/o/r/issues/7/labels", Body: `{"message":"This issue was deleted"}`}, false},
+		{"404 not found -> terminal", &scm.HTTPError{Status: 404, Path: "/repos/o/r/issues/7/labels"}, false},
+		{"500 server error -> retryable", &scm.HTTPError{Status: 500, Path: "/repos/o/r/issues/7/labels"}, true},
+		{"429 rate limit -> retryable", &scm.HTTPError{Status: 429, Path: "/repos/o/r/issues/7/labels"}, true},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, task, _ := seedLabelTask(t, fmt.Sprintf("gone-%d", i), nil)
+			var proj tatarav1alpha1.Project
+			require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
+			w := &errAddLabelWriter{addErr: tc.addErr}
+			r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(),
+				Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+				SCMFor:    func(string) (scm.SCMWriter, error) { return w, nil },
+				ReaderFor: func(_, _ string) (scm.SCMReader, error) { return &commentReader{}, nil }}
+			err := r.setLifecycleLabel(context.Background(), &proj, task, "tatara-brainstorming")
+			if tc.wantErr {
+				require.Error(t, err, "transient SCM failure must be returned so the reconcile requeues")
+			} else {
+				require.NoError(t, err, "permanent target-gone must be terminal (no requeue)")
+			}
+		})
+	}
 }
 
 type commentReader struct {
