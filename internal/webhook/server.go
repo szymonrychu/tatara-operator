@@ -269,19 +269,26 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 	// GitLab MRs default to "review" and the authoritative authorship gate runs
 	// in the controller via GetPRState (see scm-author-vs-actor-egress-gate memory).
 	kind := "issueLifecycle"
+
+	// AuthorLogin is the real PR/issue author only on GitHub; on GitLab it is the
+	// event actor (scm/gitlab.go), so a trusted maintainer acting on a third
+	// party's item must NOT bypass the gate there. GitLab authorship is enforced
+	// downstream by the controller's GetPRState egress gate.
+	trusted := provider == "github" && tatarav1.IsTrustedAuthor(&proj, nil, ev.AuthorLogin)
+
 	if ev.IsPR {
 		if ev.AuthorLogin == bot && bot != "" && provider == "github" {
 			kind = "issueLifecycle"
 		} else {
 			kind = "review"
 		}
-		if scope == "labeledOrMentioned" && !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && !mentionsBot(ev.Body, bot) && !tatarav1.IsTrustedAuthor(&proj, nil, ev.AuthorLogin) {
+		if scope == "labeledOrMentioned" && !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && !mentionsBot(ev.Body, bot) && !trusted {
 			s.count(provider, ev.Kind, ev.Action, "ignored")
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 	} else {
-		if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && (ev.AuthorLogin == bot || !tatarav1.IsTrustedAuthor(&proj, nil, ev.AuthorLogin)) {
+		if !slices.Contains(ev.Labels, proj.Spec.TriggerLabel) && (ev.AuthorLogin == bot || !trusted) {
 			s.count(provider, ev.Kind, ev.Action, "ignored")
 			w.WriteHeader(http.StatusAccepted)
 			return
