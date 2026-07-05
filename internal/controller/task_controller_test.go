@@ -320,6 +320,72 @@ func TestReconcile_NoConcurrencyGate(t *testing.T) {
 }
 
 // mkTaskKind creates a Task with an explicit Kind and RepositoryRef.
+// mkIncidentTask creates a project-scoped incident Task (empty RepositoryRef)
+// carrying the given AlertRule.
+func mkIncidentTask(t *testing.T, name, projectRef, alertRule string) {
+	t.Helper()
+	tk := &tatarav1alpha1.Task{}
+	tk.Name = name
+	tk.Namespace = testNS
+	tk.Spec.ProjectRef = projectRef
+	tk.Spec.Kind = "incident"
+	tk.Spec.AlertRule = alertRule
+	tk.Spec.Goal = "investigate the alert"
+	if err := k8sClient.Create(context.Background(), tk); err != nil {
+		t.Fatalf("create incident task: %v", err)
+	}
+}
+
+// TestTaskReconcile_InfraIncidentBypassesMemoryGate covers the #236 deadlock fix:
+// an incident Task whose alert targets core memory/storage infra must be admitted
+// even when the project memory stack is NOT Ready, so infra-outage self-heal is
+// not gated on the very subsystem it investigates. The bypass is counted.
+func TestTaskReconcile_InfraIncidentBypassesMemoryGate(t *testing.T) {
+	mkTaskProject(t, "p-infra-inc", 3)
+	mkIncidentTask(t, "t-infra-inc", "p-infra-inc", "Memory HTTP 5xx error ratio high")
+	// Deliberately do NOT set project memory Ready.
+
+	fs := newFakeSession()
+	r, reg := newTaskReconcilerReg(fs)
+	res, err := reconcileTask(t, r, "t-infra-inc")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter == memGateRequeue {
+		t.Fatalf("infra incident must not be gated by memory readiness; got memGateRequeue")
+	}
+	if res.RequeueAfter != pollRequeue {
+		t.Errorf("infra incident must reach spawn path (pollRequeue=%v); got RequeueAfter=%v", pollRequeue, res.RequeueAfter)
+	}
+	if got := counterValue(t, reg, "operator_memory_gate_bypass_total",
+		map[string]string{"project": "p-infra-inc", "kind": "incident"}); got != 1 {
+		t.Errorf("operator_memory_gate_bypass_total = %v, want 1", got)
+	}
+}
+
+// TestTaskReconcile_NonInfraIncidentKeepsMemoryGate: an incident Task whose alert
+// does NOT target core infra keeps the memory-readiness gate; only infra alerts
+// are exempt.
+func TestTaskReconcile_NonInfraIncidentKeepsMemoryGate(t *testing.T) {
+	mkTaskProject(t, "p-app-inc", 3)
+	mkIncidentTask(t, "t-app-inc", "p-app-inc", "Agent pod OOMKilled")
+	// Project memory NOT Ready.
+
+	fs := newFakeSession()
+	r, reg := newTaskReconcilerReg(fs)
+	res, err := reconcileTask(t, r, "t-app-inc")
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if res.RequeueAfter != memGateRequeue {
+		t.Fatalf("non-infra incident must be gated (memGateRequeue=%v); got %v", memGateRequeue, res.RequeueAfter)
+	}
+	if got := counterValue(t, reg, "operator_memory_gate_bypass_total",
+		map[string]string{"project": "p-app-inc", "kind": "incident"}); got != 0 {
+		t.Errorf("operator_memory_gate_bypass_total = %v, want 0 (no bypass)", got)
+	}
+}
+
 func mkTaskKind(t *testing.T, name, projectRef, repoRef, kind string) {
 	t.Helper()
 	tk := &tatarav1alpha1.Task{}

@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"fmt"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -196,6 +197,52 @@ func ValidateTaskSpec(spec TaskSpec) error {
 		return fmt.Errorf("task kind %q must have an empty repositoryRef (project-scoped); got %q", kind, spec.RepositoryRef)
 	}
 	return nil
+}
+
+// infraIncidentKeywords are lower-case substrings that mark a Grafana alert as
+// targeting the project's core memory/storage infrastructure: the memory stack
+// (LightRAG retrieval surface, Postgres/CNPG, Neo4j) or its backing storage
+// (CephFS PVCs, WAL, quorum). Matched case-insensitively against a Task's
+// AlertRule (the alertname label). Kept intentionally narrow so only genuine
+// infra alerts qualify for the admission-gate exemption below.
+var infraIncidentKeywords = []string{
+	"memory",
+	"lightrag",
+	"postgres",
+	"cnpg",
+	"neo4j",
+	"pvc",
+	"cephfs",
+	"quorum",
+	"wal",
+}
+
+// AlertTargetsCoreInfra reports whether a Grafana alert-rule name implicates the
+// project's core memory/storage infrastructure, by case-insensitive substring
+// match against infraIncidentKeywords.
+func AlertTargetsCoreInfra(alertRule string) bool {
+	lower := strings.ToLower(alertRule)
+	for _, kw := range infraIncidentKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// InfraIncidentExempt reports whether a Task is an incident-kind Task whose alert
+// targets the core memory/storage infrastructure, and is therefore exempt from
+// the project memory-readiness admission gate.
+//
+// Rationale (tatara-operator#236): when the memory stack is down, every Task is
+// gated on Memory.Phase == Ready. Applying that gate to the very incident Task
+// created to investigate the memory outage is a deadlock: the self-heal agent
+// can never run, never opens a tracker issue, and cannot escalate. Incident
+// agents investigate live via Grafana (k8s/CNPG/storage) and do not need the
+// memory graph, so it is safe to let an infra-incident run with memory down.
+// Only incident Tasks qualify; all normal work keeps the gate.
+func InfraIncidentExempt(spec TaskSpec) bool {
+	return spec.Kind == "incident" && AlertTargetsCoreInfra(spec.AlertRule)
 }
 
 // TaskSpec defines the desired state of a Task.

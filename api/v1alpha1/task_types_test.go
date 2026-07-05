@@ -253,6 +253,34 @@ func TestValidateTaskSpec_Incident(t *testing.T) {
 	}
 }
 
+// TestInfraIncidentExempt covers the memory-gate exemption predicate (#236):
+// only incident-kind Tasks whose AlertRule implicates core memory/storage infra
+// qualify; all other kinds and non-infra alerts keep the gate.
+func TestInfraIncidentExempt(t *testing.T) {
+	cases := []struct {
+		name string
+		spec v1alpha1.TaskSpec
+		want bool
+	}{
+		{"incident memory alert", v1alpha1.TaskSpec{Kind: "incident", AlertRule: "Memory HTTP 5xx error ratio high"}, true},
+		{"incident lightrag alert", v1alpha1.TaskSpec{Kind: "incident", AlertRule: "LightRAG retrieval unreachable"}, true},
+		{"incident postgres/cnpg alert", v1alpha1.TaskSpec{Kind: "incident", AlertRule: "CNPG cluster mem-tatara-pg PVC near full"}, true},
+		{"incident neo4j alert", v1alpha1.TaskSpec{Kind: "incident", AlertRule: "Neo4j quorum lost"}, true},
+		{"incident case-insensitive", v1alpha1.TaskSpec{Kind: "incident", AlertRule: "MEMORY stack stuck not ready"}, true},
+		{"incident non-infra alert", v1alpha1.TaskSpec{Kind: "incident", AlertRule: "Agent pod OOMKilled"}, false},
+		{"incident empty alert", v1alpha1.TaskSpec{Kind: "incident"}, false},
+		{"non-incident memory alert", v1alpha1.TaskSpec{Kind: "implement", AlertRule: "Memory HTTP 5xx error ratio high"}, false},
+		{"default kind memory alert", v1alpha1.TaskSpec{AlertRule: "Memory down"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := v1alpha1.InfraIncidentExempt(tc.spec); got != tc.want {
+				t.Fatalf("InfraIncidentExempt(%+v) = %v, want %v", tc.spec, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSuggestionLineMarker verifies Suggestion.Line is present and accepts a
 // valid positive value (the +kubebuilder:validation:Minimum=1 marker is a
 // CRD-schema concern; this test guards the struct field exists and is
