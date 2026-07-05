@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"fmt"
+
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -125,16 +127,44 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 		Spec: monitoringv1.PrometheusRuleSpec{
 			Groups: []monitoringv1.RuleGroup{{
 				Name:  "tatara-memory.rules",
-				Rules: memoryAlertRules(),
+				Rules: memoryAlertRules(n.PGCluster, cfg.Namespace),
 			}},
 		},
 	}
 }
 
-// memoryAlertRules is the ported alert set. Kept as a function (not a package
-// var) so each PrometheusRule gets its own slice and callers cannot mutate a
-// shared one.
-func memoryAlertRules() []monitoringv1.Rule {
+// memoryAlertRules is the alert set for the memory stack. Kept as a function
+// (not a package var) so each PrometheusRule gets its own slice and callers
+// cannot mutate a shared one.
+//
+// The first group (ported from tatara-memory#58) alerts on the tatara-memory
+// API layer (http_requests_total, up, ...). Those only fire once the API is
+// already serving 5xx - a reactive, downstream signal. The postgres-layer rules
+// appended below fire on the DB failure modes that CAUSE that 5xx, one hop
+// upstream, so the cluster degradation is caught before it reaches the API:
+//
+//   - MemoryPostgresVolumeFilling: a cnpg PVC (PGDATA or the dedicated WAL
+//     volume) is running out of space. A full volume stops Postgres writing WAL
+//     and the write path (/memories:bulk) starts returning 503 while reads keep
+//     working - the disk-exhaustion write-outage of issue #238.
+//   - MemoryPostgresInstanceRestarting: a cnpg postgres instance is
+//     crash-looping. Repeated primary crash/restart + failover thrash is the
+//     shape of both #238 and the ~3.5h #240 outage.
+//
+// These two intentionally key off kubelet_volume_stats_* (kubelet) and
+// kube_pod_container_status_restarts_total (kube-state-metrics) rather than
+// cnpg_* metrics: those cluster-standard series are already scraped and present,
+// so the rules are live immediately and do not depend on the cnpg PodMonitor
+// (PGPodMonitor) scrape, whose cnpg_* series were still absent from Prometheus
+// during the issue #252 investigation. Replication-slot / streaming-standby
+// alerting (the wedged-standby signature of #252) is deferred until cnpg_*
+// metrics are confirmed flowing - adding rules against absent series would be
+// silently inert (hard rule 4). cluster is the cnpg Cluster name (mem-<proj>-pg)
+// and its pods/PVCs are named <cluster>-<n>[-wal]; namespace scopes the series
+// to this Project's cluster since several Projects' clusters share a namespace.
+func memoryAlertRules(cluster, namespace string) []monitoringv1.Rule {
+	pgSelector := fmt.Sprintf(`namespace=%q, persistentvolumeclaim=~%q`, namespace, cluster+"-.*")
+	podSelector := fmt.Sprintf(`namespace=%q, pod=~%q, container="postgres"`, namespace, cluster+"-.*")
 	return []monitoringv1.Rule{
 		{
 			// Class-A deadman: the recall backbone has no scrape target up.
@@ -205,6 +235,38 @@ func memoryAlertRules() []monitoringv1.Rule {
 			Annotations: map[string]string{
 				"summary":     "tatara-memory HTTP handler panicked",
 				"description": "tatara-memory recovered one or more HTTP handler panics in the last 15m. A code path is wedging requests.",
+			},
+		},
+		{
+			// One free-space ratio series per cnpg PVC (PGDATA and WAL). Fires per
+			// volume that drops below the headroom threshold, before it fills and
+			// stalls WAL writes (issue #238). The dedicated WAL volume (#238) is only
+			// 2Gi by default, so 15% is a meaningful early margin, not noise.
+			Alert: "MemoryPostgresVolumeFilling",
+			Expr: intstr.FromString(fmt.Sprintf(
+				`kubelet_volume_stats_available_bytes{%[1]s} / kubelet_volume_stats_capacity_bytes{%[1]s} < 0.15`,
+				pgSelector,
+			)),
+			For:    dur("5m"),
+			Labels: map[string]string{"severity": memorySeverityWarning},
+			Annotations: map[string]string{
+				"summary":     "postgres volume for " + cluster + " is filling up",
+				"description": "A cnpg postgres PVC of cluster " + cluster + " has under 15% free space for 5m. A full PGDATA or WAL volume stops Postgres writing WAL and the memory write path (/memories:bulk) returns 503 (issue #238).",
+			},
+		},
+		{
+			// One series per crash-looping postgres instance. Repeated primary
+			// crash/restart drives failovers and the write path to 503 (#238, #240).
+			Alert: "MemoryPostgresInstanceRestarting",
+			Expr: intstr.FromString(fmt.Sprintf(
+				`increase(kube_pod_container_status_restarts_total{%s}[15m]) > 2`,
+				podSelector,
+			)),
+			For:    dur("5m"),
+			Labels: map[string]string{"severity": memorySeverityWarning},
+			Annotations: map[string]string{
+				"summary":     "postgres instance of " + cluster + " is restarting",
+				"description": "A cnpg postgres instance of cluster " + cluster + " has restarted more than twice in 15m. A crash-looping primary drives failover thrash and 503s on the memory write path (issues #238, #240).",
 			},
 		},
 	}

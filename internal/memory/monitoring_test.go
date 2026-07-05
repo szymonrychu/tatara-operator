@@ -109,6 +109,33 @@ func TestMemoryPrometheusRule(t *testing.T) {
 	for _, a := range []string{"MemoryHigh5xx", "MemoryLightragErrors", "MemoryIngestJobsFailing", "MemoryRetrievalLatencyHigh", "MemoryHandlerPanics"} {
 		require.Equal(t, "warning", bySeverity[a], "alert %s must be warning", a)
 	}
+	// The postgres-layer alerts (added for issue #252) must be present and warning.
+	for _, a := range []string{"MemoryPostgresVolumeFilling", "MemoryPostgresInstanceRestarting"} {
+		require.Equal(t, "warning", bySeverity[a], "alert %s must be warning", a)
+	}
+}
+
+// The postgres-layer alerts must scope their series to THIS Project's cnpg
+// cluster (mem-<proj>-pg) and its namespace, or a per-Project PrometheusRule
+// would fire on another Project's postgres cluster sharing the namespace.
+func TestMemoryPrometheusRule_PostgresAlertsScopedToCluster(t *testing.T) {
+	p := testProject("acme")
+	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())
+
+	byName := map[string]string{}
+	for _, r := range pr.Spec.Groups[0].Rules {
+		byName[r.Alert] = r.Expr.StrVal
+	}
+
+	vol := byName["MemoryPostgresVolumeFilling"]
+	require.Contains(t, vol, `persistentvolumeclaim=~"mem-acme-pg-.*"`, "volume alert must scope to this cluster's PVCs")
+	require.Contains(t, vol, `namespace="tatara"`, "volume alert must scope to the memory namespace")
+	require.Contains(t, vol, "kubelet_volume_stats_available_bytes", "volume alert must key off kubelet volume stats")
+
+	restart := byName["MemoryPostgresInstanceRestarting"]
+	require.Contains(t, restart, `pod=~"mem-acme-pg-.*"`, "restart alert must scope to this cluster's pods")
+	require.Contains(t, restart, `container="postgres"`, "restart alert must target the postgres container")
+	require.Contains(t, restart, "kube_pod_container_status_restarts_total", "restart alert must key off kube-state restart counter")
 }
 
 // Empty MonitorLabels (the cluster-agnostic default) must not stamp any extra
