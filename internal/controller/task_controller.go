@@ -58,24 +58,7 @@ const (
 	annParentConversationKey   = tatarav1alpha1.AnnParentConversationKey
 	annForkFromConversationKey = tatarav1alpha1.AnnForkFromConversationKey
 	annAgentUnreachableSince   = "tatara.dev/agent-unreachable-since"
-	annBootCrashAttempts       = "tatara.dev/boot-crash-attempts"
-	// annBootCrashDiagnostics holds the most recent boot-crash cause captured from
-	// pod.Status (failing container, exit code, log tail). resetAgentRun preserves
-	// it (like annBootCrashAttempts) so the cause survives the per-attempt pod
-	// delete/recreate and can be surfaced at exhaustion; setLifecycleState and
-	// recordTurn clear it so it never leaks into the next state / run.
-	annBootCrashDiagnostics = "tatara.dev/boot-crash-diagnostics"
-	// annBootCrashLastPodUID records the pod.UID whose boot crash last incremented
-	// annBootCrashAttempts, so rapid Owns(Pod) reconciles on the same stale/
-	// terminating pod cannot bump the budget more than once per distinct pod
-	// instance. resetAgentRun preserves it (like annBootCrashAttempts) across
-	// respawns; recordTurn and setLifecycleState clear it with the attempt counter.
-	annBootCrashLastPodUID = "tatara.dev/boot-crash-last-pod-uid"
 )
-
-// bootCrashDetailCap bounds the captured diagnostic so it fits comfortably in an
-// annotation and a condition message. The kubelet log tail dominates the length.
-const bootCrashDetailCap = 1024
 
 // TaskReconciler spawns one wrapper session per Task and drives it turn by
 // turn over the Task's Subtasks.
@@ -150,28 +133,15 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if len(task.Status.WorkItems) == 0 && task.Spec.Source != nil {
 		seedLedgerFromSpec(&task)
 		if len(task.Status.WorkItems) > 0 {
-			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				fresh := &tatarav1alpha1.Task{}
-				if ferr := r.Get(ctx, req.NamespacedName, fresh); ferr != nil {
-					return ferr
-				}
+			if err := r.patchTaskStatus(ctx, &task, func(fresh *tatarav1alpha1.Task) bool {
 				if len(fresh.Status.WorkItems) > 0 {
-					// Another replica already seeded; adopt its state so the
-					// downstream reconcile starts from the current resourceVersion.
-					task = *fresh
-					return nil
+					// Another replica already seeded; skip-write adopts its state
+					// (via patchTaskStatus's copy-back) so the downstream reconcile
+					// starts from the current resourceVersion.
+					return false
 				}
 				seedLedgerFromSpec(fresh)
-				if uerr := r.Status().Update(ctx, fresh); uerr != nil {
-					return uerr
-				}
-				// Status().Update bumped fresh's resourceVersion on a SEPARATE fetch;
-				// the local `task` still holds the stale RV. Adopt fresh so the rest
-				// of this reconcile (lifecycle / writeback Status().Update) operates
-				// on the current RV instead of 409-conflicting on every first
-				// reconcile during rollout (~1148 in-flight Tasks).
-				task = *fresh
-				return nil
+				return true
 			}); err != nil {
 				l.Error(err, "task: seed ledger from spec (non-fatal)",
 					"action", "ledger_seed", "resource_id", task.Name)
@@ -324,6 +294,55 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return res, nil
 }
 
+// patchTaskAnnotations Get-fresh + mutate + Update's a Task's annotations
+// (metadata subresource), retrying on conflict. mutate returns whether a
+// write is needed; when it returns false the fresh object is still copied
+// back into task unconditionally (both on skip and on a successful write) so
+// callers observe the current resourceVersion afterward instead of a stale
+// one - this is what makes a "someone else already applied this" skip-write
+// branch adopt the winner's state rather than risk a 409 on the next write in
+// the same reconcile. Mirrors repository_controller.go's patchStatus.
+func (r *TaskReconciler) patchTaskAnnotations(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if !mutate(fresh) {
+			*task = *fresh
+			return nil
+		}
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		*task = *fresh
+		return nil
+	})
+}
+
+// patchTaskStatus Get-fresh + mutate + Status().Update's a Task's status,
+// retrying on conflict. Same skip/write copy-back contract as
+// patchTaskAnnotations (and repository_controller.go's patchStatus): the
+// unconditional `*task = *fresh` on both paths is what preserves the
+// site-153 ledger-seed resourceVersion adoption (the #175 409-storm fix).
+func (r *TaskReconciler) patchTaskStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if !mutate(fresh) {
+			*task = *fresh
+			return nil
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*task = *fresh
+		return nil
+	})
+}
+
 // driveAgentRun is the shared agent-spawn + drive-turns sequence. It handles
 // ensurePodAndService, the Planning phase transition, pod readiness wait, and
 // driveTurns. Used by the generic Reconcile and by lifecycle state handlers.
@@ -353,33 +372,25 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 		// turn. Annotations are metadata, so this is a separate Update from the
 		// status write below. Overwrite unconditionally: every spawn re-enters
 		// here at Phase=="" and must measure from its own start, not a prior one.
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
+		if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			if fresh.Status.Phase != "" {
-				return nil // already advanced by a prior attempt
+				return false // already advanced by a prior attempt
 			}
 			if fresh.Annotations == nil {
 				fresh.Annotations = map[string]string{}
 			}
 			fresh.Annotations[annPlanningSince] = time.Now().UTC().Format(time.RFC3339)
-			return r.Update(ctx, fresh)
+			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("stamp planning-since: %w", err)
 		}
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
+		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			if fresh.Status.Phase != "" {
-				return nil // already advanced by a prior attempt
+				return false // already advanced by a prior attempt
 			}
 			fresh.Status.Phase = "Planning"
 			fresh.Status.PodName = agent.PodName(task)
-			return r.Status().Update(ctx, fresh)
+			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("set planning phase: %w", err)
 		}
@@ -512,34 +523,26 @@ func taskHasInflightTurn(task *tatarav1alpha1.Task) bool {
 // the model that actually ran. Best-effort: callers must not fail pod
 // creation on a stamp error (the metric label degrades to "", fail-open).
 func (r *TaskReconciler) stampResolvedModel(ctx context.Context, task *tatarav1alpha1.Task, model string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return fmt.Errorf("stampResolvedModel: %w", err)
-		}
+	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Status.ResolvedModel == model {
-			return nil
+			return false
 		}
 		fresh.Status.ResolvedModel = model
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return fmt.Errorf("stampResolvedModel: %w", err)
-		}
-		return nil
-	})
+		return true
+	}); err != nil {
+		return fmt.Errorf("stampResolvedModel: %w", err)
+	}
+	return nil
 }
 
 func (r *TaskReconciler) bumpRecreations(ctx context.Context, task *tatarav1alpha1.Task) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	return r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
 		n, _ := strconv.Atoi(fresh.Annotations[annPodRecreations])
 		fresh.Annotations[annPodRecreations] = strconv.Itoa(n + 1)
-		return r.Update(ctx, fresh)
+		return true
 	})
 }
 
@@ -558,246 +561,6 @@ func (r *TaskReconciler) podReady(ctx context.Context, task *tatarav1alpha1.Task
 		}
 	}
 	return false, nil
-}
-
-// bootCrashReason inspects a not-yet-Ready wrapper Pod and returns a non-empty
-// reason when its boot has definitively failed: the Pod reached a Failed phase
-// (restartPolicy=Never, so a wrapper that exits non-zero lands here), a
-// container is in CrashLoopBackOff, or a container terminated non-zero before
-// /readyz came up. Returns "" when the pod is merely still booting.
-func bootCrashReason(pod *corev1.Pod) string {
-	if pod.Status.Phase == corev1.PodFailed {
-		return "PodFailed"
-	}
-	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
-	statuses = append(statuses, pod.Status.InitContainerStatuses...)
-	statuses = append(statuses, pod.Status.ContainerStatuses...)
-	for _, cs := range statuses {
-		if w := cs.State.Waiting; w != nil && w.Reason == "CrashLoopBackOff" {
-			return "CrashLoopBackOff"
-		}
-		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
-			return "ContainerExited"
-		}
-	}
-	return ""
-}
-
-// bootCrashDetail extracts a bounded, human-readable diagnostic from a
-// not-yet-Ready Pod's status: the failing container name, its exit code, the
-// terminated/waiting reason, and the kubelet-captured log tail (populated by
-// terminationMessagePolicy=FallbackToLogsOnError on a non-zero exit). It reads
-// only fields already on pod.Status, so no logs API or pods/log RBAC is needed.
-// Returns "" when no container status explains the failure.
-func bootCrashDetail(pod *corev1.Pod) string {
-	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
-	statuses = append(statuses, pod.Status.InitContainerStatuses...)
-	statuses = append(statuses, pod.Status.ContainerStatuses...)
-
-	// Prefer a terminated container (carries the exit code + log tail).
-	for _, cs := range statuses {
-		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
-			return containerCrashDetail(cs.Name, t, nil)
-		}
-	}
-	// Otherwise a waiting container with a reason (CrashLoopBackOff carries its
-	// tail on LastTerminationState; ImagePullBackOff/CreateContainerError do not).
-	for _, cs := range statuses {
-		if w := cs.State.Waiting; w != nil && w.Reason != "" {
-			return containerCrashDetail(cs.Name, cs.LastTerminationState.Terminated, w)
-		}
-	}
-	// No container status pinpoints it (e.g. a bare PodFailed): fall back to the
-	// pod-level reason/message.
-	if d := strings.TrimSpace(pod.Status.Reason + " " + pod.Status.Message); d != "" {
-		return truncateDetail(d)
-	}
-	return ""
-}
-
-// containerCrashDetail formats a single container's failure into a compact,
-// bounded "key=value" string (container, waiting, exit, reason, log).
-func containerCrashDetail(name string, term *corev1.ContainerStateTerminated, wait *corev1.ContainerStateWaiting) string {
-	parts := []string{"container=" + name}
-	if wait != nil && wait.Reason != "" {
-		parts = append(parts, "waiting="+wait.Reason)
-	}
-	if term != nil {
-		parts = append(parts, fmt.Sprintf("exit=%d", term.ExitCode))
-		if term.Reason != "" {
-			parts = append(parts, "reason="+term.Reason)
-		}
-		if msg := strings.TrimSpace(term.Message); msg != "" {
-			parts = append(parts, "log="+msg)
-		}
-	}
-	return truncateDetail(strings.Join(parts, " "))
-}
-
-// truncateDetail trims and caps a diagnostic at bootCrashDetailCap.
-func truncateDetail(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) > bootCrashDetailCap {
-		return s[:bootCrashDetailCap] + "...(truncated)"
-	}
-	return s
-}
-
-// bootDeadlineExceeded reports whether a not-yet-Ready pod has exceeded
-// agentBootDeadline without becoming Ready. The deadline is anchored to
-// pod.Status.StartTime (when the container runtime started the pod) so that
-// image-pull and scheduling latency do not consume the readiness window.
-// Falls back to CreationTimestamp only when StartTime has not been set yet
-// (e.g. the pod is still being scheduled).
-func bootDeadlineExceeded(pod *corev1.Pod) bool {
-	if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
-		return time.Since(pod.Status.StartTime.Time) > agentBootDeadline
-	}
-	if pod.CreationTimestamp.IsZero() {
-		return false
-	}
-	return time.Since(pod.CreationTimestamp.Time) > agentBootDeadline
-}
-
-// handleBootCrash recovers a Task whose wrapper Pod failed to boot. On a crash
-// signal (Failed/CrashLoopBackOff/non-zero exit) or a pod that never became
-// Ready within agentBootDeadline, it respawns the run via resetAgentRun bounded
-// by maxPodRecreations boot attempts; once exhausted it fails the Task so the
-// lifecycle-orphan sweep can re-pick it rather than spinning forever.
-// handled=false means the pod is still legitimately booting -> caller requeues.
-func (r *TaskReconciler) handleBootCrash(ctx context.Context, task *tatarav1alpha1.Task) (ctrl.Result, error, bool) {
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, pod); err != nil {
-		// NotFound: ensurePodAndService recreates it next reconcile. Transient
-		// errors: keep waiting. Either way this is not a boot crash to act on.
-		return ctrl.Result{}, nil, false
-	}
-
-	// Gate 1: a pod with DeletionTimestamp is already being torn down by a prior
-	// respawn (resetAgentRun issued the Delete; the finalizer grace period keeps
-	// the object visible). Do not count this dying instance again; wait for
-	// ensurePodAndService to create the replacement.
-	if pod.DeletionTimestamp != nil {
-		return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
-	}
-
-	reason := bootCrashReason(pod)
-	if reason == "" {
-		if !bootDeadlineExceeded(pod) {
-			return ctrl.Result{}, nil, false
-		}
-		reason = "BootTimeout"
-	}
-
-	// Gate 2: count at most one boot-crash attempt per distinct pod instance.
-	// If this exact pod UID already incremented the budget, its respawn was already
-	// issued; requeue and wait for the replacement rather than bumping again. This
-	// gives a genuinely slow boot its full maxPodRecreations x agentBootDeadline.
-	if task.Annotations[annBootCrashLastPodUID] == string(pod.UID) {
-		return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
-	}
-
-	// Capture the crash cause from pod.Status BEFORE resetAgentRun / terminate
-	// delete the pod, persisting it across respawns (last-write-wins) so the
-	// terminal condition + issue comment can explain WHY the boot failed.
-	if detail := bootCrashDetail(pod); detail != "" {
-		if err := r.captureBootCrashDiagnostics(ctx, task, detail); err != nil {
-			return ctrl.Result{}, err, true
-		}
-	}
-	diag := task.Annotations[annBootCrashDiagnostics]
-
-	l := log.FromContext(ctx)
-	attempts := r.bootCrashAttempts(task) + 1
-	if attempts > maxPodRecreations {
-		r.Metrics.AgentBootCrash(reason, "failed")
-		l.Info("agent pod boot failed; recreation budget exhausted, failing task",
-			"action", "agent_boot_crash_exhausted", "resource_id", task.Name, "reason", reason,
-			"attempts", maxPodRecreations, "diagnostics", diag)
-		msg := fmt.Sprintf("wrapper pod failed to boot (%s) after %d attempts", reason, maxPodRecreations)
-		if diag != "" {
-			msg = fmt.Sprintf("wrapper pod failed to boot (%s: %s) after %d attempts", reason, diag, maxPodRecreations)
-		}
-		res, terr := r.terminate(ctx, task, "Failed", "BootCrashLoop", msg)
-		// Post the cause once to the linked issue (survives terminal-CRD GC, #81).
-		// Only after terminate commits Failed, so a terminate retry cannot double-post.
-		if terr == nil {
-			r.commentBootCrashDiagnostics(ctx, task, reason, diag)
-		}
-		return res, terr, true
-	}
-
-	r.Metrics.AgentBootCrash(reason, "respawn")
-	l.Info("agent pod boot failed; respawning",
-		"action", "agent_boot_crash", "resource_id", task.Name, "reason", reason, "attempt", attempts, "diagnostics", diag)
-	if err := r.bumpBootCrashAttempts(ctx, task, pod.UID); err != nil {
-		return ctrl.Result{}, err, true
-	}
-	if err := r.resetAgentRun(ctx, task); err != nil {
-		return ctrl.Result{}, err, true
-	}
-	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil, true
-}
-
-// bootCrashAttempts returns the count of boot-crash respawns for the current
-// run. resetAgentRun preserves this annotation (unlike pod-recreations) so the
-// budget accumulates across respawns; recordTurn clears it once a turn lands.
-func (r *TaskReconciler) bootCrashAttempts(task *tatarav1alpha1.Task) int {
-	n, _ := strconv.Atoi(task.Annotations[annBootCrashAttempts])
-	return n
-}
-
-func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatarav1alpha1.Task, podUID types.UID) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
-		if fresh.Annotations == nil {
-			fresh.Annotations = map[string]string{}
-		}
-		// Authoritative per-pod idempotency: the handleBootCrash gate reads the
-		// cache, so under cache lag two reconciles can both pass it. Re-check
-		// against the freshly-read Task here so the same pod instance bumps the
-		// budget at most once even when a conflict-retry observes the
-		// catching-up cache.
-		if fresh.Annotations[annBootCrashLastPodUID] == string(podUID) {
-			return nil
-		}
-		n, _ := strconv.Atoi(fresh.Annotations[annBootCrashAttempts])
-		fresh.Annotations[annBootCrashAttempts] = strconv.Itoa(n + 1)
-		fresh.Annotations[annBootCrashLastPodUID] = string(podUID)
-		return r.Update(ctx, fresh)
-	})
-}
-
-// captureBootCrashDiagnostics records the most recent boot-crash cause in the
-// annBootCrashDiagnostics annotation (last-write-wins) so it survives the
-// per-attempt pod delete in resetAgentRun and reaches the terminal condition /
-// issue comment at exhaustion. It also updates the in-memory task so the caller
-// reads the fresh value without a re-Get.
-func (r *TaskReconciler) captureBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, detail string) error {
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
-		if fresh.Annotations[annBootCrashDiagnostics] == detail {
-			return nil // idempotent: this exact cause is already recorded
-		}
-		if fresh.Annotations == nil {
-			fresh.Annotations = map[string]string{}
-		}
-		fresh.Annotations[annBootCrashDiagnostics] = detail
-		return r.Update(ctx, fresh)
-	}); err != nil {
-		return err
-	}
-	if task.Annotations == nil {
-		task.Annotations = map[string]string{}
-	}
-	task.Annotations[annBootCrashDiagnostics] = detail
-	return nil
 }
 
 // postTerminalComment posts a single human-readable cause to the Task's linked
@@ -826,18 +589,6 @@ func (r *TaskReconciler) postTerminalComment(ctx context.Context, task *tatarav1
 	}
 	l.Info("terminal diagnostics commented on issue",
 		"action", "task_terminal_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
-}
-
-// commentBootCrashDiagnostics posts the boot-crash cause once to the Task's
-// linked issue (the detail captured from pod.Status), formatted for the boot
-// path. Delegates the SCM plumbing to postTerminalComment.
-func (r *TaskReconciler) commentBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, diag string) {
-	body := fmt.Sprintf("Wrapper pod failed to boot (`%s`) and the run was terminated after %d boot attempts.",
-		reason, maxPodRecreations)
-	if diag != "" {
-		body += "\n\nLast captured cause from `pod.Status`:\n\n```\n" + diag + "\n```"
-	}
-	r.postTerminalComment(ctx, task, body)
 }
 
 // commentTerminalDiagnostics posts the cause of a terminal Failed run to the
@@ -955,21 +706,17 @@ func (r *TaskReconciler) handleTurnSubmitFailure(ctx context.Context, task *tata
 // earliest sighting); an absent or unparseable value is overwritten with now.
 func (r *TaskReconciler) stampUnreachableSince(ctx context.Context, task *tatarav1alpha1.Task) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	return r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
 		if cur := fresh.Annotations[annAgentUnreachableSince]; cur != "" {
 			if _, perr := time.Parse(time.RFC3339, cur); perr == nil {
-				return nil
+				return false
 			}
 		}
 		fresh.Annotations[annAgentUnreachableSince] = now
-		return r.Update(ctx, fresh)
+		return true
 	})
 }
 
@@ -1000,16 +747,12 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		}
 		// Clear pending-handover-resume annotation now that turn-0 has been submitted.
 		if task.Annotations[annPendingHandoverResume] != "" {
-			if cerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				fresh := &tatarav1alpha1.Task{}
-				if err2 := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err2 != nil {
-					return err2
-				}
+			if cerr := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 				if fresh.Annotations == nil {
-					return nil
+					return false
 				}
 				delete(fresh.Annotations, annPendingHandoverResume)
-				return r.Update(ctx, fresh)
+				return true
 			}); cerr != nil {
 				return ctrl.Result{}, fmt.Errorf("clear pending-handover-resume: %w", cerr)
 			}
@@ -1176,11 +919,7 @@ func taskTokenBudgetExceeded(project *tatarav1alpha1.Project, task *tatarav1alph
 func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Task, turnID, subtaskName string) (ctrl.Result, error) {
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	var hadCallback bool
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
@@ -1194,18 +933,14 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 		delete(fresh.Annotations, annBootCrashAttempts)
 		delete(fresh.Annotations, annBootCrashDiagnostics)
 		delete(fresh.Annotations, annBootCrashLastPodUID)
-		return r.Update(ctx, fresh)
+		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
 	}
 	if hadCallback {
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-				return err
-			}
+		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			fresh.Status.TurnsCompleted++
-			return r.Status().Update(ctx, fresh)
+			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("record turns completed: %w", err)
 		}
@@ -1305,11 +1040,7 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 		r.deriveResultSummary(ctx, task)
 	}
 
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
+	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		// Carry over any ResultSummary derived before the retry.
 		if task.Status.ResultSummary != "" && fresh.Status.ResultSummary == "" {
 			fresh.Status.ResultSummary = task.Status.ResultSummary
@@ -1332,7 +1063,7 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 				ObservedGeneration: fresh.Generation,
 			})
 		}
-		return r.Status().Update(ctx, fresh)
+		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set terminal status: %w", err)
 	}
