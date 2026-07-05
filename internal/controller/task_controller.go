@@ -150,28 +150,15 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if len(task.Status.WorkItems) == 0 && task.Spec.Source != nil {
 		seedLedgerFromSpec(&task)
 		if len(task.Status.WorkItems) > 0 {
-			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				fresh := &tatarav1alpha1.Task{}
-				if ferr := r.Get(ctx, req.NamespacedName, fresh); ferr != nil {
-					return ferr
-				}
+			if err := r.patchTaskStatus(ctx, &task, func(fresh *tatarav1alpha1.Task) bool {
 				if len(fresh.Status.WorkItems) > 0 {
-					// Another replica already seeded; adopt its state so the
-					// downstream reconcile starts from the current resourceVersion.
-					task = *fresh
-					return nil
+					// Another replica already seeded; skip-write adopts its state
+					// (via patchTaskStatus's copy-back) so the downstream reconcile
+					// starts from the current resourceVersion.
+					return false
 				}
 				seedLedgerFromSpec(fresh)
-				if uerr := r.Status().Update(ctx, fresh); uerr != nil {
-					return uerr
-				}
-				// Status().Update bumped fresh's resourceVersion on a SEPARATE fetch;
-				// the local `task` still holds the stale RV. Adopt fresh so the rest
-				// of this reconcile (lifecycle / writeback Status().Update) operates
-				// on the current RV instead of 409-conflicting on every first
-				// reconcile during rollout (~1148 in-flight Tasks).
-				task = *fresh
-				return nil
+				return true
 			}); err != nil {
 				l.Error(err, "task: seed ledger from spec (non-fatal)",
 					"action", "ledger_seed", "resource_id", task.Name)
@@ -324,6 +311,55 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return res, nil
 }
 
+// patchTaskAnnotations Get-fresh + mutate + Update's a Task's annotations
+// (metadata subresource), retrying on conflict. mutate returns whether a
+// write is needed; when it returns false the fresh object is still copied
+// back into task unconditionally (both on skip and on a successful write) so
+// callers observe the current resourceVersion afterward instead of a stale
+// one - this is what makes a "someone else already applied this" skip-write
+// branch adopt the winner's state rather than risk a 409 on the next write in
+// the same reconcile. Mirrors repository_controller.go's patchStatus.
+func (r *TaskReconciler) patchTaskAnnotations(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if !mutate(fresh) {
+			*task = *fresh
+			return nil
+		}
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		*task = *fresh
+		return nil
+	})
+}
+
+// patchTaskStatus Get-fresh + mutate + Status().Update's a Task's status,
+// retrying on conflict. Same skip/write copy-back contract as
+// patchTaskAnnotations (and repository_controller.go's patchStatus): the
+// unconditional `*task = *fresh` on both paths is what preserves the
+// site-153 ledger-seed resourceVersion adoption (the #175 409-storm fix).
+func (r *TaskReconciler) patchTaskStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if !mutate(fresh) {
+			*task = *fresh
+			return nil
+		}
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*task = *fresh
+		return nil
+	})
+}
+
 // driveAgentRun is the shared agent-spawn + drive-turns sequence. It handles
 // ensurePodAndService, the Planning phase transition, pod readiness wait, and
 // driveTurns. Used by the generic Reconcile and by lifecycle state handlers.
@@ -353,33 +389,25 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 		// turn. Annotations are metadata, so this is a separate Update from the
 		// status write below. Overwrite unconditionally: every spawn re-enters
 		// here at Phase=="" and must measure from its own start, not a prior one.
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
+		if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			if fresh.Status.Phase != "" {
-				return nil // already advanced by a prior attempt
+				return false // already advanced by a prior attempt
 			}
 			if fresh.Annotations == nil {
 				fresh.Annotations = map[string]string{}
 			}
 			fresh.Annotations[annPlanningSince] = time.Now().UTC().Format(time.RFC3339)
-			return r.Update(ctx, fresh)
+			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("stamp planning-since: %w", err)
 		}
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-				return err
-			}
+		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			if fresh.Status.Phase != "" {
-				return nil // already advanced by a prior attempt
+				return false // already advanced by a prior attempt
 			}
 			fresh.Status.Phase = "Planning"
 			fresh.Status.PodName = agent.PodName(task)
-			return r.Status().Update(ctx, fresh)
+			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("set planning phase: %w", err)
 		}
@@ -512,34 +540,26 @@ func taskHasInflightTurn(task *tatarav1alpha1.Task) bool {
 // the model that actually ran. Best-effort: callers must not fail pod
 // creation on a stamp error (the metric label degrades to "", fail-open).
 func (r *TaskReconciler) stampResolvedModel(ctx context.Context, task *tatarav1alpha1.Task, model string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return fmt.Errorf("stampResolvedModel: %w", err)
-		}
+	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Status.ResolvedModel == model {
-			return nil
+			return false
 		}
 		fresh.Status.ResolvedModel = model
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return fmt.Errorf("stampResolvedModel: %w", err)
-		}
-		return nil
-	})
+		return true
+	}); err != nil {
+		return fmt.Errorf("stampResolvedModel: %w", err)
+	}
+	return nil
 }
 
 func (r *TaskReconciler) bumpRecreations(ctx context.Context, task *tatarav1alpha1.Task) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	return r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
 		n, _ := strconv.Atoi(fresh.Annotations[annPodRecreations])
 		fresh.Annotations[annPodRecreations] = strconv.Itoa(n + 1)
-		return r.Update(ctx, fresh)
+		return true
 	})
 }
 
@@ -748,11 +768,7 @@ func (r *TaskReconciler) bootCrashAttempts(task *tatarav1alpha1.Task) int {
 }
 
 func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatarav1alpha1.Task, podUID types.UID) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	return r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
@@ -762,12 +778,12 @@ func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatara
 		// budget at most once even when a conflict-retry observes the
 		// catching-up cache.
 		if fresh.Annotations[annBootCrashLastPodUID] == string(podUID) {
-			return nil
+			return false
 		}
 		n, _ := strconv.Atoi(fresh.Annotations[annBootCrashAttempts])
 		fresh.Annotations[annBootCrashAttempts] = strconv.Itoa(n + 1)
 		fresh.Annotations[annBootCrashLastPodUID] = string(podUID)
-		return r.Update(ctx, fresh)
+		return true
 	})
 }
 
@@ -777,27 +793,16 @@ func (r *TaskReconciler) bumpBootCrashAttempts(ctx context.Context, task *tatara
 // issue comment at exhaustion. It also updates the in-memory task so the caller
 // reads the fresh value without a re-Get.
 func (r *TaskReconciler) captureBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, detail string) error {
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	return r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations[annBootCrashDiagnostics] == detail {
-			return nil // idempotent: this exact cause is already recorded
+			return false // idempotent: this exact cause is already recorded
 		}
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
 		fresh.Annotations[annBootCrashDiagnostics] = detail
-		return r.Update(ctx, fresh)
-	}); err != nil {
-		return err
-	}
-	if task.Annotations == nil {
-		task.Annotations = map[string]string{}
-	}
-	task.Annotations[annBootCrashDiagnostics] = detail
-	return nil
+		return true
+	})
 }
 
 // postTerminalComment posts a single human-readable cause to the Task's linked
@@ -955,21 +960,17 @@ func (r *TaskReconciler) handleTurnSubmitFailure(ctx context.Context, task *tata
 // earliest sighting); an absent or unparseable value is overwritten with now.
 func (r *TaskReconciler) stampUnreachableSince(ctx context.Context, task *tatarav1alpha1.Task) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	return r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
 		if cur := fresh.Annotations[annAgentUnreachableSince]; cur != "" {
 			if _, perr := time.Parse(time.RFC3339, cur); perr == nil {
-				return nil
+				return false
 			}
 		}
 		fresh.Annotations[annAgentUnreachableSince] = now
-		return r.Update(ctx, fresh)
+		return true
 	})
 }
 
@@ -1000,16 +1001,12 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		}
 		// Clear pending-handover-resume annotation now that turn-0 has been submitted.
 		if task.Annotations[annPendingHandoverResume] != "" {
-			if cerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				fresh := &tatarav1alpha1.Task{}
-				if err2 := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err2 != nil {
-					return err2
-				}
+			if cerr := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 				if fresh.Annotations == nil {
-					return nil
+					return false
 				}
 				delete(fresh.Annotations, annPendingHandoverResume)
-				return r.Update(ctx, fresh)
+				return true
 			}); cerr != nil {
 				return ctrl.Result{}, fmt.Errorf("clear pending-handover-resume: %w", cerr)
 			}
@@ -1176,11 +1173,7 @@ func taskTokenBudgetExceeded(project *tatarav1alpha1.Project, task *tatarav1alph
 func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Task, turnID, subtaskName string) (ctrl.Result, error) {
 	startedAt := time.Now().UTC().Format(time.RFC3339)
 	var hadCallback bool
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
+	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
@@ -1194,18 +1187,14 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 		delete(fresh.Annotations, annBootCrashAttempts)
 		delete(fresh.Annotations, annBootCrashDiagnostics)
 		delete(fresh.Annotations, annBootCrashLastPodUID)
-		return r.Update(ctx, fresh)
+		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("record turn annotations: %w", err)
 	}
 	if hadCallback {
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			fresh := &tatarav1alpha1.Task{}
-			if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-				return err
-			}
+		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			fresh.Status.TurnsCompleted++
-			return r.Status().Update(ctx, fresh)
+			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("record turns completed: %w", err)
 		}
@@ -1305,11 +1294,7 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 		r.deriveResultSummary(ctx, task)
 	}
 
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
+	if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		// Carry over any ResultSummary derived before the retry.
 		if task.Status.ResultSummary != "" && fresh.Status.ResultSummary == "" {
 			fresh.Status.ResultSummary = task.Status.ResultSummary
@@ -1332,7 +1317,7 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 				ObservedGeneration: fresh.Generation,
 			})
 		}
-		return r.Status().Update(ctx, fresh)
+		return true
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set terminal status: %w", err)
 	}
