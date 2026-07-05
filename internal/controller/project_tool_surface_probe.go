@@ -2,12 +2,11 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"time"
 
-	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -57,25 +56,15 @@ func (r *ProjectReconciler) updateToolSurfaceProbe(ctx context.Context) {
 		r.probeToolSurface(ctx, httpc, "operator", http.MethodGet, r.OperatorURL+"/projects")
 	}
 
-	// chat surface: per-project chat-<project> services, probed only when chat is
-	// enabled platform-wide (ChatPathPrefix set). Probe each Ready project's chat
-	// /readyz; results aggregate under backend="chat" (no project label, per the
-	// low-cardinality SP1 decision), so one project's chat going down still
-	// surfaces as a "chat" unreachable/error event.
+	// chat surface: a single shared tatara-chat service (like the operator-write
+	// surface), probed once when chat is enabled platform-wide (ChatPathPrefix set).
+	// Probe /readyz; the result meters under backend="chat" (no project label, per
+	// the low-cardinality SP1 decision). Chat is not per-project, so this is one
+	// probe per cycle regardless of how many Projects exist.
 	if r.MemoryConfig.ChatPathPrefix == "" {
 		return
 	}
-	var list tataradevv1alpha1.ProjectList
-	if err := r.List(ctx, &list); err != nil {
-		return
-	}
-	for i := range list.Items {
-		p := &list.Items[i]
-		if p.Status.Memory == nil || p.Status.Memory.Phase != "Ready" {
-			continue
-		}
-		r.probeToolSurface(ctx, httpc, "chat", http.MethodGet, r.chatBaseURL(p.Name)+"/readyz")
-	}
+	r.probeToolSurface(ctx, httpc, "chat", http.MethodGet, r.chatBaseURL()+"/readyz")
 }
 
 // probeToolSurface sends one request to a tool-backend route, classifies the
@@ -83,14 +72,23 @@ func (r *ProjectReconciler) updateToolSurfaceProbe(ctx context.Context) {
 // An unhealthy result (anything but ok/present) is logged.
 func (r *ProjectReconciler) probeToolSurface(ctx context.Context, httpc *http.Client, backend, method, url string) {
 	start := time.Now()
-	result := probeToolSurfaceRoute(ctx, httpc, method, url)
+	result, err := probeToolSurfaceRoute(ctx, httpc, method, url)
 	r.Metrics.ToolSurfaceProbe(backend, toolSurfaceVantage, result, time.Since(start).Seconds())
 	if result != "ok" && result != "present" {
-		log.FromContext(ctx).Info("tool surface probe unhealthy",
+		kv := []any{
 			"action", "tool_surface_probe",
 			"backend", backend,
 			"vantage", toolSurfaceVantage,
-			"result", result)
+			"result", result,
+			"url", url,
+		}
+		// Include the transport error on "unreachable" so a dial failure is a
+		// one-look diagnosis (no-such-host DNS vs connection-refused vs timeout)
+		// instead of requiring source cross-referencing.
+		if err != nil {
+			kv = append(kv, "error", err.Error())
+		}
+		log.FromContext(ctx).Info("tool surface probe unhealthy", kv...)
 	}
 }
 
@@ -98,39 +96,40 @@ func (r *ProjectReconciler) probeToolSurface(ctx context.Context, httpc *http.Cl
 // served status: "ok" (2xx), "present" (401/403 or any other 4xx: the route and
 // process are served but we hold no token to drive a 2xx), "absent" (404 -> route
 // missing / stale binary), "error" (5xx -> handler broken), or "unreachable"
-// (transport failure -> process down). It never returns an error; the
-// classification is the whole signal.
-func probeToolSurfaceRoute(ctx context.Context, httpc *http.Client, method, url string) string {
+// (transport failure -> process down). The classification is the whole signal;
+// the returned error is non-nil only on an "unreachable" transport failure and is
+// surfaced in the log line to make a dial failure a one-look diagnosis.
+func probeToolSurfaceRoute(ctx context.Context, httpc *http.Client, method, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
-		return "unreachable"
+		return "unreachable", err
 	}
 	resp, err := httpc.Do(req)
 	if err != nil {
-		return "unreachable"
+		return "unreachable", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	// Drain a little so the keep-alive connection can be reused.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		return "ok"
+		return "ok", nil
 	case resp.StatusCode == http.StatusNotFound:
-		return "absent"
+		return "absent", nil
 	case resp.StatusCode >= 500:
-		return "error"
+		return "error", nil
 	default:
 		// Any other 4xx (401/403/400/405/...) proves the route and process are
 		// served; only a 404 means the route itself is gone.
-		return "present"
+		return "present", nil
 	}
 }
 
-// chatBaseURL returns the in-cluster base URL of a project's chat Service (the
+// chatBaseURL returns the in-cluster base URL of the shared chat Service (the
 // TATARA_CHAT_URL agent pods receive), or the test override when set.
-func (r *ProjectReconciler) chatBaseURL(project string) string {
+func (r *ProjectReconciler) chatBaseURL() string {
 	if r.ChatBaseURL != nil {
-		return r.ChatBaseURL(project)
+		return r.ChatBaseURL()
 	}
-	return fmt.Sprintf("http://chat-%s.%s.svc:8080", project, r.MemoryConfig.Namespace)
+	return memory.ChatEndpoint(r.MemoryConfig.Namespace)
 }

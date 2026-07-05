@@ -57,7 +57,8 @@ func TestIngress_AddsChatPath(t *testing.T) {
 	if len(paths) != 2 {
 		t.Fatalf("expected memory+chat paths, got %d", len(paths))
 	}
-	if paths[1].Path != "/api/v1/chat/alpha(/|$)(.*)" || paths[1].Backend.Service.Name != "chat-alpha" {
+	// Path is project-scoped; backend is the single shared tatara-chat service.
+	if paths[1].Path != "/api/v1/chat/alpha(/|$)(.*)" || paths[1].Backend.Service.Name != ChatServiceName {
 		t.Fatalf("chat path/backend: %s %s", paths[1].Path, paths[1].Backend.Service.Name)
 	}
 }

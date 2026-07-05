@@ -13,6 +13,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
+	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -450,10 +451,11 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Operator REST URL: the agent's tatara-cli task_*/subtask_* MCP tools reach
 		// the operator API at TATARA_OPERATOR_URL.
 		{Name: "TATARA_OPERATOR_URL", Value: cfg.OperatorURL},
-		// Per-project chat endpoint: the agent's tatara-cli chat MCP tools reach
-		// the in-cluster chat service at TATARA_CHAT_URL instead of falling through
-		// to the public ingress default (DefaultChatBaseURL in cli config.go).
-		{Name: "TATARA_CHAT_URL", Value: fmt.Sprintf("http://chat-%s.%s.svc:8080", project.Name, cfg.Namespace)},
+		// Chat endpoint: the agent's tatara-cli chat MCP tools reach the shared
+		// in-cluster chat service at TATARA_CHAT_URL instead of falling through to
+		// the public ingress default (DefaultChatBaseURL in cli config.go). Chat is
+		// a single shared tatara-chat service (not per-project like memory).
+		{Name: "TATARA_CHAT_URL", Value: memory.ChatEndpoint(cfg.Namespace)},
 		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
 		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},

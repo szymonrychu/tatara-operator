@@ -25,11 +25,14 @@ func Ingress(p *tatarav1alpha1.Project, cfg Config) *networkingv1.Ingress {
 			Name: n.Memory, Port: networkingv1.ServiceBackendPort{Number: 8080}}},
 	}}
 	if cfg.ChatPathPrefix != "" {
+		// The path is project-scoped so external clients address chat per project,
+		// but chat is a single shared service, so every project's path routes to the
+		// one ChatServiceName backend (not a per-project chat-<project>).
 		paths = append(paths, networkingv1.HTTPIngressPath{
 			Path:     cfg.ChatPathPrefix + "/" + p.Name + "(/|$)(.*)",
 			PathType: &pt,
 			Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{
-				Name: "chat-" + p.Name, Port: networkingv1.ServiceBackendPort{Number: 8080}}},
+				Name: ChatServiceName, Port: networkingv1.ServiceBackendPort{Number: 8080}}},
 		})
 	}
 	meta := objectMeta(p, cfg, p.Name)

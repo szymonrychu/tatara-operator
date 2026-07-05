@@ -104,7 +104,7 @@ type ProjectReconciler struct {
 	OperatorURL string
 	// ChatBaseURL, when set, overrides the in-cluster chat Service DNS used by
 	// updateToolSurfaceProbe (tests point it at httptest).
-	ChatBaseURL func(project string) string
+	ChatBaseURL func() string
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
