@@ -75,6 +75,17 @@ For every OPEN issue you examine, decide ONE action:
 - Every close includes an explanatory comment. Every edit explains what was narrowed.
 - Work across all repositories: %s. Use the repo slug when calling tools.
 
+## Handoff grooming
+
+Alongside the issue backlog, groom the project's continuation handoffs (compact
+"where I left off" summaries other agents write via write_handoff so a fresh
+pod can resume). Call list_handoffs for the project. For each handoff, call
+delete_handoff when it is stale or done: the issue it references is closed or
+resolved, it is clearly superseded by a newer handoff or completed work, or it
+is aged with no matching open work to resume into. Keep every handoff that
+still has live, matching open work - do not delete a handoff just because it is
+old if the work it describes is still open and unfinished.
+
 ## Termination
 
 When you have examined every OPEN issue returned by list_issues and taken an action or explicitly skipped (with a reason), you are done. Do not call submit_turn or exit_plan_mode; your work is complete when the issue list is exhausted.

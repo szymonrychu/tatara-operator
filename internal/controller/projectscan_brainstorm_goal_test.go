@@ -23,3 +23,23 @@ func TestBrainstormGoalDropsCommentPathAddsEarlyExit(t *testing.T) {
 		}
 	}
 }
+
+func TestBrainstormGoalPrioritizesHandoffsFirst(t *testing.T) {
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
+
+	for _, want := range []string{"list_handoffs", "get_handoff"} {
+		if !strings.Contains(g, want) {
+			t.Fatalf("brainstorm goal missing handoff tool %q", want)
+		}
+	}
+	low := strings.ToLower(g)
+	for _, want := range []string{"handoff", "maxopenproposals", "continu"} {
+		if !strings.Contains(low, want) {
+			t.Fatalf("brainstorm goal missing handoff-prioritize guidance %q", want)
+		}
+	}
+	// Handoff prioritization must precede the fresh-ideas survey.
+	if strings.Index(low, "list_handoffs") > strings.Index(low, "invoke the `tatara-deep-research`") {
+		t.Fatalf("brainstorm goal must list_handoffs BEFORE the fresh-ideas research pass")
+	}
+}

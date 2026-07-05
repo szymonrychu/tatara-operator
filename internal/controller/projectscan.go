@@ -133,6 +133,8 @@ func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (str
 		return c.MRScan.Schedule, proj.Status.LastMRScan
 	case "issueScan":
 		return c.IssueScan.Schedule, proj.Status.LastIssueScan
+	case "cdScan":
+		return c.CDScan.Schedule, proj.Status.LastCDScan
 	case "brainstorm":
 		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
 	case "healthCheck":
@@ -1033,6 +1035,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "issueScan":
 			fresh.Status.LastIssueScan = &now
 			proj.Status.LastIssueScan = &now
+		case "cdScan":
+			fresh.Status.LastCDScan = &now
+			proj.Status.LastCDScan = &now
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
@@ -1721,7 +1726,12 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string)
 		stateBlock = repoStateCtx
 	}
 
-	goal := "Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
+	goal := "HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
+		"still describes live, unfinished work matching a real opportunity, call `get_handoff` and propose continuing " +
+		"it (a `propose_issue` framed as resuming that work), before generating any fresh ideas. Skip handoffs that no " +
+		"longer matter (superseded, already delivered, or the work is stale). Continuation proposals count against " +
+		"the same MaxOpenProposals cap as fresh ideas below - do not exceed it.\n\n" +
+		"Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
 		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
 		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
 		"Run at MAXIMUM reasoning effort. " +
@@ -2649,8 +2659,12 @@ func (r *ProjectReconciler) inflightRefineTask(ctx context.Context, proj *tatara
 }
 
 // latestTerminalRefineTask returns the most recently created terminal refine
-// Task for the project, or nil if none exist.
-func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *tatarav1alpha1.Project) (*tatarav1alpha1.Task, error) {
+// Task for the project that was created at/after since (the current cycle's
+// due-base), or nil if none exist. Scoping to since prevents a terminal
+// refine Task from a past cycle (still around because TaskRetention has not
+// GC'd it yet) from satisfying the barrier for every cycle until it expires;
+// each brainstorm cycle must be satisfied by a refine Task from that cycle.
+func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *tatarav1alpha1.Project, since time.Time) (*tatarav1alpha1.Task, error) {
 	var list tatarav1alpha1.TaskList
 	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
 		return nil, err
@@ -2662,6 +2676,9 @@ func (r *ProjectReconciler) latestTerminalRefineTask(ctx context.Context, proj *
 			continue
 		}
 		if !tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		if t.CreationTimestamp.Time.Before(since) {
 			continue
 		}
 		if latest == nil || t.CreationTimestamp.After(latest.CreationTimestamp.Time) {
@@ -2748,56 +2765,6 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		return 0, err
 	}
 
-	// refine barrier: before any due scan, ensure the project refiner has run
-	// this cycle.  Opt-in: only active when ClosedLookbackDays > 0.
-	// "This cycle" = LastRefine is nil or precedes the base time of at least one
-	// due scan.  The barrier defers all scans until a terminal refine Task exists;
-	// both Succeeded and Failed release the gate so a broken refine never wedges
-	// the platform.
-	if cronSpec.Refine.ClosedLookbackDays > 0 {
-		// Compute the earliest base among all due activities to decide whether
-		// this cycle still needs a refine.
-		var earliestBase time.Time
-		for _, act := range []string{"mrScan", "issueScan", "brainstorm", "healthCheck"} {
-			base, due, _, ok := r.activityDue(proj, act)
-			if ok && due {
-				if earliestBase.IsZero() || base.Before(earliestBase) {
-					earliestBase = base
-				}
-			}
-		}
-		if !earliestBase.IsZero() && r.refineNeededThisCycle(proj, earliestBase) {
-			// Check for a terminal refine Task (Succeeded or Failed).
-			terminal, terr := r.latestTerminalRefineTask(ctx, proj)
-			if terr != nil {
-				l.Error(terr, "scan: check terminal refine task", "action", "scan_refine_error", "resource_id", proj.Name)
-			}
-			if terminal != nil {
-				// Stamp LastRefine and fall through to scans.
-				if serr := r.stampRefine(ctx, proj); serr != nil {
-					l.Error(serr, "scan: stamp LastRefine failed", "action", "scan_stamp_error", "resource_id", proj.Name, "activity", "refine")
-				}
-			} else {
-				// Check or create an in-flight refine task.
-				inflight, ierr := r.inflightRefineTask(ctx, proj)
-				if ierr != nil {
-					l.Error(ierr, "scan: check inflight refine task", "action", "scan_refine_error", "resource_id", proj.Name)
-				}
-				if inflight == nil {
-					slugs := r.projectRepoSlugs(ctx, proj, repos)
-					lookback := cronSpec.Refine.ClosedLookbackDays
-					if lookback <= 0 {
-						lookback = 30
-					}
-					goal := refine.GoalProject(slugs, lookback)
-					_, _ = r.createRefineTask(ctx, proj, goal)
-				}
-				// Defer scans until refine is terminal.
-				return requeueRefineBarrier, nil
-			}
-		}
-	}
-
 	// mrScan: per-repo deterministic jitter (issue #181) spreads each repo's fire
 	// across the cron interval instead of firing all repos at the boundary.
 	if dueRepos, soonest, ok := r.reposDueForScan(proj, "mrScan", repos, now); ok {
@@ -2866,18 +2833,80 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 			"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "issueScan")
 	}
 
-	// brainstorm (opt-in)
-	if cronSpec.Brainstorm.Enabled {
-		if _, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
+	// cdScan: push-CD deploy-supervision backstop (project-scoped, like brainstorm).
+	// Sweeps Deploying Tasks stalled past 1.5x the deploy budget and rerolls them.
+	if cronSpec.CDScan.Schedule != "" {
+		if _, due, next, ok := r.activityDue(proj, "cdScan"); ok {
 			if due {
-				r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
-				if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
-					l.Error(serr, "scan: persist brainstorm stamp failed",
-						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
-					r.Metrics.ScanItem("brainstorm", "stamp_error")
+				r.cdScan(ctx, proj, existing)
+				if serr := r.stampScan(ctx, proj, "cdScan"); serr != nil {
+					l.Error(serr, "scan: persist cdScan stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "cdScan")
+					r.Metrics.ScanItem("cdScan", "stamp_error")
 				}
-				if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
+				if next2, ok2 := activityNextFire(cronSpec.CDScan.Schedule, now); ok2 {
 					consider(next2)
+				}
+			} else {
+				consider(next)
+			}
+		} else {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.CDScan.Schedule), "scan: invalid cdScan cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "cdScan")
+		}
+	}
+
+	// brainstorm (opt-in), gated by the refine pre-scan barrier: a due
+	// brainstorm tick first ensures the project refiner has run this cycle
+	// (grooming the backlog + handoffs) before brainstorm executes. "This
+	// cycle" = LastRefine is nil or precedes the brainstorm due-base time. The
+	// barrier defers ONLY brainstorm - mrScan/issueScan/healthCheck run on
+	// their own schedules regardless. Both Succeeded and Failed refine release
+	// the gate so a broken refine never wedges brainstorm.
+	if cronSpec.Brainstorm.Enabled {
+		if base, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
+			if due {
+				proceed := true
+				if r.refineNeededThisCycle(proj, base) {
+					terminal, terr := r.latestTerminalRefineTask(ctx, proj, base)
+					if terr != nil {
+						l.Error(terr, "scan: check terminal refine task", "action", "scan_refine_error", "resource_id", proj.Name)
+					}
+					if terminal != nil {
+						// Stamp LastRefine and fall through to brainstorm.
+						if serr := r.stampRefine(ctx, proj); serr != nil {
+							l.Error(serr, "scan: stamp LastRefine failed", "action", "scan_stamp_error", "resource_id", proj.Name, "activity", "refine")
+						}
+					} else {
+						// Check or create an in-flight refine task.
+						inflight, ierr := r.inflightRefineTask(ctx, proj)
+						if ierr != nil {
+							l.Error(ierr, "scan: check inflight refine task", "action", "scan_refine_error", "resource_id", proj.Name)
+						}
+						if inflight == nil {
+							slugs := r.projectRepoSlugs(ctx, proj, repos)
+							lookback := cronSpec.Refine.ClosedLookbackDays
+							if lookback <= 0 {
+								lookback = 30
+							}
+							goal := refine.GoalProject(slugs, lookback)
+							_, _ = r.createRefineTask(ctx, proj, goal)
+						}
+						// Defer brainstorm until refine is terminal; poll at the barrier cadence.
+						proceed = false
+						consider(now.Add(requeueRefineBarrier))
+					}
+				}
+				if proceed {
+					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
+					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
+						l.Error(serr, "scan: persist brainstorm stamp failed",
+							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
+						r.Metrics.ScanItem("brainstorm", "stamp_error")
+					}
+					if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
+						consider(next2)
+					}
 				}
 			} else {
 				consider(next)

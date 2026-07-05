@@ -127,7 +127,7 @@ func TestChangeSummary_WeakPRTitleRejected(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			body := fmt.Sprintf(`{"prTitle":%q,"prBody":"some body"}`, tc.prTitle)
+			body := fmt.Sprintf(`{"prTitle":%q,"prBody":"some body","changeSignificance":"patch"}`, tc.prTitle)
 			req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()

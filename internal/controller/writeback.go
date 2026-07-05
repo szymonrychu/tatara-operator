@@ -217,11 +217,20 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// Append "Closes #N" for the primary repo of an issue-linked lifecycle task
 		// so the MR auto-closes the issue on merge.  Never emit this on secondary
 		// repos (cross-repo leak) or for non-lifecycle / PR-entry tasks.
+		//
+		// push-CD: a pushCDEligible task (declared significance) rides the deploy
+		// cascade, and deploy-supervision closes the issue on a CONFIRMED helmfile
+		// apply with the deployed version (D9). Emitting "Closes #N" here would let
+		// native auto-merge close the issue at MERGE time - before apply - and an
+		// apply-failure/timeout reroll would then re-enter Implement with the issue
+		// already (wrongly) closed. Suppress it and let deploy-supervision own the
+		// close.
 		if repo.Name == primaryRepo.Name &&
 			task.Spec.Kind == "issueLifecycle" &&
 			task.Spec.Source != nil &&
 			!task.Spec.Source.IsPR &&
-			task.Spec.Source.Number > 0 {
+			task.Spec.Source.Number > 0 &&
+			!pushCDEligible(task) {
 			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
 		}
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
@@ -291,6 +300,22 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		}
 		l.Info("writeback: pr/mr opened", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
 		r.Metrics.WritebackOutcome("opened")
+		// push-CD visibility: an implement/lifecycle code change SHOULD declare a
+		// significance (required at the change_summary MCP tool + REST endpoint).
+		// When it is absent the PR opens unlabeled and skips the cascade (legacy
+		// close+Done path). That is allowed by design (pushCDEligible=false) but a
+		// human-merged unlabeled bot PR has no semver:<level> label for the
+		// component release workflow to read, so surface it loudly rather than let
+		// the legacy path go silent.
+		if (task.Spec.Kind == "implement" || task.Spec.Kind == "issueLifecycle") &&
+			(task.Status.ChangeSummary == nil || task.Status.ChangeSummary.Significance == "") {
+			l.Info("writeback: code-change PR opened without declared significance; no semver label / no auto-merge (legacy path)",
+				"action", "writeback_no_significance", "task", task.Name, "repo", repo.Name, "pr_url", prURL)
+			r.Metrics.WritebackOutcome("opened_no_significance")
+		}
+		// push-CD: stamp the declared significance label and enable native
+		// auto-merge on the freshly-opened bot PR (D5). Best-effort, never fatal.
+		r.applySemverAutoMerge(ctx, &proj, repo, writer, token, provider, prURL, task.Status.ChangeSummary)
 		prURLs = append(prURLs, prURL)
 		prRepos = append(prRepos, repo)
 		// Persist the primary PR URL immediately after the first successful OpenChange
@@ -435,6 +460,63 @@ func (r *TaskReconciler) persistPrimaryPRURL(ctx context.Context, task *tatarav1
 		fresh.Status.PrURL = prURL
 		return r.Status().Update(ctx, fresh)
 	})
+}
+
+// applySemverAutoMerge stamps the declared change-significance label on the
+// just-opened bot PR and enables the forge's native auto-merge (push-CD, D5). It
+// runs only when the agent declared a significance and the project has a bot
+// login: the PR is bot-authored by construction here (the operator opened it
+// with the bot token), so botLogin presence is the authorship condition. The
+// PR label is applied on GitHub only - GitHub PRs share the issues label
+// endpoint, while GitLab AddLabel routes to /issues and the GitLab
+// "infrastructure" project is not part of the GitHub-only cd-release cascade.
+// Every step is best-effort and logged; a forge that disallows auto-merge or a
+// label failure never fails the writeback.
+func (r *TaskReconciler) applySemverAutoMerge(ctx context.Context, proj *tatarav1alpha1.Project, repo tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider, prURL string, cs *tatarav1alpha1.ChangeSummary) {
+	if cs == nil || cs.Significance == "" {
+		return
+	}
+	l := log.FromContext(ctx)
+	label := semverLabel(cs.Significance)
+	color := managedLabelColors(proj.Spec.Scm)[label]
+	if eerr := writer.EnsureLabel(ctx, repo.Spec.URL, token, label, color); eerr != nil {
+		r.recordSCM(provider, "ensure_label", eerr)
+		l.Error(eerr, "writeback: ensure semver label (non-fatal)", "repo", repo.Name, "label", label)
+	}
+	if provider == "github" {
+		if slug, _, serr := repoSlugFromURL(repo.Spec.URL, provider); serr == nil {
+			if n := parsePRNumber(prURL); n > 0 {
+				prRef := fmt.Sprintf("%s#%d", slug, n)
+				aerr := writer.AddLabel(ctx, token, prRef, label)
+				r.recordSCM(provider, "add_label", aerr)
+				if aerr != nil {
+					l.Error(aerr, "writeback: add semver label (non-fatal)",
+						"repo", repo.Name, "pr_ref", prRef, "label", label)
+				}
+			}
+		}
+	}
+	// D5 auto-merge gate (b): PR author == bot. We do NOT re-fetch the PR to read
+	// its author here because this code path opened the PR itself, moments ago,
+	// with the bot's SCM token - so author == proj.Spec.Scm.BotLogin holds by
+	// construction (the same identity the writeBackSelfImprove st.Author ==
+	// BotLogin check verifies for externally-discovered PRs). The only remaining
+	// condition is that a bot login is actually configured; absent it, withhold
+	// auto-merge. Human-authored PRs never reach this path, and cd-release tag-cut
+	// keys on the label not the author, so it stays author-agnostic downstream.
+	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
+		l.Info("writeback: auto-merge withheld - no project bot login",
+			"action", "scm_auto_merge_withheld", "repo", repo.Name, "pr_url", prURL)
+		return
+	}
+	merr := writer.EnableAutoMerge(ctx, repo.Spec.URL, token, prURL, "squash")
+	r.recordSCM(provider, "auto_merge", merr)
+	if merr != nil {
+		l.Error(merr, "writeback: enable auto-merge (non-fatal)", "repo", repo.Name, "pr_url", prURL)
+		return
+	}
+	l.Info("writeback: native auto-merge enabled", "action", "scm_auto_merge",
+		"repo", repo.Name, "pr_url", prURL, "significance", cs.Significance)
 }
 
 // clearWritebackPending sets WritebackPending=False and updates status.
@@ -1195,40 +1277,20 @@ func (r *TaskReconciler) writeBackSelfImprove(ctx context.Context, task *tatarav
 		l.Info("self-improve outcome applied", "action", "scm_pr_outcome", "resource_id", task.Name, "outcome", out.Action)
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: "+out.Action)
 	case "merge":
+		// push-CD (D5): agents must NOT self-merge - native auto-merge owns
+		// merging. The bot-authored PR had auto-merge enabled at open time, so the
+		// forge squash-merges it once required checks pass. pr_outcome=merge is no
+		// longer a direct merge; honor it only as a policy confirmation and defer
+		// the merge itself to the forge. pr_outcome is retained for close.
 		if !r.mergeAllowed(&proj, st) {
 			l.Info("self-improve merge withheld: policy not satisfied", "action", "scm_merge_withheld", "resource_id", task.Name)
 			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "MergeWithheld", "merge policy not satisfied")
 		}
-		_, err = writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
-		r.recordSCM(provider, "merge", err)
-		// ErrMergeConflict -> merge conflict on an in-flight task.
-		// Do NOT return the error: that would trigger controller-runtime backoff loop.
-		// Before treating it as a conflict, re-check st.Merged: if the PR was
-		// already merged on a prior reconcile (clearWritebackPending failed then),
-		// treat as success rather than mis-labelling a completed merge as a conflict.
-		if errors.Is(err, scm.ErrMergeConflict) {
-			freshSt, stErr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
-			r.recordSCM(provider, "get_pr_state", stErr)
-			if stErr == nil && freshSt.Merged {
-				l.Info("self-improve merge: PR already merged; treating as success",
-					"action", "scm_pr_outcome", "resource_id", task.Name, "outcome", "merge")
-				return ctrl.Result{}, r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: merge (already merged)")
-			}
-			l.Info("self-improve merge conflict; clearing writeback pending",
-				"action", "scm_selfimprove_conflict", "resource_id", task.Name)
-			// Swallow the clear error here: MergeConflict is a terminal re-triage
-			// signal; best-effort clear is acceptable and avoids a backoff loop.
-			_ = r.clearWritebackPending(ctx, task, "MergeConflict", "merge conflict; left for re-triage")
-			return ctrl.Result{}, nil
-		}
+		l.Info("self-improve merge deferred to native auto-merge", "action", "scm_merge_deferred", "resource_id", task.Name)
+		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: merge (deferred to auto-merge)")
 	default:
-		err = fmt.Errorf("unknown pr outcome %q", out.Action)
+		return ctrl.Result{}, fmt.Errorf("writeback selfImprove: unknown pr outcome %q", out.Action)
 	}
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("writeback selfImprove: %w", err)
-	}
-	l.Info("self-improve outcome applied", "action", "scm_pr_outcome", "resource_id", task.Name, "outcome", out.Action)
-	return ctrl.Result{}, r.clearWritebackPending(ctx, task, "PROutcomeApplied", "pr outcome applied: "+out.Action)
 }
 
 // writeBackIssue applies a triageIssue Task's IssueOutcome: close calls

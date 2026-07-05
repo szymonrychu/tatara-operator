@@ -635,7 +635,7 @@ func TestBrainstormOutcomeRejectsNonBrainstormTask(t *testing.T) {
 
 func TestChangeSummary_WritesAllFields(t *testing.T) {
 	r := buildRouter(t, task("t1", "alpha"))
-	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"Implements login flow","deliveredScope":"login endpoint","remainingScope":"logout endpoint"}`)
+	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"Implements login flow","deliveredScope":"login endpoint","remainingScope":"logout endpoint","changeSignificance":"minor"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -648,11 +648,12 @@ func TestChangeSummary_WritesAllFields(t *testing.T) {
 	require.Equal(t, "Implements login flow", out.Status.ChangeSummary.PRBody)
 	require.Equal(t, "login endpoint", out.Status.ChangeSummary.DeliveredScope)
 	require.Equal(t, "logout endpoint", out.Status.ChangeSummary.RemainingScope)
+	require.Equal(t, "minor", out.Status.ChangeSummary.Significance)
 }
 
 func TestChangeSummary_WritesWithoutRemainingScope(t *testing.T) {
 	r := buildRouter(t, task("t2", "alpha"))
-	body := strings.NewReader(`{"prTitle":"fix: close bug","prBody":"Fixes bug","deliveredScope":"bug fixed"}`)
+	body := strings.NewReader(`{"prTitle":"fix: close bug","prBody":"Fixes bug","deliveredScope":"bug fixed","changeSignificance":"patch"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t2/change-summary", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -663,15 +664,52 @@ func TestChangeSummary_WritesWithoutRemainingScope(t *testing.T) {
 	require.NotNil(t, out.Status.ChangeSummary)
 	require.Equal(t, "bug fixed", out.Status.ChangeSummary.DeliveredScope)
 	require.Equal(t, "", out.Status.ChangeSummary.RemainingScope)
+	require.Equal(t, "patch", out.Status.ChangeSummary.Significance)
 }
 
 func TestChangeSummary_TaskNotFound(t *testing.T) {
 	r := buildRouter(t)
-	body := strings.NewReader(`{"prTitle":"fix(auth): login broken on OIDC redirect","prBody":"y","deliveredScope":"z"}`)
+	body := strings.NewReader(`{"prTitle":"fix(auth): login broken on OIDC redirect","prBody":"y","deliveredScope":"z","changeSignificance":"patch"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/missing/change-summary", body)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusNotFound, w.Code)
+}
+
+// changeSignificance is REQUIRED (D2): a missing or out-of-enum value is a 400,
+// the belt-and-suspenders REST gate behind the cli's required MCP field.
+func TestChangeSummary_SignificanceRequired(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"b","deliveredScope":"s"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+}
+
+func TestChangeSummary_SignificanceInvalidRejected(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"b","deliveredScope":"s","changeSignificance":"breaking"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+}
+
+func TestChangeSummary_SignificanceMajorAccepted(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"))
+	body := strings.NewReader(`{"prTitle":"feat!: drop v1 API","prBody":"b","deliveredScope":"s","changeSignificance":"major"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ChangeSummary)
+	require.Equal(t, "major", out.Status.ChangeSummary.Significance)
 }
 
 func TestChangeSummary_InvalidBody(t *testing.T) {
@@ -781,7 +819,7 @@ func TestIssueOutcome_PlanFieldAccepted(t *testing.T) {
 
 func TestChangeSummary_MostProblematicAccepted(t *testing.T) {
 	r := buildRouter(t, task("t1", "alpha"))
-	body := strings.NewReader(`{"prTitle":"feat(auth): implement OAuth2 login flow","prBody":"body","deliveredScope":"login","mostProblematic":"token refresh"}`)
+	body := strings.NewReader(`{"prTitle":"feat(auth): implement OAuth2 login flow","prBody":"body","deliveredScope":"login","mostProblematic":"token refresh","changeSignificance":"minor"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

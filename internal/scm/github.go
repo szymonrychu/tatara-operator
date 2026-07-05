@@ -672,6 +672,33 @@ func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, m
 	return resp.SHA, nil
 }
 
+// EnableAutoMerge turns on GitHub native auto-merge for the PR at prURL, so the
+// forge merges it once the branch's required status checks pass. Requires the
+// repo to allow auto-merge and main to have a branch-protection rule with at
+// least one required check; otherwise GitHub returns an error (callers treat it
+// as non-fatal). repoURL is unused for GitHub (the PR node id is resolved from
+// prURL) but kept for interface symmetry with GitLab.
+func (c *GitHub) EnableAutoMerge(ctx context.Context, _, token, prURL, method string) error {
+	prID, err := c.ghResourceID(ctx, token, prURL)
+	if err != nil {
+		return fmt.Errorf("github: resolve pr node id: %w", err)
+	}
+	q := fmt.Sprintf(`mutation { enablePullRequestAutoMerge(input:{pullRequestId:%q, mergeMethod: %s}) { clientMutationId } }`,
+		prID, ghMergeMethod(method))
+	return c.ghGraphQL(ctx, token, q, nil, nil)
+}
+
+func ghMergeMethod(method string) string {
+	switch method {
+	case "merge":
+		return "MERGE"
+	case "rebase":
+		return "REBASE"
+	default:
+		return "SQUASH"
+	}
+}
+
 // ClosePR closes a PR (state=closed) and posts a comment with the reason.
 func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int, body string) error {
 	owner, repo, err := ghOwnerRepo(repoURL)

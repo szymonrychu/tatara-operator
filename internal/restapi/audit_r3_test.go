@@ -215,7 +215,7 @@ func TestPostComment_RecordsMetric(t *testing.T) {
 func TestChangeSummary_RecordsMetric(t *testing.T) {
 	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	r := buildRouterWithMetrics(t, m, task("tm8", "alpha"))
-	req := httptest.NewRequest(http.MethodPost, "/tasks/tm8/change-summary", strings.NewReader(`{"prTitle":"fix(scan): retry flaky push events on CI timeout","prBody":"y","deliveredScope":"z"}`))
+	req := httptest.NewRequest(http.MethodPost, "/tasks/tm8/change-summary", strings.NewReader(`{"prTitle":"fix(scan): retry flaky push events on CI timeout","prBody":"y","deliveredScope":"z","changeSignificance":"patch"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

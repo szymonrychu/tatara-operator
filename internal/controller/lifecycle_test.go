@@ -83,6 +83,12 @@ func (f *lifecycleFakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req
 
 func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
 func (f *lifecycleFakeSCMWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
+func (f *lifecycleFakeSCMWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (f *lifecycleFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
 
 // commentBodies returns the comment bodies posted to the given issueRef, in order.
 func (f *lifecycleFakeSCMWriter) commentBodies(issueRef string) []string {
@@ -1260,6 +1266,55 @@ func TestLifecycleImplement_ClosesIssueInPrimaryRepoMRBody(t *testing.T) {
 	wantCloses := "Closes #50"
 	if !strings.Contains(primaryBody, wantCloses) {
 		t.Errorf("primary repo MR body = %q, want to contain %q", primaryBody, wantCloses)
+	}
+}
+
+// TestLifecycleImplement_PushCDEligibleSuppressesCloses verifies that a push-CD
+// eligible task (declared change significance) does NOT append "Closes #N" to its
+// primary-repo MR body: native auto-merge would otherwise close the issue at
+// MERGE time, defeating D9's close-on-confirmed-apply intent and leaving the issue
+// wrongly closed on an apply-failure reroll. deploy-supervision owns the close.
+func TestLifecycleImplement_PushCDEligibleSuppressesCloses(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-closes-pushcd"
+	proj := "lc-cpc-proj"
+	primaryRepo := "lc-cpc-repo"
+	sec := "lc-cpc-sec"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#52",
+		URL: "https://github.com/o/r/issues/52", Number: 52,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, primaryRepo, sec, src)
+	task.Status.LifecycleState = "Implement"
+	task.Status.Phase = "Succeeded"
+	// Declared significance => pushCDEligible => deploy-supervision owns the close.
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{PRTitle: "feat: x", Significance: "minor"}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.openCalls) == 0 {
+		t.Fatal("expected OpenChange to be called")
+	}
+	if strings.Contains(fw.openCalls[0].body, "Closes #52") {
+		t.Errorf("push-CD eligible MR body must NOT contain 'Closes #52', got: %q", fw.openCalls[0].body)
 	}
 }
 

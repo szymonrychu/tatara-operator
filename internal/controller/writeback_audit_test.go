@@ -229,7 +229,9 @@ func TestWriteBackSelfImprove_GetPRStateCalledOnce(t *testing.T) {
 
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
-	require.True(t, fw.mergeCalled, "Merge must be called")
+	// push-CD: pr_outcome=merge defers to native auto-merge (no force-merge), but
+	// the authorship gate still fetches PR state exactly once (no double-fetch).
+	require.False(t, fw.mergeCalled, "Merge must NOT be called - deferred to native auto-merge")
 	require.Equal(t, 1, fw.getPRCalls, "GetPRState must be called exactly once (no double-fetch)")
 }
 

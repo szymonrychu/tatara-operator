@@ -156,6 +156,7 @@ func TestTaskTerminal(t *testing.T) {
 		{"phase failed", "Failed", "", true},
 		{"phase running", "Running", "", false},
 		{"phase planning", "Planning", "", false},
+		{"phase deploying non-terminal", "Deploying", "", false},
 		{"phase empty+ls done", "", "Done", true},
 		{"phase empty+ls stopped", "", "Stopped", true},
 		{"phase empty+ls parked", "", "Parked", true},
@@ -311,7 +312,7 @@ func TestImplementOutcomeDeepCopy(t *testing.T) {
 }
 
 func TestIsRecoverableGiveup(t *testing.T) {
-	rec := []string{"implement-failed", "maxIterations", "refused-no-explanation", "deadline"}
+	rec := []string{"implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout"}
 	for _, r := range rec {
 		if !v1alpha1.IsRecoverableGiveup(r) {
 			t.Errorf("%q should be recoverable", r)
@@ -322,5 +323,77 @@ func TestIsRecoverableGiveup(t *testing.T) {
 		if v1alpha1.IsRecoverableGiveup(r) {
 			t.Errorf("%q should NOT be recoverable", r)
 		}
+	}
+}
+
+// TestDeployingPhaseAndPredicate covers the push-CD Deploying phase: the const,
+// the TaskDeploying predicate, and that Deploying is non-terminal (a Task in
+// Deploying is alive-but-podless, not finished).
+func TestDeployingPhaseAndPredicate(t *testing.T) {
+	if v1alpha1.PhaseDeploying != "Deploying" {
+		t.Fatalf("PhaseDeploying = %q, want Deploying", v1alpha1.PhaseDeploying)
+	}
+	deploying := &v1alpha1.Task{Status: v1alpha1.TaskStatus{Phase: v1alpha1.PhaseDeploying}}
+	if !v1alpha1.TaskDeploying(deploying) {
+		t.Fatal("TaskDeploying(Deploying) = false, want true")
+	}
+	if v1alpha1.TaskTerminal(deploying) {
+		t.Fatal("Deploying must be non-terminal")
+	}
+	running := &v1alpha1.Task{Status: v1alpha1.TaskStatus{Phase: v1alpha1.PhaseRunning}}
+	if v1alpha1.TaskDeploying(running) {
+		t.Fatal("TaskDeploying(Running) = true, want false")
+	}
+}
+
+// TestChangeSummarySignificance verifies the new Significance field round-trips
+// through DeepCopy independently of the original.
+func TestChangeSummarySignificance(t *testing.T) {
+	task := &v1alpha1.Task{
+		Status: v1alpha1.TaskStatus{
+			ChangeSummary: &v1alpha1.ChangeSummary{PRTitle: "feat: x", Significance: "minor"},
+		},
+	}
+	cp := task.DeepCopy()
+	if cp.Status.ChangeSummary == task.Status.ChangeSummary {
+		t.Fatal("ChangeSummary must be a distinct pointer after DeepCopy")
+	}
+	if cp.Status.ChangeSummary.Significance != "minor" {
+		t.Fatalf("Significance = %q, want minor", cp.Status.ChangeSummary.Significance)
+	}
+	cp.Status.ChangeSummary.Significance = "major"
+	if task.Status.ChangeSummary.Significance == "major" {
+		t.Fatal("mutating copy mutated original")
+	}
+}
+
+// TestDeploySupervisionStatusFields verifies the deploy-supervision status fields
+// set and round-trip through DeepCopy without loss or aliasing.
+func TestDeploySupervisionStatusFields(t *testing.T) {
+	deadline := metav1.Now()
+	task := &v1alpha1.Task{
+		Status: v1alpha1.TaskStatus{
+			Phase:           v1alpha1.PhaseDeploying,
+			DeployDeadline:  &deadline,
+			CascadeStage:    "parent-pr-open",
+			DeployedVersion: "v1.4.0",
+			DeployArtifact:  "tatara-operator@v1.4.0",
+		},
+	}
+	cp := task.DeepCopy()
+	if cp.Status.DeployDeadline == task.Status.DeployDeadline {
+		t.Fatal("DeployDeadline must be a distinct pointer after DeepCopy")
+	}
+	if cp.Status.DeployDeadline == nil || !cp.Status.DeployDeadline.Time.Equal(deadline.Time) {
+		t.Fatal("DeployDeadline mismatch after DeepCopy")
+	}
+	if cp.Status.CascadeStage != "parent-pr-open" {
+		t.Fatalf("CascadeStage = %q", cp.Status.CascadeStage)
+	}
+	if cp.Status.DeployedVersion != "v1.4.0" {
+		t.Fatalf("DeployedVersion = %q", cp.Status.DeployedVersion)
+	}
+	if cp.Status.DeployArtifact != "tatara-operator@v1.4.0" {
+		t.Fatalf("DeployArtifact = %q", cp.Status.DeployArtifact)
 	}
 }

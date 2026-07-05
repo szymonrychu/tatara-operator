@@ -68,6 +68,11 @@ func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 	// 2-minute-ago time so next-fire is in the past.
 	past := metav1.NewTime(time.Now().Add(-2 * time.Minute))
 	proj.Status.LastBrainstorm = &past
+	// Stamp LastRefine to now (after the brainstorm due-base) so the refine
+	// pre-scan barrier (merged onto the brainstorm tick) is already satisfied
+	// this cycle; this test targets the budget gate, not the refine barrier.
+	now := metav1.Now()
+	proj.Status.LastRefine = &now
 	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
 		t.Fatalf("status update LastBrainstorm: %v", err)
 	}
