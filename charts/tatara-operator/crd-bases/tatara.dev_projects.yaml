@@ -5426,6 +5426,22 @@ spec:
                       The name is kept for CRD compatibility.
                     type: integer
                 type: object
+              deployBudgetSeconds:
+                default: 3300
+                description: |-
+                  DeployBudgetSeconds is the Deploying-phase deadline budget for a push-CD
+                  cascade along the LONGEST path to a tatara-helmfile apply (2 tag-cut hops,
+                  e.g. cli -> wrapper -> helmfile): 1.2x the summed per-stage p95 durations.
+                  On exceed, a Deploying Task parks recoverable with reason deploy-timeout.
+                type: integer
+              deploySingleHopBudgetSeconds:
+                default: 2100
+                description: |-
+                  DeploySingleHopBudgetSeconds is the tighter deadline budget for artifacts
+                  one hop from tatara-helmfile (operator, memory, ingester, chat): no
+                  intermediate parent rebuild. Deploy-supervision picks this over
+                  DeployBudgetSeconds for single-hop artifacts.
+                type: integer
               grafana:
                 description: |-
                   GrafanaSpec configures the optional per-project Grafana incident-response
@@ -5588,6 +5604,25 @@ spec:
                               entirely - this is an explicit opt-in sentinel, NOT a kubebuilder default, so
                               "unset" is never indistinguishable from an active value.
                             type: integer
+                        type: object
+                      cdScan:
+                        description: |-
+                          CDScan is the push-CD deploy-supervision backstop cron: it sweeps Deploying
+                          Tasks whose cascade has stalled past 1.5x the deploy budget with no live
+                          watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
+                          Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+                        properties:
+                          maxPerRepo:
+                            default: 1
+                            description: MaxPerRepo caps the number of in-progress
+                              Tasks per repo (one lane per repo).
+                            minimum: 1
+                            type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables this activity.
+                            pattern: ^$|^(\S+\s+){4}\S+$
+                            type: string
                         type: object
                       healthCheck:
                         description: |-
@@ -5886,6 +5921,11 @@ spec:
                     type: string
                 type: object
               lastBrainstorm:
+                format: date-time
+                type: string
+              lastCDScan:
+                description: LastCDScan is the last time the push-CD deploy-supervision
+                  backstop ran.
                 format: date-time
                 type: string
               lastHealthCheck:

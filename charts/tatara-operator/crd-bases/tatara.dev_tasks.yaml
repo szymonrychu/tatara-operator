@@ -221,6 +221,16 @@ spec:
                 - action
                 - reason
                 type: object
+              cascadeStage:
+                description: |-
+                  CascadeStage tracks how far this Task's artifact has propagated toward the
+                  terminal tatara-helmfile apply.
+                enum:
+                - tagged
+                - parent-pr-open
+                - parent-merged
+                - helmfile-applied
+                type: string
               changeSummary:
                 description: |-
                   ChangeSummary holds the scope report submitted by the agent at the end of an
@@ -235,6 +245,24 @@ spec:
                   prTitle:
                     type: string
                   remainingScope:
+                    type: string
+                  significance:
+                    description: |-
+                      Significance is the agent's declared change significance, the lever the
+                      push-CD cascade uses to cut the next semver tag (major resets minor+patch,
+                      minor resets patch, patch increments). REQUIRED on the change_summary MCP
+                      tool and re-validated at the REST /change-summary endpoint (D2): a compliant
+                      agent that summarizes its change cannot omit it. Enforcement lives at those
+                      two layers, NOT in writeback - writeBackOpenChange still opens the PR when
+                      this is empty (a change with no change_summary at all keeps the legacy
+                      close+Done path, pushCDEligible=false), but applySemverAutoMerge stamps the
+                      semver:<level> label and enables native auto-merge only when it is present.
+                      An empty value therefore opens an unlabeled, non-cascading PR (logged WARN
+                      at writeback so the legacy path stays visible).
+                    enum:
+                    - major
+                    - minor
+                    - patch
                     type: string
                 type: object
               conditions:
@@ -334,6 +362,23 @@ spec:
               deadlineAt:
                 format: date-time
                 type: string
+              deployArtifact:
+                description: |-
+                  DeployArtifact is the deploy-ledger artifact identity (repo@vX.Y.Z) this
+                  Task records, the key the apply-outcome sweep matches against applied pins.
+                type: string
+              deployDeadline:
+                description: |-
+                  DeployDeadline is the wall-clock deadline for the deploy cascade
+                  (now + Project deployBudgetSeconds, single-hop override applied per
+                  artifact). On exceed, the Task parks recoverable with reason deploy-timeout.
+                format: date-time
+                type: string
+              deployedVersion:
+                description: |-
+                  DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
+                  driving toward the cluster.
+                type: string
               discoveredIssues:
                 items:
                   type: string
@@ -412,6 +457,12 @@ spec:
               lifecycleIterations:
                 type: integer
               lifecycleState:
+                description: |-
+                  Deploying is the pod-less post-merge deploy-supervision lifecycle state: the
+                  issueLifecycle Task's PR auto-merged + main CI (incl. the release tag-cut +
+                  propagation) went green, and the operator now drives the push-CD cascade to a
+                  tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
+                  occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
                 enum:
                 - Triage
                 - Conversation
@@ -419,6 +470,7 @@ spec:
                 - MRCI
                 - Merge
                 - MainCI
+                - Deploying
                 - Done
                 - Stopped
                 - Parked
@@ -463,11 +515,13 @@ spec:
                   ever writes them (approval is now driven by the SCM conversation flow and
                   projected onto labels, not a Phase transition). They are removed here to
                   keep the CRD enum honest and prevent confusion with LifecycleState.
+                  Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
                 enum:
                 - Planning
                 - Running
                 - Succeeded
                 - Failed
+                - Deploying
                 type: string
               podName:
                 type: string

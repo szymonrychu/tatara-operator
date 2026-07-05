@@ -142,6 +142,10 @@ type SCMWriter interface {
 	RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error
 	Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error
 	Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error)
+	// EnableAutoMerge turns on the forge's native auto-merge for the PR/MR at
+	// prURL so it merges itself once required checks pass. Best-effort: a forge
+	// that disallows auto-merge returns an error callers treat as non-fatal.
+	EnableAutoMerge(ctx context.Context, repoURL, token, prURL, method string) error
 	ClosePR(ctx context.Context, repoURL, token string, number int, body string) error
 	AddBoardItem(ctx context.Context, token string, board BoardRef, itemURL string) error
 	SetBoardColumn(ctx context.Context, token string, board BoardRef, itemURL, column string) error
@@ -202,6 +206,36 @@ type SCMReader interface {
 // GitHub-compatible default). Both concrete readers implement it.
 type PRCommentLister interface {
 	ListPRComments(ctx context.Context, owner, repo string, number int) ([]IssueComment, error)
+}
+
+// WorkflowRun is one CI workflow run (GitHub Actions run / GitLab pipeline) used
+// by push-CD deploy-supervision to detect a tatara-helmfile apply outcome.
+type WorkflowRun struct {
+	HeadSHA    string
+	Status     string // queued | in_progress | completed (GitHub) | pending | running | success | failed (GitLab)
+	Conclusion string // success | failure | cancelled | ... ("" until completed)
+	HTMLURL    string
+	CreatedAt  time.Time
+}
+
+// DeployWatcher is an optional SCMReader capability used by push-CD
+// deploy-supervision to read the terminal tatara-helmfile repo's CD apply
+// pipeline and applied pin state. It is separate from SCMReader because only the
+// GitHub adapter implements it (the cd-release cascade is GitHub-only; the GitLab
+// "infrastructure" project is not part of it), and deploy-supervision degrades
+// gracefully when a reader does not satisfy it.
+type DeployWatcher interface {
+	// LatestWorkflowRun returns the most recent run of the named workflow file
+	// (e.g. "apply.yaml") on branch, or ok=false when none exist.
+	LatestWorkflowRun(ctx context.Context, owner, repo, workflowFile, branch string) (WorkflowRun, bool, error)
+	// GetFileContent returns the decoded UTF-8 content of path at ref (a commit SHA
+	// or branch name). A 404 (file absent at ref) returns ("", nil) so callers can
+	// probe a set of candidate pin files without erroring on the misses.
+	GetFileContent(ctx context.Context, owner, repo, path, ref string) (string, error)
+	// LatestSemverTag returns the highest vX.Y.Z (or X.Y.Z) tag on the repo, with
+	// ok=false when the repo carries no semver tag yet. Used to learn the version a
+	// merged component repo just cut before its pin is applied.
+	LatestSemverTag(ctx context.Context, owner, repo string) (string, bool, error)
 }
 
 // Client is the per-provider SCM adapter. M2 implements DetectAndVerify;

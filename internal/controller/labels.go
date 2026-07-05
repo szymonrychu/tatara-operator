@@ -75,6 +75,19 @@ func approverMentions(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 	return "cc: " + strings.Join(parts, " ") + " (for review)"
 }
 
+// semver:* labels mark a PR's declared change significance for the push-CD
+// cascade (cd-release keys the next tag off them). Additive palette, NOT phase
+// labels: they MUST stay out of managedPhaseLabels/activePhaseLabels so
+// setLifecycleLabel never strips them.
+const (
+	semverLabelMajor = "semver:major"
+	semverLabelMinor = "semver:minor"
+	semverLabelPatch = "semver:patch"
+)
+
+// semverLabel returns the managed label for a declared significance level.
+func semverLabel(significance string) string { return "semver:" + significance }
+
 // managedLabelColors maps each managed tatara label (resolving any custom names
 // from ScmSpec) to its hex color (6 digits, no '#'), for EnsureLabel.
 func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
@@ -88,6 +101,9 @@ func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
 		incidentLabel(s): "d73a4a", // incident - red
 		idea:             "c5def5", // idea - light blue
 		rej:              "5a5a5a", // rejected - dark gray
+		semverLabelMajor: "b60205", // semver major - red
+		semverLabelMinor: "d93f0b", // semver minor - orange
+		semverLabelPatch: "0e8a16", // semver patch - green
 	}
 }
 

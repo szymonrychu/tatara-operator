@@ -143,7 +143,7 @@ func TestSelfImproveWriteBackAuthorshipGate(t *testing.T) {
 		require.Equal(t, "AuthorshipWithheld", cond.Reason)
 	})
 
-	t.Run("merge proceeds when PR author is the bot", func(t *testing.T) {
+	t.Run("merge deferred to auto-merge when PR author is the bot", func(t *testing.T) {
 		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot"}}
 		r := newFullFakeReconciler(t, fw)
 		task := seedWritebackKindTask(t, "si-wb-merge-ok", "si-wb-proj-mo", "si-wb-repo-mo", "si-wb-scm-mo",
@@ -156,7 +156,14 @@ func TestSelfImproveWriteBackAuthorshipGate(t *testing.T) {
 
 		_, err := reconcileWriteback(t, r, task.Name)
 		require.NoError(t, err)
-		require.True(t, fw.mergeCalled, "Merge must proceed for a bot-authored PR")
+		// push-CD: bot-authored PR passes the authorship gate, but pr_outcome=merge
+		// no longer force-merges - native auto-merge owns the merge.
+		require.False(t, fw.mergeCalled, "Merge must NOT be called - deferred to native auto-merge")
+		var got tatarav1alpha1.Task
+		require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, "WritebackPending")
+		require.NotNil(t, cond)
+		require.Equal(t, "PROutcomeApplied", cond.Reason)
 	})
 
 	t.Run("close refused when PR author is not the bot", func(t *testing.T) {

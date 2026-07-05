@@ -183,6 +183,24 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return r.reconcileLifecycle(ctx, &task)
 	}
 
+	// Defensive: a pod-less Deploying Task must never drive an agent run. Only
+	// issueLifecycle enters Deploying (handled above), but guard the generic path
+	// so a Phase=Deploying Task of any kind is supervised, not re-spawned.
+	if tatarav1alpha1.TaskDeploying(&task) {
+		var project tatarav1alpha1.Project
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &project); err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, fmt.Errorf("get project: %w", err)
+		}
+		res, err := r.reconcileDeploying(ctx, &project, &task)
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+	}
+
 	if isTerminal(task.Status.Phase) {
 		// M5 write-back: if the task succeeded and SCMFor is set, open PR/MR.
 		if task.Status.Phase == "Succeeded" && r.SCMFor != nil {

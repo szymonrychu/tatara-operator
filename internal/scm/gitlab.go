@@ -628,6 +628,38 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 	return resp.MergeCommitSHA, nil
 }
 
+// EnableAutoMerge sets merge-when-pipeline-succeeds on the MR at mrURL, so GitLab
+// merges it once its pipeline passes. Best-effort: the endpoint can 405 when no
+// pipeline exists yet, which callers treat as non-fatal.
+func (c *GitLab) EnableAutoMerge(ctx context.Context, repoURL, token, mrURL, method string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	iid, err := glIIDFromURL(mrURL)
+	if err != nil {
+		return err
+	}
+	in := map[string]bool{"merge_when_pipeline_succeeds": true, "squash": method == "squash"}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(iid) + "/merge"
+	return glDo(ctx, c.base(), http.MethodPut, path, token, in, nil)
+}
+
+// glIIDFromURL parses the trailing iid out of a GitLab MR web URL
+// (.../merge_requests/5, with optional trailing slash or ?#fragment).
+func glIIDFromURL(mrURL string) (int, error) {
+	s := mrURL
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimRight(s, "/")
+	i := strings.LastIndex(s, "/")
+	if i < 0 || i+1 >= len(s) {
+		return 0, fmt.Errorf("gitlab: cannot parse iid from %q", mrURL)
+	}
+	return strconv.Atoi(s[i+1:])
+}
+
 // ClosePR closes an MR (state_event=close) and posts the reason as a note.
 func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int, body string) error {
 	proj, err := glProjectPath(repoURL)

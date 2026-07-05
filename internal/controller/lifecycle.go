@@ -661,6 +661,8 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMerge(ctx, &project, task) })
 	case "MainCI":
 		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMainCI(ctx, &project, task) })
+	case tatarav1alpha1.LifecycleStateDeploying:
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.reconcileDeploying(ctx, &project, task) })
 	case "Done", "Stopped", "Parked":
 		r.Metrics.ReconcileResult("Task", "success")
 		return ctrl.Result{}, nil
@@ -2437,6 +2439,14 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 
 	case "success":
+		// push-CD (D8): a change that declared its significance does not go terminal
+		// at merge. It enters the pod-less Deploying phase; the operator drives the
+		// deploy cascade to a tatara-helmfile apply (deploy_supervision.go), then
+		// closes the originating issue with the deployed version. A change with no
+		// declared significance (legacy / non-cascade) keeps the close+Done path.
+		if pushCDEligible(task) {
+			return r.enterDeploying(ctx, project, task, &repo, provider)
+		}
 		// Close the originating issue (idempotent: swallow 404 / already-closed).
 		if task.Spec.Source != nil && task.Spec.Source.IssueRef != "" && !task.Spec.Source.IsPR {
 			repoSlug, _, slugErr := repoSlugFromURL(repo.Spec.URL, provider)

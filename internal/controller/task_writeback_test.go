@@ -504,6 +504,15 @@ type fullFakeSCMWriter struct {
 	addLabelIssueRef string
 	addLabelLabel    string
 	addLabelErr      error
+	// EnsureLabel
+	ensureLabelCalled bool
+	ensureLabelName   string
+	ensureLabelColor  string
+	// EnableAutoMerge
+	autoMergeCalled bool
+	autoMergePRURL  string
+	autoMergeMethod string
+	autoMergeErr    error
 	// GetPRState
 	prState    scm.PRState
 	prStateErr error
@@ -554,6 +563,18 @@ func (f *fullFakeSCMWriter) AddLabel(_ context.Context, _, issueRef, label strin
 	f.addLabelIssueRef = issueRef
 	f.addLabelLabel = label
 	return f.addLabelErr
+}
+func (f *fullFakeSCMWriter) EnsureLabel(_ context.Context, _, _, name, color string) error {
+	f.ensureLabelCalled = true
+	f.ensureLabelName = name
+	f.ensureLabelColor = color
+	return nil
+}
+func (f *fullFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, prURL, method string) error {
+	f.autoMergeCalled = true
+	f.autoMergePRURL = prURL
+	f.autoMergeMethod = method
+	return f.autoMergeErr
 }
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr
@@ -788,10 +809,14 @@ func TestDoWriteBackKind(t *testing.T) {
 		_, err := reconcileWriteback(t, r, task.Name)
 		require.NoError(t, err)
 
-		require.True(t, fw.mergeCalled, "Merge must be called for afterApproval pr_outcome=merge")
+		// push-CD: pr_outcome=merge no longer force-merges; native auto-merge owns it.
+		require.False(t, fw.mergeCalled, "Merge must NOT be called - deferred to native auto-merge")
 		require.False(t, fw.closePRCalled, "ClosePR must NOT be called")
-		require.Equal(t, 12, fw.mergeNumber)
-		require.Equal(t, "squash", fw.mergeMethod)
+		var got tatarav1alpha1.Task
+		require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+		cond := findCond(got.Status.Conditions, "WritebackPending")
+		require.NotNil(t, cond)
+		require.Equal(t, "PROutcomeApplied", cond.Reason)
 	})
 
 	t.Run("selfImprove/merge autoMergeOnGreenCI success", func(t *testing.T) {
@@ -817,7 +842,8 @@ func TestDoWriteBackKind(t *testing.T) {
 		_, err := reconcileWriteback(t, r, task.Name)
 		require.NoError(t, err)
 
-		require.True(t, fw.mergeCalled, "Merge must be called when CI=success")
+		// push-CD: native auto-merge owns merging; pr_outcome=merge is deferred.
+		require.False(t, fw.mergeCalled, "Merge must NOT be called - deferred to native auto-merge")
 	})
 
 	t.Run("selfImprove/merge autoMergeOnGreenCI CI absent -> afterApproval", func(t *testing.T) {
@@ -843,8 +869,9 @@ func TestDoWriteBackKind(t *testing.T) {
 		_, err := reconcileWriteback(t, r, task.Name)
 		require.NoError(t, err)
 
-		// CI absent -> falls back to afterApproval which trusts pr_outcome=merge -> merges.
-		require.True(t, fw.mergeCalled, "CI absent falls back to afterApproval which trusts pr_outcome=merge")
+		// CI absent -> falls back to afterApproval (policy satisfied), then defers the
+		// merge to native auto-merge instead of force-merging (push-CD).
+		require.False(t, fw.mergeCalled, "merge deferred to native auto-merge even when policy is satisfied")
 	})
 
 	t.Run("selfImprove/close", func(t *testing.T) {
