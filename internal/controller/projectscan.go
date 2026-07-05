@@ -746,6 +746,8 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "scan: enqueue brainstorm event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
+		// Intentional: project-scoped tasks stamp unconditionally; no backlog/fast-refire coupling,
+		// unlike createScanTask which propagates errors for per-issue deferral.
 		return false, nil
 	}
 	if created {
@@ -774,6 +776,8 @@ func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tat
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "scan: enqueue healthCheck event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
+		// Intentional: project-scoped tasks stamp unconditionally; no backlog/fast-refire coupling,
+		// unlike createScanTask which propagates errors for per-issue deferral.
 		return false, nil
 	}
 	if created {
@@ -1189,10 +1193,12 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 }
 
 // issueScan lists open issues (per-repo + board) and enqueues QueuedEvents.
-// Returns (backlog, issueCache): backlog=true when all eligible issues were NOT
-// enqueued this cycle; issueCache holds the per-repo slices fetched this cycle
-// so recoverOrphans can reuse them without a second ListOpenIssues round-trip
-// per repo (finding 4).
+// Returns (backlog, issueCache): backlog=true only when a candidate's enqueue
+// transiently failed (a genuine retriable deferral warranting the 60s re-fire);
+// terminal skips (out-of-scope, dedup, bot-last-word, stale-reapable, no-human)
+// do NOT set it. issueCache holds the per-repo slices fetched this cycle so
+// recoverOrphans can reuse them without a second ListOpenIssues round-trip per
+// repo (finding 4).
 func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.CronActivity) (bool, map[string][]scm.IssueRef) {
 	l := log.FromContext(ctx)
 	start := time.Now()
@@ -1406,6 +1412,9 @@ func (r *ProjectReconciler) issueScanPickOne(
 				"action", "adopt_lifecycle", "resource_id", adopt.Name,
 				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
 			r.Metrics.ScanItem("issueScan", "adopt_error")
+			// Adopt failure (Task already exists, just not re-entered) deliberately does NOT defer:
+			// waiting for the next normal cycle is harmless and avoids a 60s loop on a
+			// persistently un-adoptable Task. Only enqueue failures (no Task yet) defer.
 			return false, nil
 		}
 		l.Info("issueScan: adopted existing lifecycle task (re-triage, no duplicate)",

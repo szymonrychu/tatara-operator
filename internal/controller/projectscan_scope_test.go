@@ -176,3 +176,29 @@ func TestMRScan_DefaultScope_ReviewsUnlabeledMR(t *testing.T) {
 		t.Fatal("unlabeled MR must still create a review Task when prReactionScope is empty (default behavior)")
 	}
 }
+
+// TestIssueScan_BotLastWord_NoBacklog: when the only issueScan candidate is
+// blocked by the bot-last-word gate (a terminal skip), the returned backlog must
+// be false. Before the fix, the old created<len(eligible) heuristic would have
+// returned backlog=true here (1 eligible, 0 created), freezing LastIssueScan.
+func TestIssueScan_BotLastWord_NoBacklog(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 10}}
+	proj, repo := seedScanProject(t, "issuescan-blw-nobacklog", cron)
+	repos := []tatarav1alpha1.Repository{*repo}
+	// Bot (tatara-bot) authored the most recent comment -> botHadLastWord fires -> skipped_bot_last_word.
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 1, Author: "human", UpdatedAt: time.Unix(100, 0)},
+		},
+		comments: []scm.IssueComment{
+			{Author: "tatara-bot", CreatedAt: time.Unix(200, 0)},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	if backlog {
+		t.Fatal("bot-last-word-only issueScan cycle must return backlog=false; got true (stamp will freeze)")
+	}
+}
