@@ -4,16 +4,14 @@ package refine
 import (
 	"fmt"
 	"strings"
+
+	"github.com/szymonrychu/tatara-operator/internal/promptguidance"
 )
 
 // toolingNoteGuidance is the same literal used in the controller package's
-// turnloop.go. Duplicated here to avoid an import cycle. Keep byte-identical.
-const toolingNoteGuidance = "\n\n## Tooling you needed\n" +
-	"If you used mise to install a CLI tool, runtime, or linter that was NOT already in the " +
-	"target repo's .mise.toml to do this analysis, add a '## Tooling' section to the issue you " +
-	"propose listing each tool (name@version + one-line why), so the implementation agent adds it " +
-	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
-	"you are proposing."
+// turnloop.go, sourced from the dependency-free internal/promptguidance leaf
+// package. Keep byte-identical.
+const toolingNoteGuidance = promptguidance.ToolingNoteGuidance
 
 // GoalProject returns a goal instructing a refine agent to groom the existing
 // issue backlog across the listed repos within the lookback window.

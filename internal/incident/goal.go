@@ -3,28 +3,21 @@
 // can import it without a cycle.
 package incident
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/szymonrychu/tatara-operator/internal/promptguidance"
+)
 
 // platformProblemGuidance is the same literal used in the controller package's
-// turnloop.go. Duplicated here to avoid an import cycle (incident is a leaf
-// package). Keep byte-identical; the test pins both via a shared substring.
-const platformProblemGuidance = "\n\n## Platform problems\n" +
-	"If you are BLOCKED by a platform or tooling failure - an MCP server returning an error " +
-	"(e.g. grafana 401/unreachable), missing access or credentials, a tatara tool failing, or a " +
-	"required dependency you cannot reach - call `report_internal_issue` with the concrete details " +
-	"(which tool, the exact error, what you were attempting). That self-report is the ONLY correct " +
-	"channel for platform/tooling failures: it raises operator telemetry and an alert. Do NOT open, " +
-	"propose, or comment on a tracker issue asking a human to fix the platform, and do NOT treat a " +
-	"blocked tool as a reason to file your normal output - report it and stop."
+// turnloop.go, both sourced from the dependency-free internal/promptguidance
+// leaf package (incident is itself a leaf package, so it imports rather than
+// duplicates). Keep byte-identical; the test pins both via a shared substring.
+const platformProblemGuidance = promptguidance.PlatformProblemGuidance
 
 // toolingNoteGuidance is the same literal used in the controller package's
-// turnloop.go. Duplicated here to avoid an import cycle. Keep byte-identical.
-const toolingNoteGuidance = "\n\n## Tooling you needed\n" +
-	"If you used mise to install a CLI tool, runtime, or linter that was NOT already in the " +
-	"target repo's .mise.toml to do this analysis, add a '## Tooling' section to the issue you " +
-	"propose listing each tool (name@version + one-line why), so the implementation agent adds it " +
-	"to the repo's .mise.toml. Do not file a separate issue for tooling; fold it into the issue " +
-	"you are proposing."
+// turnloop.go, sourced from internal/promptguidance. Keep byte-identical.
+const toolingNoteGuidance = promptguidance.ToolingNoteGuidance
 
 // GoalProject returns the turn-0 goal for a project-scoped incident Task fired
 // by a Grafana alert. The agent investigates live (read-only) via the Grafana
