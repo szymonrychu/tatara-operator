@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -13,6 +12,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/szymonrychu/tatara-operator/internal/slug"
 )
 
 // seqRetry is a backoff with enough steps for high-concurrency CAS loops.
@@ -45,23 +46,7 @@ func seqConfigMapName(project string) string {
 // Project names are themselves DNS-1123 object names, so this is near-identity in
 // practice; a counter collision between two distinct projects is not reachable.
 func sanitizeDNS1123(s string) string {
-	s = strings.ToLower(s)
-	var b strings.Builder
-	prevDash := false
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevDash = false
-		} else if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 53 {
-		out = strings.Trim(out[:53], "-")
-	}
-	return out
+	return slug.SanitizeDNS1123(s, 53)
 }
 
 // SeqSource allocates strictly-increasing int64 sequence numbers PER PROJECT,
