@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/slug"
 )
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
@@ -246,23 +247,7 @@ func StampPodName(task *tatarav1alpha1.Task, projectName, provider, repoRef stri
 // '-', trims leading/trailing '-', and caps the result at 63 chars (the DNS-1123
 // label limit Services require).
 func sanitizeDNS1123(s string) string {
-	s = strings.ToLower(s)
-	var b strings.Builder
-	prevDash := false
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevDash = false
-		} else if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 63 {
-		out = strings.Trim(out[:63], "-")
-	}
-	return out
+	return slug.SanitizeDNS1123(s, 63)
 }
 
 func podLabels(task *tatarav1alpha1.Task) map[string]string {
@@ -317,23 +302,7 @@ func secretEnv(name, secretName, key string) corev1.EnvVar {
 // '-', trims leading/trailing '-', and caps at 40 chars (trimmed again so a cut
 // never leaves a trailing '-').
 func slugifyTitle(s string) string {
-	s = strings.ToLower(s)
-	var b strings.Builder
-	prevDash := false
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevDash = false
-		} else if !prevDash {
-			b.WriteByte('-')
-			prevDash = true
-		}
-	}
-	out := strings.Trim(b.String(), "-")
-	if len(out) > 40 {
-		out = strings.Trim(out[:40], "-")
-	}
-	return out
+	return slug.SanitizeDNS1123(s, 40)
 }
 
 // branchKind maps a Task to a conventional branch prefix.
