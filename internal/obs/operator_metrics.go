@@ -60,6 +60,7 @@ type OperatorMetrics struct {
 	systemicGroupsLed         *prometheus.CounterVec
 	tokenBudgetUsedRatio      *prometheus.GaugeVec
 	admissionBlockedTotal     *prometheus.CounterVec
+	memoryGateBypassTotal     *prometheus.CounterVec
 	repositoryIngestFailing   *prometheus.GaugeVec
 	repositoryLastIngestTime  *prometheus.GaugeVec
 	reviewOutcomeTotal        *prometheus.CounterVec
@@ -359,6 +360,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_admission_blocked_total",
 			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling).",
 		}, []string{"project", "class", "kind", "reason"}),
+		// Infra-incident admission-gate exemptions (#236): an incident Task whose
+		// alert targets core memory/storage infra was admitted with the project
+		// memory stack not Ready, instead of being gated. A nonzero rate means
+		// the memory subsystem is degraded and self-heal is running through the
+		// deadlock-breaking bypass; worth alerting on.
+		memoryGateBypassTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_memory_gate_bypass_total",
+			Help: "Incident Tasks admitted past the project memory-readiness gate under the infra-incident exemption, by project and Task kind.",
+		}, []string{"project", "kind"}),
 		reviewOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_review_outcome_total",
 			Help: "Review tasks by verdict (approved|changes_requested), keyed by the model that ran the review.",
@@ -481,6 +491,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.systemicGroupsLed,
 		m.tokenBudgetUsedRatio,
 		m.admissionBlockedTotal,
+		m.memoryGateBypassTotal,
 		m.reviewOutcomeTotal,
 		m.reviewFindingsTotal,
 		m.implementCITotal,
@@ -1104,6 +1115,19 @@ func (m *OperatorMetrics) AdmissionBlocked(project, class, kind, reason string) 
 // reason) for test assertions.
 func (m *OperatorMetrics) AdmissionBlockedCounter(project, class, kind, reason string) prometheus.Counter {
 	return m.admissionBlockedTotal.WithLabelValues(project, class, kind, reason)
+}
+
+// MemoryGateBypass increments operator_memory_gate_bypass_total: an incident Task
+// targeting core infra was admitted past the memory-readiness gate (#236) while
+// the project memory stack was not Ready.
+func (m *OperatorMetrics) MemoryGateBypass(project, kind string) {
+	m.memoryGateBypassTotal.WithLabelValues(project, kind).Inc()
+}
+
+// MemoryGateBypassCounter returns the counter for (project, kind) for test
+// assertions.
+func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) prometheus.Counter {
+	return m.memoryGateBypassTotal.WithLabelValues(project, kind)
 }
 
 // SetAccountUsage sets tatara_account_usage_utilization for a usage window

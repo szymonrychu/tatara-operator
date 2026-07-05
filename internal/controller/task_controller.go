@@ -224,9 +224,22 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	}
 
 	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
-		l.Info("task gated: project memory not ready",
-			"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
-		return ctrl.Result{RequeueAfter: memGateRequeue}, nil
+		// Infra-incident exemption (#236): an incident Task investigating the
+		// core memory/storage infrastructure must NOT be gated on that same
+		// subsystem being Ready, or infra-outage self-heal deadlocks (the agent
+		// can never run to open/annotate an issue). Incident agents investigate
+		// live via Grafana and do not need the memory graph, so admit it. All
+		// other work keeps the gate.
+		if tatarav1alpha1.InfraIncidentExempt(task.Spec) {
+			l.Info("task memory gate bypassed for infra incident",
+				"action", "task_memory_gate_bypass", "resource_id", task.Name,
+				"project", project.Name, "alert_rule", task.Spec.AlertRule)
+			r.Metrics.MemoryGateBypass(project.Name, task.Spec.Kind)
+		} else {
+			l.Info("task gated: project memory not ready",
+				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
+			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
+		}
 	}
 
 	// RepositoryRef contract guard: repo-scoped kinds require a non-empty
@@ -440,7 +453,15 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 	if err != nil {
 		return false, err
 	}
-	pod := agent.BuildPod(project, repo, task, repos, project.Status.Memory.Endpoint, r.PodConfig)
+	// Memory endpoint is normally non-nil here (the readiness gate passed). It can
+	// be nil/degraded only on the infra-incident exemption path (#236), where an
+	// incident agent runs with the memory stack down; it investigates via Grafana
+	// and does not need memory, so an empty endpoint is acceptable.
+	memEndpoint := ""
+	if project.Status.Memory != nil {
+		memEndpoint = project.Status.Memory.Endpoint
+	}
+	pod := agent.BuildPod(project, repo, task, repos, memEndpoint, r.PodConfig)
 	existing := &corev1.Pod{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, existing)
 	switch {
