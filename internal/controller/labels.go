@@ -88,6 +88,34 @@ const (
 // semverLabel returns the managed label for a declared significance level.
 func semverLabel(significance string) string { return "semver:" + significance }
 
+// ensureSemverLabelColor ensures the semver:<level> label exists with its
+// managed color (idempotent EnsureLabel), records the SCM call, and logs any
+// failure non-fatally with the caller-supplied message and fields. Shared by
+// lifecycle Merge (ensureSemverLabelBeforeMerge) and writeback
+// (applySemverAutoMerge) so both drive one EnsureLabel path; neither moves the
+// call relative to its own provider gate. logKV carries each caller's existing
+// log fields verbatim (they intentionally differ and are not unified here).
+func (r *TaskReconciler) ensureSemverLabelColor(ctx context.Context, writer scm.SCMWriter, url, token, provider, label, color, logMsg string, logKV ...any) {
+	if eerr := writer.EnsureLabel(ctx, url, token, label, color); eerr != nil {
+		r.recordSCM(provider, "ensure_label", eerr)
+		log.FromContext(ctx).Error(eerr, logMsg, logKV...)
+	}
+}
+
+// addSemverLabelToPR adds the semver:<level> label to the PR (idempotent
+// AddLabel), records the SCM call, and logs a failure non-fatally with the
+// caller-supplied message and fields. Returns the AddLabel error so each caller
+// keeps its own post-failure behavior (lifecycle returns before its success
+// info log; writeback continues). Only ever invoked from a GitHub-scoped branch.
+func (r *TaskReconciler) addSemverLabelToPR(ctx context.Context, writer scm.SCMWriter, token, provider, prRef, label, logMsg string, logKV ...any) error {
+	aerr := writer.AddLabel(ctx, token, prRef, label)
+	r.recordSCM(provider, "add_label", aerr)
+	if aerr != nil {
+		log.FromContext(ctx).Error(aerr, logMsg, logKV...)
+	}
+	return aerr
+}
+
 // managedLabelColors maps each managed tatara label (resolving any custom names
 // from ScmSpec) to its hex color (6 digits, no '#'), for EnsureLabel.
 func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {

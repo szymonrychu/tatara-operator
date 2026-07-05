@@ -475,20 +475,15 @@ func (r *TaskReconciler) applySemverAutoMerge(ctx context.Context, proj *tatarav
 	l := log.FromContext(ctx)
 	label := semverLabel(cs.Significance)
 	color := managedLabelColors(proj.Spec.Scm)[label]
-	if eerr := writer.EnsureLabel(ctx, repo.Spec.URL, token, label, color); eerr != nil {
-		r.recordSCM(provider, "ensure_label", eerr)
-		l.Error(eerr, "writeback: ensure semver label (non-fatal)", "repo", repo.Name, "label", label)
-	}
+	r.ensureSemverLabelColor(ctx, writer, repo.Spec.URL, token, provider, label, color,
+		"writeback: ensure semver label (non-fatal)", "repo", repo.Name, "label", label)
 	if provider == "github" {
 		if slug, _, serr := repoSlugFromURL(repo.Spec.URL, provider); serr == nil {
 			if n := parsePRNumber(prURL); n > 0 {
 				prRef := fmt.Sprintf("%s#%d", slug, n)
-				aerr := writer.AddLabel(ctx, token, prRef, label)
-				r.recordSCM(provider, "add_label", aerr)
-				if aerr != nil {
-					l.Error(aerr, "writeback: add semver label (non-fatal)",
-						"repo", repo.Name, "pr_ref", prRef, "label", label)
-				}
+				_ = r.addSemverLabelToPR(ctx, writer, token, provider, prRef, label,
+					"writeback: add semver label (non-fatal)",
+					"repo", repo.Name, "pr_ref", prRef, "label", label)
 			}
 		}
 	}

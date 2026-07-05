@@ -195,17 +195,13 @@ func (r *TaskReconciler) ensureSemverLabelBeforeMerge(ctx context.Context, proj 
 	}
 	label := semverLabel(significance)
 	color := managedLabelColors(proj.Spec.Scm)[label]
-	if eerr := writer.EnsureLabel(ctx, repo.Spec.URL, token, label, color); eerr != nil {
-		r.recordSCM(provider, "ensure_label", eerr)
-		l.Error(eerr, "merge: ensure semver label (non-fatal)",
-			"action", "scm_merge_semver_label", "resource_id", repo.Name, "label", label)
-	}
+	r.ensureSemverLabelColor(ctx, writer, repo.Spec.URL, token, provider, label, color,
+		"merge: ensure semver label (non-fatal)",
+		"action", "scm_merge_semver_label", "resource_id", repo.Name, "label", label)
 	prRef := fmt.Sprintf("%s#%d", slug, number)
-	aerr := writer.AddLabel(ctx, token, prRef, label)
-	r.recordSCM(provider, "add_label", aerr)
-	if aerr != nil {
-		l.Error(aerr, "merge: add semver label (non-fatal)",
-			"action", "scm_merge_semver_label", "resource_id", repo.Name, "pr_ref", prRef, "label", label)
+	if aerr := r.addSemverLabelToPR(ctx, writer, token, provider, prRef, label,
+		"merge: add semver label (non-fatal)",
+		"action", "scm_merge_semver_label", "resource_id", repo.Name, "pr_ref", prRef, "label", label); aerr != nil {
 		return
 	}
 	l.Info("merge: semver label stamped before lifecycle merge",
