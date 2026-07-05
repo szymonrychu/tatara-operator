@@ -1314,148 +1314,11 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	systemicLeads := electSystemicLeads(cands)
 	created := 0
 	for _, c := range eligible {
-		key := fmt.Sprintf("%s#%d", c.repo, c.number)
-		if d, ok := systemicLeads[key]; ok && !d.isLead {
-			// Collapsed sibling: no implementation agent. Mark idempotently and skip.
-			if w, token, werr := r.scanWriter(ctx, proj); werr == nil {
-				if cerr := commentSiblingMarker(ctx, reader, w, token, c.repo, c.number, d.leadNumber); cerr != nil {
-					l.Error(cerr, "issueScan: systemic sibling marker comment", "action", "systemic_sibling_mark",
-						"resource_id", proj.Name, "issue", key, "lead", d.leadNumber)
-				}
-			}
-			r.Metrics.SystemicSiblingCollapsed(proj.Name)
-			r.Metrics.ScanItem("issueScan", "skipped_systemic_sibling")
-			l.Info("issueScan: collapsed systemic sibling (no separate agent)",
-				"action", "systemic_dedup", "resource_id", proj.Name,
-				"issue", key, "systemic_id", d.sid, "lead", d.leadNumber)
-			continue
-		}
-		repo, ok := r.matchRepoForSlug(repos, c.repo)
-		if !ok {
-			r.Metrics.ScanItem("issueScan", "skipped_norepo")
-			continue
-		}
-		// Adoption (B1): if an issueLifecycle Task already exists for this issue
-		// (Parked from a false refusal, or otherwise live), re-enter it to Triage
-		// instead of creating a duplicate. One Task per issue forever; the shared
-		// pod/branch is intentional. Done/Stopped Tasks are excluded by the helper
-		// so deliberately-closed issues still create fresh on new activity.
-		//
-		// Defect A gate: mirror findConvTaskToReactivate - only adopt when a HUMAN
-		// comment arrived after the task's LastActivityAt. This prevents the
-		// re-adoption loop where the same old comment (after CreationTimestamp but
-		// before LastActivityAt) re-triggers adoption every cron cycle on a Parked
-		// task. Fail-open (adopt) when LastActivityAt is nil (first adoption) or
-		// when the SCM reader/botLogin/owner-split is unavailable.
-		if adopt := hasLiveOrAdoptableTask(existing, c.repo, c.number); adopt != nil {
-			if adopt.Status.LastActivityAt != nil {
-				owner, name, cut := strings.Cut(c.repo, "/")
-				if cut && reader != nil && botLogin != "" &&
-					!humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, adopt.Status.LastActivityAt.Time) {
-					r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
-					l.Info("issueScan: skipped adoption, no human activity since last activity",
-						"action", "adopt_lifecycle", "resource_id", adopt.Name,
-						"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
-						"last_activity_at", adopt.Status.LastActivityAt.Time)
-					continue
-				}
-			}
-			if err := r.adoptLifecycleTask(ctx, proj, adopt); err != nil {
-				l.Error(err, "issueScan: adopt existing lifecycle task",
-					"action", "adopt_lifecycle", "resource_id", adopt.Name,
-					"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
-				r.Metrics.ScanItem("issueScan", "adopt_error")
-				continue
-			}
-			l.Info("issueScan: adopted existing lifecycle task (re-triage, no duplicate)",
-				"action", "adopt_lifecycle", "resource_id", adopt.Name,
-				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
-			r.Metrics.ScanItem("issueScan", "adopted")
-			continue
-		}
-		// Human-activity gate on fresh creation (issue #105): when the only
-		// matching Tasks are terminal and the issue has no managed phase label,
-		// the bot's own write-back advances updatedAt and isDeduped lets the
-		// candidate through, spawning a fresh Task every cron cycle on a dormant
-		// issue. Mirror the reactivation gate: create only when a HUMAN comment
-		// is newer than the last terminal Task. Fail open (create) when the
-		// author cannot be read, preserving current behavior on read errors.
-		if lt := lastTerminalNoLabelTask(c, existing, managed); lt != nil {
-			owner, name, cut := strings.Cut(c.repo, "/")
-			if cut && reader != nil && botLogin != "" &&
-				!humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, lt.CreationTimestamp.Time) {
-				r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
-				l.Info("issueScan: skipped fresh task creation, no human activity since last terminal task",
-					"action", "scan_issue", "resource_id", proj.Name,
-					"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
-					"last_terminal_task", lt.Name)
-				continue
-			}
-		}
-		// Bot-last-word backstop (issue #188): even when no terminal Task gates this
-		// candidate (e.g. the prior lifecycle Task was GC'd, so neither the adoption
-		// nor the fresh-creation gate above fires), do not spawn a fresh agent when
-		// tatara authored the most recent comment and no human has replied -
-		// re-triaging would only re-post and complete, looping every cron cycle. A
-		// human reply (a newer non-bot comment) clears the gate on the next scan.
-		if botHadLastWord(ctx, cc, c, botLogin) {
-			r.Metrics.ScanItem("issueScan", "skipped_bot_last_word")
-			l.Info("issueScan: skipped fresh task creation, bot had the last word (awaiting human reply)",
-				"action", "scan_issue", "resource_id", proj.Name,
-				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
-			continue
-		}
-		// Source-of-churn gate (token conservation, component 5): a bot-authored
-		// brainstorming proposal no human has engaged must not be re-triaged every
-		// scan cycle. The reaper (staleProposalDays) only closes it once it is ALSO
-		// stale; this stops the churn from the first cycle. Any human comment (zero
-		// `since` = ever) clears it. Fail-open when SCM/botLogin/owner-split is
-		// unavailable, matching botHadLastWord and the reactivation gate.
-		//
-		// A prior version also treated issue UpdatedAt-after-CreatedAt (with no
-		// comment) as human engagement, as a fallback for edits/reactions the SCM
-		// reader cannot see directly. That heuristic is author-blind: bot-side
-		// mutations bump UpdatedAt too (e.g. setLifecycleLabel reasserting the
-		// brainstorming label when a triage reverts to awaiting-approval, see
-		// lifecycle.go's "triage-await-approval" arm), so a proposal nobody
-		// touched could read as human-engaged and get re-triaged - the exact churn
-		// this gate exists to suppress. Comments are the only reader-visible
-		// signal that reliably distinguishes a human actor, so that is the whole
-		// gate now.
-		if isBotBrainstormProposal(c, brainstorming, approved, implementation, declined, botLogin) {
-			owner, name, cut := strings.Cut(c.repo, "/")
-			if cut && reader != nil && botLogin != "" &&
-				!humanBrainstormEngagement(ctx, cc, owner, name, c, botLogin) {
-				r.Metrics.ScanItem("issueScan", "skipped_brainstorm_no_human")
-				l.Info("issueScan: skipped fresh task creation, brainstorming proposal awaiting human engagement",
-					"action", "scan_issue", "resource_id", proj.Name,
-					"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
-				continue
-			}
-		}
-		if r.reapEligible(proj, scm.IssueRef{Repo: c.repo, Number: c.number, Author: c.author, Labels: c.labels, UpdatedAt: c.updatedAt, IsPR: c.isPR}, existing) {
-			r.Metrics.ScanItem("issueScan", "skipped_stale_reapable")
-			l.Info("issueScan: skipped fresh task creation, proposal stale+unengaged (reaper will close)",
-				"action", "scan_issue", "resource_id", proj.Name,
-				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
-			continue
-		}
-		goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
-		var sg *tatarav1alpha1.SystemicGroup
-		if d, ok := systemicLeads[key]; ok && d.isLead && len(d.sameRepoSiblings) > 0 {
-			sg = &tatarav1alpha1.SystemicGroup{SystemicID: d.sid, SameRepoSiblings: d.sameRepoSiblings, CrossRepo: d.crossRepo}
-			r.Metrics.SystemicGroupLed(proj.Name)
-			l.Info("issueScan: systemic group lead", "action", "systemic_dedup", "resource_id", proj.Name,
-				"issue", key, "systemic_id", d.sid, "same_repo_siblings", len(d.sameRepoSiblings), "cross_repo", len(d.crossRepo))
-		}
-		ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil, sg)
+		picked, err := r.issueScanPickOne(ctx, proj, reader, repos, existing, c, systemicLeads, managed, brainstorming, approved, implementation, declined, botLogin, cc)
 		if err != nil {
-			l.Error(err, "scan: enqueue issueScan event", "resource_id", proj.Name, "repo", repo.Name)
-			r.Metrics.ScanItem("issueScan", "create_error")
 			continue
 		}
-		if ok2 {
-			r.Metrics.ScanItem("issueScan", "picked")
+		if picked {
 			created++
 		}
 	}
@@ -1463,6 +1326,174 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
 	return created < len(eligible), issueCache
+}
+
+// issueScanPickOne runs the per-candidate decision body of issueScan for one
+// eligible candidate c: systemic-sibling collapse, repo match, adoption,
+// human-activity/bot-last-word/stale-reap gates, and task creation. Moved
+// verbatim out of issueScan's loop body - every original `continue` became an
+// explicit `return false, nil` at the same point (no gate reordered).
+// systemicLeads is precomputed once per issueScan cycle by electSystemicLeads
+// over the full (pre-dedup) candidate set and passed in unchanged, preserving
+// the 2026-06-23 pre-dedup scoping fix.
+func (r *ProjectReconciler) issueScanPickOne(
+	ctx context.Context,
+	proj *tatarav1alpha1.Project,
+	reader scm.SCMReader,
+	repos []tatarav1alpha1.Repository,
+	existing []tatarav1alpha1.Task,
+	c candidate,
+	systemicLeads map[string]systemicDecision,
+	managed []string,
+	brainstorming, approved, implementation, declined string,
+	botLogin string,
+	cc *issueCommentCache,
+) (bool, error) {
+	l := log.FromContext(ctx)
+	key := fmt.Sprintf("%s#%d", c.repo, c.number)
+	if d, ok := systemicLeads[key]; ok && !d.isLead {
+		// Collapsed sibling: no implementation agent. Mark idempotently and skip.
+		if w, token, werr := r.scanWriter(ctx, proj); werr == nil {
+			if cerr := commentSiblingMarker(ctx, reader, w, token, c.repo, c.number, d.leadNumber); cerr != nil {
+				l.Error(cerr, "issueScan: systemic sibling marker comment", "action", "systemic_sibling_mark",
+					"resource_id", proj.Name, "issue", key, "lead", d.leadNumber)
+			}
+		}
+		r.Metrics.SystemicSiblingCollapsed(proj.Name)
+		r.Metrics.ScanItem("issueScan", "skipped_systemic_sibling")
+		l.Info("issueScan: collapsed systemic sibling (no separate agent)",
+			"action", "systemic_dedup", "resource_id", proj.Name,
+			"issue", key, "systemic_id", d.sid, "lead", d.leadNumber)
+		return false, nil
+	}
+	repo, ok := r.matchRepoForSlug(repos, c.repo)
+	if !ok {
+		r.Metrics.ScanItem("issueScan", "skipped_norepo")
+		return false, nil
+	}
+	// Adoption (B1): if an issueLifecycle Task already exists for this issue
+	// (Parked from a false refusal, or otherwise live), re-enter it to Triage
+	// instead of creating a duplicate. One Task per issue forever; the shared
+	// pod/branch is intentional. Done/Stopped Tasks are excluded by the helper
+	// so deliberately-closed issues still create fresh on new activity.
+	//
+	// Defect A gate: mirror findConvTaskToReactivate - only adopt when a HUMAN
+	// comment arrived after the task's LastActivityAt. This prevents the
+	// re-adoption loop where the same old comment (after CreationTimestamp but
+	// before LastActivityAt) re-triggers adoption every cron cycle on a Parked
+	// task. Fail-open (adopt) when LastActivityAt is nil (first adoption) or
+	// when the SCM reader/botLogin/owner-split is unavailable.
+	if adopt := hasLiveOrAdoptableTask(existing, c.repo, c.number); adopt != nil {
+		if adopt.Status.LastActivityAt != nil {
+			owner, name, cut := strings.Cut(c.repo, "/")
+			if cut && reader != nil && botLogin != "" &&
+				!humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, adopt.Status.LastActivityAt.Time) {
+				r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
+				l.Info("issueScan: skipped adoption, no human activity since last activity",
+					"action", "adopt_lifecycle", "resource_id", adopt.Name,
+					"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
+					"last_activity_at", adopt.Status.LastActivityAt.Time)
+				return false, nil
+			}
+		}
+		if err := r.adoptLifecycleTask(ctx, proj, adopt); err != nil {
+			l.Error(err, "issueScan: adopt existing lifecycle task",
+				"action", "adopt_lifecycle", "resource_id", adopt.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			r.Metrics.ScanItem("issueScan", "adopt_error")
+			return false, nil
+		}
+		l.Info("issueScan: adopted existing lifecycle task (re-triage, no duplicate)",
+			"action", "adopt_lifecycle", "resource_id", adopt.Name,
+			"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+		r.Metrics.ScanItem("issueScan", "adopted")
+		return false, nil
+	}
+	// Human-activity gate on fresh creation (issue #105): when the only
+	// matching Tasks are terminal and the issue has no managed phase label,
+	// the bot's own write-back advances updatedAt and isDeduped lets the
+	// candidate through, spawning a fresh Task every cron cycle on a dormant
+	// issue. Mirror the reactivation gate: create only when a HUMAN comment
+	// is newer than the last terminal Task. Fail open (create) when the
+	// author cannot be read, preserving current behavior on read errors.
+	if lt := lastTerminalNoLabelTask(c, existing, managed); lt != nil {
+		owner, name, cut := strings.Cut(c.repo, "/")
+		if cut && reader != nil && botLogin != "" &&
+			!humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, lt.CreationTimestamp.Time) {
+			r.Metrics.ScanItem("issueScan", "skipped_no_human_activity")
+			l.Info("issueScan: skipped fresh task creation, no human activity since last terminal task",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
+				"last_terminal_task", lt.Name)
+			return false, nil
+		}
+	}
+	// Bot-last-word backstop (issue #188): even when no terminal Task gates this
+	// candidate (e.g. the prior lifecycle Task was GC'd, so neither the adoption
+	// nor the fresh-creation gate above fires), do not spawn a fresh agent when
+	// tatara authored the most recent comment and no human has replied -
+	// re-triaging would only re-post and complete, looping every cron cycle. A
+	// human reply (a newer non-bot comment) clears the gate on the next scan.
+	if botHadLastWord(ctx, cc, c, botLogin) {
+		r.Metrics.ScanItem("issueScan", "skipped_bot_last_word")
+		l.Info("issueScan: skipped fresh task creation, bot had the last word (awaiting human reply)",
+			"action", "scan_issue", "resource_id", proj.Name,
+			"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+		return false, nil
+	}
+	// Source-of-churn gate (token conservation, component 5): a bot-authored
+	// brainstorming proposal no human has engaged must not be re-triaged every
+	// scan cycle. The reaper (staleProposalDays) only closes it once it is ALSO
+	// stale; this stops the churn from the first cycle. Any human comment (zero
+	// `since` = ever) clears it. Fail-open when SCM/botLogin/owner-split is
+	// unavailable, matching botHadLastWord and the reactivation gate.
+	//
+	// A prior version also treated issue UpdatedAt-after-CreatedAt (with no
+	// comment) as human engagement, as a fallback for edits/reactions the SCM
+	// reader cannot see directly. That heuristic is author-blind: bot-side
+	// mutations bump UpdatedAt too (e.g. setLifecycleLabel reasserting the
+	// brainstorming label when a triage reverts to awaiting-approval, see
+	// lifecycle.go's "triage-await-approval" arm), so a proposal nobody
+	// touched could read as human-engaged and get re-triaged - the exact churn
+	// this gate exists to suppress. Comments are the only reader-visible
+	// signal that reliably distinguishes a human actor, so that is the whole
+	// gate now.
+	if isBotBrainstormProposal(c, brainstorming, approved, implementation, declined, botLogin) {
+		owner, name, cut := strings.Cut(c.repo, "/")
+		if cut && reader != nil && botLogin != "" &&
+			!humanBrainstormEngagement(ctx, cc, owner, name, c, botLogin) {
+			r.Metrics.ScanItem("issueScan", "skipped_brainstorm_no_human")
+			l.Info("issueScan: skipped fresh task creation, brainstorming proposal awaiting human engagement",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			return false, nil
+		}
+	}
+	if r.reapEligible(proj, scm.IssueRef{Repo: c.repo, Number: c.number, Author: c.author, Labels: c.labels, UpdatedAt: c.updatedAt, IsPR: c.isPR}, existing) {
+		r.Metrics.ScanItem("issueScan", "skipped_stale_reapable")
+		l.Info("issueScan: skipped fresh task creation, proposal stale+unengaged (reaper will close)",
+			"action", "scan_issue", "resource_id", proj.Name,
+			"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+		return false, nil
+	}
+	goal := fmt.Sprintf("Triage issue %s#%d", c.repo, c.number)
+	var sg *tatarav1alpha1.SystemicGroup
+	if d, ok := systemicLeads[key]; ok && d.isLead && len(d.sameRepoSiblings) > 0 {
+		sg = &tatarav1alpha1.SystemicGroup{SystemicID: d.sid, SameRepoSiblings: d.sameRepoSiblings, CrossRepo: d.crossRepo}
+		r.Metrics.SystemicGroupLed(proj.Name)
+		l.Info("issueScan: systemic group lead", "action", "systemic_dedup", "resource_id", proj.Name,
+			"issue", key, "systemic_id", d.sid, "same_repo_siblings", len(d.sameRepoSiblings), "cross_repo", len(d.crossRepo))
+	}
+	ok2, err := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "issueLifecycle", goal, nil, sg)
+	if err != nil {
+		l.Error(err, "scan: enqueue issueScan event", "resource_id", proj.Name, "repo", repo.Name)
+		r.Metrics.ScanItem("issueScan", "create_error")
+		return false, nil
+	}
+	if ok2 {
+		r.Metrics.ScanItem("issueScan", "picked")
+	}
+	return ok2, nil
 }
 
 // brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
@@ -1497,96 +1528,11 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
 
-	// Single pass: resolve slug, set primaryRepo, accumulate backlog, collect slugs.
-	// Issues are fetched once per repo (findings 4 & 5) and cached in issuesBySlug
-	// for reuse by buildRepoStateContext below. SetOpenProposals is refreshed for
-	// every repo queried so the per-repo gauge never goes stale.
-	//
-	// Cap source (P4, migration-safe): the proposal backlog is the MAX of the
-	// ledger count (proposalBacklogFromTasks over role:proposed entries) and the
-	// per-repo SCM-issue count. During the migration window some open proposals are
-	// ledgered (role:proposed) while others live only as SCM brainstorming issues;
-	// taking the max means the cap can only over-count (safe, throttles) and never
-	// under-count (which would silently flood). The SCM count must always run -
-	// gating it on a project-wide "any task has a ledger" flag was wrong: a Task
-	// with only a role:source seed has a ledger but contributes nothing to the
-	// proposal count, so that gate zeroed the SCM backlog and bypassed the cap.
-	issuesBySlug := make(map[string][]scm.IssueRef)
-	var primaryRepo *tatarav1alpha1.Repository
-	var slugs []string
-	ledgerTotal := proposalBacklogFromTasks(existing)
-	scmTotal := 0
-	scmAtCap := false
-	for i := range sortedRepos {
-		rp := &sortedRepos[i]
-		slug := repoSlug(rp)
-		if slug == "" {
-			continue
-		}
-		if primaryRepo == nil {
-			primaryRepo = rp
-		}
-		slugs = append(slugs, slug)
-		if scmAtCap {
-			// SCM backlog already at cap; skip the issue list for remaining repos
-			// (best-effort: their per-repo gauge keeps last cycle's value). Still
-			// collect slugs for the goal text.
-			continue
-		}
-		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
-		if err != nil {
-			continue
-		}
-		iss, err := reader.ListOpenIssues(ctx, owner, name)
-		if err != nil {
-			l.Info("brainstorm: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
-			continue
-		}
-		issuesBySlug[slug] = iss
-		backlog := proposalBacklogCount(iss, brainstormingLabel, legacyIdea)
-		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		scmTotal += backlog
-		if scmTotal >= maxProp {
-			scmAtCap = true
-		}
-	}
-	total := scmTotal
-	if ledgerTotal > total {
-		total = ledgerTotal
-	}
-	atCap := total >= maxProp
-	if primaryRepo == nil {
-		l.Info("brainstorm: no valid repos", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-		return
-	}
-	if atCap {
-		r.Metrics.ScanItem("brainstorm", "skipped_cap")
-		l.Info("brainstorm: project backlog at cap; skipping cycle",
-			"action", "scan_brainstorm", "resource_id", proj.Name, "total", total, "cap", maxProp)
-		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-		return
-	}
-
-	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
-	prsBySlug, prCIBySlug, mainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, "brainstorm")
-
-	// Build rich context from already-fetched data + bounded MR/main reads.
-	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
-
-	goal := brainstormGoalProject(slugs, issuesCtx, scmGuidance(proj))
-	created, err := r.createBrainstormTask(ctx, proj, goal, act.Sources)
-	if err != nil {
-		l.Error(err, "scan: enqueue brainstorm event", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-		return
-	}
-	if created {
-		r.Metrics.ScanItem("brainstorm", "picked")
-	}
-	r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
-	l.Info("brainstorm complete", "action", "scan_brainstorm", "resource_id", proj.Name,
-		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
+	// no-valid-repos is checked before at-cap here (2026-06-13 flooding-incident
+	// ordering); healthCheck checks the opposite order below.
+	r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos, existing,
+		brainstormingLabel, legacyIdea, maxProp, "brainstorm", "scan_brainstorm", start, act.Sources,
+		false, brainstormGoalProject, r.createBrainstormTask)
 }
 
 // healthCheck runs one project-health-check cycle at PROJECT scope: at most one
@@ -1622,12 +1568,51 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 
 	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
 
-	// Aggregate proposal backlog across all repos. Cap source (P4, migration-safe):
-	// MAX of the ledger count (proposalBacklogFromTasks) and the per-repo SCM-issue
-	// count - identical rule to brainstorm (see the brainstorm comment for why the
-	// project-wide ledger gate was wrong). Issues are fetched once per repo and
-	// cached in issuesBySlug for reuse by buildRepoStateContext below. The SCM count
-	// + SetOpenProposals always run so the gauge never goes stale.
+	// at-cap is checked before no-valid-repos here, opposite of brainstorm's
+	// order above; preserved verbatim (see runProjectScopedProposalCycle doc).
+	r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos, existing,
+		brainstormingLabel, legacyIdea, maxProp, "healthCheck", "scan_healthcheck", start, act.Sources,
+		true, healthCheckGoalProject, r.createHealthCheckTask)
+}
+
+// runProjectScopedProposalCycle runs the shared 90%-identical middle of
+// brainstorm() and healthCheck(): resolve per-repo slugs, accumulate the
+// proposal backlog (SCM issue count, capped by ledgerTotal via the caller),
+// gather CI state, build the rich repo-state context, build the activity goal
+// text, and create the scan task - emitting the same log fields and metric
+// calls both callers previously duplicated.
+//
+// Cap source (P4, migration-safe): the proposal backlog is the MAX of the
+// ledger count (proposalBacklogFromTasks over role:proposed entries) and the
+// per-repo SCM-issue count. During the migration window some open proposals are
+// ledgered (role:proposed) while others live only as SCM brainstorming issues;
+// taking the max means the cap can only over-count (safe, throttles) and never
+// under-count (which would silently flood). The SCM count must always run -
+// gating it on a project-wide "any task has a ledger" flag was wrong: a Task
+// with only a role:source seed has a ledger but contributes nothing to the
+// proposal count, so that gate zeroed the SCM backlog and bypassed the cap.
+//
+// The two post-loop early-return guards (no-valid-repos / at-cap) are checked
+// in checkCapFirst order: brainstorm checks no-valid-repos first, healthCheck
+// checks at-cap first. This order is preserved verbatim per caller (do not let
+// this helper pick a single order - it touches the 2026-06-13 flooding-
+// incident path).
+func (r *ProjectReconciler) runProjectScopedProposalCycle(
+	ctx context.Context,
+	proj *tatarav1alpha1.Project,
+	reader scm.SCMReader,
+	sortedRepos []tatarav1alpha1.Repository,
+	existing []tatarav1alpha1.Task,
+	brainstormingLabel, legacyIdea string,
+	maxProp int,
+	activityLabel, scanAction string,
+	start time.Time,
+	sources []string,
+	checkCapFirst bool,
+	goalBuilder func(slugs []string, repoStateCtx, guidance string) string,
+	taskCreator func(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (bool, error),
+) {
+	l := log.FromContext(ctx)
 	issuesBySlug := make(map[string][]scm.IssueRef)
 	ledgerTotal := proposalBacklogFromTasks(existing)
 	scmTotal := 0
@@ -1641,6 +1626,9 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		}
 		slugs = append(slugs, slug)
 		if scmAtCap {
+			// SCM backlog already at cap; skip the issue list for remaining repos
+			// (best-effort: their per-repo gauge keeps last cycle's value). Still
+			// collect slugs for the goal text.
 			continue
 		}
 		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
@@ -1649,7 +1637,7 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 		}
 		iss, err := reader.ListOpenIssues(ctx, owner, name)
 		if err != nil {
-			l.Info("healthCheck: backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
+			l.Info(activityLabel+": backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
 		}
 		issuesBySlug[slug] = iss
@@ -1664,38 +1652,62 @@ func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha
 	if ledgerTotal > total {
 		total = ledgerTotal
 	}
-	if total >= maxProp {
-		r.Metrics.ScanItem("healthCheck", "skipped_cap")
-		l.Info("healthCheck: project backlog at cap; skipping cycle",
-			"action", "scan_healthcheck", "resource_id", proj.Name, "total", total, "cap", maxProp)
-		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-		return
+	atCap := total >= maxProp
+	noValidRepos := len(slugs) == 0
+
+	noValidReposGuard := func() bool {
+		if !noValidRepos {
+			return false
+		}
+		l.Info(activityLabel+": no valid repos", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
+		return true
+	}
+	atCapGuard := func() bool {
+		if !atCap {
+			return false
+		}
+		r.Metrics.ScanItem(activityLabel, "skipped_cap")
+		l.Info(activityLabel+": project backlog at cap; skipping cycle",
+			"action", scanAction, "resource_id", proj.Name, "total", total, "cap", maxProp)
+		r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
+		return true
 	}
 
-	if len(slugs) == 0 {
-		l.Info("healthCheck: no valid repos", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-		return
+	if checkCapFirst {
+		if atCapGuard() {
+			return
+		}
+		if noValidReposGuard() {
+			return
+		}
+	} else {
+		if noValidReposGuard() {
+			return
+		}
+		if atCapGuard() {
+			return
+		}
 	}
 
 	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
-	hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, "healthCheck")
+	prsBySlug, prCIBySlug, mainCIBySlug := r.gatherRepoCIState(ctx, proj, reader, sortedRepos, activityLabel)
 
 	// Build rich context from already-fetched data + bounded MR/main reads.
-	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, hcPRsBySlug, hcPRCIBySlug, hcMainCIBySlug, sortedRepos)
+	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
-	goal := healthCheckGoalProject(slugs, issuesCtx, scmGuidance(proj))
-	created, err := r.createHealthCheckTask(ctx, proj, goal, act.Sources)
+	goal := goalBuilder(slugs, issuesCtx, scmGuidance(proj))
+	created, err := taskCreator(ctx, proj, goal, sources)
 	if err != nil {
-		l.Error(err, "scan: enqueue healthCheck event", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
+		l.Error(err, "scan: enqueue "+activityLabel+" event", "resource_id", proj.Name)
+		r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
 		return
 	}
 	if created {
-		r.Metrics.ScanItem("healthCheck", "picked")
+		r.Metrics.ScanItem(activityLabel, "picked")
 	}
-	r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-	l.Info("healthCheck complete", "action", "scan_healthcheck", "resource_id", proj.Name,
+	r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
+	l.Info(activityLabel+" complete", "action", scanAction, "resource_id", proj.Name,
 		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
 }
 
