@@ -421,19 +421,19 @@ func (c *GitLab) EnsureLabel(ctx context.Context, repoURL, token, name, color st
 		return err
 	}
 	hexColor := "#" + color
-	err = glDo(ctx, c.base(), http.MethodPost,
-		"/projects/"+url.PathEscape(proj)+"/labels", token,
-		map[string]string{"name": name, "color": hexColor}, nil)
-	if err == nil {
-		return nil
-	}
-	var he *HTTPError
-	if errors.As(err, &he) && he.Status == http.StatusConflict {
-		return glDo(ctx, c.base(), http.MethodPut,
-			"/projects/"+url.PathEscape(proj)+"/labels/"+url.PathEscape(name), token,
-			map[string]string{"color": hexColor}, nil)
-	}
-	return err
+	return createOrUpdateOnConflict(
+		func() error {
+			return glDo(ctx, c.base(), http.MethodPost,
+				"/projects/"+url.PathEscape(proj)+"/labels", token,
+				map[string]string{"name": name, "color": hexColor}, nil)
+		},
+		http.StatusConflict,
+		func() error {
+			return glDo(ctx, c.base(), http.MethodPut,
+				"/projects/"+url.PathEscape(proj)+"/labels/"+url.PathEscape(name), token,
+				map[string]string{"color": hexColor}, nil)
+		},
+	)
 }
 
 // RemoveLabel removes a label from an issue identified by group/proj#iid.

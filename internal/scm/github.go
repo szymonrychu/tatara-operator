@@ -519,19 +519,19 @@ func (c *GitHub) EnsureLabel(ctx context.Context, repoURL, token, name, color st
 	if err != nil {
 		return err
 	}
-	err = ghDo(ctx, c.base(), http.MethodPost,
-		fmt.Sprintf("/repos/%s/%s/labels", owner, repo), token,
-		map[string]string{"name": name, "color": color}, nil)
-	if err == nil {
-		return nil
-	}
-	var he *HTTPError
-	if errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity {
-		return ghDo(ctx, c.base(), http.MethodPatch,
-			fmt.Sprintf("/repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name)), token,
-			map[string]string{"color": color}, nil)
-	}
-	return err
+	return createOrUpdateOnConflict(
+		func() error {
+			return ghDo(ctx, c.base(), http.MethodPost,
+				fmt.Sprintf("/repos/%s/%s/labels", owner, repo), token,
+				map[string]string{"name": name, "color": color}, nil)
+		},
+		http.StatusUnprocessableEntity,
+		func() error {
+			return ghDo(ctx, c.base(), http.MethodPatch,
+				fmt.Sprintf("/repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name)), token,
+				map[string]string{"color": color}, nil)
+		},
+	)
 }
 
 // ghCheckRun is the decoded shape of one GitHub check-run entry.

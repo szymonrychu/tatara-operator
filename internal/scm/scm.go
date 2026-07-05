@@ -264,6 +264,23 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("scm: %s -> %d: %s", e.Path, e.Status, body)
 }
 
+// createOrUpdateOnConflict runs create; if create fails with an *HTTPError
+// whose Status equals conflictStatus, it runs update instead and returns its
+// result. Any other create error, or any update error, is returned as-is.
+// Path/color/body construction stays in each provider's create/update
+// closures - do not fold that in here.
+func createOrUpdateOnConflict(create func() error, conflictStatus int, update func() error) error {
+	err := create()
+	if err == nil {
+		return nil
+	}
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == conflictStatus {
+		return update()
+	}
+	return err
+}
+
 // ErrorStatus classifies an SCM error into a metrics label: the HTTP status code
 // (e.g. "401", "403", "429", "500") when the call reached the server and got a
 // non-2xx, or "network" for connect/DNS/timeout failures that never got a reply.
