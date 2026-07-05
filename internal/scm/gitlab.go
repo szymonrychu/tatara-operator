@@ -317,30 +317,10 @@ func glDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 
 // glDoWithHeaders performs a single GET and returns (X-Next-Page header, error).
 func glDoWithHeaders(ctx context.Context, base, path, token string, out any) (nextPage string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
-	if err != nil {
-		return "", fmt.Errorf("gitlab: build request: %w", err)
-	}
-	req.Header.Set("PRIVATE-TOKEN", token)
-	req.Header.Set("Accept", "application/json")
-	resp, err := scmHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("gitlab: do request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	next := resp.Header.Get("X-Next-Page")
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
-	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-			return "", fmt.Errorf("gitlab: decode response: %w", err)
-		}
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
-	}
-	return next, nil
+	return doPagedGET(ctx, base+path, "gitlab", path, map[string]string{
+		"PRIVATE-TOKEN": token,
+		"Accept":        "application/json",
+	}, "X-Next-Page", out)
 }
 
 func glDo(ctx context.Context, base, method, path, token string, in, out any) error {

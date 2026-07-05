@@ -280,30 +280,10 @@ func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 
 // ghDoWithHeaders performs a single GET, decodes JSON body into out, and returns the Link header.
 func ghDoWithHeaders(ctx context.Context, fullURL, token string, out any) (linkHeader string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("github: build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := scmHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("github: do request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	link := resp.Header.Get("Link")
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: fullURL}
-	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-			return "", fmt.Errorf("github: decode response: %w", err)
-		}
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
-	}
-	return link, nil
+	return doPagedGET(ctx, fullURL, "github", fullURL, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Accept":        "application/vnd.github+json",
+	}, "Link", out)
 }
 
 // ghMaxRetries bounds in-process retries of a rate-limited write request.
