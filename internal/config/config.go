@@ -129,6 +129,12 @@ type Config struct {
 	// Defaults to DefaultTaskRetention and is clamped up to MinTaskRetention so GC
 	// can never delete a Task that still anchors a dedup/cooldown window.
 	TaskRetention time.Duration
+	// IdlePodReapAfter is how long an agent pod may sit with no live turn before
+	// the reaper deletes it as a leaked wrapper (issue #237). Loaded from
+	// IDLE_POD_REAP_MINUTES as an integer minute count. Defaults to
+	// DefaultIdlePodReap and is clamped up to MinIdlePodReap when positive; a
+	// zero/negative value disables the idle backstop.
+	IdlePodReapAfter time.Duration
 	// SerenaURL, when non-empty, is the in-cluster URL of the Serena
 	// code-intelligence MCP server. Read from TATARA_SERENA_URL. Empty by default
 	// (Phase 1: code path wired, no server deployed). Passed through to PodConfig
@@ -228,6 +234,24 @@ const DefaultConversationRetention = 72 * time.Hour
 // aggressively short retention. TaskRetention is clamped up to this in Load.
 const MinTaskRetention = 2 * time.Hour
 
+// DefaultIdlePodReap is the default age past which the reaper deletes an agent
+// pod that holds no live turn (issue #237). A wrapper whose turn timed out or
+// completed parks idle in epoll waiting for the next PTY input; if the operator
+// never submits a next turn or tears it down (e.g. a memory outage traps the
+// lifecycle reconcile in the spawn gate), the pod leaks a Task slot + node
+// resources for hours. 30m comfortably exceeds any healthy between-turn gap
+// (turns are submitted back-to-back within a reconcile cycle), so only a wedged
+// pod is ever reaped. Conversation persistence lets a still-live Task re-spawn a
+// fresh pod and resume, so reaping is safe.
+const DefaultIdlePodReap = 30 * time.Minute
+
+// MinIdlePodReap is the hard lower bound on IdlePodReapAfter. It keeps a
+// misconfigured short value from reaping a pod in the brief window between a
+// turn completing and the reconcile submitting the next turn. A positive
+// IdlePodReapAfter below this floor is clamped up to it in Load; zero disables
+// the idle backstop entirely.
+const MinIdlePodReap = 5 * time.Minute
+
 func getDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -259,6 +283,20 @@ func getHoursDefault(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("config: %s=%q is not a valid integer hours: %w", key, v, err)
 	}
 	return time.Duration(n) * time.Hour, nil
+}
+
+// getMinutesDefault parses key as an integer number of minutes into a Duration,
+// returning def when unset and an error when present but not a valid integer.
+func getMinutesDefault(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s=%q is not a valid integer minutes: %w", key, v, err)
+	}
+	return time.Duration(n) * time.Minute, nil
 }
 
 // getCSVList parses key as a comma-separated list, trimming whitespace and
@@ -377,6 +415,16 @@ func Load() (Config, error) {
 	if taskRetention < MinTaskRetention {
 		taskRetention = MinTaskRetention
 	}
+	idlePodReapAfter, err := getMinutesDefault("IDLE_POD_REAP_MINUTES", DefaultIdlePodReap)
+	if err != nil {
+		return Config{}, err
+	}
+	// Clamp up a positive value to the floor so a short misconfiguration cannot
+	// reap a pod in the brief between-turns window (see MinIdlePodReap). A
+	// zero/negative value disables the idle backstop and is left as-is.
+	if idlePodReapAfter > 0 && idlePodReapAfter < MinIdlePodReap {
+		idlePodReapAfter = MinIdlePodReap
+	}
 	agentRunAsNonRoot, err := getBoolDefault("AGENT_RUN_AS_NON_ROOT", false)
 	if err != nil {
 		return Config{}, err
@@ -481,6 +529,7 @@ func Load() (Config, error) {
 		PushMetricsTTL:             pushMetricsTTL,
 		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
 		TaskRetention:              taskRetention,
+		IdlePodReapAfter:           idlePodReapAfter,
 		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 		SerenaURL:                  os.Getenv("TATARA_SERENA_URL"),

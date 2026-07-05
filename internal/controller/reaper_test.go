@@ -149,6 +149,113 @@ func TestReapOrphans_LiveTaskKept(t *testing.T) {
 	}
 }
 
+// setTaskAnns sets metadata annotations on the named Task (a metadata Update,
+// separate from the status subresource).
+func setTaskAnns(t *testing.T, name string, anns map[string]string) {
+	t.Helper()
+	tk := getTask(t, name)
+	if tk.Annotations == nil {
+		tk.Annotations = map[string]string{}
+	}
+	for k, v := range anns {
+		tk.Annotations[k] = v
+	}
+	if err := k8sClient.Update(context.Background(), tk); err != nil {
+		t.Fatalf("set annotations %s: %v", name, err)
+	}
+}
+
+// idleReaperServer arms the issue #237 idle backstop: ReaperGrace tiny so a fresh
+// pod is eligible, and IdlePodReapAfter tiny so any pod with no live turn is past
+// the idle window immediately.
+func idleReaperServer() *CallbackServer {
+	s := reaperServer()
+	s.IdlePodReapAfter = time.Nanosecond
+	return s
+}
+
+// TestReapOrphans_IdleNoLiveTurn covers issue #237: a non-terminal Task whose
+// wrapper delivered its turn-complete callback (annCurrentTurn set,
+// annTurnComplete set => no in-flight turn) but was never torn down is reaped
+// once it has sat idle past IdlePodReapAfter.
+func TestReapOrphans_IdleNoLiveTurn(t *testing.T) {
+	mkTaskProject(t, "p-reap-idle", 3)
+	mkTaskRepository(t, "r-reap-idle", "p-reap-idle")
+	mkTask(t, "t-reap-idle", "p-reap-idle", "r-reap-idle")
+	setTaskPhase(t, "t-reap-idle", "Running")
+	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	setTaskAnns(t, "t-reap-idle", map[string]string{
+		annCurrentTurn:  "turn-1",
+		annTurnComplete: old,
+	})
+	mkWrapperPodSvc(t, "reap-idle", "t-reap-idle", string(getTask(t, "t-reap-idle").UID))
+
+	idleReaperServer().ReapOrphans(context.Background())
+	if podExists(t, "reap-idle") {
+		t.Error("expected idle pod with no live turn to be reaped")
+	}
+}
+
+// TestReapOrphans_InflightTurnKept is the safety counterpart: a Task with a turn
+// in flight (annCurrentTurn set, annTurnComplete empty) is owned by the
+// turn-timeout path, so the idle backstop must never reap it mid-turn even with
+// the idle window set to zero.
+func TestReapOrphans_InflightTurnKept(t *testing.T) {
+	mkTaskProject(t, "p-reap-inflight", 3)
+	mkTaskRepository(t, "r-reap-inflight", "p-reap-inflight")
+	mkTask(t, "t-reap-inflight", "p-reap-inflight", "r-reap-inflight")
+	setTaskPhase(t, "t-reap-inflight", "Running")
+	setTaskAnns(t, "t-reap-inflight", map[string]string{annCurrentTurn: "turn-1"})
+	mkWrapperPodSvc(t, "reap-inflight", "t-reap-inflight", string(getTask(t, "t-reap-inflight").UID))
+
+	idleReaperServer().ReapOrphans(context.Background())
+	if !podExists(t, "reap-inflight") {
+		t.Error("expected pod with in-flight turn to be kept")
+	}
+}
+
+// TestReapOrphans_RecentActivityKept verifies a pod whose last turn ended within
+// the idle window is kept (the healthy between-turns gap must not be reaped).
+func TestReapOrphans_RecentActivityKept(t *testing.T) {
+	mkTaskProject(t, "p-reap-recent", 3)
+	mkTaskRepository(t, "r-reap-recent", "p-reap-recent")
+	mkTask(t, "t-reap-recent", "p-reap-recent", "r-reap-recent")
+	setTaskPhase(t, "t-reap-recent", "Running")
+	now := time.Now().UTC().Format(time.RFC3339)
+	setTaskAnns(t, "t-reap-recent", map[string]string{
+		annCurrentTurn:  "turn-1",
+		annTurnComplete: now,
+	})
+	mkWrapperPodSvc(t, "reap-recent", "t-reap-recent", string(getTask(t, "t-reap-recent").UID))
+
+	srv := reaperServer()
+	srv.IdlePodReapAfter = time.Hour // fresh completion is well inside the window
+	srv.ReapOrphans(context.Background())
+	if !podExists(t, "reap-recent") {
+		t.Error("expected pod with recent turn activity to be kept")
+	}
+}
+
+// TestReapOrphans_IdleDisabled verifies IdlePodReapAfter=0 disables the idle
+// backstop: a long-idle pod on a non-terminal Task is left running.
+func TestReapOrphans_IdleDisabled(t *testing.T) {
+	mkTaskProject(t, "p-reap-idledis", 3)
+	mkTaskRepository(t, "r-reap-idledis", "p-reap-idledis")
+	mkTask(t, "t-reap-idledis", "p-reap-idledis", "r-reap-idledis")
+	setTaskPhase(t, "t-reap-idledis", "Running")
+	old := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	setTaskAnns(t, "t-reap-idledis", map[string]string{
+		annCurrentTurn:  "turn-1",
+		annTurnComplete: old,
+	})
+	mkWrapperPodSvc(t, "reap-idledis", "t-reap-idledis", string(getTask(t, "t-reap-idledis").UID))
+
+	reaperServer().ReapOrphans(context.Background()) // IdlePodReapAfter defaults to 0
+	if !podExists(t, "reap-idledis") {
+		t.Error("expected idle pod to be kept when idle backstop disabled")
+	}
+}
+
 // TestReapOrphans_CreationGrace verifies that a freshly spawned pod is never
 // reaped even when its task is absent in the cache snapshot (finding 1/2/7).
 func TestReapOrphans_CreationGrace(t *testing.T) {

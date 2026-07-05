@@ -88,6 +88,17 @@ leaderElection: true
 # anchoring a dedup/cooldown window (the longest is the 1h incident cooldown).
 taskRetentionHours: 168
 
+# idlePodReapMinutes bounds how long an agent pod may sit with no live turn before
+# the reaper deletes it as a leaked wrapper (issue #237). When a turn times out or
+# completes the wrapper parks idle in epoll waiting for the next PTY input; if the
+# operator never submits a next turn or tears it down (e.g. a memory outage traps
+# the lifecycle reconcile in the spawn gate before it processes the completed
+# turn) the pod holds a Task slot + node resources for hours. Default 30m
+# comfortably exceeds any healthy between-turn gap; conversation persistence lets a
+# still-live Task re-spawn a fresh pod and resume, so reaping is safe. The operator
+# clamps a positive value up to a 5m floor; set 0 to disable the idle backstop.
+idlePodReapMinutes: 30
+
 # pushMetricsAllowedPrefixes is the comma-separated metric-name prefix allowlist
 # the push-receiver enforces on short-lived-pod metric pushes. Series whose name
 # matches no prefix are dropped (operator_push_series_dropped_total{reason=

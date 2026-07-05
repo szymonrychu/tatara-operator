@@ -97,6 +97,7 @@ MEMORY_MONITORING_ENABLED: {{ .Values.memoryMonitoring.enabled | quote }}
 MEMORY_MONITOR_LABELS: {{ .Values.memoryMonitoring.additionalLabels | toJson | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 TASK_RETENTION_HOURS: {{ .Values.taskRetentionHours | quote }}
+IDLE_POD_REAP_MINUTES: {{ .Values.idlePodReapMinutes | quote }}
 PUSH_METRICS_ALLOWED_PREFIXES: {{ .Values.pushMetricsAllowedPrefixes | quote }}
 AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
 AGENT_CPU_LIMIT: {{ .Values.agentCpuLimit | quote }}
