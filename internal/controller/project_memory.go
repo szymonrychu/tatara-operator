@@ -85,8 +85,12 @@ const memoryFieldOwner = "tatara-operator"
 // rotated.
 func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1alpha1.Project) error {
 	cfg := r.MemoryConfig
+	pgCluster, err := r.guardPGStorageShrink(ctx, p, memory.PGCluster(p, cfg))
+	if err != nil {
+		return err
+	}
 	objs := []client.Object{
-		memory.PGCluster(p, cfg),
+		pgCluster,
 		memory.Neo4jStatefulSet(p, cfg),
 		memory.Neo4jService(p, cfg),
 		memory.LightragPVC(p, cfg),
@@ -122,6 +126,58 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		}
 	}
 	return nil
+}
+
+// guardPGStorageShrink clamps the rendered cnpg Cluster's PGDATA and WAL storage
+// sizes up to the already-provisioned cluster's sizes before it is applied, so a
+// render whose size drifted below the live volume never asks cnpg to shrink
+// storage. cnpg's admission webhook rejects any shrink, and before this guard
+// that rejection failed every apply and wedged the whole project memory reconcile
+// to Failed (issue #248). A NotFound existing cluster (first provision) or an
+// unset provisioned size leaves the render untouched.
+func (r *ProjectReconciler) guardPGStorageShrink(ctx context.Context, p *tataradevv1alpha1.Project, desired *cnpgv1.Cluster) (*cnpgv1.Cluster, error) {
+	l := log.FromContext(ctx)
+	var existing cnpgv1.Cluster
+	key := types.NamespacedName{Namespace: r.MemoryConfig.Namespace, Name: desired.Name}
+	if err := r.Get(ctx, key, &existing); err != nil {
+		if apierrors.IsNotFound(err) {
+			return desired, nil
+		}
+		// A non-NotFound read is a transient API/cache blip, not a real failure.
+		// Fail-open: apply the render unclamped rather than flipping the whole
+		// stack to Failed on a blip (the same non-flapping stance the health path
+		// takes). In steady state the render equals the provisioned size, so no
+		// shrink is requested; if the spec has genuinely drifted below the live
+		// volume, cnpg's admission webhook still rejects the shrink and the next
+		// reconcile re-reads and clamps. The other stack objects still apply.
+		l.Info("shrink guard: transient error reading existing pg cluster, applying render unclamped",
+			"action", "memory_storage_shrink_guard_read_error",
+			"resource_id", desired.Name,
+			"error", err.Error())
+		return desired, nil
+	}
+	raised, err := memory.ClampPGStorageToExisting(desired, &existing)
+	if err != nil {
+		return nil, fmt.Errorf("guard pg storage shrink: %w", err)
+	}
+	if raised {
+		r.Metrics.MemoryStorageShrinkGuarded(p.Name)
+		l.Info("raised rendered pg storage to provisioned size to avoid a cnpg shrink rejection",
+			"action", "memory_storage_shrink_guard",
+			"resource_id", desired.Name,
+			"pgdata_size", desired.Spec.StorageConfiguration.Size,
+			"wal_size", walSize(desired))
+	}
+	return desired, nil
+}
+
+// walSize returns the cluster's WAL volume size, or "" when it declares none.
+// Used only for the shrink-guard log line.
+func walSize(c *cnpgv1.Cluster) string {
+	if c.Spec.WalStorage == nil {
+		return ""
+	}
+	return c.Spec.WalStorage.Size
 }
 
 // memoryStackHealth reads the owned objects' statuses and returns the readiness

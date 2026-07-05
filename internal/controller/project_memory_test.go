@@ -145,6 +145,83 @@ func TestApplyMemoryStack_CreatesStackWithOwnerRefs(t *testing.T) {
 	}
 }
 
+func TestApplyMemoryStack_GuardsStorageShrink(t *testing.T) {
+	// Reproduces issue #248: an already-provisioned cnpg Cluster whose volume is
+	// larger than the freshly rendered default must not be shrunk by a re-apply.
+	// cnpg's webhook (absent in envtest) would reject the shrink and wedge the
+	// whole reconcile, so the operator clamps the render up before applying.
+	ctx := context.Background()
+	r, reg := newMemoryReconcilerWithReg()
+	p := mkMemoryProject(t, "stack-shrink")
+
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
+		t.Fatalf("password: %v", err)
+	}
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("first applyMemoryStack: %v", err)
+	}
+
+	names := memory.NamesFor(p.Name)
+	key := types.NamespacedName{Namespace: testNS, Name: names.PGCluster}
+
+	// Simulate a previously-provisioned, larger volume: PGDATA grown to 20Gi and
+	// WAL to 5Gi, well above the 10Gi/2Gi defaults the builder renders.
+	var cluster cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, key, &cluster); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	cluster.Spec.StorageConfiguration.Size = "20Gi"
+	cluster.Spec.WalStorage = &cnpgv1.StorageConfiguration{Size: "5Gi"}
+	if err := k8sClient.Update(ctx, &cluster); err != nil {
+		t.Fatalf("grow cluster storage: %v", err)
+	}
+
+	before := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name)
+
+	// Re-apply: the render is back to 10Gi/2Gi but must be clamped up to the
+	// provisioned 20Gi/5Gi rather than requesting a shrink.
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("second applyMemoryStack: %v", err)
+	}
+
+	var after cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, key, &after); err != nil {
+		t.Fatalf("get cluster after re-apply: %v", err)
+	}
+	if got := after.Spec.StorageConfiguration.Size; got != "20Gi" {
+		t.Fatalf("PGDATA storage shrunk to %q, want it held at 20Gi", got)
+	}
+	if after.Spec.WalStorage == nil || after.Spec.WalStorage.Size != "5Gi" {
+		t.Fatalf("WAL storage = %v, want it held at 5Gi", after.Spec.WalStorage)
+	}
+	if delta := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name) - before; delta != 1 {
+		t.Fatalf("shrink-guard counter delta = %v, want 1", delta)
+	}
+}
+
+// memoryGaugeOrCounter reads a single-labeled counter/gauge value from reg,
+// matching the one series whose label (name=value) is set.
+func memoryGaugeOrCounter(t *testing.T, reg *prometheus.Registry, metricName, label, value string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != metricName {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == label && lp.GetValue() == value {
+					return m.GetCounter().GetValue() + m.GetGauge().GetValue()
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func assertOwnedByProject(t *testing.T, refs []metav1.OwnerReference, project string) {
 	t.Helper()
 	for _, ref := range refs {
