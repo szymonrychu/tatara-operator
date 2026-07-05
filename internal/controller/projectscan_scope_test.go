@@ -127,6 +127,29 @@ func TestMRScan_LabeledOrMentioned_ReviewsMentionedMR(t *testing.T) {
 	}
 }
 
+// TestMRScan_OutOfScopeMR_NoBacklog: a single out-of-scope human PR (unlabeled,
+// un-mentioned, scope=labeledOrMentioned) must not freeze the mrScan stamp.
+// Before the fix, created(0) < len(eligible)(1) returned backlog=true even
+// though the only "work" was a terminal scope skip - causing LastMRScan to
+// stall and mrScan to re-fire ~18x its schedule (skipped_scope storm).
+func TestMRScan_OutOfScopeMR_NoBacklog(t *testing.T) {
+	proj, repo := seedScanProjectWithScope(t, "scope-nobacklog", "labeledOrMentioned", "tatara/review")
+	repos := []tatarav1alpha1.Repository{*repo}
+	reader := &fakeReader{prs: []scm.PRRef{
+		{Repo: "o/r", Number: 10, Author: "human", HeadSHA: "sha10",
+			UpdatedAt: time.Unix(100, 0)}, // no label, no @mention -> skipped_scope
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	cron := tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 10}
+	// out-of-scope-only cycle must not freeze the mrScan stamp (backlog == false)
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron)
+	if backlog {
+		t.Fatal("out-of-scope-only mrScan cycle must return backlog=false; got true (stamp will freeze)")
+	}
+}
+
 // TestMRScan_DefaultScope_ReviewsUnlabeledMR: no scope set -> unlabeled human MR
 // is reviewed (existing behavior preserved).
 func TestMRScan_DefaultScope_ReviewsUnlabeledMR(t *testing.T) {

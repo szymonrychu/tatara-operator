@@ -715,10 +715,7 @@ func (r *ProjectReconciler) createScanTask(ctx context.Context, proj *tatarav1al
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
-		// Transient enqueue error (e.g. seq CAS contention): log and skip this
-		// item rather than failing the whole scan cycle; the next cycle retries.
-		log.FromContext(ctx).Error(err, "scan: enqueue event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
-		return false, nil
+		return false, fmt.Errorf("enqueue event %s: %w", dedupKey, err)
 	}
 	if created {
 		r.Metrics.ScanTaskCreated(activity, kind)
@@ -1097,6 +1094,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 	}
 	created := 0
+	deferred := 0
 	for _, c := range eligible {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
@@ -1150,6 +1148,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if err != nil {
 				l.Error(err, "scan: enqueue mrScan issueLifecycle event", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
+				deferred++
 				continue
 			}
 			if ok2 {
@@ -1174,6 +1173,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if err != nil {
 				l.Error(err, "scan: enqueue mrScan task", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
+				deferred++
 				continue
 			}
 			if ok2 {
@@ -1185,7 +1185,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
-	return created < len(eligible)
+	return deferred > 0
 }
 
 // issueScan lists open issues (per-repo + board) and enqueues QueuedEvents.
@@ -1316,9 +1316,11 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// numbered sibling must never be promoted to lead and spawn a second agent.
 	systemicLeads := electSystemicLeads(cands)
 	created := 0
+	deferred := 0
 	for _, c := range eligible {
 		picked, err := r.issueScanPickOne(ctx, proj, reader, repos, existing, c, systemicLeads, managed, brainstorming, approved, implementation, declined, botLogin, cc)
 		if err != nil {
+			deferred++
 			continue
 		}
 		if picked {
@@ -1328,7 +1330,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
-	return created < len(eligible), issueCache
+	return deferred > 0, issueCache
 }
 
 // issueScanPickOne runs the per-candidate decision body of issueScan for one
@@ -1491,7 +1493,7 @@ func (r *ProjectReconciler) issueScanPickOne(
 	if err != nil {
 		l.Error(err, "scan: enqueue issueScan event", "resource_id", proj.Name, "repo", repo.Name)
 		r.Metrics.ScanItem("issueScan", "create_error")
-		return false, nil
+		return false, err
 	}
 	if ok2 {
 		r.Metrics.ScanItem("issueScan", "picked")
