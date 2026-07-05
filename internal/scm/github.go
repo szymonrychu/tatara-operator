@@ -280,30 +280,10 @@ func ghDoPaged[T any](ctx context.Context, base, path, token string) ([]T, error
 
 // ghDoWithHeaders performs a single GET, decodes JSON body into out, and returns the Link header.
 func ghDoWithHeaders(ctx context.Context, fullURL, token string, out any) (linkHeader string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("github: build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := scmHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("github: do request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	link := resp.Header.Get("Link")
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: fullURL}
-	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-			return "", fmt.Errorf("github: decode response: %w", err)
-		}
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
-	}
-	return link, nil
+	return doPagedGET(ctx, fullURL, "github", fullURL, map[string]string{
+		"Authorization": "Bearer " + token,
+		"Accept":        "application/vnd.github+json",
+	}, "Link", out)
 }
 
 // ghMaxRetries bounds in-process retries of a rate-limited write request.
@@ -519,19 +499,19 @@ func (c *GitHub) EnsureLabel(ctx context.Context, repoURL, token, name, color st
 	if err != nil {
 		return err
 	}
-	err = ghDo(ctx, c.base(), http.MethodPost,
-		fmt.Sprintf("/repos/%s/%s/labels", owner, repo), token,
-		map[string]string{"name": name, "color": color}, nil)
-	if err == nil {
-		return nil
-	}
-	var he *HTTPError
-	if errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity {
-		return ghDo(ctx, c.base(), http.MethodPatch,
-			fmt.Sprintf("/repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name)), token,
-			map[string]string{"color": color}, nil)
-	}
-	return err
+	return createOrUpdateOnConflict(
+		func() error {
+			return ghDo(ctx, c.base(), http.MethodPost,
+				fmt.Sprintf("/repos/%s/%s/labels", owner, repo), token,
+				map[string]string{"name": name, "color": color}, nil)
+		},
+		http.StatusUnprocessableEntity,
+		func() error {
+			return ghDo(ctx, c.base(), http.MethodPatch,
+				fmt.Sprintf("/repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name)), token,
+				map[string]string{"color": color}, nil)
+		},
+	)
 }
 
 // ghCheckRun is the decoded shape of one GitHub check-run entry.
@@ -580,28 +560,29 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	}, nil
 }
 
+// ghRunCIStatus maps one GitHub check-run to the shared "" | pending |
+// success | failure vocabulary: any non-completed run is pending regardless
+// of conclusion; a completed run is a failure unless its conclusion is
+// success/neutral/skipped.
+func ghRunCIStatus(run ghCheckRun) string {
+	if run.Status != "completed" {
+		return "pending"
+	}
+	if run.Conclusion != "success" && run.Conclusion != "neutral" && run.Conclusion != "skipped" {
+		return "failure"
+	}
+	return "success"
+}
+
 func deriveGHCIStatus(runs []ghCheckRun) string {
 	if len(runs) == 0 {
 		return ""
 	}
-	failure, pending := false, false
-	for _, run := range runs {
-		if run.Status != "completed" {
-			pending = true
-			continue
-		}
-		if run.Conclusion != "success" && run.Conclusion != "neutral" && run.Conclusion != "skipped" {
-			failure = true
-		}
+	statuses := make([]string, len(runs))
+	for i, run := range runs {
+		statuses[i] = ghRunCIStatus(run)
 	}
-	switch {
-	case failure:
-		return "failure"
-	case pending:
-		return "pending"
-	default:
-		return "success"
-	}
+	return foldCIStatuses(statuses...)
 }
 
 func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, event, body string, comments []map[string]any) error {
@@ -773,17 +754,30 @@ func (c *GitHub) commitCIStatus(ctx context.Context, owner, repo, sha, token str
 	return foldCIStatuses(checkStatus, combinedStatus), nil
 }
 
-// foldCIStatuses merges two CI status strings with the precedence rule:
-// failure > pending > success > "" (none).
-func foldCIStatuses(a, b string) string {
-	if a == "failure" || b == "failure" {
+// foldCIStatuses merges any number of CI status strings with the precedence
+// rule: failure > pending > success > "" (none). Shared by all three CI
+// aggregation sites (GitHub check-runs, GitHub check-runs+combined-status,
+// GitLab commit-statuses) so the priority rule is defined exactly once.
+func foldCIStatuses(statuses ...string) string {
+	failure, pending, success := false, false, false
+	for _, s := range statuses {
+		switch s {
+		case "failure":
+			failure = true
+		case "pending":
+			pending = true
+		case "success":
+			success = true
+		}
+	}
+	switch {
+	case failure:
 		return "failure"
-	}
-	if a == "pending" || b == "pending" {
+	case pending:
 		return "pending"
-	}
-	if a == "success" || b == "success" {
+	case success:
 		return "success"
+	default:
+		return ""
 	}
-	return ""
 }
