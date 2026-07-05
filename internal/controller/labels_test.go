@@ -175,9 +175,9 @@ func (w *errAddLabelWriter) RemoveLabel(_ context.Context, _, _, _ string) error
 // stays retryable (error returned -> requeue).
 func TestSetLifecycleLabel_TargetGone_TerminalNoRequeue(t *testing.T) {
 	tests := []struct {
-		name       string
-		addErr     error
-		wantErr    bool
+		name    string
+		addErr  error
+		wantErr bool
 	}{
 		{"410 gone -> terminal", &scm.HTTPError{Status: 410, Path: "/repos/o/r/issues/7/labels", Body: `{"message":"This issue was deleted"}`}, false},
 		{"404 not found -> terminal", &scm.HTTPError{Status: 404, Path: "/repos/o/r/issues/7/labels"}, false},
