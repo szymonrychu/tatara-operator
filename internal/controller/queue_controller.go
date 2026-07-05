@@ -217,6 +217,15 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 					held = budget.KindBlocked(cfg, sub, key, now)
 					reason = "kind_ceiling"
 				}
+				// refine is a scan-pipeline BARRIER (projectscan.go runScans defers
+				// mrScan/issueScan/brainstorm/healthCheck until a refine Task reaches
+				// a terminal state). A refine event held Queued here never runs,
+				// never becomes terminal, and wedges that barrier - and every scan
+				// behind it - forever. So refine always admits, regardless of any
+				// configured spawnCeilingByKind["refine"].
+				if key == "refine" {
+					held = false
+				}
 				if held {
 					heldOnUsage = true
 					if r.Metrics != nil {

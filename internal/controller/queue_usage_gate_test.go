@@ -141,3 +141,28 @@ func TestDispatcherSubscription_HealthCheckActivityCeiling(t *testing.T) {
 	assertQEAdmitted(t, ctx, healthCheck, true)      // 50 < healthCheck ceiling 60
 	assertQEAdmitted(t, ctx, plainBrainstorm, false) // 50 >= brainstorm ceiling 40
 }
+
+// TestDispatcherSubscription_RefineNeverGated covers the refine-barrier /
+// usage-gate coupling: refine is a scan-pipeline BARRIER
+// (projectscan.go runScans defers mrScan/issueScan/brainstorm/healthCheck until
+// a refine Task reaches a terminal state). A refine event held Queued on the
+// account-usage ceiling never runs, never becomes terminal, and wedges that
+// barrier - and every scan behind it - forever. So refine must always admit
+// regardless of any configured spawnCeilingByKind entry, while other kinds
+// (e.g. brainstorm) stay governed by their own ceiling.
+func TestDispatcherSubscription_RefineNeverGated(t *testing.T) {
+	ctx := context.Background()
+	proj := subscriptionProject(t, ctx, "p-sub-refine", 90, 95,
+		map[string]int32{"refine": 55, "brainstorm": 40})
+
+	refine := mkUsageQE(t, ctx, proj.Name, 1, tatarav1alpha1.QueueClassNormal, "refine",
+		map[string]string{tatarav1alpha1.LabelActivity: "refine"})
+	brainstorm := mkUsageQE(t, ctx, proj.Name, 2, tatarav1alpha1.QueueClassNormal, "brainstorm", nil)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Usage: usageStoreAt(60)}
+	if _, err := r.Reconcile(ctx, reqFor(refine)); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	assertQEAdmitted(t, ctx, refine, true)      // barrier: never held, even at 60 >= ceiling 55
+	assertQEAdmitted(t, ctx, brainstorm, false) // 60 >= brainstorm ceiling 40
+}
