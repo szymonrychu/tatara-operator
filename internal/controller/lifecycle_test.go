@@ -1985,6 +1985,96 @@ func TestLifecycleMerge_405ConflictSpawnsResolveAttempt_ErrNil(t *testing.T) {
 	}
 }
 
+// lifecycleFakeSCMWriterMergeLabel extends the merge fake to record the semver
+// EnsureLabel/AddLabel calls the push-CD gate (issue #229) makes before merging.
+type lifecycleFakeSCMWriterMergeLabel struct {
+	lifecycleFakeSCMWriterMerge
+	ensured []string
+	added   []struct{ ref, label string }
+}
+
+func (f *lifecycleFakeSCMWriterMergeLabel) EnsureLabel(_ context.Context, _, _, name, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensured = append(f.ensured, name)
+	return nil
+}
+
+func (f *lifecycleFakeSCMWriterMergeLabel) AddLabel(_ context.Context, _, ref, label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.added = append(f.added, struct{ ref, label string }{ref, label})
+	return nil
+}
+
+// TestLifecycleMerge_StampsSemverLabelBeforeMerge asserts the lifecycle Merge
+// phase stamps the declared-significance semver label on the PR before merging
+// (issue #229): a directly-merged bot PR must carry a semver:<level> label so
+// push-CD's release tag step does not fail closed.
+func TestLifecycleMerge_StampsSemverLabelBeforeMerge(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMergeLabel{
+		lifecycleFakeSCMWriterMerge: lifecycleFakeSCMWriterMerge{
+			prState:  scm.PRState{Author: "bot", CIStatus: "success"},
+			mergeSHA: "sha-labeled",
+		},
+	}
+	r, name := seedMergeTask(t, "semverlabel", &fw.lifecycleFakeSCMWriterMerge, time.Hour)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+
+	// Declare a minor significance so the stamp reads it (not the patch default).
+	task := fetchTask(t, name)
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{Significance: "minor"}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed change summary: %v", err)
+	}
+
+	if _, err := r.reconcileLifecycle(ctx, fetchTask(t, name)); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	got := fetchTask(t, name)
+	if got.Status.LifecycleState != "MainCI" {
+		t.Errorf("LifecycleState = %q, want MainCI on merge", got.Status.LifecycleState)
+	}
+	if len(fw.added) != 1 || fw.added[0].label != "semver:minor" || fw.added[0].ref != "o/r#42" {
+		t.Errorf("added labels = %+v, want one semver:minor on o/r#42", fw.added)
+	}
+	found := false
+	for _, e := range fw.ensured {
+		if e == "semver:minor" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ensured labels = %v, want semver:minor ensured on the repo", fw.ensured)
+	}
+}
+
+// TestLifecycleMerge_DefaultsSemverPatchWhenNoSignificance asserts that when the
+// task declared no change significance, the Merge phase defaults the label to
+// semver:patch (issue #229) rather than leaving the PR unlabeled.
+func TestLifecycleMerge_DefaultsSemverPatchWhenNoSignificance(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	fw := &lifecycleFakeSCMWriterMergeLabel{
+		lifecycleFakeSCMWriterMerge: lifecycleFakeSCMWriterMerge{
+			prState:  scm.PRState{Author: "bot", CIStatus: "success"},
+			mergeSHA: "sha-patch",
+		},
+	}
+	r, name := seedMergeTask(t, "semverpatch", &fw.lifecycleFakeSCMWriterMerge, time.Hour)
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+
+	// No ChangeSummary on the task (default seeded state) -> expect patch.
+	if _, err := r.reconcileLifecycle(ctx, fetchTask(t, name)); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	if len(fw.added) != 1 || fw.added[0].label != "semver:patch" || fw.added[0].ref != "o/r#42" {
+		t.Errorf("added labels = %+v, want one semver:patch on o/r#42", fw.added)
+	}
+}
+
 func TestLifecycleMerge_NotAllowedRequeues(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	// autoMergeOnGreenCI with pending CI -> mergeAllowed=false

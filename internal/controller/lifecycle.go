@@ -2302,6 +2302,15 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	// same already-merged commits, without a second GetPRState round-trip (finding 3).
 	mergedHead := prSt.HeadSHA
 
+	// push-CD gate (issue #229): the lifecycle Merge phase merges bot PRs directly
+	// with the bot token, bypassing the writeback path's semver-label stamping
+	// (applySemverAutoMerge). A directly-merged PR carrying no semver:<level> label
+	// makes push-CD's release tag step fail closed ("no semver label; refusing to
+	// tag"), so the change never cuts a tag or deploys until the next labeled merge.
+	// Stamp the label from the declared significance (else patch) before the merge
+	// egress so every lifecycle-merged change rides the cascade.
+	r.ensureSemverLabelBeforeMerge(ctx, project, repo, writer, token, provider, number, task.Status.ChangeSummary)
+
 	// Attempt merge.
 	sha, mergeErr := writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
 	r.recordSCM(provider, "merge", mergeErr)
@@ -2370,6 +2379,74 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		return ctrl.Result{}, r.parkOnDeadline(ctx, task, writer, token, msg)
 	}
 	return ctrl.Result{RequeueAfter: pollRequeue}, nil
+}
+
+// ensureSemverLabelBeforeMerge stamps a semver:<level> label on the bot PR the
+// lifecycle Merge phase is about to merge, closing the push-CD gap where a
+// directly-merged unlabeled PR leaves the release tag step failing closed (issue
+// #229). The level comes from the declared change significance when present, else
+// defaults to patch. It is idempotent and best-effort: an existing semver:* label
+// (writeback- or human-applied) is respected and never double-stamped, and every
+// SCM error is logged non-fatally so a labeling hiccup never blocks the merge. The
+// cd-release cascade is GitHub-only (see applySemverAutoMerge), so this no-ops on
+// other providers.
+func (r *TaskReconciler) ensureSemverLabelBeforeMerge(ctx context.Context, proj *tatarav1alpha1.Project, repo tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, cs *tatarav1alpha1.ChangeSummary) {
+	if provider != "github" || number <= 0 {
+		return
+	}
+	l := log.FromContext(ctx)
+	slug, _, serr := repoSlugFromURL(repo.Spec.URL, provider)
+	if serr != nil || slug == "" {
+		return
+	}
+	// Respect an existing semver:* label: reading the PR's current labels lets us
+	// skip when one is already present (writeback stamps it at PR-open time, and a
+	// human may set a specific level), so we never add a second, conflicting label
+	// the tag step would have to disambiguate. Fail-open (proceed to stamp) when no
+	// reader is wired or the read fails - an unlabeled merge is the failure we are
+	// closing, so erring toward stamping is correct.
+	if r.ReaderFor != nil {
+		if reader, rerr := r.ReaderFor(provider, token); rerr == nil {
+			if owner, name, oerr := scm.OwnerRepo(repo.Spec.URL); oerr == nil {
+				if prs, lerr := reader.ListOpenPRs(ctx, owner, name); lerr == nil {
+					for _, pr := range prs {
+						if pr.Number != number {
+							continue
+						}
+						for _, lb := range pr.Labels {
+							if strings.HasPrefix(lb, "semver:") {
+								return
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+
+	significance := "patch"
+	if cs != nil && cs.Significance != "" {
+		significance = cs.Significance
+	}
+	label := semverLabel(significance)
+	color := managedLabelColors(proj.Spec.Scm)[label]
+	if eerr := writer.EnsureLabel(ctx, repo.Spec.URL, token, label, color); eerr != nil {
+		r.recordSCM(provider, "ensure_label", eerr)
+		l.Error(eerr, "merge: ensure semver label (non-fatal)",
+			"action", "scm_merge_semver_label", "resource_id", repo.Name, "label", label)
+	}
+	prRef := fmt.Sprintf("%s#%d", slug, number)
+	aerr := writer.AddLabel(ctx, token, prRef, label)
+	r.recordSCM(provider, "add_label", aerr)
+	if aerr != nil {
+		l.Error(aerr, "merge: add semver label (non-fatal)",
+			"action", "scm_merge_semver_label", "resource_id", repo.Name, "pr_ref", prRef, "label", label)
+		return
+	}
+	l.Info("merge: semver label stamped before lifecycle merge",
+		"action", "scm_merge_semver_label", "resource_id", repo.Name,
+		"pr_ref", prRef, "significance", significance)
 }
 
 // handleMainCI polls the default-branch CI for the merge commit SHA,
