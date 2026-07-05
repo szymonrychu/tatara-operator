@@ -123,3 +123,17 @@ installed in the agent container and on PATH.
 - If you change a tool dependency, edit that repo's `.mise.toml` (pin an exact
   version), never install ad-hoc.
 - `.mise.toml` under /workspace is pre-trusted; no `mise trust` needed.
+
+## CD (semver push-CD)
+
+- Every change declares significance. Agents set the required
+  `change_significance` field on `change_summary` (major = breaking,
+  minor = feature, patch = fix/other). Humans set a `semver:<level>`
+  label on the PR instead.
+- Agents NEVER merge PRs. The pipeline merges (bot-authored PRs
+  auto-merge on green required checks), cuts the semver tag from the
+  label, publishes artifacts at `vX.Y.Z`, propagates the version pin to
+  the parent repo, and `tatara-helmfile` auto-applies it to the
+  cluster. The operator closes the originating issue on apply success.
+- Never hand-edit a deploy pin. Never re-run a green release job - tag
+  mode is not idempotent.
