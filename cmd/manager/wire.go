@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -176,6 +178,48 @@ func secretTokenSource(reader client.Reader, namespace, secretName, key string) 
 	}
 }
 
+// usageBundleAccessors returns Load/Save closures over an OAuth credential
+// Secret for the self-refreshing usage-poller token source. Load reads via the
+// uncached API reader (fresh resourceVersion); Save re-reads then Updates so the
+// rotated refresh token is persisted under optimistic concurrency (single leader
+// polls, so contention is nil, but the re-read keeps the version current). Keys:
+// oauth-access-token, oauth-refresh-token, oauth-expires-at (unix seconds).
+func usageBundleAccessors(reader client.Reader, writer client.Client, namespace, name string) (
+	func(context.Context) (accountusage.SecretBundle, error),
+	func(context.Context, accountusage.SecretBundle) error,
+) {
+	load := func(ctx context.Context) (accountusage.SecretBundle, error) {
+		var sec corev1.Secret
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
+			return accountusage.SecretBundle{}, fmt.Errorf("accountusage: get usage secret %s/%s: %w", namespace, name, err)
+		}
+		b := accountusage.SecretBundle{
+			AccessToken:  strings.TrimSpace(string(sec.Data["oauth-access-token"])),
+			RefreshToken: strings.TrimSpace(string(sec.Data["oauth-refresh-token"])),
+		}
+		if v := strings.TrimSpace(string(sec.Data["oauth-expires-at"])); v != "" {
+			if unix, err := strconv.ParseInt(v, 10, 64); err == nil {
+				b.ExpiresAt = time.Unix(unix, 0)
+			}
+		}
+		return b, nil
+	}
+	save := func(ctx context.Context, b accountusage.SecretBundle) error {
+		var sec corev1.Secret
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &sec); err != nil {
+			return fmt.Errorf("accountusage: get usage secret %s/%s: %w", namespace, name, err)
+		}
+		if sec.Data == nil {
+			sec.Data = map[string][]byte{}
+		}
+		sec.Data["oauth-access-token"] = []byte(b.AccessToken)
+		sec.Data["oauth-refresh-token"] = []byte(b.RefreshToken)
+		sec.Data["oauth-expires-at"] = []byte(strconv.FormatInt(b.ExpiresAt.Unix(), 10))
+		return writer.Update(ctx, &sec)
+	}
+	return load, save
+}
+
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable. It returns the
 // shared SeqSource so callers can pass it to addWebhookServer.
@@ -249,9 +293,26 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 			snap.Healthy = false
 			usageStore.Set(snap)
 		}
+		// Token source: when a UsageSecretName is set, use the self-refreshing OAuth
+		// source (the real deploy path - the shared fleet setup-token lacks the
+		// user:profile scope /api/oauth/usage needs, so the poller runs on an
+		// interactive-login token that expires ~hourly and must be refreshed +
+		// persisted). Otherwise fall back to the static oauth-token key.
+		var usageTokenSource func() (string, error)
+		if cfg.UsageSecretName != "" {
+			load, save := usageBundleAccessors(mgr.GetAPIReader(), mgr.GetClient(), cfg.Namespace, cfg.UsageSecretName)
+			usageTokenSource = accountusage.NewRefreshingTokenSource(accountusage.RefreshingTokenSourceConfig{
+				Load:    load,
+				Save:    save,
+				Refresh: accountusage.OAuthRefreshConfig{TokenURL: cfg.UsageTokenURL, ClientID: cfg.UsageOAuthClientID, UserAgent: cfg.UsageUserAgent},
+				Margin:  cfg.UsageRefreshMargin,
+			})
+		} else {
+			usageTokenSource = secretTokenSource(mgr.GetAPIReader(), cfg.Namespace, cfg.AnthropicSecretName, "oauth-token")
+		}
 		usageClient := accountusage.NewClient(accountusage.ClientConfig{
 			BaseURL:     cfg.UsageBaseURL,
-			TokenSource: secretTokenSource(mgr.GetAPIReader(), cfg.Namespace, cfg.AnthropicSecretName, "oauth-token"),
+			TokenSource: usageTokenSource,
 			UserAgent:   cfg.UsageUserAgent,
 			AuthMode:    cfg.UsageAuthMode,
 		})

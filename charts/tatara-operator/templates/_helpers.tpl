@@ -126,4 +126,14 @@ TOKEN_BUDGET_EMERGENCY_PERCENT: {{ .Values.tokenBudgetEmergencyPercent | quote }
 TOKEN_BUDGET_RESET_SCHEDULE: {{ .Values.tokenBudgetResetSchedule | quote }}
 TOKEN_BUDGET_WINDOW: {{ .Values.tokenBudgetWindow | quote }}
 TOKEN_BUDGET_TOKEN_LIMIT: {{ .Values.tokenBudgetTokenLimit | quote }}
+{{/* Claude account-usage poller (claudeSubscription gate): off until usageEnabled. */}}
+USAGE_ENABLED: {{ .Values.usageEnabled | quote }}
+USAGE_AUTH_MODE: {{ .Values.usageAuthMode | quote }}
+USAGE_POLL_INTERVAL: {{ .Values.usagePollInterval | quote }}
+USAGE_USER_AGENT: {{ .Values.usageUserAgent | quote }}
+USAGE_BASE_URL: {{ .Values.usageBaseUrl | quote }}
+USAGE_SECRET_NAME: {{ .Values.usageSecretName | quote }}
+USAGE_OAUTH_CLIENT_ID: {{ .Values.usageOauthClientId | quote }}
+USAGE_TOKEN_URL: {{ .Values.usageTokenUrl | quote }}
+USAGE_REFRESH_MARGIN: {{ .Values.usageRefreshMargin | quote }}
 {{- end -}}

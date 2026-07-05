@@ -176,6 +176,22 @@ type Config struct {
 	UsagePollInterval time.Duration
 	UsageUserAgent    string
 	UsageBaseURL      string
+	// UsageSecretName, when set, switches the poller's token source to a
+	// self-refreshing OAuth source that reads an access+refresh+expiry bundle
+	// from that Secret (keys oauth-access-token/oauth-refresh-token/
+	// oauth-expires-at) and refreshes it via the OAuth token endpoint, persisting
+	// the rotated bundle back. This is REQUIRED for a real deploy: the shared
+	// fleet setup-token lacks the user:profile scope /api/oauth/usage needs, so
+	// the poller must run on an interactive-login token (which expires ~hourly).
+	// When empty, the poller reads the static "oauth-token" key from
+	// AnthropicSecretName (back-compat; only works with a user:profile token).
+	// UsageOAuthClientID and UsageTokenURL are the (undocumented, reverse-
+	// engineered) Claude Code OAuth client id + refresh endpoint - kept as config
+	// so a provider change is a helmfile flip, not a code change.
+	UsageSecretName    string
+	UsageOAuthClientID string
+	UsageTokenURL      string
+	UsageRefreshMargin time.Duration
 }
 
 // BudgetDefaults returns the operator-wide token-budget configuration as a
@@ -409,6 +425,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	usageRefreshMargin, err := getDurationDefault("USAGE_REFRESH_MARGIN", 5*time.Minute)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
@@ -478,6 +498,11 @@ func Load() (Config, error) {
 		UsagePollInterval: usagePollInterval,
 		UsageUserAgent:    getDefault("USAGE_USER_AGENT", "claude-code/1.0.0"),
 		UsageBaseURL:      os.Getenv("USAGE_BASE_URL"),
+		UsageSecretName:   os.Getenv("USAGE_SECRET_NAME"),
+		// Public Claude Code OAuth client id (embedded in the CLI, not a secret).
+		UsageOAuthClientID: getDefault("USAGE_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"), // gitleaks:allow
+		UsageTokenURL:      getDefault("USAGE_TOKEN_URL", "https://platform.claude.com/v1/oauth/token"),
+		UsageRefreshMargin: usageRefreshMargin,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")
