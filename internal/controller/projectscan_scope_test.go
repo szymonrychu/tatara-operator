@@ -127,6 +127,29 @@ func TestMRScan_LabeledOrMentioned_ReviewsMentionedMR(t *testing.T) {
 	}
 }
 
+// TestMRScan_OutOfScopeMR_NoBacklog: a single out-of-scope human PR (unlabeled,
+// un-mentioned, scope=labeledOrMentioned) must not freeze the mrScan stamp.
+// Before the fix, created(0) < len(eligible)(1) returned backlog=true even
+// though the only "work" was a terminal scope skip - causing LastMRScan to
+// stall and mrScan to re-fire ~18x its schedule (skipped_scope storm).
+func TestMRScan_OutOfScopeMR_NoBacklog(t *testing.T) {
+	proj, repo := seedScanProjectWithScope(t, "scope-nobacklog", "labeledOrMentioned", "tatara/review")
+	repos := []tatarav1alpha1.Repository{*repo}
+	reader := &fakeReader{prs: []scm.PRRef{
+		{Repo: "o/r", Number: 10, Author: "human", HeadSHA: "sha10",
+			UpdatedAt: time.Unix(100, 0)}, // no label, no @mention -> skipped_scope
+	}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	cron := tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 10}
+	// out-of-scope-only cycle must not freeze the mrScan stamp (backlog == false)
+	backlog := r.mrScan(context.Background(), proj, reader, repos, nil, cron)
+	if backlog {
+		t.Fatal("out-of-scope-only mrScan cycle must return backlog=false; got true (stamp will freeze)")
+	}
+}
+
 // TestMRScan_DefaultScope_ReviewsUnlabeledMR: no scope set -> unlabeled human MR
 // is reviewed (existing behavior preserved).
 func TestMRScan_DefaultScope_ReviewsUnlabeledMR(t *testing.T) {
@@ -151,5 +174,31 @@ func TestMRScan_DefaultScope_ReviewsUnlabeledMR(t *testing.T) {
 	}
 	if !reviewFound {
 		t.Fatal("unlabeled MR must still create a review Task when prReactionScope is empty (default behavior)")
+	}
+}
+
+// TestIssueScan_BotLastWord_NoBacklog: when the only issueScan candidate is
+// blocked by the bot-last-word gate (a terminal skip), the returned backlog must
+// be false. Before the fix, the old created<len(eligible) heuristic would have
+// returned backlog=true here (1 eligible, 0 created), freezing LastIssueScan.
+func TestIssueScan_BotLastWord_NoBacklog(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 10}}
+	proj, repo := seedScanProject(t, "issuescan-blw-nobacklog", cron)
+	repos := []tatarav1alpha1.Repository{*repo}
+	// Bot (tatara-bot) authored the most recent comment -> botHadLastWord fires -> skipped_bot_last_word.
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 1, Author: "human", UpdatedAt: time.Unix(100, 0)},
+		},
+		comments: []scm.IssueComment{
+			{Author: "tatara-bot", CreatedAt: time.Unix(200, 0)},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	backlog, _ := r.issueScan(context.Background(), proj, reader, repos, nil, cron.IssueScan)
+	if backlog {
+		t.Fatal("bot-last-word-only issueScan cycle must return backlog=false; got true (stamp will freeze)")
 	}
 }
