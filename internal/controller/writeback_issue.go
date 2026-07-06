@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 // writeBackIssue applies a triageIssue Task's IssueOutcome: close calls
@@ -57,6 +58,17 @@ func (r *TaskReconciler) writeBackIssue(ctx context.Context, task *tatarav1alpha
 		return ctrl.Result{}, perr
 	}
 	if cerr := writer.CloseIssue(ctx, token, repoSlug, task.Spec.Source.Number, out.Comment); cerr != nil {
+		// issue #268: the source issue is permanently gone (410 deleted / 404 not
+		// found). The close can never land, so treat it as terminal - record
+		// result="gone" (not "error"), clear the writeback-pending gate, and stop
+		// instead of returning the error and retry-looping the doomed close.
+		if isPermanentTargetGone(cerr) {
+			r.recordSCMGone(provider, "close_issue", cerr)
+			l.Info("issue close: target issue permanently gone; skipping close without requeue",
+				"action", "scm_close_issue_target_gone", "resource_id", task.Name,
+				"number", task.Spec.Source.Number, "status", scm.ErrorStatus(cerr))
+			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "IssueCloseTargetGone", "issue permanently gone; close skipped")
+		}
 		r.recordSCM(provider, "close_issue", cerr)
 		return ctrl.Result{}, fmt.Errorf("writeback issue close: %w", cerr)
 	}

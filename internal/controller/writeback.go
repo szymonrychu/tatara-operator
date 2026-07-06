@@ -769,6 +769,17 @@ func (r *TaskReconciler) recordSCM(provider, verb string, err error) {
 	}
 }
 
+// recordSCMGone records an SCM write whose target is permanently gone (404/410:
+// the issue was deleted) as a distinct result="gone" outcome instead of
+// result="error". A gone target is terminal, not a genuine write failure, so
+// counting it as "error" inflated the SCM write-failure-ratio alert against a
+// single deleted issue (issue #268). The classified HTTP status is still
+// recorded on the by-status counter for visibility.
+func (r *TaskReconciler) recordSCMGone(provider, verb string, err error) {
+	r.Metrics.SCMWrite(provider, verb, "gone")
+	r.Metrics.SCMRequestErrorByStatus(provider, verb, scm.ErrorStatus(err))
+}
+
 func (r *TaskReconciler) scmToken(ctx context.Context, ns, ref string) (string, error) {
 	var sec corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: ref}, &sec); err != nil {

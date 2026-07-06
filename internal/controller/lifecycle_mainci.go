@@ -98,14 +98,20 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 			if slugErr == nil {
 				closeStart := time.Now()
 				closeErr := writer.CloseIssue(ctx, token, repoSlug, task.Spec.Source.Number, "")
-				r.recordSCM(provider, "close_issue", closeErr)
 				if closeErr != nil {
+					// 404/410 (target gone / deleted) and 422 (already closed) are
+					// terminal, not genuine write failures: record result="gone" (not
+					// "error", which inflated the SCM write-failure-ratio alert, issue
+					// #268) and continue. Everything else requeues.
 					var closeHE *scm.HTTPError
-					if !errors.As(closeErr, &closeHE) || (closeHE.Status != 404 && closeHE.Status != 422) {
+					if isPermanentTargetGone(closeErr) || (errors.As(closeErr, &closeHE) && closeHE.Status == 422) {
+						r.recordSCMGone(provider, "close_issue", closeErr)
+					} else {
+						r.recordSCM(provider, "close_issue", closeErr)
 						return ctrl.Result{}, fmt.Errorf("mainci: close issue: %w", closeErr)
 					}
-					// 404/422: already closed; continue.
 				} else {
+					r.recordSCM(provider, "close_issue", nil)
 					// Log the merge-driven close as a distinct business action (finding 8:
 					// the generic lifecycle_transition log from setLifecycleState fires but
 					// does not distinguish issue-closed-on-merge from other Done transitions).
