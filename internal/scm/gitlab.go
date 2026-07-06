@@ -658,6 +658,40 @@ func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
 
+// GetMergeState reads the MR's merge_status + has_conflicts and maps them to a
+// provider-neutral MergeState. cannot_be_merged with conflicts is a real merge
+// conflict (dirty); without conflicts it is mergeable-blocked; unchecked and
+// checking are not yet computed.
+func (c *GitLab) GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error) {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return MergeStateUnknown, fmt.Errorf("gitlab: get merge state: %w", err)
+	}
+	var mr struct {
+		MergeStatus  string `json:"merge_status"`
+		HasConflicts bool   `json:"has_conflicts"`
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number)
+	if err := glDo(ctx, c.base(), http.MethodGet, path, token, nil, &mr); err != nil {
+		return MergeStateUnknown, fmt.Errorf("gitlab: get merge state: %w", err)
+	}
+	return glMergeState(mr.MergeStatus, mr.HasConflicts), nil
+}
+
+func glMergeState(status string, hasConflicts bool) MergeState {
+	switch status {
+	case "can_be_merged":
+		return MergeStateClean
+	case "cannot_be_merged", "cannot_be_merged_recheck":
+		if hasConflicts {
+			return MergeStateDirty
+		}
+		return MergeStateBlocked
+	default: // unchecked, checking, "" - not yet computed
+		return MergeStateUnknown
+	}
+}
+
 func (c *GitLab) mrNote(ctx context.Context, base, proj string, number int, token, body string) error {
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/notes"
 	return glDo(ctx, base, http.MethodPost, path, token, map[string]string{"body": body}, nil)
