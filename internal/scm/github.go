@@ -697,7 +697,11 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }
 
-const mergeStateRecomputeDelay = 10 * time.Millisecond
+// mergeStateRecomputeDelay is how long to wait before re-fetching a PR when
+// GitHub returns mergeable:null / mergeable_state:"unknown" (lazy recompute).
+// GitHub typically resolves mergeability within 2-5 seconds. It is a package
+// var so tests can stub it to 0 instead of sleeping for real.
+var mergeStateRecomputeDelay = 2 * time.Second
 
 // GetMergeState reads the PR's mergeability via REST. GitHub computes it lazily
 // (mergeable:null / mergeable_state:"unknown" on the first read after a push),

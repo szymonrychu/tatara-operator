@@ -13,6 +13,15 @@ import (
 
 func boolPtr(b bool) *bool { return &b }
 
+// stubMergeStateDelay replaces mergeStateRecomputeDelay with 0 so tests that
+// exercise the lazy-recompute path do not sleep for the production 2s delay.
+func stubMergeStateDelay(t *testing.T) {
+	t.Helper()
+	orig := mergeStateRecomputeDelay
+	mergeStateRecomputeDelay = 0
+	t.Cleanup(func() { mergeStateRecomputeDelay = orig })
+}
+
 func TestGitHubGetMergeState(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -45,6 +54,7 @@ func TestGitHubGetMergeState(t *testing.T) {
 }
 
 func TestGitHubGetMergeState_LazyRecompute(t *testing.T) {
+	stubMergeStateDelay(t)
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls++
