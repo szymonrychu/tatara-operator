@@ -311,7 +311,14 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		}
 		// push-CD: stamp the declared significance label and enable native
 		// auto-merge on the freshly-opened bot PR (D5). Best-effort, never fatal.
-		r.applySemverAutoMerge(ctx, &proj, repo, writer, token, provider, prURL, task.Status.ChangeSummary)
+		// Documentation is not a versioned artifact (no release cascade / semver
+		// tag): it declares no significance, so skip the label and auto-merge the
+		// bot PR directly on its Build check.
+		if task.Spec.Kind == "documentation" {
+			r.enableNativeAutoMerge(ctx, &proj, repo, writer, token, provider, prURL)
+		} else {
+			r.applySemverAutoMerge(ctx, &proj, repo, writer, token, provider, prURL, task.Status.ChangeSummary)
+		}
 		prURLs = append(prURLs, prURL)
 		prRepos = append(prRepos, repo)
 		// Persist the primary PR URL immediately after the first successful OpenChange
@@ -472,7 +479,6 @@ func (r *TaskReconciler) applySemverAutoMerge(ctx context.Context, proj *tatarav
 	if cs == nil || cs.Significance == "" {
 		return
 	}
-	l := log.FromContext(ctx)
 	label := semverLabel(cs.Significance)
 	color := managedLabelColors(proj.Spec.Scm)[label]
 	r.ensureSemverLabelColor(ctx, writer, repo.Spec.URL, token, provider, label, color,
@@ -487,14 +493,21 @@ func (r *TaskReconciler) applySemverAutoMerge(ctx context.Context, proj *tatarav
 			}
 		}
 	}
-	// D5 auto-merge gate (b): PR author == bot. We do NOT re-fetch the PR to read
-	// its author here because this code path opened the PR itself, moments ago,
-	// with the bot's SCM token - so author == proj.Spec.Scm.BotLogin holds by
-	// construction (the same identity the writeBackSelfImprove st.Author ==
-	// BotLogin check verifies for externally-discovered PRs). The only remaining
-	// condition is that a bot login is actually configured; absent it, withhold
-	// auto-merge. Human-authored PRs never reach this path, and cd-release tag-cut
-	// keys on the label not the author, so it stays author-agnostic downstream.
+	r.enableNativeAutoMerge(ctx, proj, repo, writer, token, provider, prURL)
+}
+
+// enableNativeAutoMerge turns on the forge's native auto-merge for a freshly-
+// opened bot PR, gated only on a configured project bot login (the PR is
+// bot-authored by construction - the operator opened it moments ago with the bot
+// SCM token, the same authorship condition applySemverAutoMerge relied on).
+// Best-effort and logged; a forge that disallows auto-merge never fails the
+// writeback. Callers that ride the semver cascade stamp the label first; the
+// documentation kind (not a versioned artifact) calls this directly.
+func (r *TaskReconciler) enableNativeAutoMerge(ctx context.Context, proj *tatarav1alpha1.Project, repo tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider, prURL string) {
+	l := log.FromContext(ctx)
+	// D5 auto-merge gate (b): PR author == bot holds by construction here (this
+	// code path opened the PR with the bot SCM token). The only remaining
+	// condition is that a bot login is actually configured; absent it, withhold.
 	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
 		l.Info("writeback: auto-merge withheld - no project bot login",
 			"action", "scm_auto_merge_withheld", "repo", repo.Name, "pr_url", prURL)
@@ -507,7 +520,7 @@ func (r *TaskReconciler) applySemverAutoMerge(ctx context.Context, proj *tatarav
 		return
 	}
 	l.Info("writeback: native auto-merge enabled", "action", "scm_auto_merge",
-		"repo", repo.Name, "pr_url", prURL, "significance", cs.Significance)
+		"repo", repo.Name, "pr_url", prURL)
 }
 
 // clearWritebackPending sets WritebackPending=False and updates status.

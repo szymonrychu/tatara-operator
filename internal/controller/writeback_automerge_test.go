@@ -111,4 +111,27 @@ func TestWriteBackOpenChange_SemverLabelAndAutoMerge(t *testing.T) {
 		require.Equal(t, "semver:patch", fw.addLabelLabel)
 		require.False(t, fw.autoMergeCalled, "no bot login: auto-merge must be withheld")
 	})
+
+	t.Run("documentation kind -> auto-merge without significance or semver label", func(t *testing.T) {
+		fw := &fullFakeSCMWriter{}
+		r := newFullFakeReconciler(t, fw)
+		task := seedWritebackKindTask(t, "am-doc", "am-proj-doc", "am-repo-doc", "am-scm-doc",
+			tatarav1alpha1.TaskSpec{
+				Goal: "update docs for the merge", Kind: "documentation",
+				Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
+			},
+			&tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"})
+		// Documentation is not a versioned artifact (no release cascade): it declares
+		// no ChangeSummary/significance, yet its bot PR must still auto-merge on the
+		// Build check, and must NOT get a (meaningless) semver label.
+		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+		_, err := reconcileWriteback(t, r, task.Name)
+		require.NoError(t, err)
+
+		require.True(t, fw.autoMergeCalled, "documentation PR must auto-merge without significance")
+		require.Equal(t, "squash", fw.autoMergeMethod)
+		require.False(t, fw.ensureLabelCalled, "documentation: no semver label ensured")
+		require.False(t, fw.addLabelCalled, "documentation: no semver label stamped on PR")
+	})
 }
