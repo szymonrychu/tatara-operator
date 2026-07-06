@@ -20,7 +20,7 @@ import (
 const (
 	defaultPgInstances  = 1
 	defaultPgStorage    = "10Gi"
-	defaultPgWalStorage = "2Gi"
+	defaultPgWalStorage = "8Gi"
 	defaultNeo4jStorage = "10Gi"
 )
 
@@ -202,7 +202,7 @@ func pgWalStorage(p *tatarav1alpha1.Project) string {
 // slot's retained WAL exceeds this cap postgres invalidates the slot (that one
 // standby must re-sync) rather than filling the disk. Half the volume leaves
 // headroom for active/checkpoint WAL and any archive backlog. Falls back to
-// half the 2Gi default when the configured size cannot be parsed.
+// half the 8Gi default when the configured size cannot be parsed.
 func pgMaxSlotWalKeepSize(p *tatarav1alpha1.Project) string {
 	q, err := resource.ParseQuantity(pgWalStorage(p))
 	if err != nil {

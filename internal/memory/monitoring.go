@@ -241,7 +241,7 @@ func memoryAlertRules(cluster, namespace string) []monitoringv1.Rule {
 			// One free-space ratio series per cnpg PVC (PGDATA and WAL). Fires per
 			// volume that drops below the headroom threshold, before it fills and
 			// stalls WAL writes (issue #238). The dedicated WAL volume (#238) is only
-			// 2Gi by default, so 15% is a meaningful early margin, not noise.
+			// 8Gi by default, so 15% is a meaningful early margin, not noise.
 			Alert: "MemoryPostgresVolumeFilling",
 			Expr: intstr.FromString(fmt.Sprintf(
 				`kubelet_volume_stats_available_bytes{%[1]s} / kubelet_volume_stats_capacity_bytes{%[1]s} < 0.15`,

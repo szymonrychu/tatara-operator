@@ -165,21 +165,21 @@ func TestApplyMemoryStack_GuardsStorageShrink(t *testing.T) {
 	key := types.NamespacedName{Namespace: testNS, Name: names.PGCluster}
 
 	// Simulate a previously-provisioned, larger volume: PGDATA grown to 20Gi and
-	// WAL to 5Gi, well above the 10Gi/2Gi defaults the builder renders.
+	// WAL to 16Gi, well above the 10Gi/8Gi defaults the builder renders.
 	var cluster cnpgv1.Cluster
 	if err := k8sClient.Get(ctx, key, &cluster); err != nil {
 		t.Fatalf("get cluster: %v", err)
 	}
 	cluster.Spec.StorageConfiguration.Size = "20Gi"
-	cluster.Spec.WalStorage = &cnpgv1.StorageConfiguration{Size: "5Gi"}
+	cluster.Spec.WalStorage = &cnpgv1.StorageConfiguration{Size: "16Gi"}
 	if err := k8sClient.Update(ctx, &cluster); err != nil {
 		t.Fatalf("grow cluster storage: %v", err)
 	}
 
 	before := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name)
 
-	// Re-apply: the render is back to 10Gi/2Gi but must be clamped up to the
-	// provisioned 20Gi/5Gi rather than requesting a shrink.
+	// Re-apply: the render is back to 10Gi/8Gi but must be clamped up to the
+	// provisioned 20Gi/16Gi rather than requesting a shrink.
 	if err := r.applyMemoryStack(ctx, p); err != nil {
 		t.Fatalf("second applyMemoryStack: %v", err)
 	}
@@ -191,8 +191,8 @@ func TestApplyMemoryStack_GuardsStorageShrink(t *testing.T) {
 	if got := after.Spec.StorageConfiguration.Size; got != "20Gi" {
 		t.Fatalf("PGDATA storage shrunk to %q, want it held at 20Gi", got)
 	}
-	if after.Spec.WalStorage == nil || after.Spec.WalStorage.Size != "5Gi" {
-		t.Fatalf("WAL storage = %v, want it held at 5Gi", after.Spec.WalStorage)
+	if after.Spec.WalStorage == nil || after.Spec.WalStorage.Size != "16Gi" {
+		t.Fatalf("WAL storage = %v, want it held at 16Gi", after.Spec.WalStorage)
 	}
 	if delta := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name) - before; delta != 1 {
 		t.Fatalf("shrink-guard counter delta = %v, want 1", delta)
