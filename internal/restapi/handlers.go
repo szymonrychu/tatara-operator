@@ -838,8 +838,8 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		metricName: "pr_outcome",
 		logMsg:     "restapi: prOutcome",
 		logAction:  "pr_outcome",
-		kindOK:     func(kind string) bool { return kind == "selfImprove" },
-		kindErrMsg: "pr outcome only applies to a selfImprove task",
+		kindOK:     func(kind string) bool { return kind == "issueLifecycle" },
+		kindErrMsg: "pr outcome only applies to an issueLifecycle task",
 		mutate: func(t *tatarav1alpha1.Task) {
 			t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
 		},

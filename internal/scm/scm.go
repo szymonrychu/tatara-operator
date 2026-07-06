@@ -32,7 +32,7 @@ type WebhookEvent struct {
 	IsPR         bool   // true for mr/pull_request events
 	HeadSHA      string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
 	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
-	HeadBranch   string // PR/MR source branch (for selfImprove push target)
+	HeadBranch   string // PR/MR source branch
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
 }
 

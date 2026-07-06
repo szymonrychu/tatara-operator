@@ -10,7 +10,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -339,122 +338,6 @@ func TestLifecycleMainCI_GitLabUsesProjectPath(t *testing.T) {
 	// "group/sub/project".  OwnerRepo would return ("group", "sub") which is wrong.
 	if reader.owner != "group/sub/project" {
 		t.Errorf("GetCommitCIStatus owner = %q, want %q (full GitLab project path)", reader.owner, "group/sub/project")
-	}
-}
-
-// ============================================================
-// FIX 4 - writeBackSelfImprove 405 must not return the error.
-// ============================================================
-
-// selfImproveMergeFakeWriter controls Merge and GetPRState for selfImprove tests.
-type selfImproveMergeFakeWriter struct {
-	lifecycleFakeSCMWriter
-	prAuthor string
-	mergeErr error
-}
-
-func (f *selfImproveMergeFakeWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	return scm.PRState{Author: f.prAuthor, CIStatus: "success"}, nil
-}
-
-func (f *selfImproveMergeFakeWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
-	return "", f.mergeErr
-}
-
-func seedSelfImproveTask(t *testing.T, name, proj, repo, sec string) *tatarav1alpha1.Task {
-	t.Helper()
-	ctx := context.Background()
-
-	mkSecret(t, sec, map[string][]byte{"token": []byte("tok"), "webhookSecret": []byte("wh")})
-	projObj := &tatarav1alpha1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: proj, Namespace: testNS},
-		Spec: tatarav1alpha1.ProjectSpec{
-			ScmSecretRef: sec,
-			Scm: &tatarav1alpha1.ScmSpec{
-				Provider: "github", Owner: "o", BotLogin: "bot",
-				MergePolicy: "afterApproval",
-			},
-			Agent: tatarav1alpha1.AgentSpec{
-				Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
-				MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,
-			},
-		},
-	}
-	if err := k8sClient.Create(ctx, projObj); err != nil {
-		t.Fatalf("create project: %v", err)
-	}
-	projObj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
-	if err := k8sClient.Status().Update(ctx, projObj); err != nil {
-		t.Fatalf("set memory ready: %v", err)
-	}
-	repoObj := &tatarav1alpha1.Repository{
-		ObjectMeta: metav1.ObjectMeta{Name: repo, Namespace: testNS},
-		Spec: tatarav1alpha1.RepositorySpec{
-			ProjectRef: proj, URL: "https://github.com/o/r.git",
-			DefaultBranch: "main", ReingestSchedule: "0 6 * * *",
-		},
-	}
-	if err := k8sClient.Create(ctx, repoObj); err != nil {
-		t.Fatalf("create repo: %v", err)
-	}
-
-	task := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
-		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:    proj,
-			RepositoryRef: repo,
-			Kind:          "selfImprove",
-			Goal:          "self-improve test",
-			Source: &tatarav1alpha1.TaskSource{
-				Provider: "github", IsPR: true, Number: 10, URL: "https://github.com/o/r/pull/10",
-				IssueRef: "o/r#10",
-			},
-		},
-	}
-	if err := k8sClient.Create(ctx, task); err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	task.Status.Phase = "Succeeded"
-	task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge"}
-	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
-		Type: "WritebackPending", Status: metav1.ConditionTrue,
-		Reason: "AgentDone", ObservedGeneration: task.Generation,
-	})
-	if err := k8sClient.Status().Update(ctx, task); err != nil {
-		t.Fatalf("seed task status: %v", err)
-	}
-	return task
-}
-
-// TestWriteBackSelfImprove_405DoesNotReturnError verifies that a 405 from Merge
-// in writeBackSelfImprove returns nil error (no controller-runtime backoff loop)
-// and clears WritebackPending.
-func TestWriteBackSelfImprove_405DoesNotReturnError(t *testing.T) {
-	ctx := logf.IntoContext(context.Background(), logf.Log)
-	name := "lc-si-405"
-	proj := "lc-si405-proj"
-	repo := "lc-si405-repo"
-	sec := "lc-si405-sec"
-
-	task := seedSelfImproveTask(t, name, proj, repo, sec)
-
-	fw := &selfImproveMergeFakeWriter{
-		prAuthor: "bot",
-		mergeErr: scm.ErrMergeConflict,
-	}
-	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
-	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
-
-	_, err := r.doWriteBack(ctx, fetchTask(t, task.Name))
-	if err != nil {
-		t.Errorf("writeBackSelfImprove 405 must not return error (live-loop guard), got: %v", err)
-	}
-
-	// WritebackPending must be cleared (False).
-	got := fetchTask(t, task.Name)
-	cond := apimeta.FindStatusCondition(got.Status.Conditions, "WritebackPending")
-	if cond == nil || cond.Status != metav1.ConditionFalse {
-		t.Errorf("WritebackPending must be False after 405 conflict; cond=%+v", cond)
 	}
 }
 

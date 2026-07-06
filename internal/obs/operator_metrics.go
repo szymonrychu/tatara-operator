@@ -463,7 +463,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	}
 	// Pre-seed terminal-Task GC by kind so the series exist before the first sweep.
 	for _, kind := range []string{
-		"implement", "review", "selfImprove", "triageIssue",
+		"implement", "review", "triageIssue",
 		"brainstorm", "issueLifecycle", "incident", "documentation",
 	} {
 		m.tasksGCTotal.WithLabelValues(kind)

@@ -34,7 +34,7 @@ func TestTurnCap(t *testing.T) {
 		{"explicit MaxTurns caps implement", "implement", 10, 50, 10, true},
 		{"explicit MaxTurns caps issueLifecycle", "issueLifecycle", 7, 50, 7, true},
 		{"review capped at project value", "review", 0, 50, 50, true},
-		{"selfImprove stays capped", "selfImprove", 0, 50, 50, true},
+		{"brainstorm capped at project value", "brainstorm", 0, 50, 50, true},
 		{"triageIssue default cap", "triageIssue", 0, 0, 50, true},
 	}
 	for _, tt := range tests {

@@ -22,9 +22,9 @@ func TestSkillProfileForKind(t *testing.T) {
 		{"brainstorm", "brainstorm"},
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
-		{"selfImprove", "selfImprove"},
 		{"refine", "refine"},
 		{"healthCheck", ""}, // healthCheck uses Kind=brainstorm at the task level; unknown here -> fail-open
+		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open
 		{"", ""},            // empty -> fail-open
 		{"unknown", ""},     // unknown -> fail-open
 	}
@@ -35,13 +35,15 @@ func TestSkillProfileForKind(t *testing.T) {
 	}
 }
 
-// TestSkillProfileForKind_AllCRDKinds asserts that every Kind in the CRD enum maps
-// to a non-empty skill profile, so a future new kind fails this test until added.
-func TestSkillProfileForKind_AllCRDKinds(t *testing.T) {
+// TestSkillProfileForKind_AllActiveCRDKinds asserts that every active Kind in the
+// CRD enum maps to a non-empty skill profile, so a future new kind fails this test
+// until added. selfImprove is kept in the CRD enum (to avoid rejecting stored
+// terminal CRs) but is no longer an active code path - its profile is intentionally
+// removed (returns "").
+func TestSkillProfileForKind_AllActiveCRDKinds(t *testing.T) {
 	crdKinds := []string{
 		"implement",
 		"review",
-		"selfImprove",
 		"triageIssue",
 		"brainstorm",
 		"issueLifecycle",
@@ -118,10 +120,10 @@ func TestBuildPod_SkillProfileEnv(t *testing.T) {
 		{"brainstorm", "brainstorm"},
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
-		{"selfImprove", "selfImprove"},
 		{"refine", "refine"},
-		{"", ""},        // unknown -> fail-open
-		{"unknown", ""}, // unknown -> fail-open
+		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open
+		{"", ""},            // unknown -> fail-open
+		{"unknown", ""},     // unknown -> fail-open
 	}
 
 	proj := testSkillsProj()

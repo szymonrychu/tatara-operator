@@ -320,7 +320,7 @@ func branchKind(t *tatarav1alpha1.Task) string {
 		return "feat"
 	case "documentation":
 		return "docs"
-	default: // review, brainstorm (incl. healthCheck activity), selfImprove, triageIssue
+	default: // review, brainstorm (incl. healthCheck activity), triageIssue
 		return "chore"
 	}
 }
@@ -855,7 +855,6 @@ var kindProfiles = map[string]string{
 	"brainstorm":     "brainstorm",
 	"issueLifecycle": "lifecycle",
 	"incident":       "incident",
-	"selfImprove":    "selfImprove",
 	"refine":         "refine",
 	"documentation":  "documentation",
 }

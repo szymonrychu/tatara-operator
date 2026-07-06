@@ -17,6 +17,33 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
+// mergeAllowed enforces MergePolicy. autoMergeOnGreenCI waits for green CI;
+// absent CI falls back to afterApproval (trust pr_outcome=merge as the agent's
+// relay of an approving signal). st is the PR state fetched by the caller.
+//
+// afterApproval is an intentional trust-the-agent policy: the bot's pr_outcome=merge
+// signal is treated as the agent relaying an approving signal (human review happened
+// outside this gate). It does NOT consult live PR review state. If real approval
+// gating is required, use autoMergeOnGreenCI combined with a branch protection rule
+// requiring an approved review before CI can pass.
+func (r *TaskReconciler) mergeAllowed(proj *tatarav1alpha1.Project, st scm.PRState) bool {
+	policy := "afterApproval"
+	if proj.Spec.Scm != nil && proj.Spec.Scm.MergePolicy != "" {
+		policy = proj.Spec.Scm.MergePolicy
+	}
+	if policy == "autoMergeOnGreenCI" {
+		if st.CIStatus == "success" {
+			return true
+		}
+		if st.CIStatus != "" {
+			return false // CI present but not green
+		}
+		// CI absent -> fall back to afterApproval below.
+	}
+	// afterApproval: trust pr_outcome=merge as the agent's relay of an approving signal.
+	return true
+}
+
 // handleMerge attempts to merge the PR. Handles 405-conflict as a re-implement
 // signal (MUST NOT return the error to avoid controller-runtime backoff loop).
 func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {

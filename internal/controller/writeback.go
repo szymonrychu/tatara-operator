@@ -50,8 +50,6 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 	switch task.Spec.Kind {
 	case "review":
 		return r.writeBackReview(ctx, task)
-	case "selfImprove":
-		return r.writeBackSelfImprove(ctx, task)
 	case "triageIssue":
 		return r.writeBackIssue(ctx, task)
 	case "brainstorm":

@@ -471,7 +471,7 @@ func TestWriteback_SkipsRepoWith422(t *testing.T) {
 	require.NotContains(t, fw.commentArgs[0], "r2")
 }
 
-// fullFakeSCMWriter records calls to all SCMWriter methods used by review/selfImprove/implement paths.
+// fullFakeSCMWriter records calls to all SCMWriter methods used by review/issueLifecycle/implement paths.
 type fullFakeSCMWriter struct {
 	scm.SCMWriter
 	// implement path
@@ -489,7 +489,7 @@ type fullFakeSCMWriter struct {
 	commentCalled        bool
 	commentIssueRef      string
 	commentBody          string
-	// selfImprove path
+	// issueLifecycle path
 	mergeCalled   bool
 	mergeNumber   int
 	mergeMethod   string
@@ -589,7 +589,7 @@ func (f *fullFakeSCMWriter) CloseIssue(_ context.Context, _, _ string, number in
 }
 
 // seedWritebackKindTask creates the minimal project+repo+secret+task for write-back Kind tests.
-// scmSpec may be nil for implement tasks; provided for selfImprove policy tests.
+// scmSpec may be nil for implement tasks; provide for issueLifecycle/review merge-policy tests.
 func seedWritebackKindTask(t *testing.T, name, project, repo, scmSecret string, spec tatarav1alpha1.TaskSpec, scmSpec *tatarav1alpha1.ScmSpec) *tatarav1alpha1.Task {
 	t.Helper()
 	ctx := context.Background()
@@ -787,119 +787,6 @@ func TestDoWriteBackKind(t *testing.T) {
 		require.Equal(t, "g/p!12", fw.commentIssueRef)
 		require.Equal(t, "nice MR", fw.commentBody)
 		require.Zero(t, fw.openCalls, "OpenChange must NOT be called")
-	})
-
-	t.Run("selfImprove/merge afterApproval", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: ""}}
-		r := newFullFakeReconciler(t, fw)
-		task := seedWritebackKindTask(t, "wbk-si-merge", "wbk-proj-sim", "wbk-repo-sim", "wbk-scm-sim",
-			tatarav1alpha1.TaskSpec{
-				Goal: "self-improve",
-				Kind: "selfImprove",
-				Source: &tatarav1alpha1.TaskSource{
-					Provider: "github", IssueRef: "o/r#12", IsPR: true, Number: 12,
-				},
-			},
-			&tatarav1alpha1.ScmSpec{
-				Provider:    "github",
-				Owner:       "o",
-				BotLogin:    "tatara-bot",
-				MergePolicy: "afterApproval",
-			})
-		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge", Reason: "approved"}
-		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-		_, err := reconcileWriteback(t, r, task.Name)
-		require.NoError(t, err)
-
-		// push-CD: pr_outcome=merge no longer force-merges; native auto-merge owns it.
-		require.False(t, fw.mergeCalled, "Merge must NOT be called - deferred to native auto-merge")
-		require.False(t, fw.closePRCalled, "ClosePR must NOT be called")
-		var got tatarav1alpha1.Task
-		require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
-		cond := findCond(got.Status.Conditions, "WritebackPending")
-		require.NotNil(t, cond)
-		require.Equal(t, "PROutcomeApplied", cond.Reason)
-	})
-
-	t.Run("selfImprove/merge autoMergeOnGreenCI success", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: "success"}}
-		r := newFullFakeReconciler(t, fw)
-		task := seedWritebackKindTask(t, "wbk-si-maci", "wbk-proj-maci", "wbk-repo-maci", "wbk-scm-maci",
-			tatarav1alpha1.TaskSpec{
-				Goal: "self-improve CI",
-				Kind: "selfImprove",
-				Source: &tatarav1alpha1.TaskSource{
-					Provider: "github", IssueRef: "o/r#13", IsPR: true, Number: 13,
-				},
-			},
-			&tatarav1alpha1.ScmSpec{
-				Provider:    "github",
-				Owner:       "o",
-				BotLogin:    "tatara-bot",
-				MergePolicy: "autoMergeOnGreenCI",
-			})
-		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge"}
-		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-		_, err := reconcileWriteback(t, r, task.Name)
-		require.NoError(t, err)
-
-		// push-CD: native auto-merge owns merging; pr_outcome=merge is deferred.
-		require.False(t, fw.mergeCalled, "Merge must NOT be called - deferred to native auto-merge")
-	})
-
-	t.Run("selfImprove/merge autoMergeOnGreenCI CI absent -> afterApproval", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot", CIStatus: ""}}
-		r := newFullFakeReconciler(t, fw)
-		task := seedWritebackKindTask(t, "wbk-si-noci", "wbk-proj-noci", "wbk-repo-noci", "wbk-scm-noci",
-			tatarav1alpha1.TaskSpec{
-				Goal: "self-improve no CI",
-				Kind: "selfImprove",
-				Source: &tatarav1alpha1.TaskSource{
-					Provider: "github", IssueRef: "o/r#14", IsPR: true, Number: 14,
-				},
-			},
-			&tatarav1alpha1.ScmSpec{
-				Provider:    "github",
-				Owner:       "o",
-				BotLogin:    "tatara-bot",
-				MergePolicy: "autoMergeOnGreenCI",
-			})
-		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "merge"}
-		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-		_, err := reconcileWriteback(t, r, task.Name)
-		require.NoError(t, err)
-
-		// CI absent -> falls back to afterApproval (policy satisfied), then defers the
-		// merge to native auto-merge instead of force-merging (push-CD).
-		require.False(t, fw.mergeCalled, "merge deferred to native auto-merge even when policy is satisfied")
-	})
-
-	t.Run("selfImprove/close", func(t *testing.T) {
-		fw := &fullFakeSCMWriter{prState: scm.PRState{Author: "tatara-bot"}}
-		r := newFullFakeReconciler(t, fw)
-		task := seedWritebackKindTask(t, "wbk-si-close", "wbk-proj-close", "wbk-repo-close", "wbk-scm-close",
-			tatarav1alpha1.TaskSpec{
-				Goal: "self-improve close",
-				Kind: "selfImprove",
-				Source: &tatarav1alpha1.TaskSource{
-					Provider: "github", IssueRef: "o/r#15", IsPR: true, Number: 15,
-				},
-			},
-			&tatarav1alpha1.ScmSpec{
-				Provider: "github", Owner: "o", BotLogin: "tatara-bot", MergePolicy: "afterApproval",
-			})
-		task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "close", Reason: "rejecting"}
-		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-		_, err := reconcileWriteback(t, r, task.Name)
-		require.NoError(t, err)
-
-		require.True(t, fw.closePRCalled, "ClosePR must be called")
-		require.Equal(t, 15, fw.closePRNumber)
-		require.False(t, fw.mergeCalled, "Merge must NOT be called")
 	})
 
 	t.Run("implement body carries marker", func(t *testing.T) {
