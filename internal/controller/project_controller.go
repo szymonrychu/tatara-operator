@@ -105,6 +105,15 @@ type ProjectReconciler struct {
 	// ChatBaseURL, when set, overrides the in-cluster chat Service DNS used by
 	// updateToolSurfaceProbe (tests point it at httptest).
 	ChatBaseURL func() string
+
+	// toolSurfaceUnhealthyCycles tracks, per backend, the number of consecutive
+	// updateToolSurfaceProbe cycles that probed unhealthy. probeToolSurface only
+	// meters the failing result once a backend's run reaches
+	// toolSurfaceUnhealthyThreshold, so the operator's own rollout churn does not
+	// trip the tool-surface alert against a still-serving backend. Read/written
+	// only on the serialised reconcile path (MaxConcurrentReconciles=1); no mutex
+	// required.
+	toolSurfaceUnhealthyCycles map[string]int
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete

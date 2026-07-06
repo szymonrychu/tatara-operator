@@ -217,6 +217,83 @@ func TestUpdateToolSurfaceProbe_ChatProbedOnceRegardlessOfProjects(t *testing.T)
 	}
 }
 
+// TestUpdateToolSurfaceProbe_DebouncesTransientUnreachable verifies a failing
+// backend is not metered until it has failed toolSurfaceUnhealthyThreshold cycles
+// in a row: a transient transport failure (the operator's own rollout churn
+// dialing a still-serving chat, issue #253) must not trip the `> 0` alert, while a
+// sustained outage meters from the threshold cycle on.
+func TestUpdateToolSurfaceProbe_DebouncesTransientUnreachable(t *testing.T) {
+	ctx := logfIntoTestCtx()
+	r, reg := newMemoryReconcilerWithReg()
+	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
+	r.OperatorURL = "" // isolate the chat backend
+
+	// A closed server yields a transport failure -> "unreachable", the incident's
+	// class.
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := srv.URL
+	r.ToolSurfaceHTTP = srv.Client()
+	srv.Close()
+	r.ChatBaseURL = func() string { return closedURL }
+
+	// Below the threshold: transient unreachable is logged but not metered.
+	for i := 1; i < toolSurfaceUnhealthyThreshold; i++ {
+		r.updateToolSurfaceProbe(ctx)
+		if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 0 {
+			t.Fatalf("after %d transient cycle(s) probe{chat,unreachable} = %v, want 0 (debounced)", i, got)
+		}
+	}
+	// The threshold cycle meters it: a sustained outage is real signal.
+	r.updateToolSurfaceProbe(ctx)
+	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 1 {
+		t.Fatalf("at threshold probe{chat,unreachable} = %v, want 1 (sustained outage metered)", got)
+	}
+	// Every subsequent sustained-unhealthy cycle keeps metering.
+	r.updateToolSurfaceProbe(ctx)
+	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 2 {
+		t.Fatalf("past threshold probe{chat,unreachable} = %v, want 2", got)
+	}
+}
+
+// TestUpdateToolSurfaceProbe_HealthyCycleResetsDebounce verifies a healthy cycle
+// clears the consecutive-failure run, so failures on either side of a recovery do
+// not accumulate across it.
+func TestUpdateToolSurfaceProbe_HealthyCycleResetsDebounce(t *testing.T) {
+	ctx := logfIntoTestCtx()
+	r, reg := newMemoryReconcilerWithReg()
+	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
+	r.OperatorURL = "" // isolate the chat backend
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthy.Close()
+	down := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	downURL := down.URL
+	down.Close()
+
+	r.ToolSurfaceHTTP = healthy.Client() // plain-HTTP client reaches both httptest servers
+	target := downURL
+	r.ChatBaseURL = func() string { return target }
+
+	// Two transient-unhealthy cycles (below threshold), still suppressed.
+	r.updateToolSurfaceProbe(ctx)
+	r.updateToolSurfaceProbe(ctx)
+	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 0 {
+		t.Fatalf("probe{chat,unreachable} = %v after 2 transient cycles, want 0", got)
+	}
+	// A healthy cycle clears the run.
+	target = healthy.URL
+	r.updateToolSurfaceProbe(ctx)
+	// Two more transient cycles must again be suppressed (the run restarted at 0).
+	target = downURL
+	r.updateToolSurfaceProbe(ctx)
+	r.updateToolSurfaceProbe(ctx)
+	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 0 {
+		t.Fatalf("probe{chat,unreachable} = %v; a healthy cycle must reset the debounce", got)
+	}
+}
+
 // TestUpdateToolSurfaceProbe_SkipsOperatorWhenURLUnset verifies the operator
 // backend is not probed when OperatorURL is empty (unwired), so an unset URL
 // does not emit a permanent "unreachable" false alarm.
