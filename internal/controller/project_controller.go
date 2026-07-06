@@ -422,6 +422,10 @@ func issueStateFor(t *tataradevv1alpha1.Task) string {
 		if t.Status.Phase == "Planning" || t.Status.Phase == "Running" {
 			return "reviewing"
 		}
+	case "documentation":
+		if t.Status.Phase == "Planning" || t.Status.Phase == "Running" {
+			return "documenting"
+		}
 	}
 	return ""
 }

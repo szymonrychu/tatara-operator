@@ -28,6 +28,7 @@ func TestDerivePRTitle(t *testing.T) {
 		{"weak changesummary derives", mk("issueLifecycle", "Add main-branch CI health survey", "Go", "body line"), "fix(repo): Add main-branch CI health survey"},
 		{"absent changesummary derives", mk("implement", "Thread systemicId through propose_issue", "", "issue body first line"), "feat(repo): Thread systemicId through propose_issue"},
 		{"no source title falls to goal-ish but not weak", mk("issueLifecycle", "", "", "Make the brainstorm survey live state"), "fix(repo): Make the brainstorm survey live state"},
+		{"documentation kind titles as docs", mk("documentation", "", "", "Update docs for the merged diff"), "docs(repo): Update docs for the merged diff"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

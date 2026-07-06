@@ -161,6 +161,7 @@ var repoScopedKinds = map[string]bool{
 	"selfImprove":    true,
 	"triageIssue":    true,
 	"issueLifecycle": true,
+	"documentation":  true,
 }
 
 // projectScopedKinds are task kinds that must have an empty RepositoryRef.
@@ -255,7 +256,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine;documentation
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`

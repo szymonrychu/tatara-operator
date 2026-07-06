@@ -24,6 +24,7 @@ func TestToolProfileForKind(t *testing.T) {
 		{"incident", "incident"},
 		{"selfImprove", "selfImprove"},
 		{"refine", "refine"},
+		{"documentation", "documentation"},
 		{"", ""},            // unknown/empty -> fail-open
 		{"unknown", ""},     // unknown kind -> fail-open
 		{"healthCheck", ""}, // not a real Kind; brainstorm shares Kind=brainstorm
@@ -57,6 +58,7 @@ func TestToolProfileForKind_AllCRDKinds(t *testing.T) {
 		"issueLifecycle",
 		"incident",
 		"refine",
+		"documentation",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {

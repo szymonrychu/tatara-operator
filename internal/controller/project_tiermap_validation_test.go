@@ -116,3 +116,59 @@ func TestProjectTierMapValidation_AcceptsHealthCheckKey(t *testing.T) {
 		t.Fatalf("expected healthCheck key to be accepted, got error: %v", err)
 	}
 }
+
+// TestProjectTierMapValidation_AcceptsDocumentationKey asserts the apiserver
+// admits "documentation" in modelByKind/effortByKind (landmine 1: the CEL key
+// enum must be kept in sync with the kubebuilder Task Kind Enum).
+func TestProjectTierMapValidation_AcceptsDocumentationKey(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier-documentation", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "tier-documentation-scm",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"},
+			Agent: tatarav1alpha1.AgentSpec{
+				ModelByKind:  map[string]string{"documentation": "claude-sonnet-5"},
+				EffortByKind: map[string]string{"documentation": "medium"},
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("expected documentation key to be accepted, got error: %v", err)
+	}
+}
+
+// TestProjectTierMapValidation_SpawnCeilingByKindAcceptsDocumentation asserts
+// the apiserver admits "documentation" as a spawnCeilingByKind key and
+// rejects an unknown key, mirroring the modelByKind/effortByKind coverage
+// (landmine 1: this is a THIRD, independent CEL gate on the same string).
+func TestProjectTierMapValidation_SpawnCeilingByKindAcceptsDocumentation(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier-spawn-ceiling-doc", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "tier-spawn-ceiling-doc-scm",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"},
+			TokenBudget: &tatarav1alpha1.TokenBudgetSpec{
+				SpawnCeilingByKind: map[string]int32{"documentation": 80},
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("expected documentation spawnCeilingByKind key to be accepted, got error: %v", err)
+	}
+
+	bad := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier-spawn-ceiling-bad", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "tier-spawn-ceiling-bad-scm",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"},
+			TokenBudget: &tatarav1alpha1.TokenBudgetSpec{
+				SpawnCeilingByKind: map[string]int32{"docs": 80},
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, bad); err == nil {
+		t.Fatalf("expected apiserver to reject unknown spawnCeilingByKind key, got no error")
+	}
+}

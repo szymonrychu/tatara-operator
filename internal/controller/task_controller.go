@@ -1106,13 +1106,13 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	}
 	r.Metrics.SetTasksInflight(float64(n))
 	// Emit per-kind gauge for all known kinds, zeroing kinds with no in-flight tasks.
-	for _, kind := range []string{"implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle"} {
+	for _, kind := range []string{"implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle", "documentation"} {
 		r.Metrics.SetTasksInflightKind(kind, float64(byKind[kind]))
 	}
 	// Also emit any kinds seen in the list that are not in the known set.
 	for kind, count := range byKind {
 		switch kind {
-		case "implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle":
+		case "implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle", "documentation":
 			continue
 		}
 		r.Metrics.SetTasksInflightKind(kind, float64(count))

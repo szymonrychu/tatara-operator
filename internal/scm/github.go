@@ -49,6 +49,7 @@ type ghWorkItem struct {
 type ghPayload struct {
 	Action     string `json:"action"`
 	Ref        string `json:"ref"`
+	Before     string `json:"before"`
 	After      string `json:"after"`
 	Repository struct {
 		CloneURL string `json:"clone_url"`
@@ -80,7 +81,7 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	}
 	switch event {
 	case "push":
-		return WebhookEvent{Kind: "push", Repo: p.Repository.CloneURL, Branch: strings.TrimPrefix(p.Ref, "refs/heads/")}, nil
+		return WebhookEvent{Kind: "push", Repo: p.Repository.CloneURL, Branch: strings.TrimPrefix(p.Ref, "refs/heads/"), HeadSHA: p.After, BaseSHA: p.Before}, nil
 	case "issues":
 		return ghWorkItemEvent("issue", false, p, p.Issue), nil
 	case "issue_comment":

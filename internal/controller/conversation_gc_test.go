@@ -164,6 +164,18 @@ func TestGCConversations_SoloIssueDeletedWhenTerminal(t *testing.T) {
 	require.False(t, store.objects["demo/r/issue-5.jsonl"], "a closed solo issue's conversation is deleted")
 }
 
+// TestGCConversations_DocumentationSoloDeletedWhenTerminal asserts a terminal
+// documentation Task's S3 transcript is GC-eligible: it is SHA-keyed (no
+// Source.Number, so ConversationKey falls to the task-name form), and must be
+// included in the batched-Kind case or its transcript would leak forever.
+func TestGCConversations_DocumentationSoloDeletedWhenTerminal(t *testing.T) {
+	store := &fakeConvGC{objects: map[string]bool{"demo/task-doc-gc1.jsonl": true}}
+	mkConvTask(t, "doc-gc1", "documentation", "demo/task-doc-gc1.jsonl", "", true)
+
+	convGCServer(store).gcConversations(context.Background(), listConvTasks(t))
+	require.False(t, store.objects["demo/task-doc-gc1.jsonl"], "a closed documentation Task's conversation is deleted")
+}
+
 // Issue #149: a store-wide / connection-level failure must short-circuit the
 // whole pass after the first probe - one "unavailable" metric, no per-object
 // "error" churn, and the remaining backlog keys are never probed - so one

@@ -25,7 +25,7 @@ func ghHeader(event, secret string, body []byte) http.Header {
 
 func TestGitHubDetectAndVerify(t *testing.T) {
 	const secret = "s3cr3t"
-	pushBody := []byte(`{"ref":"refs/heads/main","after":"abc123","repository":{"clone_url":"https://github.com/o/r.git"}}`)
+	pushBody := []byte(`{"ref":"refs/heads/main","before":"def456","after":"abc123","repository":{"clone_url":"https://github.com/o/r.git"}}`)
 	issueBody := []byte(`{"action":"opened","sender":{"login":"alice"},"issue":{"number":7,"title":"Fix bug","body":"do it","user":{"login":"author1"},"labels":[{"name":"tatara"},{"name":"bug"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 	prBody := []byte(`{"action":"opened","sender":{"login":"alice"},"pull_request":{"number":9,"title":"PR title","body":"pr body","user":{"login":"author2"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/9"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
 
@@ -35,7 +35,7 @@ func TestGitHubDetectAndVerify(t *testing.T) {
 		body  []byte
 		want  WebhookEvent
 	}{
-		{"push", "push", pushBody, WebhookEvent{Kind: "push", Repo: "https://github.com/o/r.git", Branch: "main"}},
+		{"push", "push", pushBody, WebhookEvent{Kind: "push", Repo: "https://github.com/o/r.git", Branch: "main", HeadSHA: "abc123", BaseSHA: "def456"}},
 		{"issue", "issues", issueBody, WebhookEvent{Kind: "issue", Repo: "https://github.com/o/r.git", Labels: []string{"tatara", "bug"}, Title: "Fix bug", Body: "do it", IssueRef: "o/r#7", URL: "https://github.com/o/r/issues/7", AuthorLogin: "author1", ActorLogin: "alice", Action: "opened", Number: 7}},
 		{"pr", "pull_request", prBody, WebhookEvent{Kind: "mr", Repo: "https://github.com/o/r.git", Labels: []string{"tatara"}, Title: "PR title", Body: "pr body", IssueRef: "o/r#9", URL: "https://github.com/o/r/pull/9", AuthorLogin: "author2", ActorLogin: "alice", Action: "opened", Number: 9, IsPR: true}},
 		{"other", "ping", []byte(`{}`), WebhookEvent{Kind: "other"}},
