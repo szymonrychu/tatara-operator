@@ -313,6 +313,9 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 		// !podLive so we never call GetMergeState on an actively-worked PR.
 		if hasPR && !podLive {
 			ms, mserr := r.mergeStateForPR(ctx, proj, repos, prCand)
+			if proj.Spec.Scm != nil {
+				r.recordSCM(proj.Spec.Scm.Provider, "get_merge_state", mserr)
+			}
 			if mserr != nil {
 				l.Info("backstop: merge-state probe failed (non-fatal)",
 					"action", "backstop_merge_state_error", "repo", prCand.repo, "pr", prCand.number, "err", mserr.Error())
@@ -424,6 +427,7 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 				l.Info("backstop: conflict-fix task created for stranded DIRTY bot PR",
 					"action", "backstop_dirty_pr_selfheal", "resource_id", proj.Name,
 					"task", task.Name, "pr", prCand.number, "repo", prCand.repo)
+				r.Metrics.ScanItem("backstop", "conflict_fix_created")
 			}
 		}
 	}
@@ -533,4 +537,19 @@ func openPRCandidate(task *tatarav1alpha1.Task) (candidate, bool) {
 		}
 	}
 	return candidate{}, false
+}
+
+// recordSCM records an outbound SCM call on the shared operator_scm_writes_total
+// counter. It mirrors TaskReconciler.recordSCM so that ProjectReconciler-initiated
+// SCM calls (e.g. merge-state probes in backstopSweep) appear in the same metric
+// and dashboards as task-controller-initiated calls.
+func (r *ProjectReconciler) recordSCM(provider, verb string, err error) {
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	r.Metrics.SCMWrite(provider, verb, result)
+	if err != nil {
+		r.Metrics.SCMRequestErrorByStatus(provider, verb, scm.ErrorStatus(err))
+	}
 }
