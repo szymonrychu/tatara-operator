@@ -335,10 +335,19 @@ func (r *TaskReconciler) resolveDeployedTask(ctx context.Context, project *tatar
 			if token, terr := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef); terr == nil {
 				if repoSlug, number := parseIssueRef(task.Spec.Source.IssueRef); number > 0 {
 					cerr := writer.CloseIssue(ctx, token, repoSlug, number, comment)
-					r.recordSCM(provider, "close_issue", cerr)
 					if cerr != nil {
+						// issue #268: a permanently-gone target (404/410) is terminal, not a
+						// genuine write failure - record result="gone" so it does not inflate
+						// the SCM write-failure-ratio alert. This path is already best-effort
+						// (non-fatal), so it never looped; only the metric label changes.
+						if isPermanentTargetGone(cerr) {
+							r.recordSCMGone(provider, "close_issue", cerr)
+						} else {
+							r.recordSCM(provider, "close_issue", cerr)
+						}
 						l.Error(cerr, "deploy: close issue on apply (non-fatal)", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
 					} else {
+						r.recordSCM(provider, "close_issue", nil)
 						l.Info("deploy: issue closed on apply",
 							"action", "scm_issue_closed_on_deploy", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
 					}

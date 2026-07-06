@@ -798,6 +798,19 @@ func (r *TaskReconciler) triageCloseIssue(ctx context.Context, project *tatarav1
 	}
 	closeStart := time.Now()
 	if cerr := writer.CloseIssue(ctx, token, repoSlug, task.Spec.Source.Number, comment); cerr != nil {
+		// issue #268: the source issue is permanently gone (410 deleted / 404 not
+		// found). Requeuing the close can never succeed, so classify it terminal -
+		// record a distinct result="gone" (not "error", which inflated the SCM
+		// write-failure-ratio alert), log it, and return nil so controller-runtime
+		// does not retry-loop the doomed close forever. Mirrors the AddLabel guard
+		// added under #263 (internal/controller/labels.go).
+		if isPermanentTargetGone(cerr) {
+			r.recordSCMGone(provider, "close_issue", cerr)
+			log.FromContext(ctx).Info("triage close: target issue permanently gone; skipping close without requeue",
+				"action", "scm_close_issue_target_gone", "resource_id", task.Name,
+				"number", task.Spec.Source.Number, "status", scm.ErrorStatus(cerr))
+			return nil
+		}
 		r.recordSCM(provider, "close_issue", cerr)
 		return fmt.Errorf("triage close issue: %w", cerr)
 	}

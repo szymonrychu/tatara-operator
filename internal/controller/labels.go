@@ -221,18 +221,20 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	changed := false
 	if !known || !current[desired] {
 		if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
-			r.recordSCM(provider, "add_label", aerr)
 			// issue #263: the target issue is permanently gone (410 deleted / 404
 			// not found). Requeuing this write can never succeed, so classify it as
-			// terminal - log it, do not add/remove any further label, and return nil
-			// so the reconcile stops instead of retry-looping the doomed AddLabel
-			// (which amplified the SCM write-error ratio and fired the alert).
+			// terminal - record a distinct result="gone" (not "error", which
+			// amplified the SCM write-error ratio and fired the alert, issue #268),
+			// log it, do not add/remove any further label, and return nil so the
+			// reconcile stops instead of retry-looping the doomed AddLabel.
 			if isPermanentTargetGone(aerr) {
+				r.recordSCMGone(provider, "add_label", aerr)
 				l.Info("set label: target issue permanently gone; skipping label without requeue",
 					"action", "scm_set_label_target_gone", "resource_id", task.Name,
 					"issue_ref", issueRef, "label", desired, "status", scm.ErrorStatus(aerr))
 				return nil
 			}
+			r.recordSCM(provider, "add_label", aerr)
 			return fmt.Errorf("set label add %q: %w", desired, aerr)
 		}
 		r.recordSCM(provider, "add_label", nil)
