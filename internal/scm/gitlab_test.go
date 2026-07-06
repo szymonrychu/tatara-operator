@@ -16,7 +16,7 @@ func glHeader(event, token string) http.Header {
 
 func TestGitLabDetectAndVerify(t *testing.T) {
 	const secret = "glt0ken"
-	pushBody := []byte(`{"ref":"refs/heads/main","project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"}}`)
+	pushBody := []byte(`{"ref":"refs/heads/main","before":"def456","after":"abc123","project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"}}`)
 	issueBody := []byte(`{"object_kind":"issue","user":{"username":"alice"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":12,"title":"An issue","description":"desc","url":"https://gitlab.com/g/p/-/issues/12"},"labels":[{"title":"tatara"},{"title":"ops"}]}`)
 	mrBody := []byte(`{"object_kind":"merge_request","user":{"username":"bob"},"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},"object_attributes":{"iid":34,"title":"An MR","description":"mr desc","url":"https://gitlab.com/g/p/-/merge_requests/34"},"labels":[{"title":"tatara"}]}`)
 
@@ -26,7 +26,7 @@ func TestGitLabDetectAndVerify(t *testing.T) {
 		body  []byte
 		want  WebhookEvent
 	}{
-		{"push", "Push Hook", pushBody, WebhookEvent{Kind: "push", Repo: "https://gitlab.com/g/p.git", Branch: "main"}},
+		{"push", "Push Hook", pushBody, WebhookEvent{Kind: "push", Repo: "https://gitlab.com/g/p.git", Branch: "main", HeadSHA: "abc123", BaseSHA: "def456"}},
 		{"issue", "Issue Hook", issueBody, WebhookEvent{Kind: "issue", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara", "ops"}, Title: "An issue", Body: "desc", IssueRef: "g/p#12", URL: "https://gitlab.com/g/p/-/issues/12", AuthorLogin: "alice", ActorLogin: "alice", Action: "other", Number: 12}},
 		{"mr", "Merge Request Hook", mrBody, WebhookEvent{Kind: "mr", Repo: "https://gitlab.com/g/p.git", Labels: []string{"tatara"}, Title: "An MR", Body: "mr desc", IssueRef: "g/p!34", URL: "https://gitlab.com/g/p/-/merge_requests/34", AuthorLogin: "bob", ActorLogin: "bob", IsPR: true, Action: "other", Number: 34}},
 		{"other", "Pipeline Hook", []byte(`{}`), WebhookEvent{Kind: "other"}},

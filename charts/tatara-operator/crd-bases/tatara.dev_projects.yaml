@@ -69,13 +69,13 @@ spec:
                       EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
                       ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
                       entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
-                    maxProperties: 9
+                    maxProperties: 10
                     type: object
                     x-kubernetes-validations:
                     - message: 'effortByKind keys must be one of: implement, review,
                         triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
-                        refine, healthCheck'
-                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])
+                        refine, healthCheck, documentation'
+                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
                     - message: 'effortByKind values must be one of: low, medium, high,
                         xhigh, max'
                       rule: self.all(k, self[k] in ['low','medium','high','xhigh','max'])
@@ -5398,13 +5398,13 @@ spec:
                       healthCheck's recurring classification work be tiered separately from
                       brainstorm's creative work. A missing or empty entry falls back to Model.
                       Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
-                    maxProperties: 9
+                    maxProperties: 10
                     type: object
                     x-kubernetes-validations:
                     - message: 'modelByKind keys must be one of: implement, review,
                         triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
-                        refine, healthCheck'
-                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])
+                        refine, healthCheck, documentation'
+                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
                     - message: modelByKind values must be a claude model ID (start
                         with 'claude-', max 64 chars)
                       rule: self.all(k, self[k].startsWith('claude-') && self[k].size()
@@ -5442,6 +5442,27 @@ spec:
                   intermediate parent rebuild. Deploy-supervision picks this over
                   DeployBudgetSeconds for single-hop artifacts.
                 type: integer
+              documentation:
+                description: |-
+                  DocumentationSpec configures the optional post-merge documentation agent:
+                  a merge to any enrolled component's default branch spawns a documentation
+                  Task that updates the central docs repo if the change warrants it. Inert
+                  unless Enabled.
+                properties:
+                  enabled:
+                    description: |-
+                      Enabled has no kubebuilder:default -> false; do NOT gate behavior on
+                      == default (MEMORY trap).
+                    type: boolean
+                  repo:
+                    description: |-
+                      Repo is the central documentation repo the agent maintains (git URL).
+                      It must also be enrolled as a Repository CR under this Project so the
+                      bot has push access and mkdocs CI runs.
+                    type: string
+                required:
+                - enabled
+                type: object
               grafana:
                 description: |-
                   GrafanaSpec configures the optional per-project Grafana incident-response
@@ -5860,13 +5881,13 @@ spec:
                       SpawnCeilingByKind gates each Task kind independently in claudeSubscription
                       mode: work of kind K is held once account usage reaches the given percent.
                       Keys are Task kinds; kinds absent here fall through to proactive/emergency.
-                    maxProperties: 9
+                    maxProperties: 10
                     type: object
                     x-kubernetes-validations:
                     - message: spawnCeilingByKind values must be 0..100
                       rule: self.all(k, self[k] >= 0 && self[k] <= 100)
                     - message: spawnCeilingByKind keys must be valid Task kinds
-                      rule: self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine'])
+                      rule: self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])
                   tokenLimit:
                     description: TokenLimit is the absolute total-token budget per
                       window (customWindow mode).

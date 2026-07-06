@@ -82,3 +82,13 @@ const (
 	// AnnGrafanaAlert carries the rendered Grafana alert context on an incident Task.
 	AnnGrafanaAlert = "tatara.dev/grafana-alert"
 )
+
+// Documentation-agent annotations: a documentation Task is repo-scoped to the
+// DOCS repo (RepositoryRef), so the triggering component repo and its SHA
+// range ride as annotations rather than Source, letting the skill shallow-
+// clone the source repo and diff base..head.
+const (
+	AnnSourceRepo    = "tatara.dev/source-repo"
+	AnnSourceBaseSHA = "tatara.dev/source-base-sha"
+	AnnSourceHeadSHA = "tatara.dev/source-head-sha"
+)

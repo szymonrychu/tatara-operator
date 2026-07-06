@@ -73,6 +73,21 @@ type GrafanaStatus struct {
 	Endpoint string `json:"endpoint,omitempty"`
 }
 
+// DocumentationSpec configures the optional post-merge documentation agent:
+// a merge to any enrolled component's default branch spawns a documentation
+// Task that updates the central docs repo if the change warrants it. Inert
+// unless Enabled.
+type DocumentationSpec struct {
+	// Enabled has no kubebuilder:default -> false; do NOT gate behavior on
+	// == default (MEMORY trap).
+	Enabled bool `json:"enabled"`
+	// Repo is the central documentation repo the agent maintains (git URL).
+	// It must also be enrolled as a Repository CR under this Project so the
+	// bot has push access and mkdocs CI runs.
+	// +optional
+	Repo string `json:"repo,omitempty"`
+}
+
 // LifecycleHooks holds optional shell commands the claude-code wrapper runs at
 // fixed points in an agent session. Each is a command string executed via
 // `sh -c`; an empty field is skipped. Hooks are best-effort: a non-zero exit is
@@ -160,16 +175,16 @@ type AgentSpec struct {
 	// healthCheck's recurring classification work be tiered separately from
 	// brainstorm's creative work. A missing or empty entry falls back to Model.
 	// Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
-	// +kubebuilder:validation:MaxProperties=9
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])",message="modelByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck"
+	// +kubebuilder:validation:MaxProperties=10
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="modelByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].startsWith('claude-') && self[k].size() <= 64)",message="modelByKind values must be a claude model ID (start with 'claude-', max 64 chars)"
 	// +optional
 	ModelByKind map[string]string `json:"modelByKind,omitempty"`
 	// EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
 	// ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
 	// entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
-	// +kubebuilder:validation:MaxProperties=9
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck'])",message="effortByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck"
+	// +kubebuilder:validation:MaxProperties=10
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="effortByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] in ['low','medium','high','xhigh','max'])",message="effortByKind values must be one of: low, medium, high, xhigh, max"
 	// +optional
 	EffortByKind map[string]string `json:"effortByKind,omitempty"`
@@ -430,6 +445,8 @@ type ProjectSpec struct {
 	// +optional
 	Grafana *GrafanaSpec `json:"grafana,omitempty"`
 	// +optional
+	Documentation *DocumentationSpec `json:"documentation,omitempty"`
+	// +optional
 	Queue *QueueSpec `json:"queue,omitempty"`
 	// TokenBudget configures the token-budget admission gate (issue #189). Nil
 	// inherits the operator-wide defaults verbatim; a present block is the
@@ -497,9 +514,9 @@ type TokenBudgetSpec struct {
 	// SpawnCeilingByKind gates each Task kind independently in claudeSubscription
 	// mode: work of kind K is held once account usage reaches the given percent.
 	// Keys are Task kinds; kinds absent here fall through to proactive/emergency.
-	// +kubebuilder:validation:MaxProperties=9
+	// +kubebuilder:validation:MaxProperties=10
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] >= 0 && self[k] <= 100)",message="spawnCeilingByKind values must be 0..100"
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine'])",message="spawnCeilingByKind keys must be valid Task kinds"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])",message="spawnCeilingByKind keys must be valid Task kinds"
 	// +optional
 	SpawnCeilingByKind map[string]int32 `json:"spawnCeilingByKind,omitempty"`
 	// PollIntervalSeconds is how often the operator polls Claude account usage

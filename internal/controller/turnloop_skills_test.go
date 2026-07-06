@@ -20,6 +20,7 @@ func TestRequiredSkillsForKind(t *testing.T) {
 		{"issueLifecycle", []string{"tatara-implement-workflow", "tatara-review-checklist"}},
 		{"incident", []string{"tatara-incident-investigation", "systematic-debugging"}},
 		{"selfImprove", []string{"tatara-deep-architectural-research"}},
+		{"documentation", []string{"tatara-documentation-workflow"}},
 		{"healthCheck", nil}, // healthCheck -> empty (fail-open)
 		{"refine", nil},      // refine -> empty
 		{"", nil},            // unknown -> empty
@@ -49,7 +50,7 @@ func TestRequiredSkillsForKind(t *testing.T) {
 
 // TestSkillsDirective_RequiredWording asserts "Required skills" wording for non-reference kinds.
 func TestSkillsDirective_RequiredWording(t *testing.T) {
-	for _, kind := range []string{"implement", "review", "issueLifecycle", "incident", "selfImprove"} {
+	for _, kind := range []string{"implement", "review", "issueLifecycle", "incident", "selfImprove", "documentation"} {
 		t.Run(kind, func(t *testing.T) {
 			d := skillsDirective(kind)
 			if d == "" {

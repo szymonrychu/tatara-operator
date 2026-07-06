@@ -22,6 +22,8 @@ type glLabel struct {
 type glPayload struct {
 	ObjectKind string `json:"object_kind"`
 	Ref        string `json:"ref"`
+	Before     string `json:"before"`
+	After      string `json:"after"`
 	User       struct {
 		Username string `json:"username"`
 	} `json:"user"`
@@ -76,7 +78,7 @@ func (*GitLab) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	}
 	switch h.Get("X-Gitlab-Event") {
 	case "Push Hook":
-		return WebhookEvent{Kind: "push", Repo: p.Project.GitHTTPURL, Branch: trimGitLabRef(p.Ref)}, nil
+		return WebhookEvent{Kind: "push", Repo: p.Project.GitHTTPURL, Branch: trimGitLabRef(p.Ref), HeadSHA: p.After, BaseSHA: p.Before}, nil
 	case "Issue Hook":
 		return glWorkItemEvent("issue", false, p), nil
 	case "Merge Request Hook":

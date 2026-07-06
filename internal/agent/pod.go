@@ -208,6 +208,12 @@ func podNameSuffix(task *tatarav1alpha1.Task) string {
 	if task.Spec.Kind == "refine" {
 		return "refine"
 	}
+	if task.Spec.Kind == "documentation" {
+		if sha := shortSourceHeadSHA(task); sha != "" {
+			return "docs-" + sha
+		}
+		return "docs"
+	}
 	if s := task.Spec.Source; s != nil && s.Number > 0 {
 		if s.IsPR {
 			return fmt.Sprintf("mr-%d", s.Number)
@@ -312,14 +318,28 @@ func branchKind(t *tatarav1alpha1.Task) string {
 		return "fix"
 	case "implement":
 		return "feat"
+	case "documentation":
+		return "docs"
 	default: // review, brainstorm (incl. healthCheck activity), selfImprove, triageIssue
 		return "chore"
 	}
 }
 
+// shortSourceHeadSHA returns the first 7 chars of the documentation Task's
+// source-head-SHA annotation ("" if absent/short), used to disambiguate the
+// SHA-keyed doc Task's branch/pod name (it has no issue/PR Number).
+func shortSourceHeadSHA(t *tatarav1alpha1.Task) string {
+	sha := t.Annotations[tatarav1alpha1.AnnSourceHeadSHA]
+	if len(sha) < 7 {
+		return sha
+	}
+	return sha[:7]
+}
+
 // TaskBranch is the deterministic work branch all of the operator write-back,
 // the turn prompts, and the wrapper agree on. When the Task carries an issue/PR
-// number it is tatara/<kind>-<number>-<slug>; otherwise tatara/task-<task-name>.
+// number it is tatara/<kind>-<number>-<slug>; a documentation Task (SHA-keyed,
+// no Number) is tatara/docs-<short-sha>; otherwise tatara/task-<task-name>.
 func TaskBranch(t *tatarav1alpha1.Task) string {
 	if t.Spec.Source != nil && t.Spec.Source.Number > 0 {
 		base := fmt.Sprintf("tatara/%s-%d", branchKind(t), t.Spec.Source.Number)
@@ -330,6 +350,11 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 			base = strings.Trim(base[:63], "-")
 		}
 		return base
+	}
+	if t.Spec.Kind == "documentation" {
+		if sha := shortSourceHeadSHA(t); sha != "" {
+			return fmt.Sprintf("tatara/%s-%s", branchKind(t), sha)
+		}
 	}
 	return "tatara/task-" + t.Name
 }
@@ -645,6 +670,17 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	}
 	env = append(env, corev1.EnvVar{Name: "TATARA_WORKSPACE_FULL_CLONE", Value: fullCloneVal})
 
+	// Documentation Tasks are repo-scoped to the docs repo; the triggering
+	// component repo and SHA range ride as annotations so the skill can
+	// shallow-clone the source repo and diff base..head.
+	if task.Spec.Kind == "documentation" {
+		env = append(env,
+			corev1.EnvVar{Name: "TATARA_SOURCE_REPO", Value: task.Annotations[tatarav1alpha1.AnnSourceRepo]},
+			corev1.EnvVar{Name: "TATARA_SOURCE_BASE_SHA", Value: task.Annotations[tatarav1alpha1.AnnSourceBaseSHA]},
+			corev1.EnvVar{Name: "TATARA_SOURCE_HEAD_SHA", Value: task.Annotations[tatarav1alpha1.AnnSourceHeadSHA]},
+		)
+	}
+
 	// Operator-supplied extra envs are appended LAST, after every variable the
 	// operator itself sets, so a stray extra named like a required variable
 	// (e.g. TATARA_TASK) cannot silently shadow it -- the later duplicate in a
@@ -821,6 +857,7 @@ var kindProfiles = map[string]string{
 	"incident":       "incident",
 	"selfImprove":    "selfImprove",
 	"refine":         "refine",
+	"documentation":  "documentation",
 }
 
 // profileForKind looks up kind in kindProfiles, returning "" (fail-open) for
@@ -865,10 +902,19 @@ func resolveByKind(byKind map[string]string, kind, activity, fallback string) st
 	return fallback
 }
 
+// documentationDefaultModel is the locked model choice for the documentation
+// kind (design decision): claude-sonnet-5, regardless of the project's
+// general Model, unless the project explicitly overrides it via ModelByKind.
+const documentationDefaultModel = "claude-sonnet-5"
+
 // modelForKind resolves the MODEL env for a Task Kind+activity. See
 // resolveByKind for the healthCheck pseudo-key precedence.
 func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
-	return resolveByKind(project.Spec.Agent.ModelByKind, kind, activity, project.Spec.Agent.Model)
+	fallback := project.Spec.Agent.Model
+	if kind == "documentation" {
+		fallback = documentationDefaultModel
+	}
+	return resolveByKind(project.Spec.Agent.ModelByKind, kind, activity, fallback)
 }
 
 // ModelForKind exports modelForKind for controller callers that need to stamp

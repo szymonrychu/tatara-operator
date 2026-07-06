@@ -197,12 +197,14 @@ func TestTaskSpec_ValidateRepositoryRef(t *testing.T) {
 		{"selfImprove with ref", "selfImprove", "my-repo", false},
 		{"triageIssue with ref", "triageIssue", "my-repo", false},
 		{"issueLifecycle with ref", "issueLifecycle", "my-repo", false},
+		{"documentation with ref", "documentation", "tatara-documentation", false},
 		// repo-scoped: ref missing -> error
 		{"implement empty ref", "implement", "", true},
 		{"review empty ref", "review", "", true},
 		{"selfImprove empty ref", "selfImprove", "", true},
 		{"triageIssue empty ref", "triageIssue", "", true},
 		{"issueLifecycle empty ref", "issueLifecycle", "", true},
+		{"documentation empty ref", "documentation", "", true},
 		// project-scoped: ref must be empty
 		{"brainstorm empty ref", "brainstorm", "", false},
 		{"healthCheck empty ref", "healthCheck", "", false},

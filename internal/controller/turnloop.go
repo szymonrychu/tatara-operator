@@ -202,6 +202,8 @@ func requiredSkillsForKind(kind string) []string {
 		return []string{"tatara-incident-investigation", "systematic-debugging"}
 	case "selfImprove":
 		return []string{"tatara-deep-architectural-research"}
+	case "documentation":
+		return []string{"tatara-documentation-workflow"}
 	default:
 		return nil
 	}

@@ -694,6 +694,8 @@ func derivePRTitle(task *tatarav1alpha1.Task, scope string) string {
 	switch task.Spec.Kind {
 	case "issueLifecycle", "incident":
 		kind = "fix"
+	case "documentation":
+		kind = "docs"
 	}
 	return fmt.Sprintf("%s(%s): %s", kind, scope, subject)
 }

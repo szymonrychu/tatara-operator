@@ -78,6 +78,7 @@ spec:
                 - incident
                 - healthCheck
                 - refine
+                - documentation
                 type: string
               maxTurns:
                 type: integer

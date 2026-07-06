@@ -136,7 +136,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	durResult = "ok"
 	switch ev.Kind {
 	case "push":
-		s.handlePush(ctx, w, providerName, projectName, ev)
+		s.handlePush(ctx, w, providerName, &proj, ev)
 	case "issue", "mr":
 		s.handleWorkItem(ctx, w, providerName, proj, ev)
 	default:
@@ -144,7 +144,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider, projectName string, ev scm.WebhookEvent) {
+func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider string, proj *tatarav1.Project, ev scm.WebhookEvent) {
 	var repos tatarav1.RepositoryList
 	if err := s.cfg.Client.List(ctx, &repos, client.InNamespace(s.cfg.Namespace)); err != nil {
 		s.reject(w, http.StatusInternalServerError, "list repositories", provider, "push", ev.Action, "error")
@@ -152,7 +152,7 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 	}
 	for i := range repos.Items {
 		repo := &repos.Items[i]
-		if repo.Spec.ProjectRef != projectName {
+		if repo.Spec.ProjectRef != proj.Name {
 			continue
 		}
 		if !scm.SameRemote(repo.Spec.URL, ev.Repo) || ev.Branch != repo.Spec.DefaultBranch {
@@ -167,11 +167,72 @@ func (s *Server) handlePush(ctx context.Context, w http.ResponseWriter, provider
 			return
 		}
 		s.log.InfoContext(ctx, "webhook push re-ingest requested",
-			"provider", provider, "project", projectName, "repository", repo.Name, "branch", ev.Branch)
+			"provider", provider, "project", proj.Name, "repository", repo.Name, "branch", ev.Branch)
+
+		s.maybeEnqueueDocumentation(ctx, provider, proj, repo, ev)
+
 		s.accept(w, provider, "push", ev.Action, "accepted")
 		return
 	}
 	s.accept(w, provider, "push", ev.Action, "ignored")
+}
+
+// maybeEnqueueDocumentation spawns a documentation Task when the Project opts
+// in: the merge is on an enrolled component's default branch, the component is
+// not the docs repo itself (self-trigger guard), and the docs repo is enrolled
+// as a Repository CR under this Project. The documentation Task is repo-scoped
+// to the DOCS repo; the triggering component and its SHA range ride as
+// annotations (input context for the shallow-clone diff).
+func (s *Server) maybeEnqueueDocumentation(ctx context.Context, provider string, proj *tatarav1.Project, sourceRepo *tatarav1.Repository, ev scm.WebhookEvent) {
+	doc := proj.Spec.Documentation
+	if doc == nil || !doc.Enabled || doc.Repo == "" {
+		return
+	}
+	if scm.SameRemote(doc.Repo, sourceRepo.Spec.URL) {
+		// The docs repo's own merges must not spawn a documentation Task, or it loops.
+		return
+	}
+	if ev.HeadSHA == "" {
+		s.log.InfoContext(ctx, "documentation: push event carries no head SHA; skipping",
+			"project", proj.Name, "repository", sourceRepo.Name)
+		return
+	}
+	docsRepo, err := s.matchRepo(ctx, proj.Name, doc.Repo)
+	if err != nil {
+		s.log.ErrorContext(ctx, "documentation: list repositories", "error", err, "project", proj.Name)
+		return
+	}
+	if docsRepo == nil {
+		// docs repo not enrolled as a Repository CR under this Project; nothing to
+		// write into (and no bot push access).
+		return
+	}
+
+	dedupKey := fmt.Sprintf("doc-%s-%s", sourceRepo.Name, ev.HeadSHA)
+	payload := tatarav1.QueuedEventPayload{
+		Kind: "documentation",
+		Goal: fmt.Sprintf("A merge landed on %s@%s (from %s). Review the diff and update the "+
+			"documentation repo if it is doc-relevant; no-op otherwise.",
+			sourceRepo.Spec.URL, ev.HeadSHA, ev.Branch),
+		RepositoryRef: docsRepo.Name,
+		GenerateName:  "documentation-",
+		Provider:      provider,
+		PodRepo:       docsRepo.Name,
+		Labels:        map[string]string{tatarav1.LabelActivity: "documentation"},
+		Annotations: map[string]string{
+			tatarav1.AnnSourceRepo:    sourceRepo.Spec.URL,
+			tatarav1.AnnSourceBaseSHA: ev.BaseSHA,
+			tatarav1.AnnSourceHeadSHA: ev.HeadSHA,
+		},
+	}
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassNormal, false, dedupKey, payload)
+	if err != nil {
+		s.log.ErrorContext(ctx, "documentation: enqueue", "error", err, "project", proj.Name, "repository", sourceRepo.Name)
+		return
+	}
+	s.log.InfoContext(ctx, "documentation task enqueue",
+		"project", proj.Name, "source_repo", sourceRepo.Name, "docs_repo", docsRepo.Name,
+		"head_sha", ev.HeadSHA, "created", created)
 }
 
 // matchRepo returns the Project's Repository whose URL maps to the given remote,

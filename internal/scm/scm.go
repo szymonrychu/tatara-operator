@@ -30,7 +30,8 @@ type WebhookEvent struct {
 	Action       string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
 	Number       int    // issue/PR/MR number (github) or iid (gitlab)
 	IsPR         bool   // true for mr/pull_request events
-	HeadSHA      string // PR/MR head commit (for CI lookup)
+	HeadSHA      string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
+	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
 	HeadBranch   string // PR/MR source branch (for selfImprove push target)
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
 }

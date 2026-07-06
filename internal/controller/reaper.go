@@ -265,7 +265,7 @@ func (s *CallbackServer) gcConversations(ctx context.Context, tasks []tatarav1al
 	for i := range tasks {
 		tk := &tasks[i]
 		switch tk.Spec.Kind {
-		case "issueLifecycle", "review", "brainstorm":
+		case "issueLifecycle", "review", "brainstorm", "documentation":
 		default:
 			continue
 		}
