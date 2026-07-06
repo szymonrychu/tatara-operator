@@ -579,6 +579,9 @@ func (f *fullFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, prURL, meth
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr
 }
+func (f *fullFakeSCMWriter) GetMergeState(_ context.Context, _, _ string, _ int) (scm.MergeState, error) {
+	return scm.MergeStateClean, nil
+}
 func (f *fullFakeSCMWriter) CloseIssue(_ context.Context, _, _ string, number int, _ string) error {
 	f.closeIssueCalled = true
 	f.closeIssueNumber = number

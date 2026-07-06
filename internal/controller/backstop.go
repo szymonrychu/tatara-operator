@@ -154,6 +154,9 @@ const (
 	// bsActionReactivate: open MR + at least one open source/closes issue + no live
 	// pod - reactivate with a new MRCI task.
 	bsActionReactivate
+	// bsActionDirtyPR: open bot PR with no live pod and merge-state DIRTY -
+	// the branch has a merge conflict; create a conflict-fix issueLifecycle task.
+	bsActionDirtyPR
 )
 
 // backstopAction is Tier-2 of the cron backstop. It classifies what agent action
@@ -302,6 +305,22 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 		// pod Get), not the permanent Status.PodName flag.
 		podLive := r.podIsLive(ctx, task)
 		dec := backstopAction(task, podLive)
+
+		// DIRTY probe: if a bot PR is open and no pod is actively working it,
+		// probe the merge state once. A DIRTY result means the branch has a merge
+		// conflict and the agent exited without resolving it - override to create a
+		// conflict-fix task rather than a plain reactivation. Only probes when
+		// !podLive so we never call GetMergeState on an actively-worked PR.
+		if hasPR && !podLive {
+			ms, mserr := r.mergeStateForPR(ctx, proj, repos, prCand)
+			if mserr != nil {
+				l.Info("backstop: merge-state probe failed (non-fatal)",
+					"action", "backstop_merge_state_error", "repo", prCand.repo, "pr", prCand.number, "err", mserr.Error())
+			} else if ms == scm.MergeStateDirty {
+				dec = bsActionDirtyPR
+			}
+		}
+
 		switch dec {
 		case bsActionNone:
 			// Pure state sync or live pod; nothing to do.
@@ -366,6 +385,45 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 					"action", "backstop_reactivated", "resource_id", proj.Name,
 					"task", task.Name, "pr", prCand.number, "repo", prCand.repo)
 				r.Metrics.ScanItem("backstop", "reactivated")
+			}
+
+		case bsActionDirtyPR:
+			if !hasPR {
+				continue
+			}
+			linkedIssue := linkedIssueForPR(task, prCand.repo)
+			if priorTerminalAttemptsExcluding(existing, prCand.repo, prCand.number, task.Name) >= maxRecoveryAttempts {
+				r.closeExhaustedPR(ctx, proj, repos, prCand)
+				l.Info("backstop: closed exhausted DIRTY MR",
+					"action", "backstop_close_exhausted", "resource_id", proj.Name,
+					"task", task.Name, "pr", prCand.number, "repo", prCand.repo)
+				continue
+			}
+			if hasLiveLifecycleTaskForIssue(existing, prCand.repo, linkedIssue) {
+				r.Metrics.ScanItem("backstop", "skipped_dedup")
+				continue
+			}
+			repo, repoOK := r.matchRepoForSlug(repos, prCand.repo)
+			if !repoOK {
+				continue
+			}
+			goal := fmt.Sprintf(
+				"Resolve merge conflict on %s#%d (backstop conflict self-heal): "+
+					"merge origin/%s into the branch (never rebase), resolve conflicts, and push; "+
+					"or signal pr_outcome close if the PR is superseded or obsolete.",
+				prCand.repo, prCand.number, repo.Spec.DefaultBranch)
+			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			labelCand := candidate{repo: prCand.repo, number: linkedIssue, headSHA: prCand.headSHA, isPR: prCand.isPR}
+			ok2, cerr := r.createScanTask(ctx, proj, &repo, labelCand, prCand, "backstop", "issueLifecycle", goal, ann, nil)
+			if cerr != nil {
+				l.Error(cerr, "backstop: create conflict-fix task",
+					"action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)
+				continue
+			}
+			if ok2 {
+				l.Info("backstop: conflict-fix task created for stranded DIRTY bot PR",
+					"action", "backstop_dirty_pr_selfheal", "resource_id", proj.Name,
+					"task", task.Name, "pr", prCand.number, "repo", prCand.repo)
 			}
 		}
 	}
@@ -441,6 +499,22 @@ func (r *ProjectReconciler) closeObsoletePR(ctx context.Context, proj *tatarav1a
 		return
 	}
 	r.Metrics.ScanItem("backstop", "obsolete_closed")
+}
+
+// mergeStateForPR returns the SCM merge state for the PR identified by c,
+// using scanWriter to obtain an authenticated client from the project secret.
+// Returns MergeStateUnknown on any error so callers can treat it as a
+// non-fatal probe failure and fall back to the existing backstop action.
+func (r *ProjectReconciler) mergeStateForPR(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository, c candidate) (scm.MergeState, error) {
+	repo, ok := r.matchRepoForSlug(repos, c.repo)
+	if !ok {
+		return scm.MergeStateUnknown, fmt.Errorf("merge state: no repo for slug %q", c.repo)
+	}
+	writer, token, err := r.scanWriter(ctx, proj)
+	if err != nil {
+		return scm.MergeStateUnknown, fmt.Errorf("merge state: scm writer: %w", err)
+	}
+	return writer.GetMergeState(ctx, repo.Spec.URL, token, c.number)
 }
 
 // openPRCandidate returns a candidate built from the first open openedPR ledger
