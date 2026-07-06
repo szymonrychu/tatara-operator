@@ -88,3 +88,13 @@ func TestGoalProject_GroomsHandoffs(t *testing.T) {
 		}
 	}
 }
+
+func TestGoalProject_MandatesGroomerSkill(t *testing.T) {
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+	if !strings.Contains(g, "tatara-backlog-groomer") {
+		t.Fatal("refine goal must mandate the tatara-backlog-groomer skill FIRST")
+	}
+	if strings.Index(g, "tatara-backlog-groomer") > strings.Index(g, "project refiner") {
+		t.Fatal("groomer mandate must be prepended before the refiner body")
+	}
+}

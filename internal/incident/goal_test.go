@@ -41,3 +41,15 @@ func TestGoalProjectContainsToolingNoteGuidance(t *testing.T) {
 		t.Error("incident goal tooling-note guidance must mention .mise.toml")
 	}
 }
+
+func TestGoalProjectMandatesIncidentSRESkill(t *testing.T) {
+	g := GoalProject("groupKey=abc status=firing commonLabels={alertname=HighCPU}", []string{"o/api"})
+	for _, want := range []string{"tatara-incident-sre", "tatara-incident-investigation"} {
+		if !strings.Contains(g, want) {
+			t.Fatalf("incident goal must mandate %q", want)
+		}
+	}
+	if strings.Index(g, "tatara-incident-sre") > strings.Index(g, "A Grafana alert is FIRING") {
+		t.Fatal("incident-sre mandate must be prepended before the alert body")
+	}
+}
