@@ -117,6 +117,19 @@ type PRState struct {
 // hard-erroring.
 var ErrMergeConflict = fmt.Errorf("scm: merge conflict or PR not mergeable")
 
+// MergeState is the provider-neutral mergeability of a PR/MR, mapped from
+// GitHub REST mergeable_state and GitLab merge_status. Callers switch on it
+// exhaustively at the merge-gate / conflict-sweep decision point.
+type MergeState string
+
+const (
+	MergeStateUnknown MergeState = "unknown" // not yet computed (recompute in flight)
+	MergeStateClean   MergeState = "clean"   // mergeable, no conflict
+	MergeStateDirty   MergeState = "dirty"   // conflict with the base branch
+	MergeStateBlocked MergeState = "blocked" // mergeable-blocked (draft, failing required checks)
+	MergeStateBehind  MergeState = "behind"  // behind base; needs an update but no conflict
+)
+
 // Suggestion is one inline code suggestion on a PR/MR.
 type Suggestion struct {
 	Path string
