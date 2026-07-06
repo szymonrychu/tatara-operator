@@ -20,6 +20,17 @@ const toolSurfaceProbeTimeout = 3 * time.Second
 // later without resetting the series.
 const toolSurfaceVantage = "in-cluster"
 
+// toolSurfaceUnhealthyThreshold is how many consecutive unhealthy probe cycles
+// (one per ~60s gauge recompute) a backend must fail before probeToolSurface
+// meters the failing result. Below it the failure is logged but not metered, so
+// the operator's OWN rollout churn - transient transport failures dialing a
+// demonstrably-serving backend from a pod that is itself starting up or shutting
+// down - does not trip the `> 0 for 15m` tool-surface alert against a healthy
+// backend (issue #253). Three cycles (~3 min) rides out a single operator
+// rollout wave while a genuine sustained outage still meters from the third cycle
+// on. Mirrors memoryRetrievalUnhealthyThreshold.
+const toolSurfaceUnhealthyThreshold = 3
+
 // updateToolSurfaceProbe probes the agent-facing tool backends the autonomous
 // loop acts through - the operator-write REST surface and (when chat is enabled)
 // each Ready project's chat service - from the same in-cluster URLs agent pods
@@ -27,7 +38,10 @@ const toolSurfaceVantage = "in-cluster"
 // operator-write/chat sibling of updateMemoryRetrievalProbe (which already covers
 // tatara-memory): it runs on the 60s gauge cadence, is best-effort (a probe never
 // fails the reconcile), and is purely observational - it folds into no Project
-// condition and gates no agent dispatch.
+// condition and gates no agent dispatch. A failing result is debounced per
+// backend (toolSurfaceUnhealthyThreshold consecutive cycles) before it is metered,
+// so the operator's own rollout churn does not report a still-serving backend as
+// failing.
 //
 // The operator holds no OIDC token carrying these backends' audiences, so the
 // representative read is unauthenticated: a 401/403 ("present") proves the route
@@ -44,6 +58,9 @@ func (r *ProjectReconciler) updateToolSurfaceProbe(ctx context.Context) {
 	httpc := r.ToolSurfaceHTTP
 	if httpc == nil {
 		httpc = &http.Client{Timeout: toolSurfaceProbeTimeout}
+	}
+	if r.toolSurfaceUnhealthyCycles == nil {
+		r.toolSurfaceUnhealthyCycles = map[string]int{}
 	}
 
 	// operator-write surface: a single shared instance, so probe one
@@ -69,27 +86,49 @@ func (r *ProjectReconciler) updateToolSurfaceProbe(ctx context.Context) {
 
 // probeToolSurface sends one request to a tool-backend route, classifies the
 // served contract, and meters the result and latency under (backend, vantage).
-// An unhealthy result (anything but ok/present) is logged.
+// A healthy result (ok/present) clears the backend's unhealthy run and is metered
+// immediately. An unhealthy result (anything else) is always logged but only
+// metered once it has recurred toolSurfaceUnhealthyThreshold cycles in a row, so a
+// transient transport failure the operator emits against a still-serving backend
+// while its own pod is starting up or shutting down (issue #253) is not counted
+// against the `> 0 for 15m` tool-surface alert; a sustained outage still meters
+// from the threshold cycle on.
 func (r *ProjectReconciler) probeToolSurface(ctx context.Context, httpc *http.Client, backend, method, url string) {
 	start := time.Now()
 	result, err := probeToolSurfaceRoute(ctx, httpc, method, url)
-	r.Metrics.ToolSurfaceProbe(backend, toolSurfaceVantage, result, time.Since(start).Seconds())
-	if result != "ok" && result != "present" {
-		kv := []any{
-			"action", "tool_surface_probe",
-			"backend", backend,
-			"vantage", toolSurfaceVantage,
-			"result", result,
-			"url", url,
-		}
-		// Include the transport error on "unreachable" so a dial failure is a
-		// one-look diagnosis (no-such-host DNS vs connection-refused vs timeout)
-		// instead of requiring source cross-referencing.
-		if err != nil {
-			kv = append(kv, "error", err.Error())
-		}
-		log.FromContext(ctx).Info("tool surface probe unhealthy", kv...)
+	elapsed := time.Since(start).Seconds()
+
+	if result == "ok" || result == "present" {
+		delete(r.toolSurfaceUnhealthyCycles, backend)
+		r.Metrics.ToolSurfaceProbe(backend, toolSurfaceVantage, result, elapsed)
+		return
 	}
+
+	r.toolSurfaceUnhealthyCycles[backend]++
+	run := r.toolSurfaceUnhealthyCycles[backend]
+	kv := []any{
+		"action", "tool_surface_probe",
+		"backend", backend,
+		"vantage", toolSurfaceVantage,
+		"result", result,
+		"url", url,
+		"consecutive", run,
+	}
+	// Include the transport error on "unreachable" so a dial failure is a
+	// one-look diagnosis (no-such-host DNS vs connection-refused vs timeout)
+	// instead of requiring source cross-referencing.
+	if err != nil {
+		kv = append(kv, "error", err.Error())
+	}
+	log.FromContext(ctx).Info("tool surface probe unhealthy", kv...)
+
+	// Debounce: suppress the metric until the failure is sustained, so operator
+	// self-deploy rollout churn (a burst of transient failures per short-lived
+	// pod) does not trip the alert on a backend that is demonstrably serving.
+	if run < toolSurfaceUnhealthyThreshold {
+		return
+	}
+	r.Metrics.ToolSurfaceProbe(backend, toolSurfaceVantage, result, elapsed)
 }
 
 // probeToolSurfaceRoute sends one unauthenticated request and classifies the
