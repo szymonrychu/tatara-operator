@@ -15,7 +15,6 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // dirtyPRFakeWriter implements scm.SCMWriter with configurable GetMergeState.
@@ -171,7 +170,6 @@ func TestBackstopSweep_DirtyBotPR_CreatesConflictFixTask(t *testing.T) {
 				assert.Empty(t, conflictFixQEs, "must NOT create a conflict-fix QE for %s", tc.name)
 			}
 
-			_ = client.ObjectKeyFromObject(strandedTask) // reference used
 		})
 	}
 }

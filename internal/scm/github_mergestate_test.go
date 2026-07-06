@@ -35,6 +35,7 @@ func TestGitHubGetMergeState(t *testing.T) {
 		{"blocked", boolPtr(false), "blocked", MergeStateBlocked},
 		{"draft", boolPtr(false), "draft", MergeStateBlocked},
 		{"unstable_is_clean", boolPtr(true), "unstable", MergeStateClean},
+		{"has_hooks_is_clean", boolPtr(true), "has_hooks", MergeStateClean},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

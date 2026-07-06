@@ -311,7 +311,7 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 		// conflict and the agent exited without resolving it - override to create a
 		// conflict-fix task rather than a plain reactivation. Only probes when
 		// !podLive so we never call GetMergeState on an actively-worked PR.
-		if hasPR && !podLive {
+		if hasPR && !podLive && proj.Spec.Scm != nil {
 			ms, mserr := r.mergeStateForPR(ctx, proj, repos, prCand)
 			if proj.Spec.Scm != nil {
 				r.recordSCM(proj.Spec.Scm.Provider, "get_merge_state", mserr)
@@ -391,9 +391,6 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 			}
 
 		case bsActionDirtyPR:
-			if !hasPR {
-				continue
-			}
 			linkedIssue := linkedIssueForPR(task, prCand.repo)
 			if priorTerminalAttemptsExcluding(existing, prCand.repo, prCand.number, task.Name) >= maxRecoveryAttempts {
 				r.closeExhaustedPR(ctx, proj, repos, prCand)
@@ -510,6 +507,9 @@ func (r *ProjectReconciler) closeObsoletePR(ctx context.Context, proj *tatarav1a
 // Returns MergeStateUnknown on any error so callers can treat it as a
 // non-fatal probe failure and fall back to the existing backstop action.
 func (r *ProjectReconciler) mergeStateForPR(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository, c candidate) (scm.MergeState, error) {
+	if proj.Spec.Scm == nil {
+		return scm.MergeStateUnknown, fmt.Errorf("merge state: project has no SCM config")
+	}
 	repo, ok := r.matchRepoForSlug(repos, c.repo)
 	if !ok {
 		return scm.MergeStateUnknown, fmt.Errorf("merge state: no repo for slug %q", c.repo)
