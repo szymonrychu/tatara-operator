@@ -319,7 +319,10 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 			if mserr != nil {
 				l.Info("backstop: merge-state probe failed (non-fatal)",
 					"action", "backstop_merge_state_error", "repo", prCand.repo, "pr", prCand.number, "err", mserr.Error())
-			} else if ms == scm.MergeStateDirty {
+			} else if ms == scm.MergeStateDirty && dec != bsActionCloseObsolete {
+				// Do not clobber a deterministic obsolete-close: an obsolete PR that
+				// is also dirty must be closed by the operator, not handed to a
+				// conflict-fix agent that might resolve+push unwanted work onto main.
 				dec = bsActionDirtyPR
 			}
 		}
