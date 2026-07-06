@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,6 +25,7 @@ func buildRouter(t *testing.T, objs ...client.Object) *chi.Mux {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objs...).
