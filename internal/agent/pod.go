@@ -660,12 +660,13 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	)
 
 	// TATARA_WORKSPACE_FULL_CLONE signals the wrapper to clone every project
-	// repo with full history and all branches. Set only for project-scoped kinds
-	// (repo==nil: brainstorm/incident/refine; healthCheck is an activity
-	// label on brainstorm, not its own Kind); left empty for
-	// repo-scoped kinds so the wrapper's default shallow clone is preserved.
+	// repo with full history and all branches. Set for project-scoped kinds that
+	// need cross-branch context (incident forensics, refine backlog history); left
+	// empty for brainstorm (a read-only code-quality proposer that only needs the
+	// current default-branch source) and for repo-scoped kinds, so the wrapper's
+	// default depth-1 shallow clone is used.
 	fullCloneVal := ""
-	if repo == nil {
+	if repo == nil && task.Spec.Kind != "brainstorm" {
 		fullCloneVal = "true"
 	}
 	env = append(env, corev1.EnvVar{Name: "TATARA_WORKSPACE_FULL_CLONE", Value: fullCloneVal})
