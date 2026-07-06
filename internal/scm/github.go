@@ -697,6 +697,56 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }
 
+const mergeStateRecomputeDelay = 10 * time.Millisecond
+
+// GetMergeState reads the PR's mergeability via REST. GitHub computes it lazily
+// (mergeable:null / mergeable_state:"unknown" on the first read after a push),
+// so when the first read is unresolved this polls once more after a short delay
+// before mapping to a provider-neutral MergeState.
+func (c *GitHub) GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return MergeStateUnknown, fmt.Errorf("github: get merge state: %w", err)
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
+	var pr struct {
+		Mergeable      *bool  `json:"mergeable"`
+		MergeableState string `json:"mergeable_state"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodGet, path, token, nil, &pr); err != nil {
+		return MergeStateUnknown, fmt.Errorf("github: get merge state: %w", err)
+	}
+	if pr.Mergeable == nil || pr.MergeableState == "" || pr.MergeableState == "unknown" {
+		select {
+		case <-ctx.Done():
+			return MergeStateUnknown, fmt.Errorf("github: get merge state: %w", ctx.Err())
+		case <-time.After(mergeStateRecomputeDelay):
+		}
+		if err := ghDo(ctx, c.base(), http.MethodGet, path, token, nil, &pr); err != nil {
+			return MergeStateUnknown, fmt.Errorf("github: get merge state (recompute): %w", err)
+		}
+	}
+	return ghMergeState(pr.MergeableState), nil
+}
+
+// ghMergeState maps GitHub's mergeable_state to a provider-neutral MergeState.
+// unstable/has_hooks mean mergeable-but-noisy (non-required checks) - not a
+// conflict - so they map to clean for the conflict-sweep decision.
+func ghMergeState(state string) MergeState {
+	switch state {
+	case "clean", "has_hooks", "unstable":
+		return MergeStateClean
+	case "dirty":
+		return MergeStateDirty
+	case "behind":
+		return MergeStateBehind
+	case "blocked", "draft":
+		return MergeStateBlocked
+	default:
+		return MergeStateUnknown
+	}
+}
+
 // GetCommitCIStatus returns the CI status for the given commit sha by reading
 // both check-runs and the legacy combined-status API and folding the results:
 //   - failure if either source reports failure
