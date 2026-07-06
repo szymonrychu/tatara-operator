@@ -1782,9 +1782,6 @@ func (s *Server) getHarnessState(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("harness_state_get", "ok", 0)
-	}
 	writeJSON(w, http.StatusOK, entry)
 }
 
