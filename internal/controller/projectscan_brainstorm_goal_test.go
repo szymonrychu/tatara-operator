@@ -48,8 +48,8 @@ func TestBrainstormGoalMandatesCouncilSkill(t *testing.T) {
 	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
 	for _, want := range []string{
 		"tatara-council-brainstorm",
-		"tatara-deep-research",
-		"do NOT call",
+		"tatara-code-quality-proposal",
+		"emits the single terminal action",
 	} {
 		if !strings.Contains(g, want) {
 			t.Fatalf("brainstorm goal must mandate council skill; missing %q", want)
