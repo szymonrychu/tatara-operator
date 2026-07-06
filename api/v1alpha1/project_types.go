@@ -24,8 +24,10 @@ type MemorySpec struct {
 	// PgWalStorage sizes the dedicated CloudNativePG WAL volume. WAL is kept on
 	// its own PVC (separate from PGDATA) so a WAL burst - or WAL retained for a
 	// lagging/re-syncing standby - cannot fill the data volume and take writes
-	// down (issue #238).
-	// +kubebuilder:default="2Gi"
+	// down (issue #238). Defaults to 8Gi: max_slot_wal_keep_size is half the
+	// volume, and a 2Gi WAL volume left the other half (1Gi) unable to hold a
+	// standby-resync WAL burst, crashlooping replicas on the WAL relocation.
+	// +kubebuilder:default="8Gi"
 	// +optional
 	PgWalStorage string `json:"pgWalStorage,omitempty"`
 	// +kubebuilder:default="10Gi"
