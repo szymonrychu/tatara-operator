@@ -172,6 +172,9 @@ type SCMWriter interface {
 	// EnsureLabel ensures a label exists on the repo with the given hex color
 	// (6 hex digits, no '#'), creating it or updating its color. Idempotent.
 	EnsureLabel(ctx context.Context, repoURL, token, name, color string) error
+	// GetMergeState returns the provider-neutral mergeability of the PR/MR,
+	// used by the conflict self-heal (merge gate + stranded-DIRTY-PR sweep).
+	GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error)
 }
 
 // IssueComment is one human comment on an issue, ordered oldest-first.
