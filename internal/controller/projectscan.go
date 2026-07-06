@@ -1746,50 +1746,40 @@ func scmGuidance(proj *tatarav1alpha1.Project) string {
 // (ISSUES / OPEN MRs / MAIN HEALTH). When empty a fallback note is substituted.
 func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string) string {
 	repoList := strings.Join(slugs, ", ")
-
 	stateBlock := "No live repo state available."
 	if repoStateCtx != "" {
 		stateBlock = repoStateCtx
 	}
-
 	goal := "HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
-		"still describes live, unfinished work matching a real opportunity, call `get_handoff` and propose continuing " +
-		"it (a `propose_issue` framed as resuming that work), before generating any fresh ideas. Skip handoffs that no " +
-		"longer matter (superseded, already delivered, or the work is stale). Continuation proposals count against " +
-		"the same MaxOpenProposals cap as fresh ideas below - do not exceed it.\n\n" +
-		"Invoke the `tatara-deep-research` skill to survey the ENTIRE project and identify the highest-leverage " +
-		"discovery or improvement opportunity across ALL repositories: " + repoList + ". " +
-		"The skill defines how to research via the tatara-memory graph and on-disk code, score leverage, and dedup. " +
-		"Run at MAXIMUM reasoning effort. " +
-		"\n\n" + stateBlock + "\n\n" +
-		"EARLY EXIT (do this FIRST, cheaply): before dispatching the per-repo deep-research fan-out, do a quick scan of " +
-		"the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears the bar for a genuinely novel, high-leverage " +
-		"NEW proposal this cycle, call `skip_research(reason)` and STOP. Do NOT run the expensive fan-out just to conclude " +
-		"there is nothing to propose.\n\n" +
-		"OTHERWISE decompose the survey: dispatch one parallel subagent per repository (use the Agent/Workflow tools to fan " +
-		"out, then synthesize their findings into one systemic conclusion).\n\n" +
-		"SYSTEMIC MANDATE: prefer the single highest-leverage systemic opportunity - a pattern spanning >=2 repositories, " +
-		"a platform-wide gap (e.g. a missing CI step everywhere), or recurring debt - over a one-repo tweak.\n\n" +
-		"ARCHITECTURAL RESEARCH: when the highest-leverage opportunity is net-new architecture or a structural pattern the " +
-		"platform has never adopted (not maintenance of what exists), invoke the `tatara-deep-architectural-research` skill " +
-		"instead. Its output may be a long-lived ADR/RFC artifact (problem, options with tradeoffs, recommended option, a " +
-		"strangler migration sketch, and the fitness function that would gate it) that can be championed across cycles and is " +
-		"exempt from silence-over-noise. Open questions are allowed in an ADR. It is a proposal only: never self-implement; " +
-		"the maintainer human-gates every structural change.\n\n" +
-		"NEW-IDEAS-ONLY CONTRACT - this is a discovery cycle for NEW proposals; nursing existing issues is handled " +
-		"elsewhere. Follow exactly ONE path:\n" +
-		"1. If the best idea DUPLICATES or is merely a sub-aspect of an existing open issue listed above: do NOT propose. " +
-		"Finish with a one-line note naming the duplicate (e.g. 'Duplicate of o/repo#N'). Do NOT comment on it.\n" +
-		"2. If the idea is genuinely novel AND standalone: call `propose_issue`. Set `repo` to the owning repository. " +
-		"The proposal must be self-contained AND give the maintainer granular directional control. Required body shape: " +
-		"(a) a one-paragraph problem statement; (b) a DECOMPOSITION of the problem into its smaller constituent " +
-		"sub-problems / decision points; (c) for EACH sub-problem, 2-3 concrete implementation OPTIONS, each with a " +
-		"one-line tradeoff, and YOUR recommended pick; (d) the maintainer's decision framed as choosing one option per " +
-		"sub-problem (approve the recommended set, pick alternatives, or comment to refine). Every choice MUST come with " +
-		"concrete options and a recommendation - do NOT produce a flat list of open questions.\n\n" +
-		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY emit one " +
-		"propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` string you generate. " +
-		"State which path and scope you chose before executing."
+		"still describes live, unfinished work, call `get_handoff` and propose continuing it (a `propose_issue` framed " +
+		"as resuming that work) before generating fresh ideas. Skip stale/superseded/delivered handoffs. Continuation " +
+		"proposals count against the same MaxOpenProposals cap as fresh ideas.\n\n" +
+		"MANDATE: propose the highest-leverage code-quality, simplification, or robustness improvement across ALL " +
+		"repositories: " + repoList + ". Ground every claim in REAL code.\n\n" +
+		"READ REAL CODE (two signals, use both): (1) every listed repo is shallow-cloned read-only into " +
+		"`workspace/<owner>/<repo>` - open the actual source, configs, and tests; (2) the code-graph MCP tools " +
+		"(`code_search`, `code_explain`, `code_related`, `code_important`, `code_cross_repo`, `code_bridges`, " +
+		"`code_communities`) index every enrolled repo - use them for the whole-project map, then open the on-disk " +
+		"files they point at to confirm before proposing. See the `tatara-code-quality-proposal` skill.\n\n" +
+		stateBlock + "\n\n" +
+		"EARLY EXIT (do this FIRST, cheaply): scan the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears " +
+		"the bar for a genuinely novel, high-leverage proposal this cycle, call `skip_research(reason)` and STOP. " +
+		"Silence over noise.\n\n" +
+		"SYSTEMIC MANDATE: prefer a single systemic improvement (a pattern spanning >=2 repositories, a platform-wide " +
+		"gap, or recurring debt) over a one-repo tweak. Decompose: dispatch one parallel subagent per repository, then " +
+		"synthesize one systemic conclusion.\n\n" +
+		"NEW-IDEAS-ONLY CONTRACT - follow exactly ONE path:\n" +
+		"1. If the best idea DUPLICATES an existing open issue above: do NOT propose. Finish with a one-line note " +
+		"naming the duplicate. Do NOT comment on it.\n" +
+		"2. If genuinely novel AND standalone: call `propose_issue`. Set `repo` to the owning repository. Required " +
+		"body shape: (a) a one-paragraph problem statement citing the concrete file/symbol you read; (b) a " +
+		"DECOMPOSITION into sub-problems; (c) for EACH sub-problem, 2-3 concrete OPTIONS with one-line tradeoffs and " +
+		"your recommended pick; (d) the maintainer's decision framed as choosing one option per sub-problem. No flat " +
+		"list of open questions.\n\n" +
+		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY " +
+		"emit one propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` you " +
+		"generate. State which path and scope you chose before executing. You are a read-only proposer: never " +
+		"implement, never push, never open a PR."
 	return appendGuidance(goal+platformProblemGuidance+toolingNoteGuidance, guidance)
 }
 

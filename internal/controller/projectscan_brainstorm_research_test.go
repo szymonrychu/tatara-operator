@@ -5,22 +5,21 @@ import (
 	"testing"
 )
 
-// TestBrainstormGoalNamesResearchSkillAndADR verifies that the brainstorm goal
-// instructs the agent to invoke tatara-deep-architectural-research for net-new
-// structural opportunities and frames the output as a long-lived ADR/RFC artifact
-// that is human-gated before any implementation.
-func TestBrainstormGoalNamesResearchSkillAndADR(t *testing.T) {
+// TestBrainstormGoalNamesCodeQualitySkillAndGrounding verifies that the brainstorm goal
+// instructs the agent to use the code-quality skill backed by real on-disk code and
+// the code-graph MCP tools, not just the deep-research/ADR path.
+func TestBrainstormGoalNamesCodeQualitySkillAndGrounding(t *testing.T) {
 	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
 
-	// Must name the architectural-research skill.
-	if !strings.Contains(g, "tatara-deep-architectural-research") {
-		t.Fatal("brainstorm goal must name tatara-deep-architectural-research skill")
+	// Must name the code-quality proposal skill.
+	if !strings.Contains(g, "tatara-code-quality-proposal") {
+		t.Fatal("brainstorm goal must name tatara-code-quality-proposal skill")
 	}
 
-	// Must signal that its output is a long-lived artifact (ADR/RFC).
-	for _, want := range []string{"ADR", "championed", "human"} {
+	// Must ground proposals in real code: on-disk clones and code-graph tools.
+	for _, want := range []string{"workspace/", "code_search", "simplification", "robustness"} {
 		if !strings.Contains(g, want) {
-			t.Fatalf("brainstorm goal missing architectural-research intent keyword %q", want)
+			t.Fatalf("brainstorm goal missing code-quality grounding keyword %q", want)
 		}
 	}
 
