@@ -95,7 +95,7 @@ func TestMutateTaskStatus_ReviewVerdict_WrongKindErrorText(t *testing.T) {
 func TestMutateTaskStatus_PROutcome_Contract(t *testing.T) {
 	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	var logBuf bytes.Buffer
-	r := buildRouterWithLogAndMetrics(t, m, &logBuf, taskWithKind("t1", "alpha", "selfImprove"))
+	r := buildRouterWithLogAndMetrics(t, m, &logBuf, taskWithKind("t1", "alpha", "issueLifecycle"))
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", strings.NewReader(`{"action":"merge"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -117,7 +117,7 @@ func TestMutateTaskStatus_PROutcome_WrongKindErrorText(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code)
 	var out map[string]string
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
-	require.Equal(t, "pr outcome only applies to a selfImprove task", out["error"])
+	require.Equal(t, "pr outcome only applies to an issueLifecycle task", out["error"])
 }
 
 func TestMutateTaskStatus_ImplementOutcome_Contract(t *testing.T) {

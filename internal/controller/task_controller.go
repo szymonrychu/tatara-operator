@@ -242,27 +242,6 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return res, nil
 	}
 
-	// Authorship gate (security boundary): never spawn an agent for a
-	// selfImprove Task whose PR/MR is not actually authored by the bot. The
-	// webhook's AuthorLogin is only a hint; GetPRState is authoritative.
-	if task.Spec.Kind == "selfImprove" && !isActive(task.Status.Phase) && r.SCMFor != nil {
-		authored, gerr := r.selfImproveBotAuthored(ctx, &project, &task)
-		if gerr != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, gerr
-		}
-		if !authored {
-			res, terr := r.terminate(ctx, &task, "Failed", "NotBotAuthored",
-				"selfImprove PR/MR is not authored by the project bot login")
-			if terr != nil {
-				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, terr
-			}
-			r.Metrics.ReconcileResult("Task", "success")
-			return res, nil
-		}
-	}
-
 	// Project-scoped kinds (brainstorm, healthCheck) have an empty RepositoryRef;
 	// skip the single-repo Get and pass nil to driveAgentRun.
 	var repoPtr *tatarav1alpha1.Repository
@@ -1106,13 +1085,13 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	}
 	r.Metrics.SetTasksInflight(float64(n))
 	// Emit per-kind gauge for all known kinds, zeroing kinds with no in-flight tasks.
-	for _, kind := range []string{"implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle", "documentation"} {
+	for _, kind := range []string{"implement", "review", "triageIssue", "brainstorm", "issueLifecycle", "documentation"} {
 		r.Metrics.SetTasksInflightKind(kind, float64(byKind[kind]))
 	}
 	// Also emit any kinds seen in the list that are not in the known set.
 	for kind, count := range byKind {
 		switch kind {
-		case "implement", "review", "selfImprove", "triageIssue", "brainstorm", "issueLifecycle", "documentation":
+		case "implement", "review", "triageIssue", "brainstorm", "issueLifecycle", "documentation":
 			continue
 		}
 		r.Metrics.SetTasksInflightKind(kind, float64(count))

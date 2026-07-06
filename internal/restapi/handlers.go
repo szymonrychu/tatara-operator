@@ -818,6 +818,11 @@ type prOutcomeReq struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// prOutcomeKindOK is the kind gate for the pr_outcome endpoint.
+// Only issueLifecycle tasks may receive the pr_outcome signal; selfImprove
+// tasks (now retired) must never be admitted here.
+func prOutcomeKindOK(kind string) bool { return kind == "issueLifecycle" }
+
 func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 	var req prOutcomeReq
 	if err := decodeJSON(r, w, &req); err != nil {
@@ -838,8 +843,8 @@ func (s *Server) prOutcome(w http.ResponseWriter, r *http.Request) {
 		metricName: "pr_outcome",
 		logMsg:     "restapi: prOutcome",
 		logAction:  "pr_outcome",
-		kindOK:     func(kind string) bool { return kind == "selfImprove" },
-		kindErrMsg: "pr outcome only applies to a selfImprove task",
+		kindOK:     prOutcomeKindOK,
+		kindErrMsg: "pr outcome only applies to an issueLifecycle task",
 		mutate: func(t *tatarav1alpha1.Task) {
 			t.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: req.Action, Reason: req.Reason}
 		},

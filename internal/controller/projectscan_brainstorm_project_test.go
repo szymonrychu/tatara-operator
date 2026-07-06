@@ -189,9 +189,9 @@ func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 			t.Fatalf("goal missing slug %q: %s", slug, g)
 		}
 	}
-	// Must still call the deep-research skill.
-	if !strings.Contains(g, "tatara-deep-research") {
-		t.Fatalf("goal does not reference tatara-deep-research skill: %s", g)
+	// Must still reference the code-quality skill.
+	if !strings.Contains(g, "tatara-code-quality-proposal") {
+		t.Fatalf("goal does not reference tatara-code-quality-proposal skill: %s", g)
 	}
 	// Must instruct agent to pass repo arg to propose_issue.
 	if !strings.Contains(g, "propose_issue") {

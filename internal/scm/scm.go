@@ -32,7 +32,7 @@ type WebhookEvent struct {
 	IsPR         bool   // true for mr/pull_request events
 	HeadSHA      string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
 	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
-	HeadBranch   string // PR/MR source branch (for selfImprove push target)
+	HeadBranch   string // PR/MR source branch
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
 }
 
@@ -117,6 +117,19 @@ type PRState struct {
 // hard-erroring.
 var ErrMergeConflict = fmt.Errorf("scm: merge conflict or PR not mergeable")
 
+// MergeState is the provider-neutral mergeability of a PR/MR, mapped from
+// GitHub REST mergeable_state and GitLab merge_status. Callers switch on it
+// exhaustively at the merge-gate / conflict-sweep decision point.
+type MergeState string
+
+const (
+	MergeStateUnknown MergeState = "unknown" // not yet computed (recompute in flight)
+	MergeStateClean   MergeState = "clean"   // mergeable, no conflict
+	MergeStateDirty   MergeState = "dirty"   // conflict with the base branch
+	MergeStateBlocked MergeState = "blocked" // mergeable-blocked (draft, failing required checks)
+	MergeStateBehind  MergeState = "behind"  // behind base; needs an update but no conflict
+)
+
 // Suggestion is one inline code suggestion on a PR/MR.
 type Suggestion struct {
 	Path string
@@ -159,6 +172,9 @@ type SCMWriter interface {
 	// EnsureLabel ensures a label exists on the repo with the given hex color
 	// (6 hex digits, no '#'), creating it or updating its color. Idempotent.
 	EnsureLabel(ctx context.Context, repoURL, token, name, color string) error
+	// GetMergeState returns the provider-neutral mergeability of the PR/MR,
+	// used by the conflict self-heal (merge gate + stranded-DIRTY-PR sweep).
+	GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error)
 }
 
 // IssueComment is one human comment on an issue, ordered oldest-first.

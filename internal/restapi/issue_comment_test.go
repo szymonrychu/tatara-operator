@@ -473,3 +473,6 @@ func TestCommentOnIssue_PostsWhenBotNotYetCommented(t *testing.T) {
 }
 
 func (f *fakeWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error { return nil }
+func (f *fakeWriter) GetMergeState(_ context.Context, _, _ string, _ int) (scm.MergeState, error) {
+	return scm.MergeStateClean, nil
+}

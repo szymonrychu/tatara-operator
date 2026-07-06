@@ -38,8 +38,8 @@ func TestBrainstormGoalPrioritizesHandoffsFirst(t *testing.T) {
 			t.Fatalf("brainstorm goal missing handoff-prioritize guidance %q", want)
 		}
 	}
-	// Handoff prioritization must precede the fresh-ideas survey.
-	if strings.Index(low, "list_handoffs") > strings.Index(low, "invoke the `tatara-deep-research`") {
+	// Handoff prioritization must precede the fresh-ideas mandate.
+	if strings.Index(low, "list_handoffs") > strings.Index(low, "mandate") {
 		t.Fatalf("brainstorm goal must list_handoffs BEFORE the fresh-ideas research pass")
 	}
 }

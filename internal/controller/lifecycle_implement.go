@@ -180,6 +180,63 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, r.resetAgentRun(ctx, task)
 	}
 
+	// pr_outcome close signal (issueLifecycle): the agent signalled the PR is
+	// superseded/obsolete/unfixable. The operator owns the close egress and
+	// hard-gates on bot-authorship (the agent must never close a PR it does not
+	// own). Placed before writeBackOpenChange so a close short-circuits the
+	// open-a-new-PR path. Merge is owned by the Merge state, so a stray
+	// pr_outcome=merge here is a no-op confirmation.
+	if out := task.Status.PROutcome; out != nil && out.Action == "close" {
+		number, _ := lifecyclePR(task)
+		if number == 0 {
+			// No PR on this task: an issue-driven Implement turn misfired
+			// pr_outcome=close before any PR exists. Ignore the signal and fall
+			// through to the normal open-change path - GetPRState(0) would 404 and
+			// wedge the task in reconcile backoff.
+			l.Info("implement: pr_outcome close ignored - no PR on task",
+				"action", "lifecycle_close_noop_nopr", "resource_id", task.Name)
+		} else {
+			proj, repo, writer, token, provider, scErr := r.scmContext(ctx, task)
+			if scErr != nil {
+				return ctrl.Result{}, fmt.Errorf("implement: close outcome scm context: %w", scErr)
+			}
+			botLogin := ""
+			if proj.Spec.Scm != nil {
+				botLogin = proj.Spec.Scm.BotLogin
+			}
+			st, perr := writer.GetPRState(ctx, repo.Spec.URL, token, number)
+			r.recordSCM(provider, "get_pr_state", perr)
+			if perr != nil {
+				return ctrl.Result{}, fmt.Errorf("implement: close outcome authorship gate: %w", perr)
+			}
+			if botLogin == "" || st.Author != botLogin {
+				l.Info("implement: close outcome withheld - PR not bot-authored; parking",
+					"action", "lifecycle_close_withheld", "resource_id", task.Name, "author", st.Author)
+				if err := r.parkWithComment(ctx, task, writer, token, "not-bot-authored",
+					fmt.Sprintf("lifecycle: PR #%d close signal withheld - not authored by the bot; parking.", number)); err != nil {
+					return ctrl.Result{}, fmt.Errorf("implement: park non-bot close: %w", err)
+				}
+				return ctrl.Result{}, nil
+			}
+			if !st.Closed {
+				cerr := writer.ClosePR(ctx, repo.Spec.URL, token, number, out.Reason)
+				r.recordSCM(provider, "close", cerr)
+				if cerr != nil {
+					return ctrl.Result{}, fmt.Errorf("implement: close pr: %w", cerr)
+				}
+			}
+			l.Info("implement: pr closed on agent signal",
+				"action", "lifecycle_pr_outcome_close", "resource_id", task.Name, "pr", number, "reason", out.Reason)
+			if err := r.setLifecycleState(ctx, task, "Stopped", "pr-closed-superseded"); err != nil {
+				return ctrl.Result{}, fmt.Errorf("implement: stop after close: %w", err)
+			}
+			if r.LifecycleMetrics != nil {
+				r.LifecycleMetrics.RecordGiveup("pr-closed-superseded")
+			}
+			return ctrl.Result{}, r.resetAgentRun(ctx, task)
+		}
+	}
+
 	// Phase == Succeeded: open MR via the shared writeBackOpenChange path.
 	// writeBackOpenChange sets task.Status.PrURL when a PR was opened.
 	if _, err := r.writeBackOpenChange(ctx, task); err != nil {

@@ -120,7 +120,7 @@ func TestReviewVerdict_RetryOnConflict_HappyPath(t *testing.T) {
 }
 
 func TestPROutcome_RetryOnConflict_HappyPath(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t-pro-retry", "alpha", "selfImprove"))
+	r := buildRouter(t, taskWithKind("t-pro-retry", "alpha", "issueLifecycle"))
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t-pro-retry/pr-outcome",
 		strings.NewReader(`{"action":"merge"}`))
 	req.Header.Set("Content-Type", "application/json")

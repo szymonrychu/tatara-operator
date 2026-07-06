@@ -34,8 +34,8 @@ func TestBrainstormGoalProject_ContainsDedupInstructions(t *testing.T) {
 			t.Fatalf("goal missing slug %q: %s", slug, g)
 		}
 	}
-	if !strings.Contains(g, "tatara-deep-research") {
-		t.Fatalf("goal does not reference tatara-deep-research: %s", g)
+	if !strings.Contains(g, "tatara-code-quality-proposal") {
+		t.Fatalf("goal does not reference tatara-code-quality-proposal skill: %s", g)
 	}
 
 	// Dedup-first: must instruct agent to check existing issues first.

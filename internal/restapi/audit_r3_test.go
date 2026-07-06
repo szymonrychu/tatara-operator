@@ -169,7 +169,7 @@ func TestReviewVerdict_RecordsMetric(t *testing.T) {
 
 func TestPROutcome_RecordsMetric(t *testing.T) {
 	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
-	r := buildRouterWithMetrics(t, m, taskWithKind("tm4", "alpha", "selfImprove"))
+	r := buildRouterWithMetrics(t, m, taskWithKind("tm4", "alpha", "issueLifecycle"))
 	req := httptest.NewRequest(http.MethodPost, "/tasks/tm4/pr-outcome", strings.NewReader(`{"action":"merge"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()

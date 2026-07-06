@@ -17,6 +17,33 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
+// mergeAllowed enforces MergePolicy. autoMergeOnGreenCI waits for green CI;
+// absent CI falls back to afterApproval (trust pr_outcome=merge as the agent's
+// relay of an approving signal). st is the PR state fetched by the caller.
+//
+// afterApproval is an intentional trust-the-agent policy: the bot's pr_outcome=merge
+// signal is treated as the agent relaying an approving signal (human review happened
+// outside this gate). It does NOT consult live PR review state. If real approval
+// gating is required, use autoMergeOnGreenCI combined with a branch protection rule
+// requiring an approved review before CI can pass.
+func (r *TaskReconciler) mergeAllowed(proj *tatarav1alpha1.Project, st scm.PRState) bool {
+	policy := "afterApproval"
+	if proj.Spec.Scm != nil && proj.Spec.Scm.MergePolicy != "" {
+		policy = proj.Spec.Scm.MergePolicy
+	}
+	if policy == "autoMergeOnGreenCI" {
+		if st.CIStatus == "success" {
+			return true
+		}
+		if st.CIStatus != "" {
+			return false // CI present but not green
+		}
+		// CI absent -> fall back to afterApproval below.
+	}
+	// afterApproval: trust pr_outcome=merge as the agent's relay of an approving signal.
+	return true
+}
+
 // handleMerge attempts to merge the PR. Handles 405-conflict as a re-implement
 // signal (MUST NOT return the error to avoid controller-runtime backoff loop).
 func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
@@ -117,23 +144,38 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		return ctrl.Result{}, nil
 	}
 
-	// ErrMergeConflict -> re-implement with resolve instruction.
+	// ErrMergeConflict -> re-implement with a merge-not-rebase, resolve-or-close
+	// mandate. Rebase would need a force-push (hard-denied in the wrapper), so we
+	// instruct a merge of the default branch. The message seeds the Implement
+	// turn (via ImplementContext, folded into Status.Handover by
+	// maybeMarkHandoverResume) with the PR ref, branch, issue scope, and the
+	// binary terminal mandate.
 	if errors.Is(mergeErr, scm.ErrMergeConflict) {
 		branch := task.Status.HeadBranch
-		ctxMsg := fmt.Sprintf("Merge conflict on branch `%s`. Rebase the default branch into it, resolve conflicts, and push.", branch)
+		defaultBranch := repo.Spec.DefaultBranch
+		ctxMsg := fmt.Sprintf(
+			"Merge conflict on PR #%d (branch `%s`). Reach ONE terminal outcome this turn - never park.\n\n"+
+				"RESOLVE: `git fetch origin && git merge origin/%s` on the branch. Use git merge only (force-push is denied in this pod). "+
+				"Resolve each conflict guided by the issue intent below, commit, and `git push` (no --force). The lifecycle re-attempts the merge once you finish.\n\n"+
+				"CLOSE-AS-SUPERSEDED: after merging origin/%s in, if `git diff origin/%s...HEAD` is empty (all changes already landed), the PR is superseded - call `pr_outcome` action `close` with a superseded reason.\n\n"+
+				"CLOSE-AS-OBSOLETE: if the PR is unwanted or the conflict is genuinely unresolvable, still call `pr_outcome` action `close` with the reason.\n\n"+
+				"Originating issue scope:\n%s",
+			number, branch, defaultBranch, defaultBranch, defaultBranch, task.Spec.Goal)
 		if err := r.setImplementContext(ctx, task, ctxMsg); err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("merge: set implement context: %w", err)
 		}
 		if err := r.clearDeadline(ctx, task); err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("merge: clear deadline: %w", err)
 		}
 		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("merge: mark handover resume: %w", err)
 		}
 		if err := r.setLifecycleState(ctx, task, "Implement", "merge-conflict"); err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, fmt.Errorf("merge: set implement state: %w", err)
 		}
-		// MUST return nil error - not returning the error prevents controller-runtime backoff loop.
+		log.FromContext(ctx).Info("merge: conflict escalated to merge-not-rebase resolve-or-close",
+			"action", "lifecycle_merge_conflict_selfheal", "resource_id", task.Name, "pr", number, "branch", branch)
+		// MUST return nil error to avoid controller-runtime backoff loop.
 		return ctrl.Result{}, nil
 	}
 

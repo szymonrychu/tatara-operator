@@ -1091,8 +1091,8 @@ func TestUpdateInflightGauge_PerKind(t *testing.T) {
 	setProjectMemoryReady(t, "p-inflight", "http://mem-inflight.tatara.svc:8080")
 
 	// Create one Planning task per kind.
-	kindNames := map[string]string{"review": "t-inflight-review", "selfImprove": "t-inflight-si"}
-	for i, kind := range []string{"review", "selfImprove"} {
+	kindNames := map[string]string{"review": "t-inflight-review", "brainstorm": "t-inflight-bs"}
+	for i, kind := range []string{"review", "brainstorm"} {
 		name := kindNames[kind]
 		task := &tatarav1alpha1.Task{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
@@ -1135,9 +1135,9 @@ func TestUpdateInflightGauge_PerKind(t *testing.T) {
 	if reviewCount < 1 {
 		t.Errorf("tatara_tasks_inflight{kind=review} = %v, want >= 1", reviewCount)
 	}
-	siCount := gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "selfImprove"})
-	if siCount < 1 {
-		t.Errorf("tatara_tasks_inflight{kind=selfImprove} = %v, want >= 1", siCount)
+	bsCount := gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "brainstorm"})
+	if bsCount < 1 {
+		t.Errorf("tatara_tasks_inflight{kind=brainstorm} = %v, want >= 1", bsCount)
 	}
 	// triageIssue was not created in this test so we skip checking it is zero
 	// (other tests may have created triageIssue tasks), but we do verify the

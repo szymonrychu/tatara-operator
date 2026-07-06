@@ -1,9 +1,10 @@
 package controller
 
 // Tests for audit-r3 findings on writeback.go (2026-06-16).
-// Findings covered: 1 (close idempotency), 2 (GetPRState metered),
-// 3 (list calls metered), 4 (HeadBranch N+1 fix), 6 (incremental PrURL persist),
-// 7 (mergeAllowed returns bool), 8 (nil ReaderFor WARN), 9 (brainstorm fallback WARN).
+// Findings covered: 3 (list calls metered), 4 (HeadBranch N+1 fix),
+// 6 (incremental PrURL persist), 7 (mergeAllowed returns bool),
+// 8 (nil ReaderFor WARN), 9 (brainstorm fallback WARN).
+// Findings 1, 2, 5 covered selfImprove paths now removed; tests deleted.
 // Finding 5 (afterApproval doc/rename) is no-test: comment/doc change only.
 
 import (
@@ -15,7 +16,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,187 +25,6 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
-
-// --- Finding 1: close path skips ClosePR when PR is already closed ---
-
-// closedPRWriter reports the PR as already closed from GetPRState and counts ClosePR calls.
-type closedPRWriter struct {
-	scm.SCMWriter
-	mu            sync.Mutex
-	closeCalls    int
-	prStateClosed bool
-}
-
-func (f *closedPRWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return scm.PRState{Author: "tatara-bot", Closed: f.prStateClosed}, nil
-}
-func (f *closedPRWriter) ClosePR(_ context.Context, _, _ string, _ int, _ string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.closeCalls++
-	return nil
-}
-func (f *closedPRWriter) Comment(_ context.Context, _, _, _ string) error { return nil }
-
-// TestWriteBackSelfImprove_CloseSkipsAlreadyClosed verifies F1: when the PR is
-// already closed (st.Closed=true), ClosePR must not be called, preventing the
-// close comment from being re-posted on a requeue after clearWritebackPending failure.
-func TestWriteBackSelfImprove_CloseSkipsAlreadyClosed(t *testing.T) {
-	fw := &closedPRWriter{prStateClosed: true}
-	r := &TaskReconciler{
-		Client:  k8sClient,
-		Scheme:  k8sClient.Scheme(),
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
-		Session: newFakeSession(),
-		PodConfig: agent.PodConfig{
-			Namespace:           testNS,
-			CallbackURL:         "http://op.svc:8082",
-			OIDCIssuer:          "https://kc.svc/realms/master",
-			AnthropicSecretName: "anthropic",
-			CLIOIDCSecretName:   "tatara-cli-oidc",
-		},
-		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
-	}
-	task := seedWritebackKindTask(t, "r3-f1-already-closed", "wb3f1-proj", "wb3f1-repo", "wb3f1-scm",
-		tatarav1alpha1.TaskSpec{
-			Goal: "self-improve",
-			Kind: "selfImprove",
-			Source: &tatarav1alpha1.TaskSource{
-				Provider: "github", IsPR: true, Number: 101,
-			},
-		},
-		&tatarav1alpha1.ScmSpec{
-			Provider: "github", Owner: "o", BotLogin: "tatara-bot",
-		})
-	task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "close", Reason: "done"}
-	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-	_, err := reconcileWriteback(t, r, task.Name)
-	require.NoError(t, err)
-
-	fw.mu.Lock()
-	calls := fw.closeCalls
-	fw.mu.Unlock()
-	require.Equal(t, 0, calls, "ClosePR must not be called when PR is already closed")
-
-	// WritebackPending must still be cleared.
-	var got tatarav1alpha1.Task
-	require.NoError(t, k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
-	cond := findCond(got.Status.Conditions, "WritebackPending")
-	require.NotNil(t, cond)
-	require.Equal(t, metav1.ConditionFalse, cond.Status,
-		"WritebackPending must be cleared even when ClosePR is skipped")
-}
-
-// TestWriteBackSelfImprove_CloseCallsWhenOpen verifies F1 happy path: when the
-// PR is open (Closed=false), ClosePR IS called.
-func TestWriteBackSelfImprove_CloseCallsWhenOpen(t *testing.T) {
-	fw := &closedPRWriter{prStateClosed: false}
-	r := &TaskReconciler{
-		Client:  k8sClient,
-		Scheme:  k8sClient.Scheme(),
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
-		Session: newFakeSession(),
-		PodConfig: agent.PodConfig{
-			Namespace:           testNS,
-			CallbackURL:         "http://op.svc:8082",
-			OIDCIssuer:          "https://kc.svc/realms/master",
-			AnthropicSecretName: "anthropic",
-			CLIOIDCSecretName:   "tatara-cli-oidc",
-		},
-		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
-	}
-	task := seedWritebackKindTask(t, "r3-f1-open-pr", "wb3f1b-proj", "wb3f1b-repo", "wb3f1b-scm",
-		tatarav1alpha1.TaskSpec{
-			Goal: "self-improve",
-			Kind: "selfImprove",
-			Source: &tatarav1alpha1.TaskSource{
-				Provider: "github", IsPR: true, Number: 102,
-			},
-		},
-		&tatarav1alpha1.ScmSpec{
-			Provider: "github", Owner: "o", BotLogin: "tatara-bot",
-		})
-	task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "close", Reason: "done"}
-	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-	_, err := reconcileWriteback(t, r, task.Name)
-	require.NoError(t, err)
-
-	fw.mu.Lock()
-	calls := fw.closeCalls
-	fw.mu.Unlock()
-	require.Equal(t, 1, calls, "ClosePR must be called once when PR is open")
-}
-
-// --- Finding 2: GetPRState calls are metered via recordSCM ---
-
-// getPRStateMetricWriter records GetPRState calls and returns a configurable state.
-type getPRStateMetricWriter struct {
-	scm.SCMWriter
-	mu         sync.Mutex
-	getPRCalls int
-	state      scm.PRState
-}
-
-func (f *getPRStateMetricWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.getPRCalls++
-	return f.state, nil
-}
-func (f *getPRStateMetricWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
-	return "", nil
-}
-func (f *getPRStateMetricWriter) ClosePR(_ context.Context, _, _ string, _ int, _ string) error {
-	return nil
-}
-func (f *getPRStateMetricWriter) Comment(_ context.Context, _, _, _ string) error { return nil }
-
-// TestWriteBackSelfImprove_GetPRStateMetered verifies F2: the GetPRState call on
-// the authorship gate path emits a get_pr_state metric via recordSCM.
-func TestWriteBackSelfImprove_GetPRStateMetered(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	fw := &getPRStateMetricWriter{
-		state: scm.PRState{Author: "tatara-bot", Closed: false},
-	}
-	r := &TaskReconciler{
-		Client:  k8sClient,
-		Scheme:  k8sClient.Scheme(),
-		Metrics: obs.NewOperatorMetrics(reg),
-		Session: newFakeSession(),
-		PodConfig: agent.PodConfig{
-			Namespace:           testNS,
-			CallbackURL:         "http://op.svc:8082",
-			OIDCIssuer:          "https://kc.svc/realms/master",
-			AnthropicSecretName: "anthropic",
-			CLIOIDCSecretName:   "tatara-cli-oidc",
-		},
-		SCMFor: func(string) (scm.SCMWriter, error) { return fw, nil },
-	}
-	task := seedWritebackKindTask(t, "r3-f2-get-pr-metered", "wb3f2-proj", "wb3f2-repo", "wb3f2-scm",
-		tatarav1alpha1.TaskSpec{
-			Goal: "self-improve",
-			Kind: "selfImprove",
-			Source: &tatarav1alpha1.TaskSource{
-				Provider: "github", IsPR: true, Number: 103,
-			},
-		},
-		&tatarav1alpha1.ScmSpec{
-			Provider: "github", Owner: "o", BotLogin: "tatara-bot",
-		})
-	task.Status.PROutcome = &tatarav1alpha1.PROutcome{Action: "close", Reason: "done"}
-	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
-
-	_, err := reconcileWriteback(t, r, task.Name)
-	require.NoError(t, err)
-
-	cnt := testutil.ToFloat64(r.Metrics.SCMWriteCounter("github", "get_pr_state", "ok"))
-	require.GreaterOrEqual(t, cnt, float64(1), "get_pr_state metric must be emitted from authorship gate")
-}
 
 // --- Finding 3: ListOpenPRs and ListOpenIssues are metered ---
 
@@ -311,8 +130,7 @@ var _ scm.SCMReader = (*listMetricReader)(nil)
 
 // TestWriteback_RecoverExistingPRURL_NoGetPRStateFanout verifies F4: after the
 // HeadBranch field was added to PRRef, recoverExistingPRURL must not call
-// GetPRState per-PR; the single authorship-gate GetPRState is from writeBackSelfImprove,
-// not from this open-change path.
+// GetPRState per-PR.
 func TestWriteback_RecoverExistingPRURL_NoGetPRStateFanout(t *testing.T) {
 	// Task name determines the source branch: tatara/task-<name>.
 	taskName := "r3-f4-no-fanout"
@@ -541,6 +359,3 @@ func init() {
 	// Compile-time interface verify for listMetricReader.
 	var _ scm.SCMReader = (*listMetricReader)(nil)
 }
-
-// apimeta import used for WritebackPending condition assertions.
-var _ = apimeta.FindStatusCondition

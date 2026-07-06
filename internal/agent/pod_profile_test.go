@@ -22,9 +22,9 @@ func TestToolProfileForKind(t *testing.T) {
 		{"brainstorm", "brainstorm"},
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
-		{"selfImprove", "selfImprove"},
 		{"refine", "refine"},
 		{"documentation", "documentation"},
+		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open
 		{"", ""},            // unknown/empty -> fail-open
 		{"unknown", ""},     // unknown kind -> fail-open
 		{"healthCheck", ""}, // not a real Kind; brainstorm shares Kind=brainstorm
@@ -36,9 +36,9 @@ func TestToolProfileForKind(t *testing.T) {
 	}
 }
 
-// TestToolProfileForKind_AllCRDKinds asserts that every Kind value in the CRD
-// enum maps to a non-empty profile, so a future new kind fails this test until
-// it is added to toolProfileForKind. The enum is:
+// TestToolProfileForKind_AllActiveCRDKinds asserts that every active Kind value
+// in the CRD enum maps to a non-empty profile, so a future new kind fails this
+// test until it is added to toolProfileForKind. The enum is:
 //
 //	implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine
 //
@@ -47,12 +47,13 @@ func TestToolProfileForKind(t *testing.T) {
 // healthCheck is omitted from the loop below: it is a vestigial enum alias and
 // runtime healthCheck tasks set Kind=brainstorm, so toolProfileForKind
 // ("healthCheck") is intentionally "" (fail-open never reached at runtime).
-func TestToolProfileForKind_AllCRDKinds(t *testing.T) {
+// selfImprove is omitted: it is a dormant enum value kept only to avoid
+// rejecting stored terminal selfImprove CRs; its profile is intentionally "".
+func TestToolProfileForKind_AllActiveCRDKinds(t *testing.T) {
 	// The CRD enum is the single source of truth; update here when it changes.
 	crdKinds := []string{
 		"implement",
 		"review",
-		"selfImprove",
 		"triageIssue",
 		"brainstorm",
 		"issueLifecycle",
@@ -81,10 +82,10 @@ func TestBuildPod_ToolProfileEnv(t *testing.T) {
 		{"brainstorm", "brainstorm"},
 		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
-		{"selfImprove", "selfImprove"},
 		{"refine", "refine"},
-		{"", ""},        // unset -> empty (fail-open)
-		{"unknown", ""}, // unknown -> empty (fail-open)
+		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open
+		{"", ""},            // unset -> empty (fail-open)
+		{"unknown", ""},     // unknown -> empty (fail-open)
 	}
 
 	proj := &tatarav1alpha1.Project{

@@ -728,10 +728,10 @@ func TestBrainstorm_ListErrorSkipsBacklog_StillCreatesTask(t *testing.T) {
 
 // ----- C5: Brainstorm goal names the deep-research skill -----
 
-func TestBrainstormGoal_NamesDeepResearchSkill(t *testing.T) {
+func TestBrainstormGoal_NamesCodeQualitySkill(t *testing.T) {
 	g := brainstormGoalProject([]string{"tatara-cli"}, "", "")
-	if !strings.Contains(g, "tatara-deep-research") {
-		t.Fatalf("brainstorm goal does not invoke tatara-deep-research skill: %s", g)
+	if !strings.Contains(g, "tatara-code-quality-proposal") {
+		t.Fatalf("brainstorm goal does not reference tatara-code-quality-proposal skill: %s", g)
 	}
 	if !strings.Contains(g, "tatara-cli") {
 		t.Fatalf("brainstorm goal lost the repo slug: %s", g)

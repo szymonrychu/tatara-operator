@@ -20,8 +20,9 @@ func TestBuildPod_FullCloneEnv(t *testing.T) {
 		nilRepo bool
 		wantVal string
 	}{
-		// project-scoped: no primary repo -> full clone
-		{"brainstorm_project_scoped", "brainstorm", true, "true"},
+		// project-scoped: brainstorm uses depth-1 (read-only code proposer);
+		// incident/refine need full history for cross-branch forensics.
+		{"brainstorm_project_scoped", "brainstorm", true, ""},
 		{"incident_project_scoped", "incident", true, "true"},
 		{"refine_project_scoped", "refine", true, "true"},
 		// repo-scoped: primary repo present -> not "true"

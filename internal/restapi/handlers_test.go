@@ -339,7 +339,7 @@ func TestReviewVerdict_InvalidDecision(t *testing.T) {
 }
 
 func TestReviewVerdict_WrongKind(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "implement"))
 	body := strings.NewReader(`{"decision":"approve"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
 	w := httptest.NewRecorder()
@@ -357,7 +357,7 @@ func TestReviewVerdict_TaskNotFound(t *testing.T) {
 }
 
 func TestPROutcome(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
 	body := strings.NewReader(`{"action":"merge","reason":"green"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
 	req.Header.Set("Content-Type", "application/json")
@@ -372,7 +372,7 @@ func TestPROutcome(t *testing.T) {
 }
 
 func TestPROutcome_MissingAction(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
 	body := strings.NewReader(`{"reason":"x"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
 	w := httptest.NewRecorder()
@@ -381,7 +381,7 @@ func TestPROutcome_MissingAction(t *testing.T) {
 }
 
 func TestPROutcome_InvalidAction(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t1", "alpha", "selfImprove"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
 	body := strings.NewReader(`{"action":"rebase"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/pr-outcome", body)
 	w := httptest.NewRecorder()
