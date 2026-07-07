@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -193,6 +194,82 @@ func TestApplyMemoryStack_GuardsStorageShrink(t *testing.T) {
 	}
 	if after.Spec.WalStorage == nil || after.Spec.WalStorage.Size != "16Gi" {
 		t.Fatalf("WAL storage = %v, want it held at 16Gi", after.Spec.WalStorage)
+	}
+	if delta := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name) - before; delta != 1 {
+		t.Fatalf("shrink-guard counter delta = %v, want 1", delta)
+	}
+}
+
+func TestApplyMemoryStack_GuardsStorageShrinkAgainstExpandedPVC(t *testing.T) {
+	// Issue #258: the Cluster .spec still records the default size, but the live
+	// PGDATA PVC was manually expanded beyond it. cnpg's webhook validates a
+	// shrink against the spec, so a render at/above the spec would pass the
+	// webhook yet still be rejected downstream because the PVC cannot shrink. The
+	// guard must read the live PVC capacity and clamp the render up to it.
+	ctx := context.Background()
+	r, reg := newMemoryReconcilerWithReg()
+	p := mkMemoryProject(t, "stack-pvc-shrink")
+
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
+		t.Fatalf("password: %v", err)
+	}
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("first applyMemoryStack: %v", err)
+	}
+
+	names := memory.NamesFor(p.Name)
+	key := types.NamespacedName{Namespace: testNS, Name: names.PGCluster}
+
+	// The Cluster spec is left at the rendered default (cnpg's controller, which
+	// would sync spec to the expanded PVC, is not running in envtest). Create the
+	// PGDATA PVC cnpg would own, requested at 10Gi but with a live capacity of
+	// 30Gi as if a prior manual expansion completed.
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNS,
+			Name:      names.PGCluster + "-1",
+			Labels: map[string]string{
+				"cnpg.io/cluster": names.PGCluster,
+				"cnpg.io/pvcRole": "PG_DATA",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("10Gi")},
+			},
+		},
+	}
+	if err := k8sClient.Create(ctx, pvc); err != nil {
+		t.Fatalf("create pgdata pvc: %v", err)
+	}
+	pvc.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("30Gi")}
+	if err := k8sClient.Status().Update(ctx, pvc); err != nil {
+		t.Fatalf("set pvc status capacity: %v", err)
+	}
+	// Confirm the live capacity persisted; the guard reads status.capacity.
+	var boundPVC corev1.PersistentVolumeClaim
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pvc.Name}, &boundPVC); err != nil {
+		t.Fatalf("get pvc: %v", err)
+	}
+	if got := boundPVC.Status.Capacity[corev1.ResourceStorage]; got.String() != "30Gi" {
+		t.Fatalf("pvc status capacity = %q, want 30Gi", got.String())
+	}
+
+	before := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name)
+
+	// Re-apply: render is 10Gi but must be clamped up to the live 30Gi PVC, even
+	// though the Cluster spec (10Gi) alone would not have triggered a clamp.
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("second applyMemoryStack: %v", err)
+	}
+
+	var after cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, key, &after); err != nil {
+		t.Fatalf("get cluster after re-apply: %v", err)
+	}
+	if got := after.Spec.StorageConfiguration.Size; got != "30Gi" {
+		t.Fatalf("PGDATA storage = %q, want it clamped up to the live PVC capacity 30Gi", got)
 	}
 	if delta := memoryGaugeOrCounter(t, reg, "operator_memory_storage_shrink_guarded_total", "project", p.Name) - before; delta != 1 {
 		t.Fatalf("shrink-guard counter delta = %v, want 1", delta)
