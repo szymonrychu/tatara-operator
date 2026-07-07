@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -129,12 +130,15 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 }
 
 // guardPGStorageShrink clamps the rendered cnpg Cluster's PGDATA and WAL storage
-// sizes up to the already-provisioned cluster's sizes before it is applied, so a
-// render whose size drifted below the live volume never asks cnpg to shrink
-// storage. cnpg's admission webhook rejects any shrink, and before this guard
-// that rejection failed every apply and wedged the whole project memory reconcile
-// to Failed (issue #248). A NotFound existing cluster (first provision) or an
-// unset provisioned size leaves the render untouched.
+// sizes up to the already-provisioned sizes before it is applied, so a render
+// whose size drifted below the live volume never asks cnpg to shrink storage.
+// cnpg's admission webhook rejects any shrink, and before this guard that
+// rejection failed every apply and wedged the whole project memory reconcile to
+// Failed (issue #248). The provisioned floor is the max of the live Cluster
+// .spec size and the live PVC capacity, so a PVC manually expanded beyond the
+// recorded spec is also caught before the reconcile hits the webhook (issue
+// #258). A NotFound existing cluster (first provision) or an unset provisioned
+// size leaves the render untouched.
 func (r *ProjectReconciler) guardPGStorageShrink(ctx context.Context, p *tataradevv1alpha1.Project, desired *cnpgv1.Cluster) (*cnpgv1.Cluster, error) {
 	l := log.FromContext(ctx)
 	var existing cnpgv1.Cluster
@@ -156,7 +160,27 @@ func (r *ProjectReconciler) guardPGStorageShrink(ctx context.Context, p *tatarad
 			"error", err.Error())
 		return desired, nil
 	}
-	raised, err := memory.ClampPGStorageToExisting(desired, &existing)
+	// Also read the live PVC capacities. cnpg's webhook validates a shrink
+	// against the stored Cluster .spec, but a PVC manually expanded beyond that
+	// spec still cannot be shrunk, so a render at/above the spec yet below the
+	// live PVC would be rejected downstream (issue #258). PVC reads are
+	// best-effort hardening: on a read error, fall back to the Cluster-spec floor
+	// (the #248 incident path) rather than failing the whole apply.
+	pgDataPVCCap, walPVCCap, err := r.provisionedPGPVCCapacity(ctx, desired.Name)
+	if err != nil {
+		l.Info("shrink guard: could not read live pg pvc capacity, clamping against cluster spec only",
+			"action", "memory_storage_shrink_guard_pvc_read_error",
+			"resource_id", desired.Name,
+			"error", err.Error())
+		pgDataPVCCap, walPVCCap = "", ""
+	}
+	prov := memory.ProvisionedPGStorage{
+		PGDataSpecSize:    existing.Spec.StorageConfiguration.Size,
+		PGDataPVCCapacity: pgDataPVCCap,
+		WALSpecSize:       walSize(&existing),
+		WALPVCCapacity:    walPVCCap,
+	}
+	raised, err := memory.ClampPGStorageToProvisioned(desired, prov)
 	if err != nil {
 		return nil, fmt.Errorf("guard pg storage shrink: %w", err)
 	}
@@ -172,12 +196,89 @@ func (r *ProjectReconciler) guardPGStorageShrink(ctx context.Context, p *tatarad
 }
 
 // walSize returns the cluster's WAL volume size, or "" when it declares none.
-// Used only for the shrink-guard log line.
+// Used for the shrink-guard log line and as the existing-cluster WAL spec floor.
 func walSize(c *cnpgv1.Cluster) string {
 	if c.Spec.WalStorage == nil {
 		return ""
 	}
 	return c.Spec.WalStorage.Size
+}
+
+// cnpg labels its per-instance PVCs so the data and WAL volumes can be told
+// apart. These mirror pkg/utils.{ClusterLabelName,PvcRoleLabelName} and their
+// PG_DATA/PG_WAL role values from cloudnative-pg; hardcoded here to avoid pulling
+// the whole cnpg utils package in for two string constants.
+const (
+	cnpgClusterLabel  = "cnpg.io/cluster"
+	cnpgPVCRoleLabel  = "cnpg.io/pvcRole"
+	cnpgPVCRolePGData = "PG_DATA"
+	cnpgPVCRolePGWAL  = "PG_WAL"
+)
+
+// provisionedPGPVCCapacity returns the largest live capacity across the cnpg
+// cluster's PGDATA and WAL PVCs, as resource-quantity strings ("" when no such
+// PVC exists yet). It reads status.capacity - the actually-provisioned size that
+// reflects a manual expansion - falling back to the spec request when status is
+// not yet populated. The max across a multi-instance cluster's per-replica PVCs
+// is the floor the render must not drop below (issue #258).
+func (r *ProjectReconciler) provisionedPGPVCCapacity(ctx context.Context, clusterName string) (pgData, wal string, err error) {
+	var pvcs corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &pvcs,
+		client.InNamespace(r.MemoryConfig.Namespace),
+		client.MatchingLabels{cnpgClusterLabel: clusterName}); err != nil {
+		return "", "", fmt.Errorf("list pg pvcs for %s: %w", clusterName, err)
+	}
+	for i := range pvcs.Items {
+		pvc := &pvcs.Items[i]
+		capacity := pvcCapacity(pvc)
+		if capacity == "" {
+			continue
+		}
+		switch pvc.Labels[cnpgPVCRoleLabel] {
+		case cnpgPVCRolePGData:
+			if pgData, err = maxSizeString(pgData, capacity); err != nil {
+				return "", "", fmt.Errorf("pgdata pvc %s: %w", pvc.Name, err)
+			}
+		case cnpgPVCRolePGWAL:
+			if wal, err = maxSizeString(wal, capacity); err != nil {
+				return "", "", fmt.Errorf("wal pvc %s: %w", pvc.Name, err)
+			}
+		}
+	}
+	return pgData, wal, nil
+}
+
+// pvcCapacity returns the PVC's live storage capacity as a quantity string,
+// preferring status.capacity (the provisioned size, updated after an expansion)
+// and falling back to the spec request. Returns "" when neither is set.
+func pvcCapacity(pvc *corev1.PersistentVolumeClaim) string {
+	if q, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && !q.IsZero() {
+		return q.String()
+	}
+	if q, ok := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; ok && !q.IsZero() {
+		return q.String()
+	}
+	return ""
+}
+
+// maxSizeString returns the larger of two resource-quantity strings by magnitude;
+// an empty current value is replaced by the candidate.
+func maxSizeString(current, candidate string) (string, error) {
+	if current == "" {
+		return candidate, nil
+	}
+	curQty, err := resource.ParseQuantity(current)
+	if err != nil {
+		return "", fmt.Errorf("parse %q: %w", current, err)
+	}
+	candQty, err := resource.ParseQuantity(candidate)
+	if err != nil {
+		return "", fmt.Errorf("parse %q: %w", candidate, err)
+	}
+	if candQty.Cmp(curQty) > 0 {
+		return candidate, nil
+	}
+	return current, nil
 }
 
 // memoryStackHealth reads the owned objects' statuses and returns the readiness

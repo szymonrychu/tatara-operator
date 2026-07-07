@@ -70,21 +70,22 @@ func pgClusterWithStorage(pgdata, wal string) *cnpgv1.Cluster {
 	return c
 }
 
-func TestClampPGStorageToExisting(t *testing.T) {
-	t.Run("nil existing leaves desired untouched", func(t *testing.T) {
+func TestClampPGStorageToProvisioned(t *testing.T) {
+	t.Run("nothing provisioned leaves desired untouched", func(t *testing.T) {
 		desired := pgClusterWithStorage("10Gi", "2Gi")
-		raised, err := memory.ClampPGStorageToExisting(desired, nil)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{})
 		require.NoError(t, err)
 		require.False(t, raised)
 		require.Equal(t, "10Gi", desired.Spec.StorageConfiguration.Size)
 		require.Equal(t, "2Gi", desired.Spec.WalStorage.Size)
 	})
 
-	t.Run("shrink is clamped up to provisioned size", func(t *testing.T) {
+	t.Run("shrink is clamped up to provisioned spec size", func(t *testing.T) {
 		// The issue #248 case: default 10Gi rendered against a provisioned 20Gi.
 		desired := pgClusterWithStorage("10Gi", "2Gi")
-		existing := pgClusterWithStorage("20Gi", "5Gi")
-		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "20Gi", WALSpecSize: "5Gi",
+		})
 		require.NoError(t, err)
 		require.True(t, raised)
 		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
@@ -93,8 +94,9 @@ func TestClampPGStorageToExisting(t *testing.T) {
 
 	t.Run("equal sizes are not raised", func(t *testing.T) {
 		desired := pgClusterWithStorage("20Gi", "5Gi")
-		existing := pgClusterWithStorage("20Gi", "5Gi")
-		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "20Gi", WALSpecSize: "5Gi",
+		})
 		require.NoError(t, err)
 		require.False(t, raised)
 		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
@@ -102,8 +104,9 @@ func TestClampPGStorageToExisting(t *testing.T) {
 
 	t.Run("growth request is honored, not clamped down", func(t *testing.T) {
 		desired := pgClusterWithStorage("50Gi", "10Gi")
-		existing := pgClusterWithStorage("20Gi", "5Gi")
-		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "20Gi", WALSpecSize: "5Gi",
+		})
 		require.NoError(t, err)
 		require.False(t, raised)
 		require.Equal(t, "50Gi", desired.Spec.StorageConfiguration.Size)
@@ -112,8 +115,9 @@ func TestClampPGStorageToExisting(t *testing.T) {
 
 	t.Run("only WAL shrinks", func(t *testing.T) {
 		desired := pgClusterWithStorage("20Gi", "2Gi")
-		existing := pgClusterWithStorage("20Gi", "8Gi")
-		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "20Gi", WALSpecSize: "8Gi",
+		})
 		require.NoError(t, err)
 		require.True(t, raised)
 		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
@@ -123,27 +127,73 @@ func TestClampPGStorageToExisting(t *testing.T) {
 	t.Run("different-unit sizes compare by magnitude", func(t *testing.T) {
 		// 10240Mi == 10Gi; provisioned 20Gi must still win.
 		desired := pgClusterWithStorage("10240Mi", "2Gi")
-		existing := pgClusterWithStorage("20Gi", "2Gi")
-		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "20Gi", WALSpecSize: "2Gi",
+		})
 		require.NoError(t, err)
 		require.True(t, raised)
 		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
 	})
 
-	t.Run("existing without WAL leaves desired WAL untouched", func(t *testing.T) {
+	t.Run("no provisioned WAL leaves desired WAL untouched", func(t *testing.T) {
 		desired := pgClusterWithStorage("10Gi", "2Gi")
-		existing := pgClusterWithStorage("20Gi", "")
-		raised, err := memory.ClampPGStorageToExisting(desired, existing)
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "20Gi",
+		})
 		require.NoError(t, err)
 		require.True(t, raised)
 		require.Equal(t, "20Gi", desired.Spec.StorageConfiguration.Size)
 		require.Equal(t, "2Gi", desired.Spec.WalStorage.Size)
 	})
 
-	t.Run("unparseable existing size is an error", func(t *testing.T) {
+	t.Run("unparseable provisioned size is an error", func(t *testing.T) {
 		desired := pgClusterWithStorage("10Gi", "2Gi")
-		existing := pgClusterWithStorage("garbage", "2Gi")
-		_, err := memory.ClampPGStorageToExisting(desired, existing)
+		_, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "garbage", WALSpecSize: "2Gi",
+		})
+		require.Error(t, err)
+	})
+
+	// Issue #258: a PVC manually expanded beyond the recorded Cluster spec size.
+	// The webhook validates against the spec, but the live PVC still cannot shrink,
+	// so the guard must clamp against the larger PVC capacity too.
+	t.Run("pvc capacity above spec size is clamped", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "10Gi", PGDataPVCCapacity: "30Gi",
+			WALSpecSize: "2Gi", WALPVCCapacity: "6Gi",
+		})
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "30Gi", desired.Spec.StorageConfiguration.Size)
+		require.Equal(t, "6Gi", desired.Spec.WalStorage.Size)
+	})
+
+	t.Run("spec size above pvc capacity wins", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "25Gi", PGDataPVCCapacity: "20Gi",
+		})
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "25Gi", desired.Spec.StorageConfiguration.Size)
+	})
+
+	t.Run("pvc capacity alone (no spec floor) is clamped", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		raised, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataPVCCapacity: "30Gi",
+		})
+		require.NoError(t, err)
+		require.True(t, raised)
+		require.Equal(t, "30Gi", desired.Spec.StorageConfiguration.Size)
+	})
+
+	t.Run("unparseable pvc capacity is an error", func(t *testing.T) {
+		desired := pgClusterWithStorage("10Gi", "2Gi")
+		_, err := memory.ClampPGStorageToProvisioned(desired, memory.ProvisionedPGStorage{
+			PGDataSpecSize: "10Gi", PGDataPVCCapacity: "garbage",
+		})
 		require.Error(t, err)
 	})
 }
