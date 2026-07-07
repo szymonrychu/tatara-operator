@@ -86,4 +86,6 @@ func (s *Server) routes(r chi.Router) {
 	r.Post("/tasks/{t}/comment", s.postComment)
 	r.Post("/tasks/{t}/change-summary", s.changeSummary)
 	r.Post("/tasks/{t}/handover", s.handover)
+	r.Get("/projects/{p}/harness-state/{key}", s.getHarnessState)
+	r.Post("/projects/{p}/harness-state/{key}", s.casHarnessState)
 }

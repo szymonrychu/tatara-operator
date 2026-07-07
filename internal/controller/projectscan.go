@@ -1750,7 +1750,11 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string)
 	if repoStateCtx != "" {
 		stateBlock = repoStateCtx
 	}
-	goal := "HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
+	goal := "Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
+		"order; it owns the whole turn and emits the single terminal action itself (`propose_issue`, or " +
+		"`skip_research` when nothing clears the bar or the idea duplicates an open issue), grounded per " +
+		"the `tatara-code-quality-proposal` skill.\n\n" +
+		"HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
 		"still describes live, unfinished work, call `get_handoff` and propose continuing it (a `propose_issue` framed " +
 		"as resuming that work) before generating fresh ideas. Skip stale/superseded/delivered handoffs. Continuation " +
 		"proposals count against the same MaxOpenProposals cap as fresh ideas.\n\n" +

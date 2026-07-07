@@ -25,6 +25,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
+	"github.com/szymonrychu/tatara-operator/internal/harness"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/titlecheck"
 )
@@ -1759,4 +1760,79 @@ func markWorkItemsClosedViaClient(ctx context.Context, c client.Client, ns, repo
 		_ = c.Status().Update(ctx, fresh)
 	}
 	return nil
+}
+
+// --- Harness-state endpoints: GET/POST /projects/{p}/harness-state/{key} ---
+
+func (s *Server) getHarnessState(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	key := chi.URLParam(r, "key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "key required")
+		return
+	}
+	store := harness.Store{Client: s.c, Namespace: s.ns}
+	entry, err := store.Get(r.Context(), projName, key)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+type harnessCASReq struct {
+	Value   string `json:"value"`
+	Version string `json:"version"`
+}
+
+func (s *Server) casHarnessState(w http.ResponseWriter, r *http.Request) {
+	projName := chi.URLParam(r, "p")
+	var proj tatarav1alpha1.Project
+	if err := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: projName}, &proj); err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !authorizeCaller(w, r) {
+		return
+	}
+	key := chi.URLParam(r, "key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "key required")
+		return
+	}
+	var req harnessCASReq
+	if err := decodeJSON(r, w, &req); err != nil {
+		writeDecodeError(w, r, err)
+		return
+	}
+	start := time.Now()
+	store := harness.Store{Client: s.c, Namespace: s.ns}
+	entry, err := store.CAS(r.Context(), projName, key, req.Value, req.Version)
+	if errors.Is(err, harness.ErrConflict) {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest("harness_state_cas", "conflict", time.Since(start).Seconds())
+		}
+		writeError(w, http.StatusConflict, "harness-state version conflict; re-read and retry")
+		return
+	}
+	if err != nil {
+		if s.metrics != nil {
+			s.metrics.RecordRESTRequest("harness_state_cas", "error", time.Since(start).Seconds())
+		}
+		writeClientErr(w, err)
+		return
+	}
+	elapsed := time.Since(start)
+	if s.metrics != nil {
+		s.metrics.RecordRESTRequest("harness_state_cas", "ok", elapsed.Seconds())
+	}
+	logFields := append(reqLogFields(r), "action", "harness_state_cas",
+		"resource_id", projName, "key", key, "duration_ms", elapsed.Milliseconds())
+	s.log.InfoContext(r.Context(), "restapi: casHarnessState", logFields...)
+	writeJSON(w, http.StatusOK, entry)
 }

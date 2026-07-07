@@ -26,7 +26,9 @@ const toolingNoteGuidance = promptguidance.ToolingNoteGuidance
 // the alert (group key, status, labels, annotations, generator/external URLs).
 func GoalProject(alertCtx string, slugs []string) string {
 	repoList := strings.Join(slugs, ", ")
-	return "A Grafana alert is FIRING for this project. Investigate it and hand a well-evidenced issue " +
+	return "Invoke the `tatara-incident-sre` skill FIRST and follow its phases in order; consult " +
+		"`tatara-incident-investigation` for evidence-gathering judgment.\n\n" +
+		"A Grafana alert is FIRING for this project. Investigate it and hand a well-evidenced issue " +
 		"to the team. Repositories in this project: " + repoList + ".\n\n" +
 		"ALERT:\n" + alertCtx + "\n\n" +
 		"Investigate LIVE using the `grafana` MCP server (read-only): query the relevant Prometheus/Loki " +
