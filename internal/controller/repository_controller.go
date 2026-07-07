@@ -152,13 +152,13 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get owning project %q: %w", repo.Spec.ProjectRef, err)
 	}
 
-	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
+	if !memoryStablyReady(&project, time.Now()) {
 		if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
 			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 				Type:               "MemoryNotReady",
 				Status:             metav1.ConditionTrue,
 				Reason:             "MemoryProvisioning",
-				Message:            "waiting for project " + project.Name + " memory stack to become Ready",
+				Message:            "waiting for project " + project.Name + " memory stack to become stably Ready",
 				ObservedGeneration: fresh.Generation,
 			})
 			return true
@@ -166,7 +166,7 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("set MemoryNotReady condition: %w", err)
 		}
-		l.Info("ingest gated: project memory not ready",
+		l.Info("ingest gated: project memory not stably ready",
 			"action", "ingest_gate", "resource_id", repo.Name, "project", project.Name)
 		r.Metrics.ReconcileResult("Repository", "success")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil

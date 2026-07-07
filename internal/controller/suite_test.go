@@ -9,6 +9,7 @@ import (
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -94,4 +95,16 @@ func TestMain(m *testing.M) {
 		return m.Run()
 	}()
 	osExit(code)
+}
+
+// stableMemStatus returns a MemoryStatus with Phase=Ready and ReadySince set
+// far enough in the past that memoryStablyReady returns true immediately.
+// Use this in tests that need the memory gate to admit work without delay.
+func stableMemStatus(endpoint string) *tataradevv1alpha1.MemoryStatus {
+	readySince := metav1.NewTime(time.Now().Add(-(memoryReadyStabilizationWindow + time.Minute)))
+	return &tataradevv1alpha1.MemoryStatus{
+		Phase:      "Ready",
+		Endpoint:   endpoint,
+		ReadySince: &readySince,
+	}
 }

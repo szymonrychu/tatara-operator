@@ -271,7 +271,7 @@ func seedGitLabMainCITask(t *testing.T, suffix string, reader *fakeReaderCapture
 	if err := k8sClient.Create(ctx, projObj); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	projObj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	projObj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, projObj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}

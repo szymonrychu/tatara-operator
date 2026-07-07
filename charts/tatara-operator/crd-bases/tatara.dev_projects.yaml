@@ -6011,6 +6011,13 @@ spec:
                     type: string
                   phase:
                     type: string
+                  readySince:
+                    description: |-
+                      ReadySince records when the memory stack last transitioned into Phase==Ready.
+                      It is set on the Provisioning->Ready edge and cleared whenever the stack
+                      leaves Ready. Controllers use it to debounce herd-release on return-to-healthy.
+                    format: date-time
+                    type: string
                 type: object
               tokenBudget:
                 description: 'TokenBudget carries the token-budget accumulator/snapshot

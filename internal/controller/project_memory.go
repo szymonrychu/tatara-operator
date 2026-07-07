@@ -358,6 +358,27 @@ func memoryPhase(readyInstances, wantInstances int, neo4jReady, lightragAvail, m
 // memoryRequeue is how often the reconciler re-checks a Provisioning stack.
 const memoryRequeue = 10 * time.Second
 
+// memoryReadyStabilizationWindow is how long the memory stack must hold Phase==Ready
+// before controllers treat it as stably ready and release gated work. This matches
+// the ~3-minute window of the existing retrieval-probe unhealthy threshold, so a
+// new leader does not release the task backlog before the retrieval surface is
+// confirmed healthy. 3 min chosen to mirror memoryRetrievalUnhealthyThreshold
+// (3 cycles * 60s probe interval).
+const memoryReadyStabilizationWindow = 3 * time.Minute
+
+// memoryStablyReady reports whether p's memory stack has been continuously Ready
+// for at least memoryReadyStabilizationWindow. Use this instead of a bare Phase==Ready
+// check at task/lifecycle/ingest gate sites to prevent herd-release on return-to-healthy.
+func memoryStablyReady(p *tataradevv1alpha1.Project, now time.Time) bool {
+	if p.Status.Memory == nil || p.Status.Memory.Phase != "Ready" {
+		return false
+	}
+	if p.Status.Memory.ReadySince == nil {
+		return false
+	}
+	return now.Sub(p.Status.Memory.ReadySince.Time) >= memoryReadyStabilizationWindow
+}
+
 // reconcileMemory provisions the Project's memory stack and sets
 // project.Status.Memory + the MemoryReady condition (it does NOT persist;
 // the caller does one status update). It returns the requeue interval (set
@@ -409,6 +430,19 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 
 	phase := memoryPhase(readyInstances, memory.PgInstances(p), neo4jReady, lightragAvail, memoryAvail)
 	p.Status.Memory.Phase = phase
+
+	// Maintain ReadySince for the stabilization debounce (memoryStablyReady).
+	// Set once on the Provisioning->Ready edge; preserve on steady-state Ready;
+	// clear whenever the phase leaves Ready so the clock resets on re-entry.
+	now := metav1.Now()
+	if phase == "Ready" {
+		if prevPhase != "Ready" {
+			p.Status.Memory.ReadySince = &now
+		}
+		// else preserve existing ReadySince (steady-state; do not reset the clock)
+	} else {
+		p.Status.Memory.ReadySince = nil
+	}
 
 	condStatus := metav1.ConditionFalse
 	reason := "Provisioning"

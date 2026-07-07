@@ -193,7 +193,13 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("get project: %w", err)
 	}
 
-	if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
+	// Memory gate: spawn-only. Apply only when there is no pod yet and no
+	// in-flight turn. An already-running turn must keep being supervised, and a
+	// completed turn must be torn down, during a memory blip - gating teardown
+	// would let the reaper delete a mid-flight pod and then the same task get
+	// re-spawned once memory recovers, wasting the in-progress work.
+	taskNeedsSpawn := task.Status.Phase == "" && !taskHasInflightTurn(&task)
+	if taskNeedsSpawn && !memoryStablyReady(&project, time.Now()) {
 		// Infra-incident exemption (#236): an incident Task investigating the
 		// core memory/storage infrastructure must NOT be gated on that same
 		// subsystem being Ready, or infra-outage self-heal deadlocks (the agent
@@ -206,7 +212,7 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 				"project", project.Name, "alert_rule", task.Spec.AlertRule)
 			r.Metrics.MemoryGateBypass(project.Name, task.Spec.Kind)
 		} else {
-			l.Info("task gated: project memory not ready",
+			l.Info("task gated: project memory not stably ready",
 				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
 			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 		}
