@@ -353,7 +353,14 @@ func setProjectMemoryReady(t *testing.T, name, endpoint string) {
 		types.NamespacedName{Namespace: testNS, Name: name}, p); err != nil {
 		t.Fatalf("get project %s: %v", name, err)
 	}
-	p.Status.Memory = &tataradevv1alpha1.MemoryStatus{Phase: "Ready", Endpoint: endpoint}
+	// Set ReadySince well before the stabilization window so that memoryStablyReady
+	// returns true for tests that rely on memory being ready immediately.
+	readySince := metav1.NewTime(time.Now().Add(-(memoryReadyStabilizationWindow + time.Minute)))
+	p.Status.Memory = &tataradevv1alpha1.MemoryStatus{
+		Phase:      "Ready",
+		Endpoint:   endpoint,
+		ReadySince: &readySince,
+	}
 	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
 		t.Fatalf("set project %s memory ready: %v", name, err)
 	}

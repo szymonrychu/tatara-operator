@@ -146,7 +146,7 @@ func seedLifecycleTask(t *testing.T, name, project, repo, scmSecret string, sour
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project %s: %v", project, err)
 	}
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestReconcileLifecycle_EmptyStateInitializesToTriage(t *testing.T) {
 		t.Fatalf("create project: %v", err)
 	}
 	// Set memory ready so the gate passes.
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}
@@ -400,7 +400,7 @@ func TestReconcileLifecycle_UnknownStateReturnsError(t *testing.T) {
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}
@@ -471,7 +471,7 @@ func TestReconcileLifecycle_AnnotationEntryImplement(t *testing.T) {
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}
@@ -546,7 +546,7 @@ func TestReconcileLifecycle_NoAnnotationDefaultsTriage(t *testing.T) {
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}

@@ -518,7 +518,7 @@ func TestHandleConversation_NilDeadlineUsesConversationIdleMinutes(t *testing.T)
 	if err := k8sClient.Create(context.Background(), p); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	p.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	p.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}

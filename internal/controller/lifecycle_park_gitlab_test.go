@@ -64,7 +64,7 @@ func seedGitLabPRTask(t *testing.T, name, proj, repo, sec string) *tatarav1alpha
 	if err := k8sClient.Create(ctx, project); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	project.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	project.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, project); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}

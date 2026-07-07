@@ -784,3 +784,43 @@ func fakeStackHealthy(t *testing.T, project string) {
 		}
 	}
 }
+
+// fakeStackUnhealthy resets all owned objects' status to the not-ready values so
+// subsequent reconcileMemory calls observe Provisioning (inverse of fakeStackHealthy).
+func fakeStackUnhealthy(t *testing.T, project string) {
+	t.Helper()
+	ctx := context.Background()
+	names := memory.NamesFor(project)
+
+	var cluster cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.PGCluster}, &cluster); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	cluster.Status.ReadyInstances = 0
+	if err := k8sClient.Status().Update(ctx, &cluster); err != nil {
+		t.Fatalf("fake cluster unhealthy status: %v", err)
+	}
+
+	var sts appsv1.StatefulSet
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.Neo4j}, &sts); err != nil {
+		t.Fatalf("get sts: %v", err)
+	}
+	sts.Status.Replicas = 0
+	sts.Status.ReadyReplicas = 0
+	if err := k8sClient.Status().Update(ctx, &sts); err != nil {
+		t.Fatalf("fake sts unhealthy status: %v", err)
+	}
+
+	for _, dn := range []string{names.Lightrag, names.Memory} {
+		var dep appsv1.Deployment
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: dn}, &dep); err != nil {
+			t.Fatalf("get deployment %s: %v", dn, err)
+		}
+		dep.Status.Replicas = 0
+		dep.Status.ReadyReplicas = 0
+		dep.Status.AvailableReplicas = 0
+		if err := k8sClient.Status().Update(ctx, &dep); err != nil {
+			t.Fatalf("fake deployment %s unhealthy status: %v", dn, err)
+		}
+	}
+}

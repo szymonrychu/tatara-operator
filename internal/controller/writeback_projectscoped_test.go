@@ -45,7 +45,7 @@ func seedProjectScopedTask(t *testing.T, name, project, scmSecret string, spec t
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project %s: %v", project, err)
 	}
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set project memory ready: %v", err)
 	}

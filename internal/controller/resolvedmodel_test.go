@@ -33,7 +33,7 @@ func TestEnsurePodAndService_StampsResolvedModel(t *testing.T) {
 	if err := k8sClient.Create(ctx, proj); err != nil {
 		t.Fatalf("create project: %v", err)
 	}
-	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc:8080"}
+	proj.Status.Memory = stableMemStatus("http://mem.svc:8080")
 	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("set memory ready: %v", err)
 	}

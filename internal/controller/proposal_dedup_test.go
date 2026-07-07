@@ -149,7 +149,7 @@ func seedProposalTask(t *testing.T, name, proj, repo, secret, proposalTitle stri
 		},
 	}
 	require.NoError(t, k8sClient.Create(ctx, project))
-	project.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem.svc"}
+	project.Status.Memory = stableMemStatus("http://mem.svc")
 	require.NoError(t, k8sClient.Status().Update(ctx, project))
 
 	r := &tatarav1alpha1.Repository{

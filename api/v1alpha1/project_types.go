@@ -44,6 +44,11 @@ type MemoryStatus struct {
 	Endpoint string `json:"endpoint,omitempty"`
 	// +optional
 	ExternalEndpoint string `json:"externalEndpoint,omitempty"`
+	// ReadySince records when the memory stack last transitioned into Phase==Ready.
+	// It is set on the Provisioning->Ready edge and cleared whenever the stack
+	// leaves Ready. Controllers use it to debounce herd-release on return-to-healthy.
+	// +optional
+	ReadySince *metav1.Time `json:"readySince,omitempty"`
 }
 
 // GrafanaSpec configures the optional per-project Grafana incident-response

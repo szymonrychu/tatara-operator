@@ -608,8 +608,8 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 
 	// Memory gate: apply only when about to spawn a new agent run.
 	if needsSpawn(task.Status.LifecycleState, task.Status.Phase) {
-		if project.Status.Memory == nil || project.Status.Memory.Phase != "Ready" {
-			l.Info("lifecycle task gated: project memory not ready",
+		if !memoryStablyReady(&project, time.Now()) {
+			l.Info("lifecycle task gated: project memory not stably ready",
 				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
 			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 		}
