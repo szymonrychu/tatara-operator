@@ -516,6 +516,12 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 	// posted in order; each posted comment is dequeued under RetryOnConflict
 	// (preserving any concurrently-appended comment) BEFORE returning, so a
 	// post failure can never re-post an already-delivered comment.
+	//
+	// NOT routed through the bot-last-word gate (comment_gate.go) on purpose: these
+	// are the agent's deliberate multi-part turn output, and the turn only runs
+	// because the scan task-creation gate (issueScan/mrScan botHadLastWord) already
+	// confirmed a human spoke since the bot's last word. Gating here would suppress
+	// legitimate parts of a single response.
 	if pending := task.Status.PendingComments; len(pending) > 0 && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 		_, _, writer, token, provider, err := r.scmContext(ctx, task)
 		if err != nil {
@@ -848,7 +854,11 @@ func (r *TaskReconciler) triageCloseIssue(ctx context.Context, project *tatarav1
 	return nil
 }
 
-// triagePostComment posts the discuss comment to the source issue.
+// triagePostComment posts the discuss comment to the source issue. NOT routed
+// through the bot-last-word gate (comment_gate.go): the triage discuss arm is
+// already turn-taking-gated upstream by the triageReader botHasLastWord /
+// hasHumanReply check in finishTriage before this is called, so a second gate
+// here would be redundant and cost an extra SCM read.
 func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha1.Project, task *tatarav1alpha1.Task, comment string) error {
 	if task.Spec.Source == nil {
 		return nil
