@@ -14,7 +14,7 @@ func newSCMMetrics(reg prometheus.Registerer) *scmMetrics {
 	m := &scmMetrics{
 		scmWritesTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_scm_writes_total",
-			Help: "Total SCM operations by provider, verb, kind (read|write), and result (ok|error|blocked|gone).",
+			Help: "Total SCM operations by provider, verb, kind (read|write), and result (ok|error|blocked|gone|suppressed_last_word|suppressed_bot_mr).",
 		}, []string{"provider", "verb", "kind", "result"}),
 		scmReqErrorsByStatus: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_scm_request_errors_by_status_total",

@@ -29,6 +29,8 @@ func TestBotHasLastWordAmong(t *testing.T) {
 		{"third party after bot with empty breakers, open", []scm.IssueComment{tc(bot, 1), tc("random", 2)}, nil, false},
 		{"unordered slice, bot newest", []scm.IssueComment{tc(bot, 5), tc("maintainer", 2), tc("random", 4)}, approvers, true},
 		{"empty author skipped", []scm.IssueComment{tc(bot, 1), tc("", 2)}, approvers, true},
+		{"same-timestamp breaker favours posting", []scm.IssueComment{{Author: bot, CreatedAt: time.Unix(1_700_000_000, 0)}, {Author: "maintainer", CreatedAt: time.Unix(1_700_000_000, 0)}}, approvers, false},
+		{"zero timestamp breaker ignored, bot silent", []scm.IssueComment{tc(bot, 1), {Author: "maintainer"}}, approvers, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -65,23 +67,26 @@ func TestDecideCommentGate(t *testing.T) {
 	const bot = "tatara-bot"
 	ctx := context.Background()
 	tests := []struct {
-		name string
-		fake *gateFakeSCM
-		isPR bool
-		hint string
-		want gateReason
+		name     string
+		fake     *gateFakeSCM
+		provider string
+		isPR     bool
+		hint     string
+		want     gateReason
 	}{
-		{"bot mr via hint", &gateFakeSCM{}, true, bot, gateBotMR},
-		{"bot mr via GetPRState", &gateFakeSCM{prAuthor: bot}, true, "", gateBotMR},
-		{"human pr, bot last word", &gateFakeSCM{prAuthor: "human", comments: []scm.IssueComment{tc(bot, 2)}}, true, "human", gateLastWord},
-		{"issue, bot last word", &gateFakeSCM{comments: []scm.IssueComment{tc(bot, 2)}}, false, "", gateLastWord},
-		{"issue, human last word open", &gateFakeSCM{comments: []scm.IssueComment{tc(bot, 1), tc("human", 2)}}, false, "", gateOpen},
-		{"list error fails open", &gateFakeSCM{listErr: context.DeadlineExceeded}, false, "", gateOpen},
-		{"getprstate error falls to rule1", &gateFakeSCM{prErr: context.DeadlineExceeded, comments: []scm.IssueComment{tc(bot, 2)}}, true, "", gateLastWord},
+		{"bot mr via hint (github)", &gateFakeSCM{}, "github", true, bot, gateBotMR},
+		{"bot mr via GetPRState", &gateFakeSCM{prAuthor: bot}, "github", true, "", gateBotMR},
+		{"gitlab hint ignored, GetPRState wins (human)", &gateFakeSCM{prAuthor: "human", comments: []scm.IssueComment{tc("human", 2)}}, "gitlab", true, bot, gateOpen},
+		{"gitlab hint ignored, GetPRState says bot", &gateFakeSCM{prAuthor: bot}, "gitlab", true, "human", gateBotMR},
+		{"human pr, bot last word", &gateFakeSCM{prAuthor: "human", comments: []scm.IssueComment{tc(bot, 2)}}, "github", true, "human", gateLastWord},
+		{"issue, bot last word", &gateFakeSCM{comments: []scm.IssueComment{tc(bot, 2)}}, "github", false, "", gateLastWord},
+		{"issue, human last word open", &gateFakeSCM{comments: []scm.IssueComment{tc(bot, 1), tc("human", 2)}}, "github", false, "", gateOpen},
+		{"list error fails open", &gateFakeSCM{listErr: context.DeadlineExceeded}, "github", false, "", gateOpen},
+		{"getprstate error falls to rule1", &gateFakeSCM{prErr: context.DeadlineExceeded, comments: []scm.IssueComment{tc(bot, 2)}}, "github", true, "", gateLastWord},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := decideCommentGate(ctx, tt.fake, tt.fake, "o", "n", "https://github.com/o/n", "tok", 5, tt.isPR, bot, tt.hint, nil)
+			got := decideCommentGate(ctx, tt.fake, tt.fake, "o", "n", "https://github.com/o/n", "tok", tt.provider, 5, tt.isPR, bot, tt.hint, nil)
 			if got != tt.want {
 				t.Fatalf("decideCommentGate = %q, want %q", got, tt.want)
 			}
@@ -90,7 +95,7 @@ func TestDecideCommentGate(t *testing.T) {
 }
 
 func TestDecideCommentGate_FailOpenNilReader(t *testing.T) {
-	if got := decideCommentGate(context.Background(), nil, nil, "o", "n", "u", "t", 1, false, "bot", "", nil); got != gateOpen {
+	if got := decideCommentGate(context.Background(), nil, nil, "o", "n", "u", "t", "github", 1, false, "bot", "", nil); got != gateOpen {
 		t.Fatalf("nil reader must fail open, got %q", got)
 	}
 }

@@ -63,44 +63,28 @@ func TestPostTerminalComment_HumanReplied_Posts(t *testing.T) {
 		"terminal diagnostics must post once when a human replied after the bot")
 }
 
-// reviewGateWriter records Approve calls and returns a controllable PR author.
-type reviewGateWriter struct {
-	labelWriter
-	approveCount int
-	prAuthor     string
-}
-
-func (w *reviewGateWriter) Approve(_ context.Context, _, _ string, _ int, _ string) error {
-	w.approveCount++
-	return nil
-}
-
-func (w *reviewGateWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	return scm.PRState{Author: w.prAuthor}, nil
-}
-
-// TestWriteBackReview_BotLastWord_SuppressesApprove is the tatara-cli#77 repro:
-// the bot must not re-post a review verdict on a human PR when it already had the
-// last word. Approve must not fire and WritebackPending must be cleared so the
-// task does not requeue and re-attempt.
-func TestWriteBackReview_BotLastWord_SuppressesApprove(t *testing.T) {
-	_, task, _ := seedLabelTask(t, "rev-supp", nil)
+// TestParkWithComment_BotMR_Suppressed verifies rule 2: a park note on the bot's
+// own MR is fully suppressed (label + Status only), while the task still parks.
+func TestParkWithComment_BotMR_Suppressed(t *testing.T) {
+	_, task, _ := seedLabelTask(t, "park-botmr", nil)
 	ctx := context.Background()
 	var fresh tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
-	fresh.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: "approve", Body: "lgtm"}
-	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
+	fresh.Spec.Source.IsPR = true
+	fresh.Spec.Source.AuthorLogin = "tatara-bot" // bot-authored PR -> rule 2
+	require.NoError(t, k8sClient.Update(ctx, &fresh))
 	task = getTaskByName(t, task.Name)
 
-	rdr := &botLastWordReader{comments: []scm.IssueComment{
-		{Author: "human", CreatedAt: time.Date(2026, 7, 7, 3, 0, 0, 0, time.UTC)},
-		{Author: "tatara-bot", CreatedAt: time.Date(2026, 7, 7, 4, 42, 0, 0, time.UTC)},
-	}}
-	w := &reviewGateWriter{prAuthor: "human"}
-	r := reconcilerFor(w, rdr)
+	w := &commentCapturingWriter{}
+	r := reconcilerFor(w, &botLastWordReader{})
 
-	_, err := r.writeBackReview(ctx, task)
-	require.NoError(t, err)
-	require.Zero(t, w.approveCount,
-		"review verdict must be suppressed when the bot had the last word on the PR")
+	require.NoError(t, r.parkWithComment(ctx, task, w, "tok", "deadline",
+		"lifecycle: MRCI deadline reached for PR #7; parking."))
+
+	w.mu.Lock()
+	posted := len(w.commentBodies)
+	w.mu.Unlock()
+	require.Zero(t, posted,
+		"a park note on the bot's own MR must be fully suppressed (rule 2); got %v", w.commentBodies)
+	require.Equal(t, "Parked", getTaskByName(t, task.Name).Status.LifecycleState)
 }

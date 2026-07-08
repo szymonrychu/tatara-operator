@@ -84,12 +84,12 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 		}
 		if task.Status.LifecycleIterations >= maxIter {
 			// Backstop: too many attempts. Post comment and park.
-			implProj, implRepo, writer, token, provider, scmErr := r.scmContext(ctx, task)
+			_, _, writer, token, provider, scmErr := r.scmContext(ctx, task)
 			if scmErr == nil && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 				msg := "max lifecycle iterations reached; leaving for a human"
-				if _, cerr := r.gatedComment(ctx, &implProj, &implRepo, writer, token, provider,
-					task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin,
-					task.Spec.Source.IssueRef, msg); cerr != nil {
+				cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
+				r.recordSCM(provider, "comment", cerr)
+				if cerr != nil {
 					log.FromContext(ctx).Error(cerr, "implement: max-iterations comment (non-fatal)", "resource_id", task.Name)
 				}
 			}
@@ -273,11 +273,10 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 				"impl_action", outcome.Action, "park_reason", parkReason)
 			// Capture the Project from scmContext so we can pass it to ensurePhaseLabel
 			// without a redundant Get (finding 15).
-			if refusalProj, refusalRepo, writer, token, provider, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
+			if refusalProj, _, writer, token, provider, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
 				if fresh.Spec.Source != nil && fresh.Spec.Source.IssueRef != "" {
-					_, cerr := r.gatedComment(ctx, &refusalProj, &refusalRepo, writer, token, provider,
-						fresh.Spec.Source.Number, fresh.Spec.Source.IsPR, fresh.Spec.Source.AuthorLogin,
-						fresh.Spec.Source.IssueRef, outcome.Reason)
+					cerr := writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, outcome.Reason)
+					r.recordSCM(provider, "comment", cerr)
 					if cerr != nil {
 						l.Error(cerr, "implement: post outcome comment (non-fatal)", "resource_id", task.Name)
 					}

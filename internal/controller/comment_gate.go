@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"slices"
+	"time"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -40,35 +42,46 @@ func commentSilenceBreakers(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.R
 }
 
 // botHasLastWordAmong reports whether the bot must stay silent: it has a comment
-// and no silence-breaker has commented since. A comment breaks silence iff its
-// author is non-empty, not the bot, and (breakers empty OR author in breakers).
-// Order is by CreatedAt, robust to SCM list ordering.
+// and no silence-breaker has commented at-or-after it. A comment breaks silence
+// iff its author is non-empty, not the bot, and (breakers empty OR author in
+// breakers). Order is by CreatedAt, robust to SCM list ordering. Zero-timestamp
+// comments are skipped (a parse failure must not silently swing the decision).
+// Ties favour posting: a breaker whose comment shares the bot's timestamp (SCM
+// created_at is second-granularity) counts as "after", so a same-second human
+// reply is never suppressed.
 func botHasLastWordAmong(comments []scm.IssueComment, botLogin string, breakers []string) bool {
-	var tBot, tBreak int64 = -1, -1
+	var tBot, tBreak time.Time
+	var haveBot bool
 	for _, c := range comments {
-		ts := c.CreatedAt.UnixNano()
+		if c.CreatedAt.IsZero() {
+			continue
+		}
 		switch {
 		case c.Author == botLogin:
-			if ts > tBot {
-				tBot = ts
+			if !haveBot || c.CreatedAt.After(tBot) {
+				tBot = c.CreatedAt
+				haveBot = true
 			}
 		case c.Author != "" && (len(breakers) == 0 || slices.Contains(breakers, c.Author)):
-			if ts > tBreak {
-				tBreak = ts
+			if c.CreatedAt.After(tBreak) {
+				tBreak = c.CreatedAt
 			}
 		}
 	}
-	if tBot < 0 {
+	if !haveBot {
 		return false
 	}
-	return tBreak <= tBot
+	return tBreak.IsZero() || tBreak.Before(tBot)
 }
 
-// resolveBotMR reports whether the PR/MR at number is authored by the bot.
-// Prefers the pre-known hint (TaskSource.AuthorLogin); else reads GetPRState.
-// A read error resolves to false (fall through to the rule-1 turn-taking gate).
-func resolveBotMR(ctx context.Context, writer scm.SCMWriter, repoURL, token string, number int, botLogin, hint string) bool {
-	if hint != "" {
+// resolveBotMR reports whether the PR/MR at number is authored by the bot. The
+// pre-known hint (TaskSource.AuthorLogin) is trusted ONLY for provider=="github",
+// where AuthorLogin is the real author. On GitLab AuthorLogin is the webhook
+// actor, not the resource author (see internal/webhook/server.go), so the hint is
+// ignored and the authoritative GetPRState.Author is read instead. A read error
+// resolves to false (fall through to the rule-1 turn-taking gate).
+func resolveBotMR(ctx context.Context, writer scm.SCMWriter, repoURL, token string, number int, botLogin, hint, provider string) bool {
+	if hint != "" && provider == "github" {
 		return hint == botLogin
 	}
 	if writer == nil {
@@ -86,11 +99,11 @@ func resolveBotMR(ctx context.Context, writer scm.SCMWriter, repoURL, token stri
 // conversation and applies botHasLastWordAmong. Fail-open (gateOpen) on missing
 // inputs or read errors, matching botHadLastWord / humanCommentAfter so a lost
 // webhook can still be recovered by a later scan.
-func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, owner, name, repoURL, token string, number int, isPR bool, botLogin, authorHint string, breakers []string) gateReason {
+func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, owner, name, repoURL, token, provider string, number int, isPR bool, botLogin, authorHint string, breakers []string) gateReason {
 	if botLogin == "" || reader == nil || owner == "" {
 		return gateOpen
 	}
-	if isPR && resolveBotMR(ctx, writer, repoURL, token, number, botLogin, authorHint) {
+	if isPR && resolveBotMR(ctx, writer, repoURL, token, number, botLogin, authorHint, provider) {
 		return gateBotMR
 	}
 	var (
@@ -136,7 +149,24 @@ func (r *TaskReconciler) commentGateReason(ctx context.Context, proj *tatarav1al
 		return gateOpen
 	}
 	breakers := commentSilenceBreakers(proj, repo)
-	return decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, number, isPR, botLogin, authorHint, breakers)
+	return decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, breakers)
+}
+
+// parkIsBotMRByHint reports whether a park target is the bot's own PR/MR using
+// only the cheap author hint (reliable on GitHub, where AuthorLogin is the real
+// author). Used in the parkWithComment fail-open path where scmContext, and thus
+// the full gate, is unavailable. GitLab (hint is the actor) falls through to a
+// post - best effort, matching resolveBotMR's provider guard.
+func (r *TaskReconciler) parkIsBotMRByHint(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	if task.Spec.Source == nil || !task.Spec.Source.IsPR ||
+		task.Spec.Source.AuthorLogin == "" || task.Spec.Source.Provider != "github" {
+		return false
+	}
+	var proj tatarav1alpha1.Project
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil || proj.Spec.Scm == nil {
+		return false
+	}
+	return task.Spec.Source.AuthorLogin == proj.Spec.Scm.BotLogin
 }
 
 // gatedComment posts body to ref via writer.Comment unless commentGateReason

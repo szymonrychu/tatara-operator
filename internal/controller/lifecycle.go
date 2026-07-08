@@ -196,10 +196,18 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 			}
 			proj, repo, _, _, _, scErr := r.scmContext(ctx, task)
 			if scErr != nil {
-				cerr := writer.Comment(ctx, token, commentRef, msg)
-				r.recordSCM(provider, "comment", cerr)
-				if cerr != nil {
-					l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
+				// scmContext failed (usually token/writer, not the project). Honour
+				// rule 2 even here: suppress a park note on the bot's own MR via the
+				// cheap author hint; otherwise post ungated rather than lose the note.
+				if r.parkIsBotMRByHint(ctx, task) {
+					l.Info("lifecycle: park note suppressed on bot MR (scmContext failed; rule 2 via hint)",
+						"action", "scm_comment_suppressed", "reason", string(gateBotMR), "resource_id", task.Name)
+				} else {
+					cerr := writer.Comment(ctx, token, commentRef, msg)
+					r.recordSCM(provider, "comment", cerr)
+					if cerr != nil {
+						l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
+					}
 				}
 			} else if _, cerr := r.gatedComment(ctx, &proj, &repo, writer, token, provider,
 				number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, commentRef, msg); cerr != nil {
