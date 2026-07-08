@@ -560,20 +560,23 @@ func (r *TaskReconciler) postTerminalComment(ctx context.Context, task *tatarav1
 		return
 	}
 	l := log.FromContext(ctx)
-	_, _, writer, token, provider, err := r.scmContext(ctx, task)
+	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		l.Error(err, "terminal-diagnostics: scm context for comment (non-fatal)", "resource_id", task.Name)
 		return
 	}
-	cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, body)
-	r.recordSCM(provider, "comment", cerr)
+	posted, cerr := r.gatedComment(ctx, &proj, &repo, writer, token, provider,
+		task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin,
+		task.Spec.Source.IssueRef, body)
 	if cerr != nil {
 		l.Error(cerr, "terminal-diagnostics: post comment (non-fatal)",
 			"resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
 		return
 	}
-	l.Info("terminal diagnostics commented on issue",
-		"action", "task_terminal_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
+	if posted {
+		l.Info("terminal diagnostics commented on issue",
+			"action", "task_terminal_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
+	}
 }
 
 // commentTerminalDiagnostics posts the cause of a terminal Failed run to the

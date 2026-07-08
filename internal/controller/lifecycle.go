@@ -183,9 +183,26 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 			}
 		}
 		if commentRef != "" {
-			cerr := writer.Comment(ctx, token, commentRef, msg)
-			r.recordSCM(provider, "comment", cerr)
-			if cerr != nil {
+			// Rule 2: a park note on the bot's own MR is suppressed entirely
+			// (gateBotMR) - the drive path parks via label + Status only. Rule 1
+			// turn-taking applies to issue / human-PR park notes. scmContext resolves
+			// the project + repo the gate needs; on error we fail open and post
+			// ungated rather than silently lose the note.
+			number := task.Spec.Source.Number
+			if task.Spec.Source.IsPR {
+				if n, _ := lifecyclePR(task); n > 0 {
+					number = n
+				}
+			}
+			proj, repo, _, _, _, scErr := r.scmContext(ctx, task)
+			if scErr != nil {
+				cerr := writer.Comment(ctx, token, commentRef, msg)
+				r.recordSCM(provider, "comment", cerr)
+				if cerr != nil {
+					l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
+				}
+			} else if _, cerr := r.gatedComment(ctx, &proj, &repo, writer, token, provider,
+				number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, commentRef, msg); cerr != nil {
 				l.Error(cerr, "lifecycle: park comment (non-fatal)", "resource_id", task.Name)
 			}
 		}

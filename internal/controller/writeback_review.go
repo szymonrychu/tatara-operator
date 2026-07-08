@@ -34,11 +34,22 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 	if v == nil || task.Spec.Source == nil {
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "NoVerdict", "review task without a verdict")
 	}
-	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
+	project, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	number := task.Spec.Source.Number
+	// Review PRs are human-authored (bot PRs route to issueLifecycle), so the gate
+	// here enforces rule-1 turn-taking: do not re-post a verdict when the bot
+	// already had the last word and no reporter/approver has replied since.
+	if r.commentGateReason(ctx, &project, &repo, writer, token, provider, number, true, task.Spec.Source.AuthorLogin) != gateOpen {
+		if r.Metrics != nil {
+			r.Metrics.SCMWrite(provider, "comment", "suppressed_last_word")
+		}
+		l.Info("review verdict suppressed: bot had last word on the PR",
+			"action", "scm_comment_suppressed", "resource_id", task.Name, "decision", v.Decision)
+		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "Reviewed", "review suppressed: bot had last word")
+	}
 	var verbSent bool
 	switch v.Decision {
 	case "approve":

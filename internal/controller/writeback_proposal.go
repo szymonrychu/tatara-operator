@@ -132,9 +132,8 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 				// (2A) Post a recurrence note so the re-fire stays visible on the
 				// tracked issue (the comment's own timestamp records when).
 				issueRef := fmt.Sprintf("%s#%d", existing.Repo, existing.Number)
-				cerr := writer.Comment(ctx, token, issueRef, alertGroupRefireComment(task.Spec.ProposedIssue.AlertGroup))
-				r.recordSCM(proj.Spec.Scm.Provider, "comment", cerr)
-				if cerr != nil {
+				if _, cerr := r.gatedComment(ctx, proj, &repo, writer, token, proj.Spec.Scm.Provider,
+					existing.Number, false, "", issueRef, alertGroupRefireComment(task.Spec.ProposedIssue.AlertGroup)); cerr != nil {
 					l.Error(cerr, "proposal: alert-group re-fire comment (non-fatal)", "issue_ref", issueRef)
 				}
 			} else {
