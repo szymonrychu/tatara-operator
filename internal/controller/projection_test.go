@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -182,7 +183,7 @@ func TestObserveHumanDeclinedLabel(t *testing.T) {
 	fresh.Status.DeployState = "Conversation"
 	now := metav1.Now()
 	fresh.Status.LastActivityAt = &now
-	future := metav1.NewTime(now.Add(1e9)) // far future deadline (not passed)
+	future := metav1.NewTime(now.Add(time.Hour)) // far future deadline (not passed); must outlast a slow CI reconcile
 	fresh.Status.DeadlineAt = &future
 	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
 
@@ -223,7 +224,7 @@ func TestObserveApprovedLabel_WithoutRecordedApproval_FailsClosed(t *testing.T) 
 	fresh.Status.DeployState = "Conversation"
 	now := metav1.Now()
 	fresh.Status.LastActivityAt = &now
-	future := metav1.NewTime(now.Add(1e9))
+	future := metav1.NewTime(now.Add(time.Hour))
 	fresh.Status.DeadlineAt = &future
 	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
 
@@ -262,7 +263,7 @@ func TestObserveApprovedLabel_WithRecordedApproval_Implements(t *testing.T) {
 	fresh.Status.ApprovedByMaintainer = "szymon" // verified maintainer approval recorded by the webhook
 	now := metav1.Now()
 	fresh.Status.LastActivityAt = &now
-	future := metav1.NewTime(now.Add(1e9)) // far future deadline
+	future := metav1.NewTime(now.Add(time.Hour)) // far future deadline; must outlast a slow CI reconcile
 	fresh.Status.DeadlineAt = &future
 	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
 
