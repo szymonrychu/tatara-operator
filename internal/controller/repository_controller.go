@@ -112,17 +112,19 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// for an hour after a self-healed incremental burst (issue #138).
 	r.publishIngestHealth(&repo)
 
-	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
-		return ctrl.Result{}, nil
-	}
-
-	// item 7: keep the printcolumn-backed open issue/incident counts fresh on
-	// every reconcile, independent of ingest state/gating below.
+	// item 7 (FIX-2): keep the printcolumn-backed open issue/incident counts
+	// fresh on every reconcile, independent of ingest state/gating - this MUST
+	// run before the IngestEnabled early-return below, otherwise a non-ingested
+	// repo never gets its counts computed, contradicting this comment.
 	if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
 		return r.computeRepoCounts(ctx, fresh)
 	}); err != nil {
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("compute repo counts: %w", err)
+	}
+
+	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
+		return ctrl.Result{}, nil
 	}
 
 	// Concurrency guard: a named Job that still exists blocks new launches.
