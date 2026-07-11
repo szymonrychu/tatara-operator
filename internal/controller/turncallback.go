@@ -772,28 +772,11 @@ func (s *CallbackServer) expireStalledPlanning(ctx context.Context, task *tatara
 	return nil
 }
 
-// Start runs the callback HTTP server and the poll backstop until ctx is done.
-// It implements sigs.k8s.io/controller-runtime/pkg/manager.Runnable.
+// Start runs the callback HTTP server (callback + push-metrics + health) until
+// ctx is done. It serves on every replica (see maintenanceRunnable for the
+// leader-only poll/reap loop). Implements manager.Runnable.
 func (s *CallbackServer) Start(ctx context.Context, addr string) error {
 	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		t := time.NewTicker(pollRequeue)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				if s.Session != nil {
-					s.PollOnce(ctx)
-				}
-				// Backstop the one-shot teardown: reap wrapper pods whose Task
-				// is gone or terminal. Runs regardless of Session (orphans
-				// outlive their session).
-				s.ReapOrphans(ctx)
-			}
-		}
-	}()
 	go func() {
 		<-ctx.Done()
 		// Use a bounded context to avoid blocking shutdown forever if an
@@ -806,4 +789,28 @@ func (s *CallbackServer) Start(ctx context.Context, addr string) error {
 		return fmt.Errorf("callback server: %w", err)
 	}
 	return nil
+}
+
+// RunMaintenance drives the periodic poll backstop and orphan reaper on a
+// pollRequeue ticker until ctx is done. It is registered as a LEADER-ONLY
+// manager runnable (maintenanceRunnable): only the elected leader polls for
+// missed turn callbacks and reaps orphan pods, so N replicas no longer each
+// run full-namespace Lists + deletes every cycle. Implements manager.Runnable.
+func (s *CallbackServer) RunMaintenance(ctx context.Context) error {
+	t := time.NewTicker(pollRequeue)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if s.Session != nil {
+				s.PollOnce(ctx)
+			}
+			// Backstop the one-shot teardown: reap wrapper pods whose Task
+			// is gone or terminal. Runs regardless of Session (orphans
+			// outlive their session).
+			s.ReapOrphans(ctx)
+		}
+	}
 }
