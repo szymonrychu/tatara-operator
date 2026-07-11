@@ -91,6 +91,14 @@ func (r *umbReader) GetFileContent(_ context.Context, _, _, path, _ string) (str
 	return r.files[path], nil
 }
 
+// ListIssueComments is a no-op override: parkStalledDeploy/parkUmbrellaMergeTimeout
+// route their park comments through the FIX-8 comment gate, which now engages
+// even when the call site has no Repository CR (repo==nil), so a bare-embedded
+// nil scm.SCMReader would otherwise panic here.
+func (r *umbReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return nil, nil
+}
+
 func newUmbProjectReconciler(w *umbWriter) *ProjectReconciler {
 	return &ProjectReconciler{
 		Client:    k8sClient,

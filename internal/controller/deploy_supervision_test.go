@@ -494,9 +494,10 @@ func TestCDScan_GaugesSelfClearOnRecovery(t *testing.T) {
 // TestParkUmbrellaMergeTimeout_StillPostsViaGate verifies deploy_supervision.go's
 // parkUmbrellaMergeTimeout (item 1/3) routes through ProjectReconciler.gatedComment.
 // This site passes repo=nil (no Repository CR resolvable here without an extra
-// lookup - accepted gap per the design's own risk note), so the closed-state/
-// dedup rules degrade to a no-op and the park comment must still post
-// unconditionally, exactly as before the conversion (regression guard).
+// lookup) AND leaves ReaderFor unset, so the gate never engages regardless of
+// repo (gatedCommentCore's closed-state/dedup rules run without a Repository -
+// see TestGatedCommentCore_NilRepo_* - but still require a live reader). The
+// park comment must still post unconditionally here (regression guard).
 func TestParkUmbrellaMergeTimeout_StillPostsViaGate(t *testing.T) {
 	ctx := context.Background()
 	proj := &tatarav1alpha1.Project{

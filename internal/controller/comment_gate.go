@@ -249,10 +249,24 @@ func (r *TaskReconciler) parkIsBotMRByHint(ctx context.Context, task *tatarav1al
 // which reconciler owns it - goes through one decision path.
 func gatedCommentCore(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, metrics *obs.OperatorMetrics, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, token, provider string, number int, isPR bool, botLogin, authorHint, ref, body string) (bool, error) {
 	reason := gateOpen
-	if botLogin != "" && reader != nil && repo != nil {
-		if owner, name, err := scm.OwnerRepo(repo.Spec.URL); err == nil {
+	if botLogin != "" && reader != nil {
+		// repoURL feeds owner/name derivation plus the closed-state/dedup live
+		// reads. A Repository CR is only needed for the repo-level login-override
+		// lookup (CommentSilenceBreakers is nil-repo-safe, falling back to the
+		// project list), so a call site with no Repository (repo==nil, e.g. an
+		// umbrella-level park comment) still gets owner/name from ref itself:
+		// scm.OwnerRepo parses a bare "owner/repo" slug the same as a full clone
+		// URL. Without this, repo==nil used to skip the WHOLE gate (all 4 rules),
+		// silently disabling the closed-state and content-dedup rules there.
+		repoURL := ""
+		if repo != nil {
+			repoURL = repo.Spec.URL
+		} else {
+			repoURL = tatarav1alpha1.RepoFromIssueRef(ref)
+		}
+		if owner, name, err := scm.OwnerRepo(repoURL); err == nil {
 			breakers := CommentSilenceBreakers(proj, repo)
-			reason = decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, body, breakers)
+			reason = decideCommentGate(ctx, reader, writer, owner, name, repoURL, token, provider, number, isPR, botLogin, authorHint, body, breakers)
 		}
 	}
 	if reason != gateOpen {

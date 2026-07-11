@@ -49,13 +49,24 @@ func TestBotHasLastWordAmong(t *testing.T) {
 type gateFakeSCM struct {
 	scm.SCMReader
 	scm.SCMWriter
-	comments    []scm.IssueComment
-	listErr     error
-	prAuthor    string
-	prErr       error
-	issueClosed bool
-	prClosed    bool
-	issueErr    error
+	comments      []scm.IssueComment
+	listErr       error
+	prAuthor      string
+	prErr         error
+	issueClosed   bool
+	prClosed      bool
+	issueErr      error
+	commentPosted bool
+	commentBody   string
+}
+
+// Comment records the post so callers of gatedCommentCore/gatedComment can
+// exercise the full open path (rather than the reason-decision helpers alone)
+// without a nil-interface panic on the embedded scm.SCMWriter.
+func (f *gateFakeSCM) Comment(_ context.Context, _, _, body string) error {
+	f.commentPosted = true
+	f.commentBody = body
+	return nil
 }
 
 func (f *gateFakeSCM) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
