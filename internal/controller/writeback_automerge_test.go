@@ -100,7 +100,9 @@ func TestWriteBackOpenChange_SemverLabelAndAutoMerge(t *testing.T) {
 				Goal: "implement", Kind: "implement",
 				Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
 			},
-			&tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o"}) // BotLogin empty
+			// CRD admission now rejects an empty botLogin (MinLength=1), so the
+			// "no bot configured" runtime branch is exercised via a nil Scm instead.
+			nil)
 		task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{PRTitle: "fix: y", Significance: "patch"}
 		require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 

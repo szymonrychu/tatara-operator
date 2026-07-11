@@ -372,10 +372,18 @@ type ScmCron struct {
 }
 
 // ScmSpec binds a Project to one SCM provider and its board/merge policy.
+// +kubebuilder:validation:XValidation:rule="!has(self.maintainerLogins) || self.maintainerLogins.all(m, m != self.botLogin)",message="maintainerLogins must not contain botLogin (the bot is structurally excluded from maintainer approval)"
+// +kubebuilder:validation:XValidation:rule="!has(self.reporterLogins) || self.reporterLogins.all(r, r != self.botLogin)",message="reporterLogins must not contain botLogin (the bot is trusted implicitly; listing it is a misconfiguration)"
 type ScmSpec struct {
 	// +kubebuilder:validation:Enum=github;gitlab
 	Provider string `json:"provider"`
 	Owner    string `json:"owner"`
+	// BotLogin is the SCM login of the platform bot. Required and non-empty: it
+	// is the identity structurally excluded from the maintainer-approval gate, so
+	// an empty value would collapse the bot exclusion. Must not appear in
+	// maintainerLogins/reporterLogins (enforced by the ScmSpec CEL rules).
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=100
 	BotLogin string `json:"botLogin"`
 	// BotEmail is the git commit author email for agent commits (the bot's
 	// noreply/commit email). When empty the wrapper's default identity stands.
@@ -390,6 +398,8 @@ type ScmSpec struct {
 	// excluded from #56 autoapprove). Overridable per-repository via
 	// RepositorySpec.MaintainerLogins.
 	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=100
 	MaintainerLogins []string `json:"maintainerLogins,omitempty"`
 	// ReporterLogins gates issue/issue-comment intake (issue #102). When non-empty
 	// the operator only acts on issues and issue-comments authored by the bot, a
@@ -399,6 +409,8 @@ type ScmSpec struct {
 	// author is accepted). Overridable per-repository via
 	// RepositorySpec.ReporterLogins.
 	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=100
 	ReporterLogins []string `json:"reporterLogins,omitempty"`
 	// +optional
 	Board *BoardSpec `json:"board,omitempty"`
