@@ -29,24 +29,33 @@ import (
 
 // --- Finding 1: clearWritebackPending returns error ---
 
-// errOnClearClient injects a non-conflict error on the first Status().Update
+// errOnClearClient injects a non-conflict error on the callNum'th Status().Update
 // so clearWritebackPending's RetryOnConflict exhausts and returns the error.
+// callNum lets callers driving the full Reconcile (which now issues an earlier
+// ShortDescription status patch, item 7) target the specific call they mean to
+// fail instead of always the first.
 type errOnClearClient struct {
 	client.Client
-	calls *atomic.Int32
+	calls   *atomic.Int32
+	callNum int32
 }
 
 func (c *errOnClearClient) Status() client.SubResourceWriter {
-	return &errOnClearWriter{SubResourceWriter: c.Client.Status(), calls: c.calls}
+	return &errOnClearWriter{SubResourceWriter: c.Client.Status(), calls: c.calls, callNum: c.callNum}
 }
 
 type errOnClearWriter struct {
 	client.SubResourceWriter
-	calls *atomic.Int32
+	calls   *atomic.Int32
+	callNum int32
 }
 
 func (w *errOnClearWriter) Update(_ context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-	if w.calls.Add(1) <= 1 {
+	target := w.callNum
+	if target == 0 {
+		target = 1
+	}
+	if w.calls.Add(1) == target {
 		// Return a non-conflict error - RetryOnConflict does NOT retry these.
 		return fmt.Errorf("injected transient error")
 	}
@@ -98,7 +107,10 @@ func TestClearWritebackPending_ReturnsError(t *testing.T) {
 // reconciler requeues rather than returning nil and silently dropping the failure.
 func TestDoWriteBack_ClearErrorPropagated(t *testing.T) {
 	var calls atomic.Int32
-	cc := &errOnClearClient{Client: k8sClient, calls: &calls}
+	// callNum=2: Reconcile now issues an earlier ShortDescription status patch
+	// (item 7) before reaching the terminal-phase branch that calls doWriteBack,
+	// so clearWritebackPending's write is the 2nd Status().Update, not the 1st.
+	cc := &errOnClearClient{Client: k8sClient, calls: &calls, callNum: 2}
 
 	fw := &fullFakeSCMWriter{}
 	r := &TaskReconciler{

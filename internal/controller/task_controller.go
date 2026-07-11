@@ -126,6 +126,22 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("get task: %w", err)
 	}
 
+	// item 7: keep the printcolumn-backed ShortDescription fresh on every
+	// reconcile, independent of kind/phase branching below (kubectl get must be
+	// scannable without describe for issueLifecycle/clarify Tasks too, which
+	// return early via reconcileLifecycle/reconcileClarify).
+	if err := r.patchTaskStatus(ctx, &task, func(fresh *tatarav1alpha1.Task) bool {
+		desc := shortDescription(fresh.Spec.Goal)
+		if fresh.Status.ShortDescription == desc {
+			return false
+		}
+		fresh.Status.ShortDescription = desc
+		return true
+	}); err != nil {
+		l.Error(err, "task: update short description (non-fatal)",
+			"action", "task_short_description", "resource_id", task.Name)
+	}
+
 	// Lazy-seed the work-item ledger from Spec.Source when WorkItems is empty.
 	// This provides backward-compat for in-flight Tasks created before the ledger
 	// was introduced: first reconcile populates Status.WorkItems so Phase-2 dedup
@@ -1006,6 +1022,25 @@ func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, nam
 		}
 		return nil
 	})
+}
+
+// shortDescription is the first line of goal, truncated to ~60 runes on a
+// word boundary where possible, with an ellipsis when truncated.
+func shortDescription(goal string) string {
+	line := goal
+	if i := strings.IndexByte(goal, '\n'); i >= 0 {
+		line = goal[:i]
+	}
+	r := []rune(strings.TrimSpace(line))
+	const maxLen = 60
+	if len(r) <= maxLen {
+		return string(r)
+	}
+	cut := maxLen
+	if i := strings.LastIndexByte(string(r[:maxLen]), ' '); i > 0 {
+		cut = i
+	}
+	return strings.TrimRight(string(r[:cut]), " ") + "..."
 }
 
 // deriveResultSummary fills task.Status.ResultSummary from Done subtasks when

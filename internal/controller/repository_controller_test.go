@@ -81,6 +81,22 @@ func getRepo(t *testing.T, name string) *tataradevv1alpha1.Repository {
 	return r
 }
 
+func TestReconcileRepo_ComputesPerRepoCounts(t *testing.T) {
+	mkProject(t, "p-repo-counts", "p-repo-counts-scm")
+	mkRepo(t, "r-repo-counts", "p-repo-counts")
+	mkTaskWithKind(t, "t-issue-open-repo", "p-repo-counts", "r-repo-counts", "issueLifecycle")
+	mkTaskWithKind(t, "t-incident-open-repo", "p-repo-counts", "r-repo-counts", "incident")
+
+	if _, err := reconcileRepo(t, "r-repo-counts"); err != nil {
+		t.Fatalf("reconcileRepo: %v", err)
+	}
+
+	repo := getRepo(t, "r-repo-counts")
+	if repo.Status.OpenIssuesCount != 1 || repo.Status.OpenIncidentsCount != 1 {
+		t.Errorf("counts = (%d,%d), want (1,1)", repo.Status.OpenIssuesCount, repo.Status.OpenIncidentsCount)
+	}
+}
+
 func listIngestJobs(t *testing.T, repoName string) []batchv1.Job {
 	t.Helper()
 	var jl batchv1.JobList

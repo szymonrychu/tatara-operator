@@ -630,6 +630,11 @@ type TaskStatus struct {
 	// (liveness finding #4).
 	// +optional
 	ReviewResolveDeadline *metav1.Time `json:"reviewResolveDeadline,omitempty"`
+
+	// ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
+	// set on reconcile so `kubectl get task` is scannable without describe.
+	// +optional
+	ShortDescription string `json:"shortDescription,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -638,7 +643,9 @@ type TaskStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Lifecycle",type=string,JSONPath=`.status.lifecycleState`
 // +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.kind`
+// +kubebuilder:printcolumn:name="Project",type=string,JSONPath=`.spec.projectRef`,priority=1
 // +kubebuilder:printcolumn:name="Turns",type=integer,JSONPath=`.status.turnsCompleted`
+// +kubebuilder:printcolumn:name="Description",type=string,JSONPath=`.status.shortDescription`
 
 // Task is one agent session driving a Repository toward a goal.
 type Task struct {

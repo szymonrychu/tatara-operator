@@ -168,6 +168,8 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	requeueAfter = soonestRequeue(requeueAfter, grafanaRequeueAfter)
 
+	r.computeProjectCounts(ctx, &project)
+
 	if err := r.Status().Update(ctx, &project); err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, fmt.Errorf("update project status: %w", err)
@@ -215,6 +217,41 @@ func soonestRequeue(a, b time.Duration) time.Duration {
 		return a
 	default:
 		return b
+	}
+}
+
+// computeProjectCounts fills RepositoryCount/OpenIssuesCount/OpenIncidentsCount
+// on project.Status from a namespace-scoped List + Go filter (item 7).
+// Homelab scale: unindexed lists here are cheap (same pattern reaper/projectscan
+// already use for Task lists).
+func (r *ProjectReconciler) computeProjectCounts(ctx context.Context, project *tataradevv1alpha1.Project) {
+	var repos tataradevv1alpha1.RepositoryList
+	if err := r.List(ctx, &repos, client.InNamespace(project.Namespace)); err == nil {
+		count := 0
+		for i := range repos.Items {
+			if repos.Items[i].Spec.ProjectRef == project.Name {
+				count++
+			}
+		}
+		project.Status.RepositoryCount = count
+	}
+	var tasks tataradevv1alpha1.TaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(project.Namespace)); err == nil {
+		issues, incidents := 0, 0
+		for i := range tasks.Items {
+			t := &tasks.Items[i]
+			if t.Spec.ProjectRef != project.Name || tataradevv1alpha1.TaskTerminal(t) {
+				continue
+			}
+			switch t.Spec.Kind {
+			case "incident":
+				incidents++
+			case "issueLifecycle", "clarify":
+				issues++
+			}
+		}
+		project.Status.OpenIssuesCount = issues
+		project.Status.OpenIncidentsCount = incidents
 	}
 }
 

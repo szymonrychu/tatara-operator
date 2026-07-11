@@ -24,9 +24,16 @@ spec:
     - jsonPath: .spec.kind
       name: Kind
       type: string
+    - jsonPath: .spec.projectRef
+      name: Project
+      priority: 1
+      type: string
     - jsonPath: .status.turnsCompleted
       name: Turns
       type: integer
+    - jsonPath: .status.shortDescription
+      name: Description
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -684,6 +691,11 @@ spec:
                   SessionID is the Claude session id of the persisted conversation. The
                   operator passes it back to the next pod (as CONVERSATION_SESSION_ID) so a
                   fresh pod resumes via `claude --resume <id>` instead of starting empty.
+                type: string
+              shortDescription:
+                description: |-
+                  ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
+                  set on reconcile so `kubectl get task` is scannable without describe.
                 type: string
               turnsCompleted:
                 type: integer

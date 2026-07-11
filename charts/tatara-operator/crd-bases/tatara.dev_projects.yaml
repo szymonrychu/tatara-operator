@@ -18,6 +18,15 @@ spec:
     - jsonPath: .status.webhookURL
       name: Webhook
       type: string
+    - jsonPath: .status.repositoryCount
+      name: Repos
+      type: integer
+    - jsonPath: .status.openIssuesCount
+      name: OpenIssues
+      type: integer
+    - jsonPath: .status.openIncidentsCount
+      name: OpenIncidents
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -6102,6 +6111,21 @@ spec:
                     format: date-time
                     type: string
                 type: object
+              openIncidentsCount:
+                description: |-
+                  OpenIncidentsCount is the number of non-terminal incident Tasks for this
+                  project. Computed on reconcile.
+                type: integer
+              openIssuesCount:
+                description: |-
+                  OpenIssuesCount is the number of non-terminal issueLifecycle/clarify Tasks
+                  for this project. Computed on reconcile.
+                type: integer
+              repositoryCount:
+                description: |-
+                  RepositoryCount is the number of Repository CRs whose spec.projectRef
+                  names this Project. Computed on reconcile.
+                type: integer
               scanMarks:
                 description: |-
                   ScanMarks are per-item high-water marks of the last GitHub activity the
