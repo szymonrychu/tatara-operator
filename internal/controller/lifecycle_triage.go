@@ -623,25 +623,63 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 					"action", "lifecycle_triage_participation_error", "resource_id", task.Name, "err", aerr.Error())
 				return ctrl.Result{}, aerr
 			}
+			// autoApproveAttempted marks that path (c) below ran (whether it
+			// recorded the approval itself or found a concurrent approval already
+			// won the race, finding FIX-3) - either way approval is already fully
+			// resolved and the conversational branch further down must not
+			// re-record it or post a second audit comment.
+			autoApproveAttempted := false
 			if approver == "" {
 				// Path (c): auto-approve. Fail closed on any uncertainty - a
-				// non-bot author, missing marker, or flag-off all fall through to
-				// the existing park behavior below, unchanged.
-				if kind := tr.tataraProposedByKind(ctx); kind != "" &&
-					isBotAuthoredProposal(project, task) && project.Spec.AutoApproveTataraProposals {
-					if err := r.recordAutoApproval(ctx, task, kind); err != nil {
-						return ctrl.Result{}, err
+				// non-bot author, missing marker, flag-off, an unreadable tracked
+				// issue, or a CLOSED tracked issue all fall through to the existing
+				// park behavior below, unchanged.
+				if kind := tr.tataraProposedByKind(ctx); kind != "" && project.Spec.AutoApproveTataraProposals {
+					// Resolve the SCM writer context once for both checks below: the
+					// closed-state veto and isBotAuthoredProposal's live GitLab author
+					// verification (FIX-4) both need it. A human closing the tracked
+					// proposal issue is the ONLY veto over auto-approve - without this
+					// check nothing reacted to a closed issue, so it would still
+					// implement+deploy to prod. Fail closed on any resolution/read
+					// error: never approve on unread state.
+					_, repo, writer, token, provider, serr := r.scmContext(ctx, task)
+					if serr != nil {
+						l.Info("triage implement: auto-approve scm context unavailable; withholding (fail closed)",
+							"action", "lifecycle_triage_auto_approve_withheld", "resource_id", task.Name, "err", serr.Error())
+					} else if state, ierr := writer.GetIssueState(ctx, repo.Spec.URL, token, task.Spec.Source.Number); ierr != nil {
+						l.Info("triage implement: auto-approve issue-state read failed; withholding (fail closed)",
+							"action", "lifecycle_triage_auto_approve_withheld", "resource_id", task.Name, "err", ierr.Error())
+					} else if state.Closed {
+						l.Info("triage implement: tracked issue closed; withholding auto-approve (human veto)",
+							"action", "lifecycle_triage_auto_approve_withheld", "resource_id", task.Name, "kind", kind)
+					} else if isBotAuthoredProposal(ctx, writer, repo.Spec.URL, token, provider, project, task) {
+						autoApproveAttempted = true
+						recorded, err := r.recordAutoApproval(ctx, task, kind)
+						if err != nil {
+							return ctrl.Result{}, err
+						}
+						if recorded {
+							if r.Metrics != nil {
+								r.Metrics.AutoApproveTotal(kind)
+							}
+							l.Info("triage implement: auto-approved (tatara-proposed, bot-authored, flag on)",
+								"action", "lifecycle_triage_auto_approve", "resource_id", task.Name, "kind", kind)
+							if err := r.triagePostComment(ctx, project, task,
+								fmt.Sprintf("tatara: auto-approved - tatara-proposed via %s; the %s served as review. Starting implementation.", kind, kind)); err != nil {
+								return ctrl.Result{}, err
+							}
+						} else {
+							// A concurrent write (label or conversational approval) already
+							// recorded ApprovedByMaintainer between our approvingMaintainer
+							// scan above and this record attempt - recordAutoApproval left it
+							// untouched and reflected the winning value onto task.Status. Use
+							// it as-is: no duplicate metric, no duplicate audit comment.
+							l.Info("triage implement: auto-approve raced a concurrent approval; using the winning approval",
+								"action", "lifecycle_triage_auto_approve_race", "resource_id", task.Name,
+								"approver", task.Status.ApprovedByMaintainer)
+						}
+						approver = task.Status.ApprovedByMaintainer
 					}
-					if r.Metrics != nil {
-						r.Metrics.AutoApproveTotal(kind)
-					}
-					l.Info("triage implement: auto-approved (tatara-proposed, bot-authored, flag on)",
-						"action", "lifecycle_triage_auto_approve", "resource_id", task.Name, "kind", kind)
-					if err := r.triagePostComment(ctx, project, task,
-						fmt.Sprintf("tatara: auto-approved - tatara-proposed via %s; the %s served as review. Starting implementation.", kind, kind)); err != nil {
-						return ctrl.Result{}, err
-					}
-					approver = "<tatara:auto:" + kind + ">"
 				}
 			}
 			if approver == "" {
@@ -664,8 +702,10 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 				}
 				return ctrl.Result{}, nil
 			}
-			if strings.HasPrefix(approver, "<tatara:auto:") {
-				// Already recorded by recordAutoApproval above; nothing further to record.
+			if autoApproveAttempted {
+				// Already fully resolved by path (c) above (recorded by us or by a
+				// concurrent writer whose approval won the race) - nothing further to
+				// record or announce here.
 			} else {
 				// A verified maintainer participated: record the approval (attributed
 				// to them) and post an audit comment, then fall through to onImplement

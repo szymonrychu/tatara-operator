@@ -234,6 +234,36 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
+	// A human closing the tracked issue is the only veto over the operator's
+	// autonomous implement->review->merge->deploy lifecycle - including the
+	// auto-approve release path (item 4a): a bot-authored, tatara-proposed
+	// issue that auto-approved is investigated/implemented on the strength of
+	// nobody objecting, so a human closing it must stop the run rather than let
+	// it silently continue to implement/deploy. Park the owning non-terminal
+	// front-half Task. Scoped to non-PR "closed" events (PR/MR closes are
+	// governed by the review routing below) from a NON-bot actor: the
+	// operator's own triageCloseIssue close (a legitimate close outcome) fires
+	// this same webhook event with the bot as sender and must not re-enter here
+	// (mirrors the label self-write guard above). Always returns without
+	// falling through to the create-task path below - a closed issue must
+	// never spawn a fresh clarify Task.
+	if ev.Action == "closed" && !ev.IsPR {
+		botLogin := ""
+		if proj.Spec.Scm != nil {
+			botLogin = proj.Spec.Scm.BotLogin
+		}
+		if botLogin == "" || ev.ActorLogin != botLogin {
+			if task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef); found {
+				s.parkOnIssueClosed(ctx, proj, ev, task)
+			}
+		} else {
+			s.log.InfoContext(ctx, "issue closed event from bot actor ignored (operator self-write)",
+				"project", proj.Name, "issue_ref", ev.IssueRef)
+		}
+		s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+		return
+	}
+
 	// Verified maintainer approval: the ONLY signal that releases a front-half
 	// issue into the autonomous implement->review->merge->deploy chain. A
 	// maintainer (a MaintainerLogins member - closed by default, structurally
@@ -957,6 +987,37 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 	s.log.InfoContext(ctx, "issue_comment: reactivated parked lifecycle task",
 		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// parkOnIssueClosed parks a live owning front-half Task when its tracked
+// issue is closed by a human (FIX-1(b)). A human closing the issue is a veto:
+// it must stop the lifecycle - including the auto-approve release path (item
+// 4a) - rather than let an in-flight run silently continue to
+// implement/deploy. Best-effort wrapper teardown, mirroring
+// reactivateTask/the controller's terminate.
+func (s *Server) parkOnIssueClosed(ctx context.Context, proj tatarav1.Project, ev scm.WebhookEvent, task *tatarav1.Task) {
+	if err := agent.DeleteWrapper(ctx, s.cfg.Client, s.cfg.Namespace, task); err != nil {
+		s.log.ErrorContext(ctx, "issue closed: delete wrapper (non-fatal)", "error", err, "task", task.Name)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if tatarav1.TaskTerminal(fresh) {
+			return nil // already terminal (raced with a controller-side transition): nothing to do
+		}
+		now := metav1.Now()
+		fresh.Status.DeployState = "Parked"
+		fresh.Status.ParkReason = "issue-closed"
+		fresh.Status.LastActivityAt = &now
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	}); err != nil {
+		s.log.ErrorContext(ctx, "issue closed: park task", "error", err, "task", task.Name, "issue_ref", ev.IssueRef)
+		return
+	}
+	s.log.InfoContext(ctx, "issue closed by human: parked owning lifecycle task",
+		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef, "actor", ev.ActorLogin)
 }
 
 // findReactivatableBackHalfTask returns a discrete implement/review Task owning

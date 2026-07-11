@@ -808,22 +808,43 @@ func (r *TaskReconciler) recordConversationalApproval(ctx context.Context, task 
 // Status.ApprovedByMaintainer gets the audit sentinel "<tatara:auto:<kind>>"
 // (distinct from any real login, never confusable with one - logins cannot
 // contain '<'), Status.AutoApproved is set for a fast structural check.
-func (r *TaskReconciler) recordAutoApproval(ctx context.Context, task *tatarav1alpha1.Task, kind string) error {
+//
+// Status.ApprovedByMaintainer is re-checked INSIDE the retry closure,
+// immediately before writing (finding FIX-3): the caller's approvingMaintainer
+// scan and this call are not atomic, so a concurrent label (recordMaintainerApproval)
+// or conversational approval can land on the Task in between. Blindly
+// overwriting would corrupt the audit attribution (a real maintainer's approval
+// silently replaced by the auto sentinel) and could double-approve. When the
+// fresh read already carries an approval, this is a no-op: it reflects that
+// winning value onto task.Status (never overwriting) and returns
+// recorded=false so the caller skips its own duplicate metric/audit comment.
+func (r *TaskReconciler) recordAutoApproval(ctx context.Context, task *tatarav1alpha1.Task, kind string) (bool, error) {
 	sentinel := "<tatara:auto:" + kind + ">"
+	recorded := false
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
 		}
+		if fresh.Status.ApprovedByMaintainer != "" {
+			recorded = false
+			task.Status.ApprovedByMaintainer = fresh.Status.ApprovedByMaintainer
+			task.Status.AutoApproved = fresh.Status.AutoApproved
+			return nil
+		}
 		fresh.Status.ApprovedByMaintainer = sentinel
 		fresh.Status.AutoApproved = true
-		return r.Status().Update(ctx, fresh)
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		recorded = true
+		task.Status.ApprovedByMaintainer = sentinel
+		task.Status.AutoApproved = true
+		return nil
 	}); err != nil {
-		return fmt.Errorf("record auto approval: %w", err)
+		return false, fmt.Errorf("record auto approval: %w", err)
 	}
-	task.Status.ApprovedByMaintainer = sentinel
-	task.Status.AutoApproved = true
-	return nil
+	return recorded, nil
 }
 
 // clearImplementOutcome nils Status.ImplementOutcome (RetryOnConflict). Called
