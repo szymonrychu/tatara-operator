@@ -173,7 +173,10 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	// handoff, conversation reactivation); phase-reaping it there kills the pod
 	// mid-continuation (the blip). Its DeployState is non-empty, so this branch
 	// skips it - the lifecycle-terminal branch below reaps it once genuinely
-	// finished, and the idle backstop reaps it if it goes idle.
+	// finished, and the idle backstop reaps it if it goes idle. That backstop is
+	// the ONLY bound on a lifecycle task wedged at phase Succeeded with a
+	// non-terminal DeployState, so keep IdlePodReapAfter > 0 (default 30m);
+	// disabling it (IDLE_POD_REAP_MINUTES=0) lets such a pod linger indefinitely.
 	if task.Status.DeployState == "" && isTerminal(task.Status.Phase) {
 		return fmt.Sprintf("task phase %s", task.Status.Phase), true
 	}
