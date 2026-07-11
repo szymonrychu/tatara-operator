@@ -574,13 +574,8 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 //   - no live task -> a Parked owning task is reactivated, else a fresh task is
 //     created at Triage.
 func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
-	botLogin := ""
-	if proj.Spec.Scm != nil {
-		botLogin = proj.Spec.Scm.BotLogin
-	}
-
 	// ActorLogin is the sender of the event (comment author for issue_comment).
-	if botLogin != "" && ev.ActorLogin == botLogin {
+	if isBotActor(&proj, ev.ActorLogin) {
 		s.log.InfoContext(ctx, "issue_comment: bot-authored comment ignored",
 			"project", proj.Name, "issue_ref", ev.IssueRef)
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
@@ -687,11 +682,31 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
+// isBotActor reports whether login is the project's configured bot identity.
+// Every inbound path that could turn a comment into a Task must check this
+// before doing so - an incident agent's own evidence comment on an issue
+// (work-stream B) must never spawn a competing clarify/issue Task. Fail-open
+// (false) when login is empty or the project has no bot login configured,
+// matching the rest of the bot-actor guard family.
+func isBotActor(proj *tatarav1.Project, login string) bool {
+	if login == "" || proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
+		return false
+	}
+	return login == proj.Spec.Scm.BotLogin
+}
+
 // createClarifyTask creates a new clarify umbrella Task for an issue_comment on
 // an issue with no existing live task. clarify starts at Triage (reconcileClarify
 // ignores any lifecycle-entry annotation) and shares the deterministic dedup name
 // with the labeled-issue create path so both land on one umbrella.
 func (s *Server) createClarifyTask(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	// Belt-and-suspenders: handleIssueComment already guards its sole caller
+	// path, but a future caller reaching this directly must not spawn a Task
+	// for a bot-authored comment either.
+	if isBotActor(&proj, ev.ActorLogin) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
 	// Find the matching Repository for the event's repo URL.
 	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
 	if err != nil {

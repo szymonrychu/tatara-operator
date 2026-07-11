@@ -559,6 +559,10 @@ type issueCommentOnProjectReq struct {
 	Repo   string `json:"repo"`
 	Number int    `json:"number"`
 	Body   string `json:"body"`
+	// IsPR marks the target as a PR/MR rather than a plain issue: comments are
+	// read via PRCommentLister (when available) instead of ListIssueComments,
+	// and the ref uses the provider's PR/MR separator ('!' on GitLab).
+	IsPR bool `json:"isPR,omitempty"`
 }
 
 // commentRefusedResp is the machine-readable body returned when the permission-
@@ -711,11 +715,11 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 
 	// Permission-layer self-comment guard (CROSS-REPO-CONTRACT): refuse the comment
 	// when the last comment on the thread is tatara(bot)-authored, so the bot never
-	// answers its own comment in a loop. The SOLE exception is the refine kind, which
-	// may answer tatara's own prior comment (encoded in controller.PermitComment).
-	// Best-effort: an empty BotLogin, no reader factory, or an SCM read error all fall
-	// open (post proceeds) - matching decideCommentGate, so a lost webhook stays
-	// recoverable by a later scan (never fail-closed on a read error).
+	// answers its own comment in a loop. The SOLE exceptions are the refine and
+	// incident kinds (encoded in controller.PermitComment). Best-effort: an empty
+	// BotLogin, no reader factory, or an SCM read error all fall open (post
+	// proceeds) - matching decideCommentGate, so a lost webhook stays recoverable
+	// by a later scan (never fail-closed on a read error).
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
@@ -723,7 +727,20 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 	if botLogin != "" && s.readerFor != nil {
 		if reader, rerr := s.readerFor(provider, token); rerr == nil {
 			if owner, name, oerr := scm.OwnerRepo(matchedRepoURL); oerr == nil {
-				if comments, cerr := reader.ListIssueComments(r.Context(), owner, name, req.Number); cerr == nil {
+				var (
+					comments []scm.IssueComment
+					cerr     error
+				)
+				if req.IsPR {
+					if pl, ok := reader.(scm.PRCommentLister); ok {
+						comments, cerr = pl.ListPRComments(r.Context(), owner, name, req.Number)
+					} else {
+						comments, cerr = reader.ListIssueComments(r.Context(), owner, name, req.Number)
+					}
+				} else {
+					comments, cerr = reader.ListIssueComments(r.Context(), owner, name, req.Number)
+				}
+				if cerr == nil {
 					kind := s.callerKindForIssue(r.Context(), projName, req.Repo, req.Number)
 					breakers := controller.CommentSilenceBreakers(&proj, matchedRepo)
 					if permit, reason := controller.PermitComment(kind, comments, botLogin, breakers); !permit {
@@ -745,13 +762,41 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 						})
 						return
 					}
+					closed := false
+					if req.IsPR {
+						if st, perr := writer.GetPRState(r.Context(), matchedRepoURL, token, req.Number); perr == nil {
+							closed = st.Closed || st.Merged
+						}
+					} else if st, ierr := writer.GetIssueState(r.Context(), matchedRepoURL, token, req.Number); ierr == nil {
+						closed = st.Closed
+					}
+					if closed {
+						writeJSON(w, http.StatusConflict, commentRefusedResp{
+							Error:   "comment refused: target is closed",
+							Refused: true,
+							Reason:  "closed",
+						})
+						return
+					}
+					if controller.DuplicateRecentBotComment(comments, botLogin, req.Body) {
+						writeJSON(w, http.StatusConflict, commentRefusedResp{
+							Error:   "comment refused: duplicate of a recent bot comment",
+							Refused: true,
+							Reason:  "duplicate",
+						})
+						return
+					}
 				}
 			}
 		}
 	}
 
 	start := time.Now()
-	issueRef := fmt.Sprintf("%s#%d", req.Repo, req.Number)
+	sep := "#"
+	if provider == "gitlab" && req.IsPR {
+		sep = "!"
+	}
+	issueRef := fmt.Sprintf("%s%s%d", req.Repo, sep, req.Number)
 	commentErr := writer.Comment(r.Context(), token, issueRef, req.Body)
 	result := "ok"
 	if commentErr != nil {
