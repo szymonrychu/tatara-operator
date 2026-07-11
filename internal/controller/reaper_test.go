@@ -106,6 +106,29 @@ func TestReapOrphans_TerminalPhase(t *testing.T) {
 	}
 }
 
+// TestReapOrphans_TerminalPhaseWithLiveLifecycleKept covers the pod-blip fix:
+// a task shows phase Succeeded transiently between a turn-batch drain
+// (NoPendingSubtasks) and resetAgentRun reviving it, while its lifecycle
+// DeployState is still live (Conversation). The reaper must NOT phase-reap it -
+// that would kill the warm pod mid-continuation.
+func TestReapOrphans_TerminalPhaseWithLiveLifecycleKept(t *testing.T) {
+	mkTaskProject(t, "p-reap-phlc", 3)
+	mkTaskRepository(t, "r-reap-phlc", "p-reap-phlc")
+	mkTask(t, "t-reap-phlc", "p-reap-phlc", "r-reap-phlc")
+	setTaskPhase(t, "t-reap-phlc", "Succeeded")
+	tk := getTask(t, "t-reap-phlc")
+	tk.Status.DeployState = "Conversation"
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set lifecycle: %v", err)
+	}
+	mkWrapperPodSvc(t, "reap-phlc", "t-reap-phlc", string(tk.UID))
+
+	reaperServer().ReapOrphans(context.Background())
+	if !podExists(t, "reap-phlc") {
+		t.Error("expected pod for phase-Succeeded task with live Conversation lifecycle to be kept")
+	}
+}
+
 func TestReapOrphans_TerminalLifecycle(t *testing.T) {
 	mkTaskProject(t, "p-reap-lc", 3)
 	mkTaskRepository(t, "r-reap-lc", "p-reap-lc")
