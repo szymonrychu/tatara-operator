@@ -126,6 +126,54 @@ func TestBackstopSweep_ReactivatesStrandedTask(t *testing.T) {
 	require.Equal(t, "MRCI", ann, "QE lifecycle entry must be MRCI")
 }
 
+// TestBackstopSweep_NewModelRoutesToReview is the U-E regression: a stalled
+// NEW-MODEL task (Kind=implement umbrella, not legacy issueLifecycle) with an open
+// bot PR routes backstop reactivation through the discrete `review` kind (carrying
+// the PR head branch as AnnReviewHeadBranch), NOT the issueLifecycle bridge.
+func TestBackstopSweep_NewModelRoutesToReview(t *testing.T) {
+	proj, repo := seedBackstopSweepProject(t, "sweep-newmodel")
+	ctx := context.Background()
+
+	task := &tatarav1alpha1.Task{}
+	task.GenerateName = "sweep-nm-"
+	task.Namespace = testNS
+	task.Labels = map[string]string{labelSourceKind: "implement", labelActivity: "issueScan"}
+	task.Spec = tatarav1alpha1.TaskSpec{
+		ProjectRef:    "sweep-newmodel",
+		RepositoryRef: "", // umbrella
+		Goal:          "cross-repo change",
+		Kind:          "implement",
+		Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#70", Number: 70},
+	}
+	require.NoError(t, k8sClient.Create(ctx, task))
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 70, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+		{Provider: "github", Repo: "o/r", Number: 71, Kind: tatarav1alpha1.WorkItemPR,
+			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen, HeadSHA: "sha1", HeadBranch: "tatara/task-nm"},
+	}
+	task.Status.PodName = agent.PodName(task)
+	task.Status.DeployState = "Parked"
+	require.NoError(t, k8sClient.Status().Update(ctx, task))
+	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), task) })
+
+	reader := &backstopFakeReader{
+		openIssues: map[string][]scm.IssueRef{"o/r": {{Repo: "o/r", Number: 70}}},
+		openPRs:    map[string][]scm.PRRef{"o/r": {{Repo: "o/r", Number: 71, HeadSHA: "sha1"}}},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r.backstopSweep(ctx, proj, reader, []tatarav1alpha1.Repository{repo})
+
+	qes := listScanQEs(t, "sweep-newmodel")
+	require.Len(t, qes, 1, "want 1 recovery QE for stranded new-model task")
+	require.Equal(t, "review", qes[0].Spec.Payload.Kind, "new-model recovery must route to review, not issueLifecycle")
+	require.Equal(t, "tatara/task-nm", qes[0].Spec.Payload.Annotations[tatarav1alpha1.AnnReviewHeadBranch],
+		"review recovery must carry the PR head branch")
+	require.NotEqual(t, "MRCI", qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation],
+		"new-model recovery must NOT use the issueLifecycle MRCI bridge")
+}
+
 // TestBackstopSweep_ExhaustedClosePR: 3 prior terminal attempts for the same bot PR
 // -> sweep closes the PR and creates no new task.
 func TestBackstopSweep_ExhaustedClosePR(t *testing.T) {

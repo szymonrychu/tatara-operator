@@ -763,6 +763,12 @@ type reviewVerdictReq struct {
 	Decision    string                      `json:"decision"`
 	Body        string                      `json:"body,omitempty"`
 	Suggestions []tatarav1alpha1.Suggestion `json:"suggestions,omitempty"`
+	// Semver carries the per-MR push-CD level the review agent assigns on approval
+	// so the release tag can be cut for EVERY MR in the stream (human MRs otherwise
+	// have no change_significance). Each Level is validated against the same closed
+	// major|minor|patch set as change_summary (validChangeSignificance). Wire key
+	// is exactly "semver" (decodeJSON DisallowUnknownFields freezes it).
+	Semver []tatarav1alpha1.SemverAssignment `json:"semver,omitempty"`
 }
 
 // mutateTaskStatusParams bundles the per-handler pieces of the shared
@@ -857,6 +863,12 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "decision must be one of approve, request_changes, comment")
 		return
 	}
+	for _, sa := range req.Semver {
+		if !validChangeSignificance[sa.Level] {
+			writeError(w, http.StatusBadRequest, "semver level must be one of major|minor|patch")
+			return
+		}
+	}
 	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
 		metricName: "review_verdict",
 		logMsg:     "restapi: reviewVerdict",
@@ -864,7 +876,7 @@ func (s *Server) reviewVerdict(w http.ResponseWriter, r *http.Request) {
 		kindOK:     func(kind string) bool { return kind == "review" },
 		kindErrMsg: "review verdict only applies to a review task",
 		mutate: func(t *tatarav1alpha1.Task) {
-			t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions}
+			t.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: req.Decision, Body: req.Body, Suggestions: req.Suggestions, Semver: req.Semver}
 		},
 		extraLogFields: []any{"decision", req.Decision},
 	})

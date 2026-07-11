@@ -322,6 +322,34 @@ func TestReviewVerdict(t *testing.T) {
 	require.Len(t, out.Status.ReviewVerdict.Suggestions, 1)
 }
 
+func TestReviewVerdict_CarriesSemver(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"decision":"approve","semver":[{"repo":"o/r","number":9,"level":"minor"},{"repo":"o/r2","number":21,"level":"major"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ReviewVerdict)
+	require.Len(t, out.Status.ReviewVerdict.Semver, 2)
+	require.Equal(t, "o/r", out.Status.ReviewVerdict.Semver[0].Repo)
+	require.Equal(t, 9, out.Status.ReviewVerdict.Semver[0].Number)
+	require.Equal(t, "minor", out.Status.ReviewVerdict.Semver[0].Level)
+	require.Equal(t, "major", out.Status.ReviewVerdict.Semver[1].Level)
+}
+
+func TestReviewVerdict_InvalidSemverLevel(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"decision":"approve","semver":[{"repo":"o/r","number":9,"level":"nope"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestReviewVerdict_MissingDecision(t *testing.T) {
 	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	body := strings.NewReader(`{"body":"lgtm"}`)

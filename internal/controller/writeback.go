@@ -164,8 +164,19 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			provider = providerForRemote(ctx, primaryRepo.Spec.URL)
 		}
 	} else {
+		// Umbrella (empty RepositoryRef): scope to EffectiveReposInScope so an
+		// umbrella kind (implement/review/clarify) opens a PR on EVERY enrolled
+		// project repo (untouched repos return a benign 422 no-branch and skip),
+		// not just the ledger/source repos (the U-B fix). allSlugs bounds the scope
+		// to enrolled repos so nothing outside the project is targeted.
+		allSlugs := make([]string, 0, len(allRepos))
+		for i := range allRepos {
+			if slug, serr := scm.RepoSlugFromURL(allRepos[i].Spec.URL); serr == nil {
+				allSlugs = append(allSlugs, slug)
+			}
+		}
 		inScope := make(map[string]bool)
-		for _, slug := range tatarav1alpha1.TaskReposInScope(task) {
+		for _, slug := range tatarav1alpha1.EffectiveReposInScope(task, allSlugs) {
 			inScope[slug] = true
 		}
 		for i := range allRepos {
@@ -416,12 +427,11 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	// RetryOnConflict ensures this idempotency key lands even when a concurrent
 	// lifecycle reconcile has bumped the resource version.
 	prURLsMsg := strings.Join(prURLs, " ")
-	// Derive the openedPR ledger entry's repo slug from the SAME repo that produced
-	// prURLs[0]; when the primary repo is skipped (422 no-change) prURLs[0] belongs
-	// to a secondary repo, so using primaryRepo.Spec.URL would record a corrupt
-	// {primary-slug, secondary-number} entry the backstop/dedup can never match.
-	primaryPRSlug, _, _ := repoSlugFromURL(prRepos[0].Spec.URL, provider)
-	primaryPRNumber := parsePRNumber(prURLs[0])
+	// Derive each opened-PR ledger entry's repo slug from the SAME repo that produced
+	// the matching prURLs entry; when the primary repo is skipped (422 no-change)
+	// prURLs[0] belongs to a secondary repo, so using primaryRepo.Spec.URL would
+	// record a corrupt {primary-slug, secondary-number} entry the backstop/dedup can
+	// never match. prRepos is kept parallel to prURLs for exactly this.
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
@@ -431,17 +441,29 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// A PR opened: clear any accumulated skip-4xx attempts so a later, unrelated
 		// writeback starts with a fresh budget (issue #166).
 		fresh.Status.WritebackSkip4xxAttempts = 0
-		// Project the PR-open action onto the ledger: upsert a role:openedPR entry
-		// with state:open. The real HeadSHA is filled later by the backstop refresh
-		// (Phase 3); we do not have it here without an extra SCM round-trip.
-		if primaryPRSlug != "" && primaryPRNumber > 0 {
+		// Project EVERY opened PR onto the ledger: upsert a role:openedPR entry with
+		// state:open for each PR so Status.WorkItems tracks all N cross-repo PRs (the
+		// U-A fix), not just the first - this is what lets review/backstop/deploy see
+		// every sibling PR under the umbrella. HeadBranch is the shared task branch;
+		// the real HeadSHA is filled later by the backstop refresh (Phase 3), which we
+		// do not have here without an extra SCM round-trip.
+		for idx := range prURLs {
+			slug, _, serr := repoSlugFromURL(prRepos[idx].Spec.URL, provider)
+			if serr != nil || slug == "" {
+				continue
+			}
+			num := parsePRNumber(prURLs[idx])
+			if num <= 0 {
+				continue
+			}
 			UpsertWorkItem(fresh, tatarav1alpha1.WorkItemRef{
-				Provider: provider,
-				Repo:     primaryPRSlug,
-				Number:   primaryPRNumber,
-				Kind:     tatarav1alpha1.WorkItemPR,
-				Role:     tatarav1alpha1.RoleOpenedPR,
-				State:    tatarav1alpha1.WIOpen,
+				Provider:   provider,
+				Repo:       slug,
+				Number:     num,
+				Kind:       tatarav1alpha1.WorkItemPR,
+				Role:       tatarav1alpha1.RoleOpenedPR,
+				State:      tatarav1alpha1.WIOpen,
+				HeadBranch: sourceBranch,
 			})
 		}
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{

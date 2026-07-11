@@ -564,8 +564,14 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// only enter WorkItems via the Phase-3 backstop AFTER PRs exist) still clones
 	// them. When the ledger is empty, fall back to the full project repo list for
 	// backward-compatibility (pre-ledger Tasks carry no WorkItems).
+	// Umbrella kinds (clarify/implement/review) always clone ALL enrolled project
+	// repos - the whole point of the project-level umbrella is that the agent sees
+	// every repo at once (the U-B fix). Skip the ledger-derived narrowing for them
+	// so a narrow ledger (e.g. only the source-issue repo) does not shrink the
+	// clone set below the full project; the enrolled `repos` list bounds it to the
+	// project so nothing outside is cloned.
 	scopedRepos := repos
-	if inScope := tatarav1alpha1.TaskReposInScope(task); len(inScope) > 0 {
+	if inScope := tatarav1alpha1.TaskReposInScope(task); !tatarav1alpha1.IsUmbrellaKind(task.Spec.Kind) && len(inScope) > 0 {
 		scopeSet := make(map[string]struct{}, len(inScope))
 		for _, s := range inScope {
 			scopeSet[s] = struct{}{}

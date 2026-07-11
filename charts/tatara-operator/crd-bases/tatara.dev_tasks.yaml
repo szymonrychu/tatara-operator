@@ -577,6 +577,37 @@ spec:
                     - request_changes
                     - comment
                     type: string
+                  semver:
+                    description: |-
+                      Semver is the per-MR push-CD level the review agent assigns on approval so
+                      the release tag can be cut for EVERY MR in the stream (human MRs otherwise
+                      carry no change_significance -> cd-release refuses to tag). Applied
+                      best-effort in the approve writeback; an existing semver:* label on a member
+                      MR is respected (a deliberate human semver is authoritative).
+                    items:
+                      description: |-
+                        SemverAssignment is one per-MR push-CD level the review agent assigns on
+                        approval, so the release tag can be cut for EVERY MR in the stream - including
+                        human/maintainer MRs that carry no bot change_significance (the review approve
+                        is their ONLY stamping opportunity). Repo is the "owner/repo" slug (matches
+                        WorkItemRef.Repo); Number is the PR/MR number in that repo.
+                      properties:
+                        level:
+                          enum:
+                          - major
+                          - minor
+                          - patch
+                          type: string
+                        number:
+                          type: integer
+                        repo:
+                          type: string
+                      required:
+                      - level
+                      - number
+                      - repo
+                      type: object
+                    type: array
                   suggestions:
                     items:
                       description: Suggestion is one inline code suggestion on a PR/MR.

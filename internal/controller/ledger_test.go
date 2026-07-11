@@ -53,6 +53,34 @@ func TestUpsertWorkItem_AddAndUpdate(t *testing.T) {
 	}
 }
 
+// TestUpsertWorkItem_RefreshesHeadBranch is finding #4: an existing-match update
+// must refresh HeadBranch when the incoming ref carries one (so a later-learned
+// branch is recorded), but must not blank an existing branch when the incoming ref
+// omits it (UpsertWorkItem skips empty fields).
+func TestUpsertWorkItem_RefreshesHeadBranch(t *testing.T) {
+	task := &tatarav1alpha1.Task{}
+	UpsertWorkItem(task, tatarav1alpha1.WorkItemRef{
+		Provider: "github", Repo: "o/r", Number: 9,
+		Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen,
+	})
+	// Incoming ref learns the head branch.
+	UpsertWorkItem(task, tatarav1alpha1.WorkItemRef{
+		Provider: "github", Repo: "o/r", Number: 9,
+		Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR, HeadBranch: "feat/x",
+	})
+	if got := task.Status.WorkItems[0].HeadBranch; got != "feat/x" {
+		t.Fatalf("HeadBranch not refreshed on existing match: got %q", got)
+	}
+	// A later ref without a branch must not blank the recorded one.
+	UpsertWorkItem(task, tatarav1alpha1.WorkItemRef{
+		Provider: "github", Repo: "o/r", Number: 9,
+		Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR, HeadSHA: "abc123",
+	})
+	if got := task.Status.WorkItems[0].HeadBranch; got != "feat/x" {
+		t.Errorf("HeadBranch blanked by an empty-branch ref: got %q", got)
+	}
+}
+
 func TestUpsertWorkItem_ZeroNumberMatchByTitle(t *testing.T) {
 	task := &tatarav1alpha1.Task{}
 	// Unfiled proposal: Number==0, match by (Repo, Title, Role).

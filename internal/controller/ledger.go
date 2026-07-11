@@ -16,7 +16,8 @@ func repoFromIssueRef(issueRef string) string {
 // UpsertWorkItem upserts ref into task.Status.WorkItems. Idempotent by
 // (Repo, Number, Kind) when Number > 0; for unfiled proposals (Number==0)
 // it matches by (Repo, Title, Role). On match it updates Role, State, HeadSHA,
-// Title, and LastRefreshedAt in place; otherwise appends.
+// HeadBranch, Title, and LastRefreshedAt in place (each only when the incoming ref
+// carries a non-empty value); otherwise appends.
 func UpsertWorkItem(task *tatarav1alpha1.Task, ref tatarav1alpha1.WorkItemRef) {
 	for i := range task.Status.WorkItems {
 		wi := &task.Status.WorkItems[i]
@@ -35,6 +36,9 @@ func UpsertWorkItem(task *tatarav1alpha1.Task, ref tatarav1alpha1.WorkItemRef) {
 			}
 			if ref.HeadSHA != "" {
 				wi.HeadSHA = ref.HeadSHA
+			}
+			if ref.HeadBranch != "" {
+				wi.HeadBranch = ref.HeadBranch
 			}
 			if ref.Title != "" {
 				wi.Title = ref.Title

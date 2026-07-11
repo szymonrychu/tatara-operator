@@ -149,6 +149,17 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	// U-C stream review span: a stream review umbrella carries the shared head branch
+	// (AnnReviewHeadBranch). Seed its ledger with every role:openedPR member of the
+	// sibling implement/clarify umbrella that opened PRs on that branch, so the review
+	// spans the whole cross-repo stream (its approve/withhold decision in
+	// writeBackReview iterates all members). Idempotent; a no-op once seeded.
+	if task.Spec.Kind == "review" {
+		if branch := task.Annotations[tatarav1alpha1.AnnReviewHeadBranch]; branch != "" && !tatarav1alpha1.TaskTerminal(&task) {
+			r.seedReviewSpanFromUmbrella(ctx, &task, branch)
+		}
+	}
+
 	if task.Spec.Kind == "issueLifecycle" {
 		return r.reconcileLifecycle(ctx, &task)
 	}

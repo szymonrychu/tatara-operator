@@ -99,6 +99,49 @@ func TaskReposInScope(t *Task) []string {
 	return out
 }
 
+// umbrellaKinds are the project-level umbrella agent kinds (clarify/implement/
+// review) whose clone + writeback scope defaults to ALL enrolled project repos:
+// they operate across every repo in the project, not just the source/ledger repo.
+// documentation stays repo-scoped (docs repo only) and is deliberately absent.
+var umbrellaKinds = map[string]bool{
+	"clarify":   true,
+	"implement": true,
+	"review":    true,
+}
+
+// IsUmbrellaKind reports whether kind is a project-level umbrella kind whose
+// scope is all enrolled project repositories.
+func IsUmbrellaKind(kind string) bool { return umbrellaKinds[kind] }
+
+// EffectiveReposInScope returns the "owner/repo" slugs a Task should clone and
+// scope to. For umbrella kinds (clarify/implement/review) the scope is ALL
+// enrolled project repos (allProjectSlugs) unioned with any ledger/source repos,
+// so the umbrella agent gets every project repo at once (the U-B fix). For every
+// other kind it is the ledger-derived TaskReposInScope. allProjectSlugs bounds the
+// umbrella to the project's enrolled Repository CRs so no repo outside the project
+// is ever cloned; each caller further intersects the result with its own enrolled
+// repo list.
+func EffectiveReposInScope(t *Task, allProjectSlugs []string) []string {
+	if !umbrellaKinds[t.Spec.Kind] {
+		return TaskReposInScope(t)
+	}
+	seen := map[string]struct{}{}
+	for _, s := range allProjectSlugs {
+		if s != "" {
+			seen[s] = struct{}{}
+		}
+	}
+	for _, s := range TaskReposInScope(t) {
+		seen[s] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // WorkItemsContext formats a human-readable summary of the task's work-item
 // ledger for inclusion in the agent prompt or TATARA_WORK_ITEMS env. Returns ""
 // when WorkItems is empty.

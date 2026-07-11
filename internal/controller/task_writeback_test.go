@@ -480,7 +480,9 @@ type fullFakeSCMWriter struct {
 	// review path
 	approveCalled        bool
 	approveNumber        int
+	approveNumbers       []int
 	approveBody          string
+	approveErrByNumber   map[int]error
 	requestChangesCalled bool
 	requestChangesNumber int
 	requestChangesBody   string
@@ -504,6 +506,10 @@ type fullFakeSCMWriter struct {
 	addLabelIssueRef string
 	addLabelLabel    string
 	addLabelErr      error
+	// addLabelErrByLabel returns a per-label AddLabel error (overrides addLabelErr
+	// for the matching label), so a semver stamp can fail while tatara-approved
+	// succeeds - proving the review semver apply is strictly best-effort.
+	addLabelErrByLabel map[string]error
 	// EnsureLabel
 	ensureLabelCalled bool
 	ensureLabelName   string
@@ -516,8 +522,12 @@ type fullFakeSCMWriter struct {
 	// GetPRState
 	prState    scm.PRState
 	prStateErr error
-	// GetMergeState (default clean when empty)
-	mergeState scm.MergeState
+	// GetMergeState (default clean when empty; per-number overrides win)
+	mergeState         scm.MergeState
+	mergeStateByNumber map[int]scm.MergeState
+	// AddLabel history (umbrella fan-out asserts per-member labels)
+	addLabelRefs   []string
+	addLabelLabels []string
 	// RemoveLabel
 	removeLabelLabels []string
 }
@@ -534,8 +544,12 @@ func (f *fullFakeSCMWriter) Comment(_ context.Context, _, issueRef, body string)
 	return nil
 }
 func (f *fullFakeSCMWriter) Approve(_ context.Context, _, _ string, number int, body string) error {
+	if err, ok := f.approveErrByNumber[number]; ok {
+		return err
+	}
 	f.approveCalled = true
 	f.approveNumber = number
+	f.approveNumbers = append(f.approveNumbers, number)
 	f.approveBody = body
 	return nil
 }
@@ -566,6 +580,13 @@ func (f *fullFakeSCMWriter) AddLabel(_ context.Context, _, issueRef, label strin
 	f.addLabelCalled = true
 	f.addLabelIssueRef = issueRef
 	f.addLabelLabel = label
+	f.addLabelRefs = append(f.addLabelRefs, issueRef)
+	f.addLabelLabels = append(f.addLabelLabels, label)
+	if f.addLabelErrByLabel != nil {
+		if err, ok := f.addLabelErrByLabel[label]; ok {
+			return err
+		}
+	}
 	return f.addLabelErr
 }
 func (f *fullFakeSCMWriter) EnsureLabel(_ context.Context, _, _, name, color string) error {
@@ -583,7 +604,10 @@ func (f *fullFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, prURL, meth
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr
 }
-func (f *fullFakeSCMWriter) GetMergeState(_ context.Context, _, _ string, _ int) (scm.MergeState, error) {
+func (f *fullFakeSCMWriter) GetMergeState(_ context.Context, _, _ string, number int) (scm.MergeState, error) {
+	if ms, ok := f.mergeStateByNumber[number]; ok {
+		return ms, nil
+	}
 	if f.mergeState == "" {
 		return scm.MergeStateClean, nil
 	}

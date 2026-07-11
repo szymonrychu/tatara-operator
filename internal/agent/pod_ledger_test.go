@@ -62,6 +62,50 @@ func TestBuildPod_LedgerCloneScope(t *testing.T) {
 	require.NotContains(t, names, "extra-repo", "extra repo not in ledger must be excluded")
 }
 
+// TestBuildPod_UmbrellaKind_ClonesAllProjectRepos is the U-B regression: an
+// umbrella kind (clarify/implement/review) must clone ALL enrolled project repos
+// even when its ledger only spans the source repo, so the umbrella agent gets
+// every repo at once. A narrow ledger must NOT shrink the clone set.
+func TestBuildPod_UmbrellaKind_ClonesAllProjectRepos(t *testing.T) {
+	for _, kind := range []string{"implement", "review", "clarify"} {
+		t.Run(kind, func(t *testing.T) {
+			proj, _, task, cfg := sampleInputs()
+			task.Spec.Kind = kind
+			task.Spec.RepositoryRef = ""
+
+			// Ledger spans only repo1, but the project enrolls three repos.
+			task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+				{Provider: "github", Repo: "acme/repo1", Number: 5, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+			}
+			allRepos := []tatarav1alpha1.Repository{
+				{ObjectMeta: metav1.ObjectMeta{Name: "repo1"}, Spec: tatarav1alpha1.RepositorySpec{URL: "https://github.com/acme/repo1.git", DefaultBranch: "main"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "repo2"}, Spec: tatarav1alpha1.RepositorySpec{URL: "https://github.com/acme/repo2.git", DefaultBranch: "main"}},
+				{ObjectMeta: metav1.ObjectMeta{Name: "repo3"}, Spec: tatarav1alpha1.RepositorySpec{URL: "https://github.com/acme/repo3.git", DefaultBranch: "main"}},
+			}
+
+			pod := agent.BuildPod(proj, nil, task, allRepos, testMemoryEndpoint, cfg)
+			c := pod.Spec.Containers[0]
+
+			reposVal, ok := envValue(c, "TATARA_REPOS")
+			require.True(t, ok, "TATARA_REPOS must be present")
+			var repos []map[string]string
+			require.NoError(t, json.Unmarshal([]byte(reposVal), &repos))
+			names := make([]string, 0, len(repos))
+			for _, r := range repos {
+				names = append(names, r["name"])
+			}
+			require.Len(t, repos, 3, "umbrella kind must clone ALL project repos, not just the ledger scope")
+			require.Contains(t, names, "repo1")
+			require.Contains(t, names, "repo2")
+			require.Contains(t, names, "repo3")
+
+			// Full-clone is on for a project-scoped umbrella (repo==nil, not brainstorm).
+			fc, _ := envValue(c, "TATARA_WORKSPACE_FULL_CLONE")
+			require.Equal(t, "true", fc, "umbrella kind must full-clone")
+		})
+	}
+}
+
 // TestBuildPod_LedgerCloneScope_EmptyLedger: when the ledger is empty, fall back
 // to the full project repo list (backward compatibility).
 func TestBuildPod_LedgerCloneScope_EmptyLedger(t *testing.T) {

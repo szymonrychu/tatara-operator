@@ -300,11 +300,19 @@ func (r *TaskReconciler) buildUmbrellaPromptFor(ctx context.Context, project *ta
 		}
 	}
 
-	// Build the repos-in-scope list + slug->URL map from the project repos, limited
-	// to the Task's ledger-derived scope.
+	// Build the repos-in-scope list + slug->URL map from the project repos. For
+	// umbrella kinds the effective scope is ALL enrolled project repos (U-B), so the
+	// bundle's "Repos in scope" lists every repo with its checkout hint; for other
+	// kinds it stays the ledger-derived scope. allSlugs bounds it to enrolled repos.
 	repos, _ := r.projectRepos(ctx, project)
+	allSlugs := make([]string, 0, len(repos))
+	for i := range repos {
+		if slug, serr := scm.RepoSlugFromURL(repos[i].Spec.URL); serr == nil {
+			allSlugs = append(allSlugs, slug)
+		}
+	}
 	scope := map[string]struct{}{}
-	for _, s := range tatarav1alpha1.TaskReposInScope(task) {
+	for _, s := range tatarav1alpha1.EffectiveReposInScope(task, allSlugs) {
 		scope[s] = struct{}{}
 	}
 	var umRepos []umbrellaRepo

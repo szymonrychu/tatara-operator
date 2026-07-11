@@ -285,6 +285,47 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		return
 	}
 
+	// U-C (cross-repo umbrella review): a PR-create for a repo that belongs to an
+	// existing tatara stream routes review INTO that stream's umbrella instead of
+	// spawning a fresh per-PR review Task. The stream is identified by the PR's shared
+	// head branch alone (the implement umbrella opens ONE branch across all repos); a
+	// linked-issue-only "Closes #N" reference is deliberately not an auto-join trigger
+	// (see streamPRMatches). An existing stream review Task is JOINED (the PR is
+	// added to its ledger as role:openedPR - no second review Task per stream); a
+	// stream with only an implement/clarify umbrella spawns ONE deterministic-named
+	// stream review Task. External / human PRs match no umbrella and fall through to
+	// the per-PR review path below (unchanged).
+	if ev.IsPR && isPRCreateAction(ev.Action) {
+		prRepoSlug := tatarav1.RepoFromIssueRef(ev.IssueRef)
+		reviewT, umbrellaT := s.findStreamUmbrellas(ctx, proj.Name, ev.HeadBranch)
+		if reviewT != nil {
+			if jerr := s.joinStreamReview(ctx, reviewT, provider, prRepoSlug, ev); jerr != nil {
+				s.reject(w, http.StatusInternalServerError, "join review", provider, ev.Kind, ev.Action, "error")
+				return
+			}
+			s.log.InfoContext(ctx, "PR-create joined existing stream review umbrella",
+				"project", proj.Name, "task", reviewT.Name, "issue_ref", ev.IssueRef, "branch", ev.HeadBranch)
+			s.accept(w, provider, ev.Kind, ev.Action, "joined_umbrella")
+			return
+		}
+		if umbrellaT != nil {
+			created, cerr := s.createStreamReview(ctx, &proj, repo, umbrellaT, provider, ev)
+			if cerr != nil {
+				s.reject(w, http.StatusInternalServerError, "create review", provider, ev.Kind, ev.Action, "error")
+				return
+			}
+			result := "task_created"
+			if !created {
+				result = "duplicate"
+			}
+			s.log.InfoContext(ctx, "PR-create spawned stream review umbrella",
+				"project", proj.Name, "umbrella", umbrellaT.Name, "issue_ref", ev.IssueRef, "branch", ev.HeadBranch, "created", created)
+			s.accept(w, provider, ev.Kind, ev.Action, result)
+			return
+		}
+		// No umbrella: external / human PR - fall through to the per-PR review path.
+	}
+
 	// Reporter intake gate (issue #102): for plain issues, only act on issues
 	// authored by an allowed reporter so an unknown third party cannot drive the
 	// lifecycle via a labelled issue. PR review items are governed by
@@ -852,6 +893,162 @@ func projectRepoSlugs(ctx context.Context, c client.Client, ns, project string) 
 
 func mentionsBot(body, bot string) bool {
 	return bot != "" && strings.Contains(body, "@"+bot)
+}
+
+// isPRCreateAction reports whether a PR/MR webhook action opens a PR for review
+// (the U-C stream-review routing only fires on a genuine PR-create, not on
+// label/synchronize/close events which the per-PR review path already handles).
+func isPRCreateAction(action string) bool {
+	switch action {
+	case "opened", "reopened", "ready_for_review":
+		return true
+	}
+	return false
+}
+
+// streamPRMatches reports whether task is the umbrella of the stream a newly
+// created PR belongs to. Membership is the STRONG signal ONLY: the shared head
+// branch (the implement umbrella opens one branch across every repo, tracked as
+// role:openedPR HeadBranch, and a stream review Task carries it as
+// AnnReviewHeadBranch). A linked-issue-only match ("Closes #N" citing the umbrella's
+// source issue) is deliberately NOT an auto-join trigger: a human PR that merely
+// references the source issue on its own branch would otherwise be swept into the
+// collective approve/withhold. Such a PR falls through to the normal per-PR review
+// path instead.
+func streamPRMatches(task *tatarav1.Task, headBranch string) bool {
+	if headBranch == "" {
+		return false
+	}
+	if task.Annotations[tatarav1.AnnReviewHeadBranch] == headBranch {
+		return true
+	}
+	for _, wi := range task.Status.WorkItems {
+		if wi.Role == tatarav1.RoleOpenedPR && wi.Kind == tatarav1.WorkItemPR && wi.HeadBranch == headBranch {
+			return true
+		}
+	}
+	return false
+}
+
+// findStreamUmbrellas scans the project's Tasks for the umbrella a PR-create should
+// route into: a non-terminal review-kind Task to JOIN (review), and/or an
+// implement/clarify umbrella that established the stream (umbrella). The implement
+// umbrella may already be terminal (Succeeded, awaiting the review/merge/deploy
+// half) - it still identifies the stream, so its terminal-ness is not filtered.
+func (s *Server) findStreamUmbrellas(ctx context.Context, projName, headBranch string) (review, umbrella *tatarav1.Task) {
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+		return nil, nil
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProjectRef != projName {
+			continue
+		}
+		if !streamPRMatches(t, headBranch) {
+			continue
+		}
+		switch t.Spec.Kind {
+		case "review":
+			if review == nil && !tatarav1.TaskTerminal(t) {
+				review = t
+			}
+		case "implement", "clarify":
+			if umbrella == nil {
+				umbrella = t
+			}
+		}
+	}
+	return review, umbrella
+}
+
+// joinStreamReview upserts a newly created PR as a role:openedPR ledger member of an
+// existing stream review Task, so the umbrella review's approve/withhold decision
+// spans it (U-D) without a second review Task per stream. Idempotent: a redelivered
+// PR-create refreshes the existing entry's role/state/branch rather than duplicating.
+func (s *Server) joinStreamReview(ctx context.Context, task *tatarav1.Task, provider, prRepoSlug string, ev scm.WebhookEvent) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		for i := range fresh.Status.WorkItems {
+			wi := &fresh.Status.WorkItems[i]
+			if wi.Repo == prRepoSlug && wi.Number == ev.Number && wi.Kind == tatarav1.WorkItemPR {
+				wi.Role = tatarav1.RoleOpenedPR
+				wi.State = tatarav1.WIOpen
+				if ev.HeadBranch != "" {
+					wi.HeadBranch = ev.HeadBranch
+				}
+				return s.cfg.Client.Status().Update(ctx, fresh)
+			}
+		}
+		fresh.Status.WorkItems = append(fresh.Status.WorkItems, tatarav1.WorkItemRef{
+			Provider:   provider,
+			Repo:       prRepoSlug,
+			Number:     ev.Number,
+			Kind:       tatarav1.WorkItemPR,
+			Role:       tatarav1.RoleOpenedPR,
+			State:      tatarav1.WIOpen,
+			Title:      ev.Title,
+			HeadBranch: ev.HeadBranch,
+		})
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	})
+}
+
+// createStreamReview spawns the single stream review umbrella Task for a stream that
+// has an implement/clarify umbrella but no review Task yet. It carries the umbrella's
+// originating issue as Spec.Source (so a withheld approval re-adds tatara-implementation
+// on the issue and drives implement) and the shared head branch as AnnReviewHeadBranch
+// (the stream key: subsequent PR-creates match and JOIN this Task, and the controller
+// seeds its cross-repo openedPR span from the sibling umbrella). The deterministic name
+// makes concurrent PR-create deliveries for one branch race to a single winner.
+func (s *Server) createStreamReview(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, umbrella *tatarav1.Task, provider string, ev scm.WebhookEvent) (bool, error) {
+	repoRef := umbrella.Spec.RepositoryRef
+	if repoRef == "" {
+		repoRef = repo.Name
+	}
+	var source *tatarav1.TaskSource
+	if src := umbrella.Spec.Source; src != nil && !src.IsPR && src.IssueRef != "" {
+		source = &tatarav1.TaskSource{
+			Provider: src.Provider, IssueRef: src.IssueRef, URL: src.URL,
+			AuthorLogin: src.AuthorLogin, IsPR: false, Number: src.Number, Title: src.Title,
+		}
+	} else {
+		source = &tatarav1.TaskSource{
+			Provider: provider, IssueRef: ev.IssueRef, URL: ev.URL,
+			AuthorLogin: ev.AuthorLogin, IsPR: true, Number: ev.Number, Title: ev.Title,
+		}
+	}
+	key := ev.HeadBranch
+	if key == "" {
+		key = umbrella.Name
+	}
+	name := streamReviewTaskName(proj.Name, key)
+	payload := tatarav1.QueuedEventPayload{
+		Kind: "review",
+		Goal: fmt.Sprintf("Review the cross-repo change stream on branch %q: verify every opened PR across all repos, "+
+			"approve (native Approve + tatara-approved) only when ALL are green and mergeable, otherwise re-add "+
+			"tatara-implementation to route the stream back to implement.", ev.HeadBranch),
+		Name:          name,
+		RepositoryRef: repoRef,
+		Source:        source,
+		Provider:      provider,
+		PodRepo:       repoRef,
+		Annotations:   map[string]string{tatarav1.AnnReviewHeadBranch: ev.HeadBranch},
+	}
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassNormal, false, name, payload)
+	return created, err
+}
+
+// streamReviewTaskName is the deterministic K8s-safe name of a stream review
+// umbrella Task, keyed on (project, stream key = shared head branch). Concurrent
+// PR-create deliveries for the same branch collide on this name so exactly one
+// stream review Task is created.
+func streamReviewTaskName(project, key string) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s", project, key)))
+	return "rev-" + hex.EncodeToString(h[:])[:16]
 }
 
 // issueLifecycleTaskName returns a deterministic Kubernetes-safe Task name for

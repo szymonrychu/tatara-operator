@@ -50,6 +50,18 @@ type Suggestion struct {
 	Body string `json:"body"`
 }
 
+// SemverAssignment is one per-MR push-CD level the review agent assigns on
+// approval, so the release tag can be cut for EVERY MR in the stream - including
+// human/maintainer MRs that carry no bot change_significance (the review approve
+// is their ONLY stamping opportunity). Repo is the "owner/repo" slug (matches
+// WorkItemRef.Repo); Number is the PR/MR number in that repo.
+type SemverAssignment struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	// +kubebuilder:validation:Enum=major;minor;patch
+	Level string `json:"level"`
+}
+
 // ReviewVerdict is the agent's review decision for a human-authored PR/MR.
 type ReviewVerdict struct {
 	// +kubebuilder:validation:Enum=approve;request_changes;comment
@@ -58,6 +70,13 @@ type ReviewVerdict struct {
 	Body string `json:"body,omitempty"`
 	// +optional
 	Suggestions []Suggestion `json:"suggestions,omitempty"`
+	// Semver is the per-MR push-CD level the review agent assigns on approval so
+	// the release tag can be cut for EVERY MR in the stream (human MRs otherwise
+	// carry no change_significance -> cd-release refuses to tag). Applied
+	// best-effort in the approve writeback; an existing semver:* label on a member
+	// MR is respected (a deliberate human semver is authoritative).
+	// +optional
+	Semver []SemverAssignment `json:"semver,omitempty"`
 }
 
 // PROutcome is the agent's outcome for a tatara-authored PR/MR.
