@@ -121,3 +121,8 @@ Planned work not yet started. One line per item; link to plans for detail.
 3. [ ] helmfile -e default -l application=tatara-operator diff (should show ConfigMap + Deployment image tag change).
 4. [ ] helmfile -e default -l application=tatara-operator apply.
 5. [ ] Verify neo4j pod reaches Running: `kubectl -n tatara get pod -l app.kubernetes.io/component=neo4j`.
+
+## Scan stale-event cutoff (issue #285)
+
+- [x] Durable per-item high-water mark (ProjectStatus.ScanMarks) gates issueScan + mrScan re-triage on activity newer than last accounted. Plan: docs/superpowers/plans/2026-07-11-operator-scan-stale-cutoff.md (in tatara-new workbench).
+- [ ] Fix mrScan priorTerminalAttempts GC reset: recovery-exhaustion counter reads live Tasks only, resets to 0 after Task GC, undermining the maxRecoveryAttempts cap. Needs a durable attempt counter (candidate: reuse ScanMarks or a status counter).
