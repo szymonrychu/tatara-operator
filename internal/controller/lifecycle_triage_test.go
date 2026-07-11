@@ -329,3 +329,15 @@ func TestApprovingMaintainer_ReadErrorFailsClosed(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, "", got)
 }
+
+func TestRecordConversationalApproval(t *testing.T) {
+	_, task, _ := seedLabelTask(t, "convappr", nil)
+	r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	require.NoError(t, r.recordConversationalApproval(context.Background(), task, "szymon"))
+
+	// in-memory mirror
+	require.Equal(t, "szymon", task.Status.ApprovedByMaintainer)
+	// durable
+	got := getTaskByName(t, task.Name)
+	require.Equal(t, "szymon", got.Status.ApprovedByMaintainer)
+}
