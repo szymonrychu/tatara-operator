@@ -301,6 +301,32 @@ func (tr *triageReader) hasHumanReply(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
+// approvingMaintainer returns the login of the most-recent thread comment whose
+// author is a configured approver (EffectiveMaintainerLogins) and is not the
+// bot, or "" if none. With no approver allowlist it returns "" (closed by
+// default: nobody can approve). The listComments error propagates so the caller
+// fails closed rather than advancing on unread evidence. Mirrors hasHumanReply's
+// exact-match approver check (slices.Contains, bot excluded).
+func (tr *triageReader) approvingMaintainer(ctx context.Context) (string, error) {
+	if !tr.resolved || len(tr.approvers) == 0 {
+		return "", nil
+	}
+	comments, err := tr.listComments(ctx)
+	if err != nil {
+		return "", err
+	}
+	for i := len(comments) - 1; i >= 0; i-- {
+		author := comments[i].Author
+		if author == "" || author == tr.botLogin {
+			continue
+		}
+		if slices.Contains(tr.approvers, author) {
+			return author, nil
+		}
+	}
+	return "", nil
+}
+
 // botHasLastWord reports whether the newest comment on the issue is authored by
 // the bot (the bot already had the last word). Newest is by CreatedAt, so it is
 // robust to SCM list ordering. No comments -> false (the bot has not spoken).

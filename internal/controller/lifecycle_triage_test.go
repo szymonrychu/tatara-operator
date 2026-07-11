@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -273,4 +276,56 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 	if got.Status.DeployState != "Implement" {
 		t.Errorf("DeployState = %q, want Implement; concurrency cap must not block finishTriage", got.Status.DeployState)
 	}
+}
+
+// errListReader embeds commentReader but fails ListIssueComments, to prove the
+// approval scan fails closed on an SCM read error.
+type errListReader struct {
+	commentReader
+}
+
+func (r *errListReader) ListIssueComments(context.Context, string, string, int) ([]scm.IssueComment, error) {
+	return nil, errors.New("boom")
+}
+
+func TestApprovingMaintainer(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name      string
+		approvers []string
+		comments  []scm.IssueComment
+		want      string
+	}{
+		{"maintainer after non-maintainer", []string{"szymon"},
+			[]scm.IssueComment{{Author: "rando", Body: "x"}, {Author: "szymon", Body: "go"}}, "szymon"},
+		{"most-recent maintainer wins", []string{"szymon", "alice"},
+			[]scm.IssueComment{{Author: "szymon", Body: "a"}, {Author: "alice", Body: "b"}}, "alice"},
+		{"non-maintainer only", []string{"szymon"},
+			[]scm.IssueComment{{Author: "rando", Body: "do it"}}, ""},
+		{"bot comment ignored", []string{"szymon"},
+			[]scm.IssueComment{{Author: "bot", Body: "hi"}}, ""},
+		{"empty approver list never releases", nil,
+			[]scm.IssueComment{{Author: "szymon", Body: "go"}}, ""},
+		{"no comments", []string{"szymon"}, nil, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := triageReader{
+				reader:    &commentReader{comments: tc.comments},
+				botLogin:  "bot",
+				approvers: tc.approvers,
+				resolved:  true,
+			}
+			got, err := tr.approvingMaintainer(ctx)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestApprovingMaintainer_ReadErrorFailsClosed(t *testing.T) {
+	tr := triageReader{reader: &errListReader{}, botLogin: "bot", approvers: []string{"szymon"}, resolved: true}
+	got, err := tr.approvingMaintainer(context.Background())
+	require.Error(t, err)
+	require.Equal(t, "", got)
 }
