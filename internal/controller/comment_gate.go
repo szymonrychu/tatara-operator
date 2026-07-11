@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -224,30 +225,6 @@ func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCM
 	return gateOpen
 }
 
-// commentGateReason resolves the reader + silence-breakers for the task's
-// project/repo and returns the gate decision for a bot comment on (number,isPR).
-// Fail-open (gateOpen) when ReaderFor is nil, the reader cannot be built, or the
-// repo URL is unsplittable.
-func (r *TaskReconciler) commentGateReason(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint, body string) gateReason {
-	botLogin := ""
-	if proj != nil && proj.Spec.Scm != nil {
-		botLogin = proj.Spec.Scm.BotLogin
-	}
-	if botLogin == "" || r.ReaderFor == nil || repo == nil {
-		return gateOpen
-	}
-	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
-	if err != nil {
-		return gateOpen
-	}
-	reader, err := r.ReaderFor(provider, token)
-	if err != nil {
-		return gateOpen
-	}
-	breakers := CommentSilenceBreakers(proj, repo)
-	return decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, body, breakers)
-}
-
 // parkIsBotMRByHint reports whether a park target is the bot's own PR/MR using
 // only the cheap author hint (reliable on GitHub, where AuthorLogin is the real
 // author). Used in the parkWithComment fail-open path where scmContext, and thus
@@ -265,21 +242,69 @@ func (r *TaskReconciler) parkIsBotMRByHint(ctx context.Context, task *tatarav1al
 	return task.Spec.Source.AuthorLogin == proj.Spec.Scm.BotLogin
 }
 
-// gatedComment posts body to ref via writer.Comment unless commentGateReason
-// withholds it. A withheld post is (false, nil) and records
-// SCMWrite(provider,"comment","suppressed_<reason>"). ref is the SCM ref the
-// caller already builds so provider sigils stay identical.
-func (r *TaskReconciler) gatedComment(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint, ref, body string) (bool, error) {
-	reason := r.commentGateReason(ctx, proj, repo, writer, token, provider, number, isPR, authorHint, body)
+// gatedCommentCore is the receiver-independent core of the gate: it decides
+// whether to post body to ref and, if permitted, does so via writer.Comment.
+// Both TaskReconciler and ProjectReconciler wrap this with their own
+// reader-factory and metrics so every outbound comment site - regardless of
+// which reconciler owns it - goes through one decision path.
+func gatedCommentCore(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, metrics *obs.OperatorMetrics, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, token, provider string, number int, isPR bool, botLogin, authorHint, ref, body string) (bool, error) {
+	reason := gateOpen
+	if botLogin != "" && reader != nil && repo != nil {
+		if owner, name, err := scm.OwnerRepo(repo.Spec.URL); err == nil {
+			breakers := CommentSilenceBreakers(proj, repo)
+			reason = decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, body, breakers)
+		}
+	}
 	if reason != gateOpen {
-		if r.Metrics != nil {
-			r.Metrics.SCMWrite(provider, "comment", "suppressed_"+string(reason))
+		if metrics != nil {
+			metrics.SCMWrite(provider, "comment", "suppressed_"+string(reason))
 		}
 		log.FromContext(ctx).Info("scm comment suppressed",
 			"action", "scm_comment_suppressed", "reason", string(reason), "ref", ref)
 		return false, nil
 	}
 	err := writer.Comment(ctx, token, ref, body)
-	r.recordSCM(provider, "comment", err)
 	return err == nil, err
+}
+
+// gatedComment posts body to ref via writer.Comment unless the gate withholds
+// it. A withheld post is (false, nil) and records
+// SCMWrite(provider,"comment","suppressed_<reason>"). ref is the SCM ref the
+// caller already builds so provider sigils stay identical.
+func (r *TaskReconciler) gatedComment(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint, ref, body string) (bool, error) {
+	botLogin := ""
+	if proj != nil && proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	var reader scm.SCMReader
+	if botLogin != "" && r.ReaderFor != nil {
+		reader, _ = r.ReaderFor(provider, token)
+	}
+	posted, err := gatedCommentCore(ctx, reader, writer, r.Metrics, proj, repo, token, provider, number, isPR, botLogin, authorHint, ref, body)
+	// posted||err!=nil means an actual writer.Comment attempt was made (the gate
+	// was open); a suppressed post returns (false, nil) and is already recorded
+	// via metrics.SCMWrite inside gatedCommentCore, so it must not double-record here.
+	if posted || err != nil {
+		r.recordSCM(provider, "comment", err)
+	}
+	return posted, err
+}
+
+// gatedComment is the ProjectReconciler counterpart of TaskReconciler's method
+// of the same name: same gatedCommentCore decision path, using this
+// reconciler's own ReaderFor/Metrics.
+func (r *ProjectReconciler) gatedComment(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint, ref, body string) (bool, error) {
+	botLogin := ""
+	if proj != nil && proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
+	}
+	var reader scm.SCMReader
+	if botLogin != "" && r.ReaderFor != nil {
+		reader, _ = r.ReaderFor(provider, token)
+	}
+	posted, err := gatedCommentCore(ctx, reader, writer, r.Metrics, proj, repo, token, provider, number, isPR, botLogin, authorHint, ref, body)
+	if (posted || err != nil) && r.Metrics != nil {
+		r.Metrics.SCMWrite(provider, "comment", scmResult(err))
+	}
+	return posted, err
 }

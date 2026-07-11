@@ -12,7 +12,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
 
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -72,4 +74,29 @@ func TestWriteback_InScopeHeadInvalidWarns(t *testing.T) {
 		}
 	}
 	require.True(t, warned, "in-scope repo with no branch must produce a WARNING comment; got %v", fw.commentArgs)
+}
+
+// TestWritebackNoBranchWarning_ClosedIssue_Suppressed verifies the
+// writeback.go in-scope no-branch warning site (item 1) now routes through
+// the comment gate: an already-closed source issue must not receive the
+// warning comment.
+func TestWritebackNoBranchWarning_ClosedIssue_Suppressed(t *testing.T) {
+	fw := &fakeWriter{openErr: &scm.HTTPError{Status: 422, Body: headInvalid422, Path: "/repos/o/r/pulls"}, issueClosed: true}
+	r := newWriteBackReconciler(t, fw)
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) { return &botLastWordReader{}, nil }
+	task := seedWritebackPending(t, "wb-nobranch-closed", "wb-scm-nobranch-closed", "wb-proj-nobranch-closed", "wb-repo-nobranch-closed")
+	task.Spec.ReposInScope = []string{"wb-repo-nobranch-closed"}
+	require.NoError(t, k8sClient.Update(context.Background(), task))
+
+	var proj tatarav1alpha1.Project
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "wb-proj-nobranch-closed"}, &proj))
+	proj.Spec.Scm = &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"}
+	require.NoError(t, k8sClient.Update(context.Background(), &proj))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	require.Empty(t, fw.commentArgs, "warning comment must be suppressed on an already-closed issue, got %v", fw.commentArgs)
 }

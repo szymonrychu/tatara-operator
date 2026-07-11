@@ -387,8 +387,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			"The following in-scope repo(s) produced no change on branch `" + sourceBranch + "` (no commits, or the branch was never pushed) and got no PR/MR: " +
 			strings.Join(inScopeNoBranch, ", ") + ". " +
 			"If those repos genuinely need no change this is expected; otherwise the cross-repo edit was lost - re-run or fix manually."
-		werr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, warnBody)
-		r.recordSCM(provider, "comment", werr)
+		_, werr := r.gatedComment(ctx, &proj, &primaryRepo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, warnBody)
 		if werr != nil {
 			l.Error(werr, "writeback: in-scope no-branch warning comment (non-fatal)",
 				"action", "writeback_in_scope_warn_failed", "issue_ref", task.Spec.Source.IssueRef, "repos", strings.Join(inScopeNoBranch, ","))
@@ -408,8 +407,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		commented := task.Spec.Source != nil && task.Spec.Source.IssueRef != "" &&
 			task.Status.ResultSummary != "" && task.Status.DeployState != "Implement"
 		if commented {
-			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary)
-			r.recordSCM(provider, "comment", cerr)
+			_, cerr := r.gatedComment(ctx, &proj, &primaryRepo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, task.Status.ResultSummary)
 			if cerr != nil {
 				l.Error(cerr, "writeback: comment result on work item (non-fatal)",
 					"issue_ref", task.Spec.Source.IssueRef)
@@ -496,8 +494,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		if task.Status.ResultSummary != "" {
 			commentBody += "\n\n" + task.Status.ResultSummary
 		}
-		cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody)
-		r.recordSCM(provider, "comment", cerr)
+		_, cerr := r.gatedComment(ctx, &proj, &primaryRepo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, commentBody)
 		if cerr != nil {
 			l.Error(cerr, "writeback: comment on work item (non-fatal)",
 				"issue_ref", task.Spec.Source.IssueRef)

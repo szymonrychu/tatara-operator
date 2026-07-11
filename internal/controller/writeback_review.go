@@ -234,9 +234,7 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 			sep = "!"
 		}
 		prRef := fmt.Sprintf("%s%s%d", slug, sep, number)
-		err = writer.Comment(ctx, token, prRef, v.Body)
-		r.recordSCM(provider, "comment", err)
-		verbSent = err == nil
+		verbSent, err = r.gatedComment(ctx, &proj, &repo, writer, token, provider, number, true, "", prRef, v.Body)
 	default:
 		err = fmt.Errorf("unknown review decision %q", v.Decision)
 	}

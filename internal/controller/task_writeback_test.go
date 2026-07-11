@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
@@ -28,10 +29,11 @@ type fakeWriter struct {
 	commentArgs []string // issueRef|body
 	prURL       string
 	openErr     error
+	issueClosed bool
 }
 
 func (f *fakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
-	return scm.IssueState{}, nil
+	return scm.IssueState{Closed: f.issueClosed}, nil
 }
 func (f *fakeWriter) OpenChange(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	f.mu.Lock()
@@ -854,6 +856,36 @@ func TestDoWriteBackKind(t *testing.T) {
 		require.GreaterOrEqual(t, fw.openCalls, 1, "OpenChange must be called for implement kind")
 		require.Contains(t, fw.openCallBody, "<!-- tatara-authored -->", "implement body must carry marker")
 	})
+}
+
+// TestWritebackReviewComment_DuplicateBody_Suppressed verifies the
+// writeback_review.go "comment" verdict site (item 1 root cause: PR #295's
+// double-post) now routes through the gate: an identical normalized body
+// already posted by the bot must not be re-posted.
+func TestWritebackReviewComment_DuplicateBody_Suppressed(t *testing.T) {
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &botLastWordReader{comments: []scm.IssueComment{
+			{Author: "tatara-bot", Body: "nice work", CreatedAt: time.Unix(1_700_000_000, 0)},
+			{Author: "human", Body: "thanks", CreatedAt: time.Unix(1_700_000_100, 0)},
+		}}, nil
+	}
+	task := seedWritebackKindTask(t, "wbk-rev-dup", "wbk-proj-dup", "wbk-repo-dup", "wbk-scm-dup",
+		tatarav1alpha1.TaskSpec{
+			Goal: "comment on a PR",
+			Kind: "review",
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#11", IsPR: true, Number: 11,
+			},
+		}, &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"})
+	task.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: "comment", Body: "nice work"}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.False(t, fw.commentCalled, "duplicate review comment must be suppressed, not re-posted")
 }
 
 func TestWriteBackIssue_IsPRRefused(t *testing.T) {

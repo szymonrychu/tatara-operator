@@ -35,10 +35,13 @@ type lifecycleFakeSCMWriter struct {
 	openPRURL      string
 	createIssues   []struct{ url, title, body string }
 	createIssueURL string
+	issueClosed    bool
 }
 
 func (f *lifecycleFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
-	return scm.IssueState{}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return scm.IssueState{Closed: f.issueClosed}, nil
 }
 
 func (f *lifecycleFakeSCMWriter) CloseIssue(_ context.Context, _, repo string, _ int, comment string) error {
