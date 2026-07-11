@@ -828,6 +828,28 @@ func (r *TaskReconciler) scmContext(ctx context.Context, task *tatarav1alpha1.Ta
 	return proj, repo, writer, token, provider, nil
 }
 
+// reviewTargetClosed reports whether a review Task's target PR/MR is already
+// merged or closed, checked before a review turn is spawned (task_controller.go)
+// and before a review verdict is posted (writeback_review.go) so a stale review
+// never re-runs against, or re-comments on, a PR the deploy supervisor already
+// merged (root cause of PR #295: a review verdict posted twice on an
+// already-merged PR). Fail-open (false) on any resolution error so a transient
+// SCM hiccup never blocks a legitimate review.
+func (r *TaskReconciler) reviewTargetClosed(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	if task.Spec.Source == nil || !task.Spec.Source.IsPR || task.Spec.Source.Number <= 0 {
+		return false
+	}
+	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	if err != nil {
+		return false
+	}
+	st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, task.Spec.Source.Number)
+	if serr != nil {
+		return false
+	}
+	return st.Merged || st.Closed
+}
+
 func (r *TaskReconciler) recordSCM(provider, verb string, err error) {
 	result := "ok"
 	if err != nil {

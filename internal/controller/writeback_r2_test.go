@@ -322,6 +322,9 @@ type commentTargetFakeWriter struct {
 func (f *commentTargetFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
 	return scm.IssueState{}, nil
 }
+func (f *commentTargetFakeWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	return scm.PRState{}, nil
+}
 func (f *commentTargetFakeWriter) Comment(_ context.Context, _, issueRef, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

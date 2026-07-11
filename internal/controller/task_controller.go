@@ -279,6 +279,24 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		repoPtr = &repo
 	}
 
+	// Item-1 root cause guard (PR #295): a fresh review turn must never spawn
+	// against a PR/MR that is already merged or closed - the deploy supervisor
+	// may have merged it between scan-time task creation and this reconcile.
+	// Scoped to the pre-turn-0 spawn only (not every reconcile of an in-flight
+	// review), matching "a review turn is NOT spawned".
+	if task.Spec.Kind == "review" && task.Status.Phase == "" && task.Annotations[annCurrentTurn] == "" &&
+		r.reviewTargetClosed(ctx, &task) {
+		l.Info("review: target PR/MR already merged or closed; skipping review turn",
+			"action", "review_target_closed_skip", "resource_id", task.Name)
+		res, terr := r.terminate(ctx, &task, "Succeeded", "ReviewTargetClosed", "target PR/MR already merged or closed; review skipped")
+		if terr != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, terr
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+	}
+
 	// Review tasks (MR/PR review, issue #114 decision 4) get a review/test prompt
 	// instead of the implement-oriented plan prompt.
 	planText := planTurnText(task.Spec.Goal, taskBranch(&task), project.Name, task.Name)
