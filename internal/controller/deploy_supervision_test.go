@@ -109,7 +109,7 @@ func TestPoolInflight_ExcludesDeploying(t *testing.T) {
 	r := &DispatcherReconciler{}
 	deploying := preQueueTask("dep", "Running", "issueLifecycle", "")
 	deploying.Status.Phase = tatarav1alpha1.PhaseDeploying
-	deploying.Status.LifecycleState = tatarav1alpha1.LifecycleStateDeploying
+	deploying.Status.DeployState = tatarav1alpha1.DeployStateDeploying
 	tasks := []tatarav1alpha1.Task{
 		preQueueTask("live", "Running", "issueLifecycle", ""), // counts
 		deploying, // excluded (pod-less)
@@ -222,7 +222,7 @@ func seedDeployingTask(t *testing.T, name, project, compRepo, issueRef string, d
 	}
 	require.NoError(t, k8sClient.Create(ctx, task))
 	task.Status.Phase = tatarav1alpha1.PhaseDeploying
-	task.Status.LifecycleState = tatarav1alpha1.LifecycleStateDeploying
+	task.Status.DeployState = tatarav1alpha1.DeployStateDeploying
 	dl := metav1.NewTime(deadline)
 	task.Status.DeployDeadline = &dl
 	task.Status.MergeCommitSHA = "abcdef1234567"
@@ -262,7 +262,7 @@ func TestReconcileDeploying_LearnsVersionAndResolves(t *testing.T) {
 	require.NoError(t, err)
 
 	got := getTask(t, task.Name)
-	require.Equal(t, "Done", got.Status.LifecycleState)
+	require.Equal(t, "Done", got.Status.DeployState)
 	require.Equal(t, "", got.Status.Phase, "Deploying phase cleared on resolve")
 	require.True(t, tatarav1alpha1.TaskTerminal(got))
 	require.Len(t, fw.closeCalls, 1)
@@ -305,8 +305,8 @@ func TestReconcileDeploying_DedupSweep(t *testing.T) {
 	_, err := r.reconcileDeploying(deployCtx(), proj, getTask(t, t1.Name))
 	require.NoError(t, err)
 
-	require.Equal(t, "Done", getTask(t, t1.Name).Status.LifecycleState)
-	require.Equal(t, "Done", getTask(t, t2.Name).Status.LifecycleState)
+	require.Equal(t, "Done", getTask(t, t1.Name).Status.DeployState)
+	require.Equal(t, "Done", getTask(t, t2.Name).Status.DeployState)
 	require.Len(t, fw.closeCalls, 2, "both issues closed in one sweep")
 }
 
@@ -328,7 +328,7 @@ func TestReconcileDeploying_SuccessPredatesPin(t *testing.T) {
 	res, err := r.reconcileDeploying(deployCtx(), proj, getTask(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, deployPollRequeue, res.RequeueAfter)
-	require.Equal(t, tatarav1alpha1.LifecycleStateDeploying, getTask(t, task.Name).Status.LifecycleState)
+	require.Equal(t, tatarav1alpha1.DeployStateDeploying, getTask(t, task.Name).Status.DeployState)
 	require.Empty(t, fw.closeCalls)
 }
 
@@ -345,7 +345,7 @@ func TestReconcileDeploying_TimeoutReroll(t *testing.T) {
 	require.NoError(t, err)
 
 	got := getTask(t, task.Name)
-	require.Equal(t, "Implement", got.Status.LifecycleState)
+	require.Equal(t, "Implement", got.Status.DeployState)
 	require.Equal(t, "", got.Status.Phase)
 	require.Equal(t, 1, got.Status.ImplementGiveUps)
 	require.NotEmpty(t, got.Status.ImplementContext)
@@ -373,7 +373,7 @@ func TestReconcileDeploying_ApplyFailureReroll(t *testing.T) {
 	require.NoError(t, err)
 
 	got := getTask(t, task.Name)
-	require.Equal(t, "Implement", got.Status.LifecycleState)
+	require.Equal(t, "Implement", got.Status.DeployState)
 	require.Contains(t, got.Status.ImplementContext, "https://run/fail")
 }
 
@@ -390,7 +390,7 @@ func TestCDScan_RerollsStalled(t *testing.T) {
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
 
 	got := getTask(t, task.Name)
-	require.Equal(t, "Implement", got.Status.LifecycleState)
+	require.Equal(t, "Implement", got.Status.DeployState)
 	require.Equal(t, "", got.Status.Phase)
 	require.Equal(t, 1, got.Status.ImplementGiveUps)
 }
@@ -404,7 +404,7 @@ func TestCDScan_SkipsWithinThreshold(t *testing.T) {
 	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
 
-	require.Equal(t, tatarav1alpha1.LifecycleStateDeploying, getTask(t, task.Name).Status.LifecycleState)
+	require.Equal(t, tatarav1alpha1.DeployStateDeploying, getTask(t, task.Name).Status.DeployState)
 }
 
 // TestCDScan_StalledGaugeBudgetSpent: a Deploying Task past 1.5x its budget whose
@@ -425,7 +425,7 @@ func TestCDScan_StalledGaugeBudgetSpent(t *testing.T) {
 
 	// Not rerolled: stays Deploying, budget untouched.
 	got := getTask(t, task.Name)
-	require.Equal(t, tatarav1alpha1.LifecycleStateDeploying, got.Status.LifecycleState)
+	require.Equal(t, tatarav1alpha1.DeployStateDeploying, got.Status.DeployState)
 	require.Equal(t, maxImplGiveUps, got.Status.ImplementGiveUps)
 	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
 	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
@@ -440,7 +440,7 @@ func TestCDScan_FailedGaugeReflectsParkedDeployTimeout(t *testing.T) {
 		time.Now().Add(-2000*time.Second), "v1.0.0")
 	fcur := getTask(t, failed.Name)
 	fcur.Status.Phase = ""
-	fcur.Status.LifecycleState = "Parked"
+	fcur.Status.DeployState = "Parked"
 	fcur.Status.ParkReason = "deploy-timeout"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), fcur))
 
@@ -448,7 +448,7 @@ func TestCDScan_FailedGaugeReflectsParkedDeployTimeout(t *testing.T) {
 		time.Now().Add(-2000*time.Second), "v1.0.0")
 	ocur := getTask(t, other.Name)
 	ocur.Status.Phase = ""
-	ocur.Status.LifecycleState = "Parked"
+	ocur.Status.DeployState = "Parked"
 	ocur.Status.ParkReason = "implement-failed"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), ocur))
 
@@ -479,7 +479,7 @@ func TestCDScan_GaugesSelfClearOnRecovery(t *testing.T) {
 	// Cascade recovered: the task is no longer Deploying. Re-scan clears the gauge.
 	recovered := getTask(t, task.Name)
 	recovered.Status.Phase = ""
-	recovered.Status.LifecycleState = "Done"
+	recovered.Status.DeployState = "Done"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), recovered))
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
 	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))

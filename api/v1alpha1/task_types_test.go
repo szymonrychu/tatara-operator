@@ -74,7 +74,7 @@ func TestTaskLifecycleStatusFields(t *testing.T) {
 			Kind:          "issueLifecycle",
 		},
 		Status: v1alpha1.TaskStatus{
-			LifecycleState:      "Triage",
+			DeployState:         "Triage",
 			LastActivityAt:      &now,
 			DeadlineAt:          &later,
 			HeadBranch:          "tatara/task-foo",
@@ -92,8 +92,8 @@ func TestTaskLifecycleStatusFields(t *testing.T) {
 	if cp.Spec.Kind != "issueLifecycle" {
 		t.Errorf("Kind = %q, want issueLifecycle", cp.Spec.Kind)
 	}
-	if cp.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage", cp.Status.LifecycleState)
+	if cp.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage", cp.Status.DeployState)
 	}
 	if cp.Status.LastActivityAt == nil || !cp.Status.LastActivityAt.Time.Equal(now.Time) {
 		t.Errorf("LastActivityAt mismatch")
@@ -123,8 +123,8 @@ func TestTaskLifecycleStatusFields(t *testing.T) {
 		t.Errorf("Handover = %q, want 'resume from here'", cp.Status.Handover)
 	}
 	// Mutation safety: changing copy must not affect original
-	cp.Status.LifecycleState = "Done"
-	if task.Status.LifecycleState == "Done" {
+	cp.Status.DeployState = "Done"
+	if task.Status.DeployState == "Done" {
 		t.Error("mutating copy mutated original")
 	}
 }
@@ -142,7 +142,7 @@ func TestTaskAndSubtaskRegisteredInScheme(t *testing.T) {
 }
 
 // TestTaskTerminal covers Finding 3: the TaskTerminal helper must correctly
-// identify terminal tasks across both Phase and LifecycleState, so that
+// identify terminal tasks across both Phase and DeployState, so that
 // issueLifecycle tasks (which leave Phase empty for their whole life) are not
 // treated as indefinitely open by lane-occupancy and similar predicates.
 func TestTaskTerminal(t *testing.T) {
@@ -168,8 +168,8 @@ func TestTaskTerminal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			task := &v1alpha1.Task{
 				Status: v1alpha1.TaskStatus{
-					Phase:          tc.phase,
-					LifecycleState: tc.ls,
+					Phase:       tc.phase,
+					DeployState: tc.ls,
 				},
 			}
 			if got := v1alpha1.TaskTerminal(task); got != tc.want {
@@ -191,16 +191,21 @@ func TestTaskSpec_ValidateRepositoryRef(t *testing.T) {
 		repoRef string
 		wantErr bool
 	}{
-		// repo-scoped: ref required
+		// unconstrained umbrella kinds: both empty and non-empty ref accepted
+		// (7-kind redesign - implement/review/clarify are project-scoped umbrellas
+		// but a stored/legacy repo ref must still validate).
 		{"implement with ref", "implement", "my-repo", false},
+		{"implement empty ref", "implement", "", false},
 		{"review with ref", "review", "my-repo", false},
+		{"review empty ref", "review", "", false},
+		{"clarify empty ref", "clarify", "", false},
+		{"clarify with ref", "clarify", "my-repo", false},
+		// repo-scoped: ref required
 		{"selfImprove with ref", "selfImprove", "my-repo", false},
 		{"triageIssue with ref", "triageIssue", "my-repo", false},
 		{"issueLifecycle with ref", "issueLifecycle", "my-repo", false},
 		{"documentation with ref", "documentation", "tatara-documentation", false},
 		// repo-scoped: ref missing -> error
-		{"implement empty ref", "implement", "", true},
-		{"review empty ref", "review", "", true},
 		{"selfImprove empty ref", "selfImprove", "", true},
 		{"triageIssue empty ref", "triageIssue", "", true},
 		{"issueLifecycle empty ref", "issueLifecycle", "", true},
@@ -227,6 +232,51 @@ func TestTaskSpec_ValidateRepositoryRef(t *testing.T) {
 				t.Fatalf("want no error, got %v", err)
 			}
 		})
+	}
+}
+
+// TestValidateTaskSpec_UmbrellaScopes verifies the 7-kind redesign scoping:
+// implement/review/clarify are project-scoped umbrellas whose validator accepts
+// either an empty RepositoryRef (the umbrella norm) or a stored/legacy repo ref;
+// documentation is the one repo-scoped agent kind (empty ref -> error); retired
+// kinds stay valid for stored CRs.
+func TestValidateTaskSpec_UmbrellaScopes(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    string
+		repoRef string
+		wantErr bool
+	}{
+		{"implement umbrella empty ref", "implement", "", false},
+		{"review umbrella empty ref", "review", "", false},
+		{"clarify umbrella empty ref", "clarify", "", false},
+		{"documentation empty ref rejected", "documentation", "", true},
+		{"documentation with ref", "documentation", "tatara-documentation", false},
+		{"retired issueLifecycle with ref stays valid", "issueLifecycle", "my-repo", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := v1alpha1.ValidateTaskSpec(v1alpha1.TaskSpec{
+				ProjectRef:    "proj",
+				RepositoryRef: tc.repoRef,
+				Kind:          tc.kind,
+				Goal:          "do something",
+			})
+			if tc.wantErr && err == nil {
+				t.Fatalf("want validation error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("want no error, got %v", err)
+			}
+		})
+	}
+	// clarify is not project-scoped in the IsProjectScopedKind sense (it must not
+	// be caught by the writeback project-scoped fence).
+	if v1alpha1.IsProjectScopedKind("clarify") {
+		t.Fatalf("clarify must not be classified project-scoped by IsProjectScopedKind")
+	}
+	if v1alpha1.IsProjectScopedKind("implement") {
+		t.Fatalf("implement must not be classified project-scoped (it opens PRs)")
 	}
 }
 

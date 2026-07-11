@@ -105,10 +105,10 @@ func isFieldSelectorUnsupported(err error) bool {
 // Conversation (awaiting-human) is excluded: a task blocked on human input is
 // externally gated and is not consuming an autonomous agent slot.
 func taskActive(t *tatarav1alpha1.Task) bool {
-	if t.Status.LifecycleState == "Conversation" {
+	if t.Status.DeployState == "Conversation" {
 		return false
 	}
-	return isActive(t.Status.Phase) && !isLifecycleTerminal(t.Status.LifecycleState)
+	return isActive(t.Status.Phase) && !isLifecycleTerminal(t.Status.DeployState)
 }
 
 // Reconcile drives a Task through spawn -> plan turn -> subtask turns ->
@@ -151,6 +151,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	if task.Spec.Kind == "issueLifecycle" {
 		return r.reconcileLifecycle(ctx, &task)
+	}
+
+	// clarify is the decomposed conversational front-half kind: it reuses the
+	// lifecycle Triage/Conversation machinery via reconcileClarify but hands off
+	// to implement (label swap) and terminates rather than driving the deploy
+	// half. Routed parallel to the retained issueLifecycle bridge above.
+	if task.Spec.Kind == "clarify" {
+		return r.reconcileClarify(ctx, &task)
 	}
 
 	// Defensive: a pod-less Deploying Task must never drive an agent run. Only
@@ -268,6 +276,15 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		planText = reviewText(task.Spec.Goal, project.Name, task.Name)
 	} else if d := skillsDirective(task.Spec.Kind); d != "" {
 		planText += "\n\n" + d
+	}
+	// Turn-0 umbrella context bundle for the project-scoped cross-repo kinds: prepend
+	// every umbrella member's body + thread + state + per-repo checkout instructions
+	// so implement/review pods get the full cross-repo context upfront (skills assume
+	// it complete and must not re-crawl SCM). Only assembled before turn-0 is
+	// submitted (annCurrentTurn unset); planText drives no later turn, so re-fetching
+	// SCM on every post-turn-0 reconcile would be wasted work.
+	if (task.Spec.Kind == "implement" || task.Spec.Kind == "review") && task.Annotations[annCurrentTurn] == "" {
+		planText = r.buildUmbrellaPromptFor(ctx, &project, &task, planText)
 	}
 	res, err := r.driveAgentRun(ctx, &project, repoPtr, &task, planText)
 	if err != nil {
@@ -1094,13 +1111,13 @@ func (r *TaskReconciler) updateInflightGauge(ctx context.Context) {
 	}
 	r.Metrics.SetTasksInflight(float64(n))
 	// Emit per-kind gauge for all known kinds, zeroing kinds with no in-flight tasks.
-	for _, kind := range []string{"implement", "review", "triageIssue", "brainstorm", "issueLifecycle", "documentation"} {
+	for _, kind := range []string{"implement", "review", "clarify", "triageIssue", "brainstorm", "issueLifecycle", "documentation"} {
 		r.Metrics.SetTasksInflightKind(kind, float64(byKind[kind]))
 	}
 	// Also emit any kinds seen in the list that are not in the known set.
 	for kind, count := range byKind {
 		switch kind {
-		case "implement", "review", "triageIssue", "brainstorm", "issueLifecycle", "documentation":
+		case "implement", "review", "clarify", "triageIssue", "brainstorm", "issueLifecycle", "documentation":
 			continue
 		}
 		r.Metrics.SetTasksInflightKind(kind, float64(count))

@@ -53,7 +53,7 @@ func lifecycleTask(name, projectRef, repoRef string, issueNumber int, state stri
 			},
 		},
 		Status: tatarav1.TaskStatus{
-			LifecycleState: state,
+			DeployState:    state,
 			DeadlineAt:     &dl,
 			LastActivityAt: &now,
 		},
@@ -66,7 +66,7 @@ const issueCommentBotBody = `{"action":"created","issue":{"number":7,"title":"fi
 
 // TestIssueComment_OnConversationTask_SetsTriageAndResetsTimers verifies that a
 // human issue_comment on a Conversation task resets LastActivityAt/DeadlineAt
-// and sets LifecycleState=Triage.
+// and sets DeployState=Triage.
 func TestIssueComment_OnConversationTask_SetsTriageAndResetsTimers(t *testing.T) {
 	const secretVal = "whsec"
 	proj := projectWithBot("projic1", "projic1-scm", "tatara", "tatara-bot")
@@ -94,7 +94,7 @@ func TestIssueComment_OnConversationTask_SetsTriageAndResetsTimers(t *testing.T)
 	// Re-fetch the task and verify state transitions.
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskic1"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState)
+	require.Equal(t, "Triage", got.Status.DeployState)
 	require.NotNil(t, got.Status.DeadlineAt)
 	// DeadlineAt must have been reset (extended from now, so it should be after origDeadline or nil and re-set).
 	require.NotNil(t, got.Status.LastActivityAt)
@@ -126,7 +126,7 @@ func TestIssueComment_OnStoppedTask_ReOpens(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskic2"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState, "Stopped task must be re-opened to Triage on human comment")
+	require.Equal(t, "Triage", got.Status.DeployState, "Stopped task must be re-opened to Triage on human comment")
 }
 
 // TestIssueComment_BotComment_Ignored verifies that a comment from the bot
@@ -157,7 +157,7 @@ func TestIssueComment_BotComment_Ignored(t *testing.T) {
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskic3"}, &got))
 	// State must not change.
-	require.Equal(t, "Conversation", got.Status.LifecycleState, "bot comment must not change lifecycle state")
+	require.Equal(t, "Conversation", got.Status.DeployState, "bot comment must not change lifecycle state")
 	// DeadlineAt must remain set (not nil) - we cannot check exact time equality
 	// because the fake client status subresource may truncate or re-serialise.
 	_ = origDL
@@ -165,7 +165,7 @@ func TestIssueComment_BotComment_Ignored(t *testing.T) {
 
 // TestIssueComment_TriggerLabelOnConversation_SetsImplement verifies that a
 // "labeled" event applying the triggerLabel on a Conversation task sets
-// LifecycleState=Implement (skip-dialogue path).
+// DeployState=Implement (skip-dialogue path).
 func TestIssueComment_TriggerLabelOnConversation_SetsImplement(t *testing.T) {
 	const secretVal = "whsec"
 	proj := projectWithBot("projic4", "projic4-scm", "tatara", "tatara-bot")
@@ -192,7 +192,7 @@ func TestIssueComment_TriggerLabelOnConversation_SetsImplement(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskic4"}, &got))
-	require.Equal(t, "Implement", got.Status.LifecycleState, "triggerLabel on Conversation task must set Implement")
+	require.Equal(t, "Implement", got.Status.DeployState, "triggerLabel on Conversation task must set Implement")
 }
 
 // TestIssueComment_NoMatchingTask_Accepted verifies that an issue_comment with
@@ -249,7 +249,7 @@ func parkedLifecycleTask(name, projectRef, repoRef string) *tatarav1.Task {
 			},
 		},
 		Status: tatarav1.TaskStatus{
-			LifecycleState: "Parked",
+			DeployState:    "Parked",
 			Phase:          "Planning",
 			DeadlineAt:     &dl,
 			LastActivityAt: &now,
@@ -262,7 +262,7 @@ const issueCommentBodyIssue9 = `{"action":"created","issue":{"number":9,"title":
 
 // TestIssueCommentReactivatesParkedOwningTask verifies that a human comment on
 // an issue whose only owning Task is Parked reactivates that Task (no duplicate
-// created), clearing turn annotations and resetting LifecycleState to Triage.
+// created), clearing turn annotations and resetting DeployState to Triage.
 func TestIssueCommentReactivatesParkedOwningTask(t *testing.T) {
 	const secretVal = "whsec-p1"
 	proj := projectWithBot("projpark1", "projpark1-scm", "tatara", "tatara-bot")
@@ -291,7 +291,7 @@ func TestIssueCommentReactivatesParkedOwningTask(t *testing.T) {
 	// Re-fetch the task and verify reactivation.
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskpark1"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState, "Parked task must transition to Triage")
+	require.Equal(t, "Triage", got.Status.DeployState, "Parked task must transition to Triage")
 	require.Equal(t, "", got.Status.Phase, "Phase must be cleared on reactivation")
 	// Turn annotations must be cleared.
 	require.Empty(t, got.Annotations[tatarav1.AnnCurrentTurn], "AnnCurrentTurn must be cleared")
@@ -326,7 +326,7 @@ func TestIssueComment_InflightTurn_QueuesInterjection(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskij1"}, &got))
-	require.Equal(t, "Implement", got.Status.LifecycleState, "in-flight interjection must not change lifecycle state")
+	require.Equal(t, "Implement", got.Status.DeployState, "in-flight interjection must not change lifecycle state")
 	require.Equal(t, []string{"Please check the edge case"}, got.Status.PendingInterjections)
 
 	// No new QueuedEvent created.
@@ -367,7 +367,7 @@ func TestIssueComment_ParkedMR_Reactivated(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskmrp"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState, "Parked MR task must transition to Triage")
+	require.Equal(t, "Triage", got.Status.DeployState, "Parked MR task must transition to Triage")
 	require.Equal(t, "", got.Status.Phase)
 }
 
@@ -422,7 +422,7 @@ func TestIssueCommentNoOwningTaskCreatesFresh(t *testing.T) {
 	var qel tatarav1.QueuedEventList
 	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
 	require.Len(t, qel.Items, 1, "no owning task -> fresh Triage QueuedEvent created")
-	require.Equal(t, "Triage", qel.Items[0].Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
+	require.Equal(t, "clarify", qel.Items[0].Spec.Payload.Kind)
 }
 
 // parkedLifecycleTaskPhase1 builds the SAME Parked issueLifecycle Task for issue
@@ -473,6 +473,6 @@ func TestIssueCommentReactivatesParkedOwningTask_Phase1Labels(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskp1lbl"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState, "label-less Parked task must transition to Triage")
+	require.Equal(t, "Triage", got.Status.DeployState, "label-less Parked task must transition to Triage")
 	require.Equal(t, "", got.Status.Phase, "Phase must be cleared on reactivation")
 }

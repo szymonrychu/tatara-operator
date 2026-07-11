@@ -60,6 +60,35 @@ func TestModelForKind_Exported(t *testing.T) {
 	}
 }
 
+// TestModelForKind_PerKindDefaults asserts the locked per-kind model tiers
+// (kindDefaultModel): with no project Model and no ModelByKind override, the 7
+// kinds resolve to opus (brainstorm/incident/clarify/implement/review) or sonnet
+// (documentation/refine). An explicit ModelByKind override still wins.
+func TestModelForKind_PerKindDefaults(t *testing.T) {
+	proj := &tatarav1alpha1.Project{} // empty Model, nil ModelByKind
+	opusKinds := []string{"brainstorm", "incident", "clarify", "implement", "review"}
+	for _, k := range opusKinds {
+		t.Run("opus/"+k, func(t *testing.T) {
+			if got := modelForKind(proj, k, ""); got != "claude-opus-4-8" {
+				t.Fatalf("modelForKind(%q) = %q, want claude-opus-4-8", k, got)
+			}
+		})
+	}
+	for _, k := range []string{"documentation", "refine"} {
+		t.Run("sonnet/"+k, func(t *testing.T) {
+			if got := modelForKind(proj, k, ""); got != "claude-sonnet-5" {
+				t.Fatalf("modelForKind(%q) = %q, want claude-sonnet-5", k, got)
+			}
+		})
+	}
+	// Explicit project override wins over the per-kind default.
+	over := &tatarav1alpha1.Project{}
+	over.Spec.Agent.ModelByKind = map[string]string{"review": "claude-sonnet-5"}
+	if got := modelForKind(over, "review", ""); got != "claude-sonnet-5" {
+		t.Fatalf("ModelByKind override: modelForKind(review) = %q, want claude-sonnet-5", got)
+	}
+}
+
 func TestEffortForKind(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Spec.Agent.Effort = "high"

@@ -110,10 +110,10 @@ func TestProposeIssue_NoIncidentWhenIncidentTaskParked(t *testing.T) {
 	proj := incidentProject("parked-proj")
 	repo := incidentRepo("parked-repo", "parked-proj")
 	// Incident tasks leave Phase empty for their whole life and signal
-	// completion via LifecycleState (Done/Stopped/Parked). A parked incident
+	// completion via DeployState (Done/Stopped/Parked). A parked incident
 	// task is terminal and must NOT stamp a later proposal as an incident.
 	incTask := inflightIncidentTask("inc-task-parked", "parked-proj")
-	incTask.Status.LifecycleState = "Parked"
+	incTask.Status.DeployState = "Parked"
 
 	r, fc := buildIncidentTestRouter(t, proj, repo, incTask)
 	rec := postProposeIncident(t, r, "parked-proj", "parked-repo")

@@ -102,7 +102,7 @@ func seedSucceededImplementTaskWithOpenPR(t *testing.T, r *TaskReconciler, suffi
 
 	// Set Succeeded phase with open PR.
 	task.Status.Phase = "Succeeded"
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.PrURL = "https://github.com/o/r/pull/267"
 	task.Status.PRNumber = prNumber
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -119,7 +119,7 @@ func seedSucceededImplementTaskWithOpenPR(t *testing.T, r *TaskReconciler, suffi
 
 // TestFinishImplement_PROutcomeCloseClosesPR verifies that when the agent signals
 // pr_outcome=close on a bot-authored PR, the operator closes the PR and
-// sets LifecycleState=Stopped.
+// sets DeployState=Stopped.
 func TestFinishImplement_PROutcomeCloseClosesPR(t *testing.T) {
 	fw := &closeSignalWriter{author: "szymonrychu-bot"}
 	r := newLifecycleReconciler(t, &fw.lifecycleFakeSCMWriter)
@@ -140,7 +140,7 @@ func TestFinishImplement_PROutcomeCloseClosesPR(t *testing.T) {
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(task), &got))
-	assert.Equal(t, "Stopped", got.Status.LifecycleState)
+	assert.Equal(t, "Stopped", got.Status.DeployState)
 }
 
 // TestFinishImplement_PROutcomeCloseNonBotParks verifies that when the agent
@@ -165,5 +165,5 @@ func TestFinishImplement_PROutcomeCloseNonBotParks(t *testing.T) {
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(task), &got))
-	assert.Equal(t, "Parked", got.Status.LifecycleState)
+	assert.Equal(t, "Parked", got.Status.DeployState)
 }

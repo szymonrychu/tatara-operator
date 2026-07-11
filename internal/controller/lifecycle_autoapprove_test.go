@@ -40,7 +40,7 @@ func seedAutoapproveTriage(t *testing.T, suffix, author string, maintainers []st
 		t.Fatalf("update project scm: %v", err)
 	}
 
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
@@ -67,7 +67,7 @@ func reconcileTriageState(t *testing.T, r *TaskReconciler, name string) string {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	return got.Status.LifecycleState
+	return got.Status.DeployState
 }
 
 // TestTriageAutoapprove_ThirdPartyBypassesHold: an issue opened by a contributor
@@ -77,7 +77,7 @@ func reconcileTriageState(t *testing.T, r *TaskReconciler, name string) string {
 func TestTriageAutoapprove_ThirdPartyBypassesHold(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "thirdparty", "third-party-dev", []string{"szymon"})
 	if got := reconcileTriageState(t, r, name); got != "Implement" {
-		t.Fatalf("LifecycleState = %q, want Implement (third-party autoapprove bypasses hold)", got)
+		t.Fatalf("DeployState = %q, want Implement (third-party autoapprove bypasses hold)", got)
 	}
 }
 
@@ -87,7 +87,7 @@ func TestTriageAutoapprove_ThirdPartyBypassesHold(t *testing.T) {
 func TestTriageAutoapprove_MaintainerKeepsGate(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "maintainer", "szymon", []string{"szymon"})
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("LifecycleState = %q, want Conversation (maintainer keeps self-approve gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (maintainer keeps self-approve gate)", got)
 	}
 }
 
@@ -96,7 +96,7 @@ func TestTriageAutoapprove_MaintainerKeepsGate(t *testing.T) {
 func TestTriageAutoapprove_BotAuthoredKeepsGate(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "botauthored", "bot", nil)
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("LifecycleState = %q, want Conversation (bot-authored keeps self-approve gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (bot-authored keeps self-approve gate)", got)
 	}
 }
 
@@ -106,7 +106,7 @@ func TestTriageAutoapprove_BotAuthoredKeepsGate(t *testing.T) {
 func TestTriageAutoapprove_EmptyAuthorKeepsGate(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "noauthor", "", []string{"szymon"})
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("LifecycleState = %q, want Conversation (empty author keeps self-approve gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (empty author keeps self-approve gate)", got)
 	}
 }
 
@@ -121,7 +121,7 @@ func TestTriageApproverGate_NonApproverCommentHolds(t *testing.T) {
 			comments: []scm.IssueComment{{Author: "random-human", Body: "do it"}}}, nil
 	}
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("LifecycleState = %q, want Conversation (non-approver comment must not release the hold)", got)
+		t.Fatalf("DeployState = %q, want Conversation (non-approver comment must not release the hold)", got)
 	}
 }
 
@@ -135,7 +135,7 @@ func TestTriageApproverGate_ApproverCommentReleases(t *testing.T) {
 			comments: []scm.IssueComment{{Author: "szymon", Body: "approved"}}}, nil
 	}
 	if got := reconcileTriageState(t, r, name); got != "Implement" {
-		t.Fatalf("LifecycleState = %q, want Implement (approver comment releases the hold)", got)
+		t.Fatalf("DeployState = %q, want Implement (approver comment releases the hold)", got)
 	}
 }
 

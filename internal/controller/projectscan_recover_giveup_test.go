@@ -31,7 +31,7 @@ func mkGiveUpTask(t *testing.T, project, repoRef, slug string, number, giveUps i
 	if err := k8sClient.Create(context.Background(), task); err != nil {
 		t.Fatalf("mkGiveUpTask create: %v", err)
 	}
-	task.Status.LifecycleState = "Parked"
+	task.Status.DeployState = "Parked"
 	task.Status.ParkReason = parkReason
 	task.Status.ImplementGiveUps = giveUps
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -75,8 +75,8 @@ func TestRecoverOrphans_GiveUp_UnderCap_Rerolls(t *testing.T) {
 
 	// Task must be adopted to Implement.
 	got := getGiveUpTask(t, parked.Name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement", got.Status.DeployState)
 	}
 	if got.Status.ImplementGiveUps != 1 {
 		t.Errorf("ImplementGiveUps = %d, want 1 (preserved)", got.Status.ImplementGiveUps)
@@ -107,8 +107,8 @@ func TestRecoverOrphans_GiveUp_AtCap_Skips(t *testing.T) {
 
 	// Task must NOT be adopted (still Parked).
 	got := getGiveUpTask(t, parked.Name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (not adopted at cap)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (not adopted at cap)", got.Status.DeployState)
 	}
 }
 
@@ -129,7 +129,7 @@ func TestRecoverOrphans_GiveUp_LiveTask_NoAction(t *testing.T) {
 	if err := k8sClient.Create(context.Background(), live); err != nil {
 		t.Fatalf("create live task: %v", err)
 	}
-	live.Status.LifecycleState = "Implement"
+	live.Status.DeployState = "Implement"
 	if err := k8sClient.Status().Update(context.Background(), live); err != nil {
 		t.Fatalf("set live lifecycle: %v", err)
 	}
@@ -194,8 +194,8 @@ func TestRecoverOrphans_GiveUp_IssueClosed_MarkedDone(t *testing.T) {
 	r.recoverOrphans(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, nil)
 
 	got := getGiveUpTask(t, parked.Name)
-	if got.Status.LifecycleState != "Done" {
-		t.Errorf("LifecycleState = %q, want Done (issue closed)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Errorf("DeployState = %q, want Done (issue closed)", got.Status.DeployState)
 	}
 	if got.Status.ParkReason != "issue-closed" {
 		t.Errorf("ParkReason = %q, want issue-closed", got.Status.ParkReason)
@@ -215,8 +215,8 @@ func TestAdoptLifecycleTask_TriageResetsGiveUps(t *testing.T) {
 	}
 
 	got := getGiveUpTask(t, parked.Name)
-	if got.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage", got.Status.DeployState)
 	}
 	if got.Status.ImplementGiveUps != 0 {
 		t.Errorf("ImplementGiveUps = %d, want 0 (reset on human Triage revival)", got.Status.ImplementGiveUps)

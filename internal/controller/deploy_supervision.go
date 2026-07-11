@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -86,6 +87,292 @@ func deployBudget(proj *tatarav1alpha1.Project, repoName string) time.Duration {
 	return time.Duration(s) * time.Second
 }
 
+// mergePRSquash is the SINGLE writer.Merge call site in the controller. Every
+// operator-driven merge funnels through here: the issueLifecycle drain
+// (handleMerge) and the review-approved deploy supervisor (superviseApprovedPRs).
+// This keeps "agents never merge" structural (there is exactly one merge egress)
+// and satisfies the acceptance grep. Squash is the fixed method: push-CD cuts one
+// commit per merged change.
+func mergePRSquash(ctx context.Context, writer scm.SCMWriter, repoURL, token string, number int) (string, error) {
+	return writer.Merge(ctx, repoURL, token, number, "squash")
+}
+
+// superviseApprovedPRs is the review-approved merge trigger and the deploy
+// supervisor's gated fallback to the forge's native auto-merge. For each open bot
+// PR carrying tatara-approved on a project repo it merges only when the PR is
+// green (CIStatus==success), mergeable (not dirty/blocked), and NOT already merged
+// (native auto-merge, enabled at implement-PR-open, remains the primary path; the
+// !Merged gate prevents a double-merge). A semver:* label is stamped first so
+// push-CD's tag step never fails closed (issue #229). Non-bot PRs and PRs without
+// the approval label are never merged: agents never merge, and merges are gated on
+// green + tatara-approved (CROSS-REPO-CONTRACT). Best-effort per PR; a merge error
+// is logged non-fatally and the sweep continues.
+func (r *ProjectReconciler) superviseApprovedPRs(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository) {
+	l := log.FromContext(ctx)
+	if proj.Spec.Scm == nil || reader == nil {
+		return
+	}
+	bot := proj.Spec.Scm.BotLogin
+	provider := proj.Spec.Scm.Provider
+	_, approvedLabel, _, _ := lifecycleLabels(proj.Spec.Scm)
+	writer, token, werr := r.scanWriter(ctx, proj)
+	if werr != nil {
+		l.Error(werr, "superviseApprovedPRs: scanWriter (skipping sweep)", "action", "scm_merge_approved", "resource_id", proj.Name)
+		return
+	}
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err != nil {
+			continue
+		}
+		prs, lerr := reader.ListOpenPRs(ctx, owner, name)
+		if lerr != nil {
+			l.Error(lerr, "superviseApprovedPRs: ListOpenPRs (skipping repo)",
+				"action", "scm_merge_approved", "resource_id", proj.Name, "repo", name)
+			continue
+		}
+		for _, pr := range prs {
+			// Gate 1: only bot-authored PRs, and only those carrying tatara-approved.
+			if bot != "" && pr.Author != bot {
+				continue
+			}
+			if !hasLabel(pr.Labels, approvedLabel) {
+				continue
+			}
+			// Gate 2: green + not-already-merged. GetPRState is authoritative for the
+			// live CI + merged state (the list snapshot lacks both).
+			st, serr := writer.GetPRState(ctx, repos[i].Spec.URL, token, pr.Number)
+			r.Metrics.SCMWrite(provider, "get_pr_state", scmResult(serr))
+			if serr != nil {
+				continue
+			}
+			if st.Merged || st.Closed {
+				continue // native auto-merge already landed it, or it was closed
+			}
+			if st.CIStatus != "success" {
+				continue
+			}
+			// Gate 3: mergeability. A dirty (conflict) or blocked PR is not merged;
+			// review re-adds tatara-implementation for those. Fail-open on read error.
+			if ms, mserr := writer.GetMergeState(ctx, repos[i].Spec.URL, token, pr.Number); mserr == nil &&
+				(ms == scm.MergeStateDirty || ms == scm.MergeStateBlocked) {
+				continue
+			}
+			// Ensure a semver:* label before the merge (issue #229): a directly-merged
+			// PR with no semver label makes push-CD's release tag step fail closed.
+			r.ensureSemverBeforeApprovedMerge(ctx, proj, repos[i], writer, token, provider, pr)
+			sha, merr := mergePRSquash(ctx, writer, repos[i].Spec.URL, token, pr.Number)
+			r.Metrics.SCMWrite(provider, "merge", scmResult(merr))
+			if merr != nil {
+				l.Error(merr, "superviseApprovedPRs: merge approved PR (non-fatal)",
+					"action", "scm_merge_approved", "resource_id", proj.Name, "repo", name, "pr", pr.Number)
+				continue
+			}
+			l.Info("superviseApprovedPRs: merged approved green PR",
+				"action", "scm_merge_approved", "resource_id", proj.Name, "repo", name, "pr", pr.Number, "sha", sha)
+		}
+	}
+}
+
+// stampDeploying performs the Task status transition into the pod-less Deploying
+// phase and records the deploy-ledger entry. It is the SINGLE implementation of the
+// deploy transition, shared by TaskReconciler.enterDeploying (the issueLifecycle
+// bridge) and ProjectReconciler.enterDeployingFromMerge (the discrete-kind flow), so
+// the two producers can never drift (the "orphaned enterDeploying" landmine). Pod
+// teardown, budget computation, metrics and logging are the caller's responsibility.
+// The ledger Add is non-fatal (a dedup optimisation; the Task's own status drives
+// supervision), matching the original enterDeploying behaviour byte-for-byte.
+func stampDeploying(ctx context.Context, c client.Client, ledger *DeployLedger, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, repoName string, deadline metav1.Time) error {
+	issueRef := ""
+	if task.Spec.Source != nil {
+		issueRef = task.Spec.Source.IssueRef
+	}
+	if err := ledger.Add(ctx, project.Name, DeployLedgerEntry{
+		Artifact:      repoName,
+		SourceTaskRef: task.Name,
+		IssueRef:      issueRef,
+		HeadSHA:       task.Status.MergeCommitSHA,
+		State:         DeployStateDeploying,
+	}); err != nil {
+		log.FromContext(ctx).Error(err, "deploy: add ledger entry on Deploying entry (non-fatal)", "resource_id", task.Name)
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.Phase = tatarav1alpha1.PhaseDeploying
+		fresh.Status.DeployState = tatarav1alpha1.DeployStateDeploying
+		fresh.Status.DeployDeadline = &deadline
+		fresh.Status.CascadeStage = "tagged"
+		fresh.Status.DeployArtifact = repoName
+		return c.Status().Update(ctx, fresh)
+	})
+}
+
+// superviseMergedPRs is the discrete-kind enterDeploying producer (peer of
+// superviseApprovedPRs, run on the same mrScan cadence). superviseApprovedPRs (and
+// the forge's native auto-merge) MERGE an approved+green bot PR; this sweep then
+// drives the umbrella implement Task that owns the source issue into the pod-less
+// Deploying phase, so the push-CD cascade is supervised and the originating issue
+// closes on a confirmed apply (reusing reconcileDeploying + resolveDeployedSweep).
+//
+// It is the discrete-flow analogue of the issueLifecycle bridge's
+// handleMainCI->enterDeploying trigger. Guards:
+//   - Kind must be "implement": the issueLifecycle drain (handleMainCI) still enters
+//     Deploying for its own Tasks, so skipping other kinds avoids a double-deploy of
+//     the same change across the two paths.
+//   - The PR must be MERGED (GetPRState.Merged), read-only: this never calls Merge, so
+//     the single merge egress (mergePRSquash) is preserved (Phase-6 acceptance grep).
+//     Merged-ness is detected whoever merged it (superviseApprovedPRs OR native
+//     auto-merge), closing the native-auto-merge race.
+//   - The Task must not already carry a deploy-ledger entry (deploying/applied/failed)
+//     and must not already be Deploying: a resolved discrete implement Task is terminal
+//     but still present until GC, so without the ledger guard the sweep would resurrect
+//     it into Deploying on every tick. The ledger entry is the durable double-deploy fence.
+//   - pushCDEligible: only a change that declared a significance rides the cascade.
+func (r *ProjectReconciler) superviseMergedPRs(ctx context.Context, proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository) {
+	l := log.FromContext(ctx)
+	if proj.Spec.Scm == nil {
+		return
+	}
+	provider := proj.Spec.Scm.Provider
+	writer, token, werr := r.scanWriter(ctx, proj)
+	if werr != nil {
+		l.Error(werr, "superviseMergedPRs: scanWriter (skipping sweep)", "action", "deploy_enter_merged", "resource_id", proj.Name)
+		return
+	}
+
+	// Durable double-deploy fence: any Task already recorded in the deploy ledger
+	// (deploying/applied/failed) has been handled - never re-drive it.
+	ledger := &DeployLedger{Client: r.Client, Namespace: proj.Namespace}
+	seen := map[string]bool{}
+	if entries, lerr := ledger.List(ctx, proj.Name); lerr == nil {
+		for _, e := range entries {
+			if e.SourceTaskRef != "" {
+				seen[e.SourceTaskRef] = true
+			}
+		}
+	}
+
+	repoByName := map[string]*tatarav1alpha1.Repository{}
+	for i := range repos {
+		repoByName[repos[i].Name] = &repos[i]
+	}
+
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		l.Error(err, "superviseMergedPRs: list tasks (skipping sweep)", "action", "deploy_enter_merged", "resource_id", proj.Name)
+		return
+	}
+	for i := range list.Items {
+		task := &list.Items[i]
+		if task.Spec.ProjectRef != proj.Name || task.Spec.Kind != "implement" {
+			continue
+		}
+		if task.Spec.Source == nil || task.Spec.Source.IssueRef == "" || task.Spec.Source.IsPR {
+			continue
+		}
+		if task.Status.PRNumber == 0 || tatarav1alpha1.TaskDeploying(task) || seen[task.Name] || !pushCDEligible(task) {
+			continue
+		}
+		repo := repoByName[task.Spec.RepositoryRef]
+		if repo == nil {
+			continue
+		}
+		st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, task.Status.PRNumber)
+		r.Metrics.SCMWrite(provider, "get_pr_state", scmResult(serr))
+		if serr != nil {
+			continue
+		}
+		if !st.Merged {
+			continue // wait for the merge (superviseApprovedPRs or native auto-merge)
+		}
+		r.enterDeployingFromMerge(ctx, proj, task, repo)
+	}
+}
+
+// enterDeployingFromMerge drives one merged discrete implement Task into the pod-less
+// Deploying phase from the ProjectReconciler side (superviseMergedPRs), mirroring
+// TaskReconciler.enterDeploying but without a live reconcile context. It tears down
+// any lingering wrapper, then funnels through the shared stampDeploying so the deploy
+// transition has exactly one implementation. Best-effort: a failure is logged and the
+// next sweep retries (the Task is not yet in the ledger, so it is not lost).
+func (r *ProjectReconciler) enterDeployingFromMerge(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, repo *tatarav1alpha1.Repository) {
+	l := log.FromContext(ctx)
+	repoName := repo.Name
+	if _, name, err := scm.OwnerRepo(repo.Spec.URL); err == nil {
+		repoName = name
+	}
+	provider := "github"
+	if task.Spec.Source != nil && task.Spec.Source.Provider != "" {
+		provider = task.Spec.Source.Provider
+	}
+	budget := deployBudget(proj, repoName)
+	deadline := metav1.NewTime(time.Now().Add(budget))
+
+	// Deploying is pod-less: tear down any lingering agent pod for this Task.
+	if err := agent.DeleteWrapper(ctx, r.Client, task.Namespace, task); err != nil {
+		l.Error(err, "deploy: teardown wrapper on merge-driven Deploying (non-fatal)", "resource_id", task.Name)
+	}
+	ledger := &DeployLedger{Client: r.Client, Namespace: proj.Namespace}
+	if err := stampDeploying(ctx, r.Client, ledger, proj, task, repoName, deadline); err != nil {
+		l.Error(err, "deploy: enter Deploying from merge (retry next sweep)", "action", "deploy_enter_merged", "resource_id", task.Name)
+		return
+	}
+	if r.LifecycleMetrics != nil {
+		r.LifecycleMetrics.RecordTransition("MainCI", tatarav1alpha1.DeployStateDeploying)
+	}
+	l.Info("deploy: merged approved PR; entering Deploying (discrete-kind flow)",
+		"action", "deploy_enter_merged", "resource_id", task.Name, "artifact", repoName,
+		"pr", task.Status.PRNumber, "budget_seconds", int(budget.Seconds()),
+		"deadline", deadline.Format(time.RFC3339), "provider", provider)
+}
+
+// ensureSemverBeforeApprovedMerge stamps semver:patch on an approved bot PR that
+// carries no semver:* label yet, so the operator merge never leaves push-CD's tag
+// step failing closed. The change significance normally rides in from implement's
+// PR-open stamping (applySemverAutoMerge); this is the belt-and-braces default for
+// a PR that reached approval without one. GitHub-only (the cd-release cascade is
+// GitHub-only) and best-effort.
+func (r *ProjectReconciler) ensureSemverBeforeApprovedMerge(ctx context.Context, proj *tatarav1alpha1.Project, repo tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, pr scm.PRRef) {
+	if provider != "github" {
+		return
+	}
+	for _, lb := range pr.Labels {
+		if strings.HasPrefix(lb, "semver:") {
+			return
+		}
+	}
+	l := log.FromContext(ctx)
+	label := semverLabelPatch
+	color := managedLabelColors(proj.Spec.Scm)[label]
+	if eerr := writer.EnsureLabel(ctx, repo.Spec.URL, token, label, color); eerr != nil {
+		r.Metrics.SCMWrite(provider, "ensure_label", scmResult(eerr))
+		l.Error(eerr, "superviseApprovedPRs: ensure semver label (non-fatal)",
+			"action", "scm_merge_approved", "resource_id", proj.Name, "repo", repo.Name, "label", label)
+		return
+	}
+	slug, _, serr := repoSlugFromURL(repo.Spec.URL, provider)
+	if serr != nil {
+		return
+	}
+	prRef := fmt.Sprintf("%s#%d", slug, pr.Number)
+	if aerr := writer.AddLabel(ctx, token, prRef, label); aerr != nil {
+		r.Metrics.SCMWrite(provider, "add_label", scmResult(aerr))
+		l.Error(aerr, "superviseApprovedPRs: add semver label (non-fatal)",
+			"action", "scm_merge_approved", "resource_id", proj.Name, "repo", repo.Name, "label", label)
+	}
+}
+
+// scmResult maps an error to the SCMWrite result label ("ok"|"error").
+func scmResult(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "ok"
+}
+
 // deployLedger constructs the per-namespace deploy ledger handle.
 func (r *TaskReconciler) deployLedger(namespace string) *DeployLedger {
 	return &DeployLedger{Client: r.Client, Namespace: namespace}
@@ -111,43 +398,16 @@ func (r *TaskReconciler) enterDeploying(ctx context.Context, project *tatarav1al
 		l.Error(err, "deploy: teardown wrapper on Deploying entry (non-fatal)", "resource_id", task.Name)
 	}
 
-	issueRef := ""
-	if task.Spec.Source != nil {
-		issueRef = task.Spec.Source.IssueRef
-	}
-	if err := r.deployLedger(task.Namespace).Add(ctx, project.Name, DeployLedgerEntry{
-		Artifact:      repoName,
-		SourceTaskRef: task.Name,
-		IssueRef:      issueRef,
-		HeadSHA:       task.Status.MergeCommitSHA,
-		State:         DeployStateDeploying,
-	}); err != nil {
-		// Non-fatal: the ledger is a dedup optimisation; the Task's own status
-		// fields still drive its supervision. Log and continue.
-		l.Error(err, "deploy: add ledger entry on Deploying entry (non-fatal)", "resource_id", task.Name)
-	}
-
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
-		fresh.Status.Phase = tatarav1alpha1.PhaseDeploying
-		fresh.Status.LifecycleState = tatarav1alpha1.LifecycleStateDeploying
-		fresh.Status.DeployDeadline = &deadline
-		fresh.Status.CascadeStage = "tagged"
-		fresh.Status.DeployArtifact = repoName
-		return r.Status().Update(ctx, fresh)
-	}); err != nil {
+	if err := stampDeploying(ctx, r.Client, r.deployLedger(task.Namespace), project, task, repoName, deadline); err != nil {
 		return ctrl.Result{}, fmt.Errorf("deploy: enter Deploying: %w", err)
 	}
 	task.Status.Phase = tatarav1alpha1.PhaseDeploying
-	task.Status.LifecycleState = tatarav1alpha1.LifecycleStateDeploying
+	task.Status.DeployState = tatarav1alpha1.DeployStateDeploying
 	task.Status.DeployDeadline = &deadline
 	task.Status.DeployArtifact = repoName
 
 	if r.LifecycleMetrics != nil {
-		r.LifecycleMetrics.RecordTransition("MainCI", tatarav1alpha1.LifecycleStateDeploying)
+		r.LifecycleMetrics.RecordTransition("MainCI", tatarav1alpha1.DeployStateDeploying)
 	}
 	l.Info("deploy: entering Deploying phase",
 		"action", "deploy_enter", "resource_id", task.Name, "artifact", repoName,
@@ -362,7 +622,7 @@ func (r *TaskReconciler) resolveDeployedTask(ctx context.Context, project *tatar
 			return gerr
 		}
 		fresh.Status.Phase = ""
-		fresh.Status.LifecycleState = "Done"
+		fresh.Status.DeployState = "Done"
 		fresh.Status.CascadeStage = "helmfile-applied"
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
@@ -370,7 +630,7 @@ func (r *TaskReconciler) resolveDeployedTask(ctx context.Context, project *tatar
 		return
 	}
 	if r.LifecycleMetrics != nil {
-		r.LifecycleMetrics.RecordTransition(tatarav1alpha1.LifecycleStateDeploying, "Done")
+		r.LifecycleMetrics.RecordTransition(tatarav1alpha1.DeployStateDeploying, "Done")
 		r.LifecycleMetrics.ObserveLifecycle(time.Since(task.CreationTimestamp.Time).Seconds())
 	}
 	r.Metrics.CDResolved()
@@ -400,7 +660,7 @@ func (r *TaskReconciler) rerollDeploy(ctx context.Context, project *tatarav1alph
 				return ctrl.Result{}, perr
 			}
 		} else {
-			if perr := r.setLifecycleState(ctx, task, "Parked", deployParkReason); perr != nil {
+			if perr := r.setDeployState(ctx, task, "Parked", deployParkReason); perr != nil {
 				return ctrl.Result{}, perr
 			}
 		}
@@ -420,7 +680,7 @@ func (r *TaskReconciler) rerollDeploy(ctx context.Context, project *tatarav1alph
 	if err := r.clearDeployState(ctx, task, true); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.setLifecycleState(ctx, task, "Implement", "deploy-failure"); err != nil {
+	if err := r.setDeployState(ctx, task, "Implement", "deploy-failure"); err != nil {
 		return ctrl.Result{}, err
 	}
 	l.Info("deploy: cascade failed; rerolled to Implement",
@@ -660,7 +920,7 @@ func (r *ProjectReconciler) cdScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		}
 		// Durable failed: parked recoverable after the bounded auto-reroll budget was
 		// spent (rerollDeploy exhausted branch parks with reason deployParkReason).
-		if t.Status.LifecycleState == "Parked" && t.Status.ParkReason == deployParkReason {
+		if t.Status.DeployState == "Parked" && t.Status.ParkReason == deployParkReason {
 			failed++
 			continue
 		}

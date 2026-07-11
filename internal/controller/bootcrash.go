@@ -21,7 +21,7 @@ const annBootCrashAttempts = "tatara.dev/boot-crash-attempts"
 // annBootCrashDiagnostics holds the most recent boot-crash cause captured from
 // pod.Status (failing container, exit code, log tail). resetAgentRun preserves
 // it (like annBootCrashAttempts) so the cause survives the per-attempt pod
-// delete/recreate and can be surfaced at exhaustion; setLifecycleState and
+// delete/recreate and can be surfaced at exhaustion; setDeployState and
 // recordTurn clear it so it never leaks into the next state / run.
 const annBootCrashDiagnostics = "tatara.dev/boot-crash-diagnostics"
 
@@ -29,7 +29,7 @@ const annBootCrashDiagnostics = "tatara.dev/boot-crash-diagnostics"
 // annBootCrashAttempts, so rapid Owns(Pod) reconciles on the same stale/
 // terminating pod cannot bump the budget more than once per distinct pod
 // instance. resetAgentRun preserves it (like annBootCrashAttempts) across
-// respawns; recordTurn and setLifecycleState clear it with the attempt counter.
+// respawns; recordTurn and setDeployState clear it with the attempt counter.
 const annBootCrashLastPodUID = "tatara.dev/boot-crash-last-pod-uid"
 
 // bootCrashDetailCap bounds the captured diagnostic so it fits comfortably in an

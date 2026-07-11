@@ -87,7 +87,7 @@ func TestReapStaleProposals_RelistsLiveTaskCreatedThisCycle(t *testing.T) {
 		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5},
 	}
 	require.NoError(t, k8sClient.Create(context.Background(), task))
-	task.Status.LifecycleState = "Triage" // non-terminal
+	task.Status.DeployState = "Triage" // non-terminal
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), task) })
 

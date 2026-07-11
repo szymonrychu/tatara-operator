@@ -850,14 +850,17 @@ func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 // serves the full tool set, the wrapper installs all skills). healthCheck
 // shares Kind=brainstorm, so it is not a distinct entry.
 var kindProfiles = map[string]string{
-	"implement":      "implement",
-	"review":         "review",
+	"implement":     "implement",
+	"review":        "review",
+	"clarify":       "clarify",
+	"brainstorm":    "brainstorm",
+	"incident":      "incident",
+	"refine":        "refine",
+	"documentation": "documentation",
+	// Retired kinds retained for in-flight legacy Tasks; dropped in Phase 4 once
+	// no path creates them.
 	"triageIssue":    "triage",
-	"brainstorm":     "brainstorm",
 	"issueLifecycle": "lifecycle",
-	"incident":       "incident",
-	"refine":         "refine",
-	"documentation":  "documentation",
 }
 
 // profileForKind looks up kind in kindProfiles, returning "" (fail-open) for
@@ -902,17 +905,31 @@ func resolveByKind(byKind map[string]string, kind, activity, fallback string) st
 	return fallback
 }
 
-// documentationDefaultModel is the locked model choice for the documentation
-// kind (design decision): claude-sonnet-5, regardless of the project's
-// general Model, unless the project explicitly overrides it via ModelByKind.
-const documentationDefaultModel = "claude-sonnet-5"
+// kindDefaultModel is the locked per-kind model tier for the 7-kind model
+// (design decision, cross-repo contract). It is the fallback when the project
+// sets no per-kind ModelByKind override: opus for the reasoning kinds
+// (brainstorm/incident/clarify/implement/review), sonnet for the cheaper
+// recurring kinds (documentation/refine). A project ModelByKind override still
+// wins (resolveByKind precedence). Kinds absent here (retired legacy kinds) fall
+// back to the project-wide Model as before.
+var kindDefaultModel = map[string]string{
+	"brainstorm":    "claude-opus-4-8",
+	"incident":      "claude-opus-4-8",
+	"clarify":       "claude-opus-4-8",
+	"implement":     "claude-opus-4-8",
+	"review":        "claude-opus-4-8",
+	"documentation": "claude-sonnet-5",
+	"refine":        "claude-sonnet-5",
+}
 
-// modelForKind resolves the MODEL env for a Task Kind+activity. See
-// resolveByKind for the healthCheck pseudo-key precedence.
+// modelForKind resolves the MODEL env for a Task Kind+activity. The fallback is
+// the locked per-kind default (kindDefaultModel) when one exists, else the
+// project-wide Model. See resolveByKind for the healthCheck pseudo-key precedence
+// and the project ModelByKind override.
 func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
 	fallback := project.Spec.Agent.Model
-	if kind == "documentation" {
-		fallback = documentationDefaultModel
+	if def, ok := kindDefaultModel[kind]; ok {
+		fallback = def
 	}
 	return resolveByKind(project.Spec.Agent.ModelByKind, kind, activity, fallback)
 }

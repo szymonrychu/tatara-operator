@@ -46,7 +46,7 @@ func seedMRCITask(t *testing.T, suffix string, prState scm.PRState, deadlineOffs
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 42
 	task.Status.PrURL = "https://github.com/o/r/pull/42"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -76,8 +76,8 @@ func TestLifecycleMRCI_PendingRequeues(t *testing.T) {
 		t.Error("pending CI must requeue")
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "MRCI" {
-		t.Errorf("LifecycleState = %q, want MRCI on pending CI", got.Status.LifecycleState)
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI on pending CI", got.Status.DeployState)
 	}
 }
 
@@ -90,8 +90,8 @@ func TestLifecycleMRCI_SuccessTransitionsToMerge(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Merge" {
-		t.Errorf("LifecycleState = %q, want Merge on CI success", got.Status.LifecycleState)
+	if got.Status.DeployState != "Merge" {
+		t.Errorf("DeployState = %q, want Merge on CI success", got.Status.DeployState)
 	}
 	if got.Status.DeadlineAt != nil {
 		t.Error("DeadlineAt must be cleared on transition out of MRCI")
@@ -107,8 +107,8 @@ func TestLifecycleMRCI_FailureSetsContextAndReentersImplement(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement on CI failure", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement on CI failure", got.Status.DeployState)
 	}
 	if got.Status.ImplementContext == "" {
 		t.Error("ImplementContext must be set on MRCI failure")
@@ -128,8 +128,8 @@ func TestLifecycleMRCI_NoCITransitionsToMerge(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Merge" {
-		t.Errorf("LifecycleState = %q, want Merge when no CI", got.Status.LifecycleState)
+	if got.Status.DeployState != "Merge" {
+		t.Errorf("DeployState = %q, want Merge when no CI", got.Status.DeployState)
 	}
 }
 
@@ -143,8 +143,8 @@ func TestLifecycleMRCI_DeadlineParks(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked on deadline", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked on deadline", got.Status.DeployState)
 	}
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
@@ -162,8 +162,8 @@ func TestLifecycleMRCI_NonBotAuthorParks(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (non-bot author)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (non-bot author)", got.Status.DeployState)
 	}
 	fw.mu.Lock()
 	defer fw.mu.Unlock()

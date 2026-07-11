@@ -21,11 +21,13 @@ const (
 	gateLastWord gateReason = "last_word" // rule 1: bot already had the last word
 )
 
-// commentSilenceBreakers returns the deduped set of logins whose comment breaks
+// CommentSilenceBreakers returns the deduped set of logins whose comment breaks
 // the bot's silence: the reporter intake allowlist unioned with the
 // maintainer/approver allowlist for this repo. An empty result means no lists are
-// configured, in which case any non-bot author breaks silence.
-func commentSilenceBreakers(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository) []string {
+// configured, in which case any non-bot author breaks silence. Exported so the
+// MCP/REST comment boundary (restapi) can feed the same breaker set into
+// PermitComment as the reconciler-side decideCommentGate does.
+func CommentSilenceBreakers(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(list []string) {
@@ -72,6 +74,37 @@ func botHasLastWordAmong(comments []scm.IssueComment, botLogin string, breakers 
 		return false
 	}
 	return tBreak.IsZero() || tBreak.Before(tBot)
+}
+
+// PermitComment is the permission-layer self-comment guard enforced at the MCP/
+// REST comment boundary (CROSS-REPO-CONTRACT "Self-comment guard is
+// PERMISSION-LAYER"). It REFUSES an agent's comment when the last comment on the
+// thread is tatara(bot)-authored, so the bot never answers its own comment in a
+// loop (the Replit-postmortem guardrail-in-the-permission-layer, not the prompt).
+// It consolidates the comment-time bot-last-word predicates (botHasLastWordAmong,
+// the triage isTataraAuthored/botHasLastWord family) behind one call site so the
+// refusal is uniform across kinds.
+//
+// SOLE exception: kind=="refine" is always permitted - the backlog refiner is the
+// one kind allowed to answer tatara's own prior comment (e.g. a sharper-scope note
+// on a gave-up issue, or a "scope already delivered" reply). The carve-out is kept
+// deliberately narrow: only the exact string "refine".
+//
+// Fail-open matches the rest of the family: an empty botLogin (the guard cannot be
+// evaluated) permits, and callers permit on a comment-list read error, so a lost
+// webhook is still recoverable by a later scan. The returned reason is
+// machine-readable ("bot_last_word") so the pod skill can react to a refusal.
+func PermitComment(kind string, comments []scm.IssueComment, botLogin string, breakers []string) (bool, string) {
+	if kind == "refine" {
+		return true, ""
+	}
+	if botLogin == "" {
+		return true, ""
+	}
+	if botHasLastWordAmong(comments, botLogin, breakers) {
+		return false, "bot_last_word"
+	}
+	return true, ""
 }
 
 // resolveBotMR reports whether the PR/MR at number is authored by the bot. The
@@ -148,7 +181,7 @@ func (r *TaskReconciler) commentGateReason(ctx context.Context, proj *tatarav1al
 	if err != nil {
 		return gateOpen
 	}
-	breakers := commentSilenceBreakers(proj, repo)
+	breakers := CommentSilenceBreakers(proj, repo)
 	return decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, breakers)
 }
 

@@ -72,6 +72,10 @@ func TestBranchKind(t *testing.T) {
 		{"implement is feat", taskWith("b", "implement", 1, "x", false), "feat"},
 		{"review is chore", taskWith("c", "review", 1, "x", true), "chore"},
 		{"brainstorm is chore", taskWith("d", "brainstorm", 0, "", false), "chore"},
+		{"incident is fix", taskWith("e", "incident", 0, "", false), "fix"},
+		{"documentation is docs", taskWith("f", "documentation", 0, "", false), "docs"},
+		{"clarify is chore", taskWith("g", "clarify", 0, "", false), "chore"},
+		{"refine is chore", taskWith("h", "refine", 0, "", false), "chore"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

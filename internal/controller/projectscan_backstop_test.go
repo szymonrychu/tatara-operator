@@ -177,7 +177,7 @@ func TestBackstopSkipsIssueWithConversationTask(t *testing.T) {
 	}
 	// Conversation lifecycle state, empty phase: human-blocked, no running pod,
 	// but still owns the issue's pod name.
-	pre.Status.LifecycleState = "Conversation"
+	pre.Status.DeployState = "Conversation"
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	reader := &perRepoFakeReader{

@@ -18,6 +18,7 @@ func TestToolProfileForKind(t *testing.T) {
 	}{
 		{"implement", "implement"},
 		{"review", "review"},
+		{"clarify", "clarify"},
 		{"triageIssue", "triage"},
 		{"brainstorm", "brainstorm"},
 		{"issueLifecycle", "lifecycle"},
@@ -54,6 +55,7 @@ func TestToolProfileForKind_AllActiveCRDKinds(t *testing.T) {
 	crdKinds := []string{
 		"implement",
 		"review",
+		"clarify",
 		"triageIssue",
 		"brainstorm",
 		"issueLifecycle",

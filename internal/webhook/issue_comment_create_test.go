@@ -27,7 +27,7 @@ const prCommentUntracked = `{"action":"created","issue":{"number":11,"title":"fi
 
 // TestIssueComment_HumanOnUntrackedIssue_CreatesTriageTask verifies that a
 // human issue_comment on an issue with no live lifecycle task creates one
-// issueLifecycle Task at Triage (via the lifecycle-entry annotation).
+// clarify Task (clarify always starts at Triage; no entry annotation).
 func TestIssueComment_HumanOnUntrackedIssue_CreatesTriageTask(t *testing.T) {
 	const secretVal = "whsec-ut1"
 	proj := projectWithBot("projicut1", "projicut1-scm", "tatara", "tatara-bot")
@@ -50,14 +50,10 @@ func TestIssueComment_HumanOnUntrackedIssue_CreatesTriageTask(t *testing.T) {
 	require.Len(t, qel.Items, 1, "human issue_comment on untracked issue must create one QueuedEvent")
 
 	qe := qel.Items[0]
-	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
+	require.Equal(t, "clarify", qe.Spec.Payload.Kind)
 	require.NotNil(t, qe.Spec.Payload.Source)
 	require.Equal(t, "o/r#9", qe.Spec.Payload.Source.IssueRef)
 	require.False(t, qe.Spec.Payload.Source.IsPR, "task must not be IsPR for an issue comment")
-
-	// Lifecycle entry annotation must be "Triage".
-	require.Equal(t, "Triage", qe.Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation],
-		"issue_comment-created task must enter at Triage")
 
 	// The 3 source dedup labels are no longer written (ledger replaces them);
 	// kind and activity labels are still set.
@@ -65,7 +61,7 @@ func TestIssueComment_HumanOnUntrackedIssue_CreatesTriageTask(t *testing.T) {
 		"source-repo label must not be written (ledger-based dedup)")
 	require.Equal(t, "", qe.Spec.Payload.Labels["tatara.io/source-number"],
 		"source-number label must not be written (ledger-based dedup)")
-	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Labels[tatarav1.LabelSourceKind])
+	require.Equal(t, "clarify", qe.Spec.Payload.Labels[tatarav1.LabelSourceKind])
 }
 
 // TestIssueComment_BotOnUntrackedIssue_DoesNotCreateTask verifies that a bot
@@ -92,9 +88,8 @@ func TestIssueComment_BotOnUntrackedIssue_DoesNotCreateTask(t *testing.T) {
 }
 
 // TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask verifies that a human
-// comment on an MR (IsPR=true) with no live task creates an issueLifecycle Task
-// at Triage with Source.IsPR set (issue #25: comments on an MR with no nursing
-// agent spawn one).
+// comment on an MR (IsPR=true) with no live task creates a clarify Task with
+// Source.IsPR set (issue #25: comments on an MR with no nursing agent spawn one).
 func TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask(t *testing.T) {
 	const secretVal = "whsec-ut3"
 	proj := projectWithBot("projicut3", "projicut3-scm", "tatara", "tatara-bot")
@@ -116,11 +111,10 @@ func TestIssueComment_HumanOnUntrackedPR_CreatesTriageTask(t *testing.T) {
 	require.Len(t, qel.Items, 1, "human MR comment on untracked MR must create one QueuedEvent")
 
 	qe := qel.Items[0]
-	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
+	require.Equal(t, "clarify", qe.Spec.Payload.Kind)
 	require.NotNil(t, qe.Spec.Payload.Source)
 	require.Equal(t, "o/r#11", qe.Spec.Payload.Source.IssueRef)
 	require.True(t, qe.Spec.Payload.Source.IsPR, "task must be IsPR for an MR comment")
-	require.Equal(t, "Triage", qe.Spec.Payload.Annotations[tatarav1.LifecycleEntryAnnotation])
 	require.Equal(t, "", qe.Spec.Payload.Labels["tatara.io/source-number"],
 		"source-number label must not be written (ledger-based dedup)")
 }

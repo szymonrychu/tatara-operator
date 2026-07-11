@@ -57,7 +57,7 @@ func r3LabelsMatch(got []*dto.LabelPair, want map[string]string) bool {
 
 // ================================================================
 // Finding 1 (medium/correctness): IssueOutcome("close") must be
-// recorded AFTER setLifecycleState(Done) succeeds, not inside
+// recorded AFTER setDeployState(Done) succeeds, not inside
 // triageCloseIssue. On a successful close path, the metric must
 // be exactly 1. A duplicate-free metric after Done confirms the
 // metric moved to the committed-transition path.
@@ -89,7 +89,7 @@ func TestFinishTriage_CloseMetricAfterTransition(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "close", Comment: "closing this"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -116,8 +116,8 @@ func TestFinishTriage_CloseMetricAfterTransition(t *testing.T) {
 
 	// Task must be Done.
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Done" {
-		t.Errorf("LifecycleState = %q, want Done", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Errorf("DeployState = %q, want Done", got.Status.DeployState)
 	}
 
 	// IssueOutcome("close") must be counted exactly once (not twice, not zero).
@@ -147,7 +147,7 @@ func TestCommentDrain_ReconcileResultSuccess(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Add a pending comment to drain.
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Running"
 	task.Status.PendingComments = []string{"progress update"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -234,7 +234,7 @@ func TestFinishTriage_CloseWithheld_MetricRecorded(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Set up an unmerged change so close is withheld.
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.PrURL = "https://github.com/o/r/pull/99"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "close", Comment: "done"}
@@ -260,11 +260,11 @@ func TestFinishTriage_CloseWithheld_MetricRecorded(t *testing.T) {
 
 	// Task must NOT be Done (withheld -> Conversation).
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState == "Done" {
+	if got.Status.DeployState == "Done" {
 		t.Error("close-withheld must NOT transition to Done")
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation for close-withheld", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation for close-withheld", got.Status.DeployState)
 	}
 
 	// IssueOutcome("close-withheld") must be counted.
@@ -294,7 +294,7 @@ func TestHandleImplement_IterationIncrementNoExtraGet(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = ""
 	task.Status.LifecycleIterations = 0
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -346,7 +346,7 @@ func TestHandleMainCI_CloseIssueCalledOnSuccess(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "MainCI"
+	task.Status.DeployState = "MainCI"
 	task.Status.MergeCommitSHA = "sha-close-test"
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
 	task.Status.DeadlineAt = &dl
@@ -380,8 +380,8 @@ func TestHandleMainCI_CloseIssueCalledOnSuccess(t *testing.T) {
 		t.Errorf("CloseIssue called %d times on MainCI success, want 1", calls)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Done" {
-		t.Errorf("LifecycleState = %q, want Done", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Errorf("DeployState = %q, want Done", got.Status.DeployState)
 	}
 }
 
@@ -416,8 +416,8 @@ func TestParkWithComment_NilSource_LogsNoComment(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 	// No SCM write must have happened (nil source -> no comment).
 	emptyV := om_commentOkOrErr(reg)
@@ -466,7 +466,7 @@ func TestHandleMainCI_CIStatusError_StillRequeues(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "MainCI"
+	task.Status.DeployState = "MainCI"
 	task.Status.MergeCommitSHA = "sha-errlog"
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
 	task.Status.DeadlineAt = &dl
@@ -494,12 +494,12 @@ func TestHandleMainCI_CIStatusError_StillRequeues(t *testing.T) {
 }
 
 // ================================================================
-// Finding 13 (nit/simplification): setLifecycleState - dead `from`
+// Finding 13 (nit/simplification): setDeployState - dead `from`
 // initialization. This is verified by code review; the test is a
 // regression guard that transitions still work after the nit is applied.
 // ================================================================
 
-func TestSetLifecycleState_FromFieldPopulatedCorrectly(t *testing.T) {
+func TestSetDeployState_FromFieldPopulatedCorrectly(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
 	name := "r3-from-field"
@@ -510,7 +510,7 @@ func TestSetLifecycleState_FromFieldPopulatedCorrectly(t *testing.T) {
 		Provider: "github", IssueRef: "o/r#607",
 		URL: "https://github.com/o/r/issues/607", Number: 607,
 	})
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -521,12 +521,12 @@ func TestSetLifecycleState_FromFieldPopulatedCorrectly(t *testing.T) {
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 	}
 
-	if err := r.setLifecycleState(ctx, fetchTask(t, name), "Parked", "test"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, fetchTask(t, name), "Parked", "test"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -566,7 +566,7 @@ func TestCommentDrain_MidBatchFailure_ReturnsError(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Two pending comments; first succeeds, second fails.
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Running"
 	task.Status.PendingComments = []string{"first comment", "second comment"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -614,7 +614,7 @@ func TestFinishTriage_UnknownAction_SafeDefault(t *testing.T) {
 	// Set up a Triage/Succeeded state without an IssueOutcome via the API, then
 	// inject the unknown action directly into the in-memory object to simulate
 	// an agent that returned a non-enum string (bypasses CRD status validation).
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -640,11 +640,11 @@ func TestFinishTriage_UnknownAction_SafeDefault(t *testing.T) {
 	got := fetchTask(t, name)
 	// An unknown action must NOT enter Implement (unsafe). It must enter a safe
 	// state - Conversation (discuss hold via the new default arm).
-	if got.Status.LifecycleState == "Implement" {
+	if got.Status.DeployState == "Implement" {
 		t.Error("unknown triage action 'foobar' must NOT silently enter Implement")
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation for unknown action (safe fallback)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation for unknown action (safe fallback)", got.Status.DeployState)
 	}
 }
 
@@ -667,7 +667,7 @@ func TestCommentDrain_SuccessUsesRequeueAfter(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Running"
 	task.Status.PendingComments = []string{"comment to drain"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {

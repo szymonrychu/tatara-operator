@@ -240,7 +240,7 @@ func TestUpdateIssueStateCounts_EmitsPerIssue(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set lifecycle state: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestUpdateIssueStateCounts_EmitsPerIssue(t *testing.T) {
 }
 
 // TestUpdateIssueStateCounts_MapsConversationToAwaitingApproval verifies the
-// LifecycleState=Conversation -> state="awaiting-approval" mapping.
+// DeployState=Conversation -> state="awaiting-approval" mapping.
 func TestUpdateIssueStateCounts_MapsConversationToAwaitingApproval(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	r, reg := newProjectReconcilerWithReg()
@@ -275,7 +275,7 @@ func TestUpdateIssueStateCounts_MapsConversationToAwaitingApproval(t *testing.T)
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Conversation"
+	task.Status.DeployState = "Conversation"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set lifecycle state: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestUpdateIssueStateCounts_IncidentLabel(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set lifecycle state: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestUpdateIssueStateCounts_SkipsTerminalAndEmptyIssue(t *testing.T) {
 	if err := k8sClient.Create(ctx, done); err != nil {
 		t.Fatalf("create done task: %v", err)
 	}
-	done.Status.LifecycleState = "Done"
+	done.Status.DeployState = "Done"
 	if err := k8sClient.Status().Update(ctx, done); err != nil {
 		t.Fatalf("set lifecycle state Done: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestUpdateIssueStateCounts_ResetsClosedIssue(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set lifecycle state Triage: %v", err)
 	}
@@ -424,7 +424,7 @@ func TestUpdateIssueStateCounts_ResetsClosedIssue(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "isc-task-close"}, task); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	task.Status.LifecycleState = "Done"
+	task.Status.DeployState = "Done"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("set lifecycle state Done: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestIssueStateFor_Blocked(t *testing.T) {
 	// At cap with recoverable reason -> blocked.
 	task := &tataradevv1alpha1.Task{}
 	task.Spec.Kind = "issueLifecycle"
-	task.Status.LifecycleState = "Parked"
+	task.Status.DeployState = "Parked"
 	task.Status.ParkReason = "implement-failed"
 	task.Status.ImplementGiveUps = maxImplGiveUps
 	if got := issueStateFor(task); got != "blocked" {
@@ -453,7 +453,7 @@ func TestIssueStateFor_Blocked(t *testing.T) {
 	// Under cap (giveUps=1) -> empty (still terminal, reaper spares it).
 	task2 := &tataradevv1alpha1.Task{}
 	task2.Spec.Kind = "issueLifecycle"
-	task2.Status.LifecycleState = "Parked"
+	task2.Status.DeployState = "Parked"
 	task2.Status.ParkReason = "maxIterations"
 	task2.Status.ImplementGiveUps = 1
 	if got := issueStateFor(task2); got != "" {
@@ -463,7 +463,7 @@ func TestIssueStateFor_Blocked(t *testing.T) {
 	// Non-recoverable reason at giveUps=3 -> empty (normal terminal).
 	task3 := &tataradevv1alpha1.Task{}
 	task3.Spec.Kind = "issueLifecycle"
-	task3.Status.LifecycleState = "Parked"
+	task3.Status.DeployState = "Parked"
 	task3.Status.ParkReason = "refused-declined"
 	task3.Status.ImplementGiveUps = maxImplGiveUps
 	if got := issueStateFor(task3); got != "" {
@@ -494,7 +494,7 @@ func TestUpdateIssueStateCounts_BlockedEmitsSeries(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Parked"
+	task.Status.DeployState = "Parked"
 	task.Status.ParkReason = "implement-failed"
 	task.Status.ImplementGiveUps = maxImplGiveUps
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
@@ -508,7 +508,7 @@ func TestUpdateIssueStateCounts_BlockedEmitsSeries(t *testing.T) {
 	}
 }
 
-// TestIssueStateFor covers the pure state-mapping table for all LifecycleState
+// TestIssueStateFor covers the pure state-mapping table for all DeployState
 // and Phase/Kind combos, including terminal (must return "") and review tasks.
 func TestIssueStateFor(t *testing.T) {
 	cases := []struct {
@@ -539,7 +539,7 @@ func TestIssueStateFor(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			task := &tataradevv1alpha1.Task{}
 			task.Spec.Kind = tc.kind
-			task.Status.LifecycleState = tc.lifecycle
+			task.Status.DeployState = tc.lifecycle
 			task.Status.Phase = tc.phase
 			got := issueStateFor(task)
 			if got != tc.want {

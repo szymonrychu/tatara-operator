@@ -98,7 +98,7 @@ func TestIssueScanDedupLifecycleTerminals(t *testing.T) {
 		tk := tatarav1alpha1.Task{}
 		tk.Labels = scanTaskLabels(candidate{repo: "o/r", number: number}, "issueScan", "issueLifecycle")
 		tk.Status.Phase = phase
-		tk.Status.LifecycleState = lifecycleState
+		tk.Status.DeployState = lifecycleState
 		tk.CreationTimestamp = created
 		// Phase 1: source set so taskMatchesItem can find this task.
 		tk.Spec.Source = &tatarav1alpha1.TaskSource{
@@ -349,7 +349,7 @@ func TestIssueScanAdoptsParkedTaskInsteadOfDuplicating(t *testing.T) {
 	}
 	pre.CreationTimestamp = created
 	pre.Status.Phase = "Succeeded"
-	pre.Status.LifecycleState = "Parked"
+	pre.Status.DeployState = "Parked"
 	pre.Status.ImplementEmptyRetries = 2
 	if err := k8sClient.Status().Update(ctx, pre); err != nil {
 		t.Fatalf("pre status: %v", err)
@@ -382,8 +382,8 @@ func TestIssueScanAdoptsParkedTaskInsteadOfDuplicating(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got); err != nil {
 		t.Fatalf("get adopted task: %v", err)
 	}
-	if got.Status.LifecycleState != "Triage" {
-		t.Fatalf("adopted task LifecycleState = %q, want Triage", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Fatalf("adopted task DeployState = %q, want Triage", got.Status.DeployState)
 	}
 	if got.Status.Phase != "" {
 		t.Fatalf("adopted task Phase = %q, want cleared", got.Status.Phase)
@@ -420,7 +420,7 @@ func TestIssueScanBotCommentDoesNotRespawnTask(t *testing.T) {
 	}
 	pre.CreationTimestamp = created
 	pre.Status.Phase = "Succeeded"
-	pre.Status.LifecycleState = "Parked"
+	pre.Status.DeployState = "Parked"
 	if err := k8sClient.Status().Update(ctx, pre); err != nil {
 		t.Fatalf("pre status: %v", err)
 	}
@@ -442,8 +442,8 @@ func TestIssueScanBotCommentDoesNotRespawnTask(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Parked" {
-		t.Fatalf("bot-only comment: task must stay Parked, got %q", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Fatalf("bot-only comment: task must stay Parked, got %q", got.Status.DeployState)
 	}
 
 	// Now a human comments: the task is adopted -> Triage.
@@ -461,8 +461,8 @@ func TestIssueScanBotCommentDoesNotRespawnTask(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got2); err != nil {
 		t.Fatalf("get task 2: %v", err)
 	}
-	if got2.Status.LifecycleState != "Triage" {
-		t.Fatalf("human comment: task must be adopted to Triage, got %q", got2.Status.LifecycleState)
+	if got2.Status.DeployState != "Triage" {
+		t.Fatalf("human comment: task must be adopted to Triage, got %q", got2.Status.DeployState)
 	}
 }
 
@@ -510,7 +510,7 @@ func TestIssueScanAdoptionDoesNotLoopWithoutNewHumanComment(t *testing.T) {
 	}
 	laa := metav1.NewTime(firstAdoptionTime)
 	pre.Status.Phase = "Succeeded"
-	pre.Status.LifecycleState = "Parked"
+	pre.Status.DeployState = "Parked"
 	pre.Status.LastActivityAt = &laa
 	if err := k8sClient.Status().Update(ctx, pre); err != nil {
 		t.Fatalf("pre status: %v", err)
@@ -537,7 +537,7 @@ func TestIssueScanAdoptionDoesNotLoopWithoutNewHumanComment(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: pre.Name}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Parked" {
-		t.Fatalf("no-new-human-comment: task must stay Parked, got %q (Defect A: adoption re-looped without new human input)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Fatalf("no-new-human-comment: task must stay Parked, got %q (Defect A: adoption re-looped without new human input)", got.Status.DeployState)
 	}
 }

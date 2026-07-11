@@ -69,13 +69,13 @@ spec:
                       EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
                       ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
                       entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
-                    maxProperties: 10
+                    maxProperties: 11
                     type: object
                     x-kubernetes-validations:
                     - message: 'effortByKind keys must be one of: implement, review,
-                        triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
-                        refine, healthCheck, documentation'
-                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
+                        clarify, triageIssue, brainstorm, issueLifecycle, incident,
+                        selfImprove, refine, healthCheck, documentation'
+                      rule: self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
                     - message: 'effortByKind values must be one of: low, medium, high,
                         xhigh, max'
                       rule: self.all(k, self[k] in ['low','medium','high','xhigh','max'])
@@ -5391,20 +5391,20 @@ spec:
                       type: string
                     description: |-
                       ModelByKind overrides the project-wide Model per Task Kind. Keys are the
-                      Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
+                      Task.Spec.Kind enum values (clarify, triageIssue, review, brainstorm, refine,
                       implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
                       pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
                       key first (falling back to the brainstorm entry when absent), letting
                       healthCheck's recurring classification work be tiered separately from
                       brainstorm's creative work. A missing or empty entry falls back to Model.
                       Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
-                    maxProperties: 10
+                    maxProperties: 11
                     type: object
                     x-kubernetes-validations:
                     - message: 'modelByKind keys must be one of: implement, review,
-                        triageIssue, brainstorm, issueLifecycle, incident, selfImprove,
-                        refine, healthCheck, documentation'
-                      rule: self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
+                        clarify, triageIssue, brainstorm, issueLifecycle, incident,
+                        selfImprove, refine, healthCheck, documentation'
+                      rule: self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])
                     - message: modelByKind values must be a claude model ID (start
                         with 'claude-', max 64 chars)
                       rule: self.all(k, self[k].startsWith('claude-') && self[k].size()
@@ -5655,12 +5655,32 @@ spec:
                             pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                         type: object
+                      documentation:
+                        description: |-
+                          Documentation is the scheduled documentation-sync cron (replaces the retired
+                          per-merge push trigger): each tick spawns a documentation Task, scoped to the
+                          docs repo, for every enrolled component repo that advanced since the last run
+                          (Status.LastDocumentation). Requires Spec.Documentation.Enabled + Repo. Empty
+                          Schedule disables it.
+                        properties:
+                          maxPerRepo:
+                            default: 1
+                            description: MaxPerRepo caps the number of in-progress
+                              Tasks per repo (one lane per repo).
+                            minimum: 1
+                            type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables this activity.
+                            pattern: ^$|^(\S+\s+){4}\S+$
+                            type: string
+                        type: object
                       healthCheck:
                         description: |-
-                          HealthCheckActivity schedules the opt-in periodic project-health-check scan:
-                          a sibling to brainstorm that surveys repo health (CI failures, coverage gaps,
-                          code to simplify, pipeline steps to add, other tech-debt) and proposes one
-                          targeted discovery issue per cycle via the tatara-health-check skill.
+                          HealthCheck is RETIRED as a firing activity (its proposals were absorbed
+                          into brainstorm): the runScans dispatch is stripped. The field is kept
+                          inert only so stored Project CRs that still set it round-trip; it never
+                          fires a Task. Mirrors the retired-enum-string back-compat convention.
                         properties:
                           enabled:
                             type: boolean
@@ -5883,13 +5903,13 @@ spec:
                       SpawnCeilingByKind gates each Task kind independently in claudeSubscription
                       mode: work of kind K is held once account usage reaches the given percent.
                       Keys are Task kinds; kinds absent here fall through to proactive/emergency.
-                    maxProperties: 10
+                    maxProperties: 11
                     type: object
                     x-kubernetes-validations:
                     - message: spawnCeilingByKind values must be 0..100
                       rule: self.all(k, self[k] >= 0 && self[k] <= 100)
                     - message: spawnCeilingByKind keys must be valid Task kinds
-                      rule: self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])
+                      rule: self.all(k, k in ['implement','review','clarify','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])
                   tokenLimit:
                     description: TokenLimit is the absolute total-token budget per
                       window (customWindow mode).
@@ -5986,7 +6006,16 @@ spec:
                   backstop ran.
                 format: date-time
                 type: string
+              lastDocumentation:
+                description: |-
+                  LastDocumentation is the last time the documentation-sync cron ran; it bounds
+                  the diff-since-last-doc window each tick computes per enrolled repo.
+                format: date-time
+                type: string
               lastHealthCheck:
+                description: |-
+                  LastHealthCheck is RETIRED (healthCheck no longer fires): read-only, kept for
+                  stored-CR back-compat. No writer remains after the cron dispatch was dropped.
                 format: date-time
                 type: string
               lastIssueScan:

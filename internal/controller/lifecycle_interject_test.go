@@ -36,7 +36,7 @@ func mkInterjectFixture(t *testing.T, name string, ann map[string]string, pendin
 		},
 	}
 	require.NoError(t, k8sClient.Create(ctx, task))
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.PendingInterjections = pending
 	require.NoError(t, k8sClient.Status().Update(ctx, task))
 

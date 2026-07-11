@@ -168,8 +168,8 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	if isTerminal(task.Status.Phase) {
 		return fmt.Sprintf("task phase %s", task.Status.Phase), true
 	}
-	if isLifecycleTerminal(task.Status.LifecycleState) {
-		return fmt.Sprintf("task lifecycle %s", task.Status.LifecycleState), true
+	if isLifecycleTerminal(task.Status.DeployState) {
+		return fmt.Sprintf("task lifecycle %s", task.Status.DeployState), true
 	}
 	// Idle backstop (issue #237): a non-terminal Task whose pod holds no live turn
 	// and whose last turn activity is older than IdlePodReapAfter is a leaked
@@ -398,7 +398,7 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 		// restarting the count from zero (at cap). recoverOrphans transitions a
 		// give-up task whose issue has closed to Done ("issue-closed"), so a
 		// still-Parked recoverable give-up here means the issue is open.
-		if tk.Status.LifecycleState == "Parked" &&
+		if tk.Status.DeployState == "Parked" &&
 			tatarav1alpha1.IsRecoverableGiveup(tk.Status.ParkReason) &&
 			tk.Status.ImplementGiveUps > 0 {
 			continue

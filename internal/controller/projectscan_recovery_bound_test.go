@@ -27,7 +27,7 @@ func mkPRTask(repo string, pr int, lc string) tatarav1alpha1.Task {
 				IsPR:     true,
 			},
 		},
-		Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
+		Status: tatarav1alpha1.TaskStatus{DeployState: lc},
 	}
 }
 
@@ -44,7 +44,7 @@ func mkPRTaskLabelless(repo string, pr int, lc string) tatarav1alpha1.Task {
 				IsPR:     true,
 			},
 		},
-		Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
+		Status: tatarav1alpha1.TaskStatus{DeployState: lc},
 	}
 }
 
@@ -89,7 +89,7 @@ func mkIssueTask(repo string, num int, lc string) tatarav1alpha1.Task {
 				IsPR:     false,
 			},
 		},
-		Status: tatarav1alpha1.TaskStatus{LifecycleState: lc},
+		Status: tatarav1alpha1.TaskStatus{DeployState: lc},
 	}
 }
 

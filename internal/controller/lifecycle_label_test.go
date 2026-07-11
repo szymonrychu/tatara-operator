@@ -81,7 +81,7 @@ func TestFinishTriage_HumanFiledImplement_Approved(t *testing.T) {
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-approved"}, w.added)
-	require.Equal(t, "Implement", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Implement", getTaskByName(t, task.Name).Status.DeployState)
 }
 
 func TestFinishTriage_Close_Rejected(t *testing.T) {
@@ -92,7 +92,7 @@ func TestFinishTriage_Close_Rejected(t *testing.T) {
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-declined"}, w.added)
-	require.Equal(t, "Done", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Done", getTaskByName(t, task.Name).Status.DeployState)
 }
 
 func TestFinishTriage_Discuss_Idea(t *testing.T) {
@@ -103,7 +103,7 @@ func TestFinishTriage_Discuss_Idea(t *testing.T) {
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-brainstorming"}, w.added)
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 }
 
 // The self-approve guard applies to tatara's OWN ideas, which the bot opens, so
@@ -119,7 +119,7 @@ func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testin
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-brainstorming"}, w.added)
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 }
 
 func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testing.T) {
@@ -134,7 +134,7 @@ func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testi
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-approved"}, w.added)
-	require.Equal(t, "Implement", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Implement", getTaskByName(t, task.Name).Status.DeployState)
 }
 
 // Fail-closed: with no captured author (board-sourced issue) the author tier does
@@ -149,16 +149,16 @@ func TestFinishTriage_AuthorshipCheckError_FailsClosed_ParksIdea(t *testing.T) {
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-brainstorming"}, w.added)
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 }
 
-// TestTriageEntrySetsBrainstormingLabel: a fresh issueLifecycle task (LifecycleState "")
+// TestTriageEntrySetsBrainstormingLabel: a fresh issueLifecycle task (DeployState "")
 // with a Triage entry annotation (or no annotation, which defaults to Triage) should
 // have tatara-brainstorming added when reconcileLifecycle processes the case "" block.
 func TestTriageEntrySetsBrainstormingLabel(t *testing.T) {
 	r, task, w := seedLabelTask(t, "triage-entry", nil)
 	setProjectMemoryReady(t, task.Spec.ProjectRef, "http://mem-triage-entry.tatara.svc:8080")
-	// task is fresh (LifecycleState ""), no entry annotation -> defaults to Triage.
+	// task is fresh (DeployState ""), no entry annotation -> defaults to Triage.
 	ctx := context.Background()
 	_, err := r.reconcileLifecycle(ctx, getTaskByName(t, task.Name))
 	require.NoError(t, err)
@@ -169,16 +169,16 @@ func TestTriageEntrySetsBrainstormingLabel(t *testing.T) {
 	}
 }
 
-// TestImplementEntrySetsImplementationLabel: a task at LifecycleState "Implement" with
+// TestImplementEntrySetsImplementationLabel: a task at DeployState "Implement" with
 // Phase "" (fresh spawn) and an issue source should have tatara-implementation added.
 func TestImplementEntrySetsImplementationLabel(t *testing.T) {
 	r, task, w := seedLabelTask(t, "impl-entry", nil)
 	setProjectMemoryReady(t, task.Spec.ProjectRef, "http://mem-impl-entry.tatara.svc:8080")
-	// Set LifecycleState to Implement.
+	// Set DeployState to Implement.
 	ctx := context.Background()
 	var fresh tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
-	fresh.Status.LifecycleState = "Implement"
+	fresh.Status.DeployState = "Implement"
 	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
 
 	proj := projOf(t, &fresh)
@@ -203,9 +203,9 @@ func TestPRSourceTaskSkipsPhaseLabel(t *testing.T) {
 	fresh.Spec.Source.IsPR = true
 	fresh.Spec.Source.URL = "https://github.com/o/r/pull/9"
 	require.NoError(t, k8sClient.Update(ctx, &fresh))
-	// Set LifecycleState to Implement.
+	// Set DeployState to Implement.
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
-	fresh.Status.LifecycleState = "Implement"
+	fresh.Status.DeployState = "Implement"
 	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
 
 	proj := projOf(t, &fresh)

@@ -65,7 +65,7 @@ func seedLiveDirtyPRTask(t *testing.T, projName, repoName, issueRef string, issu
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create live task: %v", err)
 	}
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("update live task status: %v", err)
 	}

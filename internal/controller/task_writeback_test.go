@@ -516,6 +516,10 @@ type fullFakeSCMWriter struct {
 	// GetPRState
 	prState    scm.PRState
 	prStateErr error
+	// GetMergeState (default clean when empty)
+	mergeState scm.MergeState
+	// RemoveLabel
+	removeLabelLabels []string
 }
 
 func (f *fullFakeSCMWriter) OpenChange(_ context.Context, _, _, _, _, title, body string) (string, error) {
@@ -580,7 +584,14 @@ func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (s
 	return f.prState, f.prStateErr
 }
 func (f *fullFakeSCMWriter) GetMergeState(_ context.Context, _, _ string, _ int) (scm.MergeState, error) {
-	return scm.MergeStateClean, nil
+	if f.mergeState == "" {
+		return scm.MergeStateClean, nil
+	}
+	return f.mergeState, nil
+}
+func (f *fullFakeSCMWriter) RemoveLabel(_ context.Context, _, _, label string) error {
+	f.removeLabelLabels = append(f.removeLabelLabels, label)
+	return nil
 }
 func (f *fullFakeSCMWriter) CloseIssue(_ context.Context, _, _ string, number int, _ string) error {
 	f.closeIssueCalled = true

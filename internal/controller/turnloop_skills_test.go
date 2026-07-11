@@ -15,6 +15,7 @@ func TestRequiredSkillsForKind(t *testing.T) {
 	}{
 		{"implement", []string{"tatara-implement-workflow", "test-driven-development"}},
 		{"review", []string{"tatara-review-checklist"}},
+		{"clarify", []string{"tatara-clarify-conversation"}},
 		{"triageIssue", []string{"tatara-triage-judgment"}},
 		{"brainstorm", []string{"tatara-brainstorm-guardrails"}},
 		{"issueLifecycle", []string{"tatara-implement-workflow", "tatara-review-checklist"}},
@@ -68,7 +69,7 @@ func TestSkillsDirective_RequiredWording(t *testing.T) {
 
 // TestSkillsDirective_ConsultWording asserts advisory "Consult" wording for REFERENCE kinds.
 func TestSkillsDirective_ConsultWording(t *testing.T) {
-	for _, kind := range []string{"brainstorm", "triageIssue"} {
+	for _, kind := range []string{"brainstorm", "triageIssue", "clarify"} {
 		t.Run(kind, func(t *testing.T) {
 			d := skillsDirective(kind)
 			if d == "" {

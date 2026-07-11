@@ -65,7 +65,7 @@ func TestRecordGiveup_TriageFailed(t *testing.T) {
 		URL: "https://github.com/o/r/issues/401", Number: 401,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Failed"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -82,8 +82,8 @@ func TestRecordGiveup_TriageFailed(t *testing.T) {
 	if v := testutil.ToFloat64(lm.GiveupTotal("triage-failed")); v != 1 {
 		t.Errorf("giveup{triage-failed} = %v, want 1", v)
 	}
-	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got := fetchTask(t, name); got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestRecordGiveup_ImplementFailed(t *testing.T) {
 		URL: "https://github.com/o/r/issues/402", Number: 402,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Failed"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -117,8 +117,8 @@ func TestRecordGiveup_ImplementFailed(t *testing.T) {
 	if v := testutil.ToFloat64(lm.GiveupTotal("implement-failed")); v != 1 {
 		t.Errorf("giveup{implement-failed} = %v, want 1", v)
 	}
-	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got := fetchTask(t, name); got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -136,7 +136,7 @@ func TestRecordGiveup_Refused(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
 		Action: "declined", Reason: "already done in PR #100",
@@ -156,14 +156,14 @@ func TestRecordGiveup_Refused(t *testing.T) {
 	if v := testutil.ToFloat64(lm.GiveupTotal("refused-declined")); v != 1 {
 		t.Errorf("giveup{refused-declined} = %v, want 1", v)
 	}
-	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got := fetchTask(t, name); got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
 // TestRecordGiveup_AlreadyDone verifies an already_done outcome parks via the
 // codified-terminal path with giveup reason "refused-already-done" and
-// LifecycleState park reason "refused-already-done".
+// DeployState park reason "refused-already-done".
 func TestRecordGiveup_AlreadyDone(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "audit-giveup-alreadydone"
@@ -176,7 +176,7 @@ func TestRecordGiveup_AlreadyDone(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
 		Action: "already_done", Reason: "fix already committed on the shared branch in PR #101",
@@ -196,8 +196,8 @@ func TestRecordGiveup_AlreadyDone(t *testing.T) {
 	if v := testutil.ToFloat64(lm.GiveupTotal("refused-already-done")); v != 1 {
 		t.Errorf("giveup{refused-already-done} = %v, want 1", v)
 	}
-	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got := fetchTask(t, name); got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -215,7 +215,7 @@ func TestRecordGiveup_RefusedDeclinedLabel(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
 		Action: "declined", Reason: "out of scope, tracked elsewhere",
@@ -251,7 +251,7 @@ func TestRecordGiveup_RefusedNoExplanation(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	// No ImplementOutcome (no declared decline) + retry cap already exhausted.
 	task.Status.ImplementEmptyRetries = 2
@@ -270,8 +270,8 @@ func TestRecordGiveup_RefusedNoExplanation(t *testing.T) {
 	if v := testutil.ToFloat64(lm.GiveupTotal("refused-no-explanation")); v != 1 {
 		t.Errorf("giveup{refused-no-explanation} = %v, want 1", v)
 	}
-	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got := fetchTask(t, name); got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -288,7 +288,7 @@ func TestRecordGiveup_NoPRNumber(t *testing.T) {
 		URL: "https://github.com/o/r/issues/405", Number: 405,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 0
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
 	task.Status.DeadlineAt = &dl
@@ -308,8 +308,8 @@ func TestRecordGiveup_NoPRNumber(t *testing.T) {
 	if v := testutil.ToFloat64(lm.GiveupTotal("no-pr-number")); v != 1 {
 		t.Errorf("giveup{no-pr-number} = %v, want 1", v)
 	}
-	if got := fetchTask(t, name); got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got := fetchTask(t, name); got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -358,7 +358,7 @@ func TestIssueOutcomeMetric_Implement(t *testing.T) {
 		AuthorLogin: "external-user",
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -382,10 +382,10 @@ func TestIssueOutcomeMetric_Implement(t *testing.T) {
 // Finding 5: annBootCrashAttempts cleared on lifecycle-state transition
 // ============================================================
 
-// TestSetLifecycleState_ClearsBootCrashAttempts verifies that setLifecycleState
+// TestSetDeployState_ClearsBootCrashAttempts verifies that setDeployState
 // deletes the annBootCrashAttempts annotation so a new state does not inherit
 // the prior state's boot-crash budget.
-func TestSetLifecycleState_ClearsBootCrashAttempts(t *testing.T) {
+func TestSetDeployState_ClearsBootCrashAttempts(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "audit-bootcrash-clear"
 	proj := "audit-bcc-proj"
@@ -407,7 +407,7 @@ func TestSetLifecycleState_ClearsBootCrashAttempts(t *testing.T) {
 		t.Fatalf("seed annotations: %v", err)
 	}
 	task = fetchTask(t, name)
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -417,7 +417,7 @@ func TestSetLifecycleState_ClearsBootCrashAttempts(t *testing.T) {
 	fw := &lifecycleFakeSCMWriter{}
 	r := newLifecycleReconciler(t, fw)
 
-	// Transition will be Triage->Implement via setLifecycleState.
+	// Transition will be Triage->Implement via setDeployState.
 	_, err := r.reconcileLifecycle(ctx, fetchTask(t, name))
 	if err != nil {
 		t.Fatalf("reconcileLifecycle: %v", err)
@@ -425,7 +425,7 @@ func TestSetLifecycleState_ClearsBootCrashAttempts(t *testing.T) {
 
 	got := fetchTask(t, name)
 	if v, ok := got.Annotations[annBootCrashAttempts]; ok && v != "" {
-		t.Errorf("annBootCrashAttempts = %q after setLifecycleState, want cleared (empty or absent)", v)
+		t.Errorf("annBootCrashAttempts = %q after setDeployState, want cleared (empty or absent)", v)
 	}
 }
 
@@ -447,7 +447,7 @@ func TestMaxIterations_CommentErrorDoesNotBlock(t *testing.T) {
 		URL: "https://github.com/o/r/issues/408", Number: 408,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = ""
 	task.Status.LifecycleIterations = 10 // at maxIter
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -465,8 +465,8 @@ func TestMaxIterations_CommentErrorDoesNotBlock(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (comment error must not block park)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (comment error must not block park)", got.Status.DeployState)
 	}
 }
 
@@ -547,7 +547,7 @@ func TestHandleConversation_NilDeadlineUsesConversationIdleMinutes(t *testing.T)
 	if err := k8sClient.Create(context.Background(), task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Conversation"
+	task.Status.DeployState = "Conversation"
 	task.Status.DeadlineAt = nil // no deadline set
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed status: %v", err)
@@ -647,7 +647,7 @@ func TestImplementEmptyRetry_MetricIncremented(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementEmptyRetries = 0 // first retry
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {

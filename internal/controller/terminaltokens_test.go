@@ -57,7 +57,7 @@ func seedTerminalTokensTask(t *testing.T, name, project, repo, model string, in,
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.ResolvedModel = model
 	task.Status.CumulativeInput = in
 	task.Status.CumulativeOutput = out
@@ -69,7 +69,7 @@ func seedTerminalTokensTask(t *testing.T, name, project, repo, model string, in,
 	return task
 }
 
-func TestSetLifecycleState_EmitsTerminalTokens(t *testing.T) {
+func TestSetDeployState_EmitsTerminalTokens(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
 	t.Run("Parked churned", func(t *testing.T) {
@@ -81,8 +81,8 @@ func TestSetLifecycleState_EmitsTerminalTokens(t *testing.T) {
 			Scheme:  k8sClient.Scheme(),
 			Metrics: obs.NewOperatorMetrics(reg),
 		}
-		if err := r.setLifecycleState(ctx, task, "Parked", "implement-failed"); err != nil {
-			t.Fatalf("setLifecycleState: %v", err)
+		if err := r.setDeployState(ctx, task, "Parked", "implement-failed"); err != nil {
+			t.Fatalf("setDeployState: %v", err)
 		}
 
 		const proj, repo, model = "tt-proj-churn", "tt-repo-churn", "claude-sonnet-5"
@@ -109,8 +109,8 @@ func TestSetLifecycleState_EmitsTerminalTokens(t *testing.T) {
 			Scheme:  k8sClient.Scheme(),
 			Metrics: obs.NewOperatorMetrics(reg),
 		}
-		if err := r.setLifecycleState(ctx, task, "Done", ""); err != nil {
-			t.Fatalf("setLifecycleState: %v", err)
+		if err := r.setDeployState(ctx, task, "Done", ""); err != nil {
+			t.Fatalf("setDeployState: %v", err)
 		}
 
 		const proj, repo, model = "tt-proj-done", "tt-repo-done", "claude-opus-4-8"

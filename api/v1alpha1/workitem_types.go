@@ -119,6 +119,17 @@ func WorkItemsContext(t *Task) string {
 		if wi.Title != "" {
 			line += " - " + wi.Title
 		}
+		// Umbrella member-state suffix: PR/MR branch + CI + mergeability so the
+		// prompt carries the live cross-repo status without a re-crawl.
+		if wi.HeadBranch != "" {
+			line += " branch:" + wi.HeadBranch
+		}
+		if wi.CIStatus != "" {
+			line += " CI:" + wi.CIStatus
+		}
+		if wi.Mergeable != "" {
+			line += " mergeable:" + wi.Mergeable
+		}
 		sb.WriteString(line + "\n")
 	}
 	return sb.String()
@@ -138,6 +149,27 @@ type WorkItemRef struct {
 	Title string `json:"title,omitempty"`
 	// +optional
 	HeadSHA string `json:"headSHA,omitempty"`
+	// Umbrella member-state fields (7-kind redesign): kept fresh by light SCM
+	// polls (refreshUmbrellaMembers) and rendered whole into the pod's turn-0
+	// context bundle so a fresh pod reconstructs the full cross-repo state from
+	// the CR alone.
+
+	// Labels are the current SCM labels on this member.
+	// +optional
+	Labels []string `json:"labels,omitempty"`
+	// HeadBranch is the PR/MR source branch.
+	// +optional
+	HeadBranch string `json:"headBranch,omitempty"`
+	// CIStatus is the member's CI/pipeline status: ""|pending|success|failure.
+	// +optional
+	CIStatus string `json:"ciStatus,omitempty"`
+	// Mergeable is the member's mergeability: unknown|clean|dirty|blocked|behind.
+	// +optional
+	Mergeable string `json:"mergeable,omitempty"`
+	// Body is the issue/PR body captured at the last poll (turn-0 bundle source).
+	// +optional
+	Body string `json:"body,omitempty"`
+	// LastRefreshedAt is the last-synced cursor for this member.
 	// +optional
 	LastRefreshedAt *metav1.Time `json:"lastRefreshedAt,omitempty"`
 }

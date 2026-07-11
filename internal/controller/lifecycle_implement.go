@@ -93,7 +93,7 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 					log.FromContext(ctx).Error(cerr, "implement: max-iterations comment (non-fatal)", "resource_id", task.Name)
 				}
 			}
-			if err := r.setLifecycleState(ctx, task, "Parked", "maxIterations"); err != nil {
+			if err := r.setDeployState(ctx, task, "Parked", "maxIterations"); err != nil {
 				return ctrl.Result{}, err
 			}
 			if r.LifecycleMetrics != nil {
@@ -171,7 +171,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 	if task.Status.Phase == "Failed" {
 		l.Info("implement agent run failed; parking task",
 			"action", "lifecycle_implement_failed", "resource_id", task.Name)
-		if err := r.setLifecycleState(ctx, task, "Parked", "implement-failed"); err != nil {
+		if err := r.setDeployState(ctx, task, "Parked", "implement-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {
@@ -227,7 +227,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			}
 			l.Info("implement: pr closed on agent signal",
 				"action", "lifecycle_pr_outcome_close", "resource_id", task.Name, "pr", number, "reason", out.Reason)
-			if err := r.setLifecycleState(ctx, task, "Stopped", "pr-closed-superseded"); err != nil {
+			if err := r.setDeployState(ctx, task, "Stopped", "pr-closed-superseded"); err != nil {
 				return ctrl.Result{}, fmt.Errorf("implement: stop after close: %w", err)
 			}
 			if r.LifecycleMetrics != nil {
@@ -288,7 +288,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			} else {
 				l.Error(scmErr, "implement: scm context for outcome comment (non-fatal)", "resource_id", task.Name)
 			}
-			if err := r.setLifecycleState(ctx, fresh, "Parked", parkReason); err != nil {
+			if err := r.setDeployState(ctx, fresh, "Parked", parkReason); err != nil {
 				return ctrl.Result{}, err
 			}
 			if r.LifecycleMetrics != nil {
@@ -317,7 +317,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 			if r.LifecycleMetrics != nil {
 				r.LifecycleMetrics.ImplementEmptyRetry()
 			}
-			// resetAgentRun clears phase to "" and leaves LifecycleState=Implement,
+			// resetAgentRun clears phase to "" and leaves DeployState=Implement,
 			// so the next reconcile re-spawns the Implement run with ImplementContext.
 			// NOTE: LifecycleIterations will also be incremented on the re-spawn
 			// (Phase="" path). This is intentional: each empty-retry is a real
@@ -341,7 +341,7 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		} else {
 			l.Error(scmErr, "implement: scm context for empty-park comment (parking without comment)",
 				"resource_id", task.Name)
-			if err := r.setLifecycleState(ctx, fresh, "Parked", "refused-no-explanation"); err != nil {
+			if err := r.setDeployState(ctx, fresh, "Parked", "refused-no-explanation"); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -388,9 +388,9 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		return ctrl.Result{}, fmt.Errorf("implement: record pr fields: %w", err)
 	}
 
-	// Delegate the state transition to setLifecycleState so the transition log,
+	// Delegate the state transition to setDeployState so the transition log,
 	// metric, and wrapper teardown all live in one place.
-	if err := r.setLifecycleState(ctx, task, "MRCI", "implement-done"); err != nil {
+	if err := r.setDeployState(ctx, task, "MRCI", "implement-done"); err != nil {
 		return ctrl.Result{}, err
 	}
 

@@ -175,23 +175,23 @@ type AgentSpec struct {
 	// +optional
 	MaxTaskTokens int64 `json:"maxTaskTokens,omitempty"`
 	// ModelByKind overrides the project-wide Model per Task Kind. Keys are the
-	// Task.Spec.Kind enum values (triageIssue, review, brainstorm, refine,
+	// Task.Spec.Kind enum values (clarify, triageIssue, review, brainstorm, refine,
 	// implement, incident, issueLifecycle, selfImprove) plus the "healthCheck"
 	// pseudo-key: healthCheck shares Kind=brainstorm but is resolved against this
 	// key first (falling back to the brainstorm entry when absent), letting
 	// healthCheck's recurring classification work be tiered separately from
 	// brainstorm's creative work. A missing or empty entry falls back to Model.
 	// Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
-	// +kubebuilder:validation:MaxProperties=10
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="modelByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
+	// +kubebuilder:validation:MaxProperties=11
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="modelByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].startsWith('claude-') && self[k].size() <= 64)",message="modelByKind values must be a claude model ID (start with 'claude-', max 64 chars)"
 	// +optional
 	ModelByKind map[string]string `json:"modelByKind,omitempty"`
 	// EffortByKind overrides the project-wide Effort per Task Kind. Same keying as
 	// ModelByKind (including the "healthCheck" pseudo-key); a missing or empty
 	// entry falls back to Effort. Values are the effort enum (low|medium|high|xhigh|max).
-	// +kubebuilder:validation:MaxProperties=10
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="effortByKind keys must be one of: implement, review, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
+	// +kubebuilder:validation:MaxProperties=11
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="effortByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] in ['low','medium','high','xhigh','max'])",message="effortByKind values must be one of: low, medium, high, xhigh, max"
 	// +optional
 	EffortByKind map[string]string `json:"effortByKind,omitempty"`
@@ -323,8 +323,19 @@ type ScmCron struct {
 	CDScan CronActivity `json:"cdScan,omitempty"`
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
+	// HealthCheck is RETIRED as a firing activity (its proposals were absorbed
+	// into brainstorm): the runScans dispatch is stripped. The field is kept
+	// inert only so stored Project CRs that still set it round-trip; it never
+	// fires a Task. Mirrors the retired-enum-string back-compat convention.
 	// +optional
 	HealthCheck HealthCheckActivity `json:"healthCheck,omitempty"`
+	// Documentation is the scheduled documentation-sync cron (replaces the retired
+	// per-merge push trigger): each tick spawns a documentation Task, scoped to the
+	// docs repo, for every enrolled component repo that advanced since the last run
+	// (Status.LastDocumentation). Requires Spec.Documentation.Enabled + Repo. Empty
+	// Schedule disables it.
+	// +optional
+	Documentation CronActivity `json:"documentation,omitempty"`
 	// Refine configures the project-refiner pre-step. No schedule: refine fires
 	// off the existing scan cadence as a mandatory barrier before scans/brainstorm.
 	// +optional
@@ -521,9 +532,9 @@ type TokenBudgetSpec struct {
 	// SpawnCeilingByKind gates each Task kind independently in claudeSubscription
 	// mode: work of kind K is held once account usage reaches the given percent.
 	// Keys are Task kinds; kinds absent here fall through to proactive/emergency.
-	// +kubebuilder:validation:MaxProperties=10
+	// +kubebuilder:validation:MaxProperties=11
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k] >= 0 && self[k] <= 100)",message="spawnCeilingByKind values must be 0..100"
-	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])",message="spawnCeilingByKind keys must be valid Task kinds"
+	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','selfImprove','triageIssue','brainstorm','issueLifecycle','incident','healthCheck','refine','documentation'])",message="spawnCeilingByKind keys must be valid Task kinds"
 	// +optional
 	SpawnCeilingByKind map[string]int32 `json:"spawnCeilingByKind,omitempty"`
 	// PollIntervalSeconds is how often the operator polls Claude account usage
@@ -684,8 +695,14 @@ type ProjectStatus struct {
 	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
 	// +optional
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
+	// LastHealthCheck is RETIRED (healthCheck no longer fires): read-only, kept for
+	// stored-CR back-compat. No writer remains after the cron dispatch was dropped.
 	// +optional
 	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
+	// LastDocumentation is the last time the documentation-sync cron ran; it bounds
+	// the diff-since-last-doc window each tick computes per enrolled repo.
+	// +optional
+	LastDocumentation *metav1.Time `json:"lastDocumentation,omitempty"`
 	// LastCDScan is the last time the push-CD deploy-supervision backstop ran.
 	// +optional
 	LastCDScan *metav1.Time `json:"lastCDScan,omitempty"`

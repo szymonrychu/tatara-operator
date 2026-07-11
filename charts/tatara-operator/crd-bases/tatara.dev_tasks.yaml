@@ -68,6 +68,12 @@ spec:
                 type: string
               kind:
                 default: implement
+                description: |-
+                  Kind selects the agent behavior. The 7-kind model is
+                  brainstorm;incident;clarify;implement;review;documentation;refine. The
+                  strings selfImprove;triageIssue;healthCheck;issueLifecycle are RETIRED as
+                  agent kinds - inert, retained in the enum only so already-persisted terminal
+                  CRs still deserialize and read; no code path creates them anymore.
                 enum:
                 - implement
                 - review
@@ -79,6 +85,7 @@ spec:
                 - healthCheck
                 - refine
                 - documentation
+                - clarify
                 type: string
               maxTurns:
                 type: integer
@@ -464,6 +471,11 @@ spec:
                   propagation) went green, and the operator now drives the push-CD cascade to a
                   tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
                   occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
+                  The Go field is DeployState (agent-invisible, deploy-supervisor-only) but the
+                  JSON/CRD key stays lifecycleState so stored CRs still deserialize and the
+                  agent-visible task_list field is unchanged. The enum keeps the front-half
+                  values (Triage/Conversation/Implement/MRCI) for the drain of in-flight
+                  issueLifecycle Tasks.
                 enum:
                 - Triage
                 - Conversation
@@ -515,7 +527,7 @@ spec:
                   NOTE: Pending and AwaitingApproval are intentionally absent: no code path
                   ever writes them (approval is now driven by the SCM conversation flow and
                   projected onto labels, not a Phase transition). They are removed here to
-                  keep the CRD enum honest and prevent confusion with LifecycleState.
+                  keep the CRD enum honest and prevent confusion with DeployState.
                   Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
                 enum:
                 - Planning
@@ -604,12 +616,33 @@ spec:
                   description: WorkItemRef is one SCM artifact tracked by a Task's
                     work-item ledger.
                   properties:
+                    body:
+                      description: Body is the issue/PR body captured at the last
+                        poll (turn-0 bundle source).
+                      type: string
+                    ciStatus:
+                      description: 'CIStatus is the member''s CI/pipeline status:
+                        ""|pending|success|failure.'
+                      type: string
+                    headBranch:
+                      description: HeadBranch is the PR/MR source branch.
+                      type: string
                     headSHA:
                       type: string
                     kind:
                       type: string
+                    labels:
+                      description: Labels are the current SCM labels on this member.
+                      items:
+                        type: string
+                      type: array
                     lastRefreshedAt:
+                      description: LastRefreshedAt is the last-synced cursor for this
+                        member.
                       format: date-time
+                      type: string
+                    mergeable:
+                      description: 'Mergeable is the member''s mergeability: unknown|clean|dirty|blocked|behind.'
                       type: string
                     number:
                       type: integer

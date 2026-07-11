@@ -179,7 +179,7 @@ func TestObserveHumanDeclinedLabel(t *testing.T) {
 	// Set task to Conversation state (awaiting human approval).
 	var fresh tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
-	fresh.Status.LifecycleState = "Conversation"
+	fresh.Status.DeployState = "Conversation"
 	now := metav1.Now()
 	fresh.Status.LastActivityAt = &now
 	future := metav1.NewTime(now.Add(1e9)) // far future deadline (not passed)
@@ -192,7 +192,7 @@ func TestObserveHumanDeclinedLabel(t *testing.T) {
 
 	var updated tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
-	require.Equal(t, "Parked", updated.Status.LifecycleState, "declined readback must park the task")
+	require.Equal(t, "Parked", updated.Status.DeployState, "declined readback must park the task")
 	require.Equal(t, "human-declined", updated.Status.ParkReason, "park reason must be human-declined")
 	found := false
 	for _, wi := range updated.Status.WorkItems {
@@ -220,7 +220,7 @@ func TestObserveHumanApprovedLabel(t *testing.T) {
 	// Set task to Conversation state (awaiting human approval).
 	var fresh tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
-	fresh.Status.LifecycleState = "Conversation"
+	fresh.Status.DeployState = "Conversation"
 	now := metav1.Now()
 	fresh.Status.LastActivityAt = &now
 	future := metav1.NewTime(now.Add(1e9)) // far future deadline
@@ -232,7 +232,7 @@ func TestObserveHumanApprovedLabel(t *testing.T) {
 
 	var updated tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
-	require.Equal(t, "Implement", updated.Status.LifecycleState, "approved readback must drive the task to Implement")
+	require.Equal(t, "Implement", updated.Status.DeployState, "approved readback must drive the task to Implement")
 	found := false
 	for _, wi := range updated.Status.WorkItems {
 		if wi.Role == tatarav1alpha1.RoleProposed && wi.Repo == "o/r" && wi.Number == 42 {

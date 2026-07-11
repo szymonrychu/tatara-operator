@@ -52,7 +52,7 @@ func TestFinishTriage_DiscussMetricRecordedOnce(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Human-filed issue with discuss outcome -> no silence gate, posts comment.
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "discuss", Comment: "let me know your thoughts"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -79,8 +79,8 @@ func TestFinishTriage_DiscussMetricRecordedOnce(t *testing.T) {
 
 	// Must be in Conversation.
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation", got.Status.DeployState)
 	}
 
 	// IssueOutcome("discuss") must be counted exactly once.
@@ -108,7 +108,7 @@ func TestFinishTriage_NilOutcomeDefaultsToDiscuss(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Phase=Succeeded, no IssueOutcome set at all.
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = nil
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -125,11 +125,11 @@ func TestFinishTriage_NilOutcomeDefaultsToDiscuss(t *testing.T) {
 
 	// Must go to Conversation (discuss), NOT Implement.
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState == "Implement" {
+	if got.Status.DeployState == "Implement" {
 		t.Error("nil IssueOutcome must NOT default to Implement; must enter Conversation (discuss)")
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation for nil IssueOutcome", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation for nil IssueOutcome", got.Status.DeployState)
 	}
 }
 
@@ -173,7 +173,7 @@ func seedMergeTaskR2(t *testing.T, suffix string) (*TaskReconciler, *mergeCounti
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Merge"
+	task.Status.DeployState = "Merge"
 	task.Status.PRNumber = 55
 	task.Status.PrURL = "https://github.com/o/r/pull/55"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -248,7 +248,7 @@ func TestHandleMerge_GetPRStateMetricRecorded(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Merge"
+	task.Status.DeployState = "Merge"
 	task.Status.PRNumber = 56
 	task.Status.PrURL = "https://github.com/o/r/pull/56"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -322,7 +322,7 @@ func seedMainCITaskR2(t *testing.T, suffix string) (*tatarav1alpha1.Task, string
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "MainCI"
+	task.Status.DeployState = "MainCI"
 	task.Status.MergeCommitSHA = "merge123"
 	task.Status.PRNumber = 60
 	task.Status.PrURL = "https://github.com/o/r/pull/60"
@@ -462,16 +462,16 @@ func TestParkWithComment_UsesProjectProviderWhenSourceEmpty(t *testing.T) {
 }
 
 // ================================================================
-// Finding 18: setLifecycleState must skip the second RetryOnConflict
+// Finding 18: setDeployState must skip the second RetryOnConflict
 // block (boot-crash annotation clear) when the annotation is absent.
 // We can't easily count Get calls via fake client, so this is a
 // no-test (structural, verified by code review).
 // ================================================================
 
-// TestSetLifecycleState_NoAnnotation_Transitions verifies that a normal state
+// TestSetDeployState_NoAnnotation_Transitions verifies that a normal state
 // transition still works correctly when annBootCrashAttempts is absent
 // (regression guard: the annotation guard must not break normal transitions).
-func TestSetLifecycleState_NoAnnotation_Transitions(t *testing.T) {
+func TestSetDeployState_NoAnnotation_Transitions(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "r2-slca"
 	proj := "r2-slcap"
@@ -489,13 +489,13 @@ func TestSetLifecycleState_NoAnnotation_Transitions(t *testing.T) {
 		Metrics: obs.NewOperatorMetrics(reg),
 	}
 
-	if err := r.setLifecycleState(ctx, task, "Parked", "test"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, task, "Parked", "test"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -523,7 +523,7 @@ func TestFinishTriage_AwaitApproval_StateAfterFullSequence(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Tatara-authored, no human comment, implement outcome -> await-approval path.
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -545,8 +545,8 @@ func TestFinishTriage_AwaitApproval_StateAfterFullSequence(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation after await-approval", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation after await-approval", got.Status.DeployState)
 	}
 	// IssueOutcome must be cleared.
 	if got.Status.IssueOutcome != nil {
@@ -589,8 +589,8 @@ func TestParkWithComment_NilSource_NoError(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 

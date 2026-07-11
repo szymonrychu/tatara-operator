@@ -86,5 +86,5 @@ func TestParkWithComment_BotMR_Suppressed(t *testing.T) {
 	w.mu.Unlock()
 	require.Zero(t, posted,
 		"a park note on the bot's own MR must be fully suppressed (rule 2); got %v", w.commentBodies)
-	require.Equal(t, "Parked", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Parked", getTaskByName(t, task.Name).Status.DeployState)
 }

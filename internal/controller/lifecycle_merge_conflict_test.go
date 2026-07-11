@@ -31,7 +31,7 @@ func (f *mergeConflictFakeWriter) Merge(_ context.Context, _, _ string, _ int, _
 	return "", scm.ErrMergeConflict
 }
 
-// seedMergeConflictTask creates a task in LifecycleState=Merge with PR #267 and
+// seedMergeConflictTask creates a task in DeployState=Merge with PR #267 and
 // HeadBranch set. Returns the reconciler, the project, and the task name.
 func seedMergeConflictTask(t *testing.T) (*TaskReconciler, *tatarav1alpha1.Project, string) {
 	t.Helper()
@@ -50,7 +50,7 @@ func seedMergeConflictTask(t *testing.T) (*TaskReconciler, *tatarav1alpha1.Proje
 
 	// Set up as a Merge-state task with PR #267.
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
-	task.Status.LifecycleState = "Merge"
+	task.Status.DeployState = "Merge"
 	task.Status.PRNumber = 267
 	task.Status.PrURL = "https://github.com/o/r/pull/267"
 	task.Status.HeadBranch = "tatara/task-x"
@@ -83,7 +83,7 @@ func TestHandleMerge_ConflictSeedsMergeNotRebaseContext(t *testing.T) {
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, r.Get(ctx, client.ObjectKeyFromObject(task), &got))
-	assert.Equal(t, "Implement", got.Status.LifecycleState)
+	assert.Equal(t, "Implement", got.Status.DeployState)
 
 	ctxMsg := got.Status.ImplementContext
 	assert.Contains(t, ctxMsg, "git merge origin/", "must instruct merge, not rebase")

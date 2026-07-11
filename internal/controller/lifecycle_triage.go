@@ -21,9 +21,19 @@ import (
 // handleTriage drives the Triage agent-run state. On a finished run it reads
 // IssueOutcome and transitions: close->Done, discuss->Conversation, implement->Implement.
 func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	return r.handleFrontHalf(ctx, project, task, r.finishTriage)
+}
+
+// handleFrontHalf is the shared conversational front-half agent-run driver used
+// by both issueLifecycle Triage (finish=finishTriage) and the clarify kind
+// (finish=finishClarify). It ensures the brainstorming label, seeds the
+// conversation fork, builds the turn-0 triage/clarify prompt, and drives the
+// agent run. On a finished run it delegates to the kind-specific finish handler
+// which consumes Status.IssueOutcome.
+func (r *TaskReconciler) handleFrontHalf(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, finish func(context.Context, *tatarav1alpha1.Project, *tatarav1alpha1.Task) (ctrl.Result, error)) (ctrl.Result, error) {
 	// Run finished -> act on the outcome.
 	if isTerminal(task.Status.Phase) {
-		return r.finishTriage(ctx, project, task)
+		return finish(ctx, project, task)
 	}
 	// Run in progress (or not yet started) -> drive another step.
 	// Idempotent: ensure the brainstorming label is set (covers reactivation where
@@ -120,6 +130,14 @@ func (r *TaskReconciler) maybeSetupConversationFork(ctx context.Context, task *t
 // a second Get of the same Repository within the same reconcile).
 func (r *TaskReconciler) buildTriagePromptFor(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, repoURL string) string {
 	l := log.FromContext(ctx)
+	// clarify (the decomposed front-half kind) gets the full operator-assembled
+	// turn-0 cross-repo umbrella bundle instead of the single-issue triage text, so
+	// a fresh clarify pod sees every umbrella member's body + thread + state upfront
+	// and never re-crawls SCM (CROSS-REPO-CONTRACT). The retained issueLifecycle
+	// bridge keeps the legacy single-issue triage prompt below.
+	if task.Spec.Kind == "clarify" {
+		return r.buildUmbrellaPromptFor(ctx, project, task, clarifyGoalTail(task))
+	}
 	if r.ReaderFor == nil || task.Spec.Source == nil {
 		return lifecycleTriageText(task, "", "")
 	}
@@ -299,14 +317,45 @@ func (tr *triageReader) botHasLastWord(ctx context.Context) (bool, error) {
 	return botIsLastCommenter(comments, tr.botLogin), nil
 }
 
-// finishTriage consumes Status.IssueOutcome after a completed Triage agent run.
+// finishTriage consumes Status.IssueOutcome after a completed Triage agent run
+// for an issueLifecycle Task: the implement outcome transitions the same Task
+// into the Implement lifecycle state (the monolithic front-to-back-half path).
 func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	return r.finishFrontHalf(ctx, project, task, r.triageImplementAction)
+}
+
+// triageImplementAction is the issueLifecycle implement-outcome terminal action:
+// label the issue approved and transition the SAME Task into the Implement
+// lifecycle state. Returns terminal=false so finishFrontHalf runs its shared
+// clearIssueOutcome+resetAgentRun tail (the Task continues into Implement).
+func (r *TaskReconciler) triageImplementAction(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, bool, error) {
+	_, approved, _, _ := lifecycleLabels(project.Spec.Scm)
+	if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if err := r.setDeployState(ctx, task, "Implement", "triage-implement"); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	r.Metrics.IssueOutcome("implement")
+	return ctrl.Result{}, false, nil
+}
+
+// finishFrontHalf consumes Status.IssueOutcome after a completed Triage/clarify
+// agent run. The close/discuss/guard/default arms are shared; the implement arm,
+// after the self-approve guard passes, delegates to onImplement (which differs
+// by kind: issueLifecycle transitions into Implement; clarify flips the handoff
+// label and terminates). onImplement returns terminal=true when it has fully
+// handled the outcome (including any terminal transition), in which case
+// finishFrontHalf returns immediately WITHOUT running the shared
+// clearIssueOutcome+resetAgentRun tail (which would otherwise un-terminate a
+// clarify Task by resetting Phase).
+func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, onImplement func(context.Context, *tatarav1alpha1.Project, *tatarav1alpha1.Task) (ctrl.Result, bool, error)) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	if task.Status.Phase == "Failed" {
 		l.Info("triage agent run failed; parking task",
 			"action", "lifecycle_triage_failed", "resource_id", task.Name)
-		if err := r.setLifecycleState(ctx, task, "Parked", "triage-failed"); err != nil {
+		if err := r.setDeployState(ctx, task, "Parked", "triage-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {
@@ -342,7 +391,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 	// exhausts its retries after the comment/close already landed, the next
 	// reconcile re-runs the arm and may post a duplicate triage comment. That
 	// is rare and cosmetic, and preferred over the wrong-implement downgrade.
-	brainstorming, approved, _, declined := lifecycleLabels(project.Spec.Scm)
+	brainstorming, _, _, declined := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
 	case "close":
@@ -413,10 +462,10 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if err := r.triageCloseIssue(ctx, project, task, comment); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "Done", "triage-close"); err != nil {
+		if err := r.setDeployState(ctx, task, "Done", "triage-close"); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Record IssueOutcome("close") AFTER setLifecycleState commits, so a failed
+		// Record IssueOutcome("close") AFTER setDeployState commits, so a failed
 		// transition (RetryOnConflict exhausted) does not double-count on re-reconcile
 		// (finding 1). triageCloseIssue is idempotent on the SCM side; the metric is not.
 		r.Metrics.IssueOutcome("close")
@@ -464,7 +513,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 		// Record metric AFTER enterConversation commits so a failed transition does not
 		// double-count on the next reconcile (findings 1 & 5). The implement arm records
-		// after setLifecycleState; this arm now matches that discipline.
+		// after setDeployState; this arm now matches that discipline.
 		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -517,13 +566,16 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 				}
 			}
 		}
-		if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {
-			return ctrl.Result{}, err
+		res, terminal, herr := onImplement(ctx, project, task)
+		if herr != nil {
+			return ctrl.Result{}, herr
 		}
-		if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
-			return ctrl.Result{}, err
+		if terminal {
+			// onImplement fully handled the outcome (e.g. clarify handoff
+			// terminated the Task): skip the shared clearIssueOutcome+resetAgentRun
+			// tail so a resetAgentRun does not resurrect a terminated Task.
+			return res, nil
 		}
-		r.Metrics.IssueOutcome("implement")
 
 	default:
 		// Unknown action: an agent returned an unrecognized action string. Route to the

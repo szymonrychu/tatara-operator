@@ -318,147 +318,6 @@ func TestFinding7_NilMetricsPanicsAtNewServer(t *testing.T) {
 
 // --- R2 Finding 1: Bot-PR dedup uses PR number not linked-issue number ---
 
-// TestR2Finding1_BotPRClosingIssue_DedupsWithIssueTask verifies that a bot PR
-// "Closes #7" does NOT create a duplicate issueLifecycle Task when a task for
-// issue #7 already exists. Before the fix, the pre-create scan uses ev.Number
-// (PR number 21) while the existing task carries label source-number=7; the
-// scan misses it and creates a duplicate.
-func TestR2Finding1_BotPRClosingIssue_DedupsWithIssueTask(t *testing.T) {
-	const secretVal = "whsec-r2f1"
-	proj := &tatarav1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "r2f1proj", Namespace: ns},
-		Spec: tatarav1.ProjectSpec{
-			ScmSecretRef: "r2f1proj-scm",
-			TriggerLabel: "tatara",
-			Scm: &tatarav1.ScmSpec{
-				Provider: "github", Owner: "o", BotLogin: "tatara-bot",
-				PRReactionScope: "all",
-			},
-		},
-	}
-	sec := secret("r2f1proj-scm", secretVal)
-	repo := repository("r2f1repo", "r2f1proj", "https://github.com/o/r.git", "main")
-
-	// Pre-existing issueLifecycle task for issue #7 (as if created by issueScan).
-	existingIssueTask := &tatarav1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "r2f1-issue7-task",
-			Namespace: ns,
-			Labels: map[string]string{
-				"tatara.io/source-repo":   "o.r",
-				"tatara.io/source-number": "7",
-				tatarav1.LabelSourceKind:  "issueLifecycle",
-			},
-		},
-		Spec: tatarav1.TaskSpec{
-			ProjectRef:    "r2f1proj",
-			RepositoryRef: "r2f1repo",
-			Kind:          "issueLifecycle",
-			Goal:          "issue body",
-			Source: &tatarav1.TaskSource{
-				Provider: "github",
-				IssueRef: "o/r#7",
-				Number:   7,
-			},
-		},
-		Status: tatarav1.TaskStatus{
-			LifecycleState: "Implement",
-		},
-	}
-
-	c := seedClient(t, proj, sec, repo)
-	require.NoError(t, c.Create(context.Background(), existingIssueTask))
-	require.NoError(t, c.Status().Update(context.Background(), existingIssueTask))
-
-	reg := prometheus.NewRegistry()
-	srv := webhook.NewServer(webhook.Config{
-		Client:    c,
-		Namespace: ns,
-		Metrics:   obs.NewOperatorMetrics(reg),
-	})
-	h := srv.Handler()
-
-	// Bot PR #21 that closes issue #7.
-	body := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":21,"title":"fix: closes #7","body":"Closes #7","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/21","head":{"sha":"abc","ref":"fix-branch"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	hdr := http.Header{}
-	hdr.Set("X-GitHub-Event", "pull_request")
-	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
-
-	w := post(t, h, "r2f1proj", hdr, body)
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	var tasks tatarav1.TaskList
-	require.NoError(t, c.List(context.Background(), &tasks, client.InNamespace(ns)))
-	require.Len(t, tasks.Items, 1, "bot PR 'Closes #7' must NOT create a duplicate task when issue #7 task already exists")
-
-	// Metric must be "duplicate", not "task_created".
-	dupCount := counterValue(t, reg, "operator_webhook_events_total",
-		map[string]string{"provider": "github", "kind": "mr", "action": "opened", "result": "duplicate"})
-	require.Equal(t, 1.0, dupCount, "dedup must produce result=duplicate metric")
-}
-
-// TestR2Finding1_BotPRTaskNameMatchesIssueTaskName verifies that an issueLifecycle
-// task created from a bot PR "Closes #7" gets the same deterministic name as an
-// issueLifecycle task created from a direct issue #7 webhook. This ensures the
-// AlreadyExists guard fires when both paths race.
-func TestR2Finding1_BotPRTaskName_MatchesIssueDerivedName(t *testing.T) {
-	const secretVal = "whsec-r2f1b"
-	proj := &tatarav1.Project{
-		ObjectMeta: metav1.ObjectMeta{Name: "r2f1bproj", Namespace: ns},
-		Spec: tatarav1.ProjectSpec{
-			ScmSecretRef: "r2f1bproj-scm", //gitleaks:allow - k8s Secret name, not a credential
-			TriggerLabel: "tatara",
-			Scm: &tatarav1.ScmSpec{
-				Provider: "github", Owner: "o", BotLogin: "tatara-bot",
-				PRReactionScope: "all",
-			},
-		},
-	}
-	sec := secret("r2f1bproj-scm", secretVal)
-	repo := repository("r2f1brepo", "r2f1bproj", "https://github.com/o/r.git", "main")
-
-	c := seedClient(t, proj, sec, repo)
-
-	reg := prometheus.NewRegistry()
-	srv := webhook.NewServer(webhook.Config{
-		Client:    c,
-		Namespace: ns,
-		Metrics:   obs.NewOperatorMetrics(reg),
-	})
-	h := srv.Handler()
-
-	// First: issue #7 labeled -> creates issueLifecycle task.
-	issueBody := []byte(`{"action":"labeled","sender":{"login":"alice"},"label":{"name":"tatara"},"issue":{"number":7,"title":"fix","body":"fix body","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	hdr := http.Header{}
-	hdr.Set("X-GitHub-Event", "issues")
-	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, issueBody))
-	w1 := post(t, h, "r2f1bproj", hdr, issueBody)
-	require.Equal(t, http.StatusAccepted, w1.Code)
-
-	var qelAfterIssue tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qelAfterIssue, client.InNamespace(ns)))
-	require.Len(t, qelAfterIssue.Items, 1)
-	issueTaskName := qelAfterIssue.Items[0].Spec.Payload.Name
-
-	// Second: bot PR #21 "Closes #7" -> must produce same payload.Name -> dedup key collision -> duplicate.
-	prBody := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":21,"title":"fix closes #7","body":"Closes #7","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/21","head":{"sha":"abc","ref":"fix-branch"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	hdr2 := http.Header{}
-	hdr2.Set("X-GitHub-Event", "pull_request")
-	hdr2.Set("X-Hub-Signature-256", ghSign(secretVal, prBody))
-	w2 := post(t, h, "r2f1bproj", hdr2, prBody)
-	require.Equal(t, http.StatusAccepted, w2.Code)
-
-	// Still only one QueuedEvent.
-	var qelAfterPR tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qelAfterPR, client.InNamespace(ns)))
-	require.Len(t, qelAfterPR.Items, 1, "bot PR 'Closes #7' must resolve to same payload name as issue #7 QueuedEvent")
-	require.Equal(t, issueTaskName, qelAfterPR.Items[0].Spec.Payload.Name, "payload names must match so dedup fires")
-
-	dupCount := counterValue(t, reg, "operator_webhook_events_total",
-		map[string]string{"provider": "github", "kind": "mr", "action": "opened", "result": "duplicate"})
-	require.Equal(t, 1.0, dupCount)
-}
-
 // --- R2 Finding 2: Stopped+terminal task excluded from both find functions ---
 
 // TestR2Finding2_StoppedTerminalTask_ReactivatedOnComment verifies that a human
@@ -495,7 +354,7 @@ func TestR2Finding2_StoppedTerminalTask_ReactivatedOnComment(t *testing.T) {
 			},
 		},
 		Status: tatarav1.TaskStatus{
-			LifecycleState: "Stopped",
+			DeployState:    "Stopped",
 			Phase:          "Succeeded", // terminal phase -> excluded by old findLifecycleTask
 			DeadlineAt:     &dl,
 			LastActivityAt: &now,
@@ -522,7 +381,7 @@ func TestR2Finding2_StoppedTerminalTask_ReactivatedOnComment(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "r2f2-stopped-task"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState, "Stopped+Succeeded task must be reactivated to Triage")
+	require.Equal(t, "Triage", got.Status.DeployState, "Stopped+Succeeded task must be reactivated to Triage")
 }
 
 // --- R2 Finding 3: GitHub action is unnormalized in metric label ---
@@ -597,7 +456,7 @@ func TestR2Finding4_ReactivateTask_HappyPath_StillWorks(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "r2f4-task"}, &got))
-	require.Equal(t, "Triage", got.Status.LifecycleState, "reactivated task must be Triage")
+	require.Equal(t, "Triage", got.Status.DeployState, "reactivated task must be Triage")
 	require.Equal(t, "", got.Status.Phase, "Phase must be cleared")
 	require.Empty(t, got.Annotations[tatarav1.AnnCurrentTurn], "turn annotations must be cleared")
 }

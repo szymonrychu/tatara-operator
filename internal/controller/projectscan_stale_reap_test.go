@@ -25,7 +25,7 @@ const (
 func matchingTask(num int, lifecycleState string, prURL, headBranch string) tatarav1alpha1.Task {
 	t := tatarav1alpha1.Task{}
 	t.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "o/r#" + itoa(num), Number: num}
-	t.Status.LifecycleState = lifecycleState
+	t.Status.DeployState = lifecycleState
 	t.Status.PrURL = prURL
 	t.Status.HeadBranch = headBranch
 	return t

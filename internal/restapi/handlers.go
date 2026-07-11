@@ -25,6 +25,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/harness"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/titlecheck"
@@ -407,7 +408,7 @@ func (s *Server) inflightIncidentTask(ctx context.Context, project string) *tata
 			continue
 		}
 		// Incident tasks leave Phase empty for life and signal completion via
-		// LifecycleState; use the canonical terminal predicate (matches the
+		// DeployState; use the canonical terminal predicate (matches the
 		// dedup gate in internal/queue) so a parked/stopped incident is not
 		// mistaken for in-flight work.
 		if tatarav1alpha1.TaskTerminal(t) {
@@ -538,9 +539,53 @@ type issueCommentOnProjectReq struct {
 	Body   string `json:"body"`
 }
 
+// commentRefusedResp is the machine-readable body returned when the permission-
+// layer self-comment guard refuses a comment. Refused/Reason let the pod's skill
+// react (e.g. pick another action) rather than parsing a prose error.
+type commentRefusedResp struct {
+	Error   string `json:"error"`
+	Refused bool   `json:"refused"`
+	Reason  string `json:"reason"`
+}
+
+// callerKindForIssue resolves the task kind driving a comment_on_issue call on
+// (repo, number), for the PermitComment refine carve-out. Agent identity is shared
+// OIDC (see authorizeCaller), so the kind is inferred from in-flight work: a
+// non-terminal Task whose Source is exactly this issue owns it (its Kind wins);
+// otherwise a non-terminal refine Task in the project means the caller is the
+// project-scoped refiner (which grooms every open issue and carries no per-issue
+// Source). Returns "" when neither matches - the safe default (the guard then
+// applies, since only "refine" is exempt). The residual ambiguity (a brainstorm
+// commenting while a refine is also in flight) is the same shared-identity limit
+// documented on authorizeCaller and is bounded by the refine-vs-brainstorm barrier.
+func (s *Server) callerKindForIssue(ctx context.Context, projName, repoSlug string, number int) string {
+	var tasks tatarav1alpha1.TaskList
+	if err := s.c.List(ctx, &tasks, client.InNamespace(s.ns)); err != nil {
+		return ""
+	}
+	ref := fmt.Sprintf("%s#%d", repoSlug, number)
+	refineInFlight := false
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProjectRef != projName || tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		if t.Spec.Source != nil && !t.Spec.Source.IsPR && t.Spec.Source.IssueRef == ref {
+			return t.Spec.Kind
+		}
+		if t.Spec.Kind == "refine" {
+			refineInFlight = true
+		}
+	}
+	if refineInFlight {
+		return "refine"
+	}
+	return ""
+}
+
 // commentOnIssue posts a comment on a specific issue via the Project's SCM
 // provider and bot token. This is the egress-mediation path for the
-// comment_on_issue tool call from a brainstorm agent.
+// comment_on_issue tool call from a brainstorm or refine agent.
 //
 // Request body: { repo: "owner/repo", number: N, body: "..." }
 // Response:     200 { status: "ok" }
@@ -581,6 +626,7 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var matchedRepoURL string
+	var matchedRepo *tatarav1alpha1.Repository
 	for i := range repoList.Items {
 		if repoList.Items[i].Spec.ProjectRef != projName {
 			continue
@@ -591,6 +637,7 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 		}
 		if o+"/"+n == req.Repo {
 			matchedRepoURL = repoList.Items[i].Spec.URL
+			matchedRepo = &repoList.Items[i]
 			break
 		}
 	}
@@ -640,9 +687,13 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Hard-gate (cap 1): refuse a second bot comment on the same issue. Best-effort -
-	// empty BotLogin, no reader factory, or an SCM read error all fall open (post proceeds);
-	// the brainstorm prompt is the first line of defence, this is the authoritative backstop.
+	// Permission-layer self-comment guard (CROSS-REPO-CONTRACT): refuse the comment
+	// when the last comment on the thread is tatara(bot)-authored, so the bot never
+	// answers its own comment in a loop. The SOLE exception is the refine kind, which
+	// may answer tatara's own prior comment (encoded in controller.PermitComment).
+	// Best-effort: an empty BotLogin, no reader factory, or an SCM read error all fall
+	// open (post proceeds) - matching decideCommentGate, so a lost webhook stays
+	// recoverable by a later scan (never fail-closed on a read error).
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
@@ -651,21 +702,26 @@ func (s *Server) commentOnIssue(w http.ResponseWriter, r *http.Request) {
 		if reader, rerr := s.readerFor(provider, token); rerr == nil {
 			if owner, name, oerr := scm.OwnerRepo(matchedRepoURL); oerr == nil {
 				if comments, cerr := reader.ListIssueComments(r.Context(), owner, name, req.Number); cerr == nil {
-					for _, cm := range comments {
-						if cm.Author == botLogin {
-							if s.metrics != nil {
-								s.metrics.SCMWrite(provider, "comment", "blocked")
-							}
-							s.log.InfoContext(r.Context(), "restapi: commentOnIssue blocked",
-								append(reqLogFields(r),
-									"action", "scm_issue_comment_blocked",
-									"reason", "already_commented",
-									"project", projName,
-									"repo", req.Repo,
-									"number", req.Number)...)
-							writeError(w, http.StatusConflict, "bot already commented on this issue; pick another action")
-							return
+					kind := s.callerKindForIssue(r.Context(), projName, req.Repo, req.Number)
+					breakers := controller.CommentSilenceBreakers(&proj, matchedRepo)
+					if permit, reason := controller.PermitComment(kind, comments, botLogin, breakers); !permit {
+						if s.metrics != nil {
+							s.metrics.SCMWrite(provider, "comment", "blocked")
 						}
+						s.log.InfoContext(r.Context(), "restapi: commentOnIssue refused",
+							append(reqLogFields(r),
+								"action", "scm_issue_comment_blocked",
+								"reason", reason,
+								"kind", kind,
+								"project", projName,
+								"repo", req.Repo,
+								"number", req.Number)...)
+						writeJSON(w, http.StatusConflict, commentRefusedResp{
+							Error:   "comment refused: tatara has the last word on this thread; wait for a human reply before commenting again",
+							Refused: true,
+							Reason:  reason,
+						})
+						return
 					}
 				}
 			}
@@ -883,8 +939,8 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		metricName: "issue_outcome",
 		logMsg:     "restapi: issueOutcome",
 		logAction:  "issue_outcome",
-		kindOK:     func(kind string) bool { return kind == "triageIssue" || kind == "issueLifecycle" },
-		kindErrMsg: "issue outcome only applies to a triageIssue or issueLifecycle task",
+		kindOK:     func(kind string) bool { return kind == "clarify" || kind == "triageIssue" || kind == "issueLifecycle" },
+		kindErrMsg: "issue outcome only applies to a clarify, triageIssue or issueLifecycle task",
 		mutate: func(t *tatarav1alpha1.Task) {
 			t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment, Plan: req.Plan}
 		},
@@ -925,8 +981,8 @@ func (s *Server) implementOutcome(w http.ResponseWriter, r *http.Request) {
 		metricName: "implement_outcome",
 		logMsg:     "restapi: implementOutcome",
 		logAction:  "implement_outcome",
-		kindOK:     func(kind string) bool { return kind == "issueLifecycle" },
-		kindErrMsg: "implement outcome only applies to an issueLifecycle task",
+		kindOK:     func(kind string) bool { return kind == "implement" || kind == "issueLifecycle" },
+		kindErrMsg: "implement outcome only applies to an implement or issueLifecycle task",
 		mutate: func(t *tatarav1alpha1.Task) {
 			t.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{Action: req.Action, Reason: req.Reason}
 		},

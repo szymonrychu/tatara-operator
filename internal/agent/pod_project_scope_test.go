@@ -113,7 +113,9 @@ func TestBuildPod_nilRepo_stillSetsOtherEnvs(t *testing.T) {
 
 	model, ok := envValue(c, "MODEL")
 	require.True(t, ok)
-	require.Equal(t, "claude-x", model)
+	// brainstorm carries a locked per-kind model tier (kindDefaultModel=opus)
+	// that overrides the project-wide Agent.Model, matching documentation's lock.
+	require.Equal(t, "claude-opus-4-8", model)
 
 	proj2, ok2 := envValue(c, "TATARA_PROJECT")
 	require.True(t, ok2)

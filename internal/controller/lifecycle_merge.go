@@ -56,14 +56,14 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 
 	// Idempotency: if the PR is already merged (MergeCommitSHA already set on the
 	// task), skip straight to MainCI without calling Merge again. This handles the
-	// case where setLifecycleState("MainCI") failed after a successful Merge on a
+	// case where setDeployState("MainCI") failed after a successful Merge on a
 	// prior reconcile, which would otherwise re-merge -> 405 -> bogus conflict path.
 	if task.Status.MergeCommitSHA != "" {
 		// PR was merged in a prior reconcile; advance to MainCI directly.
 		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "MainCI", "already-merged"); err != nil {
+		if err := r.setDeployState(ctx, task, "MainCI", "already-merged"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -102,8 +102,11 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	// egress so every lifecycle-merged change rides the cascade.
 	r.ensureSemverLabelBeforeMerge(ctx, project, repo, writer, token, provider, number, task.Status.ChangeSummary)
 
-	// Attempt merge.
-	sha, mergeErr := writer.Merge(ctx, repo.Spec.URL, token, number, "squash")
+	// Attempt merge via the shared egress (the sole writer.Merge call site;
+	// superviseApprovedPRs is the other caller). The issueLifecycle drain keeps its
+	// existing gate (mergeAllowed) here; the review-approved path gates on green +
+	// tatara-approved in superviseApprovedPRs.
+	sha, mergeErr := mergePRSquash(ctx, writer, repo.Spec.URL, token, number)
 	r.recordSCM(provider, "merge", mergeErr)
 	if mergeErr == nil {
 		// Success: record SHA and advance.
@@ -138,7 +141,7 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "MainCI", "merged"); err != nil {
+		if err := r.setDeployState(ctx, task, "MainCI", "merged"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -170,7 +173,7 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
 			return ctrl.Result{}, fmt.Errorf("merge: mark handover resume: %w", err)
 		}
-		if err := r.setLifecycleState(ctx, task, "Implement", "merge-conflict"); err != nil {
+		if err := r.setDeployState(ctx, task, "Implement", "merge-conflict"); err != nil {
 			return ctrl.Result{}, fmt.Errorf("merge: set implement state: %w", err)
 		}
 		log.FromContext(ctx).Info("merge: conflict escalated to merge-not-rebase resolve-or-close",

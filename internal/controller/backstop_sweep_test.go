@@ -66,7 +66,7 @@ func makeStrandedTask(t *testing.T, projName, repoName string, prNumber, issueNu
 	// must treat this as not-live via an actual pod Get, not short-circuit on
 	// PodName presence, and must EXCLUDE itself from priorTerminalAttempts.
 	task.Status.PodName = agent.PodName(task)
-	task.Status.LifecycleState = "Parked"
+	task.Status.DeployState = "Parked"
 	task.Status.ParkReason = "BootCrashLoop"
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("status update stranded task: %v", err)
@@ -102,7 +102,7 @@ func TestBackstopSweep_ReactivatesStrandedTask(t *testing.T) {
 		Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#50", Number: 50, IsPR: true},
 	}
 	require.NoError(t, k8sClient.Create(context.Background(), priorTask))
-	priorTask.Status.LifecycleState = "Parked"
+	priorTask.Status.DeployState = "Parked"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), priorTask))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), priorTask) })
 
@@ -149,7 +149,7 @@ func TestBackstopSweep_ExhaustedClosePR(t *testing.T) {
 			Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#51", Number: 51, IsPR: true},
 		}
 		require.NoError(t, k8sClient.Create(context.Background(), pt))
-		pt.Status.LifecycleState = "Parked"
+		pt.Status.DeployState = "Parked"
 		require.NoError(t, k8sClient.Status().Update(context.Background(), pt))
 		t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), pt) })
 	}
@@ -305,7 +305,7 @@ func TestRunScans_BackstopSweepFiredAfterIssueScan(t *testing.T) {
 			Role: tatarav1alpha1.RoleOpenedPR, State: tatarav1alpha1.WIOpen, HeadSHA: "sha3"},
 	}
 	strandedTask.Status.PodName = agent.PodName(strandedTask)
-	strandedTask.Status.LifecycleState = "Parked"
+	strandedTask.Status.DeployState = "Parked"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), strandedTask))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), strandedTask) })
 

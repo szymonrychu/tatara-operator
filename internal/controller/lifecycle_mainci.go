@@ -113,7 +113,7 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 				} else {
 					r.recordSCM(provider, "close_issue", nil)
 					// Log the merge-driven close as a distinct business action (finding 8:
-					// the generic lifecycle_transition log from setLifecycleState fires but
+					// the generic lifecycle_transition log from setDeployState fires but
 					// does not distinguish issue-closed-on-merge from other Done transitions).
 					log.FromContext(ctx).Info("mainci: issue closed on merge",
 						"action", "scm_issue_closed_on_merge",
@@ -134,7 +134,7 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 			closeSourceIssueLedger(fresh2)
 			return r.Status().Update(ctx, fresh2)
 		})
-		if err := r.setLifecycleState(ctx, task, "Done", "mainci-success"); err != nil {
+		if err := r.setDeployState(ctx, task, "Done", "mainci-success"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {
@@ -161,7 +161,7 @@ func (r *TaskReconciler) handleMainCI(ctx context.Context, project *tatarav1alph
 		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "Implement", "mainci-failure"); err != nil {
+		if err := r.setDeployState(ctx, task, "Implement", "mainci-failure"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil

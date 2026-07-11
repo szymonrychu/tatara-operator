@@ -111,7 +111,7 @@ func TestReapOrphans_TerminalLifecycle(t *testing.T) {
 	mkTaskRepository(t, "r-reap-lc", "p-reap-lc")
 	mkTask(t, "t-reap-lc", "p-reap-lc", "r-reap-lc")
 	tk := getTask(t, "t-reap-lc")
-	tk.Status.LifecycleState = "Done"
+	tk.Status.DeployState = "Done"
 	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
 		t.Fatalf("set lifecycle: %v", err)
 	}

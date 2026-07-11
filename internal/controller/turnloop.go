@@ -192,6 +192,8 @@ func requiredSkillsForKind(kind string) []string {
 		return []string{"tatara-implement-workflow", "test-driven-development"}
 	case "review":
 		return []string{"tatara-review-checklist"}
+	case "clarify":
+		return []string{"tatara-clarify-conversation"}
 	case "triageIssue":
 		return []string{"tatara-triage-judgment"}
 	case "brainstorm":
@@ -210,7 +212,7 @@ func requiredSkillsForKind(kind string) []string {
 // isReferenceKind reports whether kind uses advisory "Consult" wording (REFERENCE
 // skills per Phase-2 contract) rather than mandatory "Required/Invoke" wording.
 func isReferenceKind(kind string) bool {
-	return kind == "brainstorm" || kind == "triageIssue"
+	return kind == "brainstorm" || kind == "triageIssue" || kind == "clarify"
 }
 
 // skillsDirective builds the required-skills line for the given kind. Returns ""

@@ -125,7 +125,7 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "Merge", "mrci-success"); err != nil {
+		if err := r.setDeployState(ctx, task, "Merge", "mrci-success"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.Metrics != nil {
@@ -145,7 +145,7 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		if err := r.maybeMarkHandoverResume(ctx, project, task); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "Implement", "mrci-failure"); err != nil {
+		if err := r.setDeployState(ctx, task, "Implement", "mrci-failure"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.Metrics != nil {
@@ -158,7 +158,7 @@ func (r *TaskReconciler) handleMRCI(ctx context.Context, project *tatarav1alpha1
 		if err := r.clearDeadline(ctx, task); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "Merge", "mrci-no-ci"); err != nil {
+		if err := r.setDeployState(ctx, task, "Merge", "mrci-no-ci"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil

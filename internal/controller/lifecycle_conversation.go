@@ -111,14 +111,14 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatara
 	} else {
 		switch state {
 		case tatarav1alpha1.WIApproved:
-			if err := r.setLifecycleState(ctx, task, "Implement", "human-approved"); err != nil {
+			if err := r.setDeployState(ctx, task, "Implement", "human-approved"); err != nil {
 				return ctrl.Result{}, fmt.Errorf("conversation: approve readback to implement: %w", err)
 			}
 			l.Info("conversation: human-approved proposal; driving implementation",
 				"action", "conversation_label_approved", "resource_id", task.Name)
 			return ctrl.Result{}, nil
 		case tatarav1alpha1.WIDeclined:
-			if err := r.setLifecycleState(ctx, task, "Parked", "human-declined"); err != nil {
+			if err := r.setDeployState(ctx, task, "Parked", "human-declined"); err != nil {
 				return ctrl.Result{}, fmt.Errorf("conversation: decline readback to park: %w", err)
 			}
 			l.Info("conversation: human-declined proposal; parking",
@@ -163,7 +163,7 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatara
 				"pending", len(task.Status.PendingInterjections))
 			return ctrl.Result{RequeueAfter: pollRequeue}, nil
 		}
-		if err := r.setLifecycleState(ctx, task, "Stopped", "idle"); err != nil {
+		if err := r.setDeployState(ctx, task, "Stopped", "idle"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {

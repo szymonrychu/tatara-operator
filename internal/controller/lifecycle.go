@@ -215,7 +215,7 @@ func (r *TaskReconciler) parkWithComment(ctx context.Context, task *tatarav1alph
 			}
 		}
 	}
-	return r.setLifecycleState(ctx, task, "Parked", reason)
+	return r.setDeployState(ctx, task, "Parked", reason)
 }
 
 // parkOnDeadline posts msg as a park comment and records the deadline giveup metric.
@@ -234,14 +234,14 @@ func (r *TaskReconciler) parkOnDeadline(ctx context.Context, task *tatarav1alpha
 
 // deleteWrapper best-effort deletes the wrapper Pod and Service for a task.
 // Idempotent: a missing object is not an error. Used by terminate (terminal
-// phase), resetAgentRun (re-spawn), and setLifecycleState (terminal lifecycle).
+// phase), resetAgentRun (re-spawn), and setDeployState (terminal lifecycle).
 // Thin receiver-bound wrapper over the shared agent.DeleteWrapper so the
 // webhook server (different receiver type) can reuse the same teardown.
 func (r *TaskReconciler) deleteWrapper(ctx context.Context, task *tatarav1alpha1.Task) error {
 	return agent.DeleteWrapper(ctx, r.Client, task.Namespace, task)
 }
 
-// setLifecycleState updates task.Status.LifecycleState to `to`, retrying on
+// setDeployState updates task.Status.DeployState to `to`, retrying on
 // conflict (same pattern as clearWritebackPending). It logs the transition at
 // INFO and increments tatara_lifecycle_transition_total{from,to}. On a
 // transition into a terminal lifecycle state (Done/Stopped/Parked) it also
@@ -268,10 +268,10 @@ func terminalOutcome(to, reason string, implementGiveUps int) string {
 	}
 }
 
-func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1alpha1.Task, to, reason string) error {
+func (r *TaskReconciler) setDeployState(ctx context.Context, task *tatarav1alpha1.Task, to, reason string) error {
 	l := log.FromContext(ctx)
 	// `from` is always overwritten inside the closure (finding 13: the outer
-	// task.Status.LifecycleState initializer was dead code since RetryOnConflict
+	// task.Status.DeployState initializer was dead code since RetryOnConflict
 	// always runs the closure at least once and sets `from = fresh.Status...`).
 	var from string
 	// Captured from the fresh Task inside the closure for the terminal-tokens
@@ -286,8 +286,8 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
 		}
-		from = fresh.Status.LifecycleState
-		fresh.Status.LifecycleState = to
+		from = fresh.Status.DeployState
+		fresh.Status.DeployState = to
 		if from == "Implement" && to == "Parked" && tatarav1alpha1.IsRecoverableGiveup(reason) {
 			fresh.Status.ImplementGiveUps++
 		}
@@ -321,14 +321,14 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		giveUps = fresh.Status.ImplementGiveUps
 		return nil
 	}); err != nil {
-		return fmt.Errorf("setLifecycleState: %w", err)
+		return fmt.Errorf("setDeployState: %w", err)
 	}
 
 	// Emit the task's whole cumulative spend to operator_task_terminal_tokens_total
 	// once, on the transition INTO a terminal lifecycle state. Reading the
 	// closure-captured cumulatives (not task.Status) avoids a stale in-memory
 	// snapshot; guarding on !isLifecycleTerminal(from) prevents a double-emit
-	// when setLifecycleState is re-called with an already-terminal `from`.
+	// when setDeployState is re-called with an already-terminal `from`.
 	if r.Metrics != nil && !isLifecycleTerminal(from) && isLifecycleTerminal(to) {
 		r.Metrics.AddTerminalTokens(task.Spec.ProjectRef, task.Spec.RepositoryRef,
 			terminalOutcome(to, reason, giveUps), stampedModel,
@@ -370,7 +370,7 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 			return r.Update(ctx, fresh2)
 		}); err != nil {
 			// Non-fatal: log and continue. The state transition itself already succeeded.
-			log.FromContext(ctx).Error(err, "setLifecycleState: clear boot-crash annotations (non-fatal)",
+			log.FromContext(ctx).Error(err, "setDeployState: clear boot-crash annotations (non-fatal)",
 				"resource_id", task.Name, "to", to)
 		}
 	}
@@ -387,12 +387,12 @@ func (r *TaskReconciler) setLifecycleState(ctx context.Context, task *tatarav1al
 		r.LifecycleMetrics.RecordTransition(from, to)
 		// The tatara_lifecycle_state gauge is NOT maintained by deltas here: it is
 		// recomputed from authoritative cluster state by
-		// ProjectReconciler.updateLifecycleStateCounts. Delta maintenance drifted on
+		// ProjectReconciler.updateDeployStateCounts. Delta maintenance drifted on
 		// restart (from-series went negative) and never decremented GC'd terminal
 		// Tasks; the periodic list-and-Set is the single source of truth.
 	}
 
-	task.Status.LifecycleState = to
+	task.Status.DeployState = to
 
 	// Terminal lifecycle states have no further agent run: tear down the wrapper
 	// Pod+Service so idle sessions do not leak CPU/mem + a work PVC. Best-effort;
@@ -511,6 +511,86 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		return ctrl.Result{}, fmt.Errorf("lifecycle: get project: %w", err)
 	}
 
+	// Drain agent-queued comments + webhook-queued interjections to the live
+	// session before dispatching to a state handler. Shared with reconcileClarify.
+	if handled, res, err := r.drainLifecycleQueues(ctx, task); handled {
+		return res, err
+	}
+
+	// Memory gate: apply only when about to spawn a new agent run.
+	if needsSpawn(task.Status.DeployState, task.Status.Phase) {
+		if !memoryStablyReady(&project, time.Now()) {
+			l.Info("lifecycle task gated: project memory not stably ready",
+				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
+			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
+		}
+	}
+
+	// dispatchLifecycle runs the per-state handler and stamps the reconcile metric
+	// exactly once, collapsing 6 identical error/success wrapping blocks (finding 14).
+	dispatchLifecycle := func(h func() (ctrl.Result, error)) (ctrl.Result, error) {
+		res, err := h()
+		if err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
+	}
+
+	switch task.Status.DeployState {
+	case "":
+		// First reconcile: initialize from the lifecycle-entry annotation set at
+		// create time by the binder/mrScan; default to Triage when absent.
+		entry := task.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
+		if entry == "" {
+			entry = "Triage"
+		}
+		if err := r.setDeployState(ctx, task, entry, "initial"); err != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, err
+		}
+		if entry == "Triage" {
+			if err := r.ensurePhaseLabel(ctx, &project, task, "brainstorming"); err != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, err
+			}
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+	case "Triage":
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleTriage(ctx, &project, task) })
+	case "Implement":
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleImplement(ctx, &project, task) })
+	case "Conversation":
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleConversation(ctx, &project, task) })
+	case "MRCI":
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMRCI(ctx, &project, task) })
+	case "Merge":
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMerge(ctx, &project, task) })
+	case "MainCI":
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMainCI(ctx, &project, task) })
+	case tatarav1alpha1.DeployStateDeploying:
+		return dispatchLifecycle(func() (ctrl.Result, error) { return r.reconcileDeploying(ctx, &project, task) })
+	case "Done", "Stopped", "Parked":
+		r.Metrics.ReconcileResult("Task", "success")
+		return ctrl.Result{}, nil
+	default:
+		r.Metrics.ReconcileResult("Task", "error")
+		return ctrl.Result{}, fmt.Errorf("lifecycle: unknown lifecycleState %q for task %s", task.Status.DeployState, task.Name)
+	}
+}
+
+// drainLifecycleQueues posts any agent-queued free-form comments and delivers
+// any webhook-queued interjections to the live wrapper session, before a
+// front-half state handler runs. It is shared by reconcileLifecycle and
+// reconcileClarify. When it takes over the reconcile it stamps the reconcile
+// metric itself and returns handled=true with the result/error the caller must
+// return verbatim; handled=false means neither queue had work and the caller
+// proceeds to dispatch.
+func (r *TaskReconciler) drainLifecycleQueues(ctx context.Context, task *tatarav1alpha1.Task) (bool, ctrl.Result, error) {
+	l := log.FromContext(ctx)
+
 	// Drain agent-queued free-form comments (from the comment MCP tool) to the
 	// linked issue before anything else, then clear and requeue. Comments are
 	// posted in order; each posted comment is dequeued under RetryOnConflict
@@ -526,7 +606,7 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		_, _, writer, token, provider, err := r.scmContext(ctx, task)
 		if err != nil {
 			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, fmt.Errorf("lifecycle drain comments: %w", err)
+			return true, ctrl.Result{}, fmt.Errorf("lifecycle drain comments: %w", err)
 		}
 		posted := 0
 		var postErr error
@@ -565,18 +645,18 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 				return r.Status().Update(ctx, &fresh)
 			}); err != nil {
 				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, fmt.Errorf("lifecycle clear comments: %w", err)
+				return true, ctrl.Result{}, fmt.Errorf("lifecycle clear comments: %w", err)
 			}
 		}
 		if postErr != nil {
 			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, fmt.Errorf("lifecycle drain comment: %w", postErr)
+			return true, ctrl.Result{}, fmt.Errorf("lifecycle drain comment: %w", postErr)
 		}
 		// Record success metric before returning; finding 2: drain success was invisible
 		// to the reconcile success counter. Use RequeueAfter to avoid busy-loop when
 		// comments are continuously appended (finding 18).
 		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+		return true, ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
 	// Drain webhook-queued interjections into the live wrapper session: new
@@ -590,14 +670,14 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		if !taskHasInflightTurn(task) {
 			if err := r.clearPendingInterjections(ctx, task, len(task.Status.PendingInterjections)); err != nil {
 				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, fmt.Errorf("lifecycle drop stale interjections: %w", err)
+				return true, ctrl.Result{}, fmt.Errorf("lifecycle drop stale interjections: %w", err)
 			}
 			l.Info("lifecycle: dropped stale interjections (no in-flight turn)",
 				"action", "interject_stale", "resource_id", task.Name)
 			// Record success before returning (finding 2). RequeueAfter avoids busy-loop
 			// when items are continuously appended (finding 18).
 			r.Metrics.ReconcileResult("Task", "success")
-			return ctrl.Result{RequeueAfter: pollRequeue}, nil
+			return true, ctrl.Result{RequeueAfter: pollRequeue}, nil
 		}
 		baseURL := agent.BaseURL(task, task.Namespace)
 		total := len(task.Status.PendingInterjections)
@@ -611,7 +691,7 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 					// Pod/turn server still booting: keep the queue intact, retry soon.
 					l.Info("lifecycle: interject unreachable; keeping queue",
 						"action", "interject_retry", "resource_id", task.Name)
-					return ctrl.Result{RequeueAfter: pollRequeue}, nil
+					return true, ctrl.Result{RequeueAfter: pollRequeue}, nil
 				}
 				deliverErr = ierr
 				l.Error(ierr, "lifecycle: interject failed", "resource_id", task.Name)
@@ -624,81 +704,20 @@ func (r *TaskReconciler) reconcileLifecycle(ctx context.Context, task *tatarav1a
 		if delivered > 0 {
 			if err := r.clearPendingInterjections(ctx, task, delivered); err != nil {
 				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, fmt.Errorf("lifecycle clear interjections: %w", err)
+				return true, ctrl.Result{}, fmt.Errorf("lifecycle clear interjections: %w", err)
 			}
 		}
 		if deliverErr != nil || delivered < total {
 			// Interjections remain after a delivery error: back off, retry later.
-			return ctrl.Result{RequeueAfter: pollRequeue}, nil
+			return true, ctrl.Result{RequeueAfter: pollRequeue}, nil
 		}
 		// Record success before returning (finding 2). RequeueAfter avoids busy-loop
 		// when items are continuously appended (finding 18).
 		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{RequeueAfter: pollRequeue}, nil
+		return true, ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}
 
-	// Memory gate: apply only when about to spawn a new agent run.
-	if needsSpawn(task.Status.LifecycleState, task.Status.Phase) {
-		if !memoryStablyReady(&project, time.Now()) {
-			l.Info("lifecycle task gated: project memory not stably ready",
-				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
-			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
-		}
-	}
-
-	// dispatchLifecycle runs the per-state handler and stamps the reconcile metric
-	// exactly once, collapsing 6 identical error/success wrapping blocks (finding 14).
-	dispatchLifecycle := func(h func() (ctrl.Result, error)) (ctrl.Result, error) {
-		res, err := h()
-		if err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return res, nil
-	}
-
-	switch task.Status.LifecycleState {
-	case "":
-		// First reconcile: initialize from the lifecycle-entry annotation set at
-		// create time by the binder/mrScan; default to Triage when absent.
-		entry := task.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
-		if entry == "" {
-			entry = "Triage"
-		}
-		if err := r.setLifecycleState(ctx, task, entry, "initial"); err != nil {
-			r.Metrics.ReconcileResult("Task", "error")
-			return ctrl.Result{}, err
-		}
-		if entry == "Triage" {
-			if err := r.ensurePhaseLabel(ctx, &project, task, "brainstorming"); err != nil {
-				r.Metrics.ReconcileResult("Task", "error")
-				return ctrl.Result{}, err
-			}
-		}
-		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{RequeueAfter: pollRequeue}, nil
-	case "Triage":
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleTriage(ctx, &project, task) })
-	case "Implement":
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleImplement(ctx, &project, task) })
-	case "Conversation":
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleConversation(ctx, &project, task) })
-	case "MRCI":
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMRCI(ctx, &project, task) })
-	case "Merge":
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMerge(ctx, &project, task) })
-	case "MainCI":
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.handleMainCI(ctx, &project, task) })
-	case tatarav1alpha1.LifecycleStateDeploying:
-		return dispatchLifecycle(func() (ctrl.Result, error) { return r.reconcileDeploying(ctx, &project, task) })
-	case "Done", "Stopped", "Parked":
-		r.Metrics.ReconcileResult("Task", "success")
-		return ctrl.Result{}, nil
-	default:
-		r.Metrics.ReconcileResult("Task", "error")
-		return ctrl.Result{}, fmt.Errorf("lifecycle: unknown lifecycleState %q for task %s", task.Status.LifecycleState, task.Name)
-	}
+	return false, ctrl.Result{}, nil
 }
 
 // repoURLForTask fetches the Repository URL for the task's RepositoryRef.
@@ -782,6 +801,14 @@ func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav
 	if project.Spec.Scm != nil && project.Spec.Scm.ConversationIdleMinutes > 0 {
 		idleMinutes = project.Spec.Scm.ConversationIdleMinutes
 	}
+	// clarify runs a live opus pod during discuss; its wait window is a fixed
+	// wall-clock kill (clarifyDiscussTimeoutMinutes), decoupled from the project idle
+	// config, so an aggressive per-project idle setting cannot shorten (nor a generous
+	// one lengthen) the clarify pod's expensive live wait. handleClarifyConversation
+	// enforces the kill at this deadline.
+	if task.Spec.Kind == "clarify" {
+		idleMinutes = clarifyDiscussTimeoutMinutes
+	}
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
@@ -795,7 +822,7 @@ func (r *TaskReconciler) enterConversation(ctx context.Context, project *tatarav
 	}); err != nil {
 		return fmt.Errorf("enter conversation: set deadline: %w", err)
 	}
-	return r.setLifecycleState(ctx, task, "Conversation", reason)
+	return r.setDeployState(ctx, task, "Conversation", reason)
 }
 
 // hasUnmergedChange reports whether the task produced a code artifact (a pushed

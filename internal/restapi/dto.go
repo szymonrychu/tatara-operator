@@ -80,7 +80,7 @@ type taskStatusDTO struct {
 	Handover          string                            `json:"handover,omitempty"`
 	Conditions        []metav1.Condition                `json:"conditions,omitempty"`
 	PendingComments   []string                          `json:"pendingComments,omitempty"`
-	LifecycleState    string                            `json:"lifecycleState,omitempty"`
+	DeployState       string                            `json:"lifecycleState,omitempty"`
 	ParkReason        string                            `json:"parkReason,omitempty"`
 	ImplementGiveUps  int                               `json:"implementGiveUps,omitempty"`
 }
@@ -162,7 +162,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			ChangeSummary:     task.Status.ChangeSummary,
 			Handover:          task.Status.Handover,
 			PendingComments:   task.Status.PendingComments,
-			LifecycleState:    task.Status.LifecycleState,
+			DeployState:       task.Status.DeployState,
 			ParkReason:        task.Status.ParkReason,
 			ImplementGiveUps:  task.Status.ImplementGiveUps,
 		},

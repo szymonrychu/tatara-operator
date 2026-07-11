@@ -92,12 +92,12 @@ func mkConvTask(t *testing.T, name, kind, convKey, forkKey string, terminal bool
 	task.Status.LastActivityAt = &old
 	if terminal {
 		if kind == "issueLifecycle" {
-			task.Status.LifecycleState = "Done"
+			task.Status.DeployState = "Done"
 		} else {
 			task.Status.Phase = "Succeeded"
 		}
 	} else {
-		task.Status.LifecycleState = "Triage"
+		task.Status.DeployState = "Triage"
 		task.Status.Phase = "Running"
 	}
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))

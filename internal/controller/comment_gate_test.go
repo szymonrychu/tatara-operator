@@ -99,3 +99,33 @@ func TestDecideCommentGate_FailOpenNilReader(t *testing.T) {
 		t.Fatalf("nil reader must fail open, got %q", got)
 	}
 }
+
+func TestPermitComment(t *testing.T) {
+	const bot = "tatara-bot"
+	botLast := []scm.IssueComment{tc("human", 5), tc(bot, 10)}
+	humanLast := []scm.IssueComment{tc(bot, 5), tc("human", 10)}
+	tests := []struct {
+		name       string
+		kind       string
+		comments   []scm.IssueComment
+		botLogin   string
+		wantPermit bool
+		wantReason string
+	}{
+		{"non-refine refused under bot last word", "implement", botLast, bot, false, "bot_last_word"},
+		{"clarify cannot answer its own comment", "clarify", botLast, bot, false, "bot_last_word"},
+		{"review refused under bot last word", "review", botLast, bot, false, "bot_last_word"},
+		{"refine may answer bot last word", "refine", botLast, bot, true, ""},
+		{"non-refine permitted when human has last word", "implement", humanLast, bot, true, ""},
+		{"refine permitted when human has last word", "refine", humanLast, bot, true, ""},
+		{"fail open on empty bot login", "implement", botLast, "", true, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			permit, reason := PermitComment(tt.kind, tt.comments, tt.botLogin, nil)
+			if permit != tt.wantPermit || reason != tt.wantReason {
+				t.Fatalf("PermitComment(%q)=(%v,%q), want (%v,%q)", tt.kind, permit, reason, tt.wantPermit, tt.wantReason)
+			}
+		})
+	}
+}

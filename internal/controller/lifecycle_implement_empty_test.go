@@ -59,7 +59,7 @@ func seedEmptyImplementTask(t *testing.T, name, proj, repo, sec string, retries 
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementEmptyRetries = retries
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -95,15 +95,15 @@ func reconcileEmptyImplementTask(t *testing.T, name string, fw *noChangeRecordin
 }
 
 // TestFinishImplement_EmptyRun_FirstRetry: counter 0 -> retry (counter==1,
-// ImplementContext set, LifecycleState still Implement, Phase=="").
+// ImplementContext set, DeployState still Implement, Phase=="").
 func TestFinishImplement_EmptyRun_FirstRetry(t *testing.T) {
 	name := "lc-empty-retry-first"
 	_, fw := seedEmptyImplementTask(t, name, "lc-erp-first", "lc-err-first", "lc-ers-first", 0)
 
 	got := reconcileEmptyImplementTask(t, name, fw)
 
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement (should still be in Implement, retrying)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement (should still be in Implement, retrying)", got.Status.DeployState)
 	}
 	if got.Status.Phase != "" {
 		t.Errorf("Phase = %q, want empty (resetAgentRun clears phase for re-spawn)", got.Status.Phase)
@@ -126,15 +126,15 @@ func TestFinishImplement_EmptyRun_FirstRetry(t *testing.T) {
 }
 
 // TestFinishImplement_EmptyRun_ParksAtCap: counter pre-set to 2 (==cap) ->
-// LifecycleState==Parked, comment posted containing "no change".
+// DeployState==Parked, comment posted containing "no change".
 func TestFinishImplement_EmptyRun_ParksAtCap(t *testing.T) {
 	name := "lc-empty-retry-cap"
 	_, fw := seedEmptyImplementTask(t, name, "lc-erp-cap", "lc-err-cap", "lc-ers-cap", 2)
 
 	got := reconcileEmptyImplementTask(t, name, fw)
 
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (at cap)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (at cap)", got.Status.DeployState)
 	}
 
 	bodies := fw.commentBodies("o/r#200")
@@ -159,7 +159,7 @@ func TestFinishImplement_PROpened_ResetsCounter(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementEmptyRetries = 1
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -221,10 +221,10 @@ func TestFinishImplement_AtCap_DoesNotEchoResultSummary(t *testing.T) {
 	}
 }
 
-// TestSetLifecycleState_EntersImplement_ResetsEmptyRetries: a fresh entry into
+// TestSetDeployState_EntersImplement_ResetsEmptyRetries: a fresh entry into
 // Implement (e.g. a human reviving a Parked task) resets the empty-run retry
 // budget so the revived task gets a fresh set of attempts.
-func TestSetLifecycleState_EntersImplement_ResetsEmptyRetries(t *testing.T) {
+func TestSetDeployState_EntersImplement_ResetsEmptyRetries(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-setstate-reset"
 	src := &tatarav1alpha1.TaskSource{
@@ -232,15 +232,15 @@ func TestSetLifecycleState_EntersImplement_ResetsEmptyRetries(t *testing.T) {
 		URL: "https://github.com/o/r/issues/203", Number: 203,
 	}
 	task := seedLifecycleTask(t, name, "lc-ssr-p", "lc-ssr-r", "lc-ssr-s", src)
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.ImplementEmptyRetries = 2
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
 	r := newLifecycleReconciler(t, nil)
-	if err := r.setLifecycleState(ctx, task, "Implement", "test-entry"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, task, "Implement", "test-entry"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 
 	got := &tatarav1alpha1.Task{}

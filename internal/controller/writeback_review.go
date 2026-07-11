@@ -34,20 +34,50 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 	if v == nil || task.Spec.Source == nil {
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "NoVerdict", "review task without a verdict")
 	}
-	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
+	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	_, approvedLabel, implementationLabel, _ := lifecycleLabels(proj.Spec.Scm)
 	number := task.Spec.Source.Number
 	var verbSent bool
-	switch v.Decision {
+
+	// Phase 6: an approve verdict is withheld when the PR is not mergeable (a
+	// conflict or a mergeable-blocked state such as failing required checks).
+	// Instead of approving, the stream routes back to implement via the managed
+	// tatara-implementation label - the same terminal effect as request_changes.
+	// Fail-open on a merge-state read error: a transient read must not block a
+	// genuine approval (the deploy supervisor re-checks mergeability at merge time).
+	decision := v.Decision
+	if decision == "approve" {
+		if ms, mserr := writer.GetMergeState(ctx, repo.Spec.URL, token, number); mserr == nil &&
+			(ms == scm.MergeStateDirty || ms == scm.MergeStateBlocked) {
+			l.Info("review: approval withheld; PR unmergeable, routing back to implement",
+				"action", "scm_review_unmergeable", "resource_id", task.Name, "pr", number, "merge_state", string(ms))
+			decision = "unmergeable"
+		}
+	}
+
+	switch decision {
 	case "approve":
+		// Approve applies the native PR approval AND the tatara-approved managed
+		// label. It NEVER merges: the deploy supervisor is the sole merge caller,
+		// gated on green + tatara-approved (CROSS-REPO-CONTRACT handoff transitions).
 		err = writer.Approve(ctx, repo.Spec.URL, token, number, v.Body)
 		r.recordSCM(provider, "approve", err)
 		verbSent = err == nil
 		if err == nil {
+			r.applyReviewLabel(ctx, &proj, task, approvedLabel)
 			r.recordReviewQuality(task, "approved", len(v.Suggestions))
 		}
+	case "unmergeable":
+		// No PR-review verb: withhold approval and re-add tatara-implementation to
+		// route the stream back to implement. This is the only egress action here,
+		// so its error propagates for a requeue (the label add is idempotent).
+		if lerr := r.setLifecycleLabel(ctx, &proj, task, implementationLabel); lerr != nil {
+			return ctrl.Result{}, fmt.Errorf("writeback review unmergeable relabel: %w", lerr)
+		}
+		r.recordReviewQuality(task, "unmergeable", len(v.Suggestions))
 	case "request_changes":
 		err = writer.RequestChanges(ctx, repo.Spec.URL, token, number, v.Body)
 		r.recordSCM(provider, "request_changes", err)
@@ -57,6 +87,8 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 			r.recordSCM(provider, "suggest", serr)
 		}
 		if err == nil {
+			// request_changes re-adds tatara-implementation (routes back to implement).
+			r.applyReviewLabel(ctx, &proj, task, implementationLabel)
 			r.recordReviewQuality(task, "changes_requested", len(v.Suggestions))
 		}
 	case "comment":
@@ -99,6 +131,19 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 	}
 	l.Info("review verdict posted", "action", "scm_review", "resource_id", task.Name, "decision", v.Decision)
 	return ctrl.Result{}, r.clearWritebackPending(ctx, task, "Reviewed", "review verdict posted: "+v.Decision)
+}
+
+// applyReviewLabel sets the given managed phase label on the review Task's PR via
+// setLifecycleLabel (preserving the exactly-one-of-4-managed-labels invariant). It
+// is best-effort: the native review verb (Approve/RequestChanges) has already
+// landed, so a label failure is logged non-fatally rather than re-sending the
+// non-idempotent verb on a requeue. The unmergeable path, which sends NO verb,
+// calls setLifecycleLabel directly so its error can propagate.
+func (r *TaskReconciler) applyReviewLabel(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, label string) {
+	if lerr := r.setLifecycleLabel(ctx, proj, task, label); lerr != nil {
+		log.FromContext(ctx).Error(lerr, "review: apply managed label (non-fatal)",
+			"action", "scm_review_label", "resource_id", task.Name, "label", label)
+	}
 }
 
 func toSCMSuggestions(in []tatarav1alpha1.Suggestion) []scm.Suggestion {

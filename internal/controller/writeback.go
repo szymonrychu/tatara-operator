@@ -130,17 +130,59 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		return ctrl.Result{}, fmt.Errorf("writeback: get project: %w", err)
 	}
 
-	var primaryRepo tatarav1alpha1.Repository
-	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &primaryRepo); err != nil {
-		return ctrl.Result{}, fmt.Errorf("writeback: get repository: %w", err)
+	// Gather all Project repos up-front; the ordered write-back set is derived
+	// from them (repo-scoped: primary first; umbrella: ledger scope, else all).
+	allRepos, err := r.projectRepos(ctx, &proj)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("writeback: list project repos: %w", err)
 	}
 
 	provider := ""
 	if task.Spec.Source != nil {
 		provider = task.Spec.Source.Provider
 	}
-	if provider == "" {
-		provider = providerForRemote(ctx, primaryRepo.Spec.URL)
+
+	// primaryRepo is the repo-scoped task's own repo (empty for an umbrella
+	// implement). ordered is the write-back set: for a repo-scoped task, primary
+	// first then the rest; for an umbrella (empty RepositoryRef) the ledger
+	// repos-in-scope intersected with project repos, falling back to all project
+	// repos. derivePRTitle is called per-repo (scope=repo.Name) so no single
+	// primary is required for the umbrella case.
+	var primaryRepo tatarav1alpha1.Repository
+	ordered := make([]tatarav1alpha1.Repository, 0, len(allRepos))
+	if task.Spec.RepositoryRef != "" {
+		if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &primaryRepo); err != nil {
+			return ctrl.Result{}, fmt.Errorf("writeback: get repository: %w", err)
+		}
+		ordered = append(ordered, primaryRepo)
+		for i := range allRepos {
+			if allRepos[i].Name != primaryRepo.Name {
+				ordered = append(ordered, allRepos[i])
+			}
+		}
+		if provider == "" {
+			provider = providerForRemote(ctx, primaryRepo.Spec.URL)
+		}
+	} else {
+		inScope := make(map[string]bool)
+		for _, slug := range tatarav1alpha1.TaskReposInScope(task) {
+			inScope[slug] = true
+		}
+		for i := range allRepos {
+			if len(inScope) == 0 {
+				ordered = append(ordered, allRepos[i])
+				continue
+			}
+			if slug, serr := scm.RepoSlugFromURL(allRepos[i].Spec.URL); serr == nil && inScope[slug] {
+				ordered = append(ordered, allRepos[i])
+			}
+		}
+		if len(ordered) == 0 {
+			ordered = append(ordered, allRepos...)
+		}
+		if provider == "" && len(ordered) > 0 {
+			provider = providerForRemote(ctx, ordered[0].Spec.URL)
+		}
 	}
 
 	writer, err := r.SCMFor(provider)
@@ -154,22 +196,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		return ctrl.Result{}, fmt.Errorf("writeback: scm token: %w", err)
 	}
 
-	// Gather all Project repos; primary first, then the rest.
-	allRepos, err := r.projectRepos(ctx, &proj)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("writeback: list project repos: %w", err)
-	}
-	// Build an ordered list with the primary first.
-	ordered := make([]tatarav1alpha1.Repository, 0, len(allRepos))
-	ordered = append(ordered, primaryRepo)
-	for i := range allRepos {
-		if allRepos[i].Name != primaryRepo.Name {
-			ordered = append(ordered, allRepos[i])
-		}
-	}
-
 	sourceBranch := taskBranch(task)
-	title := derivePRTitle(task, primaryRepo.Name)
 	baseBody := writeBackBody(task)
 
 	// M4: when the agent submitted a change_summary, use PRBody + Delivered block
@@ -227,6 +254,9 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			!pushCDEligible(task) {
 			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
 		}
+		// Per-repo title: the conventional scope is the repo the PR opens on, so a
+		// cross-repo umbrella labels each PR with its own repo scope.
+		title := derivePRTitle(task, repo.Name)
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
 		r.recordSCM(provider, "open_change", openErr)
 		if openErr != nil {
@@ -355,7 +385,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// retries plus a single escalation), so echoing the per-run ResultSummary
 		// would spam the issue once per empty retry.
 		commented := task.Spec.Source != nil && task.Spec.Source.IssueRef != "" &&
-			task.Status.ResultSummary != "" && task.Status.LifecycleState != "Implement"
+			task.Status.ResultSummary != "" && task.Status.DeployState != "Implement"
 		if commented {
 			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary)
 			r.recordSCM(provider, "comment", cerr)
