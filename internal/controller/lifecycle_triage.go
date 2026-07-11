@@ -554,36 +554,63 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 		r.Metrics.IssueOutcome("discuss")
 
 	case "implement":
-		// EXPLICIT MAINTAINER APPROVAL is the ONLY signal that releases a
-		// front-half issue into the autonomous implement->review->merge->deploy
-		// chain. The operator advances ONLY when a VERIFIED maintainer approval has
-		// been recorded on the Task (Status.ApprovedByMaintainer, set by the webhook
-		// when a MaintainerLogins member applies the approved label - an
-		// identity-verified fact, NOT raw label presence and NOT any comment). An
-		// agent/pod that sets the approved label itself acts AS the bot, so its
-		// write is dropped by the webhook bot-actor guard and never recorded; a
-		// drive-by comment or third-party authorship no longer releases the gate.
-		// Fail CLOSED otherwise: park to Conversation and await the maintainer. This
-		// is the platform's core safety promise - tatara never self-approves.
+		// A front-half issue is released into the autonomous
+		// implement->review->merge->deploy chain by a VERIFIED maintainer
+		// approval, recorded on the Task as Status.ApprovedByMaintainer. Two
+		// paths record it, both identity-verified by the operator (never the
+		// agent, never the bot):
+		//   1. A MaintainerLogins member applies the approved label (webhook,
+		//      recordMaintainerApproval).
+		//   2. A MaintainerLogins member comments a go-ahead in the thread; the
+		//      agent's implement verdict means scope is complete, and the
+		//      operator confirms a maintainer actually participated
+		//      (approvingMaintainer) before recording the approval here.
+		// The agent cannot self-approve: a non-maintainer comment, its own
+		// comment, or an empty maintainer list all fail closed. Fail CLOSED on
+		// any uncertainty (no participation, or an SCM read error): park to
+		// Conversation / requeue and await the maintainer.
 		if task.Status.ApprovedByMaintainer == "" {
-			l.Info("triage implement outcome withheld: no verified maintainer approval; parking (fail closed)",
-				"action", "lifecycle_triage_await_approval", "resource_id", task.Name)
-			if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
+			approver, aerr := tr.approvingMaintainer(ctx)
+			if aerr != nil {
+				// SCM read error: fail closed by requeueing WITHOUT advancing or
+				// parking - the next reconcile re-attempts the scan. Never
+				// advance on unread evidence.
+				l.Info("triage implement: maintainer-participation scan failed; requeueing (fail closed)",
+					"action", "lifecycle_triage_participation_error", "resource_id", task.Name, "err", aerr.Error())
+				return ctrl.Result{}, aerr
+			}
+			if approver == "" {
+				l.Info("triage implement outcome withheld: no verified maintainer approval; parking (fail closed)",
+					"action", "lifecycle_triage_await_approval", "resource_id", task.Name)
+				if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
+					return ctrl.Result{}, err
+				}
+				// Tear down the wrapper BEFORE Conversation so a failed resetAgentRun
+				// leaves the task in Triage (still owns the pod) rather than in
+				// Conversation with a leaked live pod (finding 19).
+				if err := r.resetAgentRun(ctx, task); err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := r.clearIssueOutcome(ctx, task); err != nil {
+					return ctrl.Result{}, err
+				}
+				if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+			// A verified maintainer participated: record the approval (attributed
+			// to them) and post an audit comment, then fall through to onImplement
+			// (which stamps the approved label, sets Implement, records the metric).
+			if err := r.recordConversationalApproval(ctx, task, approver); err != nil {
 				return ctrl.Result{}, err
 			}
-			// Tear down the wrapper BEFORE transitioning to Conversation so a failed
-			// resetAgentRun leaves the task in Triage (still owns the pod) rather than
-			// in Conversation with a leaked live pod that nothing else reaps (finding 19).
-			if err := r.resetAgentRun(ctx, task); err != nil {
+			l.Info("triage implement: released by verified maintainer conversational approval",
+				"action", "lifecycle_triage_conversational_approval", "resource_id", task.Name, "maintainer", approver)
+			if err := r.triagePostComment(ctx, project, task,
+				fmt.Sprintf("tatara: approved by @%s via conversation; starting implementation.", approver)); err != nil {
 				return ctrl.Result{}, err
 			}
-			if err := r.clearIssueOutcome(ctx, task); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
 		}
 		res, terminal, herr := onImplement(ctx, project, task)
 		if herr != nil {
