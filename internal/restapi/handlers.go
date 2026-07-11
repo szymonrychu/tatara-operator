@@ -342,6 +342,21 @@ func (s *Server) createSubtask(w http.ResponseWriter, r *http.Request) {
 	if s.metrics != nil {
 		s.metrics.RecordRESTRequest("create_subtask", "ok", elapsed.Seconds())
 	}
+	// item 8: seed the durable rollup entry so it is visible via task_get even
+	// before the subtask's first turn completes. Best-effort: a failure here
+	// does not fail subtask creation itself.
+	if uerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if gerr := s.c.Get(r.Context(), client.ObjectKey{Namespace: s.ns, Name: taskName}, fresh); gerr != nil {
+			return gerr
+		}
+		controller.UpsertSubtaskRollup(&fresh.Status, tatarav1alpha1.SubtaskRef{
+			Name: st.Name, Order: st.Spec.Order, Title: st.Spec.Title, Phase: "Pending",
+		})
+		return s.c.Status().Update(r.Context(), fresh)
+	}); uerr != nil {
+		s.log.ErrorContext(r.Context(), "createSubtask: rollup update (non-fatal)", "error", uerr)
+	}
 	s.log.InfoContext(r.Context(), "restapi: createSubtask",
 		append(reqLogFields(r),
 			"action", "create_subtask",

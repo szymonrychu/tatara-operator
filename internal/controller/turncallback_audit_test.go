@@ -68,6 +68,33 @@ func TestRecordResult_CurrentTurnIsStamped(t *testing.T) {
 	}
 }
 
+// TestRecordResult_PlanTurn_CapturesSyntheticOrderZeroEntry verifies item 8:
+// the plan turn (turn 0, no annCurrentSubtask) writes its FinalText onto a
+// synthetic order-0 "Planning" rollup entry instead of discarding it.
+func TestRecordResult_PlanTurn_CapturesSyntheticOrderZeroEntry(t *testing.T) {
+	mkTaskProject(t, "p-planturn", 3)
+	mkTaskRepository(t, "r-planturn", "p-planturn")
+	mkTask(t, "t-planturn", "p-planturn", "r-planturn")
+	annotate(t, "t-planturn", map[string]string{annCurrentTurn: "turn-0"})
+
+	cb := newCallbackServer()
+	task, err := cb.resolveTaskByTurn(context.Background(), "turn-0")
+	if err != nil {
+		t.Fatalf("resolveTaskByTurn: %v", err)
+	}
+	if err := cb.recordResult(context.Background(), agent.TurnResult{State: "completed", FinalText: "the plan text"}, task, "turn-0"); err != nil {
+		t.Fatalf("recordResult: %v", err)
+	}
+	tk := getTask(t, "t-planturn")
+	if len(tk.Status.Subtasks) != 1 {
+		t.Fatalf("Status.Subtasks = %+v, want 1 synthetic planning entry", tk.Status.Subtasks)
+	}
+	got := tk.Status.Subtasks[0]
+	if got.Name != "" || got.Order != 0 || got.Title != "Planning" || got.Phase != "Done" || got.Result != "the plan text" {
+		t.Errorf("Subtasks[0] = %+v, want {Name:\"\" Order:0 Title:Planning Phase:Done Result:\"the plan text\"}", got)
+	}
+}
+
 // --- Finding 3: expireTimedOutTurn must clear annCurrentTurn ---
 
 // TestExpireTimedOutTurn_ClearsCurrentTurnAnnotation verifies that after

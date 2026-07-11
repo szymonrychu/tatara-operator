@@ -83,6 +83,7 @@ type taskStatusDTO struct {
 	DeployState       string                            `json:"lifecycleState,omitempty"`
 	ParkReason        string                            `json:"parkReason,omitempty"`
 	ImplementGiveUps  int                               `json:"implementGiveUps,omitempty"`
+	Subtasks          []tatarav1alpha1.SubtaskRef       `json:"subtasks,omitempty"`
 }
 
 // TaskDTO is the stable JSON shape for a Task CRD.
@@ -168,6 +169,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			DeployState:       task.Status.DeployState,
 			ParkReason:        task.Status.ParkReason,
 			ImplementGiveUps:  task.Status.ImplementGiveUps,
+			Subtasks:          task.Status.Subtasks,
 		},
 	}
 	if task.Spec.Source != nil {

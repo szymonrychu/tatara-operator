@@ -446,6 +446,15 @@ func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, 
 			}(); err != nil {
 				return fmt.Errorf("write subtask result: %w", err)
 			}
+		} else if tr.FinalText != "" {
+			// Plan turn (turn 0): no backing Subtask object exists, so capture
+			// FinalText as a synthetic order-0 rollup entry instead of discarding
+			// it (item 8 - the full reasoning trail must be visible, including the
+			// plan turn).
+			upsertSubtaskRollup(&fresh.Status, tatarav1alpha1.SubtaskRef{Order: 0, Title: "Planning", Phase: "Done", Result: tr.FinalText})
+			if err := s.Client.Status().Update(ctx, fresh); err != nil {
+				return fmt.Errorf("write plan-turn rollup entry: %w", err)
+			}
 		}
 
 		// Stamp turn-complete to requeue the reconcile.

@@ -199,6 +199,27 @@ func TestCreateSubtask_OwnerRefAndTaskRef(t *testing.T) {
 	require.NotEmpty(t, out.Name)
 }
 
+func TestCreateSubtask_AddsRollupEntry(t *testing.T) {
+	r := buildRouter(t, task("t1", "alpha"))
+	body := strings.NewReader(`{"title":"write tests","detail":"unit","order":1}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/subtasks", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code)
+
+	req2 := httptest.NewRequest(http.MethodGet, "/tasks/t1", nil)
+	w2 := httptest.NewRecorder()
+	r.ServeHTTP(w2, req2)
+	require.Equal(t, http.StatusOK, w2.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w2.Body.Bytes(), &out))
+	require.Len(t, out.Status.Subtasks, 1)
+	require.Equal(t, "write tests", out.Status.Subtasks[0].Title)
+	require.Equal(t, "Pending", out.Status.Subtasks[0].Phase)
+	require.Equal(t, 1, out.Status.Subtasks[0].Order)
+}
+
 func TestCreateSubtask_TaskNotFound(t *testing.T) {
 	r := buildRouter(t)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/nope/subtasks", strings.NewReader(`{"title":"x"}`))
