@@ -201,6 +201,7 @@ func TestMarkSubtaskDone_RetriesOnStatusConflict(t *testing.T) {
 	mkTaskRepository(t, "r-msdretry", "p-msdretry")
 	mkTask(t, "t-msdretry", "p-msdretry", "r-msdretry")
 	mkSubtask(t, "t-msdretry-s1", "t-msdretry", 1)
+	task := getTask(t, "t-msdretry")
 
 	var statusCalls atomic.Int32
 	cc := &conflictOnceStatusAndMetaWriter{Client: k8sClient, statusCalls: &statusCalls}
@@ -211,7 +212,7 @@ func TestMarkSubtaskDone_RetriesOnStatusConflict(t *testing.T) {
 		Session: newFakeSession(),
 	}
 
-	if err := r.markSubtaskDone(ctx, testNS, "t-msdretry-s1", "turn-xyz"); err != nil {
+	if err := r.markSubtaskDone(ctx, task, "t-msdretry-s1", "turn-xyz"); err != nil {
 		t.Fatalf("markSubtaskDone must succeed despite status conflict: %v", err)
 	}
 

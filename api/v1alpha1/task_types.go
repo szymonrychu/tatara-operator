@@ -635,6 +635,29 @@ type TaskStatus struct {
 	// set on reconcile so `kubectl get task` is scannable without describe.
 	// +optional
 	ShortDescription string `json:"shortDescription,omitempty"`
+
+	// Subtasks is the durable rollup of every subtask (incl. the synthetic
+	// order-0 planning entry), maintained as subtasks progress. See SubtaskRef.
+	// +optional
+	Subtasks []SubtaskRef `json:"subtasks,omitempty"`
+}
+
+// SubtaskRef is a durable point-in-time snapshot of one subtask, rolled onto
+// TaskStatus.Subtasks as subtasks progress. Lets kubectl and a re-entering
+// agent read the full reasoning trail (including the synthetic order-0
+// "Planning" entry capturing turn 0's FinalText) without listing Subtask
+// objects directly (item 8).
+type SubtaskRef struct {
+	// Name is the Subtask object's name, empty for the synthetic order-0
+	// planning entry (turn 0 has no backing Subtask object).
+	// +optional
+	Name  string `json:"name,omitempty"`
+	Order int    `json:"order"`
+	Title string `json:"title"`
+	// +kubebuilder:validation:Enum=Pending;Running;Done;Failed
+	Phase string `json:"phase"`
+	// +optional
+	Result string `json:"result,omitempty"`
 }
 
 // +kubebuilder:object:root=true

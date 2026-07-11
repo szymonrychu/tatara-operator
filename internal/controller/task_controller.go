@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -830,7 +831,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	// A callback arrived. Mark the executing Subtask Done (if any).
 	if prev := task.Annotations[annCurrentSubtask]; prev != "" {
-		if err := r.markSubtaskDone(ctx, task.Namespace, prev, current); err != nil {
+		if err := r.markSubtaskDone(ctx, task, prev, current); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -1003,13 +1004,15 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 }
 
 // markSubtaskDone sets a Subtask Done, recording the turn id (its result is
-// written by the callback before this reconcile runs). Wrapped in
+// written by the callback before this reconcile runs), then upserts the
+// completed entry onto the parent Task's durable rollup (item 8). Wrapped in
 // RetryOnConflict because the callback's recordResult writes the same
 // Subtask's status subresource concurrently and may race the reconcile.
-func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, name, turnID string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *TaskReconciler) markSubtaskDone(ctx context.Context, task *tatarav1alpha1.Task, name, turnID string) error {
+	var done *tatarav1alpha1.Subtask
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		st := &tatarav1alpha1.Subtask{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: taskNamespace, Name: name}, st); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, st); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
@@ -1020,8 +1023,48 @@ func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, nam
 		if err := r.Status().Update(ctx, st); err != nil {
 			return fmt.Errorf("mark subtask done: %w", err)
 		}
+		done = st
 		return nil
+	}); err != nil {
+		return err
+	}
+	if done == nil {
+		// Subtask vanished before we could mark it (rare race); nothing to roll up.
+		return nil
+	}
+	return r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		upsertSubtaskRollup(&fresh.Status, tatarav1alpha1.SubtaskRef{
+			Name: done.Name, Order: done.Spec.Order, Title: done.Spec.Title, Phase: "Done", Result: done.Status.Result,
+		})
+		return true
 	})
+}
+
+const subtaskResultMaxLen = 512
+
+// upsertSubtaskRollup finds a matching entry in status.Subtasks (by Name+Order)
+// and replaces it, or appends and re-sorts by Order when absent. Result is
+// truncated so the rollup stays kubectl-describe-sized even with many long
+// turn results.
+func upsertSubtaskRollup(status *tatarav1alpha1.TaskStatus, ref tatarav1alpha1.SubtaskRef) {
+	const suffix = "...(truncated)"
+	if len(ref.Result) > subtaskResultMaxLen {
+		ref.Result = ref.Result[:subtaskResultMaxLen-len(suffix)] + suffix
+	}
+	for i := range status.Subtasks {
+		if status.Subtasks[i].Name == ref.Name && status.Subtasks[i].Order == ref.Order {
+			status.Subtasks[i] = ref
+			return
+		}
+	}
+	status.Subtasks = append(status.Subtasks, ref)
+	sort.Slice(status.Subtasks, func(i, j int) bool { return status.Subtasks[i].Order < status.Subtasks[j].Order })
+}
+
+// UpsertSubtaskRollup is the exported form of upsertSubtaskRollup, used by
+// internal/restapi's createSubtask handler to seed a Pending rollup entry.
+func UpsertSubtaskRollup(status *tatarav1alpha1.TaskStatus, ref tatarav1alpha1.SubtaskRef) {
+	upsertSubtaskRollup(status, ref)
 }
 
 // shortDescription is the first line of goal, truncated to ~60 runes on a

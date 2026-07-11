@@ -697,6 +697,42 @@ spec:
                   ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
                   set on reconcile so `kubectl get task` is scannable without describe.
                 type: string
+              subtasks:
+                description: |-
+                  Subtasks is the durable rollup of every subtask (incl. the synthetic
+                  order-0 planning entry), maintained as subtasks progress. See SubtaskRef.
+                items:
+                  description: |-
+                    SubtaskRef is a durable point-in-time snapshot of one subtask, rolled onto
+                    TaskStatus.Subtasks as subtasks progress. Lets kubectl and a re-entering
+                    agent read the full reasoning trail (including the synthetic order-0
+                    "Planning" entry capturing turn 0's FinalText) without listing Subtask
+                    objects directly (item 8).
+                  properties:
+                    name:
+                      description: |-
+                        Name is the Subtask object's name, empty for the synthetic order-0
+                        planning entry (turn 0 has no backing Subtask object).
+                      type: string
+                    order:
+                      type: integer
+                    phase:
+                      enum:
+                      - Pending
+                      - Running
+                      - Done
+                      - Failed
+                      type: string
+                    result:
+                      type: string
+                    title:
+                      type: string
+                  required:
+                  - order
+                  - phase
+                  - title
+                  type: object
+                type: array
               turnsCompleted:
                 type: integer
               workItems:
