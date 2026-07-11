@@ -77,13 +77,25 @@ type RepositoryStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// OpenIssuesCount is the number of non-terminal issueLifecycle/clarify Tasks
+	// scoped to this repo. Computed on reconcile.
+	// +optional
+	OpenIssuesCount int `json:"openIssuesCount,omitempty"`
+	// OpenIncidentsCount is the number of non-terminal incident Tasks scoped to
+	// this repo. Computed on reconcile.
+	// +optional
+	OpenIncidentsCount int `json:"openIncidentsCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:printcolumn:name="Project",type=string,JSONPath=`.spec.projectRef`
+// +kubebuilder:printcolumn:name="URL",type=string,JSONPath=`.spec.url`,priority=1
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="Commit",type=string,JSONPath=`.status.lastIngestedCommit`
+// +kubebuilder:printcolumn:name="Commit",type=string,JSONPath=`.status.lastIngestedCommit`,priority=1
+// +kubebuilder:printcolumn:name="OpenIssues",type=integer,JSONPath=`.status.openIssuesCount`
+// +kubebuilder:printcolumn:name="OpenIncidents",type=integer,JSONPath=`.status.openIncidentsCount`
 
 // Repository is a git remote ingested into tatara-memory for a Project.
 type Repository struct {

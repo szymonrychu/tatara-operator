@@ -32,6 +32,9 @@ type trackingFakeWriter struct {
 	openErr      error
 }
 
+func (f *trackingFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *trackingFakeWriter) OpenChange(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -41,7 +41,10 @@ func (r *commentCountingReader) ListIssueComments(_ context.Context, _, _ string
 
 // TestFinishTriage_Discuss_AuthoredWithHumanReply_MemoizesComments verifies the
 // success path (tatara-authored issue, human already replied) fetches
-// ListIssueComments exactly ONCE across hasHumanReply + botHasLastWord.
+// ListIssueComments exactly TWICE: once (memoized) across hasHumanReply +
+// botHasLastWord, plus one more from triagePostComment's comment gate (FIX-6:
+// the gate's closed-state/dedup rules need their own live read - the
+// triageReader's memoization is a separate cache from the gate's).
 func TestFinishTriage_Discuss_AuthoredWithHumanReply_MemoizesComments(t *testing.T) {
 	task, proj := seedDiscussSilenceTask(t, "memo-ok")
 
@@ -56,14 +59,15 @@ func TestFinishTriage_Discuss_AuthoredWithHumanReply_MemoizesComments(t *testing
 	require.NoError(t, err)
 
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
-	require.Equal(t, 1, rdr.callCount,
-		"authored+human-replied success path must fetch ListIssueComments exactly once (memoized)")
+	require.Equal(t, 2, rdr.callCount,
+		"authored+human-replied success path: hasHumanReply+botHasLastWord memoize to 1 call, plus 1 more from the FIX-6 comment gate")
 }
 
 // TestFinishTriage_Discuss_FirstListCommentsErrorStillRetriesLive verifies the
 // fail-open path: a transient error on the FIRST ListIssueComments call (from
-// hasHumanReply) must NOT be cached, so botHasLastWord's call is a second, live
-// attempt -- matching pre-fix behavior.
+// hasHumanReply) must NOT be cached, so botHasLastWord's call is a second,
+// live attempt -- matching pre-fix behavior -- plus a third call from
+// triagePostComment's comment gate (FIX-6).
 func TestFinishTriage_Discuss_FirstListCommentsErrorStillRetriesLive(t *testing.T) {
 	task, proj := seedDiscussSilenceTask(t, "memo-err")
 
@@ -79,6 +83,6 @@ func TestFinishTriage_Discuss_FirstListCommentsErrorStillRetriesLive(t *testing.
 	require.NoError(t, err)
 
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
-	require.Equal(t, 2, rdr.callCount,
-		"a first-call ListIssueComments error must not be cached; botHasLastWord must retry live (call count 2)")
+	require.Equal(t, 3, rdr.callCount,
+		"a first-call ListIssueComments error must not be cached; botHasLastWord retries live (call 2), plus 1 more from the FIX-6 comment gate (call 3)")
 }

@@ -38,6 +38,13 @@ func TestTaskFields(t *testing.T) {
 	}
 }
 
+func TestTaskSpec_DedupKeyRoundTrips(t *testing.T) {
+	spec := v1alpha1.TaskSpec{DedupKey: "deadbeefcafe1234"}
+	if spec.DedupKey != "deadbeefcafe1234" {
+		t.Fatalf("DedupKey = %q, want deadbeefcafe1234", spec.DedupKey)
+	}
+}
+
 func TestSubtaskFields(t *testing.T) {
 	s := v1alpha1.Subtask{
 		Spec: v1alpha1.SubtaskSpec{

@@ -791,6 +791,28 @@ func TestLifecycleImplement_BackstopParksWhenMaxIterationsReached(t *testing.T) 
 	}
 }
 
+// TestWritebackImplementMaxIter_ClosedIssue_Suppressed verifies the
+// lifecycle_implement.go max-iterations backstop comment (item 1) routes
+// through the gate: an already-closed source issue must not receive the
+// backstop comment.
+func TestWritebackImplementMaxIter_ClosedIssue_Suppressed(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	r, fw, task := seedImplementReadyTask(t, "closedmax", 3) // 3 >= max(3) -> park
+	fw.issueClosed = true
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) { return &botLastWordReader{}, nil }
+
+	_, err := r.reconcileLifecycle(ctx, fetchTask(t, task.Name))
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) != 0 {
+		t.Errorf("backstop comment must be suppressed on an already-closed issue; got %+v", fw.commentCalls)
+	}
+}
+
 // TestLifecycleImplement_BackstopAllowsSpawnBelowMax verifies that with iterations
 // below max, Implement still spawns (transitions away from Implement).
 func TestLifecycleImplement_BackstopAllowsSpawnBelowMax(t *testing.T) {

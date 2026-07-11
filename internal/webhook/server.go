@@ -234,6 +234,36 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		}
 	}
 
+	// A human closing the tracked issue is the only veto over the operator's
+	// autonomous implement->review->merge->deploy lifecycle - including the
+	// auto-approve release path (item 4a): a bot-authored, tatara-proposed
+	// issue that auto-approved is investigated/implemented on the strength of
+	// nobody objecting, so a human closing it must stop the run rather than let
+	// it silently continue to implement/deploy. Park the owning non-terminal
+	// front-half Task. Scoped to non-PR "closed" events (PR/MR closes are
+	// governed by the review routing below) from a NON-bot actor: the
+	// operator's own triageCloseIssue close (a legitimate close outcome) fires
+	// this same webhook event with the bot as sender and must not re-enter here
+	// (mirrors the label self-write guard above). Always returns without
+	// falling through to the create-task path below - a closed issue must
+	// never spawn a fresh clarify Task.
+	if ev.Action == "closed" && !ev.IsPR {
+		botLogin := ""
+		if proj.Spec.Scm != nil {
+			botLogin = proj.Spec.Scm.BotLogin
+		}
+		if botLogin == "" || ev.ActorLogin != botLogin {
+			if task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef); found {
+				s.parkOnIssueClosed(ctx, proj, ev, task)
+			}
+		} else {
+			s.log.InfoContext(ctx, "issue closed event from bot actor ignored (operator self-write)",
+				"project", proj.Name, "issue_ref", ev.IssueRef)
+		}
+		s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+		return
+	}
+
 	// Verified maintainer approval: the ONLY signal that releases a front-half
 	// issue into the autonomous implement->review->merge->deploy chain. A
 	// maintainer (a MaintainerLogins member - closed by default, structurally
@@ -574,13 +604,8 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 //   - no live task -> a Parked owning task is reactivated, else a fresh task is
 //     created at Triage.
 func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
-	botLogin := ""
-	if proj.Spec.Scm != nil {
-		botLogin = proj.Spec.Scm.BotLogin
-	}
-
 	// ActorLogin is the sender of the event (comment author for issue_comment).
-	if botLogin != "" && ev.ActorLogin == botLogin {
+	if isBotActor(&proj, ev.ActorLogin) {
 		s.log.InfoContext(ctx, "issue_comment: bot-authored comment ignored",
 			"project", proj.Name, "issue_ref", ev.IssueRef)
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
@@ -687,11 +712,31 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
+// isBotActor reports whether login is the project's configured bot identity.
+// Every inbound path that could turn a comment into a Task must check this
+// before doing so - an incident agent's own evidence comment on an issue
+// (work-stream B) must never spawn a competing clarify/issue Task. Fail-open
+// (false) when login is empty or the project has no bot login configured,
+// matching the rest of the bot-actor guard family.
+func isBotActor(proj *tatarav1.Project, login string) bool {
+	if login == "" || proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" {
+		return false
+	}
+	return login == proj.Spec.Scm.BotLogin
+}
+
 // createClarifyTask creates a new clarify umbrella Task for an issue_comment on
 // an issue with no existing live task. clarify starts at Triage (reconcileClarify
 // ignores any lifecycle-entry annotation) and shares the deterministic dedup name
 // with the labeled-issue create path so both land on one umbrella.
 func (s *Server) createClarifyTask(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	// Belt-and-suspenders: handleIssueComment already guards its sole caller
+	// path, but a future caller reaching this directly must not spawn a Task
+	// for a bot-authored comment either.
+	if isBotActor(&proj, ev.ActorLogin) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
 	// Find the matching Repository for the event's repo URL.
 	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
 	if err != nil {
@@ -944,6 +989,37 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
+// parkOnIssueClosed parks a live owning front-half Task when its tracked
+// issue is closed by a human (FIX-1(b)). A human closing the issue is a veto:
+// it must stop the lifecycle - including the auto-approve release path (item
+// 4a) - rather than let an in-flight run silently continue to
+// implement/deploy. Best-effort wrapper teardown, mirroring
+// reactivateTask/the controller's terminate.
+func (s *Server) parkOnIssueClosed(ctx context.Context, proj tatarav1.Project, ev scm.WebhookEvent, task *tatarav1.Task) {
+	if err := agent.DeleteWrapper(ctx, s.cfg.Client, s.cfg.Namespace, task); err != nil {
+		s.log.ErrorContext(ctx, "issue closed: delete wrapper (non-fatal)", "error", err, "task", task.Name)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if tatarav1.TaskTerminal(fresh) {
+			return nil // already terminal (raced with a controller-side transition): nothing to do
+		}
+		now := metav1.Now()
+		fresh.Status.DeployState = "Parked"
+		fresh.Status.ParkReason = "issue-closed"
+		fresh.Status.LastActivityAt = &now
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	}); err != nil {
+		s.log.ErrorContext(ctx, "issue closed: park task", "error", err, "task", task.Name, "issue_ref", ev.IssueRef)
+		return
+	}
+	s.log.InfoContext(ctx, "issue closed by human: parked owning lifecycle task",
+		"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef, "actor", ev.ActorLogin)
+}
+
 // findReactivatableBackHalfTask returns a discrete implement/review Task owning
 // issueRef that is comment-resumable: DeployState=="Parked" (a labelled-but-dead
 // issue). It deliberately matches ONLY the Parked state so a live Deploying or
@@ -1098,13 +1174,12 @@ func (s *Server) reactivateStaleIncident(ctx context.Context, projectName, group
 		return false
 	}
 	var tasks tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace),
-		client.MatchingLabels{tatarav1.LabelAlertGroup: groupHash}); err != nil {
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
 		return false
 	}
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
-		if t.Spec.ProjectRef != projectName || t.Spec.Kind != "incident" {
+		if t.Spec.ProjectRef != projectName || t.Spec.Kind != "incident" || t.Spec.DedupKey != groupHash {
 			continue
 		}
 		if tatarav1.TaskTerminal(t) {
@@ -1178,7 +1253,8 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 		Goal:         goal,
 		GenerateName: "incident-",
 		AlertRule:    alertRuleName(alert),
-		Labels:       map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
+		DedupKey:     groupHash,
+		Labels:       map[string]string{tatarav1.LabelActivity: "incident"},
 		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}
 	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, groupHash, payload)

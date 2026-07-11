@@ -126,6 +126,9 @@ type deployFakeWriter struct {
 	closeCalls []string // repo|number|comment
 }
 
+func (f *deployFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *deployFakeWriter) CloseIssue(_ context.Context, _, repo string, number int, comment string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -486,4 +489,34 @@ func TestCDScan_GaugesSelfClearOnRecovery(t *testing.T) {
 	require.NoError(t, k8sClient.Status().Update(context.Background(), recovered))
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
 	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
+}
+
+// TestParkUmbrellaMergeTimeout_StillPostsViaGate verifies deploy_supervision.go's
+// parkUmbrellaMergeTimeout (item 1/3) routes through ProjectReconciler.gatedComment.
+// This site passes repo=nil (no Repository CR resolvable here without an extra
+// lookup) AND leaves ReaderFor unset, so the gate never engages regardless of
+// repo (gatedCommentCore's closed-state/dedup rules run without a Repository -
+// see TestGatedCommentCore_NilRepo_* - but still require a live reader). The
+// park comment must still post unconditionally here (regression guard).
+func TestParkUmbrellaMergeTimeout_StillPostsViaGate(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "put-proj", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{Scm: &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"}},
+	}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "put-task", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj.Name, Kind: "implement",
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, task))
+
+	fw := &fullFakeSCMWriter{}
+	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	pr.parkUmbrellaMergeTimeout(ctx, proj, task, fw, "tok", "github", []string{"o/other"})
+
+	require.True(t, fw.commentCalled, "merge-timeout park note must still post (repo=nil accepted gap, no gating applied)")
 }

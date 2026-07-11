@@ -78,6 +78,15 @@ func TestToTaskDTO_NewFields(t *testing.T) {
 	require.Equal(t, "merge", d.Status.PROutcome.Action)
 }
 
+func TestToTaskDTO_IncludesDedupKeyAndAlertRule(t *testing.T) {
+	task := tatarav1alpha1.Task{
+		Spec: tatarav1alpha1.TaskSpec{DedupKey: "abc123", AlertRule: "MyAlert"},
+	}
+	d := toTaskDTO(task)
+	require.Equal(t, "abc123", d.DedupKey)
+	require.Equal(t, "MyAlert", d.AlertRule)
+}
+
 func TestToSubtaskDTO(t *testing.T) {
 	st := tatarav1alpha1.Subtask{
 		ObjectMeta: metav1.ObjectMeta{Name: "s1"},

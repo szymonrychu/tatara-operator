@@ -1629,7 +1629,15 @@ func (r *ProjectReconciler) issueScanPickOne(
 	if d, ok := systemicLeads[key]; ok && !d.isLead {
 		// Collapsed sibling: no implementation agent. Mark idempotently and skip.
 		if w, token, werr := r.scanWriter(ctx, proj); werr == nil {
-			if cerr := commentSiblingMarker(ctx, reader, w, token, c.repo, c.number, d.leadNumber); cerr != nil {
+			var siblingRepoCRPtr *tatarav1alpha1.Repository
+			if siblingRepoCR, ok := r.matchRepoForSlug(repos, c.repo); ok {
+				siblingRepoCRPtr = &siblingRepoCR
+			}
+			var provider string
+			if proj.Spec.Scm != nil {
+				provider = proj.Spec.Scm.Provider
+			}
+			if cerr := commentSiblingMarker(ctx, r, reader, w, proj, siblingRepoCRPtr, token, provider, c.repo, c.number, d.leadNumber); cerr != nil {
 				l.Error(cerr, "issueScan: systemic sibling marker comment", "action", "systemic_sibling_mark",
 					"resource_id", proj.Name, "issue", key, "lead", d.leadNumber)
 			}
@@ -2428,8 +2436,13 @@ func systemicMarker(lead int) string {
 }
 
 // commentSiblingMarker posts the marker once. It is a no-op when a comment
-// whose body contains the marker already exists (reconcile-safe).
-func commentSiblingMarker(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, token, repo string, number, lead int) error {
+// whose body contains the marker already exists (reconcile-safe) - kept as an
+// explicit check rather than relying solely on the gate's content-dedup rule,
+// since repoCR may be nil (unresolved sibling repo) and the gate degrades to a
+// no-op without a Repository CR. Routes the actual post through
+// ProjectReconciler.gatedComment so it also gets the closed-state/bot-mr/
+// last-word rules whenever repoCR does resolve (item 1/3).
+func commentSiblingMarker(ctx context.Context, r *ProjectReconciler, reader scm.SCMReader, writer scm.SCMWriter, proj *tatarav1alpha1.Project, repoCR *tatarav1alpha1.Repository, token, provider, repo string, number, lead int) error {
 	owner, name, _ := strings.Cut(repo, "/")
 	marker := systemicMarker(lead)
 	if comments, err := reader.ListIssueComments(ctx, owner, name, number); err == nil {
@@ -2439,7 +2452,8 @@ func commentSiblingMarker(ctx context.Context, reader scm.SCMReader, writer scm.
 			}
 		}
 	}
-	return writer.Comment(ctx, token, fmt.Sprintf("%s#%d", repo, number), marker)
+	_, err := r.gatedComment(ctx, proj, repoCR, writer, token, provider, number, false, "", fmt.Sprintf("%s#%d", repo, number), marker)
+	return err
 }
 
 // repoSlug returns "owner/name" for a Repository URL, or "" on error.
@@ -3003,10 +3017,13 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 				if proj.Spec.Scm != nil {
 					provider = proj.Spec.Scm.Provider
 				}
+				var orphanRepoCR *tatarav1alpha1.Repository
+				if rc, ok := r.matchRepoForSlug(repos, slug); ok {
+					orphanRepoCR = &rc
+				}
 				msg := "tatara: this issue has been parked awaiting a human for a long time after repeated " +
 					"failed attempts, and I'm cleaning up the stalled task. Comment here to have me try again."
-				cerr := w.Comment(ctx, token, issueRef, msg)
-				r.Metrics.SCMWrite(provider, "comment", scmResult(cerr))
+				_, cerr := r.gatedComment(ctx, proj, orphanRepoCR, w, token, provider, tk.Spec.Source.Number, tk.Spec.Source.IsPR, tk.Spec.Source.AuthorLogin, issueRef, msg)
 				if cerr != nil {
 					l.Error(cerr, "backstop: aged-out park re-ping comment (non-fatal)",
 						"action", "backstop_park_aged_out", "resource_id", proj.Name, "task", tk.Name)
@@ -3095,6 +3112,37 @@ func (r *ProjectReconciler) inflightRefineTask(ctx context.Context, proj *tatara
 		}
 	}
 	return nil, nil
+}
+
+// siblingsByIssueForProject builds the sibling-URL map fed to refine's
+// GoalProject (item 5): for every Task in the project whose Status.
+// DiscoveredIssues holds 2+ tracked issue URLs, each URL maps to the OTHERS -
+// the same set syncSiblingLinks maintains via the tatara-links managed block,
+// so refine's dedup actions can keep it correct.
+func (r *ProjectReconciler) siblingsByIssueForProject(ctx context.Context, proj *tatarav1alpha1.Project) map[string][]string {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		return nil
+	}
+	out := map[string][]string{}
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.ProjectRef != proj.Name {
+			continue
+		}
+		siblings := discoveredIssueSiblings(t)
+		for _, self := range siblings {
+			for _, u := range siblings {
+				if u != self {
+					out[self] = append(out[self], u)
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // latestTerminalRefineTask returns the most recently created terminal refine
@@ -3337,7 +3385,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 							if lookback <= 0 {
 								lookback = 30
 							}
-							goal := refine.GoalProject(slugs, lookback)
+							goal := refine.GoalProject(slugs, lookback, r.siblingsByIssueForProject(ctx, proj))
 							_, _ = r.createRefineTask(ctx, proj, goal)
 						}
 						// Defer brainstorm until refine is terminal; poll at the barrier cadence.

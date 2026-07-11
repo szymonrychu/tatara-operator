@@ -534,6 +534,17 @@ type ProjectSpec struct {
 	// +kubebuilder:default=720
 	// +optional
 	MergeWaitBudgetMinutes int `json:"mergeWaitBudgetMinutes,omitempty"`
+	// AutoApproveTataraProposals releases a bot-authored, tatara-proposed issue
+	// (marked <!-- tatara-proposed-by:<kind> -->) straight into
+	// implement->review->auto-merge->deploy without a second human gate: the
+	// brainstorm/incident investigation that produced the proposal IS the
+	// review. Never applies to a human-authored issue, marker or not - the
+	// bot-authorship check is independent and mandatory. Defaults false;
+	// cluster-agnostic charts only flip this per-project via helmfile
+	// enrollment values.
+	// +kubebuilder:default=false
+	// +optional
+	AutoApproveTataraProposals bool `json:"autoApproveTataraProposals,omitempty"`
 }
 
 // TokenBudgetSpec configures the per-Project token-budget admission gate (issue
@@ -770,6 +781,18 @@ type ProjectStatus struct {
 	// +listMapKey=repo
 	// +listMapKey=number
 	ScanMarks []ScanMark `json:"scanMarks,omitempty"`
+	// RepositoryCount is the number of Repository CRs whose spec.projectRef
+	// names this Project. Computed on reconcile.
+	// +optional
+	RepositoryCount int `json:"repositoryCount,omitempty"`
+	// OpenIssuesCount is the number of non-terminal issueLifecycle/clarify Tasks
+	// for this project. Computed on reconcile.
+	// +optional
+	OpenIssuesCount int `json:"openIssuesCount,omitempty"`
+	// OpenIncidentsCount is the number of non-terminal incident Tasks for this
+	// project. Computed on reconcile.
+	// +optional
+	OpenIncidentsCount int `json:"openIncidentsCount,omitempty"`
 }
 
 // ScanMark records the last GitHub activity timestamp the issue/PR scan has
@@ -819,6 +842,9 @@ type TokenBudgetStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
 // +kubebuilder:printcolumn:name="Webhook",type=string,JSONPath=`.status.webhookURL`
+// +kubebuilder:printcolumn:name="Repos",type=integer,JSONPath=`.status.repositoryCount`
+// +kubebuilder:printcolumn:name="OpenIssues",type=integer,JSONPath=`.status.openIssuesCount`
+// +kubebuilder:printcolumn:name="OpenIncidents",type=integer,JSONPath=`.status.openIncidentsCount`
 
 // Project is the top-level grouping for repositories and tasks.
 type Project struct {

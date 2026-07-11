@@ -181,6 +181,47 @@ func TestGitHubGetIssue(t *testing.T) {
 	}
 }
 
+func TestGitHubGetIssueState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/issues/21" {
+			t.Fatalf("unexpected path: %q", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"number": 21,
+			"user":   map[string]any{"login": "alice"},
+			"state":  "closed",
+		})
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	st, err := c.GetIssueState(context.Background(), "https://github.com/o/r", "tok", 21)
+	if err != nil {
+		t.Fatalf("GetIssueState: %v", err)
+	}
+	if st.Author != "alice" || !st.Closed {
+		t.Fatalf("st = %+v, want Author=alice Closed=true", st)
+	}
+}
+
+func TestGitHubGetIssueState_Open(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"number": 21,
+			"user":   map[string]any{"login": "alice"},
+			"state":  "open",
+		})
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	st, err := c.GetIssueState(context.Background(), "https://github.com/o/r", "tok", 21)
+	if err != nil {
+		t.Fatalf("GetIssueState: %v", err)
+	}
+	if st.Closed {
+		t.Fatalf("st.Closed = true, want false for state=open")
+	}
+}
+
 // TestGitHubListOpenPRsPaginated verifies that ListOpenPRs follows Link rel="next" headers
 // and returns items from all pages concatenated.
 func TestGitHubListOpenPRsPaginated(t *testing.T) {

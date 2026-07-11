@@ -64,3 +64,14 @@ func TestGoalProjectContainsDedupInstruction(t *testing.T) {
 		t.Fatalf("incident goal must instruct surveying existing issues to avoid duplicates:\n%s", g)
 	}
 }
+
+// TestGoalProject_MentionsTaskSurvey asserts the incident goal instructs the
+// agent to also survey open incident Tasks (via task_list), not just issues -
+// so a recurring alert dedups onto an in-flight investigation before it has
+// even filed an issue.
+func TestGoalProject_MentionsTaskSurvey(t *testing.T) {
+	g := GoalProject("groupKey=abc status=firing commonLabels={alertname=HighCPU}", []string{"o/api"})
+	if !strings.Contains(g, "task_list") {
+		t.Fatal("incident goal must instruct the agent to survey open incident Tasks via task_list, not just issues")
+	}
+}

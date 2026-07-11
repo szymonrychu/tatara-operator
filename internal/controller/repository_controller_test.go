@@ -81,6 +81,46 @@ func getRepo(t *testing.T, name string) *tataradevv1alpha1.Repository {
 	return r
 }
 
+func TestReconcileRepo_ComputesPerRepoCounts(t *testing.T) {
+	mkProject(t, "p-repo-counts", "p-repo-counts-scm")
+	mkRepo(t, "r-repo-counts", "p-repo-counts")
+	mkTaskWithKind(t, "t-issue-open-repo", "p-repo-counts", "r-repo-counts", "issueLifecycle")
+	mkTaskWithKind(t, "t-incident-open-repo", "p-repo-counts", "r-repo-counts", "incident")
+
+	if _, err := reconcileRepo(t, "r-repo-counts"); err != nil {
+		t.Fatalf("reconcileRepo: %v", err)
+	}
+
+	repo := getRepo(t, "r-repo-counts")
+	if repo.Status.OpenIssuesCount != 1 || repo.Status.OpenIncidentsCount != 1 {
+		t.Errorf("counts = (%d,%d), want (1,1)", repo.Status.OpenIssuesCount, repo.Status.OpenIncidentsCount)
+	}
+}
+
+// TestReconcileRepo_ComputesPerRepoCounts_IngestDisabled verifies computeRepoCounts
+// runs even for a repo with IngestEnabled=false (FIX-2): the printcolumn-backed
+// open issue/incident counts must stay live independent of ingest gating, per
+// computeRepoCounts's own doc comment ("independent of ingest state/gating").
+func TestReconcileRepo_ComputesPerRepoCounts_IngestDisabled(t *testing.T) {
+	mkProject(t, "p-repo-counts-off", "p-repo-counts-off-scm")
+	repo := mkRepo(t, "r-repo-counts-off", "p-repo-counts-off")
+	repo.Spec.IngestEnabled = boolPtrRC(false)
+	if err := k8sClient.Update(context.Background(), repo); err != nil {
+		t.Fatalf("disable ingest: %v", err)
+	}
+	mkTaskWithKind(t, "t-issue-open-repo-off", "p-repo-counts-off", "r-repo-counts-off", "issueLifecycle")
+	mkTaskWithKind(t, "t-incident-open-repo-off", "p-repo-counts-off", "r-repo-counts-off", "incident")
+
+	if _, err := reconcileRepo(t, "r-repo-counts-off"); err != nil {
+		t.Fatalf("reconcileRepo: %v", err)
+	}
+
+	got := getRepo(t, "r-repo-counts-off")
+	if got.Status.OpenIssuesCount != 1 || got.Status.OpenIncidentsCount != 1 {
+		t.Errorf("counts = (%d,%d), want (1,1) even with ingest disabled", got.Status.OpenIssuesCount, got.Status.OpenIncidentsCount)
+	}
+}
+
 func listIngestJobs(t *testing.T, repoName string) []batchv1.Job {
 	t.Helper()
 	var jl batchv1.JobList

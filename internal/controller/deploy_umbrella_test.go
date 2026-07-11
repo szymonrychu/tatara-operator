@@ -45,6 +45,10 @@ func (w *umbWriter) GetPRState(_ context.Context, _, _ string, number int) (scm.
 	return scm.PRState{Merged: w.merged[number], Closed: w.closed[number], CIStatus: "success"}, nil
 }
 
+func (w *umbWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
+
 func (w *umbWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -85,6 +89,14 @@ func (r *umbReader) LatestWorkflowRun(_ context.Context, _, _, _, _ string) (scm
 
 func (r *umbReader) GetFileContent(_ context.Context, _, _, path, _ string) (string, error) {
 	return r.files[path], nil
+}
+
+// ListIssueComments is a no-op override: parkStalledDeploy/parkUmbrellaMergeTimeout
+// route their park comments through the FIX-8 comment gate, which now engages
+// even when the call site has no Repository CR (repo==nil), so a bare-embedded
+// nil scm.SCMReader would otherwise panic here.
+func (r *umbReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return nil, nil
 }
 
 func newUmbProjectReconciler(w *umbWriter) *ProjectReconciler {

@@ -804,6 +804,49 @@ func (r *TaskReconciler) recordConversationalApproval(ctx context.Context, task 
 	return nil
 }
 
+// recordAutoApproval durably records the auto-approve release path (item 4a):
+// Status.ApprovedByMaintainer gets the audit sentinel "<tatara:auto:<kind>>"
+// (distinct from any real login, never confusable with one - logins cannot
+// contain '<'), Status.AutoApproved is set for a fast structural check.
+//
+// Status.ApprovedByMaintainer is re-checked INSIDE the retry closure,
+// immediately before writing (finding FIX-3): the caller's approvingMaintainer
+// scan and this call are not atomic, so a concurrent label (recordMaintainerApproval)
+// or conversational approval can land on the Task in between. Blindly
+// overwriting would corrupt the audit attribution (a real maintainer's approval
+// silently replaced by the auto sentinel) and could double-approve. When the
+// fresh read already carries an approval, this is a no-op: it reflects that
+// winning value onto task.Status (never overwriting) and returns
+// recorded=false so the caller skips its own duplicate metric/audit comment.
+func (r *TaskReconciler) recordAutoApproval(ctx context.Context, task *tatarav1alpha1.Task, kind string) (bool, error) {
+	sentinel := "<tatara:auto:" + kind + ">"
+	recorded := false
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Status.ApprovedByMaintainer != "" {
+			recorded = false
+			task.Status.ApprovedByMaintainer = fresh.Status.ApprovedByMaintainer
+			task.Status.AutoApproved = fresh.Status.AutoApproved
+			return nil
+		}
+		fresh.Status.ApprovedByMaintainer = sentinel
+		fresh.Status.AutoApproved = true
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		recorded = true
+		task.Status.ApprovedByMaintainer = sentinel
+		task.Status.AutoApproved = true
+		return nil
+	}); err != nil {
+		return false, fmt.Errorf("record auto approval: %w", err)
+	}
+	return recorded, nil
+}
+
 // clearImplementOutcome nils Status.ImplementOutcome (RetryOnConflict). Called
 // after the refusal arm has committed its state transition.
 func (r *TaskReconciler) clearImplementOutcome(ctx context.Context, task *tatarav1alpha1.Task) error {
@@ -913,12 +956,16 @@ func (r *TaskReconciler) triageCloseIssue(ctx context.Context, project *tatarav1
 	return nil
 }
 
-// triagePostComment posts the discuss comment to the source issue. NOT routed
-// through the bot-last-word gate (comment_gate.go): the triage discuss arm is
-// already turn-taking-gated upstream by the triageReader botHasLastWord /
-// hasHumanReply check in finishTriage before this is called, so a second gate
-// here would be redundant and cost an extra SCM read.
-func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha1.Project, task *tatarav1alpha1.Task, comment string) error {
+// triagePostComment posts the discuss comment to the source issue. Routed
+// through gatedComment (FIX-6) for the closed-state and content-dedup rules:
+// callers include the auto-approve audit comment and discuss/close-withheld
+// notes, which can land on an issue closed since the decision to comment, or
+// duplicate on a retried reconcile - neither of those was covered by the old
+// upstream-only justification (which addressed rule-1 last-word alone, via
+// the triageReader botHasLastWord / hasHumanReply check in finishTriage). A
+// redundant rule-1 re-check inside gatedComment is harmless: the upstream
+// check already prevents reaching here in that case.
+func (r *TaskReconciler) triagePostComment(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, comment string) error {
 	if task.Spec.Source == nil {
 		return nil
 	}
@@ -932,15 +979,18 @@ func (r *TaskReconciler) triagePostComment(ctx context.Context, _ *tatarav1alpha
 			"action", "scm_issue_discuss_skipped_blank", "resource_id", task.Name)
 		return nil
 	}
-	_, _, writer, token, provider, err := r.scmContext(ctx, task)
+	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("triage discuss: %w", err)
 	}
 	commentStart := time.Now()
-	cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, comment)
-	r.recordSCM(provider, "comment", cerr)
+	posted, cerr := r.gatedComment(ctx, project, &repo, writer, token, provider,
+		task.Spec.Source.Number, false, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, comment)
 	if cerr != nil {
 		return fmt.Errorf("triage discuss comment: %w", cerr)
+	}
+	if !posted {
+		return nil
 	}
 	log.FromContext(ctx).Info("lifecycle triage: discuss comment posted",
 		"action", "scm_issue_discuss",

@@ -76,3 +76,17 @@ func TestGatedComment_SuppressesBotMR(t *testing.T) {
 		t.Fatalf("bot MR must be silent, got posted=%v calls=%v", posted, fake.posted)
 	}
 }
+
+func TestGatedCommentCore_SuppressesDuplicateContent(t *testing.T) {
+	const bot = "tatara-bot"
+	fake := &recordingGateSCM{gateFakeSCM: &gateFakeSCM{comments: []scm.IssueComment{tc(bot, 2)}}}
+	fake.comments[0].Body = "hello"
+	proj, repo := gateProjRepo(bot)
+	posted, err := gatedCommentCore(context.Background(), fake, fake, nil, proj, repo, "tok", "github", 7, false, bot, "", "o/n#7", "hello")
+	if err != nil || posted {
+		t.Fatalf("want (false,nil) for duplicate content, got (%v,%v)", posted, err)
+	}
+	if len(fake.posted) != 0 {
+		t.Fatalf("suppressed post must not call Comment, got %v", fake.posted)
+	}
+}

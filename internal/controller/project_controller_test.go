@@ -71,6 +71,30 @@ func getProject(t *testing.T, name string) *tataradevv1alpha1.Project {
 	return p
 }
 
+func TestReconcileProject_ComputesCounts(t *testing.T) {
+	mkTaskProject(t, "p-counts", 3)
+	mkTaskRepository(t, "r-counts-a", "p-counts")
+	mkTaskRepository(t, "r-counts-b", "p-counts")
+	mkTaskWithKind(t, "t-issue-open", "p-counts", "r-counts-a", "issueLifecycle")
+	mkTaskWithKind(t, "t-incident-open", "p-counts", "r-counts-a", "incident")
+	mkTaskWithKindTerminal(t, "t-issue-closed", "p-counts", "r-counts-a", "issueLifecycle")
+
+	if _, err := reconcileProject(t, "p-counts"); err != nil {
+		t.Fatalf("reconcileProject: %v", err)
+	}
+
+	proj := getProject(t, "p-counts")
+	if proj.Status.RepositoryCount != 2 {
+		t.Errorf("RepositoryCount = %d, want 2", proj.Status.RepositoryCount)
+	}
+	if proj.Status.OpenIssuesCount != 1 {
+		t.Errorf("OpenIssuesCount = %d, want 1 (terminal excluded)", proj.Status.OpenIssuesCount)
+	}
+	if proj.Status.OpenIncidentsCount != 1 {
+		t.Errorf("OpenIncidentsCount = %d, want 1", proj.Status.OpenIncidentsCount)
+	}
+}
+
 func waitProjectReady(t *testing.T, name string, want metav1.ConditionStatus) *tataradevv1alpha1.Project {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

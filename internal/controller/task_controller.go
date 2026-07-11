@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -124,6 +126,32 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		r.Metrics.ReconcileResult("Task", "error")
 		return ctrl.Result{}, fmt.Errorf("get task: %w", err)
+	}
+
+	// item 7/9: keep the printcolumn-backed ShortDescription and the
+	// describe-visible IssueLinks/PRLinks fresh on every reconcile, independent
+	// of kind/phase branching below (kubectl get/describe must be scannable
+	// without extra lookups for issueLifecycle/clarify Tasks too, which return
+	// early via reconcileLifecycle/reconcileClarify).
+	if err := r.patchTaskStatus(ctx, &task, func(fresh *tatarav1alpha1.Task) bool {
+		changed := false
+		if desc := shortDescription(fresh.Spec.Goal); fresh.Status.ShortDescription != desc {
+			fresh.Status.ShortDescription = desc
+			changed = true
+		}
+		issues, prs := deriveIssuePRLinks(fresh)
+		if !slices.Equal(fresh.Status.IssueLinks, issues) {
+			fresh.Status.IssueLinks = issues
+			changed = true
+		}
+		if !slices.Equal(fresh.Status.PRLinks, prs) {
+			fresh.Status.PRLinks = prs
+			changed = true
+		}
+		return changed
+	}); err != nil {
+		l.Error(err, "task: update derived status (non-fatal)",
+			"action", "task_derived_status", "resource_id", task.Name)
 	}
 
 	// Lazy-seed the work-item ledger from Spec.Source when WorkItems is empty.
@@ -277,6 +305,24 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
 		}
 		repoPtr = &repo
+	}
+
+	// Item-1 root cause guard (PR #295): a fresh review turn must never spawn
+	// against a PR/MR that is already merged or closed - the deploy supervisor
+	// may have merged it between scan-time task creation and this reconcile.
+	// Scoped to the pre-turn-0 spawn only (not every reconcile of an in-flight
+	// review), matching "a review turn is NOT spawned".
+	if task.Spec.Kind == "review" && task.Status.Phase == "" && task.Annotations[annCurrentTurn] == "" &&
+		r.reviewTargetClosed(ctx, &task) {
+		l.Info("review: target PR/MR already merged or closed; skipping review turn",
+			"action", "review_target_closed_skip", "resource_id", task.Name)
+		res, terr := r.terminate(ctx, &task, "Succeeded", "ReviewTargetClosed", "target PR/MR already merged or closed; review skipped")
+		if terr != nil {
+			r.Metrics.ReconcileResult("Task", "error")
+			return ctrl.Result{}, terr
+		}
+		r.Metrics.ReconcileResult("Task", "success")
+		return res, nil
 	}
 
 	// Review tasks (MR/PR review, issue #114 decision 4) get a review/test prompt
@@ -796,7 +842,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 
 	// A callback arrived. Mark the executing Subtask Done (if any).
 	if prev := task.Annotations[annCurrentSubtask]; prev != "" {
-		if err := r.markSubtaskDone(ctx, task.Namespace, prev, current); err != nil {
+		if err := r.markSubtaskDone(ctx, task, prev, current); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -969,13 +1015,15 @@ func (r *TaskReconciler) recordTurn(ctx context.Context, task *tatarav1alpha1.Ta
 }
 
 // markSubtaskDone sets a Subtask Done, recording the turn id (its result is
-// written by the callback before this reconcile runs). Wrapped in
+// written by the callback before this reconcile runs), then upserts the
+// completed entry onto the parent Task's durable rollup (item 8). Wrapped in
 // RetryOnConflict because the callback's recordResult writes the same
 // Subtask's status subresource concurrently and may race the reconcile.
-func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, name, turnID string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+func (r *TaskReconciler) markSubtaskDone(ctx context.Context, task *tatarav1alpha1.Task, name, turnID string) error {
+	var done *tatarav1alpha1.Subtask
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		st := &tatarav1alpha1.Subtask{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: taskNamespace, Name: name}, st); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, st); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
@@ -986,8 +1034,144 @@ func (r *TaskReconciler) markSubtaskDone(ctx context.Context, taskNamespace, nam
 		if err := r.Status().Update(ctx, st); err != nil {
 			return fmt.Errorf("mark subtask done: %w", err)
 		}
+		done = st
 		return nil
+	}); err != nil {
+		return err
+	}
+	if done == nil {
+		// Subtask vanished before we could mark it (rare race); nothing to roll up.
+		return nil
+	}
+	return r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		upsertSubtaskRollup(&fresh.Status, tatarav1alpha1.SubtaskRef{
+			Name: done.Name, Order: done.Spec.Order, Title: done.Spec.Title, Phase: "Done", Result: done.Status.Result,
+		})
+		return true
 	})
+}
+
+const subtaskResultMaxLen = 512
+
+// upsertSubtaskRollup finds a matching entry in status.Subtasks (by Name+Order)
+// and replaces it, or appends and re-sorts by Order when absent. Result is
+// truncated so the rollup stays kubectl-describe-sized even with many long
+// turn results.
+func upsertSubtaskRollup(status *tatarav1alpha1.TaskStatus, ref tatarav1alpha1.SubtaskRef) {
+	const suffix = "...(truncated)"
+	if len(ref.Result) > subtaskResultMaxLen {
+		ref.Result = ref.Result[:subtaskResultMaxLen-len(suffix)] + suffix
+	}
+	for i := range status.Subtasks {
+		if status.Subtasks[i].Name == ref.Name && status.Subtasks[i].Order == ref.Order {
+			status.Subtasks[i] = ref
+			return
+		}
+	}
+	status.Subtasks = append(status.Subtasks, ref)
+	sort.Slice(status.Subtasks, func(i, j int) bool { return status.Subtasks[i].Order < status.Subtasks[j].Order })
+}
+
+// UpsertSubtaskRollup is the exported form of upsertSubtaskRollup, used by
+// internal/restapi's createSubtask handler to seed a Pending rollup entry.
+func UpsertSubtaskRollup(status *tatarav1alpha1.TaskStatus, ref tatarav1alpha1.SubtaskRef) {
+	upsertSubtaskRollup(status, ref)
+}
+
+// linkKey normalizes a link to a repo#N identity so a full SCM URL
+// (DiscoveredIssues/PrURL/FollowupIssueURL) and a WorkItems-derived "repo#N"
+// ref pointing at the same artifact dedupe against each other even though
+// their string forms differ.
+func linkKey(v string) string {
+	if repo, n, ok := parseURLRepoNumber(v); ok {
+		return fmt.Sprintf("%s#%d", repo, n)
+	}
+	return v
+}
+
+// parseURLRepoNumber extracts owner/repo and the trailing item number from a
+// GitHub/GitLab issue or PR/MR URL (".../o/n/issues/1", ".../o/n/pull/2",
+// ".../o/n/-/merge_requests/3"). Returns ok=false for anything else (already
+// a "repo#N" ref, or an unrecognized shape).
+func parseURLRepoNumber(u string) (repo string, number int, ok bool) {
+	segs := strings.Split(strings.TrimRight(u, "/"), "/")
+	if len(segs) < 4 {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(segs[len(segs)-1])
+	if err != nil {
+		return "", 0, false
+	}
+	kindIdx := len(segs) - 2
+	if segs[kindIdx] == "-" {
+		// GitLab merge-request URLs insert a bare "-" segment.
+		kindIdx--
+	}
+	if kindIdx < 2 {
+		return "", 0, false
+	}
+	return segs[kindIdx-2] + "/" + segs[kindIdx-1], n, true
+}
+
+// deriveIssuePRLinks builds the SCM-footprint link lists (item 9) from every
+// ledger source: the full-URL fields (DiscoveredIssues, PrURL,
+// FollowupIssueURL) plus WorkItems entries rendered as "repo#N" refs, deduped
+// by normalized identity (linkKey) so a URL and a ref for the same artifact
+// collapse to one entry.
+func deriveIssuePRLinks(t *tatarav1alpha1.Task) (issues, prs []string) {
+	seenI, seenP := map[string]bool{}, map[string]bool{}
+	addI := func(v string) {
+		if v == "" {
+			return
+		}
+		if k := linkKey(v); !seenI[k] {
+			seenI[k] = true
+			issues = append(issues, v)
+		}
+	}
+	addP := func(v string) {
+		if v == "" {
+			return
+		}
+		if k := linkKey(v); !seenP[k] {
+			seenP[k] = true
+			prs = append(prs, v)
+		}
+	}
+	for _, u := range t.Status.DiscoveredIssues {
+		addI(u)
+	}
+	addI(t.Status.FollowupIssueURL)
+	addP(t.Status.PrURL)
+	for _, w := range t.Status.WorkItems {
+		ref := fmt.Sprintf("%s#%d", w.Repo, w.Number)
+		switch w.Kind {
+		case tatarav1alpha1.WorkItemIssue:
+			addI(ref)
+		case tatarav1alpha1.WorkItemPR:
+			addP(ref)
+		}
+	}
+	return issues, prs
+}
+
+// shortDescription is the first line of goal, truncated to ~60 runes on a
+// word boundary where possible, with an ellipsis when truncated.
+func shortDescription(goal string) string {
+	line := goal
+	if i := strings.IndexByte(goal, '\n'); i >= 0 {
+		line = goal[:i]
+	}
+	r := []rune(strings.TrimSpace(line))
+	const maxLen = 60
+	if len(r) <= maxLen {
+		return string(r)
+	}
+	cut := maxLen
+	if i := strings.LastIndexByte(string(r[:maxLen]), ' '); i > 0 {
+		cut = i
+	}
+	return strings.TrimRight(string(r[:cut]), " ") + "..."
 }
 
 // deriveResultSummary fills task.Status.ResultSummary from Done subtasks when

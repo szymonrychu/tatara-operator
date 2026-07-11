@@ -17,6 +17,9 @@ type labelCapturingWriter struct {
 	lastBody   string
 }
 
+func (f *labelCapturingWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (w *labelCapturingWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
 	w.lastLabels = req.Labels
 	w.lastBody = req.Body

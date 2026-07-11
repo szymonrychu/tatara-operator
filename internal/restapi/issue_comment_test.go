@@ -33,9 +33,12 @@ import (
 
 // fakeWriter captures Comment calls.
 type fakeWriter struct {
-	mu         sync.Mutex
-	comments   []capturedComment
-	commentErr error
+	mu            sync.Mutex
+	comments      []capturedComment
+	commentErr    error
+	prState       scm.PRState
+	issueState    scm.IssueState
+	issueStateErr error
 }
 
 type capturedComment struct {
@@ -62,7 +65,10 @@ func (f *fakeWriter) CreateIssue(_ context.Context, _, _ string, _ scm.IssueReq)
 func (f *fakeWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
 func (f *fakeWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
 func (f *fakeWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	return scm.PRState{}, nil
+	return f.prState, nil
+}
+func (f *fakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return f.issueState, f.issueStateErr
 }
 func (f *fakeWriter) Approve(_ context.Context, _, _ string, _ int, _ string) error { return nil }
 func (f *fakeWriter) RequestChanges(_ context.Context, _, _ string, _ int, _ string) error {
@@ -542,4 +548,105 @@ func TestCommentOnIssue_RefinePermittedUnderBotLastWord(t *testing.T) {
 func (f *fakeWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error { return nil }
 func (f *fakeWriter) GetMergeState(_ context.Context, _, _ string, _ int) (scm.MergeState, error) {
 	return scm.MergeStateClean, nil
+}
+
+// prCommentFakeReader tracks whether ListPRComments (vs ListIssueComments) was
+// called, for the isPR provider-aware listing test.
+type prCommentFakeReader struct {
+	fakeReader
+	prCalled    bool
+	issueCalled bool
+	prComments  []scm.IssueComment
+}
+
+func (f *prCommentFakeReader) ListPRComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	f.prCalled = true
+	return f.prComments, nil
+}
+
+func (f *prCommentFakeReader) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]scm.IssueComment, error) {
+	f.issueCalled = true
+	return f.fakeReader.ListIssueComments(ctx, owner, repo, number)
+}
+
+// TestCommentOnIssue_GitLabMR_UsesPRCommentLister verifies the PR-thread bug fix
+// (item 1/3): a comment on a PR/MR target must read the conversation via
+// ListPRComments (when the reader implements PRCommentLister), not
+// ListIssueComments - GitLab MRs live in a distinct notes endpoint.
+func TestCommentOnIssue_GitLabMR_UsesPRCommentLister(t *testing.T) {
+	writer := &fakeWriter{}
+	reader := &prCommentFakeReader{}
+	proj := projectWithBot("projpr", "projpr-scm", "tatara-bot")
+	secret := scmSecret("projpr-scm", "tok")
+	repo := repoForProject("projpr-repo", "projpr", "https://github.com/o/r.git")
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"lgtm","isPR":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projpr/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	require.True(t, reader.prCalled, "isPR=true must use ListPRComments")
+	require.False(t, reader.issueCalled, "isPR=true must NOT use ListIssueComments")
+}
+
+// TestCommentOnIssue_ClosedTarget_Refused mirrors the controller-side
+// closed-state test but through the REST path (item 1/3).
+func TestCommentOnIssue_ClosedTarget_Refused(t *testing.T) {
+	writer := &fakeWriter{issueState: scm.IssueState{Closed: true}}
+	reader := &fakeReader{}
+	proj := projectWithBot("projclosed", "projclosed-scm", "tatara-bot")
+	secret := scmSecret("projclosed-scm", "tok")
+	repo := repoForProject("projclosed-repo", "projclosed", "https://github.com/o/r.git")
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"my take"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projclosed/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, true, resp["refused"])
+	require.Equal(t, "closed", resp["reason"])
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	require.Len(t, writer.comments, 0, "must not post on an already-closed target")
+}
+
+// TestCommentOnIssue_DuplicateBody_Refused mirrors the controller-side
+// content-dedup test but through the REST path (item 1/3).
+func TestCommentOnIssue_DuplicateBody_Refused(t *testing.T) {
+	base := time.Now()
+	writer := &fakeWriter{}
+	reader := &fakeReader{comments: []scm.IssueComment{
+		{Author: "tatara-bot", Body: "  Done -   opened PR  ", CreatedAt: base},
+		{Author: "human", Body: "thanks", CreatedAt: base.Add(time.Minute)},
+	}}
+	proj := projectWithBot("projdup", "projdup-scm", "tatara-bot")
+	secret := scmSecret("projdup-scm", "tok")
+	repo := repoForProject("projdup-repo", "projdup", "https://github.com/o/r.git")
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"done - opened pr"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projdup/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, true, resp["refused"])
+	require.Equal(t, "duplicate", resp["reason"])
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	require.Len(t, writer.comments, 0, "must not re-post a normalized-duplicate body")
 }

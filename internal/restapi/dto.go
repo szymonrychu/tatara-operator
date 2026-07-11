@@ -83,6 +83,7 @@ type taskStatusDTO struct {
 	DeployState       string                            `json:"lifecycleState,omitempty"`
 	ParkReason        string                            `json:"parkReason,omitempty"`
 	ImplementGiveUps  int                               `json:"implementGiveUps,omitempty"`
+	Subtasks          []tatarav1alpha1.SubtaskRef       `json:"subtasks,omitempty"`
 }
 
 // TaskDTO is the stable JSON shape for a Task CRD.
@@ -92,6 +93,8 @@ type TaskDTO struct {
 	RepositoryRef    string            `json:"repositoryRef,omitempty"`
 	Goal             string            `json:"goal,omitempty"`
 	Kind             string            `json:"kind,omitempty"`
+	DedupKey         string            `json:"dedupKey,omitempty"`
+	AlertRule        string            `json:"alertRule,omitempty"`
 	ApprovalRequired bool              `json:"approvalRequired,omitempty"`
 	Source           *taskSourceDTO    `json:"source,omitempty"`
 	ProposedIssue    *proposedIssueDTO `json:"proposedIssue,omitempty"`
@@ -148,7 +151,8 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 	d := TaskDTO{
 		Name: task.Name, ProjectRef: task.Spec.ProjectRef, RepositoryRef: task.Spec.RepositoryRef,
 		Goal: task.Spec.Goal, MaxTurns: task.Spec.MaxTurns,
-		Kind: task.Spec.Kind, ApprovalRequired: task.Spec.ApprovalRequired,
+		Kind: task.Spec.Kind, DedupKey: task.Spec.DedupKey, AlertRule: task.Spec.AlertRule,
+		ApprovalRequired: task.Spec.ApprovalRequired,
 		Status: taskStatusDTO{
 			Phase: task.Status.Phase, PodName: task.Status.PodName,
 			TurnsCompleted: task.Status.TurnsCompleted, PrURL: task.Status.PrURL,
@@ -165,6 +169,7 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			DeployState:       task.Status.DeployState,
 			ParkReason:        task.Status.ParkReason,
 			ImplementGiveUps:  task.Status.ImplementGiveUps,
+			Subtasks:          task.Status.Subtasks,
 		},
 	}
 	if task.Spec.Source != nil {

@@ -25,6 +25,9 @@ type dirtyPRFakeWriter struct {
 	closeCalls int
 }
 
+func (f *dirtyPRFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *dirtyPRFakeWriter) GetMergeState(_ context.Context, _, _ string, _ int) (scm.MergeState, error) {
 	return f.mergeState, nil
 }

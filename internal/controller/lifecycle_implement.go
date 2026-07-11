@@ -84,11 +84,10 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 		}
 		if task.Status.LifecycleIterations >= maxIter {
 			// Backstop: too many attempts. Post comment and park.
-			_, _, writer, token, provider, scmErr := r.scmContext(ctx, task)
+			proj, repo, writer, token, provider, scmErr := r.scmContext(ctx, task)
 			if scmErr == nil && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 				msg := "max lifecycle iterations reached; leaving for a human"
-				cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
-				r.recordSCM(provider, "comment", cerr)
+				_, cerr := r.gatedComment(ctx, &proj, &repo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, msg)
 				if cerr != nil {
 					log.FromContext(ctx).Error(cerr, "implement: max-iterations comment (non-fatal)", "resource_id", task.Name)
 				}
@@ -287,10 +286,9 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 				"impl_action", outcome.Action, "park_reason", parkReason)
 			// Capture the Project from scmContext so we can pass it to ensurePhaseLabel
 			// without a redundant Get (finding 15).
-			if refusalProj, _, writer, token, provider, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
+			if refusalProj, refusalRepo, writer, token, provider, scmErr := r.scmContext(ctx, fresh); scmErr == nil {
 				if fresh.Spec.Source != nil && fresh.Spec.Source.IssueRef != "" {
-					cerr := writer.Comment(ctx, token, fresh.Spec.Source.IssueRef, outcome.Reason)
-					r.recordSCM(provider, "comment", cerr)
+					_, cerr := r.gatedComment(ctx, &refusalProj, &refusalRepo, writer, token, provider, fresh.Spec.Source.Number, fresh.Spec.Source.IsPR, fresh.Spec.Source.AuthorLogin, fresh.Spec.Source.IssueRef, outcome.Reason)
 					if cerr != nil {
 						l.Error(cerr, "implement: post outcome comment (non-fatal)", "resource_id", task.Name)
 					}
@@ -435,7 +433,11 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 
 	issueTitle := "Follow-up: " + firstLine(task.Spec.Goal) + " (remaining scope)"
 	prURL := task.Status.PrURL
-	issueBody := cs.RemainingScope + "\n\nOpened as a follow-up to: " + prURL + "\n\n" + tataraAuthoredMarker
+	// tataraProposedByMarker(kind) (FIX-7) keeps provenance spec-complete
+	// alongside tataraAuthoredMarker: the follow-up is a tatara-authored
+	// proposal too (kind "followup"), even though auto-approve is fail-safe
+	// here (a merged PR already delivered the reviewed portion).
+	issueBody := cs.RemainingScope + "\n\nOpened as a follow-up to: " + prURL + "\n\n" + tataraAuthoredMarker + "\n" + tataraProposedByMarker("followup")
 
 	createStart := time.Now()
 	created, cerr := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
@@ -455,7 +457,8 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 		"duration_ms", time.Since(createStart).Milliseconds(),
 	)
 
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	var siblings []string
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
@@ -475,10 +478,20 @@ func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatar
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
+		siblings = discoveredIssueSiblings(fresh)
 		task.Status.DiscoveredIssues = fresh.Status.DiscoveredIssues
 		task.Status.FollowupIssueURL = fresh.Status.FollowupIssueURL
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	// FIX-5: cross-link the follow-up against any existing sibling
+	// (discoveredIssueSiblings), mirroring completeProposal - without this the
+	// item-5 cross-links only ever seeded via the brainstorm path, never here.
+	if len(siblings) >= 2 {
+		r.syncSiblingLinks(ctx, provider, token, siblings)
+	}
+	return nil
 }
 
 // parsePRNumber extracts the trailing integer from a PR/MR URL

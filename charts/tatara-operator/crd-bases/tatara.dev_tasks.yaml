@@ -24,9 +24,16 @@ spec:
     - jsonPath: .spec.kind
       name: Kind
       type: string
+    - jsonPath: .spec.projectRef
+      name: Project
+      priority: 1
+      type: string
     - jsonPath: .status.turnsCompleted
       name: Turns
       type: integer
+    - jsonPath: .status.shortDescription
+      name: Description
+      type: string
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -55,8 +62,7 @@ spec:
               alertRule:
                 description: |-
                   AlertRule names the Grafana alert rule that produced an incident Task
-                  (commonLabels.alertname, falling back to groupKey). Descriptive only; the
-                  dedup key is the tatara.dev/alert-group hash label.
+                  (commonLabels.alertname, falling back to groupKey). Descriptive only.
                 type: string
               approvalRequired:
                 description: |-
@@ -64,6 +70,15 @@ spec:
                   this field for any gating decision. Approval is driven by the SCM
                   conversation flow. Do not set this field expecting behavior - it has none.
                 type: boolean
+              dedupKey:
+                description: |-
+                  DedupKey is the dedup identity for an incident Task: the alert-group hash
+                  (sha256(groupKey)[:16]) that ties re-fires of the same alert to the same
+                  tracked issue. Replaces the former tatara.dev/alert-group Task label and
+                  tatara/alert-group-<hash> issue label - dedup lookups List incident Tasks
+                  and filter by this field in Go instead of a label selector. Empty for
+                  non-incident Tasks.
+                type: string
               goal:
                 type: string
               kind:
@@ -98,12 +113,12 @@ spec:
                   alertGroup:
                     description: |-
                       AlertGroup is the per-alert-group dedup identity of the incident that filed
-                      this proposal: the tatara.dev/alert-group hash label of the in-flight
-                      incident Task, falling back to its descriptive AlertRule name. createProposal
-                      stamps tatara/alert-group-<hash> on the created incident issue and dedups
-                      future incident proposals by it, so a recurring alert tracks onto its
-                      existing open issue instead of spawning a near-duplicate. Empty for
-                      non-incident proposals.
+                      this proposal: the Spec.DedupKey of the in-flight incident Task, falling
+                      back to its descriptive AlertRule name. createProposal dedups future
+                      incident proposals by it (matching another incident Task's DedupKey and
+                      its recorded tracked issue), so a recurring alert tracks onto its existing
+                      open issue instead of spawning a near-duplicate. Empty for non-incident
+                      proposals.
                     type: string
                   body:
                     type: string
@@ -230,6 +245,14 @@ spec:
                   which an agent with SCM write could forge. Holds the approving maintainer's
                   login for audit.
                 type: string
+              autoApproved:
+                description: |-
+                  AutoApproved is true when ApprovedByMaintainer was set by the auto-approve
+                  release path (item 4a) rather than a real maintainer - the sentinel value
+                  "<tatara:auto:<kind>>" is also written to ApprovedByMaintainer for audit,
+                  but this bool is the fast structural check (avoids string-parsing the
+                  sentinel at every consumer).
+                type: boolean
               brainstormOutcome:
                 description: |-
                   BrainstormOutcome is the agent's declared outcome for a brainstorm task when
@@ -455,6 +478,15 @@ spec:
                 - action
                 - reason
                 type: object
+              issueLinks:
+                description: |-
+                  IssueLinks is every issue this Task touched: DiscoveredIssues,
+                  FollowupIssueURL, and issue-kind WorkItems, deduped. Full URLs where the
+                  source field carries one (DiscoveredIssues/FollowupIssueURL); "repo#N"
+                  refs where only a WorkItemRef exists (item 9).
+                items:
+                  type: string
+                type: array
               issueOutcome:
                 description: IssueOutcome is the agent's outcome for an issue-triage
                   task.
@@ -563,6 +595,13 @@ spec:
                 type: string
               podName:
                 type: string
+              prLinks:
+                description: |-
+                  PRLinks is every PR/MR this Task touched: PrURL and PR-kind WorkItems,
+                  deduped. Same mixed URL/"repo#N" format as IssueLinks.
+                items:
+                  type: string
+                type: array
               prNumber:
                 type: integer
               prOutcome:
@@ -669,6 +708,47 @@ spec:
                   operator passes it back to the next pod (as CONVERSATION_SESSION_ID) so a
                   fresh pod resumes via `claude --resume <id>` instead of starting empty.
                 type: string
+              shortDescription:
+                description: |-
+                  ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
+                  set on reconcile so `kubectl get task` is scannable without describe.
+                type: string
+              subtasks:
+                description: |-
+                  Subtasks is the durable rollup of every subtask (incl. the synthetic
+                  order-0 planning entry), maintained as subtasks progress. See SubtaskRef.
+                items:
+                  description: |-
+                    SubtaskRef is a durable point-in-time snapshot of one subtask, rolled onto
+                    TaskStatus.Subtasks as subtasks progress. Lets kubectl and a re-entering
+                    agent read the full reasoning trail (including the synthetic order-0
+                    "Planning" entry capturing turn 0's FinalText) without listing Subtask
+                    objects directly (item 8).
+                  properties:
+                    name:
+                      description: |-
+                        Name is the Subtask object's name, empty for the synthetic order-0
+                        planning entry (turn 0 has no backing Subtask object).
+                      type: string
+                    order:
+                      type: integer
+                    phase:
+                      enum:
+                      - Pending
+                      - Running
+                      - Done
+                      - Failed
+                      type: string
+                    result:
+                      type: string
+                    title:
+                      type: string
+                  required:
+                  - order
+                  - phase
+                  - title
+                  type: object
+                type: array
               turnsCompleted:
                 type: integer
               workItems:

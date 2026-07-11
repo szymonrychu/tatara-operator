@@ -26,6 +26,9 @@ type clarifyFakeWriter struct {
 	closes       []struct{ repo, comment string }
 }
 
+func (f *clarifyFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *clarifyFakeWriter) AddLabel(_ context.Context, _, issueRef, label string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

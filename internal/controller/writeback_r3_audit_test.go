@@ -125,6 +125,9 @@ func (f *singleGetPRStateRecoveryWriter) GetPRState(_ context.Context, _, _ stri
 func (f *singleGetPRStateRecoveryWriter) Comment(_ context.Context, _, _, _ string) error {
 	return nil
 }
+func (f *singleGetPRStateRecoveryWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 
 var _ scm.SCMReader = (*listMetricReader)(nil)
 
@@ -185,6 +188,9 @@ type transientSecondRepoWriter struct {
 	openCalls int
 }
 
+func (f *transientSecondRepoWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *transientSecondRepoWriter) OpenChange(_ context.Context, repoURL, _, _, _, _, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

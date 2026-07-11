@@ -13,8 +13,39 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
+
+// TestDefaultTaskRetention_IsSevenDays locks in item 10's "sane default"
+// requirement: if this ever changes, the plan's assumption (and this test)
+// must be revisited deliberately, not silently.
+func TestDefaultTaskRetention_IsSevenDays(t *testing.T) {
+	if config.DefaultTaskRetention != 168*time.Hour {
+		t.Fatalf("DefaultTaskRetention = %v, want 168h (7 days)", config.DefaultTaskRetention)
+	}
+}
+
+// TestReapOrphans_DeliveredTaskIsTerminal confirms item 10's delivered->terminal
+// path: a Task whose deploy cascade finished (DeployState=Done, mirroring
+// deploy_supervision.go's resolveDeployedTask) is TaskTerminal, so gcTerminalTasks
+// GCs it after TaskRetention like any other finished Task.
+func TestReapOrphans_DeliveredTaskIsTerminal(t *testing.T) {
+	mkTaskProject(t, "p-delivered", 3)
+	mkTaskRepository(t, "r-delivered", "p-delivered")
+	mkTask(t, "t-delivered", "p-delivered", "r-delivered")
+
+	tk := getTask(t, "t-delivered")
+	tk.Status.DeployState = "Done"
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set DeployState=Done: %v", err)
+	}
+
+	task := getTaskByName(t, "t-delivered")
+	if !tatarav1alpha1.TaskTerminal(task) {
+		t.Fatal("a Task with DeployState=Done must be TaskTerminal (delivered -> terminal path, item 10)")
+	}
+}
 
 // reaperServer returns a CallbackServer with ReaperGrace=1ns so freshly
 // created test pods are not protected by the grace window.
@@ -552,5 +583,72 @@ func TestReapOrphans_GCDisabledWhenRetentionZero(t *testing.T) {
 
 	if !taskExists(t, "t-gc-off") {
 		t.Error("expected GC disabled (retention=0) to keep the terminal Task")
+	}
+}
+
+func setTaskKind(t *testing.T, name, kind string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Spec.Kind = kind
+	if err := k8sClient.Update(context.Background(), tk); err != nil {
+		t.Fatalf("set kind %s: %v", name, err)
+	}
+}
+
+func setTaskDiscoveredIssues(t *testing.T, name string, urls []string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Status.DiscoveredIssues = urls
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set discovered issues %s: %v", name, err)
+	}
+}
+
+func setTaskWorkItemState(t *testing.T, name, repo string, number int, kind, state string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Status.WorkItems = append(tk.Status.WorkItems, tatarav1alpha1.WorkItemRef{
+		Repo: repo, Number: number, Kind: kind, State: state,
+	})
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set work item state %s: %v", name, err)
+	}
+}
+
+// TestReapOrphans_GCKeepsIncidentWithOpenTrackerIssue verifies a terminal
+// incident Task whose tracked issue is still open is spared from GC (item 6):
+// dedup now lives on the Task itself (Spec.DedupKey), so GC'ing it the moment
+// it goes terminal would drop the dedup lookup while the alert is still open.
+func TestReapOrphans_GCKeepsIncidentWithOpenTrackerIssue(t *testing.T) {
+	mkTaskProject(t, "p-gc-inc", 3)
+	mkTaskRepository(t, "r-gc-inc", "p-gc-inc")
+	mkTask(t, "t-gc-inc", "p-gc-inc", "r-gc-inc")
+	setTaskKind(t, "t-gc-inc", "incident")
+	setTaskDiscoveredIssues(t, "t-gc-inc", []string{"https://github.com/o/n/issues/9"})
+	setTaskWorkItemState(t, "t-gc-inc", "o/n", 9, tatarav1alpha1.WorkItemIssue, tatarav1alpha1.WIOpen)
+	setTaskPhase(t, "t-gc-inc", "Succeeded")
+
+	gcServer(prometheus.NewRegistry(), time.Nanosecond).ReapOrphans(context.Background())
+
+	if !taskExists(t, "t-gc-inc") {
+		t.Error("expected terminal incident Task with an open tracker issue to be SPARED from GC")
+	}
+}
+
+// TestReapOrphans_GCsIncidentAfterTrackerIssueCloses verifies GC proceeds
+// normally once the incident's tracked issue has closed.
+func TestReapOrphans_GCsIncidentAfterTrackerIssueCloses(t *testing.T) {
+	mkTaskProject(t, "p-gc-inc-closed", 3)
+	mkTaskRepository(t, "r-gc-inc-closed", "p-gc-inc-closed")
+	mkTask(t, "t-gc-inc-closed", "p-gc-inc-closed", "r-gc-inc-closed")
+	setTaskKind(t, "t-gc-inc-closed", "incident")
+	setTaskDiscoveredIssues(t, "t-gc-inc-closed", []string{"https://github.com/o/n/issues/10"})
+	setTaskWorkItemState(t, "t-gc-inc-closed", "o/n", 10, tatarav1alpha1.WorkItemIssue, tatarav1alpha1.WIClosed)
+	setTaskPhase(t, "t-gc-inc-closed", "Succeeded")
+
+	gcServer(prometheus.NewRegistry(), time.Nanosecond).ReapOrphans(context.Background())
+
+	if taskExists(t, "t-gc-inc-closed") {
+		t.Error("expected terminal incident Task with a closed tracker issue to be garbage-collected")
 	}
 }

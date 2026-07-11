@@ -43,6 +43,7 @@ type OperatorMetrics struct {
 	scanTasksCreatedTotal     *prometheus.CounterVec
 	scanDurationSeconds       *prometheus.HistogramVec
 	issueOutcomeTotal         *prometheus.CounterVec
+	autoApproveTotal          *prometheus.CounterVec
 	tasksInflightKind         *prometheus.GaugeVec
 	agentBootRaceRequeue      prometheus.Counter
 	agentSessionBusyRequeue   prometheus.Counter
@@ -144,6 +145,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "tatara_issue_outcome_total",
 			Help: "Issue-triage outcomes by action.",
 		}, []string{"action"}),
+		autoApproveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_auto_approve_total",
+			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
+		}, []string{"kind"}),
 		tasksInflightKind: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "tatara_tasks_inflight",
 			Help: "In-flight Tasks by kind.",
@@ -393,6 +398,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.scanTasksCreatedTotal,
 		m.scanDurationSeconds,
 		m.issueOutcomeTotal,
+		m.autoApproveTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
 		m.agentSessionBusyRequeue,
@@ -633,6 +639,12 @@ func (m *OperatorMetrics) ObserveScanDuration(activity string, seconds float64) 
 // IssueOutcome increments tatara_issue_outcome_total for an action.
 func (m *OperatorMetrics) IssueOutcome(action string) {
 	m.issueOutcomeTotal.WithLabelValues(action).Inc()
+}
+
+// AutoApproveTotal increments operator_auto_approve_total for a proposal kind
+// (item 4a auto-approve release path).
+func (m *OperatorMetrics) AutoApproveTotal(kind string) {
+	m.autoApproveTotal.WithLabelValues(kind).Inc()
 }
 
 // IssueOutcomeTotal returns the counter for a specific action, for test assertions.

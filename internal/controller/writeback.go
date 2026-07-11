@@ -387,8 +387,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			"The following in-scope repo(s) produced no change on branch `" + sourceBranch + "` (no commits, or the branch was never pushed) and got no PR/MR: " +
 			strings.Join(inScopeNoBranch, ", ") + ". " +
 			"If those repos genuinely need no change this is expected; otherwise the cross-repo edit was lost - re-run or fix manually."
-		werr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, warnBody)
-		r.recordSCM(provider, "comment", werr)
+		_, werr := r.gatedComment(ctx, &proj, &primaryRepo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, warnBody)
 		if werr != nil {
 			l.Error(werr, "writeback: in-scope no-branch warning comment (non-fatal)",
 				"action", "writeback_in_scope_warn_failed", "issue_ref", task.Spec.Source.IssueRef, "repos", strings.Join(inScopeNoBranch, ","))
@@ -408,8 +407,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		commented := task.Spec.Source != nil && task.Spec.Source.IssueRef != "" &&
 			task.Status.ResultSummary != "" && task.Status.DeployState != "Implement"
 		if commented {
-			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary)
-			r.recordSCM(provider, "comment", cerr)
+			_, cerr := r.gatedComment(ctx, &proj, &primaryRepo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, task.Status.ResultSummary)
 			if cerr != nil {
 				l.Error(cerr, "writeback: comment result on work item (non-fatal)",
 					"issue_ref", task.Spec.Source.IssueRef)
@@ -496,8 +494,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		if task.Status.ResultSummary != "" {
 			commentBody += "\n\n" + task.Status.ResultSummary
 		}
-		cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, commentBody)
-		r.recordSCM(provider, "comment", cerr)
+		_, cerr := r.gatedComment(ctx, &proj, &primaryRepo, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, commentBody)
 		if cerr != nil {
 			l.Error(cerr, "writeback: comment on work item (non-fatal)",
 				"issue_ref", task.Spec.Source.IssueRef)
@@ -799,6 +796,45 @@ func writeBackBody(t *tatarav1alpha1.Task) string {
 
 const tataraAuthoredMarker = "<!-- tatara-authored -->"
 
+// tataraProposedByMarkerPrefix delimits the kind-bearing provenance marker
+// written on proposal issues only (item 4a): it extends tataraAuthoredMarker
+// with WHICH tatara workflow proposed the issue, so the auto-approve release
+// path can key on kind. Both markers are written together; the plain
+// tataraAuthoredMarker substring check keeps working unmodified.
+const tataraProposedByMarkerPrefix = "<!-- tatara-proposed-by:"
+
+func tataraProposedByMarker(kind string) string {
+	return tataraProposedByMarkerPrefix + kind + " -->"
+}
+
+// tataraProposedByKind extracts the kind from a body's tatara-proposed-by
+// marker, or "" when absent.
+func tataraProposedByKind(body string) string {
+	i := strings.Index(body, tataraProposedByMarkerPrefix)
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len(tataraProposedByMarkerPrefix):]
+	end := strings.Index(rest, " -->")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// proposalKind derives the kind marker to stamp on a proposal issue: refine
+// never creates ProposedIssue Tasks today (see MEMORY.md), so only
+// brainstorm/incident are distinguished here.
+func proposalKind(task *tatarav1alpha1.Task) string {
+	if task.Spec.ProposedIssue == nil {
+		return ""
+	}
+	if task.Spec.ProposedIssue.Incident {
+		return "incident"
+	}
+	return "brainstorm"
+}
+
 // scmContext resolves project, primary repo, writer, token, and provider for a Task.
 // It must not be called for project-scoped tasks (empty RepositoryRef).
 func (r *TaskReconciler) scmContext(ctx context.Context, task *tatarav1alpha1.Task) (tatarav1alpha1.Project, tatarav1alpha1.Repository, scm.SCMWriter, string, string, error) {
@@ -829,6 +865,28 @@ func (r *TaskReconciler) scmContext(ctx context.Context, task *tatarav1alpha1.Ta
 		return proj, repo, writer, "", provider, fmt.Errorf("writeback: scm token: %w", err)
 	}
 	return proj, repo, writer, token, provider, nil
+}
+
+// reviewTargetClosed reports whether a review Task's target PR/MR is already
+// merged or closed, checked before a review turn is spawned (task_controller.go)
+// and before a review verdict is posted (writeback_review.go) so a stale review
+// never re-runs against, or re-comments on, a PR the deploy supervisor already
+// merged (root cause of PR #295: a review verdict posted twice on an
+// already-merged PR). Fail-open (false) on any resolution error so a transient
+// SCM hiccup never blocks a legitimate review.
+func (r *TaskReconciler) reviewTargetClosed(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	if task.Spec.Source == nil || !task.Spec.Source.IsPR || task.Spec.Source.Number <= 0 {
+		return false
+	}
+	_, repo, writer, token, _, err := r.scmContext(ctx, task)
+	if err != nil {
+		return false
+	}
+	st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, task.Spec.Source.Number)
+	if serr != nil {
+		return false
+	}
+	return st.Merged || st.Closed
 }
 
 func (r *TaskReconciler) recordSCM(provider, verb string, err error) {

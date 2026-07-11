@@ -136,6 +136,24 @@ func TestBuildTaskFromQueuedEvent_CopiesAlertRule(t *testing.T) {
 	}
 }
 
+func TestBuildTaskFromQueuedEvent_CopiesDedupKey(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-y", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", DedupKey: "deadbeefcafe1234", GenerateName: "incident-"},
+		},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if task.Spec.DedupKey != "deadbeefcafe1234" {
+		t.Fatalf("want DedupKey=deadbeefcafe1234, got %q", task.Spec.DedupKey)
+	}
+}
+
 func TestEnqueueEvent_DedupGatedByTaskTerminalState(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	c := fake.NewClientBuilder().

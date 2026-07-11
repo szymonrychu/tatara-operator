@@ -23,6 +23,9 @@ type capturingWriter struct {
 	req scm.IssueReq
 }
 
+func (f *capturingWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (c *capturingWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
 	c.mu.Lock()
 	c.req = req

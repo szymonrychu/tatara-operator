@@ -308,7 +308,7 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	// not get a spurious role:proposed entry. No-op for non-proposal labels
 	// (implementation/legacy idea/rejected map to "").
 	if wiState := lifecycleLabelToWIState(proj.Spec.Scm, desired); wiState != "" {
-		if isBotAuthoredProposal(proj, task) {
+		if isBotAuthoredProposal(ctx, writer, repo.Spec.URL, token, provider, proj, task) {
 			if seedErr := r.seedProposedEntry(ctx, task, issueRef, wiState); seedErr != nil {
 				l.Info("set label: seed proposed ledger entry failed (non-fatal)",
 					"action", "scm_set_label_ledger_seed", "resource_id", task.Name,
@@ -361,16 +361,41 @@ func (r *TaskReconciler) currentIssueLabels(ctx context.Context, provider, token
 }
 
 // isBotAuthoredProposal reports whether the task's source issue is a
-// tatara-authored brainstorm proposal: a non-PR issue whose AuthorLogin equals
-// the configured BotLogin. Proposals filed by createProposal carry the bot
-// login; human-reported issues do not. This gates the role:proposed producer so
-// human bug reports never get ledgered as proposals.
-func isBotAuthoredProposal(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
+// tatara-authored brainstorm proposal: a non-PR issue whose real author is the
+// configured BotLogin. Proposals filed by createProposal carry the bot login;
+// human-reported issues do not. This gates the role:proposed producer (never
+// ledger a human bug report as a proposal) AND the auto-approve release path
+// (item 4a) - a bot-authored, tatara-proposed issue is how an agent's own
+// investigation self-releases into implement.
+//
+// Source.AuthorLogin is trusted directly ONLY for provider=="github", where it
+// IS the real resource author. On GitLab AuthorLogin is the webhook ACTOR (see
+// internal/webhook/server.go), not the author - a human re-triaging a bot issue
+// (or, adversarially, an actor whose login happens to equal BotLogin) must not
+// be mistaken for a bot-authored issue. GitLab verifies the author live via
+// GetIssueState instead (mirrors resolveBotMR in comment_gate.go). Fails CLOSED
+// (not bot-authored) on a nil writer or a read error - this is on the
+// auto-approve path, so an unverifiable author must never be treated as
+// bot-authored.
+func isBotAuthoredProposal(ctx context.Context, writer scm.SCMWriter, repoURL, token, provider string, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
 	if proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" || task.Spec.Source == nil {
 		return false
 	}
 	s := task.Spec.Source
-	return !s.IsPR && s.IssueRef != "" && s.AuthorLogin == proj.Spec.Scm.BotLogin
+	if s.IsPR || s.IssueRef == "" {
+		return false
+	}
+	if provider == "github" {
+		return s.AuthorLogin == proj.Spec.Scm.BotLogin
+	}
+	if writer == nil {
+		return false
+	}
+	state, err := writer.GetIssueState(ctx, repoURL, token, s.Number)
+	if err != nil {
+		return false
+	}
+	return state.Author == proj.Spec.Scm.BotLogin
 }
 
 // seedProposedEntry appends a role:proposed WorkItemRef for issueRef (parsed
@@ -518,9 +543,12 @@ func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alph
 }
 
 // NOTE: the former thirdPartyAuthor autoapprove tier (issue #56) was removed
-// when the maintainer-approval gate landed: third-party authorship is no longer
-// a release signal. Only a VERIFIED maintainer approval (Status.ApprovedByMaintainer,
-// recorded by the webhook from a MaintainerLogins actor applying the approved
-// label) advances a front-half issue to implement. Author-based intake gating
-// still lives in IsAllowedReporter (reporter intake) and IsTrustedAuthor
-// (trigger-label/reaction-scope bypass); neither releases implementation.
+// when the maintainer-approval gate landed: third-party authorship is no
+// longer a release signal by itself. Three paths now release a front-half
+// issue to implement, all recorded on Status.ApprovedByMaintainer: (a) a
+// MaintainerLogins member applying the approved label, (b) a verified
+// maintainer conversational go-ahead, (c) auto-approve (item 4a) - a
+// bot-authored, tatara-proposed issue under an explicit per-project flag,
+// where the brainstorm/incident investigation itself served as the review.
+// Author-based intake gating still lives in IsAllowedReporter/IsTrustedAuthor;
+// neither releases implementation on its own.

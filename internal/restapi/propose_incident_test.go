@@ -143,12 +143,12 @@ func TestProposeIssue_NoIncidentWhenOnlyBrainstormInflight(t *testing.T) {
 	}
 }
 
-func TestProposeIssue_StampsAlertGroupFromLabel(t *testing.T) {
+func TestProposeIssue_StampsAlertGroupFromDedupKey(t *testing.T) {
 	proj := incidentProject("ag-proj")
 	repo := incidentRepo("ag-repo", "ag-proj")
 	incTask := inflightIncidentTask("ag-task-1", "ag-proj")
 	// The webhook stamps the per-alert-group dedup hash on the incident Task.
-	incTask.Labels = map[string]string{tatarav1alpha1.LabelAlertGroup: "deadbeefcafe1234"}
+	incTask.Spec.DedupKey = "deadbeefcafe1234"
 	incTask.Spec.AlertRule = "OperatorQueueDepthBacklog"
 
 	r, fc := buildIncidentTestRouter(t, proj, repo, incTask)
@@ -159,14 +159,14 @@ func TestProposeIssue_StampsAlertGroupFromLabel(t *testing.T) {
 	require.NotNil(t, task.Spec.ProposedIssue)
 	require.True(t, task.Spec.ProposedIssue.Incident)
 	require.Equal(t, "deadbeefcafe1234", task.Spec.ProposedIssue.AlertGroup,
-		"AlertGroup must come from the alert-group label, not the AlertRule fallback")
+		"AlertGroup must come from Spec.DedupKey, not the AlertRule fallback")
 }
 
 func TestProposeIssue_AlertGroupFallsBackToAlertRule(t *testing.T) {
 	proj := incidentProject("agf-proj")
 	repo := incidentRepo("agf-repo", "agf-proj")
 	incTask := inflightIncidentTask("agf-task-1", "agf-proj")
-	// No alert-group label: fall back to the descriptive alertname.
+	// No DedupKey: fall back to the descriptive alertname.
 	incTask.Spec.AlertRule = "OperatorQueueDepthBacklog"
 
 	r, fc := buildIncidentTestRouter(t, proj, repo, incTask)
@@ -177,7 +177,7 @@ func TestProposeIssue_AlertGroupFallsBackToAlertRule(t *testing.T) {
 	require.NotNil(t, task.Spec.ProposedIssue)
 	require.True(t, task.Spec.ProposedIssue.Incident)
 	require.Equal(t, "OperatorQueueDepthBacklog", task.Spec.ProposedIssue.AlertGroup,
-		"AlertGroup must fall back to AlertRule when the label is absent")
+		"AlertGroup must fall back to AlertRule when DedupKey is absent")
 }
 
 func TestProposeIssue_NoAlertGroupForBrainstorm(t *testing.T) {

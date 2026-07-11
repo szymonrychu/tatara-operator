@@ -413,8 +413,7 @@ func (r *ProjectReconciler) parkUmbrellaMergeTimeout(ctx context.Context, proj *
 	if writer != nil && task.Spec.Source != nil && task.Spec.Source.IssueRef != "" {
 		msg := "Deploy blocked: member PR(s) in " + strings.Join(stuckRepos, ", ") +
 			" stayed unmerged past the merge-wait budget. Review/merge or close them - the originating issue stays open until every member deploys."
-		cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
-		r.Metrics.SCMWrite(provider, "comment", scmResult(cerr))
+		_, cerr := r.gatedComment(ctx, proj, nil, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, msg)
 		if cerr != nil {
 			l.Error(cerr, "deploy: umbrella merge-timeout comment (non-fatal)", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
 		}
@@ -462,13 +461,12 @@ func (r *ProjectReconciler) parkStalledDeploy(ctx context.Context, proj *tatarav
 			msg := "Deploy blocked: the push-CD cascade for " + artifact +
 				" stalled past the backstop window and the automatic recovery budget is exhausted; leaving this for a human. " +
 				"The change is merged but not deployed - investigate the cascade (component tag, parent bump PR, tatara-helmfile apply) and push a fix."
-			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, msg)
-			r.Metrics.SCMWrite(provider, "comment", scmResult(cerr))
+			posted, cerr := r.gatedComment(ctx, proj, nil, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, msg)
 			if cerr != nil {
 				l.Error(cerr, "cdScan: exhausted-stall park comment (non-fatal)",
 					"resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
 			} else {
-				commented = true
+				commented = posted
 			}
 		}
 	}

@@ -21,6 +21,9 @@ type siblingFakeSCM struct {
 	commentCalls int
 }
 
+func (f *siblingFakeSCM) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *siblingFakeSCM) ListIssueComments(_ context.Context, owner, repo string, number int) ([]scm.IssueComment, error) {
 	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
 	return f.comments[key], nil
@@ -33,12 +36,14 @@ func (f *siblingFakeSCM) Comment(_ context.Context, _, _, _ string) error {
 
 func TestCommentSiblingMarker_Idempotent(t *testing.T) {
 	marker := systemicMarker(12)
+	pr := &ProjectReconciler{Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	proj := &tatarav1alpha1.Project{}
 	// reader with a comment containing the marker -> writer must NOT be called.
 	reader := &siblingFakeSCM{comments: map[string][]scm.IssueComment{
 		"o/r1#15": {{Author: "bot", Body: "earlier " + marker + " trailing"}},
 	}}
 	writer := &siblingFakeSCM{}
-	if err := commentSiblingMarker(context.Background(), reader, writer, "tok", "o/r1", 15, 12); err != nil {
+	if err := commentSiblingMarker(context.Background(), pr, reader, writer, proj, nil, "tok", "github", "o/r1", 15, 12); err != nil {
 		t.Fatal(err)
 	}
 	if writer.commentCalls != 0 {
@@ -47,7 +52,7 @@ func TestCommentSiblingMarker_Idempotent(t *testing.T) {
 	// fresh issue (no existing comments) -> must post once.
 	reader2 := &siblingFakeSCM{comments: map[string][]scm.IssueComment{}}
 	writer2 := &siblingFakeSCM{}
-	if err := commentSiblingMarker(context.Background(), reader2, writer2, "tok", "o/r1", 16, 12); err != nil {
+	if err := commentSiblingMarker(context.Background(), pr, reader2, writer2, proj, nil, "tok", "github", "o/r1", 16, 12); err != nil {
 		t.Fatal(err)
 	}
 	if writer2.commentCalls != 1 {

@@ -112,6 +112,17 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// for an hour after a self-healed incremental burst (issue #138).
 	r.publishIngestHealth(&repo)
 
+	// item 7 (FIX-2): keep the printcolumn-backed open issue/incident counts
+	// fresh on every reconcile, independent of ingest state/gating - this MUST
+	// run before the IngestEnabled early-return below, otherwise a non-ingested
+	// repo never gets its counts computed, contradicting this comment.
+	if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
+		return r.computeRepoCounts(ctx, fresh)
+	}); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("compute repo counts: %w", err)
+	}
+
 	if !tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true) {
 		return ctrl.Result{}, nil
 	}
@@ -506,6 +517,36 @@ func (r *RepositoryReconciler) patchStatus(ctx context.Context, repo *tataradevv
 		*repo = *fresh
 		return nil
 	})
+}
+
+// computeRepoCounts fills OpenIssuesCount/OpenIncidentsCount on repo.Status
+// from a namespace-scoped Task List + Go filter (item 7), scoped to this repo
+// via Spec.RepositoryRef. Returns whether status changed, matching
+// patchStatus's mutate signature.
+func (r *RepositoryReconciler) computeRepoCounts(ctx context.Context, repo *tataradevv1alpha1.Repository) bool {
+	var tasks tataradevv1alpha1.TaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(repo.Namespace)); err != nil {
+		return false
+	}
+	issues, incidents := 0, 0
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.RepositoryRef != repo.Name || tataradevv1alpha1.TaskTerminal(t) {
+			continue
+		}
+		switch t.Spec.Kind {
+		case "incident":
+			incidents++
+		case "issueLifecycle", "clarify":
+			issues++
+		}
+	}
+	if repo.Status.OpenIssuesCount == issues && repo.Status.OpenIncidentsCount == incidents {
+		return false
+	}
+	repo.Status.OpenIssuesCount = issues
+	repo.Status.OpenIncidentsCount = incidents
+	return true
 }
 
 // handleFinishedJob applies a terminal ingest Job's outcome to the Repository

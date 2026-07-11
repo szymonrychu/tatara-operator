@@ -15,12 +15,26 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .spec.projectRef
+      name: Project
+      type: string
+    - jsonPath: .spec.url
+      name: URL
+      priority: 1
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
     - jsonPath: .status.lastIngestedCommit
       name: Commit
+      priority: 1
       type: string
+    - jsonPath: .status.openIssuesCount
+      name: OpenIssues
+      type: integer
+    - jsonPath: .status.openIncidentsCount
+      name: OpenIncidents
+      type: integer
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -179,6 +193,16 @@ spec:
                   reingest-requested annotation; used as the base for the next fire.
                 format: date-time
                 type: string
+              openIncidentsCount:
+                description: |-
+                  OpenIncidentsCount is the number of non-terminal incident Tasks scoped to
+                  this repo. Computed on reconcile.
+                type: integer
+              openIssuesCount:
+                description: |-
+                  OpenIssuesCount is the number of non-terminal issueLifecycle/clarify Tasks
+                  scoped to this repo. Computed on reconcile.
+                type: integer
               phase:
                 enum:
                 - Ingesting

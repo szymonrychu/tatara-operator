@@ -49,6 +49,16 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	// Item-1 root cause guard (PR #295): never post a review verdict - approve,
+	// request_changes, or comment - once the target PR/MR is already merged or
+	// closed. GetPRState is the authoritative check.
+	if task.Spec.Source.IsPR && task.Spec.Source.Number > 0 {
+		if st, serr := writer.GetPRState(ctx, repo.Spec.URL, token, task.Spec.Source.Number); serr == nil && (st.Merged || st.Closed) {
+			l.Info("review: target PR/MR already merged or closed; withholding verdict",
+				"action", "review_target_closed_skip_verdict", "resource_id", task.Name)
+			return ctrl.Result{}, r.clearWritebackPending(ctx, task, "ReviewTargetClosed", "target PR/MR already merged or closed; verdict withheld")
+		}
+	}
 	_, approvedLabel, implementationLabel, _ := lifecycleLabels(proj.Spec.Scm)
 	number := task.Spec.Source.Number
 	var verbSent bool
@@ -234,9 +244,7 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 			sep = "!"
 		}
 		prRef := fmt.Sprintf("%s%s%d", slug, sep, number)
-		err = writer.Comment(ctx, token, prRef, v.Body)
-		r.recordSCM(provider, "comment", err)
-		verbSent = err == nil
+		verbSent, err = r.gatedComment(ctx, &proj, &repo, writer, token, provider, number, true, "", prRef, v.Body)
 	default:
 		err = fmt.Errorf("unknown review decision %q", v.Decision)
 	}

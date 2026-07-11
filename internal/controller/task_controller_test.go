@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,6 +122,39 @@ func getTask(t *testing.T, name string) *tatarav1alpha1.Task {
 	return tk
 }
 
+func mkTaskWithKind(t *testing.T, name, projectRef, repoRef, kind string) {
+	t.Helper()
+	tk := &tatarav1alpha1.Task{}
+	tk.Name = name
+	tk.Namespace = testNS
+	tk.Spec.ProjectRef = projectRef
+	tk.Spec.RepositoryRef = repoRef
+	tk.Spec.Goal = "ship the feature"
+	tk.Spec.Kind = kind
+	if err := k8sClient.Create(context.Background(), tk); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+}
+
+func mkTaskWithKindTerminal(t *testing.T, name, projectRef, repoRef, kind string) {
+	t.Helper()
+	mkTaskWithKind(t, name, projectRef, repoRef, kind)
+	tk := getTask(t, name)
+	tk.Status.Phase = "Succeeded"
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set terminal %s: %v", name, err)
+	}
+}
+
+func setTaskGoal(t *testing.T, name, goal string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Spec.Goal = goal
+	if err := k8sClient.Update(context.Background(), tk); err != nil {
+		t.Fatalf("set goal %s: %v", name, err)
+	}
+}
+
 func setTaskPhase(t *testing.T, name, phase string) {
 	t.Helper()
 	tk := getTask(t, name)
@@ -187,6 +221,61 @@ func findCond(conds []metav1.Condition, typ string) *metav1.Condition {
 		}
 	}
 	return nil
+}
+
+func TestReconcileTask_SetsShortDescription(t *testing.T) {
+	mkTaskProject(t, "p-short", 3)
+	mkTaskRepository(t, "r-short", "p-short")
+	mkTask(t, "t-short", "p-short", "r-short")
+	setTaskGoal(t, "t-short", "Fix the flaky retry loop in the deploy supervisor because it spins forever on 429s and burns quota")
+
+	fs := newFakeSession()
+	r := newTaskReconciler(fs)
+	if _, err := reconcileTask(t, r, "t-short"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	task := getTask(t, "t-short")
+	if len(task.Status.ShortDescription) > 63 {
+		t.Errorf("ShortDescription too long: %q (%d chars)", task.Status.ShortDescription, len(task.Status.ShortDescription))
+	}
+	if !strings.HasPrefix(task.Status.ShortDescription, "Fix the flaky retry loop") {
+		t.Errorf("ShortDescription = %q, want it to start with the goal's first words", task.Status.ShortDescription)
+	}
+}
+
+func TestDeriveIssuePRLinks_MixedLedger(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			DiscoveredIssues: []string{"https://github.com/o/n/issues/1"},
+			PrURL:            "https://github.com/o/n/pull/2",
+			FollowupIssueURL: "https://github.com/o/n/issues/3",
+			WorkItems: []tatarav1alpha1.WorkItemRef{
+				{Provider: "github", Repo: "o/n", Number: 4, Kind: tatarav1alpha1.WorkItemIssue},
+				{Provider: "github", Repo: "o/n", Number: 5, Kind: tatarav1alpha1.WorkItemPR},
+			},
+		},
+	}
+	issues, prs := deriveIssuePRLinks(task)
+	if len(issues) != 3 {
+		t.Errorf("issues = %v, want 3 entries", issues)
+	}
+	if len(prs) != 2 {
+		t.Errorf("prs = %v, want 2 entries", prs)
+	}
+}
+
+func TestDeriveIssuePRLinks_Dedupes(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			DiscoveredIssues: []string{"https://github.com/o/n/issues/1"},
+			WorkItems:        []tatarav1alpha1.WorkItemRef{{Provider: "github", Repo: "o/n", Number: 1, Kind: tatarav1alpha1.WorkItemIssue}},
+		},
+	}
+	issues, _ := deriveIssuePRLinks(task)
+	if len(issues) != 1 {
+		t.Errorf("issues = %v, want deduped to 1 entry", issues)
+	}
 }
 
 // ----- Task 6: concurrency gate + spawn -----

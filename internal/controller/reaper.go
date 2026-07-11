@@ -428,6 +428,16 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 			tk.Status.ImplementGiveUps > 0 {
 			continue
 		}
+		// Spare a terminal incident Task while its tracker issue is still open
+		// (item 6/10 tension): dedup is now purely Task-based (Spec.DedupKey), so
+		// GC'ing the Task the moment it goes terminal would drop the dedup lookup
+		// while the underlying problem is still being tracked. Non-incident Tasks
+		// are unaffected. Reads only cached WorkItems state - the reaper does no
+		// SCM egress.
+		if tk.Spec.Kind == "incident" && len(tk.Status.DiscoveredIssues) > 0 &&
+			incidentTrackerIssueStillOpen(tk) {
+			continue
+		}
 		age := time.Since(tk.CreationTimestamp.Time)
 		// Clean per-issue token and turn series before deletion so Prometheus does
 		// not accumulate stale series forever (bounded cardinality). Skip project-
@@ -449,4 +459,22 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 			"resource_id", tk.Name, "kind", tk.Spec.Kind, "age_seconds", age.Seconds())
 		s.Metrics.TasksGC(tk.Spec.Kind)
 	}
+}
+
+// incidentTrackerIssueStillOpen reports whether the head DiscoveredIssues URL
+// still has an open WorkItems ledger entry. Defaults to "open" (spare it) when
+// no matching ledger entry exists yet, since an unrefreshed/missing entry is
+// not evidence of closure - fail toward retaining, not toward premature GC.
+func incidentTrackerIssueStillOpen(tk *tatarav1alpha1.Task) bool {
+	repoSlug, number, ok := parseIssueURL(tk.Status.DiscoveredIssues[0])
+	if !ok {
+		return true
+	}
+	for _, w := range tk.Status.WorkItems {
+		if w.Kind != tatarav1alpha1.WorkItemIssue || w.Repo != repoSlug || w.Number != number {
+			continue
+		}
+		return w.State != tatarav1alpha1.WIClosed
+	}
+	return true
 }
