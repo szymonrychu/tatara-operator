@@ -13,8 +13,39 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
+
+// TestDefaultTaskRetention_IsSevenDays locks in item 10's "sane default"
+// requirement: if this ever changes, the plan's assumption (and this test)
+// must be revisited deliberately, not silently.
+func TestDefaultTaskRetention_IsSevenDays(t *testing.T) {
+	if config.DefaultTaskRetention != 168*time.Hour {
+		t.Fatalf("DefaultTaskRetention = %v, want 168h (7 days)", config.DefaultTaskRetention)
+	}
+}
+
+// TestReapOrphans_DeliveredTaskIsTerminal confirms item 10's delivered->terminal
+// path: a Task whose deploy cascade finished (DeployState=Done, mirroring
+// deploy_supervision.go's resolveDeployedTask) is TaskTerminal, so gcTerminalTasks
+// GCs it after TaskRetention like any other finished Task.
+func TestReapOrphans_DeliveredTaskIsTerminal(t *testing.T) {
+	mkTaskProject(t, "p-delivered", 3)
+	mkTaskRepository(t, "r-delivered", "p-delivered")
+	mkTask(t, "t-delivered", "p-delivered", "r-delivered")
+
+	tk := getTask(t, "t-delivered")
+	tk.Status.DeployState = "Done"
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set DeployState=Done: %v", err)
+	}
+
+	task := getTaskByName(t, "t-delivered")
+	if !tatarav1alpha1.TaskTerminal(task) {
+		t.Fatal("a Task with DeployState=Done must be TaskTerminal (delivered -> terminal path, item 10)")
+	}
+}
 
 // reaperServer returns a CallbackServer with ReaperGrace=1ns so freshly
 // created test pods are not protected by the grace window.
