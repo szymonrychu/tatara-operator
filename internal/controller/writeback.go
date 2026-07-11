@@ -796,6 +796,45 @@ func writeBackBody(t *tatarav1alpha1.Task) string {
 
 const tataraAuthoredMarker = "<!-- tatara-authored -->"
 
+// tataraProposedByMarkerPrefix delimits the kind-bearing provenance marker
+// written on proposal issues only (item 4a): it extends tataraAuthoredMarker
+// with WHICH tatara workflow proposed the issue, so the auto-approve release
+// path can key on kind. Both markers are written together; the plain
+// tataraAuthoredMarker substring check keeps working unmodified.
+const tataraProposedByMarkerPrefix = "<!-- tatara-proposed-by:"
+
+func tataraProposedByMarker(kind string) string {
+	return tataraProposedByMarkerPrefix + kind + " -->"
+}
+
+// tataraProposedByKind extracts the kind from a body's tatara-proposed-by
+// marker, or "" when absent.
+func tataraProposedByKind(body string) string {
+	i := strings.Index(body, tataraProposedByMarkerPrefix)
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len(tataraProposedByMarkerPrefix):]
+	end := strings.Index(rest, " -->")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// proposalKind derives the kind marker to stamp on a proposal issue: refine
+// never creates ProposedIssue Tasks today (see MEMORY.md), so only
+// brainstorm/incident are distinguished here.
+func proposalKind(task *tatarav1alpha1.Task) string {
+	if task.Spec.ProposedIssue == nil {
+		return ""
+	}
+	if task.Spec.ProposedIssue.Incident {
+		return "incident"
+	}
+	return "brainstorm"
+}
+
 // scmContext resolves project, primary repo, writer, token, and provider for a Task.
 // It must not be called for project-scoped tasks (empty RepositoryRef).
 func (r *TaskReconciler) scmContext(ctx context.Context, task *tatarav1alpha1.Task) (tatarav1alpha1.Project, tatarav1alpha1.Repository, scm.SCMWriter, string, string, error) {

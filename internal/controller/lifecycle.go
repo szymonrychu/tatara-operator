@@ -804,6 +804,28 @@ func (r *TaskReconciler) recordConversationalApproval(ctx context.Context, task 
 	return nil
 }
 
+// recordAutoApproval durably records the auto-approve release path (item 4a):
+// Status.ApprovedByMaintainer gets the audit sentinel "<tatara:auto:<kind>>"
+// (distinct from any real login, never confusable with one - logins cannot
+// contain '<'), Status.AutoApproved is set for a fast structural check.
+func (r *TaskReconciler) recordAutoApproval(ctx context.Context, task *tatarav1alpha1.Task, kind string) error {
+	sentinel := "<tatara:auto:" + kind + ">"
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ApprovedByMaintainer = sentinel
+		fresh.Status.AutoApproved = true
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return fmt.Errorf("record auto approval: %w", err)
+	}
+	task.Status.ApprovedByMaintainer = sentinel
+	task.Status.AutoApproved = true
+	return nil
+}
+
 // clearImplementOutcome nils Status.ImplementOutcome (RetryOnConflict). Called
 // after the refusal arm has committed its state transition.
 func (r *TaskReconciler) clearImplementOutcome(ctx context.Context, task *tatarav1alpha1.Task) error {

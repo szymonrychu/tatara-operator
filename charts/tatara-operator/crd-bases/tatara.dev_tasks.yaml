@@ -238,6 +238,14 @@ spec:
                   which an agent with SCM write could forge. Holds the approving maintainer's
                   login for audit.
                 type: string
+              autoApproved:
+                description: |-
+                  AutoApproved is true when ApprovedByMaintainer was set by the auto-approve
+                  release path (item 4a) rather than a real maintainer - the sentinel value
+                  "<tatara:auto:<kind>>" is also written to ApprovedByMaintainer for audit,
+                  but this bool is the fast structural check (avoids string-parsing the
+                  sentinel at every consumer).
+                type: boolean
               brainstormOutcome:
                 description: |-
                   BrainstormOutcome is the agent's declared outcome for a brainstorm task when

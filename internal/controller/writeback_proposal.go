@@ -174,7 +174,7 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	if cc := approverMentions(proj, &repo); cc != "" {
 		body += "\n\n" + cc
 	}
-	body += "\n\n" + tataraAuthoredMarker
+	body += "\n\n" + tataraAuthoredMarker + "\n" + tataraProposedByMarker(proposalKind(task))
 	ref, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
 		Title:  proposalTitle,
 		Body:   body,

@@ -188,6 +188,30 @@ type triageReader struct {
 	// its own live fetch (preserving the existing fail-open retry).
 	comments        []scm.IssueComment
 	commentsFetched bool
+
+	// content/contentFetched memoize the GetIssue result across
+	// isTataraAuthored/tataraProposedByKind/isBotAuthoredSource within one
+	// finishTriage call, so a single reconcile fetches the issue body/author
+	// once instead of up to three times. Memoized ONLY on success, matching the
+	// comments memoization discipline above.
+	content        scm.IssueContent
+	contentFetched bool
+}
+
+// getIssueContent returns the memoized GetIssue result, fetching it on first
+// use. Never cached on error, so a transient failure lets the next caller
+// within the same finishTriage invocation retry live.
+func (tr *triageReader) getIssueContent(ctx context.Context) (scm.IssueContent, error) {
+	if tr.contentFetched {
+		return tr.content, nil
+	}
+	content, err := tr.reader.GetIssue(ctx, tr.owner, tr.repoName, tr.issueNum)
+	if err != nil {
+		return scm.IssueContent{}, err
+	}
+	tr.content = content
+	tr.contentFetched = true
+	return content, nil
 }
 
 // listComments returns the memoized comment list if a prior call on this
@@ -270,11 +294,25 @@ func (tr *triageReader) isTataraAuthored(ctx context.Context) (bool, error) {
 	if !tr.resolved {
 		return false, nil
 	}
-	content, err := tr.reader.GetIssue(ctx, tr.owner, tr.repoName, tr.issueNum)
+	content, err := tr.getIssueContent(ctx)
 	if err != nil {
 		return false, err
 	}
 	return strings.Contains(content.Body, tataraAuthoredMarker), nil
+}
+
+// tataraProposedByKind uses the pre-resolved triageReader to read the
+// tatara-proposed-by kind marker (item 4a auto-approve), sharing the
+// memoized GetIssue fetch with isTataraAuthored/isBotAuthoredSource.
+func (tr *triageReader) tataraProposedByKind(ctx context.Context) string {
+	if !tr.resolved {
+		return ""
+	}
+	content, err := tr.getIssueContent(ctx)
+	if err != nil {
+		return ""
+	}
+	return tataraProposedByKind(content.Body)
 }
 
 // hasHumanReply uses the pre-resolved triageReader to check for a human comment
@@ -556,18 +594,24 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 	case "implement":
 		// A front-half issue is released into the autonomous
 		// implement->review->merge->deploy chain by a VERIFIED maintainer
-		// approval, recorded on the Task as Status.ApprovedByMaintainer. Two
-		// paths record it, both identity-verified by the operator (never the
-		// agent, never the bot):
-		//   1. A MaintainerLogins member applies the approved label (webhook,
-		//      recordMaintainerApproval).
-		//   2. A MaintainerLogins member comments a go-ahead in the thread; the
-		//      agent's implement verdict means scope is complete, and the
-		//      operator confirms a maintainer actually participated
-		//      (approvingMaintainer) before recording the approval here.
-		// The agent cannot self-approve: a non-maintainer comment, its own
-		// comment, or an empty maintainer list all fail closed. Fail CLOSED on
-		// any uncertainty (no participation, or an SCM read error): park to
+		// approval, recorded on the Task as Status.ApprovedByMaintainer. Three
+		// paths record it:
+		//   (a) A MaintainerLogins member applies the approved label (webhook,
+		//       recordMaintainerApproval) - identity-verified by the operator.
+		//   (b) A MaintainerLogins member comments a go-ahead in the thread; the
+		//       agent's implement verdict means scope is complete, and the
+		//       operator confirms a maintainer actually participated
+		//       (approvingMaintainer) before recording the approval here -
+		//       identity-verified by the operator.
+		//   (c) Auto-approve (item 4a): a bot-authored, tatara-proposed issue
+		//       (tatara-proposed-by marker) under an explicit per-project flag -
+		//       the brainstorm/incident investigation that produced the proposal
+		//       IS the review. Attempted only when (b) found no maintainer
+		//       participant; a human's live approval always takes precedence.
+		// The agent cannot self-approve via (a)/(b): a non-maintainer comment,
+		// its own comment, or an empty maintainer list all fail closed. Fail
+		// CLOSED on any uncertainty (no participation, an SCM read error, a
+		// non-bot author, a missing marker, or the flag off): park to
 		// Conversation / requeue and await the maintainer.
 		if task.Status.ApprovedByMaintainer == "" {
 			approver, aerr := tr.approvingMaintainer(ctx)
@@ -578,6 +622,27 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 				l.Info("triage implement: maintainer-participation scan failed; requeueing (fail closed)",
 					"action", "lifecycle_triage_participation_error", "resource_id", task.Name, "err", aerr.Error())
 				return ctrl.Result{}, aerr
+			}
+			if approver == "" {
+				// Path (c): auto-approve. Fail closed on any uncertainty - a
+				// non-bot author, missing marker, or flag-off all fall through to
+				// the existing park behavior below, unchanged.
+				if kind := tr.tataraProposedByKind(ctx); kind != "" &&
+					isBotAuthoredProposal(project, task) && project.Spec.AutoApproveTataraProposals {
+					if err := r.recordAutoApproval(ctx, task, kind); err != nil {
+						return ctrl.Result{}, err
+					}
+					if r.Metrics != nil {
+						r.Metrics.AutoApproveTotal(kind)
+					}
+					l.Info("triage implement: auto-approved (tatara-proposed, bot-authored, flag on)",
+						"action", "lifecycle_triage_auto_approve", "resource_id", task.Name, "kind", kind)
+					if err := r.triagePostComment(ctx, project, task,
+						fmt.Sprintf("tatara: auto-approved - tatara-proposed via %s; the %s served as review. Starting implementation.", kind, kind)); err != nil {
+						return ctrl.Result{}, err
+					}
+					approver = "<tatara:auto:" + kind + ">"
+				}
 			}
 			if approver == "" {
 				l.Info("triage implement outcome withheld: no verified maintainer approval; parking (fail closed)",
@@ -599,17 +664,21 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 				}
 				return ctrl.Result{}, nil
 			}
-			// A verified maintainer participated: record the approval (attributed
-			// to them) and post an audit comment, then fall through to onImplement
-			// (which stamps the approved label, sets Implement, records the metric).
-			if err := r.recordConversationalApproval(ctx, task, approver); err != nil {
-				return ctrl.Result{}, err
-			}
-			l.Info("triage implement: released by verified maintainer conversational approval",
-				"action", "lifecycle_triage_conversational_approval", "resource_id", task.Name, "maintainer", approver)
-			if err := r.triagePostComment(ctx, project, task,
-				fmt.Sprintf("tatara: approved by @%s via conversation; starting implementation.", approver)); err != nil {
-				return ctrl.Result{}, err
+			if strings.HasPrefix(approver, "<tatara:auto:") {
+				// Already recorded by recordAutoApproval above; nothing further to record.
+			} else {
+				// A verified maintainer participated: record the approval (attributed
+				// to them) and post an audit comment, then fall through to onImplement
+				// (which stamps the approved label, sets Implement, records the metric).
+				if err := r.recordConversationalApproval(ctx, task, approver); err != nil {
+					return ctrl.Result{}, err
+				}
+				l.Info("triage implement: released by verified maintainer conversational approval",
+					"action", "lifecycle_triage_conversational_approval", "resource_id", task.Name, "maintainer", approver)
+				if err := r.triagePostComment(ctx, project, task,
+					fmt.Sprintf("tatara: approved by @%s via conversation; starting implementation.", approver)); err != nil {
+					return ctrl.Result{}, err
+				}
 			}
 		}
 		res, terminal, herr := onImplement(ctx, project, task)

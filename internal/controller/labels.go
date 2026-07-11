@@ -518,9 +518,12 @@ func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alph
 }
 
 // NOTE: the former thirdPartyAuthor autoapprove tier (issue #56) was removed
-// when the maintainer-approval gate landed: third-party authorship is no longer
-// a release signal. Only a VERIFIED maintainer approval (Status.ApprovedByMaintainer,
-// recorded by the webhook from a MaintainerLogins actor applying the approved
-// label) advances a front-half issue to implement. Author-based intake gating
-// still lives in IsAllowedReporter (reporter intake) and IsTrustedAuthor
-// (trigger-label/reaction-scope bypass); neither releases implementation.
+// when the maintainer-approval gate landed: third-party authorship is no
+// longer a release signal by itself. Three paths now release a front-half
+// issue to implement, all recorded on Status.ApprovedByMaintainer: (a) a
+// MaintainerLogins member applying the approved label, (b) a verified
+// maintainer conversational go-ahead, (c) auto-approve (item 4a) - a
+// bot-authored, tatara-proposed issue under an explicit per-project flag,
+// where the brainstorm/incident investigation itself served as the review.
+// Author-based intake gating still lives in IsAllowedReporter/IsTrustedAuthor;
+// neither releases implementation on its own.

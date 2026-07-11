@@ -32,12 +32,12 @@ type ProposedIssueSpec struct {
 	// +optional
 	Incident bool `json:"incident,omitempty"`
 	// AlertGroup is the per-alert-group dedup identity of the incident that filed
-	// this proposal: the tatara.dev/alert-group hash label of the in-flight
-	// incident Task, falling back to its descriptive AlertRule name. createProposal
-	// stamps tatara/alert-group-<hash> on the created incident issue and dedups
-	// future incident proposals by it, so a recurring alert tracks onto its
-	// existing open issue instead of spawning a near-duplicate. Empty for
-	// non-incident proposals.
+	// this proposal: the Spec.DedupKey of the in-flight incident Task, falling
+	// back to its descriptive AlertRule name. createProposal dedups future
+	// incident proposals by it (matching another incident Task's DedupKey and
+	// its recorded tracked issue), so a recurring alert tracks onto its existing
+	// open issue instead of spawning a near-duplicate. Empty for non-incident
+	// proposals.
 	// +optional
 	AlertGroup string `json:"alertGroup,omitempty"`
 }
@@ -584,6 +584,13 @@ type TaskStatus struct {
 	// login for audit.
 	// +optional
 	ApprovedByMaintainer string `json:"approvedByMaintainer,omitempty"`
+	// AutoApproved is true when ApprovedByMaintainer was set by the auto-approve
+	// release path (item 4a) rather than a real maintainer - the sentinel value
+	// "<tatara:auto:<kind>>" is also written to ApprovedByMaintainer for audit,
+	// but this bool is the fast structural check (avoids string-parsing the
+	// sentinel at every consumer).
+	// +optional
+	AutoApproved bool `json:"autoApproved,omitempty"`
 
 	// Deploy-supervision fields (PhaseDeploying only; empty otherwise). The
 	// implement Task does not go terminal at PR-merge: it enters Deploying and

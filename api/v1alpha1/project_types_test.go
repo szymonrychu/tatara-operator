@@ -41,6 +41,13 @@ func TestProjectFields(t *testing.T) {
 	}
 }
 
+func TestProjectSpec_AutoApproveTataraProposals_DefaultsFalse(t *testing.T) {
+	var s v1alpha1.ProjectSpec
+	if s.AutoApproveTataraProposals {
+		t.Fatal("AutoApproveTataraProposals must be zero-value false")
+	}
+}
+
 func TestRepositoryFields(t *testing.T) {
 	r := v1alpha1.Repository{
 		Spec: v1alpha1.RepositorySpec{

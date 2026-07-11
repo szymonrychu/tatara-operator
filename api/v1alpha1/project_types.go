@@ -534,6 +534,17 @@ type ProjectSpec struct {
 	// +kubebuilder:default=720
 	// +optional
 	MergeWaitBudgetMinutes int `json:"mergeWaitBudgetMinutes,omitempty"`
+	// AutoApproveTataraProposals releases a bot-authored, tatara-proposed issue
+	// (marked <!-- tatara-proposed-by:<kind> -->) straight into
+	// implement->review->auto-merge->deploy without a second human gate: the
+	// brainstorm/incident investigation that produced the proposal IS the
+	// review. Never applies to a human-authored issue, marker or not - the
+	// bot-authorship check is independent and mandatory. Defaults false;
+	// cluster-agnostic charts only flip this per-project via helmfile
+	// enrollment values.
+	// +kubebuilder:default=false
+	// +optional
+	AutoApproveTataraProposals bool `json:"autoApproveTataraProposals,omitempty"`
 }
 
 // TokenBudgetSpec configures the per-Project token-budget admission gate (issue

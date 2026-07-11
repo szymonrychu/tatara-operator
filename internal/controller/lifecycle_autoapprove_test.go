@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -106,5 +107,154 @@ func TestTriageGate_NonApproverCommentHolds(t *testing.T) {
 	}
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
 		t.Fatalf("DeployState = %q, want Conversation (non-maintainer comment must not release)", got)
+	}
+}
+
+// ----- Path (c): auto-approve (item 4a) -----
+
+// setAutoApproveFlag flips Project.Spec.AutoApproveTataraProposals.
+func setAutoApproveFlag(t *testing.T, projName string, on bool) {
+	t.Helper()
+	ctx := context.Background()
+	var p tatarav1alpha1.Project
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: projName}, &p); err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	p.Spec.AutoApproveTataraProposals = on
+	if err := k8sClient.Update(ctx, &p); err != nil {
+		t.Fatalf("set auto-approve flag: %v", err)
+	}
+}
+
+// TestLifecycleTriage_AutoApprove_BotAuthored_FlagOn_Releases: a bot-authored,
+// tatara-proposed issue under the project flag auto-approves - the incident
+// investigation itself served as review.
+func TestLifecycleTriage_AutoApprove_BotAuthored_FlagOn_Releases(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "aa-on", "bot", nil)
+	setAutoApproveFlag(t, "lc-aap-aa-on", true)
+	fw := &lifecycleFakeSCMWriter{}
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &commentReader{body: tataraAuthoredMarker + "\n" + tataraProposedByMarker("incident")}, nil
+	}
+
+	if got := reconcileTriageState(t, r, name); got != "Implement" {
+		t.Fatalf("DeployState = %q, want Implement (bot-authored + tatara-proposed + flag on must auto-approve)", got)
+	}
+	got := getTaskByName(t, name)
+	if got.Status.ApprovedByMaintainer != "<tatara:auto:incident>" {
+		t.Fatalf("ApprovedByMaintainer = %q, want the auto sentinel", got.Status.ApprovedByMaintainer)
+	}
+	if !got.Status.AutoApproved {
+		t.Error("AutoApproved must be true")
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) != 1 {
+		t.Fatalf("want exactly 1 audit comment, got %d", len(fw.commentCalls))
+	}
+	if !strings.Contains(fw.commentCalls[0].body, "auto-approved") {
+		t.Errorf("audit comment = %q, want to mention auto-approved", fw.commentCalls[0].body)
+	}
+}
+
+// TestLifecycleTriage_AutoApprove_HumanAuthored_NeverReleases: a human-authored
+// issue must NEVER auto-approve, even with the marker present (adversarial:
+// marker text injected into a human-authored issue body).
+func TestLifecycleTriage_AutoApprove_HumanAuthored_NeverReleases(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "aa-human", "random-human", nil)
+	setAutoApproveFlag(t, "lc-aap-aa-human", true)
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &commentReader{body: tataraAuthoredMarker + "\n" + tataraProposedByMarker("incident")}, nil
+	}
+
+	if got := reconcileTriageState(t, r, name); got != "Conversation" {
+		t.Fatalf("DeployState = %q, want Conversation (human-authored must never auto-approve)", got)
+	}
+	got := getTaskByName(t, name)
+	if got.Status.ApprovedByMaintainer != "" {
+		t.Errorf("ApprovedByMaintainer = %q, want empty", got.Status.ApprovedByMaintainer)
+	}
+	if got.Status.AutoApproved {
+		t.Error("AutoApproved must stay false")
+	}
+}
+
+// TestLifecycleTriage_AutoApprove_FlagOff_ParksAsToday: bot-authored + marker
+// present but the project flag is off (default) - parks exactly as today.
+func TestLifecycleTriage_AutoApprove_FlagOff_ParksAsToday(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "aa-flagoff", "bot", nil)
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &commentReader{body: tataraAuthoredMarker + "\n" + tataraProposedByMarker("brainstorm")}, nil
+	}
+
+	if got := reconcileTriageState(t, r, name); got != "Conversation" {
+		t.Fatalf("DeployState = %q, want Conversation (flag off must not auto-approve)", got)
+	}
+}
+
+// TestLifecycleTriage_AutoApprove_NoMarker_NeverReleases: bot-authored, flag on,
+// but the body has no tatara-proposed-by marker (e.g. a plain tataraAuthoredMarker-
+// only follow-up issue) - must not auto-approve.
+func TestLifecycleTriage_AutoApprove_NoMarker_NeverReleases(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "aa-nomarker", "bot", nil)
+	setAutoApproveFlag(t, "lc-aap-aa-nomarker", true)
+	// seedAutoapproveTriage's default reader body carries only tataraAuthoredMarker.
+
+	if got := reconcileTriageState(t, r, name); got != "Conversation" {
+		t.Fatalf("DeployState = %q, want Conversation (no kind marker must not auto-approve)", got)
+	}
+}
+
+// TestLifecycleTriage_AutoApprove_ComposesWithLabelPath_NoDoubleApprove: when
+// path (a) (label approval) already recorded ApprovedByMaintainer, the whole
+// gate block is skipped - no double-approve, no audit comment, no metric.
+func TestLifecycleTriage_AutoApprove_ComposesWithLabelPath_NoDoubleApprove(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "aa-label", "bot", nil)
+	setAutoApproveFlag(t, "lc-aap-aa-label", true)
+	fw := &lifecycleFakeSCMWriter{}
+	r.SCMFor = func(string) (scm.SCMWriter, error) { return fw, nil }
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &commentReader{body: tataraAuthoredMarker + "\n" + tataraProposedByMarker("incident")}, nil
+	}
+	recordApproval(t, name, "szymon")
+
+	if got := reconcileTriageState(t, r, name); got != "Implement" {
+		t.Fatalf("DeployState = %q, want Implement (already approved via label path)", got)
+	}
+	got := getTaskByName(t, name)
+	if got.Status.ApprovedByMaintainer != "szymon" {
+		t.Errorf("ApprovedByMaintainer = %q, want szymon (must not be overwritten by auto-approve)", got.Status.ApprovedByMaintainer)
+	}
+	if got.Status.AutoApproved {
+		t.Error("AutoApproved must stay false - path (a) already released, path (c) never ran")
+	}
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) != 0 {
+		t.Errorf("want no audit comment when already approved via label path, got %d", len(fw.commentCalls))
+	}
+}
+
+// TestLifecycleTriage_AutoApprove_ComposesWithConversationalPath_PrefersConversational:
+// when a verified maintainer conversational approval (path b) is ALSO available,
+// it wins over auto-approve (path c) - a human's live approval takes precedence.
+func TestLifecycleTriage_AutoApprove_ComposesWithConversationalPath_PrefersConversational(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "aa-conv", "bot", []string{"szymon"})
+	setAutoApproveFlag(t, "lc-aap-aa-conv", true)
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &commentReader{body: tataraAuthoredMarker + "\n" + tataraProposedByMarker("incident"),
+			comments: []scm.IssueComment{{Author: "szymon", Body: "approved, go"}}}, nil
+	}
+
+	if got := reconcileTriageState(t, r, name); got != "Implement" {
+		t.Fatalf("DeployState = %q, want Implement", got)
+	}
+	got := getTaskByName(t, name)
+	if got.Status.ApprovedByMaintainer != "szymon" {
+		t.Errorf("ApprovedByMaintainer = %q, want szymon (conversational approval takes precedence)", got.Status.ApprovedByMaintainer)
+	}
+	if got.Status.AutoApproved {
+		t.Error("AutoApproved must stay false when conversational approval released it")
 	}
 }
