@@ -1513,6 +1513,23 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			created++
 		}
 	}
+	// Persist per-item high-water marks (issue #285): record the observed
+	// UpdatedAt for every candidate we scanned this cycle, and prune marks for
+	// items no longer open in the repos we actually listed. Scoped to issues
+	// (isPR=false); mrScan owns PR marks.
+	scannedRepos := make(map[string]bool, len(issueCache))
+	for slug := range issueCache {
+		scannedRepos[slug] = true
+	}
+	keepKeys := make(map[string]bool, len(cands))
+	upserts := make([]scanMarkUpsert, 0, len(cands))
+	for _, c := range cands {
+		keepKeys[scanMarkKey(c.repo, c.number)] = true
+		upserts = append(upserts, scanMarkUpsert{repo: c.repo, number: c.number, updatedAt: c.updatedAt, isPR: false})
+	}
+	if err := r.persistScanMarks(ctx, proj, upserts, keepKeys, scannedRepos, false); err != nil {
+		l.Error(err, "issueScan: persist scan marks", "action", "scan_issue", "resource_id", proj.Name)
+	}
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
 		"listed", len(cands), "picked", created, "duration_ms", time.Since(start).Milliseconds())
@@ -1602,6 +1619,24 @@ func (r *ProjectReconciler) issueScanPickOne(
 			"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
 		r.Metrics.ScanItem("issueScan", "adopted")
 		return false, nil
+	}
+	// Stale-activity cutoff (durable high-water mark, issue #285): once we have
+	// accounted for an item's activity, skip re-triage until it has genuinely
+	// newer activity. This survives Task GC (unlike the terminal-Task gates
+	// below), so a fresh restart does not re-spawn an agent for a long-handled
+	// issue whose Task was reaped. First sight (no mark) and truly-new activity
+	// fall through to the existing gates; the mark is (re)written for every
+	// scanned candidate at the end of issueScan regardless of this decision.
+	// A zero UpdatedAt (board/synthetic candidate) never gates.
+	if !c.updatedAt.IsZero() {
+		if m := lookupScanMark(proj.Status.ScanMarks, c.repo, c.number); m != nil && !c.updatedAt.After(m.AccountedAt.Time) {
+			r.Metrics.ScanItem("issueScan", "skipped_stale_mark")
+			l.Info("issueScan: skipped fresh task creation, no new activity since accounted mark",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
+				"accounted_at", m.AccountedAt.Time, "updated_at", c.updatedAt)
+			return false, nil
+		}
 	}
 	// Human-activity gate on fresh creation (issue #105): when the only
 	// matching Tasks are terminal and the issue has no managed phase label,

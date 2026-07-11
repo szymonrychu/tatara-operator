@@ -1,10 +1,13 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
@@ -61,4 +64,24 @@ func buildScanMarks(cur []tatarav1alpha1.ScanMark, upserts []scanMarkUpsert, kee
 		out = append(out, tatarav1alpha1.ScanMark{Repo: u.repo, Number: u.number, IsPR: u.isPR, AccountedAt: at})
 	}
 	return out
+}
+
+// persistScanMarks folds this scan cycle's observations into Project status
+// under RetryOnConflict, mirroring stampScan. It merges into the freshly-read
+// status (never blind-overwrite) so a concurrent scan of the other item type is
+// not clobbered. No-op when nothing was scanned.
+func (r *ProjectReconciler) persistScanMarks(ctx context.Context, proj *tatarav1alpha1.Project, upserts []scanMarkUpsert, keep, scanned map[string]bool, isPR bool) error {
+	if len(scanned) == 0 {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Project{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
+			return err
+		}
+		merged := buildScanMarks(fresh.Status.ScanMarks, upserts, keep, scanned, isPR)
+		fresh.Status.ScanMarks = merged
+		proj.Status.ScanMarks = merged
+		return r.Status().Update(ctx, fresh)
+	})
 }
