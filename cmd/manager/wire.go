@@ -412,6 +412,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return nil, fmt.Errorf("add callback server: %w", err)
 	}
+	if err := mgr.Add(maintenanceRunnable{srv: cbServer}); err != nil {
+		return nil, fmt.Errorf("add maintenance runnable: %w", err)
+	}
 	return seq, nil
 }
 
@@ -428,3 +431,18 @@ func (c callbackRunnable) Start(ctx context.Context) error {
 // and push-metrics server is stateless and must start on every replica,
 // independent of leadership.
 func (c callbackRunnable) NeedLeaderElection() bool { return false }
+
+// maintenanceRunnable runs the CallbackServer's poll-backstop + orphan-reaper
+// ticker. Unlike the callback HTTP server (callbackRunnable, every replica),
+// this is LEADER-ONLY: NeedLeaderElection true so only the elected leader
+// polls for missed turn callbacks and reaps orphan pods. When leader election
+// is disabled (single replica), controller-runtime still runs it.
+type maintenanceRunnable struct {
+	srv *controller.CallbackServer
+}
+
+func (m maintenanceRunnable) Start(ctx context.Context) error {
+	return m.srv.RunMaintenance(ctx)
+}
+
+func (m maintenanceRunnable) NeedLeaderElection() bool { return true }
