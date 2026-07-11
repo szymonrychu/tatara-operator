@@ -749,6 +749,29 @@ type ProjectStatus struct {
 	// TokenBudget carries the token-budget accumulator/snapshot (issue #189).
 	// +optional
 	TokenBudget *TokenBudgetStatus `json:"tokenBudget,omitempty"`
+	// ScanMarks are per-item high-water marks of the last GitHub activity the
+	// issue/PR scans have accounted for. They survive Task GC so a long-handled
+	// item is not re-triaged after its Task is reaped on operator restart.
+	// Pruned each scan to the currently-open item set of the scanned repos.
+	// +optional
+	// +listType=map
+	// +listMapKey=repo
+	// +listMapKey=number
+	ScanMarks []ScanMark `json:"scanMarks,omitempty"`
+}
+
+// ScanMark records the last GitHub activity timestamp the issue/PR scan has
+// accounted for on one item, keyed by (Repo, Number). It survives Task GC,
+// letting a scan skip re-triaging an item that has had no new activity since it
+// was last handled. IsPR scopes prune authority: issueScan prunes only issue
+// marks, mrScan only PR marks.
+type ScanMark struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	// +optional
+	IsPR bool `json:"isPR,omitempty"`
+	// AccountedAt is the GitHub UpdatedAt the scan last accounted for.
+	AccountedAt metav1.Time `json:"accountedAt"`
 }
 
 // TokenBudgetStatus carries the observed token-budget state for a Project
