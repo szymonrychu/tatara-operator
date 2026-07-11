@@ -1206,6 +1206,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		bot = proj.Spec.Scm.BotLogin
 	}
 	seen := map[string]bool{}
+	scannedRepos := make(map[string]bool)
 	var cands []candidate
 	for i := range repos {
 		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
@@ -1217,6 +1218,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			l.Error(err, "scan: ListOpenPRs", "action", "scan_list_error", "resource_id", proj.Name, "activity", "mrScan", "repo", repos[i].Name)
 			continue
 		}
+		scannedRepos[owner+"/"+name] = true
 		for _, c := range candidatesFromPRs(prs) {
 			key := fmt.Sprintf("%s#%d", c.repo, c.number)
 			if seen[key] {
@@ -1242,6 +1244,12 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	}
 	created := 0
 	deferred := 0
+	// failedMark tracks candidates whose createScanTask call failed this cycle
+	// (transient enqueue error, no RetryOnConflict). Their key is excluded from
+	// upserts below so the scan mark is NOT advanced - advancing it would make
+	// the freshness gate skip the item forever despite the fast 60s backlog
+	// retry, silently dropping it from ever getting its Task.
+	failedMark := map[string]bool{}
 	for _, c := range eligible {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
@@ -1267,6 +1275,19 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if hasLiveLifecycleTaskForIssue(existing, c.repo, dedupNumber) {
 				r.Metrics.ScanItem("mrScan", "skipped_dedup")
 				continue
+			}
+			// Stale-activity cutoff (issue #285): a bot lifecycle PR with no new
+			// activity since we last accounted for it must not be re-created after
+			// its terminal Task is GC'd. Keyed by the PR number (c.number), which
+			// is what botHadLastWord below also reads. Zero UpdatedAt never gates.
+			if !c.updatedAt.IsZero() {
+				if m := lookupScanMark(proj.Status.ScanMarks, c.repo, c.number); m != nil && !c.updatedAt.After(m.AccountedAt.Time) {
+					r.Metrics.ScanItem("mrScan", "skipped_stale_mark")
+					l.Info("mrScan: skipped bot PR re-creation, no new activity since accounted mark",
+						"action", "scan_mr", "resource_id", proj.Name, "repo", c.repo, "pr", c.number,
+						"accounted_at", m.AccountedAt.Time, "updated_at", c.updatedAt)
+					continue
+				}
 			}
 			labelCand := candidate{
 				repo: c.repo, number: dedupNumber, headSHA: c.headSHA,
@@ -1296,6 +1317,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				l.Error(err, "scan: enqueue mrScan issueLifecycle event", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
 				deferred++
+				failedMark[scanMarkKey(c.repo, c.number)] = true
 				continue
 			}
 			if ok2 {
@@ -1321,6 +1343,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				l.Error(err, "scan: enqueue mrScan task", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
 				deferred++
+				failedMark[scanMarkKey(c.repo, c.number)] = true
 				continue
 			}
 			if ok2 {
@@ -1328,6 +1351,23 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				created++
 			}
 		}
+	}
+	// Persist per-item high-water marks (issue #285): record the observed
+	// UpdatedAt for every PR candidate we scanned this cycle, and prune marks for
+	// items no longer open in the repos we actually listed. Scoped to PRs
+	// (isPR=true); issueScan owns issue marks.
+	keepKeys := make(map[string]bool, len(cands))
+	upserts := make([]scanMarkUpsert, 0, len(cands))
+	for _, c := range cands {
+		k := scanMarkKey(c.repo, c.number)
+		keepKeys[k] = true
+		if failedMark[k] {
+			continue // creation failed this cycle; do not advance the mark, so the fast retry re-attempts
+		}
+		upserts = append(upserts, scanMarkUpsert{repo: c.repo, number: c.number, updatedAt: c.updatedAt, isPR: true})
+	}
+	if err := r.persistScanMarks(ctx, proj, upserts, keepKeys, scannedRepos, true); err != nil {
+		l.Error(err, "mrScan: persist scan marks", "action", "scan_mr", "resource_id", proj.Name)
 	}
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
@@ -1458,6 +1498,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// ("implement\x00<issueRef>") plus needsImplementProducer's Task check keep it
 	// to one implement Task per episode.
 	produced := map[string]bool{}
+	// failedMark tracks candidates whose createScanTask call failed this cycle
+	// (transient enqueue error, no RetryOnConflict), across both this producer
+	// loop and the triage loop below. Their key is excluded from upserts in the
+	// mark-collection block so the scan mark is NOT advanced - advancing it
+	// would make the freshness gate skip the item forever despite the fast 60s
+	// backlog retry, silently dropping it from ever getting its Task.
+	failedMark := map[string]bool{}
 	for _, c := range cands {
 		if !needsImplementProducer(c, existing, implementation) {
 			continue
@@ -1466,11 +1513,26 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		if !ok {
 			continue
 		}
+		// Stale-activity cutoff (issue #285): once an implement Task from a prior
+		// handoff is GC'd, the issue still carries the implementation label and
+		// re-satisfies needsImplementProducer, spawning a fresh agent pod for no
+		// new activity. Skip when no new activity since the last accounted mark;
+		// a freshly-added label bumps UpdatedAt past any prior mark and still fires.
+		if !c.updatedAt.IsZero() {
+			if m := lookupScanMark(proj.Status.ScanMarks, c.repo, c.number); m != nil && !c.updatedAt.After(m.AccountedAt.Time) {
+				r.Metrics.ScanItem("issueScan", "skipped_stale_mark")
+				l.Info("issueScan: skipped implement producer, no new activity since accounted mark",
+					"action", "scan_issue", "resource_id", proj.Name, "repo", c.repo, "issue", c.number,
+					"accounted_at", m.AccountedAt.Time, "updated_at", c.updatedAt)
+				continue
+			}
+		}
 		goal := fmt.Sprintf("Implement issue %s#%d", c.repo, c.number)
 		created, cerr := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "implement", goal, nil, nil)
 		if cerr != nil {
 			l.Error(cerr, "issueScan: enqueue implement producer event", "action", "scan_issue",
 				"resource_id", proj.Name, "repo", repo.Name, "issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			failedMark[scanMarkKey(c.repo, c.number)] = true
 			continue
 		}
 		produced[fmt.Sprintf("%s#%d", c.repo, c.number)] = true
@@ -1507,11 +1569,33 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		picked, err := r.issueScanPickOne(ctx, proj, reader, repos, existing, c, systemicLeads, managed, brainstorming, approved, implementation, declined, botLogin, cc)
 		if err != nil {
 			deferred++
+			failedMark[scanMarkKey(c.repo, c.number)] = true
 			continue
 		}
 		if picked {
 			created++
 		}
+	}
+	// Persist per-item high-water marks (issue #285): record the observed
+	// UpdatedAt for every candidate we scanned this cycle, and prune marks for
+	// items no longer open in the repos we actually listed. Scoped to issues
+	// (isPR=false); mrScan owns PR marks.
+	scannedRepos := make(map[string]bool, len(issueCache))
+	for slug := range issueCache {
+		scannedRepos[slug] = true
+	}
+	keepKeys := make(map[string]bool, len(cands))
+	upserts := make([]scanMarkUpsert, 0, len(cands))
+	for _, c := range cands {
+		k := scanMarkKey(c.repo, c.number)
+		keepKeys[k] = true
+		if failedMark[k] {
+			continue // creation failed this cycle; do not advance the mark, so the fast retry re-attempts
+		}
+		upserts = append(upserts, scanMarkUpsert{repo: c.repo, number: c.number, updatedAt: c.updatedAt, isPR: false})
+	}
+	if err := r.persistScanMarks(ctx, proj, upserts, keepKeys, scannedRepos, false); err != nil {
+		l.Error(err, "issueScan: persist scan marks", "action", "scan_issue", "resource_id", proj.Name)
 	}
 	r.Metrics.ObserveScanDuration("issueScan", time.Since(start).Seconds())
 	l.Info("issueScan complete", "action", "scan_issue", "resource_id", proj.Name,
@@ -1602,6 +1686,24 @@ func (r *ProjectReconciler) issueScanPickOne(
 			"issue", fmt.Sprintf("%s#%d", c.repo, c.number))
 		r.Metrics.ScanItem("issueScan", "adopted")
 		return false, nil
+	}
+	// Stale-activity cutoff (durable high-water mark, issue #285): once we have
+	// accounted for an item's activity, skip re-triage until it has genuinely
+	// newer activity. This survives Task GC (unlike the terminal-Task gates
+	// below), so a fresh restart does not re-spawn an agent for a long-handled
+	// issue whose Task was reaped. First sight (no mark) and truly-new activity
+	// fall through to the existing gates; the mark is (re)written for every
+	// scanned candidate at the end of issueScan regardless of this decision.
+	// A zero UpdatedAt (board/synthetic candidate) never gates.
+	if !c.updatedAt.IsZero() {
+		if m := lookupScanMark(proj.Status.ScanMarks, c.repo, c.number); m != nil && !c.updatedAt.After(m.AccountedAt.Time) {
+			r.Metrics.ScanItem("issueScan", "skipped_stale_mark")
+			l.Info("issueScan: skipped fresh task creation, no new activity since accounted mark",
+				"action", "scan_issue", "resource_id", proj.Name,
+				"issue", fmt.Sprintf("%s#%d", c.repo, c.number),
+				"accounted_at", m.AccountedAt.Time, "updated_at", c.updatedAt)
+			return false, nil
+		}
 	}
 	// Human-activity gate on fresh creation (issue #105): when the only
 	// matching Tasks are terminal and the issue has no managed phase label,

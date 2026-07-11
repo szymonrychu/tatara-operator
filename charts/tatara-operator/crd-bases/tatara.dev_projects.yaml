@@ -6070,6 +6070,41 @@ spec:
                     format: date-time
                     type: string
                 type: object
+              scanMarks:
+                description: |-
+                  ScanMarks are per-item high-water marks of the last GitHub activity the
+                  issue/PR scans have accounted for. They survive Task GC so a long-handled
+                  item is not re-triaged after its Task is reaped on operator restart.
+                  Pruned each scan to the currently-open item set of the scanned repos.
+                items:
+                  description: |-
+                    ScanMark records the last GitHub activity timestamp the issue/PR scan has
+                    accounted for on one item, keyed by (Repo, Number). It survives Task GC,
+                    letting a scan skip re-triaging an item that has had no new activity since it
+                    was last handled. IsPR scopes prune authority: issueScan prunes only issue
+                    marks, mrScan only PR marks.
+                  properties:
+                    accountedAt:
+                      description: AccountedAt is the GitHub UpdatedAt the scan last
+                        accounted for.
+                      format: date-time
+                      type: string
+                    isPR:
+                      type: boolean
+                    number:
+                      type: integer
+                    repo:
+                      type: string
+                  required:
+                  - accountedAt
+                  - number
+                  - repo
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - repo
+                - number
+                x-kubernetes-list-type: map
               tokenBudget:
                 description: 'TokenBudget carries the token-budget accumulator/snapshot
                   (issue #189).'
