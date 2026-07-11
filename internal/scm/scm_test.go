@@ -54,6 +54,13 @@ func TestHTTPErrorShortBodyUnchanged(t *testing.T) {
 	require.Contains(t, msg, "404")
 }
 
+func TestIssueState_ClosedField(t *testing.T) {
+	st := IssueState{Author: "alice", Closed: true}
+	if !st.Closed {
+		t.Fatal("IssueState.Closed must round-trip true")
+	}
+}
+
 func TestErrorStatus(t *testing.T) {
 	require.Equal(t, "", ErrorStatus(nil))
 	require.Equal(t, "401", ErrorStatus(&HTTPError{Status: 401, Path: "/x"}))

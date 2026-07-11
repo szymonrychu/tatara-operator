@@ -111,6 +111,13 @@ type PRState struct {
 	Closed     bool   // true when the PR/MR is closed (not merged, state=closed)
 }
 
+// IssueState is the inspected state of a plain issue (no PR/MR). Mirrors
+// PRState's Author/Closed fields; issues have no Merged concept.
+type IssueState struct {
+	Author string
+	Closed bool
+}
+
 // ErrMergeConflict is returned by Merge when the SCM signals the PR is not
 // mergeable or a conflict prevents the merge (GitHub 405/409, GitLab 405/406/409).
 // Callers should use errors.Is(err, ErrMergeConflict) and re-triage rather than
@@ -154,6 +161,9 @@ type SCMWriter interface {
 	AddLabel(ctx context.Context, token, issueRef, label string) error
 	RemoveLabel(ctx context.Context, token, issueRef, label string) error
 	GetPRState(ctx context.Context, repoURL, token string, number int) (PRState, error)
+	// GetIssueState resolves the closed/open state of a plain issue, used by the
+	// comment gate's closed-state rule when the target is not a PR/MR.
+	GetIssueState(ctx context.Context, repoURL, token string, number int) (IssueState, error)
 	Approve(ctx context.Context, repoURL, token string, number int, body string) error
 	RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error
 	Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error

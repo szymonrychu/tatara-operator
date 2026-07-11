@@ -561,6 +561,21 @@ func (c *GitHub) GetPRState(ctx context.Context, repoURL, token string, number i
 	}, nil
 }
 
+// GetIssueState resolves an issue's author and closed state using the
+// per-call token (not c.token), matching GetPRState's writer-client contract.
+func (c *GitHub) GetIssueState(ctx context.Context, repoURL, token string, number int) (IssueState, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return IssueState{}, err
+	}
+	var raw ghIssueItem
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number)
+	if err := ghDo(ctx, c.base(), http.MethodGet, path, token, nil, &raw); err != nil {
+		return IssueState{}, err
+	}
+	return IssueState{Author: raw.User.Login, Closed: raw.State == "closed"}, nil
+}
+
 // ghRunCIStatus maps one GitHub check-run to the shared "" | pending |
 // success | failure vocabulary: any non-completed run is pending regardless
 // of conclusion; a completed run is a failure unless its conclusion is

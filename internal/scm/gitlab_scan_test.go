@@ -78,6 +78,28 @@ func TestGitLabGetIssue(t *testing.T) {
 	}
 }
 
+func TestGitLabGetIssueState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if glTestPath(r) != "/projects/g%2Fp/issues/21" {
+			t.Fatalf("unexpected path: %q", glTestPath(r))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"iid":    21,
+			"author": map[string]any{"username": "dave"},
+			"state":  "closed",
+		})
+	}))
+	defer srv.Close()
+	c := &GitLab{apiBase: srv.URL}
+	st, err := c.GetIssueState(context.Background(), "https://gitlab.com/g/p", "tok", 21)
+	if err != nil {
+		t.Fatalf("GetIssueState: %v", err)
+	}
+	if st.Author != "dave" || !st.Closed {
+		t.Fatalf("st = %+v, want Author=dave Closed=true", st)
+	}
+}
+
 // TestGitLabGetIssueSplitOwnerRepo verifies the project id is built from a
 // split (owner, repo) coordinate pair, not owner alone. Controller callers that
 // derive coordinates via scm.OwnerRepo pass ("g", "p"); the GitLab project path

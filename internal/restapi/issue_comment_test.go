@@ -33,9 +33,12 @@ import (
 
 // fakeWriter captures Comment calls.
 type fakeWriter struct {
-	mu         sync.Mutex
-	comments   []capturedComment
-	commentErr error
+	mu            sync.Mutex
+	comments      []capturedComment
+	commentErr    error
+	prState       scm.PRState
+	issueState    scm.IssueState
+	issueStateErr error
 }
 
 type capturedComment struct {
@@ -62,7 +65,10 @@ func (f *fakeWriter) CreateIssue(_ context.Context, _, _ string, _ scm.IssueReq)
 func (f *fakeWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
 func (f *fakeWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
 func (f *fakeWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
-	return scm.PRState{}, nil
+	return f.prState, nil
+}
+func (f *fakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return f.issueState, f.issueStateErr
 }
 func (f *fakeWriter) Approve(_ context.Context, _, _ string, _ int, _ string) error { return nil }
 func (f *fakeWriter) RequestChanges(_ context.Context, _, _ string, _ int, _ string) error {

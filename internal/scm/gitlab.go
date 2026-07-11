@@ -487,6 +487,26 @@ func (c *GitLab) GetPRState(ctx context.Context, repoURL, token string, number i
 	}, nil
 }
 
+// GetIssueState resolves an issue's author and closed state using the
+// per-call token (not c.token), matching GetPRState's writer-client contract.
+func (c *GitLab) GetIssueState(ctx context.Context, repoURL, token string, number int) (IssueState, error) {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return IssueState{}, err
+	}
+	var raw struct {
+		Author struct {
+			Username string `json:"username"`
+		} `json:"author"`
+		State string `json:"state"`
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(number)
+	if err := glDo(ctx, c.base(), http.MethodGet, path, token, nil, &raw); err != nil {
+		return IssueState{}, err
+	}
+	return IssueState{Author: raw.Author.Username, Closed: raw.State == "closed"}, nil
+}
+
 func glCIStatus(s string) string {
 	switch s {
 	case "":
