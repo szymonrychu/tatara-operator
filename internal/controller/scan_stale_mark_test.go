@@ -189,3 +189,63 @@ func TestMRScan_PersistsAndPrunesMarks(t *testing.T) {
 		t.Fatalf("want closed PR 8 mark pruned, got %+v", m)
 	}
 }
+
+// The clarify->implement handoff producer (issueScan's second, ungated
+// Task-creating loop) has the same GC-rescan gap as the gated triage/mrScan
+// paths: once a terminal implement Task is GC'd, an open issue still carrying
+// tatara-implementation re-satisfies needsImplementProducer and spawns a fresh
+// implement Task on every scan. A mark at/after the issue's UpdatedAt, no live
+// Task of any kind: the stale-mark gate must skip and record skipped_stale_mark.
+func TestIssueScan_ImplementProducer_SkipsWhenActivityNotNewerThanMark(t *testing.T) {
+	const impl = "tatara-implementation"
+
+	t.Run("mark at UpdatedAt -> no implement QE, metric fires", func(t *testing.T) {
+		const projName = "stalemark-impl-skip"
+		cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
+		proj, repoObj := seedScanProject(t, projName, cron)
+		proj.Status.ScanMarks = []tatarav1alpha1.ScanMark{
+			{Repo: "o/r", Number: 5, IsPR: false, AccountedAt: metav1.NewTime(time.Unix(100, 0))},
+		}
+		reader := &fakeReader{issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 5, Author: "human", Labels: []string{impl}, UpdatedAt: time.Unix(100, 0)},
+		}}
+		r := newScanReconciler(reader)
+		reg := prometheus.NewRegistry()
+		r.Metrics = obs.NewOperatorMetrics(reg)
+
+		_, _ = r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{*repoObj}, nil, cron.IssueScan)
+
+		if qes := listScanQEs(t, projName); len(qes) != 0 {
+			t.Fatalf("want 0 QEs (no new activity since mark), got %d", len(qes))
+		}
+		require.GreaterOrEqual(t,
+			counterValue(t, reg, "tatara_scan_items_total", map[string]string{"activity": "issueScan", "outcome": "skipped_stale_mark"}),
+			float64(1), "skipped_stale_mark must fire")
+	})
+
+	// Companion: new activity (UpdatedAt 200 > mark 100) must still produce the
+	// implement Task, proving the gate does not drop real handoffs.
+	t.Run("mark before UpdatedAt -> implement QE produced", func(t *testing.T) {
+		const projName = "stalemark-impl-create"
+		cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *", MaxPerRepo: 5}}
+		proj, repoObj := seedScanProject(t, projName, cron)
+		proj.Status.ScanMarks = []tatarav1alpha1.ScanMark{
+			{Repo: "o/r", Number: 5, IsPR: false, AccountedAt: metav1.NewTime(time.Unix(100, 0))},
+		}
+		reader := &fakeReader{issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 5, Author: "human", Labels: []string{impl}, UpdatedAt: time.Unix(200, 0)},
+		}}
+		r := newScanReconciler(reader)
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+		_, _ = r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{*repoObj}, nil, cron.IssueScan)
+
+		qes := listScanQEs(t, projName)
+		if len(qes) != 1 {
+			t.Fatalf("want 1 implement QE (new activity past mark), got %d", len(qes))
+		}
+		if qes[0].Spec.Payload.Kind != "implement" {
+			t.Fatalf("want implement QE, got kind %q", qes[0].Spec.Payload.Kind)
+		}
+	})
+}

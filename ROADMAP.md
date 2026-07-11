@@ -124,5 +124,7 @@ Planned work not yet started. One line per item; link to plans for detail.
 
 ## Scan stale-event cutoff (issue #285)
 
-- [x] Durable per-item high-water mark (ProjectStatus.ScanMarks) gates issueScan + mrScan re-triage on activity newer than last accounted. Plan: docs/superpowers/plans/2026-07-11-operator-scan-stale-cutoff.md (in tatara-new workbench).
+- [x] Durable per-item high-water mark (ProjectStatus.ScanMarks) gates issueScan triage + issueScan implement-producer + mrScan bot-PR re-triage on activity newer than last accounted. Plan: docs/superpowers/plans/2026-07-11-operator-scan-stale-cutoff.md (in tatara-new workbench).
 - [ ] Fix mrScan priorTerminalAttempts GC reset: recovery-exhaustion counter reads live Tasks only, resets to 0 after Task GC, undermining the maxRecoveryAttempts cap. Needs a durable attempt counter (candidate: reuse ScanMarks or a status counter).
+- [ ] Gate mrScan human-PR review branch on ScanMarks (same GC-rescan gap, scoped out of initial fix; low-harm re-review of unchanged PRs).
+- [ ] buildScanMarks prunes only scanned repos - marks for removed repos leak; add size cap or periodic full reconcile if repo churn grows.

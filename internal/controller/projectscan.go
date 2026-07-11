@@ -1494,6 +1494,20 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		if !ok {
 			continue
 		}
+		// Stale-activity cutoff (issue #285): once an implement Task from a prior
+		// handoff is GC'd, the issue still carries the implementation label and
+		// re-satisfies needsImplementProducer, spawning a fresh agent pod for no
+		// new activity. Skip when no new activity since the last accounted mark;
+		// a freshly-added label bumps UpdatedAt past any prior mark and still fires.
+		if !c.updatedAt.IsZero() {
+			if m := lookupScanMark(proj.Status.ScanMarks, c.repo, c.number); m != nil && !c.updatedAt.After(m.AccountedAt.Time) {
+				r.Metrics.ScanItem("issueScan", "skipped_stale_mark")
+				l.Info("issueScan: skipped implement producer, no new activity since accounted mark",
+					"action", "scan_issue", "resource_id", proj.Name, "repo", c.repo, "issue", c.number,
+					"accounted_at", m.AccountedAt.Time, "updated_at", c.updatedAt)
+				continue
+			}
+		}
 		goal := fmt.Sprintf("Implement issue %s#%d", c.repo, c.number)
 		created, cerr := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "implement", goal, nil, nil)
 		if cerr != nil {
