@@ -333,10 +333,17 @@ type TaskSpec struct {
 	// +optional
 	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
 	// AlertRule names the Grafana alert rule that produced an incident Task
-	// (commonLabels.alertname, falling back to groupKey). Descriptive only; the
-	// dedup key is the tatara.dev/alert-group hash label.
+	// (commonLabels.alertname, falling back to groupKey). Descriptive only.
 	// +optional
 	AlertRule string `json:"alertRule,omitempty"`
+	// DedupKey is the dedup identity for an incident Task: the alert-group hash
+	// (sha256(groupKey)[:16]) that ties re-fires of the same alert to the same
+	// tracked issue. Replaces the former tatara.dev/alert-group Task label and
+	// tatara/alert-group-<hash> issue label - dedup lookups List incident Tasks
+	// and filter by this field in Go instead of a label selector. Empty for
+	// non-incident Tasks.
+	// +optional
+	DedupKey string `json:"dedupKey,omitempty"`
 }
 
 // Task Phase string literals. Phases are bare strings on Status.Phase (there is

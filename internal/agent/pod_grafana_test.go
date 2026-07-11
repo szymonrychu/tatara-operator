@@ -72,17 +72,10 @@ func TestPodEnv_OmitsGitEmailWhenUnset(t *testing.T) {
 }
 
 func incidentTask(groupHash string) *tatarav1alpha1.Task {
-	t := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   "inc-" + groupHash,
-			Labels: map[string]string{},
-		},
-		Spec: tatarav1alpha1.TaskSpec{Kind: "incident"},
+	return &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "inc-" + groupHash},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "incident", DedupKey: groupHash},
 	}
-	if groupHash != "" {
-		t.Labels[tatarav1alpha1.LabelAlertGroup] = groupHash
-	}
-	return t
 }
 
 // TestIncidentPodSuffix_ContainsIncident verifies the suffix starts with "incident".
@@ -95,7 +88,7 @@ func TestIncidentPodSuffix_ContainsIncident(t *testing.T) {
 }
 
 // TestIncidentPodSuffix_UniquePerAlertGroup verifies two tasks with different
-// LabelAlertGroup values produce different pod name suffixes (and thus different
+// Spec.DedupKey values produce different pod name suffixes (and thus different
 // pod names), preventing incident Tasks from colliding on the same pod name.
 func TestIncidentPodSuffix_UniquePerAlertGroup(t *testing.T) {
 	taskA := incidentTask("group-hash-aaa")
@@ -108,7 +101,7 @@ func TestIncidentPodSuffix_UniquePerAlertGroup(t *testing.T) {
 }
 
 // TestIncidentPodSuffix_NoLabelFallback verifies a graceful fallback when
-// LabelAlertGroup is absent.
+// DedupKey is absent.
 func TestIncidentPodSuffix_NoLabelFallback(t *testing.T) {
 	task := incidentTask("")
 	suffix := podNameSuffix(task)

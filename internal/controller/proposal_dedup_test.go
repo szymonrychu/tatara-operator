@@ -432,33 +432,33 @@ func markIncidentProposal(t *testing.T, task *tatarav1alpha1.Task, alertGroup st
 	return &fresh
 }
 
-func containsLabel(labels []string, want string) bool {
-	for _, l := range labels {
-		if l == want {
-			return true
-		}
+// seedIncidentTrackerTask creates a Kind=incident Task carrying dedupKey and a
+// tracked issue URL in Status.DiscoveredIssues, simulating an earlier incident
+// investigation that already opened (and is tracking) an issue.
+func seedIncidentTrackerTask(t *testing.T, name, proj, dedupKey, issueURL string) {
+	t.Helper()
+	ctx := context.Background()
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj, Kind: "incident", Goal: "investigate", DedupKey: dedupKey},
 	}
-	return false
+	require.NoError(t, k8sClient.Create(ctx, task))
+	task.Status.DiscoveredIssues = []string{issueURL}
+	require.NoError(t, k8sClient.Status().Update(ctx, task))
 }
 
-// TestCreateProposal_AlertGroupDuplicateSkipsCreate: an incident proposal whose
-// alert-group already has an open issue (matched by the tatara/alert-group-<hash>
-// label, NOT the title) skips CreateIssue, wires Source to the existing issue,
-// and posts a recurrence comment.
-func TestCreateProposal_AlertGroupDuplicateSkipsCreate(t *testing.T) {
+// TestCreateProposal_DedupsByDedupKeyNotLabel: an incident proposal whose
+// DedupKey matches an existing incident Task's recorded tracker issue skips
+// CreateIssue, wires Source to that issue, and posts a recurrence comment.
+func TestCreateProposal_DedupsByDedupKeyNotLabel(t *testing.T) {
 	fw := &fakeProposalWriter{}
 
 	const ag = "deadbeefcafe1234"
-	existing := scm.IssueRef{
-		Repo:   "o/r",
-		Number: 42,
-		Title:  "a completely different free-text incident title",
-		Labels: []string{alertGroupLabel(ag)},
-	}
-	reader := &fakeProposalReader{issues: []scm.IssueRef{existing}}
+	reader := &fakeProposalReader{}
 	r := newProposalReconciler(t, fw, func(_, _ string) (scm.SCMReader, error) { return reader, nil })
 
 	task := seedProposalTask(t, "prop-ag-dup", "prop-ag-dup-proj", "prop-ag-dup-repo", "prop-ag-dup-scm", "Investigated: queue depth spiking again")
+	seedIncidentTrackerTask(t, "prop-ag-dup-tracker", "prop-ag-dup-proj", ag, "https://github.com/o/r/issues/42")
 	task = markIncidentProposal(t, task, ag)
 
 	var proj tatarav1alpha1.Project
@@ -467,11 +467,11 @@ func TestCreateProposal_AlertGroupDuplicateSkipsCreate(t *testing.T) {
 	_, err := r.createProposal(context.Background(), &proj, task)
 	require.NoError(t, err)
 
-	require.Zero(t, fw.calls(), "CreateIssue must not be called when an alert-group duplicate exists")
+	require.Zero(t, fw.calls(), "CreateIssue must not be called when a DedupKey match exists")
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
-	require.NotNil(t, got.Spec.Source, "Source must be set to the existing alert-group issue")
+	require.NotNil(t, got.Spec.Source, "Source must be set to the existing tracked issue")
 	require.Equal(t, 42, got.Spec.Source.Number)
 	require.Equal(t, "Succeeded", got.Status.Phase)
 
@@ -481,17 +481,14 @@ func TestCreateProposal_AlertGroupDuplicateSkipsCreate(t *testing.T) {
 	require.Contains(t, comments[0].body, ag, "recurrence comment should reference the alert-group")
 }
 
-// TestCreateProposal_AlertGroupNoMatchStampsLabel: an incident proposal with no
-// existing alert-group issue creates the issue and stamps the
-// tatara/alert-group-<hash> label so future re-fires dedup onto it.
-func TestCreateProposal_AlertGroupNoMatchStampsLabel(t *testing.T) {
+// TestCreateProposal_NoAlertGroupLabelOnCreatedIssue: an incident proposal with
+// no matching DedupKey creates the issue and does NOT stamp any
+// tatara/alert-group-<hash> label (item 6 removes the label entirely).
+func TestCreateProposal_NoAlertGroupLabelOnCreatedIssue(t *testing.T) {
 	fw := &fakeProposalWriter{}
 
 	const ag = "feedface00001111"
-	// An unrelated open issue with a different alert-group label - no match.
-	reader := &fakeProposalReader{issues: []scm.IssueRef{
-		{Repo: "o/r", Number: 7, Title: "unrelated", Labels: []string{alertGroupLabel("other")}},
-	}}
+	reader := &fakeProposalReader{}
 	r := newProposalReconciler(t, fw, func(_, _ string) (scm.SCMReader, error) { return reader, nil })
 
 	task := seedProposalTask(t, "prop-ag-new", "prop-ag-new-proj", "prop-ag-new-repo", "prop-ag-new-scm", "New incident writeup")
@@ -503,9 +500,11 @@ func TestCreateProposal_AlertGroupNoMatchStampsLabel(t *testing.T) {
 	_, err := r.createProposal(context.Background(), &proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, fw.calls(), "CreateIssue must be called when no alert-group match")
-	require.True(t, containsLabel(fw.createdLabels(), alertGroupLabel(ag)),
-		"created incident issue must be stamped with the alert-group label; got %v", fw.createdLabels())
+	require.Equal(t, 1, fw.calls(), "CreateIssue must be called when no DedupKey match")
+	for _, l := range fw.createdLabels() {
+		require.False(t, strings.HasPrefix(l, "tatara/alert-group-"),
+			"created incident issue must not carry an alert-group label; got %v", fw.createdLabels())
+	}
 	require.Empty(t, fw.commentCalls(), "no recurrence comment when a fresh issue is created")
 }
 
@@ -565,16 +564,4 @@ func TestCreateProposal_CrossSourceNearDupTitle(t *testing.T) {
 	var got tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
 	require.Equal(t, 21, got.Spec.Source.Number)
-}
-
-// TestAlertGroupLabel_StableAndLabelSafe: the same identity always maps to the
-// same label-safe token, and distinct identities differ.
-func TestAlertGroupLabel_StableAndLabelSafe(t *testing.T) {
-	a := alertGroupLabel("OperatorQueueDepthBacklog with spaces / and slashes")
-	b := alertGroupLabel("OperatorQueueDepthBacklog with spaces / and slashes")
-	c := alertGroupLabel("deadbeefcafe1234")
-	require.Equal(t, a, b, "same identity must map to the same label")
-	require.NotEqual(t, a, c, "distinct identities must map to distinct labels")
-	require.True(t, strings.HasPrefix(a, "tatara/alert-group-"))
-	require.Len(t, a, len("tatara/alert-group-")+16, "suffix is a 16-char hash regardless of input")
 }

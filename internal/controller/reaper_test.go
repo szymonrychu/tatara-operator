@@ -554,3 +554,70 @@ func TestReapOrphans_GCDisabledWhenRetentionZero(t *testing.T) {
 		t.Error("expected GC disabled (retention=0) to keep the terminal Task")
 	}
 }
+
+func setTaskKind(t *testing.T, name, kind string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Spec.Kind = kind
+	if err := k8sClient.Update(context.Background(), tk); err != nil {
+		t.Fatalf("set kind %s: %v", name, err)
+	}
+}
+
+func setTaskDiscoveredIssues(t *testing.T, name string, urls []string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Status.DiscoveredIssues = urls
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set discovered issues %s: %v", name, err)
+	}
+}
+
+func setTaskWorkItemState(t *testing.T, name, repo string, number int, kind, state string) {
+	t.Helper()
+	tk := getTask(t, name)
+	tk.Status.WorkItems = append(tk.Status.WorkItems, tatarav1alpha1.WorkItemRef{
+		Repo: repo, Number: number, Kind: kind, State: state,
+	})
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set work item state %s: %v", name, err)
+	}
+}
+
+// TestReapOrphans_GCKeepsIncidentWithOpenTrackerIssue verifies a terminal
+// incident Task whose tracked issue is still open is spared from GC (item 6):
+// dedup now lives on the Task itself (Spec.DedupKey), so GC'ing it the moment
+// it goes terminal would drop the dedup lookup while the alert is still open.
+func TestReapOrphans_GCKeepsIncidentWithOpenTrackerIssue(t *testing.T) {
+	mkTaskProject(t, "p-gc-inc", 3)
+	mkTaskRepository(t, "r-gc-inc", "p-gc-inc")
+	mkTask(t, "t-gc-inc", "p-gc-inc", "r-gc-inc")
+	setTaskKind(t, "t-gc-inc", "incident")
+	setTaskDiscoveredIssues(t, "t-gc-inc", []string{"https://github.com/o/n/issues/9"})
+	setTaskWorkItemState(t, "t-gc-inc", "o/n", 9, tatarav1alpha1.WorkItemIssue, tatarav1alpha1.WIOpen)
+	setTaskPhase(t, "t-gc-inc", "Succeeded")
+
+	gcServer(prometheus.NewRegistry(), time.Nanosecond).ReapOrphans(context.Background())
+
+	if !taskExists(t, "t-gc-inc") {
+		t.Error("expected terminal incident Task with an open tracker issue to be SPARED from GC")
+	}
+}
+
+// TestReapOrphans_GCsIncidentAfterTrackerIssueCloses verifies GC proceeds
+// normally once the incident's tracked issue has closed.
+func TestReapOrphans_GCsIncidentAfterTrackerIssueCloses(t *testing.T) {
+	mkTaskProject(t, "p-gc-inc-closed", 3)
+	mkTaskRepository(t, "r-gc-inc-closed", "p-gc-inc-closed")
+	mkTask(t, "t-gc-inc-closed", "p-gc-inc-closed", "r-gc-inc-closed")
+	setTaskKind(t, "t-gc-inc-closed", "incident")
+	setTaskDiscoveredIssues(t, "t-gc-inc-closed", []string{"https://github.com/o/n/issues/10"})
+	setTaskWorkItemState(t, "t-gc-inc-closed", "o/n", 10, tatarav1alpha1.WorkItemIssue, tatarav1alpha1.WIClosed)
+	setTaskPhase(t, "t-gc-inc-closed", "Succeeded")
+
+	gcServer(prometheus.NewRegistry(), time.Nanosecond).ReapOrphans(context.Background())
+
+	if taskExists(t, "t-gc-inc-closed") {
+		t.Error("expected terminal incident Task with a closed tracker issue to be garbage-collected")
+	}
+}

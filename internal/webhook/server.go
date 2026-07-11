@@ -1113,13 +1113,12 @@ func (s *Server) reactivateStaleIncident(ctx context.Context, projectName, group
 		return false
 	}
 	var tasks tatarav1.TaskList
-	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace),
-		client.MatchingLabels{tatarav1.LabelAlertGroup: groupHash}); err != nil {
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
 		return false
 	}
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
-		if t.Spec.ProjectRef != projectName || t.Spec.Kind != "incident" {
+		if t.Spec.ProjectRef != projectName || t.Spec.Kind != "incident" || t.Spec.DedupKey != groupHash {
 			continue
 		}
 		if tatarav1.TaskTerminal(t) {
@@ -1193,7 +1192,8 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 		Goal:         goal,
 		GenerateName: "incident-",
 		AlertRule:    alertRuleName(alert),
-		Labels:       map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: groupHash},
+		DedupKey:     groupHash,
+		Labels:       map[string]string{tatarav1.LabelActivity: "incident"},
 		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}
 	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, groupHash, payload)

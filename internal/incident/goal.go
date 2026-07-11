@@ -34,10 +34,13 @@ func GoalProject(alertCtx string, slugs []string) string {
 		"Investigate LIVE using the `grafana` MCP server (read-only): query the relevant Prometheus/Loki " +
 		"datasources, read the firing alert rule (follow its generatorURL), and inspect related dashboards. " +
 		"Form a diagnosis backed by the queries you ran and their results.\n\n" +
-		"Before proposing, SURVEY the project's EXISTING OPEN issues (use your issue-listing tool across the " +
-		"repos above). If this same problem is ALREADY tracked by an open issue - filed by a human, a brainstorm, " +
-		"or an earlier incident - do NOT open a DUPLICATE: add your fresh evidence as a comment on that existing " +
-		"issue and finish. Only propose a new issue when nothing open already covers it.\n\n" +
+		"Before proposing, SURVEY for an existing tracker: (1) list open incident Tasks for this project with " +
+		"your task_list tool and check whether any carries a matching alert identity, and (2) SURVEY the " +
+		"project's EXISTING OPEN issues (use your issue-listing tool across the repos above). If this same " +
+		"problem is ALREADY tracked - by an open incident Task, a human-reported issue, a brainstorm, or an " +
+		"earlier incident - do NOT open a DUPLICATE: add your fresh evidence as a comment on the existing " +
+		"tracked issue (comment_on_issue) and finish. Only propose a new issue when nothing open already " +
+		"covers it.\n\n" +
 		"Then call propose_issue(repo, body) EXACTLY ONCE. Choose the `repo` (from the list above) that the " +
 		"evidence implicates. The body MUST contain: the alert summary, the queries/tools you ran and their " +
 		"results, your diagnosis, and the Grafana links (generatorURL/externalURL). The issue lands with the " +

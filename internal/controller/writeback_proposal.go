@@ -2,8 +2,6 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -104,28 +102,29 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	// issues is safe; the body/marker check is skipped because tracking a
 	// human's identically-titled issue is still safer than creating a duplicate.
 	// (C') Incident proposals carry agent free-text titles that exact-title dedup
-	// cannot catch, so they dedup by the tatara/alert-group-<hash> label instead:
-	// a recurring alert tracks onto its existing open issue rather than spawning a
-	// near-duplicate investigation.
+	// cannot catch, so they dedup by Spec.DedupKey instead (item 6): a recurring
+	// alert tracks onto the existing open issue recorded by another incident
+	// Task carrying the same DedupKey, rather than spawning a near-duplicate
+	// investigation.
 	proposalTitle := task.Spec.ProposedIssue.Title
 	incidentDedup := task.Spec.ProposedIssue.Incident && task.Spec.ProposedIssue.AlertGroup != ""
+	var (
+		existing      scm.IssueRef
+		found         bool
+		viaAlertGroup bool
+	)
+	if incidentDedup {
+		if existingURL, ok := r.matchIncidentByDedupKey(ctx, proj, task.Spec.ProposedIssue.AlertGroup, task.Name); ok {
+			if repoSlug, num, pok := parseIssueURL(existingURL); pok {
+				existing, found, viaAlertGroup = scm.IssueRef{Repo: repoSlug, Number: num}, true, true
+			}
+		}
+	}
 	if r.ReaderFor != nil {
 		issues, rerr := r.listOpenProposalIssues(ctx, proj, repo.Spec.URL, token)
-		var (
-			existing      scm.IssueRef
-			found         bool
-			viaAlertGroup bool
-		)
 		if rerr != nil {
 			l.Error(rerr, "proposal: list open issues for dedup check (non-fatal, proceeding with create)")
 		} else {
-			// (C') Incident alert-group dedup: a re-fire of the SAME alert tracks onto
-			// its existing open issue (agent free-text titles defeat title dedup).
-			if incidentDedup {
-				if e, ok := matchOpenIssueByLabel(issues, alertGroupLabel(task.Spec.ProposedIssue.AlertGroup)); ok {
-					existing, found, viaAlertGroup = e, true, true
-				}
-			}
 			// (C+) Cross-source near-duplicate guard (finding #5): a normalized-title
 			// match against ANY open issue - human-, brainstorm-, OR incident-filed -
 			// tracks onto it instead of opening a near-duplicate. This is the code-level
@@ -138,38 +137,34 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 				}
 			}
 		}
-		if found {
-			if viaAlertGroup {
-				l.Info("proposal skipped: alert-group duplicate exists",
-					"action", "scm_propose_skip_alert_group",
-					"resource_id", task.Name,
-					"alert_group", task.Spec.ProposedIssue.AlertGroup,
-					"existing_number", existing.Number)
-				// (2A) Post a recurrence note so the re-fire stays visible on the
-				// tracked issue (the comment's own timestamp records when).
-				issueRef := fmt.Sprintf("%s#%d", existing.Repo, existing.Number)
-				if _, cerr := r.gatedComment(ctx, proj, &repo, writer, token, proj.Spec.Scm.Provider,
-					existing.Number, false, "", issueRef, alertGroupRefireComment(task.Spec.ProposedIssue.AlertGroup)); cerr != nil {
-					l.Error(cerr, "proposal: alert-group re-fire comment (non-fatal)", "issue_ref", issueRef)
-				}
-			} else {
-				l.Info("proposal skipped: duplicate exists",
-					"action", "scm_propose_skip_duplicate",
-					"resource_id", task.Name,
-					"existing_number", existing.Number)
+	}
+	if found {
+		if viaAlertGroup {
+			l.Info("proposal skipped: alert-group duplicate exists",
+				"action", "scm_propose_skip_alert_group",
+				"resource_id", task.Name,
+				"alert_group", task.Spec.ProposedIssue.AlertGroup,
+				"existing_number", existing.Number)
+			// (2A) Post a recurrence note so the re-fire stays visible on the
+			// tracked issue (the comment's own timestamp records when).
+			issueRef := fmt.Sprintf("%s#%d", existing.Repo, existing.Number)
+			if _, cerr := r.gatedComment(ctx, proj, &repo, writer, token, proj.Spec.Scm.Provider,
+				existing.Number, false, "", issueRef, alertGroupRefireComment(task.Spec.ProposedIssue.AlertGroup)); cerr != nil {
+				l.Error(cerr, "proposal: alert-group re-fire comment (non-fatal)", "issue_ref", issueRef)
 			}
-			return r.recordExistingProposal(ctx, proj, task, existing, repo.Spec.URL)
+		} else {
+			l.Info("proposal skipped: duplicate exists",
+				"action", "scm_propose_skip_duplicate",
+				"resource_id", task.Name,
+				"existing_number", existing.Number)
 		}
+		return r.recordExistingProposal(ctx, proj, task, existing, repo.Spec.URL)
 	}
 
 	brainstorming, _, _, _ := lifecycleLabels(proj.Spec.Scm)
 	labels := []string{brainstorming}
 	if task.Spec.ProposedIssue.Incident {
 		labels = append(labels, incidentLabel(proj.Spec.Scm))
-		// Stamp the alert-group identity so future re-fires dedup onto this issue.
-		if ag := task.Spec.ProposedIssue.AlertGroup; ag != "" {
-			labels = append(labels, alertGroupLabel(ag))
-		}
 	}
 	body := task.Spec.ProposedIssue.Body
 	if sid := task.Spec.ProposedIssue.SystemicID; sid != "" {
@@ -363,19 +358,29 @@ func matchOpenIssueByTitle(issues []scm.IssueRef, want string) (scm.IssueRef, bo
 	return scm.IssueRef{}, false
 }
 
-// matchOpenIssueByLabel returns the first non-PR open issue carrying label.
-func matchOpenIssueByLabel(issues []scm.IssueRef, label string) (scm.IssueRef, bool) {
-	for _, iss := range issues {
-		if iss.IsPR {
+// matchIncidentByDedupKey finds another incident Task (excluding selfName) in
+// the same project whose DedupKey matches and which has already recorded a
+// tracked issue, returning that issue's URL. Replaces the former
+// matchOpenIssueByLabel(alertGroupLabel(...)) issue-label lookup (item 6):
+// dedup identity now lives on TaskSpec.DedupKey, not an SCM label.
+func (r *TaskReconciler) matchIncidentByDedupKey(ctx context.Context, proj *tatarav1alpha1.Project, dedupKey, selfName string) (string, bool) {
+	if dedupKey == "" {
+		return "", false
+	}
+	var tasks tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(proj.Namespace)); err != nil {
+		return "", false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Name == selfName || t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "incident" || t.Spec.DedupKey != dedupKey {
 			continue
 		}
-		for _, lbl := range iss.Labels {
-			if lbl == label {
-				return iss, true
-			}
+		if len(t.Status.DiscoveredIssues) > 0 {
+			return t.Status.DiscoveredIssues[0], true
 		}
 	}
-	return scm.IssueRef{}, false
+	return "", false
 }
 
 // normalizeTitle folds a title to a comparison key: lower-case, non-alphanumeric
@@ -396,15 +401,6 @@ func normalizeTitle(s string) string {
 		}
 	}
 	return strings.TrimRight(b.String(), " ")
-}
-
-// alertGroupLabel maps an incident proposal's alert-group identity to a stable,
-// label-safe tracker label. The identity is hashed to 16 hex chars so any value
-// (the alert-group hash or the alertname fallback) yields a valid label that is
-// identical across re-fires of the same alert.
-func alertGroupLabel(alertGroup string) string {
-	sum := sha256.Sum256([]byte(alertGroup))
-	return "tatara/alert-group-" + hex.EncodeToString(sum[:])[:16]
 }
 
 // alertGroupRefireComment is the short recurrence note posted to the existing

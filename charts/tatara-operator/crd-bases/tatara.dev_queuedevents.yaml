@@ -72,6 +72,11 @@ spec:
                     additionalProperties:
                       type: string
                     type: object
+                  dedupKey:
+                    description: |-
+                      DedupKey is carried from the incident webhook onto the built Task's
+                      Spec.DedupKey (the incident dedup identity, item 6).
+                    type: string
                   generateName:
                     description: |-
                       GenerateName is used when Name is empty; Name is a fixed deterministic

@@ -40,6 +40,10 @@ type QueuedEventPayload struct {
 	// AlertRule is carried from the incident webhook onto the built Task.
 	// +optional
 	AlertRule string `json:"alertRule,omitempty"`
+	// DedupKey is carried from the incident webhook onto the built Task's
+	// Spec.DedupKey (the incident dedup identity, item 6).
+	// +optional
+	DedupKey string `json:"dedupKey,omitempty"`
 }
 
 type QueuedEventSpec struct {

@@ -442,14 +442,14 @@ func (s *Server) inflightIncidentTask(ctx context.Context, project string) *tata
 }
 
 // incidentAlertGroup returns the alert-group dedup identity of an in-flight
-// incident task: its tatara.dev/alert-group hash label, falling back to the
-// descriptive AlertRule name. Empty when t is nil (non-incident proposal).
+// incident task: its Spec.DedupKey, falling back to the descriptive AlertRule
+// name. Empty when t is nil (non-incident proposal).
 func incidentAlertGroup(t *tatarav1alpha1.Task) string {
 	if t == nil {
 		return ""
 	}
-	if g := t.Labels[tatarav1alpha1.LabelAlertGroup]; g != "" {
-		return g
+	if t.Spec.DedupKey != "" {
+		return t.Spec.DedupKey
 	}
 	return t.Spec.AlertRule
 }

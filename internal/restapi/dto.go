@@ -92,6 +92,8 @@ type TaskDTO struct {
 	RepositoryRef    string            `json:"repositoryRef,omitempty"`
 	Goal             string            `json:"goal,omitempty"`
 	Kind             string            `json:"kind,omitempty"`
+	DedupKey         string            `json:"dedupKey,omitempty"`
+	AlertRule        string            `json:"alertRule,omitempty"`
 	ApprovalRequired bool              `json:"approvalRequired,omitempty"`
 	Source           *taskSourceDTO    `json:"source,omitempty"`
 	ProposedIssue    *proposedIssueDTO `json:"proposedIssue,omitempty"`
@@ -148,7 +150,8 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 	d := TaskDTO{
 		Name: task.Name, ProjectRef: task.Spec.ProjectRef, RepositoryRef: task.Spec.RepositoryRef,
 		Goal: task.Spec.Goal, MaxTurns: task.Spec.MaxTurns,
-		Kind: task.Spec.Kind, ApprovalRequired: task.Spec.ApprovalRequired,
+		Kind: task.Spec.Kind, DedupKey: task.Spec.DedupKey, AlertRule: task.Spec.AlertRule,
+		ApprovalRequired: task.Spec.ApprovalRequired,
 		Status: taskStatusDTO{
 			Phase: task.Status.Phase, PodName: task.Status.PodName,
 			TurnsCompleted: task.Status.TurnsCompleted, PrURL: task.Status.PrURL,

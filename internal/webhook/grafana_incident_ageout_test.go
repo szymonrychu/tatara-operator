@@ -27,9 +27,9 @@ func TestGrafana_StaleIncident_ReTriggers(t *testing.T) {
 	stale := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "stale-incident", Namespace: "tatara",
-			Labels: map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: gh, queue.LabelDedupKey: gh},
+			Labels: map[string]string{tatarav1.LabelActivity: "incident", queue.LabelDedupKey: gh},
 		},
-		Spec:   tatarav1.TaskSpec{ProjectRef: "pstale", Kind: "incident", Goal: "investigate"},
+		Spec:   tatarav1.TaskSpec{ProjectRef: "pstale", Kind: "incident", Goal: "investigate", DedupKey: gh},
 		Status: tatarav1.TaskStatus{Phase: "Running"},
 	}
 
@@ -59,9 +59,9 @@ func TestGrafana_FreshIncident_StillDeduped(t *testing.T) {
 	fresh := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "fresh-incident", Namespace: "tatara",
-			Labels: map[string]string{tatarav1.LabelActivity: "incident", tatarav1.LabelAlertGroup: gh, queue.LabelDedupKey: gh},
+			Labels: map[string]string{tatarav1.LabelActivity: "incident", queue.LabelDedupKey: gh},
 		},
-		Spec:   tatarav1.TaskSpec{ProjectRef: "pfresh", Kind: "incident", Goal: "investigate"},
+		Spec:   tatarav1.TaskSpec{ProjectRef: "pfresh", Kind: "incident", Goal: "investigate", DedupKey: gh},
 		Status: tatarav1.TaskStatus{Phase: "Running"},
 	}
 
