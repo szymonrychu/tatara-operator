@@ -355,7 +355,15 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 	if task.Status.Phase == "Failed" {
 		l.Info("triage agent run failed; parking task",
 			"action", "lifecycle_triage_failed", "resource_id", task.Name)
-		if err := r.setDeployState(ctx, task, "Parked", "triage-failed"); err != nil {
+		// Liveness finding #2: park with a diagnostic issue comment so the reporter
+		// sees the triage run failed and is awaiting a human, not a silent Parked.
+		msg := "tatara: triage of this issue failed and I've paused it for a human to look at. " +
+			"Comment here with more context to retry."
+		if _, _, writer, token, _, scmErr := r.parkSCMContext(ctx, task); scmErr == nil {
+			if err := r.parkWithComment(ctx, task, writer, token, "triage-failed", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if err := r.setDeployState(ctx, task, "Parked", "triage-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {
@@ -520,51 +528,36 @@ func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1a
 		r.Metrics.IssueOutcome("discuss")
 
 	case "implement":
-		// Author-tiered autoapprove (issue #56): an issue opened by a known
-		// third-party contributor (author is neither the bot nor a maintainer) is
-		// trusted, so the triage agent's implement decision is honored straight
-		// through without the self-approve hold. Bot- and tatara-authored ideas,
-		// and the empty/maintainer-authored case, fall through to the guard below.
-		if !thirdPartyAuthor(project, task) {
-			// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
-			// human has engaged. Authorship is detected via the tatara-authored marker
-			// in the issue body - the reliable, egress-verified fallback for the
-			// bot/maintainer/empty-author case the third-party tier does not cover
-			// (Source.AuthorLogin is empty for board-sourced candidates).
-			// Uses the pre-resolved triageReader (finding 6: shared reader context).
-			authored, aerr := tr.isTataraAuthored(ctx)
-			if aerr != nil {
-				l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
-					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
-				authored = true
+		// EXPLICIT MAINTAINER APPROVAL is the ONLY signal that releases a
+		// front-half issue into the autonomous implement->review->merge->deploy
+		// chain. The operator advances ONLY when a VERIFIED maintainer approval has
+		// been recorded on the Task (Status.ApprovedByMaintainer, set by the webhook
+		// when a MaintainerLogins member applies the approved label - an
+		// identity-verified fact, NOT raw label presence and NOT any comment). An
+		// agent/pod that sets the approved label itself acts AS the bot, so its
+		// write is dropped by the webhook bot-actor guard and never recorded; a
+		// drive-by comment or third-party authorship no longer releases the gate.
+		// Fail CLOSED otherwise: park to Conversation and await the maintainer. This
+		// is the platform's core safety promise - tatara never self-approves.
+		if task.Status.ApprovedByMaintainer == "" {
+			l.Info("triage implement outcome withheld: no verified maintainer approval; parking (fail closed)",
+				"action", "lifecycle_triage_await_approval", "resource_id", task.Name)
+			if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
+				return ctrl.Result{}, err
 			}
-			if authored {
-				human, herr := tr.hasHumanReply(ctx)
-				if herr != nil {
-					l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
-						"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
-					human = false
-				}
-				if !human {
-					if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
-						return ctrl.Result{}, err
-					}
-					// Tear down the wrapper BEFORE transitioning to Conversation so a
-					// failed resetAgentRun leaves the task in Triage (still owns the pod)
-					// rather than in Conversation with a leaked live pod that nothing
-					// else will reap (finding 19).
-					if err := r.resetAgentRun(ctx, task); err != nil {
-						return ctrl.Result{}, err
-					}
-					if err := r.clearIssueOutcome(ctx, task); err != nil {
-						return ctrl.Result{}, err
-					}
-					if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
-						return ctrl.Result{}, err
-					}
-					return ctrl.Result{}, nil
-				}
+			// Tear down the wrapper BEFORE transitioning to Conversation so a failed
+			// resetAgentRun leaves the task in Triage (still owns the pod) rather than
+			// in Conversation with a leaked live pod that nothing else reaps (finding 19).
+			if err := r.resetAgentRun(ctx, task); err != nil {
+				return ctrl.Result{}, err
 			}
+			if err := r.clearIssueOutcome(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
 		}
 		res, terminal, herr := onImplement(ctx, project, task)
 		if herr != nil {

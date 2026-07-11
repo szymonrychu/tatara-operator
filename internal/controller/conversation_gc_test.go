@@ -91,7 +91,7 @@ func mkConvTask(t *testing.T, name, kind, convKey, forkKey string, terminal bool
 	old := metav1.NewTime(time.Now().Add(-2 * time.Hour)) // past the 1h grace
 	task.Status.LastActivityAt = &old
 	if terminal {
-		if kind == "issueLifecycle" {
+		if kind == "issueLifecycle" || kind == "clarify" {
 			task.Status.DeployState = "Done"
 		} else {
 			task.Status.Phase = "Succeeded"
@@ -174,6 +174,54 @@ func TestGCConversations_DocumentationSoloDeletedWhenTerminal(t *testing.T) {
 
 	convGCServer(store).gcConversations(context.Background(), listConvTasks(t))
 	require.False(t, store.objects["demo/task-doc-gc1.jsonl"], "a closed documentation Task's conversation is deleted")
+}
+
+// TestGCConversations_ClarifySoloDeletedWhenTerminal is the M1 regression:
+// clarify is the redesigned front-half kind that replaces issueLifecycle's
+// Triage/Conversation states (shares handleFrontHalf/maybeSetupConversationFork
+// verbatim) and owns the same S3 conversation/fork objects, but the GC kind
+// switch had only "issueLifecycle" (a missed rename) - a terminal clarify Task's
+// transcript would leak forever without this.
+func TestGCConversations_ClarifySoloDeletedWhenTerminal(t *testing.T) {
+	store := &fakeConvGC{objects: map[string]bool{"demo/r/issue-6.jsonl": true}}
+	mkConvTask(t, "gc-clarify-6", "clarify", "demo/r/issue-6.jsonl", "", true)
+
+	convGCServer(store).gcConversations(context.Background(), listConvTasks(t))
+	require.False(t, store.objects["demo/r/issue-6.jsonl"], "a closed clarify Task's conversation is deleted")
+}
+
+// TestGCConversations_ClarifyBatchWithOpenSiblingSurvives verifies clarify
+// participates in the same fork-batch grouping as issueLifecycle: a clarify
+// child forked from a brainstorm parent must not be deleted while a sibling in
+// the same batch is still open.
+func TestGCConversations_ClarifyBatchWithOpenSiblingSurvives(t *testing.T) {
+	const bkey = "demo/task-brainstorm-gc3.jsonl"
+	store := &fakeConvGC{objects: map[string]bool{
+		bkey:                   true,
+		"demo/r/issue-7.jsonl": true,
+		"demo/r/issue-8.jsonl": true,
+	}}
+	mkConvTask(t, "gc3-brain", "brainstorm", bkey, "", true)
+	mkConvTask(t, "gc3-child-clarify", "clarify", "demo/r/issue-7.jsonl", bkey, true)
+	mkConvTask(t, "gc3-child-open", "clarify", "demo/r/issue-8.jsonl", bkey, false) // still open
+
+	convGCServer(store).gcConversations(context.Background(), listConvTasks(t))
+
+	require.Empty(t, store.deleted, "no key may be deleted while a clarify sibling is open")
+	require.True(t, store.objects[bkey])
+	require.True(t, store.objects["demo/r/issue-7.jsonl"])
+}
+
+// TestGCConversations_IncidentSoloDeletedWhenTerminal is the M1 regression's
+// second half: incident runs a live conversational pod turn (recordConversation
+// records SessionID/ConversationObjectKey the same as any other kind) but was
+// also absent from the GC kind switch.
+func TestGCConversations_IncidentSoloDeletedWhenTerminal(t *testing.T) {
+	store := &fakeConvGC{objects: map[string]bool{"demo/task-incident-gc1.jsonl": true}}
+	mkConvTask(t, "gc-incident-1", "incident", "demo/task-incident-gc1.jsonl", "", true)
+
+	convGCServer(store).gcConversations(context.Background(), listConvTasks(t))
+	require.False(t, store.objects["demo/task-incident-gc1.jsonl"], "a closed incident Task's conversation is deleted")
 }
 
 // Issue #149: a store-wide / connection-level failure must short-circuit the

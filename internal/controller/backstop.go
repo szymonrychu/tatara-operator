@@ -268,14 +268,21 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 		changed, confirmedPRRepos := refreshLedger(ctx, reader, task)
 		if changed {
 			// Persist the refreshed ledger. Use RetryOnConflict so a concurrent status
-			// update from the main reconcile loop does not drop our refresh.
-			latest := task.DeepCopy()
+			// update from the main reconcile loop does not drop our refresh. Merge
+			// per-member (UpsertWorkItem) into the freshly-read Task rather than
+			// assigning the snapshot slice wholesale: a blind
+			// `fresh.Status.WorkItems = <snapshot>` never conflicts (full overwrite),
+			// so it would silently drop a member appended concurrently by another
+			// writer between our read and this persist.
+			refreshed := task.DeepCopy().Status.WorkItems
 			retryErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 				fresh := &tatarav1alpha1.Task{}
-				if err := r.Get(ctx, client.ObjectKeyFromObject(latest), fresh); err != nil {
+				if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 					return err
 				}
-				fresh.Status.WorkItems = latest.Status.WorkItems
+				for i := range refreshed {
+					UpsertWorkItem(fresh, refreshed[i])
+				}
 				return r.Status().Update(ctx, fresh)
 			})
 			if retryErr != nil {

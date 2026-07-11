@@ -6,7 +6,6 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -15,9 +14,11 @@ import (
 // implement outcome and the given issue author, under a project whose Scm
 // carries BotLogin "bot" plus the given maintainer logins. The reconciler's
 // ReaderFor returns a commentReader whose GetIssue body carries the
-// tataraAuthoredMarker and which reports NO human comments - so the self-approve
-// guard holds (-> Conversation) unless the author-tier bypass approves first
-// (-> Implement). Returns the reconciler and task name.
+// tataraAuthoredMarker and which reports NO human comments. With the
+// maintainer-approval gate in force, the task holds in Conversation unless a
+// verified maintainer approval has been recorded on its status
+// (Status.ApprovedByMaintainer); authorship no longer changes the outcome.
+// Returns the reconciler and task name.
 func seedAutoapproveTriage(t *testing.T, suffix, author string, maintainers []string) (*TaskReconciler, string) {
 	t.Helper()
 	ctx := context.Background()
@@ -70,130 +71,40 @@ func reconcileTriageState(t *testing.T, r *TaskReconciler, name string) string {
 	return got.Status.DeployState
 }
 
-// TestTriageAutoapprove_ThirdPartyBypassesHold: an issue opened by a contributor
-// who is neither the bot nor a maintainer is approved straight to Implement even
-// though the body carries the tatara-authored marker and no human has commented
-// (which would otherwise hold the issue in Conversation).
-func TestTriageAutoapprove_ThirdPartyBypassesHold(t *testing.T) {
-	r, name := seedAutoapproveTriage(t, "thirdparty", "third-party-dev", []string{"szymon"})
-	if got := reconcileTriageState(t, r, name); got != "Implement" {
-		t.Fatalf("DeployState = %q, want Implement (third-party autoapprove bypasses hold)", got)
-	}
-}
-
-// TestTriageAutoapprove_MaintainerKeepsGate: an issue authored by a maintainer
-// is NOT third-party, so the self-approve guard still applies; with the marker
-// present and no human comment it holds in Conversation.
-func TestTriageAutoapprove_MaintainerKeepsGate(t *testing.T) {
+// TestTriageGate_MaintainerAuthorHolds: an issue authored by a maintainer with
+// no recorded approval still holds in Conversation - authorship is not approval.
+func TestTriageGate_MaintainerAuthorHolds(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "maintainer", "szymon", []string{"szymon"})
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("DeployState = %q, want Conversation (maintainer keeps self-approve gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (maintainer author is not approval)", got)
 	}
 }
 
-// TestTriageAutoapprove_BotAuthoredKeepsGate: a bot-authored issue (author ==
-// BotLogin) keeps the existing self-approve guard and holds in Conversation.
-func TestTriageAutoapprove_BotAuthoredKeepsGate(t *testing.T) {
+// TestTriageGate_BotAuthoredHolds: a bot-authored issue holds in Conversation.
+func TestTriageGate_BotAuthoredHolds(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "botauthored", "bot", nil)
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("DeployState = %q, want Conversation (bot-authored keeps self-approve gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (bot-authored holds)", got)
 	}
 }
 
-// TestTriageAutoapprove_EmptyAuthorKeepsGate: when no author was captured the
-// issue is not treated as third-party, so the marker-based self-approve guard
-// still holds it in Conversation.
-func TestTriageAutoapprove_EmptyAuthorKeepsGate(t *testing.T) {
+// TestTriageGate_EmptyAuthorHolds: an issue with no captured author holds.
+func TestTriageGate_EmptyAuthorHolds(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "noauthor", "", []string{"szymon"})
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("DeployState = %q, want Conversation (empty author keeps self-approve gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (empty author holds)", got)
 	}
 }
 
-// TestTriageApproverGate_NonApproverCommentHolds: issue #102 - with a maintainer
-// allowlist configured, a human comment from a NON-approver does not release the
-// self-approve hold, so a marker-bearing maintainer-authored issue stays in
-// Conversation (an injected non-approver comment cannot trigger implementation).
-func TestTriageApproverGate_NonApproverCommentHolds(t *testing.T) {
+// TestTriageGate_NonApproverCommentHolds: a comment from a NON-maintainer does
+// not release the gate - the issue stays in Conversation.
+func TestTriageGate_NonApproverCommentHolds(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "apprgatenon", "szymon", []string{"szymon"})
 	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
 		return &commentReader{body: tataraAuthoredMarker,
 			comments: []scm.IssueComment{{Author: "random-human", Body: "do it"}}}, nil
 	}
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("DeployState = %q, want Conversation (non-approver comment must not release the hold)", got)
-	}
-}
-
-// TestTriageApproverGate_ApproverCommentReleases: a comment from a maintainer
-// (the unified approver set) releases the self-approve hold and drives the issue
-// straight to Implement.
-func TestTriageApproverGate_ApproverCommentReleases(t *testing.T) {
-	r, name := seedAutoapproveTriage(t, "apprgateappr", "szymon", []string{"szymon"})
-	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
-		return &commentReader{body: tataraAuthoredMarker,
-			comments: []scm.IssueComment{{Author: "szymon", Body: "approved"}}}, nil
-	}
-	if got := reconcileTriageState(t, r, name); got != "Implement" {
-		t.Fatalf("DeployState = %q, want Implement (approver comment releases the hold)", got)
-	}
-}
-
-// TestThirdPartyAuthor_Classification unit-checks the author tier directly.
-func TestThirdPartyAuthor_Classification(t *testing.T) {
-	mk := func(author string, maintainers []string) (*tatarav1alpha1.Project, *tatarav1alpha1.Task) {
-		p := &tatarav1alpha1.Project{Spec: tatarav1alpha1.ProjectSpec{
-			Scm: &tatarav1alpha1.ScmSpec{BotLogin: "bot", MaintainerLogins: maintainers}}}
-		tk := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "x"},
-			Spec: tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{AuthorLogin: author}}}
-		return p, tk
-	}
-	cases := []struct {
-		name        string
-		author      string
-		maintainers []string
-		want        bool
-	}{
-		{"third party", "carol", []string{"szymon"}, true},
-		{"bot", "bot", []string{"szymon"}, false},
-		{"maintainer", "szymon", []string{"szymon"}, false},
-		{"second maintainer", "alex", []string{"szymon", "alex"}, false},
-		{"empty author", "", []string{"szymon"}, false},
-		{"third party no maintainers", "carol", nil, true},
-	}
-	for _, c := range cases {
-		p, tk := mk(c.author, c.maintainers)
-		if got := thirdPartyAuthor(p, tk); got != c.want {
-			t.Errorf("%s: thirdPartyAuthor = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
-// TestThirdPartyAuthor_ReporterGate checks issue #102: with a configured reporter
-// allowlist, only third parties IN the allowlist autoapprove; an empty allowlist
-// preserves the historical open behavior (every external author autoapproves).
-func TestThirdPartyAuthor_ReporterGate(t *testing.T) {
-	mk := func(author string, reporters []string) (*tatarav1alpha1.Project, *tatarav1alpha1.Task) {
-		p := &tatarav1alpha1.Project{Spec: tatarav1alpha1.ProjectSpec{
-			Scm: &tatarav1alpha1.ScmSpec{BotLogin: "bot", MaintainerLogins: []string{"szymon"}, ReporterLogins: reporters}}}
-		tk := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "x"},
-			Spec: tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{AuthorLogin: author}}}
-		return p, tk
-	}
-	cases := []struct {
-		name      string
-		author    string
-		reporters []string
-		want      bool
-	}{
-		{"open default: third party autoapproves", "carol", nil, true},
-		{"gated: listed reporter autoapproves", "carol", []string{"carol"}, true},
-		{"gated: unlisted third party does not autoapprove", "mallory", []string{"carol"}, false},
-	}
-	for _, c := range cases {
-		p, tk := mk(c.author, c.reporters)
-		if got := thirdPartyAuthor(p, tk); got != c.want {
-			t.Errorf("%s: thirdPartyAuthor = %v, want %v", c.name, got, c.want)
-		}
+		t.Fatalf("DeployState = %q, want Conversation (non-maintainer comment must not release)", got)
 	}
 }

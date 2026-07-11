@@ -62,7 +62,7 @@ func TestElectSystemicLeads(t *testing.T) {
 		{repo: "o/r2", number: 9, labels: []string{"tatara/systemic-abc"}, title: "B"},
 		{repo: "o/r1", number: 7, labels: []string{"bug"}, title: "standalone"},
 	}
-	got := electSystemicLeads(cands)
+	got := electSystemicLeads(cands, "tatara-declined")
 	if _, ok := got["o/r1#7"]; ok {
 		t.Fatal("standalone (no systemic label) must not be in the map")
 	}

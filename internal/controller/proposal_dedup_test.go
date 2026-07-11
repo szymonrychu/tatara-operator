@@ -506,18 +506,19 @@ func TestCreateProposal_AlertGroupNoMatchStampsLabel(t *testing.T) {
 	require.Empty(t, fw.commentCalls(), "no recurrence comment when a fresh issue is created")
 }
 
-// TestCreateProposal_IncidentIgnoresTitleDuplicate: an incident proposal whose
-// free-text title collides with an existing open issue is NOT deduped by title
-// (that issue lacks the matching alert-group label), so a new issue is created.
-// This proves incident dedup is label-driven, not title-driven (sub-problem 3A).
-func TestCreateProposal_IncidentIgnoresTitleDuplicate(t *testing.T) {
+// TestCreateProposal_IncidentDedupsByCrossSourceTitle: an incident proposal whose
+// title near-matches an existing open issue tracks onto it even without an
+// alert-group match (finding #5 cross-source near-dup guard). This supersedes the
+// prior label-only behavior: the same problem must not land as a second issue just
+// because it arrived via a different source than the one already open.
+func TestCreateProposal_IncidentDedupsByCrossSourceTitle(t *testing.T) {
 	fw := &fakeProposalWriter{}
 
 	const ag = "0011223344556677"
 	const title = "Investigated: writeback 404 loop"
-	// Same title, but a DIFFERENT alert-group label.
+	// A human-filed issue with the SAME normalized title and NO alert-group label.
 	reader := &fakeProposalReader{issues: []scm.IssueRef{
-		{Repo: "o/r", Number: 9, Title: title, Labels: []string{alertGroupLabel("different")}},
+		{Repo: "o/r", Number: 9, Title: "investigated writeback 404 loop"},
 	}}
 	r := newProposalReconciler(t, fw, func(_, _ string) (scm.SCMReader, error) { return reader, nil })
 
@@ -530,7 +531,37 @@ func TestCreateProposal_IncidentIgnoresTitleDuplicate(t *testing.T) {
 	_, err := r.createProposal(context.Background(), &proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, 1, fw.calls(), "incident proposal must NOT dedup by title; a new issue is created when no alert-group match")
+	require.Zero(t, fw.calls(), "incident proposal near-matching an existing open issue must dedup onto it (no duplicate)")
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	require.NotNil(t, got.Spec.Source)
+	require.Equal(t, 9, got.Spec.Source.Number, "Source tracks the existing issue")
+	// A cross-source title match is NOT an alert-group re-fire, so no recurrence
+	// comment is posted.
+	require.Empty(t, fw.commentCalls(), "cross-source title dedup posts no alert-group re-fire comment")
+}
+
+// TestCreateProposal_CrossSourceNearDupTitle: a brainstorm proposal whose title
+// differs only in punctuation/case from an existing open issue dedups onto it.
+func TestCreateProposal_CrossSourceNearDupTitle(t *testing.T) {
+	fw := &fakeProposalWriter{}
+	reader := &fakeProposalReader{issues: []scm.IssueRef{
+		{Repo: "o/r", Number: 21, Title: "Add retry backoff to the memory client!"},
+	}}
+	r := newProposalReconciler(t, fw, func(_, _ string) (scm.SCMReader, error) { return reader, nil })
+
+	task := seedProposalTask(t, "prop-neardup", "prop-neardup-proj", "prop-neardup-repo", "prop-neardup-scm",
+		"Add retry backoff to the memory client")
+
+	var proj tatarav1alpha1.Project
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Spec.ProjectRef}, &proj))
+
+	_, err := r.createProposal(context.Background(), &proj, task)
+	require.NoError(t, err)
+	require.Zero(t, fw.calls(), "near-duplicate title (punctuation/case only) must dedup")
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	require.Equal(t, 21, got.Spec.Source.Number)
 }
 
 // TestAlertGroupLabel_StableAndLabelSafe: the same identity always maps to the

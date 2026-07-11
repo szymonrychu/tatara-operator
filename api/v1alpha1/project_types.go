@@ -267,12 +267,14 @@ type BrainstormActivity struct {
 	// +kubebuilder:default=5
 	// +optional
 	MaxOpenProposals int `json:"maxOpenProposals,omitempty"`
-	// StaleProposalDays opts in the staleness reaper: a positive value auto-closes
-	// bot-authored proposals that have had no human engagement (no human comment,
-	// no live work) for at least that many days, clearing dead proposals out of the
-	// MaxOpenProposals backlog. A value <=0 (the unset default) disables the reaper
-	// entirely - this is an explicit opt-in sentinel, NOT a kubebuilder default, so
-	// "unset" is never indistinguishable from an active value.
+	// StaleProposalDays configures the staleness reaper that auto-closes
+	// bot-authored proposals with no human engagement (no human comment, no live
+	// work) for at least that many days, clearing dead proposals out of the
+	// MaxOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
+	// sets an explicit window; the UNSET default (0) enables the reaper with a
+	// generous-but-finite default window (defaultStaleProposalDays) so un-approved
+	// proposals do not accumulate unboundedly; a NEGATIVE value is the explicit
+	// opt-out that disables the reaper entirely.
 	// +optional
 	StaleProposalDays int `json:"staleProposalDays,omitempty"`
 	// +kubebuilder:validation:items:Enum=docs;memory;internet
@@ -309,6 +311,24 @@ type RefineActivity struct {
 	ClosedLookbackDays int `json:"closedLookbackDays,omitempty"`
 }
 
+// CDScanActivity is the push-CD deploy-supervision backstop cron. A dedicated
+// type (vs CronActivity) so its Schedule carries a field-level default that
+// actually applies: cdScan is an always-serialized struct field, so an
+// object-level default never fires, but a defaulted string Schedule field does.
+type CDScanActivity struct {
+	// Schedule is a 5-field cron (robfig ParseStandard). Defaults to every 10 min;
+	// set it empty explicitly to disable the backstop.
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
+	// +kubebuilder:default="*/10 * * * *"
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
+	// MaxPerRepo caps the number of in-progress Tasks per repo (one lane per repo).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	// +optional
+	MaxPerRepo int `json:"maxPerRepo,omitempty"`
+}
+
 // ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
@@ -319,8 +339,17 @@ type ScmCron struct {
 	// Tasks whose cascade has stalled past 1.5x the deploy budget with no live
 	// watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
 	// Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+	//
+	// Defaulted on (every 10 min): without an explicit schedule a Project would
+	// have NO durable deploy backstop - only the in-memory 60s requeue, lost on an
+	// operator restart - so a stalled cascade could sit undetected. A Project that
+	// wants it off can set an empty schedule explicitly. Its own type (not
+	// CronActivity) so the field-level Schedule default fires only for cdScan: a
+	// struct field with omitempty is always serialized, so an object-level default
+	// would never apply, but the string Schedule field IS omitted when empty, so a
+	// field default fills it.
 	// +optional
-	CDScan CronActivity `json:"cdScan,omitempty"`
+	CDScan CDScanActivity `json:"cdScan,omitempty"`
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
 	// HealthCheck is RETIRED as a firing activity (its proposals were absorbed
@@ -485,6 +514,14 @@ type ProjectSpec struct {
 	// +kubebuilder:default=2100
 	// +optional
 	DeploySingleHopBudgetSeconds int `json:"deploySingleHopBudgetSeconds,omitempty"`
+	// MergeWaitBudgetMinutes bounds how long a discrete-implement umbrella waits
+	// for its member PRs to be reviewed + merged before it parks recoverable with
+	// an issue comment naming the stuck member(s) (item 3: the pre-merge deadline).
+	// Default 720 (12h): generous enough for human review, bounded so a
+	// permanently-stuck member surfaces instead of sitting open+approved forever.
+	// +kubebuilder:default=720
+	// +optional
+	MergeWaitBudgetMinutes int `json:"mergeWaitBudgetMinutes,omitempty"`
 }
 
 // TokenBudgetSpec configures the per-Project token-budget admission gate (issue

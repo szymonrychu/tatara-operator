@@ -402,14 +402,16 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			checkoutBranchVal = hb
 		}
 	}
+	targetRepo := ""
 	if repo != nil {
 		env = append(env,
 			corev1.EnvVar{Name: "REPO_URL", Value: repo.Spec.URL},
 			corev1.EnvVar{Name: "REPO_BRANCH", Value: repo.Spec.DefaultBranch},
 		)
+		targetRepo = repoComponentName(repo.Spec.URL)
 	}
 	env = append(env, []corev1.EnvVar{
-		{Name: "MODEL", Value: modelForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
+		{Name: "MODEL", Value: modelForKindOnRepo(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity], targetRepo)},
 		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
@@ -940,10 +942,61 @@ func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string
 	return resolveByKind(project.Spec.Agent.ModelByKind, kind, activity, fallback)
 }
 
-// ModelForKind exports modelForKind for controller callers that need to stamp
-// the resolved model on Task.Status at pod-creation.
-func ModelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+// helmfileTargetRepo is the terminal self-heal repo (the tier-revert flow opens
+// its revert MR here). Keyed on the repo component name (URL slug), matching the
+// controller's helmfileRepoName.
+const helmfileTargetRepo = "tatara-helmfile"
+
+// modelFloorKinds are the reasoning kinds pinned to their locked opus default
+// when the task targets the self-heal repo (helmfileTargetRepo). documentation
+// and refine (the cheap, freely-tierable kinds) are deliberately absent.
+var modelFloorKinds = map[string]bool{
+	"brainstorm": true, "incident": true, "clarify": true, "implement": true, "review": true,
+}
+
+// modelFloorAppliesOnRepo reports whether the tier-revert self-heal model floor
+// applies to a (kind, activity) task targeting targetRepo. The floor pins a
+// reasoning-kind task on tatara-helmfile to its locked opus default: the
+// tier-revert incident opens its revert MR against tatara-helmfile and the very
+// implement/review that must FIX a broken or downgraded ModelByKind lives on that
+// repo, so it must not run on the same broken tier being reverted. healthCheck (a
+// brainstorm-kind recurring classification) is exempt so it stays tierable, and
+// component-repo tiering (any other repo) is unaffected: this is the narrow
+// "bypass modelForKind for tier-revert-originated Tasks" the floor sanctions,
+// identified structurally by the terminal-repo target rather than a propagated
+// origin marker (any helmfile change deserves opus reasoning regardless).
+func modelFloorAppliesOnRepo(kind, activity, targetRepo string) bool {
+	return targetRepo == helmfileTargetRepo && activity != "healthCheck" && modelFloorKinds[kind]
+}
+
+// modelForKindOnRepo resolves the MODEL env with the tier-revert self-heal floor
+// applied when the task targets the terminal tatara-helmfile repo. targetRepo is
+// the repo component name (URL slug). Empty/other repos resolve via modelForKind.
+func modelForKindOnRepo(project *tatarav1alpha1.Project, kind, activity, targetRepo string) string {
+	if modelFloorAppliesOnRepo(kind, activity, targetRepo) {
+		if def, ok := kindDefaultModel[kind]; ok {
+			return def
+		}
+	}
 	return modelForKind(project, kind, activity)
+}
+
+// repoComponentName returns the repo component (URL slug tail) for a repository
+// URL, e.g. "tatara-helmfile" for ".../szymonrychu/tatara-helmfile". Empty on a
+// parse failure (the floor then does not apply, matching non-helmfile targets).
+func repoComponentName(repoURL string) string {
+	if _, name, err := scm.OwnerRepo(repoURL); err == nil {
+		return name
+	}
+	return ""
+}
+
+// ModelForKind exports the MODEL resolution for controller callers that need to
+// stamp the resolved model on Task.Status at pod-creation. repoURL is the target
+// repository URL so the tier-revert self-heal floor is applied consistently with
+// BuildPod.
+func ModelForKind(project *tatarav1alpha1.Project, kind, activity, repoURL string) string {
+	return modelForKindOnRepo(project, kind, activity, repoComponentName(repoURL))
 }
 
 // effortForKind resolves the EFFORT env for a Task Kind+activity, keying on

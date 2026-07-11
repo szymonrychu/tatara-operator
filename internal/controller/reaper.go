@@ -238,11 +238,18 @@ func (s *CallbackServer) reapWrapper(ctx context.Context, name string) error {
 // terminal past the conversation-retention grace (issue #114 decision 5: delete
 // a conversation when all sibling issues are closed).
 //
-// Batching: conversation-bearing Tasks (issueLifecycle, review, brainstorm) are
-// grouped by batch id = the fork-from-conversation key when set, else the Task's
-// own conversation key. A brainstorm Task's own key equals the fork key of the
-// issues forked from it, so the brainstorm and all its sibling issues land in
-// one batch; a solo issue/PR is its own singleton batch. A batch is deleted only
+// Batching: conversation-bearing Tasks (issueLifecycle, clarify, review,
+// brainstorm, documentation) are grouped by batch id = the fork-from-conversation
+// key when set, else the Task's own conversation key. A brainstorm Task's own key
+// equals the fork key of the issues forked from it, so the brainstorm and all its
+// sibling issues land in one batch; a solo issue/PR is its own singleton batch.
+// clarify is the redesigned front-half kind that replaces issueLifecycle's
+// Triage/Conversation states (see handleFrontHalf/maybeSetupConversationFork,
+// shared verbatim between the two) - it owns the same conversation/fork objects
+// and must stay in this set for that reason alone; incident also runs a live
+// conversational pod turn (recordConversation records its SessionID/
+// ConversationObjectKey the same as any other kind) and is grouped here too.
+// A batch is deleted only
 // when EVERY member is terminal and the newest went terminal more than the grace
 // ago (so a quick reopen-after-close keeps the thread). Deletes are idempotent
 // (Exists-then-Delete), so re-running until the Tasks are reaped is a no-op.
@@ -265,7 +272,7 @@ func (s *CallbackServer) gcConversations(ctx context.Context, tasks []tatarav1al
 	for i := range tasks {
 		tk := &tasks[i]
 		switch tk.Spec.Kind {
-		case "issueLifecycle", "review", "brainstorm", "documentation":
+		case "issueLifecycle", "clarify", "review", "brainstorm", "documentation", "incident":
 		default:
 			continue
 		}
@@ -398,6 +405,12 @@ func (s *CallbackServer) gcTerminalTasks(ctx context.Context, tasks []tatarav1al
 		// restarting the count from zero (at cap). recoverOrphans transitions a
 		// give-up task whose issue has closed to Done ("issue-closed"), so a
 		// still-Parked recoverable give-up here means the issue is open.
+		//
+		// Liveness finding #6: this spare is NOT unbounded. recoverOrphans enforces a
+		// max-park-age (maxRecoverableParkAge): an at-cap recoverable park on a
+		// still-open issue that ages past that bound is re-pinged with an issue
+		// comment and resolved Done there, so it stops matching this spare and is
+		// GC'd - a permanently-parked task never accumulates silently.
 		if tk.Status.DeployState == "Parked" &&
 			tatarav1alpha1.IsRecoverableGiveup(tk.Status.ParkReason) &&
 			tk.Status.ImplementGiveUps > 0 {

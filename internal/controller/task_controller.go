@@ -501,7 +501,11 @@ func (r *TaskReconciler) ensurePodAndService(ctx context.Context, project *tatar
 		if err := r.Create(ctx, pod); err != nil {
 			return false, fmt.Errorf("create wrapper pod: %w", err)
 		}
-		model := agent.ModelForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])
+		repoURL := ""
+		if repo != nil {
+			repoURL = repo.Spec.URL
+		}
+		model := agent.ModelForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity], repoURL)
 		_ = r.stampResolvedModel(ctx, task, model)
 	case err != nil:
 		return false, fmt.Errorf("get wrapper pod: %w", err)

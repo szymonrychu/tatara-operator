@@ -389,9 +389,12 @@ func TaskDeploying(t *Task) bool {
 
 // IsRecoverableGiveup reports whether a Parked reason represents an
 // implementation that gave up and may be re-rolled (vs a deliberate decline).
+// merge-timeout (parkUmbrellaMergeTimeout's mergeParkReason) is symmetric with
+// deploy-timeout: both are auto-recoverable stalls, not a human decline, so both
+// must be aged-out by recoverOrphans and spared by the reaper the same way.
 func IsRecoverableGiveup(reason string) bool {
 	switch reason {
-	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout":
+	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout", "merge-timeout":
 		return true
 	default:
 		return false
@@ -559,6 +562,22 @@ type TaskStatus struct {
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
 
+	// ApprovedByMaintainer records the identity-verified fact that a HUMAN
+	// MAINTAINER explicitly approved this issue for implementation, by applying
+	// the approved label to it. It is set by the webhook ONLY when it observes an
+	// issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
+	// (never the bot: a bot/agent that sets the label itself cannot self-approve).
+	// It is the ONLY signal that releases a front-half Task (clarify / the
+	// issueLifecycle bridge) into the autonomous implement->review->merge->deploy
+	// chain: every path that would advance a front-half issue to Implement gates
+	// on it (finishFrontHalf, the Conversation label readback, the trigger-label
+	// jump). Empty means NO verified maintainer approval - the operator fails
+	// CLOSED (parks to Conversation) rather than trusting raw label presence,
+	// which an agent with SCM write could forge. Holds the approving maintainer's
+	// login for audit.
+	// +optional
+	ApprovedByMaintainer string `json:"approvedByMaintainer,omitempty"`
+
 	// Deploy-supervision fields (PhaseDeploying only; empty otherwise). The
 	// implement Task does not go terminal at PR-merge: it enters Deploying and
 	// the operator drives the push-CD cascade to a tatara-helmfile apply, then
@@ -582,6 +601,21 @@ type TaskStatus struct {
 	// Task records, the key the apply-outcome sweep matches against applied pins.
 	// +optional
 	DeployArtifact string `json:"deployArtifact,omitempty"`
+	// MergeWaitDeadline bounds a discrete-implement umbrella Task's wait for its
+	// member PRs to be reviewed + merged (the pre-Deploying window). When members
+	// stay unmerged past this wall clock, superviseMergedPRs parks the stream
+	// recoverable with an issue comment naming the stuck member(s) (item 3). It is
+	// distinct from DeployDeadline, which bounds the post-merge cascade.
+	// +optional
+	MergeWaitDeadline *metav1.Time `json:"mergeWaitDeadline,omitempty"`
+	// ReviewResolveDeadline bounds an umbrella review's wall-clock wait for an
+	// unresolvable member repo URL to become resolvable (un-enrolled member repo,
+	// or a projectRepoURLBySlug List error). Stamped on the first unresolvable
+	// encounter; once it elapses, writeBackReview parks the review recoverable with
+	// an issue comment naming the stuck member instead of error-looping forever
+	// (liveness finding #4).
+	// +optional
+	ReviewResolveDeadline *metav1.Time `json:"reviewResolveDeadline,omitempty"`
 }
 
 // +kubebuilder:object:root=true

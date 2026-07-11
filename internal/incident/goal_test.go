@@ -53,3 +53,14 @@ func TestGoalProjectMandatesIncidentSRESkill(t *testing.T) {
 		t.Fatal("incident-sre mandate must be prepended before the alert body")
 	}
 }
+
+// TestGoalProjectContainsDedupInstruction asserts the incident goal instructs the
+// agent to survey existing open issues and NOT open a duplicate when the problem
+// is already tracked (cross-source dedup, finding #5).
+func TestGoalProjectContainsDedupInstruction(t *testing.T) {
+	g := GoalProject("groupKey=abc status=firing commonLabels={alertname=HighCPU}", []string{"o/api"})
+	low := strings.ToLower(g)
+	if !strings.Contains(low, "existing") || !strings.Contains(low, "duplicate") {
+		t.Fatalf("incident goal must instruct surveying existing issues to avoid duplicates:\n%s", g)
+	}
+}

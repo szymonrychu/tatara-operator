@@ -41,7 +41,14 @@ func seedImplementUmbrella(t *testing.T, proj *tatarav1alpha1.Project, name stri
 	require.NoError(t, k8sClient.Create(ctx, task))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), task) })
 	task.Status.Phase = "Succeeded"
-	task.Status.PRNumber = 42
+	// Discrete-implement supervision drives off the role:openedPR ledger members,
+	// not Status.PRNumber (which the umbrella writeback never sets). Seed the PR #42
+	// member on the scene repo "o/r".
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{{
+		Provider: "github", Repo: "o/r", Number: 42,
+		Kind: tatarav1alpha1.WorkItemPR, Role: tatarav1alpha1.RoleOpenedPR,
+		State: tatarav1alpha1.WIOpen, HeadBranch: "tatara/task-" + name,
+	}}
 	if significance != "" {
 		task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{Significance: significance}
 	}

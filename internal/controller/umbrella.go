@@ -336,9 +336,19 @@ func (r *TaskReconciler) buildUmbrellaPromptFor(ctx context.Context, project *ta
 
 	// Light poll: refresh member structured state, persist if anything changed.
 	if refreshUmbrellaMembers(ctx, reader, merger, slugToURL, token, task, umbrellaRefreshTTL, time.Now()) {
-		latest := task.DeepCopy()
+		// Merge the refreshed members into the freshly-read Task per-member rather
+		// than assigning the snapshot slice wholesale: a blind
+		// `fresh.Status.WorkItems = <snapshot>` under RetryOnConflict never
+		// conflicts (it is a full overwrite), so it silently drops a member appended
+		// concurrently by another writer (e.g. joinStreamReview adding a stream PR to
+		// the review span between our read and this persist), which would make a
+		// later review approve/merge a stream MISSING a PR. UpsertWorkItem unions +
+		// field-refreshes, preserving concurrent appends.
+		refreshed := task.DeepCopy().Status.WorkItems
 		if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-			fresh.Status.WorkItems = latest.Status.WorkItems
+			for i := range refreshed {
+				UpsertWorkItem(fresh, refreshed[i])
+			}
 			return true
 		}); perr != nil {
 			l.Info("umbrella: persist refreshed members failed (non-fatal)", "resource_id", task.Name, "err", perr.Error())

@@ -392,7 +392,7 @@ func TestImplementOutcomeDeepCopy(t *testing.T) {
 }
 
 func TestIsRecoverableGiveup(t *testing.T) {
-	rec := []string{"implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout"}
+	rec := []string{"implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout", "merge-timeout"}
 	for _, r := range rec {
 		if !v1alpha1.IsRecoverableGiveup(r) {
 			t.Errorf("%q should be recoverable", r)

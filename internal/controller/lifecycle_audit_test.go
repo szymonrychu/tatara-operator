@@ -354,7 +354,6 @@ func TestIssueOutcomeMetric_Implement(t *testing.T) {
 	src := &tatarav1alpha1.TaskSource{
 		Provider: "github", IssueRef: "o/r#406",
 		URL: "https://github.com/o/r/issues/406", Number: 406,
-		// AuthorLogin set to a non-bot, non-maintainer to satisfy thirdPartyAuthor.
 		AuthorLogin: "external-user",
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
@@ -364,6 +363,7 @@ func TestIssueOutcomeMetric_Implement(t *testing.T) {
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	recordApproval(t, name, "szymon") // verified maintainer approval releases the implement outcome
 
 	fw := &lifecycleFakeSCMWriter{}
 	r, _, om := newAuditReconciler(t, fw)

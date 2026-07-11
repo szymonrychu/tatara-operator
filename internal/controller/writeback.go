@@ -224,6 +224,16 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		baseBody = deliveredBody
 	}
 
+	// Systemic approval gate (finding #4): the agent-authored body may carry
+	// "Closes #N" for systemic siblings. Neutralize any close directive targeting a
+	// sibling that is NOT currently maintainer-approved so merging this combined PR
+	// never force-closes an unapproved or declined sibling. This is the authoritative
+	// net behind the prompt-level filter (agents are unreliable). Approved siblings
+	// and the lead's own close stay intact.
+	if unapproved := r.unapprovedSystemicSiblings(ctx, task); len(unapproved) > 0 {
+		baseBody = neutralizeUnapprovedCloses(baseBody, unapproved)
+	}
+
 	var prURLs []string
 	// prRepos[i] is the Repository that produced prURLs[i]; kept parallel so the
 	// openedPR ledger entry derives its slug from the SAME repo as the PR number,

@@ -132,7 +132,13 @@ func (r *TaskReconciler) handleImplement(ctx context.Context, project *tatarav1a
 	// instructions). Do NOT clear it here - it must persist until the pod is ready
 	// and driveTurns submits the turn-0 prompt. Clearing happens in finishImplement,
 	// after the run has completed and the context has been used.
-	planText := implementPrompt(task)
+	//
+	// Systemic approval gate (finding #4): re-filter the SystemicGroup against the
+	// CURRENT recorded maintainer approvals before prompting, so the lead is never
+	// instructed to "Closes #N" a sibling a maintainer has not approved (or declined).
+	// The re-filter runs on a shallow copy so only the prompt sees the narrowed group.
+	promptTask := r.withApprovedSystemicGroup(ctx, task)
+	planText := implementPrompt(promptTask)
 	return r.driveAgentRun(ctx, project, &repo, task, planText)
 }
 
@@ -171,7 +177,15 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 	if task.Status.Phase == "Failed" {
 		l.Info("implement agent run failed; parking task",
 			"action", "lifecycle_implement_failed", "resource_id", task.Name)
-		if err := r.setDeployState(ctx, task, "Parked", "implement-failed"); err != nil {
+		// Liveness finding #2: park with a diagnostic issue comment so the reporter
+		// sees the implement run failed and is awaiting a human, not a silent Parked.
+		msg := "tatara: the implementation run failed and I've paused this issue for a human to look at. " +
+			"Comment here with guidance to retry."
+		if _, _, writer, token, _, scmErr := r.parkSCMContext(ctx, task); scmErr == nil {
+			if err := r.parkWithComment(ctx, task, writer, token, "implement-failed", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if err := r.setDeployState(ctx, task, "Parked", "implement-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {

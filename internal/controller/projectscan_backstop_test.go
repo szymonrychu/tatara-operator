@@ -242,7 +242,12 @@ func TestBackstopAlwaysRuns(t *testing.T) {
 	}
 }
 
-func TestBackstopApprovedOrphanToImplement(t *testing.T) {
+// TestBackstopApprovedOrphanToTriage: an orphaned issue bearing only the approved
+// label must be recovered at Triage, NOT Implement - label presence is not a
+// verified maintainer approval, so a recovered task must re-triage and re-request
+// explicit approval (fail closed). Only the implementation label (a past-the-gate
+// state) resumes at Implement.
+func TestBackstopApprovedOrphanToTriage(t *testing.T) {
 	proj, repo := seedBackstopProject(t, "backstop-approved")
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
@@ -260,8 +265,8 @@ func TestBackstopApprovedOrphanToImplement(t *testing.T) {
 		t.Fatalf("want 1 recovery QE for approved orphan, got %d", len(qes))
 	}
 	entry := qes[0].Spec.Payload.Annotations[tatarav1alpha1.LifecycleEntryAnnotation]
-	if entry != "Implement" {
-		t.Fatalf("entry = %q, want Implement", entry)
+	if entry != "Triage" {
+		t.Fatalf("entry = %q, want Triage (approved label alone must not auto-implement)", entry)
 	}
 }
 

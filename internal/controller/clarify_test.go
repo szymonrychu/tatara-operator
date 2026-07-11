@@ -177,6 +177,7 @@ func TestClarify_ImplementHandoff(t *testing.T) {
 	r, fw, name := seedClarifyTask(t, "impl", "human", &tatarav1alpha1.IssueOutcome{
 		Action: "implement", Comment: "Agreed plan: rework the auth middleware.",
 	})
+	recordApproval(t, name, "szymon") // verified maintainer approval gates the handoff
 
 	if _, err := r.reconcileClarify(ctx, getClarifyTask(t, ctx, name)); err != nil {
 		t.Fatalf("reconcileClarify: %v", err)

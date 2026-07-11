@@ -163,15 +163,15 @@ func TestIssueComment_BotComment_Ignored(t *testing.T) {
 	_ = origDL
 }
 
-// TestIssueComment_TriggerLabelOnConversation_SetsImplement verifies that a
-// "labeled" event applying the triggerLabel on a Conversation task sets
-// DeployState=Implement (skip-dialogue path).
-func TestIssueComment_TriggerLabelOnConversation_SetsImplement(t *testing.T) {
+// TestIssueComment_TriggerLabelOnConversation_MaintainerSetsImplement verifies
+// that a MAINTAINER applying the triggerLabel on a Conversation issueLifecycle
+// task records a verified approval and jumps to Implement (skip-dialogue path).
+func TestIssueComment_TriggerLabelOnConversation_MaintainerSetsImplement(t *testing.T) {
 	const secretVal = "whsec"
 	proj := projectWithBot("projic4", "projic4-scm", "tatara", "tatara-bot")
+	proj.Spec.Scm.MaintainerLogins = []string{"maintainer"} // sender is a real maintainer
 	repo := repository("repoic4", "projic4", "https://github.com/o/r.git", "main")
 	task := lifecycleTask("taskic4", "projic4", "repoic4", 7, "Conversation")
-	// Add the triggerLabel to the task labels so it matches.
 	task.Labels["tatara.io/source-repo"] = "o.r"
 	task.Labels["tatara.io/source-number"] = "7"
 
@@ -181,7 +181,6 @@ func TestIssueComment_TriggerLabelOnConversation_SetsImplement(t *testing.T) {
 
 	h, _ := newServer(t, c)
 
-	// Send a "labeled" issue event adding the triggerLabel.
 	labeledBody := []byte(`{"action":"labeled","issue":{"number":7,"title":"fix","body":"please fix","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"label":{"name":"tatara"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"sender":{"login":"maintainer"}}`)
 	hdr := http.Header{}
 	hdr.Set("X-GitHub-Event", "issues")
@@ -192,7 +191,38 @@ func TestIssueComment_TriggerLabelOnConversation_SetsImplement(t *testing.T) {
 
 	var got tatarav1.Task
 	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskic4"}, &got))
-	require.Equal(t, "Implement", got.Status.DeployState, "triggerLabel on Conversation task must set Implement")
+	require.Equal(t, "Implement", got.Status.DeployState, "maintainer triggerLabel on Conversation task must set Implement")
+	require.Equal(t, "maintainer", got.Status.ApprovedByMaintainer, "maintainer triggerLabel jump must record the verified approval")
+}
+
+// TestIssueComment_TriggerLabelOnConversation_NonMaintainer_NoImplement verifies
+// that a NON-maintainer applying the triggerLabel on a Conversation task does NOT
+// jump to Implement (the bypass is closed); the task stays in Conversation.
+func TestIssueComment_TriggerLabelOnConversation_NonMaintainer_NoImplement(t *testing.T) {
+	const secretVal = "whsec"
+	proj := projectWithBot("projic4b", "projic4b-scm", "tatara", "tatara-bot")
+	proj.Spec.Scm.MaintainerLogins = []string{"szymon"} // sender "rando" is NOT a maintainer
+	repo := repository("repoic4b", "projic4b", "https://github.com/o/r.git", "main")
+	task := lifecycleTask("taskic4b", "projic4b", "repoic4b", 7, "Conversation")
+
+	c := seedClient(t, proj, secret("projic4b-scm", secretVal), repo)
+	require.NoError(t, c.Create(context.Background(), task))
+	require.NoError(t, c.Status().Update(context.Background(), task))
+
+	h, _ := newServer(t, c)
+
+	labeledBody := []byte(`{"action":"labeled","issue":{"number":7,"title":"fix","body":"please fix","labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"label":{"name":"tatara"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"sender":{"login":"rando"}}`)
+	hdr := http.Header{}
+	hdr.Set("X-GitHub-Event", "issues")
+	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, labeledBody))
+
+	w := post(t, h, "projic4b", hdr, labeledBody)
+	require.Equal(t, http.StatusAccepted, w.Code)
+
+	var got tatarav1.Task
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: "taskic4b"}, &got))
+	require.Equal(t, "Conversation", got.Status.DeployState, "non-maintainer triggerLabel must NOT advance to Implement")
+	require.Empty(t, got.Status.ApprovedByMaintainer, "non-maintainer action must not record an approval")
 }
 
 // TestIssueComment_NoMatchingTask_Accepted verifies that an issue_comment with

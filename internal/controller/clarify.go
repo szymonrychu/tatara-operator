@@ -156,7 +156,15 @@ func (r *TaskReconciler) handleClarifyConversation(ctx context.Context, project 
 		if err := r.deleteWrapper(ctx, task); err != nil {
 			l.Error(err, "clarify: kill live pod on timeout (non-fatal)", "resource_id", task.Name)
 		}
-		if err := r.setDeployState(ctx, task, "Parked", "clarify-timeout"); err != nil {
+		// Liveness finding #2: park with an issue comment so the reporter can tell
+		// "timed out / dead" from "still thinking", not a silent Parked state.
+		msg := "tatara: this thread timed out after 1h with no reply, so I paused work on it. " +
+			"Comment here to resume - I'll pick the conversation back up."
+		if _, _, writer, token, _, scmErr := r.parkSCMContext(ctx, task); scmErr == nil {
+			if err := r.parkWithComment(ctx, task, writer, token, "clarify-timeout", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if err := r.setDeployState(ctx, task, "Parked", "clarify-timeout"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {

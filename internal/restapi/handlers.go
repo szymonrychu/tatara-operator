@@ -391,6 +391,28 @@ func (s *Server) inflightBrainstormConversationKey(ctx context.Context, project 
 	return agent.ConversationKey(newest)
 }
 
+// hasLiveTaskForIssue reports whether any non-terminal Task in the namespace is
+// working the issue (repoSlug, number). Identity is spec/ledger via TaskMatchesItem
+// (the same match the webhook dedup uses). Used by refine's close/edit tool layer
+// to refuse mutating an issue an implement/review/clarify pod is mid-flight on.
+// Fails open (returns false) only when the Task list itself cannot be read.
+func (s *Server) hasLiveTaskForIssue(ctx context.Context, repoSlug string, number int) bool {
+	var tasks tatarav1alpha1.TaskList
+	if err := s.c.List(ctx, &tasks, client.InNamespace(s.ns)); err != nil {
+		return false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if tatarav1alpha1.TaskTerminal(t) {
+			continue
+		}
+		if tatarav1alpha1.TaskMatchesItem(t, repoSlug, number) {
+			return true
+		}
+	}
+	return false
+}
+
 // inflightIncidentTask returns the project's first non-terminal incident Task,
 // or nil when none is in flight. Agent identity is shared OIDC, so an
 // incident-investigation agent is inferred from the project's in-flight incident
@@ -1575,6 +1597,13 @@ func (s *Server) closeProjectIssue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "repo not found in project")
 		return
 	}
+	// Hard refusal: refine must not close an issue an implement/review/clarify pod
+	// is actively working (a non-terminal Task for this issue). The legit close of a
+	// delivered/duplicate issue with no live task still passes.
+	if s.hasLiveTaskForIssue(r.Context(), repoSlug, number) {
+		writeError(w, http.StatusConflict, "issue has an active task; cannot close while work is in flight")
+		return
+	}
 	writer, token, ok := s.projectSCMWriterAndToken(w, r, &proj)
 	if !ok {
 		return
@@ -1641,6 +1670,13 @@ func (s *Server) editProjectIssue(w http.ResponseWriter, r *http.Request) {
 	_, ok := repoSlugInProject(repos, repoSlug)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "repo not found in project")
+		return
+	}
+	// Hard refusal: refine must not rewrite an issue an implement/review/clarify pod
+	// is actively working (a non-terminal Task for this issue), which would change
+	// the goal out from under a live pod.
+	if s.hasLiveTaskForIssue(r.Context(), repoSlug, number) {
+		writeError(w, http.StatusConflict, "issue has an active task; cannot edit while work is in flight")
 		return
 	}
 	writer, token, ok := s.projectSCMWriterAndToken(w, r, &proj)

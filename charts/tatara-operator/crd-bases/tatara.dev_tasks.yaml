@@ -214,6 +214,22 @@ spec:
           status:
             description: TaskStatus defines the observed state of a Task.
             properties:
+              approvedByMaintainer:
+                description: |-
+                  ApprovedByMaintainer records the identity-verified fact that a HUMAN
+                  MAINTAINER explicitly approved this issue for implementation, by applying
+                  the approved label to it. It is set by the webhook ONLY when it observes an
+                  issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
+                  (never the bot: a bot/agent that sets the label itself cannot self-approve).
+                  It is the ONLY signal that releases a front-half Task (clarify / the
+                  issueLifecycle bridge) into the autonomous implement->review->merge->deploy
+                  chain: every path that would advance a front-half issue to Implement gates
+                  on it (finishFrontHalf, the Conversation label readback, the trigger-label
+                  jump). Empty means NO verified maintainer approval - the operator fails
+                  CLOSED (parks to Conversation) rather than trusting raw label presence,
+                  which an agent with SCM write could forge. Holds the approving maintainer's
+                  login for audit.
+                type: string
               brainstormOutcome:
                 description: |-
                   BrainstormOutcome is the agent's declared outcome for a brainstorm task when
@@ -490,6 +506,15 @@ spec:
                 type: string
               mergeCommitSHA:
                 type: string
+              mergeWaitDeadline:
+                description: |-
+                  MergeWaitDeadline bounds a discrete-implement umbrella Task's wait for its
+                  member PRs to be reviewed + merged (the pre-Deploying window). When members
+                  stay unmerged past this wall clock, superviseMergedPRs parks the stream
+                  recoverable with an issue comment naming the stuck member(s) (item 3). It is
+                  distinct from DeployDeadline, which bounds the post-merge cascade.
+                format: date-time
+                type: string
               mergedHeadSHA:
                 description: |-
                   MergedHeadSHA is the source-branch head commit SHA of the most recently
@@ -564,6 +589,16 @@ spec:
                   model that actually ran. +optional
                 type: string
               resultSummary:
+                type: string
+              reviewResolveDeadline:
+                description: |-
+                  ReviewResolveDeadline bounds an umbrella review's wall-clock wait for an
+                  unresolvable member repo URL to become resolvable (un-enrolled member repo,
+                  or a projectRepoURLBySlug List error). Stamped on the first unresolvable
+                  encounter; once it elapses, writeBackReview parks the review recoverable with
+                  an issue comment naming the stuck member instead of error-looping forever
+                  (liveness finding #4).
+                format: date-time
                 type: string
               reviewVerdict:
                 description: ReviewVerdict is the agent's review decision for a human-authored
@@ -654,6 +689,14 @@ spec:
                     ciStatus:
                       description: 'CIStatus is the member''s CI/pipeline status:
                         ""|pending|success|failure.'
+                      type: string
+                    deployState:
+                      description: 'DeployState is the member''s push-CD cascade state:
+                        ""|deploying|applied.'
+                      type: string
+                    deployedVersion:
+                      description: DeployedVersion is the semver tag this member's
+                        artifact cut on merge.
                       type: string
                     headBranch:
                       description: HeadBranch is the PR/MR source branch.

@@ -154,6 +154,60 @@ func (r *TaskReconciler) handleMerge(ctx context.Context, project *tatarav1alpha
 	// maybeMarkHandoverResume) with the PR ref, branch, issue scope, and the
 	// binary terminal mandate.
 	if errors.Is(mergeErr, scm.ErrMergeConflict) {
+		// Double-merge guard: superviseApprovedPRs (the review-approved path) and the
+		// forge's native auto-merge can merge this same approved bot PR concurrently
+		// with this issueLifecycle drain. GitHub returns 405 for a merge attempt on an
+		// already-merged PR, which surfaces here as ErrMergeConflict. Before treating
+		// it as a genuine branch conflict, re-fetch authoritative PR state: if it is
+		// already merged, this is a successful (idempotent) merge, not a conflict.
+		// Record the merge and advance to MainCI instead of rerolling an
+		// already-merged change back to Implement (which would re-run implement on
+		// commits that already landed on main).
+		if postSt, pserr := writer.GetPRState(ctx, repo.Spec.URL, token, number); pserr == nil && postSt.Merged {
+			r.recordSCM(provider, "get_pr_state", nil)
+			mergeRepoSlug, _, _ := repoSlugFromURL(repo.Spec.URL, provider)
+			// PRState carries no merge-commit SHA; use the merged head as the non-empty
+			// marker so the top-of-handleMerge idempotency guard short-circuits any
+			// later re-entry, and the ledger reflects state:merged.
+			if uerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				fresh := &tatarav1alpha1.Task{}
+				if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
+					return gerr
+				}
+				if fresh.Status.MergeCommitSHA == "" {
+					fresh.Status.MergeCommitSHA = mergedHead
+				}
+				fresh.Status.MergedHeadSHA = mergedHead
+				if mergeRepoSlug != "" && number > 0 {
+					UpsertWorkItem(fresh, tatarav1alpha1.WorkItemRef{
+						Provider: provider,
+						Repo:     mergeRepoSlug,
+						Number:   number,
+						Kind:     tatarav1alpha1.WorkItemPR,
+						Role:     tatarav1alpha1.RoleOpenedPR,
+						State:    tatarav1alpha1.WIMerged,
+						HeadSHA:  mergedHead,
+					})
+				}
+				return r.Status().Update(ctx, fresh)
+			}); uerr != nil {
+				return ctrl.Result{}, fmt.Errorf("merge: record concurrent-merge sha: %w", uerr)
+			}
+			if task.Status.MergeCommitSHA == "" {
+				task.Status.MergeCommitSHA = mergedHead
+			}
+			task.Status.MergedHeadSHA = mergedHead
+			if err := r.clearDeadline(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.setDeployState(ctx, task, "MainCI", "already-merged-concurrent"); err != nil {
+				return ctrl.Result{}, err
+			}
+			log.FromContext(ctx).Info("merge: PR already merged concurrently; advancing to MainCI (idempotent)",
+				"action", "lifecycle_merge_concurrent", "resource_id", task.Name, "pr", number)
+			return ctrl.Result{}, nil
+		}
+
 		branch := task.Status.HeadBranch
 		defaultBranch := repo.Spec.DefaultBranch
 		ctxMsg := fmt.Sprintf(

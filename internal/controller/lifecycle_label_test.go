@@ -78,6 +78,7 @@ func TestFinishTriage_HumanFiledImplement_Approved(t *testing.T) {
 	r := reconcilerFor(w, &commentReader{})
 	proj := projOf(t, task)
 	markSucceededWithOutcome(t, task.Name, "implement")
+	recordApproval(t, task.Name, "szymon") // verified maintainer approval is the release signal
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-approved"}, w.added)
@@ -122,7 +123,10 @@ func TestFinishTriage_TataraAuthoredImplement_NoHumanComment_ParksIdea(t *testin
 	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 }
 
-func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testing.T) {
+// TestFinishTriage_TataraAuthoredImplement_WithMaintainerApproval_Approved: a
+// tatara-authored idea whose triage returned implement advances only once a
+// verified maintainer approval is recorded (a comment alone no longer releases).
+func TestFinishTriage_TataraAuthoredImplement_WithMaintainerApproval_Approved(t *testing.T) {
 	_, task, w := seedLabelTask(t, "auth-h", nil)
 	setTaskAuthor(t, task.Name, "tatara-bot")
 	r := reconcilerFor(w, &commentReader{
@@ -131,6 +135,7 @@ func TestFinishTriage_TataraAuthoredImplement_WithHumanComment_Approved(t *testi
 	})
 	proj := projOf(t, task)
 	markSucceededWithOutcome(t, task.Name, "implement")
+	recordApproval(t, task.Name, "szymon") // verified maintainer approval is the release signal
 	_, err := r.finishTriage(context.Background(), proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []string{"tatara-approved"}, w.added)

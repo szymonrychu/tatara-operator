@@ -126,6 +126,18 @@ func (r *TaskReconciler) setDeadlineMinutes(ctx context.Context, task *tatarav1a
 	})
 }
 
+// parkSCMContext resolves the SCM writer/token for a park-with-comment site,
+// returning an error (never panicking) when the reconciler has no SCMFor wired
+// (e.g. SCM-less unit tests). scmContext calls r.SCMFor unconditionally and would
+// nil-deref; the park sites (liveness finding #2) use this guarded wrapper so an
+// unwired writer falls back to a silent setDeployState instead of crashing.
+func (r *TaskReconciler) parkSCMContext(ctx context.Context, task *tatarav1alpha1.Task) (tatarav1alpha1.Project, tatarav1alpha1.Repository, scm.SCMWriter, string, string, error) {
+	if r.SCMFor == nil {
+		return tatarav1alpha1.Project{}, tatarav1alpha1.Repository{}, nil, "", "", fmt.Errorf("park: no SCM writer configured")
+	}
+	return r.scmContext(ctx, task)
+}
+
 // parkWithComment posts a comment on the PR/issue and transitions to Parked.
 // For issue-linked tasks it comments on the issue (IssueRef). For bot-PR-entry
 // tasks with no issue ref, it falls back to the PR ref derived from lifecyclePR.

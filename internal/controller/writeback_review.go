@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -12,6 +14,13 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
+
+// reviewResolveBudget bounds an umbrella review's wall-clock wait for an
+// unresolvable member repo URL to become resolvable before the review parks
+// recoverable with a comment naming the stuck member (liveness finding #4). It is
+// generous (a member enrollment / transient List error should clear well within
+// it) yet finite so the review never error-loops forever.
+const reviewResolveBudget = 60 * time.Minute
 
 // recordReviewQuality records the G4 quality-proxy signal for a review
 // verdict that was just written back successfully: the verdict itself
@@ -74,9 +83,38 @@ func (r *TaskReconciler) writeBackReview(ctx context.Context, task *tatarav1alph
 		// enrollment lands), so a requeue re-drives to a real decision.
 		for _, m := range members {
 			if memberURLs[m.Repo] == "" {
-				return ctrl.Result{}, fmt.Errorf(
-					"writeback review: umbrella member %s#%d repo URL unresolvable; withholding approval pending resolution",
-					m.Repo, m.Number)
+				// Liveness finding #4: an unresolvable member repo URL used to
+				// error-loop FOREVER (no deadline, no comment, no park). Bound the
+				// retries with a wall-clock deadline: stamp it on first sight and keep
+				// requeueing until it elapses; past the deadline park recoverable with
+				// an issue comment naming the stuck member and clear writeback-pending
+				// so the loop stops.
+				if task.Status.ReviewResolveDeadline == nil {
+					if serr := r.stampReviewResolveDeadline(ctx, task); serr != nil {
+						return ctrl.Result{}, serr
+					}
+					return ctrl.Result{}, fmt.Errorf(
+						"writeback review: umbrella member %s#%d repo URL unresolvable; stamped resolve deadline, withholding approval pending resolution",
+						m.Repo, m.Number)
+				}
+				if time.Now().Before(task.Status.ReviewResolveDeadline.Time) {
+					return ctrl.Result{}, fmt.Errorf(
+						"writeback review: umbrella member %s#%d repo URL unresolvable; withholding approval pending resolution",
+						m.Repo, m.Number)
+				}
+				l.Info("review: member repo URL unresolvable past resolve deadline; parking recoverable",
+					"action", "scm_review_unresolvable_parked", "resource_id", task.Name,
+					"pr", m.Number, "repo", m.Repo)
+				msg := fmt.Sprintf(
+					"tatara: I paused review of this stream - member PR %s#%d lives in a repo I cannot resolve "+
+						"(not enrolled as a Repository, or a transient lookup error) and it has not resolved within %s. "+
+						"Enroll the member repo (or re-trigger once it resolves) and comment here to resume.",
+					m.Repo, m.Number, reviewResolveBudget)
+				if perr := r.parkWithComment(ctx, task, writer, token, "review-unresolvable", msg); perr != nil {
+					return ctrl.Result{}, perr
+				}
+				return ctrl.Result{}, r.clearWritebackPending(ctx, task, "ReviewUnresolvable",
+					"review parked: member repo URL unresolvable past resolve deadline")
 			}
 		}
 		for _, m := range members {
@@ -232,6 +270,22 @@ func (r *TaskReconciler) applyReviewLabel(ctx context.Context, proj *tatarav1alp
 		log.FromContext(ctx).Error(lerr, "review: apply managed label (non-fatal)",
 			"action", "scm_review_label", "resource_id", task.Name, "label", label)
 	}
+}
+
+// stampReviewResolveDeadline records the wall-clock deadline (now + budget) an
+// umbrella review waits for an unresolvable member repo URL to become resolvable
+// before parking (liveness finding #4). Idempotent: a no-op once stamped, so the
+// deadline is anchored to the FIRST unresolvable encounter and copied back so the
+// caller observes it.
+func (r *TaskReconciler) stampReviewResolveDeadline(ctx context.Context, task *tatarav1alpha1.Task) error {
+	return r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		if fresh.Status.ReviewResolveDeadline != nil {
+			return false
+		}
+		dl := metav1.NewTime(time.Now().Add(reviewResolveBudget))
+		fresh.Status.ReviewResolveDeadline = &dl
+		return true
+	})
 }
 
 // umbrellaPRMembers returns the non-terminal role:openedPR PR members of an

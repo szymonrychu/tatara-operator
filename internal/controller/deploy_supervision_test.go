@@ -414,7 +414,7 @@ func TestCDScan_StalledGaugeBudgetSpent(t *testing.T) {
 	proj := seedDeployScene(t, "cdscanstall", "tatara-operator")
 	task := seedDeployingTask(t, "dep-cdscanstall", proj.Name, "dep-comp-cdscanstall", "szymonrychu/tatara-operator#7",
 		time.Now().Add(-2000*time.Second), "v1.0.0")
-	// Spend the auto-reroll budget so cdScan leaves it for a human (stalled).
+	// Spend the auto-reroll budget: no auto-recovery left.
 	cur := getTask(t, task.Name)
 	cur.Status.ImplementGiveUps = maxImplGiveUps
 	require.NoError(t, k8sClient.Status().Update(context.Background(), cur))
@@ -423,12 +423,14 @@ func TestCDScan_StalledGaugeBudgetSpent(t *testing.T) {
 	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: m}
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
 
-	// Not rerolled: stays Deploying, budget untouched.
+	// Liveness finding #1: an exhausted stall now PARKS terminal (failed gauge),
+	// instead of sitting Deploying forever (the old stalled-gauge-only behavior).
 	got := getTask(t, task.Name)
-	require.Equal(t, tatarav1alpha1.DeployStateDeploying, got.Status.DeployState)
-	require.Equal(t, maxImplGiveUps, got.Status.ImplementGiveUps)
-	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
-	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
+	require.Equal(t, "Parked", got.Status.DeployState)
+	require.Equal(t, deployParkReason, got.Status.ParkReason)
+	require.False(t, tatarav1alpha1.TaskDeploying(got))
+	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
 }
 
 // TestCDScan_FailedGaugeReflectsParkedDeployTimeout: a Task parked recoverable
@@ -473,14 +475,15 @@ func TestCDScan_GaugesSelfClearOnRecovery(t *testing.T) {
 
 	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	pr := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: m}
+	// Exhausted stall parks -> counted in the CD-health FAILED gauge (finding #1).
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
-	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
+	require.Equal(t, 1.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
 
-	// Cascade recovered: the task is no longer Deploying. Re-scan clears the gauge.
+	// A human resolved the parked cascade to Done: a re-scan self-clears the gauge.
 	recovered := getTask(t, task.Name)
 	recovered.Status.Phase = ""
 	recovered.Status.DeployState = "Done"
 	require.NoError(t, k8sClient.Status().Update(context.Background(), recovered))
 	pr.cdScan(deployCtx(), proj, []tatarav1alpha1.Task{*getTask(t, task.Name)})
-	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeStalledGauge(proj.Name)))
+	require.Equal(t, 0.0, testutil.ToFloat64(m.CDCascadeFailedGauge(proj.Name)))
 }

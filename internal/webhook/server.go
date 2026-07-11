@@ -208,31 +208,102 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 		return
 	}
 
-	// triggerLabel on a Conversation task -> jump to Implement without spawning
-	// a new task. Checked before the dedup loop so we never create a duplicate.
-	// Also clears DeadlineAt so MRCI gets a fresh babysit deadline (not the stale
-	// conversation idle deadline). Wrapped in RetryOnConflict to avoid clobbering
-	// a concurrent lifecycle reconcile.
-	if ev.Action == "labeled" && !ev.IsPR && ev.ChangedLabel == proj.Spec.TriggerLabel {
-		if task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef); found &&
-			task.Spec.Kind == "issueLifecycle" && task.Status.DeployState == "Conversation" {
-			updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-				fresh := &tatarav1.Task{}
-				if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-					return err
-				}
-				fresh.Status.DeployState = "Implement"
-				fresh.Status.DeadlineAt = nil // clear stale conversation deadline
-				return s.cfg.Client.Status().Update(ctx, fresh)
-			})
-			if updateErr != nil {
-				s.reject(w, http.StatusInternalServerError, "update task", provider, ev.Kind, ev.Action, "error")
+	// Drop ISSUE label-mutation events the operator ITSELF emitted. setLifecycleLabel
+	// and the clarify->implement handoff (handoffToImplement) flip managed phase
+	// labels with the bot token, and GitHub/GitLab echo those writes back as
+	// issues.labeled/unlabeled with sender == bot. Without this guard the operator's
+	// own tatara-implementation write on a clarify handoff re-enters handleWorkItem,
+	// passes the trigger-label gate (the issue still carries the trigger label), and
+	// spawns a fresh clarify Task that re-stamps brainstorming while an implement Task
+	// already owns the issue. Mirrors the comment-path bot-sender guard
+	// (handleIssueComment: ev.ActorLogin == botLogin). ActorLogin is the event sender.
+	//
+	// Scoped to issues (!ev.IsPR): PR/MR label events are governed by the review /
+	// stream-review routing below, and on GitLab a bot actor on an MR is the event
+	// actor, not the author (a legitimate review must still proceed).
+	if (ev.Action == "labeled" || ev.Action == "unlabeled") && !ev.IsPR {
+		botLogin := ""
+		if proj.Spec.Scm != nil {
+			botLogin = proj.Spec.Scm.BotLogin
+		}
+		if botLogin != "" && ev.ActorLogin == botLogin {
+			s.log.InfoContext(ctx, "issue label event from bot actor ignored (operator self-write)",
+				"project", proj.Name, "issue_ref", ev.IssueRef, "action", ev.Action, "label", ev.ChangedLabel)
+			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+			return
+		}
+	}
+
+	// Verified maintainer approval: the ONLY signal that releases a front-half
+	// issue into the autonomous implement->review->merge->deploy chain. A
+	// maintainer (a MaintainerLogins member - closed by default, structurally
+	// never the bot) explicitly applying the approved label to an ISSUE records
+	// an identity-verified approval on the owning front-half Task. Bot-set
+	// approved labels never reach here (dropped by the bot-actor guard above), so
+	// an agent/pod that sets the label itself cannot self-approve; a
+	// non-maintainer actor is ignored (their label is not approval). The recorded
+	// fact (Status.ApprovedByMaintainer), not raw label presence, is what the
+	// controller gates on.
+	if ev.Action == "labeled" && !ev.IsPR &&
+		ev.ChangedLabel == tatarav1.ResolvedApprovedLabel(proj.Spec.Scm) {
+		repoForAuth, _ := s.matchRepo(ctx, proj.Name, ev.Repo)
+		if tatarav1.IsMaintainer(&proj, repoForAuth, ev.ActorLogin) {
+			if s.recordMaintainerApproval(ctx, proj.Name, ev.IssueRef, ev.ActorLogin) {
+				s.log.InfoContext(ctx, "verified maintainer approval recorded",
+					"project", proj.Name, "issue_ref", ev.IssueRef, "maintainer", ev.ActorLogin, "label", ev.ChangedLabel)
+				s.accept(w, provider, ev.Kind, ev.Action, "approved")
 				return
 			}
-			s.log.InfoContext(ctx, "triggerLabel on Conversation task: set Implement",
-				"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef)
-			s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+			// Maintainer approved an issue with no live front-half Task to record
+			// on: applying the approved label is how a maintainer approves work in
+			// progress, not how work is started. Nothing to release; ignore.
+			s.log.InfoContext(ctx, "maintainer approved but no front-half task to record on; ignoring",
+				"project", proj.Name, "issue_ref", ev.IssueRef, "maintainer", ev.ActorLogin)
+			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 			return
+		}
+		// Approved label applied by a NON-maintainer actor (random human, allowed
+		// reporter, or an agent that is not the bot): NOT a verified approval. Never
+		// record it and never advance anything on the strength of the label.
+		s.log.InfoContext(ctx, "approved label from non-maintainer actor ignored (not a verified approval)",
+			"project", proj.Name, "issue_ref", ev.IssueRef, "actor", ev.ActorLogin)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+
+	// triggerLabel by a MAINTAINER on a Conversation issueLifecycle task -> record
+	// the verified approval and jump straight to Implement (the maintainer skips
+	// the remaining dialogue). Gated on IsMaintainer(actor): a non-maintainer
+	// applying the trigger label must NOT advance the issue to implement - it falls
+	// through to normal handling (which re-triages, gated on a recorded approval).
+	// Checked before the dedup loop so we never create a duplicate. Clears
+	// DeadlineAt so MRCI gets a fresh babysit deadline (not the stale conversation
+	// idle deadline). Wrapped in RetryOnConflict to avoid clobbering a concurrent
+	// lifecycle reconcile.
+	if ev.Action == "labeled" && !ev.IsPR && ev.ChangedLabel == proj.Spec.TriggerLabel {
+		repoForAuth, _ := s.matchRepo(ctx, proj.Name, ev.Repo)
+		if tatarav1.IsMaintainer(&proj, repoForAuth, ev.ActorLogin) {
+			if task, found := s.findLifecycleTask(ctx, proj.Name, ev.IssueRef); found &&
+				task.Spec.Kind == "issueLifecycle" && task.Status.DeployState == "Conversation" {
+				updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+					fresh := &tatarav1.Task{}
+					if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+						return err
+					}
+					fresh.Status.ApprovedByMaintainer = ev.ActorLogin
+					fresh.Status.DeployState = "Implement"
+					fresh.Status.DeadlineAt = nil // clear stale conversation deadline
+					return s.cfg.Client.Status().Update(ctx, fresh)
+				})
+				if updateErr != nil {
+					s.reject(w, http.StatusInternalServerError, "update task", provider, ev.Kind, ev.Action, "error")
+					return
+				}
+				s.log.InfoContext(ctx, "maintainer triggerLabel on Conversation task: recorded approval, set Implement",
+					"project", proj.Name, "task", task.Name, "issue_ref", ev.IssueRef, "maintainer", ev.ActorLogin)
+				s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+				return
+			}
 		}
 	}
 
@@ -314,13 +385,33 @@ func (s *Server) handleWorkItem(ctx context.Context, w http.ResponseWriter, prov
 				s.reject(w, http.StatusInternalServerError, "create review", provider, ev.Kind, ev.Action, "error")
 				return
 			}
-			result := "task_created"
 			if !created {
-				result = "duplicate"
+				// The deterministic-name Create lost the race: a concurrent PR-create
+				// delivery for this shared branch already spawned the single stream
+				// review Task. That winner does NOT carry OUR PR in its span (the
+				// review Task's span is seeded per-branch from the umbrella, and this
+				// PR may not be in the umbrella ledger yet, or may be an external PR).
+				// Fall through to joinStreamReview so the loser's PR is added to the
+				// span regardless of who created the Task - otherwise this PR is
+				// silently dropped from the collective approve/withhold review.
+				if reviewT2, _ := s.findStreamUmbrellas(ctx, proj.Name, ev.HeadBranch); reviewT2 != nil {
+					if jerr := s.joinStreamReview(ctx, reviewT2, provider, prRepoSlug, ev); jerr != nil {
+						s.reject(w, http.StatusInternalServerError, "join review", provider, ev.Kind, ev.Action, "error")
+						return
+					}
+					s.log.InfoContext(ctx, "PR-create joined concurrently-created stream review umbrella",
+						"project", proj.Name, "task", reviewT2.Name, "issue_ref", ev.IssueRef, "branch", ev.HeadBranch)
+					s.accept(w, provider, ev.Kind, ev.Action, "joined_umbrella")
+					return
+				}
+				s.log.InfoContext(ctx, "PR-create stream review already exists but not resolvable to join",
+					"project", proj.Name, "umbrella", umbrellaT.Name, "issue_ref", ev.IssueRef, "branch", ev.HeadBranch)
+				s.accept(w, provider, ev.Kind, ev.Action, "duplicate")
+				return
 			}
 			s.log.InfoContext(ctx, "PR-create spawned stream review umbrella",
 				"project", proj.Name, "umbrella", umbrellaT.Name, "issue_ref", ev.IssueRef, "branch", ev.HeadBranch, "created", created)
-			s.accept(w, provider, ev.Kind, ev.Action, result)
+			s.accept(w, provider, ev.Kind, ev.Action, "task_created")
 			return
 		}
 		// No umbrella: external / human PR - fall through to the per-PR review path.
@@ -518,6 +609,16 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 			s.reactivateTask(ctx, w, provider, proj, ev, parked)
 			return
 		}
+		// Liveness finding #3: a discrete implement/review Task Parked at the give-up
+		// cap is a permanent wedge - the producer stays blocked and the kind is not
+		// front-half comment-resumable. A human comment re-drives that Parked
+		// back-half task to a live Running state (fresh give-up budget). A Kind=
+		// implement Task in the pod-less Deploying phase is ALIVE and is NEVER matched
+		// (findReactivatableBackHalfTask requires DeployState=="Parked").
+		if parked, ok := s.findReactivatableBackHalfTask(ctx, proj.Name, ev.IssueRef); ok {
+			s.reactivateBackHalfTask(ctx, w, provider, proj, ev, parked)
+			return
+		}
 		s.createClarifyTask(ctx, w, provider, proj, ev)
 		return
 	}
@@ -696,6 +797,49 @@ func (s *Server) findLifecycleTask(ctx context.Context, projectName, issueRef st
 	return nil, false
 }
 
+// recordMaintainerApproval durably records a VERIFIED maintainer approval on the
+// front-half Task owning issueRef and re-drives the front half so the implement
+// gate re-evaluates with the approval in hand. It sets Status.ApprovedByMaintainer
+// (the identity-verified fact the controller gates on) and, when the task is
+// parked awaiting the maintainer (Conversation/Stopped/Parked), flips it back to
+// Triage so the front half re-runs. Returns false when no owning front-half Task
+// exists (nothing to record on) or the status write ultimately failed. The caller
+// has already verified the actor is a maintainer.
+func (s *Server) recordMaintainerApproval(ctx context.Context, projName, issueRef, maintainer string) bool {
+	task, found := s.findLifecycleTask(ctx, projName, issueRef)
+	if !found {
+		task, found = s.findReactivatableTask(ctx, projName, issueRef)
+	}
+	if !found {
+		return false
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ApprovedByMaintainer = maintainer
+		now := metav1.Now()
+		fresh.Status.LastActivityAt = &now
+		fresh.Status.DeadlineAt = nil
+		// Re-run the front half so the implement gate re-evaluates now that the
+		// verified approval is recorded (mirrors the comment-driven reactivation).
+		// A Conversation/Stopped/Parked task carries no live pod (it was torn down
+		// on entering that state), so flipping to Triage is safe.
+		switch fresh.Status.DeployState {
+		case "Conversation", "Stopped", "Parked":
+			fresh.Status.DeployState = "Triage"
+			fresh.Status.Phase = ""
+		}
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	}); err != nil {
+		s.log.ErrorContext(ctx, "record maintainer approval: status update failed",
+			"error", err, "task", task.Name, "issue_ref", issueRef)
+		return false
+	}
+	return true
+}
+
 // findReactivatableTask returns an owning issueLifecycle Task for issueRef that
 // is resumable: DeployState=="Parked" OR DeployState=="Stopped" (regardless
 // of Phase). Done tasks are NOT reactivated (their work is complete). A Stopped
@@ -800,6 +944,92 @@ func (s *Server) reactivateTask(ctx context.Context, w http.ResponseWriter, prov
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
+// findReactivatableBackHalfTask returns a discrete implement/review Task owning
+// issueRef that is comment-resumable: DeployState=="Parked" (a labelled-but-dead
+// issue). It deliberately matches ONLY the Parked state so a live Deploying or
+// Running back-half task is never resurrected (liveness finding #3). Returns
+// (task, true) when found.
+func (s *Server) findReactivatableBackHalfTask(ctx context.Context, projectName, issueRef string) (*tatarav1.Task, bool) {
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, s.taskListOpts()...); err != nil {
+		return nil, false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.Kind != "implement" && t.Spec.Kind != "review" {
+			continue
+		}
+		if t.Spec.ProjectRef != projectName {
+			continue
+		}
+		if t.Spec.Source == nil || t.Spec.Source.IssueRef != issueRef {
+			continue
+		}
+		if t.Status.DeployState == "Parked" {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// reactivateBackHalfTask re-drives a Parked discrete implement/review Task back to a
+// live run (liveness finding #3): it tears down any stale wrapper, clears the run
+// state (Phase, park, turn annotations) and RESETS the give-up budget so the task
+// is not instantly re-parked at cap, then stamps fresh timers. Unlike
+// reactivateTask (which sends a front-half task to Triage), a back-half task has no
+// triage; clearing Phase/DeployState re-spawns its own agent run on the next
+// reconcile.
+func (s *Server) reactivateBackHalfTask(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent, task *tatarav1.Task) {
+	if err := agent.DeleteWrapper(ctx, s.cfg.Client, s.cfg.Namespace, task); err != nil {
+		s.log.ErrorContext(ctx, "reactivate back-half: delete wrapper (non-fatal)", "error", err, "task", task.Name)
+	}
+	idleMinutes := 60
+	if proj.Spec.Scm != nil && proj.Spec.Scm.ConversationIdleMinutes > 0 {
+		idleMinutes = proj.Spec.Scm.ConversationIdleMinutes
+	}
+	if statusErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		now := metav1.Now()
+		deadline := metav1.NewTime(now.Add(time.Duration(idleMinutes) * time.Minute))
+		fresh.Status.Phase = ""
+		fresh.Status.DeployState = ""
+		fresh.Status.ParkReason = ""
+		fresh.Status.ImplementGiveUps = 0
+		fresh.Status.ImplementEmptyRetries = 0
+		fresh.Status.LifecycleIterations = 0
+		fresh.Status.LastActivityAt = &now
+		fresh.Status.DeadlineAt = &deadline
+		return s.cfg.Client.Status().Update(ctx, fresh)
+	}); statusErr != nil {
+		s.log.ErrorContext(ctx, "reactivate back-half: update task status", "error", statusErr, "task", task.Name)
+		s.reject(w, http.StatusInternalServerError, "reactivate task", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if annErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh2 := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(task), fresh2); err != nil {
+			return err
+		}
+		if fresh2.Annotations != nil {
+			delete(fresh2.Annotations, tatarav1.AnnCurrentTurn)
+			delete(fresh2.Annotations, tatarav1.AnnCurrentSubtask)
+			delete(fresh2.Annotations, tatarav1.AnnTurnComplete)
+			delete(fresh2.Annotations, tatarav1.AnnTurnStartedAt)
+			delete(fresh2.Annotations, tatarav1.AnnTurnLastActivity)
+			delete(fresh2.Annotations, tatarav1.AnnPodRecreations)
+		}
+		return s.cfg.Client.Update(ctx, fresh2)
+	}); annErr != nil {
+		s.log.ErrorContext(ctx, "reactivate back-half: clear annotations (non-fatal, reactivation committed)", "error", annErr, "task", task.Name)
+	}
+	s.log.InfoContext(ctx, "issue_comment: reactivated parked back-half task",
+		"project", proj.Name, "task", task.Name, "kind", task.Spec.Kind, "issue_ref", ev.IssueRef)
+	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
 func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	projectName := chi.URLParam(r, "project")
@@ -850,11 +1080,95 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// incidentStaleAge bounds how long an open (non-terminal) incident Task may sit
+// before a persistent re-fire of the same alert group re-triggers it. Generous so a
+// live investigation is never disrupted, yet finite so a wedged incident cannot
+// suppress escalation forever (liveness finding #5). Anchor: LastActivityAt
+// (fallback CreationTimestamp).
+const incidentStaleAge = 6 * time.Hour
+
+// reactivateStaleIncident re-drives a WEDGED non-terminal incident Task for the
+// alert group when it has been idle past incidentStaleAge, so a persistent re-fire
+// escalates instead of being deduped forever. It bumps LastActivityAt and clears
+// Phase so the reconciler re-spawns the investigation, and tears down any stale
+// wrapper. Returns true when it reactivated one (the caller then skips enqueueing a
+// duplicate).
+func (s *Server) reactivateStaleIncident(ctx context.Context, projectName, groupHash string) bool {
+	if groupHash == "" {
+		return false
+	}
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace),
+		client.MatchingLabels{tatarav1.LabelAlertGroup: groupHash}); err != nil {
+		return false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProjectRef != projectName || t.Spec.Kind != "incident" {
+			continue
+		}
+		if tatarav1.TaskTerminal(t) {
+			continue
+		}
+		anchor := t.CreationTimestamp.Time
+		if t.Status.LastActivityAt != nil {
+			anchor = t.Status.LastActivityAt.Time
+		}
+		if time.Since(anchor) < incidentStaleAge {
+			continue // a live, recently-active investigation: do not disrupt
+		}
+		if err := agent.DeleteWrapper(ctx, s.cfg.Client, s.cfg.Namespace, t); err != nil {
+			s.log.ErrorContext(ctx, "reactivate stale incident: delete wrapper (non-fatal)", "error", err, "task", t.Name)
+		}
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1.Task{}
+			if gerr := s.cfg.Client.Get(ctx, client.ObjectKeyFromObject(t), fresh); gerr != nil {
+				return gerr
+			}
+			now := metav1.Now()
+			fresh.Status.Phase = ""
+			fresh.Status.LastActivityAt = &now
+			return s.cfg.Client.Status().Update(ctx, fresh)
+		}); err != nil {
+			s.log.ErrorContext(ctx, "reactivate stale incident: status update", "error", err, "task", t.Name)
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) (bool, error) {
 	slugs := projectRepoSlugs(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name)
 	alertCtx := renderAlertContext(alert)
+	tierRevert := alert.CommonLabels["tatara_tier_quality"] == "true"
+	// In-flight-work dedup (finding #6): a firing alert that implicates a repo which
+	// already has a non-terminal Task must not spin a competing clarify->implement
+	// cycle (e.g. a component mid-deploy throwing a symptomatic alert). The alert-
+	// group hash only catches a re-fire of the SAME alert; this catches a DIFFERENT
+	// alert on a repo that is already being worked. The tier-revert self-heal is
+	// exempt: it targets tatara-helmfile and must always proceed.
+	if !tierRevert {
+		implicated := alertImplicatedRepoSlugs(alert, slugs)
+		if len(implicated) > 0 && s.repoHasNonTerminalTask(ctx, proj.Name, implicated) {
+			s.log.InfoContext(ctx, "incident skipped: implicated repo has in-flight work",
+				"action", "incident_skip_repo_inflight", "project", proj.Name,
+				"alert_group", groupHash, "repos", strings.Join(implicated, ","))
+			return false, nil
+		}
+	}
+	// Liveness finding #5: a re-firing alert is deduped for the WHOLE lifetime of a
+	// non-terminal incident Task (dedup on alertGroupHash). If that incident is
+	// WEDGED non-terminal, the firing alert can never escalate. Past a staleness
+	// bound, re-drive the wedged incident (bump last-activity + reset Phase so it
+	// re-runs) instead of the dedup suppressing the re-fire forever.
+	if s.reactivateStaleIncident(ctx, proj.Name, groupHash) {
+		s.log.InfoContext(ctx, "incident re-fired against a stale wedged incident; re-driving it",
+			"action", "incident_stale_retrigger", "project", proj.Name, "alert_group", groupHash)
+		return false, nil
+	}
 	var goal string
-	if alert.CommonLabels["tatara_tier_quality"] == "true" {
+	if tierRevert {
 		goal = incident.GoalTierRevert(proj.Name, alert.CommonLabels["kind"], alert.CommonLabels["model"])
 	} else {
 		goal = incident.GoalProject(alertCtx, slugs)
@@ -889,6 +1203,63 @@ func projectRepoSlugs(ctx context.Context, c client.Client, ns, project string) 
 	}
 	sort.Strings(slugs)
 	return slugs
+}
+
+// alertImplicatedRepoSlugs returns the project repo slugs an alert implicates: any
+// project slug whose component name (or the full slug) appears as a LABEL VALUE on
+// the alert (commonLabels or per-alert labels, e.g. service=tatara-operator). This
+// is the deterministic alert->repo mapping the in-flight-work dedup keys on.
+func alertImplicatedRepoSlugs(alert GrafanaAlert, projectSlugs []string) []string {
+	// Collect all label values once.
+	values := map[string]struct{}{}
+	for _, v := range alert.CommonLabels {
+		values[v] = struct{}{}
+	}
+	for _, a := range alert.Alerts {
+		for _, v := range a.Labels {
+			values[v] = struct{}{}
+		}
+	}
+	var out []string
+	for _, slug := range projectSlugs {
+		comp := slug
+		if i := strings.LastIndex(slug, "/"); i >= 0 {
+			comp = slug[i+1:]
+		}
+		if _, ok := values[comp]; ok {
+			out = append(out, slug)
+			continue
+		}
+		if _, ok := values[slug]; ok {
+			out = append(out, slug)
+		}
+	}
+	return out
+}
+
+// repoHasNonTerminalTask reports whether any non-terminal Task in the project spans
+// one of the implicated repo slugs (via its ledger/source scope).
+func (s *Server) repoHasNonTerminalTask(ctx context.Context, projName string, implicated []string) bool {
+	want := map[string]struct{}{}
+	for _, slug := range implicated {
+		want[slug] = struct{}{}
+	}
+	var tasks tatarav1.TaskList
+	if err := s.cfg.Client.List(ctx, &tasks, client.InNamespace(s.cfg.Namespace)); err != nil {
+		return false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.ProjectRef != projName || tatarav1.TaskTerminal(t) {
+			continue
+		}
+		for _, slug := range tatarav1.TaskReposInScope(t) {
+			if _, ok := want[slug]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func mentionsBot(body, bot string) bool {

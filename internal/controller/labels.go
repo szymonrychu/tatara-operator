@@ -182,6 +182,7 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	}
 	l := log.FromContext(ctx)
 	managed := managedPhaseLabels(proj.Spec.Scm)
+	brainstorming, _, implementation, _ := lifecycleLabels(proj.Spec.Scm)
 	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
 	if err != nil {
 		return fmt.Errorf("set label: %w", err)
@@ -194,24 +195,19 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	// "exactly one managed label" contract silently breaks. In that case we
 	// add + remove unconditionally; AddLabel is idempotent and RemoveLabel is
 	// best-effort (tolerates the label being absent).
-	current := map[string]bool{}
-	known := false
-	if r.ReaderFor != nil {
-		if reader, rerr := r.ReaderFor(provider, token); rerr == nil {
-			if owner, name, oerr := scm.OwnerRepo(repo.Spec.URL); oerr == nil {
-				if issues, lerr := reader.ListOpenIssues(ctx, owner, name); lerr == nil {
-					for _, iss := range issues {
-						if fmt.Sprintf("%s#%d", iss.Repo, iss.Number) == issueRef {
-							for _, lb := range iss.Labels {
-								current[lb] = true
-							}
-							known = true
-							break
-						}
-					}
-				}
-			}
-		}
+	current, known := r.currentIssueLabels(ctx, provider, token, repo.Spec.URL, issueRef)
+
+	// One-of-4 invariant guard: refuse to (re)set brainstorming on an issue that
+	// already carries the implementation label. The issue has been handed off to an
+	// implement Task (which owns the implementation phase); a stale front-half
+	// (e.g. a spurious clarify Task re-entering at Triage, or a triage revert racing
+	// the handoff) re-stamping brainstorming would drag the actively-implementing
+	// issue back a phase and re-trigger the front-half. Only enforced when we could
+	// read the current labels (fail-open to the add otherwise).
+	if known && desired == brainstorming && current[implementation] {
+		l.Info("set label: issue already in implementation; refusing brainstorming re-stamp",
+			"action", "scm_set_label_impl_guard", "resource_id", task.Name, "issue_ref", issueRef)
+		return nil
 	}
 
 	// changed tracks whether an actual add/remove API call landed, so the
@@ -219,6 +215,7 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 	// it logged on every reconcile (~160/h of misleading no-op lines) even when
 	// the label was already correct and AddLabel was skipped.
 	changed := false
+	addedDesired := false
 	if !known || !current[desired] {
 		if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
 			// issue #263: the target issue is permanently gone (410 deleted / 404
@@ -239,9 +236,51 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		}
 		r.recordSCM(provider, "add_label", nil)
 		changed = true
+		addedDesired = true
 	}
+
+	// Re-list the issue's labels IMMEDIATELY before the removes. The
+	// list->add->remove sequence is three separate SCM calls with no CAS, and the
+	// TaskReconciler, ProjectReconciler, and webhook can all drive it concurrently;
+	// deciding the removes off the stale top-of-function read could remove a label a
+	// racing controller just set (leaving zero managed labels) or skip removing one
+	// it just added (leaving two). Re-reading here shrinks that window to the gap
+	// between this read and each remove.
+	//
+	// Residual (documented; not closable without a distributed lock): two controllers
+	// asserting DIFFERENT desired phase labels at the same instant remain logically
+	// racy - re-listing narrows the mechanical window but cannot serialize conflicting
+	// intents. In practice a given issue's phase is driven by one producer at a time,
+	// and the implementation-guard above blocks the highest-impact conflict.
+	fresh, freshKnown := r.currentIssueLabels(ctx, provider, token, repo.Spec.URL, issueRef)
+	if freshKnown {
+		// Add-then-verify: if the fresh read shows `desired` gone and we did NOT add it
+		// ourselves this call (i.e. it was believed already present), a racing writer
+		// stripped it - re-add once so the desired label is never lost.
+		if !fresh[desired] && !addedDesired {
+			if aerr := writer.AddLabel(ctx, token, issueRef, desired); aerr != nil {
+				if isPermanentTargetGone(aerr) {
+					r.recordSCMGone(provider, "add_label", aerr)
+					return nil
+				}
+				r.recordSCM(provider, "add_label", aerr)
+				return fmt.Errorf("set label re-add %q: %w", desired, aerr)
+			}
+			r.recordSCM(provider, "add_label", nil)
+			fresh[desired] = true
+			changed = true
+		}
+	}
+
 	for _, lb := range managed {
-		if lb == desired || (known && !current[lb]) {
+		if lb == desired {
+			continue
+		}
+		// Remove only labels the FRESH read still shows present (when known). Our own
+		// just-added `desired` is never in this set (skipped above). When the fresh
+		// read failed, fall back to unconditional best-effort removes so the
+		// exactly-one-managed-label contract still holds (RemoveLabel tolerates absent).
+		if freshKnown && !fresh[lb] {
 			continue
 		}
 		if rerr := writer.RemoveLabel(ctx, token, issueRef, lb); rerr != nil {
@@ -283,6 +322,42 @@ func (r *TaskReconciler) setLifecycleLabel(ctx context.Context, proj *tatarav1al
 		}
 	}
 	return nil
+}
+
+// currentIssueLabels reads the managed source issue's current label set from live
+// SCM. It returns (labels, known): known is false when the labels could not be
+// determined (nil reader, reader/parse error, list error, or the issue not present
+// in the open list e.g. just-closed), in which case labels is empty and callers
+// must fall back to their read-failure behaviour rather than trusting the empty set.
+// setLifecycleLabel calls it twice per invocation - once before the add (for the
+// add-skip decision + the implementation guard) and once immediately before the
+// removes (to shrink the RMW window).
+func (r *TaskReconciler) currentIssueLabels(ctx context.Context, provider, token, repoURL, issueRef string) (map[string]bool, bool) {
+	labels := map[string]bool{}
+	if r.ReaderFor == nil {
+		return labels, false
+	}
+	reader, rerr := r.ReaderFor(provider, token)
+	if rerr != nil {
+		return labels, false
+	}
+	owner, name, oerr := scm.OwnerRepo(repoURL)
+	if oerr != nil {
+		return labels, false
+	}
+	issues, lerr := reader.ListOpenIssues(ctx, owner, name)
+	if lerr != nil {
+		return labels, false
+	}
+	for _, iss := range issues {
+		if fmt.Sprintf("%s#%d", iss.Repo, iss.Number) == issueRef {
+			for _, lb := range iss.Labels {
+				labels[lb] = true
+			}
+			return labels, true
+		}
+	}
+	return labels, false
 }
 
 // isBotAuthoredProposal reports whether the task's source issue is a
@@ -442,34 +517,10 @@ func (r *TaskReconciler) hasHumanComment(ctx context.Context, proj *tatarav1alph
 	return false, nil
 }
 
-// thirdPartyAuthor reports whether the task's source issue was opened by a
-// known external contributor: a non-empty Source.AuthorLogin that is neither
-// the configured BotLogin nor any MaintainerLogin, and (issue #102) that is an
-// allowed reporter. Third-party issues are
-// trusted and autoapproved through triage without the self-approve hold
-// (issue #56). AuthorLogin is authoritative here - for cron-scanned issues it
-// is captured from the authenticated ListOpenIssues call, and on the webhook
-// path it comes from the HMAC-verified payload. A genuine tatara-authored issue
-// carries the bot login, so it never reads as third-party.
-func thirdPartyAuthor(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) bool {
-	if proj.Spec.Scm == nil || task.Spec.Source == nil {
-		return false
-	}
-	author := task.Spec.Source.AuthorLogin
-	if author == "" || author == proj.Spec.Scm.BotLogin {
-		return false
-	}
-	for _, m := range proj.Spec.Scm.MaintainerLogins {
-		if author == m {
-			return false
-		}
-	}
-	// Issue #102: only autoapprove third-party authors that are allowed reporters.
-	// With an empty reporter allowlist this is a no-op (every external author is
-	// trusted, preserving issue #56); once an allowlist is configured a non-reporter
-	// would already have been dropped at intake, so this is belt-and-braces.
-	if !tatarav1alpha1.IsAllowedReporter(proj, nil, author) {
-		return false
-	}
-	return true
-}
+// NOTE: the former thirdPartyAuthor autoapprove tier (issue #56) was removed
+// when the maintainer-approval gate landed: third-party authorship is no longer
+// a release signal. Only a VERIFIED maintainer approval (Status.ApprovedByMaintainer,
+// recorded by the webhook from a MaintainerLogins actor applying the approved
+// label) advances a front-half issue to implement. Author-based intake gating
+// still lives in IsAllowedReporter (reporter intake) and IsTrustedAuthor
+// (trigger-label/reaction-scope bypass); neither releases implementation.

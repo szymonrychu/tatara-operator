@@ -204,23 +204,62 @@ func TestObserveHumanDeclinedLabel(t *testing.T) {
 	require.True(t, found, "role:proposed entry for o/r#42 not found or not updated to declined")
 }
 
-// TestObserveHumanApprovedLabel verifies that when the issue carries
-// tatara-approved, reconcileLifecycle updates the role:proposed entry to
-// WIApproved and transitions to Implement.
-func TestObserveHumanApprovedLabel(t *testing.T) {
+// TestObserveApprovedLabel_WithoutRecordedApproval_FailsClosed: the approved
+// label being present (an agent/pod with SCM write could set it, and
+// ListOpenIssues cannot tell WHO applied it) must NOT drive the task to
+// Implement. The ledger still projects WIApproved (observability), but the task
+// stays in Conversation until a VERIFIED maintainer approval is recorded.
+func TestObserveApprovedLabel_WithoutRecordedApproval_FailsClosed(t *testing.T) {
 	ctx := context.Background()
-	r, task, _ := seedProjectionTask(t, "obs-approved")
-	setProjectMemoryReady(t, task.Spec.ProjectRef, "http://mem-obs-approved.tatara.svc:8080")
+	r, task, _ := seedProjectionTask(t, "obs-approved-noappr")
+	setProjectMemoryReady(t, task.Spec.ProjectRef, "http://mem-obs-approved-noappr.tatara.svc:8080")
 
-	// Issue now has tatara-approved (human relabeled).
 	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
 		return &observeLabelReader{labels: []string{"tatara-approved"}}, nil
 	}
 
-	// Set task to Conversation state (awaiting human approval).
 	var fresh tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
 	fresh.Status.DeployState = "Conversation"
+	now := metav1.Now()
+	fresh.Status.LastActivityAt = &now
+	future := metav1.NewTime(now.Add(1e9))
+	fresh.Status.DeadlineAt = &future
+	require.NoError(t, k8sClient.Status().Update(ctx, &fresh))
+
+	_, err := r.reconcileLifecycle(ctx, getTaskByName(t, task.Name))
+	require.NoError(t, err)
+
+	var updated tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
+	require.Equal(t, "Conversation", updated.Status.DeployState,
+		"approved label without a recorded maintainer approval must NOT drive Implement (fail closed)")
+	found := false
+	for _, wi := range updated.Status.WorkItems {
+		if wi.Role == tatarav1alpha1.RoleProposed && wi.Repo == "o/r" && wi.Number == 42 {
+			require.Equal(t, tatarav1alpha1.WIApproved, wi.State, "ledger must still project WIApproved for observability")
+			found = true
+		}
+	}
+	require.True(t, found, "role:proposed entry for o/r#42 not found")
+}
+
+// TestObserveApprovedLabel_WithRecordedApproval_Implements: with a verified
+// maintainer approval recorded on the Task, the approved-label readback drives
+// the task to Implement.
+func TestObserveApprovedLabel_WithRecordedApproval_Implements(t *testing.T) {
+	ctx := context.Background()
+	r, task, _ := seedProjectionTask(t, "obs-approved")
+	setProjectMemoryReady(t, task.Spec.ProjectRef, "http://mem-obs-approved.tatara.svc:8080")
+
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &observeLabelReader{labels: []string{"tatara-approved"}}, nil
+	}
+
+	var fresh tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &fresh))
+	fresh.Status.DeployState = "Conversation"
+	fresh.Status.ApprovedByMaintainer = "szymon" // verified maintainer approval recorded by the webhook
 	now := metav1.Now()
 	fresh.Status.LastActivityAt = &now
 	future := metav1.NewTime(now.Add(1e9)) // far future deadline
@@ -232,7 +271,7 @@ func TestObserveHumanApprovedLabel(t *testing.T) {
 
 	var updated tatarav1alpha1.Task
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &updated))
-	require.Equal(t, "Implement", updated.Status.DeployState, "approved readback must drive the task to Implement")
+	require.Equal(t, "Implement", updated.Status.DeployState, "approved readback with recorded approval must drive Implement")
 	found := false
 	for _, wi := range updated.Status.WorkItems {
 		if wi.Role == tatarav1alpha1.RoleProposed && wi.Repo == "o/r" && wi.Number == 42 {

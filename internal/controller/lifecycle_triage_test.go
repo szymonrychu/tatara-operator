@@ -122,6 +122,7 @@ func TestLifecycleTriage_Implement(t *testing.T) {
 	r, fw, name := seedTriageSucceeded(t, "impl", &tatarav1alpha1.IssueOutcome{
 		Action: "implement",
 	})
+	recordApproval(t, name, "szymon") // verified maintainer approval is the release signal
 
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
 		tk := &tatarav1alpha1.Task{}
@@ -249,6 +250,7 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("seed triage succeeded: %v", err)
 	}
+	recordApproval(t, name, "szymon") // verified maintainer approval is the release signal
 
 	r := newLifecycleReconciler(t, &lifecycleFakeSCMWriter{})
 

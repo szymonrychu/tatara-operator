@@ -71,6 +71,37 @@ func IsTrustedAuthor(proj *Project, repo *Repository, login string) bool {
 	return containsLogin(EffectiveReporterLogins(proj, repo), login)
 }
 
+// IsMaintainer reports whether login is a VERIFIED human maintainer for the
+// project/repo: a member of the effective MaintainerLogins set that is NOT the
+// bot. It is the trust check behind the explicit-maintainer-approval gate.
+//
+// CLOSED by default: an empty MaintainerLogins set means NOBODY is a maintainer,
+// so nothing can be approved and every issue fails closed (this is deliberate -
+// a project must name its maintainers before any issue can advance to implement).
+// The bot is structurally excluded even if misconfigured into the list, so an
+// agent/pod acting AS the bot can never satisfy a maintainer-gated check.
+func IsMaintainer(proj *Project, repo *Repository, login string) bool {
+	if login == "" {
+		return false
+	}
+	if proj != nil && proj.Spec.Scm != nil && login == proj.Spec.Scm.BotLogin {
+		return false
+	}
+	return containsLogin(EffectiveMaintainerLogins(proj, repo), login)
+}
+
+// ResolvedApprovedLabel returns the maintainer-approval label (Scm.ApprovedLabel
+// or the "tatara-approved" default). This is the label a maintainer applies to
+// an issue to explicitly approve it for implementation; the webhook records a
+// verified approval only when a MaintainerLogins member applies exactly this
+// label. Kept in sync with the controller's lifecycleLabels default.
+func ResolvedApprovedLabel(s *ScmSpec) string {
+	if s != nil && s.ApprovedLabel != "" {
+		return s.ApprovedLabel
+	}
+	return "tatara-approved"
+}
+
 func containsLogin(list []string, login string) bool {
 	for _, x := range list {
 		if x == login {

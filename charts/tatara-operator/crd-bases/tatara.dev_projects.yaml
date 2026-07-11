@@ -5527,6 +5527,15 @@ spec:
                       standby-resync WAL burst, crashlooping replicas on the WAL relocation.
                     type: string
                 type: object
+              mergeWaitBudgetMinutes:
+                default: 720
+                description: |-
+                  MergeWaitBudgetMinutes bounds how long a discrete-implement umbrella waits
+                  for its member PRs to be reviewed + merged before it parks recoverable with
+                  an issue comment naming the stuck member(s) (item 3: the pre-merge deadline).
+                  Default 720 (12h): generous enough for human review, bounded so a
+                  permanently-stuck member surfaces instead of sitting open+approved forever.
+                type: integer
               queue:
                 description: QueueSpec configures the in-operator agent-work admission
                   queue.
@@ -5628,12 +5637,14 @@ spec:
                             type: array
                           staleProposalDays:
                             description: |-
-                              StaleProposalDays opts in the staleness reaper: a positive value auto-closes
-                              bot-authored proposals that have had no human engagement (no human comment,
-                              no live work) for at least that many days, clearing dead proposals out of the
-                              MaxOpenProposals backlog. A value <=0 (the unset default) disables the reaper
-                              entirely - this is an explicit opt-in sentinel, NOT a kubebuilder default, so
-                              "unset" is never indistinguishable from an active value.
+                              StaleProposalDays configures the staleness reaper that auto-closes
+                              bot-authored proposals with no human engagement (no human comment, no live
+                              work) for at least that many days, clearing dead proposals out of the
+                              MaxOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
+                              sets an explicit window; the UNSET default (0) enables the reaper with a
+                              generous-but-finite default window (defaultStaleProposalDays) so un-approved
+                              proposals do not accumulate unboundedly; a NEGATIVE value is the explicit
+                              opt-out that disables the reaper entirely.
                             type: integer
                         type: object
                       cdScan:
@@ -5642,6 +5653,15 @@ spec:
                           Tasks whose cascade has stalled past 1.5x the deploy budget with no live
                           watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
                           Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+
+                          Defaulted on (every 10 min): without an explicit schedule a Project would
+                          have NO durable deploy backstop - only the in-memory 60s requeue, lost on an
+                          operator restart - so a stalled cascade could sit undetected. A Project that
+                          wants it off can set an empty schedule explicitly. Its own type (not
+                          CronActivity) so the field-level Schedule default fires only for cdScan: a
+                          struct field with omitempty is always serialized, so an object-level default
+                          would never apply, but the string Schedule field IS omitted when empty, so a
+                          field default fills it.
                         properties:
                           maxPerRepo:
                             default: 1
@@ -5650,8 +5670,10 @@ spec:
                             minimum: 1
                             type: integer
                           schedule:
-                            description: Schedule is a 5-field cron (robfig ParseStandard).
-                              Empty disables this activity.
+                            default: '*/10 * * * *'
+                            description: |-
+                              Schedule is a 5-field cron (robfig ParseStandard). Defaults to every 10 min;
+                              set it empty explicitly to disable the backstop.
                             pattern: ^$|^(\S+\s+){4}\S+$
                             type: string
                         type: object

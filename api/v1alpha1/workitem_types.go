@@ -215,4 +215,16 @@ type WorkItemRef struct {
 	// LastRefreshedAt is the last-synced cursor for this member.
 	// +optional
 	LastRefreshedAt *metav1.Time `json:"lastRefreshedAt,omitempty"`
+
+	// Per-member deploy tracking (discrete-implement umbrella deploy supervision):
+	// a merged member PR rides the push-CD cascade independently, so each member
+	// carries its own cut version + cascade state. The originating issue closes
+	// only when EVERY merged member reaches DeployState=applied (confirm-all).
+
+	// DeployedVersion is the semver tag this member's artifact cut on merge.
+	// +optional
+	DeployedVersion string `json:"deployedVersion,omitempty"`
+	// DeployState is the member's push-CD cascade state: ""|deploying|applied.
+	// +optional
+	DeployState string `json:"deployState,omitempty"`
 }

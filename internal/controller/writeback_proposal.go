@@ -110,20 +110,36 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	proposalTitle := task.Spec.ProposedIssue.Title
 	incidentDedup := task.Spec.ProposedIssue.Incident && task.Spec.ProposedIssue.AlertGroup != ""
 	if r.ReaderFor != nil {
+		issues, rerr := r.listOpenProposalIssues(ctx, proj, repo.Spec.URL, token)
 		var (
-			existing scm.IssueRef
-			found    bool
-			rerr     error
+			existing      scm.IssueRef
+			found         bool
+			viaAlertGroup bool
 		)
-		if incidentDedup {
-			existing, found, rerr = r.findOpenIssueByLabel(ctx, proj, repo.Spec.URL, token, alertGroupLabel(task.Spec.ProposedIssue.AlertGroup))
-		} else {
-			existing, found, rerr = r.findOpenIssueByTitle(ctx, proj, repo.Spec.URL, token, proposalTitle)
-		}
 		if rerr != nil {
 			l.Error(rerr, "proposal: list open issues for dedup check (non-fatal, proceeding with create)")
-		} else if found {
+		} else {
+			// (C') Incident alert-group dedup: a re-fire of the SAME alert tracks onto
+			// its existing open issue (agent free-text titles defeat title dedup).
 			if incidentDedup {
+				if e, ok := matchOpenIssueByLabel(issues, alertGroupLabel(task.Spec.ProposedIssue.AlertGroup)); ok {
+					existing, found, viaAlertGroup = e, true, true
+				}
+			}
+			// (C+) Cross-source near-duplicate guard (finding #5): a normalized-title
+			// match against ANY open issue - human-, brainstorm-, OR incident-filed -
+			// tracks onto it instead of opening a near-duplicate. This is the code-level
+			// backstop to the LLM's (context-window-capped) survey, and it applies to
+			// BOTH brainstorm and incident proposals so the same problem never lands as
+			// three separate issues across sources.
+			if !found {
+				if e, ok := matchOpenIssueByTitle(issues, proposalTitle); ok {
+					existing, found = e, true
+				}
+			}
+		}
+		if found {
+			if viaAlertGroup {
 				l.Info("proposal skipped: alert-group duplicate exists",
 					"action", "scm_propose_skip_alert_group",
 					"resource_id", task.Name,
@@ -317,41 +333,69 @@ func (r *TaskReconciler) listOpenProposalIssues(ctx context.Context, proj *tatar
 }
 
 // findOpenIssueByTitle lists open issues for the repo and returns the first
-// one whose Title matches proposalTitle exactly. Returns (zero, false, nil)
-// when no match is found, (zero, false, err) on list failure.
+// one whose Title matches proposalTitle (exact or normalized near-duplicate).
+// Returns (zero, false, nil) when no match is found, (zero, false, err) on list
+// failure. Retained as the listing+match wrapper (its GitLab project-path plumbing
+// is covered by writeback_r2_test); createProposal uses the pure matchers directly.
 func (r *TaskReconciler) findOpenIssueByTitle(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token, proposalTitle string) (scm.IssueRef, bool, error) {
 	issues, err := r.listOpenProposalIssues(ctx, proj, repoURL, token)
 	if err != nil {
 		return scm.IssueRef{}, false, err
 	}
-	for _, iss := range issues {
-		if !iss.IsPR && iss.Title == proposalTitle {
-			return iss, true, nil
-		}
-	}
-	return scm.IssueRef{}, false, nil
+	e, ok := matchOpenIssueByTitle(issues, proposalTitle)
+	return e, ok, nil
 }
 
-// findOpenIssueByLabel lists open issues for the repo and returns the first
-// non-PR issue carrying label. Returns (zero, false, nil) when none match,
-// (zero, false, err) on list failure. Used by the incident alert-group dedup
-// path, whose agent free-text titles defeat findOpenIssueByTitle.
-func (r *TaskReconciler) findOpenIssueByLabel(ctx context.Context, proj *tatarav1alpha1.Project, repoURL, token, label string) (scm.IssueRef, bool, error) {
-	issues, err := r.listOpenProposalIssues(ctx, proj, repoURL, token)
-	if err != nil {
-		return scm.IssueRef{}, false, err
+// matchOpenIssueByTitle returns the first non-PR open issue whose Title matches
+// want either exactly or after title normalization (the cross-source near-dup
+// guard, finding #5). Normalization lower-cases, drops punctuation, and collapses
+// whitespace so "Fix: writeback 404 loop" and "fix writeback 404 loop" collide.
+func matchOpenIssueByTitle(issues []scm.IssueRef, want string) (scm.IssueRef, bool) {
+	nWant := normalizeTitle(want)
+	for _, iss := range issues {
+		if iss.IsPR {
+			continue
+		}
+		if iss.Title == want || (nWant != "" && normalizeTitle(iss.Title) == nWant) {
+			return iss, true
+		}
 	}
+	return scm.IssueRef{}, false
+}
+
+// matchOpenIssueByLabel returns the first non-PR open issue carrying label.
+func matchOpenIssueByLabel(issues []scm.IssueRef, label string) (scm.IssueRef, bool) {
 	for _, iss := range issues {
 		if iss.IsPR {
 			continue
 		}
 		for _, lbl := range iss.Labels {
 			if lbl == label {
-				return iss, true, nil
+				return iss, true
 			}
 		}
 	}
-	return scm.IssueRef{}, false, nil
+	return scm.IssueRef{}, false
+}
+
+// normalizeTitle folds a title to a comparison key: lower-case, non-alphanumeric
+// runs collapsed to single spaces, trimmed. Empty when the title has no
+// alphanumeric content (which never near-matches).
+func normalizeTitle(s string) string {
+	var b strings.Builder
+	prevSpace := true // trims leading space
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevSpace = false
+			continue
+		}
+		if !prevSpace {
+			b.WriteByte(' ')
+			prevSpace = true
+		}
+	}
+	return strings.TrimRight(b.String(), " ")
 }
 
 // alertGroupLabel maps an incident proposal's alert-group identity to a stable,
