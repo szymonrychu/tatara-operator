@@ -79,6 +79,9 @@ func TestIssueScan_PersistsAndPrunesMarks(t *testing.T) {
 	proj.Status.ScanMarks = []tatarav1alpha1.ScanMark{
 		{Repo: "o/r", Number: 8, IsPR: false, AccountedAt: metav1.NewTime(time.Unix(50, 0))},
 	}
+	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
+		t.Fatalf("seed mark via status update: %v", err)
+	}
 	reader := &lastWordReader{
 		fakeReader:    fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 5, Author: "human", UpdatedAt: time.Unix(300, 0)}}},
 		issueComments: map[int][]scm.IssueComment{5: {blwCmt("human", 2)}},
