@@ -29,7 +29,7 @@ const toolingNoteGuidance = promptguidance.ToolingNoteGuidance
 //   - Close already-implemented issues (cite the implementing commit SHA or PR
 //     from task_list / list_commits / a closed sibling).
 //   - Tighten scope drift via edit_issue.
-func GoalProject(repoSlugs []string, lookbackDays int) string {
+func GoalProject(repoSlugs []string, lookbackDays int, siblingsByIssue map[string][]string) string {
 	repoList := strings.Join(repoSlugs, ", ")
 	return fmt.Sprintf(`Invoke the `+"`tatara-backlog-groomer`"+` skill FIRST and follow its seven phases in order.
 
@@ -86,8 +86,26 @@ is aged with no matching open work to resume into. Keep every handoff that
 still has live, matching open work - do not delete a handoff just because it is
 old if the work it describes is still open and unfinished.
 
+## Link maintenance
+
+Some issues carry a managed `+"`<!-- tatara-links:start -->...<!-- tatara-links:end -->`"+` block listing sibling issues opened for the same task. When you close a duplicate or edit a canonical issue, keep this block correct: drop the closed issue from every remaining sibling's block, and repoint the duplicate's block (before closing it) to name the canonical issue. Use edit_issue with only the block region changed - never touch the rest of the body. Sibling sets for issues you may touch this run:
+%s
+
 ## Termination
 
 When you have examined every OPEN issue returned by list_issues and taken an action or explicitly skipped (with a reason), you are done. Do not call submit_turn or exit_plan_mode; your work is complete when the issue list is exhausted.
-`, repoList, lookbackDays, lookbackDays, lookbackDays, repoList) + toolingNoteGuidance
+`, repoList, lookbackDays, lookbackDays, lookbackDays, repoList, renderSiblingsForPrompt(siblingsByIssue)) + toolingNoteGuidance
+}
+
+// renderSiblingsForPrompt formats siblingsByIssue as a bulleted list for the
+// prompt, or a placeholder when empty.
+func renderSiblingsForPrompt(m map[string][]string) string {
+	if len(m) == 0 {
+		return "(none this run)"
+	}
+	var b strings.Builder
+	for issue, sibs := range m {
+		fmt.Fprintf(&b, "- %s: %s\n", issue, strings.Join(sibs, ", "))
+	}
+	return b.String()
 }

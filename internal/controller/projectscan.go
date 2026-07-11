@@ -3114,6 +3114,37 @@ func (r *ProjectReconciler) inflightRefineTask(ctx context.Context, proj *tatara
 	return nil, nil
 }
 
+// siblingsByIssueForProject builds the sibling-URL map fed to refine's
+// GoalProject (item 5): for every Task in the project whose Status.
+// DiscoveredIssues holds 2+ tracked issue URLs, each URL maps to the OTHERS -
+// the same set syncSiblingLinks maintains via the tatara-links managed block,
+// so refine's dedup actions can keep it correct.
+func (r *ProjectReconciler) siblingsByIssueForProject(ctx context.Context, proj *tatarav1alpha1.Project) map[string][]string {
+	var list tatarav1alpha1.TaskList
+	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		return nil
+	}
+	out := map[string][]string{}
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Spec.ProjectRef != proj.Name {
+			continue
+		}
+		siblings := discoveredIssueSiblings(t)
+		for _, self := range siblings {
+			for _, u := range siblings {
+				if u != self {
+					out[self] = append(out[self], u)
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // latestTerminalRefineTask returns the most recently created terminal refine
 // Task for the project that was created at/after since (the current cycle's
 // due-base), or nil if none exist. Scoping to since prevents a terminal
@@ -3354,7 +3385,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 							if lookback <= 0 {
 								lookback = 30
 							}
-							goal := refine.GoalProject(slugs, lookback)
+							goal := refine.GoalProject(slugs, lookback, r.siblingsByIssueForProject(ctx, proj))
 							_, _ = r.createRefineTask(ctx, proj, goal)
 						}
 						// Defer brainstorm until refine is terminal; poll at the barrier cadence.

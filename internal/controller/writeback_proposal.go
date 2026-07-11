@@ -79,7 +79,7 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 		l.Info("proposal skipped: source already set",
 			"action", "scm_propose_skip_source_set", "resource_id", task.Name,
 			"issue_url", task.Spec.Source.URL)
-		return r.completeProposal(ctx, task, task.Spec.Source.URL)
+		return r.completeProposal(ctx, proj, task, task.Spec.Source.URL)
 	}
 
 	repo, err := r.resolveRepository(ctx, task.Namespace, proj.Name, task.Spec.ProposedIssue.RepositoryRef)
@@ -226,13 +226,14 @@ func (r *TaskReconciler) createProposal(ctx context.Context, proj *tatarav1alpha
 	l.Info("proposal issue opened", "action", "scm_propose_issue",
 		"resource_id", task.Name, "project", proj.Name, "issue_ref", ref.Ref)
 
-	return r.completeProposal(ctx, task, ref.URL)
+	return r.completeProposal(ctx, proj, task, ref.URL)
 }
 
 // completeProposal marks the brainstorm proposal Task Succeeded after the idea
 // issue has been opened. The issue (now carrying the idea label) flows through
 // the normal issue lifecycle from here; there is no AwaitingApproval parking.
-func (r *TaskReconciler) completeProposal(ctx context.Context, task *tatarav1alpha1.Task, issueURL string) (ctrl.Result, error) {
+func (r *TaskReconciler) completeProposal(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, issueURL string) (ctrl.Result, error) {
+	var siblings []string
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
@@ -256,9 +257,15 @@ func (r *TaskReconciler) completeProposal(ctx context.Context, task *tatarav1alp
 			Message:            "proposal issue opened with idea label",
 			ObservedGeneration: fresh.Generation,
 		})
+		siblings = discoveredIssueSiblings(fresh)
 		return r.Status().Update(ctx, fresh)
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("proposal: complete: %w", err)
+	}
+	if len(siblings) >= 2 && proj != nil && proj.Spec.Scm != nil {
+		if token, terr := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef); terr == nil {
+			r.syncSiblingLinks(ctx, proj.Spec.Scm.Provider, token, siblings)
+		}
 	}
 	return ctrl.Result{}, nil
 }
@@ -292,7 +299,7 @@ func (r *TaskReconciler) recordExistingProposal(ctx context.Context, proj *tatar
 		return ctrl.Result{}, fmt.Errorf("proposal: record existing source: %w", err)
 	}
 
-	return r.completeProposal(ctx, task, issueURL)
+	return r.completeProposal(ctx, proj, task, issueURL)
 }
 
 // listOpenProposalIssues lists the repo's open issues using the provider-correct

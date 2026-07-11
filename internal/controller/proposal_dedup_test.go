@@ -15,6 +15,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,12 +44,36 @@ type proposalComment struct {
 
 // fakeProposalWriter counts CreateIssue calls, captures the last IssueReq, and
 // records Comment calls.
+type editIssueCall struct {
+	repo   string
+	number int
+	body   string
+}
+
 type fakeProposalWriter struct {
 	scm.SCMWriter
 	mu          sync.Mutex
 	createCalls int
 	lastReq     scm.IssueReq
 	comments    []proposalComment
+	editCalls   []editIssueCall
+}
+
+func (f *fakeProposalWriter) EditIssue(_ context.Context, _, repo string, number int, req scm.EditIssueReq) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	body := ""
+	if req.Body != nil {
+		body = *req.Body
+	}
+	f.editCalls = append(f.editCalls, editIssueCall{repo: repo, number: number, body: body})
+	return nil
+}
+
+func (f *fakeProposalWriter) editCallsSnapshot() []editIssueCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]editIssueCall(nil), f.editCalls...)
 }
 
 func (f *fakeProposalWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
@@ -94,6 +119,9 @@ func (f *fakeProposalWriter) commentCalls() []proposalComment {
 // fakeProposalReader returns a configurable list of open issues.
 type fakeProposalReader struct {
 	issues []scm.IssueRef
+	// bodies maps "owner/repo#number" to a GetIssue Body response, for
+	// syncSiblingLinks tests. Nil/missing entries return an empty body.
+	bodies map[string]string
 }
 
 func (f *fakeProposalReader) ListOpenIssues(_ context.Context, _, _ string) ([]scm.IssueRef, error) {
@@ -114,8 +142,9 @@ func (f *fakeProposalReader) GetCommitCIStatus(_ context.Context, _, _, _ string
 func (f *fakeProposalReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
 	return nil, nil
 }
-func (f *fakeProposalReader) GetIssue(_ context.Context, _, _ string, _ int) (scm.IssueContent, error) {
-	return scm.IssueContent{}, nil
+func (f *fakeProposalReader) GetIssue(_ context.Context, owner, name string, number int) (scm.IssueContent, error) {
+	key := fmt.Sprintf("%s/%s#%d", owner, name, number)
+	return scm.IssueContent{Body: f.bodies[key]}, nil
 }
 func (f *fakeProposalReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {
 	return "", nil

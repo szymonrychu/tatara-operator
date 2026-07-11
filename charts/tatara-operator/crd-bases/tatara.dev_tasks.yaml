@@ -106,12 +106,12 @@ spec:
                   alertGroup:
                     description: |-
                       AlertGroup is the per-alert-group dedup identity of the incident that filed
-                      this proposal: the tatara.dev/alert-group hash label of the in-flight
-                      incident Task, falling back to its descriptive AlertRule name. createProposal
-                      stamps tatara/alert-group-<hash> on the created incident issue and dedups
-                      future incident proposals by it, so a recurring alert tracks onto its
-                      existing open issue instead of spawning a near-duplicate. Empty for
-                      non-incident proposals.
+                      this proposal: the Spec.DedupKey of the in-flight incident Task, falling
+                      back to its descriptive AlertRule name. createProposal dedups future
+                      incident proposals by it (matching another incident Task's DedupKey and
+                      its recorded tracked issue), so a recurring alert tracks onto its existing
+                      open issue instead of spawning a near-duplicate. Empty for non-incident
+                      proposals.
                     type: string
                   body:
                     type: string

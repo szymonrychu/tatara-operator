@@ -8,7 +8,7 @@ import (
 )
 
 func TestGoalProject_GroomsExistingBacklogOnly(t *testing.T) {
-	g := refine.GoalProject([]string{"szymonrychu/tatara-operator", "szymonrychu/tatara-cli"}, 30)
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator", "szymonrychu/tatara-cli"}, 30, nil)
 
 	// Input + the close/dedup/edit action set.
 	for _, want := range []string{
@@ -40,7 +40,7 @@ func TestGoalProject_GroomsExistingBacklogOnly(t *testing.T) {
 }
 
 func TestGoalProject_ContainsToolingNoteGuidance(t *testing.T) {
-	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30, nil)
 	if !strings.Contains(g, "## Tooling you needed") {
 		t.Fatal("refine goal must contain tooling-note guidance so proposer folds mise tools into the issue")
 	}
@@ -50,7 +50,7 @@ func TestGoalProject_ContainsToolingNoteGuidance(t *testing.T) {
 }
 
 func TestGoalProject_GaveUpCategory(t *testing.T) {
-	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30, nil)
 
 	// The gave-up category, its three-tier action policy, and the live-task guard
 	// must all be present (spec: close-if-resolved / comment-if<3 / escalate-if>=3,
@@ -74,7 +74,7 @@ func TestGoalProject_GaveUpCategory(t *testing.T) {
 }
 
 func TestGoalProject_GroomsHandoffs(t *testing.T) {
-	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30, nil)
 
 	for _, want := range []string{"list_handoffs", "delete_handoff"} {
 		if !strings.Contains(g, want) {
@@ -90,11 +90,22 @@ func TestGoalProject_GroomsHandoffs(t *testing.T) {
 }
 
 func TestGoalProject_MandatesGroomerSkill(t *testing.T) {
-	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30)
+	g := refine.GoalProject([]string{"szymonrychu/tatara-operator"}, 30, nil)
 	if !strings.Contains(g, "tatara-backlog-groomer") {
 		t.Fatal("refine goal must mandate the tatara-backlog-groomer skill FIRST")
 	}
 	if strings.Index(g, "tatara-backlog-groomer") > strings.Index(g, "project refiner") {
 		t.Fatal("groomer mandate must be prepended before the refiner body")
+	}
+}
+
+func TestGoalProject_IncludesSiblingsAndLinkMaintenanceInstruction(t *testing.T) {
+	siblings := map[string][]string{"o/a#1": {"o/b#2", "o/c#3"}}
+	g := refine.GoalProject([]string{"o/a", "o/b", "o/c"}, 30, siblings)
+	if !strings.Contains(g, "tatara-links") {
+		t.Fatal("GoalProject must instruct refine to maintain the tatara-links block on dedup")
+	}
+	if !strings.Contains(g, "o/b#2") {
+		t.Fatal("GoalProject must surface the sibling URL set so refine knows what to maintain")
 	}
 }
