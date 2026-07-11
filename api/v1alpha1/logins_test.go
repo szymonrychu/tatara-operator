@@ -151,6 +151,47 @@ func TestIsMaintainer(t *testing.T) {
 	}
 }
 
+func TestEffectiveListsStripBot(t *testing.T) {
+	proj := projWith("bot", []string{"bot", "szymon"}, []string{"bot", "carol"})
+
+	m := EffectiveMaintainerLogins(proj, nil)
+	if containsLogin(m, "bot") {
+		t.Errorf("EffectiveMaintainerLogins must strip bot, got %v", m)
+	}
+	if !containsLogin(m, "szymon") {
+		t.Errorf("EffectiveMaintainerLogins must keep humans, got %v", m)
+	}
+
+	r := EffectiveReporterLogins(proj, nil)
+	if containsLogin(r, "bot") {
+		t.Errorf("EffectiveReporterLogins must strip bot, got %v", r)
+	}
+	if !containsLogin(r, "carol") {
+		t.Errorf("EffectiveReporterLogins must keep humans, got %v", r)
+	}
+
+	// Per-repo override is also stripped (uses the project bot login).
+	// repoOverride(reporters, maintainers) per its definition above.
+	repo := repoOverride(strs("bot", "carol"), strs("bot", "dave"))
+	if containsLogin(EffectiveMaintainerLogins(proj, repo), "bot") {
+		t.Error("repo-override maintainer list must also strip bot")
+	}
+	if containsLogin(EffectiveReporterLogins(proj, repo), "bot") {
+		t.Error("repo-override reporter list must also strip bot")
+	}
+
+	// Trust semantics UNCHANGED: bot still trusted reporter/author, still not maintainer.
+	if !IsAllowedReporter(proj, nil, "bot") {
+		t.Error("bot must remain a trusted reporter (implicit trust, not via list)")
+	}
+	if !IsTrustedAuthor(proj, nil, "bot") {
+		t.Error("bot must remain a trusted author")
+	}
+	if IsMaintainer(proj, nil, "bot") {
+		t.Error("bot must never be a maintainer")
+	}
+}
+
 func TestResolvedApprovedLabel(t *testing.T) {
 	if got := ResolvedApprovedLabel(nil); got != "tatara-approved" {
 		t.Errorf("nil spec = %q, want default tatara-approved", got)
