@@ -35,7 +35,7 @@ func TestIssueWithTriggerLabelCreatesTask(t *testing.T) {
 	require.Equal(t, "proj1wi", qe.Spec.ProjectRef)
 	require.Equal(t, "repo1wi", qe.Spec.RepositoryRef)
 	require.Equal(t, "please fix", qe.Spec.Payload.Goal)
-	require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
+	require.Equal(t, "clarify", qe.Spec.Payload.Kind)
 	require.NotNil(t, qe.Spec.Payload.Source)
 	require.Equal(t, "github", qe.Spec.Payload.Source.Provider)
 	require.Equal(t, "o/r#7", qe.Spec.Payload.Source.IssueRef)

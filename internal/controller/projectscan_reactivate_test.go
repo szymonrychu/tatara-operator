@@ -37,7 +37,7 @@ func convTask(repoSlug string, num int, state string, lastAct time.Time) tatarav
 			},
 		},
 		Status: tatarav1alpha1.TaskStatus{
-			LifecycleState: state,
+			DeployState:    state,
 			LastActivityAt: &la,
 		},
 	}

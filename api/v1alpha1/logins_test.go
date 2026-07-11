@@ -112,3 +112,53 @@ func TestIsAllowedReporter(t *testing.T) {
 		})
 	}
 }
+
+func TestIsMaintainer(t *testing.T) {
+	proj := projWith("bot", []string{"szymon", "alex"}, nil)
+	cases := []struct {
+		name  string
+		login string
+		want  bool
+	}{
+		{"maintainer", "szymon", true},
+		{"second maintainer", "alex", true},
+		{"bot excluded even if acting", "bot", false},
+		{"non-maintainer human", "rando", false},
+		{"empty login", "", false},
+	}
+	for _, c := range cases {
+		if got := IsMaintainer(proj, nil, c.login); got != c.want {
+			t.Errorf("%s: IsMaintainer(%q) = %v, want %v", c.name, c.login, got, c.want)
+		}
+	}
+	// Closed by default: no maintainers configured => nobody is a maintainer.
+	empty := projWith("bot", nil, nil)
+	if IsMaintainer(empty, nil, "szymon") {
+		t.Error("empty MaintainerLogins must make IsMaintainer closed (fail closed)")
+	}
+	// Bot is excluded even if misconfigured into the maintainer list.
+	botListed := projWith("bot", []string{"bot"}, nil)
+	if IsMaintainer(botListed, nil, "bot") {
+		t.Error("bot must be structurally excluded from IsMaintainer")
+	}
+	// Per-repo maintainer override is honored.
+	repo := repoOverride(nil, strs("carol"))
+	if !IsMaintainer(proj, repo, "carol") {
+		t.Error("repo-level maintainer override must be honored")
+	}
+	if IsMaintainer(proj, repo, "szymon") {
+		t.Error("repo-level override replaces the project maintainer list")
+	}
+}
+
+func TestResolvedApprovedLabel(t *testing.T) {
+	if got := ResolvedApprovedLabel(nil); got != "tatara-approved" {
+		t.Errorf("nil spec = %q, want default tatara-approved", got)
+	}
+	if got := ResolvedApprovedLabel(&ScmSpec{}); got != "tatara-approved" {
+		t.Errorf("empty ApprovedLabel = %q, want default", got)
+	}
+	if got := ResolvedApprovedLabel(&ScmSpec{ApprovedLabel: "custom-approved"}); got != "custom-approved" {
+		t.Errorf("custom = %q, want custom-approved", got)
+	}
+}

@@ -130,17 +130,70 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		return ctrl.Result{}, fmt.Errorf("writeback: get project: %w", err)
 	}
 
-	var primaryRepo tatarav1alpha1.Repository
-	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &primaryRepo); err != nil {
-		return ctrl.Result{}, fmt.Errorf("writeback: get repository: %w", err)
+	// Gather all Project repos up-front; the ordered write-back set is derived
+	// from them (repo-scoped: primary first; umbrella: ledger scope, else all).
+	allRepos, err := r.projectRepos(ctx, &proj)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("writeback: list project repos: %w", err)
 	}
 
 	provider := ""
 	if task.Spec.Source != nil {
 		provider = task.Spec.Source.Provider
 	}
-	if provider == "" {
-		provider = providerForRemote(ctx, primaryRepo.Spec.URL)
+
+	// primaryRepo is the repo-scoped task's own repo (empty for an umbrella
+	// implement). ordered is the write-back set: for a repo-scoped task, primary
+	// first then the rest; for an umbrella (empty RepositoryRef) the ledger
+	// repos-in-scope intersected with project repos, falling back to all project
+	// repos. derivePRTitle is called per-repo (scope=repo.Name) so no single
+	// primary is required for the umbrella case.
+	var primaryRepo tatarav1alpha1.Repository
+	ordered := make([]tatarav1alpha1.Repository, 0, len(allRepos))
+	if task.Spec.RepositoryRef != "" {
+		if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &primaryRepo); err != nil {
+			return ctrl.Result{}, fmt.Errorf("writeback: get repository: %w", err)
+		}
+		ordered = append(ordered, primaryRepo)
+		for i := range allRepos {
+			if allRepos[i].Name != primaryRepo.Name {
+				ordered = append(ordered, allRepos[i])
+			}
+		}
+		if provider == "" {
+			provider = providerForRemote(ctx, primaryRepo.Spec.URL)
+		}
+	} else {
+		// Umbrella (empty RepositoryRef): scope to EffectiveReposInScope so an
+		// umbrella kind (implement/review/clarify) opens a PR on EVERY enrolled
+		// project repo (untouched repos return a benign 422 no-branch and skip),
+		// not just the ledger/source repos (the U-B fix). allSlugs bounds the scope
+		// to enrolled repos so nothing outside the project is targeted.
+		allSlugs := make([]string, 0, len(allRepos))
+		for i := range allRepos {
+			if slug, serr := scm.RepoSlugFromURL(allRepos[i].Spec.URL); serr == nil {
+				allSlugs = append(allSlugs, slug)
+			}
+		}
+		inScope := make(map[string]bool)
+		for _, slug := range tatarav1alpha1.EffectiveReposInScope(task, allSlugs) {
+			inScope[slug] = true
+		}
+		for i := range allRepos {
+			if len(inScope) == 0 {
+				ordered = append(ordered, allRepos[i])
+				continue
+			}
+			if slug, serr := scm.RepoSlugFromURL(allRepos[i].Spec.URL); serr == nil && inScope[slug] {
+				ordered = append(ordered, allRepos[i])
+			}
+		}
+		if len(ordered) == 0 {
+			ordered = append(ordered, allRepos...)
+		}
+		if provider == "" && len(ordered) > 0 {
+			provider = providerForRemote(ctx, ordered[0].Spec.URL)
+		}
 	}
 
 	writer, err := r.SCMFor(provider)
@@ -154,22 +207,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		return ctrl.Result{}, fmt.Errorf("writeback: scm token: %w", err)
 	}
 
-	// Gather all Project repos; primary first, then the rest.
-	allRepos, err := r.projectRepos(ctx, &proj)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("writeback: list project repos: %w", err)
-	}
-	// Build an ordered list with the primary first.
-	ordered := make([]tatarav1alpha1.Repository, 0, len(allRepos))
-	ordered = append(ordered, primaryRepo)
-	for i := range allRepos {
-		if allRepos[i].Name != primaryRepo.Name {
-			ordered = append(ordered, allRepos[i])
-		}
-	}
-
 	sourceBranch := taskBranch(task)
-	title := derivePRTitle(task, primaryRepo.Name)
 	baseBody := writeBackBody(task)
 
 	// M4: when the agent submitted a change_summary, use PRBody + Delivered block
@@ -184,6 +222,16 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// Preserve the tatara-authored marker so downstream merge-gate logic works.
 		deliveredBody += "\n\n" + tataraAuthoredMarker
 		baseBody = deliveredBody
+	}
+
+	// Systemic approval gate (finding #4): the agent-authored body may carry
+	// "Closes #N" for systemic siblings. Neutralize any close directive targeting a
+	// sibling that is NOT currently maintainer-approved so merging this combined PR
+	// never force-closes an unapproved or declined sibling. This is the authoritative
+	// net behind the prompt-level filter (agents are unreliable). Approved siblings
+	// and the lead's own close stay intact.
+	if unapproved := r.unapprovedSystemicSiblings(ctx, task); len(unapproved) > 0 {
+		baseBody = neutralizeUnapprovedCloses(baseBody, unapproved)
 	}
 
 	var prURLs []string
@@ -227,6 +275,9 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 			!pushCDEligible(task) {
 			body = body + "\n\nCloses #" + strconv.Itoa(task.Spec.Source.Number)
 		}
+		// Per-repo title: the conventional scope is the repo the PR opens on, so a
+		// cross-repo umbrella labels each PR with its own repo scope.
+		title := derivePRTitle(task, repo.Name)
 		prURL, openErr := writer.OpenChange(ctx, repo.Spec.URL, token, sourceBranch, repo.Spec.DefaultBranch, title, body)
 		r.recordSCM(provider, "open_change", openErr)
 		if openErr != nil {
@@ -355,7 +406,7 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// retries plus a single escalation), so echoing the per-run ResultSummary
 		// would spam the issue once per empty retry.
 		commented := task.Spec.Source != nil && task.Spec.Source.IssueRef != "" &&
-			task.Status.ResultSummary != "" && task.Status.LifecycleState != "Implement"
+			task.Status.ResultSummary != "" && task.Status.DeployState != "Implement"
 		if commented {
 			cerr := writer.Comment(ctx, token, task.Spec.Source.IssueRef, task.Status.ResultSummary)
 			r.recordSCM(provider, "comment", cerr)
@@ -386,12 +437,11 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 	// RetryOnConflict ensures this idempotency key lands even when a concurrent
 	// lifecycle reconcile has bumped the resource version.
 	prURLsMsg := strings.Join(prURLs, " ")
-	// Derive the openedPR ledger entry's repo slug from the SAME repo that produced
-	// prURLs[0]; when the primary repo is skipped (422 no-change) prURLs[0] belongs
-	// to a secondary repo, so using primaryRepo.Spec.URL would record a corrupt
-	// {primary-slug, secondary-number} entry the backstop/dedup can never match.
-	primaryPRSlug, _, _ := repoSlugFromURL(prRepos[0].Spec.URL, provider)
-	primaryPRNumber := parsePRNumber(prURLs[0])
+	// Derive each opened-PR ledger entry's repo slug from the SAME repo that produced
+	// the matching prURLs entry; when the primary repo is skipped (422 no-change)
+	// prURLs[0] belongs to a secondary repo, so using primaryRepo.Spec.URL would
+	// record a corrupt {primary-slug, secondary-number} entry the backstop/dedup can
+	// never match. prRepos is kept parallel to prURLs for exactly this.
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if gerr := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); gerr != nil {
@@ -401,17 +451,29 @@ func (r *TaskReconciler) writeBackOpenChange(ctx context.Context, task *tatarav1
 		// A PR opened: clear any accumulated skip-4xx attempts so a later, unrelated
 		// writeback starts with a fresh budget (issue #166).
 		fresh.Status.WritebackSkip4xxAttempts = 0
-		// Project the PR-open action onto the ledger: upsert a role:openedPR entry
-		// with state:open. The real HeadSHA is filled later by the backstop refresh
-		// (Phase 3); we do not have it here without an extra SCM round-trip.
-		if primaryPRSlug != "" && primaryPRNumber > 0 {
+		// Project EVERY opened PR onto the ledger: upsert a role:openedPR entry with
+		// state:open for each PR so Status.WorkItems tracks all N cross-repo PRs (the
+		// U-A fix), not just the first - this is what lets review/backstop/deploy see
+		// every sibling PR under the umbrella. HeadBranch is the shared task branch;
+		// the real HeadSHA is filled later by the backstop refresh (Phase 3), which we
+		// do not have here without an extra SCM round-trip.
+		for idx := range prURLs {
+			slug, _, serr := repoSlugFromURL(prRepos[idx].Spec.URL, provider)
+			if serr != nil || slug == "" {
+				continue
+			}
+			num := parsePRNumber(prURLs[idx])
+			if num <= 0 {
+				continue
+			}
 			UpsertWorkItem(fresh, tatarav1alpha1.WorkItemRef{
-				Provider: provider,
-				Repo:     primaryPRSlug,
-				Number:   primaryPRNumber,
-				Kind:     tatarav1alpha1.WorkItemPR,
-				Role:     tatarav1alpha1.RoleOpenedPR,
-				State:    tatarav1alpha1.WIOpen,
+				Provider:   provider,
+				Repo:       slug,
+				Number:     num,
+				Kind:       tatarav1alpha1.WorkItemPR,
+				Role:       tatarav1alpha1.RoleOpenedPR,
+				State:      tatarav1alpha1.WIOpen,
+				HeadBranch: sourceBranch,
 			})
 		}
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{

@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/refine"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -49,6 +51,25 @@ const maxRecoveryAttempts = 3
 // maxImplGiveUps bounds how many times recoverOrphans rerolls an implementation
 // that gave up before stopping and escalating to a human.
 const maxImplGiveUps = 3
+
+// defaultStaleProposalDays is the generous-but-finite default staleness window for
+// the stale-proposal reaper when StaleProposalDays is unset (0). It is the
+// intended-idle case (proposals a human never engaged), so the default is generous
+// yet non-infinite so dead proposals do not accumulate unboundedly (liveness
+// finding #8). A NEGATIVE StaleProposalDays is the explicit opt-out.
+const defaultStaleProposalDays = 30
+
+// maxRecoverableParkAge bounds how long a recoverable-giveup Parked task at the
+// give-up cap may sit on a still-open issue before the orphan sweep re-pings the
+// issue and resolves the task Done for GC, so a permanently-parked task does not
+// accumulate silently with no human signal (liveness finding #6). The park anchor
+// is Status.LastActivityAt (fallback CreationTimestamp).
+const maxRecoverableParkAge = 7 * 24 * time.Hour
+
+// maxDocReactivations bounds how many times a dropped/Parked documentation cycle
+// is reactivated by the orphan sweep before it is left terminal for a human
+// (liveness finding #7).
+const maxDocReactivations = 3
 
 // taskIsPRSlot reports whether the Task targets PR number prNumber in the PR
 // slot (as opposed to issue #prNumber). On GitLab issue #N and MR !N are
@@ -104,7 +125,7 @@ func priorTerminalAttemptsExcluding(existing []tatarav1alpha1.Task, repoSlug str
 		if !taskIsPRSlot(t, prNumber) {
 			continue
 		}
-		if isLifecycleTerminal(t.Status.LifecycleState) {
+		if isLifecycleTerminal(t.Status.DeployState) {
 			n++
 		}
 	}
@@ -137,7 +158,11 @@ func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (str
 		return c.CDScan.Schedule, proj.Status.LastCDScan
 	case "brainstorm":
 		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
+	case "documentation":
+		return c.Documentation.Schedule, proj.Status.LastDocumentation
 	case "healthCheck":
+		// Retired activity kept inert for stored-CR back-compat: activityDue
+		// against it never runs from runScans (the dispatch was dropped).
 		return c.HealthCheck.Schedule, proj.Status.LastHealthCheck
 	}
 	return "", nil
@@ -229,7 +254,7 @@ func findConvTaskToReactivate(ctx context.Context, c candidate, existing []tatar
 		if !taskMatchesItem(t, c.repo, c.number) {
 			continue
 		}
-		state := t.Status.LifecycleState
+		state := t.Status.DeployState
 		if state != "Conversation" && state != "Stopped" {
 			continue
 		}
@@ -280,7 +305,7 @@ func (r *ProjectReconciler) adoptLifecycleTaskAt(ctx context.Context, proj *tata
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
 		}
-		fresh.Status.LifecycleState = entry
+		fresh.Status.DeployState = entry
 		fresh.Status.Phase = ""
 		fresh.Status.ImplementEmptyRetries = 0
 		fresh.Status.ParkReason = ""
@@ -306,7 +331,7 @@ func matchingTerminalParkedLifecycleTask(existing []tatarav1alpha1.Task, slug st
 		if !taskMatchesItem(t, slug, number) {
 			continue
 		}
-		if t.Status.LifecycleState == "Parked" && tatarav1alpha1.IsRecoverableGiveup(t.Status.ParkReason) {
+		if t.Status.DeployState == "Parked" && tatarav1alpha1.IsRecoverableGiveup(t.Status.ParkReason) {
 			return t
 		}
 	}
@@ -600,10 +625,17 @@ type systemicDecision struct {
 	crossRepo        []string
 }
 
-func electSystemicLeads(cands []candidate) map[string]systemicDecision {
+func electSystemicLeads(cands []candidate, declinedLabel string) map[string]systemicDecision {
 	group := map[string][]candidate{}
 	for _, c := range cands {
 		if c.isPR {
+			continue
+		}
+		// A maintainer-declined issue is a permanent "no": never group it (as lead or
+		// sibling) so approving another group member can never force-close it. Approval
+		// of the remaining members is enforced authoritatively at implement + writeback
+		// (recorded approval is not yet available at scan time).
+		if declinedLabel != "" && hasLabel(c.labels, declinedLabel) {
 			continue
 		}
 		if sid := systemicIDOf(c.labels); sid != "" {
@@ -756,32 +788,143 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 	return created, nil
 }
 
-// createHealthCheckTask enqueues a project-scoped healthCheck QueuedEvent.
-// Returns created=true when a new event was enqueued.
-func (r *ProjectReconciler) createHealthCheckTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (bool, error) {
+// documentationScan is the scheduled documentation-sync tick. For each enrolled
+// component repo (excluding the docs repo itself) that advanced since
+// Status.LastDocumentation, it enqueues a documentation Task scoped to the docs
+// repo carrying the source diff window as annotations. The push webhook trigger
+// is retired; this is the sole documentation producer. The agent decides doc
+// relevance (no-ops on trivial change); the operator only spawns when the
+// source default branch has commits in the since-last-doc window.
+func (r *ProjectReconciler) documentationScan(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository) {
+	l := log.FromContext(ctx)
+	doc := proj.Spec.Documentation
+	if doc == nil || !doc.Enabled || doc.Repo == "" {
+		return
+	}
+	var docsRepo *tatarav1alpha1.Repository
+	for i := range repos {
+		if scm.SameRemote(doc.Repo, repos[i].Spec.URL) {
+			docsRepo = &repos[i]
+			break
+		}
+	}
+	if docsRepo == nil {
+		// Docs repo not enrolled as a Repository CR: no push access, nowhere to
+		// write. Mirrors the retired push path's guard.
+		l.Info("documentation: docs repo not enrolled; skipping cycle",
+			"action", "scan_documentation_no_docs_repo", "resource_id", proj.Name, "docs_repo", doc.Repo)
+		return
+	}
+	// Liveness finding #7: overlap/orphan guard. The per-head dedup key means two
+	// doc Tasks for DIFFERENT source heads never dedup and could run concurrently.
+	// Re-sweep dropped/Parked doc cycles so they retry (bounded), then an in-flight
+	// guard (mirroring brainstormInFlightProject) suppresses starting a new doc Task
+	// while one is already live. Fail-open on a list error (keep prior behavior).
+	if existing, lerr := r.existingScanTasks(ctx, proj); lerr == nil {
+		reactivated := r.reactivateOrphanedDocTasks(ctx, existing)
+		if reactivated || documentationInFlightProject(existing) {
+			l.Info("documentation: a doc cycle is already in-flight; skipping new doc Task this tick",
+				"action", "scan_documentation_inflight", "resource_id", proj.Name)
+			return
+		}
+	} else {
+		l.Error(lerr, "documentation: list tasks for in-flight guard failed; proceeding",
+			"action", "scan_documentation_guard_error", "resource_id", proj.Name)
+	}
+
+	var since time.Time
+	if proj.Status.LastDocumentation != nil {
+		since = proj.Status.LastDocumentation.Time
+	}
+	for i := range repos {
+		src := &repos[i]
+		if src.Name == docsRepo.Name || scm.SameRemote(doc.Repo, src.Spec.URL) {
+			continue // self-trigger guard
+		}
+		owner, name, err := scm.OwnerRepo(src.Spec.URL)
+		if err != nil {
+			continue
+		}
+		commits, err := reader.ListCommits(ctx, owner, name, since)
+		if err != nil {
+			l.Error(err, "documentation: ListCommits", "action", "scan_list_error", "resource_id", proj.Name, "activity", "documentation", "repo", src.Name)
+			continue
+		}
+		if len(commits) == 0 {
+			continue // no change since last doc run
+		}
+		head, err := reader.GetDefaultBranchHeadSHA(ctx, owner, name)
+		if err != nil || head == "" {
+			// Fall back to the newest commit in the window as head.
+			head = latestCommitSHA(commits)
+		}
+		base := oldestCommitSHA(commits)
+		if _, cerr := r.createDocumentationTask(ctx, proj, docsRepo, src, base, head); cerr != nil {
+			l.Error(cerr, "documentation: enqueue", "action", "scan_enqueue_failed", "resource_id", proj.Name, "repo", src.Name)
+		}
+	}
+}
+
+// oldestCommitSHA / latestCommitSHA pick the window boundary SHAs by commit date
+// without assuming the reader's ordering.
+func oldestCommitSHA(commits []scm.CommitRef) string {
+	oldest := commits[0]
+	for _, c := range commits[1:] {
+		if c.Date.Before(oldest.Date) {
+			oldest = c
+		}
+	}
+	return oldest.SHA
+}
+
+func latestCommitSHA(commits []scm.CommitRef) string {
+	latest := commits[0]
+	for _, c := range commits[1:] {
+		if c.Date.After(latest.Date) {
+			latest = c
+		}
+	}
+	return latest.SHA
+}
+
+// createDocumentationTask enqueues a documentation QueuedEvent repo-scoped to the
+// docs repo (documentation is the one repo-scoped agent kind). The source repo +
+// its diff window ride as annotations, matching the retired push path's shape so
+// the skill contract is unchanged. Model tier (sonnet) comes from the Phase-2
+// kindDefaultModel map. dedupKey keys on the source head SHA so a head that has
+// not advanced re-collapses to the same event (no duplicate work per window).
+func (r *ProjectReconciler) createDocumentationTask(ctx context.Context, proj *tatarav1alpha1.Project, docsRepo, sourceRepo *tatarav1alpha1.Repository, baseSHA, headSHA string) (bool, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
-	dedupKey := "healthCheck-" + proj.Name
+	dedupKey := fmt.Sprintf("doc-%s-%s", sourceRepo.Name, headSHA)
 	payload := tatarav1alpha1.QueuedEventPayload{
-		Kind:         "brainstorm",
-		Goal:         goal,
-		Labels:       map[string]string{labelActivity: "healthCheck"},
-		Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
-		GenerateName: "healthcheck-",
-		Provider:     provider,
-		PodRepo:      "",
+		Kind: "documentation",
+		Goal: fmt.Sprintf("Scheduled documentation sync: %s advanced to %s since the last doc "+
+			"update. Review the diff and update the documentation repo if it is doc-relevant; "+
+			"no-op otherwise.", sourceRepo.Spec.URL, headSHA),
+		RepositoryRef: docsRepo.Name,
+		GenerateName:  "documentation-",
+		Provider:      provider,
+		PodRepo:       docsRepo.Name,
+		Labels:        map[string]string{labelActivity: "documentation"},
+		Annotations: map[string]string{
+			tatarav1alpha1.AnnSourceRepo:    sourceRepo.Spec.URL,
+			tatarav1alpha1.AnnSourceBaseSHA: baseSHA,
+			tatarav1alpha1.AnnSourceHeadSHA: headSHA,
+		},
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, tatarav1alpha1.QueueClassNormal, true, dedupKey, payload)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "scan: enqueue healthCheck event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
-		// Intentional: project-scoped tasks stamp unconditionally; no backlog/fast-refire coupling,
-		// unlike createScanTask which propagates errors for per-issue deferral.
+		log.FromContext(ctx).Error(err, "scan: enqueue documentation event failed; skipping item", "action", "scan_enqueue_failed", "project", proj.Name)
 		return false, nil
 	}
 	if created {
-		r.Metrics.ScanTaskCreated("healthCheck", "brainstorm")
+		r.Metrics.ScanTaskCreated("documentation", "documentation")
+		log.FromContext(ctx).Info("scan: enqueued documentation",
+			"action", "scan_task_created", "resource_id", proj.Name,
+			"source_repo", sourceRepo.Name, "docs_repo", docsRepo.Name, "head_sha", headSHA)
 	}
 	return created, nil
 }
@@ -1045,9 +1188,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
-		case "healthCheck":
-			fresh.Status.LastHealthCheck = &now
-			proj.Status.LastHealthCheck = &now
+		case "documentation":
+			fresh.Status.LastDocumentation = &now
+			proj.Status.LastDocumentation = &now
 		}
 		return r.Status().Update(ctx, fresh)
 	})
@@ -1287,7 +1430,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 			if fetchErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, task); fetchErr != nil {
 				return fetchErr
 			}
-			task.Status.LifecycleState = "Triage"
+			task.Status.DeployState = "Triage"
 			task.Status.LastActivityAt = &now
 			task.Status.DeadlineAt = &deadline
 			return r.Status().Update(ctx, task)
@@ -1306,8 +1449,45 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	managed := managedPhaseLabels(proj.Spec.Scm)
 	brainstorming, approved, implementation, declined := lifecycleLabels(proj.Spec.Scm)
 	gate := r.humanActivityGate(ctx, cc, botLogin)
+
+	// Implement producer (clarify->implement handoff): an issue carrying
+	// tatara-implementation with no live Task is a handed-off stream needing a
+	// fresh implement Task. This runs BEFORE the dedup loop because isDeduped
+	// treats the managed label + a terminal clarify Task as done and would
+	// otherwise dead-end the handoff. createScanTask's kind-scoped dedup key
+	// ("implement\x00<issueRef>") plus needsImplementProducer's Task check keep it
+	// to one implement Task per episode.
+	produced := map[string]bool{}
+	for _, c := range cands {
+		if !needsImplementProducer(c, existing, implementation) {
+			continue
+		}
+		repo, ok := r.matchRepoForSlug(repos, c.repo)
+		if !ok {
+			continue
+		}
+		goal := fmt.Sprintf("Implement issue %s#%d", c.repo, c.number)
+		created, cerr := r.createScanTask(ctx, proj, &repo, c, c, "issueScan", "implement", goal, nil, nil)
+		if cerr != nil {
+			l.Error(cerr, "issueScan: enqueue implement producer event", "action", "scan_issue",
+				"resource_id", proj.Name, "repo", repo.Name, "issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			continue
+		}
+		produced[fmt.Sprintf("%s#%d", c.repo, c.number)] = true
+		if created {
+			r.Metrics.ScanItem("issueScan", "implement_produced")
+			l.Info("issueScan: produced implement Task from clarify->implement handoff",
+				"action", "scan_issue", "resource_id", proj.Name, "issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+		}
+	}
+
 	var eligible []candidate
 	for _, c := range cands {
+		if produced[fmt.Sprintf("%s#%d", c.repo, c.number)] {
+			// The implement producer already claimed this candidate; do not also run
+			// it through the issueLifecycle dedup/create path.
+			continue
+		}
 		if isDeduped(c, existing, managed, gate) {
 			r.Metrics.ScanItem("issueScan", "skipped_dedup")
 		} else {
@@ -1320,7 +1500,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// full candidate set (not the post-dedup eligible set) so a sibling stays
 	// collapsed even when its lead is currently in-flight (deduped out): a higher-
 	// numbered sibling must never be promoted to lead and spawn a second agent.
-	systemicLeads := electSystemicLeads(cands)
+	systemicLeads := electSystemicLeads(cands, declined)
 	created := 0
 	deferred := 0
 	for _, c := range eligible {
@@ -1547,46 +1727,6 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos, existing,
 		brainstormingLabel, legacyIdea, maxProp, "brainstorm", "scan_brainstorm", start, act.Sources,
 		false, brainstormGoalProject, r.createBrainstormTask)
-}
-
-// healthCheck runs one project-health-check cycle at PROJECT scope: at most one
-// healthCheck QueuedEvent per cycle for the whole project. It mirrors brainstorm
-// (single in-flight guard, proposal-backlog cap, project-spanning goal) but
-// drives the tatara-health-check skill. Concurrency is bounded solely by the
-// dispatcher's QueueCapacity.
-func (r *ProjectReconciler) healthCheck(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.HealthCheckActivity) {
-	l := log.FromContext(ctx)
-	start := time.Now()
-	maxProp := act.MaxOpenProposals
-	if maxProp < 1 {
-		maxProp = 10
-	}
-
-	// Project-scoped in-flight guard: any non-terminal healthCheck Task blocks.
-	if healthCheckInFlightProject(existing) {
-		r.Metrics.ScanItem("healthCheck", "skipped_inflight")
-		l.Info("healthCheck: in-flight project health-check task; skipping cycle",
-			"action", "scan_healthcheck", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("healthCheck", time.Since(start).Seconds())
-		return
-	}
-
-	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
-
-	// Sort repos by name for deterministic iteration.
-	sortedRepos := make([]tatarav1alpha1.Repository, len(repos))
-	copy(sortedRepos, repos)
-	sort.Slice(sortedRepos, func(i, j int) bool {
-		return sortedRepos[i].Name < sortedRepos[j].Name
-	})
-
-	legacyIdea, _ := legacyLabels(proj.Spec.Scm)
-
-	// at-cap is checked before no-valid-repos here, opposite of brainstorm's
-	// order above; preserved verbatim (see runProjectScopedProposalCycle doc).
-	r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos, existing,
-		brainstormingLabel, legacyIdea, maxProp, "healthCheck", "scan_healthcheck", start, act.Sources,
-		true, healthCheckGoalProject, r.createHealthCheckTask)
 }
 
 // runProjectScopedProposalCycle runs the shared 90%-identical middle of
@@ -2221,16 +2361,85 @@ func brainstormInFlightProject(existing []tatarav1alpha1.Task) bool {
 	return false
 }
 
-// healthCheckInFlightProject reports whether ANY non-terminal healthCheck Task
-// exists in the project (project-scoped guard, mirrors brainstormInFlightProject).
-func healthCheckInFlightProject(existing []tatarav1alpha1.Task) bool {
+// annDocRetries counts how many times the orphan sweep has reactivated a dropped
+// documentation cycle, bounding retries at maxDocReactivations (liveness #7).
+const annDocRetries = "tatara.dev/doc-retries"
+
+// documentationInFlightProject reports whether ANY non-terminal documentation Task
+// exists in the project. The overlap guard for the doc-sync cron (liveness #7):
+// TaskTerminal (not isTerminal(Phase)) so a Parked doc task counts as terminal (it
+// is re-swept separately by reactivateOrphanedDocTasks).
+func documentationInFlightProject(existing []tatarav1alpha1.Task) bool {
 	for i := range existing {
-		t := existing[i]
-		if t.Labels[labelActivity] == "healthCheck" && !isTerminal(t.Status.Phase) {
+		t := &existing[i]
+		if t.Labels[labelActivity] == "documentation" && !tatarav1alpha1.TaskTerminal(t) {
 			return true
 		}
 	}
 	return false
+}
+
+// reactivateOrphanedDocTasks re-sweeps dropped documentation cycles: a doc Task
+// that Parked or Failed is reactivated (Phase/DeployState/park cleared, wrapper
+// torn down) so the next reconcile re-runs it, up to maxDocReactivations attempts
+// (after which it is left terminal for a human). Returns true when it reactivated
+// at least one, so the caller treats a doc cycle as in-flight this tick (liveness
+// finding #7).
+func (r *ProjectReconciler) reactivateOrphanedDocTasks(ctx context.Context, existing []tatarav1alpha1.Task) bool {
+	l := log.FromContext(ctx)
+	any := false
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelActivity] != "documentation" {
+			continue
+		}
+		if t.Status.DeployState != "Parked" && t.Status.Phase != tatarav1alpha1.PhaseFailed {
+			continue
+		}
+		retries := 0
+		if v := t.Annotations[annDocRetries]; v != "" {
+			if n, aerr := strconv.Atoi(v); aerr == nil {
+				retries = n
+			}
+		}
+		if retries >= maxDocReactivations {
+			continue // exhausted; leave terminal for a human
+		}
+		if derr := agent.DeleteWrapper(ctx, r.Client, t.Namespace, t); derr != nil {
+			l.Error(derr, "documentation: delete wrapper on doc reactivation (non-fatal)",
+				"action", "scan_documentation_reactivate", "resource_id", t.Name)
+		}
+		// Bump the retry counter (metadata) then reset the run state (status).
+		if aerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &tatarav1alpha1.Task{}
+			if gerr := r.Get(ctx, client.ObjectKeyFromObject(t), fresh); gerr != nil {
+				return gerr
+			}
+			if fresh.Annotations == nil {
+				fresh.Annotations = map[string]string{}
+			}
+			fresh.Annotations[annDocRetries] = strconv.Itoa(retries + 1)
+			return r.Update(ctx, fresh)
+		}); aerr != nil {
+			l.Error(aerr, "documentation: bump doc retry annotation (skipping reactivation)",
+				"action", "scan_documentation_reactivate", "resource_id", t.Name)
+			continue
+		}
+		if serr := r.patchTaskStatus(ctx, t, func(fresh *tatarav1alpha1.Task) bool {
+			fresh.Status.Phase = ""
+			fresh.Status.DeployState = ""
+			fresh.Status.ParkReason = ""
+			return true
+		}); serr != nil {
+			l.Error(serr, "documentation: reset doc task status (skipping reactivation)",
+				"action", "scan_documentation_reactivate", "resource_id", t.Name)
+			continue
+		}
+		any = true
+		l.Info("documentation: reactivated dropped doc cycle",
+			"action", "scan_documentation_reactivate", "resource_id", t.Name, "retry", retries+1)
+	}
+	return any
 }
 
 // proposalBacklogCount counts open, undecided ideas in a pre-fetched issue
@@ -2304,11 +2513,56 @@ func hasLiveLifecycleTaskForIssue(existing []tatarav1alpha1.Task, slug string, n
 	return false
 }
 
+// hasKindTaskForIssue reports whether any Task (terminal or live) of the given
+// scan kind exists for the issue (slug, number). Used by the implement producer
+// to avoid re-producing an implement Task once one already handled the issue (the
+// tatara-implementation label persists after implement completes, so a live-only
+// check would re-fire every scan cycle).
+func hasKindTaskForIssue(existing []tatarav1alpha1.Task, slug string, number int, kind string) bool {
+	for i := range existing {
+		t := &existing[i]
+		if t.Labels[labelSourceKind] != kind {
+			continue
+		}
+		if taskMatchesItem(t, slug, number) {
+			return true
+		}
+	}
+	return false
+}
+
+// needsImplementProducer reports whether an issue candidate carrying the
+// tatara-implementation phase label needs a fresh implement Task. This is the
+// clarify->implement handoff producer (CROSS-REPO-CONTRACT): clarify flips the
+// label to tatara-implementation and TERMINATES its own Task, leaving the issue
+// with only a terminal Task - which isDeduped skips (managed-label state-of-truth
+// treats it as done), dead-ending the stream. The producer fires exactly once per
+// implementation-label episode: only for an issue (not a PR) carrying the label
+// with no live Task of any kind and no prior implement Task already spun up.
+func needsImplementProducer(c candidate, existing []tatarav1alpha1.Task, implementation string) bool {
+	if c.isPR || !hasLabel(c.labels, implementation) {
+		return false
+	}
+	if hasLiveLifecycleTaskForIssue(existing, c.repo, c.number) {
+		return false
+	}
+	// The issueLifecycle bridge (and its backstop recoverOrphans drain) owns any
+	// issue that already has an issueLifecycle Task, terminal or live: the backstop
+	// re-adopts such an orphan into the issueLifecycle Implement state, so minting a
+	// discrete implement Task too would double-process the stream. The producer is
+	// for the clarify->implement handoff, where the terminated Task is a clarify
+	// Task (or there is no Task), never an issueLifecycle one.
+	if hasKindTaskForIssue(existing, c.repo, c.number, "issueLifecycle") {
+		return false
+	}
+	return !hasKindTaskForIssue(existing, c.repo, c.number, "implement")
+}
+
 // hasLiveOrAdoptableTask returns the single issueLifecycle Task for (slug, number)
 // that should be ADOPTED rather than duplicated: any matching issueLifecycle Task
-// whose LifecycleState is neither "Done" nor "Stopped". This covers the in-flight
+// whose DeployState is neither "Done" nor "Stopped". This covers the in-flight
 // states (Triage/Conversation/Implement/MRCI/Merge/MainCI), the unstarted state
-// (empty LifecycleState), AND the Parked state that the false-refusal duplicate
+// (empty DeployState), AND the Parked state that the false-refusal duplicate
 // storm produces. Done (deliberately closed) and Stopped (idle, owned by the
 // reactivation pass) are excluded so genuinely-finished issues are not resurrected.
 // A Parked sibling is preferred over a Done/Stopped one. Returns nil when no
@@ -2324,7 +2578,7 @@ func hasLiveOrAdoptableTask(existing []tatarav1alpha1.Task, slug string, number 
 		if !taskMatchesItem(t, slug, number) {
 			continue
 		}
-		switch t.Status.LifecycleState {
+		switch t.Status.DeployState {
 		case "Done", "Stopped":
 			continue
 		}
@@ -2355,11 +2609,21 @@ func staleProposalWindow(proj *tatarav1alpha1.Project) (time.Duration, bool) {
 	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
 		return 0, false
 	}
-	d := proj.Spec.Scm.Cron.Brainstorm.StaleProposalDays
-	if d <= 0 {
+	return staleWindowDays(proj.Spec.Scm.Cron.Brainstorm.StaleProposalDays)
+}
+
+// staleWindowDays applies the stale-proposal reaper's default-on semantics
+// (liveness finding #8) to a StaleProposalDays value: a POSITIVE value is an
+// explicit window; the UNSET default (0) enables the reaper with the generous
+// defaultStaleProposalDays window; a NEGATIVE value is the explicit opt-out.
+func staleWindowDays(days int) (time.Duration, bool) {
+	if days < 0 {
 		return 0, false
 	}
-	return time.Duration(d) * 24 * time.Hour, true
+	if days == 0 {
+		days = defaultStaleProposalDays
+	}
+	return time.Duration(days) * 24 * time.Hour, true
 }
 
 // reapEligible reports whether the issue is a stale, unengaged proposal the
@@ -2388,7 +2652,12 @@ func (r *ProjectReconciler) reapEligible(proj *tatarav1alpha1.Project, iss scm.I
 }
 
 func (r *ProjectReconciler) reapStaleProposals(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, issueCache map[string][]scm.IssueRef, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
-	if act.StaleProposalDays <= 0 {
+	// Liveness finding #8: the window is resolved via staleWindowDays so the reaper
+	// is ON by default (unset -> generous default) and a NEGATIVE value is the
+	// explicit opt-out. Driven off act.StaleProposalDays (the project's brainstorm
+	// activity the caller passes).
+	window, on := staleWindowDays(act.StaleProposalDays)
+	if !on {
 		return
 	}
 	l := log.FromContext(ctx)
@@ -2403,7 +2672,6 @@ func (r *ProjectReconciler) reapStaleProposals(ctx context.Context, proj *tatara
 		l.Error(ferr, "reap: re-list tasks failed; using passed snapshot",
 			"action", "scan_stale_proposal_close", "resource_id", proj.Name)
 	}
-	window := time.Duration(act.StaleProposalDays) * 24 * time.Hour
 	brainstorming, approved, implementation, declined := lifecycleLabels(proj.Spec.Scm)
 	botLogin := ""
 	if proj.Spec.Scm != nil {
@@ -2443,8 +2711,9 @@ func (r *ProjectReconciler) reapStaleProposals(ctx context.Context, proj *tatara
 				l.Info("reap: remove brainstorming label failed (non-fatal)",
 					"action", "scan_stale_proposal_close", "resource_id", proj.Name, "issue", issueRef, "err", rerr.Error())
 			}
+			windowDays := int(window / (24 * time.Hour))
 			note := fmt.Sprintf("tatara: auto-closing this proposal - it has had no human engagement for %d days "+
-				"and no work is in flight. Reopen or re-file to revive.", act.StaleProposalDays)
+				"and no work is in flight. Reopen or re-file to revive.", windowDays)
 			if cerr := w.CloseIssue(ctx, token, repoSlug, iss.Number, note); cerr != nil {
 				l.Error(cerr, "reap: close stale proposal failed (leaving open)",
 					"action", "scan_stale_proposal_close", "resource_id", proj.Name, "issue", issueRef)
@@ -2454,7 +2723,7 @@ func (r *ProjectReconciler) reapStaleProposals(ctx context.Context, proj *tatara
 			r.Metrics.IssueOutcome("stale-close")
 			l.Info("stale proposal auto-closed",
 				"action", "scan_stale_proposal_close", "resource_id", proj.Name,
-				"issue", issueRef, "updated_at", iss.UpdatedAt, "window_days", act.StaleProposalDays)
+				"issue", issueRef, "updated_at", iss.UpdatedAt, "window_days", windowDays)
 		}
 	}
 }
@@ -2513,8 +2782,15 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 				entry = "Implement"
 				goal = fmt.Sprintf("Resume implementation for %s#%d (phase label present, no live task)", slug, iss.Number)
 			case hasLabel(iss.Labels, approved):
-				entry = "Implement"
-				goal = fmt.Sprintf("Implement approved issue %s#%d", slug, iss.Number)
+				// Fail closed: an orphaned issue bearing only the approved label
+				// (with no live task) must NOT auto-enter implementation - label
+				// presence is not a verified maintainer approval, and a freshly
+				// recovered task carries no recorded approval (Status.ApprovedByMaintainer).
+				// Re-triage instead; the front half re-requests explicit maintainer
+				// approval. Only the implementation label (a post-handoff, past-the-gate
+				// state) resumes at Implement above.
+				entry = "Triage"
+				goal = fmt.Sprintf("Re-triage approved-labeled issue %s#%d (no live task; awaiting verified maintainer approval)", slug, iss.Number)
 			case hasLabel(iss.Labels, brainstorming) || hasLabel(iss.Labels, legacyIdea):
 				entry = "Triage"
 				goal = fmt.Sprintf("Triage issue %s#%d", slug, iss.Number)
@@ -2584,7 +2860,7 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 	// metric stops for a closed issue. Only repos listed this cycle are judged.
 	for i := range existing {
 		tk := &existing[i]
-		if tk.Status.LifecycleState != "Parked" ||
+		if tk.Status.DeployState != "Parked" ||
 			!tatarav1alpha1.IsRecoverableGiveup(tk.Status.ParkReason) ||
 			tk.Status.ImplementGiveUps == 0 || tk.Spec.Source == nil {
 			continue
@@ -2601,6 +2877,47 @@ func (r *ProjectReconciler) recoverOrphans(ctx context.Context, proj *tatarav1al
 			}
 		}
 		if open {
+			// Liveness finding #6: a recoverable-giveup Parked task at the give-up cap
+			// on a STILL-OPEN issue used to be spared by the reaper forever (never
+			// GC'd, never re-nudged). Past maxRecoverableParkAge, re-ping the issue with
+			// a comment (a human signal) AND resolve the task Done so the reaper
+			// reclaims it - a permanently-parked task must not accumulate silently. The
+			// under-cap reroll ran earlier this pass, so a still-Parked task here is
+			// at-cap (permanently wedged). Park anchor: LastActivityAt (fallback
+			// CreationTimestamp).
+			if tk.Status.ImplementGiveUps < maxImplGiveUps {
+				continue
+			}
+			anchor := tk.CreationTimestamp.Time
+			if tk.Status.LastActivityAt != nil {
+				anchor = tk.Status.LastActivityAt.Time
+			}
+			if time.Since(anchor) < maxRecoverableParkAge {
+				continue
+			}
+			issueRef := tk.Spec.Source.IssueRef
+			if w, token, werr := r.scanWriter(ctx, proj); werr == nil && w != nil && issueRef != "" {
+				provider := ""
+				if proj.Spec.Scm != nil {
+					provider = proj.Spec.Scm.Provider
+				}
+				msg := "tatara: this issue has been parked awaiting a human for a long time after repeated " +
+					"failed attempts, and I'm cleaning up the stalled task. Comment here to have me try again."
+				cerr := w.Comment(ctx, token, issueRef, msg)
+				r.Metrics.SCMWrite(provider, "comment", scmResult(cerr))
+				if cerr != nil {
+					l.Error(cerr, "backstop: aged-out park re-ping comment (non-fatal)",
+						"action", "backstop_park_aged_out", "resource_id", proj.Name, "task", tk.Name)
+				}
+			}
+			if derr := r.markLifecycleDone(ctx, tk, "park-aged-out"); derr != nil {
+				l.Error(derr, "backstop: resolve aged-out park Done",
+					"action", "backstop_recover_error", "resource_id", proj.Name, "task", tk.Name)
+				continue
+			}
+			r.Metrics.ScanItem("backstop", "park_aged_out")
+			l.Info("backstop: recoverable park aged out; re-pinged issue and resolved Done for GC",
+				"action", "backstop_park_aged_out", "resource_id", proj.Name, "task", tk.Name)
 			continue
 		}
 		if derr := r.markLifecycleDone(ctx, tk, "issue-closed"); derr != nil {
@@ -2623,10 +2940,10 @@ func (r *ProjectReconciler) markLifecycleDone(ctx context.Context, task *tatarav
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
 		}
-		if fresh.Status.LifecycleState == "Done" {
+		if fresh.Status.DeployState == "Done" {
 			return nil
 		}
-		fresh.Status.LifecycleState = "Done"
+		fresh.Status.DeployState = "Done"
 		fresh.Status.ParkReason = reason
 		return r.Status().Update(ctx, fresh)
 	})
@@ -2790,6 +3107,15 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if dueRepos, soonest, ok := r.reposDueForScan(proj, "mrScan", repos, now); ok {
 		if len(dueRepos) > 0 {
 			backlog := r.mrScan(ctx, proj, reader, dueRepos, existing, cronSpec.MRScan)
+			// Deploy supervisor (Phase 6): merge review-approved, green, mergeable bot
+			// PRs (the gated fallback to native auto-merge). Runs on the mrScan cadence
+			// over the same due repos so it reuses the fetched reader.
+			r.superviseApprovedPRs(ctx, proj, reader, dueRepos)
+			// Enter Deploying for the discrete-kind flow (Phase 8 item 3): drive a merged
+			// approved bot PR's umbrella implement Task into pod-less Deploying so the
+			// cascade is supervised and its source issue closes on apply. Reads all project
+			// repos (not just dueRepos) so a merge on a not-due repo is still caught.
+			r.superviseMergedPRs(ctx, proj, repos)
 			// Only advance the stamp when there is no backlog. When backlog=true the
 			// 60s short requeue must re-fire; if we stamp now, the (stamp, now] window
 			// closes and the backlog drain requeue becomes a no-op (finding 3).
@@ -2937,27 +3263,36 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		}
 	}
 
-	// healthCheck (opt-in)
-	if cronSpec.HealthCheck.Enabled {
-		if _, due, next, ok := r.activityDue(proj, "healthCheck"); ok {
+	// documentation (opt-in cron): the scheduled doc-sync tick. Replaces the
+	// retired per-merge push trigger. Gated on Spec.Documentation being enabled
+	// with a docs repo; each due tick spawns a doc Task per changed source repo
+	// and stamps LastDocumentation (advancing the diff window) even when nothing
+	// changed, so it does not busy-refire.
+	doc := proj.Spec.Documentation
+	if cronSpec.Documentation.Schedule != "" && doc != nil && doc.Enabled && doc.Repo != "" {
+		if _, due, next, ok := r.activityDue(proj, "documentation"); ok {
 			if due {
-				r.healthCheck(ctx, proj, reader, repos, existing, cronSpec.HealthCheck)
-				if serr := r.stampScan(ctx, proj, "healthCheck"); serr != nil {
-					l.Error(serr, "scan: persist healthCheck stamp failed",
-						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "healthCheck")
-					r.Metrics.ScanItem("healthCheck", "stamp_error")
+				r.documentationScan(ctx, proj, reader, repos)
+				if serr := r.stampScan(ctx, proj, "documentation"); serr != nil {
+					l.Error(serr, "scan: persist documentation stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "documentation")
+					r.Metrics.ScanItem("documentation", "stamp_error")
 				}
-				if next2, ok2 := activityNextFire(cronSpec.HealthCheck.Schedule, now); ok2 {
+				if next2, ok2 := activityNextFire(cronSpec.Documentation.Schedule, now); ok2 {
 					consider(next2)
 				}
 			} else {
 				consider(next)
 			}
-		} else if cronSpec.HealthCheck.Schedule != "" {
-			l.Error(fmt.Errorf("invalid cron %q", cronSpec.HealthCheck.Schedule), "scan: invalid healthCheck cron, disabling",
-				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "healthCheck")
+		} else {
+			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Documentation.Schedule), "scan: invalid documentation cron, disabling",
+				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "documentation")
 		}
 	}
+
+	// healthCheck is RETIRED: its cron dispatch was removed (proposals absorbed
+	// into brainstorm). ScmCron.HealthCheck + Status.LastHealthCheck are kept
+	// inert for stored-CR back-compat; nothing fires them.
 
 	return soonest, nil
 }

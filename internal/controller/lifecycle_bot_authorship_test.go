@@ -124,7 +124,7 @@ func newLifecycleTaskInMRCI(t *testing.T, r *TaskReconciler, repoName string, pr
 	if err := r.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = prNumber
 	task.Status.PrURL = prWebURL
 	task.Status.HeadBranch = "tatara/task-" + lcAuthorshipTask
@@ -148,12 +148,12 @@ func testProject(t *testing.T) *tatarav1alpha1.Project {
 func TestMRCI_NonBotPRParks(t *testing.T) {
 	fw := &authorshipFakeWriter{prAuthor: "some-human", ciStatus: "success"}
 	r := newLifecycleTestReconciler(t, fw)
-	task := newLifecycleTaskInMRCI(t, r, "tatara-operator", 267) // LifecycleState=MRCI, bot login=szymonrychu-bot
+	task := newLifecycleTaskInMRCI(t, r, "tatara-operator", 267) // DeployState=MRCI, bot login=szymonrychu-bot
 	_, err := r.handleMRCI(context.Background(), testProject(t), task)
 	require.NoError(t, err)
 	var got tatarav1alpha1.Task
 	require.NoError(t, r.Get(context.Background(), client.ObjectKeyFromObject(task), &got))
-	assert.Equal(t, "Parked", got.Status.LifecycleState, "non-bot PR must park, never merge")
+	assert.Equal(t, "Parked", got.Status.DeployState, "non-bot PR must park, never merge")
 	fw.mu.Lock()
 	mergeCalls := fw.mergeCalls
 	fw.mu.Unlock()

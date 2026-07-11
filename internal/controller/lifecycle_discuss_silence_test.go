@@ -93,7 +93,7 @@ func TestFinishTriage_TataraAuthored_Discuss_NoHumanComment_SilentHold(t *testin
 	require.NoError(t, err)
 
 	// Must enter Conversation (silent hold).
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState,
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState,
 		"tatara-authored issue with discuss and no human reply must enter Conversation silently")
 
 	// Must NOT post any comment.
@@ -120,7 +120,7 @@ func TestFinishTriage_TataraAuthored_Discuss_WithHumanComment_PostsComment(t *te
 	require.NoError(t, err)
 
 	// Must enter Conversation (discuss flow).
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 
 	// Must post the discuss comment.
 	w.mu.Lock()
@@ -147,7 +147,7 @@ func TestFinishTriage_HumanFiled_Discuss_AlwaysPostsComment(t *testing.T) {
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 
 	// Always post for human-filed issues.
 	w.mu.Lock()
@@ -179,7 +179,7 @@ func TestFinishTriage_HumanFiled_Discuss_BotHasLastWord_Suppresses(t *testing.T)
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 	w.mu.Lock()
 	posted := len(w.commentBodies)
 	w.mu.Unlock()
@@ -203,7 +203,7 @@ func TestFinishTriage_HumanFiled_Discuss_ListCommentsError_PostsComment(t *testi
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 	w.mu.Lock()
 	posted := len(w.commentBodies)
 	w.mu.Unlock()

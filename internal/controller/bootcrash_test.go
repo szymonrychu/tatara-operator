@@ -666,7 +666,7 @@ func TestBootCrashBudgetRegressions(t *testing.T) {
 		}
 	})
 
-	t.Run("setLifecycleState_clears_last_pod_uid", func(t *testing.T) {
+	t.Run("setDeployState_clears_last_pod_uid", func(t *testing.T) {
 		_, _, task := seedBootCrashTask(t, "bc-reg-lsclr", corev1.PodRunning)
 		task.Annotations = map[string]string{
 			annBootCrashAttempts:   "1",
@@ -679,15 +679,15 @@ func TestBootCrashBudgetRegressions(t *testing.T) {
 
 		r := newTaskReconciler(newFakeSession())
 		r.LifecycleMetrics = obs.NewLifecycleMetrics(prometheus.NewRegistry())
-		if err := r.setLifecycleState(ctx, task, "Triage", "initial"); err != nil {
-			t.Fatalf("setLifecycleState: %v", err)
+		if err := r.setDeployState(ctx, task, "Triage", "initial"); err != nil {
+			t.Fatalf("setDeployState: %v", err)
 		}
 		got := getTask(t, "bc-reg-lsclr")
 		if _, ok := got.Annotations[annBootCrashAttempts]; ok {
-			t.Error("annBootCrashAttempts must be cleared by setLifecycleState")
+			t.Error("annBootCrashAttempts must be cleared by setDeployState")
 		}
 		if _, ok := got.Annotations[annBootCrashLastPodUID]; ok {
-			t.Error("annBootCrashLastPodUID must be cleared by setLifecycleState")
+			t.Error("annBootCrashLastPodUID must be cleared by setDeployState")
 		}
 	})
 

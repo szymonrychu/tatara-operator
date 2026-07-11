@@ -425,11 +425,12 @@ func projectWithBot(name, secretName, bot string) *tatarav1alpha1.Project {
 	return p
 }
 
-func TestCommentOnIssue_BlockedWhenBotAlreadyCommented(t *testing.T) {
+func TestCommentOnIssue_BlockedWhenBotHasLastWord(t *testing.T) {
+	base := time.Now()
 	writer := &fakeWriter{}
 	reader := &fakeReader{comments: []scm.IssueComment{
-		{Author: "someone", Body: "first"},
-		{Author: "tatara-bot", Body: "already weighed in"},
+		{Author: "someone", Body: "first", CreatedAt: base},
+		{Author: "tatara-bot", Body: "already weighed in", CreatedAt: base.Add(time.Minute)},
 	}}
 	proj := projectWithBot("projblk", "projblk-scm", "tatara-bot")
 	secret := scmSecret("projblk-scm", "tok")
@@ -444,15 +445,21 @@ func TestCommentOnIssue_BlockedWhenBotAlreadyCommented(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+	// Machine-readable refusal so the pod's skill can react.
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, true, resp["refused"])
+	require.Equal(t, "bot_last_word", resp["reason"])
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
-	require.Len(t, writer.comments, 0, "must not post when already commented")
+	require.Len(t, writer.comments, 0, "must not post when bot has the last word")
 }
 
 func TestCommentOnIssue_PostsWhenBotNotYetCommented(t *testing.T) {
+	base := time.Now()
 	writer := &fakeWriter{}
 	reader := &fakeReader{comments: []scm.IssueComment{
-		{Author: "someone", Body: "first"},
+		{Author: "someone", Body: "first", CreatedAt: base},
 	}}
 	proj := projectWithBot("projok", "projok-scm", "tatara-bot")
 	secret := scmSecret("projok-scm", "tok")
@@ -467,6 +474,66 @@ func TestCommentOnIssue_PostsWhenBotNotYetCommented(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	require.Len(t, writer.comments, 1)
+}
+
+// A human reply after the bot's comment breaks silence: the guard permits again
+// (bot no longer has the last word). This is the turn-taking loosening vs the old
+// cap-1 "any bot comment blocks forever".
+func TestCommentOnIssue_PostsWhenHumanRepliedAfterBot(t *testing.T) {
+	base := time.Now()
+	writer := &fakeWriter{}
+	reader := &fakeReader{comments: []scm.IssueComment{
+		{Author: "someone", Body: "first", CreatedAt: base},
+		{Author: "tatara-bot", Body: "weighed in", CreatedAt: base.Add(time.Minute)},
+		{Author: "human", Body: "actually, reconsider", CreatedAt: base.Add(2 * time.Minute)},
+	}}
+	proj := projectWithBot("projhum", "projhum-scm", "tatara-bot")
+	secret := scmSecret("projhum-scm", "tok")
+	repo := repoForProject("projhum-repo", "projhum", "https://github.com/o/r.git")
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"answering the human"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projhum/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	require.Len(t, writer.comments, 1)
+}
+
+// The SOLE refine carve-out: a refine agent (inferred from an in-flight refine
+// Task) may answer tatara's own last comment; the guard permits despite bot last word.
+func TestCommentOnIssue_RefinePermittedUnderBotLastWord(t *testing.T) {
+	base := time.Now()
+	writer := &fakeWriter{}
+	reader := &fakeReader{comments: []scm.IssueComment{
+		{Author: "someone", Body: "first", CreatedAt: base},
+		{Author: "tatara-bot", Body: "tatara note", CreatedAt: base.Add(time.Minute)},
+	}}
+	proj := projectWithBot("projref", "projref-scm", "tatara-bot")
+	secret := scmSecret("projref-scm", "tok")
+	repo := repoForProject("projref-repo", "projref", "https://github.com/o/r.git")
+	refineTask := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "refine-projref", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "projref", Kind: "refine"},
+	}
+
+	r := buildRouterWithReader(t, writer, reader, proj, secret, repo, refineTask)
+
+	body := strings.NewReader(`{"repo":"o/r","number":9,"body":"sharper scope"}`)
+	req := httptest.NewRequest(http.MethodPost, "/projects/projref/issue-comment", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, "refine must be permitted; body: %s", w.Body.String())
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
 	require.Len(t, writer.comments, 1)

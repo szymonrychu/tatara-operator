@@ -268,14 +268,21 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 		changed, confirmedPRRepos := refreshLedger(ctx, reader, task)
 		if changed {
 			// Persist the refreshed ledger. Use RetryOnConflict so a concurrent status
-			// update from the main reconcile loop does not drop our refresh.
-			latest := task.DeepCopy()
+			// update from the main reconcile loop does not drop our refresh. Merge
+			// per-member (UpsertWorkItem) into the freshly-read Task rather than
+			// assigning the snapshot slice wholesale: a blind
+			// `fresh.Status.WorkItems = <snapshot>` never conflicts (full overwrite),
+			// so it would silently drop a member appended concurrently by another
+			// writer between our read and this persist.
+			refreshed := task.DeepCopy().Status.WorkItems
 			retryErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 				fresh := &tatarav1alpha1.Task{}
-				if err := r.Get(ctx, client.ObjectKeyFromObject(latest), fresh); err != nil {
+				if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 					return err
 				}
-				fresh.Status.WorkItems = latest.Status.WorkItems
+				for i := range refreshed {
+					UpsertWorkItem(fresh, refreshed[i])
+				}
 				return r.Status().Update(ctx, fresh)
 			})
 			if retryErr != nil {
@@ -375,12 +382,26 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 			if !repoOK {
 				continue
 			}
-			goal := fmt.Sprintf("Resume stalled implementation for %s#%d (backstop reactivation)", prCand.repo, prCand.number)
-			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			// U-E: legacy issueLifecycle tasks keep the issueLifecycle MRCI bridge;
+			// new-model tasks route stalled-PR recovery through the discrete `review`
+			// kind (checks out the PR head read-only, re-reviews, routes back to
+			// implement when unmergeable).
+			recoveryKind := backstopRecoveryKind(task)
+			var goal string
+			var ann map[string]string
+			if recoveryKind == "review" {
+				goal = fmt.Sprintf("Re-review stalled PR %s#%d (backstop reactivation): approve if mergeable and green; otherwise request changes and re-add tatara-implementation to drive implement.", prCand.repo, prCand.number)
+				if hb := prHeadBranchFromLedger(task, prCand.repo); hb != "" {
+					ann = map[string]string{tatarav1alpha1.AnnReviewHeadBranch: hb}
+				}
+			} else {
+				goal = fmt.Sprintf("Resume stalled implementation for %s#%d (backstop reactivation)", prCand.repo, prCand.number)
+				ann = map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			}
 			// labelCand carries the linked-issue identity (dedup key); srcCand carries
 			// the PR identity (createScanTask sets DedupNumber when they differ).
 			labelCand := candidate{repo: prCand.repo, number: linkedIssue, headSHA: prCand.headSHA, isPR: prCand.isPR}
-			ok2, cerr := r.createScanTask(ctx, proj, &repo, labelCand, prCand, "backstop", "issueLifecycle", goal, ann, nil)
+			ok2, cerr := r.createScanTask(ctx, proj, &repo, labelCand, prCand, "backstop", recoveryKind, goal, ann, nil)
 			if cerr != nil {
 				l.Error(cerr, "backstop: create reactivation task",
 					"action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)
@@ -410,14 +431,29 @@ func (r *ProjectReconciler) backstopSweep(ctx context.Context, proj *tatarav1alp
 			if !repoOK {
 				continue
 			}
-			goal := fmt.Sprintf(
-				"Resolve merge conflict on %s#%d (backstop conflict self-heal): "+
-					"merge origin/%s into the branch (never rebase), resolve conflicts, and push; "+
-					"or signal pr_outcome close if the PR is superseded or obsolete.",
-				prCand.repo, prCand.number, repo.Spec.DefaultBranch)
-			ann := map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			// U-E: an unmergeable (DIRTY) MR. Legacy issueLifecycle tasks self-heal via
+			// the issueLifecycle MRCI conflict-fix bridge; new-model tasks route to the
+			// discrete `review` kind, which withholds approval on the unmergeable MR and
+			// re-adds tatara-implementation to drive implement to resolve the conflict
+			// (CROSS-REPO-CONTRACT: "any unmergeable MR -> invoke implement").
+			recoveryKind := backstopRecoveryKind(task)
+			var goal string
+			var ann map[string]string
+			if recoveryKind == "review" {
+				goal = fmt.Sprintf("Re-review unmergeable PR %s#%d (backstop conflict self-heal): the branch has a merge conflict and is unmergeable - request changes and re-add tatara-implementation to drive implement to resolve the conflict.", prCand.repo, prCand.number)
+				if hb := prHeadBranchFromLedger(task, prCand.repo); hb != "" {
+					ann = map[string]string{tatarav1alpha1.AnnReviewHeadBranch: hb}
+				}
+			} else {
+				goal = fmt.Sprintf(
+					"Resolve merge conflict on %s#%d (backstop conflict self-heal): "+
+						"merge origin/%s into the branch (never rebase), resolve conflicts, and push; "+
+						"or signal pr_outcome close if the PR is superseded or obsolete.",
+					prCand.repo, prCand.number, repo.Spec.DefaultBranch)
+				ann = map[string]string{tatarav1alpha1.LifecycleEntryAnnotation: "MRCI"}
+			}
 			labelCand := candidate{repo: prCand.repo, number: linkedIssue, headSHA: prCand.headSHA, isPR: prCand.isPR}
-			ok2, cerr := r.createScanTask(ctx, proj, &repo, labelCand, prCand, "backstop", "issueLifecycle", goal, ann, nil)
+			ok2, cerr := r.createScanTask(ctx, proj, &repo, labelCand, prCand, "backstop", recoveryKind, goal, ann, nil)
 			if cerr != nil {
 				l.Error(cerr, "backstop: create conflict-fix task",
 					"action", "backstop_create_error", "resource_id", proj.Name, "repo", repo.Name)
@@ -449,6 +485,35 @@ func (r *ProjectReconciler) podIsLive(ctx context.Context, task *tatarav1alpha1.
 		return false
 	}
 	return true
+}
+
+// backstopRecoveryKind selects the recovery task kind for a stalled task. Legacy
+// in-flight issueLifecycle tasks keep the issueLifecycle bridge - the operator CD
+// back-half still drives them end to end. New-model tasks (implement/review/
+// clarify umbrellas) route stalled / unmergeable PR recovery through the discrete
+// `review` kind, which re-reviews the PR and, per the CROSS-REPO-CONTRACT handoff
+// transitions, re-adds tatara-implementation to drive implement when the MR is
+// unmergeable. This keeps the issueLifecycle bridge scoped to genuinely legacy
+// Tasks while new recovery uses the discrete kinds (U-E).
+func backstopRecoveryKind(task *tatarav1alpha1.Task) string {
+	if task.Spec.Kind == "issueLifecycle" {
+		return "issueLifecycle"
+	}
+	return "review"
+}
+
+// prHeadBranchFromLedger returns the recorded head branch for the open bot PR in
+// repo so a review recovery task can check it out read-only (AnnReviewHeadBranch).
+// Returns "" when no head branch is recorded (the review pod then falls back to
+// its default behavior).
+func prHeadBranchFromLedger(task *tatarav1alpha1.Task, repo string) string {
+	for _, wi := range task.Status.WorkItems {
+		if wi.Kind == tatarav1alpha1.WorkItemPR && wi.Role == tatarav1alpha1.RoleOpenedPR &&
+			wi.Repo == repo && wi.State == tatarav1alpha1.WIOpen && wi.HeadBranch != "" {
+			return wi.HeadBranch
+		}
+	}
+	return ""
 }
 
 // linkedIssueForPR returns the number of the open role:source/role:closes issue

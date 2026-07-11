@@ -402,14 +402,16 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 			checkoutBranchVal = hb
 		}
 	}
+	targetRepo := ""
 	if repo != nil {
 		env = append(env,
 			corev1.EnvVar{Name: "REPO_URL", Value: repo.Spec.URL},
 			corev1.EnvVar{Name: "REPO_BRANCH", Value: repo.Spec.DefaultBranch},
 		)
+		targetRepo = repoComponentName(repo.Spec.URL)
 	}
 	env = append(env, []corev1.EnvVar{
-		{Name: "MODEL", Value: modelForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
+		{Name: "MODEL", Value: modelForKindOnRepo(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity], targetRepo)},
 		{Name: "EFFORT", Value: effortForKind(project, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity])},
 		{Name: "PERMISSION_MODE", Value: project.Spec.Agent.PermissionMode},
 		{Name: "TURN_TIMEOUT_SECONDS", Value: strconv.Itoa(project.Spec.Agent.TurnTimeoutSeconds)},
@@ -564,8 +566,14 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// only enter WorkItems via the Phase-3 backstop AFTER PRs exist) still clones
 	// them. When the ledger is empty, fall back to the full project repo list for
 	// backward-compatibility (pre-ledger Tasks carry no WorkItems).
+	// Umbrella kinds (clarify/implement/review) always clone ALL enrolled project
+	// repos - the whole point of the project-level umbrella is that the agent sees
+	// every repo at once (the U-B fix). Skip the ledger-derived narrowing for them
+	// so a narrow ledger (e.g. only the source-issue repo) does not shrink the
+	// clone set below the full project; the enrolled `repos` list bounds it to the
+	// project so nothing outside is cloned.
 	scopedRepos := repos
-	if inScope := tatarav1alpha1.TaskReposInScope(task); len(inScope) > 0 {
+	if inScope := tatarav1alpha1.TaskReposInScope(task); !tatarav1alpha1.IsUmbrellaKind(task.Spec.Kind) && len(inScope) > 0 {
 		scopeSet := make(map[string]struct{}, len(inScope))
 		for _, s := range inScope {
 			scopeSet[s] = struct{}{}
@@ -850,14 +858,17 @@ func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 // serves the full tool set, the wrapper installs all skills). healthCheck
 // shares Kind=brainstorm, so it is not a distinct entry.
 var kindProfiles = map[string]string{
-	"implement":      "implement",
-	"review":         "review",
+	"implement":     "implement",
+	"review":        "review",
+	"clarify":       "clarify",
+	"brainstorm":    "brainstorm",
+	"incident":      "incident",
+	"refine":        "refine",
+	"documentation": "documentation",
+	// Retired kinds retained for in-flight legacy Tasks; dropped in Phase 4 once
+	// no path creates them.
 	"triageIssue":    "triage",
-	"brainstorm":     "brainstorm",
 	"issueLifecycle": "lifecycle",
-	"incident":       "incident",
-	"refine":         "refine",
-	"documentation":  "documentation",
 }
 
 // profileForKind looks up kind in kindProfiles, returning "" (fail-open) for
@@ -902,25 +913,90 @@ func resolveByKind(byKind map[string]string, kind, activity, fallback string) st
 	return fallback
 }
 
-// documentationDefaultModel is the locked model choice for the documentation
-// kind (design decision): claude-sonnet-5, regardless of the project's
-// general Model, unless the project explicitly overrides it via ModelByKind.
-const documentationDefaultModel = "claude-sonnet-5"
+// kindDefaultModel is the locked per-kind model tier for the 7-kind model
+// (design decision, cross-repo contract). It is the fallback when the project
+// sets no per-kind ModelByKind override: opus for the reasoning kinds
+// (brainstorm/incident/clarify/implement/review), sonnet for the cheaper
+// recurring kinds (documentation/refine). A project ModelByKind override still
+// wins (resolveByKind precedence). Kinds absent here (retired legacy kinds) fall
+// back to the project-wide Model as before.
+var kindDefaultModel = map[string]string{
+	"brainstorm":    "claude-opus-4-8",
+	"incident":      "claude-opus-4-8",
+	"clarify":       "claude-opus-4-8",
+	"implement":     "claude-opus-4-8",
+	"review":        "claude-opus-4-8",
+	"documentation": "claude-sonnet-5",
+	"refine":        "claude-sonnet-5",
+}
 
-// modelForKind resolves the MODEL env for a Task Kind+activity. See
-// resolveByKind for the healthCheck pseudo-key precedence.
+// modelForKind resolves the MODEL env for a Task Kind+activity. The fallback is
+// the locked per-kind default (kindDefaultModel) when one exists, else the
+// project-wide Model. See resolveByKind for the healthCheck pseudo-key precedence
+// and the project ModelByKind override.
 func modelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
 	fallback := project.Spec.Agent.Model
-	if kind == "documentation" {
-		fallback = documentationDefaultModel
+	if def, ok := kindDefaultModel[kind]; ok {
+		fallback = def
 	}
 	return resolveByKind(project.Spec.Agent.ModelByKind, kind, activity, fallback)
 }
 
-// ModelForKind exports modelForKind for controller callers that need to stamp
-// the resolved model on Task.Status at pod-creation.
-func ModelForKind(project *tatarav1alpha1.Project, kind, activity string) string {
+// helmfileTargetRepo is the terminal self-heal repo (the tier-revert flow opens
+// its revert MR here). Keyed on the repo component name (URL slug), matching the
+// controller's helmfileRepoName.
+const helmfileTargetRepo = "tatara-helmfile"
+
+// modelFloorKinds are the reasoning kinds pinned to their locked opus default
+// when the task targets the self-heal repo (helmfileTargetRepo). documentation
+// and refine (the cheap, freely-tierable kinds) are deliberately absent.
+var modelFloorKinds = map[string]bool{
+	"brainstorm": true, "incident": true, "clarify": true, "implement": true, "review": true,
+}
+
+// modelFloorAppliesOnRepo reports whether the tier-revert self-heal model floor
+// applies to a (kind, activity) task targeting targetRepo. The floor pins a
+// reasoning-kind task on tatara-helmfile to its locked opus default: the
+// tier-revert incident opens its revert MR against tatara-helmfile and the very
+// implement/review that must FIX a broken or downgraded ModelByKind lives on that
+// repo, so it must not run on the same broken tier being reverted. healthCheck (a
+// brainstorm-kind recurring classification) is exempt so it stays tierable, and
+// component-repo tiering (any other repo) is unaffected: this is the narrow
+// "bypass modelForKind for tier-revert-originated Tasks" the floor sanctions,
+// identified structurally by the terminal-repo target rather than a propagated
+// origin marker (any helmfile change deserves opus reasoning regardless).
+func modelFloorAppliesOnRepo(kind, activity, targetRepo string) bool {
+	return targetRepo == helmfileTargetRepo && activity != "healthCheck" && modelFloorKinds[kind]
+}
+
+// modelForKindOnRepo resolves the MODEL env with the tier-revert self-heal floor
+// applied when the task targets the terminal tatara-helmfile repo. targetRepo is
+// the repo component name (URL slug). Empty/other repos resolve via modelForKind.
+func modelForKindOnRepo(project *tatarav1alpha1.Project, kind, activity, targetRepo string) string {
+	if modelFloorAppliesOnRepo(kind, activity, targetRepo) {
+		if def, ok := kindDefaultModel[kind]; ok {
+			return def
+		}
+	}
 	return modelForKind(project, kind, activity)
+}
+
+// repoComponentName returns the repo component (URL slug tail) for a repository
+// URL, e.g. "tatara-helmfile" for ".../szymonrychu/tatara-helmfile". Empty on a
+// parse failure (the floor then does not apply, matching non-helmfile targets).
+func repoComponentName(repoURL string) string {
+	if _, name, err := scm.OwnerRepo(repoURL); err == nil {
+		return name
+	}
+	return ""
+}
+
+// ModelForKind exports the MODEL resolution for controller callers that need to
+// stamp the resolved model on Task.Status at pod-creation. repoURL is the target
+// repository URL so the tier-revert self-heal floor is applied consistently with
+// BuildPod.
+func ModelForKind(project *tatarav1alpha1.Project, kind, activity, repoURL string) string {
+	return modelForKindOnRepo(project, kind, activity, repoComponentName(repoURL))
 }
 
 // effortForKind resolves the EFFORT env for a Task Kind+activity, keying on

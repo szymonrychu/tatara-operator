@@ -54,7 +54,7 @@ func TestFinishTriage_HumanFiled_Discuss_WhitespaceComment_SkipsPost(t *testing.
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState,
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState,
 		"blank discuss comment must still enter Conversation")
 
 	w.mu.Lock()
@@ -80,7 +80,7 @@ func TestFinishTriage_HumanFiled_NilOutcome_SkipsPost(t *testing.T) {
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState,
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState,
 		"inconclusive triage (nil outcome) must enter Conversation")
 
 	w.mu.Lock()

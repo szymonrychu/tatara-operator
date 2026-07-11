@@ -81,7 +81,7 @@ func seedMRCITaskWithTokens(t *testing.T, suffix string, ctxWindowTokens, thresh
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task %s: %v", name, err)
 	}
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 42
 	task.Status.PrURL = "https://github.com/o/r/pull/42"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -131,8 +131,8 @@ func TestContextGuard_HeavyContext_MRCIFailure_SetsResumeMarker(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement", got.Status.DeployState)
 	}
 	if got.Annotations[annPendingHandoverResume] != "true" {
 		t.Errorf("annotation %q = %q, want 'true'", annPendingHandoverResume, got.Annotations[annPendingHandoverResume])

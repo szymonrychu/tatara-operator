@@ -401,13 +401,14 @@ func mkTaskKind(t *testing.T, name, projectRef, repoRef, kind string) {
 }
 
 // TestTaskReconcile_RepoScopedKindEmptyRef_TerminatesInvalid: a repo-scoped kind
-// (implement) with an empty RepositoryRef must be terminated Failed with
-// InvalidTaskSpec, NOT silently driven (which would build a project-scoped pod
-// for a repo-scoped task and wedge writeback). The reconcile must not error
-// (erroring would hot-loop the Task forever).
+// (documentation - the one remaining repo-scoped agent kind post-redesign) with
+// an empty RepositoryRef must be terminated Failed with InvalidTaskSpec, NOT
+// silently driven. The reconcile must not error (erroring would hot-loop the
+// Task forever). implement/review/clarify are now unconstrained umbrellas and an
+// empty ref is valid for them, so they no longer exercise this path.
 func TestTaskReconcile_RepoScopedKindEmptyRef_TerminatesInvalid(t *testing.T) {
 	mkTaskProject(t, "p-invref", 3)
-	mkTaskKind(t, "t-invref", "p-invref", "", "implement")
+	mkTaskKind(t, "t-invref", "p-invref", "", "documentation")
 	setProjectMemoryReady(t, "p-invref", "http://mem-p-invref.tatara.svc:8080")
 
 	fs := newFakeSession()

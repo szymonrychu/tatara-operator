@@ -34,7 +34,7 @@ func TestContextGuard_ResumeFromHandover_InjectsTurnZero(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 	handoverDoc := "Prior work is on branch feat/login-fix; read its diff. OAuth2 login is done."
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = ""
 	task.Status.LifecycleIterations = 1
 	task.Status.Handover = handoverDoc

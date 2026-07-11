@@ -85,11 +85,9 @@ func TestHandleWorkItemKind(t *testing.T) {
 		require.Equal(t, http.StatusAccepted, w.Code)
 
 		qe := singleQueuedEvent(t, c, proj.Name)
-		// kind switch: was "implement", now "issueLifecycle" (migration note: in-flight
-		// "implement" tasks created before this deploy still complete via old writeback arm)
-		require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
-		// Entry state is now carried by the create-time annotation (FIX 3).
-		require.Equal(t, "Implement", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"])
+		// kind switch: labeled issues now route to "clarify", starting at Triage.
+		require.Equal(t, "clarify", qe.Spec.Payload.Kind)
+		require.Empty(t, qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"])
 		require.NotNil(t, qe.Spec.Payload.Source)
 		require.Equal(t, "alice", qe.Spec.Payload.Source.AuthorLogin)
 		require.False(t, qe.Spec.Payload.Source.IsPR)
@@ -111,12 +109,9 @@ func TestHandleWorkItemKind(t *testing.T) {
 		require.Equal(t, http.StatusAccepted, w.Code)
 
 		qe := singleQueuedEvent(t, c, proj.Name)
-		// kind switch: was "selfImprove", now "issueLifecycle" (migration note: in-flight
-		// "selfImprove" tasks created before this deploy still complete via old writeback arm)
-		require.Equal(t, "issueLifecycle", qe.Spec.Payload.Kind)
-		// Entry state is now carried by the create-time annotation, not a post-create
-		// Status().Update (FIX 3). reconcileLifecycle initializes LifecycleState from it.
-		require.Equal(t, "MRCI", qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"])
+		// kind switch: the bot-PR special case is gone; any PR open now routes to "review".
+		require.Equal(t, "review", qe.Spec.Payload.Kind)
+		require.Empty(t, qe.Spec.Payload.Annotations["tatara.dev/lifecycle-entry"])
 		require.NotNil(t, qe.Spec.Payload.Source)
 		require.Equal(t, "tatara-bot", qe.Spec.Payload.Source.AuthorLogin)
 		require.True(t, qe.Spec.Payload.Source.IsPR)

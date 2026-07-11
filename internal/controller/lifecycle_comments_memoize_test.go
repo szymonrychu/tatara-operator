@@ -55,7 +55,7 @@ func TestFinishTriage_Discuss_AuthoredWithHumanReply_MemoizesComments(t *testing
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 	require.Equal(t, 1, rdr.callCount,
 		"authored+human-replied success path must fetch ListIssueComments exactly once (memoized)")
 }
@@ -78,7 +78,7 @@ func TestFinishTriage_Discuss_FirstListCommentsErrorStillRetriesLive(t *testing.
 	_, err := r.finishTriage(context.Background(), proj, task)
 	require.NoError(t, err)
 
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 	require.Equal(t, 2, rdr.callCount,
 		"a first-call ListIssueComments error must not be cached; botHasLastWord must retry live (call count 2)")
 }

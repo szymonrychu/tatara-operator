@@ -53,7 +53,7 @@ func TestTriageCloseIssue_TargetGone_TerminalNoRequeue(t *testing.T) {
 				URL: "https://github.com/o/r/issues/700", Number: 700,
 			}
 			task := seedLifecycleTask(t, name, name+"-p", name+"-r", name+"-s", src)
-			task.Status.LifecycleState = "Triage"
+			task.Status.DeployState = "Triage"
 			task.Status.Phase = "Succeeded"
 			task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "close", Comment: "closing this"}
 			if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -81,8 +81,8 @@ func TestTriageCloseIssue_TargetGone_TerminalNoRequeue(t *testing.T) {
 				if err != nil {
 					t.Fatalf("expected nil error (no requeue) for a permanently-gone target, got %v", err)
 				}
-				if got := fetchTask(t, name); got.Status.LifecycleState != "Done" {
-					t.Errorf("LifecycleState = %q, want Done after terminal close", got.Status.LifecycleState)
+				if got := fetchTask(t, name); got.Status.DeployState != "Done" {
+					t.Errorf("DeployState = %q, want Done after terminal close", got.Status.DeployState)
 				}
 			}
 

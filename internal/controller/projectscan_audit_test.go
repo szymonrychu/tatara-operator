@@ -412,36 +412,6 @@ func TestIssueScan_SkippedBudget_EmitsMetric(t *testing.T) {
 	require.Equal(t, 3, len(qes), "expected all 3 issues enqueued (no budget cap)")
 }
 
-// --- Finding 7/8: healthCheck calls SetOpenProposals ---
-
-// TestHealthCheck_SetOpenProposals verifies that healthCheck updates the
-// operator_open_proposals gauge for each repo it queries (matching brainstorm).
-func TestHealthCheck_SetOpenProposals(t *testing.T) {
-	proj, repos := seedHealthCheckProject(t, "hc-gauge-proj", []string{"o/p1", "o/p2"}, 10)
-	reader := &perRepoFakeReader{
-		issuesByRepo: map[string][]scm.IssueRef{
-			"o/p1": {
-				{Repo: "o/p1", Number: 1, Labels: []string{"tatara-idea"}},
-			},
-			"o/p2": {
-				{Repo: "o/p2", Number: 2, Labels: []string{"tatara-idea"}},
-				{Repo: "o/p2", Number: 3, Labels: []string{"tatara-idea"}},
-			},
-		},
-	}
-	reg := prometheus.NewRegistry()
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(reg)
-
-	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 10}
-	r.healthCheck(context.Background(), proj, reader, repos, nil, act)
-
-	g1 := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/p1"})
-	g2 := auditGaugeValue(t, reg, "operator_open_proposals", map[string]string{"repo": "o/p2"})
-	require.Equal(t, float64(1), g1, "healthCheck must set open_proposals gauge for o/p1")
-	require.Equal(t, float64(2), g2, "healthCheck must set open_proposals gauge for o/p2")
-}
-
 // --- Finding 16: distinct recovery_close_attempt metric on close path ---
 
 // TestMRScan_RecoveryCloseAttempt_EmitsDistinctMetric verifies that when a bot

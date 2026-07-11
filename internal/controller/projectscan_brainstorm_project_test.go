@@ -264,28 +264,6 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	}
 }
 
-// TestHealthCheck_ProjectLevel_EmptyRepositoryRef: healthCheck creates a Task with
-// an empty RepositoryRef (project-scoped).
-func TestHealthCheck_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
-	proj, repos := seedHealthCheckProject(t, "hc-emptyref", []string{"o/a", "o/b"}, 3)
-	reader := &perRepoFakeReader{
-		issuesByRepo: map[string][]scm.IssueRef{"o/a": {}, "o/b": {}},
-	}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 3}
-	r.healthCheck(context.Background(), proj, reader, repos, nil, act)
-
-	qes := listHealthCheckQEs(t, "hc-emptyref")
-	if len(qes) != 1 {
-		t.Fatalf("want 1 healthCheck QE, got %d", len(qes))
-	}
-	if qes[0].Spec.RepositoryRef != "" {
-		t.Fatalf("healthCheck QE RepositoryRef = %q, want empty (project-scoped)", qes[0].Spec.RepositoryRef)
-	}
-}
-
 // TestBrainstorm_ProjectLevel_ProjectScopedPodName: brainstorm QE is project-scoped.
 // PodRepo is empty because pod-name is stamped at admit time, not at enqueue time.
 func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {

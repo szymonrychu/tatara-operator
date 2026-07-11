@@ -32,7 +32,7 @@ func TestLifecycleImplement_SucceededOpensMRAndEntersMRCI(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 	// Seed: Implement agent run completed successfully.
 	// LifecycleIterations=1: spawn already incremented it when Phase was "".
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -67,8 +67,8 @@ func TestLifecycleImplement_SucceededOpensMRAndEntersMRCI(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "MRCI" {
-		t.Errorf("LifecycleState = %q, want MRCI", got.Status.LifecycleState)
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI", got.Status.DeployState)
 	}
 	if got.Status.PrURL != "https://github.com/o/r/pull/42" {
 		t.Errorf("PrURL = %q, want https://github.com/o/r/pull/42", got.Status.PrURL)
@@ -104,7 +104,7 @@ func TestLifecycleImplement_NoPRFirstEmptyRetries(t *testing.T) {
 	sec := "lc-is-nopr"
 	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#11", Number: 11}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -133,8 +133,8 @@ func TestLifecycleImplement_NoPRFirstEmptyRetries(t *testing.T) {
 		t.Fatalf("get task after: %v", err)
 	}
 	// First empty run retries (counter 0 -> 1), stays Implement.
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement (first empty run should retry, not park)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement (first empty run should retry, not park)", got.Status.DeployState)
 	}
 	if got.Status.ImplementEmptyRetries != 1 {
 		t.Errorf("ImplementEmptyRetries = %d, want 1", got.Status.ImplementEmptyRetries)
@@ -149,7 +149,7 @@ func TestLifecycleImplement_FailedTransitionsToParked(t *testing.T) {
 	sec := "lc-is-fail"
 	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#12", Number: 12}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Failed"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -171,8 +171,8 @@ func TestLifecycleImplement_FailedTransitionsToParked(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (implement-failed)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (implement-failed)", got.Status.DeployState)
 	}
 }
 
@@ -243,7 +243,7 @@ func TestLifecycleImplement_ContextClearedAfterRunStarts(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 	// State: ready to spawn a fresh implement run; ImplementContext is set (re-entry).
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = ""
 	task.Status.ImplementContext = "CI failed: test_auth timed out"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -294,7 +294,7 @@ func TestLifecycleImplement_ContextInPromptWhenPodReady(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// State: pod exists and is ready, Phase=Planning, ImplementContext set.
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Planning"
 	task.Status.PodName = agent.PodName(task)
 	task.Status.ImplementContext = "CI failed: build timed out"
@@ -386,7 +386,7 @@ func TestLifecycleImplement_ClosesIssueInPrimaryRepoMRBody(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, primaryRepo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -435,7 +435,7 @@ func TestLifecycleImplement_PushCDEligibleSuppressesCloses(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, primaryRepo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	// Declared significance => pushCDEligible => deploy-supervision owns the close.
 	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{PRTitle: "feat: x", Significance: "minor"}
@@ -482,7 +482,7 @@ func TestLifecycleImplement_ClosesIssueNotInSecondaryRepoMRBody(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTaskWithSecondaryRepo(t, name, proj, primaryRepo, secondaryRepo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -531,7 +531,7 @@ func TestLifecycleImplement_NoPREntryLifecycleTaskDoesNotClose(t *testing.T) {
 		IsPR: true,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -646,7 +646,7 @@ func TestLifecycleImplement_LegacyImplementTaskDoesNotClose(t *testing.T) {
 
 // TestLifecycleImplement_IdempotentOnRetry verifies that calling the implement-finish
 // path twice (Phase Succeeded, PrURL already set from a previous reconcile) opens
-// the PR exactly once and still ends in LifecycleState=MRCI.
+// the PR exactly once and still ends in DeployState=MRCI.
 func TestLifecycleImplement_IdempotentOnRetry(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-impl-idem"
@@ -661,8 +661,8 @@ func TestLifecycleImplement_IdempotentOnRetry(t *testing.T) {
 
 	// Simulate: first reconcile opened the PR and set PrURL, but then errored
 	// before finishing the state transition. So: Phase=Succeeded, PrURL already set,
-	// LifecycleState still Implement.
-	task.Status.LifecycleState = "Implement"
+	// DeployState still Implement.
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.PrURL = "https://github.com/o/r/pull/77"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -694,8 +694,8 @@ func TestLifecycleImplement_IdempotentOnRetry(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "MRCI" {
-		t.Errorf("LifecycleState = %q, want MRCI after idempotent retry", got.Status.LifecycleState)
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI after idempotent retry", got.Status.DeployState)
 	}
 	if got.Status.PrURL != "https://github.com/o/r/pull/77" {
 		t.Errorf("PrURL = %q, want unchanged", got.Status.PrURL)
@@ -706,7 +706,7 @@ func TestLifecycleImplement_IdempotentOnRetry(t *testing.T) {
 // Task 6 - Iteration backstop
 // ============================================================
 
-// seedImplementReadyTask seeds a task in LifecycleState=Implement, Phase=""
+// seedImplementReadyTask seeds a task in DeployState=Implement, Phase=""
 // (ready to spawn a fresh run). Extra status fields set via the returned task
 // pointer before calling reconcileLifecycle.
 func seedImplementReadyTask(t *testing.T, suffix string, iterations int) (*TaskReconciler, *lifecycleFakeSCMWriter, *tatarav1alpha1.Task) {
@@ -731,7 +731,7 @@ func seedImplementReadyTask(t *testing.T, suffix string, iterations int) (*TaskR
 		t.Fatalf("update project MaxLifecycleIterations: %v", err)
 	}
 
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = ""
 	task.Status.LifecycleIterations = iterations
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
@@ -766,8 +766,8 @@ func TestLifecycleImplement_BackstopParksWhenMaxIterationsReached(t *testing.T) 
 	}
 
 	got := fetchTask(t, task.Name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (backstop)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (backstop)", got.Status.DeployState)
 	}
 	// No pod spawned.
 	pods := &corev1.PodList{}
@@ -804,8 +804,8 @@ func TestLifecycleImplement_BackstopAllowsSpawnBelowMax(t *testing.T) {
 
 	got := fetchTask(t, task.Name)
 	// Phase should advance (Planning) meaning spawn occurred, not Parked.
-	if got.Status.LifecycleState == "Parked" {
-		t.Error("LifecycleState must not be Parked below max iterations")
+	if got.Status.DeployState == "Parked" {
+		t.Error("DeployState must not be Parked below max iterations")
 	}
 	// LifecycleIterations must be incremented.
 	if got.Status.LifecycleIterations != 3 {

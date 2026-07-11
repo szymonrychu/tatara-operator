@@ -46,7 +46,7 @@ func seedConvTask(t *testing.T, projName, repoName, taskName, state string, acti
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create conv task: %v", err)
 	}
-	task.Status.LifecycleState = state
+	task.Status.DeployState = state
 	task.Status.LastActivityAt = &act
 	task.Status.DeadlineAt = &dl
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
@@ -99,8 +99,8 @@ func TestIssueScan_ReactivatesConversationTask(t *testing.T) {
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "conv-task-1"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage (reactivated)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage (reactivated)", got.Status.DeployState)
 	}
 	if got.Status.LastActivityAt == nil || !got.Status.LastActivityAt.After(lastActivityAt) {
 		t.Error("LastActivityAt must be updated to a time after the original last activity")
@@ -146,8 +146,8 @@ func TestIssueScan_ReactivatesStoppedTask(t *testing.T) {
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "stopped-task-1"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage (Stopped re-open)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage (Stopped re-open)", got.Status.DeployState)
 	}
 }
 
@@ -186,8 +186,8 @@ func TestIssueScan_NoReactivationWhenIssueNotNewer(t *testing.T) {
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "conv-no-task-1"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation (no reactivation)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation (no reactivation)", got.Status.DeployState)
 	}
 }
 

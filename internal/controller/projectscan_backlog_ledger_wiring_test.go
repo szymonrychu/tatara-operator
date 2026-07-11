@@ -54,28 +54,6 @@ func TestBrainstorm_MigrationWindow_SourceLedgerPlusSCMProposals_TripsCap(t *tes
 	require.Empty(t, qes, "cap must trip from SCM count even when source-only ledgers exist; no brainstorm QE expected")
 }
 
-// TestHealthCheck_MigrationWindow_SourceLedgerPlusSCMProposals_TripsCap mirrors
-// the brainstorm regression test for the healthCheck path.
-func TestHealthCheck_MigrationWindow_SourceLedgerPlusSCMProposals_TripsCap(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "hc-mig-cap", []string{"o/h1", "o/h2"}, 2)
-	reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{
-		"o/h1": {{Repo: "o/h1", Number: 1, Labels: []string{"tatara-brainstorming"}}},
-		"o/h2": {{Repo: "o/h2", Number: 2, Labels: []string{"tatara-brainstorming"}}},
-	}}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	existing := []tatarav1alpha1.Task{
-		mkSourceLedgerTask("hlife-1", "o/h1", 1),
-		mkSourceLedgerTask("hlife-2", "o/h2", 2),
-	}
-	act := tatarav1alpha1.HealthCheckActivity{Enabled: true, MaxOpenProposals: 2}
-	r.healthCheck(context.Background(), proj, reader, repos, existing, act)
-
-	qes := listHealthCheckQEs(t, "hc-mig-cap")
-	require.Empty(t, qes, "healthCheck cap must trip from SCM count even when source-only ledgers exist")
-}
-
 // TestBrainstorm_LedgerProposals_TripCap verifies the ledger path: N role:proposed
 // entries at the cap block a new brainstorm even when SCM returns no proposal issues
 // (the ledger is authoritative when it counts higher).

@@ -50,7 +50,7 @@ func seedMergeTask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMerge,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Merge"
+	task.Status.DeployState = "Merge"
 	task.Status.PRNumber = 42
 	task.Status.PrURL = "https://github.com/o/r/pull/42"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -80,8 +80,8 @@ func TestLifecycleMerge_AllowedOK_TransitionsToMainCIWithSHA(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "MainCI" {
-		t.Errorf("LifecycleState = %q, want MainCI on successful merge", got.Status.LifecycleState)
+	if got.Status.DeployState != "MainCI" {
+		t.Errorf("DeployState = %q, want MainCI on successful merge", got.Status.DeployState)
 	}
 	if got.Status.MergeCommitSHA != "abc123sha" {
 		t.Errorf("MergeCommitSHA = %q, want abc123sha", got.Status.MergeCommitSHA)
@@ -95,7 +95,7 @@ func TestLifecycleMerge_AllowedOK_TransitionsToMainCIWithSHA(t *testing.T) {
 // (not the pure UpsertWorkItem helper) and asserts the role:openedPR ledger entry
 // is flipped to state:merged with the right repo slug/number at the RetryOnConflict
 // persistence site - exercising repoSlugFromURL, the mergeRepoSlug/number guards,
-// and the placement before setLifecycleState.
+// and the placement before setDeployState.
 func TestLifecycleMerge_LedgerOpenedPRFlipsMerged(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	fw := &lifecycleFakeSCMWriterMerge{
@@ -163,8 +163,8 @@ func TestLifecycleMerge_405ConflictSpawnsResolveAttempt_ErrNil(t *testing.T) {
 	_ = result
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement (spawn resolve attempt)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement (spawn resolve attempt)", got.Status.DeployState)
 	}
 	if got.Status.ImplementContext == "" {
 		t.Error("ImplementContext must be set for conflict resolve instruction")
@@ -223,8 +223,8 @@ func TestLifecycleMerge_StampsSemverLabelBeforeMerge(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "MainCI" {
-		t.Errorf("LifecycleState = %q, want MainCI on merge", got.Status.LifecycleState)
+	if got.Status.DeployState != "MainCI" {
+		t.Errorf("DeployState = %q, want MainCI on merge", got.Status.DeployState)
 	}
 	if len(fw.added) != 1 || fw.added[0].label != "semver:minor" || fw.added[0].ref != "o/r#42" {
 		t.Errorf("added labels = %+v, want one semver:minor on o/r#42", fw.added)
@@ -289,8 +289,8 @@ func TestLifecycleMerge_NotAllowedRequeues(t *testing.T) {
 		t.Error("not-allowed merge must requeue")
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Merge" {
-		t.Errorf("LifecycleState = %q, want Merge (not allowed, requeue)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Merge" {
+		t.Errorf("DeployState = %q, want Merge (not allowed, requeue)", got.Status.DeployState)
 	}
 }
 
@@ -310,8 +310,8 @@ func TestLifecycleMerge_TransientErrorRequeues(t *testing.T) {
 		t.Error("transient merge error must requeue")
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Merge" {
-		t.Errorf("LifecycleState = %q, want Merge (transient)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Merge" {
+		t.Errorf("DeployState = %q, want Merge (transient)", got.Status.DeployState)
 	}
 }
 
@@ -328,7 +328,7 @@ func TestLifecycleMerge_TransientDeadlineParks(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (transient error + deadline)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (transient error + deadline)", got.Status.DeployState)
 	}
 }

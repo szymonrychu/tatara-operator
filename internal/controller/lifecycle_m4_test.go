@@ -31,7 +31,7 @@ func TestLifecycleImplement_ChangeSummarySetUsesPRTitleAndBody(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
 	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
@@ -101,7 +101,7 @@ func TestLifecycleImplement_ChangeSummaryUnsetFallsBack(t *testing.T) {
 	if err := k8sClient.Update(context.Background(), task); err != nil {
 		t.Fatalf("update task spec goal: %v", err)
 	}
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
 	// ChangeSummary is intentionally nil (not set)
@@ -163,7 +163,7 @@ func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
 	if err := k8sClient.Update(context.Background(), task); err != nil {
 		t.Fatalf("update task spec: %v", err)
 	}
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
 	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
@@ -243,7 +243,7 @@ func TestLifecycleImplement_RemainingScope_Idempotent(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
 	// PrURL already set simulates idempotent retry (PR already open).
@@ -299,7 +299,7 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
 	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{

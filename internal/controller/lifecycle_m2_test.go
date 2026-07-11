@@ -232,7 +232,7 @@ func TestHandleTriage_PromptIncludesCommentWhenReaderWired(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// State: Triage, agent run about to submit turn-0 (pod ready, Phase=Planning, no turn yet).
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Planning"
 	task.Status.PodName = agent.PodName(task)
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -305,7 +305,7 @@ func TestHandleTriage_PromptNoCommentWhenReaderNotWired(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Planning"
 	task.Status.PodName = agent.PodName(task)
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -367,7 +367,7 @@ func TestConversation_BeforeDeadline_Requeues(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
-	task.Status.LifecycleState = "Conversation"
+	task.Status.DeployState = "Conversation"
 	task.Status.DeadlineAt = &dl
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -392,8 +392,8 @@ func TestConversation_BeforeDeadline_Requeues(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation (before deadline)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation (before deadline)", got.Status.DeployState)
 	}
 
 	// No pod must be created.
@@ -417,7 +417,7 @@ func TestConversation_AfterDeadline_TransitionsToStopped(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	dl := metav1.NewTime(time.Now().Add(-time.Minute)) // already past
-	task.Status.LifecycleState = "Conversation"
+	task.Status.DeployState = "Conversation"
 	task.Status.DeadlineAt = &dl
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -439,8 +439,8 @@ func TestConversation_AfterDeadline_TransitionsToStopped(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Stopped" {
-		t.Errorf("LifecycleState = %q, want Stopped after deadline", got.Status.LifecycleState)
+	if got.Status.DeployState != "Stopped" {
+		t.Errorf("DeployState = %q, want Stopped after deadline", got.Status.DeployState)
 	}
 	// No pod.
 	pod := &corev1.Pod{}
@@ -465,7 +465,7 @@ func TestTriagePrompt_ContainsRealTitleAndBody(t *testing.T) {
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Planning"
 	task.Status.PodName = agent.PodName(task)
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {

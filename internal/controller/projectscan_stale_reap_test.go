@@ -25,7 +25,7 @@ const (
 func matchingTask(num int, lifecycleState string, prURL, headBranch string) tatarav1alpha1.Task {
 	t := tatarav1alpha1.Task{}
 	t.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "o/r#" + itoa(num), Number: num}
-	t.Status.LifecycleState = lifecycleState
+	t.Status.DeployState = lifecycleState
 	t.Status.PrURL = prURL
 	t.Status.HeadBranch = headBranch
 	return t
@@ -152,8 +152,14 @@ type reapFakeWriter struct {
 		number int
 		note   string
 	}
+	commentCalls  []struct{ issueRef, body string }
 	addLabelErr   error
 	closeIssueErr error
+}
+
+func (f *reapFakeWriter) Comment(_ context.Context, _, issueRef, body string) error {
+	f.commentCalls = append(f.commentCalls, struct{ issueRef, body string }{issueRef, body})
+	return nil
 }
 
 func (f *reapFakeWriter) AddLabel(_ context.Context, _, issueRef, label string) error {
@@ -251,7 +257,8 @@ func TestReapStaleProposals_DisabledNoSCMWrites(t *testing.T) {
 	reader := &reapFakeReader{comments: []scm.IssueComment{{Author: reapBot}}}
 	fw := &reapFakeWriter{}
 	r, proj := newReapReconciler(t, "reap-disabled", reader, fw)
-	act := tatarav1alpha1.BrainstormActivity{StaleProposalDays: 0}
+	// Negative -> explicit opt-out (finding #8: 0 now defaults the reaper ON).
+	act := tatarav1alpha1.BrainstormActivity{StaleProposalDays: -1}
 
 	r.reapStaleProposals(context.Background(), proj, reader, staleIssueCache(), nil, act)
 

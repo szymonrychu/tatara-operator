@@ -39,7 +39,7 @@ func TestFinishImplement_ClearsDeadlineBeforeMRCI(t *testing.T) {
 	// Simulate: task went Conversation (deadline set near-future),
 	// then triggerLabel jumped it to Implement. Implement run completed.
 	conversationDeadline := metav1.NewTime(time.Now().Add(5 * time.Minute))
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.DeadlineAt = &conversationDeadline // stale conversation deadline
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -55,8 +55,8 @@ func TestFinishImplement_ClearsDeadlineBeforeMRCI(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "MRCI" {
-		t.Errorf("LifecycleState = %q, want MRCI", got.Status.LifecycleState)
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI", got.Status.DeployState)
 	}
 	// FIX: DeadlineAt must be nil when entering MRCI so ensureDeadline sets a fresh one.
 	if got.Status.DeadlineAt != nil {
@@ -79,7 +79,7 @@ func TestMRCI_AfterConversationDeadlineCleared_GetsFreshDeadline(t *testing.T) {
 
 	got := fetchTask(t, name)
 	// Must NOT park (deadline just set should be far in the future).
-	if got.Status.LifecycleState == "Parked" {
+	if got.Status.DeployState == "Parked" {
 		t.Error("MRCI must NOT park immediately when it just received a fresh deadline from ensureDeadline")
 	}
 	// ensureDeadline must have set a deadline.
@@ -115,7 +115,7 @@ func TestConversation_NilDeadline_SetsDeadlineAndRequeues(t *testing.T) {
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// Explicitly nil DeadlineAt in Conversation (e.g. state set without deadline).
-	task.Status.LifecycleState = "Conversation"
+	task.Status.DeployState = "Conversation"
 	task.Status.DeadlineAt = nil // intentionally nil
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -134,7 +134,7 @@ func TestConversation_NilDeadline_SetsDeadlineAndRequeues(t *testing.T) {
 
 	got := fetchTask(t, name)
 	// Must NOT have transitioned to Stopped (deadline not yet passed).
-	if got.Status.LifecycleState == "Stopped" {
+	if got.Status.DeployState == "Stopped" {
 		t.Error("Conversation with nil DeadlineAt must not immediately transition to Stopped")
 	}
 	// FIX: DeadlineAt must be set now (the safety net populated it).

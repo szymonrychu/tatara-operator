@@ -50,6 +50,18 @@ type Suggestion struct {
 	Body string `json:"body"`
 }
 
+// SemverAssignment is one per-MR push-CD level the review agent assigns on
+// approval, so the release tag can be cut for EVERY MR in the stream - including
+// human/maintainer MRs that carry no bot change_significance (the review approve
+// is their ONLY stamping opportunity). Repo is the "owner/repo" slug (matches
+// WorkItemRef.Repo); Number is the PR/MR number in that repo.
+type SemverAssignment struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	// +kubebuilder:validation:Enum=major;minor;patch
+	Level string `json:"level"`
+}
+
 // ReviewVerdict is the agent's review decision for a human-authored PR/MR.
 type ReviewVerdict struct {
 	// +kubebuilder:validation:Enum=approve;request_changes;comment
@@ -58,6 +70,13 @@ type ReviewVerdict struct {
 	Body string `json:"body,omitempty"`
 	// +optional
 	Suggestions []Suggestion `json:"suggestions,omitempty"`
+	// Semver is the per-MR push-CD level the review agent assigns on approval so
+	// the release tag can be cut for EVERY MR in the stream (human MRs otherwise
+	// carry no change_significance -> cd-release refuses to tag). Applied
+	// best-effort in the approve writeback; an existing semver:* label on a member
+	// MR is respected (a deliberate human semver is authoritative).
+	// +optional
+	Semver []SemverAssignment `json:"semver,omitempty"`
 }
 
 // PROutcome is the agent's outcome for a tatara-authored PR/MR.
@@ -154,17 +173,28 @@ type TaskSource struct {
 	DedupNumber int `json:"dedupNumber,omitempty"`
 }
 
+// The 7-kind redesign makes every agent kind project-scoped EXCEPT
+// documentation. Three of the seven (implement, review, clarify) are
+// project-scoped umbrellas that nonetheless still carry a repo ref for stored /
+// legacy CRs and (implement) open PRs, so they are deliberately UNCONSTRAINED
+// here: the validator accepts either an empty or a non-empty RepositoryRef for
+// them, and IsProjectScopedKind returns false so the writeback project-scoped
+// fence never short-circuits implement's PR path.
+
 // repoScopedKinds are task kinds that require a non-empty RepositoryRef.
+// documentation is the ONE repo-scoped agent kind; the rest are the retired
+// legacy kinds, kept here so a stored repo-scoped legacy Task still validates.
 var repoScopedKinds = map[string]bool{
-	"implement":      true,
-	"review":         true,
+	"documentation":  true,
 	"selfImprove":    true,
 	"triageIssue":    true,
 	"issueLifecycle": true,
-	"documentation":  true,
 }
 
-// projectScopedKinds are task kinds that must have an empty RepositoryRef.
+// projectScopedKinds are task kinds that must have an empty RepositoryRef and
+// never open a PR/MR (IsProjectScopedKind true). implement/review/clarify are
+// project-scoped umbrellas but are NOT in this map (they are unconstrained; see
+// the note above).
 var projectScopedKinds = map[string]bool{
 	"brainstorm":  true,
 	"healthCheck": true,
@@ -172,10 +202,27 @@ var projectScopedKinds = map[string]bool{
 	"refine":      true,
 }
 
+// unconstrainedKinds are the umbrella agent kinds that validate with either an
+// empty or a non-empty RepositoryRef. They are known kinds (IsKnownKind true)
+// but neither repo- nor project-scoped for validation purposes.
+var unconstrainedKinds = map[string]bool{
+	"implement": true,
+	"review":    true,
+	"clarify":   true,
+}
+
 // IsProjectScopedKind reports whether a task kind is project-scoped (operates on
 // the whole Project, carries an empty RepositoryRef, and never opens a PR/MR).
+// implement/review/clarify are umbrella kinds but return false here so the
+// writeback fence does not stop implement from opening PRs.
 func IsProjectScopedKind(kind string) bool {
 	return projectScopedKinds[kind]
+}
+
+// IsKnownKind reports whether kind is a valid Task kind (any of the scoped,
+// project-scoped, or unconstrained sets). Used by the QueuedEvent validator.
+func IsKnownKind(kind string) bool {
+	return repoScopedKinds[kind] || projectScopedKinds[kind] || unconstrainedKinds[kind]
 }
 
 // ValidateTaskSpec validates the RepositoryRef contract for a TaskSpec:
@@ -256,7 +303,12 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// +optional
 	MaxTurns int `json:"maxTurns,omitempty"`
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine;documentation
+	// Kind selects the agent behavior. The 7-kind model is
+	// brainstorm;incident;clarify;implement;review;documentation;refine. The
+	// strings selfImprove;triageIssue;healthCheck;issueLifecycle are RETIRED as
+	// agent kinds - inert, retained in the enum only so already-persisted terminal
+	// CRs still deserialize and read; no code path creates them anymore.
+	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine;documentation;clarify
 	// +kubebuilder:default="implement"
 	// +optional
 	Kind string `json:"kind,omitempty"`
@@ -303,17 +355,17 @@ const (
 	// (operator-laneoccupancy-starves-recovery-2026-06-15). It re-acquires a lane
 	// only to spawn a fix agent.
 	PhaseDeploying = "Deploying"
-	// LifecycleStateDeploying is the issueLifecycle counterpart of PhaseDeploying:
-	// the durable per-issue Task carries it in Status.LifecycleState while the
+	// DeployStateDeploying is the issueLifecycle counterpart of PhaseDeploying:
+	// the durable per-issue Task carries it in Status.DeployState while the
 	// operator drives the post-merge deploy cascade. It is set together with
 	// Status.Phase=PhaseDeploying. It is NOT a terminal lifecycle state (TaskTerminal
 	// stays false) so conversation-GC / reaper / lane logic treat it as live.
-	LifecycleStateDeploying = "Deploying"
+	DeployStateDeploying = "Deploying"
 )
 
 // TaskTerminal reports whether t has reached a terminal state, accounting for
-// the dual Phase / LifecycleState design: issueLifecycle tasks leave Phase
-// empty for their whole life and signal completion via LifecycleState. Any
+// the dual Phase / DeployState design: issueLifecycle tasks leave Phase
+// empty for their whole life and signal completion via DeployState. Any
 // predicate that must treat finished lifecycle tasks as terminal MUST call
 // this helper instead of testing Phase alone.
 //
@@ -324,7 +376,7 @@ func TaskTerminal(t *Task) bool {
 	if t.Status.Phase == PhaseSucceeded || t.Status.Phase == PhaseFailed {
 		return true
 	}
-	ls := t.Status.LifecycleState
+	ls := t.Status.DeployState
 	return ls == "Done" || ls == "Stopped" || ls == "Parked"
 }
 
@@ -337,9 +389,12 @@ func TaskDeploying(t *Task) bool {
 
 // IsRecoverableGiveup reports whether a Parked reason represents an
 // implementation that gave up and may be re-rolled (vs a deliberate decline).
+// merge-timeout (parkUmbrellaMergeTimeout's mergeParkReason) is symmetric with
+// deploy-timeout: both are auto-recoverable stalls, not a human decline, so both
+// must be aged-out by recoverOrphans and spared by the reaper the same way.
 func IsRecoverableGiveup(reason string) bool {
 	switch reason {
-	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout":
+	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout", "merge-timeout":
 		return true
 	default:
 		return false
@@ -352,7 +407,7 @@ type TaskStatus struct {
 	// NOTE: Pending and AwaitingApproval are intentionally absent: no code path
 	// ever writes them (approval is now driven by the SCM conversation flow and
 	// projected onto labels, not a Phase transition). They are removed here to
-	// keep the CRD enum honest and prevent confusion with LifecycleState.
+	// keep the CRD enum honest and prevent confusion with DeployState.
 	// Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
 	// +optional
 	Phase string `json:"phase,omitempty"`
@@ -397,9 +452,14 @@ type TaskStatus struct {
 	// propagation) went green, and the operator now drives the push-CD cascade to a
 	// tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
 	// occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
+	// The Go field is DeployState (agent-invisible, deploy-supervisor-only) but the
+	// JSON/CRD key stays lifecycleState so stored CRs still deserialize and the
+	// agent-visible task_list field is unchanged. The enum keeps the front-half
+	// values (Triage/Conversation/Implement/MRCI) for the drain of in-flight
+	// issueLifecycle Tasks.
 	// +kubebuilder:validation:Enum=Triage;Conversation;Implement;MRCI;Merge;MainCI;Deploying;Done;Stopped;Parked
 	// +optional
-	LifecycleState string `json:"lifecycleState,omitempty"`
+	DeployState string `json:"lifecycleState,omitempty"`
 	// +optional
 	LastActivityAt *metav1.Time `json:"lastActivityAt,omitempty"`
 	// +optional
@@ -502,6 +562,22 @@ type TaskStatus struct {
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
 
+	// ApprovedByMaintainer records the identity-verified fact that a HUMAN
+	// MAINTAINER explicitly approved this issue for implementation, by applying
+	// the approved label to it. It is set by the webhook ONLY when it observes an
+	// issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
+	// (never the bot: a bot/agent that sets the label itself cannot self-approve).
+	// It is the ONLY signal that releases a front-half Task (clarify / the
+	// issueLifecycle bridge) into the autonomous implement->review->merge->deploy
+	// chain: every path that would advance a front-half issue to Implement gates
+	// on it (finishFrontHalf, the Conversation label readback, the trigger-label
+	// jump). Empty means NO verified maintainer approval - the operator fails
+	// CLOSED (parks to Conversation) rather than trusting raw label presence,
+	// which an agent with SCM write could forge. Holds the approving maintainer's
+	// login for audit.
+	// +optional
+	ApprovedByMaintainer string `json:"approvedByMaintainer,omitempty"`
+
 	// Deploy-supervision fields (PhaseDeploying only; empty otherwise). The
 	// implement Task does not go terminal at PR-merge: it enters Deploying and
 	// the operator drives the push-CD cascade to a tatara-helmfile apply, then
@@ -525,6 +601,21 @@ type TaskStatus struct {
 	// Task records, the key the apply-outcome sweep matches against applied pins.
 	// +optional
 	DeployArtifact string `json:"deployArtifact,omitempty"`
+	// MergeWaitDeadline bounds a discrete-implement umbrella Task's wait for its
+	// member PRs to be reviewed + merged (the pre-Deploying window). When members
+	// stay unmerged past this wall clock, superviseMergedPRs parks the stream
+	// recoverable with an issue comment naming the stuck member(s) (item 3). It is
+	// distinct from DeployDeadline, which bounds the post-merge cascade.
+	// +optional
+	MergeWaitDeadline *metav1.Time `json:"mergeWaitDeadline,omitempty"`
+	// ReviewResolveDeadline bounds an umbrella review's wall-clock wait for an
+	// unresolvable member repo URL to become resolvable (un-enrolled member repo,
+	// or a projectRepoURLBySlug List error). Stamped on the first unresolvable
+	// encounter; once it elapses, writeBackReview parks the review recoverable with
+	// an issue comment naming the stuck member instead of error-looping forever
+	// (liveness finding #4).
+	// +optional
+	ReviewResolveDeadline *metav1.Time `json:"reviewResolveDeadline,omitempty"`
 }
 
 // +kubebuilder:object:root=true

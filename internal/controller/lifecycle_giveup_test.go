@@ -13,7 +13,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
-func TestSetLifecycleState_ImplementGiveUps(t *testing.T) {
+func TestSetDeployState_ImplementGiveUps(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
 	reg := prometheus.NewRegistry()
@@ -44,15 +44,15 @@ func TestSetLifecycleState_ImplementGiveUps(t *testing.T) {
 	}
 
 	// First give-up: Implement -> Parked with recoverable reason.
-	if err := r.setLifecycleState(ctx, task, "Implement", "initial"); err != nil {
-		t.Fatalf("setLifecycleState Implement: %v", err)
+	if err := r.setDeployState(ctx, task, "Implement", "initial"); err != nil {
+		t.Fatalf("setDeployState Implement: %v", err)
 	}
 	got := &tatarav1alpha1.Task{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if err := r.setLifecycleState(ctx, got, "Parked", "implement-failed"); err != nil {
-		t.Fatalf("setLifecycleState Parked: %v", err)
+	if err := r.setDeployState(ctx, got, "Parked", "implement-failed"); err != nil {
+		t.Fatalf("setDeployState Parked: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
@@ -62,14 +62,14 @@ func TestSetLifecycleState_ImplementGiveUps(t *testing.T) {
 	}
 
 	// Second give-up: re-enter Implement then Parked again with recoverable reason.
-	if err := r.setLifecycleState(ctx, got, "Implement", "triage-implement"); err != nil {
-		t.Fatalf("setLifecycleState Implement 2: %v", err)
+	if err := r.setDeployState(ctx, got, "Implement", "triage-implement"); err != nil {
+		t.Fatalf("setDeployState Implement 2: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if err := r.setLifecycleState(ctx, got, "Parked", "maxIterations"); err != nil {
-		t.Fatalf("setLifecycleState Parked 2: %v", err)
+	if err := r.setDeployState(ctx, got, "Parked", "maxIterations"); err != nil {
+		t.Fatalf("setDeployState Parked 2: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
@@ -79,14 +79,14 @@ func TestSetLifecycleState_ImplementGiveUps(t *testing.T) {
 	}
 
 	// Non-recoverable reason: counter must NOT increment.
-	if err := r.setLifecycleState(ctx, got, "Implement", "triage-implement"); err != nil {
-		t.Fatalf("setLifecycleState Implement 3: %v", err)
+	if err := r.setDeployState(ctx, got, "Implement", "triage-implement"); err != nil {
+		t.Fatalf("setDeployState Implement 3: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if err := r.setLifecycleState(ctx, got, "Parked", "refused-declined"); err != nil {
-		t.Fatalf("setLifecycleState Parked non-recoverable: %v", err)
+	if err := r.setDeployState(ctx, got, "Parked", "refused-declined"); err != nil {
+		t.Fatalf("setDeployState Parked non-recoverable: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
@@ -96,14 +96,14 @@ func TestSetLifecycleState_ImplementGiveUps(t *testing.T) {
 	}
 
 	// Transition NOT from Implement: counter must NOT increment.
-	if err := r.setLifecycleState(ctx, got, "Triage", ""); err != nil {
-		t.Fatalf("setLifecycleState Triage: %v", err)
+	if err := r.setDeployState(ctx, got, "Triage", ""); err != nil {
+		t.Fatalf("setDeployState Triage: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if err := r.setLifecycleState(ctx, got, "Parked", "implement-failed"); err != nil {
-		t.Fatalf("setLifecycleState Parked from Triage: %v", err)
+	if err := r.setDeployState(ctx, got, "Parked", "implement-failed"); err != nil {
+		t.Fatalf("setDeployState Parked from Triage: %v", err)
 	}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "gu-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)

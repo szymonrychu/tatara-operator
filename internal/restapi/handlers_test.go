@@ -322,6 +322,34 @@ func TestReviewVerdict(t *testing.T) {
 	require.Len(t, out.Status.ReviewVerdict.Suggestions, 1)
 }
 
+func TestReviewVerdict_CarriesSemver(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"decision":"approve","semver":[{"repo":"o/r","number":9,"level":"minor"},{"repo":"o/r2","number":21,"level":"major"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ReviewVerdict)
+	require.Len(t, out.Status.ReviewVerdict.Semver, 2)
+	require.Equal(t, "o/r", out.Status.ReviewVerdict.Semver[0].Repo)
+	require.Equal(t, 9, out.Status.ReviewVerdict.Semver[0].Number)
+	require.Equal(t, "minor", out.Status.ReviewVerdict.Semver[0].Level)
+	require.Equal(t, "major", out.Status.ReviewVerdict.Semver[1].Level)
+}
+
+func TestReviewVerdict_InvalidSemverLevel(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"decision":"approve","semver":[{"repo":"o/r","number":9,"level":"nope"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/review", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestReviewVerdict_MissingDecision(t *testing.T) {
 	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	body := strings.NewReader(`{"body":"lgtm"}`)
@@ -431,6 +459,23 @@ func TestIssueOutcome_Implement(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestIssueOutcome_Clarify(t *testing.T) {
+	// A clarify umbrella pod is instructed (clarifyGoalTail) to call issue_outcome
+	// as its REQUIRED terminal; finishClarify consumes Status.IssueOutcome. The
+	// handler must admit kind=clarify or every clarify->implement handoff 409s.
+	r := buildRouter(t, taskWithKind("t1", "alpha", "clarify"))
+	body := strings.NewReader(`{"action":"implement"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.IssueOutcome)
+	require.Equal(t, "implement", out.Status.IssueOutcome.Action)
 }
 
 func TestIssueOutcome_DiscussLifecycle(t *testing.T) {
@@ -554,8 +599,27 @@ func TestImplementOutcome_MissingReason(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestImplementOutcome_WrongKind(t *testing.T) {
+func TestImplementOutcome_DiscreteImplement(t *testing.T) {
+	// The discrete implement umbrella kind runs tatara-implement-workflow, whose
+	// terminal (per tatara-mcp-scm-lifecycle) is decline_implementation /
+	// already_done -> implement_outcome. The handler must admit kind=implement.
 	r := buildRouter(t, taskWithKind("t1", "alpha", "implement"))
+	body := strings.NewReader(`{"action":"declined","reason":"out of scope after investigation"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var out restapi.TaskDTO
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.NotNil(t, out.Status.ImplementOutcome)
+	require.Equal(t, "declined", out.Status.ImplementOutcome.Action)
+	require.Equal(t, "out of scope after investigation", out.Status.ImplementOutcome.Reason)
+}
+
+func TestImplementOutcome_WrongKind(t *testing.T) {
+	// review has no implement_outcome tool in its profile; it must still 409.
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	body := strings.NewReader(`{"action":"declined","reason":"not needed"}`)
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", body)
 	w := httptest.NewRecorder()

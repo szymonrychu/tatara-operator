@@ -93,7 +93,7 @@ func seedMainCITask(t *testing.T, suffix string, fw *lifecycleFakeSCMWriterMainC
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
-	task.Status.LifecycleState = "MainCI"
+	task.Status.DeployState = "MainCI"
 	task.Status.MergeCommitSHA = "deadbeef"
 	task.Status.PRNumber = 55
 	task.Status.PrURL = "https://github.com/o/r/pull/55"
@@ -126,8 +126,8 @@ func TestLifecycleMainCI_PendingRequeues(t *testing.T) {
 		t.Error("pending MainCI must requeue")
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "MainCI" {
-		t.Errorf("LifecycleState = %q, want MainCI on pending", got.Status.LifecycleState)
+	if got.Status.DeployState != "MainCI" {
+		t.Errorf("DeployState = %q, want MainCI on pending", got.Status.DeployState)
 	}
 }
 
@@ -142,8 +142,8 @@ func TestLifecycleMainCI_SuccessClosesDoneIdempotent(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Done" {
-		t.Errorf("LifecycleState = %q, want Done on MainCI success", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Errorf("DeployState = %q, want Done on MainCI success", got.Status.DeployState)
 	}
 }
 
@@ -171,8 +171,8 @@ func TestLifecycleMainCI_LedgerCloseProjection(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Done" {
-		t.Fatalf("LifecycleState = %q, want Done", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Fatalf("DeployState = %q, want Done", got.Status.DeployState)
 	}
 	var src, sib *tatarav1alpha1.WorkItemRef
 	for i := range got.Status.WorkItems {
@@ -209,8 +209,8 @@ func TestLifecycleMainCI_SuccessCloseIssueIdempotentOnNotFound(t *testing.T) {
 		t.Fatalf("reconcileLifecycle on idempotent close: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Done" {
-		t.Errorf("LifecycleState = %q, want Done (idempotent CloseIssue)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Errorf("DeployState = %q, want Done (idempotent CloseIssue)", got.Status.DeployState)
 	}
 }
 
@@ -224,8 +224,8 @@ func TestLifecycleMainCI_FailureReentersImplement(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement on MainCI failure", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement on MainCI failure", got.Status.DeployState)
 	}
 	if got.Status.ImplementContext == "" {
 		t.Error("ImplementContext must be set on MainCI failure")
@@ -242,8 +242,8 @@ func TestLifecycleMainCI_DeadlineParks(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked on MainCI deadline", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked on MainCI deadline", got.Status.DeployState)
 	}
 	fw.mu.Lock()
 	defer fw.mu.Unlock()

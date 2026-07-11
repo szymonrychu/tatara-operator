@@ -16,7 +16,17 @@ func repoFromIssueRef(issueRef string) string {
 // UpsertWorkItem upserts ref into task.Status.WorkItems. Idempotent by
 // (Repo, Number, Kind) when Number > 0; for unfiled proposals (Number==0)
 // it matches by (Repo, Title, Role). On match it updates Role, State, HeadSHA,
-// Title, and LastRefreshedAt in place; otherwise appends.
+// HeadBranch, Title, LastRefreshedAt, the umbrella member-state fields
+// (Labels, Body, CIStatus, Mergeable), and the per-member deploy fields
+// (DeployedVersion, DeployState) in place (each only when the incoming ref
+// carries a non-empty value); otherwise appends.
+//
+// It is the sole merge primitive used to persist a refreshed member ledger under
+// RetryOnConflict: callers upsert each refreshed member into the freshly-read Task
+// rather than assigning a snapshot slice wholesale, so a member appended
+// concurrently (e.g. a stream PR joined mid-refresh) is never dropped by the
+// refresh persist. Carrying the umbrella member-state fields here keeps that
+// merge-refresh lossless.
 func UpsertWorkItem(task *tatarav1alpha1.Task, ref tatarav1alpha1.WorkItemRef) {
 	for i := range task.Status.WorkItems {
 		wi := &task.Status.WorkItems[i]
@@ -36,11 +46,35 @@ func UpsertWorkItem(task *tatarav1alpha1.Task, ref tatarav1alpha1.WorkItemRef) {
 			if ref.HeadSHA != "" {
 				wi.HeadSHA = ref.HeadSHA
 			}
+			if ref.HeadBranch != "" {
+				wi.HeadBranch = ref.HeadBranch
+			}
 			if ref.Title != "" {
 				wi.Title = ref.Title
 			}
 			if ref.LastRefreshedAt != nil {
 				wi.LastRefreshedAt = ref.LastRefreshedAt
+			}
+			if len(ref.Labels) > 0 {
+				wi.Labels = ref.Labels
+			}
+			if ref.Body != "" {
+				wi.Body = ref.Body
+			}
+			if ref.CIStatus != "" {
+				wi.CIStatus = ref.CIStatus
+			}
+			if ref.Mergeable != "" {
+				wi.Mergeable = ref.Mergeable
+			}
+			// Per-member deploy tracking (discrete-umbrella deploy supervision):
+			// carried through the same conflict-safe merge so a concurrent member
+			// refresh never blind-overwrites a member's cut version / cascade state.
+			if ref.DeployedVersion != "" {
+				wi.DeployedVersion = ref.DeployedVersion
+			}
+			if ref.DeployState != "" {
+				wi.DeployState = ref.DeployState
 			}
 			return
 		}

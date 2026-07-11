@@ -29,6 +29,12 @@ func TestDerivePRTitle(t *testing.T) {
 		{"absent changesummary derives", mk("implement", "Thread systemicId through propose_issue", "", "issue body first line"), "feat(repo): Thread systemicId through propose_issue"},
 		{"no source title falls to goal-ish but not weak", mk("issueLifecycle", "", "", "Make the brainstorm survey live state"), "fix(repo): Make the brainstorm survey live state"},
 		{"documentation kind titles as docs", mk("documentation", "", "", "Update docs for the merged diff"), "docs(repo): Update docs for the merged diff"},
+		{"incident kind titles as fix", mk("incident", "Memory 5xx spike", "", "b"), "fix(repo): Memory 5xx spike"},
+		{"implement kind titles as feat", mk("implement", "Add umbrella bundle", "", "b"), "feat(repo): Add umbrella bundle"},
+		{"review kind defaults feat", mk("review", "Review PR", "", "b"), "feat(repo): Review PR"},
+		{"clarify kind defaults feat", mk("clarify", "Clarify scope", "", "b"), "feat(repo): Clarify scope"},
+		{"refine kind defaults feat", mk("refine", "Refine backlog", "", "b"), "feat(repo): Refine backlog"},
+		{"scope arg is the repo name", mk("implement", "X", "", "b"), "feat(repo): X"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

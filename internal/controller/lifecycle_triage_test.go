@@ -12,7 +12,7 @@ import (
 
 // ----- Task 5: Triage state handler -----
 
-// seedTriageSucceeded seeds a task in LifecycleState=Triage/Phase=Succeeded
+// seedTriageSucceeded seeds a task in DeployState=Triage/Phase=Succeeded
 // with the given IssueOutcome, then returns the reconciler and task name.
 func seedTriageSucceeded(t *testing.T, nameSuffix string, outcome *tatarav1alpha1.IssueOutcome) (r *TaskReconciler, fw *lifecycleFakeSCMWriter, taskName string) {
 	t.Helper()
@@ -26,8 +26,8 @@ func seedTriageSucceeded(t *testing.T, nameSuffix string, outcome *tatarav1alpha
 		Number: 5,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	// Seed the task as if a Triage agent run completed: LifecycleState=Triage, Phase=Succeeded.
-	task.Status.LifecycleState = "Triage"
+	// Seed the task as if a Triage agent run completed: DeployState=Triage, Phase=Succeeded.
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = outcome
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
@@ -68,8 +68,8 @@ func TestLifecycleTriage_Close(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Done" {
-		t.Errorf("LifecycleState = %q, want Done", got.Status.LifecycleState)
+	if got.Status.DeployState != "Done" {
+		t.Errorf("DeployState = %q, want Done", got.Status.DeployState)
 	}
 	if got.Status.IssueOutcome != nil {
 		t.Error("IssueOutcome must be cleared after consuming")
@@ -106,8 +106,8 @@ func TestLifecycleTriage_Discuss(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation", got.Status.DeployState)
 	}
 	if got.Status.DeadlineAt == nil {
 		t.Error("DeadlineAt must be set after discuss transition")
@@ -122,6 +122,7 @@ func TestLifecycleTriage_Implement(t *testing.T) {
 	r, fw, name := seedTriageSucceeded(t, "impl", &tatarav1alpha1.IssueOutcome{
 		Action: "implement",
 	})
+	recordApproval(t, name, "szymon") // verified maintainer approval is the release signal
 
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
 		tk := &tatarav1alpha1.Task{}
@@ -147,8 +148,8 @@ func TestLifecycleTriage_Implement(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement", got.Status.DeployState)
 	}
 	if got.Status.IssueOutcome != nil {
 		t.Error("IssueOutcome must be cleared after consuming")
@@ -179,11 +180,11 @@ func TestLifecycleTriage_NilOutcomeDefaultsToDiscuss(t *testing.T) {
 		t.Fatalf("get task after: %v", err)
 	}
 	// After the fix: nil outcome -> Conversation (inconclusive, await human input).
-	if got.Status.LifecycleState == "Implement" {
+	if got.Status.DeployState == "Implement" {
 		t.Error("nil IssueOutcome must NOT enter Implement; inconclusive run should enter Conversation")
 	}
-	if got.Status.LifecycleState != "Conversation" {
-		t.Errorf("LifecycleState = %q, want Conversation (nil outcome is inconclusive, not implement)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Conversation" {
+		t.Errorf("DeployState = %q, want Conversation (nil outcome is inconclusive, not implement)", got.Status.DeployState)
 	}
 }
 
@@ -195,7 +196,7 @@ func TestLifecycleTriage_FailedTransitionsToParked(t *testing.T) {
 	sec := "lc-ts-failed"
 	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Failed"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed failed status: %v", err)
@@ -217,8 +218,8 @@ func TestLifecycleTriage_FailedTransitionsToParked(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 }
 
@@ -243,12 +244,13 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 	task := seedLifecycleTask(t, name, projName, repoName, sec, src)
 
 	// Put the task into Triage / Succeeded with an implement outcome.
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.Phase = "Succeeded"
 	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("seed triage succeeded: %v", err)
 	}
+	recordApproval(t, name, "szymon") // verified maintainer approval is the release signal
 
 	r := newLifecycleReconciler(t, &lifecycleFakeSCMWriter{})
 
@@ -268,7 +270,7 @@ func TestLifecycleTriage_ConcurrencyCapDoesNotBlockFinishTriage(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); err != nil {
 		t.Fatalf("get task after: %v", err)
 	}
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement; concurrency cap must not block finishTriage", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement; concurrency cap must not block finishTriage", got.Status.DeployState)
 	}
 }

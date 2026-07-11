@@ -26,7 +26,7 @@ func tk(name, phase, lifecycle, queuedEvent string) tatarav1alpha1.Task {
 	return tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara", Labels: map[string]string{queue.LabelQueuedEvent: queuedEvent}},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p"},
-		Status:     tatarav1alpha1.TaskStatus{Phase: phase, LifecycleState: lifecycle},
+		Status:     tatarav1alpha1.TaskStatus{Phase: phase, DeployState: lifecycle},
 	}
 }
 
@@ -325,7 +325,7 @@ func TestAdmit_StaleTerminalTaskNameCollision(t *testing.T) {
 		t.Fatalf("fresh Task %q not found: %v", fixedName, err)
 	}
 	if tatarav1alpha1.TaskTerminal(freshTask) {
-		t.Fatalf("fresh Task must be non-terminal, got phase=%q ls=%q", freshTask.Status.Phase, freshTask.Status.LifecycleState)
+		t.Fatalf("fresh Task must be non-terminal, got phase=%q ls=%q", freshTask.Status.Phase, freshTask.Status.DeployState)
 	}
 }
 

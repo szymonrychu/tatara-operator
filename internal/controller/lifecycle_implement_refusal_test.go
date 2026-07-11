@@ -24,7 +24,7 @@ func seedDeclaredDeclineTask(t *testing.T, name, proj, repo, sec, reason string)
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
 		Action: "declined",
@@ -73,8 +73,8 @@ func TestFinishImplement_DeclaredDecline_Parks(t *testing.T) {
 
 	got := reconcileDeclaredDeclineTask(t, name, fw)
 
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (refused)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (refused)", got.Status.DeployState)
 	}
 	if got.Status.ImplementOutcome != nil {
 		t.Errorf("ImplementOutcome should be nil after consuming; got %+v", got.Status.ImplementOutcome)
@@ -103,7 +103,7 @@ func TestFinishImplement_DeclaredDecline_ResetsRetries(t *testing.T) {
 		URL: "https://github.com/o/r/issues/301", Number: 301,
 	}
 	task := seedLifecycleTask(t, name, "lc-rrr-proj", "lc-rrr-repo", "lc-rrr-sec", src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementEmptyRetries = 1 // was already retried once silently
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
@@ -117,8 +117,8 @@ func TestFinishImplement_DeclaredDecline_ResetsRetries(t *testing.T) {
 
 	got := reconcileDeclaredDeclineTask(t, name, fw)
 
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 	if got.Status.ImplementEmptyRetries != 0 {
 		t.Errorf("ImplementEmptyRetries = %d, want 0", got.Status.ImplementEmptyRetries)
@@ -134,8 +134,8 @@ func TestFinishImplement_NoDecline_FirstRetryWithPrompt(t *testing.T) {
 
 	got := reconcileEmptyImplementTask(t, name, fw)
 
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement (should retry)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement (should retry)", got.Status.DeployState)
 	}
 	if got.Status.ImplementEmptyRetries != 1 {
 		t.Errorf("ImplementEmptyRetries = %d, want 1", got.Status.ImplementEmptyRetries)
@@ -155,8 +155,8 @@ func TestFinishImplement_NoDecline_ParksAtCapWithComment(t *testing.T) {
 
 	got := reconcileEmptyImplementTask(t, name, fw)
 
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (at cap, no explanation)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (at cap, no explanation)", got.Status.DeployState)
 	}
 
 	// A comment must be posted noting the agent did not explain.
@@ -176,7 +176,7 @@ func TestFinishImplement_PROpened_IgnoresImplementOutcome(t *testing.T) {
 		URL: "https://github.com/o/r/issues/302", Number: 302,
 	}
 	task := seedLifecycleTask(t, name, "lc-rpo-proj", "lc-rpo-repo", "lc-rpo-sec", src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	// ImplementOutcome set but a PR was also opened - PR wins.
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
@@ -207,19 +207,19 @@ func TestFinishImplement_PROpened_IgnoresImplementOutcome(t *testing.T) {
 	}
 
 	// Should have moved to MRCI, not Parked.
-	if got.Status.LifecycleState != "MRCI" {
-		t.Errorf("LifecycleState = %q, want MRCI (PR opened overrides refusal)", got.Status.LifecycleState)
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI (PR opened overrides refusal)", got.Status.DeployState)
 	}
 	if got.Status.PrURL == "" {
 		t.Error("PrURL should be set when PR was opened")
 	}
 }
 
-// TestSetLifecycleState_EntersImplement_ClearsImplementOutcome verifies that a
+// TestSetDeployState_EntersImplement_ClearsImplementOutcome verifies that a
 // triage-initiated Implement entry clears ImplementOutcome (fresh triage-implement
 // transition). CI-failure re-entries do NOT clear it so a stale refusal is not
 // silently discarded (finding 8).
-func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) {
+func TestSetDeployState_EntersImplement_ClearsImplementOutcome(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-refusal-entry-clear"
 	src := &tatarav1alpha1.TaskSource{
@@ -227,7 +227,7 @@ func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) 
 		URL: "https://github.com/o/r/issues/303", Number: 303,
 	}
 	task := seedLifecycleTask(t, name, "lc-rec-proj", "lc-rec-repo", "lc-rec-sec", src)
-	task.Status.LifecycleState = "Triage"
+	task.Status.DeployState = "Triage"
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
 		Action: "declined",
 		Reason: "stale from prior run",
@@ -240,8 +240,8 @@ func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) 
 	// Use "triage-implement" reason: this is a fresh triage-initiated entry and must
 	// clear ImplementOutcome. CI-failure re-entries ("mrci-failure", "mainci-failure")
 	// must NOT clear it.
-	if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, task, "Implement", "triage-implement"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 
 	got := &tatarav1alpha1.Task{}
@@ -253,10 +253,10 @@ func TestSetLifecycleState_EntersImplement_ClearsImplementOutcome(t *testing.T) 
 	}
 }
 
-// TestSetLifecycleState_CIFailureReentry_PreservesImplementOutcome verifies that
+// TestSetDeployState_CIFailureReentry_PreservesImplementOutcome verifies that
 // CI-failure re-entries do NOT clear ImplementOutcome (finding 8: stale refusal
 // must not be discarded silently on a re-implement).
-func TestSetLifecycleState_CIFailureReentry_PreservesImplementOutcome(t *testing.T) {
+func TestSetDeployState_CIFailureReentry_PreservesImplementOutcome(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-refusal-ci-reentry"
 	src := &tatarav1alpha1.TaskSource{
@@ -264,7 +264,7 @@ func TestSetLifecycleState_CIFailureReentry_PreservesImplementOutcome(t *testing
 		URL: "https://github.com/o/r/issues/304", Number: 304,
 	}
 	task := seedLifecycleTask(t, name, "lc-rci-proj", "lc-rci-repo", "lc-rci-sec", src)
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.ImplementOutcome = &tatarav1alpha1.ImplementOutcome{
 		Action: "declined",
 		Reason: "stale refusal from a failed clearImplementOutcome",
@@ -274,8 +274,8 @@ func TestSetLifecycleState_CIFailureReentry_PreservesImplementOutcome(t *testing
 	}
 
 	r := newLifecycleReconciler(t, nil)
-	if err := r.setLifecycleState(ctx, task, "Implement", "mrci-failure"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, task, "Implement", "mrci-failure"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 
 	got := &tatarav1alpha1.Task{}

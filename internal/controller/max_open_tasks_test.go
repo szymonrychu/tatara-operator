@@ -41,7 +41,7 @@ func TestTaskActive_ExcludesTerminalLifecycle(t *testing.T) {
 	for _, tc := range cases {
 		tk := &tatarav1alpha1.Task{}
 		tk.Status.Phase = tc.phase
-		tk.Status.LifecycleState = tc.lifecycle
+		tk.Status.DeployState = tc.lifecycle
 		if got := taskActive(tk); got != tc.want {
 			t.Errorf("taskActive(phase=%q, lifecycle=%q) = %v, want %v", tc.phase, tc.lifecycle, got, tc.want)
 		}

@@ -137,7 +137,7 @@ func TestMutateTaskStatus_ImplementOutcome_Contract(t *testing.T) {
 }
 
 func TestMutateTaskStatus_ImplementOutcome_WrongKindErrorText(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t1", "alpha", "implement"))
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
 	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/implement-outcome", strings.NewReader(`{"action":"declined","reason":"not needed"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -145,7 +145,7 @@ func TestMutateTaskStatus_ImplementOutcome_WrongKindErrorText(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code)
 	var out map[string]string
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
-	require.Equal(t, "implement outcome only applies to an issueLifecycle task", out["error"])
+	require.Equal(t, "implement outcome only applies to an implement or issueLifecycle task", out["error"])
 }
 
 func TestMutateTaskStatus_BrainstormOutcome_Contract(t *testing.T) {
@@ -206,5 +206,5 @@ func TestMutateTaskStatus_IssueOutcome_WrongKindErrorText(t *testing.T) {
 	require.Equal(t, http.StatusConflict, w.Code)
 	var out map[string]string
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
-	require.Equal(t, "issue outcome only applies to a triageIssue or issueLifecycle task", out["error"])
+	require.Equal(t, "issue outcome only applies to a clarify, triageIssue or issueLifecycle task", out["error"])
 }

@@ -19,7 +19,7 @@ import (
 // --- Findings 1+2: dedup loop uses Phase-only terminality, blocks re-trigger of Done lifecycle task ---
 
 // TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger verifies that a
-// trigger-label on an issue whose lifecycle Task has LifecycleState=Done
+// trigger-label on an issue whose lifecycle Task has DeployState=Done
 // (Phase="") is NOT treated as a duplicate. Before the fix, Phase="" passes
 // `Phase != "Succeeded" && Phase != "Failed"` and the event is swallowed as
 // "duplicate". After the fix (using TaskTerminal), Done is terminal so the
@@ -29,7 +29,7 @@ func TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger(t *testing.T) {
 	proj := projectWithBot("r3f12proj", "r3f12proj-scm", "tatara", "tatara-bot")
 	repo := repository("r3f12repo", "r3f12proj", "https://github.com/o/r.git", "main")
 
-	// Done lifecycle task: Phase="" (as always for lifecycle tasks), LifecycleState=Done.
+	// Done lifecycle task: Phase="" (as always for lifecycle tasks), DeployState=Done.
 	doneTask := &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "r3f12-done-task",
@@ -52,8 +52,8 @@ func TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger(t *testing.T) {
 			},
 		},
 		Status: tatarav1.TaskStatus{
-			Phase:          "", // issueLifecycle tasks always have empty Phase
-			LifecycleState: "Done",
+			Phase:       "", // issueLifecycle tasks always have empty Phase
+			DeployState: "Done",
 		},
 	}
 
@@ -88,7 +88,7 @@ func TestR3Finding1And2_DoneLifecycleTask_AllowsRetrigger(t *testing.T) {
 }
 
 // TestR3Finding1And2_ParkedLifecycleTask_AllowsRetrigger verifies that a
-// Parked (LifecycleState=Parked, Phase="") lifecycle Task does not block a
+// Parked (DeployState=Parked, Phase="") lifecycle Task does not block a
 // new trigger-label event. TaskTerminal returns true for Parked, so the
 // dedup scan skips it and a new Task is created.
 func TestR3Finding1And2_ParkedLifecycleTask_AllowsRetrigger(t *testing.T) {
@@ -118,8 +118,8 @@ func TestR3Finding1And2_ParkedLifecycleTask_AllowsRetrigger(t *testing.T) {
 			},
 		},
 		Status: tatarav1.TaskStatus{
-			Phase:          "",
-			LifecycleState: "Parked",
+			Phase:       "",
+			DeployState: "Parked",
 		},
 	}
 
@@ -156,7 +156,7 @@ func TestR3Finding1And2_ParkedLifecycleTask_AllowsRetrigger(t *testing.T) {
 }
 
 // TestR3Finding1And2_ActiveLifecycleTask_StillDeduped verifies that a
-// genuinely in-progress lifecycle Task (LifecycleState=Implement, Phase="")
+// genuinely in-progress lifecycle Task (DeployState=Implement, Phase="")
 // still blocks a duplicate trigger-label event. After the fix, TaskTerminal
 // returns false for Implement, so the dedup scan correctly blocks it.
 func TestR3Finding1And2_ActiveLifecycleTask_StillDeduped(t *testing.T) {
@@ -186,8 +186,8 @@ func TestR3Finding1And2_ActiveLifecycleTask_StillDeduped(t *testing.T) {
 			},
 		},
 		Status: tatarav1.TaskStatus{
-			Phase:          "",
-			LifecycleState: "Implement",
+			Phase:       "",
+			DeployState: "Implement",
 		},
 	}
 
@@ -322,7 +322,7 @@ func TestR3Finding5_CommentBodyPreservedAtTriage(t *testing.T) {
 	var qel tatarav1.QueuedEventList
 	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
 	require.Len(t, qel.Items, 1, "human comment on untracked issue must create one QueuedEvent")
-	require.Equal(t, "issueLifecycle", qel.Items[0].Spec.Payload.Kind)
+	require.Equal(t, "clarify", qel.Items[0].Spec.Payload.Kind)
 }
 
 // --- Finding 6: routing on ev.Action=="created" is fragile; use IsComment flag ---
@@ -417,7 +417,7 @@ func TestPhase1_LabelLessActiveTask_StillDeduped(t *testing.T) {
 				Number:   7,
 			},
 		},
-		Status: tatarav1.TaskStatus{LifecycleState: "Implement"},
+		Status: tatarav1.TaskStatus{DeployState: "Implement"},
 	}
 
 	c := seedClient(t, proj, secret("p1dedupproj-scm", secretVal), repo)

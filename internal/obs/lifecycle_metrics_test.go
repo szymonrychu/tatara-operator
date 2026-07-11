@@ -30,7 +30,7 @@ func TestLifecycleMetricsNamesStable(t *testing.T) {
 	// Touch each metric so it emits at least one series in Gather.
 	m.RecordTransition("Triage", "Implement")
 	m.RecordGiveup("triage-failed")
-	m.SetLifecycleState("Triage", 0)
+	m.SetDeployState("Triage", 0)
 	m.RecordHandover()
 	m.RecordIdleStop()
 	m.ObserveMRCIWait(1)

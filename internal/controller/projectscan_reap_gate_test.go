@@ -40,9 +40,10 @@ func TestIssueScan_SkipsReapEligibleProposal(t *testing.T) {
 
 func TestIssueScan_TriagesWhenReaperDisabled(t *testing.T) {
 	proj, repo := seedBackstopProject(t, "reapgate-issuescan-off")
-	// StaleProposalDays left 0 -> reaper disabled -> normal triage (guard against
-	// the gate firing when the feature is off). A human comment is seeded so the
-	// (unrelated) bot-brainstorm-no-human-activity gate does not also suppress it.
+	enableReaper(proj, -1) // negative -> reaper explicitly disabled (finding #8: 0 now defaults ON)
+	// Reaper disabled -> normal triage (guard against the gate firing when the
+	// feature is off). A human comment is seeded so the (unrelated)
+	// bot-brainstorm-no-human-activity gate does not also suppress it.
 	reader := &perRepoFakeReader{
 		fakeReader:   fakeReader{comments: []scm.IssueComment{{Author: "szymonrychu", Body: "please build this", CreatedAt: time.Now()}}},
 		issuesByRepo: map[string][]scm.IssueRef{"o/r": {staleReapableIssue()}},
@@ -87,7 +88,7 @@ func TestReapStaleProposals_RelistsLiveTaskCreatedThisCycle(t *testing.T) {
 		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5},
 	}
 	require.NoError(t, k8sClient.Create(context.Background(), task))
-	task.Status.LifecycleState = "Triage" // non-terminal
+	task.Status.DeployState = "Triage" // non-terminal
 	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
 	t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), task) })
 

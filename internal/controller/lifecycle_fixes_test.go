@@ -38,7 +38,7 @@ func TestLifecycleImplement_ContextNotClearedOnSpawn(t *testing.T) {
 		Number: 40,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = ""
 	task.Status.ImplementContext = "CI failed: test_auth timed out"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -80,7 +80,7 @@ func TestLifecycleImplement_ContextInSubmittedTurnAcrossPlanningRequeue(t *testi
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 
 	// State: pod already in Planning, ImplementContext still set (was NOT cleared on spawn).
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Planning"
 	task.Status.PodName = agent.PodName(task)
 	task.Status.ImplementContext = "MainCI failed after merge (SHA abc). Re-implement the fix."
@@ -136,7 +136,7 @@ func TestLifecycleImplement_ContextClearedInFinishImplement(t *testing.T) {
 		Number: 42,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Implement"
+	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.ImplementContext = "some re-entry context"
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
@@ -174,8 +174,8 @@ func TestLifecycleMainCI_FailureClearsDeadline(t *testing.T) {
 		t.Fatalf("reconcileLifecycle: %v", err)
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement", got.Status.DeployState)
 	}
 	if got.Status.DeadlineAt != nil {
 		t.Errorf("DeadlineAt must be cleared on MainCI->Implement transition, got %v", got.Status.DeadlineAt)
@@ -198,7 +198,7 @@ func TestLifecycleMRCI_AfterMainCIFailureGetsNewDeadline(t *testing.T) {
 		t.Error("MRCI with pending CI must requeue, not park")
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState == "Parked" {
+	if got.Status.DeployState == "Parked" {
 		t.Error("MRCI must not park immediately on first entry with nil DeadlineAt")
 	}
 	if got.Status.DeadlineAt == nil {
@@ -307,7 +307,7 @@ func seedGitLabMainCITask(t *testing.T, suffix string, reader *fakeReaderCapture
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.LifecycleState = "MainCI"
+	task.Status.DeployState = "MainCI"
 	task.Status.MergeCommitSHA = "cafebabe"
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
 	task.Status.DeadlineAt = &dl
@@ -378,7 +378,7 @@ func TestParkWithComment_PREntryTaskCommentsOnPR(t *testing.T) {
 		URL: "https://github.com/o/r/pull/77", Number: 77,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 77
 	task.Status.PrURL = "https://github.com/o/r/pull/77"
 	// Set an already-expired deadline so parkWithComment fires.
@@ -398,8 +398,8 @@ func TestParkWithComment_PREntryTaskCommentsOnPR(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked", got.Status.DeployState)
 	}
 
 	// A comment must have been posted somewhere - either the issue ref or the PR.
@@ -452,7 +452,7 @@ func TestLifecycleMerge_AlreadyMergedSkipsMergeTransitionsToMainCI(t *testing.T)
 		Number: 9,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "Merge"
+	task.Status.DeployState = "Merge"
 	task.Status.PRNumber = 42
 	task.Status.PrURL = "https://github.com/o/r/pull/42"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -474,8 +474,8 @@ func TestLifecycleMerge_AlreadyMergedSkipsMergeTransitionsToMainCI(t *testing.T)
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "MainCI" {
-		t.Errorf("LifecycleState = %q, want MainCI (already-merged PR)", got.Status.LifecycleState)
+	if got.Status.DeployState != "MainCI" {
+		t.Errorf("DeployState = %q, want MainCI (already-merged PR)", got.Status.DeployState)
 	}
 
 	fw.mu.Lock()
@@ -502,7 +502,7 @@ func TestLifecycleMRCI_ZeroPRNumberParks(t *testing.T) {
 	// No PR number set; IsPR=false, no PRNumber in status.
 	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 0 // explicit zero
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
 	task.Status.DeadlineAt = &dl
@@ -521,8 +521,8 @@ func TestLifecycleMRCI_ZeroPRNumberParks(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked when PR number is 0", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked when PR number is 0", got.Status.DeployState)
 	}
 }
 
@@ -542,7 +542,7 @@ func TestLifecycleMainCI_EmptyMergeCommitSHARequeues(t *testing.T) {
 		Number: 12,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "MainCI"
+	task.Status.DeployState = "MainCI"
 	task.Status.MergeCommitSHA = "" // empty - the bug scenario
 	dl := metav1.NewTime(time.Now().Add(time.Hour))
 	task.Status.DeadlineAt = &dl
@@ -564,7 +564,7 @@ func TestLifecycleMainCI_EmptyMergeCommitSHARequeues(t *testing.T) {
 		t.Error("MainCI with empty MergeCommitSHA must requeue, not park immediately")
 	}
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState == "Parked" {
+	if got.Status.DeployState == "Parked" {
 		t.Error("MainCI with empty MergeCommitSHA must not park immediately")
 	}
 }
@@ -596,8 +596,8 @@ func TestLifecycleMainCI_FailureClearsMergedChangeState(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Implement" {
-		t.Fatalf("LifecycleState = %q, want Implement on MainCI failure", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Fatalf("DeployState = %q, want Implement on MainCI failure", got.Status.DeployState)
 	}
 	if got.Status.MergeCommitSHA != "" {
 		t.Errorf("MergeCommitSHA = %q, want cleared so the next Merge actually merges the new MR", got.Status.MergeCommitSHA)
@@ -661,7 +661,7 @@ func TestLifecycleMRCI_DuplicateOfMergedHeadParks(t *testing.T) {
 		Number: 21,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 50
 	task.Status.PrURL = "https://github.com/o/r/pull/50"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -684,8 +684,8 @@ func TestLifecycleMRCI_DuplicateOfMergedHeadParks(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("LifecycleState = %q, want Parked (duplicate of merged head)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("DeployState = %q, want Parked (duplicate of merged head)", got.Status.DeployState)
 	}
 	fw.mu.Lock()
 	closed := fw.closePRCalled
@@ -714,7 +714,7 @@ func TestLifecycleMRCI_AdvancedHeadAfterMergeProceeds(t *testing.T) {
 		Number: 22,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.LifecycleState = "MRCI"
+	task.Status.DeployState = "MRCI"
 	task.Status.PRNumber = 60
 	task.Status.PrURL = "https://github.com/o/r/pull/60"
 	task.Status.HeadBranch = "tatara/task-" + name
@@ -736,8 +736,8 @@ func TestLifecycleMRCI_AdvancedHeadAfterMergeProceeds(t *testing.T) {
 	}
 
 	got := fetchTask(t, name)
-	if got.Status.LifecycleState != "Merge" {
-		t.Errorf("LifecycleState = %q, want Merge (advanced head, green CI)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Merge" {
+		t.Errorf("DeployState = %q, want Merge (advanced head, green CI)", got.Status.DeployState)
 	}
 	fw.mu.Lock()
 	closed := fw.closePRCalled

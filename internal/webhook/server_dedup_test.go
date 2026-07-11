@@ -76,7 +76,7 @@ func TestP2Dedup_PRSlotNotBlockedByIssueSlot(t *testing.T) {
 				IsPR:     false,
 			},
 		},
-		Status: tatarav1.TaskStatus{LifecycleState: "Implement"},
+		Status: tatarav1.TaskStatus{DeployState: "Implement"},
 	}
 
 	c := seedClient(t, proj, secret("p2pri-scm", secretVal), repo)
@@ -171,7 +171,7 @@ func TestP2Dedup_SlotViaSrcIsPR_NotLabel(t *testing.T) {
 				IsPR:     false,
 			},
 		},
-		Status: tatarav1.TaskStatus{LifecycleState: "Implement"},
+		Status: tatarav1.TaskStatus{DeployState: "Implement"},
 	}
 
 	c := seedClient(t, proj, secret("p2sl-scm", secretVal), repo)
@@ -192,63 +192,6 @@ func TestP2Dedup_SlotViaSrcIsPR_NotLabel(t *testing.T) {
 	dupCount := counterValue(t, reg, "operator_webhook_events_total",
 		map[string]string{"provider": "github", "kind": "mr", "action": "opened", "result": "duplicate"})
 	require.Equal(t, 0.0, dupCount, "PR-slot event must not be blocked by issue-slot task (Spec.Source.IsPR=false)")
-}
-
-// TestP2Dedup_BotPRClosesIssue_DedupsAgainstScanTask verifies the cross-kind
-// dedup the migration relies on: a bot PR "Closes #7" must dedup against an
-// existing scan-created Task for issue #7 that carries LabelSourceKind=issueScan
-// (NOT issueLifecycle) and NO legacy source-* labels. The webhook list must not
-// pre-filter on LabelSourceKind, and the match must hit via TaskMatchesItem on
-// (dedupRepo, dedupNumber=7) + Spec.Source identity, not the legacy-label shortcut.
-func TestP2Dedup_BotPRClosesIssue_DedupsAgainstScanTask(t *testing.T) {
-	const secretVal = "p2dedup-crosskind" //gitleaks:allow
-	proj := projectWithBot("p2ck-proj", "p2ck-scm", "tatara", "tatara-bot")
-	repo := repository("p2ck-repo", "p2ck-proj", "https://github.com/o/r.git", "main")
-
-	// Scan-created issue task for issue #7: kind=issueScan, NO source-* labels,
-	// identity only via Spec.Source (the Phase-2 path the migration depends on).
-	scanTask := &tatarav1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "p2ck-scan-issue7",
-			Namespace: ns,
-			Labels:    map[string]string{tatarav1.LabelSourceKind: "issueScan"},
-		},
-		Spec: tatarav1.TaskSpec{
-			ProjectRef:    "p2ck-proj",
-			RepositoryRef: "p2ck-repo",
-			Kind:          "issueLifecycle",
-			Source: &tatarav1.TaskSource{
-				Provider: "github",
-				IssueRef: "o/r#7",
-				Number:   7,
-				IsPR:     false,
-			},
-		},
-		Status: tatarav1.TaskStatus{LifecycleState: "Implement"},
-	}
-
-	c := seedClient(t, proj, secret("p2ck-scm", secretVal), repo)
-	require.NoError(t, c.Create(context.Background(), scanTask))
-	require.NoError(t, c.Status().Update(context.Background(), scanTask))
-
-	h, reg := newServer(t, c)
-
-	// Bot PR #21 closing issue #7 -> dedup slot is issue #7 (dedupIsPR=false).
-	prBody := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":21,"title":"fix","body":"Closes #7","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/21","head":{"sha":"sha21","ref":"fix-7"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	prHdr := http.Header{}
-	prHdr.Set("X-GitHub-Event", "pull_request")
-	prHdr.Set("X-Hub-Signature-256", ghSign(secretVal, prBody))
-
-	require.Equal(t, http.StatusAccepted, post(t, h, "p2ck-proj", prHdr, prBody).Code)
-
-	// No new QueuedEvent: the scan task already owns issue #7's slot.
-	var qel tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
-	require.Len(t, qel.Items, 0, "bot PR 'Closes #7' must dedup against the existing issueScan task, not create a QueuedEvent")
-
-	dupCount := counterValue(t, reg, "operator_webhook_events_total",
-		map[string]string{"provider": "github", "kind": "mr", "action": "opened", "result": "duplicate"})
-	require.Equal(t, 1.0, dupCount, "cross-kind dedup must produce result=duplicate")
 }
 
 // TestP2Dedup_IssueSlotNotBlockedByPRSlot is the reverse of
@@ -278,7 +221,7 @@ func TestP2Dedup_IssueSlotNotBlockedByPRSlot(t *testing.T) {
 				IsPR:     true,
 			},
 		},
-		Status: tatarav1.TaskStatus{LifecycleState: "MRCI"},
+		Status: tatarav1.TaskStatus{DeployState: "MRCI"},
 	}
 
 	c := seedClient(t, proj, secret("p2ip-scm", secretVal), repo)
@@ -302,33 +245,4 @@ func TestP2Dedup_IssueSlotNotBlockedByPRSlot(t *testing.T) {
 	var qel tatarav1.QueuedEventList
 	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
 	require.Len(t, qel.Items, 1, "issue-slot event must create a new QueuedEvent when only a PR-slot task exists")
-}
-
-// TestP2Dedup_BotPRLinkedIssue_DedupNumber verifies that when a bot PR with
-// "Closes #N" is processed, the created Task's Source.DedupNumber is set to N
-// (the linked issue number), not the PR number.
-func TestP2Dedup_BotPRLinkedIssue_DedupNumber(t *testing.T) {
-	const secretVal = "p2dedup-botpr" //gitleaks:allow
-	proj := projectWithBot("p2bp-proj", "p2bp-scm", "tatara", "tatara-bot")
-	repo := repository("p2bp-repo", "p2bp-proj", "https://github.com/o/r.git", "main")
-
-	c := seedClient(t, proj, secret("p2bp-scm", secretVal), repo)
-	h, _ := newServer(t, c)
-
-	// Bot PR #20 with "Closes #5" in the body.
-	prBody := []byte(`{"action":"opened","sender":{"login":"tatara-bot"},"pull_request":{"number":20,"title":"fix issue 5","body":"Closes #5","user":{"login":"tatara-bot"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/pull/20","head":{"sha":"sha-bot","ref":"fix-5"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-	prHdr := http.Header{}
-	prHdr.Set("X-GitHub-Event", "pull_request")
-	prHdr.Set("X-Hub-Signature-256", ghSign(secretVal, prBody))
-
-	require.Equal(t, http.StatusAccepted, post(t, h, "p2bp-proj", prHdr, prBody).Code)
-
-	var qel tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
-	require.Len(t, qel.Items, 1)
-
-	src := qel.Items[0].Spec.Payload.Source
-	require.NotNil(t, src)
-	require.Equal(t, 20, src.Number, "Source.Number must be the PR number")
-	require.Equal(t, 5, src.DedupNumber, "Source.DedupNumber must be the linked issue number (5)")
 }

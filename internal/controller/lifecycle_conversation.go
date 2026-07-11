@@ -111,14 +111,29 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatara
 	} else {
 		switch state {
 		case tatarav1alpha1.WIApproved:
-			if err := r.setLifecycleState(ctx, task, "Implement", "human-approved"); err != nil {
+			// Label readback reflects the approved label onto the ledger for
+			// observability, but label PRESENCE alone must NEVER drive
+			// implementation: an agent/pod with SCM write could set the approved
+			// label itself, and ListOpenIssues cannot tell WHO applied it. Advance
+			// to Implement ONLY when a VERIFIED maintainer approval has been recorded
+			// on the Task (Status.ApprovedByMaintainer, set by the webhook from a
+			// MaintainerLogins actor). Otherwise stay in the idle wait (fail closed):
+			// the ledger still shows WIApproved but the autonomous chain does not
+			// start until a real maintainer approves.
+			if task.Status.ApprovedByMaintainer == "" {
+				l.Info("conversation: approved label present but no verified maintainer approval; NOT implementing (fail closed)",
+					"action", "conversation_label_approved_unverified", "resource_id", task.Name)
+				break // fall through to the idle-deadline path below
+			}
+			if err := r.setDeployState(ctx, task, "Implement", "human-approved"); err != nil {
 				return ctrl.Result{}, fmt.Errorf("conversation: approve readback to implement: %w", err)
 			}
-			l.Info("conversation: human-approved proposal; driving implementation",
-				"action", "conversation_label_approved", "resource_id", task.Name)
+			l.Info("conversation: verified maintainer approval; driving implementation",
+				"action", "conversation_label_approved", "resource_id", task.Name,
+				"maintainer", task.Status.ApprovedByMaintainer)
 			return ctrl.Result{}, nil
 		case tatarav1alpha1.WIDeclined:
-			if err := r.setLifecycleState(ctx, task, "Parked", "human-declined"); err != nil {
+			if err := r.setDeployState(ctx, task, "Parked", "human-declined"); err != nil {
 				return ctrl.Result{}, fmt.Errorf("conversation: decline readback to park: %w", err)
 			}
 			l.Info("conversation: human-declined proposal; parking",
@@ -163,7 +178,7 @@ func (r *TaskReconciler) handleConversation(ctx context.Context, project *tatara
 				"pending", len(task.Status.PendingInterjections))
 			return ctrl.Result{RequeueAfter: pollRequeue}, nil
 		}
-		if err := r.setLifecycleState(ctx, task, "Stopped", "idle"); err != nil {
+		if err := r.setDeployState(ctx, task, "Stopped", "idle"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {

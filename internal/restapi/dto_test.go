@@ -100,13 +100,13 @@ func TestToTaskDTO_GiveUpFields(t *testing.T) {
 			Kind: "issueLifecycle",
 		},
 		Status: tatarav1alpha1.TaskStatus{
-			LifecycleState:   "Parked",
+			DeployState:      "Parked",
 			ParkReason:       "implement-failed",
 			ImplementGiveUps: 2,
 		},
 	}
 	d := toTaskDTO(task)
-	require.Equal(t, "Parked", d.Status.LifecycleState)
+	require.Equal(t, "Parked", d.Status.DeployState)
 	require.Equal(t, "implement-failed", d.Status.ParkReason)
 	require.Equal(t, 2, d.Status.ImplementGiveUps)
 }

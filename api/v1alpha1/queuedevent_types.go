@@ -97,7 +97,7 @@ func ValidateQueuedEventSpec(spec QueuedEventSpec) error {
 	if spec.ProjectRef == "" {
 		return fmt.Errorf("queuedevent: projectRef required")
 	}
-	if !repoScopedKinds[spec.Kind] && !projectScopedKinds[spec.Kind] {
+	if !IsKnownKind(spec.Kind) {
 		return fmt.Errorf("queuedevent: invalid kind %q", spec.Kind)
 	}
 	if projectScopedKinds[spec.Kind] && spec.RepositoryRef != "" {

@@ -68,6 +68,12 @@ spec:
                 type: string
               kind:
                 default: implement
+                description: |-
+                  Kind selects the agent behavior. The 7-kind model is
+                  brainstorm;incident;clarify;implement;review;documentation;refine. The
+                  strings selfImprove;triageIssue;healthCheck;issueLifecycle are RETIRED as
+                  agent kinds - inert, retained in the enum only so already-persisted terminal
+                  CRs still deserialize and read; no code path creates them anymore.
                 enum:
                 - implement
                 - review
@@ -79,6 +85,7 @@ spec:
                 - healthCheck
                 - refine
                 - documentation
+                - clarify
                 type: string
               maxTurns:
                 type: integer
@@ -207,6 +214,22 @@ spec:
           status:
             description: TaskStatus defines the observed state of a Task.
             properties:
+              approvedByMaintainer:
+                description: |-
+                  ApprovedByMaintainer records the identity-verified fact that a HUMAN
+                  MAINTAINER explicitly approved this issue for implementation, by applying
+                  the approved label to it. It is set by the webhook ONLY when it observes an
+                  issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
+                  (never the bot: a bot/agent that sets the label itself cannot self-approve).
+                  It is the ONLY signal that releases a front-half Task (clarify / the
+                  issueLifecycle bridge) into the autonomous implement->review->merge->deploy
+                  chain: every path that would advance a front-half issue to Implement gates
+                  on it (finishFrontHalf, the Conversation label readback, the trigger-label
+                  jump). Empty means NO verified maintainer approval - the operator fails
+                  CLOSED (parks to Conversation) rather than trusting raw label presence,
+                  which an agent with SCM write could forge. Holds the approving maintainer's
+                  login for audit.
+                type: string
               brainstormOutcome:
                 description: |-
                   BrainstormOutcome is the agent's declared outcome for a brainstorm task when
@@ -464,6 +487,11 @@ spec:
                   propagation) went green, and the operator now drives the push-CD cascade to a
                   tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
                   occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
+                  The Go field is DeployState (agent-invisible, deploy-supervisor-only) but the
+                  JSON/CRD key stays lifecycleState so stored CRs still deserialize and the
+                  agent-visible task_list field is unchanged. The enum keeps the front-half
+                  values (Triage/Conversation/Implement/MRCI) for the drain of in-flight
+                  issueLifecycle Tasks.
                 enum:
                 - Triage
                 - Conversation
@@ -477,6 +505,15 @@ spec:
                 - Parked
                 type: string
               mergeCommitSHA:
+                type: string
+              mergeWaitDeadline:
+                description: |-
+                  MergeWaitDeadline bounds a discrete-implement umbrella Task's wait for its
+                  member PRs to be reviewed + merged (the pre-Deploying window). When members
+                  stay unmerged past this wall clock, superviseMergedPRs parks the stream
+                  recoverable with an issue comment naming the stuck member(s) (item 3). It is
+                  distinct from DeployDeadline, which bounds the post-merge cascade.
+                format: date-time
                 type: string
               mergedHeadSHA:
                 description: |-
@@ -515,7 +552,7 @@ spec:
                   NOTE: Pending and AwaitingApproval are intentionally absent: no code path
                   ever writes them (approval is now driven by the SCM conversation flow and
                   projected onto labels, not a Phase transition). They are removed here to
-                  keep the CRD enum honest and prevent confusion with LifecycleState.
+                  keep the CRD enum honest and prevent confusion with DeployState.
                   Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
                 enum:
                 - Planning
@@ -553,6 +590,16 @@ spec:
                 type: string
               resultSummary:
                 type: string
+              reviewResolveDeadline:
+                description: |-
+                  ReviewResolveDeadline bounds an umbrella review's wall-clock wait for an
+                  unresolvable member repo URL to become resolvable (un-enrolled member repo,
+                  or a projectRepoURLBySlug List error). Stamped on the first unresolvable
+                  encounter; once it elapses, writeBackReview parks the review recoverable with
+                  an issue comment naming the stuck member instead of error-looping forever
+                  (liveness finding #4).
+                format: date-time
+                type: string
               reviewVerdict:
                 description: ReviewVerdict is the agent's review decision for a human-authored
                   PR/MR.
@@ -565,6 +612,37 @@ spec:
                     - request_changes
                     - comment
                     type: string
+                  semver:
+                    description: |-
+                      Semver is the per-MR push-CD level the review agent assigns on approval so
+                      the release tag can be cut for EVERY MR in the stream (human MRs otherwise
+                      carry no change_significance -> cd-release refuses to tag). Applied
+                      best-effort in the approve writeback; an existing semver:* label on a member
+                      MR is respected (a deliberate human semver is authoritative).
+                    items:
+                      description: |-
+                        SemverAssignment is one per-MR push-CD level the review agent assigns on
+                        approval, so the release tag can be cut for EVERY MR in the stream - including
+                        human/maintainer MRs that carry no bot change_significance (the review approve
+                        is their ONLY stamping opportunity). Repo is the "owner/repo" slug (matches
+                        WorkItemRef.Repo); Number is the PR/MR number in that repo.
+                      properties:
+                        level:
+                          enum:
+                          - major
+                          - minor
+                          - patch
+                          type: string
+                        number:
+                          type: integer
+                        repo:
+                          type: string
+                      required:
+                      - level
+                      - number
+                      - repo
+                      type: object
+                    type: array
                   suggestions:
                     items:
                       description: Suggestion is one inline code suggestion on a PR/MR.
@@ -604,12 +682,41 @@ spec:
                   description: WorkItemRef is one SCM artifact tracked by a Task's
                     work-item ledger.
                   properties:
+                    body:
+                      description: Body is the issue/PR body captured at the last
+                        poll (turn-0 bundle source).
+                      type: string
+                    ciStatus:
+                      description: 'CIStatus is the member''s CI/pipeline status:
+                        ""|pending|success|failure.'
+                      type: string
+                    deployState:
+                      description: 'DeployState is the member''s push-CD cascade state:
+                        ""|deploying|applied.'
+                      type: string
+                    deployedVersion:
+                      description: DeployedVersion is the semver tag this member's
+                        artifact cut on merge.
+                      type: string
+                    headBranch:
+                      description: HeadBranch is the PR/MR source branch.
+                      type: string
                     headSHA:
                       type: string
                     kind:
                       type: string
+                    labels:
+                      description: Labels are the current SCM labels on this member.
+                      items:
+                        type: string
+                      type: array
                     lastRefreshedAt:
+                      description: LastRefreshedAt is the last-synced cursor for this
+                        member.
                       format: date-time
+                      type: string
+                    mergeable:
+                      description: 'Mergeable is the member''s mergeability: unknown|clean|dirty|blocked|behind.'
                       type: string
                     number:
                       type: integer

@@ -21,9 +21,19 @@ import (
 // handleTriage drives the Triage agent-run state. On a finished run it reads
 // IssueOutcome and transitions: close->Done, discuss->Conversation, implement->Implement.
 func (r *TaskReconciler) handleTriage(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	return r.handleFrontHalf(ctx, project, task, r.finishTriage)
+}
+
+// handleFrontHalf is the shared conversational front-half agent-run driver used
+// by both issueLifecycle Triage (finish=finishTriage) and the clarify kind
+// (finish=finishClarify). It ensures the brainstorming label, seeds the
+// conversation fork, builds the turn-0 triage/clarify prompt, and drives the
+// agent run. On a finished run it delegates to the kind-specific finish handler
+// which consumes Status.IssueOutcome.
+func (r *TaskReconciler) handleFrontHalf(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, finish func(context.Context, *tatarav1alpha1.Project, *tatarav1alpha1.Task) (ctrl.Result, error)) (ctrl.Result, error) {
 	// Run finished -> act on the outcome.
 	if isTerminal(task.Status.Phase) {
-		return r.finishTriage(ctx, project, task)
+		return finish(ctx, project, task)
 	}
 	// Run in progress (or not yet started) -> drive another step.
 	// Idempotent: ensure the brainstorming label is set (covers reactivation where
@@ -120,6 +130,14 @@ func (r *TaskReconciler) maybeSetupConversationFork(ctx context.Context, task *t
 // a second Get of the same Repository within the same reconcile).
 func (r *TaskReconciler) buildTriagePromptFor(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, repoURL string) string {
 	l := log.FromContext(ctx)
+	// clarify (the decomposed front-half kind) gets the full operator-assembled
+	// turn-0 cross-repo umbrella bundle instead of the single-issue triage text, so
+	// a fresh clarify pod sees every umbrella member's body + thread + state upfront
+	// and never re-crawls SCM (CROSS-REPO-CONTRACT). The retained issueLifecycle
+	// bridge keeps the legacy single-issue triage prompt below.
+	if task.Spec.Kind == "clarify" {
+		return r.buildUmbrellaPromptFor(ctx, project, task, clarifyGoalTail(task))
+	}
 	if r.ReaderFor == nil || task.Spec.Source == nil {
 		return lifecycleTriageText(task, "", "")
 	}
@@ -299,14 +317,53 @@ func (tr *triageReader) botHasLastWord(ctx context.Context) (bool, error) {
 	return botIsLastCommenter(comments, tr.botLogin), nil
 }
 
-// finishTriage consumes Status.IssueOutcome after a completed Triage agent run.
+// finishTriage consumes Status.IssueOutcome after a completed Triage agent run
+// for an issueLifecycle Task: the implement outcome transitions the same Task
+// into the Implement lifecycle state (the monolithic front-to-back-half path).
 func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, error) {
+	return r.finishFrontHalf(ctx, project, task, r.triageImplementAction)
+}
+
+// triageImplementAction is the issueLifecycle implement-outcome terminal action:
+// label the issue approved and transition the SAME Task into the Implement
+// lifecycle state. Returns terminal=false so finishFrontHalf runs its shared
+// clearIssueOutcome+resetAgentRun tail (the Task continues into Implement).
+func (r *TaskReconciler) triageImplementAction(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (ctrl.Result, bool, error) {
+	_, approved, _, _ := lifecycleLabels(project.Spec.Scm)
+	if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	if err := r.setDeployState(ctx, task, "Implement", "triage-implement"); err != nil {
+		return ctrl.Result{}, false, err
+	}
+	r.Metrics.IssueOutcome("implement")
+	return ctrl.Result{}, false, nil
+}
+
+// finishFrontHalf consumes Status.IssueOutcome after a completed Triage/clarify
+// agent run. The close/discuss/guard/default arms are shared; the implement arm,
+// after the self-approve guard passes, delegates to onImplement (which differs
+// by kind: issueLifecycle transitions into Implement; clarify flips the handoff
+// label and terminates). onImplement returns terminal=true when it has fully
+// handled the outcome (including any terminal transition), in which case
+// finishFrontHalf returns immediately WITHOUT running the shared
+// clearIssueOutcome+resetAgentRun tail (which would otherwise un-terminate a
+// clarify Task by resetting Phase).
+func (r *TaskReconciler) finishFrontHalf(ctx context.Context, project *tatarav1alpha1.Project, task *tatarav1alpha1.Task, onImplement func(context.Context, *tatarav1alpha1.Project, *tatarav1alpha1.Task) (ctrl.Result, bool, error)) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
 	if task.Status.Phase == "Failed" {
 		l.Info("triage agent run failed; parking task",
 			"action", "lifecycle_triage_failed", "resource_id", task.Name)
-		if err := r.setLifecycleState(ctx, task, "Parked", "triage-failed"); err != nil {
+		// Liveness finding #2: park with a diagnostic issue comment so the reporter
+		// sees the triage run failed and is awaiting a human, not a silent Parked.
+		msg := "tatara: triage of this issue failed and I've paused it for a human to look at. " +
+			"Comment here with more context to retry."
+		if _, _, writer, token, _, scmErr := r.parkSCMContext(ctx, task); scmErr == nil {
+			if err := r.parkWithComment(ctx, task, writer, token, "triage-failed", msg); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if err := r.setDeployState(ctx, task, "Parked", "triage-failed"); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.LifecycleMetrics != nil {
@@ -342,7 +399,7 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 	// exhausts its retries after the comment/close already landed, the next
 	// reconcile re-runs the arm and may post a duplicate triage comment. That
 	// is rare and cosmetic, and preferred over the wrong-implement downgrade.
-	brainstorming, approved, _, declined := lifecycleLabels(project.Spec.Scm)
+	brainstorming, _, _, declined := lifecycleLabels(project.Spec.Scm)
 
 	switch action {
 	case "close":
@@ -413,10 +470,10 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		if err := r.triageCloseIssue(ctx, project, task, comment); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.setLifecycleState(ctx, task, "Done", "triage-close"); err != nil {
+		if err := r.setDeployState(ctx, task, "Done", "triage-close"); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Record IssueOutcome("close") AFTER setLifecycleState commits, so a failed
+		// Record IssueOutcome("close") AFTER setDeployState commits, so a failed
 		// transition (RetryOnConflict exhausted) does not double-count on re-reconcile
 		// (finding 1). triageCloseIssue is idempotent on the SCM side; the metric is not.
 		r.Metrics.IssueOutcome("close")
@@ -464,66 +521,54 @@ func (r *TaskReconciler) finishTriage(ctx context.Context, project *tatarav1alph
 		}
 		// Record metric AFTER enterConversation commits so a failed transition does not
 		// double-count on the next reconcile (findings 1 & 5). The implement arm records
-		// after setLifecycleState; this arm now matches that discipline.
+		// after setDeployState; this arm now matches that discipline.
 		if err := r.enterConversation(ctx, project, task, "triage-discuss"); err != nil {
 			return ctrl.Result{}, err
 		}
 		r.Metrics.IssueOutcome("discuss")
 
 	case "implement":
-		// Author-tiered autoapprove (issue #56): an issue opened by a known
-		// third-party contributor (author is neither the bot nor a maintainer) is
-		// trusted, so the triage agent's implement decision is honored straight
-		// through without the self-approve hold. Bot- and tatara-authored ideas,
-		// and the empty/maintainer-authored case, fall through to the guard below.
-		if !thirdPartyAuthor(project, task) {
-			// Self-approve guard (R1/R2): tatara never approves its OWN idea before a
-			// human has engaged. Authorship is detected via the tatara-authored marker
-			// in the issue body - the reliable, egress-verified fallback for the
-			// bot/maintainer/empty-author case the third-party tier does not cover
-			// (Source.AuthorLogin is empty for board-sourced candidates).
-			// Uses the pre-resolved triageReader (finding 6: shared reader context).
-			authored, aerr := tr.isTataraAuthored(ctx)
-			if aerr != nil {
-				l.Info("triage: authorship check failed; treating as tatara-authored (fail closed)",
-					"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", aerr.Error())
-				authored = true
+		// EXPLICIT MAINTAINER APPROVAL is the ONLY signal that releases a
+		// front-half issue into the autonomous implement->review->merge->deploy
+		// chain. The operator advances ONLY when a VERIFIED maintainer approval has
+		// been recorded on the Task (Status.ApprovedByMaintainer, set by the webhook
+		// when a MaintainerLogins member applies the approved label - an
+		// identity-verified fact, NOT raw label presence and NOT any comment). An
+		// agent/pod that sets the approved label itself acts AS the bot, so its
+		// write is dropped by the webhook bot-actor guard and never recorded; a
+		// drive-by comment or third-party authorship no longer releases the gate.
+		// Fail CLOSED otherwise: park to Conversation and await the maintainer. This
+		// is the platform's core safety promise - tatara never self-approves.
+		if task.Status.ApprovedByMaintainer == "" {
+			l.Info("triage implement outcome withheld: no verified maintainer approval; parking (fail closed)",
+				"action", "lifecycle_triage_await_approval", "resource_id", task.Name)
+			if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
+				return ctrl.Result{}, err
 			}
-			if authored {
-				human, herr := tr.hasHumanReply(ctx)
-				if herr != nil {
-					l.Info("triage: hasHumanComment failed; parking as brainstorming (fail closed)",
-						"action", "lifecycle_triage_guard", "resource_id", task.Name, "err", herr.Error())
-					human = false
-				}
-				if !human {
-					if err := r.setLifecycleLabel(ctx, project, task, brainstorming); err != nil {
-						return ctrl.Result{}, err
-					}
-					// Tear down the wrapper BEFORE transitioning to Conversation so a
-					// failed resetAgentRun leaves the task in Triage (still owns the pod)
-					// rather than in Conversation with a leaked live pod that nothing
-					// else will reap (finding 19).
-					if err := r.resetAgentRun(ctx, task); err != nil {
-						return ctrl.Result{}, err
-					}
-					if err := r.clearIssueOutcome(ctx, task); err != nil {
-						return ctrl.Result{}, err
-					}
-					if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
-						return ctrl.Result{}, err
-					}
-					return ctrl.Result{}, nil
-				}
+			// Tear down the wrapper BEFORE transitioning to Conversation so a failed
+			// resetAgentRun leaves the task in Triage (still owns the pod) rather than
+			// in Conversation with a leaked live pod that nothing else reaps (finding 19).
+			if err := r.resetAgentRun(ctx, task); err != nil {
+				return ctrl.Result{}, err
 			}
+			if err := r.clearIssueOutcome(ctx, task); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := r.enterConversation(ctx, project, task, "triage-await-approval"); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
 		}
-		if err := r.setLifecycleLabel(ctx, project, task, approved); err != nil {
-			return ctrl.Result{}, err
+		res, terminal, herr := onImplement(ctx, project, task)
+		if herr != nil {
+			return ctrl.Result{}, herr
 		}
-		if err := r.setLifecycleState(ctx, task, "Implement", "triage-implement"); err != nil {
-			return ctrl.Result{}, err
+		if terminal {
+			// onImplement fully handled the outcome (e.g. clarify handoff
+			// terminated the Task): skip the shared clearIssueOutcome+resetAgentRun
+			// tail so a resetAgentRun does not resurrect a terminated Task.
+			return res, nil
 		}
-		r.Metrics.IssueOutcome("implement")
 
 	default:
 		// Unknown action: an agent returned an unrecognized action string. Route to the

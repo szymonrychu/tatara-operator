@@ -178,9 +178,9 @@ func seedLifecycleTask(t *testing.T, name, project, repo, scmSecret string, sour
 	return task
 }
 
-// ----- Task 3: setLifecycleState + metrics -----
+// ----- Task 3: setDeployState + metrics -----
 
-func TestSetLifecycleState_TransitionsStateAndIncrementMetric(t *testing.T) {
+func TestSetDeployState_TransitionsStateAndIncrementMetric(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
 	reg := prometheus.NewRegistry()
@@ -237,8 +237,8 @@ func TestSetLifecycleState_TransitionsStateAndIncrementMetric(t *testing.T) {
 		},
 	}
 
-	if err := r.setLifecycleState(ctx, task, "Triage", "initial"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, task, "Triage", "initial"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 
 	// Verify state persisted.
@@ -246,8 +246,8 @@ func TestSetLifecycleState_TransitionsStateAndIncrementMetric(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "lc-state-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage", got.Status.DeployState)
 	}
 
 	// Verify counter incremented.
@@ -257,10 +257,10 @@ func TestSetLifecycleState_TransitionsStateAndIncrementMetric(t *testing.T) {
 	}
 }
 
-// TestSetLifecycleState_TerminalDeletesWrapper verifies that transitioning into
+// TestSetDeployState_TerminalDeletesWrapper verifies that transitioning into
 // a terminal lifecycle state (Parked/Done/Stopped) tears down the wrapper
 // Pod+Service so idle agent sessions do not accumulate.
-func TestSetLifecycleState_TerminalDeletesWrapper(t *testing.T) {
+func TestSetDeployState_TerminalDeletesWrapper(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-term-cleanup"
 	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7}
@@ -283,8 +283,8 @@ func TestSetLifecycleState_TerminalDeletesWrapper(t *testing.T) {
 	}
 
 	r := newLifecycleReconciler(t, nil)
-	if err := r.setLifecycleState(ctx, task, "Parked", "test-terminal"); err != nil {
-		t.Fatalf("setLifecycleState: %v", err)
+	if err := r.setDeployState(ctx, task, "Parked", "test-terminal"); err != nil {
+		t.Fatalf("setDeployState: %v", err)
 	}
 
 	// envtest has no kubelet, so a deleted Pod may linger with a DeletionTimestamp
@@ -377,13 +377,13 @@ func TestReconcileLifecycle_EmptyStateInitializesToTriage(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "lc-init-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage", got.Status.DeployState)
 	}
 }
 
 // TestReconcileLifecycle_UnknownStateReturnsError verifies that reconcileLifecycle
-// returns a descriptive error for an unrecognised LifecycleState. The CRD enum
+// returns a descriptive error for an unrecognised DeployState. The CRD enum
 // prevents this through the API, so we call reconcileLifecycle directly on an
 // in-memory task with a bogus state that bypasses CRD validation.
 func TestReconcileLifecycle_UnknownStateReturnsError(t *testing.T) {
@@ -444,7 +444,7 @@ func TestReconcileLifecycle_UnknownStateReturnsError(t *testing.T) {
 			Kind:          "issueLifecycle",
 		},
 		Status: tatarav1alpha1.TaskStatus{
-			LifecycleState: "NotAValidState",
+			DeployState: "NotAValidState",
 		},
 	}
 
@@ -454,11 +454,11 @@ func TestReconcileLifecycle_UnknownStateReturnsError(t *testing.T) {
 	}
 }
 
-// ----- FIX 3+5: reconcileLifecycle initializes LifecycleState from lifecycle-entry annotation -----
+// ----- FIX 3+5: reconcileLifecycle initializes DeployState from lifecycle-entry annotation -----
 
-// TestReconcileLifecycle_AnnotationEntryImplement asserts that when LifecycleState
+// TestReconcileLifecycle_AnnotationEntryImplement asserts that when DeployState
 // is empty but the tatara.dev/lifecycle-entry annotation is "Implement", the first
-// reconcile sets LifecycleState=Implement (not the default Triage).
+// reconcile sets DeployState=Implement (not the default Triage).
 func TestReconcileLifecycle_AnnotationEntryImplement(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
@@ -486,7 +486,7 @@ func TestReconcileLifecycle_AnnotationEntryImplement(t *testing.T) {
 		t.Fatalf("create repo: %v", err)
 	}
 
-	// Task with lifecycle-entry=Implement annotation, empty LifecycleState.
+	// Task with lifecycle-entry=Implement annotation, empty DeployState.
 	task := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "lc-annimpl-task",
@@ -527,13 +527,13 @@ func TestReconcileLifecycle_AnnotationEntryImplement(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "lc-annimpl-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Implement" {
-		t.Errorf("LifecycleState = %q, want Implement (from annotation); default would be Triage", got.Status.LifecycleState)
+	if got.Status.DeployState != "Implement" {
+		t.Errorf("DeployState = %q, want Implement (from annotation); default would be Triage", got.Status.DeployState)
 	}
 }
 
 // TestReconcileLifecycle_NoAnnotationDefaultsTriage asserts that without the
-// lifecycle-entry annotation, LifecycleState is still initialized to Triage.
+// lifecycle-entry annotation, DeployState is still initialized to Triage.
 func TestReconcileLifecycle_NoAnnotationDefaultsTriage(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
@@ -597,8 +597,8 @@ func TestReconcileLifecycle_NoAnnotationDefaultsTriage(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "lc-noann-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.LifecycleState != "Triage" {
-		t.Errorf("LifecycleState = %q, want Triage (default when no annotation)", got.Status.LifecycleState)
+	if got.Status.DeployState != "Triage" {
+		t.Errorf("DeployState = %q, want Triage (default when no annotation)", got.Status.DeployState)
 	}
 }
 

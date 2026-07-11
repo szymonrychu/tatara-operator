@@ -31,7 +31,7 @@ import (
 )
 
 // defaultGaugeRecomputeInterval is how often updateMemoryStackCounts and
-// updateLifecycleStateCounts run. Both do a full ProjectList / TaskList scan;
+// updateDeployStateCounts run. Both do a full ProjectList / TaskList scan;
 // running them on every per-Project reconcile is O(N) per cycle per project.
 // 60 s is coarse-grained enough to avoid list pressure while still converging
 // the gauges quickly after any phase/state change.
@@ -57,7 +57,7 @@ type ProjectReconciler struct {
 	Seq *queue.SeqSource
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
-	// (updateMemoryStackCounts + updateLifecycleStateCounts) run. Defaults to
+	// (updateMemoryStackCounts + updateDeployStateCounts) run. Defaults to
 	// defaultGaugeRecomputeInterval when zero. MaxConcurrentReconciles=1 means
 	// this field is read/written under the controller's serialised call path;
 	// no mutex required.
@@ -218,7 +218,7 @@ func soonestRequeue(a, b time.Duration) time.Duration {
 	}
 }
 
-// maybeRecomputeGauges runs updateMemoryStackCounts and updateLifecycleStateCounts
+// maybeRecomputeGauges runs updateMemoryStackCounts and updateDeployStateCounts
 // at most once per GaugeRecomputeInterval (defaultGaugeRecomputeInterval when
 // zero). Calling it on every Reconcile is safe: it skips the expensive full
 // ProjectList + TaskList scans until the interval has elapsed.
@@ -231,7 +231,7 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 		return
 	}
 	r.updateMemoryStackCounts(ctx)
-	r.updateLifecycleStateCounts(ctx)
+	r.updateDeployStateCounts(ctx)
 	r.updateIssueStateCounts(ctx)
 	r.updateLightragDocCounts(ctx)
 	r.updateMemoryRetrievalProbe(ctx)
@@ -358,7 +358,7 @@ func parseLightragStatusCounts(body []byte) (map[string]int, error) {
 }
 
 // lifecycleStates is the full set of issueLifecycle states the
-// tatara_lifecycle_state gauge tracks. updateLifecycleStateCounts Sets every one
+// tatara_lifecycle_state gauge tracks. updateDeployStateCounts Sets every one
 // each pass (including 0 for drained states) so a state that empties out reads 0
 // rather than retaining its last value.
 var lifecycleStates = []string{
@@ -366,15 +366,15 @@ var lifecycleStates = []string{
 	"Done", "Stopped", "Parked",
 }
 
-// updateLifecycleStateCounts recomputes tatara_lifecycle_state from authoritative
+// updateDeployStateCounts recomputes tatara_lifecycle_state from authoritative
 // cluster state: it lists every issueLifecycle Task, counts them by
-// Status.LifecycleState, and Sets the gauge for all known states (zeros
+// Status.DeployState, and Sets the gauge for all known states (zeros
 // included). This is the sole writer of the gauge; it is restart-safe and
 // terminal-safe, unlike the per-transition deltas it replaced, and mirrors
-// updateMemoryStackCounts. Tasks of other Kinds carry an empty LifecycleState and
+// updateMemoryStackCounts. Tasks of other Kinds carry an empty DeployState and
 // are naturally excluded; the explicit Kind filter guards against ever emitting a
 // state="" series.
-func (r *ProjectReconciler) updateLifecycleStateCounts(ctx context.Context) {
+func (r *ProjectReconciler) updateDeployStateCounts(ctx context.Context) {
 	if r.LifecycleMetrics == nil {
 		return
 	}
@@ -385,13 +385,13 @@ func (r *ProjectReconciler) updateLifecycleStateCounts(ctx context.Context) {
 	counts := make(map[string]int, len(lifecycleStates))
 	for i := range list.Items {
 		t := &list.Items[i]
-		if t.Spec.Kind != "issueLifecycle" || t.Status.LifecycleState == "" {
+		if t.Spec.Kind != "issueLifecycle" || t.Status.DeployState == "" {
 			continue
 		}
-		counts[t.Status.LifecycleState]++
+		counts[t.Status.DeployState]++
 	}
 	for _, state := range lifecycleStates {
-		r.LifecycleMetrics.SetLifecycleState(state, float64(counts[state]))
+		r.LifecycleMetrics.SetDeployState(state, float64(counts[state]))
 	}
 }
 
@@ -403,7 +403,7 @@ func issueStateFor(t *tataradevv1alpha1.Task) string {
 	// blocked: at-cap give-up must appear in the metric even though TaskTerminal
 	// classifies Parked as terminal. Check this before the terminal guard.
 	if t.Spec.Kind == "issueLifecycle" &&
-		t.Status.LifecycleState == "Parked" &&
+		t.Status.DeployState == "Parked" &&
 		tataradevv1alpha1.IsRecoverableGiveup(t.Status.ParkReason) &&
 		t.Status.ImplementGiveUps >= maxImplGiveUps {
 		return "blocked"
@@ -413,7 +413,7 @@ func issueStateFor(t *tataradevv1alpha1.Task) string {
 	}
 	switch t.Spec.Kind {
 	case "issueLifecycle":
-		switch t.Status.LifecycleState {
+		switch t.Status.DeployState {
 		case "Triage":
 			return "triage"
 		case "Conversation":
@@ -442,7 +442,7 @@ func issueStateFor(t *tataradevv1alpha1.Task) string {
 // updateIssueStateCounts recomputes tatara_issue_state from authoritative cluster
 // state by listing all non-terminal, issue-scoped Tasks and setting one gauge
 // series per live issue. A Reset() before each pass ensures stale (closed or
-// terminal) issues are not retained. This mirrors updateLifecycleStateCounts but
+// terminal) issues are not retained. This mirrors updateDeployStateCounts but
 // tracks per-issue state rather than aggregate counts, enabling the dashboard to
 // list every open issue with its current state, token usage, and turn count.
 func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {

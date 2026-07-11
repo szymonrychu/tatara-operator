@@ -13,7 +13,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
-func TestSetLifecycleState_ParkReasonPersisted(t *testing.T) {
+func TestSetDeployState_ParkReasonPersisted(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
 	reg := prometheus.NewRegistry()
@@ -45,8 +45,8 @@ func TestSetLifecycleState_ParkReasonPersisted(t *testing.T) {
 	}
 
 	// Transition to Parked with a reason.
-	if err := r.setLifecycleState(ctx, task, "Parked", "triage-failed"); err != nil {
-		t.Fatalf("setLifecycleState Parked: %v", err)
+	if err := r.setDeployState(ctx, task, "Parked", "triage-failed"); err != nil {
+		t.Fatalf("setDeployState Parked: %v", err)
 	}
 	got := &tatarav1alpha1.Task{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "pr-task"}, got); err != nil {
@@ -55,13 +55,13 @@ func TestSetLifecycleState_ParkReasonPersisted(t *testing.T) {
 	if got.Status.ParkReason != "triage-failed" {
 		t.Errorf("expected ParkReason=triage-failed, got %q", got.Status.ParkReason)
 	}
-	if got.Status.LifecycleState != "Parked" {
-		t.Errorf("expected LifecycleState=Parked, got %q", got.Status.LifecycleState)
+	if got.Status.DeployState != "Parked" {
+		t.Errorf("expected DeployState=Parked, got %q", got.Status.DeployState)
 	}
 
 	// Transition out of Parked: ParkReason must be cleared.
-	if err := r.setLifecycleState(ctx, got, "Implement", "triage-implement"); err != nil {
-		t.Fatalf("setLifecycleState Implement: %v", err)
+	if err := r.setDeployState(ctx, got, "Implement", "triage-implement"); err != nil {
+		t.Fatalf("setDeployState Implement: %v", err)
 	}
 	got2 := &tatarav1alpha1.Task{}
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "pr-task"}, got2); err != nil {

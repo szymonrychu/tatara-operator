@@ -166,7 +166,7 @@ func TestDedupPRHeadShaUnchanged(t *testing.T) {
 func mkLifecycleKindTask(repo string, number int, lifecycleState string) tatarav1alpha1.Task {
 	tk := tatarav1alpha1.Task{}
 	tk.Labels = scanTaskLabels(candidate{repo: repo, number: number}, "issueScan", "issueLifecycle")
-	tk.Status.LifecycleState = lifecycleState
+	tk.Status.DeployState = lifecycleState
 	// Phase 1: source set so taskMatchesItem can find this task (labels no longer written).
 	tk.Spec.Source = &tatarav1alpha1.TaskSource{
 		Provider: "github",
@@ -225,7 +225,7 @@ func TestHasLiveOrAdoptableTask(t *testing.T) {
 				func() tatarav1alpha1.Task {
 					tk := tatarav1alpha1.Task{}
 					tk.Labels = scanTaskLabels(candidate{repo: "o/r", number: 8}, "mrScan", "review")
-					tk.Status.LifecycleState = "Parked"
+					tk.Status.DeployState = "Parked"
 					return tk
 				}(),
 			},
@@ -263,7 +263,7 @@ func mkSpecTask(repo string, number int, isPR bool, headSHA, lifecycleState, pha
 		IsPR:     isPR,
 	}
 	tk.Status.Phase = phase
-	tk.Status.LifecycleState = lifecycleState
+	tk.Status.DeployState = lifecycleState
 	if headSHA != "" {
 		// Seed the openedPR work-item so headSHAForTask can find it.
 		tk.Status.WorkItems = []tatarav1alpha1.WorkItemRef{{
@@ -390,7 +390,7 @@ func TestHeadSHAForTask_FallbackMergedHeadSHA(t *testing.T) {
 func TestIsDeduped_BotCommentDoesNotFreeKey(t *testing.T) {
 	created := metav1.Now()
 	terminal := mkCronTask("o/r", 7, "issueLifecycle", "", "Succeeded")
-	terminal.Status.LifecycleState = "Parked"
+	terminal.Status.DeployState = "Parked"
 	terminal.CreationTimestamp = created
 	existing := []tatarav1alpha1.Task{terminal}
 	managed := managedPhaseLabels(nil)

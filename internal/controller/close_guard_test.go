@@ -28,7 +28,7 @@ func TestFinishTriage_Close_WithUnmergedChange_NotClosed(t *testing.T) {
 	_, err := r.finishTriage(ctx, proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Empty(t, w.closed, "issue must NOT be closed while an unmerged change exists")
-	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Conversation", getTaskByName(t, task.Name).Status.DeployState)
 	require.Equal(t, []string{"tatara-brainstorming"}, w.added, "label brainstorming, not declined")
 }
 
@@ -43,6 +43,6 @@ func TestFinishTriage_Close_NoChange_Closed(t *testing.T) {
 	_, err := r.finishTriage(ctx, proj, getTaskByName(t, task.Name))
 	require.NoError(t, err)
 	require.Equal(t, []int{7}, w.closed, "pure triage reject closes the issue")
-	require.Equal(t, "Done", getTaskByName(t, task.Name).Status.LifecycleState)
+	require.Equal(t, "Done", getTaskByName(t, task.Name).Status.DeployState)
 	require.Contains(t, w.added, "tatara-declined")
 }

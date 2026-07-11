@@ -25,7 +25,7 @@ func mkParkedLifecycleTask(t *testing.T, name, project, repoRef string, giveUps 
 	if err := k8sClient.Create(context.Background(), tk); err != nil {
 		t.Fatalf("mkParkedLifecycleTask create %s: %v", name, err)
 	}
-	tk.Status.LifecycleState = "Parked"
+	tk.Status.DeployState = "Parked"
 	tk.Status.ParkReason = parkReason
 	tk.Status.ImplementGiveUps = giveUps
 	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
