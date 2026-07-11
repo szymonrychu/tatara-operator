@@ -478,6 +478,15 @@ spec:
                 - action
                 - reason
                 type: object
+              issueLinks:
+                description: |-
+                  IssueLinks is every issue this Task touched: DiscoveredIssues,
+                  FollowupIssueURL, and issue-kind WorkItems, deduped. Full URLs where the
+                  source field carries one (DiscoveredIssues/FollowupIssueURL); "repo#N"
+                  refs where only a WorkItemRef exists (item 9).
+                items:
+                  type: string
+                type: array
               issueOutcome:
                 description: IssueOutcome is the agent's outcome for an issue-triage
                   task.
@@ -586,6 +595,13 @@ spec:
                 type: string
               podName:
                 type: string
+              prLinks:
+                description: |-
+                  PRLinks is every PR/MR this Task touched: PrURL and PR-kind WorkItems,
+                  deduped. Same mixed URL/"repo#N" format as IssueLinks.
+                items:
+                  type: string
+                type: array
               prNumber:
                 type: integer
               prOutcome:

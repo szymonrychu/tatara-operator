@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -127,20 +128,30 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, fmt.Errorf("get task: %w", err)
 	}
 
-	// item 7: keep the printcolumn-backed ShortDescription fresh on every
-	// reconcile, independent of kind/phase branching below (kubectl get must be
-	// scannable without describe for issueLifecycle/clarify Tasks too, which
-	// return early via reconcileLifecycle/reconcileClarify).
+	// item 7/9: keep the printcolumn-backed ShortDescription and the
+	// describe-visible IssueLinks/PRLinks fresh on every reconcile, independent
+	// of kind/phase branching below (kubectl get/describe must be scannable
+	// without extra lookups for issueLifecycle/clarify Tasks too, which return
+	// early via reconcileLifecycle/reconcileClarify).
 	if err := r.patchTaskStatus(ctx, &task, func(fresh *tatarav1alpha1.Task) bool {
-		desc := shortDescription(fresh.Spec.Goal)
-		if fresh.Status.ShortDescription == desc {
-			return false
+		changed := false
+		if desc := shortDescription(fresh.Spec.Goal); fresh.Status.ShortDescription != desc {
+			fresh.Status.ShortDescription = desc
+			changed = true
 		}
-		fresh.Status.ShortDescription = desc
-		return true
+		issues, prs := deriveIssuePRLinks(fresh)
+		if !slices.Equal(fresh.Status.IssueLinks, issues) {
+			fresh.Status.IssueLinks = issues
+			changed = true
+		}
+		if !slices.Equal(fresh.Status.PRLinks, prs) {
+			fresh.Status.PRLinks = prs
+			changed = true
+		}
+		return changed
 	}); err != nil {
-		l.Error(err, "task: update short description (non-fatal)",
-			"action", "task_short_description", "resource_id", task.Name)
+		l.Error(err, "task: update derived status (non-fatal)",
+			"action", "task_derived_status", "resource_id", task.Name)
 	}
 
 	// Lazy-seed the work-item ledger from Spec.Source when WorkItems is empty.
@@ -1065,6 +1076,83 @@ func upsertSubtaskRollup(status *tatarav1alpha1.TaskStatus, ref tatarav1alpha1.S
 // internal/restapi's createSubtask handler to seed a Pending rollup entry.
 func UpsertSubtaskRollup(status *tatarav1alpha1.TaskStatus, ref tatarav1alpha1.SubtaskRef) {
 	upsertSubtaskRollup(status, ref)
+}
+
+// linkKey normalizes a link to a repo#N identity so a full SCM URL
+// (DiscoveredIssues/PrURL/FollowupIssueURL) and a WorkItems-derived "repo#N"
+// ref pointing at the same artifact dedupe against each other even though
+// their string forms differ.
+func linkKey(v string) string {
+	if repo, n, ok := parseURLRepoNumber(v); ok {
+		return fmt.Sprintf("%s#%d", repo, n)
+	}
+	return v
+}
+
+// parseURLRepoNumber extracts owner/repo and the trailing item number from a
+// GitHub/GitLab issue or PR/MR URL (".../o/n/issues/1", ".../o/n/pull/2",
+// ".../o/n/-/merge_requests/3"). Returns ok=false for anything else (already
+// a "repo#N" ref, or an unrecognized shape).
+func parseURLRepoNumber(u string) (repo string, number int, ok bool) {
+	segs := strings.Split(strings.TrimRight(u, "/"), "/")
+	if len(segs) < 4 {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(segs[len(segs)-1])
+	if err != nil {
+		return "", 0, false
+	}
+	kindIdx := len(segs) - 2
+	if segs[kindIdx] == "-" {
+		// GitLab merge-request URLs insert a bare "-" segment.
+		kindIdx--
+	}
+	if kindIdx < 2 {
+		return "", 0, false
+	}
+	return segs[kindIdx-2] + "/" + segs[kindIdx-1], n, true
+}
+
+// deriveIssuePRLinks builds the SCM-footprint link lists (item 9) from every
+// ledger source: the full-URL fields (DiscoveredIssues, PrURL,
+// FollowupIssueURL) plus WorkItems entries rendered as "repo#N" refs, deduped
+// by normalized identity (linkKey) so a URL and a ref for the same artifact
+// collapse to one entry.
+func deriveIssuePRLinks(t *tatarav1alpha1.Task) (issues, prs []string) {
+	seenI, seenP := map[string]bool{}, map[string]bool{}
+	addI := func(v string) {
+		if v == "" {
+			return
+		}
+		if k := linkKey(v); !seenI[k] {
+			seenI[k] = true
+			issues = append(issues, v)
+		}
+	}
+	addP := func(v string) {
+		if v == "" {
+			return
+		}
+		if k := linkKey(v); !seenP[k] {
+			seenP[k] = true
+			prs = append(prs, v)
+		}
+	}
+	for _, u := range t.Status.DiscoveredIssues {
+		addI(u)
+	}
+	addI(t.Status.FollowupIssueURL)
+	addP(t.Status.PrURL)
+	for _, w := range t.Status.WorkItems {
+		ref := fmt.Sprintf("%s#%d", w.Repo, w.Number)
+		switch w.Kind {
+		case tatarav1alpha1.WorkItemIssue:
+			addI(ref)
+		case tatarav1alpha1.WorkItemPR:
+			addP(ref)
+		}
+	}
+	return issues, prs
 }
 
 // shortDescription is the first line of goal, truncated to ~60 runes on a

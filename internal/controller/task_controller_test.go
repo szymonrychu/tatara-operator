@@ -244,6 +244,40 @@ func TestReconcileTask_SetsShortDescription(t *testing.T) {
 	}
 }
 
+func TestDeriveIssuePRLinks_MixedLedger(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			DiscoveredIssues: []string{"https://github.com/o/n/issues/1"},
+			PrURL:            "https://github.com/o/n/pull/2",
+			FollowupIssueURL: "https://github.com/o/n/issues/3",
+			WorkItems: []tatarav1alpha1.WorkItemRef{
+				{Provider: "github", Repo: "o/n", Number: 4, Kind: tatarav1alpha1.WorkItemIssue},
+				{Provider: "github", Repo: "o/n", Number: 5, Kind: tatarav1alpha1.WorkItemPR},
+			},
+		},
+	}
+	issues, prs := deriveIssuePRLinks(task)
+	if len(issues) != 3 {
+		t.Errorf("issues = %v, want 3 entries", issues)
+	}
+	if len(prs) != 2 {
+		t.Errorf("prs = %v, want 2 entries", prs)
+	}
+}
+
+func TestDeriveIssuePRLinks_Dedupes(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			DiscoveredIssues: []string{"https://github.com/o/n/issues/1"},
+			WorkItems:        []tatarav1alpha1.WorkItemRef{{Provider: "github", Repo: "o/n", Number: 1, Kind: tatarav1alpha1.WorkItemIssue}},
+		},
+	}
+	issues, _ := deriveIssuePRLinks(task)
+	if len(issues) != 1 {
+		t.Errorf("issues = %v, want deduped to 1 entry", issues)
+	}
+}
+
 // ----- Task 6: concurrency gate + spawn -----
 
 func TestTaskReconcile_GatesUntilMemoryReady(t *testing.T) {

@@ -640,6 +640,17 @@ type TaskStatus struct {
 	// order-0 planning entry), maintained as subtasks progress. See SubtaskRef.
 	// +optional
 	Subtasks []SubtaskRef `json:"subtasks,omitempty"`
+
+	// IssueLinks is every issue this Task touched: DiscoveredIssues,
+	// FollowupIssueURL, and issue-kind WorkItems, deduped. Full URLs where the
+	// source field carries one (DiscoveredIssues/FollowupIssueURL); "repo#N"
+	// refs where only a WorkItemRef exists (item 9).
+	// +optional
+	IssueLinks []string `json:"issueLinks,omitempty"`
+	// PRLinks is every PR/MR this Task touched: PrURL and PR-kind WorkItems,
+	// deduped. Same mixed URL/"repo#N" format as IssueLinks.
+	// +optional
+	PRLinks []string `json:"prLinks,omitempty"`
 }
 
 // SubtaskRef is a durable point-in-time snapshot of one subtask, rolled onto
