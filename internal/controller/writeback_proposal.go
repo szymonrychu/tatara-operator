@@ -380,7 +380,20 @@ func (r *TaskReconciler) matchIncidentByDedupKey(ctx context.Context, proj *tata
 	}
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
-		if t.Name == selfName || t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "incident" || t.Spec.DedupKey != dedupKey {
+		if t.Name == selfName || t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "incident" {
+			continue
+		}
+		// Candidate identity mirrors incidentAlertGroup's own fallback (restapi
+		// package): DedupKey when set, else the descriptive AlertRule name.
+		// Without this, a legacy pre-migration Task (DedupKey=="" but AlertRule
+		// set) never matches - comparing its raw empty DedupKey against a
+		// caller's AlertRule-name fallback always mismatches, silently disabling
+		// the backstop for exactly the in-flight Tasks it exists to catch.
+		identity := t.Spec.DedupKey
+		if identity == "" {
+			identity = t.Spec.AlertRule
+		}
+		if identity == "" || identity != dedupKey {
 			continue
 		}
 		if len(t.Status.DiscoveredIssues) > 0 {
