@@ -189,6 +189,17 @@ func TestCallbackRunnableNeedLeaderElection(t *testing.T) {
 	}
 }
 
+func TestMaintenanceRunnable_IsLeaderOnly(t *testing.T) {
+	var m maintenanceRunnable
+	if !m.NeedLeaderElection() {
+		t.Error("maintenanceRunnable must require leader election (leader-only poll/reap)")
+	}
+	var c callbackRunnable
+	if c.NeedLeaderElection() {
+		t.Error("callbackRunnable must NOT require leader election (HTTP serves on every replica)")
+	}
+}
+
 func TestMemoryConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
 		Namespace:               "tatara",
