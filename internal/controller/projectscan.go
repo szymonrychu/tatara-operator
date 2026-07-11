@@ -1244,6 +1244,12 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	}
 	created := 0
 	deferred := 0
+	// failedMark tracks candidates whose createScanTask call failed this cycle
+	// (transient enqueue error, no RetryOnConflict). Their key is excluded from
+	// upserts below so the scan mark is NOT advanced - advancing it would make
+	// the freshness gate skip the item forever despite the fast 60s backlog
+	// retry, silently dropping it from ever getting its Task.
+	failedMark := map[string]bool{}
 	for _, c := range eligible {
 		repo, ok := r.matchRepoForSlug(repos, c.repo)
 		if !ok {
@@ -1311,6 +1317,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				l.Error(err, "scan: enqueue mrScan issueLifecycle event", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
 				deferred++
+				failedMark[scanMarkKey(c.repo, c.number)] = true
 				continue
 			}
 			if ok2 {
@@ -1336,6 +1343,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				l.Error(err, "scan: enqueue mrScan task", "resource_id", proj.Name, "repo", repo.Name)
 				r.Metrics.ScanItem("mrScan", "create_error")
 				deferred++
+				failedMark[scanMarkKey(c.repo, c.number)] = true
 				continue
 			}
 			if ok2 {
@@ -1351,7 +1359,11 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 	keepKeys := make(map[string]bool, len(cands))
 	upserts := make([]scanMarkUpsert, 0, len(cands))
 	for _, c := range cands {
-		keepKeys[scanMarkKey(c.repo, c.number)] = true
+		k := scanMarkKey(c.repo, c.number)
+		keepKeys[k] = true
+		if failedMark[k] {
+			continue // creation failed this cycle; do not advance the mark, so the fast retry re-attempts
+		}
 		upserts = append(upserts, scanMarkUpsert{repo: c.repo, number: c.number, updatedAt: c.updatedAt, isPR: true})
 	}
 	if err := r.persistScanMarks(ctx, proj, upserts, keepKeys, scannedRepos, true); err != nil {
@@ -1486,6 +1498,13 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	// ("implement\x00<issueRef>") plus needsImplementProducer's Task check keep it
 	// to one implement Task per episode.
 	produced := map[string]bool{}
+	// failedMark tracks candidates whose createScanTask call failed this cycle
+	// (transient enqueue error, no RetryOnConflict), across both this producer
+	// loop and the triage loop below. Their key is excluded from upserts in the
+	// mark-collection block so the scan mark is NOT advanced - advancing it
+	// would make the freshness gate skip the item forever despite the fast 60s
+	// backlog retry, silently dropping it from ever getting its Task.
+	failedMark := map[string]bool{}
 	for _, c := range cands {
 		if !needsImplementProducer(c, existing, implementation) {
 			continue
@@ -1513,6 +1532,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		if cerr != nil {
 			l.Error(cerr, "issueScan: enqueue implement producer event", "action", "scan_issue",
 				"resource_id", proj.Name, "repo", repo.Name, "issue", fmt.Sprintf("%s#%d", c.repo, c.number))
+			failedMark[scanMarkKey(c.repo, c.number)] = true
 			continue
 		}
 		produced[fmt.Sprintf("%s#%d", c.repo, c.number)] = true
@@ -1549,6 +1569,7 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 		picked, err := r.issueScanPickOne(ctx, proj, reader, repos, existing, c, systemicLeads, managed, brainstorming, approved, implementation, declined, botLogin, cc)
 		if err != nil {
 			deferred++
+			failedMark[scanMarkKey(c.repo, c.number)] = true
 			continue
 		}
 		if picked {
@@ -1566,7 +1587,11 @@ func (r *ProjectReconciler) issueScan(ctx context.Context, proj *tatarav1alpha1.
 	keepKeys := make(map[string]bool, len(cands))
 	upserts := make([]scanMarkUpsert, 0, len(cands))
 	for _, c := range cands {
-		keepKeys[scanMarkKey(c.repo, c.number)] = true
+		k := scanMarkKey(c.repo, c.number)
+		keepKeys[k] = true
+		if failedMark[k] {
+			continue // creation failed this cycle; do not advance the mark, so the fast retry re-attempts
+		}
 		upserts = append(upserts, scanMarkUpsert{repo: c.repo, number: c.number, updatedAt: c.updatedAt, isPR: false})
 	}
 	if err := r.persistScanMarks(ctx, proj, upserts, keepKeys, scannedRepos, false); err != nil {
