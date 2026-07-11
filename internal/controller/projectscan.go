@@ -1206,6 +1206,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 		bot = proj.Spec.Scm.BotLogin
 	}
 	seen := map[string]bool{}
+	scannedRepos := make(map[string]bool)
 	var cands []candidate
 	for i := range repos {
 		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
@@ -1217,6 +1218,7 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			l.Error(err, "scan: ListOpenPRs", "action", "scan_list_error", "resource_id", proj.Name, "activity", "mrScan", "repo", repos[i].Name)
 			continue
 		}
+		scannedRepos[owner+"/"+name] = true
 		for _, c := range candidatesFromPRs(prs) {
 			key := fmt.Sprintf("%s#%d", c.repo, c.number)
 			if seen[key] {
@@ -1267,6 +1269,19 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 			if hasLiveLifecycleTaskForIssue(existing, c.repo, dedupNumber) {
 				r.Metrics.ScanItem("mrScan", "skipped_dedup")
 				continue
+			}
+			// Stale-activity cutoff (issue #285): a bot lifecycle PR with no new
+			// activity since we last accounted for it must not be re-created after
+			// its terminal Task is GC'd. Keyed by the PR number (c.number), which
+			// is what botHadLastWord below also reads. Zero UpdatedAt never gates.
+			if !c.updatedAt.IsZero() {
+				if m := lookupScanMark(proj.Status.ScanMarks, c.repo, c.number); m != nil && !c.updatedAt.After(m.AccountedAt.Time) {
+					r.Metrics.ScanItem("mrScan", "skipped_stale_mark")
+					l.Info("mrScan: skipped bot PR re-creation, no new activity since accounted mark",
+						"action", "scan_mr", "resource_id", proj.Name, "repo", c.repo, "pr", c.number,
+						"accounted_at", m.AccountedAt.Time, "updated_at", c.updatedAt)
+					continue
+				}
 			}
 			labelCand := candidate{
 				repo: c.repo, number: dedupNumber, headSHA: c.headSHA,
@@ -1328,6 +1343,19 @@ func (r *ProjectReconciler) mrScan(ctx context.Context, proj *tatarav1alpha1.Pro
 				created++
 			}
 		}
+	}
+	// Persist per-item high-water marks (issue #285): record the observed
+	// UpdatedAt for every PR candidate we scanned this cycle, and prune marks for
+	// items no longer open in the repos we actually listed. Scoped to PRs
+	// (isPR=true); issueScan owns issue marks.
+	keepKeys := make(map[string]bool, len(cands))
+	upserts := make([]scanMarkUpsert, 0, len(cands))
+	for _, c := range cands {
+		keepKeys[scanMarkKey(c.repo, c.number)] = true
+		upserts = append(upserts, scanMarkUpsert{repo: c.repo, number: c.number, updatedAt: c.updatedAt, isPR: true})
+	}
+	if err := r.persistScanMarks(ctx, proj, upserts, keepKeys, scannedRepos, true); err != nil {
+		l.Error(err, "mrScan: persist scan marks", "action", "scan_mr", "resource_id", proj.Name)
 	}
 	r.Metrics.ObserveScanDuration("mrScan", time.Since(start).Seconds())
 	l.Info("mrScan complete", "action", "scan_mr", "resource_id", proj.Name,
