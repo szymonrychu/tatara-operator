@@ -30,6 +30,9 @@ type fakeWriter struct {
 	openErr     error
 }
 
+func (f *fakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *fakeWriter) OpenChange(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -295,6 +298,9 @@ type fakeWriterPerRepo struct {
 	errRepos    map[string]bool   // repoURL -> return 422
 }
 
+func (f *fakeWriterPerRepo) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *fakeWriterPerRepo) OpenChange(_ context.Context, repoURL, _, _, _, _, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -522,6 +528,9 @@ type fullFakeSCMWriter struct {
 	// GetPRState
 	prState    scm.PRState
 	prStateErr error
+	// GetIssueState
+	issueState    scm.IssueState
+	issueStateErr error
 	// GetMergeState (default clean when empty; per-number overrides win)
 	mergeState         scm.MergeState
 	mergeStateByNumber map[int]scm.MergeState
@@ -603,6 +612,9 @@ func (f *fullFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, prURL, meth
 }
 func (f *fullFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
 	return f.prState, f.prStateErr
+}
+func (f *fullFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return f.issueState, f.issueStateErr
 }
 func (f *fullFakeSCMWriter) GetMergeState(_ context.Context, _, _ string, number int) (scm.MergeState, error) {
 	if ms, ok := f.mergeStateByNumber[number]; ok {

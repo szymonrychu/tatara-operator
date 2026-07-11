@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,7 +21,43 @@ const (
 	gateOpen     gateReason = ""
 	gateBotMR    gateReason = "bot_mr"    // rule 2: never comment on the bot's own MR
 	gateLastWord gateReason = "last_word" // rule 1: bot already had the last word
+	gateClosed   gateReason = "closed"    // rule: target PR/MR/issue is closed or merged
+	gateDedup    gateReason = "duplicate" // rule: identical normalized bot comment already posted
 )
+
+// volatileTokenRE strips turn counters and RFC3339 timestamps so two bot
+// comments differing only in those render identically for dedup purposes.
+var volatileTokenRE = regexp.MustCompile(`(?i)\bturn\s+\d+\b|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-]\d{2}:\d{2})?`)
+
+// normalizeCommentBody collapses whitespace, lowercases, and strips volatile
+// tokens so two comments are compared on stable content only.
+func normalizeCommentBody(body string) string {
+	stripped := volatileTokenRE.ReplaceAllString(body, "")
+	return strings.ToLower(strings.Join(strings.Fields(stripped), " "))
+}
+
+// NormalizeCommentBody is the exported form for restapi reuse (rule 3 parity).
+func NormalizeCommentBody(body string) string { return normalizeCommentBody(body) }
+
+// duplicateRecentBotComment reports whether body normalizes identically to a
+// bot comment already present in the thread window.
+func duplicateRecentBotComment(comments []scm.IssueComment, botLogin, body string) bool {
+	want := normalizeCommentBody(body)
+	if want == "" {
+		return false
+	}
+	for _, c := range comments {
+		if c.Author == botLogin && normalizeCommentBody(c.Body) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// DuplicateRecentBotComment is the exported form for restapi reuse.
+func DuplicateRecentBotComment(comments []scm.IssueComment, botLogin, body string) bool {
+	return duplicateRecentBotComment(comments, botLogin, body)
+}
 
 // CommentSilenceBreakers returns the deduped set of logins whose comment breaks
 // the bot's silence: the reporter intake allowlist unioned with the
@@ -85,17 +123,20 @@ func botHasLastWordAmong(comments []scm.IssueComment, botLogin string, breakers 
 // the triage isTataraAuthored/botHasLastWord family) behind one call site so the
 // refusal is uniform across kinds.
 //
-// SOLE exception: kind=="refine" is always permitted - the backlog refiner is the
+// SOLE exceptions: kind=="refine" is always permitted - the backlog refiner is the
 // one kind allowed to answer tatara's own prior comment (e.g. a sharper-scope note
-// on a gave-up issue, or a "scope already delivered" reply). The carve-out is kept
-// deliberately narrow: only the exact string "refine".
+// on a gave-up issue, or a "scope already delivered" reply). kind=="incident" is
+// also always permitted - an incident agent posts sequential evidence/status
+// updates on its own tracker issue as investigation progresses, which is expected
+// self-follow-up, not a runaway loop. Both carve-outs are kept deliberately narrow:
+// only the exact strings "refine" and "incident".
 //
 // Fail-open matches the rest of the family: an empty botLogin (the guard cannot be
 // evaluated) permits, and callers permit on a comment-list read error, so a lost
 // webhook is still recoverable by a later scan. The returned reason is
 // machine-readable ("bot_last_word") so the pod skill can react to a refusal.
 func PermitComment(kind string, comments []scm.IssueComment, botLogin string, breakers []string) (bool, string) {
-	if kind == "refine" {
+	if kind == "refine" || kind == "incident" {
 		return true, ""
 	}
 	if botLogin == "" {
@@ -129,10 +170,14 @@ func resolveBotMR(ctx context.Context, writer scm.SCMWriter, repoURL, token stri
 
 // decideCommentGate reports whether a bot comment must be withheld and why.
 // Rule 2 (bot MR) short-circuits before any comment listing. Rule 1 lists the
-// conversation and applies botHasLastWordAmong. Fail-open (gateOpen) on missing
-// inputs or read errors, matching botHadLastWord / humanCommentAfter so a lost
-// webhook can still be recovered by a later scan.
-func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, owner, name, repoURL, token, provider string, number int, isPR bool, botLogin, authorHint string, breakers []string) gateReason {
+// conversation and applies botHasLastWordAmong. The closed-state rule then
+// checks GetPRState/GetIssueState so a bot comment never lands on a target that
+// already resolved (merged/closed) between the decision to comment and now. The
+// content-dedup rule then checks whether body normalizes identically to a bot
+// comment already on the thread. Fail-open (gateOpen) on missing inputs or read
+// errors, matching botHadLastWord / humanCommentAfter so a lost webhook can
+// still be recovered by a later scan.
+func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCMWriter, owner, name, repoURL, token, provider string, number int, isPR bool, botLogin, authorHint, body string, breakers []string) gateReason {
 	if botLogin == "" || reader == nil || owner == "" {
 		return gateOpen
 	}
@@ -158,6 +203,24 @@ func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCM
 	if botHasLastWordAmong(comments, botLogin, breakers) {
 		return gateLastWord
 	}
+	if writer != nil {
+		closed := false
+		if isPR {
+			if st, perr := writer.GetPRState(ctx, repoURL, token, number); perr == nil {
+				closed = st.Closed || st.Merged
+			}
+		} else {
+			if st, ierr := writer.GetIssueState(ctx, repoURL, token, number); ierr == nil {
+				closed = st.Closed
+			}
+		}
+		if closed {
+			return gateClosed
+		}
+	}
+	if duplicateRecentBotComment(comments, botLogin, body) {
+		return gateDedup
+	}
 	return gateOpen
 }
 
@@ -165,7 +228,7 @@ func decideCommentGate(ctx context.Context, reader scm.SCMReader, writer scm.SCM
 // project/repo and returns the gate decision for a bot comment on (number,isPR).
 // Fail-open (gateOpen) when ReaderFor is nil, the reader cannot be built, or the
 // repo URL is unsplittable.
-func (r *TaskReconciler) commentGateReason(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint string) gateReason {
+func (r *TaskReconciler) commentGateReason(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint, body string) gateReason {
 	botLogin := ""
 	if proj != nil && proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
@@ -182,7 +245,7 @@ func (r *TaskReconciler) commentGateReason(ctx context.Context, proj *tatarav1al
 		return gateOpen
 	}
 	breakers := CommentSilenceBreakers(proj, repo)
-	return decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, breakers)
+	return decideCommentGate(ctx, reader, writer, owner, name, repo.Spec.URL, token, provider, number, isPR, botLogin, authorHint, body, breakers)
 }
 
 // parkIsBotMRByHint reports whether a park target is the bot's own PR/MR using
@@ -207,7 +270,7 @@ func (r *TaskReconciler) parkIsBotMRByHint(ctx context.Context, task *tatarav1al
 // SCMWrite(provider,"comment","suppressed_<reason>"). ref is the SCM ref the
 // caller already builds so provider sigils stay identical.
 func (r *TaskReconciler) gatedComment(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, writer scm.SCMWriter, token, provider string, number int, isPR bool, authorHint, ref, body string) (bool, error) {
-	reason := r.commentGateReason(ctx, proj, repo, writer, token, provider, number, isPR, authorHint)
+	reason := r.commentGateReason(ctx, proj, repo, writer, token, provider, number, isPR, authorHint, body)
 	if reason != gateOpen {
 		if r.Metrics != nil {
 			r.Metrics.SCMWrite(provider, "comment", "suppressed_"+string(reason))

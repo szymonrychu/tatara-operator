@@ -142,6 +142,9 @@ type perRepoOpenWriter struct {
 	skipNoChange map[string]bool   // repoURL -> return 422 no-change
 }
 
+func (f *perRepoOpenWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *perRepoOpenWriter) OpenChange(_ context.Context, repoURL, _, _, _, _, _ string) (string, error) {
 	if f.skipNoChange[repoURL] {
 		return "", &scm.HTTPError{Status: 422, Body: "No commits between main and the branch"}

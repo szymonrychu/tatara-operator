@@ -22,6 +22,9 @@ type noChangeRecordingSCMWriter struct {
 	commentCalls []struct{ issueRef, body string }
 }
 
+func (f *noChangeRecordingSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (n *noChangeRecordingSCMWriter) OpenChange(_ context.Context, _, _, _, _, _, _ string) (string, error) {
 	return "", &scm.HTTPError{Status: 422, Body: "no diff", Path: "/pulls"}
 }

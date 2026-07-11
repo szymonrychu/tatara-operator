@@ -36,6 +36,10 @@ func (f *authorshipFakeWriter) GetPRState(_ context.Context, _, _ string, _ int)
 	return scm.PRState{Author: f.prAuthor, CIStatus: f.ciStatus}, nil
 }
 
+func (f *authorshipFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
+
 func (f *authorshipFakeWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

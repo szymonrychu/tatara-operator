@@ -19,6 +19,9 @@ type fakeTokenRecordingWriter struct {
 	capturedToken string
 }
 
+func (f *fakeTokenRecordingWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *fakeTokenRecordingWriter) CloseIssue(_ context.Context, token, _ string, _ int, _ string) error {
 	f.capturedToken = token
 	return nil

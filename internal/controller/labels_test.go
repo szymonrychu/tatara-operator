@@ -36,6 +36,12 @@ func (w *labelWriter) RemoveLabel(_ context.Context, _, _, label string) error {
 	w.removed = append(w.removed, label)
 	return nil
 }
+func (w *labelWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	return scm.PRState{}, nil
+}
+func (w *labelWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 
 type labelReader struct {
 	fakeProposalReader
@@ -162,6 +168,9 @@ type errAddLabelWriter struct {
 	addErr error
 }
 
+func (f *errAddLabelWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (w *errAddLabelWriter) AddLabel(_ context.Context, _, _, _ string) error { return w.addErr }
 func (w *errAddLabelWriter) RemoveLabel(_ context.Context, _, _, _ string) error {
 	return nil

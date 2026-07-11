@@ -31,6 +31,9 @@ type mergeGateWriter struct {
 func (w *mergeGateWriter) GetPRState(context.Context, string, string, int) (scm.PRState, error) {
 	return w.prState, nil
 }
+func (w *mergeGateWriter) GetIssueState(context.Context, string, string, int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (w *mergeGateWriter) GetMergeState(context.Context, string, string, int) (scm.MergeState, error) {
 	if w.mergeState == "" {
 		return scm.MergeStateClean, nil

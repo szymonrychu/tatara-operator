@@ -45,6 +45,10 @@ func (w *umbWriter) GetPRState(_ context.Context, _, _ string, number int) (scm.
 	return scm.PRState{Merged: w.merged[number], Closed: w.closed[number], CIStatus: "success"}, nil
 }
 
+func (w *umbWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
+
 func (w *umbWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

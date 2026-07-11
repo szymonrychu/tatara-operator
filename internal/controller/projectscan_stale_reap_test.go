@@ -157,6 +157,9 @@ type reapFakeWriter struct {
 	closeIssueErr error
 }
 
+func (f *reapFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *reapFakeWriter) Comment(_ context.Context, _, issueRef, body string) error {
 	f.commentCalls = append(f.commentCalls, struct{ issueRef, body string }{issueRef, body})
 	return nil

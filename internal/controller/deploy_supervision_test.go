@@ -126,6 +126,9 @@ type deployFakeWriter struct {
 	closeCalls []string // repo|number|comment
 }
 
+func (f *deployFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *deployFakeWriter) CloseIssue(_ context.Context, _, repo string, number int, comment string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

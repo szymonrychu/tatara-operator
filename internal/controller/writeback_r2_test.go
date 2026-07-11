@@ -155,6 +155,10 @@ func (f *alreadyExistsFakeWriter) GetPRState(_ context.Context, _, _ string, _ i
 	return scm.PRState{Author: "bot", HeadBranch: f.headBranch}, nil
 }
 
+func (f *alreadyExistsFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
+
 func (f *alreadyExistsFakeWriter) Comment(_ context.Context, _, _, _ string) error { return nil }
 
 // fakePRReader is a minimal SCMReader that returns one open PR.
@@ -315,6 +319,9 @@ type commentTargetFakeWriter struct {
 	commentIssueRef string
 }
 
+func (f *commentTargetFakeWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *commentTargetFakeWriter) Comment(_ context.Context, _, issueRef, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

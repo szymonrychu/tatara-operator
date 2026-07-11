@@ -37,6 +37,10 @@ type lifecycleFakeSCMWriter struct {
 	createIssueURL string
 }
 
+func (f *lifecycleFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
+
 func (f *lifecycleFakeSCMWriter) CloseIssue(_ context.Context, _, repo string, _ int, comment string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

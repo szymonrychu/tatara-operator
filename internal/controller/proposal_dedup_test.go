@@ -51,6 +51,9 @@ type fakeProposalWriter struct {
 	comments    []proposalComment
 }
 
+func (f *fakeProposalWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *fakeProposalWriter) CreateIssue(_ context.Context, _, _ string, req scm.IssueReq) (scm.CreatedIssue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

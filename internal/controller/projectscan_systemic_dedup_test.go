@@ -21,6 +21,9 @@ type siblingFakeSCM struct {
 	commentCalls int
 }
 
+func (f *siblingFakeSCM) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *siblingFakeSCM) ListIssueComments(_ context.Context, owner, repo string, number int) ([]scm.IssueComment, error) {
 	key := fmt.Sprintf("%s/%s#%d", owner, repo, number)
 	return f.comments[key], nil

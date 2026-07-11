@@ -20,6 +20,9 @@ type fakeIssueWriter struct {
 	closeErr   error    // returned by CloseIssue when set
 }
 
+func (f *fakeIssueWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
+	return scm.IssueState{}, nil
+}
 func (f *fakeIssueWriter) CloseIssue(_ context.Context, _, repo string, _ int, comment string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
