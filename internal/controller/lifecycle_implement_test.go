@@ -572,7 +572,7 @@ func TestLifecycleImplement_LegacyImplementTaskDoesNotClose(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "lc-legacy-proj", Namespace: testNS},
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "lc-legacy-sec",
-			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o"},
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "tatara-bot"},
 			Agent: tatarav1alpha1.AgentSpec{
 				Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
 				MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,

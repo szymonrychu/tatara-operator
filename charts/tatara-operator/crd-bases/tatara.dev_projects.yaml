@@ -5592,6 +5592,13 @@ spec:
                       noreply/commit email). When empty the wrapper's default identity stands.
                     type: string
                   botLogin:
+                    description: |-
+                      BotLogin is the SCM login of the platform bot. Required and non-empty: it
+                      is the identity structurally excluded from the maintainer-approval gate, so
+                      an empty value would collapse the bot exclusion. Must not appear in
+                      maintainerLogins/reporterLogins (enforced by the ScmSpec CEL rules).
+                    maxLength: 100
+                    minLength: 1
                     type: string
                   brainstormingLabel:
                     default: tatara-brainstorming
@@ -5806,7 +5813,9 @@ spec:
                       excluded from #56 autoapprove). Overridable per-repository via
                       RepositorySpec.MaintainerLogins.
                     items:
+                      maxLength: 100
                       type: string
+                    maxItems: 100
                     type: array
                   mergePolicy:
                     default: afterApproval
@@ -5852,13 +5861,24 @@ spec:
                       author is accepted). Overridable per-repository via
                       RepositorySpec.ReporterLogins.
                     items:
+                      maxLength: 100
                       type: string
+                    maxItems: 100
                     type: array
                 required:
                 - botLogin
                 - owner
                 - provider
                 type: object
+                x-kubernetes-validations:
+                - message: maintainerLogins must not contain botLogin (the bot is
+                    structurally excluded from maintainer approval)
+                  rule: '!has(self.maintainerLogins) || self.maintainerLogins.all(m,
+                    m != self.botLogin)'
+                - message: reporterLogins must not contain botLogin (the bot is trusted
+                    implicitly; listing it is a misconfiguration)
+                  rule: '!has(self.reporterLogins) || self.reporterLogins.all(r, r
+                    != self.botLogin)'
               scmSecretRef:
                 type: string
               tokenBudget:

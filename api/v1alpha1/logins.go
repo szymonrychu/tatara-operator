@@ -9,26 +9,26 @@ package v1alpha1
 // repo, falling back to the Project's ScmSpec list when the repo sets no
 // override. A nil repo resolves to the project list.
 func EffectiveReporterLogins(proj *Project, repo *Repository) []string {
+	var list []string
 	if repo != nil && repo.Spec.ReporterLogins != nil {
-		return *repo.Spec.ReporterLogins
+		list = *repo.Spec.ReporterLogins
+	} else if proj != nil && proj.Spec.Scm != nil {
+		list = proj.Spec.Scm.ReporterLogins
 	}
-	if proj != nil && proj.Spec.Scm != nil {
-		return proj.Spec.Scm.ReporterLogins
-	}
-	return nil
+	return withoutBotLogin(proj, list)
 }
 
 // EffectiveMaintainerLogins returns the maintainer/approver allowlist in effect
 // for repo. Maintainers are the unified trusted-insider + approver set (issue
 // #102): the list that gates approval and the issue #56 autoapprove tier.
 func EffectiveMaintainerLogins(proj *Project, repo *Repository) []string {
+	var list []string
 	if repo != nil && repo.Spec.MaintainerLogins != nil {
-		return *repo.Spec.MaintainerLogins
+		list = *repo.Spec.MaintainerLogins
+	} else if proj != nil && proj.Spec.Scm != nil {
+		list = proj.Spec.Scm.MaintainerLogins
 	}
-	if proj != nil && proj.Spec.Scm != nil {
-		return proj.Spec.Scm.MaintainerLogins
-	}
-	return nil
+	return withoutBotLogin(proj, list)
 }
 
 // IsAllowedReporter reports whether login may drive issue/comment intake for the
@@ -100,6 +100,25 @@ func ResolvedApprovedLabel(s *ScmSpec) string {
 		return s.ApprovedLabel
 	}
 	return "tatara-approved"
+}
+
+// withoutBotLogin returns list with the project's bot login removed, so a bot
+// login misconfigured into a maintainer/reporter list has no runtime effect.
+// The bot's insider trust (IsAllowedReporter/IsTrustedAuthor) does not depend on
+// list membership - it is checked separately - so stripping the list is safe.
+// Returns list unchanged when no project bot login is set or the list is empty.
+func withoutBotLogin(proj *Project, list []string) []string {
+	if proj == nil || proj.Spec.Scm == nil || proj.Spec.Scm.BotLogin == "" || len(list) == 0 {
+		return list
+	}
+	bot := proj.Spec.Scm.BotLogin
+	out := make([]string, 0, len(list))
+	for _, x := range list {
+		if x != bot {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 func containsLogin(list []string, login string) bool {

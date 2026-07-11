@@ -45,17 +45,53 @@ func TestApprovalGate_MaintainerApproval_Implements(t *testing.T) {
 	}
 }
 
-// TestApprovalGate_MaintainerComment_DoesNotRelease: a maintainer COMMENT (no
-// recorded label approval) must NOT release the gate - comments are no longer an
-// approval signal (the any-comment / approver-comment release is removed).
-func TestApprovalGate_MaintainerComment_DoesNotRelease(t *testing.T) {
+// TestApprovalGate_MaintainerComment_Releases: a comment from a verified
+// maintainer, combined with the agent's implement verdict, now RELEASES the
+// gate - the operator records the approval (attributed to that maintainer) and
+// advances to Implement. This reverses the earlier "a comment alone no longer
+// releases" behavior, now gated on operator-verified maintainer identity.
+func TestApprovalGate_MaintainerComment_Releases(t *testing.T) {
 	r, name := seedAutoapproveTriage(t, "gate-cmt", "szymon", []string{"szymon"})
 	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
 		return &commentReader{body: tataraAuthoredMarker,
-			comments: []scm.IssueComment{{Author: "szymon", Body: "approved"}}}, nil
+			comments: []scm.IssueComment{{Author: "szymon", Body: "approved, go"}}}, nil
+	}
+	if got := reconcileTriageState(t, r, name); got != "Implement" {
+		t.Fatalf("DeployState = %q, want Implement (verified maintainer comment releases)", got)
+	}
+	if got := getTaskByName(t, name).Status.ApprovedByMaintainer; got != "szymon" {
+		t.Fatalf("ApprovedByMaintainer = %q, want szymon (attributed to the commenter)", got)
+	}
+}
+
+// TestApprovalGate_MaintainerCommentEmptyList_FailsClosed: with no maintainers
+// configured, even a matching-looking comment cannot release (closed by default).
+func TestApprovalGate_MaintainerCommentEmptyList_FailsClosed(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "gate-cmt-empty", "szymon", nil)
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &commentReader{body: tataraAuthoredMarker,
+			comments: []scm.IssueComment{{Author: "szymon", Body: "go"}}}, nil
 	}
 	if got := reconcileTriageState(t, r, name); got != "Conversation" {
-		t.Fatalf("DeployState = %q, want Conversation (maintainer comment must not release the gate)", got)
+		t.Fatalf("DeployState = %q, want Conversation (no maintainers => nothing releases)", got)
+	}
+}
+
+// TestApprovalGate_ParticipationReadError_FailsClosed: an SCM error while
+// scanning the thread must fail closed - requeue (error returned), never advance
+// and never park; state is unchanged (still Triage).
+func TestApprovalGate_ParticipationReadError_FailsClosed(t *testing.T) {
+	r, name := seedAutoapproveTriage(t, "gate-readerr", "szymon", []string{"szymon"})
+	r.ReaderFor = func(_, _ string) (scm.SCMReader, error) {
+		return &errListReader{commentReader{body: tataraAuthoredMarker}}, nil
+	}
+	ctx := context.Background()
+	tk := getTaskByName(t, name)
+	if _, err := r.reconcileLifecycle(ctx, tk); err == nil {
+		t.Fatal("want error (fail closed + requeue) on participation read error, got nil")
+	}
+	if got := getTaskByName(t, name).Status.DeployState; got != "Triage" {
+		t.Fatalf("DeployState = %q, want Triage (read error must not change state)", got)
 	}
 }
 

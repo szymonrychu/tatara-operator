@@ -784,6 +784,26 @@ func (r *TaskReconciler) clearIssueOutcome(ctx context.Context, task *tatarav1al
 	return nil
 }
 
+// recordConversationalApproval durably records a maintainer approval on the
+// Task's status (Status.ApprovedByMaintainer), attributed to the maintainer
+// whose thread comment released the implement gate. Mirrors the webhook's
+// recordMaintainerApproval, minus the DeployState flip (the caller falls
+// through to onImplement immediately).
+func (r *TaskReconciler) recordConversationalApproval(ctx context.Context, task *tatarav1alpha1.Task, maintainer string) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		fresh.Status.ApprovedByMaintainer = maintainer
+		return r.Status().Update(ctx, fresh)
+	}); err != nil {
+		return fmt.Errorf("record conversational approval: %w", err)
+	}
+	task.Status.ApprovedByMaintainer = maintainer
+	return nil
+}
+
 // clearImplementOutcome nils Status.ImplementOutcome (RetryOnConflict). Called
 // after the refusal arm has committed its state transition.
 func (r *TaskReconciler) clearImplementOutcome(ctx context.Context, task *tatarav1alpha1.Task) error {
