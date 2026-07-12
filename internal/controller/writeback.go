@@ -92,7 +92,36 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "ProjectScopedComplete", task.Spec.Kind+" is project-scoped; no PR to open")
 	}
 
+	// F4: enforce full-scope-or-decline on the generic write-back path too (the
+	// kind=implement Task created off the tatara-implementation label - see
+	// checkRemainingScopeHardFail). Must run before writeBackOpenChange, same
+	// ordering requirement as the issueLifecycle bridge (F1).
+	if res, err, handled := r.checkRemainingScopeHardFail(ctx, task); handled {
+		return res, err
+	}
+
 	return r.writeBackOpenChange(ctx, task)
+}
+
+// checkRemainingScopeHardFail hard-fails task Failed/IncompleteImplementation
+// when ChangeSummary.RemainingScope is non-empty, BEFORE writeBackOpenChange
+// ever runs (Request C, full-scope-or-decline). Shared by both write-back
+// entry points - the issueLifecycle bridge (finishImplement, F1) and the
+// generic kind=implement path (doWriteBack, F4) - so they cannot drift: an
+// incomplete change must never open a PR, get the semver label, or have
+// auto-merge enabled. handled=true means the task was terminated and the
+// caller must return (res, err) immediately without opening any change.
+func (r *TaskReconciler) checkRemainingScopeHardFail(ctx context.Context, task *tatarav1alpha1.Task) (res ctrl.Result, err error, handled bool) {
+	cs := task.Status.ChangeSummary
+	if cs == nil || cs.RemainingScope == "" {
+		return ctrl.Result{}, nil, false
+	}
+	log.FromContext(ctx).Info("writeback: change_summary declared remaining scope; failing task before any PR opens (full-scope-or-decline)",
+		"action", "lifecycle_implement_incomplete_scope", "resource_id", task.Name)
+	res, err = r.terminate(ctx, task, "Failed", "IncompleteImplementation",
+		"change_summary declared remaining_scope; agents must implement the full scope in one PR "+
+			"or call decline_implementation instead of leaving a gap - no follow-up issues are filed")
+	return res, err, true
 }
 
 // writeBackOpenChange attempts a PR/MR on every Project repo and opens one on

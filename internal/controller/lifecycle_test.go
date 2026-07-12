@@ -38,6 +38,8 @@ type lifecycleFakeSCMWriter struct {
 	issueClosed    bool
 	issueAuthor    string
 	issueStateErr  error
+	labelCalls     []string
+	autoMergeCalls int
 }
 
 func (f *lifecycleFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
@@ -90,12 +92,20 @@ func (f *lifecycleFakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req
 	return scm.CreatedIssue{Ref: "o/r#99", URL: url}, nil
 }
 
-func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
+func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.labelCalls = append(f.labelCalls, label)
+	return nil
+}
 func (f *lifecycleFakeSCMWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
 func (f *lifecycleFakeSCMWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error {
 	return nil
 }
 func (f *lifecycleFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.autoMergeCalls++
 	return nil
 }
 

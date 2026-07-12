@@ -210,6 +210,77 @@ func TestLifecycleImplement_RemainingScope_FailsIncomplete(t *testing.T) {
 	}
 }
 
+// TestLifecycleImplement_RemainingScope_NeverOpensPROrAutoMerges verifies F1:
+// the RemainingScope hard-fail must run BEFORE writeBackOpenChange, so an
+// incomplete change never gets its PR opened, never gets the semver label
+// stamped, and never has auto-merge enabled. Before the fix the hard-fail ran
+// AFTER writeBackOpenChange had already opened the PR, labeled it, and turned
+// on auto-merge - CI going green would then auto-merge the incomplete work
+// despite the Task terminating Failed.
+func TestLifecycleImplement_RemainingScope_NeverOpensPROrAutoMerges(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-m4-rem-noship"
+	proj := "lc-m4-rns-p"
+	repo := "lc-m4-rns-r"
+	sec := "lc-m4-rns-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#95",
+		URL: "https://github.com/o/r/issues/95", Number: 95,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.DeployState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.LifecycleIterations = 1
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: login",
+		PRBody:         "Adds login.",
+		DeliveredScope: "login endpoint",
+		RemainingScope: "logout endpoint, password reset",
+		Significance:   "minor", // set so a buggy ordering WOULD stamp the label + auto-merge
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/96"}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	if len(fw.openCalls) != 0 {
+		t.Errorf("OpenChange called %d times; want 0 - no PR may open for an incomplete change", len(fw.openCalls))
+	}
+	if len(fw.labelCalls) != 0 {
+		t.Errorf("AddLabel called %d times; want 0 - no semver label for an incomplete change", len(fw.labelCalls))
+	}
+	if fw.autoMergeCalls != 0 {
+		t.Errorf("EnableAutoMerge called %d times; want 0 - auto-merge must never be enabled for an incomplete change", fw.autoMergeCalls)
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", got.Status.Phase)
+	}
+	if got.Status.PrURL != "" {
+		t.Errorf("PrURL = %q, want empty - no PR must ever be recorded for an incomplete change", got.Status.PrURL)
+	}
+}
+
 // TestLifecycleImplement_EmptyRemainingScope_Succeeds verifies that when
 // RemainingScope is empty the Task proceeds normally (no follow-up issue,
 // no hard-fail; transitions to MRCI).

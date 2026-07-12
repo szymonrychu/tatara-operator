@@ -248,6 +248,16 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		}
 	}
 
+	// F1: full-scope-or-decline MUST be checked BEFORE writeBackOpenChange -
+	// opening the PR first (as this used to do, checking RemainingScope only
+	// after) let an incomplete change get its PR opened, semver-labeled, and
+	// auto-merge enabled before the hard-fail below ever ran, shipping the gap.
+	// checkRemainingScopeHardFail terminates the task and returns immediately
+	// when ChangeSummary.RemainingScope is non-empty; no PR is ever opened.
+	if res, err, handled := r.checkRemainingScopeHardFail(ctx, task); handled {
+		return res, err
+	}
+
 	// Phase == Succeeded: open MR via the shared writeBackOpenChange path.
 	// writeBackOpenChange sets task.Status.PrURL when a PR was opened.
 	if _, err := r.writeBackOpenChange(ctx, task); err != nil {
@@ -366,21 +376,6 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		if err := r.setImplementEmptyRetries(ctx, fresh, 0); err != nil {
 			l.Error(err, "implement: reset empty-retry counter (non-fatal)", "resource_id", task.Name)
 		}
-	}
-
-	// Request C: RemainingScope now means the implementation is INCOMPLETE.
-	// No follow-up issues are ever filed; the agent must implement the full
-	// scope in one PR or call decline_implementation instead of leaving a
-	// gap. A non-empty RemainingScope hard-fails the Task so it never
-	// reaches Succeeded - terminate() records TaskTerminal{reason=
-	// IncompleteImplementation}, making the gap alertable.
-	if fresh.Status.ChangeSummary != nil && fresh.Status.ChangeSummary.RemainingScope != "" {
-		l.Info("implement: change_summary declared remaining scope; failing task (full-scope-or-decline)",
-			"action", "lifecycle_implement_incomplete_scope", "resource_id", task.Name,
-			"pr_url", fresh.Status.PrURL)
-		return r.terminate(ctx, fresh, "Failed", "IncompleteImplementation",
-			"change_summary declared remaining_scope; agents must implement the full scope in one PR "+
-				"or call decline_implementation instead of leaving a gap - no follow-up issues are filed")
 	}
 
 	// Record head branch, PR number, and clear the stale deadline (e.g. from a

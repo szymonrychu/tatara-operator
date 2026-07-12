@@ -179,6 +179,69 @@ func TestTaskWriteBackOpensPRAndComments(t *testing.T) {
 	require.Contains(t, fw.commentArgs[0], "o/r#7|")
 }
 
+// TestTaskWriteBack_KindImplement_RemainingScopeNeverOpensPR verifies F4: the
+// full-scope-or-decline hard-fail must also apply on the generic kind=implement
+// write-back path (doWriteBack's default case), not only the issueLifecycle
+// bridge (finishImplement). Before the fix, a kind=implement Task with a
+// non-empty ChangeSummary.RemainingScope sailed straight through
+// writeBackOpenChange with no check at all.
+func TestTaskWriteBack_KindImplement_RemainingScopeNeverOpensPR(t *testing.T) {
+	fw := &fakeWriter{prURL: "https://github.com/o/r/pull/50"}
+	r := newWriteBackReconciler(t, fw)
+
+	ctx := context.Background()
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "wb-scm-impl", Namespace: testNS},
+		Data:       map[string][]byte{"token": []byte("pat"), "webhookSecret": []byte("w")},
+	}
+	require.NoError(t, k8sClient.Create(ctx, sec))
+	require.NoError(t, k8sClient.Create(ctx, &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "wb-proj-impl", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{ScmSecretRef: "wb-scm-impl"},
+	}))
+	require.NoError(t, k8sClient.Create(ctx, &tatarav1alpha1.Repository{
+		ObjectMeta: metav1.ObjectMeta{Name: "wb-repo-impl", Namespace: testNS},
+		Spec:       tatarav1alpha1.RepositorySpec{ProjectRef: "wb-proj-impl", URL: "https://github.com/o/r.git", DefaultBranch: "main", ReingestSchedule: "0 6 * * *"},
+	}))
+	src := &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#50", URL: "https://github.com/o/r/issues/50", Number: 50}
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "wb-task-impl", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "wb-proj-impl", RepositoryRef: "wb-repo-impl",
+			Kind: "implement", Goal: "Implement issue 50", Source: src,
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, task))
+	task.Status.Phase = "Succeeded"
+	task.Status.ResultSummary = "did the thing"
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: partial",
+		PRBody:         "Partial implementation.",
+		DeliveredScope: "half of it",
+		RemainingScope: "the other half",
+	}
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+		Type: "WritebackPending", Status: metav1.ConditionTrue, Reason: "AwaitingM5",
+	})
+	require.NoError(t, k8sClient.Status().Update(ctx, task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	openCalls := fw.openCalls
+	fw.mu.Unlock()
+	require.Equal(t, 0, openCalls, "OpenChange must never be called for a Task with declared RemainingScope")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	require.Empty(t, got.Status.PrURL, "no PR must ever be recorded for an incomplete change")
+	require.Equal(t, "Failed", got.Status.Phase)
+	cond := findCond(got.Status.Conditions, "Ready")
+	require.NotNil(t, cond)
+	require.Equal(t, "IncompleteImplementation", cond.Reason)
+}
+
 func TestTaskWriteBackNoCommentWhenNoSource(t *testing.T) {
 	fw := &fakeWriter{prURL: "https://github.com/o/r/pull/6"}
 	r := newWriteBackReconciler(t, fw)
