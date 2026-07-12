@@ -343,6 +343,41 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	if (task.Spec.Kind == "implement" || task.Spec.Kind == "review") && task.Annotations[annCurrentTurn] == "" {
 		planText = r.buildUmbrellaPromptFor(ctx, &project, &task, planText)
 	}
+	// Layer-1 incident dedup gate (pre-spawn): before paying for a full agent
+	// investigation, skip spawning a duplicate when an earlier incident Task for
+	// the SAME alert rule already has a still-open tracker issue. Falls through
+	// to a normal spawn when no prior Task matches, or every prior tracker issue
+	// has since closed (the fix regressed; this is a genuinely new occurrence).
+	// Scoped to the pre-turn-0 spawn only, mirroring the review-target-closed
+	// guard above. This keys on Spec.AlertRule (the alertname) rather than the
+	// finer-grained Spec.DedupKey that createProposal's matchIncidentByDedupKey
+	// (layer 2) uses after an agent decides to propose - layer 1 only needs to
+	// catch the coarse "same alert firing again" case to be worth the spawn-cost
+	// savings; layer 2 still runs for anything layer 1 lets through.
+	if task.Spec.Kind == "incident" && task.Status.Phase == "" && task.Annotations[annCurrentTurn] == "" {
+		if issueURL, repoSlug, number, ok := r.preSpawnIncidentDuplicate(ctx, &project, &task); ok {
+			l.Info("incident: duplicate alert rule with an open tracker issue; skipping spawn",
+				"action", "incident_dedup_skip", "resource_id", task.Name,
+				"alert_rule", task.Spec.AlertRule, "existing_issue", issueURL)
+			if writer, werr := r.SCMFor(project.Spec.Scm.Provider); werr == nil {
+				if token, terr := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef); terr == nil {
+					issueRef := fmt.Sprintf("%s#%d", repoSlug, number)
+					if _, cerr := r.gatedComment(ctx, &project, nil, writer, token, project.Spec.Scm.Provider,
+						number, false, "", issueRef, incidentDedupRefireComment(task.Spec.AlertRule)); cerr != nil {
+						l.Error(cerr, "incident: dedup re-fire comment (non-fatal)", "issue_ref", issueRef)
+					}
+				}
+			}
+			res, terr := r.terminate(ctx, &task, "Succeeded", "IncidentDuplicate",
+				fmt.Sprintf("duplicate incident for alert rule %q; already tracked by %s", task.Spec.AlertRule, issueURL))
+			if terr != nil {
+				r.Metrics.ReconcileResult("Task", "error")
+				return ctrl.Result{}, terr
+			}
+			r.Metrics.ReconcileResult("Task", "success")
+			return res, nil
+		}
+	}
 	res, err := r.driveAgentRun(ctx, &project, repoPtr, &task, planText)
 	if err != nil {
 		r.Metrics.ReconcileResult("Task", "error")
@@ -1281,6 +1316,66 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	}
 	r.updateInflightGauge(ctx)
 	return ctrl.Result{}, nil
+}
+
+// preSpawnIncidentDuplicate returns the tracker issue URL, repo slug, and
+// issue number of an OTHER incident Task (terminal or not, self excluded)
+// sharing task.Spec.AlertRule whose recorded DiscoveredIssues[0] is still
+// open on the SCM, or ("", "", 0, false) when none exists or every match's
+// tracker issue has since closed. Mirrors matchIncidentByDedupKey's List+match
+// shape (writeback_proposal.go), keyed on the coarser Spec.AlertRule instead
+// of Spec.DedupKey, plus a live SCM state check since existence alone is not
+// enough to prove the issue is still open at pre-spawn time. Fail-open (not
+// found) on any SCM or lookup error, matching reviewTargetClosed's fail-open
+// convention above - a transient SCM hiccup must never block a legitimate
+// incident investigation.
+func (r *TaskReconciler) preSpawnIncidentDuplicate(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (issueURL, repoSlug string, number int, found bool) {
+	if task.Spec.AlertRule == "" || r.SCMFor == nil || proj.Spec.Scm == nil {
+		return "", "", 0, false
+	}
+	var tasks tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(proj.Namespace)); err != nil {
+		return "", "", 0, false
+	}
+	writer, err := r.SCMFor(proj.Spec.Scm.Provider)
+	if err != nil {
+		return "", "", 0, false
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		return "", "", 0, false
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Name == task.Name || t.Spec.ProjectRef != proj.Name || t.Spec.Kind != "incident" {
+			continue
+		}
+		if t.Spec.AlertRule != task.Spec.AlertRule {
+			continue
+		}
+		if len(t.Status.DiscoveredIssues) == 0 {
+			continue
+		}
+		slug, num, pok := parseIssueURL(t.Status.DiscoveredIssues[0])
+		if !pok {
+			continue
+		}
+		st, serr := writer.GetIssueState(ctx, slug, token, num)
+		if serr != nil || st.Closed {
+			continue
+		}
+		return t.Status.DiscoveredIssues[0], slug, num, true
+	}
+	return "", "", 0, false
+}
+
+// incidentDedupRefireComment is the re-fire note posted to an existing open
+// tracker issue when a new incident Task for the SAME alert rule was
+// short-circuited at pre-spawn (layer-1 dedup) rather than spawning a
+// duplicate investigation. Mirrors alertGroupRefireComment's shape
+// (writeback_proposal.go:429-431).
+func incidentDedupRefireComment(alertRule string) string {
+	return fmt.Sprintf("Alert `%s` re-fired. This condition is already tracked by this open incident issue, so no duplicate investigation was spawned.", alertRule)
 }
 
 // isTurnTimedOut reports whether the in-flight turn has stalled: no agent
