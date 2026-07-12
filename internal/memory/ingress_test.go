@@ -50,6 +50,32 @@ func TestIngress_MemoryPathOnly(t *testing.T) {
 	}
 }
 
+// TestIngress_UsesRegexAnnotation asserts nginx.ingress.kubernetes.io/use-regex
+// is set whenever the rewrite-target annotation is (same gate): the path is
+// built as a regex (MemoryPathPrefix + "/" + name + "(/|$)(.*)"), and without
+// use-regex nginx treats it as a literal path, 404-ing query/search_entities.
+func TestIngress_UsesRegexAnnotation(t *testing.T) {
+	cfg := Config{Namespace: "tatara", IngressHost: "tatara.szymonrichert.pl", IngressClassName: "nginx", IngressRewriteTarget: "/$2", MemoryPathPrefix: "/api/v1/memory"}
+	ing := Ingress(testProject("alpha"), cfg)
+	if ing == nil {
+		t.Fatal("expected non-nil ingress")
+	}
+	if ing.Annotations["nginx.ingress.kubernetes.io/use-regex"] != "true" {
+		t.Fatalf("use-regex annotation = %q, want \"true\"; annotations: %v", ing.Annotations["nginx.ingress.kubernetes.io/use-regex"], ing.Annotations)
+	}
+}
+
+// TestIngress_NoUseRegexWhenRewriteUnset mirrors TestIngress_NoRewriteWhenUnset:
+// use-regex is gated on the same condition as rewrite-target (cluster-agnostic,
+// rule 14) - a non-nginx controller must not be handed either nginx annotation.
+func TestIngress_NoUseRegexWhenRewriteUnset(t *testing.T) {
+	cfg := Config{Namespace: "tatara", IngressHost: "h", MemoryPathPrefix: "/api/v1/memory"}
+	ing := Ingress(testProject("alpha"), cfg)
+	if _, ok := ing.Annotations["nginx.ingress.kubernetes.io/use-regex"]; ok {
+		t.Fatalf("use-regex annotation must be absent when rewrite-target is unset: %v", ing.Annotations)
+	}
+}
+
 func TestIngress_AddsChatPath(t *testing.T) {
 	cfg := Config{Namespace: "tatara", IngressHost: "h", MemoryPathPrefix: "/api/v1/memory", ChatPathPrefix: "/api/v1/chat"}
 	ing := Ingress(testProject("alpha"), cfg)
