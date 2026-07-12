@@ -33,13 +33,11 @@ type umbrellaRepo struct {
 
 // systemicSiblingInfo summarizes one systemic-group sibling issue's
 // resolution state for the clarify turn-0 bundle (item Request C/c):
-// whether a Task tracks it yet, and whether that Task's clarify
-// conversation is implementation-locked (no open questions) or still open.
+// whether a Task tracks it yet, and which lifecycle phase that Task is in.
 type systemicSiblingInfo struct {
-	Ref    string // "owner/repo#N" (same-repo) or the raw CrossRepo ref string
-	Found  bool
-	Locked bool
-	Phase  string // "" (not started) | "open" (still discussing) | "locked" (ready) | any raw DeployState
+	Ref   string // "owner/repo#N" (same-repo) or the raw CrossRepo ref string
+	Found bool
+	Phase string // "" (not started) | "open" (still discussing) | any raw DeployState
 }
 
 // systemicGroupSiblingsSummary resolves the state of every sibling issue in
@@ -60,9 +58,8 @@ func (r *TaskReconciler) systemicGroupSiblingsSummary(ctx context.Context, task 
 	// clarify plus a later re-triage Task created after it went Done, ...), so
 	// resolve via newestTaskForSource - source-identity-only matching (never a
 	// lead's own role:closes ledger entry) plus newest-wins. This is the exact
-	// resolution issueIsImplementationLocked uses, so the two always agree: the
-	// bundle never claims "still open" for a sibling the approval fan-out
-	// already treats as locked, or vice versa.
+	// resolution issueHasRecordedApproval uses, so the bundle and the approval
+	// gate always agree on WHICH Task speaks for a sibling issue.
 	find := func(repo string, number int) (*tatarav1alpha1.Task, bool) {
 		t := newestTaskForSource(tl.Items, repo, number)
 		return t, t != nil
@@ -72,14 +69,9 @@ func (r *TaskReconciler) systemicGroupSiblingsSummary(ctx context.Context, task 
 		if !found {
 			return systemicSiblingInfo{Ref: ref}
 		}
-		info := systemicSiblingInfo{Ref: ref, Found: true, Locked: t.Status.ImplementationLocked}
-		switch {
-		case t.Status.ImplementationLocked:
-			info.Phase = "locked"
-		case t.Status.DeployState == "Conversation" || t.Status.DeployState == "Triage":
+		info := systemicSiblingInfo{Ref: ref, Found: true, Phase: t.Status.DeployState}
+		if t.Status.DeployState == "Conversation" || t.Status.DeployState == "Triage" {
 			info.Phase = "open"
-		default:
-			info.Phase = t.Status.DeployState
 		}
 		return info
 	}
@@ -327,18 +319,15 @@ func buildUmbrellaPrompt(task *tatarav1alpha1.Task, repos []umbrellaRepo, thread
 			switch {
 			case !s.Found:
 				fmt.Fprintf(&sb, "- %s: not yet tracked by a tatara Task.\n", s.Ref)
-			case s.Locked:
-				fmt.Fprintf(&sb, "- %s: implementation-locked (design settled, no open questions).\n", s.Ref)
 			case s.Phase == "open":
 				fmt.Fprintf(&sb, "- %s: still open (%s) - if the human's answer here affects that issue's design, say so explicitly.\n", s.Ref, s.Phase)
 			case s.Phase == "":
 				fmt.Fprintf(&sb, "- %s: tracked, no lifecycle phase recorded yet.\n", s.Ref)
 			default:
 				// F7: a Done/Parked/Stopped/... sibling is NOT "still open" - it
-				// finished (or was set aside) without ever reaching
-				// implementation-locked. Render its actual state instead of
+				// finished (or was set aside). Render its actual state instead of
 				// misleadingly implying live discussion.
-				fmt.Fprintf(&sb, "- %s: not implementation-locked (state: %s).\n", s.Ref, s.Phase)
+				fmt.Fprintf(&sb, "- %s: tracked (state: %s).\n", s.Ref, s.Phase)
 			}
 		}
 	}

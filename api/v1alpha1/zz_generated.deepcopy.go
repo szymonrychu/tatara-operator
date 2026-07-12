@@ -1278,10 +1278,6 @@ func (in *TaskStatus) DeepCopyInto(out *TaskStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
-	if in.ImplementationLockedAt != nil {
-		in, out := &in.ImplementationLockedAt, &out.ImplementationLockedAt
-		*out = (*in).DeepCopy()
-	}
 	if in.DeployDeadline != nil {
 		in, out := &in.DeployDeadline, &out.DeployDeadline
 		*out = (*in).DeepCopy()

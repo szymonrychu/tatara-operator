@@ -1007,9 +1007,6 @@ type issueOutcomeReq struct {
 	Action  string `json:"action"`
 	Comment string `json:"comment,omitempty"`
 	Plan    string `json:"plan,omitempty"` // posted as implementation-start message when action==implement
-	// Locked declares, when Action==implement, that the clarify agent found
-	// no open questions and every decision is settled (item Request C/d).
-	Locked bool `json:"locked,omitempty"`
 }
 
 func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
@@ -1039,7 +1036,7 @@ func (s *Server) issueOutcome(w http.ResponseWriter, r *http.Request) {
 		kindOK:     func(kind string) bool { return kind == "clarify" || kind == "triageIssue" || kind == "issueLifecycle" },
 		kindErrMsg: "issue outcome only applies to a clarify, triageIssue or issueLifecycle task",
 		mutate: func(t *tatarav1alpha1.Task) {
-			t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment, Plan: req.Plan, Locked: req.Locked}
+			t.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: req.Action, Comment: req.Comment, Plan: req.Plan}
 		},
 		extraLogFields: []any{"issue_action", req.Action},
 		onSuccess: func(t *tatarav1alpha1.Task) {

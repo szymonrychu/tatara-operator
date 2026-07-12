@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,7 +14,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
-	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
 func approvedTask(name, repoSlug string, number int, maintainer string) tatarav1alpha1.Task {
@@ -48,12 +45,29 @@ func TestFilterSystemicGroupByApproval(t *testing.T) {
 		CrossRepo:        []string{"o/r2#3 - approved thing", "o/r2#4 - unapproved thing"},
 	}
 
-	filtered, unapproved, fannedOut := filterSystemicGroupByApproval(sg, "o/r1", false, tasks)
+	filtered, unapproved := filterSystemicGroupByApproval(sg, "o/r1", tasks)
 	require.Equal(t, []int{7}, filtered.SameRepoSiblings, "only #7 is maintainer-approved")
 	require.ElementsMatch(t, []int{8, 9}, unapproved, "#8 (unapproved task) and #9 (no task) are unapproved")
 	require.Equal(t, []string{"o/r2#3 - approved thing"}, filtered.CrossRepo, "only the approved cross-repo ref survives")
 	require.Equal(t, "abc", filtered.SystemicID)
-	require.Empty(t, fannedOut, "leadApproved=false must never fan out, regardless of locked siblings")
+}
+
+// TestFilterSystemicGroupByApproval_UnapprovedSiblingAlwaysStripped: an
+// unapproved sibling is stripped unconditionally - an approved lead's own
+// approval never extends to it, whatever state its own conversation reached.
+func TestFilterSystemicGroupByApproval_UnapprovedSiblingAlwaysStripped(t *testing.T) {
+	tasks := []tatarav1alpha1.Task{
+		approvedTask("lead", "o/r1", 12, "maint"),
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "sib7", Namespace: "tatara"},
+			Spec:       tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r1#7", Number: 7}},
+		},
+	}
+	sg := &tatarav1alpha1.SystemicGroup{SystemicID: "abc", SameRepoSiblings: []int{7}}
+
+	filtered, unapproved := filterSystemicGroupByApproval(sg, "o/r1", tasks)
+	require.Empty(t, filtered.SameRepoSiblings, "an unapproved sibling never co-resolves with an approved lead")
+	require.Equal(t, []int{7}, unapproved)
 }
 
 // TestIssueHasRecordedApproval_LeadLedgerSelfMatchExcluded verifies F2: a
@@ -76,103 +90,6 @@ func TestIssueHasRecordedApproval_LeadLedgerSelfMatchExcluded(t *testing.T) {
 		"the lead's own role:closes ledger entry for #7 must NOT count as #7's own approval")
 	require.True(t, issueHasRecordedApproval(tasks, "o/r1", 12),
 		"the lead's own source identity (#12) must still resolve to its own approval")
-}
-
-// TestIssueIsImplementationLocked_LeadLedgerSelfMatchExcluded is the
-// issueIsImplementationLocked half of F2's self-match bug.
-func TestIssueIsImplementationLocked_LeadLedgerSelfMatchExcluded(t *testing.T) {
-	lead := tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "lead", Namespace: "tatara"},
-		Spec: tatarav1alpha1.TaskSpec{
-			Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r1#12", Number: 12},
-		},
-		Status: tatarav1alpha1.TaskStatus{
-			ImplementationLocked: true,
-			WorkItems: []tatarav1alpha1.WorkItemRef{
-				{Repo: "o/r1", Number: 7, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleCloses},
-			},
-		},
-	}
-	tasks := []tatarav1alpha1.Task{lead}
-
-	require.False(t, issueIsImplementationLocked(tasks, "o/r1", 7),
-		"the lead's own locked status must NOT be reported as sibling #7's own lock state")
-	require.True(t, issueIsImplementationLocked(tasks, "o/r1", 12),
-		"the lead's own source identity (#12) must still resolve to its own lock state")
-}
-
-// TestIssueIsImplementationLocked_NewestTaskWins_StaleLockedIgnored verifies
-// F3: a stale, terminal, locked Task from an EARLIER triage cycle must not
-// outlive its NEWER, unlocked successor (a re-triage after new human
-// questions reopened the conversation).
-func TestIssueIsImplementationLocked_NewestTaskWins_StaleLockedIgnored(t *testing.T) {
-	older := lockedTask("old-clarify", "o/r1", 7)
-	older.CreationTimestamp = metav1.NewTime(time.Unix(1000, 0))
-	newer := tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "new-clarify", Namespace: "tatara", CreationTimestamp: metav1.NewTime(time.Unix(2000, 0))},
-		Spec: tatarav1alpha1.TaskSpec{
-			Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r1#7", Number: 7},
-		},
-		// Unlocked: the re-opened conversation has not settled again yet.
-	}
-	tasks := []tatarav1alpha1.Task{older, newer}
-
-	require.False(t, issueIsImplementationLocked(tasks, "o/r1", 7),
-		"the newer, unlocked Task must win over the stale locked predecessor")
-}
-
-// TestIssueIsImplementationLocked_NewestTaskWins_FreshLockHonored is the
-// reverse direction: a newer LOCKED Task must be honored even when an older
-// Task for the same issue was unlocked.
-func TestIssueIsImplementationLocked_NewestTaskWins_FreshLockHonored(t *testing.T) {
-	older := tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "old-clarify", Namespace: "tatara", CreationTimestamp: metav1.NewTime(time.Unix(1000, 0))},
-		Spec: tatarav1alpha1.TaskSpec{
-			Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r1#7", Number: 7},
-		},
-	}
-	newer := lockedTask("new-clarify", "o/r1", 7)
-	newer.CreationTimestamp = metav1.NewTime(time.Unix(2000, 0))
-	tasks := []tatarav1alpha1.Task{older, newer}
-
-	require.True(t, issueIsImplementationLocked(tasks, "o/r1", 7),
-		"the newer, locked Task must be honored")
-}
-
-// TestWithApprovedSystemicGroup_FanoutMetricFires_ForGenuineLockedSibling
-// verifies the fan-out counter/log still fire for a REAL (non-self-match)
-// locked sibling after the F2 identity-matching fix - the fix must narrow
-// matching to source identity, not silently break the legitimate fan-out path.
-func TestWithApprovedSystemicGroup_FanoutMetricFires_ForGenuineLockedSibling(t *testing.T) {
-	ctx := context.Background()
-	lead := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "wire-lead-fo", Namespace: testNS},
-		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef: "wire-proj-fo", Kind: "issueLifecycle", Goal: "g",
-			Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/wrfo#12", Number: 12},
-			SystemicGroup: &tatarav1alpha1.SystemicGroup{SystemicID: "abc", SameRepoSiblings: []int{7}},
-		},
-	}
-	require.NoError(t, k8sClient.Create(ctx, lead))
-	lead.Status.ApprovedByMaintainer = "maint"
-	require.NoError(t, k8sClient.Status().Update(ctx, lead))
-
-	sib7 := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "wire-sib7-fo", Namespace: testNS},
-		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "wire-proj-fo", Kind: "clarify", Goal: "g", Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/wrfo#7", Number: 7}},
-	}
-	require.NoError(t, k8sClient.Create(ctx, sib7))
-	sib7.Status.ImplementationLocked = true
-	require.NoError(t, k8sClient.Status().Update(ctx, sib7))
-
-	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
-	r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: m}
-	got := getTask(t, "wire-lead-fo")
-
-	pt := r.withApprovedSystemicGroup(ctx, got)
-	require.Equal(t, []int{7}, pt.Spec.SystemicGroup.SameRepoSiblings, "genuinely locked sibling #7 still fans out")
-	require.Equal(t, float64(1), testutil.ToFloat64(m.SystemicApprovalFanoutCounter()),
-		"tatara_systemic_approval_fanout_total must increment for a genuine fan-out")
 }
 
 // TestNewestTaskForSource_TieBreakDeterministic is the m6 regression:
@@ -200,9 +117,8 @@ func TestNewestTaskForSource_TieBreakDeterministic(t *testing.T) {
 
 // TestIssueHasRecordedApproval_NewestTaskWins is the m7 regression:
 // issueHasRecordedApproval scanned ANY matching Task, so a stale approved Task
-// from an earlier cycle could outlive a newer, unapproved re-triage - asymmetric
-// with issueIsImplementationLocked's newest-wins resolution for the same source
-// identity.
+// from an earlier cycle could outlive a newer, unapproved re-triage for the
+// same source identity.
 func TestIssueHasRecordedApproval_NewestTaskWins(t *testing.T) {
 	older := approvedTask("old", "o/r1", 7, "maint")
 	older.CreationTimestamp = metav1.NewTime(time.Unix(1000, 0))
@@ -219,62 +135,18 @@ func TestIssueHasRecordedApproval_NewestTaskWins(t *testing.T) {
 
 // TestIssueHasRecordedApproval_AutoApproveSentinelCounts documents that the
 // auto-approve sentinel ("<tatara:auto:kind>") IS a recorded approval for this
-// check's purposes (accepted design: auto-approve composes with fan-out) - the
-// function must not special-case it away.
+// check's purposes (accepted design) - the function must not special-case it
+// away.
 func TestIssueHasRecordedApproval_AutoApproveSentinelCounts(t *testing.T) {
 	tasks := []tatarav1alpha1.Task{approvedTask("auto", "o/r1", 7, "<tatara:auto:clarify>")}
 	require.True(t, issueHasRecordedApproval(tasks, "o/r1", 7),
 		"the auto-approve sentinel must count as a recorded approval")
 }
 
-func lockedTask(name, repoSlug string, number int) tatarav1alpha1.Task {
-	return tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
-		Spec: tatarav1alpha1.TaskSpec{
-			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: repoSlug + "#" + strconv.Itoa(number), Number: number},
-		},
-		Status: tatarav1alpha1.TaskStatus{ImplementationLocked: true},
-	}
-}
-
-func TestFilterSystemicGroupByApproval_FansOutToLockedSiblingsWhenLeadApproved(t *testing.T) {
-	tasks := []tatarav1alpha1.Task{
-		approvedTask("lead", "o/r1", 12, "maint"),
-		lockedTask("sib7", "o/r1", 7), // no direct approval, but implementation-locked
-		{
-			ObjectMeta: metav1.ObjectMeta{Name: "sib8", Namespace: "tatara"},
-			Spec:       tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r1#8", Number: 8}},
-			// sib8: neither approved nor locked - stays excluded.
-		},
-	}
-	sg := &tatarav1alpha1.SystemicGroup{
-		SystemicID:       "abc",
-		SameRepoSiblings: []int{7, 8},
-	}
-
-	filtered, unapproved, fannedOut := filterSystemicGroupByApproval(sg, "o/r1", true, tasks)
-	require.Equal(t, []int{7}, filtered.SameRepoSiblings, "locked sibling #7 fans out under an approved lead")
-	require.Equal(t, []int{8}, unapproved, "unlocked, unapproved sibling #8 stays excluded")
-	require.Equal(t, []string{"o/r1#7"}, fannedOut, "fan-out audit trail records #7")
-}
-
-func TestFilterSystemicGroupByApproval_NoFanOutWhenLeadNotApproved(t *testing.T) {
-	tasks := []tatarav1alpha1.Task{
-		lockedTask("sib7", "o/r1", 7),
-	}
-	sg := &tatarav1alpha1.SystemicGroup{SystemicID: "abc", SameRepoSiblings: []int{7}}
-
-	filtered, unapproved, fannedOut := filterSystemicGroupByApproval(sg, "o/r1", false, tasks)
-	require.Empty(t, filtered.SameRepoSiblings, "a locked sibling never fans out without the lead's own approval")
-	require.Equal(t, []int{7}, unapproved)
-	require.Empty(t, fannedOut)
-}
-
 func TestFilterSystemicGroupByApproval_Nil(t *testing.T) {
-	sg, un, fo := filterSystemicGroupByApproval(nil, "o/r1", false, nil)
+	sg, un := filterSystemicGroupByApproval(nil, "o/r1", nil)
 	require.Nil(t, sg)
 	require.Nil(t, un)
-	require.Nil(t, fo)
 }
 
 // TestNeutralizeUnapprovedCloses: close directives for unapproved siblings become

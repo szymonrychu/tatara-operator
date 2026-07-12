@@ -499,20 +499,6 @@ func TestIssueOutcome_Clarify(t *testing.T) {
 	require.Equal(t, "implement", out.Status.IssueOutcome.Action)
 }
 
-func TestIssueOutcome_LockedFieldAccepted(t *testing.T) {
-	r := buildRouter(t, taskWithKind("t1", "alpha", "clarify"))
-	body := strings.NewReader(`{"action":"implement","locked":true}`)
-	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/issue-outcome", body)
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	require.Equal(t, http.StatusOK, w.Code)
-	var out restapi.TaskDTO
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
-	require.NotNil(t, out.Status.IssueOutcome)
-	require.True(t, out.Status.IssueOutcome.Locked)
-}
-
 func TestIssueOutcome_DiscussLifecycle(t *testing.T) {
 	r := buildRouter(t, taskWithKind("t1", "alpha", "issueLifecycle"))
 	body := strings.NewReader(`{"action":"discuss","comment":"need details: which repo?"}`)

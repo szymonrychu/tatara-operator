@@ -32,63 +32,61 @@ type OperatorMetrics struct {
 	*queueMetrics
 	*taskMetrics
 	*accountUsageMetrics
-	reconcileTotal              *prometheus.CounterVec
-	ingestJobDuration           prometheus.Histogram
-	turnDuration                prometheus.Histogram
-	webhookEvents               *prometheus.CounterVec
-	tasksInflight               prometheus.Gauge
-	memoryProvisionDuration     prometheus.Histogram
-	memoryStacks                *prometheus.GaugeVec
-	scanItemsTotal              *prometheus.CounterVec
-	scanTasksCreatedTotal       *prometheus.CounterVec
-	scanDurationSeconds         *prometheus.HistogramVec
-	issueOutcomeTotal           *prometheus.CounterVec
-	autoApproveTotal            *prometheus.CounterVec
-	implementationLockedTotal   prometheus.Counter
-	systemicApprovalFanoutTotal prometheus.Counter
-	tasksInflightKind           *prometheus.GaugeVec
-	agentBootRaceRequeue        prometheus.Counter
-	agentSessionBusyRequeue     prometheus.Counter
-	openProposals               *prometheus.GaugeVec
-	turnTimeoutTotal            *prometheus.CounterVec
-	ingestJobTotal              *prometheus.CounterVec
-	agentUnreachableTermTotal   prometheus.Counter
-	agentBootCrashTotal         *prometheus.CounterVec
-	orphanReapedTotal           *prometheus.CounterVec
-	reapDeleteErrorTotal        *prometheus.CounterVec
-	tasksGCTotal                *prometheus.CounterVec
-	conversationGCTotal         *prometheus.CounterVec
-	turnSubmitTotal             *prometheus.CounterVec
-	turnSubmitDuration          *prometheus.HistogramVec
-	agentHTTPTotal              *prometheus.CounterVec
-	agentHTTPDuration           *prometheus.HistogramVec
-	authTotal                   *prometheus.CounterVec
-	writebackOutcomeTotal       *prometheus.CounterVec
-	writebackSkip4xxTotal       *prometheus.CounterVec
-	brainstormOutcomeTotal      *prometheus.CounterVec
-	webhookDuration             *prometheus.HistogramVec
-	restapiRequestsTotal        *prometheus.CounterVec
-	restapiRequestDuration      *prometheus.HistogramVec
-	memoryHealthReadErrors      prometheus.Counter
-	memoryStorageShrinkGuard    *prometheus.CounterVec
-	lightragDocuments           *prometheus.GaugeVec
-	lightragQueryErrors         prometheus.Counter
-	memoryRetrievalProbe        *prometheus.CounterVec
-	toolSurfaceProbe            *prometheus.CounterVec
-	toolSurfaceProbeDuration    *prometheus.HistogramVec
-	systemicSiblingsCollapsed   *prometheus.CounterVec
-	systemicGroupsLed           *prometheus.CounterVec
-	tokenBudgetUsedRatio        *prometheus.GaugeVec
-	admissionBlockedTotal       *prometheus.CounterVec
-	memoryGateBypassTotal       *prometheus.CounterVec
-	repositoryIngestFailing     *prometheus.GaugeVec
-	repositoryLastIngestTime    *prometheus.GaugeVec
-	reviewOutcomeTotal          *prometheus.CounterVec
-	reviewFindingsTotal         *prometheus.CounterVec
-	implementCITotal            *prometheus.CounterVec
-	cdCascadeFailed             *prometheus.GaugeVec
-	cdCascadeStalled            *prometheus.GaugeVec
-	cdResolvedTotal             prometheus.Counter
+	reconcileTotal            *prometheus.CounterVec
+	ingestJobDuration         prometheus.Histogram
+	turnDuration              prometheus.Histogram
+	webhookEvents             *prometheus.CounterVec
+	tasksInflight             prometheus.Gauge
+	memoryProvisionDuration   prometheus.Histogram
+	memoryStacks              *prometheus.GaugeVec
+	scanItemsTotal            *prometheus.CounterVec
+	scanTasksCreatedTotal     *prometheus.CounterVec
+	scanDurationSeconds       *prometheus.HistogramVec
+	issueOutcomeTotal         *prometheus.CounterVec
+	autoApproveTotal          *prometheus.CounterVec
+	tasksInflightKind         *prometheus.GaugeVec
+	agentBootRaceRequeue      prometheus.Counter
+	agentSessionBusyRequeue   prometheus.Counter
+	openProposals             *prometheus.GaugeVec
+	turnTimeoutTotal          *prometheus.CounterVec
+	ingestJobTotal            *prometheus.CounterVec
+	agentUnreachableTermTotal prometheus.Counter
+	agentBootCrashTotal       *prometheus.CounterVec
+	orphanReapedTotal         *prometheus.CounterVec
+	reapDeleteErrorTotal      *prometheus.CounterVec
+	tasksGCTotal              *prometheus.CounterVec
+	conversationGCTotal       *prometheus.CounterVec
+	turnSubmitTotal           *prometheus.CounterVec
+	turnSubmitDuration        *prometheus.HistogramVec
+	agentHTTPTotal            *prometheus.CounterVec
+	agentHTTPDuration         *prometheus.HistogramVec
+	authTotal                 *prometheus.CounterVec
+	writebackOutcomeTotal     *prometheus.CounterVec
+	writebackSkip4xxTotal     *prometheus.CounterVec
+	brainstormOutcomeTotal    *prometheus.CounterVec
+	webhookDuration           *prometheus.HistogramVec
+	restapiRequestsTotal      *prometheus.CounterVec
+	restapiRequestDuration    *prometheus.HistogramVec
+	memoryHealthReadErrors    prometheus.Counter
+	memoryStorageShrinkGuard  *prometheus.CounterVec
+	lightragDocuments         *prometheus.GaugeVec
+	lightragQueryErrors       prometheus.Counter
+	memoryRetrievalProbe      *prometheus.CounterVec
+	toolSurfaceProbe          *prometheus.CounterVec
+	toolSurfaceProbeDuration  *prometheus.HistogramVec
+	systemicSiblingsCollapsed *prometheus.CounterVec
+	systemicGroupsLed         *prometheus.CounterVec
+	tokenBudgetUsedRatio      *prometheus.GaugeVec
+	admissionBlockedTotal     *prometheus.CounterVec
+	memoryGateBypassTotal     *prometheus.CounterVec
+	repositoryIngestFailing   *prometheus.GaugeVec
+	repositoryLastIngestTime  *prometheus.GaugeVec
+	reviewOutcomeTotal        *prometheus.CounterVec
+	reviewFindingsTotal       *prometheus.CounterVec
+	implementCITotal          *prometheus.CounterVec
+	cdCascadeFailed           *prometheus.GaugeVec
+	cdCascadeStalled          *prometheus.GaugeVec
+	cdResolvedTotal           prometheus.Counter
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -151,14 +149,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_auto_approve_total",
 			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
 		}, []string{"kind"}),
-		implementationLockedTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "tatara_implementation_locked_total",
-			Help: "Clarify Tasks that declared implementation-locked (no open questions) on handoff.",
-		}),
-		systemicApprovalFanoutTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "tatara_systemic_approval_fanout_total",
-			Help: "Systemic-group approvals that fanned out to implementation-locked siblings without their own direct maintainer approval.",
-		}),
 		tasksInflightKind: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "tatara_tasks_inflight",
 			Help: "In-flight Tasks by kind.",
@@ -409,8 +399,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.scanDurationSeconds,
 		m.issueOutcomeTotal,
 		m.autoApproveTotal,
-		m.implementationLockedTotal,
-		m.systemicApprovalFanoutTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
 		m.agentSessionBusyRequeue,
@@ -662,22 +650,6 @@ func (m *OperatorMetrics) AutoApproveTotal(kind string) {
 // IssueOutcomeTotal returns the counter for a specific action, for test assertions.
 func (m *OperatorMetrics) IssueOutcomeTotal(action string) prometheus.Counter {
 	return m.issueOutcomeTotal.WithLabelValues(action)
-}
-
-// ImplementationLocked increments tatara_implementation_locked_total.
-func (m *OperatorMetrics) ImplementationLocked() {
-	m.implementationLockedTotal.Inc()
-}
-
-// SystemicApprovalFanout increments tatara_systemic_approval_fanout_total.
-func (m *OperatorMetrics) SystemicApprovalFanout() {
-	m.systemicApprovalFanoutTotal.Inc()
-}
-
-// SystemicApprovalFanoutCounter exposes the raw counter for test assertions
-// (testutil.ToFloat64), mirroring the *Counter getters below.
-func (m *OperatorMetrics) SystemicApprovalFanoutCounter() prometheus.Counter {
-	return m.systemicApprovalFanoutTotal
 }
 
 // AgentBootRaceRequeue increments operator_agent_boot_race_requeue_total: a

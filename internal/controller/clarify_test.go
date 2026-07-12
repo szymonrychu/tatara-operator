@@ -208,40 +208,6 @@ func TestClarify_ImplementHandoff(t *testing.T) {
 	}
 }
 
-func TestClarify_ImplementHandoff_LockedSetsStatus(t *testing.T) {
-	ctx := logf.IntoContext(context.Background(), logf.Log)
-	r, _, name := seedClarifyTask(t, "impl-locked", "human", &tatarav1alpha1.IssueOutcome{
-		Action: "implement", Comment: "Agreed plan.", Locked: true,
-	})
-	recordApproval(t, name, "szymon")
-
-	if _, err := r.reconcileClarify(ctx, getClarifyTask(t, ctx, name)); err != nil {
-		t.Fatalf("reconcileClarify: %v", err)
-	}
-
-	got := getClarifyTask(t, ctx, name)
-	if !got.Status.ImplementationLocked {
-		t.Error("ImplementationLocked = false, want true when issue_outcome carried locked=true")
-	}
-}
-
-func TestClarify_ImplementHandoff_UnlockedLeavesStatusFalse(t *testing.T) {
-	ctx := logf.IntoContext(context.Background(), logf.Log)
-	r, _, name := seedClarifyTask(t, "impl-unlocked", "human", &tatarav1alpha1.IssueOutcome{
-		Action: "implement", Comment: "Agreed plan.", // Locked defaults to false
-	})
-	recordApproval(t, name, "szymon")
-
-	if _, err := r.reconcileClarify(ctx, getClarifyTask(t, ctx, name)); err != nil {
-		t.Fatalf("reconcileClarify: %v", err)
-	}
-
-	got := getClarifyTask(t, ctx, name)
-	if got.Status.ImplementationLocked {
-		t.Error("ImplementationLocked = true, want false when issue_outcome did not carry locked")
-	}
-}
-
 // TestClarify_DiscussStaysLive: a clarify Task whose agent chose discuss posts
 // the comment and stays live in Conversation with a deadline.
 func TestClarify_DiscussStaysLive(t *testing.T) {

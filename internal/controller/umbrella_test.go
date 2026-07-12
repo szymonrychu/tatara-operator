@@ -138,34 +138,30 @@ func TestBuildUmbrellaPrompt_RendersSystemicSiblings(t *testing.T) {
 	task := &tatarav1alpha1.Task{}
 	task.Spec.Goal = "Ship the design"
 	siblings := []systemicSiblingInfo{
-		{Ref: "o/r1#7", Found: true, Locked: true, Phase: "locked"},
-		{Ref: "o/r2#9", Found: true, Locked: false, Phase: "open"},
+		{Ref: "o/r2#9", Found: true, Phase: "open"},
 		{Ref: "o/r3#3", Found: false},
 	}
 	out := buildUmbrellaPrompt(task, nil, nil, "goal", siblings)
 
 	require.Contains(t, out, "## Related systemic-group issues")
-	require.Contains(t, out, "o/r1#7: implementation-locked")
 	require.Contains(t, out, "o/r2#9: still open")
 	require.Contains(t, out, "o/r3#3: not yet tracked")
 }
 
-// TestBuildUmbrellaPrompt_TerminalUnlockedSiblingNotRenderedAsOpen verifies
-// F7: a Found+unlocked sibling whose tracking Task reached a TERMINAL
-// DeployState (Done/Parked/Stopped/...) must not be rendered as "still open" -
-// only Conversation/Triage are genuinely "still open". Before the fix, the
-// default branch rendered every non-locked sibling as "still open (<Phase>)"
-// regardless of whether Phase was actually a live conversational state.
-func TestBuildUmbrellaPrompt_TerminalUnlockedSiblingNotRenderedAsOpen(t *testing.T) {
+// TestBuildUmbrellaPrompt_TerminalSiblingNotRenderedAsOpen verifies F7: a
+// Found sibling whose tracking Task reached a TERMINAL DeployState
+// (Done/Parked/Stopped/...) must not be rendered as "still open" - only
+// Conversation/Triage are genuinely "still open".
+func TestBuildUmbrellaPrompt_TerminalSiblingNotRenderedAsOpen(t *testing.T) {
 	task := &tatarav1alpha1.Task{}
 	task.Spec.Goal = "Ship the design"
 	siblings := []systemicSiblingInfo{
-		{Ref: "o/r4#5", Found: true, Locked: false, Phase: "Done"},
+		{Ref: "o/r4#5", Found: true, Phase: "Done"},
 	}
 	out := buildUmbrellaPrompt(task, nil, nil, "goal", siblings)
 
 	require.NotContains(t, out, "still open (Done)", "a terminal Done sibling must not be rendered as still open")
-	require.Contains(t, out, "o/r4#5: not implementation-locked (state: Done)")
+	require.Contains(t, out, "o/r4#5: tracked (state: Done)")
 }
 
 // ---- refreshUmbrellaMembers -------------------------------------------
@@ -282,7 +278,11 @@ func TestBuildUmbrellaPromptFor_AssemblesLiveBundle(t *testing.T) {
 	require.Contains(t, out, "GOAL-TAIL-MARKER")
 }
 
-func TestBuildUmbrellaPromptFor_IncludesLockedSystemicSibling(t *testing.T) {
+// TestBuildUmbrellaPromptFor_IncludesSystemicSibling covers item Request C/c:
+// the clarify turn-0 bundle surfaces every systemic-group sibling issue and
+// the lifecycle phase of the Task tracking it, so the agent knows the answer
+// it is about to give may affect a related issue.
+func TestBuildUmbrellaPromptFor_IncludesSystemicSibling(t *testing.T) {
 	ctx := context.Background()
 	fw := &fullFakeSCMWriter{}
 	r := newFullFakeReconciler(t, fw)
@@ -310,10 +310,10 @@ func TestBuildUmbrellaPromptFor_IncludesLockedSystemicSibling(t *testing.T) {
 	}
 	require.NoError(t, k8sClient.Status().Update(ctx, task))
 
-	// Seed the sibling's own Task, already implementation-locked. Created
-	// directly (not via seedWritebackKindTask) since the lead task above
-	// already seeded the shared project/repo/secret and re-seeding them
-	// under the same names would collide on Create.
+	// Seed the sibling's own Task, still in conversation. Created directly (not
+	// via seedWritebackKindTask) since the lead task above already seeded the
+	// shared project/repo/secret and re-seeding them under the same names would
+	// collide on Create.
 	sibling := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "umbrella-sibs-sib", Namespace: testNS},
 		Spec: tatarav1alpha1.TaskSpec{
@@ -324,7 +324,7 @@ func TestBuildUmbrellaPromptFor_IncludesLockedSystemicSibling(t *testing.T) {
 		},
 	}
 	require.NoError(t, k8sClient.Create(ctx, sibling))
-	sibling.Status.ImplementationLocked = true
+	sibling.Status.DeployState = "Conversation"
 	require.NoError(t, k8sClient.Status().Update(ctx, sibling))
 
 	var proj tatarav1alpha1.Project
@@ -332,7 +332,7 @@ func TestBuildUmbrellaPromptFor_IncludesLockedSystemicSibling(t *testing.T) {
 
 	out := r.buildUmbrellaPromptFor(ctx, &proj, task, "GOAL-TAIL-MARKER")
 	require.Contains(t, out, "## Related systemic-group issues")
-	require.Contains(t, out, "o/r#7: implementation-locked")
+	require.Contains(t, out, "o/r#7: still open")
 }
 
 // TestSystemicGroupSiblingsSummary_LeadLedgerSelfMatchExcluded verifies the

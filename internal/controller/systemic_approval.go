@@ -4,7 +4,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -20,12 +19,12 @@ import (
 // matches (repo, number), or nil when none match. Two bugs this fixes:
 //  1. F2 self-match: a systemic lead's own ledger is seeded with a role:closes
 //     entry for every sibling it references (seedLedgerFromSpec), so matching
-//     via TaskMatchesItem (any role) made the lead's own approval/lock state
-//     appear to belong to every sibling it merely leads. Source-identity-only
+//     via TaskMatchesItem (any role) made the lead's own approval state appear
+//     to belong to every sibling it merely leads. Source-identity-only
 //     matching (TaskMatchesItemAsSource) fixes this.
 //  2. F3 staleness: more than one Task can track the same issue over its life
 //     (a terminal clarify Task plus a later re-triage Task created after it
-//     went Done). An any-match scan let a stale locked Task from an earlier
+//     went Done). An any-match scan let a stale approved Task from an earlier
 //     cycle outlive its successor. Picking the newest by CreationTimestamp
 //     fixes this.
 func newestTaskForSource(tasks []tatarav1alpha1.Task, repo string, number int) *tatarav1alpha1.Task {
@@ -62,71 +61,47 @@ func isNewerTask(t, other *tatarav1alpha1.Task) bool {
 // issueHasRecordedApproval reports whether the NEWEST Task that IS (repoSlug,
 // number) - resolved by source identity only, never a lead's role:closes
 // ledger entry - carries a recorded approval (Status.ApprovedByMaintainer
-// set). m7: newest-wins, matching issueIsImplementationLocked's resolution
-// for the same source identity - an ANY-match scan let a stale approved Task
-// from an earlier cycle outlive a newer, unapproved re-triage. A sibling a
-// maintainer declined or never approved never has it set (on its newest
-// Task), so it fails this check and is stripped from any force-close.
+// set). m7: newest-wins - an ANY-match scan let a stale approved Task from an
+// earlier cycle outlive a newer, unapproved re-triage. A sibling a maintainer
+// declined or never approved never has it set (on its newest Task), so it
+// fails this check and is stripped from any force-close.
 // ApprovedByMaintainer also carries the auto-approve sentinel
 // ("<tatara:auto:<kind>>", set by recordAutoApproval) - that is an accepted
-// approval source for this check by design (auto-approve composes with
-// fan-out), not a bypass to guard against.
+// approval source for this check by design, not a bypass to guard against.
 func issueHasRecordedApproval(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
 	t := newestTaskForSource(tasks, repoSlug, number)
 	return t != nil && t.Status.ApprovedByMaintainer != ""
 }
 
-// issueIsImplementationLocked reports whether the NEWEST Task that IS
-// (repoSlug, number) - resolved by source identity only - has
-// Status.ImplementationLocked set: its own clarify conversation reached
-// no-open-questions with every decision settled (item Request C/d). Used by
-// the systemic-group approval fan-out: a sibling with no direct maintainer
-// approval of its own is still included in an approved lead's release when it
-// is implementation-locked.
-func issueIsImplementationLocked(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
-	t := newestTaskForSource(tasks, repoSlug, number)
-	return t != nil && t.Status.ImplementationLocked
-}
-
 // filterSystemicGroupByApproval returns a copy of sg keeping only the members
-// eligible to co-resolve with the lead: SameRepoSiblings/CrossRepo verified
-// either (a) maintainer-approved in their own right (issueHasRecordedApproval)
-// or (b) implementation-locked AND leadApproved is true (item Request C/d fan-out:
-// an approved lead's release extends to every OTHER member that has no open
-// questions of its own, even without its own direct approval). Also returns
-// the same-repo sibling numbers that are NOT eligible (for the writeback
-// close-strip) and the refs that were included via the fan-out path only
-// (for audit logging/metrics at the caller). A nil sg yields (nil, nil, nil).
-func filterSystemicGroupByApproval(sg *tatarav1alpha1.SystemicGroup, leadRepo string, leadApproved bool, tasks []tatarav1alpha1.Task) (filtered *tatarav1alpha1.SystemicGroup, unapproved []int, fannedOut []string) {
+// eligible to co-resolve with the lead: SameRepoSiblings/CrossRepo that are
+// maintainer-approved in their own right (issueHasRecordedApproval). An
+// unapproved member is ALWAYS excluded - the lead's own approval never extends
+// to it, whatever state its own conversation reached. Also returns the
+// same-repo sibling numbers that are NOT eligible, for the writeback
+// close-strip. A nil sg yields (nil, nil).
+func filterSystemicGroupByApproval(sg *tatarav1alpha1.SystemicGroup, leadRepo string, tasks []tatarav1alpha1.Task) (filtered *tatarav1alpha1.SystemicGroup, unapproved []int) {
 	if sg == nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	out := &tatarav1alpha1.SystemicGroup{SystemicID: sg.SystemicID}
 	for _, n := range sg.SameRepoSiblings {
-		switch {
-		case leadRepo != "" && issueHasRecordedApproval(tasks, leadRepo, n):
+		if leadRepo != "" && issueHasRecordedApproval(tasks, leadRepo, n) {
 			out.SameRepoSiblings = append(out.SameRepoSiblings, n)
-		case leadApproved && leadRepo != "" && issueIsImplementationLocked(tasks, leadRepo, n):
-			out.SameRepoSiblings = append(out.SameRepoSiblings, n)
-			fannedOut = append(fannedOut, fmt.Sprintf("%s#%d", leadRepo, n))
-		default:
-			unapproved = append(unapproved, n)
+			continue
 		}
+		unapproved = append(unapproved, n)
 	}
 	for _, ref := range sg.CrossRepo {
 		repo, num := parseCrossRepoRef(ref)
 		if repo == "" {
 			continue
 		}
-		switch {
-		case issueHasRecordedApproval(tasks, repo, num):
+		if issueHasRecordedApproval(tasks, repo, num) {
 			out.CrossRepo = append(out.CrossRepo, ref)
-		case leadApproved && issueIsImplementationLocked(tasks, repo, num):
-			out.CrossRepo = append(out.CrossRepo, ref)
-			fannedOut = append(fannedOut, ref)
 		}
 	}
-	return out, unapproved, fannedOut
+	return out, unapproved
 }
 
 // leadRepoOf returns the lead issue's repo slug (siblings live in this repo).
@@ -153,22 +128,13 @@ func (r *TaskReconciler) withApprovedSystemicGroup(ctx context.Context, task *ta
 		// A copy with an empty (but non-nil) SystemicGroup is the safe default:
 		// no member fans out until a later reconcile can actually verify
 		// approval state.
-		log.FromContext(ctx).Error(err, "systemic approval: list tasks failed; failing closed (no fan-out)",
+		log.FromContext(ctx).Error(err, "systemic approval: list tasks failed; failing closed (no member survives)",
 			"action", "systemic_approval_list_error", "resource_id", task.Name)
 		tc := *task
 		tc.Spec.SystemicGroup = &tatarav1alpha1.SystemicGroup{SystemicID: task.Spec.SystemicGroup.SystemicID}
 		return &tc
 	}
-	leadApproved := task.Status.ApprovedByMaintainer != ""
-	filtered, _, fannedOut := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), leadApproved, tl.Items)
-	if len(fannedOut) > 0 {
-		log.FromContext(ctx).Info("systemic approval: fan-out to implementation-locked siblings",
-			"action", "systemic_approval_fanout", "resource_id", task.Name,
-			"approver", task.Status.ApprovedByMaintainer, "member_count", len(fannedOut), "members", fannedOut)
-		if r.Metrics != nil {
-			r.Metrics.SystemicApprovalFanout()
-		}
-	}
+	filtered, _ := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), tl.Items)
 	tc := *task
 	tc.Spec.SystemicGroup = filtered
 	return &tc
@@ -195,8 +161,7 @@ func (r *TaskReconciler) unapprovedSystemicSiblings(ctx context.Context, task *t
 		}
 		return m
 	}
-	leadApproved := task.Status.ApprovedByMaintainer != ""
-	_, unapproved, _ := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), leadApproved, tl.Items)
+	_, unapproved := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), tl.Items)
 	if len(unapproved) == 0 {
 		return nil
 	}
