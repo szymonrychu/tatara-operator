@@ -122,6 +122,12 @@ type ChangeSummary struct {
 	PRBody string `json:"prBody,omitempty"`
 	// +optional
 	DeliveredScope string `json:"deliveredScope,omitempty"`
+	// RemainingScope, when non-empty, means the implementation is INCOMPLETE:
+	// the operator hard-fails the Task (Phase=Failed, reason=
+	// IncompleteImplementation) rather than opening a follow-up issue.
+	// Agents must implement the full scope in one PR or call
+	// decline_implementation instead. Item Request C (full-scope-or-
+	// decline); no follow-up issues are ever filed by the operator.
 	// +optional
 	RemainingScope string `json:"remainingScope,omitempty"`
 	// +optional
@@ -444,9 +450,11 @@ type TaskStatus struct {
 	BrainstormOutcome *BrainstormOutcome `json:"brainstormOutcome,omitempty"`
 	// +optional
 	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
-	// FollowupIssueURL is the URL of the follow-up issue opened when
-	// ChangeSummary.RemainingScope is non-empty. Used as an idempotency guard to
-	// prevent opening a second follow-up issue on re-entry.
+	// FollowupIssueURL is DEPRECATED and vestigial: the operator no longer
+	// opens follow-up issues (item Request C, full-scope-or-decline - a
+	// non-empty ChangeSummary.RemainingScope now hard-fails the Task
+	// instead). Retained on the CRD for backward compatibility with
+	// existing Tasks/readers only; nothing writes to it anymore.
 	// +optional
 	FollowupIssueURL string `json:"followupIssueURL,omitempty"`
 	// +optional

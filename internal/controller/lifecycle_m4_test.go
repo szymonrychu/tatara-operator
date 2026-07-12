@@ -141,13 +141,14 @@ func TestLifecycleImplement_ChangeSummaryUnsetFallsBack(t *testing.T) {
 }
 
 // ============================================================
-// M4 Task 4 - follow-up issue on remaining scope
+// Request C - RemainingScope hard-fails instead of opening a follow-up issue
 // ============================================================
 
-// TestLifecycleImplement_RemainingScope_OpensFollowupIssue verifies that when
-// ChangeSummary.RemainingScope is non-empty a follow-up issue is created and
-// the URL is appended to Status.DiscoveredIssues.
-func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
+// TestLifecycleImplement_RemainingScope_FailsIncomplete verifies that when
+// ChangeSummary.RemainingScope is non-empty the Task hard-fails
+// (Phase=Failed, reason=IncompleteImplementation) instead of opening a
+// follow-up issue.
+func TestLifecycleImplement_RemainingScope_FailsIncomplete(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-m4-rem"
 	proj := "lc-m4-rp"
@@ -176,10 +177,7 @@ func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	fw := &lifecycleFakeSCMWriter{
-		openPRURL:      "https://github.com/o/r/pull/91",
-		createIssueURL: "https://github.com/o/r/issues/99",
-	}
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/91"}
 	r := newLifecycleReconciler(t, fw)
 
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
@@ -194,100 +192,28 @@ func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
 	}
 
 	fw.mu.Lock()
-	defer fw.mu.Unlock()
-	if len(fw.createIssues) == 0 {
-		t.Fatal("expected CreateIssue to be called for remaining scope")
+	if len(fw.createIssues) != 0 {
+		t.Errorf("CreateIssue called %d times; want 0 - no follow-up issues are ever filed", len(fw.createIssues))
 	}
-	issue := fw.createIssues[0]
-	if !strings.Contains(issue.title, "Follow-up:") {
-		t.Errorf("follow-up issue title = %q, want to contain 'Follow-up:'", issue.title)
-	}
-	if !strings.Contains(issue.title, "(remaining scope)") {
-		t.Errorf("follow-up issue title = %q, want to contain '(remaining scope)'", issue.title)
-	}
-	if !strings.Contains(issue.body, "logout endpoint, password reset") {
-		t.Errorf("follow-up issue body = %q, want remaining scope content", issue.body)
-	}
-	if !strings.Contains(issue.body, "https://github.com/o/r/pull/91") {
-		t.Errorf("follow-up issue body = %q, want PR URL linked", issue.body)
-	}
+	fw.mu.Unlock()
 
-	// Verify DiscoveredIssues is populated.
 	got := &tatarav1alpha1.Task{}
 	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
 		t.Fatalf("get task after: %v", e)
 	}
-	found := false
-	for _, u := range got.Status.DiscoveredIssues {
-		if u == "https://github.com/o/r/issues/99" {
-			found = true
-		}
+	if got.Status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", got.Status.Phase)
 	}
-	if !found {
-		t.Errorf("follow-up issue URL not in DiscoveredIssues: %v", got.Status.DiscoveredIssues)
+	cond := findCond(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "IncompleteImplementation" {
+		t.Fatalf("Ready condition reason = %v, want IncompleteImplementation", cond)
 	}
 }
 
-// TestLifecycleImplement_RemainingScope_Idempotent verifies that a second
-// reconcile with DiscoveredIssues already containing the follow-up URL does NOT
-// open a second follow-up issue.
-func TestLifecycleImplement_RemainingScope_Idempotent(t *testing.T) {
-	ctx := logf.IntoContext(context.Background(), logf.Log)
-	name := "lc-m4-idem"
-	proj := "lc-m4-ip"
-	repo := "lc-m4-ir"
-	sec := "lc-m4-is"
-	src := &tatarav1alpha1.TaskSource{
-		Provider: "github", IssueRef: "o/r#100",
-		URL: "https://github.com/o/r/issues/100", Number: 100,
-		IsPR: false,
-	}
-	task := seedLifecycleTask(t, name, proj, repo, sec, src)
-	task.Status.DeployState = "Implement"
-	task.Status.Phase = "Succeeded"
-	task.Status.LifecycleIterations = 1
-	// PrURL already set simulates idempotent retry (PR already open).
-	task.Status.PrURL = "https://github.com/o/r/pull/101"
-	// DiscoveredIssues already contains the follow-up URL from a prior reconcile.
-	task.Status.DiscoveredIssues = []string{"https://github.com/o/r/issues/102"}
-	task.Status.FollowupIssueURL = "https://github.com/o/r/issues/102"
-	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
-		PRTitle:        "feat: x",
-		PRBody:         "y",
-		DeliveredScope: "part A",
-		RemainingScope: "part B",
-	}
-	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	fw := &lifecycleFakeSCMWriter{
-		openPRURL:      "https://github.com/o/r/pull/101",
-		createIssueURL: "https://github.com/o/r/issues/103",
-	}
-	r := newLifecycleReconciler(t, fw)
-
-	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
-		tk := &tatarav1alpha1.Task{}
-		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
-			t.Fatalf("get task: %v", e)
-		}
-		return tk
-	}())
-	if err != nil {
-		t.Fatalf("reconcileLifecycle: %v", err)
-	}
-
-	fw.mu.Lock()
-	defer fw.mu.Unlock()
-	if len(fw.createIssues) != 0 {
-		t.Errorf("CreateIssue called %d times on idempotent retry; want 0", len(fw.createIssues))
-	}
-}
-
-// TestLifecycleImplement_EmptyRemainingScope_NoFollowup verifies that when
-// RemainingScope is empty no follow-up issue is opened.
-func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
+// TestLifecycleImplement_EmptyRemainingScope_Succeeds verifies that when
+// RemainingScope is empty the Task proceeds normally (no follow-up issue,
+// no hard-fail; transitions to MRCI).
+func TestLifecycleImplement_EmptyRemainingScope_Succeeds(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-m4-empty-rem"
 	proj := "lc-m4-ep"
@@ -306,7 +232,7 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 		PRTitle:        "feat: all done",
 		PRBody:         "Complete.",
 		DeliveredScope: "everything",
-		RemainingScope: "", // empty - no follow-up
+		RemainingScope: "", // empty - proceeds normally
 	}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -327,8 +253,19 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 	}
 
 	fw.mu.Lock()
-	defer fw.mu.Unlock()
 	if len(fw.createIssues) != 0 {
-		t.Errorf("CreateIssue called %d times; want 0 for empty RemainingScope", len(fw.createIssues))
+		t.Errorf("CreateIssue called %d times; want 0", len(fw.createIssues))
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase == "Failed" {
+		t.Errorf("Phase = Failed, want non-Failed (empty RemainingScope must not hard-fail)")
+	}
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI", got.Status.DeployState)
 	}
 }
