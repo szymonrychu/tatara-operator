@@ -52,7 +52,7 @@ func TestAllIssueSiblingURLs_UnionsWorkItemsDiscoveredAndCrossRepo(t *testing.T)
 			},
 		},
 	}
-	got := allIssueSiblingURLs(task)
+	got := allIssueSiblingURLs(task, "")
 	want := []string{
 		"https://github.com/o/r/issues/7",
 		"https://github.com/o/r/issues/8",
@@ -77,8 +77,41 @@ func TestAllIssueSiblingURLs_DedupesAndSkipsBelowThreshold(t *testing.T) {
 			DiscoveredIssues: []string{"https://github.com/o/r/issues/7"}, // duplicate of WorkItems entry
 		},
 	}
-	got := allIssueSiblingURLs(task)
+	got := allIssueSiblingURLs(task, "")
 	if len(got) != 1 {
 		t.Fatalf("allIssueSiblingURLs() = %v, want exactly 1 deduped URL", got)
+	}
+}
+
+// TestAllIssueSiblingURLs_ThreadsProjectProvider verifies F6: a CrossRepo ref
+// (which never carries its own provider) and a WorkItemRef with no Provider
+// set both render using the PROJECT's provider, not a hardcoded "github" -
+// a GitLab project must get gitlab.com/-/issues links, not github.com ones.
+func TestAllIssueSiblingURLs_ThreadsProjectProvider(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			WorkItems: []tatarav1alpha1.WorkItemRef{
+				{Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue}, // no Provider set
+			},
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{
+				SystemicID: "sg1",
+				CrossRepo:  []string{"o/other#3 - the other issue"},
+			},
+		},
+	}
+	got := allIssueSiblingURLs(task, "gitlab")
+	want := []string{
+		"https://gitlab.com/o/r/-/issues/7",
+		"https://gitlab.com/o/other/-/issues/3",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("allIssueSiblingURLs() = %v, want %v", got, want)
+	}
+	for i, u := range want {
+		if got[i] != u {
+			t.Errorf("allIssueSiblingURLs()[%d] = %q, want %q", i, got[i], u)
+		}
 	}
 }

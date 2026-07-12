@@ -445,6 +445,13 @@ type TaskStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	DiscoveredIssues []string `json:"discoveredIssues,omitempty"`
+	// LinksSyncedURLs is the sibling issue URL set (allIssueSiblingURLs) as of
+	// the last tatara-links cross-linking sync (F5). syncAllSiblingLinksIfNeeded
+	// compares the current set against this before re-syncing, so a Task whose
+	// sibling set is unchanged skips the per-sibling SCM GetIssue sweep instead
+	// of re-reading every sibling issue on every reconcile.
+	// +optional
+	LinksSyncedURLs []string `json:"linksSyncedURLs,omitempty"`
 	// +optional
 	ReviewVerdict *ReviewVerdict `json:"reviewVerdict,omitempty"`
 	// +optional

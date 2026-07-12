@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"regexp"
+	"slices"
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -69,6 +70,7 @@ func (r *TaskReconciler) syncSiblingLinks(ctx context.Context, provider, token s
 		}
 		owner, name, _ := strings.Cut(repoSlug, "/")
 		content, gerr := reader.GetIssue(ctx, owner, name, number)
+		r.recordSCM(provider, "get_issue", gerr)
 		if gerr != nil {
 			continue
 		}
@@ -94,11 +96,19 @@ func discoveredIssueSiblings(task *tatarav1alpha1.Task) []string {
 // allIssueSiblingURLs returns the deduped union of every issue URL this Task
 // spans: Status.WorkItems issue-kind entries, Status.DiscoveredIssues, and
 // Spec.SystemicGroup.CrossRepo refs (item Request C/b: all-links comment on
-// multi-issue tasks). Provider defaults to "github" when a WorkItemRef or
-// CrossRepo ref does not carry one (the "owner/repo#N" ref format used
-// throughout this codebase is GitHub-style; no self-hosted-GitLab base is
-// resolvable from a bare ref string).
-func allIssueSiblingURLs(task *tatarav1alpha1.Task) []string {
+// multi-issue tasks). defaultProvider (typically the owning Project's
+// Spec.Scm.Provider) is used when a WorkItemRef does not carry its own
+// Provider, and for every CrossRepo ref (F6: CrossRepo refs never carry a
+// provider field at all, so they used to hardcode "github" unconditionally,
+// rendering github.com links for a GitLab project). Falls back to "github"
+// only when defaultProvider is itself empty (the "owner/repo#N" ref format
+// used throughout this codebase is GitHub-style; no self-hosted-GitLab base
+// is resolvable from a bare ref string with no provider hint at all).
+func allIssueSiblingURLs(task *tatarav1alpha1.Task, defaultProvider string) []string {
+	fallback := defaultProvider
+	if fallback == "" {
+		fallback = "github"
+	}
 	seen := make(map[string]bool)
 	var urls []string
 	add := func(u string) {
@@ -114,7 +124,7 @@ func allIssueSiblingURLs(task *tatarav1alpha1.Task) []string {
 		}
 		provider := wi.Provider
 		if provider == "" {
-			provider = "github"
+			provider = fallback
 		}
 		add(issueURLFromRepoURL("", provider, wi.Repo, wi.Number))
 	}
@@ -127,7 +137,7 @@ func allIssueSiblingURLs(task *tatarav1alpha1.Task) []string {
 			if repo == "" || n == 0 {
 				continue
 			}
-			add(issueURLFromRepoURL("", "github", repo, n))
+			add(issueURLFromRepoURL("", fallback, repo, n))
 		}
 	}
 	return urls
@@ -139,12 +149,16 @@ func allIssueSiblingURLs(task *tatarav1alpha1.Task) []string {
 // not only from the two prior triggers (proposal completion, the removed
 // implement follow-up). Best-effort: any lookup/SCM failure is logged and
 // swallowed so it never blocks the Task's real reconcile work.
+//
+// F5: gated on the synced sibling URL set (Status.LinksSyncedURLs) actually
+// changing since the last sync. Before this gate, every reconcile of every
+// multi-issue Task re-read every sibling issue (one GetIssue per sibling, no
+// TTL, no change check) - unbounded read amplification on the shared bot rate
+// limit for a Task that sits in Conversation/Planning for a long time with a
+// stable sibling set. The writes were already idempotent; only the redundant
+// reads needed bounding.
 func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *tatarav1alpha1.Task) {
 	if r.SCMFor == nil || r.ReaderFor == nil {
-		return
-	}
-	urls := allIssueSiblingURLs(task)
-	if len(urls) < 2 {
 		return
 	}
 	var project tatarav1alpha1.Project
@@ -156,6 +170,13 @@ func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *
 	if project.Spec.Scm == nil {
 		return
 	}
+	urls := allIssueSiblingURLs(task, project.Spec.Scm.Provider)
+	if len(urls) < 2 {
+		return
+	}
+	if slices.Equal(task.Status.LinksSyncedURLs, urls) {
+		return
+	}
 	token, terr := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef)
 	if terr != nil {
 		log.FromContext(ctx).Info("links: scm token lookup failed (non-fatal)",
@@ -163,4 +184,13 @@ func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *
 		return
 	}
 	r.syncSiblingLinks(ctx, project.Spec.Scm.Provider, token, urls)
+	if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+		if slices.Equal(fresh.Status.LinksSyncedURLs, urls) {
+			return false
+		}
+		fresh.Status.LinksSyncedURLs = urls
+		return true
+	}); perr != nil {
+		log.FromContext(ctx).Error(perr, "links: persist synced url set (non-fatal)", "resource_id", task.Name)
+	}
 }
