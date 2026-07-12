@@ -36,10 +36,16 @@ func Ingress(p *tatarav1alpha1.Project, cfg Config) *networkingv1.Ingress {
 		})
 	}
 	meta := objectMeta(p, cfg, p.Name)
-	// Emit the nginx-specific rewrite-target annotation only when configured, so
-	// a non-nginx controller is not handed nginx annotations (rule 14).
+	// Emit nginx-specific annotations only when rewrite-target is configured,
+	// so a non-nginx controller is not handed nginx annotations (rule 14).
+	// use-regex must accompany rewrite-target: the path above is itself a regex
+	// (MemoryPathPrefix + "/" + name + "(/|$)(.*)"), and without use-regex nginx
+	// treats it as a literal path - query/search_entities 404 at the ingress.
 	if cfg.IngressRewriteTarget != "" {
-		meta.Annotations = map[string]string{"nginx.ingress.kubernetes.io/rewrite-target": cfg.IngressRewriteTarget}
+		meta.Annotations = map[string]string{
+			"nginx.ingress.kubernetes.io/rewrite-target": cfg.IngressRewriteTarget,
+			"nginx.ingress.kubernetes.io/use-regex":      "true",
+		}
 	}
 	// Leave IngressClassName nil (cluster default IngressClass applies) when
 	// unconfigured, rather than a pointer-to-empty-string.

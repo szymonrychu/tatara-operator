@@ -92,6 +92,20 @@ type conversationGC interface {
 	Delete(ctx context.Context, key string) error
 }
 
+// InternalIssueReport is one report_internal_issue call the agent made during
+// a turn, as reported by the wrapper's transcript Tailer. Category/Severity
+// are the wrapper's already-clamped values (always exactly one of the known
+// enum members, e.g. severity is always "error" or "warn"), not raw agent
+// input. JSON tags must match tatara-claude-code-wrapper's
+// internal/turn.InternalIssueReport exactly.
+type InternalIssueReport struct {
+	Category      string `json:"category"`
+	Severity      string `json:"severity"`
+	Description   string `json:"description"`
+	OffendingTool string `json:"offending_tool"`
+	ResourceID    string `json:"resource_id"`
+}
+
 type turnCompletePayload struct {
 	TurnID string `json:"turnId"`
 	// TaskName is optionally set by the wrapper (TATARA_TASK env) to enable
@@ -110,6 +124,11 @@ type turnCompletePayload struct {
 	// next-phase pod.
 	SessionID             string `json:"sessionId,omitempty"`
 	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
+	// InternalIssues mirrors tatara-claude-code-wrapper's
+	// internal/turn.InternalIssueReport JSON shape exactly (no shared Go
+	// module between the two repos - this is a wire contract, not an import).
+	// Empty/absent when the turn reported nothing.
+	InternalIssues []InternalIssueReport `json:"internalIssues,omitempty"`
 	// rateLimit was the per-turn Claude usage snapshot the wrapper reported for
 	// the claudeSubscription budget mode (issue #189). Retired: subscription
 	// state now lives only in the fleet-wide account-usage poller/store (issue
@@ -223,6 +242,25 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		l.Error(err, "update project token budget (non-fatal)", "turn_id", p.TurnID)
 	}
 	l.Info("recorded turn result", "action", "turn_complete", "turn_id", p.TurnID, "state", p.State)
+	// Re-log each internal-issue report on the operator's own (Loki-collected)
+	// stdout: agent pods are not scraped, so this is the only path the
+	// description reaches an alertable log stream. One line per issue.
+	for _, ii := range p.InternalIssues {
+		fields := []any{
+			"action", "agent_internal_issue",
+			"category", ii.Category,
+			"severity", ii.Severity,
+			"description", ii.Description,
+			"turn_id", p.TurnID,
+			"offending_tool", ii.OffendingTool,
+			"resource_id", ii.ResourceID,
+		}
+		if ii.Severity == "error" {
+			l.Error(nil, "agent reported an internal issue", fields...)
+		} else {
+			l.Info("agent reported an internal issue", fields...)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
