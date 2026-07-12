@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -141,13 +142,14 @@ func TestLifecycleImplement_ChangeSummaryUnsetFallsBack(t *testing.T) {
 }
 
 // ============================================================
-// M4 Task 4 - follow-up issue on remaining scope
+// Request C - RemainingScope hard-fails instead of opening a follow-up issue
 // ============================================================
 
-// TestLifecycleImplement_RemainingScope_OpensFollowupIssue verifies that when
-// ChangeSummary.RemainingScope is non-empty a follow-up issue is created and
-// the URL is appended to Status.DiscoveredIssues.
-func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
+// TestLifecycleImplement_RemainingScope_FailsIncomplete verifies that when
+// ChangeSummary.RemainingScope is non-empty the Task hard-fails
+// (Phase=Failed, reason=IncompleteImplementation) instead of opening a
+// follow-up issue.
+func TestLifecycleImplement_RemainingScope_FailsIncomplete(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-m4-rem"
 	proj := "lc-m4-rp"
@@ -176,10 +178,77 @@ func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	fw := &lifecycleFakeSCMWriter{
-		openPRURL:      "https://github.com/o/r/pull/91",
-		createIssueURL: "https://github.com/o/r/issues/99",
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/91"}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
 	}
+
+	fw.mu.Lock()
+	if len(fw.createIssues) != 0 {
+		t.Errorf("CreateIssue called %d times; want 0 - no follow-up issues are ever filed", len(fw.createIssues))
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", got.Status.Phase)
+	}
+	cond := findCond(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "IncompleteImplementation" {
+		t.Fatalf("Ready condition reason = %v, want IncompleteImplementation", cond)
+	}
+}
+
+// TestLifecycleImplement_RemainingScope_CommentsAndRemovesLabel is the m9
+// regression: checkRemainingScopeHardFail used to post NO issue comment and
+// leave the tatara-implementation label in place, unlike every other terminal
+// path (parkWithComment / the codifiedTerminal declined path) - a human saw an
+// implementation-labelled issue with no PR and no explanation. It must post an
+// explanatory comment mentioning the declared remaining scope, and remove the
+// implementation label (setLifecycleLabel's declined swap), matching those
+// other terminal paths.
+func TestLifecycleImplement_RemainingScope_CommentsAndRemovesLabel(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-m9-rem"
+	proj := "lc-m9-rp"
+	repo := "lc-m9-rr"
+	sec := "lc-m9-rs"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#91",
+		URL: "https://github.com/o/r/issues/91", Number: 91,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Spec.Goal = "Implement login system"
+	if err := k8sClient.Update(context.Background(), task); err != nil {
+		t.Fatalf("update task spec: %v", err)
+	}
+	task.Status.DeployState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.LifecycleIterations = 1
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: login",
+		PRBody:         "Adds login.",
+		DeliveredScope: "login endpoint",
+		RemainingScope: "logout endpoint, password reset",
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/92"}
 	r := newLifecycleReconciler(t, fw)
 
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
@@ -195,76 +264,60 @@ func TestLifecycleImplement_RemainingScope_OpensFollowupIssue(t *testing.T) {
 
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
-	if len(fw.createIssues) == 0 {
-		t.Fatal("expected CreateIssue to be called for remaining scope")
+	if len(fw.commentCalls) != 1 {
+		t.Fatalf("commentCalls = %d, want 1 (explanatory comment for the human)", len(fw.commentCalls))
 	}
-	issue := fw.createIssues[0]
-	if !strings.Contains(issue.title, "Follow-up:") {
-		t.Errorf("follow-up issue title = %q, want to contain 'Follow-up:'", issue.title)
+	if !strings.Contains(fw.commentCalls[0].body, "logout endpoint, password reset") {
+		t.Errorf("comment body = %q, want it to mention the declared remaining scope", fw.commentCalls[0].body)
 	}
-	if !strings.Contains(issue.title, "(remaining scope)") {
-		t.Errorf("follow-up issue title = %q, want to contain '(remaining scope)'", issue.title)
-	}
-	if !strings.Contains(issue.body, "logout endpoint, password reset") {
-		t.Errorf("follow-up issue body = %q, want remaining scope content", issue.body)
-	}
-	if !strings.Contains(issue.body, "https://github.com/o/r/pull/91") {
-		t.Errorf("follow-up issue body = %q, want PR URL linked", issue.body)
-	}
-
-	// Verify DiscoveredIssues is populated.
-	got := &tatarav1alpha1.Task{}
-	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
-		t.Fatalf("get task after: %v", e)
+	if fw.commentCalls[0].issueRef != "o/r#91" {
+		t.Errorf("comment issueRef = %q, want o/r#91", fw.commentCalls[0].issueRef)
 	}
 	found := false
-	for _, u := range got.Status.DiscoveredIssues {
-		if u == "https://github.com/o/r/issues/99" {
+	for _, lb := range fw.removeLabelCalls {
+		if lb == "tatara-implementation" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("follow-up issue URL not in DiscoveredIssues: %v", got.Status.DiscoveredIssues)
+		t.Errorf("removeLabelCalls = %v, want tatara-implementation removed", fw.removeLabelCalls)
 	}
 }
 
-// TestLifecycleImplement_RemainingScope_Idempotent verifies that a second
-// reconcile with DiscoveredIssues already containing the follow-up URL does NOT
-// open a second follow-up issue.
-func TestLifecycleImplement_RemainingScope_Idempotent(t *testing.T) {
+// TestLifecycleImplement_RemainingScope_NeverOpensPROrAutoMerges verifies F1:
+// the RemainingScope hard-fail must run BEFORE writeBackOpenChange, so an
+// incomplete change never gets its PR opened, never gets the semver label
+// stamped, and never has auto-merge enabled. Before the fix the hard-fail ran
+// AFTER writeBackOpenChange had already opened the PR, labeled it, and turned
+// on auto-merge - CI going green would then auto-merge the incomplete work
+// despite the Task terminating Failed.
+func TestLifecycleImplement_RemainingScope_NeverOpensPROrAutoMerges(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
-	name := "lc-m4-idem"
-	proj := "lc-m4-ip"
-	repo := "lc-m4-ir"
-	sec := "lc-m4-is"
+	name := "lc-m4-rem-noship"
+	proj := "lc-m4-rns-p"
+	repo := "lc-m4-rns-r"
+	sec := "lc-m4-rns-s"
 	src := &tatarav1alpha1.TaskSource{
-		Provider: "github", IssueRef: "o/r#100",
-		URL: "https://github.com/o/r/issues/100", Number: 100,
+		Provider: "github", IssueRef: "o/r#95",
+		URL: "https://github.com/o/r/issues/95", Number: 95,
 		IsPR: false,
 	}
 	task := seedLifecycleTask(t, name, proj, repo, sec, src)
 	task.Status.DeployState = "Implement"
 	task.Status.Phase = "Succeeded"
 	task.Status.LifecycleIterations = 1
-	// PrURL already set simulates idempotent retry (PR already open).
-	task.Status.PrURL = "https://github.com/o/r/pull/101"
-	// DiscoveredIssues already contains the follow-up URL from a prior reconcile.
-	task.Status.DiscoveredIssues = []string{"https://github.com/o/r/issues/102"}
-	task.Status.FollowupIssueURL = "https://github.com/o/r/issues/102"
 	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
-		PRTitle:        "feat: x",
-		PRBody:         "y",
-		DeliveredScope: "part A",
-		RemainingScope: "part B",
+		PRTitle:        "feat: login",
+		PRBody:         "Adds login.",
+		DeliveredScope: "login endpoint",
+		RemainingScope: "logout endpoint, password reset",
+		Significance:   "minor", // set so a buggy ordering WOULD stamp the label + auto-merge
 	}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	fw := &lifecycleFakeSCMWriter{
-		openPRURL:      "https://github.com/o/r/pull/101",
-		createIssueURL: "https://github.com/o/r/issues/103",
-	}
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/96"}
 	r := newLifecycleReconciler(t, fw)
 
 	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
@@ -279,15 +332,40 @@ func TestLifecycleImplement_RemainingScope_Idempotent(t *testing.T) {
 	}
 
 	fw.mu.Lock()
-	defer fw.mu.Unlock()
-	if len(fw.createIssues) != 0 {
-		t.Errorf("CreateIssue called %d times on idempotent retry; want 0", len(fw.createIssues))
+	if len(fw.openCalls) != 0 {
+		t.Errorf("OpenChange called %d times; want 0 - no PR may open for an incomplete change", len(fw.openCalls))
+	}
+	// m9: checkRemainingScopeHardFail now swaps the phase label to
+	// tatara-declined (labelCalls carries "tatara-declined"), a legitimate,
+	// intentional label write distinct from the semver label this test
+	// actually guards against - that one would come from applySemverAutoMerge
+	// downstream of writeBackOpenChange, which never runs here.
+	for _, lb := range fw.labelCalls {
+		if strings.HasPrefix(lb, "semver:") {
+			t.Errorf("AddLabel(%q) called; want no semver label for an incomplete change", lb)
+		}
+	}
+	if fw.autoMergeCalls != 0 {
+		t.Errorf("EnableAutoMerge called %d times; want 0 - auto-merge must never be enabled for an incomplete change", fw.autoMergeCalls)
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", got.Status.Phase)
+	}
+	if got.Status.PrURL != "" {
+		t.Errorf("PrURL = %q, want empty - no PR must ever be recorded for an incomplete change", got.Status.PrURL)
 	}
 }
 
-// TestLifecycleImplement_EmptyRemainingScope_NoFollowup verifies that when
-// RemainingScope is empty no follow-up issue is opened.
-func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
+// TestLifecycleImplement_EmptyRemainingScope_Succeeds verifies that when
+// RemainingScope is empty the Task proceeds normally (no follow-up issue,
+// no hard-fail; transitions to MRCI).
+func TestLifecycleImplement_EmptyRemainingScope_Succeeds(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 	name := "lc-m4-empty-rem"
 	proj := "lc-m4-ep"
@@ -306,7 +384,7 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 		PRTitle:        "feat: all done",
 		PRBody:         "Complete.",
 		DeliveredScope: "everything",
-		RemainingScope: "", // empty - no follow-up
+		RemainingScope: "", // empty - proceeds normally
 	}
 	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -327,8 +405,95 @@ func TestLifecycleImplement_EmptyRemainingScope_NoFollowup(t *testing.T) {
 	}
 
 	fw.mu.Lock()
-	defer fw.mu.Unlock()
 	if len(fw.createIssues) != 0 {
-		t.Errorf("CreateIssue called %d times; want 0 for empty RemainingScope", len(fw.createIssues))
+		t.Errorf("CreateIssue called %d times; want 0", len(fw.createIssues))
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase == "Failed" {
+		t.Errorf("Phase = Failed, want non-Failed (empty RemainingScope must not hard-fail)")
+	}
+	if got.Status.DeployState != "MRCI" {
+		t.Errorf("DeployState = %q, want MRCI", got.Status.DeployState)
+	}
+}
+
+// TestLifecycleImplement_RemainingScope_WithOpenPR_DisarmsAutoMerge is the D1
+// regression. Auto-merge is armed on the PR at OPEN time (applySemverAutoMerge)
+// and was never disarmed, while the lifecycle re-enters Implement with that PR
+// still open on four paths (mrci-failure, merge-conflict, mainci-failure,
+// deploy-failure). So: turn 1 posts a clean change_summary -> PR opens, semver
+// label stamped, native auto-merge ARMED -> CI red -> re-enter Implement ->
+// turn 2 posts change_summary{remainingScope} -> the hard-fail terminated the
+// Task Failed/IncompleteImplementation but LEFT the armed PR open, and the
+// forge merged the incomplete change as soon as CI went green. The hard-fail
+// must now disarm the already-open PR: disable auto-merge, strip the semver
+// label, and close the PR.
+func TestLifecycleImplement_RemainingScope_WithOpenPR_DisarmsAutoMerge(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-d1-rem-openpr"
+	proj := "lc-d1-p"
+	repo := "lc-d1-r"
+	sec := "lc-d1-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#95",
+		URL: "https://github.com/o/r/issues/95", Number: 95,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.DeployState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.LifecycleIterations = 2
+	// Turn 1 already opened the PR and armed auto-merge on it.
+	task.Status.PrURL = "https://github.com/o/r/pull/96"
+	task.Status.PRNumber = 96
+	// Turn 2's change_summary declares a gap.
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: login",
+		PRBody:         "Adds login.",
+		DeliveredScope: "login endpoint",
+		RemainingScope: "logout endpoint, password reset",
+		Significance:   "minor",
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	cur := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, cur); e != nil {
+		t.Fatalf("get task: %v", e)
+	}
+	if _, err := r.reconcileLifecycle(ctx, cur); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	if fw.disableAutoMergeCalls != 1 {
+		t.Errorf("DisableAutoMerge called %d times; want 1 - an armed PR must be disarmed when the change is declared incomplete", fw.disableAutoMergeCalls)
+	}
+	if len(fw.closePRCalls) != 1 || fw.closePRCalls[0].number != 96 {
+		t.Errorf("ClosePR calls = %+v; want exactly one close of PR #96", fw.closePRCalls)
+	}
+	if !containsStr(fw.removeLabelCalls, "semver:minor") {
+		t.Errorf("removeLabelCalls = %v; want the semver:minor label stripped from the incomplete PR", fw.removeLabelCalls)
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", got.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "IncompleteImplementation" {
+		t.Errorf("Ready condition = %+v, want reason IncompleteImplementation", cond)
 	}
 }

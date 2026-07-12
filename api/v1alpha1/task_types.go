@@ -122,6 +122,12 @@ type ChangeSummary struct {
 	PRBody string `json:"prBody,omitempty"`
 	// +optional
 	DeliveredScope string `json:"deliveredScope,omitempty"`
+	// RemainingScope, when non-empty, means the implementation is INCOMPLETE:
+	// the operator hard-fails the Task (Phase=Failed, reason=
+	// IncompleteImplementation) rather than opening a follow-up issue.
+	// Agents must implement the full scope in one PR or call
+	// decline_implementation instead. Item Request C (full-scope-or-
+	// decline); no follow-up issues are ever filed by the operator.
 	// +optional
 	RemainingScope string `json:"remainingScope,omitempty"`
 	// +optional
@@ -217,6 +223,19 @@ var unconstrainedKinds = map[string]bool{
 // writeback fence does not stop implement from opening PRs.
 func IsProjectScopedKind(kind string) bool {
 	return projectScopedKinds[kind]
+}
+
+// IsChangeOpeningKind reports whether a task kind can legitimately OPEN a
+// PR/MR, i.e. reaches writeBackOpenChange in doWriteBack's kind switch. That is
+// every kind except (a) the project-scoped ones, which open no change at all,
+// and (b) review, which posts a verdict on an EXISTING PR and never opens one.
+// It gates the change_summary REST endpoint and the full-scope-or-decline
+// hard-fail: a kind that cannot open a PR can never ship an incomplete change,
+// so a change_summary (and any remainingScope on it) is meaningless there - and
+// hard-failing on one would kill a Task whose real job, e.g. posting a review
+// verdict, was still pending.
+func IsChangeOpeningKind(kind string) bool {
+	return !IsProjectScopedKind(kind) && kind != "review"
 }
 
 // IsKnownKind reports whether kind is a valid Task kind (any of the scoped,
@@ -432,6 +451,24 @@ type TaskStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 	// +optional
 	DiscoveredIssues []string `json:"discoveredIssues,omitempty"`
+	// LinksSyncedURLs is the sibling issue URL set (allIssueSiblingURLs) as of
+	// the last tatara-links cross-linking sync (F5). syncAllSiblingLinksIfNeeded
+	// compares the current set against this before re-syncing, so a Task whose
+	// sibling set is unchanged skips the per-sibling SCM GetIssue sweep instead
+	// of re-reading every sibling issue on every reconcile.
+	// +optional
+	LinksSyncedURLs []string `json:"linksSyncedURLs,omitempty"`
+	// LinksSyncFailures counts consecutive INCOMPLETE tatara-links sweeps for
+	// the current sibling URL set (D2). isPermanentTargetGone only classifies
+	// 404/410 as terminal, so any other permanent failure (403 conversation-
+	// locked, a bot without issues:write, a 422 body over the 65536-char limit)
+	// would otherwise keep the sweep unclean, LinksSyncedURLs unstamped, and the
+	// per-sibling GetIssue re-read running on every reconcile forever. Bounded
+	// like Status.WritebackSkip4xxAttempts: at linksSyncFailureCap the sweep
+	// gives up, stamps the URL set anyway, and resets this to 0 - so a later
+	// CHANGE to the sibling set gets a fresh retry budget.
+	// +optional
+	LinksSyncFailures int `json:"linksSyncFailures,omitempty"`
 	// +optional
 	ReviewVerdict *ReviewVerdict `json:"reviewVerdict,omitempty"`
 	// +optional
@@ -444,9 +481,11 @@ type TaskStatus struct {
 	BrainstormOutcome *BrainstormOutcome `json:"brainstormOutcome,omitempty"`
 	// +optional
 	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
-	// FollowupIssueURL is the URL of the follow-up issue opened when
-	// ChangeSummary.RemainingScope is non-empty. Used as an idempotency guard to
-	// prevent opening a second follow-up issue on re-entry.
+	// FollowupIssueURL is DEPRECATED and vestigial: the operator no longer
+	// opens follow-up issues (item Request C, full-scope-or-decline - a
+	// non-empty ChangeSummary.RemainingScope now hard-fails the Task
+	// instead). Retained on the CRD for backward compatibility with
+	// existing Tasks/readers only; nothing writes to it anymore.
 	// +optional
 	FollowupIssueURL string `json:"followupIssueURL,omitempty"`
 	// +optional
@@ -545,6 +584,17 @@ type TaskStatus struct {
 	// SCM API every reconcile. Reset to 0 when a PR opens.
 	// +optional
 	WritebackSkip4xxAttempts int `json:"writebackSkip4xxAttempts,omitempty"`
+	// DisarmFailures counts consecutive INCOMPLETE disarmOpenChanges sweeps for
+	// the full-scope-or-decline hard-fail (F2). A sweep is incomplete when any
+	// target PR could not be verifiably closed (a transient SCM error, not a
+	// permanent 404/410 "already gone"). Bounded like WritebackSkip4xxAttempts /
+	// LinksSyncFailures: the Task does NOT terminate while a sweep is dirty and
+	// under disarmFailureCap - it requeues and retries. Once the cap is spent
+	// the Task terminates anyway but records a DisarmFailed condition so an
+	// armed-PR-that-could-not-be-disarmed is alertable. Reset to 0 once a sweep
+	// verifies clean or the cap is reached.
+	// +optional
+	DisarmFailures int `json:"disarmFailures,omitempty"`
 	// PendingComments are free-form comments queued by the agent via the
 	// comment MCP tool, posted to the task's linked issue on the next
 	// reconcile and then cleared. Does not change the lifecycle state.
@@ -569,19 +619,23 @@ type TaskStatus struct {
 	// +optional
 	ParkReason string `json:"parkReason,omitempty"`
 
-	// ApprovedByMaintainer records the identity-verified fact that a HUMAN
-	// MAINTAINER explicitly approved this issue for implementation, by applying
-	// the approved label to it. It is set by the webhook ONLY when it observes an
-	// issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
-	// (never the bot: a bot/agent that sets the label itself cannot self-approve).
-	// It is the ONLY signal that releases a front-half Task (clarify / the
-	// issueLifecycle bridge) into the autonomous implement->review->merge->deploy
-	// chain: every path that would advance a front-half issue to Implement gates
-	// on it (finishFrontHalf, the Conversation label readback, the trigger-label
-	// jump). Empty means NO verified maintainer approval - the operator fails
-	// CLOSED (parks to Conversation) rather than trusting raw label presence,
-	// which an agent with SCM write could forge. Holds the approving maintainer's
-	// login for audit.
+	// ApprovedByMaintainer records that this issue was approved for
+	// implementation, either by a HUMAN MAINTAINER (the webhook sets it ONLY
+	// when it observes an issues.labeled{approved} event whose ACTOR is a
+	// MaintainerLogins member - never the bot: a bot/agent that sets the label
+	// itself cannot self-approve) OR by the auto-approve release path (item 4a,
+	// recordAutoApproval), which writes the audit sentinel
+	// "<tatara:auto:<kind>>" instead of a login - see AutoApproved. Both are
+	// accepted approval sources by design; consumers that need to distinguish
+	// them check AutoApproved. It is the ONLY signal that releases a
+	// front-half Task (clarify / the issueLifecycle bridge) into the
+	// autonomous implement->review->merge->deploy chain: every path that would
+	// advance a front-half issue to Implement gates on it (finishFrontHalf,
+	// the Conversation label readback, the trigger-label jump). Empty means NO
+	// recorded approval - the operator fails CLOSED (parks to Conversation)
+	// rather than trusting raw label presence, which an agent with SCM write
+	// could forge. Holds the approving maintainer's login (or the auto-approve
+	// sentinel) for audit.
 	// +optional
 	ApprovedByMaintainer string `json:"approvedByMaintainer,omitempty"`
 	// AutoApproved is true when ApprovedByMaintainer was set by the auto-approve

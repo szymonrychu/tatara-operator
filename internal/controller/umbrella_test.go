@@ -92,7 +92,7 @@ func TestBuildUmbrellaPrompt_RendersAllSections(t *testing.T) {
 		"o/a#7":  {{Author: "alice", Body: "please do X"}},
 		"o/b!42": {{Author: "bob", Body: "LGTM"}},
 	}
-	out := buildUmbrellaPrompt(task, repos, threads, "Do the clarify thing.")
+	out := buildUmbrellaPrompt(task, repos, threads, "Do the clarify thing.", nil)
 
 	require.Contains(t, out, "# Umbrella task: Ship cross-repo feature")
 	// Repos in scope + per-repo checkout instructions.
@@ -130,8 +130,38 @@ func TestBuildUmbrellaPrompt_PerMemberThreadBudget(t *testing.T) {
 	threads := map[string][]scm.IssueComment{
 		"o/a#1": {{Author: "a", Body: long}},
 	}
-	out := buildUmbrellaPrompt(task, nil, threads, "goal")
+	out := buildUmbrellaPrompt(task, nil, threads, "goal", nil)
 	require.Less(t, len(out), len(long), "per-member thread must be char-budgeted")
+}
+
+func TestBuildUmbrellaPrompt_RendersSystemicSiblings(t *testing.T) {
+	task := &tatarav1alpha1.Task{}
+	task.Spec.Goal = "Ship the design"
+	siblings := []systemicSiblingInfo{
+		{Ref: "o/r2#9", Found: true, Phase: "open"},
+		{Ref: "o/r3#3", Found: false},
+	}
+	out := buildUmbrellaPrompt(task, nil, nil, "goal", siblings)
+
+	require.Contains(t, out, "## Related systemic-group issues")
+	require.Contains(t, out, "o/r2#9: still open")
+	require.Contains(t, out, "o/r3#3: not yet tracked")
+}
+
+// TestBuildUmbrellaPrompt_TerminalSiblingNotRenderedAsOpen verifies F7: a
+// Found sibling whose tracking Task reached a TERMINAL DeployState
+// (Done/Parked/Stopped/...) must not be rendered as "still open" - only
+// Conversation/Triage are genuinely "still open".
+func TestBuildUmbrellaPrompt_TerminalSiblingNotRenderedAsOpen(t *testing.T) {
+	task := &tatarav1alpha1.Task{}
+	task.Spec.Goal = "Ship the design"
+	siblings := []systemicSiblingInfo{
+		{Ref: "o/r4#5", Found: true, Phase: "Done"},
+	}
+	out := buildUmbrellaPrompt(task, nil, nil, "goal", siblings)
+
+	require.NotContains(t, out, "still open (Done)", "a terminal Done sibling must not be rendered as still open")
+	require.Contains(t, out, "o/r4#5: tracked (state: Done)")
 }
 
 // ---- refreshUmbrellaMembers -------------------------------------------
@@ -246,6 +276,95 @@ func TestBuildUmbrellaPromptFor_AssemblesLiveBundle(t *testing.T) {
 	require.Contains(t, out, "the live issue body")
 	require.Contains(t, out, "**carol**: context comment")
 	require.Contains(t, out, "GOAL-TAIL-MARKER")
+}
+
+// TestBuildUmbrellaPromptFor_IncludesSystemicSibling covers item Request C/c:
+// the clarify turn-0 bundle surfaces every systemic-group sibling issue and
+// the lifecycle phase of the Task tracking it, so the agent knows the answer
+// it is about to give may affect a related issue.
+func TestBuildUmbrellaPromptFor_IncludesSystemicSibling(t *testing.T) {
+	ctx := context.Background()
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	reader := &umbrellaFakeReader{
+		openIssues: map[string][]scm.IssueRef{
+			"o/r": {{Repo: "o/r", Number: 5, State: "open"}},
+		},
+		issueBody: map[string]string{"o/r#5": "the live issue body"},
+	}
+	r.ReaderFor = func(string, string) (scm.SCMReader, error) { return reader, nil }
+
+	task := seedWritebackKindTask(t, "umbrella-sibs", "umbrella-sibs-proj", "umbrella-sibs-repo", "umbrella-sibs-sec",
+		tatarav1alpha1.TaskSpec{
+			Kind:   "clarify",
+			Goal:   "Clarify the thing",
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5},
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{
+				SystemicID:       "sg1",
+				SameRepoSiblings: []int{7},
+			},
+		}, &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"})
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 5, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	}
+	require.NoError(t, k8sClient.Status().Update(ctx, task))
+
+	// Seed the sibling's own Task, still in conversation. Created directly (not
+	// via seedWritebackKindTask) since the lead task above already seeded the
+	// shared project/repo/secret and re-seeding them under the same names would
+	// collide on Create.
+	sibling := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "umbrella-sibs-sib", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    "umbrella-sibs-proj",
+			RepositoryRef: "umbrella-sibs-repo",
+			Kind:          "clarify",
+			Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, sibling))
+	sibling.Status.DeployState = "Conversation"
+	require.NoError(t, k8sClient.Status().Update(ctx, sibling))
+
+	var proj tatarav1alpha1.Project
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "umbrella-sibs-proj"}, &proj))
+
+	out := r.buildUmbrellaPromptFor(ctx, &proj, task, "GOAL-TAIL-MARKER")
+	require.Contains(t, out, "## Related systemic-group issues")
+	require.Contains(t, out, "o/r#7: still open")
+}
+
+// TestSystemicGroupSiblingsSummary_LeadLedgerSelfMatchExcluded verifies the
+// F2 self-match fix also applies to the clarify-bundle sibling resolver
+// (systemicGroupSiblingsSummary's find closure): a lead Task's own ledger,
+// seeded with a role:closes entry for every sibling it references, must not
+// make the lead appear to BE its own sibling when no Task actually tracks
+// that sibling issue in its own right.
+func TestSystemicGroupSiblingsSummary_LeadLedgerSelfMatchExcluded(t *testing.T) {
+	ctx := context.Background()
+	lead := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "sibsum-lead", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "sibsum-proj", Kind: "clarify", Goal: "g",
+			Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/ss#12", Number: 12},
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{SystemicID: "sg1", SameRepoSiblings: []int{7}},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, lead))
+	lead.Status.DeployState = "MRCI"
+	lead.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Repo: "o/ss", Number: 7, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleCloses},
+	}
+	require.NoError(t, k8sClient.Status().Update(ctx, lead))
+
+	r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	got := getTask(t, "sibsum-lead")
+
+	summary := r.systemicGroupSiblingsSummary(ctx, got)
+	require.Len(t, summary, 1)
+	require.False(t, summary[0].Found,
+		"no Task tracks #7 in its own right; the lead's own role:closes ledger entry must not self-match")
 }
 
 // ---- umbrellaLinkedIssue (source-issue <-> PR linkage) -----------------

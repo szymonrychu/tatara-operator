@@ -11,6 +11,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -28,6 +29,61 @@ type umbrellaRepo struct {
 	Name          string
 	URL           string
 	DefaultBranch string
+}
+
+// systemicSiblingInfo summarizes one systemic-group sibling issue's
+// resolution state for the clarify turn-0 bundle (item Request C/c):
+// whether a Task tracks it yet, and which lifecycle phase that Task is in.
+type systemicSiblingInfo struct {
+	Ref   string // "owner/repo#N" (same-repo) or the raw CrossRepo ref string
+	Found bool
+	Phase string // "" (not started) | "open" (still discussing) | any raw DeployState
+}
+
+// systemicGroupSiblingsSummary resolves the state of every sibling issue in
+// task's systemic group (same-repo + cross-repo) by looking up its own Task
+// CR (if any) across the shared namespace. Best-effort: a lookup failure
+// yields no siblings (never blocks the caller).
+func (r *TaskReconciler) systemicGroupSiblingsSummary(ctx context.Context, task *tatarav1alpha1.Task) []systemicSiblingInfo {
+	g := task.Spec.SystemicGroup
+	if g == nil || (len(g.SameRepoSiblings) == 0 && len(g.CrossRepo) == 0) {
+		return nil
+	}
+	var tl tatarav1alpha1.TaskList
+	if err := r.List(ctx, &tl, client.InNamespace(task.Namespace)); err != nil {
+		return nil
+	}
+	leadRepo := leadRepoOf(task)
+	// More than one Task can track the same issue over its life (a terminal
+	// clarify plus a later re-triage Task created after it went Done, ...), so
+	// resolve via newestTaskForSource - source-identity-only matching (never a
+	// lead's own role:closes ledger entry) plus newest-wins. This is the exact
+	// resolution issueHasRecordedApproval uses, so the bundle and the approval
+	// gate always agree on WHICH Task speaks for a sibling issue.
+	find := func(repo string, number int) (*tatarav1alpha1.Task, bool) {
+		t := newestTaskForSource(tl.Items, repo, number)
+		return t, t != nil
+	}
+	summarize := func(ref, repo string, number int) systemicSiblingInfo {
+		t, found := find(repo, number)
+		if !found {
+			return systemicSiblingInfo{Ref: ref}
+		}
+		info := systemicSiblingInfo{Ref: ref, Found: true, Phase: t.Status.DeployState}
+		if t.Status.DeployState == "Conversation" || t.Status.DeployState == "Triage" {
+			info.Phase = "open"
+		}
+		return info
+	}
+	var out []systemicSiblingInfo
+	for _, n := range g.SameRepoSiblings {
+		out = append(out, summarize(fmt.Sprintf("%s#%d", leadRepo, n), leadRepo, n))
+	}
+	for _, ref := range g.CrossRepo {
+		repo, n := parseCrossRepoRef(ref)
+		out = append(out, summarize(ref, repo, n))
+	}
+	return out
 }
 
 // umbrellaMergeStater is the single SCMWriter capability refreshUmbrellaMembers
@@ -205,7 +261,7 @@ func umbrellaMemberFresh(wi *tatarav1alpha1.WorkItemRef, ttl time.Duration, now 
 // caller. threads maps a member ref ("<repo>#<n>" / "<repo>!<n>") to its
 // oldest-first comment thread; each thread is char-budgeted (triageCommentCharBudget)
 // so a large umbrella stays bounded. goalTail is the kind directive + skills line.
-func buildUmbrellaPrompt(task *tatarav1alpha1.Task, repos []umbrellaRepo, threads map[string][]scm.IssueComment, goalTail string) string {
+func buildUmbrellaPrompt(task *tatarav1alpha1.Task, repos []umbrellaRepo, threads map[string][]scm.IssueComment, goalTail string, siblings []systemicSiblingInfo) string {
 	goal := task.Spec.Goal
 	if goal == "" {
 		goal = "(cross-repo umbrella)"
@@ -254,6 +310,25 @@ func buildUmbrellaPrompt(task *tatarav1alpha1.Task, repos []umbrellaRepo, thread
 				umbrellaField(wi.Mergeable), umbrellaLabels(wi.Labels))
 			sb.WriteString(umbrellaBody(wi.Body))
 			sb.WriteString(umbrellaThread(threads[ref]))
+		}
+	}
+
+	if len(siblings) > 0 {
+		sb.WriteString("\n## Related systemic-group issues (other repos/issues, do NOT edit here)\n")
+		for _, s := range siblings {
+			switch {
+			case !s.Found:
+				fmt.Fprintf(&sb, "- %s: not yet tracked by a tatara Task.\n", s.Ref)
+			case s.Phase == "open":
+				fmt.Fprintf(&sb, "- %s: still open (%s) - if the human's answer here affects that issue's design, say so explicitly.\n", s.Ref, s.Phase)
+			case s.Phase == "":
+				fmt.Fprintf(&sb, "- %s: tracked, no lifecycle phase recorded yet.\n", s.Ref)
+			default:
+				// F7: a Done/Parked/Stopped/... sibling is NOT "still open" - it
+				// finished (or was set aside). Render its actual state instead of
+				// misleadingly implying live discussion.
+				fmt.Fprintf(&sb, "- %s: tracked (state: %s).\n", s.Ref, s.Phase)
+			}
 		}
 	}
 
@@ -382,7 +457,7 @@ func (r *TaskReconciler) buildUmbrellaPromptFor(ctx context.Context, project *ta
 		}
 	}
 
-	return buildUmbrellaPrompt(task, umRepos, threads, goalTail)
+	return buildUmbrellaPrompt(task, umRepos, threads, goalTail, r.systemicGroupSiblingsSummary(ctx, task))
 }
 
 // clarifyGoalTail is the "## Your task" directive for a clarify umbrella pod: the

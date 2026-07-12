@@ -6,11 +6,13 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type fakeIssueWriter struct {
@@ -104,4 +106,52 @@ func TestWriteBackIssueClose_TargetGone(t *testing.T) {
 	if v := testutil.ToFloat64(r.Metrics.SCMWriteCounter("github", "close_issue", "error")); v != 0 {
 		t.Errorf("close_issue{result=error} = %v, want 0 for a gone target", v)
 	}
+}
+
+// TestWriteBackIssue_Implement_RemainingScopeNeverOpensPR is the M1 regression:
+// writeBackIssue's implement branch (out.Action == "implement") used to call
+// writeBackOpenChange directly with no checkRemainingScopeHardFail ahead of
+// it, and doWriteBack dispatches the "triageIssue" case BEFORE the F4 guard -
+// so a triageIssue task whose agent declared ChangeSummary.RemainingScope
+// sailed straight through to OpenChange. Must hard-fail Failed/
+// IncompleteImplementation and never call OpenChange.
+func TestWriteBackIssue_Implement_RemainingScopeNeverOpensPR(t *testing.T) {
+	ctx := context.Background()
+	fw := &fakeWriter{prURL: "https://github.com/o/r/pull/60"}
+	r := newWriteBackReconciler(t, fw)
+
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "iwrs-scm", Namespace: testNS}, Data: map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")}}
+	require.NoError(t, k8sClient.Create(ctx, sec))
+	proj := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "iwrs-proj", Namespace: testNS}, Spec: tatarav1alpha1.ProjectSpec{ScmSecretRef: "iwrs-scm", Scm: &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "bot"}}}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+	repo := &tatarav1alpha1.Repository{ObjectMeta: metav1.ObjectMeta{Name: "iwrs-repo", Namespace: testNS}, Spec: tatarav1alpha1.RepositorySpec{ProjectRef: "iwrs-proj", URL: "https://github.com/o/r.git", DefaultBranch: "main", ReingestSchedule: "0 6 * * *"}}
+	require.NoError(t, k8sClient.Create(ctx, repo))
+
+	task := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "iwrs-task", Namespace: testNS}}
+	task.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "iwrs-proj", RepositoryRef: "iwrs-repo", Goal: "g", Kind: "triageIssue",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#9", URL: "https://github.com/o/r/issues/9", Number: 9}}
+	require.NoError(t, k8sClient.Create(ctx, task))
+	task.Status.Phase = "Succeeded"
+	task.Status.IssueOutcome = &tatarav1alpha1.IssueOutcome{Action: "implement"}
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle: "feat: partial", PRBody: "partial", DeliveredScope: "half", RemainingScope: "the other half",
+	}
+	apimeta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{Type: "WritebackPending", Status: metav1.ConditionTrue, Reason: "x", Message: "x"})
+	require.NoError(t, k8sClient.Status().Update(ctx, task))
+
+	_, err := reconcileWriteback(t, r, "iwrs-task")
+	require.NoError(t, err)
+
+	fw.mu.Lock()
+	openCalls := fw.openCalls
+	fw.mu.Unlock()
+	require.Equal(t, 0, openCalls, "OpenChange must never be called for a triageIssue-implement Task with declared RemainingScope")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "iwrs-task"}, &got))
+	require.Empty(t, got.Status.PrURL)
+	require.Equal(t, "Failed", got.Status.Phase)
+	cond := findCond(got.Status.Conditions, "Ready")
+	require.NotNil(t, cond)
+	require.Equal(t, "IncompleteImplementation", cond.Reason)
 }

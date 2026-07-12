@@ -196,6 +196,32 @@ func TestGitHubEnableAutoMerge(t *testing.T) {
 	require.Contains(t, gotGraphQL, "SQUASH")
 }
 
+// TestGitHubDisableAutoMerge covers the D1 disarm verb: an incomplete change
+// whose PR was already opened with auto-merge armed must have it turned back
+// off so the forge cannot merge it once its checks go green.
+func TestGitHubDisableAutoMerge(t *testing.T) {
+	var gotGraphQL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case strings.Contains(string(body), "resource(url:"):
+			_, _ = w.Write([]byte(`{"data":{"resource":{"id":"PR_node_123"}}}`))
+		case strings.Contains(string(body), "disablePullRequestAutoMerge"):
+			gotGraphQL = string(body)
+			_, _ = w.Write([]byte(`{"data":{"disablePullRequestAutoMerge":{"clientMutationId":null}}}`))
+		default:
+			t.Fatalf("unexpected graphql body: %s", body)
+		}
+	}))
+	defer srv.Close()
+
+	c := &GitHub{graphQLBase: srv.URL}
+	err := c.DisableAutoMerge(context.Background(), "https://github.com/o/r.git", "ghtok",
+		"https://github.com/o/r/pull/7")
+	require.NoError(t, err)
+	require.Contains(t, gotGraphQL, "PR_node_123")
+}
+
 func TestGitHubEnableAutoMergeError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

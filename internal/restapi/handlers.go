@@ -1231,46 +1231,32 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "change significance must be one of major|minor|patch")
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	start := time.Now()
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
-			PRTitle:         req.PRTitle,
-			PRBody:          req.PRBody,
-			DeliveredScope:  req.DeliveredScope,
-			RemainingScope:  req.RemainingScope,
-			MostProblematic: req.MostProblematic,
-			Significance:    req.ChangeSignificance,
-		}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("change_summary", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("change_summary", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: changeSummary",
-		append(reqLogFields(r),
-			"action", "change_summary",
-			"resource_id", key.Name,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	// M1/D3: kind gate (unlike issue_outcome/implement_outcome, this handler had
+	// none - any kind could carry a RemainingScope value that a writeback path
+	// might later trust). Accept a change summary only from the kinds that
+	// legitimately OPEN a change (IsChangeOpeningKind). M1 rejected only the
+	// project-scoped kinds, which left kind=review through: a review agent that
+	// misfired remainingScope (describing what the PR UNDER REVIEW still lacks)
+	// tripped the full-scope-or-decline hard-fail - hoisted above doWriteBack's
+	// kind switch - and killed the review Task before its verdict was posted,
+	// leaving the PR unreviewed.
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "change_summary",
+		logMsg:     "restapi: changeSummary",
+		logAction:  "change_summary",
+		kindOK:     func(kind string) bool { return tatarav1alpha1.IsChangeOpeningKind(kind) },
+		kindErrMsg: "change summary only applies to a task that opens a change",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+				PRTitle:         req.PRTitle,
+				PRBody:          req.PRBody,
+				DeliveredScope:  req.DeliveredScope,
+				RemainingScope:  req.RemainingScope,
+				MostProblematic: req.MostProblematic,
+				Significance:    req.ChangeSignificance,
+			}
+		},
+	})
 }
 
 // --- M3: POST /tasks/{t}/handover ---

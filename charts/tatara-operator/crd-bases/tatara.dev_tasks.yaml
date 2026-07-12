@@ -231,19 +231,23 @@ spec:
             properties:
               approvedByMaintainer:
                 description: |-
-                  ApprovedByMaintainer records the identity-verified fact that a HUMAN
-                  MAINTAINER explicitly approved this issue for implementation, by applying
-                  the approved label to it. It is set by the webhook ONLY when it observes an
-                  issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
-                  (never the bot: a bot/agent that sets the label itself cannot self-approve).
-                  It is the ONLY signal that releases a front-half Task (clarify / the
-                  issueLifecycle bridge) into the autonomous implement->review->merge->deploy
-                  chain: every path that would advance a front-half issue to Implement gates
-                  on it (finishFrontHalf, the Conversation label readback, the trigger-label
-                  jump). Empty means NO verified maintainer approval - the operator fails
-                  CLOSED (parks to Conversation) rather than trusting raw label presence,
-                  which an agent with SCM write could forge. Holds the approving maintainer's
-                  login for audit.
+                  ApprovedByMaintainer records that this issue was approved for
+                  implementation, either by a HUMAN MAINTAINER (the webhook sets it ONLY
+                  when it observes an issues.labeled{approved} event whose ACTOR is a
+                  MaintainerLogins member - never the bot: a bot/agent that sets the label
+                  itself cannot self-approve) OR by the auto-approve release path (item 4a,
+                  recordAutoApproval), which writes the audit sentinel
+                  "<tatara:auto:<kind>>" instead of a login - see AutoApproved. Both are
+                  accepted approval sources by design; consumers that need to distinguish
+                  them check AutoApproved. It is the ONLY signal that releases a
+                  front-half Task (clarify / the issueLifecycle bridge) into the
+                  autonomous implement->review->merge->deploy chain: every path that would
+                  advance a front-half issue to Implement gates on it (finishFrontHalf,
+                  the Conversation label readback, the trigger-label jump). Empty means NO
+                  recorded approval - the operator fails CLOSED (parks to Conversation)
+                  rather than trusting raw label presence, which an agent with SCM write
+                  could forge. Holds the approving maintainer's login (or the auto-approve
+                  sentinel) for audit.
                 type: string
               autoApproved:
                 description: |-
@@ -292,6 +296,13 @@ spec:
                   prTitle:
                     type: string
                   remainingScope:
+                    description: |-
+                      RemainingScope, when non-empty, means the implementation is INCOMPLETE:
+                      the operator hard-fails the Task (Phase=Failed, reason=
+                      IncompleteImplementation) rather than opening a follow-up issue.
+                      Agents must implement the full scope in one PR or call
+                      decline_implementation instead. Item Request C (full-scope-or-
+                      decline); no follow-up issues are ever filed by the operator.
                     type: string
                   significance:
                     description: |-
@@ -426,15 +437,29 @@ spec:
                   DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
                   driving toward the cluster.
                 type: string
+              disarmFailures:
+                description: |-
+                  DisarmFailures counts consecutive INCOMPLETE disarmOpenChanges sweeps for
+                  the full-scope-or-decline hard-fail (F2). A sweep is incomplete when any
+                  target PR could not be verifiably closed (a transient SCM error, not a
+                  permanent 404/410 "already gone"). Bounded like WritebackSkip4xxAttempts /
+                  LinksSyncFailures: the Task does NOT terminate while a sweep is dirty and
+                  under disarmFailureCap - it requeues and retries. Once the cap is spent
+                  the Task terminates anyway but records a DisarmFailed condition so an
+                  armed-PR-that-could-not-be-disarmed is alertable. Reset to 0 once a sweep
+                  verifies clean or the cap is reached.
+                type: integer
               discoveredIssues:
                 items:
                   type: string
                 type: array
               followupIssueURL:
                 description: |-
-                  FollowupIssueURL is the URL of the follow-up issue opened when
-                  ChangeSummary.RemainingScope is non-empty. Used as an idempotency guard to
-                  prevent opening a second follow-up issue on re-entry.
+                  FollowupIssueURL is DEPRECATED and vestigial: the operator no longer
+                  opens follow-up issues (item Request C, full-scope-or-decline - a
+                  non-empty ChangeSummary.RemainingScope now hard-fails the Task
+                  instead). Retained on the CRD for backward compatibility with
+                  existing Tasks/readers only; nothing writes to it anymore.
                 type: string
               gateEnteredAt:
                 format: date-time
@@ -536,6 +561,28 @@ spec:
                 - Stopped
                 - Parked
                 type: string
+              linksSyncFailures:
+                description: |-
+                  LinksSyncFailures counts consecutive INCOMPLETE tatara-links sweeps for
+                  the current sibling URL set (D2). isPermanentTargetGone only classifies
+                  404/410 as terminal, so any other permanent failure (403 conversation-
+                  locked, a bot without issues:write, a 422 body over the 65536-char limit)
+                  would otherwise keep the sweep unclean, LinksSyncedURLs unstamped, and the
+                  per-sibling GetIssue re-read running on every reconcile forever. Bounded
+                  like Status.WritebackSkip4xxAttempts: at linksSyncFailureCap the sweep
+                  gives up, stamps the URL set anyway, and resets this to 0 - so a later
+                  CHANGE to the sibling set gets a fresh retry budget.
+                type: integer
+              linksSyncedURLs:
+                description: |-
+                  LinksSyncedURLs is the sibling issue URL set (allIssueSiblingURLs) as of
+                  the last tatara-links cross-linking sync (F5). syncAllSiblingLinksIfNeeded
+                  compares the current set against this before re-syncing, so a Task whose
+                  sibling set is unchanged skips the per-sibling SCM GetIssue sweep instead
+                  of re-reading every sibling issue on every reconcile.
+                items:
+                  type: string
+                type: array
               mergeCommitSHA:
                 type: string
               mergeWaitDeadline:

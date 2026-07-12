@@ -807,6 +807,21 @@ func TestChangeSummary_InvalidBody(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+// TestChangeSummary_RejectsProjectScopedKind is the M1 kind-gate regression:
+// unlike issue_outcome/implement_outcome, change-summary had NO kind gate at
+// all, so a project-scoped kind (incident/healthCheck/brainstorm - never opens
+// a PR) could still carry a RemainingScope value. Project-scoped kinds are
+// rejected the same way brainstorm-outcome rejects a non-brainstorm task.
+func TestChangeSummary_RejectsProjectScopedKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t4", "alpha", "incident"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"b","deliveredScope":"s","remainingScope":"gap","changeSignificance":"minor"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t4/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+}
+
 // --- POST /tasks/{t}/comment ---
 
 func taskWithSource(name, projectRef, issueRef string) *tatarav1alpha1.Task {
@@ -949,4 +964,33 @@ func TestProposeIssue_ImprovementKindAccepted(t *testing.T) {
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusCreated, w.Code)
+}
+
+// TestChangeSummary_RejectedForReviewKind is the D3 gate: change_summary is
+// accepted only from kinds that legitimately OPEN a change. The old gate only
+// rejected project-scoped kinds, so a review agent could post one - and a
+// remainingScope on it hard-failed the review Task before its verdict was
+// written back.
+func TestChangeSummary_RejectedForReviewKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "review"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","changeSignificance":"minor","remainingScope":"the PR still lacks logout"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	// 409 is this API's kind-gate status (mutateTaskStatusParams.kindOK), the
+	// same code review_verdict/pr_outcome/issue_outcome return for a wrong kind.
+	require.Equal(t, http.StatusConflict, w.Code, "a review task never opens a change; it must not post a change summary")
+}
+
+// TestChangeSummary_AcceptedForImplementKind pins the positive half of the D3
+// gate: the change-opening kinds still post change summaries normally.
+func TestChangeSummary_AcceptedForImplementKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t1", "alpha", "implement"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","changeSignificance":"minor"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t1/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -16,7 +15,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
-	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
 // implementPrompt builds the turn-0 prompt for the Implement state.
@@ -250,6 +248,16 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		}
 	}
 
+	// F1: full-scope-or-decline MUST be checked BEFORE writeBackOpenChange -
+	// opening the PR first (as this used to do, checking RemainingScope only
+	// after) let an incomplete change get its PR opened, semver-labeled, and
+	// auto-merge enabled before the hard-fail below ever ran, shipping the gap.
+	// checkRemainingScopeHardFail terminates the task and returns immediately
+	// when ChangeSummary.RemainingScope is non-empty; no PR is ever opened.
+	if res, err, handled := r.checkRemainingScopeHardFail(ctx, task); handled {
+		return res, err
+	}
+
 	// Phase == Succeeded: open MR via the shared writeBackOpenChange path.
 	// writeBackOpenChange sets task.Status.PrURL when a PR was opened.
 	if _, err := r.writeBackOpenChange(ctx, task); err != nil {
@@ -370,18 +378,11 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 		}
 	}
 
-	// M4: open a follow-up issue when RemainingScope is set and not already done.
-	if err := r.maybeOpenFollowupIssue(ctx, fresh); err != nil {
-		// Non-fatal: log and continue so the lifecycle does not stall.
-		l.Error(err, "implement: open follow-up issue (non-fatal)", "resource_id", task.Name)
-	}
-
 	// Record head branch, PR number, and clear the stale deadline (e.g. from a
 	// prior Conversation idle deadline) in one RetryOnConflict write BEFORE the
-	// state transition. The RetryOnConflict does its own Get internally so the
-	// extra re-Get after maybeOpenFollowupIssue is not needed (finding 17).
+	// state transition. The RetryOnConflict does its own Get internally.
 	// fresh.Status.PrURL is current from the Get at the top of finishImplement;
-	// maybeOpenFollowupIssue does not modify PrURL.
+	// the RemainingScope check above does not modify PrURL.
 	prNumber := parsePRNumber(fresh.Status.PrURL)
 	if prNumber == 0 && fresh.Status.PrURL != "" {
 		l.Error(nil, "implement: parsePRNumber returned 0 for non-empty PrURL; unexpected URL shape",
@@ -409,89 +410,6 @@ func (r *TaskReconciler) finishImplement(ctx context.Context, task *tatarav1alph
 	// resetAgentRun does its own Get+RetryOnConflict internally so a fresh re-Get
 	// here is redundant (finding 17).
 	return ctrl.Result{}, r.resetAgentRun(ctx, task)
-}
-
-// maybeOpenFollowupIssue creates a follow-up issue when ChangeSummary.RemainingScope
-// is non-empty and Status.FollowupIssueURL is not yet set (idempotency guard).
-// It appends the new issue URL to Status.DiscoveredIssues and records it in
-// Status.FollowupIssueURL so re-entry does not open a duplicate.
-// Non-fatal: if CreateIssue fails the caller logs and continues.
-func (r *TaskReconciler) maybeOpenFollowupIssue(ctx context.Context, task *tatarav1alpha1.Task) error {
-	cs := task.Status.ChangeSummary
-	if cs == nil || cs.RemainingScope == "" {
-		return nil
-	}
-	// Idempotency guard: already opened.
-	if task.Status.FollowupIssueURL != "" {
-		return nil
-	}
-
-	_, repo, writer, token, provider, err := r.scmContext(ctx, task)
-	if err != nil {
-		return fmt.Errorf("followup: scm context: %w", err)
-	}
-
-	issueTitle := "Follow-up: " + firstLine(task.Spec.Goal) + " (remaining scope)"
-	prURL := task.Status.PrURL
-	// tataraProposedByMarker(kind) (FIX-7) keeps provenance spec-complete
-	// alongside tataraAuthoredMarker: the follow-up is a tatara-authored
-	// proposal too (kind "followup"), even though auto-approve is fail-safe
-	// here (a merged PR already delivered the reviewed portion).
-	issueBody := cs.RemainingScope + "\n\nOpened as a follow-up to: " + prURL + "\n\n" + tataraAuthoredMarker + "\n" + tataraProposedByMarker("followup")
-
-	createStart := time.Now()
-	created, cerr := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
-		Title: issueTitle,
-		Body:  issueBody,
-	})
-	r.recordSCM(provider, "create_issue", cerr)
-	if cerr != nil {
-		return fmt.Errorf("followup: create issue: %w", cerr)
-	}
-
-	log.FromContext(ctx).Info("lifecycle implement: follow-up issue opened",
-		"action", "scm_followup_issue",
-		"resource_id", task.Name,
-		"issue_url", created.URL,
-		"pr_url", prURL,
-		"duration_ms", time.Since(createStart).Milliseconds(),
-	)
-
-	var siblings []string
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-			return err
-		}
-		// Append to DiscoveredIssues only if not already present.
-		alreadyPresent := false
-		for _, u := range fresh.Status.DiscoveredIssues {
-			if u == created.URL {
-				alreadyPresent = true
-				break
-			}
-		}
-		if !alreadyPresent {
-			fresh.Status.DiscoveredIssues = append(fresh.Status.DiscoveredIssues, created.URL)
-		}
-		fresh.Status.FollowupIssueURL = created.URL
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		siblings = discoveredIssueSiblings(fresh)
-		task.Status.DiscoveredIssues = fresh.Status.DiscoveredIssues
-		task.Status.FollowupIssueURL = fresh.Status.FollowupIssueURL
-		return nil
-	}); err != nil {
-		return err
-	}
-	// FIX-5: cross-link the follow-up against any existing sibling
-	// (discoveredIssueSiblings), mirroring completeProposal - without this the
-	// item-5 cross-links only ever seeded via the brainstorm path, never here.
-	if len(siblings) >= 2 {
-		r.syncSiblingLinks(ctx, provider, token, siblings)
-	}
-	return nil
 }
 
 // parsePRNumber extracts the trailing integer from a PR/MR URL

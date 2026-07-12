@@ -1214,6 +1214,11 @@ func (in *TaskStatus) DeepCopyInto(out *TaskStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.LinksSyncedURLs != nil {
+		in, out := &in.LinksSyncedURLs, &out.LinksSyncedURLs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.ReviewVerdict != nil {
 		in, out := &in.ReviewVerdict, &out.ReviewVerdict
 		*out = new(ReviewVerdict)

@@ -32,12 +32,31 @@ type lifecycleFakeSCMWriter struct {
 	openCalls     []struct {
 		repoURL, sourceBranch, title, body string
 	}
-	openPRURL      string
-	createIssues   []struct{ url, title, body string }
-	createIssueURL string
-	issueClosed    bool
-	issueAuthor    string
-	issueStateErr  error
+	openPRURL             string
+	createIssues          []struct{ url, title, body string }
+	createIssueURL        string
+	issueClosed           bool
+	issueAuthor           string
+	issueStateErr         error
+	labelCalls            []string
+	removeLabelCalls      []string
+	autoMergeCalls        int
+	disableAutoMergeCalls int
+	closePRCalls          []struct {
+		number int
+		body   string
+	}
+	// prState/prStateErr (C1 disarm-merged check): GetPRState's canned return.
+	// Zero value (Merged: false) matches every existing caller's assumption
+	// that the PR is not merged unless a test opts in.
+	prState    scm.PRState
+	prStateErr error
+}
+
+func (f *lifecycleFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prState, f.prStateErr
 }
 
 func (f *lifecycleFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
@@ -90,12 +109,40 @@ func (f *lifecycleFakeSCMWriter) CreateIssue(_ context.Context, _, _ string, req
 	return scm.CreatedIssue{Ref: "o/r#99", URL: url}, nil
 }
 
-func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
-func (f *lifecycleFakeSCMWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
+func (f *lifecycleFakeSCMWriter) AddLabel(_ context.Context, _, _, label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.labelCalls = append(f.labelCalls, label)
+	return nil
+}
+func (f *lifecycleFakeSCMWriter) RemoveLabel(_ context.Context, _, _, label string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeLabelCalls = append(f.removeLabelCalls, label)
+	return nil
+}
 func (f *lifecycleFakeSCMWriter) EnsureLabel(_ context.Context, _, _, _, _ string) error {
 	return nil
 }
 func (f *lifecycleFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.autoMergeCalls++
+	return nil
+}
+func (f *lifecycleFakeSCMWriter) DisableAutoMerge(_ context.Context, _, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.disableAutoMergeCalls++
+	return nil
+}
+func (f *lifecycleFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closePRCalls = append(f.closePRCalls, struct {
+		number int
+		body   string
+	}{number, body})
 	return nil
 }
 

@@ -177,6 +177,10 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	// Request C/b: cross-link every issue this Task spans, for every Task
+	// kind, on every reconcile - not only from the two legacy triggers.
+	r.syncAllSiblingLinksIfNeeded(ctx, &task)
+
 	// U-C stream review span: a stream review umbrella carries the shared head branch
 	// (AnnReviewHeadBranch). Seed its ledger with every role:openedPR member of the
 	// sibling implement/clarify umbrella that opened PRs on that branch, so the review
