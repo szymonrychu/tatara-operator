@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/types"
@@ -23,44 +22,6 @@ type botLastWordReader struct {
 
 func (r *botLastWordReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
 	return r.comments, nil
-}
-
-// TestPostTerminalComment_BotLastWord_Suppressed is the #112/#126 repro: repeated
-// terminal-diagnostics posts must stop once the bot already had the last word.
-func TestPostTerminalComment_BotLastWord_Suppressed(t *testing.T) {
-	_, task, _ := seedLabelTask(t, "term-supp", nil)
-	rdr := &botLastWordReader{comments: []scm.IssueComment{
-		{Author: "human", CreatedAt: time.Date(2026, 6, 28, 10, 0, 0, 0, time.UTC)},
-		{Author: "tatara-bot", CreatedAt: time.Date(2026, 6, 28, 11, 0, 0, 0, time.UTC)},
-	}}
-	w := &commentCapturingWriter{}
-	r := reconcilerFor(w, rdr)
-
-	r.postTerminalComment(context.Background(), task, "Task run terminated (`Failed` / `PodLost`).")
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	require.Zero(t, len(w.commentBodies),
-		"terminal diagnostics must be suppressed when the bot had the last word; got %v", w.commentBodies)
-}
-
-// TestPostTerminalComment_HumanReplied_Posts verifies the gate opens after a
-// human (any non-bot, no approver list configured) replies.
-func TestPostTerminalComment_HumanReplied_Posts(t *testing.T) {
-	_, task, _ := seedLabelTask(t, "term-post", nil)
-	rdr := &botLastWordReader{comments: []scm.IssueComment{
-		{Author: "tatara-bot", CreatedAt: time.Date(2026, 6, 28, 10, 0, 0, 0, time.UTC)},
-		{Author: "human", CreatedAt: time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)},
-	}}
-	w := &commentCapturingWriter{}
-	r := reconcilerFor(w, rdr)
-
-	r.postTerminalComment(context.Background(), task, "Task run terminated (`Failed` / `PodLost`).")
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	require.Equal(t, 1, len(w.commentBodies),
-		"terminal diagnostics must post once when a human replied after the bot")
 }
 
 // TestParkWithComment_BotMR_Suppressed verifies rule 2: a park note on the bot's

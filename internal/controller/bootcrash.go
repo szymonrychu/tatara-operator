@@ -195,11 +195,6 @@ func (r *TaskReconciler) handleBootCrash(ctx context.Context, task *tatarav1alph
 			msg = fmt.Sprintf("wrapper pod failed to boot (%s: %s) after %d attempts", reason, diag, maxPodRecreations)
 		}
 		res, terr := r.terminate(ctx, task, "Failed", "BootCrashLoop", msg)
-		// Post the cause once to the linked issue (survives terminal-CRD GC, #81).
-		// Only after terminate commits Failed, so a terminate retry cannot double-post.
-		if terr == nil {
-			r.commentBootCrashDiagnostics(ctx, task, reason, diag)
-		}
 		return res, terr, true
 	}
 
@@ -259,16 +254,4 @@ func (r *TaskReconciler) captureBootCrashDiagnostics(ctx context.Context, task *
 		fresh.Annotations[annBootCrashDiagnostics] = detail
 		return true
 	})
-}
-
-// commentBootCrashDiagnostics posts the boot-crash cause once to the Task's
-// linked issue (the detail captured from pod.Status), formatted for the boot
-// path. Delegates the SCM plumbing to postTerminalComment (task_controller.go).
-func (r *TaskReconciler) commentBootCrashDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, diag string) {
-	body := fmt.Sprintf("Wrapper pod failed to boot (`%s`) and the run was terminated after %d boot attempts.",
-		reason, maxPodRecreations)
-	if diag != "" {
-		body += "\n\nLast captured cause from `pod.Status`:\n\n```\n" + diag + "\n```"
-	}
-	r.postTerminalComment(ctx, task, body)
 }
