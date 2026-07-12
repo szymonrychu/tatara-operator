@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -329,5 +330,59 @@ func TestSyncAllSiblingLinksIfNeeded_PermanentNon404FailureStopsAtCap(t *testing
 	if reader.getIssueCalls != atCap {
 		t.Fatalf("GetIssue calls kept growing after the cap: %d at cap, %d after %d more reconciles - a permanently-failing sweep must stop re-reading",
 			atCap, reader.getIssueCalls, 4)
+	}
+}
+
+// TestSyncAllSiblingLinksIfNeeded_CapGiveUpEmitsMetric is the F3 regression:
+// the permanent give-up at linksSyncFailureCap used to be INFO-log only, with
+// no counter - unlike its stated model, writebackSkip4xxCap, which emits
+// operator_writeback_outcome_total{result="skip_4xx_capped"}. The give-up
+// must be alertable via a counter too.
+func TestSyncAllSiblingLinksIfNeeded_CapGiveUpEmitsMetric(t *testing.T) {
+	ctx := context.Background()
+	name := "links-perm-403-metric"
+	proj := "links-perm-403-metric-p"
+	repo := "links-perm-403-metric-r"
+	sec := "links-perm-403-metric-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#5",
+		URL: "https://github.com/o/r/issues/5", Number: 5,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 5, Kind: tatarav1alpha1.WorkItemIssue},
+		{Provider: "github", Repo: "o/r", Number: 6, Kind: tatarav1alpha1.WorkItemIssue},
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &fakeProposalWriter{}
+	reader := &fakeProposalReader{
+		bodies:       map[string]string{"o/r#5": "issue 5 body"},
+		getIssueErrs: map[string]error{"o/r#6": &scm.HTTPError{Status: 403, Path: "/repos/o/r/issues/6"}},
+	}
+	r := &TaskReconciler{
+		Client:    k8sClient,
+		Scheme:    k8sClient.Scheme(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		SCMFor:    func(string) (scm.SCMWriter, error) { return fw, nil },
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return reader, nil },
+	}
+
+	if got := testutil.ToFloat64(r.Metrics.WritebackOutcomeCounter("links_sync_capped")); got != 0 {
+		t.Fatalf("links_sync_capped counter = %v before any sweep, want 0", got)
+	}
+
+	for i := 0; i < linksSyncFailureCap; i++ {
+		fresh := &tatarav1alpha1.Task{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, fresh); err != nil {
+			t.Fatalf("re-get task: %v", err)
+		}
+		r.syncAllSiblingLinksIfNeeded(ctx, fresh)
+	}
+
+	if got := testutil.ToFloat64(r.Metrics.WritebackOutcomeCounter("links_sync_capped")); got != 1 {
+		t.Fatalf("links_sync_capped counter = %v after reaching the cap, want 1", got)
 	}
 }

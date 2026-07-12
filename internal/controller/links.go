@@ -252,6 +252,10 @@ func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *
 		log.FromContext(ctx).Info("links: sibling sweep still incomplete at the attempt cap; giving up on this sibling set (no more re-reads)",
 			"action", "task_links_sync_capped", "resource_id", task.Name,
 			"attempts", attempts, "cap", linksSyncFailureCap)
+		// F3: mirror writebackSkip4xxCap's self-diagnosing companion metric
+		// (writeback_outcome_total{result="skip_4xx_capped"}) so this give-up is
+		// alertable, not just an INFO log line a human has to go find.
+		r.Metrics.WritebackOutcome("links_sync_capped")
 	}
 	if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if slices.Equal(fresh.Status.LinksSyncedURLs, urls) && fresh.Status.LinksSyncFailures == 0 {
