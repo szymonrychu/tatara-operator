@@ -265,3 +265,69 @@ func TestSyncAllSiblingLinksIfNeeded_PermanentGoneStillStamps(t *testing.T) {
 		t.Fatalf("a permanently-gone sibling must still count as a clean sweep, got LinksSyncedURLs=%v", fresh.Status.LinksSyncedURLs)
 	}
 }
+
+// TestSyncAllSiblingLinksIfNeeded_PermanentNon404FailureStopsAtCap is the D2
+// regression: syncSiblingLinks reports only clean/unclean, and
+// isPermanentTargetGone classifies ONLY 404/410 as terminal. Any OTHER
+// permanent failure - 403 conversation-locked, a bot without issues:write, a
+// 422 body over GitHub's 65536-char limit - kept clean=false forever, so
+// LinksSyncedURLs was never stamped and syncAllSiblingLinksIfNeeded re-read
+// EVERY sibling on EVERY reconcile, for good: exactly the read amplification
+// the F5 gate exists to bound. The sweep must give up after a bounded number
+// of attempts (linksSyncFailureCap, mirroring writebackSkip4xxCap) and stop
+// re-reading.
+func TestSyncAllSiblingLinksIfNeeded_PermanentNon404FailureStopsAtCap(t *testing.T) {
+	ctx := context.Background()
+	name := "links-perm-403"
+	proj := "links-perm-403-p"
+	repo := "links-perm-403-r"
+	sec := "links-perm-403-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#5",
+		URL: "https://github.com/o/r/issues/5", Number: 5,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 5, Kind: tatarav1alpha1.WorkItemIssue},
+		{Provider: "github", Repo: "o/r", Number: 6, Kind: tatarav1alpha1.WorkItemIssue},
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &fakeProposalWriter{}
+	reader := &fakeProposalReader{
+		bodies: map[string]string{"o/r#5": "issue 5 body"},
+		// #6 is permanently unreadable, but NOT with a 404/410: the conversation
+		// is locked / the bot lacks issues:write. This never resolves.
+		getIssueErrs: map[string]error{"o/r#6": &scm.HTTPError{Status: 403, Path: "/repos/o/r/issues/6"}},
+	}
+	r := &TaskReconciler{
+		Client:    k8sClient,
+		Scheme:    k8sClient.Scheme(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		SCMFor:    func(string) (scm.SCMWriter, error) { return fw, nil },
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return reader, nil },
+	}
+
+	// Reconcile far past the cap. The reads must plateau, not grow linearly.
+	var atCap int
+	for i := 0; i < linksSyncFailureCap+4; i++ {
+		fresh := &tatarav1alpha1.Task{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, fresh); err != nil {
+			t.Fatalf("re-get task: %v", err)
+		}
+		r.syncAllSiblingLinksIfNeeded(ctx, fresh)
+		if i == linksSyncFailureCap-1 {
+			atCap = reader.getIssueCalls
+		}
+	}
+
+	if atCap == 0 {
+		t.Fatalf("no GetIssue calls at all; the sweep never ran")
+	}
+	if reader.getIssueCalls != atCap {
+		t.Fatalf("GetIssue calls kept growing after the cap: %d at cap, %d after %d more reconciles - a permanently-failing sweep must stop re-reading",
+			atCap, reader.getIssueCalls, 4)
+	}
+}

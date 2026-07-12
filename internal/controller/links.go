@@ -20,6 +20,16 @@ const (
 
 var linksBlockRE = regexp.MustCompile(`(?s)` + regexp.QuoteMeta(linksBlockStart) + `.*?` + regexp.QuoteMeta(linksBlockEnd))
 
+// linksSyncFailureCap bounds how many consecutive INCOMPLETE tatara-links
+// sweeps a Task retries for one sibling URL set before giving up on it (D2).
+// It mirrors writebackSkip4xxCap (issue #166): a permanent failure the
+// gone-check cannot see (403 conversation-locked, a bot without issues:write, a
+// 422 body over GitHub's 65536-char limit) is never clean, so without a cap the
+// sweep re-reads every sibling on every reconcile forever. A couple of attempts
+// cover a genuinely transient error (rate-limit) and then it stops; in the
+// healthy case the first sweep is clean and the counter never leaves 0.
+const linksSyncFailureCap = 3
+
 // RenderLinksBlock builds the marker-delimited managed block cross-linking
 // sibling issues opened for the same Task (item 5). urls is the OTHER
 // siblings only (not the issue the block is being written into).
@@ -214,19 +224,41 @@ func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *
 		return
 	}
 	if clean := r.syncSiblingLinks(ctx, project.Spec.Scm.Provider, token, urls); !clean {
-		// M5: an unclean sweep (a transient failure on at least one sibling)
-		// must NOT stamp LinksSyncedURLs, so the next reconcile retries the
-		// whole sweep instead of the sibling-set-changed gate above masking it
-		// forever.
-		log.FromContext(ctx).Info("links: sibling sweep incomplete (transient error); will retry next reconcile",
-			"action", "task_links_sync_incomplete", "resource_id", task.Name)
-		return
+		// M5: an unclean sweep (a failure on at least one sibling) must NOT stamp
+		// LinksSyncedURLs, so the next reconcile retries the whole sweep instead
+		// of the sibling-set-changed gate above masking it forever.
+		//
+		// D2: bounded, though. isPermanentTargetGone only treats 404/410 as
+		// terminal, so a sibling failing permanently for any OTHER reason (403
+		// conversation-locked, no issues:write, 422 body too large) stayed
+		// unclean forever and re-read every sibling on every reconcile - the exact
+		// read amplification this gate exists to bound. Count the attempts and,
+		// at the cap, fall through to the stamp: the sweep gives up on this
+		// sibling set, the reads stop, and a later CHANGE to the set re-arms a
+		// fresh budget (the stamp resets the counter).
+		attempts := task.Status.LinksSyncFailures + 1
+		if attempts < linksSyncFailureCap {
+			log.FromContext(ctx).Info("links: sibling sweep incomplete; will retry next reconcile",
+				"action", "task_links_sync_incomplete", "resource_id", task.Name,
+				"attempts", attempts, "cap", linksSyncFailureCap)
+			if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+				fresh.Status.LinksSyncFailures = attempts
+				return true
+			}); perr != nil {
+				log.FromContext(ctx).Error(perr, "links: persist sweep failure count (non-fatal)", "resource_id", task.Name)
+			}
+			return
+		}
+		log.FromContext(ctx).Info("links: sibling sweep still incomplete at the attempt cap; giving up on this sibling set (no more re-reads)",
+			"action", "task_links_sync_capped", "resource_id", task.Name,
+			"attempts", attempts, "cap", linksSyncFailureCap)
 	}
 	if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-		if slices.Equal(fresh.Status.LinksSyncedURLs, urls) {
+		if slices.Equal(fresh.Status.LinksSyncedURLs, urls) && fresh.Status.LinksSyncFailures == 0 {
 			return false
 		}
 		fresh.Status.LinksSyncedURLs = urls
+		fresh.Status.LinksSyncFailures = 0
 		return true
 	}); perr != nil {
 		log.FromContext(ctx).Error(perr, "links: persist synced url set (non-fatal)", "resource_id", task.Name)

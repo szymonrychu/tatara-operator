@@ -445,6 +445,17 @@ type TaskStatus struct {
 	// of re-reading every sibling issue on every reconcile.
 	// +optional
 	LinksSyncedURLs []string `json:"linksSyncedURLs,omitempty"`
+	// LinksSyncFailures counts consecutive INCOMPLETE tatara-links sweeps for
+	// the current sibling URL set (D2). isPermanentTargetGone only classifies
+	// 404/410 as terminal, so any other permanent failure (403 conversation-
+	// locked, a bot without issues:write, a 422 body over the 65536-char limit)
+	// would otherwise keep the sweep unclean, LinksSyncedURLs unstamped, and the
+	// per-sibling GetIssue re-read running on every reconcile forever. Bounded
+	// like Status.WritebackSkip4xxAttempts: at linksSyncFailureCap the sweep
+	// gives up, stamps the URL set anyway, and resets this to 0 - so a later
+	// CHANGE to the sibling set gets a fresh retry budget.
+	// +optional
+	LinksSyncFailures int `json:"linksSyncFailures,omitempty"`
 	// +optional
 	ReviewVerdict *ReviewVerdict `json:"reviewVerdict,omitempty"`
 	// +optional
