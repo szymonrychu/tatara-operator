@@ -1,5 +1,7 @@
 # MEMORY - tatara-operator
 
+- 2026-07-12 - Request C/d approval fan-out RISK (accepted by user): approving one issue of a multi-issue systemic group now releases every OTHER member that is Status.ImplementationLocked=true, without that member's own direct maintainer approval. This composes with autoApproveTataraProposals (project.Spec.AutoApproveTataraProposals) - a bot-authored, tatara-proposed lead issue that auto-approves can fan out to locked siblings with ZERO human review of any member. No auto-approve carve-out was added per explicit instruction. Auditable via the "systemic_approval_fanout" structured log line + tatara_systemic_approval_fanout_total counter; alert on that counter if this proves too permissive in practice.
+
 - 2026-07-12 - Request C/d: added Status.ImplementationLocked (bool) + IssueOutcome.Locked (bool), set via issue_outcome{action=implement, locked=true} on clarify handoff. Read by systemic-group approval fan-out (Op-Task 4). Chose a plain bool over a Condition to match the existing ApprovedByMaintainer/AutoApproved sibling fields' style.
 
 - 2026-07-12 - Request C: removed maybeOpenFollowupIssue entirely - a non-empty ChangeSummary.RemainingScope now hard-fails the Task (Phase=Failed, reason=IncompleteImplementation) instead of filing a follow-up issue. FollowupIssueURL/RemainingScope CRD fields kept (API compat) but RemainingScope is now vestigial-on-success (its presence is always a failure signal).

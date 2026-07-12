@@ -4,10 +4,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strconv"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
@@ -29,33 +31,64 @@ func issueHasRecordedApproval(tasks []tatarav1alpha1.Task, repoSlug string, numb
 	return false
 }
 
-// filterSystemicGroupByApproval returns a copy of sg keeping only maintainer-approved
-// members - SameRepoSiblings verified in leadRepo, CrossRepo by their own parsed repo
-// - plus the same-repo sibling numbers that are NOT approved (for the writeback
-// close-strip). A nil sg yields (nil, nil). This is the authoritative approval gate on
-// systemic co-resolution: approving the lead never force-closes an unapproved or
-// declined sibling because that sibling is filtered out here before the prompt is
-// built and its close directive is stripped at writeback.
-func filterSystemicGroupByApproval(sg *tatarav1alpha1.SystemicGroup, leadRepo string, tasks []tatarav1alpha1.Task) (*tatarav1alpha1.SystemicGroup, []int) {
+// issueIsImplementationLocked reports whether any Task for (repoSlug, number)
+// has Status.ImplementationLocked set: its own clarify conversation reached
+// no-open-questions with every decision settled (item Request C/d). Used by
+// the systemic-group approval fan-out: a sibling with no direct maintainer
+// approval of its own is still included in an approved lead's release when it
+// is implementation-locked.
+func issueIsImplementationLocked(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
+	for i := range tasks {
+		t := &tasks[i]
+		if !t.Status.ImplementationLocked {
+			continue
+		}
+		if tatarav1alpha1.TaskMatchesItem(t, repoSlug, number) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterSystemicGroupByApproval returns a copy of sg keeping only the members
+// eligible to co-resolve with the lead: SameRepoSiblings/CrossRepo verified
+// either (a) maintainer-approved in their own right (issueHasRecordedApproval)
+// or (b) implementation-locked AND leadApproved is true (item Request C/d fan-out:
+// an approved lead's release extends to every OTHER member that has no open
+// questions of its own, even without its own direct approval). Also returns
+// the same-repo sibling numbers that are NOT eligible (for the writeback
+// close-strip) and the refs that were included via the fan-out path only
+// (for audit logging/metrics at the caller). A nil sg yields (nil, nil, nil).
+func filterSystemicGroupByApproval(sg *tatarav1alpha1.SystemicGroup, leadRepo string, leadApproved bool, tasks []tatarav1alpha1.Task) (filtered *tatarav1alpha1.SystemicGroup, unapproved []int, fannedOut []string) {
 	if sg == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	out := &tatarav1alpha1.SystemicGroup{SystemicID: sg.SystemicID}
-	var unapproved []int
 	for _, n := range sg.SameRepoSiblings {
-		if leadRepo != "" && issueHasRecordedApproval(tasks, leadRepo, n) {
+		switch {
+		case leadRepo != "" && issueHasRecordedApproval(tasks, leadRepo, n):
 			out.SameRepoSiblings = append(out.SameRepoSiblings, n)
-		} else {
+		case leadApproved && leadRepo != "" && issueIsImplementationLocked(tasks, leadRepo, n):
+			out.SameRepoSiblings = append(out.SameRepoSiblings, n)
+			fannedOut = append(fannedOut, fmt.Sprintf("%s#%d", leadRepo, n))
+		default:
 			unapproved = append(unapproved, n)
 		}
 	}
 	for _, ref := range sg.CrossRepo {
 		repo, num := parseCrossRepoRef(ref)
-		if repo != "" && issueHasRecordedApproval(tasks, repo, num) {
+		if repo == "" {
+			continue
+		}
+		switch {
+		case issueHasRecordedApproval(tasks, repo, num):
 			out.CrossRepo = append(out.CrossRepo, ref)
+		case leadApproved && issueIsImplementationLocked(tasks, repo, num):
+			out.CrossRepo = append(out.CrossRepo, ref)
+			fannedOut = append(fannedOut, ref)
 		}
 	}
-	return out, unapproved
+	return out, unapproved, fannedOut
 }
 
 // leadRepoOf returns the lead issue's repo slug (siblings live in this repo).
@@ -78,7 +111,16 @@ func (r *TaskReconciler) withApprovedSystemicGroup(ctx context.Context, task *ta
 	if err := r.List(ctx, &tl, client.InNamespace(task.Namespace)); err != nil {
 		return task
 	}
-	filtered, _ := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), tl.Items)
+	leadApproved := task.Status.ApprovedByMaintainer != ""
+	filtered, _, fannedOut := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), leadApproved, tl.Items)
+	if len(fannedOut) > 0 {
+		log.FromContext(ctx).Info("systemic approval: fan-out to implementation-locked siblings",
+			"action", "systemic_approval_fanout", "resource_id", task.Name,
+			"approver", task.Status.ApprovedByMaintainer, "member_count", len(fannedOut), "members", fannedOut)
+		if r.Metrics != nil {
+			r.Metrics.SystemicApprovalFanout()
+		}
+	}
 	tc := *task
 	tc.Spec.SystemicGroup = filtered
 	return &tc
@@ -95,7 +137,8 @@ func (r *TaskReconciler) unapprovedSystemicSiblings(ctx context.Context, task *t
 	if err := r.List(ctx, &tl, client.InNamespace(task.Namespace)); err != nil {
 		return nil
 	}
-	_, unapproved := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), tl.Items)
+	leadApproved := task.Status.ApprovedByMaintainer != ""
+	_, unapproved, _ := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), leadApproved, tl.Items)
 	if len(unapproved) == 0 {
 		return nil
 	}

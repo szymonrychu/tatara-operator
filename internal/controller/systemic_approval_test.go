@@ -40,17 +40,62 @@ func TestFilterSystemicGroupByApproval(t *testing.T) {
 		CrossRepo:        []string{"o/r2#3 - approved thing", "o/r2#4 - unapproved thing"},
 	}
 
-	filtered, unapproved := filterSystemicGroupByApproval(sg, "o/r1", tasks)
+	filtered, unapproved, fannedOut := filterSystemicGroupByApproval(sg, "o/r1", false, tasks)
 	require.Equal(t, []int{7}, filtered.SameRepoSiblings, "only #7 is maintainer-approved")
 	require.ElementsMatch(t, []int{8, 9}, unapproved, "#8 (unapproved task) and #9 (no task) are unapproved")
 	require.Equal(t, []string{"o/r2#3 - approved thing"}, filtered.CrossRepo, "only the approved cross-repo ref survives")
 	require.Equal(t, "abc", filtered.SystemicID)
+	require.Empty(t, fannedOut, "leadApproved=false must never fan out, regardless of locked siblings")
+}
+
+func lockedTask(name, repoSlug string, number int) tatarav1alpha1.Task {
+	return tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
+		Spec: tatarav1alpha1.TaskSpec{
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: repoSlug + "#" + strconv.Itoa(number), Number: number},
+		},
+		Status: tatarav1alpha1.TaskStatus{ImplementationLocked: true},
+	}
+}
+
+func TestFilterSystemicGroupByApproval_FansOutToLockedSiblingsWhenLeadApproved(t *testing.T) {
+	tasks := []tatarav1alpha1.Task{
+		approvedTask("lead", "o/r1", 12, "maint"),
+		lockedTask("sib7", "o/r1", 7), // no direct approval, but implementation-locked
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "sib8", Namespace: "tatara"},
+			Spec:       tatarav1alpha1.TaskSpec{Source: &tatarav1alpha1.TaskSource{IssueRef: "o/r1#8", Number: 8}},
+			// sib8: neither approved nor locked - stays excluded.
+		},
+	}
+	sg := &tatarav1alpha1.SystemicGroup{
+		SystemicID:       "abc",
+		SameRepoSiblings: []int{7, 8},
+	}
+
+	filtered, unapproved, fannedOut := filterSystemicGroupByApproval(sg, "o/r1", true, tasks)
+	require.Equal(t, []int{7}, filtered.SameRepoSiblings, "locked sibling #7 fans out under an approved lead")
+	require.Equal(t, []int{8}, unapproved, "unlocked, unapproved sibling #8 stays excluded")
+	require.Equal(t, []string{"o/r1#7"}, fannedOut, "fan-out audit trail records #7")
+}
+
+func TestFilterSystemicGroupByApproval_NoFanOutWhenLeadNotApproved(t *testing.T) {
+	tasks := []tatarav1alpha1.Task{
+		lockedTask("sib7", "o/r1", 7),
+	}
+	sg := &tatarav1alpha1.SystemicGroup{SystemicID: "abc", SameRepoSiblings: []int{7}}
+
+	filtered, unapproved, fannedOut := filterSystemicGroupByApproval(sg, "o/r1", false, tasks)
+	require.Empty(t, filtered.SameRepoSiblings, "a locked sibling never fans out without the lead's own approval")
+	require.Equal(t, []int{7}, unapproved)
+	require.Empty(t, fannedOut)
 }
 
 func TestFilterSystemicGroupByApproval_Nil(t *testing.T) {
-	sg, un := filterSystemicGroupByApproval(nil, "o/r1", nil)
+	sg, un, fo := filterSystemicGroupByApproval(nil, "o/r1", false, nil)
 	require.Nil(t, sg)
 	require.Nil(t, un)
+	require.Nil(t, fo)
 }
 
 // TestNeutralizeUnapprovedCloses: close directives for unapproved siblings become
