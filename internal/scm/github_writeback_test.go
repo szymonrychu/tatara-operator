@@ -110,6 +110,36 @@ func TestGitHubRemoveLabelRealErrorSurfaces(t *testing.T) {
 	}
 }
 
+// Issue #301: approving a bot-authored PR returns a deterministic 422 "Can not
+// approve your own pull request". That is terminal, not transient, so Approve must
+// swallow it as a benign no-op (the tatara-approved label gates the merge) instead
+// of surfacing an error that gets retried forever and floods the write-failure alert.
+func TestGitHubApproveToleratesSelfApproval422(t *testing.T) {
+	var hits int
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		require.Equal(t, "/repos/o/r/pulls/5/reviews", r.URL.Path)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Unprocessable Entity","errors":[{"resource":"PullRequestReview","field":"user_id","code":"custom","message":"Can not approve your own pull request"}]}`))
+	})
+	require.NoError(t, c.Approve(context.Background(), "https://github.com/o/r", "tok", 5, "lgtm"))
+	require.Equal(t, 1, hits)
+}
+
+// A 422 that is NOT the self-approval case (e.g. some other validation failure)
+// still surfaces so it is not silently swallowed.
+func TestGitHubApprovePropagatesOther422(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"message":"Validation Failed","errors":[{"resource":"PullRequestReview","code":"missing_field","field":"body"}]}`))
+	})
+	err := c.Approve(context.Background(), "https://github.com/o/r", "tok", 5, "")
+	require.Error(t, err)
+	var he *HTTPError
+	require.ErrorAs(t, err, &he)
+	require.Equal(t, http.StatusUnprocessableEntity, he.Status)
+}
+
 func TestGitHubParse(t *testing.T) {
 	tests := []struct {
 		name      string

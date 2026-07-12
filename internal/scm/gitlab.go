@@ -384,13 +384,16 @@ func (c *GitLab) CreateIssue(ctx context.Context, repoURL, token string, req Iss
 	return CreatedIssue{Ref: ref, URL: out.WebURL}, nil
 }
 
-// AddLabel adds a label to an issue identified by group/proj#iid.
+// AddLabel adds a label to the work item identified by ref. A '!' ref
+// (group/proj!iid) targets a merge request; a '#' ref (group/proj#iid) targets an
+// issue (glLabelRef routes it). Issue #301: MR label writes used to fail
+// "malformed issue ref" because this path only understood '#'.
 func (c *GitLab) AddLabel(ctx context.Context, token, issueRef, label string) error {
-	proj, iid, err := glHashRef(issueRef)
+	proj, iid, resource, err := glLabelRef(issueRef)
 	if err != nil {
 		return err
 	}
-	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
+	path := "/projects/" + url.PathEscape(proj) + "/" + resource + "/" + strconv.Itoa(iid)
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"add_labels": label}, nil)
 }
 
@@ -418,13 +421,14 @@ func (c *GitLab) EnsureLabel(ctx context.Context, repoURL, token, name, color st
 	)
 }
 
-// RemoveLabel removes a label from an issue identified by group/proj#iid.
+// RemoveLabel removes a label from the work item identified by ref. Routing
+// mirrors AddLabel: a '!' ref targets a merge request, a '#' ref an issue.
 func (c *GitLab) RemoveLabel(ctx context.Context, token, issueRef, label string) error {
-	proj, iid, err := glHashRef(issueRef)
+	proj, iid, resource, err := glLabelRef(issueRef)
 	if err != nil {
 		return err
 	}
-	path := "/projects/" + url.PathEscape(proj) + "/issues/" + strconv.Itoa(iid)
+	path := "/projects/" + url.PathEscape(proj) + "/" + resource + "/" + strconv.Itoa(iid)
 	return glDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"remove_labels": label}, nil)
 }
 
@@ -757,6 +761,21 @@ func glHashRef(ref string) (string, int, error) { return glParseRef(ref, '#', "i
 
 // glBangRef parses group/proj!iid into project path + iid (MR refs use '!').
 func glBangRef(ref string) (string, int, error) { return glParseRef(ref, '!', "mr") }
+
+// glLabelRef parses a work-item ref into the project path, iid, and GitLab REST
+// resource segment ("merge_requests" or "issues") for a label write. A '!' ref
+// (group/proj!iid) targets a merge request; a '#' ref (group/proj#iid) an issue.
+// Issues and MRs have separate iid spaces and endpoints, so routing an MR ref to
+// /issues mislabels or 404s. Routing mirrors Comment (LastIndex so project paths
+// containing the sigil are not misrouted).
+func glLabelRef(ref string) (proj string, iid int, resource string, err error) {
+	if strings.LastIndex(ref, "!") > strings.LastIndex(ref, "#") {
+		proj, iid, err = glBangRef(ref)
+		return proj, iid, "merge_requests", err
+	}
+	proj, iid, err = glHashRef(ref)
+	return proj, iid, "issues", err
+}
 
 // glIssueURLRef parses a GitLab issue web URL (.../g/p/-/issues/4) into a
 // project path + iid for board label updates.
