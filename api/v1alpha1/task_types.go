@@ -95,6 +95,13 @@ type IssueOutcome struct {
 	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
 	// +optional
 	Plan string `json:"plan,omitempty"` // short description of what will be implemented; posted as an implementation-start message when Action==implement
+	// Locked declares, when Action==implement, that the clarify agent found NO
+	// open questions and every decision is settled - the issue is ready for
+	// full-scope implementation the moment a maintainer approves it. Wired
+	// through to Status.ImplementationLocked on handoff (item Request C/d:
+	// "implementation locked" + approval fan-out). Ignored when Action != implement.
+	// +optional
+	Locked bool `json:"locked,omitempty"`
 }
 
 // ImplementOutcome is the agent's declared outcome for an implement task when
@@ -599,6 +606,16 @@ type TaskStatus struct {
 	// sentinel at every consumer).
 	// +optional
 	AutoApproved bool `json:"autoApproved,omitempty"`
+
+	// ImplementationLocked records that this Task's clarify conversation
+	// reached a state with NO open questions and every decision locked (set
+	// via issue_outcome{action=implement, locked=true} on handoff to
+	// implement). It is the signal systemic-group approval fan-out
+	// (filterSystemicGroupByApproval) checks for a sibling that lacks its
+	// own direct maintainer approval: an approved lead's group extends to
+	// every OTHER member that is implementation-locked. Item Request C/d.
+	// +optional
+	ImplementationLocked bool `json:"implementationLocked,omitempty"`
 
 	// Deploy-supervision fields (PhaseDeploying only; empty otherwise). The
 	// implement Task does not go terminal at PR-merge: it enters Deploying and

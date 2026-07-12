@@ -32,6 +32,14 @@ func (r *TaskReconciler) clarifyImplementAction(ctx context.Context, project *ta
 	if err := r.handoffToImplement(ctx, project, task); err != nil {
 		return ctrl.Result{}, false, err
 	}
+	if task.Status.IssueOutcome != nil && task.Status.IssueOutcome.Locked {
+		if err := r.setImplementationLocked(ctx, task); err != nil {
+			return ctrl.Result{}, false, err
+		}
+		if r.Metrics != nil {
+			r.Metrics.ImplementationLocked()
+		}
+	}
 	r.Metrics.IssueOutcome("implement")
 	// Terminate the clarify Task: setDeployState(Done) tears down the wrapper
 	// pod/service. A separate implement Task picks up the tatara-implementation
@@ -40,6 +48,30 @@ func (r *TaskReconciler) clarifyImplementAction(ctx context.Context, project *ta
 		return ctrl.Result{}, false, err
 	}
 	return ctrl.Result{}, true, nil
+}
+
+// setImplementationLocked durably records Status.ImplementationLocked=true
+// (item Request C/d): the clarify agent declared no open questions and every
+// decision settled via issue_outcome{action=implement, locked=true}. Read
+// later by systemic-group approval fan-out (filterSystemicGroupByApproval) to
+// decide whether an approved lead's release extends to this sibling.
+func (r *TaskReconciler) setImplementationLocked(ctx context.Context, task *tatarav1alpha1.Task) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if fresh.Status.ImplementationLocked {
+			task.Status.ImplementationLocked = true
+			return nil
+		}
+		fresh.Status.ImplementationLocked = true
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		task.Status.ImplementationLocked = true
+		return nil
+	})
 }
 
 // handoffToImplement performs the clarify->implement label flip and ensures the
