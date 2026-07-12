@@ -355,18 +355,14 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// catch the coarse "same alert firing again" case to be worth the spawn-cost
 	// savings; layer 2 still runs for anything layer 1 lets through.
 	if task.Spec.Kind == "incident" && task.Status.Phase == "" && task.Annotations[annCurrentTurn] == "" {
-		if issueURL, repoSlug, number, ok := r.preSpawnIncidentDuplicate(ctx, &project, &task); ok {
+		if writer, token, issueURL, repoSlug, number, ok := r.preSpawnIncidentDuplicate(ctx, &project, &task); ok {
 			l.Info("incident: duplicate alert rule with an open tracker issue; skipping spawn",
 				"action", "incident_dedup_skip", "resource_id", task.Name,
 				"alert_rule", task.Spec.AlertRule, "existing_issue", issueURL)
-			if writer, werr := r.SCMFor(project.Spec.Scm.Provider); werr == nil {
-				if token, terr := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef); terr == nil {
-					issueRef := fmt.Sprintf("%s#%d", repoSlug, number)
-					if _, cerr := r.gatedComment(ctx, &project, nil, writer, token, project.Spec.Scm.Provider,
-						number, false, "", issueRef, incidentDedupRefireComment(task.Spec.AlertRule)); cerr != nil {
-						l.Error(cerr, "incident: dedup re-fire comment (non-fatal)", "issue_ref", issueRef)
-					}
-				}
+			issueRef := fmt.Sprintf("%s#%d", repoSlug, number)
+			if _, cerr := r.gatedComment(ctx, &project, nil, writer, token, project.Spec.Scm.Provider,
+				number, false, "", issueRef, incidentDedupRefireComment(task.Spec.AlertRule)); cerr != nil {
+				l.Error(cerr, "incident: dedup re-fire comment (non-fatal)", "issue_ref", issueRef)
 			}
 			res, terr := r.terminate(ctx, &task, "Succeeded", "IncidentDuplicate",
 				fmt.Sprintf("duplicate incident for alert rule %q; already tracked by %s", task.Spec.AlertRule, issueURL))
@@ -1318,32 +1314,35 @@ func (r *TaskReconciler) terminate(ctx context.Context, task *tatarav1alpha1.Tas
 	return ctrl.Result{}, nil
 }
 
-// preSpawnIncidentDuplicate returns the tracker issue URL, repo slug, and
-// issue number of an OTHER incident Task (terminal or not, self excluded)
-// sharing task.Spec.AlertRule whose recorded DiscoveredIssues[0] is still
-// open on the SCM, or ("", "", 0, false) when none exists or every match's
-// tracker issue has since closed. Mirrors matchIncidentByDedupKey's List+match
-// shape (writeback_proposal.go), keyed on the coarser Spec.AlertRule instead
-// of Spec.DedupKey, plus a live SCM state check since existence alone is not
+// preSpawnIncidentDuplicate returns the resolved SCM writer and token
+// alongside the tracker issue URL, repo slug, and issue number of an OTHER
+// incident Task (terminal or not, self excluded) sharing task.Spec.AlertRule
+// whose recorded DiscoveredIssues[0] is still open on the SCM, or
+// (nil, "", "", "", 0, false) when none exists or every match's tracker
+// issue has since closed. The writer/token are returned so the caller can
+// reuse them for the re-fire comment instead of re-resolving (both were
+// already paid for here). Mirrors matchIncidentByDedupKey's List+match shape
+// (writeback_proposal.go), keyed on the coarser Spec.AlertRule instead of
+// Spec.DedupKey, plus a live SCM state check since existence alone is not
 // enough to prove the issue is still open at pre-spawn time. Fail-open (not
 // found) on any SCM or lookup error, matching reviewTargetClosed's fail-open
 // convention above - a transient SCM hiccup must never block a legitimate
 // incident investigation.
-func (r *TaskReconciler) preSpawnIncidentDuplicate(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (issueURL, repoSlug string, number int, found bool) {
+func (r *TaskReconciler) preSpawnIncidentDuplicate(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (writer scm.SCMWriter, token, issueURL, repoSlug string, number int, found bool) {
 	if task.Spec.AlertRule == "" || r.SCMFor == nil || proj.Spec.Scm == nil {
-		return "", "", 0, false
+		return nil, "", "", "", 0, false
 	}
 	var tasks tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tasks, client.InNamespace(proj.Namespace)); err != nil {
-		return "", "", 0, false
+		return nil, "", "", "", 0, false
 	}
 	writer, err := r.SCMFor(proj.Spec.Scm.Provider)
 	if err != nil {
-		return "", "", 0, false
+		return nil, "", "", "", 0, false
 	}
-	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	token, err = r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
 	if err != nil {
-		return "", "", 0, false
+		return nil, "", "", "", 0, false
 	}
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
@@ -1364,9 +1363,9 @@ func (r *TaskReconciler) preSpawnIncidentDuplicate(ctx context.Context, proj *ta
 		if serr != nil || st.Closed {
 			continue
 		}
-		return t.Status.DiscoveredIssues[0], slug, num, true
+		return writer, token, t.Status.DiscoveredIssues[0], slug, num, true
 	}
-	return "", "", 0, false
+	return nil, "", "", "", 0, false
 }
 
 // incidentDedupRefireComment is the re-fire note posted to an existing open
