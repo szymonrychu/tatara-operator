@@ -92,7 +92,7 @@ func TestBuildUmbrellaPrompt_RendersAllSections(t *testing.T) {
 		"o/a#7":  {{Author: "alice", Body: "please do X"}},
 		"o/b!42": {{Author: "bob", Body: "LGTM"}},
 	}
-	out := buildUmbrellaPrompt(task, repos, threads, "Do the clarify thing.")
+	out := buildUmbrellaPrompt(task, repos, threads, "Do the clarify thing.", nil)
 
 	require.Contains(t, out, "# Umbrella task: Ship cross-repo feature")
 	// Repos in scope + per-repo checkout instructions.
@@ -130,8 +130,24 @@ func TestBuildUmbrellaPrompt_PerMemberThreadBudget(t *testing.T) {
 	threads := map[string][]scm.IssueComment{
 		"o/a#1": {{Author: "a", Body: long}},
 	}
-	out := buildUmbrellaPrompt(task, nil, threads, "goal")
+	out := buildUmbrellaPrompt(task, nil, threads, "goal", nil)
 	require.Less(t, len(out), len(long), "per-member thread must be char-budgeted")
+}
+
+func TestBuildUmbrellaPrompt_RendersSystemicSiblings(t *testing.T) {
+	task := &tatarav1alpha1.Task{}
+	task.Spec.Goal = "Ship the design"
+	siblings := []systemicSiblingInfo{
+		{Ref: "o/r1#7", Found: true, Locked: true, Phase: "locked"},
+		{Ref: "o/r2#9", Found: true, Locked: false, Phase: "open"},
+		{Ref: "o/r3#3", Found: false},
+	}
+	out := buildUmbrellaPrompt(task, nil, nil, "goal", siblings)
+
+	require.Contains(t, out, "## Related systemic-group issues")
+	require.Contains(t, out, "o/r1#7: implementation-locked")
+	require.Contains(t, out, "o/r2#9: still open")
+	require.Contains(t, out, "o/r3#3: not yet tracked")
 }
 
 // ---- refreshUmbrellaMembers -------------------------------------------
@@ -246,6 +262,59 @@ func TestBuildUmbrellaPromptFor_AssemblesLiveBundle(t *testing.T) {
 	require.Contains(t, out, "the live issue body")
 	require.Contains(t, out, "**carol**: context comment")
 	require.Contains(t, out, "GOAL-TAIL-MARKER")
+}
+
+func TestBuildUmbrellaPromptFor_IncludesLockedSystemicSibling(t *testing.T) {
+	ctx := context.Background()
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	reader := &umbrellaFakeReader{
+		openIssues: map[string][]scm.IssueRef{
+			"o/r": {{Repo: "o/r", Number: 5, State: "open"}},
+		},
+		issueBody: map[string]string{"o/r#5": "the live issue body"},
+	}
+	r.ReaderFor = func(string, string) (scm.SCMReader, error) { return reader, nil }
+
+	task := seedWritebackKindTask(t, "umbrella-sibs", "umbrella-sibs-proj", "umbrella-sibs-repo", "umbrella-sibs-sec",
+		tatarav1alpha1.TaskSpec{
+			Kind:   "clarify",
+			Goal:   "Clarify the thing",
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#5", Number: 5},
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{
+				SystemicID:       "sg1",
+				SameRepoSiblings: []int{7},
+			},
+		}, &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"})
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 5, Kind: tatarav1alpha1.WorkItemIssue,
+			Role: tatarav1alpha1.RoleSource, State: tatarav1alpha1.WIOpen},
+	}
+	require.NoError(t, k8sClient.Status().Update(ctx, task))
+
+	// Seed the sibling's own Task, already implementation-locked. Created
+	// directly (not via seedWritebackKindTask) since the lead task above
+	// already seeded the shared project/repo/secret and re-seeding them
+	// under the same names would collide on Create.
+	sibling := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "umbrella-sibs-sib", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    "umbrella-sibs-proj",
+			RepositoryRef: "umbrella-sibs-repo",
+			Kind:          "clarify",
+			Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#7", Number: 7},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, sibling))
+	sibling.Status.ImplementationLocked = true
+	require.NoError(t, k8sClient.Status().Update(ctx, sibling))
+
+	var proj tatarav1alpha1.Project
+	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "umbrella-sibs-proj"}, &proj))
+
+	out := r.buildUmbrellaPromptFor(ctx, &proj, task, "GOAL-TAIL-MARKER")
+	require.Contains(t, out, "## Related systemic-group issues")
+	require.Contains(t, out, "o/r#7: implementation-locked")
 }
 
 // ---- umbrellaLinkedIssue (source-issue <-> PR linkage) -----------------
