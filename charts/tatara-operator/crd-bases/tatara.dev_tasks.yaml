@@ -437,6 +437,18 @@ spec:
                   DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
                   driving toward the cluster.
                 type: string
+              disarmFailures:
+                description: |-
+                  DisarmFailures counts consecutive INCOMPLETE disarmOpenChanges sweeps for
+                  the full-scope-or-decline hard-fail (F2). A sweep is incomplete when any
+                  target PR could not be verifiably closed (a transient SCM error, not a
+                  permanent 404/410 "already gone"). Bounded like WritebackSkip4xxAttempts /
+                  LinksSyncFailures: the Task does NOT terminate while a sweep is dirty and
+                  under disarmFailureCap - it requeues and retries. Once the cap is spent
+                  the Task terminates anyway but records a DisarmFailed condition so an
+                  armed-PR-that-could-not-be-disarmed is alertable. Reset to 0 once a sweep
+                  verifies clean or the cap is reached.
+                type: integer
               discoveredIssues:
                 items:
                   type: string

@@ -584,6 +584,17 @@ type TaskStatus struct {
 	// SCM API every reconcile. Reset to 0 when a PR opens.
 	// +optional
 	WritebackSkip4xxAttempts int `json:"writebackSkip4xxAttempts,omitempty"`
+	// DisarmFailures counts consecutive INCOMPLETE disarmOpenChanges sweeps for
+	// the full-scope-or-decline hard-fail (F2). A sweep is incomplete when any
+	// target PR could not be verifiably closed (a transient SCM error, not a
+	// permanent 404/410 "already gone"). Bounded like WritebackSkip4xxAttempts /
+	// LinksSyncFailures: the Task does NOT terminate while a sweep is dirty and
+	// under disarmFailureCap - it requeues and retries. Once the cap is spent
+	// the Task terminates anyway but records a DisarmFailed condition so an
+	// armed-PR-that-could-not-be-disarmed is alertable. Reset to 0 once a sweep
+	// verifies clean or the cap is reached.
+	// +optional
+	DisarmFailures int `json:"disarmFailures,omitempty"`
 	// PendingComments are free-form comments queued by the agent via the
 	// comment MCP tool, posted to the task's linked issue on the next
 	// reconcile and then cleared. Does not change the lifecycle state.

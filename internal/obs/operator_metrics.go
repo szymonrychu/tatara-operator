@@ -229,7 +229,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		}, []string{"result"}),
 		writebackOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_writeback_outcome_total",
-			Help: "Writeback terminal outcomes by result (no_change, in_scope_no_branch, skip_4xx, no_pr, skip_4xx_capped, opened).",
+			Help: "Writeback terminal outcomes by result (no_change, in_scope_no_branch, skip_4xx, no_pr, skip_4xx_capped, opened, disarm_failed, links_sync_capped).",
 		}, []string{"result"}),
 		// Self-diagnosing companion to writeback_outcome_total{result="skip_4xx"}
 		// (issue #166): the un-triageable 4xx-skip loop emitted a metric that could
@@ -484,7 +484,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
 	}
-	for _, result := range []string{"no_change", "in_scope_no_branch", "skip_4xx", "no_pr", "skip_4xx_capped", "opened"} {
+	for _, result := range []string{"no_change", "in_scope_no_branch", "skip_4xx", "no_pr", "skip_4xx_capped", "opened", "disarm_failed", "links_sync_capped"} {
 		m.writebackOutcomeTotal.WithLabelValues(result)
 	}
 	// Pre-seed the realistic skip-4xx (status, reason) combos so the diagnosing

@@ -245,6 +245,54 @@ func TestTaskWriteBack_KindImplement_RemainingScopeNeverOpensPR(t *testing.T) {
 	require.Equal(t, "IncompleteImplementation", cond.Reason)
 }
 
+// TestTaskWriteBack_KindImplement_RemainingScopeWithOpenPR_Disarms is the F1
+// regression: checkRemainingScopeHardFail ran AFTER doWriteBack's PrURL
+// idempotency guard, so a kind=implement Task re-entering writeback with
+// Status.PrURL already set (e.g. reactivateBackHalfTask resets Phase/
+// DeployState on a Parked back-half Task but never clears PrURL) and a newly
+// declared RemainingScope hit "AlreadyWritten" first and terminated Succeeded
+// - the armed, semver-labelled PR shipped silently the moment CI went green.
+// The hard-fail must run before the guard, disarm the already-open PR
+// (auto-merge off, semver label stripped, PR closed), and terminate the Task
+// Failed/IncompleteImplementation, never Succeeded.
+func TestTaskWriteBack_KindImplement_RemainingScopeWithOpenPR_Disarms(t *testing.T) {
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	task := seedWritebackKindTask(t, "wbk-f1-openpr", "wbk-f1-proj", "wbk-f1-repo", "wbk-f1-scm",
+		tatarav1alpha1.TaskSpec{
+			Goal: "Implement issue 120",
+			Kind: "implement",
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#120", URL: "https://github.com/o/r/issues/120", Number: 120,
+			},
+		}, nil)
+	task.Status.PrURL = "https://github.com/o/r/pull/121"
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: partial",
+		PRBody:         "Partial implementation.",
+		DeliveredScope: "half of it",
+		RemainingScope: "the other half",
+		Significance:   "minor",
+	}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.Zero(t, fw.openCalls, "OpenChange must never be called for a Task with declared RemainingScope")
+	require.True(t, fw.disableAutoMergeCalled, "DisableAutoMerge must be called to disarm the already-open PR")
+	require.True(t, fw.closePRCalled, "ClosePR must be called to disarm the already-open PR")
+	require.Equal(t, 121, fw.closePRNumber)
+	require.Contains(t, fw.removeLabelLabels, "semver:minor")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: task.Name}, &got))
+	require.Equal(t, "Failed", got.Status.Phase, "the Task must terminate Failed, never Succeeded, for a declared-incomplete change even when PrURL was already set")
+	cond := findCond(got.Status.Conditions, "Ready")
+	require.NotNil(t, cond)
+	require.Equal(t, "IncompleteImplementation", cond.Reason)
+}
+
 func TestTaskWriteBackNoCommentWhenNoSource(t *testing.T) {
 	fw := &fakeWriter{prURL: "https://github.com/o/r/pull/6"}
 	r := newWriteBackReconciler(t, fw)
@@ -611,6 +659,11 @@ type fullFakeSCMWriter struct {
 	disableAutoMergeCalled bool
 	disableAutoMergePRURL  string
 	disableAutoMergeErr    error
+	// closePRErrs (F2 disarm tests): if non-empty, ClosePR pops one error per
+	// call in order (nil entries succeed); once exhausted the last entry
+	// repeats. Empty/nil means ClosePR always succeeds.
+	closePRErrs      []error
+	closePRCallCount int
 }
 
 func (f *fullFakeSCMWriter) OpenChange(_ context.Context, _, _, _, _, title, body string) (string, error) {
@@ -655,7 +708,15 @@ func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, 
 	f.closePRCalled = true
 	f.closePRNumber = number
 	f.closePRBody = body
-	return nil
+	f.closePRCallCount++
+	if len(f.closePRErrs) == 0 {
+		return nil
+	}
+	idx := f.closePRCallCount - 1
+	if idx >= len(f.closePRErrs) {
+		idx = len(f.closePRErrs) - 1
+	}
+	return f.closePRErrs[idx]
 }
 func (f *fullFakeSCMWriter) AddLabel(_ context.Context, _, issueRef, label string) error {
 	f.addLabelCalled = true
