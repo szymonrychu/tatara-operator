@@ -128,6 +128,76 @@ func TestGitLabBangRef(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestGitLabLabelRef(t *testing.T) {
+	proj, iid, resource, err := glLabelRef("g/sub/p#12")
+	require.NoError(t, err)
+	require.Equal(t, "g/sub/p", proj)
+	require.Equal(t, 12, iid)
+	require.Equal(t, "issues", resource)
+
+	proj, iid, resource, err = glLabelRef("g/sub/p!42")
+	require.NoError(t, err)
+	require.Equal(t, "g/sub/p", proj)
+	require.Equal(t, 42, iid)
+	require.Equal(t, "merge_requests", resource)
+
+	_, _, _, err = glLabelRef("garbage")
+	require.Error(t, err)
+}
+
+// Issue #301: an MR label write (group/proj!iid) used to fail "malformed issue
+// ref" because AddLabel only understood '#'. It must now route to the
+// /merge_requests endpoint; an issue ref (#) still routes to /issues.
+func TestGitLabAddLabelRoutesIssueAndMR(t *testing.T) {
+	t.Run("issue", func(t *testing.T) {
+		var body map[string]string
+		c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodPut, r.Method)
+			require.Equal(t, "/projects/g%2Fp/issues/7", r.URL.EscapedPath())
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			w.WriteHeader(http.StatusOK)
+		})
+		require.NoError(t, c.AddLabel(context.Background(), "gltok", "g/p#7", "tatara-approved"))
+		require.Equal(t, "tatara-approved", body["add_labels"])
+	})
+	t.Run("mr", func(t *testing.T) {
+		var body map[string]string
+		c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodPut, r.Method)
+			require.Equal(t, "/projects/g%2Fp/merge_requests/42", r.URL.EscapedPath())
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			w.WriteHeader(http.StatusOK)
+		})
+		require.NoError(t, c.AddLabel(context.Background(), "gltok", "g/p!42", "tatara-approved"))
+		require.Equal(t, "tatara-approved", body["add_labels"])
+	})
+}
+
+func TestGitLabRemoveLabelRoutesIssueAndMR(t *testing.T) {
+	t.Run("issue", func(t *testing.T) {
+		var body map[string]string
+		c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodPut, r.Method)
+			require.Equal(t, "/projects/g%2Fp/issues/7", r.URL.EscapedPath())
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			w.WriteHeader(http.StatusOK)
+		})
+		require.NoError(t, c.RemoveLabel(context.Background(), "gltok", "g/p#7", "tatara-approved"))
+		require.Equal(t, "tatara-approved", body["remove_labels"])
+	})
+	t.Run("mr", func(t *testing.T) {
+		var body map[string]string
+		c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodPut, r.Method)
+			require.Equal(t, "/projects/g%2Fp/merge_requests/42", r.URL.EscapedPath())
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			w.WriteHeader(http.StatusOK)
+		})
+		require.NoError(t, c.RemoveLabel(context.Background(), "gltok", "g/p!42", "tatara-approved"))
+		require.Equal(t, "tatara-approved", body["remove_labels"])
+	})
+}
+
 func TestGitLabEditIssue_PUTsOnlyProvided(t *testing.T) {
 	var gotBody map[string]any
 	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {

@@ -618,8 +618,23 @@ func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, 
 }
 
 // Approve posts an APPROVE review.
+//
+// GitHub forbids approving your own pull request: a bot-authored PR returns a
+// deterministic 422 ("Can not approve your own pull request"). That is a terminal
+// client error, not a transient one, so retrying it is pointless and floods the
+// SCM write-failure alert forever (issue #301). Tolerate that specific 422 as a
+// benign no-op - mirroring GitLab.Approve tolerating the already-approved 401. A
+// bot PR does not need a native GitHub approval to merge: the tatara-approved
+// managed label gates the deploy supervisor and native auto-merge, so the caller
+// proceeds to label it. Any other error (including an unrelated 422) still surfaces.
 func (c *GitHub) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
-	return c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
+	err := c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity &&
+		strings.Contains(he.Body, "Can not approve your own pull request") {
+		return nil
+	}
+	return err
 }
 
 // RequestChanges posts a REQUEST_CHANGES review.
