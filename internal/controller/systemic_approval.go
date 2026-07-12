@@ -14,40 +14,62 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
-// issueHasRecordedApproval reports whether any Task for (repoSlug, number) carries a
-// recorded maintainer approval (Status.ApprovedByMaintainer set). This is the strong
-// human-gate signal: a sibling a maintainer declined or never approved never has it
-// set, so it fails this check and is stripped from any force-close.
+// newestTaskForSource returns the most-recently-created Task among tasks whose
+// SOURCE identity (TaskMatchesItemAsSource - never a ledger role:closes entry)
+// matches (repo, number), or nil when none match. Two bugs this fixes:
+//  1. F2 self-match: a systemic lead's own ledger is seeded with a role:closes
+//     entry for every sibling it references (seedLedgerFromSpec), so matching
+//     via TaskMatchesItem (any role) made the lead's own approval/lock state
+//     appear to belong to every sibling it merely leads. Source-identity-only
+//     matching (TaskMatchesItemAsSource) fixes this.
+//  2. F3 staleness: more than one Task can track the same issue over its life
+//     (a terminal clarify Task plus a later re-triage Task created after it
+//     went Done). An any-match scan let a stale locked Task from an earlier
+//     cycle outlive its successor. Picking the newest by CreationTimestamp
+//     fixes this.
+func newestTaskForSource(tasks []tatarav1alpha1.Task, repo string, number int) *tatarav1alpha1.Task {
+	var newest *tatarav1alpha1.Task
+	for i := range tasks {
+		t := &tasks[i]
+		if !tatarav1alpha1.TaskMatchesItemAsSource(t, repo, number) {
+			continue
+		}
+		if newest == nil || newest.CreationTimestamp.Before(&t.CreationTimestamp) {
+			newest = t
+		}
+	}
+	return newest
+}
+
+// issueHasRecordedApproval reports whether the Task that IS (repoSlug, number) -
+// resolved by source identity only, never a lead's role:closes ledger entry -
+// carries a recorded maintainer approval (Status.ApprovedByMaintainer set).
+// This is the strong human-gate signal: a sibling a maintainer declined or
+// never approved never has it set, so it fails this check and is stripped
+// from any force-close.
 func issueHasRecordedApproval(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
 	for i := range tasks {
 		t := &tasks[i]
 		if t.Status.ApprovedByMaintainer == "" {
 			continue
 		}
-		if tatarav1alpha1.TaskMatchesItem(t, repoSlug, number) {
+		if tatarav1alpha1.TaskMatchesItemAsSource(t, repoSlug, number) {
 			return true
 		}
 	}
 	return false
 }
 
-// issueIsImplementationLocked reports whether any Task for (repoSlug, number)
-// has Status.ImplementationLocked set: its own clarify conversation reached
+// issueIsImplementationLocked reports whether the NEWEST Task that IS
+// (repoSlug, number) - resolved by source identity only - has
+// Status.ImplementationLocked set: its own clarify conversation reached
 // no-open-questions with every decision settled (item Request C/d). Used by
 // the systemic-group approval fan-out: a sibling with no direct maintainer
 // approval of its own is still included in an approved lead's release when it
 // is implementation-locked.
 func issueIsImplementationLocked(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
-	for i := range tasks {
-		t := &tasks[i]
-		if !t.Status.ImplementationLocked {
-			continue
-		}
-		if tatarav1alpha1.TaskMatchesItem(t, repoSlug, number) {
-			return true
-		}
-	}
-	return false
+	t := newestTaskForSource(tasks, repoSlug, number)
+	return t != nil && t.Status.ImplementationLocked
 }
 
 // filterSystemicGroupByApproval returns a copy of sg keeping only the members

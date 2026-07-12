@@ -76,6 +76,39 @@ func TaskMatchesItem(t *Task, repo string, number int) bool {
 	return false
 }
 
+// TaskMatchesItemAsSource reports whether the Task's own SOURCE identity
+// (Spec.Source, or a Status.WorkItems entry with Role==RoleSource - never any
+// other role) matches (repo, number). Unlike TaskMatchesItem, a ledger entry
+// seeded with a non-source role (e.g. role:closes, seeded on a systemic lead
+// for every sibling it references) is never matched here: matching on it would
+// make a lead Task's own approval/lock status appear to belong to every
+// sibling it merely references (the systemic self-match bug). Callers that
+// resolve "which Task IS this issue" (as opposed to "which Tasks touch this
+// issue") must use this, not TaskMatchesItem.
+func TaskMatchesItemAsSource(t *Task, repo string, number int) bool {
+	if s := t.Spec.Source; s != nil {
+		srcRepo := RepoFromIssueRef(s.IssueRef)
+		dedupNum := s.DedupNumber
+		if dedupNum == 0 {
+			dedupNum = s.Number
+		}
+		if srcRepo == repo && dedupNum == number {
+			return true
+		}
+	}
+	for _, wi := range t.Status.WorkItems {
+		if wi.Role == RoleSource && wi.Repo == repo && wi.Number == number {
+			return true
+		}
+	}
+	repoSlug := strings.ReplaceAll(repo, "/", ".")
+	numStr := fmt.Sprintf("%d", number)
+	if t.Labels["tatara.io/source-repo"] == repoSlug && t.Labels["tatara.io/source-number"] == numStr {
+		return true
+	}
+	return false
+}
+
 // TaskReposInScope returns a sorted, deduplicated list of "owner/repo" slugs this
 // Task spans, derived from the ledger entries and the Spec.Source IssueRef.
 // This is the authoritative clone-scope helper shared by the agent and controller.

@@ -57,25 +57,15 @@ func (r *TaskReconciler) systemicGroupSiblingsSummary(ctx context.Context, task 
 	}
 	leadRepo := leadRepoOf(task)
 	// More than one Task can track the same issue over its life (a terminal
-	// clarify plus its successor implement, a re-created scan Task, ...), so a
-	// first-match lookup would report an arbitrary one. Prefer a locked match,
-	// mirroring issueIsImplementationLocked's any-match semantics - the two
-	// must agree or the bundle would claim "still open" for a sibling the
-	// approval fan-out already treats as locked.
+	// clarify plus a later re-triage Task created after it went Done, ...), so
+	// resolve via newestTaskForSource - source-identity-only matching (never a
+	// lead's own role:closes ledger entry) plus newest-wins. This is the exact
+	// resolution issueIsImplementationLocked uses, so the two always agree: the
+	// bundle never claims "still open" for a sibling the approval fan-out
+	// already treats as locked, or vice versa.
 	find := func(repo string, number int) (*tatarav1alpha1.Task, bool) {
-		var first *tatarav1alpha1.Task
-		for i := range tl.Items {
-			if !tatarav1alpha1.TaskMatchesItem(&tl.Items[i], repo, number) {
-				continue
-			}
-			if tl.Items[i].Status.ImplementationLocked {
-				return &tl.Items[i], true
-			}
-			if first == nil {
-				first = &tl.Items[i]
-			}
-		}
-		return first, first != nil
+		t := newestTaskForSource(tl.Items, repo, number)
+		return t, t != nil
 	}
 	summarize := func(ref, repo string, number int) systemicSiblingInfo {
 		t, found := find(repo, number)
@@ -339,8 +329,16 @@ func buildUmbrellaPrompt(task *tatarav1alpha1.Task, repos []umbrellaRepo, thread
 				fmt.Fprintf(&sb, "- %s: not yet tracked by a tatara Task.\n", s.Ref)
 			case s.Locked:
 				fmt.Fprintf(&sb, "- %s: implementation-locked (design settled, no open questions).\n", s.Ref)
-			default:
+			case s.Phase == "open":
 				fmt.Fprintf(&sb, "- %s: still open (%s) - if the human's answer here affects that issue's design, say so explicitly.\n", s.Ref, s.Phase)
+			case s.Phase == "":
+				fmt.Fprintf(&sb, "- %s: tracked, no lifecycle phase recorded yet.\n", s.Ref)
+			default:
+				// F7: a Done/Parked/Stopped/... sibling is NOT "still open" - it
+				// finished (or was set aside) without ever reaching
+				// implementation-locked. Render its actual state instead of
+				// misleadingly implying live discussion.
+				fmt.Fprintf(&sb, "- %s: not implementation-locked (state: %s).\n", s.Ref, s.Phase)
 			}
 		}
 	}

@@ -150,6 +150,24 @@ func TestBuildUmbrellaPrompt_RendersSystemicSiblings(t *testing.T) {
 	require.Contains(t, out, "o/r3#3: not yet tracked")
 }
 
+// TestBuildUmbrellaPrompt_TerminalUnlockedSiblingNotRenderedAsOpen verifies
+// F7: a Found+unlocked sibling whose tracking Task reached a TERMINAL
+// DeployState (Done/Parked/Stopped/...) must not be rendered as "still open" -
+// only Conversation/Triage are genuinely "still open". Before the fix, the
+// default branch rendered every non-locked sibling as "still open (<Phase>)"
+// regardless of whether Phase was actually a live conversational state.
+func TestBuildUmbrellaPrompt_TerminalUnlockedSiblingNotRenderedAsOpen(t *testing.T) {
+	task := &tatarav1alpha1.Task{}
+	task.Spec.Goal = "Ship the design"
+	siblings := []systemicSiblingInfo{
+		{Ref: "o/r4#5", Found: true, Locked: false, Phase: "Done"},
+	}
+	out := buildUmbrellaPrompt(task, nil, nil, "goal", siblings)
+
+	require.NotContains(t, out, "still open (Done)", "a terminal Done sibling must not be rendered as still open")
+	require.Contains(t, out, "o/r4#5: not implementation-locked (state: Done)")
+}
+
 // ---- refreshUmbrellaMembers -------------------------------------------
 
 func TestRefreshUmbrellaMembers_MergesFreshState(t *testing.T) {
@@ -315,6 +333,38 @@ func TestBuildUmbrellaPromptFor_IncludesLockedSystemicSibling(t *testing.T) {
 	out := r.buildUmbrellaPromptFor(ctx, &proj, task, "GOAL-TAIL-MARKER")
 	require.Contains(t, out, "## Related systemic-group issues")
 	require.Contains(t, out, "o/r#7: implementation-locked")
+}
+
+// TestSystemicGroupSiblingsSummary_LeadLedgerSelfMatchExcluded verifies the
+// F2 self-match fix also applies to the clarify-bundle sibling resolver
+// (systemicGroupSiblingsSummary's find closure): a lead Task's own ledger,
+// seeded with a role:closes entry for every sibling it references, must not
+// make the lead appear to BE its own sibling when no Task actually tracks
+// that sibling issue in its own right.
+func TestSystemicGroupSiblingsSummary_LeadLedgerSelfMatchExcluded(t *testing.T) {
+	ctx := context.Background()
+	lead := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "sibsum-lead", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: "sibsum-proj", Kind: "clarify", Goal: "g",
+			Source:        &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/ss#12", Number: 12},
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{SystemicID: "sg1", SameRepoSiblings: []int{7}},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, lead))
+	lead.Status.DeployState = "MRCI"
+	lead.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Repo: "o/ss", Number: 7, Kind: tatarav1alpha1.WorkItemIssue, Role: tatarav1alpha1.RoleCloses},
+	}
+	require.NoError(t, k8sClient.Status().Update(ctx, lead))
+
+	r := &TaskReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	got := getTask(t, "sibsum-lead")
+
+	summary := r.systemicGroupSiblingsSummary(ctx, got)
+	require.Len(t, summary, 1)
+	require.False(t, summary[0].Found,
+		"no Task tracks #7 in its own right; the lead's own role:closes ledger entry must not self-match")
 }
 
 // ---- umbrellaLinkedIssue (source-issue <-> PR linkage) -----------------

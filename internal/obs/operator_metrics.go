@@ -674,6 +674,12 @@ func (m *OperatorMetrics) SystemicApprovalFanout() {
 	m.systemicApprovalFanoutTotal.Inc()
 }
 
+// SystemicApprovalFanoutCounter exposes the raw counter for test assertions
+// (testutil.ToFloat64), mirroring the *Counter getters below.
+func (m *OperatorMetrics) SystemicApprovalFanoutCounter() prometheus.Counter {
+	return m.systemicApprovalFanoutTotal
+}
+
 // AgentBootRaceRequeue increments operator_agent_boot_race_requeue_total: a
 // turn submit reached a still-booting wrapper and was requeued (not errored).
 func (m *OperatorMetrics) AgentBootRaceRequeue() {
