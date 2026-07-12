@@ -81,6 +81,7 @@ func (f *fakeWriter) Merge(_ context.Context, _, _ string, _ int, _ string) (str
 	return "", nil
 }
 func (f *fakeWriter) EnableAutoMerge(_ context.Context, _, _, _, _ string) error    { return nil }
+func (f *fakeWriter) DisableAutoMerge(_ context.Context, _, _, _ string) error      { return nil }
 func (f *fakeWriter) ClosePR(_ context.Context, _, _ string, _ int, _ string) error { return nil }
 func (f *fakeWriter) AddBoardItem(_ context.Context, _ string, _ scm.BoardRef, _ string) error {
 	return nil

@@ -32,15 +32,20 @@ type lifecycleFakeSCMWriter struct {
 	openCalls     []struct {
 		repoURL, sourceBranch, title, body string
 	}
-	openPRURL        string
-	createIssues     []struct{ url, title, body string }
-	createIssueURL   string
-	issueClosed      bool
-	issueAuthor      string
-	issueStateErr    error
-	labelCalls       []string
-	removeLabelCalls []string
-	autoMergeCalls   int
+	openPRURL             string
+	createIssues          []struct{ url, title, body string }
+	createIssueURL        string
+	issueClosed           bool
+	issueAuthor           string
+	issueStateErr         error
+	labelCalls            []string
+	removeLabelCalls      []string
+	autoMergeCalls        int
+	disableAutoMergeCalls int
+	closePRCalls          []struct {
+		number int
+		body   string
+	}
 }
 
 func (f *lifecycleFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {
@@ -112,6 +117,21 @@ func (f *lifecycleFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, _, _ s
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.autoMergeCalls++
+	return nil
+}
+func (f *lifecycleFakeSCMWriter) DisableAutoMerge(_ context.Context, _, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.disableAutoMergeCalls++
+	return nil
+}
+func (f *lifecycleFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, body string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closePRCalls = append(f.closePRCalls, struct {
+		number int
+		body   string
+	}{number, body})
 	return nil
 }
 

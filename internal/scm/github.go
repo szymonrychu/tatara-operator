@@ -685,6 +685,20 @@ func (c *GitHub) EnableAutoMerge(ctx context.Context, _, token, prURL, method st
 	return c.ghGraphQL(ctx, token, q, nil, nil)
 }
 
+// DisableAutoMerge turns GitHub native auto-merge back off for the PR at prURL,
+// so a PR the operator has decided must not ship cannot merge itself once its
+// required checks pass. GitHub errors when auto-merge was never enabled;
+// callers treat that as non-fatal. repoURL is unused (the PR node id is
+// resolved from prURL), kept for interface symmetry with GitLab.
+func (c *GitHub) DisableAutoMerge(ctx context.Context, _, token, prURL string) error {
+	prID, err := c.ghResourceID(ctx, token, prURL)
+	if err != nil {
+		return fmt.Errorf("github: resolve pr node id: %w", err)
+	}
+	q := fmt.Sprintf(`mutation { disablePullRequestAutoMerge(input:{pullRequestId:%q}) { clientMutationId } }`, prID)
+	return c.ghGraphQL(ctx, token, q, nil, nil)
+}
+
 func ghMergeMethod(method string) string {
 	switch method {
 	case "merge":

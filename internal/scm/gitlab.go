@@ -647,6 +647,23 @@ func (c *GitLab) EnableAutoMerge(ctx context.Context, repoURL, token, mrURL, met
 	return glDo(ctx, c.base(), http.MethodPut, path, token, in, nil)
 }
 
+// DisableAutoMerge cancels merge-when-pipeline-succeeds on the MR at mrURL, so
+// an MR the operator has decided must not ship cannot merge itself once its
+// pipeline passes. Best-effort: the endpoint 406s when the MR has no pending
+// auto-merge, which callers treat as non-fatal.
+func (c *GitLab) DisableAutoMerge(ctx context.Context, repoURL, token, mrURL string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	iid, err := glIIDFromURL(mrURL)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(iid) + "/cancel_merge_when_pipeline_succeeds"
+	return glDo(ctx, c.base(), http.MethodPost, path, token, nil, nil)
+}
+
 // glIIDFromURL parses the trailing iid out of a GitLab MR web URL
 // (.../merge_requests/5, with optional trailing slash or ?#fragment).
 func glIIDFromURL(mrURL string) (int, error) {

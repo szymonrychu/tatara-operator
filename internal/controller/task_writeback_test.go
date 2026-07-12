@@ -607,6 +607,10 @@ type fullFakeSCMWriter struct {
 	addLabelLabels []string
 	// RemoveLabel
 	removeLabelLabels []string
+	// DisableAutoMerge
+	disableAutoMergeCalled bool
+	disableAutoMergePRURL  string
+	disableAutoMergeErr    error
 }
 
 func (f *fullFakeSCMWriter) OpenChange(_ context.Context, _, _, _, _, title, body string) (string, error) {
@@ -671,6 +675,11 @@ func (f *fullFakeSCMWriter) EnsureLabel(_ context.Context, _, _, name, color str
 	f.ensureLabelName = name
 	f.ensureLabelColor = color
 	return nil
+}
+func (f *fullFakeSCMWriter) DisableAutoMerge(_ context.Context, _, _, prURL string) error {
+	f.disableAutoMergeCalled = true
+	f.disableAutoMergePRURL = prURL
+	return f.disableAutoMergeErr
 }
 func (f *fullFakeSCMWriter) EnableAutoMerge(_ context.Context, _, _, prURL, method string) error {
 	f.autoMergeCalled = true

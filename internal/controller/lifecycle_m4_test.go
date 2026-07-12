@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -418,5 +419,81 @@ func TestLifecycleImplement_EmptyRemainingScope_Succeeds(t *testing.T) {
 	}
 	if got.Status.DeployState != "MRCI" {
 		t.Errorf("DeployState = %q, want MRCI", got.Status.DeployState)
+	}
+}
+
+// TestLifecycleImplement_RemainingScope_WithOpenPR_DisarmsAutoMerge is the D1
+// regression. Auto-merge is armed on the PR at OPEN time (applySemverAutoMerge)
+// and was never disarmed, while the lifecycle re-enters Implement with that PR
+// still open on four paths (mrci-failure, merge-conflict, mainci-failure,
+// deploy-failure). So: turn 1 posts a clean change_summary -> PR opens, semver
+// label stamped, native auto-merge ARMED -> CI red -> re-enter Implement ->
+// turn 2 posts change_summary{remainingScope} -> the hard-fail terminated the
+// Task Failed/IncompleteImplementation but LEFT the armed PR open, and the
+// forge merged the incomplete change as soon as CI went green. The hard-fail
+// must now disarm the already-open PR: disable auto-merge, strip the semver
+// label, and close the PR.
+func TestLifecycleImplement_RemainingScope_WithOpenPR_DisarmsAutoMerge(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-d1-rem-openpr"
+	proj := "lc-d1-p"
+	repo := "lc-d1-r"
+	sec := "lc-d1-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#95",
+		URL: "https://github.com/o/r/issues/95", Number: 95,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.DeployState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.LifecycleIterations = 2
+	// Turn 1 already opened the PR and armed auto-merge on it.
+	task.Status.PrURL = "https://github.com/o/r/pull/96"
+	task.Status.PRNumber = 96
+	// Turn 2's change_summary declares a gap.
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: login",
+		PRBody:         "Adds login.",
+		DeliveredScope: "login endpoint",
+		RemainingScope: "logout endpoint, password reset",
+		Significance:   "minor",
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{}
+	r := newLifecycleReconciler(t, fw)
+
+	cur := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, cur); e != nil {
+		t.Fatalf("get task: %v", e)
+	}
+	if _, err := r.reconcileLifecycle(ctx, cur); err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	if fw.disableAutoMergeCalls != 1 {
+		t.Errorf("DisableAutoMerge called %d times; want 1 - an armed PR must be disarmed when the change is declared incomplete", fw.disableAutoMergeCalls)
+	}
+	if len(fw.closePRCalls) != 1 || fw.closePRCalls[0].number != 96 {
+		t.Errorf("ClosePR calls = %+v; want exactly one close of PR #96", fw.closePRCalls)
+	}
+	if !containsStr(fw.removeLabelCalls, "semver:minor") {
+		t.Errorf("removeLabelCalls = %v; want the semver:minor label stripped from the incomplete PR", fw.removeLabelCalls)
+	}
+	fw.mu.Unlock()
+
+	got := &tatarav1alpha1.Task{}
+	if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, got); e != nil {
+		t.Fatalf("get task after: %v", e)
+	}
+	if got.Status.Phase != "Failed" {
+		t.Errorf("Phase = %q, want Failed", got.Status.Phase)
+	}
+	cond := apimeta.FindStatusCondition(got.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "IncompleteImplementation" {
+		t.Errorf("Ready condition = %+v, want reason IncompleteImplementation", cond)
 	}
 }

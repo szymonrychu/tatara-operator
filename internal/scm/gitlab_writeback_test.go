@@ -167,6 +167,22 @@ func TestGitLabEnableAutoMerge(t *testing.T) {
 	require.Contains(t, gotBody, "merge_when_pipeline_succeeds")
 }
 
+// TestGitLabDisableAutoMerge covers the D1 disarm verb on GitLab: cancel
+// merge-when-pipeline-succeeds so an incomplete MR cannot merge itself.
+func TestGitLabDisableAutoMerge(t *testing.T) {
+	var gotPath, gotMethod string
+	c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		gotMethod = r.Method
+		_, _ = w.Write([]byte(`{}`))
+	})
+	err := c.DisableAutoMerge(context.Background(), "https://gitlab.com/g/p.git", "gltok",
+		"https://gitlab.com/g/p/-/merge_requests/5")
+	require.NoError(t, err)
+	require.Equal(t, http.MethodPost, gotMethod)
+	require.Equal(t, "/projects/g%2Fp/merge_requests/5/cancel_merge_when_pipeline_succeeds", gotPath)
+}
+
 func TestGLIIDFromURL(t *testing.T) {
 	for _, tt := range []struct {
 		url  string

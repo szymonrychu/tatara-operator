@@ -147,10 +147,145 @@ func (r *TaskReconciler) checkRemainingScopeHardFail(ctx context.Context, task *
 	} else {
 		l.Error(scmErr, "writeback: scm context for remaining-scope comment (non-fatal)", "resource_id", task.Name)
 	}
+	// D1: the hard-fail can also fire on a LATER turn, with a PR already open
+	// from an earlier one (the lifecycle re-enters Implement with the PR still
+	// open on four paths: mrci-failure, merge-conflict, mainci-failure,
+	// deploy-failure). That PR carries native auto-merge, armed at open time and
+	// never disarmed - so terminating the Task Failed left the forge free to
+	// merge the incomplete change the moment CI went green, and push-CD to tag
+	// and release it. Disarm every PR this Task opened before terminating.
+	r.disarmOpenChanges(ctx, task)
 	res, err = r.terminate(ctx, task, "Failed", "IncompleteImplementation",
 		"change_summary declared remaining_scope; agents must implement the full scope in one PR "+
 			"or call decline_implementation instead of leaving a gap - no follow-up issues are filed")
 	return res, err, true
+}
+
+// disarmOpenChanges makes every PR/MR this Task already opened unmergeable, for
+// a Task the operator has decided must NOT ship (the full-scope-or-decline
+// hard-fail): it disables the forge's native auto-merge, strips the semver
+// label that drives the release cascade, and closes the PR. Without it, an
+// incomplete change opened on turn 1 (auto-merge armed by applySemverAutoMerge)
+// still merged itself as soon as its checks went green, even though the Task
+// terminated Failed on turn 2.
+//
+// Every PR on the ledger is disarmed, not only Status.PrURL: a cross-repo
+// umbrella opens one PR per repo in scope and each one is armed at open time,
+// so disarming the primary alone would still ship the siblings. Wholly
+// best-effort: each step is logged and never fails the terminal path (the Task
+// fails either way; a forge hiccup must not wedge it in reconcile backoff).
+func (r *TaskReconciler) disarmOpenChanges(ctx context.Context, task *tatarav1alpha1.Task) {
+	if task.Status.PrURL == "" {
+		return
+	}
+	l := log.FromContext(ctx)
+	var proj tatarav1alpha1.Project
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &proj); err != nil {
+		l.Error(err, "writeback: disarm open changes: get project (non-fatal)", "resource_id", task.Name)
+		return
+	}
+	repos, err := r.projectRepos(ctx, &proj)
+	if err != nil {
+		l.Error(err, "writeback: disarm open changes: list project repos (non-fatal)", "resource_id", task.Name)
+		return
+	}
+	provider := ""
+	if task.Spec.Source != nil {
+		provider = task.Spec.Source.Provider
+	}
+	if provider == "" && len(repos) > 0 {
+		provider = providerForRemote(ctx, repos[0].Spec.URL)
+	}
+	slugToURL := map[string]string{}
+	for i := range repos {
+		if slug, _, serr := repoSlugFromURL(repos[i].Spec.URL, provider); serr == nil && slug != "" {
+			slugToURL[slug] = repos[i].Spec.URL
+		}
+	}
+	writer, err := r.SCMFor(provider)
+	if err != nil {
+		l.Error(err, "writeback: disarm open changes: scm writer (non-fatal)", "resource_id", task.Name, "provider", provider)
+		return
+	}
+	token, err := r.scmToken(ctx, task.Namespace, proj.Spec.ScmSecretRef)
+	if err != nil {
+		l.Error(err, "writeback: disarm open changes: scm token (non-fatal)", "resource_id", task.Name)
+		return
+	}
+
+	// Targets: every openedPR ledger entry that is not already terminal. The
+	// ledger is the authoritative set of PRs this Task opened (writeBackOpenChange
+	// upserts one entry per opened PR). Fall back to the primary PrURL + the
+	// Task's own repo when the ledger holds none (the status write that records
+	// them lands after the first OpenChange, so an interrupted writeback can leave
+	// PrURL set with no entry).
+	type target struct {
+		repoURL string
+		number  int
+		prURL   string
+	}
+	var targets []target
+	for _, wi := range task.Status.WorkItems {
+		if wi.Kind != tatarav1alpha1.WorkItemPR || wi.Role != tatarav1alpha1.RoleOpenedPR ||
+			wi.Number == 0 || isWITerminal(wi.State) {
+			continue
+		}
+		if url := slugToURL[wi.Repo]; url != "" {
+			targets = append(targets, target{repoURL: url, number: wi.Number, prURL: prWebURL(url, provider, wi.Repo, wi.Number)})
+		}
+	}
+	if len(targets) == 0 {
+		if n := parsePRNumber(task.Status.PrURL); n > 0 && task.Spec.RepositoryRef != "" {
+			var repo tatarav1alpha1.Repository
+			if gerr := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo); gerr == nil {
+				targets = append(targets, target{repoURL: repo.Spec.URL, number: n, prURL: task.Status.PrURL})
+			}
+		}
+	}
+	if len(targets) == 0 {
+		l.Info("writeback: disarm open changes: no resolvable PR to disarm",
+			"action", "writeback_disarm_no_target", "resource_id", task.Name, "pr_url", task.Status.PrURL)
+		return
+	}
+
+	closeMsg := "Closing: the implementation declared remaining scope instead of completing it in one PR " +
+		"(full-scope-or-decline). This change must not merge - auto-merge disabled and the semver label removed."
+	for _, tg := range targets {
+		// A PR whose web URL could not be reconstructed still gets closed (the
+		// close verb is number-based); only the URL-keyed auto-merge call is
+		// skipped, and closing already blocks the merge.
+		if tg.prURL != "" {
+			derr := writer.DisableAutoMerge(ctx, tg.repoURL, token, tg.prURL)
+			r.recordSCM(provider, "disable_auto_merge", derr)
+			if derr != nil {
+				l.Error(derr, "writeback: disable auto-merge on incomplete PR (non-fatal)",
+					"resource_id", task.Name, "pr_url", tg.prURL)
+			}
+		}
+		// Strip the semver label so a human-merged PR cannot still cut a release
+		// tag. GitHub only, mirroring applySemverAutoMerge: GitLab AddLabel routes
+		// to /issues and never stamped the MR in the first place.
+		if cs := task.Status.ChangeSummary; cs != nil && cs.Significance != "" && provider == "github" {
+			if slug, _, serr := repoSlugFromURL(tg.repoURL, provider); serr == nil && slug != "" {
+				prRef := fmt.Sprintf("%s#%d", slug, tg.number)
+				lerr := writer.RemoveLabel(ctx, token, prRef, semverLabel(cs.Significance))
+				r.recordSCM(provider, "remove_label", lerr)
+				if lerr != nil {
+					l.Error(lerr, "writeback: strip semver label from incomplete PR (non-fatal)",
+						"resource_id", task.Name, "pr_ref", prRef)
+				}
+			}
+		}
+		cerr := writer.ClosePR(ctx, tg.repoURL, token, tg.number, closeMsg)
+		r.recordSCM(provider, "close", cerr)
+		if cerr != nil {
+			l.Error(cerr, "writeback: close incomplete PR (non-fatal)",
+				"resource_id", task.Name, "pr_url", tg.prURL)
+			continue
+		}
+		l.Info("writeback: incomplete change disarmed (auto-merge off, semver label stripped, PR closed)",
+			"action", "writeback_disarm_incomplete_pr", "resource_id", task.Name, "pr_url", tg.prURL)
+	}
 }
 
 // writeBackOpenChange attempts a PR/MR on every Project repo and opens one on
@@ -1043,15 +1178,26 @@ func (r *TaskReconciler) recoverExistingPRURL(ctx context.Context, token, provid
 			if serr != nil {
 				return "", serr
 			}
-			base, berr := parseRepoBase(repoURL)
-			if berr != nil {
-				return "", berr
-			}
-			if provider == "gitlab" {
-				return fmt.Sprintf("%s/%s/-/merge_requests/%d", base, slug, pr.Number), nil
-			}
-			return fmt.Sprintf("%s/%s/pull/%d", base, slug, pr.Number), nil
+			return prWebURL(repoURL, provider, slug, pr.Number), nil
 		}
 	}
 	return "", nil
+}
+
+// prWebURL renders the web URL of PR/MR number in the repo at repoURL, from the
+// repo URL's own base host (so a self-hosted forge renders against its own host,
+// never a hardcoded github.com/gitlab.com). Returns "" when the base cannot be
+// parsed or slug is empty.
+func prWebURL(repoURL, provider, slug string, number int) string {
+	if slug == "" || number <= 0 {
+		return ""
+	}
+	base, err := parseRepoBase(repoURL)
+	if err != nil {
+		return ""
+	}
+	if provider == "gitlab" {
+		return fmt.Sprintf("%s/%s/-/merge_requests/%d", base, slug, number)
+	}
+	return fmt.Sprintf("%s/%s/pull/%d", base, slug, number)
 }
