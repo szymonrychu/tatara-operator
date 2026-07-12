@@ -443,11 +443,7 @@ func (r *TaskReconciler) driveAgentRun(ctx context.Context, project *tatarav1alp
 	}
 	if exhausted {
 		const detail = "wrapper pod lost; recreation budget exhausted"
-		res, terr := r.terminate(ctx, task, "Failed", "PodLost", detail)
-		if terr == nil {
-			r.commentTerminalDiagnostics(ctx, task, "PodLost", detail)
-		}
-		return res, terr
+		return r.terminate(ctx, task, "Failed", "PodLost", detail)
 	}
 
 	// Set Planning on first spawn. RetryOnConflict: lifecycle handlers write
@@ -657,51 +653,6 @@ func (r *TaskReconciler) podReady(ctx context.Context, task *tatarav1alpha1.Task
 	return false, nil
 }
 
-// postTerminalComment posts a single human-readable cause to the Task's linked
-// issue, so a human (or the loop) can read WHY the run ended even after the
-// terminal Task CR is garbage-collected (#81). It is the shared plumbing behind
-// the boot-crash comment (#115) and the generic terminal-Failed comment (#116).
-// Best-effort: a missing SCM wiring / source, a project-scoped task (no repo),
-// or a comment failure is logged and ignored - the terminal condition message
-// and structured log still carry the cause.
-func (r *TaskReconciler) postTerminalComment(ctx context.Context, task *tatarav1alpha1.Task, body string) {
-	if r.SCMFor == nil || task.Spec.Source == nil || task.Spec.Source.IssueRef == "" {
-		return
-	}
-	l := log.FromContext(ctx)
-	proj, repo, writer, token, provider, err := r.scmContext(ctx, task)
-	if err != nil {
-		l.Error(err, "terminal-diagnostics: scm context for comment (non-fatal)", "resource_id", task.Name)
-		return
-	}
-	posted, cerr := r.gatedComment(ctx, &proj, &repo, writer, token, provider,
-		task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin,
-		task.Spec.Source.IssueRef, body)
-	if cerr != nil {
-		l.Error(cerr, "terminal-diagnostics: post comment (non-fatal)",
-			"resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
-		return
-	}
-	if posted {
-		l.Info("terminal diagnostics commented on issue",
-			"action", "task_terminal_commented", "resource_id", task.Name, "issue_ref", task.Spec.Source.IssueRef)
-	}
-}
-
-// commentTerminalDiagnostics posts the cause of a terminal Failed run to the
-// Task's linked issue, generalizing the boot-crash comment (#115) to the other
-// terminal-Failed reasons surfaced from a reconcile - AgentUnreachable,
-// TurnTimeout, PodLost (#116) - so each leaves a durable cause on the issue
-// (#81). Callers invoke it once, only after terminate has committed Failed, so a
-// terminate retry cannot double-post (the boot-crash ordering).
-func (r *TaskReconciler) commentTerminalDiagnostics(ctx context.Context, task *tatarav1alpha1.Task, reason, detail string) {
-	body := fmt.Sprintf("Task run terminated (`Failed` / `%s`).", reason)
-	if detail != "" {
-		body += "\n\n" + detail
-	}
-	r.postTerminalComment(ctx, task, body)
-}
-
 // handleTransientWrapper handles a SubmitTurn error that means "the wrapper is
 // not ready yet" rather than a hard failure: either an agent UnreachableError
 // (the turn server is still booting even though the pod is Ready) or a wrapper
@@ -741,9 +692,6 @@ func (r *TaskReconciler) handleTransientWrapper(ctx context.Context, task *tatar
 			"deadline", agentBootDeadline.String(), "outcome", agent.SubmitOutcome(err))
 		detail := fmt.Sprintf("wrapper agent unreachable for over %s", agentBootDeadline)
 		res, terr := r.terminate(ctx, task, "Failed", "AgentUnreachable", detail)
-		if terr == nil {
-			r.commentTerminalDiagnostics(ctx, task, "AgentUnreachable", detail)
-		}
 		return res, terr, true
 	}
 
@@ -862,11 +810,7 @@ func (r *TaskReconciler) driveTurns(ctx context.Context, project *tatarav1alpha1
 		if r.isTurnTimedOut(project, task) {
 			r.Metrics.TurnTimeout("reconcile")
 			detail := fmt.Sprintf("turn %s exceeded timeout", current)
-			res, terr := r.terminate(ctx, task, "Failed", "TurnTimeout", detail)
-			if terr == nil {
-				r.commentTerminalDiagnostics(ctx, task, "TurnTimeout", detail)
-			}
-			return res, terr
+			return r.terminate(ctx, task, "Failed", "TurnTimeout", detail)
 		}
 		return ctrl.Result{RequeueAfter: pollRequeue}, nil
 	}

@@ -353,7 +353,10 @@ func TestHandleBootCrashCapturesDiagnostics(t *testing.T) {
 
 // TestHandleBootCrashExhaustedSurfacesDiagnostics asserts that at budget
 // exhaustion the captured cause is folded into the terminal BootCrashLoop
-// condition message AND posted once to the linked issue.
+// condition message (the kubectl-inspect fallback), and that termination no
+// longer posts a comment to the linked issue - the condition message, the
+// structured log, and operator_agent_boot_crash_total already carry the
+// cause.
 func TestHandleBootCrashExhaustedSurfacesDiagnostics(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
@@ -421,10 +424,10 @@ func TestHandleBootCrashExhaustedSurfacesDiagnostics(t *testing.T) {
 	require.Contains(t, cond.Message, "exit=1")
 	require.Contains(t, cond.Message, "panic: boom")
 
-	// The cause is posted exactly once to the linked issue (durable past CRD GC).
-	require.Len(t, fw.commentArgs, 1)
-	require.Contains(t, fw.commentArgs[0], "o/r#82|")
-	require.Contains(t, fw.commentArgs[0], "panic: boom")
+	// No comment is posted to the linked issue - the condition message above
+	// already carries the cause, and it is durable past the terminal CRD's GC
+	// via the structured log + metric.
+	require.Empty(t, fw.commentArgs)
 
 	require.Equal(t, float64(1), counterValue(t, reg, "operator_agent_boot_crash_total",
 		map[string]string{"reason": "ContainerExited", "outcome": "failed"}))
