@@ -203,23 +203,45 @@ func (r *TaskReconciler) checkRemainingScopeHardFail(ctx context.Context, task *
 	if clean := r.disarmOpenChanges(ctx, task); !clean {
 		attempts := task.Status.DisarmFailures + 1
 		if attempts < disarmFailureCap {
-			l.Info("writeback: disarm sweep incomplete; will retry before terminating",
-				"action", "writeback_disarm_incomplete", "resource_id", task.Name,
-				"attempts", attempts, "cap", disarmFailureCap)
+			var persisted bool
 			if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 				fresh.Status.DisarmFailures = attempts
 				return true
 			}); perr != nil {
 				l.Error(perr, "writeback: persist disarm failure count (non-fatal)", "resource_id", task.Name)
+			} else {
+				persisted = task.Status.DisarmFailures == attempts
 			}
-			return ctrl.Result{RequeueAfter: disarmRetryRequeue}, nil, true
+			if persisted {
+				l.Info("writeback: disarm sweep incomplete; will retry before terminating",
+					"action", "writeback_disarm_incomplete", "resource_id", task.Name,
+					"attempts", attempts, "cap", disarmFailureCap)
+				return ctrl.Result{RequeueAfter: disarmRetryRequeue}, nil, true
+			}
+			// C2: the counter write appeared to succeed (no error) but did not
+			// actually stick - e.g. a deployed CRD that predates
+			// Status.DisarmFailures silently prunes the field server-side.
+			// Requeuing blind here would livelock: every reconcile re-reads the
+			// unadvanced counter, retries the full disarm sweep, and never reaches
+			// disarmFailureCap. Fall through to the terminate-loudly path instead
+			// so the loop stays bounded even when the counter itself cannot be
+			// persisted.
+			l.Error(errors.New("disarm failure counter did not persist"),
+				"writeback: disarm failure counter write did not stick; terminating instead of requeuing blind to avoid a livelock",
+				"action", "writeback_disarm_counter_unpersisted", "resource_id", task.Name, "attempted", attempts)
 		}
 		l.Error(errors.New("disarm attempt budget exhausted"),
 			"writeback: disarm sweep still unverified at the attempt cap; terminating anyway - the PR may still be open and armed, human must check",
 			"action", "writeback_disarm_capped", "resource_id", task.Name, "attempts", attempts, "cap", disarmFailureCap)
 		r.Metrics.WritebackOutcome("disarm_failed")
 		if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-			fresh.Status.DisarmFailures = 0
+			// C4: do NOT reset DisarmFailures here. Resetting before terminate()
+			// runs made the retry budget non-monotonic: if terminate() itself then
+			// errored, the next reconcile re-read a fresh 0 and restarted the whole
+			// disarmFailureCap-sweep cycle instead of re-terminating immediately.
+			// The counter is only ever reset on an actual successful/clean disarm
+			// (the else branch below) or a reactivation, never as a side effect of
+			// giving up.
 			apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 				Type:   "DisarmFailed",
 				Status: metav1.ConditionTrue,
@@ -261,18 +283,23 @@ func (r *TaskReconciler) checkRemainingScopeHardFail(ctx context.Context, task *
 // umbrella opens one PR per repo in scope and each one is armed at open time,
 // so disarming the primary alone would still ship the siblings.
 //
-// F2: returns clean=true only when every target PR is VERIFIED closed (or was
-// already permanently gone - 404/410, e.g. a human already closed it) - the
-// one action that actually prevents the forge from auto-merging the PR once
-// CI goes green, regardless of whether auto-merge was ever armed. The caller
-// (checkRemainingScopeHardFail) must not let the Task terminate on a dirty
-// sweep. DisableAutoMerge and the semver-label strip stay best-effort and do
-// NOT gate clean: both forges document erroring here as the EXPECTED outcome
-// when there was nothing to disable/strip (GitHub errors "auto-merge was
-// never enabled"; GitLab 406s "no pending auto-merge") - a non-HTTPError,
-// non-4xx-classifiable condition on GitHub's GraphQL transport that would
-// otherwise misclassify as transient and spin the retry budget on a false
-// alarm every single time significance was never set on the PR.
+// F2/C3: returns clean=true only when every target is resolved: ClosePR
+// VERIFIED closed (or already permanently gone - 404/410, e.g. a human
+// already closed it), AND - when this Task's repo has a configured bot login
+// (the operator itself armed auto-merge on this PR at open time via
+// applySemverAutoMerge) - DisableAutoMerge did not fail with a real error.
+// ClosePR alone is NOT sufficient to gate clean: GitHub does not document
+// PR-close as an action that disables auto-merge, and a later reopen
+// plausibly restores the prior armed state, so an unverified DisableAutoMerge
+// on an operator-armed PR must keep the sweep dirty, not just closed.
+// DisableAutoMerge/RemoveLabel stay best-effort and do NOT gate clean when the
+// error is the documented "nothing to disable" no-op both forges use when
+// auto-merge was never armed or already off (GitHub GraphQL: "auto merge is
+// not enabled ..."; GitLab: 406 "no pending auto-merge") - see
+// isAutoMergeAlreadyOffError. The caller (checkRemainingScopeHardFail) must
+// not let the Task terminate on a dirty sweep. A target this sweep finds
+// already MERGED (C1) is handled distinctly below - not silently folded into
+// a "clean" outcome via ClosePR's close-of-an-already-merged no-op.
 func (r *TaskReconciler) disarmOpenChanges(ctx context.Context, task *tatarav1alpha1.Task) bool {
 	if task.Status.PrURL == "" {
 		return true
@@ -310,6 +337,15 @@ func (r *TaskReconciler) disarmOpenChanges(ctx context.Context, task *tatarav1al
 	if err != nil {
 		l.Error(err, "writeback: disarm open changes: scm token", "resource_id", task.Name)
 		return false
+	}
+	// botLogin is set only when the operator has a configured bot login for this
+	// repo - the same condition enableNativeAutoMerge/applySemverAutoMerge gate
+	// on, so its presence here means the PR was actually armed by the operator
+	// at open time. C3 uses it to decide whether an unverified DisableAutoMerge
+	// failure must gate clean=false.
+	botLogin := ""
+	if proj.Spec.Scm != nil {
+		botLogin = proj.Spec.Scm.BotLogin
 	}
 
 	// Targets: every openedPR ledger entry that is not already terminal. The
@@ -355,16 +391,68 @@ func (r *TaskReconciler) disarmOpenChanges(ctx context.Context, task *tatarav1al
 		"(full-scope-or-decline). This change must not merge - auto-merge disabled and the semver label removed."
 	clean := true
 	for _, tg := range targets {
+		// C1: check whether this target already merged BEFORE attempting to
+		// disarm it. A merged PR is already state=closed, so ClosePR's PATCH
+		// below would be a silent 200 no-op that used to look like an ordinary
+		// clean disarm - no distinct signal, and a "this change must not merge"
+		// comment posted onto a PR that already merged (and may have already cut
+		// a release tag). Shout distinctly instead: nothing is left to disarm on
+		// an already-merged target (retrying cannot un-merge it, so it counts as
+		// resolved, not dirty), but the log/metric/condition/comment all say
+		// MERGED, never "disarmed".
+		st, serr := writer.GetPRState(ctx, tg.repoURL, token, tg.number)
+		r.recordSCM(provider, "get_pr_state", serr)
+		if serr == nil && st.Merged {
+			l.Error(fmt.Errorf("incomplete change already merged: %s", tg.prURL),
+				"writeback: disarm sweep found an already-MERGED PR for a Task with declared remaining scope; the incomplete change shipped - human must check",
+				"action", "writeback_disarm_merged", "resource_id", task.Name, "pr_url", tg.prURL)
+			r.Metrics.WritebackOutcome("disarm_merged")
+			if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+				apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+					Type:   "IncompleteChangeMerged",
+					Status: metav1.ConditionTrue,
+					Reason: "DisarmTargetAlreadyMerged",
+					Message: fmt.Sprintf("PR %s carried a declared-incomplete change (remaining scope) and already "+
+						"merged before the disarm sweep could close it; the change has SHIPPED - check manually", tg.prURL),
+					ObservedGeneration: fresh.Generation,
+				})
+				return true
+			}); perr != nil {
+				l.Error(perr, "writeback: persist IncompleteChangeMerged condition (non-fatal)", "resource_id", task.Name)
+			}
+			if task.Spec.Source != nil && !task.Spec.Source.IsPR && task.Spec.Source.IssueRef != "" {
+				remaining := ""
+				if cs := task.Status.ChangeSummary; cs != nil {
+					remaining = cs.RemainingScope
+				}
+				mergedMsg := fmt.Sprintf("The implementation declared remaining scope (%q) but PR %s already "+
+					"MERGED before the operator's disarm sweep could close it (full-scope-or-decline). The "+
+					"incomplete change has ALREADY SHIPPED - this cannot be undone automatically and needs human attention.",
+					remaining, tg.prURL)
+				if _, cerr := r.gatedComment(ctx, &proj, nil, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, mergedMsg); cerr != nil {
+					l.Error(cerr, "writeback: post already-merged comment (non-fatal)", "resource_id", task.Name)
+				}
+			}
+			continue
+		}
 		// A PR whose web URL could not be reconstructed still gets closed (the
 		// close verb is number-based); only the URL-keyed auto-merge call is
-		// skipped, and closing already blocks the merge. Best-effort: see the
-		// doc comment above for why a DisableAutoMerge failure never gates clean.
+		// skipped, and closing already blocks the merge.
 		if tg.prURL != "" {
 			derr := writer.DisableAutoMerge(ctx, tg.repoURL, token, tg.prURL)
 			r.recordSCM(provider, "disable_auto_merge", derr)
 			if derr != nil {
 				l.Error(derr, "writeback: disable auto-merge on incomplete PR (non-fatal)",
 					"resource_id", task.Name, "pr_url", tg.prURL)
+				// C3: a real DisableAutoMerge failure on a PR the operator itself
+				// armed (botLogin configured) must not be waved through as
+				// best-effort - see the doc comment above for why ClosePR alone is
+				// not sufficient proof this PR can never auto-merge again after a
+				// reopen. The documented "nothing was ever armed" no-op stays
+				// non-fatal and does not gate clean.
+				if botLogin != "" && !isAutoMergeAlreadyOffError(derr) {
+					clean = false
+				}
 			}
 		}
 		// Strip the semver label so a human-merged PR cannot still cut a release
@@ -382,12 +470,19 @@ func (r *TaskReconciler) disarmOpenChanges(ctx context.Context, task *tatarav1al
 				}
 			}
 		}
-		// ClosePR is the safety-critical action: a closed PR cannot be merged by
-		// the forge regardless of auto-merge/label state, so it alone gates clean.
-		// A permanent 404/410 (already gone - e.g. a human already closed it)
-		// counts as done, not as a failure; anything else (429/5xx, a reachability
-		// error) leaves this sweep dirty and the caller retries.
-		cerr := writer.ClosePR(ctx, tg.repoURL, token, tg.number, closeMsg)
+		// ClosePR is the primary safety-critical action - a closed PR cannot be
+		// merged by the forge - but per C3 it no longer gates clean alone: see
+		// the doc comment above. A permanent 404/410 (already gone - e.g. a human
+		// already closed it) still counts as done here; anything else (429/5xx,
+		// a reachability error) leaves this sweep dirty and the caller retries.
+		// C5: the "must not merge" note is content-deduped against the PR's own
+		// comment thread so a dirty sweep's repeated retries do not re-post it on
+		// an already-clean, already-closed target every pass.
+		closeBody := closeMsg
+		if r.disarmCloseCommentAlreadyPosted(ctx, provider, token, tg.repoURL, tg.number, botLogin, closeMsg) {
+			closeBody = ""
+		}
+		cerr := writer.ClosePR(ctx, tg.repoURL, token, tg.number, closeBody)
 		r.recordSCM(provider, "close", cerr)
 		if cerr != nil {
 			if !isPermanentTargetGone(cerr) {
@@ -400,6 +495,64 @@ func (r *TaskReconciler) disarmOpenChanges(ctx context.Context, task *tatarav1al
 			"action", "writeback_disarm_incomplete_pr", "resource_id", task.Name, "pr_url", tg.prURL)
 	}
 	return clean
+}
+
+// isAutoMergeAlreadyOffError classifies a DisableAutoMerge failure as the
+// documented "nothing to disable" no-op both forges use when auto-merge was
+// never armed or was already off, as opposed to a real/unexpected failure
+// (rate limit, auth, network) that C3 must not wave through as best-effort.
+// GitLab surfaces the no-op as a 406 HTTPError (DisableAutoMerge's own doc
+// comment: "the endpoint 406s when the MR has no pending auto-merge"). GitHub's
+// GraphQL mutation transport succeeds even when the mutation itself reports
+// nothing to do - ghGraphQL surfaces that as a plain error carrying the
+// GraphQL response's message text, not an HTTPError - so it needs a message
+// match on the "auto merge is not enabled" text GitHub returns.
+func isAutoMergeAlreadyOffError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var he *scm.HTTPError
+	if errors.As(err, &he) {
+		return he.Status == 406
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "auto merge is not enabled") ||
+		strings.Contains(msg, "auto-merge is not enabled")
+}
+
+// disarmCloseCommentAlreadyPosted reports whether the disarm sweep's "must not
+// merge" close note (closeMsg, embedded in ClosePR's body) is already present
+// on the PR/MR thread, reusing the same content-dedup normalization the
+// comment gate applies elsewhere (duplicateRecentBotComment). This
+// deliberately bypasses the FULL comment gate (decideCommentGate): that gate
+// also withholds on a CLOSED target, which this PR always is by the time the
+// dedup check would matter (ClosePR itself closes it), so routing through the
+// full gate would suppress the very first post too, not just repeats (C5).
+// Fail-open (false, i.e. "not yet posted") on any read error or missing
+// wiring, matching the gate family's fail-open contract - a lost read must
+// never block the close verb itself.
+func (r *TaskReconciler) disarmCloseCommentAlreadyPosted(ctx context.Context, provider, token, repoURL string, number int, botLogin, body string) bool {
+	if botLogin == "" || r.ReaderFor == nil {
+		return false
+	}
+	reader, err := r.ReaderFor(provider, token)
+	if err != nil || reader == nil {
+		return false
+	}
+	owner, name, err := scm.OwnerRepo(repoURL)
+	if err != nil {
+		return false
+	}
+	var comments []scm.IssueComment
+	if pl, ok := reader.(scm.PRCommentLister); ok {
+		comments, err = pl.ListPRComments(ctx, owner, name, number)
+	} else {
+		comments, err = reader.ListIssueComments(ctx, owner, name, number)
+	}
+	if err != nil {
+		return false
+	}
+	return duplicateRecentBotComment(comments, botLogin, body)
 }
 
 // writeBackOpenChange attempts a PR/MR on every Project repo and opens one on

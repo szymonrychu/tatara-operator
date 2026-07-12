@@ -46,6 +46,17 @@ type lifecycleFakeSCMWriter struct {
 		number int
 		body   string
 	}
+	// prState/prStateErr (C1 disarm-merged check): GetPRState's canned return.
+	// Zero value (Merged: false) matches every existing caller's assumption
+	// that the PR is not merged unless a test opts in.
+	prState    scm.PRState
+	prStateErr error
+}
+
+func (f *lifecycleFakeSCMWriter) GetPRState(_ context.Context, _, _ string, _ int) (scm.PRState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.prState, f.prStateErr
 }
 
 func (f *lifecycleFakeSCMWriter) GetIssueState(_ context.Context, _, _ string, _ int) (scm.IssueState, error) {

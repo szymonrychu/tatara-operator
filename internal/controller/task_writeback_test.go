@@ -664,6 +664,14 @@ type fullFakeSCMWriter struct {
 	// repeats. Empty/nil means ClosePR always succeeds.
 	closePRErrs      []error
 	closePRCallCount int
+	// closePRErrByNumber (C5 multi-repo disarm tests): per-PR-number override,
+	// checked before closePRErrs, so one target can stay permanently dirty
+	// across retries while another stays clean in the same sweep.
+	closePRErrByNumber map[int]error
+	// closePRBodyByNumber (C5): every ClosePR body, appended per call, keyed by
+	// PR number - lets a multi-pass test see whether the close note was
+	// re-posted (non-empty body) on a retry for an already-clean target.
+	closePRBodyByNumber map[int][]string
 }
 
 func (f *fullFakeSCMWriter) OpenChange(_ context.Context, _, _, _, _, title, body string) (string, error) {
@@ -709,6 +717,13 @@ func (f *fullFakeSCMWriter) ClosePR(_ context.Context, _, _ string, number int, 
 	f.closePRNumber = number
 	f.closePRBody = body
 	f.closePRCallCount++
+	if f.closePRBodyByNumber == nil {
+		f.closePRBodyByNumber = map[int][]string{}
+	}
+	f.closePRBodyByNumber[number] = append(f.closePRBodyByNumber[number], body)
+	if err, ok := f.closePRErrByNumber[number]; ok {
+		return err
+	}
 	if len(f.closePRErrs) == 0 {
 		return nil
 	}
