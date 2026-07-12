@@ -122,6 +122,9 @@ type fakeProposalReader struct {
 	// bodies maps "owner/repo#number" to a GetIssue Body response, for
 	// syncSiblingLinks tests. Nil/missing entries return an empty body.
 	bodies map[string]string
+	// getIssueErrs maps "owner/repo#number" to a GetIssue error, for M5's
+	// syncSiblingLinks clean-sweep tests.
+	getIssueErrs map[string]error
 }
 
 func (f *fakeProposalReader) ListOpenIssues(_ context.Context, _, _ string) ([]scm.IssueRef, error) {
@@ -144,6 +147,9 @@ func (f *fakeProposalReader) ListIssueComments(_ context.Context, _, _ string, _
 }
 func (f *fakeProposalReader) GetIssue(_ context.Context, owner, name string, number int) (scm.IssueContent, error) {
 	key := fmt.Sprintf("%s/%s#%d", owner, name, number)
+	if err, ok := f.getIssueErrs[key]; ok {
+		return scm.IssueContent{}, err
+	}
 	return scm.IssueContent{Body: f.bodies[key]}, nil
 }
 func (f *fakeProposalReader) GetDefaultBranchHeadSHA(_ context.Context, _, _ string) (string, error) {

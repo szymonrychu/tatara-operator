@@ -231,19 +231,23 @@ spec:
             properties:
               approvedByMaintainer:
                 description: |-
-                  ApprovedByMaintainer records the identity-verified fact that a HUMAN
-                  MAINTAINER explicitly approved this issue for implementation, by applying
-                  the approved label to it. It is set by the webhook ONLY when it observes an
-                  issues.labeled{approved} event whose ACTOR is a MaintainerLogins member
-                  (never the bot: a bot/agent that sets the label itself cannot self-approve).
-                  It is the ONLY signal that releases a front-half Task (clarify / the
-                  issueLifecycle bridge) into the autonomous implement->review->merge->deploy
-                  chain: every path that would advance a front-half issue to Implement gates
-                  on it (finishFrontHalf, the Conversation label readback, the trigger-label
-                  jump). Empty means NO verified maintainer approval - the operator fails
-                  CLOSED (parks to Conversation) rather than trusting raw label presence,
-                  which an agent with SCM write could forge. Holds the approving maintainer's
-                  login for audit.
+                  ApprovedByMaintainer records that this issue was approved for
+                  implementation, either by a HUMAN MAINTAINER (the webhook sets it ONLY
+                  when it observes an issues.labeled{approved} event whose ACTOR is a
+                  MaintainerLogins member - never the bot: a bot/agent that sets the label
+                  itself cannot self-approve) OR by the auto-approve release path (item 4a,
+                  recordAutoApproval), which writes the audit sentinel
+                  "<tatara:auto:<kind>>" instead of a login - see AutoApproved. Both are
+                  accepted approval sources by design; consumers that need to distinguish
+                  them check AutoApproved. It is the ONLY signal that releases a
+                  front-half Task (clarify / the issueLifecycle bridge) into the
+                  autonomous implement->review->merge->deploy chain: every path that would
+                  advance a front-half issue to Implement gates on it (finishFrontHalf,
+                  the Conversation label readback, the trigger-label jump). Empty means NO
+                  recorded approval - the operator fails CLOSED (parks to Conversation)
+                  rather than trusting raw label presence, which an agent with SCM write
+                  could forge. Holds the approving maintainer's login (or the auto-approve
+                  sentinel) for audit.
                 type: string
               autoApproved:
                 description: |-
@@ -497,6 +501,19 @@ spec:
                   own direct maintainer approval: an approved lead's group extends to
                   every OTHER member that is implementation-locked. Item Request C/d.
                 type: boolean
+              implementationLockedAt:
+                description: |-
+                  ImplementationLockedAt is when ImplementationLocked was set (handoff.go,
+                  setImplementationLocked). M4: a collapsed systemic sibling never gets a
+                  superseding Task (issueScanPickOne skips task creation for it entirely -
+                  "no separate agent"), so a lock with no successor Task would otherwise
+                  stand forever even after new human activity reopens the conversation.
+                  issueScanPickOne compares this timestamp against the issue's live
+                  comment history on every scan of a collapsed sibling and clears a stale
+                  lock when a human comment postdates it, instead of depending on a new
+                  Task ever existing.
+                format: date-time
+                type: string
               issueLinks:
                 description: |-
                   IssueLinks is every issue this Task touched: DiscoveredIssues,

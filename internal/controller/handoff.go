@@ -6,6 +6,7 @@ import (
 	"context"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -63,14 +64,39 @@ func (r *TaskReconciler) setImplementationLocked(ctx context.Context, task *tata
 		}
 		if fresh.Status.ImplementationLocked {
 			task.Status.ImplementationLocked = true
+			task.Status.ImplementationLockedAt = fresh.Status.ImplementationLockedAt
 			return nil
 		}
+		now := metav1.Now()
 		fresh.Status.ImplementationLocked = true
+		fresh.Status.ImplementationLockedAt = &now
 		if err := r.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
 		task.Status.ImplementationLocked = true
+		task.Status.ImplementationLockedAt = &now
 		return nil
+	})
+}
+
+// clearImplementationLock resets Status.ImplementationLocked/ImplementationLockedAt
+// on the given Task (M4: a collapsed systemic sibling never gets a superseding
+// Task, so a stale lock must be cleared in place when new human activity
+// reopens the conversation - see issueScanPickOne's collapsed-sibling branch).
+// A free function (not a *TaskReconciler method) since the only caller,
+// issueScanPickOne, is a *ProjectReconciler method; both embed client.Client.
+func clearImplementationLock(ctx context.Context, c client.Client, task *tatarav1alpha1.Task) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+			return err
+		}
+		if !fresh.Status.ImplementationLocked {
+			return nil
+		}
+		fresh.Status.ImplementationLocked = false
+		fresh.Status.ImplementationLockedAt = nil
+		return c.Status().Update(ctx, fresh)
 	})
 }
 

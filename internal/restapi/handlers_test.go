@@ -821,6 +821,21 @@ func TestChangeSummary_InvalidBody(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+// TestChangeSummary_RejectsProjectScopedKind is the M1 kind-gate regression:
+// unlike issue_outcome/implement_outcome, change-summary had NO kind gate at
+// all, so a project-scoped kind (incident/healthCheck/brainstorm - never opens
+// a PR) could still carry a RemainingScope value. Project-scoped kinds are
+// rejected the same way brainstorm-outcome rejects a non-brainstorm task.
+func TestChangeSummary_RejectsProjectScopedKind(t *testing.T) {
+	r := buildRouter(t, taskWithKind("t4", "alpha", "incident"))
+	body := strings.NewReader(`{"prTitle":"feat: add login","prBody":"b","deliveredScope":"s","remainingScope":"gap","changeSignificance":"minor"}`)
+	req := httptest.NewRequest(http.MethodPost, "/tasks/t4/change-summary", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusConflict, w.Code, "body: %s", w.Body.String())
+}
+
 // --- POST /tasks/{t}/comment ---
 
 func taskWithSource(name, projectRef, issueRef string) *tatarav1alpha1.Task {

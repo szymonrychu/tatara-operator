@@ -4,6 +4,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -156,5 +157,111 @@ func TestSyncAllSiblingLinksIfNeeded_SkipsSingleIssue(t *testing.T) {
 
 	if edits := fw.editCallsSnapshot(); len(edits) != 0 {
 		t.Errorf("want 0 edits for a lone issue, got %d: %+v", len(edits), edits)
+	}
+}
+
+// TestSyncAllSiblingLinksIfNeeded_TransientFailureDoesNotStamp is the M5
+// regression: syncSiblingLinks used to swallow every GetIssue/EditIssue error
+// (best-effort) while syncAllSiblingLinksIfNeeded stamped LinksSyncedURLs
+// UNCONDITIONALLY afterwards - so under SCM rate-limiting (a transient error)
+// a sibling whose read failed was never retried until the sibling SET
+// changed. A transient failure on one sibling must leave LinksSyncedURLs
+// unstamped so the NEXT reconcile retries the whole sweep.
+func TestSyncAllSiblingLinksIfNeeded_TransientFailureDoesNotStamp(t *testing.T) {
+	ctx := context.Background()
+	name := "links-transient-fail"
+	proj := "links-transient-fail-p"
+	repo := "links-transient-fail-r"
+	sec := "links-transient-fail-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#5",
+		URL: "https://github.com/o/r/issues/5", Number: 5,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 5, Kind: tatarav1alpha1.WorkItemIssue},
+		{Provider: "github", Repo: "o/r", Number: 6, Kind: tatarav1alpha1.WorkItemIssue},
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &fakeProposalWriter{}
+	reader := &fakeProposalReader{
+		bodies: map[string]string{"o/r#5": "issue 5 body", "o/r#6": "issue 6 body"},
+		// #6's GetIssue fails transiently (e.g. rate-limited): NOT a 404/410.
+		getIssueErrs: map[string]error{"o/r#6": errors.New("rate limited")},
+	}
+	r := &TaskReconciler{
+		Client:    k8sClient,
+		Scheme:    k8sClient.Scheme(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		SCMFor:    func(string) (scm.SCMWriter, error) { return fw, nil },
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return reader, nil },
+	}
+
+	r.syncAllSiblingLinksIfNeeded(ctx, task)
+
+	fresh := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, fresh); err != nil {
+		t.Fatalf("re-get task: %v", err)
+	}
+	if len(fresh.Status.LinksSyncedURLs) != 0 {
+		t.Fatalf("LinksSyncedURLs must NOT be stamped after a transient sibling failure, got %v", fresh.Status.LinksSyncedURLs)
+	}
+
+	// A second reconcile must retry the sweep (not gated by a wrongly-stamped
+	// URL set): the failing sibling's edit is attempted again.
+	editsBefore := len(fw.editCallsSnapshot())
+	r.syncAllSiblingLinksIfNeeded(ctx, fresh)
+	if got := len(fw.editCallsSnapshot()); got <= editsBefore {
+		t.Fatalf("second reconcile after a transient failure must retry the sweep; edits before=%d after=%d", editsBefore, got)
+	}
+}
+
+// TestSyncAllSiblingLinksIfNeeded_PermanentGoneStillStamps: a 404/410 on a
+// sibling is terminal (the issue can never be read again), so it must count
+// as "done" for that sibling and the sweep may still stamp LinksSyncedURLs -
+// unlike a transient error, it must not retry forever.
+func TestSyncAllSiblingLinksIfNeeded_PermanentGoneStillStamps(t *testing.T) {
+	ctx := context.Background()
+	name := "links-gone"
+	proj := "links-gone-p"
+	repo := "links-gone-r"
+	sec := "links-gone-s"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#5",
+		URL: "https://github.com/o/r/issues/5", Number: 5,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Status.WorkItems = []tatarav1alpha1.WorkItemRef{
+		{Provider: "github", Repo: "o/r", Number: 5, Kind: tatarav1alpha1.WorkItemIssue},
+		{Provider: "github", Repo: "o/r", Number: 6, Kind: tatarav1alpha1.WorkItemIssue},
+	}
+	if err := k8sClient.Status().Update(ctx, task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &fakeProposalWriter{}
+	reader := &fakeProposalReader{
+		bodies:       map[string]string{"o/r#5": "issue 5 body"},
+		getIssueErrs: map[string]error{"o/r#6": &scm.HTTPError{Status: 404, Path: "/repos/o/r/issues/6"}},
+	}
+	r := &TaskReconciler{
+		Client:    k8sClient,
+		Scheme:    k8sClient.Scheme(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		SCMFor:    func(string) (scm.SCMWriter, error) { return fw, nil },
+		ReaderFor: func(_, _ string) (scm.SCMReader, error) { return reader, nil },
+	}
+
+	r.syncAllSiblingLinksIfNeeded(ctx, task)
+
+	fresh := &tatarav1alpha1.Task{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, fresh); err != nil {
+		t.Fatalf("re-get task: %v", err)
+	}
+	if len(fresh.Status.LinksSyncedURLs) != 2 {
+		t.Fatalf("a permanently-gone sibling must still count as a clean sweep, got LinksSyncedURLs=%v", fresh.Status.LinksSyncedURLs)
 	}
 }

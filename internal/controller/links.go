@@ -42,21 +42,28 @@ func SpliceLinksBlock(body, block string) string {
 
 // syncSiblingLinks rewrites the managed tatara-links block in every sibling
 // issue so each one lists the OTHERS. Called whenever a Task's issue-kind
-// ledger gains a member (item 5). No-op when fewer than 2 issue siblings
-// exist (a lone issue has nothing to cross-link). Best-effort per sibling: one
-// failed edit does not block the rest.
-func (r *TaskReconciler) syncSiblingLinks(ctx context.Context, provider, token string, siblingURLs []string) {
+// ledger gains a member (item 5). No-op (clean) when fewer than 2 issue
+// siblings exist (a lone issue has nothing to cross-link). Best-effort per
+// sibling: one failed edit does not block the rest, but the sweep as a whole
+// reports whether it was clean via the returned bool - M5: the caller only
+// stamps Status.LinksSyncedURLs (which gates the NEXT resync) when the sweep
+// was clean, so a sibling hit by a transient SCM error (e.g. rate-limiting)
+// gets retried on the next reconcile instead of being silently skipped
+// forever. A permanent 404/410 (the issue is gone and can never be read
+// again) is treated as done, not as a reason to keep retrying.
+func (r *TaskReconciler) syncSiblingLinks(ctx context.Context, provider, token string, siblingURLs []string) bool {
 	if len(siblingURLs) < 2 || r.ReaderFor == nil {
-		return
+		return true
 	}
 	reader, err := r.ReaderFor(provider, token)
 	if err != nil {
-		return
+		return false
 	}
 	writer, err := r.SCMFor(provider)
 	if err != nil {
-		return
+		return false
 	}
+	clean := true
 	for _, self := range siblingURLs {
 		repoSlug, number, ok := parseIssueURL(self)
 		if !ok {
@@ -72,6 +79,9 @@ func (r *TaskReconciler) syncSiblingLinks(ctx context.Context, provider, token s
 		content, gerr := reader.GetIssue(ctx, owner, name, number)
 		r.recordSCM(provider, "get_issue", gerr)
 		if gerr != nil {
+			if !isPermanentTargetGone(gerr) {
+				clean = false
+			}
 			continue
 		}
 		newBody := SpliceLinksBlock(content.Body, RenderLinksBlock(others))
@@ -80,8 +90,12 @@ func (r *TaskReconciler) syncSiblingLinks(ctx context.Context, provider, token s
 		}
 		if eerr := writer.EditIssue(ctx, token, repoSlug, number, scm.EditIssueReq{Body: &newBody}); eerr != nil {
 			log.FromContext(ctx).Error(eerr, "syncSiblingLinks: edit issue (non-fatal, best-effort)", "issue", self)
+			if !isPermanentTargetGone(eerr) {
+				clean = false
+			}
 		}
 	}
+	return clean
 }
 
 // discoveredIssueSiblings returns Status.DiscoveredIssues when it holds 2+
@@ -104,7 +118,12 @@ func discoveredIssueSiblings(task *tatarav1alpha1.Task) []string {
 // only when defaultProvider is itself empty (the "owner/repo#N" ref format
 // used throughout this codebase is GitHub-style; no self-hosted-GitLab base
 // is resolvable from a bare ref string with no provider hint at all).
-func allIssueSiblingURLs(task *tatarav1alpha1.Task, defaultProvider string) []string {
+// repoURLFor (m8) is an optional owner/repo-slug -> Repository.Spec.URL
+// lookup: when it resolves a slug, that repo's real URL threads through to
+// issueURLFromRepoURL so a self-hosted GitLab project renders links against
+// its own host instead of the gitlab.com fallback. A slug with no entry (or
+// a nil map) still falls back to the provider-derived default host.
+func allIssueSiblingURLs(task *tatarav1alpha1.Task, defaultProvider string, repoURLFor map[string]string) []string {
 	fallback := defaultProvider
 	if fallback == "" {
 		fallback = "github"
@@ -126,7 +145,7 @@ func allIssueSiblingURLs(task *tatarav1alpha1.Task, defaultProvider string) []st
 		if provider == "" {
 			provider = fallback
 		}
-		add(issueURLFromRepoURL("", provider, wi.Repo, wi.Number))
+		add(issueURLFromRepoURL(repoURLFor[wi.Repo], provider, wi.Repo, wi.Number))
 	}
 	for _, u := range task.Status.DiscoveredIssues {
 		add(u)
@@ -137,7 +156,7 @@ func allIssueSiblingURLs(task *tatarav1alpha1.Task, defaultProvider string) []st
 			if repo == "" || n == 0 {
 				continue
 			}
-			add(issueURLFromRepoURL("", fallback, repo, n))
+			add(issueURLFromRepoURL(repoURLFor[repo], fallback, repo, n))
 		}
 	}
 	return urls
@@ -170,7 +189,18 @@ func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *
 	if project.Spec.Scm == nil {
 		return
 	}
-	urls := allIssueSiblingURLs(task, project.Spec.Scm.Provider)
+	// m8: resolve each enrolled repo's real URL so a self-hosted GitLab
+	// project's sibling links render against its own host instead of the
+	// gitlab.com fallback (issueURLFromRepoURL's default when repoURL is "").
+	repoURLFor := map[string]string{}
+	if repos, rerr := r.projectRepos(ctx, &project); rerr == nil {
+		for i := range repos {
+			if slug, serr := scm.RepoSlugFromURL(repos[i].Spec.URL); serr == nil {
+				repoURLFor[slug] = repos[i].Spec.URL
+			}
+		}
+	}
+	urls := allIssueSiblingURLs(task, project.Spec.Scm.Provider, repoURLFor)
 	if len(urls) < 2 {
 		return
 	}
@@ -183,7 +213,15 @@ func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *
 			"action", "task_links_sync_skip", "resource_id", task.Name, "err", terr.Error())
 		return
 	}
-	r.syncSiblingLinks(ctx, project.Spec.Scm.Provider, token, urls)
+	if clean := r.syncSiblingLinks(ctx, project.Spec.Scm.Provider, token, urls); !clean {
+		// M5: an unclean sweep (a transient failure on at least one sibling)
+		// must NOT stamp LinksSyncedURLs, so the next reconcile retries the
+		// whole sweep instead of the sibling-set-changed gate above masking it
+		// forever.
+		log.FromContext(ctx).Info("links: sibling sweep incomplete (transient error); will retry next reconcile",
+			"action", "task_links_sync_incomplete", "resource_id", task.Name)
+		return
+	}
 	if perr := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 		if slices.Equal(fresh.Status.LinksSyncedURLs, urls) {
 			return false

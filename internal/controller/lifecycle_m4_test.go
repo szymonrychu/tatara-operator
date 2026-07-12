@@ -210,6 +210,79 @@ func TestLifecycleImplement_RemainingScope_FailsIncomplete(t *testing.T) {
 	}
 }
 
+// TestLifecycleImplement_RemainingScope_CommentsAndRemovesLabel is the m9
+// regression: checkRemainingScopeHardFail used to post NO issue comment and
+// leave the tatara-implementation label in place, unlike every other terminal
+// path (parkWithComment / the codifiedTerminal declined path) - a human saw an
+// implementation-labelled issue with no PR and no explanation. It must post an
+// explanatory comment mentioning the declared remaining scope, and remove the
+// implementation label (setLifecycleLabel's declined swap), matching those
+// other terminal paths.
+func TestLifecycleImplement_RemainingScope_CommentsAndRemovesLabel(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	name := "lc-m9-rem"
+	proj := "lc-m9-rp"
+	repo := "lc-m9-rr"
+	sec := "lc-m9-rs"
+	src := &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "o/r#91",
+		URL: "https://github.com/o/r/issues/91", Number: 91,
+		IsPR: false,
+	}
+	task := seedLifecycleTask(t, name, proj, repo, sec, src)
+	task.Spec.Goal = "Implement login system"
+	if err := k8sClient.Update(context.Background(), task); err != nil {
+		t.Fatalf("update task spec: %v", err)
+	}
+	task.Status.DeployState = "Implement"
+	task.Status.Phase = "Succeeded"
+	task.Status.LifecycleIterations = 1
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		PRTitle:        "feat: login",
+		PRBody:         "Adds login.",
+		DeliveredScope: "login endpoint",
+		RemainingScope: "logout endpoint, password reset",
+	}
+	if err := k8sClient.Status().Update(context.Background(), task); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	fw := &lifecycleFakeSCMWriter{openPRURL: "https://github.com/o/r/pull/92"}
+	r := newLifecycleReconciler(t, fw)
+
+	_, err := r.reconcileLifecycle(ctx, func() *tatarav1alpha1.Task {
+		tk := &tatarav1alpha1.Task{}
+		if e := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: name}, tk); e != nil {
+			t.Fatalf("get task: %v", e)
+		}
+		return tk
+	}())
+	if err != nil {
+		t.Fatalf("reconcileLifecycle: %v", err)
+	}
+
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if len(fw.commentCalls) != 1 {
+		t.Fatalf("commentCalls = %d, want 1 (explanatory comment for the human)", len(fw.commentCalls))
+	}
+	if !strings.Contains(fw.commentCalls[0].body, "logout endpoint, password reset") {
+		t.Errorf("comment body = %q, want it to mention the declared remaining scope", fw.commentCalls[0].body)
+	}
+	if fw.commentCalls[0].issueRef != "o/r#91" {
+		t.Errorf("comment issueRef = %q, want o/r#91", fw.commentCalls[0].issueRef)
+	}
+	found := false
+	for _, lb := range fw.removeLabelCalls {
+		if lb == "tatara-implementation" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("removeLabelCalls = %v, want tatara-implementation removed", fw.removeLabelCalls)
+	}
+}
+
 // TestLifecycleImplement_RemainingScope_NeverOpensPROrAutoMerges verifies F1:
 // the RemainingScope hard-fail must run BEFORE writeBackOpenChange, so an
 // incomplete change never gets its PR opened, never gets the semver label
@@ -261,8 +334,15 @@ func TestLifecycleImplement_RemainingScope_NeverOpensPROrAutoMerges(t *testing.T
 	if len(fw.openCalls) != 0 {
 		t.Errorf("OpenChange called %d times; want 0 - no PR may open for an incomplete change", len(fw.openCalls))
 	}
-	if len(fw.labelCalls) != 0 {
-		t.Errorf("AddLabel called %d times; want 0 - no semver label for an incomplete change", len(fw.labelCalls))
+	// m9: checkRemainingScopeHardFail now swaps the phase label to
+	// tatara-declined (labelCalls carries "tatara-declined"), a legitimate,
+	// intentional label write distinct from the semver label this test
+	// actually guards against - that one would come from applySemverAutoMerge
+	// downstream of writeBackOpenChange, which never runs here.
+	for _, lb := range fw.labelCalls {
+		if strings.HasPrefix(lb, "semver:") {
+			t.Errorf("AddLabel(%q) called; want no semver label for an incomplete change", lb)
+		}
 	}
 	if fw.autoMergeCalls != 0 {
 		t.Errorf("EnableAutoMerge called %d times; want 0 - auto-merge must never be enabled for an incomplete change", fw.autoMergeCalls)

@@ -1627,6 +1627,28 @@ func (r *ProjectReconciler) issueScanPickOne(
 	l := log.FromContext(ctx)
 	key := fmt.Sprintf("%s#%d", c.repo, c.number)
 	if d, ok := systemicLeads[key]; ok && !d.isLead {
+		// M4: a collapsed sibling never gets a separate Task/agent (below), so
+		// this is the ONLY place a stale ImplementationLocked lock can ever be
+		// noticed and cleared - issueScanPickOne returns before task creation,
+		// so no successor Task is ever created to supersede it, and a lock
+		// with no successor would otherwise stand forever even after new
+		// human activity reopens the conversation. Clear it here when a human
+		// comment postdates the lock.
+		if sib := newestTaskForSource(existing, c.repo, c.number); sib != nil &&
+			sib.Status.ImplementationLocked && sib.Status.ImplementationLockedAt != nil {
+			owner, name, cut := strings.Cut(c.repo, "/")
+			if cut && reader != nil && botLogin != "" &&
+				humanCommentAfter(ctx, cc, owner, name, c.number, botLogin, sib.Status.ImplementationLockedAt.Time) {
+				if err := clearImplementationLock(ctx, r.Client, sib); err != nil {
+					l.Error(err, "issueScan: clear stale implementation lock", "action", "systemic_lock_clear_error",
+						"resource_id", sib.Name, "issue", key)
+				} else {
+					l.Info("issueScan: cleared stale implementation lock (human activity since lock)",
+						"action", "systemic_lock_clear", "resource_id", sib.Name, "issue", key,
+						"locked_at", sib.Status.ImplementationLockedAt.Time)
+				}
+			}
+		}
 		// Collapsed sibling: no implementation agent. Mark idempotently and skip.
 		if w, token, werr := r.scanWriter(ctx, proj); werr == nil {
 			var siblingRepoCRPtr *tatarav1alpha1.Repository

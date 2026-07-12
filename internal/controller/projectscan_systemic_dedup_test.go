@@ -10,6 +10,8 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // siblingFakeSCM implements both scm.SCMReader and scm.SCMWriter for
@@ -179,5 +181,118 @@ func TestIssueScan_SystemicDedup_LeadInFlightStillCollapsesSibling(t *testing.T)
 	collapsedCount := counterValue(t, reg, "tatara_systemic_siblings_collapsed_total", map[string]string{"project": "systemic-dedup-inflight"})
 	if collapsedCount < 1 {
 		t.Fatalf("sibling must be collapsed even with lead in-flight; collapsed counter = %v", collapsedCount)
+	}
+}
+
+// TestIssueScan_SystemicDedup_StaleLockClearedOnHumanActivity is the M4
+// regression: a collapsed systemic sibling never gets a superseding Task
+// (issueScanPickOne skips task creation for it entirely - "no separate
+// agent"), so an ImplementationLocked sibling whose lock predates a NEW human
+// comment must have its lock cleared right here, at the one place a collapsed
+// sibling is still visited every scan - otherwise the lock stands forever and
+// the approved lead's PR would force-close a sibling with live open
+// questions.
+func TestIssueScan_SystemicDedup_StaleLockClearedOnHumanActivity(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, _ := seedScanProject(t, "systemic-stale-lock", cron)
+	repo := mkScanRepo(t, "systemic-stale-lock", "systemic-stale-lock-r", "https://github.com/o/r.git")
+
+	// Real-clock-relative timestamps (issue dedup ALSO gates on human activity
+	// since the Task's real CreationTimestamp, so Unix-epoch stub times would
+	// make the candidate look stale and never reach issueScanPickOne at all).
+	t0 := time.Now()
+	sib := &tatarav1alpha1.Task{}
+	sib.GenerateName = "clarify-"
+	sib.Namespace = testNS
+	sib.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "systemic-stale-lock", RepositoryRef: repo.Name, Goal: "g", Kind: "clarify",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#15", Number: 15}}
+	if err := k8sClient.Create(context.Background(), sib); err != nil {
+		t.Fatalf("pre-create sibling: %v", err)
+	}
+	lockedAt := metav1.NewTime(t0.Add(1 * time.Minute))
+	sib.Status.Phase = "Succeeded"
+	sib.Status.ImplementationLocked = true
+	sib.Status.ImplementationLockedAt = &lockedAt
+	if err := k8sClient.Status().Update(context.Background(), sib); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+
+	// Human comment on #15 AFTER the lock timestamp: the conversation reopened.
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 12, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(100, 0), Title: "A"},
+			{Repo: "o/r", Number: 15, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(200, 0), Title: "C"},
+		},
+		comments: []scm.IssueComment{
+			{Author: "a-human", Body: "wait, I have another question", CreatedAt: t0.Add(2 * time.Minute)},
+		},
+	}
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, []tatarav1alpha1.Task{*sib}, cron.IssueScan)
+
+	var got tatarav1alpha1.Task
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: sib.Name}, &got); err != nil {
+		t.Fatalf("re-get sibling: %v", err)
+	}
+	if got.Status.ImplementationLocked {
+		t.Fatalf("stale lock must be cleared after a human comment postdating ImplementationLockedAt")
+	}
+	if got.Status.ImplementationLockedAt != nil {
+		t.Fatalf("ImplementationLockedAt must be cleared alongside the lock")
+	}
+}
+
+// TestIssueScan_SystemicDedup_FreshLockNotClearedWithoutNewActivity is the
+// negative case: a human comment exists (so the candidate still clears the
+// issueScan dedup gate and reaches the collapsed-sibling branch), but it
+// PREdates the lock, so the lock must survive untouched (the fan-out path
+// still needs it).
+func TestIssueScan_SystemicDedup_FreshLockNotClearedWithoutNewActivity(t *testing.T) {
+	cron := &tatarav1alpha1.ScmCron{IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 * * * *"}}
+	proj, _ := seedScanProject(t, "systemic-fresh-lock", cron)
+	repo := mkScanRepo(t, "systemic-fresh-lock", "systemic-fresh-lock-r", "https://github.com/o/r.git")
+
+	t0 := time.Now()
+	sib := &tatarav1alpha1.Task{}
+	sib.GenerateName = "clarify-"
+	sib.Namespace = testNS
+	sib.Spec = tatarav1alpha1.TaskSpec{ProjectRef: "systemic-fresh-lock", RepositoryRef: repo.Name, Goal: "g", Kind: "clarify",
+		Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "o/r#15", Number: 15}}
+	if err := k8sClient.Create(context.Background(), sib); err != nil {
+		t.Fatalf("pre-create sibling: %v", err)
+	}
+	lockedAt := metav1.NewTime(t0.Add(1 * time.Minute))
+	sib.Status.Phase = "Succeeded"
+	sib.Status.ImplementationLocked = true
+	sib.Status.ImplementationLockedAt = &lockedAt
+	if err := k8sClient.Status().Update(context.Background(), sib); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+
+	// Comment exists (clears the dedup gate) but is BEFORE the lock timestamp:
+	// no new activity since the lock was set.
+	reader := &fakeReader{
+		issues: []scm.IssueRef{
+			{Repo: "o/r", Number: 12, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(100, 0), Title: "A"},
+			{Repo: "o/r", Number: 15, Labels: []string{"tatara/systemic-abc"}, UpdatedAt: time.Unix(200, 0), Title: "C"},
+		},
+		comments: []scm.IssueComment{
+			{Author: "a-human", Body: "original question", CreatedAt: t0.Add(30 * time.Second)},
+		},
+	}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	r.issueScan(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, []tatarav1alpha1.Task{*sib}, cron.IssueScan)
+
+	var got tatarav1alpha1.Task
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: sib.Name}, &got); err != nil {
+		t.Fatalf("re-get sibling: %v", err)
+	}
+	if !got.Status.ImplementationLocked {
+		t.Fatalf("lock must survive when no new human activity postdates it")
 	}
 }

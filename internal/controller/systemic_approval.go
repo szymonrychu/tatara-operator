@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -34,30 +35,45 @@ func newestTaskForSource(tasks []tatarav1alpha1.Task, repo string, number int) *
 		if !tatarav1alpha1.TaskMatchesItemAsSource(t, repo, number) {
 			continue
 		}
-		if newest == nil || newest.CreationTimestamp.Before(&t.CreationTimestamp) {
+		if newest == nil || isNewerTask(t, newest) {
 			newest = t
 		}
 	}
 	return newest
 }
 
-// issueHasRecordedApproval reports whether the Task that IS (repoSlug, number) -
-// resolved by source identity only, never a lead's role:closes ledger entry -
-// carries a recorded maintainer approval (Status.ApprovedByMaintainer set).
-// This is the strong human-gate signal: a sibling a maintainer declined or
-// never approved never has it set, so it fails this check and is stripped
-// from any force-close.
-func issueHasRecordedApproval(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
-	for i := range tasks {
-		t := &tasks[i]
-		if t.Status.ApprovedByMaintainer == "" {
-			continue
-		}
-		if tatarav1alpha1.TaskMatchesItemAsSource(t, repoSlug, number) {
-			return true
-		}
+// isNewerTask reports whether t is newer than other. m6: metav1.Time is
+// second-granularity, so two Tasks created in the same wall-clock second have
+// an equal CreationTimestamp and CreationTimestamp.Before() never picks a
+// winner between them - the caller's scan order then decided non-
+// deterministically. Falls back to a stable, input-order-independent
+// tie-break (greater Name) so the same pair always resolves to the same
+// winner; the tie-break carries no recency meaning of its own.
+func isNewerTask(t, other *tatarav1alpha1.Task) bool {
+	if other.CreationTimestamp.Before(&t.CreationTimestamp) {
+		return true
+	}
+	if t.CreationTimestamp.Equal(&other.CreationTimestamp) {
+		return t.Name > other.Name
 	}
 	return false
+}
+
+// issueHasRecordedApproval reports whether the NEWEST Task that IS (repoSlug,
+// number) - resolved by source identity only, never a lead's role:closes
+// ledger entry - carries a recorded approval (Status.ApprovedByMaintainer
+// set). m7: newest-wins, matching issueIsImplementationLocked's resolution
+// for the same source identity - an ANY-match scan let a stale approved Task
+// from an earlier cycle outlive a newer, unapproved re-triage. A sibling a
+// maintainer declined or never approved never has it set (on its newest
+// Task), so it fails this check and is stripped from any force-close.
+// ApprovedByMaintainer also carries the auto-approve sentinel
+// ("<tatara:auto:<kind>>", set by recordAutoApproval) - that is an accepted
+// approval source for this check by design (auto-approve composes with
+// fan-out), not a bypass to guard against.
+func issueHasRecordedApproval(tasks []tatarav1alpha1.Task, repoSlug string, number int) bool {
+	t := newestTaskForSource(tasks, repoSlug, number)
+	return t != nil && t.Status.ApprovedByMaintainer != ""
 }
 
 // issueIsImplementationLocked reports whether the NEWEST Task that IS
@@ -131,7 +147,17 @@ func (r *TaskReconciler) withApprovedSystemicGroup(ctx context.Context, task *ta
 	}
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(task.Namespace)); err != nil {
-		return task
+		// M3: fail CLOSED on a List error - handing the agent prompt the FULL
+		// unfiltered group (the old behaviour, returning task unchanged) would
+		// let it reference/close every member with no approval check at all.
+		// A copy with an empty (but non-nil) SystemicGroup is the safe default:
+		// no member fans out until a later reconcile can actually verify
+		// approval state.
+		log.FromContext(ctx).Error(err, "systemic approval: list tasks failed; failing closed (no fan-out)",
+			"action", "systemic_approval_list_error", "resource_id", task.Name)
+		tc := *task
+		tc.Spec.SystemicGroup = &tatarav1alpha1.SystemicGroup{SystemicID: task.Spec.SystemicGroup.SystemicID}
+		return &tc
 	}
 	leadApproved := task.Status.ApprovedByMaintainer != ""
 	filtered, _, fannedOut := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), leadApproved, tl.Items)
@@ -157,7 +183,17 @@ func (r *TaskReconciler) unapprovedSystemicSiblings(ctx context.Context, task *t
 	}
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(task.Namespace)); err != nil {
-		return nil
+		// M3: fail CLOSED on a List error - the old nil return let the
+		// writeback caller skip neutralization entirely (every "Closes #N"
+		// survives). Treat every same-repo sibling as unapproved instead, so
+		// the caller strips them all.
+		log.FromContext(ctx).Error(err, "systemic approval: list tasks failed; failing closed (all siblings unapproved)",
+			"action", "systemic_approval_list_error", "resource_id", task.Name)
+		m := make(map[int]bool, len(task.Spec.SystemicGroup.SameRepoSiblings))
+		for _, n := range task.Spec.SystemicGroup.SameRepoSiblings {
+			m[n] = true
+		}
+		return m
 	}
 	leadApproved := task.Status.ApprovedByMaintainer != ""
 	_, unapproved, _ := filterSystemicGroupByApproval(task.Spec.SystemicGroup, leadRepoOf(task), leadApproved, tl.Items)
@@ -171,26 +207,60 @@ func (r *TaskReconciler) unapprovedSystemicSiblings(ctx context.Context, task *t
 	return m
 }
 
-// closeDirectiveRE matches a GitHub/GitLab auto-close directive ("closes #12",
-// "Fixes #7", "resolved #3", ...) capturing the issue number. Cross-repo forms
-// ("closes owner/repo#3") deliberately do NOT match: systemic CrossRepo members are
-// reference-only and are never closed from the lead PR body.
-var closeDirectiveRE = regexp.MustCompile(`(?i)\b(?:clos(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed))\s+#(\d+)`)
+// closeDirectiveRE matches a GitHub/GitLab auto-close directive: the keyword
+// set both forges recognize (close/fix/resolve/implement, every inflection -
+// base, -s, -ed, -ing), an optional colon, an optional "issue"/"issues" word,
+// then a comma/"and"-separated list of "#N" refs ("Closes: #7", "Closing #7",
+// "Fixes issue #7", "Closes #7, #8", ...). Captures the whole ref-list as
+// group 1 so every number in a list can be neutralized individually, not only
+// the first. Cross-repo forms ("closes owner/repo#3") deliberately do NOT
+// match: systemic CrossRepo members are reference-only and are never closed
+// from the lead PR body - "owner/repo" is neither "issue"/"issues" nor a bare
+// "#", so the ref-list alternation fails right after the keyword.
+var closeDirectiveRE = regexp.MustCompile(
+	`(?i)\b(?:clos(?:e|es|ed|ing)|fix(?:es|ed|ing)?|resolv(?:e|es|ed|ing)|implement(?:s|ed|ing)?)` +
+		`\s*:?\s*(?:issues?\s+)?(#\d+(?:\s*(?:,|and)\s*(?:issues?\s+)?#\d+)*)`)
 
-// neutralizeUnapprovedCloses rewrites any auto-close directive targeting an
+// closeDirectiveRefRE extracts each individual "#N" ref out of a
+// closeDirectiveRE ref-list match.
+var closeDirectiveRefRE = regexp.MustCompile(`#(\d+)`)
+
+// neutralizeUnapprovedCloses rewrites every auto-close directive targeting an
 // unapproved sibling number into a plain "refs #N" reference, so merging the lead's
-// combined PR never force-closes a sibling a maintainer has not approved. Directives
-// for approved siblings (and the lead's own issue) are left intact.
+// combined PR never force-closes a sibling a maintainer has not approved.
+//   - A directive whose every ref is approved is left byte-for-byte untouched
+//     (preserves the agent's original keyword/casing).
+//   - A directive whose every ref is unapproved is rewritten to a "refs #N"
+//     list, dropping the original keyword entirely.
+//   - A MIXED list ("Closes #7, #8" with only #8 approved) is rebuilt ref-by-ref:
+//     an unapproved ref becomes "refs #N", an approved ref is normalized to
+//     "Closes #N" (the original single keyword cannot represent both states at
+//     once).
 func neutralizeUnapprovedCloses(body string, unapproved map[int]bool) string {
 	if len(unapproved) == 0 {
 		return body
 	}
 	return closeDirectiveRE.ReplaceAllStringFunc(body, func(m string) string {
-		sub := closeDirectiveRE.FindStringSubmatch(m)
-		n, err := strconv.Atoi(sub[1])
-		if err == nil && unapproved[n] {
-			return "refs #" + sub[1]
+		refs := closeDirectiveRefRE.FindAllStringSubmatch(m, -1)
+		anyUnapproved := false
+		for _, sub := range refs {
+			if n, err := strconv.Atoi(sub[1]); err == nil && unapproved[n] {
+				anyUnapproved = true
+				break
+			}
 		}
-		return m
+		if !anyUnapproved {
+			return m
+		}
+		parts := make([]string, 0, len(refs))
+		for _, sub := range refs {
+			n, _ := strconv.Atoi(sub[1])
+			if unapproved[n] {
+				parts = append(parts, "refs #"+sub[1])
+			} else {
+				parts = append(parts, "Closes #"+sub[1])
+			}
+		}
+		return strings.Join(parts, ", ")
 	})
 }

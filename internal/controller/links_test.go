@@ -52,7 +52,7 @@ func TestAllIssueSiblingURLs_UnionsWorkItemsDiscoveredAndCrossRepo(t *testing.T)
 			},
 		},
 	}
-	got := allIssueSiblingURLs(task, "")
+	got := allIssueSiblingURLs(task, "", nil)
 	want := []string{
 		"https://github.com/o/r/issues/7",
 		"https://github.com/o/r/issues/8",
@@ -77,7 +77,7 @@ func TestAllIssueSiblingURLs_DedupesAndSkipsBelowThreshold(t *testing.T) {
 			DiscoveredIssues: []string{"https://github.com/o/r/issues/7"}, // duplicate of WorkItems entry
 		},
 	}
-	got := allIssueSiblingURLs(task, "")
+	got := allIssueSiblingURLs(task, "", nil)
 	if len(got) != 1 {
 		t.Fatalf("allIssueSiblingURLs() = %v, want exactly 1 deduped URL", got)
 	}
@@ -101,9 +101,45 @@ func TestAllIssueSiblingURLs_ThreadsProjectProvider(t *testing.T) {
 			},
 		},
 	}
-	got := allIssueSiblingURLs(task, "gitlab")
+	got := allIssueSiblingURLs(task, "gitlab", nil)
 	want := []string{
 		"https://gitlab.com/o/r/-/issues/7",
+		"https://gitlab.com/o/other/-/issues/3",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("allIssueSiblingURLs() = %v, want %v", got, want)
+	}
+	for i, u := range want {
+		if got[i] != u {
+			t.Errorf("allIssueSiblingURLs()[%d] = %q, want %q", i, got[i], u)
+		}
+	}
+}
+
+// TestAllIssueSiblingURLs_ThreadsRepoURLForSelfHostedGitLab is the m8
+// regression: issueURLFromRepoURL("", "gitlab", ...) hardcodes gitlab.com when
+// no repo URL is threaded, rendering wrong links for a self-hosted GitLab
+// project. When a repoURLFor lookup resolves the repo's real URL, that host
+// must be used instead of the gitlab.com fallback.
+func TestAllIssueSiblingURLs_ThreadsRepoURLForSelfHostedGitLab(t *testing.T) {
+	task := &tatarav1alpha1.Task{
+		Status: tatarav1alpha1.TaskStatus{
+			WorkItems: []tatarav1alpha1.WorkItemRef{
+				{Repo: "o/r", Number: 7, Kind: tatarav1alpha1.WorkItemIssue},
+			},
+		},
+		Spec: tatarav1alpha1.TaskSpec{
+			SystemicGroup: &tatarav1alpha1.SystemicGroup{
+				SystemicID: "sg1",
+				CrossRepo:  []string{"o/other#3 - the other issue"},
+			},
+		},
+	}
+	repoURLFor := map[string]string{"o/r": "https://gitlab.example.com/o/r.git"}
+	got := allIssueSiblingURLs(task, "gitlab", repoURLFor)
+	want := []string{
+		"https://gitlab.example.com/o/r/-/issues/7",
+		// o/other has no repoURLFor entry: falls back to gitlab.com.
 		"https://gitlab.com/o/other/-/issues/3",
 	}
 	if len(got) != len(want) {

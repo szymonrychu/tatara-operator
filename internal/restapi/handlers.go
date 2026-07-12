@@ -1234,46 +1234,29 @@ func (s *Server) changeSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "change significance must be one of major|minor|patch")
 		return
 	}
-	key := client.ObjectKey{Namespace: s.ns, Name: chi.URLParam(r, "t")}
-	var t tatarav1alpha1.Task
-	if err := s.c.Get(r.Context(), key, &t); err != nil {
-		writeClientErr(w, err)
-		return
-	}
-	if !authorizeCaller(w, r) {
-		return
-	}
-	start := time.Now()
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if gerr := s.c.Get(r.Context(), key, &t); gerr != nil {
-			return gerr
-		}
-		t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
-			PRTitle:         req.PRTitle,
-			PRBody:          req.PRBody,
-			DeliveredScope:  req.DeliveredScope,
-			RemainingScope:  req.RemainingScope,
-			MostProblematic: req.MostProblematic,
-			Significance:    req.ChangeSignificance,
-		}
-		return s.c.Status().Update(r.Context(), &t)
-	}); err != nil {
-		if s.metrics != nil {
-			s.metrics.RecordRESTRequest("change_summary", "error", time.Since(start).Seconds())
-		}
-		writeClientErr(w, err)
-		return
-	}
-	elapsed := time.Since(start)
-	if s.metrics != nil {
-		s.metrics.RecordRESTRequest("change_summary", "ok", elapsed.Seconds())
-	}
-	s.log.InfoContext(r.Context(), "restapi: changeSummary",
-		append(reqLogFields(r),
-			"action", "change_summary",
-			"resource_id", key.Name,
-			"duration_ms", elapsed.Milliseconds())...)
-	writeJSON(w, http.StatusOK, toTaskDTO(t))
+	// M1: kind gate (unlike issue_outcome/implement_outcome, this handler had
+	// none - any kind, including project-scoped kinds that never open a PR,
+	// could carry a RemainingScope value that a writeback path might later
+	// trust). Project-scoped kinds (incident/healthCheck/brainstorm) are
+	// rejected; every other kind can open a change and legitimately posts a
+	// change summary.
+	s.mutateTaskStatus(w, r, mutateTaskStatusParams{
+		metricName: "change_summary",
+		logMsg:     "restapi: changeSummary",
+		logAction:  "change_summary",
+		kindOK:     func(kind string) bool { return !tatarav1alpha1.IsProjectScopedKind(kind) },
+		kindErrMsg: "change summary does not apply to a project-scoped task",
+		mutate: func(t *tatarav1alpha1.Task) {
+			t.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+				PRTitle:         req.PRTitle,
+				PRBody:          req.PRBody,
+				DeliveredScope:  req.DeliveredScope,
+				RemainingScope:  req.RemainingScope,
+				MostProblematic: req.MostProblematic,
+				Significance:    req.ChangeSignificance,
+			}
+		},
+	})
 }
 
 // --- M3: POST /tasks/{t}/handover ---

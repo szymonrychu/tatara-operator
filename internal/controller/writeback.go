@@ -47,6 +47,15 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "AlreadyWritten", "pr/mr url already set")
 	}
 
+	// M1: hoisted ABOVE the kind switch so EVERY branch is guarded, including
+	// "triageIssue" (writeBackIssue's implement action used to call
+	// writeBackOpenChange directly with no check at all - the one entry point
+	// F4 missed). No-ops when ChangeSummary is nil or carries no RemainingScope,
+	// so kinds that never set it (review/brainstorm/...) are unaffected.
+	if res, err, handled := r.checkRemainingScopeHardFail(ctx, task); handled {
+		return res, err
+	}
+
 	switch task.Spec.Kind {
 	case "review":
 		return r.writeBackReview(ctx, task)
@@ -92,14 +101,9 @@ func (r *TaskReconciler) doWriteBack(ctx context.Context, task *tatarav1alpha1.T
 		return ctrl.Result{}, r.clearWritebackPending(ctx, task, "ProjectScopedComplete", task.Spec.Kind+" is project-scoped; no PR to open")
 	}
 
-	// F4: enforce full-scope-or-decline on the generic write-back path too (the
-	// kind=implement Task created off the tatara-implementation label - see
-	// checkRemainingScopeHardFail). Must run before writeBackOpenChange, same
-	// ordering requirement as the issueLifecycle bridge (F1).
-	if res, err, handled := r.checkRemainingScopeHardFail(ctx, task); handled {
-		return res, err
-	}
-
+	// F4/M1: full-scope-or-decline already enforced above, before the kind
+	// switch, for every branch including this fallthrough (kind=implement and
+	// future kinds that open a change).
 	return r.writeBackOpenChange(ctx, task)
 }
 
@@ -116,8 +120,33 @@ func (r *TaskReconciler) checkRemainingScopeHardFail(ctx context.Context, task *
 	if cs == nil || cs.RemainingScope == "" {
 		return ctrl.Result{}, nil, false
 	}
-	log.FromContext(ctx).Info("writeback: change_summary declared remaining scope; failing task before any PR opens (full-scope-or-decline)",
+	l := log.FromContext(ctx)
+	l.Info("writeback: change_summary declared remaining scope; failing task before any PR opens (full-scope-or-decline)",
 		"action", "lifecycle_implement_incomplete_scope", "resource_id", task.Name)
+	// m9: every other terminal path (parkWithComment / the codifiedTerminal
+	// declined path) posts an explanatory issue comment and swaps the phase
+	// label off tatara-implementation; this hard-fail used to do neither,
+	// leaving a human staring at an implementation-labelled issue with no PR
+	// and no explanation. Post the same CONVERSATIONAL comment those other
+	// paths use (gated, not an operator-internal status comment) and remove
+	// the implementation label - best-effort, degrading to log-only when the
+	// SCM context is unresolvable (e.g. an umbrella task with no single
+	// RepositoryRef), matching parkWithComment's own degrade path.
+	msg := "The implementation declared remaining scope (\"" + cs.RemainingScope + "\") instead of completing it in " +
+		"one PR or calling decline_implementation. No PR was opened and no follow-up issue was filed " +
+		"(full-scope-or-decline) - leaving this for a human."
+	if proj, _, writer, token, provider, scmErr := r.scmContext(ctx, task); scmErr == nil {
+		if task.Spec.Source != nil && !task.Spec.Source.IsPR && task.Spec.Source.IssueRef != "" {
+			if _, cerr := r.gatedComment(ctx, &proj, nil, writer, token, provider, task.Spec.Source.Number, task.Spec.Source.IsPR, task.Spec.Source.AuthorLogin, task.Spec.Source.IssueRef, msg); cerr != nil {
+				l.Error(cerr, "writeback: post remaining-scope comment (non-fatal)", "resource_id", task.Name)
+			}
+			if lerr := r.ensurePhaseLabel(ctx, &proj, task, "declined"); lerr != nil {
+				l.Error(lerr, "writeback: remove implementation label (non-fatal)", "resource_id", task.Name)
+			}
+		}
+	} else {
+		l.Error(scmErr, "writeback: scm context for remaining-scope comment (non-fatal)", "resource_id", task.Name)
+	}
 	res, err = r.terminate(ctx, task, "Failed", "IncompleteImplementation",
 		"change_summary declared remaining_scope; agents must implement the full scope in one PR "+
 			"or call decline_implementation instead of leaving a gap - no follow-up issues are filed")

@@ -55,6 +55,9 @@ func (f *fakeWriter) Comment(_ context.Context, _, issueRef, body string) error 
 	return nil
 }
 
+func (f *fakeWriter) AddLabel(_ context.Context, _, _, _ string) error    { return nil }
+func (f *fakeWriter) RemoveLabel(_ context.Context, _, _, _ string) error { return nil }
+
 func newWriteBackReconciler(t *testing.T, fw *fakeWriter) *TaskReconciler {
 	t.Helper()
 	return &TaskReconciler{
