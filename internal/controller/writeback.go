@@ -120,6 +120,15 @@ func (r *TaskReconciler) checkRemainingScopeHardFail(ctx context.Context, task *
 	if cs == nil || cs.RemainingScope == "" {
 		return ctrl.Result{}, nil, false
 	}
+	// D3: only a kind that OPENS a change can ship an incomplete one. The REST
+	// change_summary endpoint now rejects every other kind, but the guard is
+	// hoisted above doWriteBack's whole kind switch, so a change_summary already
+	// stored on (say) a review Task would otherwise hard-fail it before
+	// writeBackReview ever ran - the verdict would never post and the PR would
+	// sit unreviewed.
+	if !tatarav1alpha1.IsChangeOpeningKind(task.Spec.Kind) {
+		return ctrl.Result{}, nil, false
+	}
 	l := log.FromContext(ctx)
 	l.Info("writeback: change_summary declared remaining scope; failing task before any PR opens (full-scope-or-decline)",
 		"action", "lifecycle_implement_incomplete_scope", "resource_id", task.Name)

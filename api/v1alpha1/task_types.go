@@ -225,6 +225,19 @@ func IsProjectScopedKind(kind string) bool {
 	return projectScopedKinds[kind]
 }
 
+// IsChangeOpeningKind reports whether a task kind can legitimately OPEN a
+// PR/MR, i.e. reaches writeBackOpenChange in doWriteBack's kind switch. That is
+// every kind except (a) the project-scoped ones, which open no change at all,
+// and (b) review, which posts a verdict on an EXISTING PR and never opens one.
+// It gates the change_summary REST endpoint and the full-scope-or-decline
+// hard-fail: a kind that cannot open a PR can never ship an incomplete change,
+// so a change_summary (and any remainingScope on it) is meaningless there - and
+// hard-failing on one would kill a Task whose real job, e.g. posting a review
+// verdict, was still pending.
+func IsChangeOpeningKind(kind string) bool {
+	return !IsProjectScopedKind(kind) && kind != "review"
+}
+
 // IsKnownKind reports whether kind is a valid Task kind (any of the scoped,
 // project-scoped, or unconstrained sets). Used by the QueuedEvent validator.
 func IsKnownKind(kind string) bool {

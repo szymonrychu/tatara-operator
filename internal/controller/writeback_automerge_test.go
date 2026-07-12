@@ -137,3 +137,40 @@ func TestWriteBackOpenChange_SemverLabelAndAutoMerge(t *testing.T) {
 		require.False(t, fw.addLabelCalled, "documentation: no semver label stamped on PR")
 	})
 }
+
+// TestDoWriteBack_ReviewKind_RemainingScopeStillPostsVerdict is the D3
+// regression. The change_summary REST gate rejected only PROJECT-scoped kinds,
+// so kind=review could carry a change_summary - and the full-scope-or-decline
+// hard-fail is hoisted ABOVE doWriteBack's kind switch. A review agent that
+// misfired remainingScope (plausibly describing what the PR UNDER REVIEW still
+// lacks) therefore hard-failed its own REVIEW Task before writeBackReview ran:
+// the verdict never posted and the PR sat unreviewed forever. A review Task
+// opens no PR, so remaining scope on it can never ship anything - the hard-fail
+// must not apply to it.
+func TestDoWriteBack_ReviewKind_RemainingScopeStillPostsVerdict(t *testing.T) {
+	fw := &fullFakeSCMWriter{}
+	r := newFullFakeReconciler(t, fw)
+	task := seedWritebackKindTask(t, "wbk-rev-remscope", "wbk-rrs-p", "wbk-rrs-r", "wbk-rrs-s",
+		tatarav1alpha1.TaskSpec{
+			Goal: "review a PR",
+			Kind: "review",
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: "github", IssueRef: "o/r#9", IsPR: true, Number: 9,
+			},
+		}, nil)
+	task.Status.ReviewVerdict = &tatarav1alpha1.ReviewVerdict{Decision: "approve", Body: "lgtm"}
+	task.Status.ChangeSummary = &tatarav1alpha1.ChangeSummary{
+		RemainingScope: "the PR under review still lacks logout",
+		Significance:   "minor",
+	}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), task))
+
+	_, err := reconcileWriteback(t, r, task.Name)
+	require.NoError(t, err)
+
+	require.True(t, fw.approveCalled, "the review verdict must still post: a review Task opens no PR, so remaining scope cannot ship anything")
+	require.Equal(t, 9, fw.approveNumber)
+
+	got := getTask(t, task.Name)
+	require.NotEqual(t, "Failed", got.Status.Phase, "a review Task must never hard-fail on remaining scope")
+}
