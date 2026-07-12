@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -433,5 +434,51 @@ func TestTurnComplete_EmitsTaskTokens(t *testing.T) {
 	}
 	if input != 1200 {
 		t.Errorf("input tokens = %v, want 1200", input)
+	}
+}
+
+func TestTurnComplete_LogsAgentInternalIssue(t *testing.T) {
+	mkTaskProject(t, "p-ii", 3)
+	mkTaskRepository(t, "r-ii", "p-ii")
+	mkTask(t, "t-ii", "p-ii", "r-ii")
+	annotate(t, "t-ii", map[string]string{annCurrentTurn: "turn-ii-1"})
+
+	var buf bytes.Buffer
+	ctx := captureLogger(&buf)
+
+	cb := newCallbackServer()
+	body, _ := json.Marshal(map[string]any{
+		"turnId": "turn-ii-1", "state": "completed",
+		"internalIssues": []map[string]string{
+			{
+				"category": "tool_error", "severity": "error",
+				"description": "the tool blew up", "offending_tool": "Bash", "resource_id": "res-1",
+			},
+			{
+				"category": "auth", "severity": "warn",
+				"description": "auth flaked",
+			},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/internal/turn-complete", bytes.NewReader(body)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	cb.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%s", w.Code, w.Body.String())
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, `"action": "agent_internal_issue"`) {
+		t.Fatalf("expected an agent_internal_issue log line, got: %s", out)
+	}
+	if !strings.Contains(out, `"category": "tool_error"`) || !strings.Contains(out, `"description": "the tool blew up"`) {
+		t.Errorf("first issue fields missing from log output: %s", out)
+	}
+	if !strings.Contains(out, `"category": "auth"`) || !strings.Contains(out, `"description": "auth flaked"`) {
+		t.Errorf("second issue fields missing from log output: %s", out)
+	}
+	if !strings.Contains(out, `"turn_id": "turn-ii-1"`) {
+		t.Errorf("turn_id field missing from log output: %s", out)
 	}
 }
