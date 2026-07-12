@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -88,4 +89,78 @@ func discoveredIssueSiblings(task *tatarav1alpha1.Task) []string {
 		return nil
 	}
 	return task.Status.DiscoveredIssues
+}
+
+// allIssueSiblingURLs returns the deduped union of every issue URL this Task
+// spans: Status.WorkItems issue-kind entries, Status.DiscoveredIssues, and
+// Spec.SystemicGroup.CrossRepo refs (item Request C/b: all-links comment on
+// multi-issue tasks). Provider defaults to "github" when a WorkItemRef or
+// CrossRepo ref does not carry one (the "owner/repo#N" ref format used
+// throughout this codebase is GitHub-style; no self-hosted-GitLab base is
+// resolvable from a bare ref string).
+func allIssueSiblingURLs(task *tatarav1alpha1.Task) []string {
+	seen := make(map[string]bool)
+	var urls []string
+	add := func(u string) {
+		if u == "" || seen[u] {
+			return
+		}
+		seen[u] = true
+		urls = append(urls, u)
+	}
+	for _, wi := range task.Status.WorkItems {
+		if wi.Kind != tatarav1alpha1.WorkItemIssue || wi.Number == 0 || wi.Repo == "" {
+			continue
+		}
+		provider := wi.Provider
+		if provider == "" {
+			provider = "github"
+		}
+		add(issueURLFromRepoURL("", provider, wi.Repo, wi.Number))
+	}
+	for _, u := range task.Status.DiscoveredIssues {
+		add(u)
+	}
+	if g := task.Spec.SystemicGroup; g != nil {
+		for _, ref := range g.CrossRepo {
+			repo, n := parseCrossRepoRef(ref)
+			if repo == "" || n == 0 {
+				continue
+			}
+			add(issueURLFromRepoURL("", "github", repo, n))
+		}
+	}
+	return urls
+}
+
+// syncAllSiblingLinksIfNeeded posts/refreshes the tatara-links cross-linking
+// comment on every issue this Task spans, whenever that union holds 2+
+// members (item Request C/b). Runs once per Reconcile for every Task kind,
+// not only from the two prior triggers (proposal completion, the removed
+// implement follow-up). Best-effort: any lookup/SCM failure is logged and
+// swallowed so it never blocks the Task's real reconcile work.
+func (r *TaskReconciler) syncAllSiblingLinksIfNeeded(ctx context.Context, task *tatarav1alpha1.Task) {
+	if r.SCMFor == nil || r.ReaderFor == nil {
+		return
+	}
+	urls := allIssueSiblingURLs(task)
+	if len(urls) < 2 {
+		return
+	}
+	var project tatarav1alpha1.Project
+	if err := r.Get(ctx, client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.ProjectRef}, &project); err != nil {
+		log.FromContext(ctx).Info("links: project lookup failed (non-fatal)",
+			"action", "task_links_sync_skip", "resource_id", task.Name, "err", err.Error())
+		return
+	}
+	if project.Spec.Scm == nil {
+		return
+	}
+	token, terr := r.scmToken(ctx, task.Namespace, project.Spec.ScmSecretRef)
+	if terr != nil {
+		log.FromContext(ctx).Info("links: scm token lookup failed (non-fatal)",
+			"action", "task_links_sync_skip", "resource_id", task.Name, "err", terr.Error())
+		return
+	}
+	r.syncSiblingLinks(ctx, project.Spec.Scm.Provider, token, urls)
 }
