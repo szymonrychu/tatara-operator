@@ -173,12 +173,23 @@ func queueTaskHoldsSlot(t *tatarav1alpha1.Task) bool {
 // reviewing would hold its implement ticket forever AND take a second slot for
 // its review ticket.
 //
-// A legacy payload (no agentKind) has no requested stage: the TASK is the
-// ticket, so only terminality frees it - that path is unchanged.
+// A MINT payload (no agentKind: the legacy flat event or the B.7 blueprint)
+// reserved a lane only to bring the Task into existence. Once the Task leaves
+// the create -> triaging bootstrap and cuts its OWN per-stage pod-ticket, that
+// ticket is the accurate slot accounting and the mint MUST release. Without
+// this an incident's alert-class create event stays inflight and deadlocks
+// against its own alert-class pod-ticket at AlertCapacity=1: the Task holds the
+// single alert slot its investigating pod needs, so the pod never spawns and
+// the slot never frees (2026-07-13, found on first live incident post-cutover).
 func ticketSpent(q *tatarav1alpha1.QueuedEvent, t *tatarav1alpha1.Task) bool {
 	want := q.Spec.Payload.AgentKind
 	if want == "" {
-		return false
+		switch t.Status.Stage {
+		case "", tatarav1alpha1.StageTriaging:
+			return false // still bootstrapping; the mint holds the lane
+		default:
+			return true // in the stage machine; the per-stage ticket accounts for the slot
+		}
 	}
 	if cur := stage.AgentKindFor(t.Status.Stage); cur != "" {
 		return cur != want
