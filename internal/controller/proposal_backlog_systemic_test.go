@@ -23,7 +23,7 @@ func TestProposalBacklogCount_GroupsSystemic(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := proposalBacklogCount(tc.iss, bs, "tatara-idea"); got != tc.want {
+			if got := proposalBacklogCount(tc.iss, bs); got != tc.want {
 				t.Fatalf("proposalBacklogCount = %d, want %d", got, tc.want)
 			}
 		})

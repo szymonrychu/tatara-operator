@@ -5,6 +5,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -13,11 +14,12 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// seedTerminalTokensTask creates a project+repo+task with the given
-// resolved model + cumulative token classes, entering the given lifecycle
-// state. Distinct names per case to avoid the shared-envtest-namespace lesson.
+// seedTerminalTokensTask creates a project+repo+task with the given resolved
+// model + cumulative token classes, parked in a non-terminal stage. Distinct
+// names per case to avoid the shared-envtest-namespace lesson.
 func seedTerminalTokensTask(t *testing.T, name, project, repo, model string, in, out, cr, cc int64) *tatarav1alpha1.Task {
 	t.Helper()
 	ctx := context.Background()
@@ -51,71 +53,65 @@ func seedTerminalTokensTask(t *testing.T, name, project, repo, model string, in,
 			ProjectRef:    project,
 			RepositoryRef: repo,
 			Goal:          "test terminal tokens",
-			Kind:          "issueLifecycle",
+			Kind:          "clarify",
 		},
 	}
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create task: %v", err)
 	}
-	task.Status.DeployState = "Implement"
+	task.Status.Stage = tatarav1alpha1.StageImplementing
 	task.Status.ResolvedModel = model
-	task.Status.CumulativeInput = in
-	task.Status.CumulativeOutput = out
-	task.Status.CumulativeCacheRead = cr
-	task.Status.CumulativeCacheCreation = cc
+	task.Status.Stats.TokensInput = in
+	task.Status.Stats.TokensOutput = out
+	task.Status.Stats.TokensCacheRead = cr
+	task.Status.Stats.TokensCacheCreation = cc
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("seed task status: %v", err)
 	}
 	return task
 }
 
-func TestSetDeployState_EmitsTerminalTokens(t *testing.T) {
+// TestEnterStage_EmitsTerminalTokens guards operator_task_terminal_tokens_total.
+// Its only emitter used to be the retired machine's setDeployState; it now fires
+// from EnterStage, the single transition choke point, so EVERY terminal entry
+// (TaskReconciler's, StageDriver's, the doc batch's) is accounted. The `outcome`
+// label is the terminal STAGE, matching D1's stage vocabulary.
+func TestEnterStage_EmitsTerminalTokens(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
-	t.Run("Parked churned", func(t *testing.T) {
+	t.Run("failed", func(t *testing.T) {
 		task := seedTerminalTokensTask(t, "tt-task-churn", "tt-proj-churn", "tt-repo-churn", "claude-sonnet-5", 1000, 300, 500, 50)
 
 		reg := prometheus.NewRegistry()
-		r := &TaskReconciler{
-			Client:  k8sClient,
-			Scheme:  k8sClient.Scheme(),
-			Metrics: obs.NewOperatorMetrics(reg),
-		}
-		if err := r.setDeployState(ctx, task, "Parked", "implement-failed"); err != nil {
-			t.Fatalf("setDeployState: %v", err)
+		m := obs.NewOperatorMetrics(reg)
+		if err := EnterStage(ctx, k8sClient, nil, m, task, nil,
+			tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now(), nil); err != nil {
+			t.Fatalf("EnterStage: %v", err)
 		}
 
 		const proj, repo, model = "tt-proj-churn", "tt-repo-churn", "claude-sonnet-5"
-		if got := testutil.ToFloat64(r.Metrics.TaskTerminalTokensCounter(proj, repo, "churned", model, "input")); got != 1000 {
-			t.Errorf("churned input = %v, want 1000", got)
-		}
-		if got := testutil.ToFloat64(r.Metrics.TaskTerminalTokensCounter(proj, repo, "churned", model, "output")); got != 300 {
-			t.Errorf("churned output = %v, want 300", got)
-		}
-		if got := testutil.ToFloat64(r.Metrics.TaskTerminalTokensCounter(proj, repo, "churned", model, "cache_read")); got != 500 {
-			t.Errorf("churned cache_read = %v, want 500", got)
-		}
-		if got := testutil.ToFloat64(r.Metrics.TaskTerminalTokensCounter(proj, repo, "churned", model, "cache_creation")); got != 50 {
-			t.Errorf("churned cache_creation = %v, want 50", got)
+		for _, tc := range []struct {
+			class string
+			want  float64
+		}{{"input", 1000}, {"output", 300}, {"cache_read", 500}, {"cache_creation", 50}} {
+			if got := testutil.ToFloat64(m.TaskTerminalTokensCounter(proj, repo, tatarav1alpha1.StageFailed, model, tc.class)); got != tc.want {
+				t.Errorf("failed %s = %v, want %v", tc.class, got, tc.want)
+			}
 		}
 	})
 
-	t.Run("Done delivered", func(t *testing.T) {
-		task := seedTerminalTokensTask(t, "tt-task-done", "tt-proj-done", "tt-repo-done", "claude-opus-4-8", 700, 200, 100, 10)
+	t.Run("no emit on a non-terminal entry", func(t *testing.T) {
+		task := seedTerminalTokensTask(t, "tt-task-live", "tt-proj-live", "tt-repo-live", "claude-opus-4-8", 700, 200, 100, 10)
 
 		reg := prometheus.NewRegistry()
-		r := &TaskReconciler{
-			Client:  k8sClient,
-			Scheme:  k8sClient.Scheme(),
-			Metrics: obs.NewOperatorMetrics(reg),
+		m := obs.NewOperatorMetrics(reg)
+		if err := EnterStage(ctx, k8sClient, nil, m, task, nil,
+			tatarav1alpha1.StageReviewing, "", time.Now(), nil); err != nil {
+			t.Fatalf("EnterStage: %v", err)
 		}
-		if err := r.setDeployState(ctx, task, "Done", ""); err != nil {
-			t.Fatalf("setDeployState: %v", err)
-		}
-
-		const proj, repo, model = "tt-proj-done", "tt-repo-done", "claude-opus-4-8"
-		if got := testutil.ToFloat64(r.Metrics.TaskTerminalTokensCounter(proj, repo, "delivered", model, "input")); got != 700 {
-			t.Errorf("delivered input = %v, want 700", got)
+		got := testutil.ToFloat64(m.TaskTerminalTokensCounter("tt-proj-live", "tt-repo-live", tatarav1alpha1.StageReviewing, "claude-opus-4-8", "input"))
+		if got != 0 {
+			t.Errorf("a non-terminal stage entry must not emit terminal tokens, got %v", got)
 		}
 	})
 }

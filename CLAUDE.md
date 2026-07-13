@@ -54,10 +54,24 @@ subdirectory. The parent `.gitignore` keeps them out of this repo.
    ConfigMap/Secret -> workload consumes via `envFrom`. Genuinely
    list-shaped data is rendered into a templated ConfigMap and read at
    runtime.
-7. **Sonnet for implementation. Opus for merges.** Implementation
-   subagents are sonnet (`claude-sonnet-4-6` or current stable). The
-   merge subagent that integrates parallel work is opus. Plan and
-   review work runs in opus.
+7. **semver push-CD.** Every change declares `change_significance`
+   (major/minor/patch) on `submit_outcome`, or a human sets a
+   `semver:<level>` PR label. **The IMPLEMENTER owns the level; a
+   reviewer may raise it, never lower it.** **Merge is an OPERATOR
+   action, triggered by a review agent's approval. Auto-merge is never
+   armed. Agents never call merge directly** - no MCP tool exposes it -
+   **and agents never post a review either**: the operator writes the
+   SCM review from the accepted verdict. The operator merges each repo
+   in `Task.spec.mergeOrder` sequentially, on green CI, against the
+   exact reviewed head SHA. Never hand-edit a deploy pin; never re-run a
+   green release job (tag mode is not idempotent).
+
+   **In-cluster carve-out (L.10):** **in-cluster agent pods** may not
+   use `gh`/`glab` and may not merge. This is enforced structurally, not
+   by instruction: the pod holds no forge token and the MCP profile
+   exposes no merge action. **Workstation skills** run by a human at a
+   terminal with their own `gh` auth KEEP `gh` and KEEP human-driven
+   merge.
 8. **EVERYTHING through superpowers.** brainstorming, writing-plans,
    test-driven-development, systematic-debugging,
    requesting-code-review, verification-before-completion,
@@ -86,6 +100,14 @@ subdirectory. The parent `.gitignore` keeps them out of this repo.
     `values/common.yaml` + per-release `values/<name>/{common,<env>}.yaml`
     + sops `<env>.secrets.yaml`). Tatara releases live in that repo's
     `helmfiles/tatara/` bucket.
+15. **Sonnet for implementation. Opus for merges.** Implementation
+    subagents are sonnet (`claude-sonnet-4-6` or current stable). The
+    merge subagent that integrates parallel work is opus. Plan and
+    review work runs in opus. (This was rule 7 until the task-centric
+    redesign; 7 is now the semver push-CD contract. The numbering of
+    rules 1-14 is load-bearing - `values.yaml` cites "rule 6" and
+    "rule 14" by number - so this moved to the end rather than
+    renumbering.)
 
 ## Writing rules
 
@@ -126,14 +148,16 @@ installed in the agent container and on PATH.
 
 ## CD (semver push-CD)
 
-- Every change declares significance. Agents set the required
-  `change_significance` field on `change_summary` (major = breaking,
-  minor = feature, patch = fix/other). Humans set a `semver:<level>`
-  label on the PR instead.
-- Agents NEVER merge PRs. The pipeline merges (bot-authored PRs
-  auto-merge on green required checks), cuts the semver tag from the
-  label, publishes artifacts at `vX.Y.Z`, propagates the version pin to
-  the parent repo, and `tatara-helmfile` auto-applies it to the
-  cluster. The operator closes the originating issue on apply success.
-- Never hand-edit a deploy pin. Never re-run a green release job - tag
-  mode is not idempotent.
+See **hard rule 7**. It is the single source of truth and this section
+carries no separate copy on purpose: the previous copy here said "the
+pipeline merges (bot-authored PRs auto-merge on green required checks)",
+which directly contradicts rule 7's "merge is an OPERATOR action,
+auto-merge is never armed". A contradiction left alive in a second
+section is the exact failure mode the redesign's contract review kept
+finding: an implementer reads ONE section.
+
+The operator applies the `semver:<level>` label itself, as a one-way
+projection of `MergeRequest.status.significance` (which `submit_outcome`
+stamps), and it applies it BEFORE the merge - CI cuts the tag from the
+label at the merge commit, so a merge that lands before the label is a
+release that never gets tagged.

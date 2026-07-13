@@ -24,16 +24,24 @@ type interjection struct {
 type fakeSession struct {
 	mu           sync.Mutex
 	submits      []submittedTurn
+	handoffs     []submittedTurn
 	nextID       int
 	getResult    map[string]agent.TurnResult
 	deleted      []string
 	submitErr    error
 	interjects   []interjection
 	interjectErr error
+	// sessionInfo is what GetSession returns; sessionErr overrides it.
+	sessionInfo agent.SessionInfo
+	sessionErr  error
 }
 
 func newFakeSession() *fakeSession {
-	return &fakeSession{getResult: map[string]agent.TurnResult{}}
+	v := agent.ContractVersion
+	return &fakeSession{
+		getResult:   map[string]agent.TurnResult{},
+		sessionInfo: agent.SessionInfo{State: agent.SessionStateReady, ContractVersion: &v},
+	}
 }
 
 func (f *fakeSession) SubmitTurn(_ context.Context, baseURL, text, callbackURL string) (string, error) {
@@ -48,6 +56,27 @@ func (f *fakeSession) SubmitTurn(_ context.Context, baseURL, text, callbackURL s
 	return id, nil
 }
 
+func (f *fakeSession) SubmitHandoffTurn(_ context.Context, baseURL, text, callbackURL string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.submitErr != nil {
+		return "", f.submitErr
+	}
+	f.nextID++
+	id := "turn-" + strconv.Itoa(f.nextID)
+	f.handoffs = append(f.handoffs, submittedTurn{BaseURL: baseURL, Text: text, CallbackURL: callbackURL, TurnID: id})
+	return id, nil
+}
+
+func (f *fakeSession) GetSession(_ context.Context, _ string) (agent.SessionInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sessionErr != nil {
+		return agent.SessionInfo{}, f.sessionErr
+	}
+	return f.sessionInfo, nil
+}
+
 func (f *fakeSession) Interject(_ context.Context, baseURL, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -56,12 +85,6 @@ func (f *fakeSession) Interject(_ context.Context, baseURL, text string) error {
 	}
 	f.interjects = append(f.interjects, interjection{BaseURL: baseURL, Text: text})
 	return nil
-}
-
-func (f *fakeSession) allInterjects() []interjection {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]interjection(nil), f.interjects...)
 }
 
 func (f *fakeSession) GetTurn(_ context.Context, _ string, turnID string) (agent.TurnResult, error) {

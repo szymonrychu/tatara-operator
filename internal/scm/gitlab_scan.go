@@ -16,8 +16,12 @@ type glMR struct {
 	IID          int    `json:"iid"`
 	SHA          string `json:"sha"`
 	SourceBranch string `json:"source_branch"` // head/source branch name
-	Description  string `json:"description"`
-	Author       struct {
+	// GitLab reports the fork relationship as project IDs, not paths: an MR whose
+	// source project differs from its target project is a FORK MR (B.4 clause 1c).
+	SourceProjectID int    `json:"source_project_id"`
+	TargetProjectID int    `json:"target_project_id"`
+	Description     string `json:"description"`
+	Author          struct {
 		Username string `json:"username"`
 	} `json:"author"`
 	Labels    []string  `json:"labels"`
@@ -61,8 +65,19 @@ func (c *GitLab) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 	}
 	out := make([]PRRef, 0, len(raw))
 	for _, m := range raw {
+		// HeadRepo is reported in Repo's namespace (the project path) only when the
+		// MR is same-project. A fork gets its numeric source project id, which never
+		// equals a path, so the B.4 adoption guard refuses it; an unreported source
+		// project leaves it empty, which also fails closed.
+		headRepo := ""
+		if m.SourceProjectID != 0 {
+			headRepo = strconv.Itoa(m.SourceProjectID)
+			if m.SourceProjectID == m.TargetProjectID {
+				headRepo = proj
+			}
+		}
 		out = append(out, PRRef{
-			Repo: proj, Number: m.IID, Author: m.Author.Username,
+			Repo: proj, Number: m.IID, Author: m.Author.Username, HeadRepo: headRepo,
 			HeadSHA: m.SHA, HeadBranch: m.SourceBranch, Body: m.Description, Labels: m.Labels, UpdatedAt: m.UpdatedAt,
 		})
 	}
@@ -141,6 +156,7 @@ func (c *GitLab) ListBoardItems(_ context.Context, _ BoardRef) ([]BoardItem, err
 
 // glNote is the JSON shape of a GitLab issue note.
 type glNote struct {
+	ID     int64 `json:"id"`
 	Author struct {
 		Username string `json:"username"`
 	} `json:"author"`
@@ -205,7 +221,12 @@ func (c *GitLab) glListNotes(ctx context.Context, resource, owner, repo string, 
 		if n.System {
 			continue
 		}
-		out = append(out, IssueComment{Author: n.Author.Username, Body: n.Body, CreatedAt: n.CreatedAt})
+		out = append(out, IssueComment{
+			ExternalID: strconv.FormatInt(n.ID, 10),
+			Author:     n.Author.Username,
+			Body:       n.Body,
+			CreatedAt:  n.CreatedAt,
+		})
 	}
 	// Defensive sort: GitLab returns notes newest-first by default; sort guards
 	// ordering within the fetched set regardless of server-side default.

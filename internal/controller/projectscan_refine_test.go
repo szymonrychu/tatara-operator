@@ -70,7 +70,7 @@ func listRefineQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
 // markRefineTerminal finds the refine Task created for the project (creating
 // one directly if the QE hasn't materialized into a Task in envtest) and sets
 // its Phase, driving the barrier to terminal.
-func markRefineTerminal(t *testing.T, project, phase string) {
+func markRefineTerminal(t *testing.T, project, stg string) {
 	t.Helper()
 	ctx := context.Background()
 	var refineTask *tatarav1alpha1.Task
@@ -93,9 +93,9 @@ func markRefineTerminal(t *testing.T, project, phase string) {
 			t.Fatalf("create refine task: %v", err)
 		}
 	}
-	refineTask.Status.Phase = phase
+	refineTask.Status.Stage = stg
 	if err := k8sClient.Status().Update(ctx, refineTask); err != nil {
-		t.Fatalf("mark refine %s: %v", phase, err)
+		t.Fatalf("mark refine %s: %v", stg, err)
 	}
 }
 
@@ -154,7 +154,7 @@ func TestRefineBarrier_TerminalRefineReleasesBrainstorm(t *testing.T) {
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 1: %v", err)
 	}
-	markRefineTerminal(t, "refine-release", "Succeeded")
+	markRefineTerminal(t, "refine-release", tatarav1alpha1.StageDelivered)
 
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
@@ -185,7 +185,7 @@ func TestRefineBarrier_FailedRefineStillReleases(t *testing.T) {
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 1: %v", err)
 	}
-	markRefineTerminal(t, "refine-failed", "Failed")
+	markRefineTerminal(t, "refine-failed", tatarav1alpha1.StageFailed)
 
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
@@ -255,30 +255,6 @@ func TestRefine_LastRefineRecentSkipsNewRefine(t *testing.T) {
 	}
 }
 
-// TestRefineBarrier_DoesNotGateIssueScanOrMRScan: mrScan and issueScan run on
-// their own due schedule even while the refine barrier holds brainstorm.
-func TestRefineBarrier_DoesNotGateIssueScanOrMRScan(t *testing.T) {
-	proj := seedRefineProject(t, "refine-nogate-issuescan")
-	reader := &fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 1, Title: "open issue"}}}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	ctx := context.Background()
-
-	if _, err := r.runScans(ctx, proj); err != nil {
-		t.Fatalf("runScans: %v", err)
-	}
-	// The refine barrier holds brainstorm (no terminal refine yet)...
-	if len(listBrainstormQEs(t, "refine-nogate-issuescan")) != 0 {
-		t.Fatalf("want brainstorm held pending refine")
-	}
-	// ...but issueScan (due on its own schedule) still fires in the same
-	// reconcile: it is no longer gated on refine.
-	if len(listIssueQEs(t, "refine-nogate-issuescan")) == 0 {
-		t.Fatalf("want issueScan to run even while the refine barrier holds brainstorm")
-	}
-}
-
 // TestLatestTerminalRefineTask_ScopedToCycle: a terminal refine Task from a
 // past cycle (created before the current cycle's due-base) must NOT satisfy
 // the barrier for a later cycle - only a Task created at/after `since`
@@ -299,7 +275,7 @@ func TestLatestTerminalRefineTask_ScopedToCycle(t *testing.T) {
 	if err := k8sClient.Create(ctx, task); err != nil {
 		t.Fatalf("create refine task: %v", err)
 	}
-	task.Status.Phase = "Succeeded"
+	task.Status.Stage = tatarav1alpha1.StageDelivered
 	if err := k8sClient.Status().Update(ctx, task); err != nil {
 		t.Fatalf("mark refine succeeded: %v", err)
 	}
@@ -324,17 +300,4 @@ func TestLatestTerminalRefineTask_ScopedToCycle(t *testing.T) {
 	if laterCycle != nil {
 		t.Fatalf("want stale terminal task NOT to satisfy a later cycle's barrier, got %s", laterCycle.Name)
 	}
-}
-
-// listIssueQEs returns QueuedEvents for the project whose activity == issueScan.
-func listIssueQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
-	t.Helper()
-	qes := listScanQEs(t, project)
-	var out []tatarav1alpha1.QueuedEvent
-	for _, qe := range qes {
-		if qe.Spec.Payload.Labels[labelActivity] == "issueScan" {
-			out = append(out, qe)
-		}
-	}
-	return out
 }

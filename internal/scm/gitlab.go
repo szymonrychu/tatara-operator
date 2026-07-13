@@ -334,6 +334,9 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 		}
 		rdr = bytes.NewReader(b)
 	}
+	if werr := waitEgress(ctx, "gitlab", path); werr != nil {
+		return werr
+	}
 	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
 	if err != nil {
 		return fmt.Errorf("gitlab: build request: %w", err)
@@ -350,6 +353,10 @@ func glDo(ctx context.Context, base, method, path, token string, in, out any) er
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		buf, _ := io.ReadAll(resp.Body)
+		if ghIsRateLimited(resp, string(buf)) {
+			recordRateLimited("gitlab", path, resp, string(buf))
+			return rateLimitedError(resp.StatusCode, string(buf), path)
+		}
 		return &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
 	}
 	if out == nil {
@@ -608,7 +615,13 @@ func (c *GitLab) Suggest(ctx context.Context, repoURL, token string, number int,
 // ErrMergeConflict when GitLab signals the MR is not mergeable (405/406/409).
 // method must be "squash" or "merge"; GitLab does not support "rebase" via the
 // merge endpoint and treating it silently as a non-squash merge would be wrong.
-func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
+// expectedHeadSHA, when non-empty, is sent as `sha`: GitLab refuses the merge with
+// a 409 ("SHA does not match HEAD of source branch") if the head moved between the
+// review and the merge, and that 409 maps to ErrHeadMoved rather than
+// ErrMergeConflict so the caller re-reviews the new head. This closes the TOCTOU
+// on the forge that owns tatara-helmfile, whose deploy runner is cluster-admin.
+// An empty expectedHeadSHA means "no pin" and preserves the pre-pin behaviour.
+func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, method, expectedHeadSHA string) (string, error) {
 	proj, err := glProjectPath(repoURL)
 	if err != nil {
 		return "", err
@@ -619,15 +632,23 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 	default:
 		return "", fmt.Errorf("gitlab: unsupported merge method %q (use \"squash\" or \"merge\")", method)
 	}
-	in := map[string]bool{"squash": method == "squash"}
+	in := map[string]any{"squash": method == "squash"}
+	if expectedHeadSHA != "" {
+		in["sha"] = expectedHeadSHA
+	}
 	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/merge"
 	var resp struct {
 		MergeCommitSHA string `json:"merge_commit_sha"`
 	}
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
 		var he *HTTPError
-		if errors.As(err, &he) && (he.Status == 405 || he.Status == 406 || he.Status == 409) {
-			return "", ErrMergeConflict
+		if errors.As(err, &he) && !errors.Is(err, ErrRateLimited) {
+			if he.Status == http.StatusConflict && expectedHeadSHA != "" {
+				return "", fmt.Errorf("%w: %w", ErrHeadMoved, err)
+			}
+			if he.Status == http.StatusMethodNotAllowed || he.Status == http.StatusNotAcceptable || he.Status == http.StatusConflict {
+				return "", ErrMergeConflict
+			}
 		}
 		return "", err
 	}

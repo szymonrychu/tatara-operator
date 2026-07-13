@@ -45,14 +45,6 @@ spec:
       ports:
         - port: 8080
           protocol: TCP
-    # tatara-chat service.
-    - to:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: {{ .Values.managedPodNetworkPolicy.chatServiceName }}
-      ports:
-        - port: 8080
-          protocol: TCP
     # Operator REST API (HTTP_ADDR :8080) and internal turn-complete callback
     # (INTERNAL_ADDR :8082, via the tatara-operator-internal Service).
     - to:

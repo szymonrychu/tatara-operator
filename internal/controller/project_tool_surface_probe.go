@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -32,10 +31,9 @@ const toolSurfaceVantage = "in-cluster"
 const toolSurfaceUnhealthyThreshold = 3
 
 // updateToolSurfaceProbe probes the agent-facing tool backends the autonomous
-// loop acts through - the operator-write REST surface and (when chat is enabled)
-// each Ready project's chat service - from the same in-cluster URLs agent pods
+// loop acts through - the operator-write REST surface - from the same in-cluster URLs agent pods
 // receive, and meters the served contract per backend. It is the
-// operator-write/chat sibling of updateMemoryRetrievalProbe (which already covers
+// operator-write sibling of updateMemoryRetrievalProbe (which already covers
 // tatara-memory): it runs on the 60s gauge cadence, is best-effort (a probe never
 // fails the reconcile), and is purely observational - it folds into no Project
 // condition and gates no agent dispatch. A failing result is debounced per
@@ -73,15 +71,6 @@ func (r *ProjectReconciler) updateToolSurfaceProbe(ctx context.Context) {
 		r.probeToolSurface(ctx, httpc, "operator", http.MethodGet, r.OperatorURL+"/projects")
 	}
 
-	// chat surface: a single shared tatara-chat service (like the operator-write
-	// surface), probed once when chat is enabled platform-wide (ChatPathPrefix set).
-	// Probe /readyz; the result meters under backend="chat" (no project label, per
-	// the low-cardinality SP1 decision). Chat is not per-project, so this is one
-	// probe per cycle regardless of how many Projects exist.
-	if r.MemoryConfig.ChatPathPrefix == "" {
-		return
-	}
-	r.probeToolSurface(ctx, httpc, "chat", http.MethodGet, r.chatBaseURL()+"/readyz")
 }
 
 // probeToolSurface sends one request to a tool-backend route, classifies the
@@ -162,13 +151,4 @@ func probeToolSurfaceRoute(ctx context.Context, httpc *http.Client, method, url 
 		// served; only a 404 means the route itself is gone.
 		return "present", nil
 	}
-}
-
-// chatBaseURL returns the in-cluster base URL of the shared chat Service (the
-// TATARA_CHAT_URL agent pods receive), or the test override when set.
-func (r *ProjectReconciler) chatBaseURL() string {
-	if r.ChatBaseURL != nil {
-		return r.ChatBaseURL()
-	}
-	return memory.ChatEndpoint(r.MemoryConfig.Namespace)
 }

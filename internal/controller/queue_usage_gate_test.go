@@ -19,8 +19,8 @@ func subscriptionProject(t *testing.T, ctx context.Context, name string, proacti
 	proj := &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec: tatarav1alpha1.ProjectSpec{
-			MaxConcurrentTasks: 5,
-			Queue:              &tatarav1alpha1.QueueSpec{Capacity: 5, AlertCapacity: 5},
+			MaxConcurrentAgents: 5,
+			Queue:               &tatarav1alpha1.QueueSpec{Capacity: 5, AlertCapacity: 5},
 			TokenBudget: &tatarav1alpha1.TokenBudgetSpec{
 				Enabled: true, Mode: "claudeSubscription",
 				ProactivePercent: proactive, EmergencyPercent: emergency,

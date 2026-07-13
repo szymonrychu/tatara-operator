@@ -1,0 +1,12 @@
+<task_index project="tatara" count="2" scope="all">
+  <task name="tatara-refine-2026-07-11-a1b2c" kind="refine" stage="refining" age="26h">
+    <title>Groom the operator backlog</title>
+    <body>First 500 chars of spec.goal...</body>
+    <issues>tatara-operator#291, tatara-cli#80</issues>
+    <mrs>tatara-operator!295</mrs>
+  </task>
+  <task name="tatara-brainstorm-2026-07-09-q7w2e" kind="brainstorm" stage="brainstorming" age="3d">
+    <title>Autonomy budget for the reviewer</title>
+    <body>The in-cluster reviewer is flaky; bound its rounds.</body>
+  </task>
+</task_index>

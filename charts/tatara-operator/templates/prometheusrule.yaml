@@ -31,13 +31,16 @@ spec:
             summary: "tatara-operator reconciled nothing for 15m"
             description: "operator_reconcile_total has not increased for any kind in 15m while the operator is up: the workqueue is wedged even though the pod is alive."
         - alert: TataraLoopStalled
-          expr: increase(tatara_scan_tasks_created_total[3h]) == 0 and increase(tatara_scan_items_total[3h]) == 0
+          expr: |
+            sum(increase(operator_tasks_minted_per_sweep_count[3h])) == 0
+            and
+            sum(increase(tatara_scan_items_total[3h])) == 0
           for: 30m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "tatara loop produced no scan activity for 3h"
-            description: "Neither tatara_scan_items_total nor tatara_scan_tasks_created_total has moved in 3h. The hourly scan cron is producing no work: the loop is silently processing nothing with zero errors (the worst failure class)."
+            summary: "the tatara scan cron produced no activity for 3h"
+            description: "Neither the B.4 sweep nor the brainstorm/documentation/refine scans have run a single pass in 3h. The loop is silently processing nothing with zero errors (the worst failure class). NOTE the primary term is operator_tasks_minted_per_sweep_count, NOT the old tatara_scan_* pair: since the task-centric redesign the SWEEP is the intake and it does not emit tatara_scan_* at all (only brainstorm/documentation/refine still do, on their own slow cadences), so the old expression would have gone from a deadman to a false-firing alert in steady state. The sweep observes that histogram on EVERY pass including a zero-mint one and including a FAILING one - it means 'the cron fired', where TataraSweepStalled's heartbeat gauge means 'a pass completed cleanly'. Both are needed: the gauge produces no series at all until the first clean pass, so it cannot fire on an operator whose sweep has never once succeeded."
         - alert: TataraMemoryStackFailed
           expr: operator_memory_stacks{phase="Failed"} > 0
           for: 15m
@@ -64,12 +67,19 @@ spec:
             summary: "tatara-operator reconciles are erroring"
             description: "operator_reconcile_total{result=\"error\"} has been increasing for 15m; reconciliation is failing for at least one resource kind."
         - alert: TataraTaskFailures
-          expr: increase(operator_task_terminal_total{phase="Failed"}[30m]) > 0
+          expr: increase(operator_task_terminal_total{stage="failed"}[30m]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "Tasks are reaching a terminal Failed phase"
-            description: "{{ "{{" }} $value {{ "}}" }} Task(s) terminated Failed in the last 30m (reason label carries why: PodLost, TurnTimeout, PlanningStalled, BootCrashLoop, ...). This is the uniform loop-failure signal."
+            summary: "Tasks are reaching the terminal failed stage"
+            description: "{{ "{{" }} $value {{ "}}" }} Task(s) entered stage=failed in the last 30m. The stageReason label carries why (pod-recreation-exhausted, agent-unreachable, merge-conflict, merge-timeout, ...). operator_task_terminal_total is labelled {kind, stage, stageReason} since the task-centric redesign - the old {phase=\"Failed\"} selector matched nothing and this alert was silently green."
+        - alert: TataraTasksParked
+          expr: increase(operator_task_terminal_total{stage="parked"}[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "Tasks are parking (the loop gave up and wants a human)"
+            description: "{{ "{{" }} $value {{ "}}" }} Task(s) entered stage=parked in the last 1h: the loop stopped making progress on its own and is waiting on a human. The stageReason label carries why (admission-starved, stage-deadline, awaiting-human, review-cap, ...). Replaces the pre-redesign TataraLifecycleGiveups: tatara_lifecycle_giveup_total died with the issueLifecycle machine. A sweep-minted park (from=\"\") is NOT counted - only a Task that actually ran and then gave up."
         - alert: TataraTurnTimeouts
           expr: increase(operator_turn_timeout_total[1h]) > 0
           labels:
@@ -78,12 +88,12 @@ spec:
             summary: "agent turns are timing out"
             description: "operator_turn_timeout_total increased in the last 1h: one or more agent turns stalled past the inactivity deadline."
         - alert: TataraAgentBootCrashLoop
-          expr: increase(operator_agent_boot_crash_total{outcome="failed"}[30m]) > 0
+          expr: increase(operator_task_terminal_total{stage="failed",stageReason="pod-recreation-exhausted"}[30m]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "wrapper agents are failing to boot"
-            description: "operator_agent_boot_crash_total{outcome=\"failed\"} increased in 30m: a wrapper Pod exhausted its recreation budget without /readyz coming up."
+            description: "A Task terminated failed(pod-recreation-exhausted) in the last 30m: its wrapper Pod exhausted maxPodRecreations without /readyz coming up inside podReadyTimeout. The redesign deleted bootcrash.go and with it the only emitter of operator_agent_boot_crash_total, so this alert now selects the terminal stage reason the stage machine actually writes (F.4 clock 2 -> respawn, budget spent -> failed(pod-recreation-exhausted))."
         - alert: TataraAgentUnreachable
           expr: increase(operator_agent_unreachable_termination_total[15m]) > 0
           labels:
@@ -107,13 +117,6 @@ spec:
           annotations:
             summary: "a repo has not been re-ingested recently"
             description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} last ingested {{ "{{" }} $value | humanizeDuration {{ "}}" }} ago, past the {{ .Values.prometheusRule.ingestStaleAfterSeconds }}s staleness budget: the recall corpus is going stale even though no ingest Job is actively failing (e.g. the re-ingest cron is not landing). Tune via prometheusRule.ingestStaleAfterSeconds."
-        - alert: TataraLifecycleGiveups
-          expr: increase(tatara_lifecycle_giveup_total[1h]) > 0
-          labels:
-            severity: {{ .Values.prometheusRule.severityLabel | quote }}
-          annotations:
-            summary: "issueLifecycle Tasks are giving up"
-            description: "tatara_lifecycle_giveup_total increased in 1h (reason label carries why): the loop abandoned work on an issue/PR."
         - alert: TataraSCMWriteErrors
           expr: increase(operator_scm_writes_total{kind="write",result="error"}[15m]) > 0
           labels:
@@ -136,13 +139,55 @@ spec:
           annotations:
             summary: "SCM write failure ratio high"
             description: "More than 30% of SCM write-backs (comments/labels/approvals/PRs/board) errored over 15m, with at least 3 writes attempted. Denominator excludes kind=\"read\" traffic and blocked (deliberate hard-gate refusals), so this tracks genuine write failures. Break down operator_scm_request_errors_by_status_total by (verb, status) first to see which write is failing: 401/403 => token in the project ScmSecretRef, 429 => rate limit, network/5xx => egress or provider outage. A burst confined to verb=\"remove_label\" status=\"404\" is benign lifecycle-label churn (the label was already absent), swallowed since issue #159 and no longer counted as an error."
-        - alert: TataraWritebackGaveUp4xx
-          expr: increase(operator_writeback_outcome_total{result="skip_4xx_capped"}[1h]) > 0
+        # ---- Class B2: the task-centric machine's own failure modes ----
+        # TataraWritebackGaveUp4xx was DELETED here: operator_writeback_outcome_total
+        # lost its last emitter when the redesign deleted writeback.go. The agent now
+        # opens its own PR through the REST API (mr_write), so there is no operator-side
+        # writeback retry loop left to give up, and a 4xx on that call is answered to the
+        # agent synchronously. An alert on a metric nothing emits is green forever.
+        - alert: TataraUnexpectedMerge
+          expr: increase(operator_unexpected_merge_total[15m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.criticalSeverityLabel | quote }}
+          annotations:
+            summary: "a PR merged that the operator did not merge"
+            description: "operator_unexpected_merge_total{repo=\"{{ "{{" }} $labels.repo {{ "}}" }}\"} increased in 15m: a MergeRequest was observed merged with no mergeCursor advance, i.e. something merged a PR that was NOT the operator's sequential merge. THE MERGE GATE IS OPERATOR LOGIC, NOT A FORGE-ENFORCED CONTROL (accepted risk D-A / contract C.9): one bot identity means the operator cannot post an approving review, so branch protection can never require one, and any pod holding GIT_TOKEN can bypass the gate by curling the merge endpoint. This counter is the DETECTION half of that decision. Treat a non-zero value as an unreviewed change on main until proven otherwise."
+        - alert: TataraIllegalStageTransition
+          expr: increase(operator_illegal_stage_transition_total[30m]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "a Task permanently abandoned writeback on a repeated 4xx"
-            description: "operator_writeback_outcome_total{result=\"skip_4xx_capped\"} increased in 1h: a Succeeded task's writeback hit a permanent 4xx on every project repo for the full skip-4xx attempt budget and gave up (issue #166), so no PR was opened and the loop was stopped. Break down operator_writeback_skip_4xx_total by (status, reason) to name the failure mode without the leader pod's logs: status=\"404\"/\"403\" reason=\"other\" => a wrong/renamed repo URL or a token lacking access; reason=\"already_exists\" => an MR exists but its URL could not be recovered. The offending repo + 4xx body are in the writeback_skip_4xx log line on the leader pod."
+            summary: "the stage machine refused an illegal transition"
+            description: "operator_illegal_stage_transition_total{from=\"{{ "{{" }} $labels.from {{ "}}" }}\",to=\"{{ "{{" }} $labels.to {{ "}}" }}\"} increased in 30m: a caller asked EnterStage for an edge that is not in the F.3 transition table. A non-zero value is a CODE BUG, not an operational condition - the Task is stuck wherever it was."
+        - alert: TataraSemverLabelMissing
+          expr: increase(operator_semver_label_missing_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a PR merged with no semver label: CI cut no release tag"
+            description: "operator_semver_label_missing_total{repo=\"{{ "{{" }} $labels.repo {{ "}}" }}\"} increased in 1h: the operator merged a MergeRequest that carried no declared change significance, so no semver:<level> label was on the PR at the merge commit and the push-CD pipeline cuts NO tag from it (contract H.4). No tag means no publish, no pin, and the deploying stage never resolves. The merge is deliberately NOT stalled on this (that would strand a reviewed, approved change behind an operator bug); a human must tag the merged commit."
+        - alert: TataraSweepStalled
+          expr: (time() - max by (activity) (operator_sweep_last_success_timestamp_seconds)) > {{ .Values.prometheusRule.sweepStaleAfterSeconds }}
+          for: 15m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "the B.4 sweep has not completed a clean pass"
+            description: "No fully successful sweep pass for activity {{ "{{" }} $labels.activity {{ "}}" }} in {{ "{{" }} $value | humanizeDuration {{ "}}" }} (budget {{ .Values.prometheusRule.sweepStaleAfterSeconds }}s). SINCE THE REDESIGN THE SWEEP IS THE ONLY INTAKE - the webhook mints nothing - so a sweep that errors on every pass means the platform silently takes in no work at all while looking healthy. The heartbeat gauge is only stamped when a pass completes with zero errors, so a single failing repo suppresses it; break down operator_sweep_errors_total by (activity, reason) for which step failed. Tune via prometheusRule.sweepStaleAfterSeconds (must exceed the project's issueScan schedule)."
+        - alert: TataraSweepErrors
+          expr: increase(operator_sweep_errors_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "the B.4 sweep is erroring"
+            description: "operator_sweep_errors_total{activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased in 1h: the only intake path is failing on at least one repo (list_issues, list_prs, owner_repo, mint, ...). Work on the forge is not being picked up."
+        - alert: TataraObjectTooLarge
+          expr: increase(operator_object_too_large_total[1h]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a CR exceeded the byte budget with nothing left to evict"
+            description: "operator_object_too_large_total{kind=\"{{ "{{" }} $labels.kind {{ "}}" }}\",name=\"{{ "{{" }} $labels.name {{ "}}" }}\"} increased in 1h: the A.7 pre-write guard refused a write because the object is over budget and every evictable field is already empty. The write was DROPPED - a comment, note or event is lost - and the object cannot grow again until a human prunes it."
         - alert: TataraPushMetricsRejected
           expr: increase(operator_push_receive_total{result="rejected"}[15m]) > 0
           labels:

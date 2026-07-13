@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/accountusage"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/auth"
@@ -17,8 +18,9 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
+	"github.com/szymonrychu/tatara-operator/internal/memclient"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
-	"github.com/szymonrychu/tatara-operator/internal/objstore"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/pushmetrics"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
@@ -28,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // memoryConfigFromConfig maps operator config to the per-project memory stack
@@ -47,8 +50,6 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		IngressClassName:     cfg.IngressClassName,
 		IngressRewriteTarget: cfg.IngressRewriteTarget,
 		MemoryPathPrefix:     cfg.MemoryPathPrefix,
-		ChatPathPrefix:       cfg.ChatPathPrefix,
-		ChatImage:            cfg.ChatImage,
 		MonitorEnabled:       cfg.MemoryMonitoringEnabled,
 		MonitorLabels:        cfg.MemoryMonitorLabels,
 	}
@@ -93,11 +94,15 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 	httpMux := newWebhookMux()
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
+	// SpillerFor resolves the A.7 spill client per Project (the E.3 pendingEvents
+	// mirror + the identity-unverified re-verify both write through objbudget); an
+	// unset SpillerFor left reverifyParked dead (fix W1).
 	webhook.NewServer(webhook.Config{
-		Client:    mgr.GetClient(),
-		Namespace: cfg.Namespace,
-		Metrics:   metrics,
-		Seq:       seq,
+		Client:     mgr.GetClient(),
+		Namespace:  cfg.Namespace,
+		Metrics:    metrics,
+		Seq:        seq,
+		SpillerFor: newSpillerFor(mgr, cfg),
 	}).Mount(httpMux)
 
 	// M3 REST API - OIDC-gated. Discovery failures at startup are fatal so
@@ -120,9 +125,36 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		},
 		Logger:  slog.Default(),
 		Metrics: metrics,
+		// Approval is the C.6 grammar seam. Before this was wired the field was
+		// nil, so verifyApprovalScope FAILED CLOSED on every clarify
+		// decision=implement and the platform could never implement anything
+		// (fix W1). GrammarVerifier runs the real maintainer-identity + anchored-
+		// phrase check against the Issue CR's mirrored comments.
+		Approval: &controller.GrammarVerifier{Client: mgr.GetClient()},
 	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))
+}
+
+// newSpillerFor builds the per-project A.7 spill-client resolver: the
+// tatara-memory client for that Project's status.memory.endpoint. The endpoint
+// is per-project, so the Spiller is resolved per write, not captured once. It is
+// the SAME construction the mirror reconcilers use (addReconcilers), shared so
+// the webhook pendingEvents path spills to the identical per-project endpoint.
+func newSpillerFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.Project) objbudget.Spiller {
+	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
+		ClientID:     cfg.OperatorOIDCClientID,
+		ClientSecret: cfg.OperatorOIDCClientSecret,
+		Audience:     "tatara-memory",
+	})
+	return func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
+		endpoint := ""
+		if proj.Status.Memory != nil {
+			endpoint = proj.Status.Memory.Endpoint
+		}
+		return memclient.New(endpoint, memoryTokens.Token, nil)
+	}
 }
 
 // podConfigFromConfig maps operator config to the wrapper Pod/Service builder
@@ -150,12 +182,6 @@ func podConfigFromConfig(cfg config.Config) agent.PodConfig {
 		Affinity:               cfg.Scheduling.Affinity,
 		CallbackHMACSecretName: cfg.CallbackHMACSecretName,
 		SerenaURL:              cfg.SerenaURL,
-		S3Endpoint:             cfg.S3Endpoint,
-		S3Bucket:               cfg.S3Bucket,
-		S3Region:               cfg.S3Region,
-		S3KeyPrefix:            cfg.S3KeyPrefix,
-		S3ForcePathStyle:       cfg.S3ForcePathStyle,
-		S3SecretName:           cfg.S3SecretName,
 	}
 }
 
@@ -223,7 +249,7 @@ func usageBundleAccessors(reader client.Reader, writer client.Client, namespace,
 // addReconcilers constructs and registers all reconcilers with mgr, and adds
 // the turn-complete callback server as a manager Runnable. It returns the
 // shared SeqSource so callers can pass it to addWebhookServer.
-func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, lifecycleMetrics *obs.LifecycleMetrics, pushReceiver *pushmetrics.Receiver) (*queue.SeqSource, error) {
+func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMetrics, pushReceiver *pushmetrics.Receiver) (*queue.SeqSource, error) {
 	// Fail fast at startup if any wrapper-pod resource quantity is malformed,
 	// rather than silently dropping it on every reconcile.
 	if err := agent.ValidatePodResourceQuantities(podConfigFromConfig(cfg)); err != nil {
@@ -251,7 +277,6 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		Metrics:             metrics,
-		LifecycleMetrics:    lifecycleMetrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,
 		MemoryConfig:        memoryConfigFromConfig(cfg),
 		MemoryToken:         memoryTokens.Token,
@@ -365,13 +390,23 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		ClientSecret: cfg.OperatorOIDCClientSecret,
 		Audience:     "tatara-claude-code-wrapper",
 	})
+	spillerFor := func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
+		endpoint := ""
+		if proj.Status.Memory != nil {
+			endpoint = proj.Status.Memory.Endpoint
+		}
+		return memclient.New(endpoint, memoryTokens.Token, nil)
+	}
+
 	if err := (&controller.TaskReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		Metrics:          metrics,
-		LifecycleMetrics: lifecycleMetrics,
-		Session:          agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
-		PodConfig:        podConfigFromConfig(cfg),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Metrics:       metrics,
+		SpillerFor:    spillerFor,
+		Seq:           seq,
+		BundleMetrics: obs.NewBundleMetrics(ctrlmetrics.Registry),
+		Session:       agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
+		PodConfig:     podConfigFromConfig(cfg),
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
@@ -382,6 +417,63 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		return nil, fmt.Errorf("setup TaskReconciler: %w", err)
 	}
 
+	// The MIRROR (contract B.4/C.1). Both reconcilers write through the A.7
+	// byte-budget guard, whose Spiller is the per-project tatara-memory client
+	// built from that Project's status.memory.endpoint. The endpoint is
+	// per-project, so the Spiller is resolved per write, not captured once. A
+	// project whose memory stack is not up yet has an empty endpoint: memclient
+	// then fails the spill, and objbudget ABORTS the write rather than dropping
+	// comments (SPILL FIRST, DROP ONLY ON SPILL SUCCESS).
+	// THE OPERATOR EGRESS (contract C.4, C.5). One driver, shared by the three
+	// reconcilers that own a piece of it: the mirror reconcilers drain the durable
+	// review/comment intents the REST + MCP layers persist, and the stage
+	// reconciler drives the two pod-less operator stages (merging, deploying). It
+	// is the SOLE merge caller and the SOLE review poster.
+	stageDriver := &controller.StageDriver{
+		Client:  mgr.GetClient(),
+		Metrics: metrics,
+		SCMFor: func(provider string) (scm.SCMWriter, error) {
+			return scm.ByProvider(provider)
+		},
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
+		SpillerFor: spillerFor,
+		Now:        time.Now,
+	}
+	if err := (&controller.IssueReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		SCMFor: func(provider string) (scm.SCMWriter, error) {
+			return scm.ByProvider(provider)
+		},
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
+		SpillerFor: spillerFor,
+		Driver:     stageDriver,
+	}).SetupWithManager(mgr); err != nil {
+		return nil, fmt.Errorf("setup IssueReconciler: %w", err)
+	}
+	if err := (&controller.MergeRequestReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
+		SpillerFor: spillerFor,
+		Driver:     stageDriver,
+	}).SetupWithManager(mgr); err != nil {
+		return nil, fmt.Errorf("setup MergeRequestReconciler: %w", err)
+	}
+	if err := (&controller.StageReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Driver: stageDriver,
+	}).SetupWithManager(mgr); err != nil {
+		return nil, fmt.Errorf("setup StageReconciler: %w", err)
+	}
+
 	cbServer := &controller.CallbackServer{
 		Client:           mgr.GetClient(),
 		Metrics:          metrics,
@@ -389,25 +481,8 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Namespace:        cfg.Namespace,
 		PushMetrics:      pushReceiver.PushHandler(),
 		CallbackSecret:   cfg.CallbackHMACSecret,
-		TaskRetention:    cfg.TaskRetention,
 		IdlePodReapAfter: cfg.IdlePodReapAfter,
 		BudgetDefaults:   cfg.BudgetDefaults(),
-	}
-	// Conversation GC (issue #114 decision 5): wire the operator's S3 client when a
-	// bucket is configured so the reaper can delete fully-closed batches' objects.
-	if oc := (objstore.Config{
-		Endpoint:       cfg.S3Endpoint,
-		Bucket:         cfg.S3Bucket,
-		Region:         cfg.S3Region,
-		KeyPrefix:      cfg.S3KeyPrefix,
-		ForcePathStyle: cfg.S3ForcePathStyle,
-	}); oc.Enabled() {
-		oclient, err := objstore.New(context.Background(), oc)
-		if err != nil {
-			return nil, fmt.Errorf("objstore client: %w", err)
-		}
-		cbServer.ConvStore = oclient
-		cbServer.ConversationRetention = cfg.S3ConversationRetention
 	}
 	if err := mgr.Add(callbackRunnable{srv: cbServer, addr: cfg.InternalAddr}); err != nil {
 		return nil, fmt.Errorf("add callback server: %w", err)

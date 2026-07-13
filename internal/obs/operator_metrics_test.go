@@ -235,11 +235,10 @@ func TestSCMRequestErrorByStatus(t *testing.T) {
 func TestScanMetricsRegistered(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
-	m.ScanItem("mrScan", "picked")
-	m.ScanTaskCreated("mrScan", "review")
-	m.ObserveScanDuration("mrScan", 0.5)
-	m.IssueOutcome("close")
-	m.SetTasksInflightKind("triageIssue", 2)
+	m.ScanItem("issueScan", "picked")
+	m.ScanTaskCreated("issueScan", "review")
+	m.ObserveScanDuration("issueScan", 0.5)
+	m.SetTasksInflightKind("clarify", 2)
 
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -249,7 +248,6 @@ func TestScanMetricsRegistered(t *testing.T) {
 		"tatara_scan_items_total":         false,
 		"tatara_scan_tasks_created_total": false,
 		"tatara_scan_duration_seconds":    false,
-		"tatara_issue_outcome_total":      false,
 		"tatara_tasks_inflight":           false,
 	}
 	for _, mf := range mfs {
@@ -408,37 +406,6 @@ func TestReapDeleteError(t *testing.T) {
 
 // Finding 25: planning_watchdog must be pre-seeded so the series exists from
 // startup without waiting for the first stall to fire.
-func TestTurnTimeoutTotal_PlanningWatchdogPreSeeded(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewOperatorMetrics(reg)
-
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	var found bool
-	for _, mf := range mfs {
-		if mf.GetName() != "operator_turn_timeout_total" {
-			continue
-		}
-		for _, metric := range mf.GetMetric() {
-			for _, lp := range metric.GetLabel() {
-				if lp.GetName() == "source" && lp.GetValue() == "planning_watchdog" {
-					found = true
-				}
-			}
-		}
-	}
-	if !found {
-		t.Fatal("operator_turn_timeout_total{source=planning_watchdog} not pre-seeded")
-	}
-	// Calling TurnTimeout must increment it.
-	m.TurnTimeout("planning_watchdog")
-	if got := testutil.ToFloat64(m.turnTimeoutTotal.WithLabelValues("planning_watchdog")); got != 1 {
-		t.Fatalf("turn_timeout planning_watchdog = %v, want 1", got)
-	}
-}
-
 // Finding 8: auth_total counter must exist and RecordAuth must increment it.
 func TestRecordAuth(t *testing.T) {
 	reg := prometheus.NewRegistry()
@@ -500,114 +467,10 @@ func TestAuthTotal_PreSeeded(t *testing.T) {
 }
 
 // Finding 15: WritebackOutcome counter must exist and be incrementable.
-func TestWritebackOutcome(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewOperatorMetrics(reg)
-
-	m.WritebackOutcome("no_change")
-	m.WritebackOutcome("skip_4xx")
-	m.WritebackOutcome("no_pr")
-	m.WritebackOutcome("opened")
-	m.WritebackOutcome("opened")
-
-	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("no_change")); got != 1 {
-		t.Fatalf("writeback no_change = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("skip_4xx")); got != 1 {
-		t.Fatalf("writeback skip_4xx = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("no_pr")); got != 1 {
-		t.Fatalf("writeback no_pr = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(m.WritebackOutcomeCounter("opened")); got != 2 {
-		t.Fatalf("writeback opened = %v, want 2", got)
-	}
-}
-
 // Finding 15: all writeback outcome labels must be pre-seeded.
-func TestWritebackOutcome_PreSeeded(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	NewOperatorMetrics(reg)
-
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	want := map[string]bool{
-		"no_change": false,
-		"skip_4xx":  false,
-		"no_pr":     false,
-		"opened":    false,
-	}
-	for _, mf := range mfs {
-		if mf.GetName() != "operator_writeback_outcome_total" {
-			continue
-		}
-		for _, metric := range mf.GetMetric() {
-			for _, lp := range metric.GetLabel() {
-				if lp.GetName() == "result" {
-					want[lp.GetValue()] = true
-				}
-			}
-		}
-	}
-	for label, seen := range want {
-		if !seen {
-			t.Errorf("operator_writeback_outcome_total{result=%q} not pre-seeded", label)
-		}
-	}
-}
-
 // All brainstorm-outcome labels must be pre-seeded so both series exist at zero
 // before any brainstorm run completes (the yield rate is graphable from startup).
-func TestBrainstormOutcome_PreSeeded(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	NewOperatorMetrics(reg)
-
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	want := map[string]bool{
-		"proposed": false,
-		"no_yield": false,
-	}
-	for _, mf := range mfs {
-		if mf.GetName() != "operator_brainstorm_outcome_total" {
-			continue
-		}
-		for _, metric := range mf.GetMetric() {
-			for _, lp := range metric.GetLabel() {
-				if lp.GetName() == "result" {
-					want[lp.GetValue()] = true
-				}
-			}
-		}
-	}
-	for label, seen := range want {
-		if !seen {
-			t.Errorf("operator_brainstorm_outcome_total{result=%q} not pre-seeded", label)
-		}
-	}
-}
-
 // BrainstormOutcome increments the right series per result.
-func TestBrainstormOutcome(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	m := NewOperatorMetrics(reg)
-
-	m.BrainstormOutcome("proposed")
-	m.BrainstormOutcome("no_yield")
-	m.BrainstormOutcome("no_yield")
-
-	if got := testutil.ToFloat64(m.BrainstormOutcomeCounter("proposed")); got != 1 {
-		t.Fatalf("brainstorm proposed = %v, want 1", got)
-	}
-	if got := testutil.ToFloat64(m.BrainstormOutcomeCounter("no_yield")); got != 2 {
-		t.Fatalf("brainstorm no_yield = %v, want 2", got)
-	}
-}
-
 // Finding 2: REST API metrics - counter and histogram must exist and be recordable.
 func TestRecordRESTRequest(t *testing.T) {
 	reg := prometheus.NewRegistry()
@@ -663,7 +526,7 @@ func TestRESTAPIMetrics_PreSeeded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
-	wantEndpoints := []string{"patch_task", "propose_issue", "review_verdict", "pr_outcome", "issue_outcome"}
+	wantEndpoints := []string{"task_context", "task_note", "submit_outcome", "scm_read", "issue_write", "mr_write"}
 	found := map[string]bool{}
 	for _, mf := range mfs {
 		if mf.GetName() != "operator_restapi_requests_total" {
@@ -950,15 +813,53 @@ func TestTaskTerminal(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.TaskTerminal("issueLifecycle", "Succeeded", "NoPendingSubtasks")
-	m.TaskTerminal("issueLifecycle", "Failed", "PodLost")
-	m.TaskTerminal("issueLifecycle", "Failed", "PodLost")
+	m.TaskTerminal("implement", "delivered", "NoPendingSubtasks")
+	m.TaskTerminal("implement", "failed", "PodLost")
+	m.TaskTerminal("implement", "failed", "PodLost")
 
-	if got := testutil.ToFloat64(m.taskTerminalTotal.WithLabelValues("issueLifecycle", "Succeeded", "NoPendingSubtasks")); got != 1 {
-		t.Fatalf("Succeeded/NoPendingSubtasks = %v, want 1", got)
+	if got := testutil.ToFloat64(m.taskTerminalTotal.WithLabelValues("implement", "delivered", "NoPendingSubtasks")); got != 1 {
+		t.Fatalf("delivered/NoPendingSubtasks = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.taskTerminalTotal.WithLabelValues("issueLifecycle", "Failed", "PodLost")); got != 2 {
-		t.Fatalf("Failed/PodLost = %v, want 2", got)
+	if got := testutil.ToFloat64(m.taskTerminalTotal.WithLabelValues("implement", "failed", "PodLost")); got != 2 {
+		t.Fatalf("failed/PodLost = %v, want 2", got)
+	}
+}
+
+// TestTaskTerminalLabels asserts operator_task_terminal_total is registered
+// with exactly the label set {kind,stage,stageReason} (contract K.1 / D1):
+// the tatara-observability alert rules select on stage/stageReason by name,
+// so a label rename here would silently break them without a build error.
+func TestTaskTerminalLabels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.TaskTerminal("implement", "failed", "TurnTimeout")
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	var found *dto.MetricFamily
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_task_terminal_total" {
+			found = mf
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("operator_task_terminal_total not gathered after a live record")
+	}
+	gotLabels := map[string]bool{}
+	for _, l := range found.GetMetric()[0].GetLabel() {
+		gotLabels[l.GetName()] = true
+	}
+	for _, want := range []string{"kind", "stage", "stageReason"} {
+		if !gotLabels[want] {
+			t.Errorf("operator_task_terminal_total missing label %q, got %v", want, gotLabels)
+		}
+	}
+	if len(gotLabels) != 3 {
+		t.Errorf("operator_task_terminal_total has %d labels, want exactly 3: %v", len(gotLabels), gotLabels)
 	}
 }
 
@@ -1202,6 +1103,13 @@ func TestMemoryRetrievalProbe_PreSeeded(t *testing.T) {
 	}
 }
 
+// RecordReviewOutcome is nil-safe: a reconciler wired without metrics is a
+// test, not an outage, matching TaskTerminalEntry's convention.
+func TestRecordReviewOutcome_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "approved")
+}
+
 func TestQualityMetrics_Emit(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
@@ -1245,59 +1153,154 @@ func TestQualityMetrics_Emit(t *testing.T) {
 	}
 }
 
-// TestWritebackSkip4xx_PreSeeded pins the writeback_skip_4xx pre-seed as a
-// hand-written curated-pairs literal (issue #166), not a cartesian product:
-// exactly the 4 realistic (status, reason) combos must be pre-seeded, and
-// combos that were never actually observed (403/already_exists,
-// 404/already_exists) must NOT appear as a byproduct of a future refactor.
-func TestWritebackSkip4xx_PreSeeded(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Contract K.1: five metrics that were named but never emitted.
+// ---------------------------------------------------------------------------
+
+// operator_task_stage is a low-cardinality COUNT per (stage,kind) bucket, not
+// per-task. ResetTaskStageGauges clears both it and the per-task age gauge so a
+// Task that left its bucket does not linger (contract M22).
+func TestTaskStageGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	NewOperatorMetrics(reg)
+	m := NewOperatorMetrics(reg)
+
+	m.SetTaskStage("implementing", "implement", 3)
+	if got := testutil.ToFloat64(m.TaskStageGauge("implementing", "implement")); got != 3 {
+		t.Fatalf("operator_task_stage{implementing,implement} = %v, want 3", got)
+	}
+
+	m.ResetTaskStageGauges()
+	if got := testutil.ToFloat64(m.TaskStageGauge("implementing", "implement")); got != 0 {
+		t.Fatalf("operator_task_stage after Reset = %v, want 0 (series gone)", got)
+	}
+}
+
+func TestTaskStageGauge_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.SetTaskStage("implementing", "implement", 3)
+	m.ResetTaskStageGauges()
+}
+
+// operator_task_stage_age_seconds is per-task.
+func TestTaskStageAgeGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetTaskStageAge("task-1", "implementing", "implement", 120)
+	if got := testutil.ToFloat64(m.TaskStageAgeGauge("task-1", "implementing", "implement")); got != 120 {
+		t.Fatalf("operator_task_stage_age_seconds = %v, want 120", got)
+	}
+
+	m.ResetTaskStageGauges()
+	if got := testutil.ToFloat64(m.TaskStageAgeGauge("task-1", "implementing", "implement")); got != 0 {
+		t.Fatalf("operator_task_stage_age_seconds after Reset = %v, want 0 (series gone)", got)
+	}
+}
+
+func TestTaskStageAgeGauge_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.SetTaskStageAge("task-1", "implementing", "implement", 120)
+}
+
+// operator_task_parked_total increments once per park TRANSITION, labelled by
+// the stage the Task parked FROM and the park reason.
+func TestTaskParked(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.TaskParked("implementing", "implement-declined")
+	m.TaskParked("implementing", "implement-declined")
+	m.TaskParked("triaging", "triage-stalled")
+
+	if got := testutil.ToFloat64(m.TaskParkedCounter("implementing", "implement-declined")); got != 2 {
+		t.Fatalf("operator_task_parked_total{implementing,implement-declined} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.TaskParkedCounter("triaging", "triage-stalled")); got != 1 {
+		t.Fatalf("operator_task_parked_total{triaging,triage-stalled} = %v, want 1", got)
+	}
+}
+
+func TestTaskParked_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.TaskParked("implementing", "implement-declined")
+}
+
+// operator_orphan_adopted_total increments once per orphan work item the sweep
+// mints a Task for.
+func TestOrphanAdopted(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.OrphanAdopted("clarify")
+	m.OrphanAdopted("clarify")
+	m.OrphanAdopted("review")
+
+	if got := testutil.ToFloat64(m.OrphanAdoptedCounter("clarify")); got != 2 {
+		t.Fatalf("operator_orphan_adopted_total{clarify} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.OrphanAdoptedCounter("review")); got != 1 {
+		t.Fatalf("operator_orphan_adopted_total{review} = %v, want 1", got)
+	}
+}
+
+func TestOrphanAdopted_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.OrphanAdopted("clarify")
+}
+
+// operator_queue_age_seconds is the age of the OLDEST QueuedEvent per
+// (class,priority,state) bucket. ResetQueueAge clears stale buckets each pass.
+func TestQueueAgeGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetQueueAge("normal", "2", "Queued", 45)
+	if got := testutil.ToFloat64(m.QueueAgeGauge("normal", "2", "Queued")); got != 45 {
+		t.Fatalf("operator_queue_age_seconds = %v, want 45", got)
+	}
+
+	m.ResetQueueAge()
+	if got := testutil.ToFloat64(m.QueueAgeGauge("normal", "2", "Queued")); got != 0 {
+		t.Fatalf("operator_queue_age_seconds after Reset = %v, want 0 (series gone)", got)
+	}
+}
+
+func TestQueueAgeGauge_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.SetQueueAge("normal", "2", "Queued", 45)
+	m.ResetQueueAge()
+}
+
+// TestK1MetricsNamesRegistered pins the five contract K.1 metric names onto the
+// registry, mirroring TestOperatorMetricsNamesStable.
+func TestK1MetricsNamesRegistered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetTaskStage("implementing", "implement", 1)
+	m.SetTaskStageAge("task-1", "implementing", "implement", 1)
+	m.TaskParked("implementing", "implement-declined")
+	m.OrphanAdopted("clarify")
+	m.SetQueueAge("normal", "2", "Queued", 1)
 
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
-	type key struct{ status, reason string }
-	want := map[key]bool{
-		{"403", "other"}:          false,
-		{"404", "other"}:          false,
-		{"422", "already_exists"}: false,
-		{"422", "other"}:          false,
+	want := map[string]bool{
+		"operator_task_stage":             false,
+		"operator_task_stage_age_seconds": false,
+		"operator_task_parked_total":      false,
+		"operator_orphan_adopted_total":   false,
+		"operator_queue_age_seconds":      false,
 	}
-	mustNotExist := map[key]bool{
-		{"403", "already_exists"}: true,
-		{"404", "already_exists"}: true,
-	}
-	seen := map[key]bool{}
 	for _, mf := range mfs {
-		if mf.GetName() != "operator_writeback_skip_4xx_total" {
-			continue
-		}
-		for _, metric := range mf.GetMetric() {
-			var k key
-			for _, lp := range metric.GetLabel() {
-				switch lp.GetName() {
-				case "status":
-					k.status = lp.GetValue()
-				case "reason":
-					k.reason = lp.GetValue()
-				}
-			}
-			seen[k] = true
+		if _, ok := want[mf.GetName()]; ok {
+			want[mf.GetName()] = true
 		}
 	}
-	for k := range want {
-		if !seen[k] {
-			t.Errorf("operator_writeback_skip_4xx_total{status=%q,reason=%q} not pre-seeded", k.status, k.reason)
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("metric %q not registered", name)
 		}
-	}
-	for k := range mustNotExist {
-		if seen[k] {
-			t.Errorf("operator_writeback_skip_4xx_total{status=%q,reason=%q} unexpectedly pre-seeded", k.status, k.reason)
-		}
-	}
-	if len(seen) != len(want) {
-		t.Errorf("operator_writeback_skip_4xx_total pre-seeded %d combos, want exactly %d (curated pairs, not cartesian)", len(seen), len(want))
 	}
 }

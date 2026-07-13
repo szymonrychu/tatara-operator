@@ -15,11 +15,14 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .status.phase
-      name: Phase
+    - jsonPath: .status.stage
+      name: Stage
       type: string
-    - jsonPath: .status.lifecycleState
-      name: Lifecycle
+    - jsonPath: .status.stageReason
+      name: Reason
+      type: string
+    - jsonPath: .status.agentKind
+      name: Agent
       type: string
     - jsonPath: .spec.kind
       name: Kind
@@ -28,7 +31,7 @@ spec:
       name: Project
       priority: 1
       type: string
-    - jsonPath: .status.turnsCompleted
+    - jsonPath: .status.stats.turns
       name: Turns
       type: integer
     - jsonPath: .status.shortDescription
@@ -37,7 +40,8 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Task is one agent session driving a Repository toward a goal.
+        description: Task is one unit of agent-driven work, advanced through the F.1
+          stage machine.
         properties:
           apiVersion:
             description: |-
@@ -59,127 +63,101 @@ spec:
           spec:
             description: TaskSpec defines the desired state of a Task.
             properties:
-              alertRule:
-                description: |-
-                  AlertRule names the Grafana alert rule that produced an incident Task
-                  (commonLabels.alertname, falling back to groupKey). Descriptive only.
-                type: string
-              approvalRequired:
-                description: |-
-                  ApprovalRequired is reserved for future use; no production code path reads
-                  this field for any gating decision. Approval is driven by the SCM
-                  conversation flow. Do not set this field expecting behavior - it has none.
-                type: boolean
+              alertRules:
+                items:
+                  type: string
+                maxItems: 50
+                type: array
               dedupKey:
                 description: |-
                   DedupKey is the dedup identity for an incident Task: the alert-group hash
                   (sha256(groupKey)[:16]) that ties re-fires of the same alert to the same
-                  tracked issue. Replaces the former tatara.dev/alert-group Task label and
-                  tatara/alert-group-<hash> issue label - dedup lookups List incident Tasks
-                  and filter by this field in Go instead of a label selector. Empty for
-                  non-incident Tasks.
+                  tracked issue. It is the ONE dedup mechanism that does NOT fold into the
+                  (repo, number) natural key: a firing alert arrives from Grafana with no
+                  Issue and no MR to key on. Empty for non-incident Tasks.
                 type: string
-              goal:
-                type: string
-              kind:
-                default: implement
+              documentsTasks:
                 description: |-
-                  Kind selects the agent behavior. The 7-kind model is
-                  brainstorm;incident;clarify;implement;review;documentation;refine. The
-                  strings selfImprove;triageIssue;healthCheck;issueLifecycle are RETIRED as
-                  agent kinds - inert, retained in the enum only so already-persisted terminal
-                  CRs still deserialize and read; no code path creates them anymore.
-                enum:
-                - implement
-                - review
-                - selfImprove
-                - triageIssue
-                - brainstorm
-                - issueLifecycle
-                - incident
-                - healthCheck
-                - refine
-                - documentation
-                - clarify
-                type: string
-              maxTurns:
-                type: integer
-              projectRef:
-                type: string
-              proposedIssue:
-                description: ProposedIssueSpec is a tatara-proposed issue awaiting
-                  human approval.
-                properties:
-                  alertGroup:
-                    description: |-
-                      AlertGroup is the per-alert-group dedup identity of the incident that filed
-                      this proposal: the Spec.DedupKey of the in-flight incident Task, falling
-                      back to its descriptive AlertRule name. createProposal dedups future
-                      incident proposals by it (matching another incident Task's DedupKey and
-                      its recorded tracked issue), so a recurring alert tracks onto its existing
-                      open issue instead of spawning a near-duplicate. Empty for non-incident
-                      proposals.
-                    type: string
-                  body:
-                    type: string
-                  incident:
-                    description: |-
-                      Incident is true when this proposal was filed by an incident-investigation
-                      agent; createProposal then adds the incident label to the tracker issue.
-                    type: boolean
-                  kind:
-                    enum:
-                    - bug
-                    - improvement
-                    type: string
-                  repositoryRef:
-                    type: string
-                  systemicId:
-                    description: |-
-                      SystemicID correlates one of several issues opened for a single systemic
-                      improvement. When set, createProposal stamps label tatara/systemic-<id>
-                      and a sibling footer; the group counts as one against maxOpenProposals.
-                    type: string
-                  title:
-                    type: string
-                required:
-                - body
-                - kind
-                - repositoryRef
-                - title
-                type: object
-              reposInScope:
-                description: |-
-                  ReposInScope is the optional declarative list of Project Repository CR
-                  names this Task is expected to change. When set, the implement prompt tells
-                  the agent the issue spans these repos and writeback posts a WARNING comment
-                  for any in-scope repo whose branch produced no commits, instead of skipping
-                  it silently. Absent/empty = single-repo behavior (primary repo only), so
-                  existing Tasks are unaffected.
+                  DocumentsTasks are the delivered Tasks this NIGHTLY DOCUMENTATION BATCH
+                  covers (fix F2 - USER DECISION). Documentation is ONE batch Task per
+                  project per night covering everything delivered in the last 24h, NOT one
+                  Task per delivery: per-delivery was a 3-5x work amplifier (doc Task -> doc
+                  MR -> review pod -> merge -> a tatara-documentation release, for every
+                  one-line patch fix) against 3 agent slots.
                 items:
                   type: string
+                maxItems: 100
                 type: array
+              goal:
+                description: |-
+                  Goal is NON-EVICTABLE: the A.7 byte guard can spill comments and notes, but
+                  it can never shrink the goal. It therefore needs a hard cap of its own
+                  (fix L31) or it eats the budget the guard is defending.
+                  The same cap applies to QueuedTaskBlueprint.Goal (B.7).
+                maxLength: 16384
+                type: string
+              initialStage:
+                description: |-
+                  InitialStage is the F.3 Create-edge target a mint chooses when it is NOT the
+                  default triaging: the sweep mints straight into parked(backlog-sweep) or
+                  triaging, and the nightly doc batch into documenting. It is carried in the
+                  IMMUTABLE spec so the TaskReconciler create-edge derives the stage with NO
+                  post-create status write that must win a race against the reconciler's own
+                  create-edge (fix C5). Empty = triaging.
+                type: string
+              initialStageReason:
+                description: |-
+                  InitialStageReason is the stageReason paired with InitialStage (e.g.
+                  backlog-sweep). Empty for the reason-less initial stages.
+                type: string
+              kind:
+                description: |-
+                  Kind is the ORIGIN. Immutable, baked into the name. NOT the running agent
+                  kind (that is Status.AgentKind, driven by the F.2 stage table).
+                enum:
+                - brainstorm
+                - incident
+                - clarify
+                - refine
+                - review
+                - documentation
+                type: string
+              maxTurnsPerTask:
+                description: |-
+                  MaxTurnsPerTask is the LIFETIME turn backstop across every pod of this
+                  Task. Zero = Project.spec.agent.maxTurnsPerTask (default 300).
+                type: integer
+              mergeOrder:
+                description: |-
+                  MergeOrder is the sequential, dependency-ordered list of Repository CR
+                  names whose MRs merge in this order. REQUIRED (and validated to cover every
+                  owned MR's repo) whenever the Task owns MRs in MORE THAN ONE repo.
+                  THERE IS NO LEXICAL DEFAULT (fix 11): lexical order is
+                  agent-skills < cli < claude-code-wrapper < operator, i.e. it merges cli
+                  BEFORE operator - precisely the DisallowUnknownFields fleet outage this
+                  redesign exists to prevent.
+                items:
+                  type: string
+                maxItems: 20
+                type: array
+              projectRef:
+                type: string
               repositoryRef:
+                description: |-
+                  RepositoryRef is the PRIMARY repo, set ONLY on documentation Tasks (and on
+                  a proposal-born clarify, which carries the repo its proposal was filed in).
                 type: string
               source:
-                description: TaskSource records the SCM work-item that originated
-                  a webhook-born Task.
+                description: |-
+                  Source is the originating SCM work item. It is the seed identity triaging
+                  mints the Issue CR from and the base of the deterministic task branch.
+                  Absent on brainstorm/refine Tasks and on alert-born incidents.
                 properties:
                   authorLogin:
                     type: string
-                  dedupNumber:
-                    description: |-
-                      DedupNumber is the linked-issue number for bot-PR tasks. When a bot MR
-                      carries "Closes #N" in its body, this field holds N so the dedup logic can
-                      match the task against the issue slot (not the PR number). Zero means the
-                      task targets the item identified by Number (the PR/issue number itself).
-                    type: integer
                   headSHA:
-                    description: |-
-                      HeadSHA is the PR/MR head commit SHA captured at enqueue. It seeds the
-                      review Task's role:reviewed ledger entry so same-head re-review dedup works
-                      on the very next scan cycle, without waiting for the cron backstop to fill
-                      it. Empty for issues.
+                    description: HeadSHA is the PR/MR head commit SHA captured at
+                      mint. Empty for issues.
                     type: string
                   isPR:
                     type: boolean
@@ -194,7 +172,7 @@ spec:
                     type: string
                   title:
                     description: |-
-                      Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
+                      Title is the originating issue/PR/MR title, captured at mint. Feeds the
                       branch slug (TaskBranch) and the no-agent PR-title fallback.
                     type: string
                   url:
@@ -203,25 +181,6 @@ spec:
                 - issueRef
                 - provider
                 type: object
-              systemicGroup:
-                description: |-
-                  SystemicGroup, when set, marks this Task as the lead for a brainstorm
-                  systemic group: it resolves SameRepoSiblings in one combined PR and is
-                  aware of CrossRepo siblings (reference only).
-                properties:
-                  crossRepo:
-                    items:
-                      type: string
-                    type: array
-                  sameRepoSiblings:
-                    items:
-                      type: integer
-                    type: array
-                  systemicId:
-                    type: string
-                required:
-                - systemicId
-                type: object
             required:
             - goal
             - projectRef
@@ -229,100 +188,16 @@ spec:
           status:
             description: TaskStatus defines the observed state of a Task.
             properties:
-              approvedByMaintainer:
-                description: |-
-                  ApprovedByMaintainer records that this issue was approved for
-                  implementation, either by a HUMAN MAINTAINER (the webhook sets it ONLY
-                  when it observes an issues.labeled{approved} event whose ACTOR is a
-                  MaintainerLogins member - never the bot: a bot/agent that sets the label
-                  itself cannot self-approve) OR by the auto-approve release path (item 4a,
-                  recordAutoApproval), which writes the audit sentinel
-                  "<tatara:auto:<kind>>" instead of a login - see AutoApproved. Both are
-                  accepted approval sources by design; consumers that need to distinguish
-                  them check AutoApproved. It is the ONLY signal that releases a
-                  front-half Task (clarify / the issueLifecycle bridge) into the
-                  autonomous implement->review->merge->deploy chain: every path that would
-                  advance a front-half issue to Implement gates on it (finishFrontHalf,
-                  the Conversation label readback, the trigger-label jump). Empty means NO
-                  recorded approval - the operator fails CLOSED (parks to Conversation)
-                  rather than trusting raw label presence, which an agent with SCM write
-                  could forge. Holds the approving maintainer's login (or the auto-approve
-                  sentinel) for audit.
-                type: string
-              autoApproved:
-                description: |-
-                  AutoApproved is true when ApprovedByMaintainer was set by the auto-approve
-                  release path (item 4a) rather than a real maintainer - the sentinel value
-                  "<tatara:auto:<kind>>" is also written to ApprovedByMaintainer for audit,
-                  but this bool is the fast structural check (avoids string-parsing the
-                  sentinel at every consumer).
-                type: boolean
-              brainstormOutcome:
-                description: |-
-                  BrainstormOutcome is the agent's declared outcome for a brainstorm task when
-                  it files no proposal (a deliberate early-exit). Mirrors ImplementOutcome.
-                properties:
-                  action:
-                    enum:
-                    - none
-                    type: string
-                  reason:
-                    type: string
-                required:
-                - action
-                - reason
-                type: object
-              cascadeStage:
-                description: |-
-                  CascadeStage tracks how far this Task's artifact has propagated toward the
-                  terminal tatara-helmfile apply.
+              agentKind:
                 enum:
-                - tagged
-                - parent-pr-open
-                - parent-merged
-                - helmfile-applied
+                - brainstorm
+                - incident
+                - clarify
+                - refine
+                - review
+                - documentation
+                - implement
                 type: string
-              changeSummary:
-                description: |-
-                  ChangeSummary holds the scope report submitted by the agent at the end of an
-                  Implement run via the change_summary MCP tool.
-                properties:
-                  deliveredScope:
-                    type: string
-                  mostProblematic:
-                    type: string
-                  prBody:
-                    type: string
-                  prTitle:
-                    type: string
-                  remainingScope:
-                    description: |-
-                      RemainingScope, when non-empty, means the implementation is INCOMPLETE:
-                      the operator hard-fails the Task (Phase=Failed, reason=
-                      IncompleteImplementation) rather than opening a follow-up issue.
-                      Agents must implement the full scope in one PR or call
-                      decline_implementation instead. Item Request C (full-scope-or-
-                      decline); no follow-up issues are ever filed by the operator.
-                    type: string
-                  significance:
-                    description: |-
-                      Significance is the agent's declared change significance, the lever the
-                      push-CD cascade uses to cut the next semver tag (major resets minor+patch,
-                      minor resets patch, patch increments). REQUIRED on the change_summary MCP
-                      tool and re-validated at the REST /change-summary endpoint (D2): a compliant
-                      agent that summarizes its change cannot omit it. Enforcement lives at those
-                      two layers, NOT in writeback - writeBackOpenChange still opens the PR when
-                      this is empty (a change with no change_summary at all keeps the legacy
-                      close+Done path, pushCDEligible=false), but applySemverAutoMerge stamps the
-                      semver:<level> label and enables native auto-merge only when it is present.
-                      An empty value therefore opens an unlabeled, non-cascading PR (logged WARN
-                      at writeback so the legacy path stays visible).
-                    enum:
-                    - major
-                    - minor
-                    - patch
-                    type: string
-                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -382,497 +257,301 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              conversationObjectKey:
-                description: |-
-                  ConversationObjectKey is the S3 object key under which the wrapper stores
-                  and restores this Task's full Claude conversation transcript (issue #114).
-                  Stable across lifecycle phases. Empty until conversation persistence is
-                  configured and the first run has reported it (or a forked key is set for a
-                  brainstorm-derived issue).
-                type: string
-              cumulativeCacheCreation:
-                description: |-
-                  CumulativeCacheCreation is the running total of cache-creation input
-                  tokens across all turns of this Task. +optional
-                format: int64
-                type: integer
-              cumulativeCacheRead:
-                description: |-
-                  CumulativeCacheRead is the running total of cache-read input tokens
-                  across all turns of this Task. +optional
-                format: int64
-                type: integer
-              cumulativeInput:
-                description: |-
-                  CumulativeInput is the running total of uncached input tokens
-                  (turnUsage.InputTokens) across all turns of this Task. +optional
-                format: int64
-                type: integer
-              cumulativeOutput:
-                description: |-
-                  CumulativeOutput is the running total of output tokens across all turns
-                  of this Task. +optional
-                format: int64
-                type: integer
-              cumulativeTokens:
-                format: int64
-                type: integer
-              deadlineAt:
+              deliveredAt:
                 format: date-time
                 type: string
-              deployArtifact:
-                description: |-
-                  DeployArtifact is the deploy-ledger artifact identity (repo@vX.Y.Z) this
-                  Task records, the key the apply-outcome sweep matches against applied pins.
-                type: string
-              deployDeadline:
-                description: |-
-                  DeployDeadline is the wall-clock deadline for the deploy cascade
-                  (now + Project deployBudgetSeconds, single-hop override applied per
-                  artifact). On exceed, the Task parks recoverable with reason deploy-timeout.
-                format: date-time
-                type: string
-              deployedVersion:
-                description: |-
-                  DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
-                  driving toward the cluster.
-                type: string
-              disarmFailures:
-                description: |-
-                  DisarmFailures counts consecutive INCOMPLETE disarmOpenChanges sweeps for
-                  the full-scope-or-decline hard-fail (F2). A sweep is incomplete when any
-                  target PR could not be verifiably closed (a transient SCM error, not a
-                  permanent 404/410 "already gone"). Bounded like WritebackSkip4xxAttempts /
-                  LinksSyncFailures: the Task does NOT terminate while a sweep is dirty and
-                  under disarmFailureCap - it requeues and retries. Once the cap is spent
-                  the Task terminates anyway but records a DisarmFailed condition so an
-                  armed-PR-that-could-not-be-disarmed is alertable. Reset to 0 once a sweep
-                  verifies clean or the cap is reached.
+              deployReentries:
                 type: integer
-              discoveredIssues:
+              documentedBy:
+                description: |-
+                  DocumentedBy is the NIGHTLY BATCH documentation Task that covered this
+                  delivered Task (fix F2). Empty until a batch has covered it. The reaper
+                  holds a delivered Task until it is either covered or provably needs no
+                  coverage (zero merged MRs).
+                type: string
+              foldInFlight:
+                description: |-
+                  FoldInFlight names the member Tasks a refine umbrella is mid-adoption of.
+                  The reaper SKIPS any Task named here (fix 8).
                 items:
                   type: string
+                maxItems: 20
                 type: array
-              followupIssueURL:
+              headMoveReentries:
                 description: |-
-                  FollowupIssueURL is DEPRECATED and vestigial: the operator no longer
-                  opens follow-up issues (item Request C, full-scope-or-decline - a
-                  non-empty ChangeSummary.RemainingScope now hard-fails the Task
-                  instead). Retained on the CRD for backward compatibility with
-                  existing Tasks/readers only; nothing writes to it anymore.
-                type: string
-              gateEnteredAt:
-                format: date-time
-                type: string
-              handover:
-                type: string
-              headBranch:
-                type: string
-              implementContext:
-                description: |-
-                  ImplementContext is an optional re-entry prompt injected at the start of
-                  the next Implement agent turn (e.g. CI failure details, conflict notice).
-                  Cleared after the turn is submitted so a later fresh entry is clean.
-                type: string
-              implementEmptyRetries:
-                description: |-
-                  ImplementEmptyRetries counts consecutive Implement runs that finished
-                  with zero commits (no PR opened). Bounded retry guard: after the cap the
-                  task is commented + parked with reason "implement-empty" instead of
-                  silently parked as a benign no-change. Reset to 0 when a run opens a PR.
+                  HeadMoveReentries bounds the FOURTH cycle - the one that SPAWNS PODS
+                  (fix M3-9). merging -> reviewing on a moved head does NOT touch
+                  MergeReentries (only the PARKED path does), and ReviewRounds increments
+                  only on request_changes. So reviewing -> merging -> (head moved) ->
+                  reviewing -> ... had no counter at all, and spawned a REVIEW POD every lap.
+                  H7 claimed "three cycles exist, all three bounded". There are four.
+                  Cap 3 -> failed(head-moving).
                 type: integer
-              implementGiveUps:
+              humanReviewRounds:
                 description: |-
-                  ImplementGiveUps counts implementation attempts that gave up for this
-                  issue's durable lifecycle Task (transition Implement->Parked with a
-                  recoverable reason). Bounds the auto-reroll backstop. +optional
+                  HumanReviewRounds bounds the reviewing <-> parked(awaiting-human) cycle on a
+                  kind=review Task (fix V7-9). Cap 5, then it STAYS parked.
+
+                  v6 claimed that cycle was "bounded by mr.status.reviewRounds". IT IS NOT:
+                  ReviewRounds increments only on request_changes, so on the approve path the
+                  cycle spawned ONE REVIEW POD PER HUMAN COMMENT, bounded only by
+                  maxTurnsPerTask (300). It terminated - but not for the stated reason, and it
+                  is a real cost amplifier on a chatty PR thread.
                 type: integer
-              implementOutcome:
-                description: |-
-                  ImplementOutcome is the agent's declared outcome for an implement task when
-                  it opens no PR (e.g. a deliberate refusal). Mirrors IssueOutcome.
-                properties:
-                  action:
-                    enum:
-                    - declined
-                    - already_done
-                    type: string
-                  reason:
-                    type: string
-                required:
-                - action
-                - reason
-                type: object
-              issueLinks:
-                description: |-
-                  IssueLinks is every issue this Task touched: DiscoveredIssues,
-                  FollowupIssueURL, and issue-kind WorkItems, deduped. Full URLs where the
-                  source field carries one (DiscoveredIssues/FollowupIssueURL); "repo#N"
-                  refs where only a WorkItemRef exists (item 9).
+              issueRefs:
                 items:
                   type: string
+                maxItems: 50
                 type: array
-              issueOutcome:
-                description: IssueOutcome is the agent's outcome for an issue-triage
-                  task.
-                properties:
-                  action:
-                    enum:
-                    - implement
-                    - close
-                    - discuss
-                    type: string
-                  comment:
-                    type: string
-                  plan:
-                    type: string
-                required:
-                - action
-                type: object
-              lastActivityAt:
-                format: date-time
-                type: string
-              lastTurnInputTokens:
-                format: int64
-                type: integer
-              lifecycleIterations:
-                type: integer
-              lifecycleState:
+              mergeCursor:
                 description: |-
-                  Deploying is the pod-less post-merge deploy-supervision lifecycle state: the
-                  issueLifecycle Task's PR auto-merged + main CI (incl. the release tag-cut +
-                  propagation) went green, and the operator now drives the push-CD cascade to a
-                  tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
-                  occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
-                  The Go field is DeployState (agent-invisible, deploy-supervisor-only) but the
-                  JSON/CRD key stays lifecycleState so stored CRs still deserialize and the
-                  agent-visible task_list field is unchanged. The enum keeps the front-half
-                  values (Triage/Conversation/Implement/MRCI) for the drain of in-flight
-                  issueLifecycle Tasks.
-                enum:
-                - Triage
-                - Conversation
-                - Implement
-                - MRCI
-                - Merge
-                - MainCI
-                - Deploying
-                - Done
-                - Stopped
-                - Parked
-                type: string
-              linksSyncFailures:
-                description: |-
-                  LinksSyncFailures counts consecutive INCOMPLETE tatara-links sweeps for
-                  the current sibling URL set (D2). isPermanentTargetGone only classifies
-                  404/410 as terminal, so any other permanent failure (403 conversation-
-                  locked, a bot without issues:write, a 422 body over the 65536-char limit)
-                  would otherwise keep the sweep unclean, LinksSyncedURLs unstamped, and the
-                  per-sibling GetIssue re-read running on every reconcile forever. Bounded
-                  like Status.WritebackSkip4xxAttempts: at linksSyncFailureCap the sweep
-                  gives up, stamps the URL set anyway, and resets this to 0 - so a later
-                  CHANGE to the sibling set gets a fresh retry budget.
+                  MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
+                  Persisted so a restarted operator resumes and never re-merges.
                 type: integer
-              linksSyncedURLs:
+              mergeReentries:
                 description: |-
-                  LinksSyncedURLs is the sibling issue URL set (allIssueSiblingURLs) as of
-                  the last tatara-links cross-linking sync (F5). syncAllSiblingLinksIfNeeded
-                  compares the current set against this before re-syncing, so a Task whose
-                  sibling set is unchanged skips the per-sibling SCM GetIssue sweep instead
-                  of re-reading every sibling issue on every reconcile.
+                  MergeReentries / DeployReentries bound the merging<->parked and
+                  deploying<->parked 2-CYCLES (fix H7). v3 let them spin FOREVER on a red MR:
+                  F.6 re-entered the stage on timeout, EVERY transition re-stamped
+                  stageEnteredAt granting a fresh 4h, neither stage spawns a pod (so
+                  maxTurnsPerTask and maxPodRecreations never accrue), and parkRetention never
+                  fired because the Task kept LEAVING parked. The "every stage has an exit"
+                  invariant was satisfied per-stage and violated GLOBALLY.
+                  At maxMergeReentries (3): -> failed(merge-blocked) / failed(deploy-blocked).
+                  This is the treatment maxReviewRounds already gets right on the
+                  reviewing<->implementing cycle.
+                type: integer
+              mrRefs:
                 items:
                   type: string
+                maxItems: 50
                 type: array
-              mergeCommitSHA:
-                type: string
-              mergeWaitDeadline:
+              notes:
                 description: |-
-                  MergeWaitDeadline bounds a discrete-implement umbrella Task's wait for its
-                  member PRs to be reviewed + merged (the pre-Deploying window). When members
-                  stay unmerged past this wall clock, superviseMergedPRs parks the stream
-                  recoverable with an issue comment naming the stuck member(s) (item 3). It is
-                  distinct from DeployDeadline, which bounds the post-merge cascade.
-                format: date-time
-                type: string
-              mergedHeadSHA:
-                description: |-
-                  MergedHeadSHA is the source-branch head commit SHA of the most recently
-                  merged PR/MR. Recorded on a successful Merge and deliberately preserved
-                  across clearMergedChangeState so the next MRCI cycle can detect a re-opened
-                  PR that re-proposes the already-merged commits with no new fix (the
-                  deterministic task branch is reused; if a post-merge re-implement does not
-                  advance it, writeBackOpenChange opens a duplicate of the merged change).
-                type: string
-              parkReason:
-                description: |-
-                  ParkReason is the reason string passed to the last Parked transition.
-                  Cleared when the Task transitions out of Parked. Carried for context and
-                  observability; does NOT gate re-activation.
-                type: string
-              pendingComments:
-                description: |-
-                  PendingComments are free-form comments queued by the agent via the
-                  comment MCP tool, posted to the task's linked issue on the next
-                  reconcile and then cleared. Does not change the lifecycle state.
+                  Notes: append-only journal. IT IS the continuation state. Capped at 50 in
+                  Go (drop-oldest, spilled to tatara-memory); MaxItems is a backstop only.
                 items:
-                  type: string
+                  description: |-
+                    Note is one entry in a Task's append-only journal (contract A.4). Notes ARE
+                    the continuation state read back by task_context(notes=all).
+                  properties:
+                    agent:
+                      description: |-
+                        Agent is the WRITER. The REST layer stamps it from Status.AgentKind; an
+                        agent can NEVER produce "operator" (fix 19). The only writer of
+                        agent="operator" is the operator itself, in-process.
+                      enum:
+                      - brainstorm
+                      - incident
+                      - clarify
+                      - refine
+                      - review
+                      - documentation
+                      - implement
+                      - operator
+                      type: string
+                    at:
+                      format: date-time
+                      type: string
+                    body:
+                      maxLength: 4096
+                      type: string
+                    kind:
+                      enum:
+                      - note
+                      - plan
+                      - handoff
+                      type: string
+                  required:
+                  - agent
+                  - at
+                  - body
+                  - kind
+                  type: object
+                maxItems: 60
                 type: array
-              pendingInterjections:
+              parkedFromStage:
                 description: |-
-                  PendingInterjections are comment bodies queued by the webhook when a new
-                  issue/MR comment arrives while an agent turn is in flight. The reconciler
-                  delivers each to the live wrapper session (as mid-session user input) and
-                  then clears them. Does not change the lifecycle state.
-                items:
-                  type: string
-                type: array
-              phase:
-                description: |-
-                  NOTE: Pending and AwaitingApproval are intentionally absent: no code path
-                  ever writes them (approval is now driven by the SCM conversation flow and
-                  projected onto labels, not a Phase transition). They are removed here to
-                  keep the CRD enum honest and prevent confusion with DeployState.
-                  Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
-                enum:
-                - Planning
-                - Running
-                - Succeeded
-                - Failed
-                - Deploying
+                  ParkedFromStage is OBSERVABILITY ONLY. The un-park TARGET is NEVER derived
+                  from it (fix 2); it is re-derived from Issue.status.status and the owned-MR
+                  state (F.6).
                 type: string
+              pendingEvents:
+                description: |-
+                  PendingEvents: capped at 20 in Go (drop-oldest BEFORE the write; an
+                  API-server 422 is NOT retried and would hot-loop webhook redelivery).
+                  Cleared by SET-DIFFERENCE inside RetryOnConflict, never by nil-assign
+                  (fix 23).
+                items:
+                  description: |-
+                    TaskEvent is one mid-flight SCM event, delivered at the TURN BOUNDARY.
+                    A BOT-authored event is NEVER enqueued (fix 2): the enqueue filter drops
+                    author == Project.spec.scm.botLogin, so the operator's own park comment can
+                    never un-park the Task the operator just parked.
+                  properties:
+                    at:
+                      format: date-time
+                      type: string
+                    author:
+                      type: string
+                    body:
+                      maxLength: 4096
+                      type: string
+                    kind:
+                      enum:
+                      - issue_comment
+                      - mr_comment
+                      - mr_review
+                      - label
+                      - alert
+                      type: string
+                    number:
+                      type: integer
+                    repo:
+                      type: string
+                  required:
+                  - at
+                  - author
+                  - body
+                  - kind
+                  - number
+                  - repo
+                  type: object
+                maxItems: 25
+                type: array
               podName:
                 type: string
-              prLinks:
+              podStartedAt:
                 description: |-
-                  PRLinks is every PR/MR this Task touched: PrURL and PR-kind WorkItems,
-                  deduped. Same mixed URL/"repo#N" format as IssueLinks.
-                items:
-                  type: string
-                type: array
-              prNumber:
-                type: integer
-              prOutcome:
-                description: PROutcome is the agent's outcome for a tatara-authored
-                  PR/MR.
-                properties:
-                  action:
-                    enum:
-                    - merge
-                    - close
-                    type: string
-                  reason:
-                    type: string
-                required:
-                - action
-                type: object
-              prURL:
+                  PodStartedAt is stamped when the pod is CREATED (not when it becomes Ready),
+                  and RE-stamped on every podRecreations respawn. It is:
+                    - the arming condition for clock 1 vs clock 2 (F.4), and
+                    - the base of the pod TTL: t0 = podStartedAt + agentPodTTLSeconds (G.7).
+
+                  LIFECYCLE, and it is LOAD-BEARING (fix V7-4):
+                    CLEARED on EVERY stage transition. Both this and StageWorkStartedAt.
+
+                  v6 declared this field with no doc comment and no clearing rule, while only
+                  StageWorkStartedAt said "cleared on every stage transition". On the NORMAL
+                  re-entry edges (reviewing -> implementing, merging -> reviewing, every
+                  un-park) a STALE non-nil PodStartedAt then:
+                    (a) DISARMS clock 1 (which is armed only when PodStartedAt == nil) while
+                        the Task waits for admission - and clock 2 cannot run because
+                        its evaluator needs a pod that does not exist yet. THE TASK IS COVERED
+                        BY NO CLOCK AT ALL WHILE QUEUED: exactly the nil-case the three-clock
+                        model claims to exclude.
+                    (b) makes G.7's t0 = PodStartedAt + agentPodTTLSeconds ALREADY IN THE PAST
+                        for the fresh pod, so the operator TTL-stops a pod that just started -
+                        and under fix V6-6 the wrapper then 410s every turn it is given.
+                format: date-time
                 type: string
               resolvedModel:
                 description: |-
                   ResolvedModel is the MODEL env resolved for this Task's agent pod at spawn
                   (modelForKind: per-kind override else project-wide). Stamped once at
                   pod-creation; read by the token/terminal metrics so $ is priced by the
-                  model that actually ran. +optional
-                type: string
-              resultSummary:
-                type: string
-              reviewResolveDeadline:
-                description: |-
-                  ReviewResolveDeadline bounds an umbrella review's wall-clock wait for an
-                  unresolvable member repo URL to become resolvable (un-enrolled member repo,
-                  or a projectRepoURLBySlug List error). Stamped on the first unresolvable
-                  encounter; once it elapses, writeBackReview parks the review recoverable with
-                  an issue comment naming the stuck member instead of error-looping forever
-                  (liveness finding #4).
-                format: date-time
-                type: string
-              reviewVerdict:
-                description: ReviewVerdict is the agent's review decision for a human-authored
-                  PR/MR.
-                properties:
-                  body:
-                    type: string
-                  decision:
-                    enum:
-                    - approve
-                    - request_changes
-                    - comment
-                    type: string
-                  semver:
-                    description: |-
-                      Semver is the per-MR push-CD level the review agent assigns on approval so
-                      the release tag can be cut for EVERY MR in the stream (human MRs otherwise
-                      carry no change_significance -> cd-release refuses to tag). Applied
-                      best-effort in the approve writeback; an existing semver:* label on a member
-                      MR is respected (a deliberate human semver is authoritative).
-                    items:
-                      description: |-
-                        SemverAssignment is one per-MR push-CD level the review agent assigns on
-                        approval, so the release tag can be cut for EVERY MR in the stream - including
-                        human/maintainer MRs that carry no bot change_significance (the review approve
-                        is their ONLY stamping opportunity). Repo is the "owner/repo" slug (matches
-                        WorkItemRef.Repo); Number is the PR/MR number in that repo.
-                      properties:
-                        level:
-                          enum:
-                          - major
-                          - minor
-                          - patch
-                          type: string
-                        number:
-                          type: integer
-                        repo:
-                          type: string
-                      required:
-                      - level
-                      - number
-                      - repo
-                      type: object
-                    type: array
-                  suggestions:
-                    items:
-                      description: Suggestion is one inline code suggestion on a PR/MR.
-                      properties:
-                        body:
-                          type: string
-                        line:
-                          minimum: 1
-                          type: integer
-                        path:
-                          type: string
-                      required:
-                      - body
-                      - line
-                      - path
-                      type: object
-                    type: array
-                required:
-                - decision
-                type: object
-              sessionID:
-                description: |-
-                  SessionID is the Claude session id of the persisted conversation. The
-                  operator passes it back to the next pod (as CONVERSATION_SESSION_ID) so a
-                  fresh pod resumes via `claude --resume <id>` instead of starting empty.
+                  model that actually ran.
                 type: string
               shortDescription:
                 description: |-
                   ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
                   set on reconcile so `kubectl get task` is scannable without describe.
                 type: string
-              subtasks:
+              stage:
+                enum:
+                - triaging
+                - brainstorming
+                - clarifying
+                - investigating
+                - refining
+                - approved
+                - implementing
+                - reviewing
+                - merging
+                - deploying
+                - delivered
+                - documenting
+                - rejected
+                - failed
+                - parked
+                type: string
+              stageEnteredAt:
                 description: |-
-                  Subtasks is the durable rollup of every subtask (incl. the synthetic
-                  order-0 planning entry), maintained as subtasks progress. See SubtaskRef.
-                items:
-                  description: |-
-                    SubtaskRef is a durable point-in-time snapshot of one subtask, rolled onto
-                    TaskStatus.Subtasks as subtasks progress. Lets kubectl and a re-entering
-                    agent read the full reasoning trail (including the synthetic order-0
-                    "Planning" entry capturing turn 0's FinalText) without listing Subtask
-                    objects directly (item 8).
-                  properties:
-                    name:
-                      description: |-
-                        Name is the Subtask object's name, empty for the synthetic order-0
-                        planning entry (turn 0 has no backing Subtask object).
-                      type: string
-                    order:
-                      type: integer
-                    phase:
-                      enum:
-                      - Pending
-                      - Running
-                      - Done
-                      - Failed
-                      type: string
-                    result:
-                      type: string
-                    title:
-                      type: string
-                  required:
-                  - order
-                  - phase
-                  - title
-                  type: object
-                type: array
-              turnsCompleted:
-                type: integer
-              workItems:
+                  StageEnteredAt is stamped on EVERY stage transition. It is the clock for the
+                  POD-LESS stages (F.4).
+                format: date-time
+                type: string
+              stageReason:
                 description: |-
-                  WorkItems is the work-item ledger: every SCM artifact (issues, PRs,
-                  proposals) this Task spans. Carried as the single source of truth for
-                  dedup, stall recovery, and prompt-building. Seeded lazily from Spec.Source
-                  on first reconcile; maintained by the operator as the agent drives actions
-                  via MCP tools.
-                items:
-                  description: WorkItemRef is one SCM artifact tracked by a Task's
-                    work-item ledger.
-                  properties:
-                    body:
-                      description: Body is the issue/PR body captured at the last
-                        poll (turn-0 bundle source).
-                      type: string
-                    ciStatus:
-                      description: 'CIStatus is the member''s CI/pipeline status:
-                        ""|pending|success|failure.'
-                      type: string
-                    deployState:
-                      description: 'DeployState is the member''s push-CD cascade state:
-                        ""|deploying|applied.'
-                      type: string
-                    deployedVersion:
-                      description: DeployedVersion is the semver tag this member's
-                        artifact cut on merge.
-                      type: string
-                    headBranch:
-                      description: HeadBranch is the PR/MR source branch.
-                      type: string
-                    headSHA:
-                      type: string
-                    kind:
-                      type: string
-                    labels:
-                      description: Labels are the current SCM labels on this member.
-                      items:
-                        type: string
-                      type: array
-                    lastRefreshedAt:
-                      description: LastRefreshedAt is the last-synced cursor for this
-                        member.
-                      format: date-time
-                      type: string
-                    mergeable:
-                      description: 'Mergeable is the member''s mergeability: unknown|clean|dirty|blocked|behind.'
-                      type: string
-                    number:
-                      type: integer
-                    provider:
-                      type: string
-                    repo:
-                      type: string
-                    role:
-                      type: string
-                    state:
-                      type: string
-                    title:
-                      type: string
-                  required:
-                  - kind
-                  - provider
-                  - repo
-                  - role
-                  type: object
-                type: array
-              writebackSkip4xxAttempts:
+                  StageReason is the machine reason for the current stage. MANDATORY on
+                  parked/failed/rejected. Closed set: F.5.
+                type: string
+              stageWorkStartedAt:
                 description: |-
-                  WritebackSkip4xxAttempts counts consecutive writeback sweeps that opened
-                  no PR because every project repo returned a permanent 4xx from OpenChange
-                  (issue #166: the un-triageable 4xx-skip loop). Bounded loop-breaker: once
-                  it reaches writebackSkip4xxCap the writeback gate stops re-sweeping the SCM
-                  and records a terminal WritebackFailed condition instead of churning the
-                  SCM API every reconcile. Reset to 0 when a PR opens.
-                type: integer
+                  StageWorkStartedAt is stamped when this stage's POD BECOMES READY (fix H12).
+                  It is the clock for every POD-SPAWNING stage's deadline. StageEnteredAt is
+                  NOT, because it starts ticking the moment the Task enters the stage - which
+                  is when its QueuedEvent is ENQUEUED, not when it is admitted. With 3 agent
+                  slots and 3-4 serial pod admissions per Task, a Task could burn its entire
+                  2h budget QUEUEING and die parked(stage-deadline) HAVING NEVER RUN A POD -
+                  and that park has no re-entry rule. The stage deadline must measure WORK,
+                  not queue wait. Cleared on every stage transition.
+                format: date-time
+                type: string
+              stats:
+                description: TaskStats is the running usage/token accounting for a
+                  Task (contract A.4).
+                properties:
+                  agentsRun:
+                    items:
+                      type: string
+                    maxItems: 50
+                    type: array
+                  issueCount:
+                    type: integer
+                  mrCount:
+                    type: integer
+                  notesSpilled:
+                    description: |-
+                      NotesSpilled / NotesSpilledRefs: notes evicted to tatara-memory by the A.7
+                      byte guard. NotesSpilledRefs ACCUMULATES, one track_id per spill batch
+                      (fix M19). They are READ BACK via task_context(notes=all) (fix H10) - notes
+                      are the continuation state, so a spilled note that cannot be read is
+                      continuity silently lost.
+                    type: integer
+                  notesSpilledRefs:
+                    description: |-
+                      The MaxItems marker belongs on the LIST, not on the scalar above it
+                      (addendum 2 - v4 put it on NotesSpilled int, where it is meaningless).
+                    items:
+                      type: string
+                    maxItems: 50
+                    type: array
+                  podRecreations:
+                    description: |-
+                      PodRecreations counts pod respawns within the CURRENT stage. At
+                      maxPodRecreations the stage -> failed. Reset to 0 on EVERY transition.
+                    type: integer
+                  podRuns:
+                    type: integer
+                  tokensCacheCreation:
+                    format: int64
+                    type: integer
+                  tokensCacheRead:
+                    format: int64
+                    type: integer
+                  tokensInput:
+                    format: int64
+                    type: integer
+                  tokensOutput:
+                    format: int64
+                    type: integer
+                  turns:
+                    type: integer
+                  wallSeconds:
+                    format: int64
+                    type: integer
+                type: object
             type: object
         type: object
     served: true

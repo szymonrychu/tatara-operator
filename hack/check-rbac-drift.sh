@@ -35,11 +35,16 @@ tatara.dev|repositories
 tatara.dev|tasks
 tatara.dev|subtasks
 tatara.dev|queuedevents
+tatara.dev|issues
+tatara.dev|mergerequests
 tatara.dev|projects/status
 tatara.dev|repositories/status
 tatara.dev|tasks/status
 tatara.dev|subtasks/status
 tatara.dev|queuedevents/status
+tatara.dev|issues/status
+tatara.dev|mergerequests/status
+tatara.dev|tasks/finalizers
 batch|jobs
 ""|pods
 ""|services

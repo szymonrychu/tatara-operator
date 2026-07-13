@@ -31,58 +31,8 @@ func projectWithReporters(name, secretRef, trigger, bot string, reporters []stri
 	}
 }
 
-func issueOpenedBy(author string) []byte {
-	return []byte(`{"action":"opened","sender":{"login":"` + author + `"},"issue":{"number":7,"title":"Fix the bug","body":"please fix","user":{"login":"` + author + `"},"labels":[{"name":"tatara"}],"html_url":"https://github.com/o/r/issues/7"},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"}}`)
-}
-
 func issueCommentBy(author string) []byte {
 	return []byte(`{"action":"created","issue":{"number":9,"title":"old bug","body":"still broken","html_url":"https://github.com/o/r/issues/9"},"comment":{"id":5,"body":"please implement now","user":{"login":"` + author + `"}},"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"sender":{"login":"` + author + `"}}`)
-}
-
-func TestReporterGate_IssueFromNonReporter_Dropped(t *testing.T) {
-	const secretVal = "whsec-rg1"
-	c := seedClient(t,
-		projectWithReporters("projrg1", "projrg1-scm", "tatara", "bot", []string{"alice"}),
-		secret("projrg1-scm", secretVal),
-		repository("reporg1", "projrg1", "https://github.com/o/r.git", "main"),
-	)
-	h, reg := newServer(t, c)
-
-	body := issueOpenedBy("mallory")
-	hdr := http.Header{}
-	hdr.Set("X-GitHub-Event", "issues")
-	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
-
-	w := post(t, h, "projrg1", hdr, body)
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	var qel tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
-	require.Empty(t, qel.Items, "issue from a non-reporter must not create a task")
-	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total",
-		map[string]string{"provider": "github", "kind": "issue", "action": "opened", "result": "ignored"}))
-}
-
-func TestReporterGate_IssueFromReporter_Accepted(t *testing.T) {
-	const secretVal = "whsec-rg2"
-	c := seedClient(t,
-		projectWithReporters("projrg2", "projrg2-scm", "tatara", "bot", []string{"alice"}),
-		secret("projrg2-scm", secretVal),
-		repository("reporg2", "projrg2", "https://github.com/o/r.git", "main"),
-	)
-	h, _ := newServer(t, c)
-
-	body := issueOpenedBy("alice")
-	hdr := http.Header{}
-	hdr.Set("X-GitHub-Event", "issues")
-	hdr.Set("X-Hub-Signature-256", ghSign(secretVal, body))
-
-	w := post(t, h, "projrg2", hdr, body)
-	require.Equal(t, http.StatusAccepted, w.Code)
-
-	var qel tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
-	require.Len(t, qel.Items, 1, "issue from a listed reporter must create a task")
 }
 
 func TestReporterGate_CommentFromNonReporter_Ignored(t *testing.T) {
@@ -109,14 +59,18 @@ func TestReporterGate_CommentFromNonReporter_Ignored(t *testing.T) {
 		map[string]string{"provider": "github", "kind": "issue", "action": "created", "result": "ignored"}))
 }
 
-func TestReporterGate_CommentFromReporter_CreatesTask(t *testing.T) {
+// TestReporterGate_CommentFromReporter_Delivered verifies that a comment from
+// a listed reporter clears the reporter gate and reaches deliverPendingEvent
+// (result=accepted), instead of being dropped as ignored. The webhook mints no
+// Task itself (B.4 sweep owns intake); this only proves the gate passed.
+func TestReporterGate_CommentFromReporter_Delivered(t *testing.T) {
 	const secretVal = "whsec-rg4"
 	c := seedClient(t,
 		projectWithReporters("projrg4", "projrg4-scm", "tatara", "bot", []string{"alice"}),
 		secret("projrg4-scm", secretVal),
 		repository("reporg4", "projrg4", "https://github.com/o/r.git", "main"),
 	)
-	h, _ := newServer(t, c)
+	h, reg := newServer(t, c)
 
 	body := issueCommentBy("alice")
 	hdr := http.Header{}
@@ -126,7 +80,9 @@ func TestReporterGate_CommentFromReporter_CreatesTask(t *testing.T) {
 	w := post(t, h, "projrg4", hdr, body)
 	require.Equal(t, http.StatusAccepted, w.Code)
 
-	var qel tatarav1.QueuedEventList
-	require.NoError(t, c.List(context.Background(), &qel, client.InNamespace(ns)))
-	require.Len(t, qel.Items, 1, "comment from a listed reporter must create a triage task")
+	require.Equal(t, 1.0, counterValue(t, reg, "operator_webhook_events_total",
+		map[string]string{"provider": "github", "kind": "issue", "action": "created", "result": "accepted"}),
+		"comment from a listed reporter must clear the gate (result=accepted)")
+	require.Equal(t, 0.0, counterValue(t, reg, "operator_webhook_events_total",
+		map[string]string{"provider": "github", "kind": "issue", "action": "created", "result": "ignored"}))
 }

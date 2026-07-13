@@ -96,28 +96,6 @@ func TestBuildTaskFromQueuedEvent(t *testing.T) {
 	}
 }
 
-func TestBuildTaskFromQueuedEvent_SystemicGroup(t *testing.T) {
-	scheme := newEnqueueTestScheme(t)
-	proj := testProj("p", "ns")
-	qe := &tatarav1alpha1.QueuedEvent{
-		ObjectMeta: metav1.ObjectMeta{Name: "qe1", Namespace: "ns"},
-		Spec: tatarav1alpha1.QueuedEventSpec{Payload: tatarav1alpha1.QueuedEventPayload{
-			Kind: "issueLifecycle", RepositoryRef: "r", Goal: "g", GenerateName: "scan-",
-			SystemicGroup: &tatarav1alpha1.SystemicGroup{
-				SystemicID: "abc", SameRepoSiblings: []int{12, 15}, CrossRepo: []string{"o/r2#3 - x"},
-			},
-		}},
-	}
-	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if task.Spec.SystemicGroup == nil || task.Spec.SystemicGroup.SystemicID != "abc" ||
-		len(task.Spec.SystemicGroup.SameRepoSiblings) != 2 || len(task.Spec.SystemicGroup.CrossRepo) != 1 {
-		t.Fatalf("SystemicGroup not mapped: %+v", task.Spec.SystemicGroup)
-	}
-}
-
 func TestBuildTaskFromQueuedEvent_CopiesAlertRule(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	proj := testProj("p", "ns")
@@ -131,8 +109,8 @@ func TestBuildTaskFromQueuedEvent_CopiesAlertRule(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if task.Spec.AlertRule != "HighCPU" {
-		t.Fatalf("want AlertRule=HighCPU, got %q", task.Spec.AlertRule)
+	if len(task.Spec.AlertRules) != 1 || task.Spec.AlertRules[0] != "HighCPU" {
+		t.Fatalf("want AlertRules=[HighCPU], got %v", task.Spec.AlertRules)
 	}
 }
 
@@ -181,7 +159,7 @@ func TestEnqueueEvent_DedupGatedByTaskTerminalState(t *testing.T) {
 	task, err := BuildTaskFromQueuedEvent(qe, proj, c.Scheme())
 	require.NoError(t, err)
 	require.NoError(t, c.Create(context.Background(), task))
-	task.Status.Phase = "Running"
+	task.Status.Stage = tatarav1alpha1.StageInvestigating
 	require.NoError(t, c.Status().Update(context.Background(), task))
 	require.NoError(t, c.Delete(context.Background(), qe))
 
@@ -191,7 +169,7 @@ func TestEnqueueEvent_DedupGatedByTaskTerminalState(t *testing.T) {
 	require.False(t, created2, "dedup while incident Task non-terminal")
 
 	// Mark the Task terminal; third firing -> fresh event created.
-	task.Status.Phase = "Succeeded"
+	task.Status.Stage = tatarav1alpha1.StageFailed
 	require.NoError(t, c.Status().Update(context.Background(), task))
 	_, created3, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassAlert, false, "rulehash", pay)
 	require.NoError(t, err)
@@ -231,5 +209,145 @@ func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	}
 	if !created {
 		t.Fatal("should allow enqueue when existing dedupKey event is Done")
+	}
+}
+
+// TestDedupKeyIndexer_RoundTripsThroughSpecField verifies the NEW dedup
+// mechanism (contract B.7 addendum 7): the natural key round-trips through
+// QueuedEvent.spec.dedupKey and the DedupKeyIndex field index, with NO label
+// involved anywhere.
+func TestDedupKeyIndexer_RoundTripsThroughSpecField(t *testing.T) {
+	qe := &tatarav1alpha1.QueuedEvent{
+		Spec: tatarav1alpha1.QueuedEventSpec{DedupKey: "iss:o/r#42"},
+	}
+	got := DedupKeyIndexer(qe)
+	require.Equal(t, []string{"iss:o/r#42"}, got)
+	if qe.Labels != nil {
+		t.Fatalf("DedupKeyIndexer must not require or inspect labels, got %v", qe.Labels)
+	}
+}
+
+func TestDedupKeyIndexer_EmptyDedupKeyIndexesNothing(t *testing.T) {
+	qe := &tatarav1alpha1.QueuedEvent{}
+	if got := DedupKeyIndexer(qe); got != nil {
+		t.Fatalf("want nil for empty dedupKey, got %v", got)
+	}
+}
+
+// TestQueuedEventStillQueued_FindsByFieldIndex_NoLabel proves the natural key
+// "iss:<repo>#<number>" - which CANNOT be a label value (':' and '#' are not
+// label-safe) - is found via the DedupKeyIndex field lookup on a QueuedEvent
+// that carries NO tatara.dev/dedup-key label at all.
+func TestQueuedEventStillQueued_FindsByFieldIndex_NoLabel(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).
+		WithIndex(&tatarav1alpha1.QueuedEvent{}, DedupKeyIndex, DedupKeyIndexer).
+		Build()
+
+	natural := "iss:o/r#42"
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-field-dedup", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.QueuedEventSpec{Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "review", ProjectRef: "p", DedupKey: natural},
+	}
+	require.NoError(t, c.Create(context.Background(), qe))
+	qe.Status.State = tatarav1alpha1.QueueStateQueued
+	require.NoError(t, c.Status().Update(context.Background(), qe))
+
+	if len(qe.Labels) != 0 {
+		t.Fatalf("QueuedEvent built without EnqueueEvent must carry no labels, got %v", qe.Labels)
+	}
+
+	found, err := QueuedEventStillQueued(context.Background(), c, "tatara", "p", natural)
+	require.NoError(t, err)
+	if !found {
+		t.Fatal("want QueuedEventStillQueued true: natural key is Queued, found via the field index, no label involved")
+	}
+
+	notFound, err := QueuedEventStillQueued(context.Background(), c, "tatara", "p", "mr:o/r!7")
+	require.NoError(t, err)
+	if notFound {
+		t.Fatal("want false for a dedupKey that has no matching QueuedEvent")
+	}
+}
+
+func TestQueuedEventStillQueued_AdmittedDoesNotCount(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).
+		WithIndex(&tatarav1alpha1.QueuedEvent{}, DedupKeyIndex, DedupKeyIndexer).
+		Build()
+
+	natural := "iss:o/r#43"
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-field-dedup-admitted", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.QueuedEventSpec{Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "review", ProjectRef: "p", DedupKey: natural},
+	}
+	require.NoError(t, c.Create(context.Background(), qe))
+	qe.Status.State = tatarav1alpha1.QueueStateAdmitted
+	require.NoError(t, c.Status().Update(context.Background(), qe))
+
+	found, err := QueuedEventStillQueued(context.Background(), c, "tatara", "p", natural)
+	require.NoError(t, err)
+	if found {
+		t.Fatal("an Admitted QueuedEvent is no longer 'Queued but not yet Admitted' - must not count")
+	}
+}
+
+// TestBuildTaskFromQueuedEvent_TaskRefIsNotAMint: a TaskRef payload is an
+// ADMISSION TICKET for an existing Task (contract B.7), never a mint. Building a
+// Task from it is a programming error and must be refused loudly rather than
+// silently creating a second Task alongside the one the ticket names.
+func TestBuildTaskFromQueuedEvent_TaskRefIsNotAMint(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-ticket", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{Payload: tatarav1alpha1.QueuedEventPayload{
+			Kind: "implement", AgentKind: "implement", TaskRef: "existing-task",
+		}},
+	}
+	if _, err := BuildTaskFromQueuedEvent(qe, proj, scheme); err == nil {
+		t.Fatal("BuildTaskFromQueuedEvent must refuse a taskRef payload")
+	}
+}
+
+// TestBuildTaskFromQueuedEvent_NewTaskBlueprint: the B.7 mint shape. The
+// blueprint - not the flat legacy fields - describes the Task.
+func TestBuildTaskFromQueuedEvent_NewTaskBlueprint(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-mint", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			DedupKey: "iss:o/r#7",
+			Payload: tatarav1alpha1.QueuedEventPayload{
+				Kind: "clarify", AgentKind: "clarify",
+				NewTask: &tatarav1alpha1.QueuedTaskBlueprint{
+					Name: "p-clarify-2026-07-13-a1b2c", Kind: "clarify", Goal: "fix it",
+					ProjectRef: "p", RepositoryRef: "r",
+					AlertRules: []string{"HighCPU"},
+					Labels:     map[string]string{"x": "y"},
+				},
+			},
+		},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Name != "p-clarify-2026-07-13-a1b2c" {
+		t.Fatalf("blueprint name not used: %q", task.Name)
+	}
+	if task.Spec.Kind != "clarify" || task.Spec.Goal != "fix it" || task.Spec.RepositoryRef != "r" {
+		t.Fatalf("blueprint not mapped onto spec: %+v", task.Spec)
+	}
+	if len(task.Spec.AlertRules) != 1 || task.Spec.AlertRules[0] != "HighCPU" {
+		t.Fatalf("blueprint alertRules not mapped: %+v", task.Spec.AlertRules)
+	}
+	if task.Labels["x"] != "y" || task.Labels[LabelQueuedEvent] != "qe-mint" {
+		t.Fatalf("labels: %v", task.Labels)
 	}
 }

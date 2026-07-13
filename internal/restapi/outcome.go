@@ -1,0 +1,1479 @@
+package restapi
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
+)
+
+// outcomeAcceptedCondition is the DURABLE idempotency record of an accepted
+// submit_outcome. Its Message is sha256(agentKind|payload), so a TTL-stopped
+// pod's retry of an IDENTICAL outcome is recognised and answered 200 with the
+// unchanged Task - it must not 409 the Task into failure. It rides in the SAME
+// status write as the stage transition, so the record and the effect are atomic.
+const outcomeAcceptedCondition = "OutcomeAccepted"
+
+func sha256Sum(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+// outcomeEnvelope is C.2.7's two-stage decode. DisallowUnknownFields on BOTH
+// stages: an unknown key is a 400, never a silently-dropped instruction.
+type outcomeEnvelope struct {
+	Kind    string          `json:"kind"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+type implementPayload struct {
+	Action             string   `json:"action"`
+	Title              string   `json:"title,omitempty"`
+	Body               string   `json:"body,omitempty"`
+	ChangeSignificance string   `json:"changeSignificance,omitempty"`
+	MergeOrder         []string `json:"mergeOrder,omitempty"`
+	Reason             string   `json:"reason,omitempty"`
+}
+
+type reviewedSHA struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	SHA    string `json:"sha"`
+}
+
+type reviewFindingPayload struct {
+	Repo     string `json:"repo"`
+	Number   int    `json:"number"`
+	Path     string `json:"path,omitempty"`
+	Line     int    `json:"line,omitempty"`
+	Body     string `json:"body"`
+	Severity string `json:"severity"`
+}
+
+type reviewPayload struct {
+	Verdict            string                 `json:"verdict"`
+	ChangeSignificance string                 `json:"changeSignificance,omitempty"`
+	ReviewedSHAs       []reviewedSHA          `json:"reviewedSHAs"`
+	Findings           []reviewFindingPayload `json:"findings,omitempty"`
+}
+
+type clarifyPayload struct {
+	Decision string `json:"decision"`
+	Reason   string `json:"reason"`
+}
+
+type proposalPayload struct {
+	Repo  string `json:"repo"`
+	Title string `json:"title"`
+	Body  string `json:"body"`
+	Kind  string `json:"kind"`
+}
+
+type brainstormPayload struct {
+	Action    string            `json:"action"`
+	Proposals []proposalPayload `json:"proposals,omitempty"`
+	Reason    string            `json:"reason,omitempty"`
+}
+
+type incidentIssue struct {
+	Repo  string `json:"repo"`
+	Title string `json:"title"`
+	Body  string `json:"body"`
+}
+
+type incidentPayload struct {
+	Action     string         `json:"action"`
+	AlertRules []string       `json:"alertRules"`
+	Issue      *incidentIssue `json:"issue,omitempty"`
+	Reason     string         `json:"reason"`
+}
+
+type foldRef struct {
+	Task string `json:"task"`
+}
+
+type closeRef struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	Reason string `json:"reason"`
+}
+
+type linkRef struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	IsPR   bool   `json:"isPR,omitempty"`
+}
+
+type refinePayload struct {
+	Folds  []foldRef  `json:"folds,omitempty"`
+	Closes []closeRef `json:"closes,omitempty"`
+	Links  []linkRef  `json:"links,omitempty"`
+}
+
+// decodeStrict is the second decode stage: DisallowUnknownFields over the raw
+// payload bytes.
+func decodeStrict(raw []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	return nil
+}
+
+// postOutcome is POST /tasks/{t}/outcome: the ONE terminal signal (C.2.7).
+//
+// IT MAKES NO FORGE WRITE. The single forge call it can make is a READ
+// (GetPRHead, kind=review), to verify the SHA the agent says it reviewed is
+// still the live head. The SCM review itself is PERSISTED AS INTENT
+// (mr.status.pendingReview) and posted by the MergeRequest RECONCILER (C.5.3).
+func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
+	if !authorizeCaller(w, r) {
+		return
+	}
+	ctx := r.Context()
+	name := chi.URLParam(r, "t")
+
+	var env outcomeEnvelope
+	if err := decodeJSON(r, w, &env); err != nil {
+		writeDecodeError(w, r, err)
+		return
+	}
+	if env.Kind == "" {
+		writeError(w, http.StatusBadRequest, "kind required")
+		return
+	}
+	if len(env.Payload) == 0 {
+		writeError(w, http.StatusBadRequest, "payload required")
+		return
+	}
+
+	// IDEMPOTENCY FIRST, before the terminal-stage and kind gates, and CLAIMED
+	// atomically before any forge/child-mint side effect (C7): the handler
+	// runs on every replica, so a stale top-of-handler read of a stamped-only-
+	// at-commit fingerprint admits two concurrent identical POSTs straight
+	// through to the same forge write / child-mint / ReviewRounds increment.
+	// claimOutcomeFingerprint re-Gets the Task fresh and, under
+	// RetryOnConflict, either finds fp already stamped (a sequential retry,
+	// or the loser of a race - both take the SAME no-op path) or stamps it on
+	// THIS Status().Update. Exactly one of two concurrent identical POSTs can
+	// win that Update under optimistic concurrency, so the side effects that
+	// follow run at most once. A TTL-stopped pod's retry must not 409 the
+	// Task into failure - and by the time it retries, both status.stage and
+	// status.agentKind have moved on, so both gates below would refuse it.
+	fp := outcomeFingerprint(env.Kind, env.Payload)
+	key := types.NamespacedName{Namespace: s.ns, Name: name}
+	task, claimed, err := claimOutcomeFingerprint(ctx, s.c, key, fp, s.now())
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+	if !claimed {
+		s.log.InfoContext(ctx, "restapi: outcome replay accepted as a no-op",
+			append(reqLogFields(r), "action", "submit_outcome", "task", task.Name, "kind", env.Kind)...)
+		writeJSON(w, http.StatusOK, toTaskDTO(*task))
+		return
+	}
+
+	if tatarav1alpha1.StageTerminal(task) || task.Status.Stage == tatarav1alpha1.StageDelivered {
+		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "terminal-stage").Inc()
+		writeError(w, http.StatusConflict, "task is in a terminal stage")
+		return
+	}
+	// The pod's claim is not trusted: kind MUST equal status.agentKind.
+	if env.Kind != task.Status.AgentKind {
+		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "kind-mismatch").Inc()
+		writeError(w, http.StatusConflict, "kind does not match the task's agent kind")
+		return
+	}
+
+	proj, err := s.getProjectCR(ctx, task.Spec.ProjectRef)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+
+	oc := &outcomeCtx{s: s, w: w, r: r, task: task, proj: proj, fp: fp, kind: env.Kind}
+	switch env.Kind {
+	case "implement", "documentation":
+		var p implementPayload
+		if err := decodeStrict(env.Payload, &p); err != nil {
+			writeDecodeError(w, r, err)
+			return
+		}
+		oc.implement(p)
+	case "review":
+		var p reviewPayload
+		if err := decodeStrict(env.Payload, &p); err != nil {
+			writeDecodeError(w, r, err)
+			return
+		}
+		oc.review(p)
+	case "clarify":
+		var p clarifyPayload
+		if err := decodeStrict(env.Payload, &p); err != nil {
+			writeDecodeError(w, r, err)
+			return
+		}
+		oc.clarify(p)
+	case "brainstorm":
+		var p brainstormPayload
+		if err := decodeStrict(env.Payload, &p); err != nil {
+			writeDecodeError(w, r, err)
+			return
+		}
+		oc.brainstorm(p)
+	case "incident":
+		var p incidentPayload
+		if err := decodeStrict(env.Payload, &p); err != nil {
+			writeDecodeError(w, r, err)
+			return
+		}
+		oc.incident(p)
+	case "refine":
+		var p refinePayload
+		if err := decodeStrict(env.Payload, &p); err != nil {
+			writeDecodeError(w, r, err)
+			return
+		}
+		oc.refine(p)
+	default:
+		writeError(w, http.StatusBadRequest, "unknown outcome kind")
+	}
+}
+
+func outcomeFingerprint(kind string, payload []byte) string {
+	// Re-marshal through a generic value so whitespace and key order in the
+	// request body cannot change the fingerprint of an identical outcome.
+	var v any
+	if err := json.Unmarshal(payload, &v); err != nil {
+		return fmt.Sprintf("%x", sha256Sum(kind+"|"+string(payload)))
+	}
+	canon, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("%x", sha256Sum(kind+"|"+string(payload)))
+	}
+	return fmt.Sprintf("%x", sha256Sum(kind+"|"+string(canon)))
+}
+
+func outcomeAlreadyAccepted(task *tatarav1alpha1.Task, fp string) bool {
+	for _, c := range task.Status.Conditions {
+		if c.Type == outcomeAcceptedCondition && c.Message == fp {
+			return true
+		}
+	}
+	return false
+}
+
+// claimOutcomeFingerprint atomically claims fp against a FRESH re-read of the
+// Task, before any forge/child-mint side effect (C7). Under
+// RetryOnConflict, each attempt re-Gets the Task and either observes fp
+// already stamped - a sequential retry, or the loser of a race between two
+// concurrent identical POSTs - and reports claimed=false with no write, or
+// stamps fp on THIS Status().Update and reports claimed=true. Optimistic
+// concurrency lets exactly one of two concurrent identical POSTs win the
+// Update, so the caller's side effects run at most once.
+func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.NamespacedName,
+	fp string, now time.Time) (*tatarav1alpha1.Task, bool, error) {
+	fresh := &tatarav1alpha1.Task{}
+	claimed := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := c.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if outcomeAlreadyAccepted(fresh, fp) {
+			claimed = false
+			return nil
+		}
+		setCondition(fresh, metav1.Condition{
+			Type:               outcomeAcceptedCondition,
+			Status:             metav1.ConditionTrue,
+			Reason:             conditionReason(""),
+			Message:            fp,
+			LastTransitionTime: metav1.NewTime(now),
+		})
+		if err := c.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		claimed = true
+		return nil
+	})
+	return fresh, claimed, err
+}
+
+// outcomeCtx carries the per-request state every payload handler needs.
+type outcomeCtx struct {
+	s    *Server
+	w    http.ResponseWriter
+	r    *http.Request
+	task *tatarav1alpha1.Task
+	proj *tatarav1alpha1.Project
+	fp   string
+	kind string
+}
+
+func (o *outcomeCtx) bad(msg string, reason string) {
+	obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, reason).Inc()
+	writeError(o.w, http.StatusBadRequest, msg)
+}
+
+func (o *outcomeCtx) conflict(msg string, reason string) {
+	obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, reason).Inc()
+	writeError(o.w, http.StatusConflict, msg)
+}
+
+// commit applies the Task status mutation (a stage transition, notes, counters)
+// AND stamps the idempotency condition in ONE status write.
+//
+// It is the REST layer's half of the D1 emit. An /outcome is how a Task reaches
+// parked(implement-declined), parked(awaiting-human), parked(identity-unverified),
+// rejected(declined), rejected(false-positive) and delivered - i.e. most of the
+// terminal outcomes the platform ever produces - and not one of them was counted
+// before. The counter fires ONCE, AFTER the write lands: objbudget.FitTask re-runs
+// the closure to size the write and again on every conflict retry, so an emit
+// inside it would be inflated 2-3x.
+func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
+	ctx := o.r.Context()
+	s := o.s
+	key := types.NamespacedName{Namespace: s.ns, Name: o.task.Name}
+	var mutErr error
+	from := o.task.Status.Stage
+	var to, toReason string
+	err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+		if mutate != nil {
+			if err := mutate(t); err != nil {
+				mutErr = err
+				return
+			}
+		}
+		to, toReason = t.Status.Stage, t.Status.StageReason
+		setCondition(t, metav1.Condition{
+			Type:               outcomeAcceptedCondition,
+			Status:             metav1.ConditionTrue,
+			Reason:             conditionReason(o.kind),
+			Message:            o.fp,
+			LastTransitionTime: metav1.NewTime(s.now()),
+		})
+	})
+	if mutErr != nil {
+		var ill *stage.IllegalTransitionError
+		if errors.As(mutErr, &ill) {
+			s.log.ErrorContext(ctx, "restapi: outcome asked for an illegal stage transition",
+				append(reqLogFields(o.r), "task", o.task.Name, "from", ill.From, "to", ill.To)...)
+			o.conflict(mutErr.Error(), "illegal-transition")
+			return false
+		}
+		writeError(o.w, http.StatusInternalServerError, "internal error")
+		s.log.ErrorContext(ctx, "restapi: outcome mutation failed",
+			append(reqLogFields(o.r), "task", o.task.Name, "error", mutErr)...)
+		return false
+	}
+	if errors.Is(err, objbudget.ErrObjectTooLarge) {
+		obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, stage.ReasonObjectTooLarge).Inc()
+		if perr := objbudget.MinimalFailPatch(ctx, s.c, o.task, stage.ReasonObjectTooLarge); perr != nil {
+			s.log.ErrorContext(ctx, "restapi: minimal fail patch failed",
+				append(reqLogFields(o.r), "task", o.task.Name, "error", perr)...)
+		}
+		writeError(o.w, http.StatusInsufficientStorage, "task exceeds the byte budget")
+		return false
+	}
+	if err != nil {
+		writeClientErr(o.w, err)
+		return false
+	}
+	s.metrics.TaskTerminalEntry(o.task.Spec.Kind, from, to, toReason)
+	if to != from {
+		s.log.InfoContext(ctx, "stage transition",
+			append(reqLogFields(o.r), "action", "stage_transition", "task", o.task.Name,
+				"from", from, "to", to, "stage_reason", toReason)...)
+	}
+	return true
+}
+
+// conditionReason is a CamelCase k8s condition reason.
+func conditionReason(kind string) string {
+	if kind == "" {
+		return "Outcome"
+	}
+	return strings.ToUpper(kind[:1]) + kind[1:]
+}
+
+func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {
+	for i := range t.Status.Conditions {
+		if t.Status.Conditions[i].Type == c.Type {
+			t.Status.Conditions[i] = c
+			return
+		}
+	}
+	t.Status.Conditions = append(t.Status.Conditions, c)
+}
+
+// ok writes the accepted 200 with the fresh Task.
+func (o *outcomeCtx) ok(action string, fields ...any) {
+	ctx := o.r.Context()
+	fresh, err := o.s.getTaskCR(ctx, o.task.Name)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, action).Inc()
+	o.s.log.InfoContext(ctx, "restapi: outcome accepted",
+		append(append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name,
+			"kind", o.kind, "outcome", action, "stage", fresh.Status.Stage), fields...)...)
+	writeJSON(o.w, http.StatusOK, toTaskDTO(*fresh))
+}
+
+// note records an agent-authored note in the same status write as the
+// transition. The writer is ALWAYS status.agentKind: an agent can never produce
+// agent="operator".
+func agentNote(t *tatarav1alpha1.Task, agent, kind, body string, now time.Time) {
+	t.Status.Notes = append(t.Status.Notes, tatarav1alpha1.Note{
+		At: metav1.NewTime(now), Agent: agent, Kind: kind,
+		Body: truncateValidUTF8(body, noteBodyMaxBytes),
+	})
+}
+
+// --- implement / documentation --------------------------------------------
+
+func (o *outcomeCtx) implement(p implementPayload) {
+	ctx := o.r.Context()
+	s := o.s
+
+	switch p.Action {
+	case "submitted":
+		if strings.TrimSpace(p.Title) == "" || strings.TrimSpace(p.Body) == "" ||
+			strings.TrimSpace(p.ChangeSignificance) == "" {
+			o.bad("action=submitted requires title, body and changeSignificance", "missing-field")
+			return
+		}
+		if p.Reason != "" {
+			o.bad("reason is only for action=declined", "unexpected-field")
+			return
+		}
+		if !validChangeSignificance[p.ChangeSignificance] {
+			o.bad("changeSignificance must be one of major, minor, patch", "bad-significance")
+			return
+		}
+	case "declined":
+		if strings.TrimSpace(p.Reason) == "" {
+			o.bad("action=declined requires a non-empty reason", "missing-field")
+			return
+		}
+	default:
+		o.bad("action must be one of submitted, declined", "bad-action")
+		return
+	}
+
+	mrs, err := s.ownedMRs(ctx, o.task)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+
+	if p.Action == "declined" {
+		to, reason := tatarav1alpha1.StageParked, stage.ReasonImplementDeclined
+		if o.kind == "documentation" {
+			// A declined documentation batch is DELIVERED, not parked: there was
+			// nothing to document (F.3).
+			to, reason = tatarav1alpha1.StageDelivered, ""
+		}
+		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			agentNote(t, o.kind, "note", "declined: "+p.Reason, s.now())
+			return stage.Enter(t, mrs, to, reason, s.now())
+		}) {
+			return
+		}
+		if o.kind == "documentation" {
+			if err := s.stampDocumentedBy(ctx, o.task); err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+		}
+		o.ok("declined")
+		return
+	}
+
+	// MERGE ORDER RESOLUTION (fix C2). This is what made the COMMON case -
+	// one issue, one repo, one MR - unmergeable in v3: mergeOrder was nil, the
+	// C.5.2 loop ran ZERO times, and delivered was unreachable.
+	open := openMRs(mrs)
+	repos := ownedMRRepos(open)
+	switch {
+	case len(repos) == 0:
+		o.bad("action=submitted but this task owns no open MR", "no-open-mr")
+		return
+	case len(repos) == 1:
+		// mergeOrder is OPTIONAL. With one repo there is exactly one order and
+		// nothing to get wrong. This is NOT a lexical default.
+		if len(p.MergeOrder) == 0 {
+			p.MergeOrder = repos
+		}
+	default:
+		// mergeOrder is REQUIRED. There is NO LEXICAL DEFAULT: lexical order is
+		// agent-skills < cli < claude-code-wrapper < operator, which merges cli
+		// BEFORE operator - precisely the fleet outage this redesign prevents.
+		if len(p.MergeOrder) == 0 {
+			o.bad("mergeOrder required for a multi-repo change", "merge-order-missing")
+			return
+		}
+	}
+	for _, repo := range repos {
+		if !contains(p.MergeOrder, repo) {
+			o.bad("mergeOrder does not cover repo "+repo, "merge-order-coverage")
+			return
+		}
+	}
+
+	// changeSignificance is written to EVERY owned MR's status.significance. It
+	// is IMPLEMENT-OWNED (fix 12).
+	for i := range open {
+		mr := &open[i]
+		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+			m.Status.Significance = p.ChangeSignificance
+		}); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+	}
+	if err := s.updateTaskSpec(ctx, o.task.Name, func(t *tatarav1alpha1.Task) {
+		t.Spec.MergeOrder = p.MergeOrder
+	}); err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		agentNote(t, o.kind, "note", "submitted: "+p.Title+"\n\n"+p.Body, s.now())
+		return stage.Enter(t, mrs, tatarav1alpha1.StageReviewing, "", s.now())
+	}) {
+		return
+	}
+	o.ok("submitted", "merge_order", strings.Join(p.MergeOrder, ","),
+		"change_significance", p.ChangeSignificance)
+}
+
+// ownedMRRepos is the DEDUPED repo list of the MRs still open, in stable order.
+func ownedMRRepos(mrs []tatarav1alpha1.MergeRequest) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(mrs))
+	for i := range mrs {
+		repo := mrs[i].Spec.RepositoryRef
+		if !seen[repo] {
+			seen[repo] = true
+			out = append(out, repo)
+		}
+	}
+	return out
+}
+
+// stampDocumentedBy stamps status.documentedBy on every Task the batch covered
+// (F.3: either way, documented or declined).
+func (s *Server) stampDocumentedBy(ctx context.Context, batch *tatarav1alpha1.Task) error {
+	for _, name := range batch.Spec.DocumentsTasks {
+		key := types.NamespacedName{Namespace: s.ns, Name: name}
+		var covered tatarav1alpha1.Task
+		if err := s.c.Get(ctx, key, &covered); err != nil {
+			if client.IgnoreNotFound(err) == nil {
+				continue
+			}
+			return err
+		}
+		if err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+			t.Status.DocumentedBy = batch.Name
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- review ---------------------------------------------------------------
+
+var significanceRank = map[string]int{"patch": 1, "minor": 2, "major": 3}
+
+func (o *outcomeCtx) review(p reviewPayload) {
+	ctx := o.r.Context()
+	s := o.s
+
+	switch p.Verdict {
+	case "approve":
+	case "request_changes":
+		if len(p.Findings) == 0 {
+			o.bad("verdict=request_changes requires at least one finding", "missing-findings")
+			return
+		}
+	default:
+		o.bad("verdict must be one of approve, request_changes", "bad-verdict")
+		return
+	}
+	if p.ChangeSignificance != "" && !validChangeSignificance[p.ChangeSignificance] {
+		o.bad("changeSignificance must be one of major, minor, patch", "bad-significance")
+		return
+	}
+	if len(p.ReviewedSHAs) == 0 {
+		o.bad("reviewedSHAs is required: report the head SHA you actually checked out and read, for every MR this task owns", "missing-reviewed-shas")
+		return
+	}
+
+	all, err := s.ownedMRs(ctx, o.task)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	open := openMRs(all)
+	if len(open) == 0 {
+		o.bad("this task owns no open MR", "no-open-mr")
+		return
+	}
+
+	// COVERAGE IS TOTAL. A reviewedSHAs that omits an owned MR is a 400, NOT
+	// "unreviewed but fine": a multi-repo Task is exactly where a review agent
+	// is most likely to read three MRs and report two.
+	reported := map[string]string{}
+	for _, rs := range p.ReviewedSHAs {
+		if rs.Repo == "" || rs.Number == 0 || rs.SHA == "" {
+			o.bad("every reviewedSHAs entry requires repo, number and sha", "bad-reviewed-sha")
+			return
+		}
+		reported[mrKey(rs.Repo, rs.Number)] = rs.SHA
+	}
+	for i := range open {
+		mr := &open[i]
+		k := mrKey(mr.Spec.RepositoryRef, mr.Spec.Number)
+		if _, ok := reported[k]; !ok {
+			o.bad(fmt.Sprintf("reviewed_shas does not cover %s - review every MR in this task, or request_changes", k),
+				"review-coverage")
+			return
+		}
+	}
+	for k := range reported {
+		if !mrKeyOwned(open, k) {
+			o.bad("task does not own "+k, "reviewed-sha-unowned")
+			return
+		}
+	}
+
+	// THE LIVE HEAD READ - the ONE forge call this handler makes, and it is a
+	// READ. v3 stamped reviewedSHA from the live head at /outcome, which
+	// certifies whatever was pushed BETWEEN the agent's checkout and its
+	// outcome: the merge pin then guarantees that unreviewed code is what ships.
+	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+	if !ok {
+		return
+	}
+	for i := range open {
+		mr := &open[i]
+		repo, err := s.repoCR(ctx, o.proj.Name, mr.Spec.RepositoryRef)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		live, err := writer.GetPRHead(ctx, repo.Spec.URL, token, mr.Spec.Number)
+		if err != nil {
+			s.log.ErrorContext(ctx, "restapi: live head read failed",
+				append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name,
+					"number", mr.Spec.Number, "error", err)...)
+			writeError(o.w, http.StatusBadGateway, "scm read failed")
+			return
+		}
+		k := mrKey(mr.Spec.RepositoryRef, mr.Spec.Number)
+		if live != reported[k] {
+			// NOTHING IS STAMPED. The agent re-reads and re-submits.
+			obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, "head-moved").Inc()
+			writeError(o.w, http.StatusConflict, "head moved since you reviewed it")
+			return
+		}
+	}
+
+	// PERSIST THE INTENT, and only the intent (C.5.3 phase 1). The MergeRequest
+	// RECONCILER posts the review; this handler makes NO forge write.
+	body := reviewBody(p.Verdict)
+	for i := range open {
+		mr := &open[i]
+		k := mrKey(mr.Spec.RepositoryRef, mr.Spec.Number)
+		sha := reported[k]
+		findings := findingsFor(p.Findings, mr.Spec.RepositoryRef, mr.Spec.Number)
+		verdict := p.Verdict
+		sig := p.ChangeSignificance
+		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+			round := m.Status.ReviewRounds + 1
+			m.Status.ReviewedSHA = sha
+			m.Status.PendingReview = &tatarav1alpha1.PendingReview{
+				Body: body, Findings: findings, SHA: sha, Round: round,
+			}
+			if verdict == "approve" {
+				m.Status.Status = "approved"
+			} else {
+				m.Status.Status = "needs-changes"
+				m.Status.ReviewRounds = round
+			}
+			// changeSignificance is IMPLEMENT-OWNED: a review may only ESCALATE
+			// it. A LOWER value is IGNORED and logged WARN - the in-cluster
+			// reviewer is documented-flaky and must never downgrade a major
+			// release to a patch.
+			if sig != "" && significanceRank[sig] > significanceRank[m.Status.Significance] {
+				m.Status.Significance = sig
+			}
+		}); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		if sig != "" && significanceRank[sig] <= significanceRank[mr.Status.Significance] &&
+			sig != mr.Status.Significance {
+			s.log.WarnContext(ctx, "restapi: review tried to LOWER changeSignificance; ignored (it is implement-owned)",
+				append(reqLogFields(o.r), "task", o.task.Name, "repo", mr.Spec.RepositoryRef,
+					"number", mr.Spec.Number, "implement", mr.Status.Significance, "review", sig)...)
+		}
+		// G4 quality-proxy signal: tatara-quality.yaml's rubber-stamp alert
+		// selects operator_review_outcome_total{verdict="changes_requested"},
+		// which is NOT this payload's own "request_changes" vocabulary.
+		s.metrics.RecordReviewOutcome(o.proj.Name, mr.Spec.RepositoryRef, o.proj.Spec.Agent.Model,
+			reviewOutcomeVerdictLabel(verdict))
+	}
+
+	// NO stage transition here. reviewing -> implementing and reviewing ->
+	// merging are BOTH gated on every owned MR having pendingReview == nil
+	// (stage.LegalFor, contract C.5.3): a pod spawned before the review is
+	// recorded renders a bundle with no findings in it. The MergeRequest
+	// reconciler posts the review, clears pendingReview, and the Task
+	// reconciler then takes the F.3 edge from the MR statuses this handler just
+	// wrote.
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		agentNote(t, o.kind, "note", "review: "+p.Verdict, s.now())
+		return nil
+	}) {
+		return
+	}
+	o.ok(p.Verdict, "mrs", len(open), "findings", len(p.Findings))
+}
+
+// reviewOutcomeVerdictLabel maps the REST payload's verdict vocabulary
+// (approve/request_changes) onto operator_review_outcome_total's label
+// vocabulary (approved/changes_requested, RecordReviewOutcome's own doc
+// comment), which tatara-quality.yaml's rubber-stamp alert selects on
+// directly.
+func reviewOutcomeVerdictLabel(verdict string) string {
+	if verdict == "approve" {
+		return "approved"
+	}
+	return "changes_requested"
+}
+
+func reviewBody(verdict string) string {
+	if verdict == "approve" {
+		return "## Review: approved"
+	}
+	return "## Review: changes requested"
+}
+
+func mrKey(repo string, number int) string { return fmt.Sprintf("%s!%d", repo, number) }
+
+func mrKeyOwned(mrs []tatarav1alpha1.MergeRequest, key string) bool {
+	for i := range mrs {
+		if mrKey(mrs[i].Spec.RepositoryRef, mrs[i].Spec.Number) == key {
+			return true
+		}
+	}
+	return false
+}
+
+func findingsFor(in []reviewFindingPayload, repo string, number int) []tatarav1alpha1.ReviewFinding {
+	var out []tatarav1alpha1.ReviewFinding
+	for _, f := range in {
+		if f.Repo != repo || f.Number != number {
+			continue
+		}
+		out = append(out, tatarav1alpha1.ReviewFinding{
+			Path: f.Path, Line: f.Line, Body: f.Body, Severity: f.Severity,
+		})
+	}
+	return out
+}
+
+// --- clarify --------------------------------------------------------------
+
+func (o *outcomeCtx) clarify(p clarifyPayload) {
+	ctx := o.r.Context()
+	s := o.s
+
+	switch p.Decision {
+	case "implement", "close", "discuss":
+	default:
+		o.bad("decision must be one of implement, close, discuss", "bad-decision")
+		return
+	}
+	if strings.TrimSpace(p.Reason) == "" {
+		o.bad("reason is required on every clarify decision", "missing-field")
+		return
+	}
+
+	mrs, err := s.ownedMRs(ctx, o.task)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+
+	switch p.Decision {
+	case "discuss":
+		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			agentNote(t, o.kind, "note", "discuss: "+p.Reason, s.now())
+			return stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, s.now())
+		}) {
+			return
+		}
+		o.ok("discuss")
+		return
+	case "close":
+		// The OPERATOR closes the issue; the agent never does it from here.
+		// The close is queued as a pending comment intent on every owned Issue,
+		// drained by the Issue reconciler.
+		issues, err := s.ownedIssues(ctx, o.task)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		for i := range issues {
+			if err := s.queueIssueClose(ctx, &issues[i], o.task.Name, p.Reason); err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+		}
+		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			agentNote(t, o.kind, "note", "close: "+p.Reason, s.now())
+			return stage.Enter(t, mrs, tatarav1alpha1.StageRejected, stage.ReasonDeclined, s.now())
+		}) {
+			return
+		}
+		o.ok("close")
+		return
+	}
+
+	// decision=implement. APPROVAL IS IN NO SCHEMA: the agent reports its
+	// decision and the operator INDEPENDENTLY verifies the C.6 grammar - both
+	// the TEXT (anchored whole-line) and the SCOPE (EVERY owned Issue, not one:
+	// fix H9).
+	issues, err := s.ownedIssues(ctx, o.task)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues)
+	if !granted {
+		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
+			return stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now())
+		}) {
+			return
+		}
+		s.log.WarnContext(ctx, "restapi: clarify reported approval but the C.6 grammar did not pass on every owned issue",
+			append(reqLogFields(o.r), "task", o.task.Name, "issues", len(issues))...)
+		o.ok("implement-unverified")
+		return
+	}
+
+	for i := range issues {
+		iss := &issues[i]
+		ev := evidence[iss.Name]
+		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
+		if err := objbudget.FitIssue(ctx, s.c, s.spiller, key, func(is *tatarav1alpha1.Issue) {
+			is.Status.Status = "approved"
+			is.Status.Approval = ev
+		}); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+	}
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
+		return stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now())
+	}) {
+		return
+	}
+	o.ok("implement", "issues", len(issues))
+}
+
+// verifyApprovalScope runs the C.6 grammar over EVERY owned Issue. The empty
+// set is NOT a licence: a clarify Task with no Issue has nothing to approve and
+// is refused.
+//
+// A nil verifier FAILS CLOSED.
+func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,
+	issues []tatarav1alpha1.Issue) (bool, map[string]*tatarav1alpha1.ApprovalEvidence) {
+	if len(issues) == 0 || s.approval == nil {
+		return false, nil
+	}
+	out := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(issues))
+	for i := range issues {
+		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i])
+		if !ok {
+			return false, nil
+		}
+		out[issues[i].Name] = ev
+	}
+	return true, out
+}
+
+func (s *Server) queueIssueClose(ctx context.Context, iss *tatarav1alpha1.Issue, taskName, reason string) error {
+	requestID := newRequestID(taskName, "close", iss.Name, reason)
+	key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
+	return objbudget.FitIssue(ctx, s.c, s.spiller, key, func(i *tatarav1alpha1.Issue) {
+		for _, e := range i.Status.PendingComments {
+			if e.RequestID == requestID {
+				return
+			}
+		}
+		if len(i.Status.PendingComments) >= pendingCommentsCap {
+			return
+		}
+		i.Status.PendingComments = append(i.Status.PendingComments, tatarav1alpha1.PendingComment{
+			RequestID: requestID, Action: "comment", Body: closeIntentBody(reason),
+		})
+	})
+}
+
+func closeIntentBody(reason string) string {
+	return "<!-- tatara-close -->\n" + reason
+}
+
+// --- brainstorm -----------------------------------------------------------
+
+func (o *outcomeCtx) brainstorm(p brainstormPayload) {
+	ctx := o.r.Context()
+	s := o.s
+
+	switch p.Action {
+	case "propose":
+		if len(p.Proposals) < 1 || len(p.Proposals) > 5 {
+			o.bad("proposals must carry 1 to 5 entries when action=propose", "bad-proposals")
+			return
+		}
+		for _, pr := range p.Proposals {
+			if pr.Repo == "" || strings.TrimSpace(pr.Title) == "" || strings.TrimSpace(pr.Body) == "" {
+				o.bad("every proposal requires repo, title and body", "bad-proposals")
+				return
+			}
+			if pr.Kind != "bug" && pr.Kind != "improvement" {
+				o.bad("proposal kind must be bug or improvement", "bad-proposals")
+				return
+			}
+		}
+	case "skip":
+		if strings.TrimSpace(p.Reason) == "" {
+			o.bad("action=skip requires a non-empty reason", "missing-field")
+			return
+		}
+	default:
+		o.bad("action must be one of propose, skip", "bad-action")
+		return
+	}
+
+	if p.Action == "skip" {
+		// documentedBy stays EMPTY (fix 25): a cron brainstorm that correctly
+		// says "nothing novel" must not spawn a docs pod, a docs PR about
+		// nothing, a review, a merge and a release - every day.
+		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			agentNote(t, o.kind, "note", "skip: "+p.Reason, s.now())
+			return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+		}) {
+			return
+		}
+		o.ok("skip")
+		return
+	}
+
+	// Each proposal becomes its OWN new clarify Task, owning its OWN Issue
+	// (F.3). brainstorm files issues through submit_outcome, not issue_write,
+	// so the proposal cap and dedup still apply.
+	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+	if !ok {
+		return
+	}
+	spawned := make([]string, 0, len(p.Proposals))
+	for _, pr := range p.Proposals {
+		repo, err := s.repoCR(ctx, o.proj.Name, pr.Repo)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: pr.Title, Body: pr.Body})
+		controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
+		if err != nil {
+			s.log.ErrorContext(ctx, "restapi: filing a brainstorm proposal failed",
+				append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name, "error", err)...)
+			writeError(o.w, http.StatusBadGateway, "scm write failed")
+			return
+		}
+		number := issueRefNumber(created.Ref)
+		if number == 0 {
+			writeError(o.w, http.StatusBadGateway, "scm returned no issue number")
+			return
+		}
+		child, err := s.mintClarifyTask(ctx, o.proj, repo, pr, number, created.URL)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, pr.Body); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		spawned = append(spawned, child.Name)
+	}
+
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		agentNote(t, o.kind, "note", "proposed: "+strings.Join(spawned, ", "), s.now())
+		return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+	}) {
+		return
+	}
+	o.ok("propose", "spawned", strings.Join(spawned, ","))
+}
+
+// mintClarifyTask creates the clarify Task a brainstorm proposal becomes.
+func (s *Server) mintClarifyTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, pr proposalPayload, number int, url string) (*tatarav1alpha1.Task, error) {
+	name := tatarav1alpha1.TaskName(proj.Name, "clarify", s.now(), rand.String(5))
+	t := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj.Name, RepositoryRef: repo.Name, Kind: "clarify",
+			Goal: pr.Title + "\n\n" + pr.Body,
+			Source: &tatarav1alpha1.TaskSource{
+				Provider: providerOf(proj), IssueRef: issueRef(repo, number),
+				URL: url, Number: number,
+			},
+		},
+	}
+	if err := s.c.Create(ctx, t); err != nil {
+		return nil, fmt.Errorf("create clarify task %s: %w", name, err)
+	}
+	return t, nil
+}
+
+// issueRef is the provider-shaped owner/repo#N reference.
+func issueRef(repo *tatarav1alpha1.Repository, number int) string {
+	return fmt.Sprintf("%s#%d", repoSlug(repo), number)
+}
+
+func providerOf(proj *tatarav1alpha1.Project) string {
+	if proj.Spec.Scm == nil {
+		return ""
+	}
+	return proj.Spec.Scm.Provider
+}
+
+// --- incident -------------------------------------------------------------
+
+func (o *outcomeCtx) incident(p incidentPayload) {
+	ctx := o.r.Context()
+	s := o.s
+
+	if len(p.AlertRules) == 0 {
+		o.bad("alertRules is required (at least one) on both actions", "missing-field")
+		return
+	}
+	if strings.TrimSpace(p.Reason) == "" {
+		o.bad("reason is required on both actions", "missing-field")
+		return
+	}
+	switch p.Action {
+	case "file_issue":
+		if p.Issue == nil || p.Issue.Repo == "" ||
+			strings.TrimSpace(p.Issue.Title) == "" || strings.TrimSpace(p.Issue.Body) == "" {
+			o.bad("action=file_issue requires issue.repo, issue.title and issue.body", "missing-field")
+			return
+		}
+	case "false_positive":
+		if p.Issue != nil {
+			o.bad("issue is only for action=file_issue", "unexpected-field")
+			return
+		}
+	default:
+		o.bad("action must be one of file_issue, false_positive", "bad-action")
+		return
+	}
+
+	// alertRules are merged into Task.spec.alertRules; spec is
+	// operator-writable and agent-unwritable, and this is the operator writing.
+	if err := s.updateTaskSpec(ctx, o.task.Name, func(t *tatarav1alpha1.Task) {
+		for _, rule := range p.AlertRules {
+			if !contains(t.Spec.AlertRules, rule) {
+				t.Spec.AlertRules = append(t.Spec.AlertRules, rule)
+			}
+		}
+	}); err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+
+	if p.Action == "false_positive" {
+		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			agentNote(t, o.kind, "note", "false_positive: "+p.Reason, s.now())
+			return stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, s.now())
+		}) {
+			return
+		}
+		o.ok("false_positive")
+		return
+	}
+
+	// The tracker Issue is created under THIS Task (F.3), and the Task then
+	// goes to clarifying: the human decides whether it is worked.
+	repo, err := s.repoCR(ctx, o.proj.Name, p.Issue.Repo)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+	if !ok {
+		return
+	}
+	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: p.Issue.Title, Body: p.Issue.Body})
+	controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
+	if err != nil {
+		s.log.ErrorContext(ctx, "restapi: filing the incident tracker issue failed",
+			append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name, "error", err)...)
+		writeError(o.w, http.StatusBadGateway, "scm write failed")
+		return
+	}
+	number := issueRefNumber(created.Ref)
+	if number == 0 {
+		writeError(o.w, http.StatusBadGateway, "scm returned no issue number")
+		return
+	}
+	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, p.Issue.Body); err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		agentNote(t, o.kind, "note", "file_issue: "+p.Reason, s.now())
+		return stage.Enter(t, nil, tatarav1alpha1.StageClarifying, "", s.now())
+	}) {
+		return
+	}
+	o.ok("file_issue", "repo", repo.Name, "number", number)
+}
+
+// --- refine, and the B.3 fold ---------------------------------------------
+
+func (o *outcomeCtx) refine(p refinePayload) {
+	ctx := o.r.Context()
+	s := o.s
+
+	if len(p.Folds) == 0 && len(p.Closes) == 0 && len(p.Links) == 0 {
+		o.bad("at least one of folds, closes, links must be non-empty", "empty-refine")
+		return
+	}
+
+	// LIVENESS GATE on closes[] (fix 8): a closes[] target whose controller
+	// owner is not this Task has an ACTIVE task working it, and closing it out
+	// from under that Task is how two agents end up on one human's thread.
+	for _, c := range p.Closes {
+		if c.Repo == "" || c.Number == 0 || strings.TrimSpace(c.Reason) == "" {
+			o.bad("every closes entry requires repo, number and reason", "bad-closes")
+			return
+		}
+		name := tatarav1alpha1.IssueName(c.Repo, c.Number)
+		var iss tatarav1alpha1.Issue
+		if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: name}, &iss); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		if ctrl, ok := own.ControllerOwner(&iss); ok && ctrl != o.task.Name {
+			o.conflict("issue has an active task", "close-target-live")
+			return
+		}
+	}
+
+	// LIVENESS GATE on folds[] (fix 8): a member with a running pod or a live
+	// post-approved stage has work in flight.
+	members := make([]*tatarav1alpha1.Task, 0, len(p.Folds))
+	for _, f := range p.Folds {
+		if f.Task == "" {
+			o.bad("every folds entry requires task", "bad-folds")
+			return
+		}
+		m, err := s.getTaskCR(ctx, f.Task)
+		if err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+		if m.Name == o.task.Name {
+			o.bad("a task cannot fold itself", "bad-folds")
+			return
+		}
+		if foldMemberBusy(m) {
+			o.conflict("fold target has work in flight", "fold-target-live")
+			return
+		}
+		members = append(members, m)
+	}
+
+	// Adopt, verify, THEN delete (B.3). A crash between step 2 and step 4 is
+	// safe and idempotent: nothing is lost, and a re-run re-adopts what it
+	// already adopted.
+	if len(members) > 0 {
+		if err := s.foldMembers(ctx, o.task, members); err != nil {
+			if errors.Is(err, errFoldUnverified) {
+				if !o.commit(func(t *tatarav1alpha1.Task) error {
+					return stage.Enter(t, nil, tatarav1alpha1.StageFailed,
+						stage.ReasonFoldAdoptionUnverified, s.now())
+				}) {
+					return
+				}
+				obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, stage.ReasonFoldAdoptionUnverified).Inc()
+				s.log.ErrorContext(ctx, "restapi: fold adoption could not be verified; the umbrella FAILED and the members were NOT deleted",
+					append(reqLogFields(o.r), "task", o.task.Name)...)
+				writeError(o.w, http.StatusConflict, "fold adoption could not be verified")
+				return
+			}
+			writeClientErr(o.w, err)
+			return
+		}
+	}
+
+	// closes[] is LIVE-REVALIDATED against SCM immediately before each close:
+	// refine may act on a view up to an hour stale.
+	if len(p.Closes) > 0 {
+		writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+		if !ok {
+			return
+		}
+		for _, c := range p.Closes {
+			repo, err := s.repoCR(ctx, o.proj.Name, c.Repo)
+			if err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+			st, err := writer.GetIssueState(ctx, repo.Spec.URL, token, c.Number)
+			if err != nil {
+				s.log.ErrorContext(ctx, "restapi: revalidating a close target failed",
+					append(reqLogFields(o.r), "task", o.task.Name, "repo", repo.Name,
+						"number", c.Number, "error", err)...)
+				writeError(o.w, http.StatusBadGateway, "scm read failed")
+				return
+			}
+			if st.Closed {
+				continue
+			}
+			name := tatarav1alpha1.IssueName(c.Repo, c.Number)
+			var iss tatarav1alpha1.Issue
+			if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: name}, &iss); err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+			if err := s.queueIssueClose(ctx, &iss, o.task.Name, c.Reason); err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+		}
+	}
+
+	// links[] adopt the named artifact as a PLAIN owner of this Task: the link
+	// holds the GC open and puts the artifact in the umbrella's bundle.
+	for _, l := range p.Links {
+		if l.Repo == "" || l.Number == 0 {
+			o.bad("every links entry requires repo and number", "bad-links")
+			return
+		}
+		if err := s.linkArtifact(ctx, o.task, l); err != nil {
+			writeClientErr(o.w, err)
+			return
+		}
+	}
+
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		t.Status.FoldInFlight = nil
+		return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+	}) {
+		return
+	}
+	o.ok("refine", "folds", len(p.Folds), "closes", len(p.Closes), "links", len(p.Links))
+}
+
+// foldMemberBusy is the B.3 liveness gate: a running pod, or a live
+// post-approved stage.
+func foldMemberBusy(m *tatarav1alpha1.Task) bool {
+	if m.Status.PodName != "" && m.Status.PodStartedAt != nil {
+		return true
+	}
+	switch m.Status.Stage {
+	case tatarav1alpha1.StageApproved, tatarav1alpha1.StageImplementing,
+		tatarav1alpha1.StageReviewing, tatarav1alpha1.StageMerging,
+		tatarav1alpha1.StageDeploying:
+		return true
+	}
+	return false
+}
+
+var errFoldUnverified = errors.New("restapi: fold adoption could not be verified")
+
+// foldMembers runs the B.3 fold sequence IN ORDER:
+//
+//  1. status.foldInFlight = [M1..Mn]                    (one Status().Update)
+//  2. for each artifact A owned by Mi: ONE Update on A - append U
+//     (controller=false), rewrite Mi to controller=false, rewrite U to
+//     controller=true. The API server rejects two controller=true refs, so the
+//     swap MUST be one PUT (own.HandOverController).
+//  3. RE-LIST every named artifact; VERIFY U is a solid owner with
+//     controller=true. On ANY mismatch: -> failed(fold-adoption-unverified),
+//     foldInFlight cleared, members NOT deleted. Nothing is lost; a human sees
+//     a failed umbrella.
+//  4. only then: delete M1..Mn
+//  5. foldInFlight = []
+//
+// A crash between 2 and 4 is safe and idempotent. A crash after 4 leaves
+// foldInFlight set; the reconciler clears it once the members are gone. The
+// reaper SKIPS any Task named in a live umbrella's foldInFlight.
+func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task, members []*tatarav1alpha1.Task) error {
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		names = append(names, m.Name)
+	}
+
+	// STEP 1.
+	key := types.NamespacedName{Namespace: s.ns, Name: umbrella.Name}
+	if err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+		t.Status.FoldInFlight = names
+	}); err != nil {
+		return err
+	}
+
+	// STEP 2.
+	var adopted []client.Object
+	for _, m := range members {
+		issues, err := s.ownedIssues(ctx, m)
+		if err != nil {
+			return err
+		}
+		for i := range issues {
+			iss := issues[i]
+			if err := s.adopt(ctx, &iss, m, umbrella); err != nil {
+				return err
+			}
+			// The umbrella's Status.IssueRefs is what every downstream
+			// consumer reads (the C.6 approval grammar, the reaper's
+			// owned-set, the agent bundle) - NOT ownerRefs. Adoption without
+			// this leaves adopted work unguarded and absent from the bundle.
+			if err := s.appendTaskRefFor(ctx, umbrella.Name, &iss); err != nil {
+				return err
+			}
+			adopted = append(adopted, &tatarav1alpha1.Issue{
+				ObjectMeta: metav1.ObjectMeta{Name: iss.Name, Namespace: s.ns},
+			})
+		}
+		mrs, err := s.ownedMRs(ctx, m)
+		if err != nil {
+			return err
+		}
+		for i := range mrs {
+			mr := mrs[i]
+			if err := s.adopt(ctx, &mr, m, umbrella); err != nil {
+				return err
+			}
+			if err := s.appendTaskRefFor(ctx, umbrella.Name, &mr); err != nil {
+				return err
+			}
+			adopted = append(adopted, &tatarav1alpha1.MergeRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: mr.Name, Namespace: s.ns},
+			})
+		}
+	}
+
+	// STEP 3: RE-LIST and VERIFY. Adopt, verify, THEN delete.
+	for _, obj := range adopted {
+		fresh := obj.DeepCopyObject().(client.Object)
+		if err := s.c.Get(ctx, client.ObjectKeyFromObject(obj), fresh); err != nil {
+			return errFoldUnverified
+		}
+		ctrl, ok := own.ControllerOwner(fresh)
+		if !ok || ctrl != umbrella.Name {
+			return errFoldUnverified
+		}
+	}
+
+	// STEP 4: only NOW are the members deleted.
+	for _, m := range members {
+		if err := s.c.Delete(ctx, m); err != nil && client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+
+	// STEP 5.
+	return objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+		t.Status.FoldInFlight = nil
+	})
+}
+
+// adopt is the single-PUT controller swap: append the umbrella as a plain
+// owner, then hand the controller flag over, in ONE Update. Two controller=true
+// refs are a 422 at admission, so the demote and the promote CANNOT be two PUTs.
+func (s *Server) adopt(ctx context.Context, obj client.Object, from, to *tatarav1alpha1.Task) error {
+	own.AddPlainOwner(obj, to)
+	if err := own.HandOverController(obj, from, to); err != nil {
+		return err
+	}
+	if err := s.c.Update(ctx, obj); err != nil {
+		return fmt.Errorf("adopt %s onto %s: %w", obj.GetName(), to.Name, err)
+	}
+	return nil
+}
+
+// linkArtifact appends the umbrella as a PLAIN owner of a linked Issue/MR. A
+// plain owner's only job is to hold the GC open; the controller flag - and with
+// it the authorization to write to the forge - is untouched.
+func (s *Server) linkArtifact(ctx context.Context, task *tatarav1alpha1.Task, l linkRef) error {
+	var obj client.Object
+	if l.IsPR {
+		obj = &tatarav1alpha1.MergeRequest{}
+		if err := s.c.Get(ctx, types.NamespacedName{
+			Namespace: s.ns, Name: tatarav1alpha1.MergeRequestName(l.Repo, l.Number),
+		}, obj); err != nil {
+			return err
+		}
+	} else {
+		obj = &tatarav1alpha1.Issue{}
+		if err := s.c.Get(ctx, types.NamespacedName{
+			Namespace: s.ns, Name: tatarav1alpha1.IssueName(l.Repo, l.Number),
+		}, obj); err != nil {
+			return err
+		}
+	}
+	if !own.AddPlainOwner(obj, task) {
+		return nil
+	}
+	if err := s.c.Update(ctx, obj); err != nil {
+		return fmt.Errorf("link %s onto %s: %w", obj.GetName(), task.Name, err)
+	}
+	return s.appendTaskRefFor(ctx, task.Name, obj)
+}
+
+func (s *Server) appendTaskRefFor(ctx context.Context, taskName string, obj client.Object) error {
+	if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+		return s.appendTaskRef(ctx, taskName, "", obj.GetName())
+	}
+	return s.appendTaskRef(ctx, taskName, obj.GetName(), "")
+}

@@ -19,9 +19,7 @@ func TestSkillProfileForKind(t *testing.T) {
 		{"implement", "implement"},
 		{"review", "review"},
 		{"clarify", "clarify"},
-		{"triageIssue", "triage"},
 		{"brainstorm", "brainstorm"},
-		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"refine", "refine"},
 		{"healthCheck", ""}, // healthCheck uses Kind=brainstorm at the task level; unknown here -> fail-open
@@ -31,7 +29,7 @@ func TestSkillProfileForKind(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.kind, func(t *testing.T) {
-			require.Equal(t, tc.want, skillProfileForKind(tc.kind))
+			require.Equal(t, tc.want, profileForKind(tc.kind))
 		})
 	}
 }
@@ -46,15 +44,13 @@ func TestSkillProfileForKind_AllActiveCRDKinds(t *testing.T) {
 		"implement",
 		"review",
 		"clarify",
-		"triageIssue",
 		"brainstorm",
-		"issueLifecycle",
 		"incident",
 		"refine",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {
-			profile := skillProfileForKind(kind)
+			profile := profileForKind(kind)
 			require.NotEmpty(t, profile, "CRD kind %q must map to a non-empty skill profile", kind)
 		})
 	}
@@ -118,9 +114,7 @@ func TestBuildPod_SkillProfileEnv(t *testing.T) {
 	}{
 		{"implement", "implement"},
 		{"review", "review"},
-		{"triageIssue", "triage"},
 		{"brainstorm", "brainstorm"},
-		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"refine", "refine"},
 		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open

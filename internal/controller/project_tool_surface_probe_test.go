@@ -89,134 +89,6 @@ func gatherToolSurfaceCounter(t *testing.T, reg *prometheus.Registry, backend, r
 	return 0
 }
 
-// gatherToolSurfaceDurationCount reads the sample count of
-// operator_tool_surface_probe_duration_seconds{backend}.
-func gatherToolSurfaceDurationCount(t *testing.T, reg *prometheus.Registry, backend string) uint64 {
-	t.Helper()
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	for _, mf := range mfs {
-		if mf.GetName() != "operator_tool_surface_probe_duration_seconds" {
-			continue
-		}
-		for _, m := range mf.GetMetric() {
-			for _, lp := range m.GetLabel() {
-				if lp.GetName() == "backend" && lp.GetValue() == backend {
-					return m.GetHistogram().GetSampleCount()
-				}
-			}
-		}
-	}
-	return 0
-}
-
-// TestUpdateToolSurfaceProbe_OperatorAndChat drives the probe against fake
-// operator (401 -> present, the healthy OIDC-gated state) and chat (200 -> ok)
-// backends and asserts both are metered with a recorded latency.
-func TestUpdateToolSurfaceProbe_OperatorAndChat(t *testing.T) {
-	ctx := logfIntoTestCtx()
-	r, reg := newMemoryReconcilerWithReg()
-	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
-
-	mkMemoryProject(t, "ts-ready")
-	setMemoryPhaseReady(t, "ts-ready")
-
-	opSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized) // operator-write route present, auth gate working
-	}))
-	defer opSrv.Close()
-	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK) // chat /readyz healthy
-	}))
-	defer chatSrv.Close()
-
-	r.ToolSurfaceHTTP = opSrv.Client()
-	r.OperatorURL = opSrv.URL
-	chatProbes := 0
-	r.ChatBaseURL = func() string { chatProbes++; return chatSrv.URL }
-
-	r.updateToolSurfaceProbe(ctx)
-
-	if got := gatherToolSurfaceCounter(t, reg, "operator", "present"); got < 1 {
-		t.Fatalf("probe{operator,present} = %v, want >= 1", got)
-	}
-	if got := gatherToolSurfaceCounter(t, reg, "chat", "ok"); got < 1 {
-		t.Fatalf("probe{chat,ok} = %v, want >= 1", got)
-	}
-	if got := gatherToolSurfaceDurationCount(t, reg, "operator"); got < 1 {
-		t.Fatalf("operator latency samples = %d, want >= 1", got)
-	}
-	// chat is a single shared service: probed exactly once, not once per Project.
-	if chatProbes != 1 {
-		t.Fatalf("chat probed %d times, want exactly 1 (shared service, no per-project fan-out)", chatProbes)
-	}
-}
-
-// TestUpdateToolSurfaceProbe_SkipsChatWhenDisabled verifies chat is never probed
-// when ChatPathPrefix is empty, while the operator backend still is.
-func TestUpdateToolSurfaceProbe_SkipsChatWhenDisabled(t *testing.T) {
-	ctx := logfIntoTestCtx()
-	r, reg := newMemoryReconcilerWithReg()
-	r.MemoryConfig.ChatPathPrefix = "" // chat disabled platform-wide
-
-	opSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer opSrv.Close()
-	r.ToolSurfaceHTTP = opSrv.Client()
-	r.OperatorURL = opSrv.URL
-	probedChat := false
-	r.ChatBaseURL = func() string { probedChat = true; return "http://unused" }
-
-	r.updateToolSurfaceProbe(ctx)
-
-	if probedChat {
-		t.Fatal("chat was probed despite ChatPathPrefix being empty")
-	}
-	if got := gatherToolSurfaceCounter(t, reg, "operator", "present"); got < 1 {
-		t.Fatalf("operator probe should still run: probe{operator,present} = %v", got)
-	}
-	for _, res := range []string{"ok", "present", "absent", "error", "unreachable"} {
-		if got := gatherToolSurfaceCounter(t, reg, "chat", res); got != 0 {
-			t.Fatalf("probe{chat,%s} = %v, want 0 (chat disabled)", res, got)
-		}
-	}
-}
-
-// TestUpdateToolSurfaceProbe_ChatProbedOnceRegardlessOfProjects verifies chat is
-// probed exactly once per cycle when enabled: it is a single shared service, so
-// its probing is decoupled from Project count and readiness (no per-project
-// fan-out, which was the bug that reported the shared chat service unreachable).
-func TestUpdateToolSurfaceProbe_ChatProbedOnceRegardlessOfProjects(t *testing.T) {
-	ctx := logfIntoTestCtx()
-	r, reg := newMemoryReconcilerWithReg()
-	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
-
-	// A mix of non-Ready and Ready projects must not change chat probing.
-	mkMemoryProject(t, "ts-once-prov") // leave status.memory unset -> not Ready
-	mkMemoryProject(t, "ts-once-ready")
-	setMemoryPhaseReady(t, "ts-once-ready")
-
-	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer chatSrv.Close()
-	r.ToolSurfaceHTTP = chatSrv.Client()
-	chatProbes := 0
-	r.ChatBaseURL = func() string { chatProbes++; return chatSrv.URL }
-
-	r.updateToolSurfaceProbe(ctx)
-
-	if chatProbes != 1 {
-		t.Fatalf("chat probed %d times, want exactly 1 regardless of Project count/readiness", chatProbes)
-	}
-	if got := gatherToolSurfaceCounter(t, reg, "chat", "ok"); got != 1 {
-		t.Fatalf("probe{chat,ok} = %v, want 1", got)
-	}
-}
-
 // TestUpdateToolSurfaceProbe_DebouncesTransientUnreachable verifies a failing
 // backend is not metered until it has failed toolSurfaceUnhealthyThreshold cycles
 // in a row: a transient transport failure (the operator's own rollout churn
@@ -225,33 +97,30 @@ func TestUpdateToolSurfaceProbe_ChatProbedOnceRegardlessOfProjects(t *testing.T)
 func TestUpdateToolSurfaceProbe_DebouncesTransientUnreachable(t *testing.T) {
 	ctx := logfIntoTestCtx()
 	r, reg := newMemoryReconcilerWithReg()
-	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
-	r.OperatorURL = "" // isolate the chat backend
 
 	// A closed server yields a transport failure -> "unreachable", the incident's
 	// class.
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	closedURL := srv.URL
+	r.OperatorURL = srv.URL
 	r.ToolSurfaceHTTP = srv.Client()
 	srv.Close()
-	r.ChatBaseURL = func() string { return closedURL }
 
 	// Below the threshold: transient unreachable is logged but not metered.
 	for i := 1; i < toolSurfaceUnhealthyThreshold; i++ {
 		r.updateToolSurfaceProbe(ctx)
-		if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 0 {
-			t.Fatalf("after %d transient cycle(s) probe{chat,unreachable} = %v, want 0 (debounced)", i, got)
+		if got := gatherToolSurfaceCounter(t, reg, "operator", "unreachable"); got != 0 {
+			t.Fatalf("after %d transient cycle(s) probe{operator,unreachable} = %v, want 0 (debounced)", i, got)
 		}
 	}
 	// The threshold cycle meters it: a sustained outage is real signal.
 	r.updateToolSurfaceProbe(ctx)
-	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 1 {
-		t.Fatalf("at threshold probe{chat,unreachable} = %v, want 1 (sustained outage metered)", got)
+	if got := gatherToolSurfaceCounter(t, reg, "operator", "unreachable"); got != 1 {
+		t.Fatalf("at threshold probe{operator,unreachable} = %v, want 1 (sustained outage metered)", got)
 	}
 	// Every subsequent sustained-unhealthy cycle keeps metering.
 	r.updateToolSurfaceProbe(ctx)
-	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 2 {
-		t.Fatalf("past threshold probe{chat,unreachable} = %v, want 2", got)
+	if got := gatherToolSurfaceCounter(t, reg, "operator", "unreachable"); got != 2 {
+		t.Fatalf("past threshold probe{operator,unreachable} = %v, want 2", got)
 	}
 }
 
@@ -261,8 +130,6 @@ func TestUpdateToolSurfaceProbe_DebouncesTransientUnreachable(t *testing.T) {
 func TestUpdateToolSurfaceProbe_HealthyCycleResetsDebounce(t *testing.T) {
 	ctx := logfIntoTestCtx()
 	r, reg := newMemoryReconcilerWithReg()
-	r.MemoryConfig.ChatPathPrefix = "/api/v1/chat"
-	r.OperatorURL = "" // isolate the chat backend
 
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -273,24 +140,23 @@ func TestUpdateToolSurfaceProbe_HealthyCycleResetsDebounce(t *testing.T) {
 	down.Close()
 
 	r.ToolSurfaceHTTP = healthy.Client() // plain-HTTP client reaches both httptest servers
-	target := downURL
-	r.ChatBaseURL = func() string { return target }
+	r.OperatorURL = downURL
 
 	// Two transient-unhealthy cycles (below threshold), still suppressed.
 	r.updateToolSurfaceProbe(ctx)
 	r.updateToolSurfaceProbe(ctx)
-	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 0 {
-		t.Fatalf("probe{chat,unreachable} = %v after 2 transient cycles, want 0", got)
+	if got := gatherToolSurfaceCounter(t, reg, "operator", "unreachable"); got != 0 {
+		t.Fatalf("probe{operator,unreachable} = %v after 2 transient cycles, want 0", got)
 	}
 	// A healthy cycle clears the run.
-	target = healthy.URL
+	r.OperatorURL = healthy.URL
 	r.updateToolSurfaceProbe(ctx)
 	// Two more transient cycles must again be suppressed (the run restarted at 0).
-	target = downURL
+	r.OperatorURL = downURL
 	r.updateToolSurfaceProbe(ctx)
 	r.updateToolSurfaceProbe(ctx)
-	if got := gatherToolSurfaceCounter(t, reg, "chat", "unreachable"); got != 0 {
-		t.Fatalf("probe{chat,unreachable} = %v; a healthy cycle must reset the debounce", got)
+	if got := gatherToolSurfaceCounter(t, reg, "operator", "unreachable"); got != 0 {
+		t.Fatalf("probe{operator,unreachable} = %v; a healthy cycle must reset the debounce", got)
 	}
 }
 
@@ -300,7 +166,6 @@ func TestUpdateToolSurfaceProbe_HealthyCycleResetsDebounce(t *testing.T) {
 func TestUpdateToolSurfaceProbe_SkipsOperatorWhenURLUnset(t *testing.T) {
 	ctx := logfIntoTestCtx()
 	r, reg := newMemoryReconcilerWithReg()
-	r.MemoryConfig.ChatPathPrefix = "" // isolate the operator branch
 
 	r.updateToolSurfaceProbe(ctx)
 

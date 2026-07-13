@@ -89,7 +89,7 @@ func TestGitLabCapabilities(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := &GitLab{apiBase: srv.URL}
-		if _, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash"); err != nil {
+		if _, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash", ""); err != nil {
 			t.Fatalf("Merge: %v", err)
 		}
 		if gotPath != "/projects/"+url.PathEscape("g/p")+"/merge_requests/5/merge" || gotMethod != http.MethodPut {
@@ -183,7 +183,7 @@ func TestGitLabMergeConflict(t *testing.T) {
 			}))
 			defer srv.Close()
 			c := &GitLab{apiBase: srv.URL}
-			_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash")
+			_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash", "")
 			if !errors.Is(err, ErrMergeConflict) {
 				t.Fatalf("expected ErrMergeConflict for HTTP %d, got %v", status, err)
 			}

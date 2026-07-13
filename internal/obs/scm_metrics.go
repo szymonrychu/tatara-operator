@@ -36,6 +36,8 @@ var scmReadVerbs = map[string]bool{
 	"list_open_prs":        true,
 	"get_pr_state":         true,
 	"get_commit_ci_status": true,
+	"get_pr_head":          true,
+	"get_merge_state":      true,
 }
 
 // SCMVerbKind returns "read" or "write" for an SCM verb.
@@ -62,4 +64,10 @@ func (m *scmMetrics) SCMRequestErrorByStatus(provider, verb, status string) {
 // SCMWriteCounter returns the counter for (provider, verb, result) for test assertions.
 func (m *scmMetrics) SCMWriteCounter(provider, verb, result string) prometheus.Counter {
 	return m.scmWritesTotal.WithLabelValues(provider, verb, SCMVerbKind(verb), result)
+}
+
+// SCMRequestErrorByStatusCounter returns the counter for (provider, verb, status)
+// for test assertions.
+func (m *scmMetrics) SCMRequestErrorByStatusCounter(provider, verb, status string) prometheus.Counter {
+	return m.scmReqErrorsByStatus.WithLabelValues(provider, verb, status)
 }

@@ -1,6 +1,11 @@
 apiVersion: v2
 name: tatara-operator
-description: Kubernetes operator orchestrating the tatara agentic-development loop (Project/Repository/Task/Subtask CRDs)
+description: Kubernetes operator orchestrating the tatara agentic-development loop (Project/Repository/Task/Issue/MergeRequest/QueuedEvent CRDs)
 type: application
-version: 0.4.10
+# 1.0.0: the task-centric redesign. BREAKING - the Subtask CRD is gone (the
+# stage machine replaces it), Task.status.phase/lifecycleState/workItems are
+# gone, and the Issue/MergeRequest mirrors are new. The Subtask CRD carries
+# helm.sh/resource-policy: keep, so `helm upgrade` does NOT remove it: the
+# cutover must run `kubectl delete crd subtasks.tatara.dev` explicitly.
+version: 1.0.0
 appVersion: "0.4.5"

@@ -19,9 +19,7 @@ func TestToolProfileForKind(t *testing.T) {
 		{"implement", "implement"},
 		{"review", "review"},
 		{"clarify", "clarify"},
-		{"triageIssue", "triage"},
 		{"brainstorm", "brainstorm"},
-		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"refine", "refine"},
 		{"documentation", "documentation"},
@@ -32,41 +30,36 @@ func TestToolProfileForKind(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.kind, func(t *testing.T) {
-			require.Equal(t, tc.want, toolProfileForKind(tc.kind))
+			require.Equal(t, tc.want, profileForKind(tc.kind))
 		})
 	}
 }
 
 // TestToolProfileForKind_AllActiveCRDKinds asserts that every active Kind value
 // in the CRD enum maps to a non-empty profile, so a future new kind fails this
-// test until it is added to toolProfileForKind. The enum is:
+// test until it is added to profileForKind. The enum is:
 //
-//	implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine
+//	brainstorm;incident;clarify;refine;review;documentation
 //
 // (from +kubebuilder:validation:Enum on TaskSpec.Kind)
 //
-// healthCheck is omitted from the loop below: it is a vestigial enum alias and
-// runtime healthCheck tasks set Kind=brainstorm, so toolProfileForKind
-// ("healthCheck") is intentionally "" (fail-open never reached at runtime).
-// selfImprove is omitted: it is a dormant enum value kept only to avoid
-// rejecting stored terminal selfImprove CRs; its profile is intentionally "".
+// "implement" is not in the TaskSpec.Kind enum but IS an active agent kind
+// (status.agentKind, contract G.9), so it is included here too.
 func TestToolProfileForKind_AllActiveCRDKinds(t *testing.T) {
 	// The CRD enum is the single source of truth; update here when it changes.
 	crdKinds := []string{
 		"implement",
 		"review",
 		"clarify",
-		"triageIssue",
 		"brainstorm",
-		"issueLifecycle",
 		"incident",
 		"refine",
 		"documentation",
 	}
 	for _, kind := range crdKinds {
 		t.Run(kind, func(t *testing.T) {
-			profile := toolProfileForKind(kind)
-			require.NotEmpty(t, profile, "CRD kind %q must map to a non-empty profile in toolProfileForKind", kind)
+			profile := profileForKind(kind)
+			require.NotEmpty(t, profile, "CRD kind %q must map to a non-empty profile in profileForKind", kind)
 		})
 	}
 }
@@ -80,9 +73,7 @@ func TestBuildPod_ToolProfileEnv(t *testing.T) {
 	}{
 		{"implement", "implement"},
 		{"review", "review"},
-		{"triageIssue", "triage"},
 		{"brainstorm", "brainstorm"},
-		{"issueLifecycle", "lifecycle"},
 		{"incident", "incident"},
 		{"refine", "refine"},
 		{"selfImprove", ""}, // selfImprove removed; dormant CRD enum value maps to fail-open

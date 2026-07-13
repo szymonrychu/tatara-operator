@@ -16,8 +16,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -63,33 +61,15 @@ type CallbackServer struct {
 	// deleting it. Zero means use the default (pollRequeue). Set to a small
 	// value in tests to bypass the grace window without waiting.
 	ReaperGrace time.Duration
-	// TaskRetention is how long a terminal Task is kept before the reaper
-	// garbage-collects it (its Subtasks cascade via owner reference). Set from
-	// config.TaskRetention, already clamped to config.MinTaskRetention. Zero or
-	// negative disables the GC pass (e.g. tests that do not exercise it).
-	TaskRetention time.Duration
 	// IdlePodReapAfter is how long an agent pod may sit with no live turn before
 	// the reaper deletes it as a leaked wrapper (issue #237). Set from
 	// config.IdlePodReapAfter, already clamped to config.MinIdlePodReap. Zero or
 	// negative disables the idle backstop (e.g. tests that do not exercise it).
 	IdlePodReapAfter time.Duration
-	// ConvStore deletes S3 conversation objects for the conversation GC pass
-	// (issue #114 decision 5). Nil disables conversation GC (S3 not configured).
-	ConvStore conversationGC
-	// ConversationRetention is the grace after a conversation's whole batch goes
-	// terminal before its S3 objects are deleted. Zero disables conversation GC.
-	ConversationRetention time.Duration
 	// BudgetDefaults is the operator-wide token-budget config (issue #189). Each
 	// Project layers its spec.tokenBudget over this via Project.BudgetConfig. The
 	// zero value is disabled, so the budget accounting is inert until configured.
 	BudgetDefaults budget.Config
-}
-
-// conversationGC is the minimal S3 surface the conversation GC pass needs;
-// implemented by internal/objstore.Client and faked in tests.
-type conversationGC interface {
-	Exists(ctx context.Context, key string) (bool, error)
-	Delete(ctx context.Context, key string) error
 }
 
 // InternalIssueReport is one report_internal_issue call the agent made during
@@ -118,12 +98,16 @@ type turnCompletePayload struct {
 	Error           string          `json:"error"`
 	DurationSeconds float64         `json:"durationSeconds"`
 	Usage           json.RawMessage `json:"usage,omitempty"`
-	// SessionID and ConversationObjectKey are the persisted-conversation pointer
-	// the wrapper reports when conversation persistence is on (issue #114). Empty
-	// when the feature is off; recorded on the Task Status and replayed on the
-	// next-phase pod.
-	SessionID             string `json:"sessionId,omitempty"`
-	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
+	// sessionId / conversationObjectKey were the persisted-conversation pointer
+	// an older wrapper reports. Conversation persistence is DELETED (the bundle
+	// IS the continuation state). The fields are deliberately not declared, so
+	// json.Unmarshal - which does NOT use DisallowUnknownFields here - silently
+	// ignores them from an old wrapper instead of failing the callback.
+	// PushedRepos are the repos the agent actually pushed this turn (contract
+	// G.2). It is RETAINED, not dropped: without it the operator cannot tell "no
+	// diff" from "forgot to push" on a multi-repo Task, and the G.7 TTL synthetic
+	// handoff note is BUILT from it.
+	PushedRepos []string `json:"pushedRepos,omitempty"`
 	// InternalIssues mirrors tatara-claude-code-wrapper's
 	// internal/turn.InternalIssueReport JSON shape exactly (no shared Go
 	// module between the two repos - this is a wire contract, not an import).
@@ -145,6 +129,21 @@ type turnUsage struct {
 	OutputTokens             int64 `json:"output_tokens"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+// rollTurnStats rolls one turn's usage onto Task.status.stats (contract G.4):
+// the four token counters, and stats.turns, which is a LIFETIME count checked
+// against maxTurnsPerTask - it is NOT reset by a stage transition or a pod
+// respawn, unlike stats.podRecreations.
+//
+// It runs inside recordUsage's RetryOnConflict closure, behind the same
+// stale/duplicate-callback guards, so a replayed callback cannot double-count.
+func rollTurnStats(t *tatarav1alpha1.Task, u turnUsage) {
+	t.Status.Stats.TokensInput += u.InputTokens
+	t.Status.Stats.TokensOutput += u.OutputTokens
+	t.Status.Stats.TokensCacheRead += u.CacheReadInputTokens
+	t.Status.Stats.TokensCacheCreation += u.CacheCreationInputTokens
+	t.Status.Stats.Turns++
 }
 
 // Handler returns the http.Handler for POST /internal/turn-complete.
@@ -228,12 +227,6 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "record failed", http.StatusInternalServerError)
 		return
 	}
-	// Record the conversation pointer (issue #114) so the next-phase pod resumes.
-	// Non-fatal: the sessionId is stable across turns, so a missed write is
-	// recovered on the next turn-complete.
-	if err := s.recordConversation(r.Context(), task, p.SessionID, p.ConversationObjectKey); err != nil {
-		l.Error(err, "record conversation pointer (non-fatal)", "turn_id", p.TurnID)
-	}
 	// Roll the project's custom-window token accumulator (issue #189). Best-effort:
 	// a budget bookkeeping failure never fails the turn. The claudeSubscription
 	// snapshot is no longer sourced here; it comes from the fleet-wide
@@ -303,15 +296,10 @@ func (s *CallbackServer) recordUsage(ctx context.Context, task *tatarav1alpha1.T
 		if fresh.Annotations[annTurnComplete] != "" {
 			return nil
 		}
-		if isTerminal(fresh.Status.Phase) {
+		if tatarav1alpha1.TaskDone(fresh) {
 			return nil
 		}
-		fresh.Status.LastTurnInputTokens = inputTotal
-		fresh.Status.CumulativeTokens += u.OutputTokens
-		fresh.Status.CumulativeInput += u.InputTokens
-		fresh.Status.CumulativeOutput += u.OutputTokens
-		fresh.Status.CumulativeCacheRead += u.CacheReadInputTokens
-		fresh.Status.CumulativeCacheCreation += u.CacheCreationInputTokens
+		rollTurnStats(fresh, u)
 		if err := s.Client.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -386,40 +374,6 @@ func (s *CallbackServer) updateProjectBudget(ctx context.Context, task *tatarav1
 	return nil
 }
 
-// recordConversation persists the conversation pointer (SessionID +
-// ConversationObjectKey) reported by the wrapper onto the Task Status via
-// RetryOnConflict, so the next-phase pod resumes the prior conversation (issue
-// #114). It is a no-op when persistence is off (sessionID empty). Unlike usage,
-// it carries no per-turn accumulation, so no stale-turn guard is needed: the
-// sessionId is stable across a conversation and the latest pointer always wins.
-// It writes only when a field actually changes, to avoid status churn.
-func (s *CallbackServer) recordConversation(ctx context.Context, task *tatarav1alpha1.Task, sessionID, objectKey string) error {
-	if sessionID == "" {
-		return nil
-	}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: task.Name}, fresh); err != nil {
-			return fmt.Errorf("reload task for conversation pointer: %w", err)
-		}
-		changed := false
-		if fresh.Status.SessionID != sessionID {
-			fresh.Status.SessionID = sessionID
-			changed = true
-		}
-		// Record the object key only if reported and not already set; never
-		// overwrite a key (e.g. a fork key set by the operator, subtask 8).
-		if objectKey != "" && fresh.Status.ConversationObjectKey == "" {
-			fresh.Status.ConversationObjectKey = objectKey
-			changed = true
-		}
-		if !changed {
-			return nil
-		}
-		return s.Client.Status().Update(ctx, fresh)
-	})
-}
-
 // taskTokenLabels returns the project, repo, kind, and issue labels for token
 // metrics. issue is set only for issue-scoped tasks (Spec.Source present),
 // preferring the IssueRef and falling back to the numeric Number, and is left
@@ -440,12 +394,9 @@ func taskTokenLabels(task *tatarav1alpha1.Task) (project, repo, kind, issue, mod
 	return
 }
 
-// recordResult writes finalText onto the executing Subtask (if any) and bumps
-// the Task's turn-complete annotation to requeue its reconcile.
-// Both writes happen inside a single RetryOnConflict that first fetches a fresh
-// Task and verifies the stale-turn and terminal guards before resolving the
-// current subtask name. This prevents a stale/duplicate callback from writing
-// its FinalText onto a newer subtask (findings 2, 5, 8).
+// recordResult bumps the Task's turn-complete annotation to requeue its
+// reconcile, behind the stale-turn and terminal guards so a duplicate or
+// late callback cannot stamp a turn the Task has already moved past.
 // task must be the already-resolved Task; turnID is the turn being completed.
 func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, task *tatarav1alpha1.Task, turnID string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -454,45 +405,13 @@ func (s *CallbackServer) recordResult(ctx context.Context, tr agent.TurnResult, 
 			return fmt.Errorf("reload task: %w", err)
 		}
 		// Guard: bail out if the Task has advanced to a different turn (stale
-		// callback) or is already in a terminal phase. Must be checked before
-		// the subtask write so a stale callback cannot clobber a newer subtask
-		// result (findings 1, 2, 4, 5).
+		// callback) or its work is already over.
 		if fresh.Annotations[annCurrentTurn] != turnID {
 			// Turn has advanced or been cleared; stale callback - no-op.
 			return nil
 		}
-		if isTerminal(fresh.Status.Phase) {
-			// Task already terminated (e.g. by the reconcile); no-op.
+		if tatarav1alpha1.TaskDone(fresh) {
 			return nil
-		}
-
-		// Resolve annCurrentSubtask from the fresh object, not the caller's
-		// potentially-stale snapshot (finding 8).
-		if sub := fresh.Annotations[annCurrentSubtask]; sub != "" {
-			if err := func() error {
-				return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					st := &tatarav1alpha1.Subtask{}
-					if err := s.Client.Get(ctx, types.NamespacedName{Namespace: s.Namespace, Name: sub}, st); err != nil {
-						if apierrors.IsNotFound(err) {
-							return nil
-						}
-						return fmt.Errorf("get executing subtask: %w", err)
-					}
-					st.Status.Result = tr.FinalText
-					return s.Client.Status().Update(ctx, st)
-				})
-			}(); err != nil {
-				return fmt.Errorf("write subtask result: %w", err)
-			}
-		} else if tr.FinalText != "" {
-			// Plan turn (turn 0): no backing Subtask object exists, so capture
-			// FinalText as a synthetic order-0 rollup entry instead of discarding
-			// it (item 8 - the full reasoning trail must be visible, including the
-			// plan turn).
-			upsertSubtaskRollup(&fresh.Status, tatarav1alpha1.SubtaskRef{Order: 0, Title: "Planning", Phase: "Done", Result: tr.FinalText})
-			if err := s.Client.Status().Update(ctx, fresh); err != nil {
-				return fmt.Errorf("write plan-turn rollup entry: %w", err)
-			}
 		}
 
 		// Stamp turn-complete to requeue the reconcile.
@@ -562,23 +481,14 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 	}
 	for i := range list.Items {
 		task := &list.Items[i]
-		if isTerminal(task.Status.Phase) {
+		if tatarav1alpha1.TaskDone(task) {
 			continue
 		}
 		turn := task.Annotations[annCurrentTurn]
 		if turn == "" {
-			// Spawn watchdog: a Task wedged in Planning with no in-flight turn
-			// can never time out via the turn backstop (that needs a
-			// turn-started-at). Fail it once past the stall deadline so the
-			// lifecycle-orphan sweep can re-pick the issue cleanly.
-			if s.isPlanningStalled(task) {
-				if s.Metrics != nil {
-					s.Metrics.TurnTimeout("planning_watchdog")
-				}
-				l.Info("task stalled in Planning with no turn; failing via spawn watchdog",
-					"action", "planning_watchdog", "task", task.Name)
-				_ = s.expireStalledPlanning(ctx, task)
-			}
+			// No turn in flight: the F.4 clocks (admission / readiness / work)
+			// own a Task that is not running one. There is no separate spawn
+			// watchdog any more.
 			continue
 		}
 		if task.Annotations[annTurnComplete] != "" {
@@ -613,7 +523,7 @@ func (s *CallbackServer) PollOnce(ctx context.Context) {
 		if !tr.LastActivityAt.IsZero() {
 			s.refreshLastActivity(ctx, task.Name, task.Namespace, turn, tr.LastActivityAt.UTC().Format(time.RFC3339))
 		}
-		if tr.State == "completed" || tr.State == "failed" {
+		if tr.State == "complete" || tr.State == "failed" {
 			_ = s.recordResult(ctx, tr, task, turn)
 		}
 	}
@@ -700,12 +610,16 @@ func (s *CallbackServer) isTurnTimedOut(ctx context.Context, task *tatarav1alpha
 	return turnTimedOut(task.Annotations[annTurnStartedAt], task.Annotations[annTurnLastActivity], project.Spec.Agent.TurnTimeoutSeconds)
 }
 
-// expireTimedOutTurn performs the terminal cleanup for a timed-out turn:
-// deletes the session + Pod/Service, clears the current-turn annotations so
-// late callbacks cannot resolve this task, and sets Task phase=Failed/TurnTimeout.
-// It is a no-op if the task is already terminal (finding 4 - guard against
-// double teardown racing with the reconcile). The status update uses
-// RetryOnConflict to handle a concurrent reconcile write (finding 4).
+// expireTimedOutTurn performs the cleanup for a stalled turn: it deletes the
+// session + Pod/Service and clears the current-turn annotations so a late
+// callback cannot resolve this Task.
+//
+// It DOES NOT terminate the Task. A stalled turn is a POD problem, not a Task
+// outcome: tearing the pod down hands the Task back to the stage machine, which
+// re-ensures a pod for the current stage (the F.4 WORK clock bounds the retry
+// loop and parks at stage-deadline if the agent keeps hanging). The old machine
+// failed the Task outright here, which killed a long healthy stage on one hung
+// turn and had no re-entry.
 func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1alpha1.Task, turn string) error {
 	if s.Session != nil {
 		_ = s.Session.DeleteSession(ctx, agent.BaseURL(task, s.Namespace))
@@ -720,102 +634,28 @@ func (s *CallbackServer) expireTimedOutTurn(ctx context.Context, task *tatarav1a
 	svc.Namespace = task.Namespace
 	_ = s.Client.Delete(ctx, svc)
 
-	var failed bool
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
 			return err
 		}
-		// Guard: if reconcile already set a terminal phase, do not overwrite it
-		// (finding 4 - prevents duplicate terminal writes and status conflicts).
-		if isTerminal(fresh.Status.Phase) {
+		if tatarav1alpha1.TaskDone(fresh) {
 			return nil
 		}
 		// Clear turn annotations so late/duplicate callbacks cannot resolve this
-		// task and stamp annTurnComplete on an already-failed task (finding 3).
+		// task and stamp annTurnComplete on the next stage's fresh turn.
 		if fresh.Annotations != nil {
 			delete(fresh.Annotations, annCurrentTurn)
 			delete(fresh.Annotations, annTurnStartedAt)
 			delete(fresh.Annotations, annTurnLastActivity)
 			delete(fresh.Annotations, annTurnComplete)
 		}
-		if err := s.Client.Update(ctx, fresh); err != nil {
-			return err
-		}
-		// Re-get after annotation update so status write uses the latest resourceVersion.
-		if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-			return err
-		}
-		fresh.Status.Phase = "Failed"
-		apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-			Type:               "Ready",
-			Status:             metav1.ConditionTrue,
-			Reason:             "TurnTimeout",
-			Message:            fmt.Sprintf("turn %s exceeded timeout", turn),
-			ObservedGeneration: fresh.Generation,
-		})
-		if err := s.Client.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		failed = true
-		return nil
+		return s.Client.Update(ctx, fresh)
 	}); err != nil {
 		return err
 	}
-	// Meter the terminal transition once, only when this path actually set the
-	// Failed phase (the guard above skips when reconcile won the race).
-	if failed && s.Metrics != nil {
-		s.Metrics.TaskTerminal(task.Spec.Kind, "Failed", "TurnTimeout")
-	}
-	return nil
-}
-
-// isPlanningStalled reports whether a Task has been in Planning past the stall
-// deadline without acquiring a turn. Returns false on any missing/unparseable
-// signal (safe default), or when the Task is not in Planning.
-func (s *CallbackServer) isPlanningStalled(task *tatarav1alpha1.Task) bool {
-	if task.Status.Phase != "Planning" {
-		return false
-	}
-	raw := task.Annotations[annPlanningSince]
-	if raw == "" {
-		return false
-	}
-	since, err := time.Parse(time.RFC3339, raw)
-	if err != nil {
-		return false
-	}
-	return time.Now().After(since.Add(planningStallDeadline))
-}
-
-// expireStalledPlanning fails a Task wedged in Planning. It only sets the Task
-// phase: unlike expireTimedOutTurn it does NOT delete the Pod/Service, because a
-// duplicate Task shares the live Task's pod name and deleting by name would kill
-// the live agent's pod. The orphan reaper correlates pods to Tasks by UID and
-// reaps this Task's own pod (if any) once it is terminal. The pre-write re-Get
-// guards against racing the reconcile that may have advanced the Task meanwhile.
-func (s *CallbackServer) expireStalledPlanning(ctx context.Context, task *tatarav1alpha1.Task) error {
-	fresh := &tatarav1alpha1.Task{}
-	if err := s.Client.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, fresh); err != nil {
-		return err
-	}
-	if fresh.Status.Phase != "Planning" || fresh.Annotations[annCurrentTurn] != "" {
-		return nil // advanced since we observed it
-	}
-	fresh.Status.Phase = "Failed"
-	apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
-		Type:               "Ready",
-		Status:             metav1.ConditionTrue,
-		Reason:             "PlanningStalled",
-		Message:            fmt.Sprintf("stuck in Planning with no turn past %s", planningStallDeadline),
-		ObservedGeneration: fresh.Generation,
-	})
-	if err := s.Client.Status().Update(ctx, fresh); err != nil {
-		return err
-	}
-	if s.Metrics != nil {
-		s.Metrics.TaskTerminal(task.Spec.Kind, "Failed", "PlanningStalled")
-	}
+	log.FromContext(ctx).Info("stalled turn expired; pod torn down for respawn",
+		"action", "turn_timeout_expired", "resource_id", task.Name, "turn_id", turn)
 	return nil
 }
 

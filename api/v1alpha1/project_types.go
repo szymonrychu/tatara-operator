@@ -135,7 +135,10 @@ type AgentSpec struct {
 	// +kubebuilder:default="bypassPermissions"
 	// +optional
 	PermissionMode string `json:"permissionMode,omitempty"`
-	// +kubebuilder:default=50
+	// MaxTurnsPerTask is the LIFETIME turn backstop across every pod of a
+	// Task, for ALL agent kinds (contract A.6). Task.Spec.MaxTurnsPerTask
+	// overrides this per-Task when set.
+	// +kubebuilder:default=300
 	// +optional
 	MaxTurnsPerTask int `json:"maxTurnsPerTask,omitempty"`
 	// TurnTimeoutSeconds is the per-turn stall (inactivity) window in seconds: a
@@ -145,6 +148,20 @@ type AgentSpec struct {
 	// +kubebuilder:default=1800
 	// +optional
 	TurnTimeoutSeconds int `json:"turnTimeoutSeconds,omitempty"`
+	// MaxTurnsPerPod bounds turns within ONE pod's life. The implement agent
+	// kind is EXEMPT (a long, healthy coding run must not be cut off mid-pod;
+	// the boot-crash and TTL watchdogs remain its runaway bounds).
+	// +kubebuilder:default=40
+	// +optional
+	MaxTurnsPerPod int `json:"maxTurnsPerPod,omitempty"`
+	// MaxReviewRounds bounds request_changes round-trips on a kind=review Task.
+	// +kubebuilder:default=3
+	// +optional
+	MaxReviewRounds int `json:"maxReviewRounds,omitempty"`
+	// MaxPodRecreations bounds boot-crash respawns of one Task's agent pod.
+	// +kubebuilder:default=3
+	// +optional
+	MaxPodRecreations int `json:"maxPodRecreations,omitempty"`
 	// +kubebuilder:default=200000
 	// +optional
 	ContextWindowTokens int `json:"contextWindowTokens,omitempty"`
@@ -222,6 +239,26 @@ type AgentSpec struct {
 	// ExtraInitContainers populate the agent Pod's initContainers.
 	// +optional
 	ExtraInitContainers []corev1.Container `json:"extraInitContainers,omitempty"`
+}
+
+// ModelFor resolves the model for the given AGENT kind (brainstorm, incident,
+// clarify, refine, review, documentation, implement) - NOT the Task origin
+// kind (fix H9). ModelByKind is keyed on the agent kind; a missing or empty
+// entry falls back to Model.
+func (a AgentSpec) ModelFor(agentKind string) string {
+	if m, ok := a.ModelByKind[agentKind]; ok && m != "" {
+		return m
+	}
+	return a.Model
+}
+
+// EffortFor resolves the effort for the given AGENT kind. Same keying and
+// fallback rule as ModelFor.
+func (a AgentSpec) EffortFor(agentKind string) string {
+	if e, ok := a.EffortByKind[agentKind]; ok && e != "" {
+		return e
+	}
+	return a.Effort
 }
 
 // BoardSpec configures the project board tatara participates in.
@@ -429,24 +466,10 @@ type ScmSpec struct {
 	// +kubebuilder:validation:Enum=labeledOrMentioned;all
 	// +optional
 	PRReactionScope string `json:"prReactionScope,omitempty"`
-	// ApprovalLabel is DEPRECATED and no longer used: approval is now driven by
-	// the conversation (the triage agent reads the thread) and projected onto the
-	// idea/approved/rejected labels below. Kept only for migration tooling.
-	// +kubebuilder:default="tatara/awaiting-approval"
-	// +optional
-	ApprovalLabel string `json:"approvalLabel,omitempty"`
-	// IdeaLabel is DEPRECATED (legacy alias for BrainstormingLabel); kept for lazy migration.
-	// +kubebuilder:default="tatara-idea"
-	// +optional
-	IdeaLabel string `json:"ideaLabel,omitempty"`
 	// ApprovedLabel marks an issue approved for implementation.
 	// +kubebuilder:default="tatara-approved"
 	// +optional
 	ApprovedLabel string `json:"approvedLabel,omitempty"`
-	// RejectedLabel is DEPRECATED (legacy alias for DeclinedLabel); kept for lazy migration.
-	// +kubebuilder:default="tatara-rejected"
-	// +optional
-	RejectedLabel string `json:"rejectedLabel,omitempty"`
 	// BrainstormingLabel marks an issue tatara is triaging / discussing (pre-approval).
 	// +kubebuilder:default="tatara-brainstorming"
 	// +optional
@@ -478,6 +501,37 @@ type ScmSpec struct {
 	// +kubebuilder:default=60
 	// +optional
 	ConversationIdleMinutes int `json:"conversationIdleMinutes,omitempty"`
+	// ApprovalPhrases is the closed, per-project wordlist an approving
+	// maintainer comment must match. The match is an ANCHORED WHOLE-LINE
+	// match, NOT a substring (fix C3 / D-B, USER DECISION): some LINE of the
+	// normalised body must match ^\s*(<phrase>)[\s.!]*$ - the comment must
+	// CONSIST OF the phrase, not merely contain it. Substring matching meant
+	// "I can't approve this until the tests pass" APPROVED - and because the
+	// grammar takes the maintainer's MOST RECENT comment, their corrective
+	// follow-up approved too. Anchored, "go ahead" approves and "don't go
+	// ahead with this" does not. Empty means the DEFAULT list
+	// (DefaultApprovalPhrases); it can NEVER mean "any text approves".
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	// +kubebuilder:validation:items:MinLength=2
+	ApprovalPhrases []string `json:"approvalPhrases,omitempty"`
+}
+
+// DefaultApprovalPhrases is the closed wordlist used when a project does not
+// configure ScmSpec.ApprovalPhrases. An empty configuration NEVER means "any
+// text approves" (fix C3 / D-B) - it means this list.
+func DefaultApprovalPhrases() []string {
+	return []string{"lgtm", "approve", "approved", "ship it", "go ahead", "go", "implement it"}
+}
+
+// EffectiveApprovalPhrases returns the project's configured approval
+// wordlist, or DefaultApprovalPhrases() when unset (a nil Scm block or an
+// empty/absent ApprovalPhrases). It can NEVER return "match anything".
+func EffectiveApprovalPhrases(p *Project) []string {
+	if p.Spec.Scm != nil && len(p.Spec.Scm.ApprovalPhrases) > 0 {
+		return p.Spec.Scm.ApprovalPhrases
+	}
+	return DefaultApprovalPhrases()
 }
 
 // ProjectSpec defines the desired state of a Project.
@@ -486,15 +540,46 @@ type ProjectSpec struct {
 	// +kubebuilder:default="tatara"
 	// +optional
 	TriggerLabel string `json:"triggerLabel,omitempty"`
+	// MaxConcurrentAgents gates AGENT PODS (the admission unit is the pod-spawn,
+	// not the Task). ZERO IS THE FULL-PROJECT PAUSE KILL SWITCH: at 0, admission
+	// short-circuits and NO QueuedEvent is ever admitted, so no pod and no Task
+	// is created. There is deliberately NO Minimum=1 (fix S2).
+	//
+	// It REPLACES the pre-redesign maxConcurrentTasks, which was PRUNED rather
+	// than kept alongside: a stale helmfile value for the old key would otherwise
+	// be silently ignored (structural pruning drops it) and concurrency would
+	// quietly fall back to this field's default instead of erroring.
 	// +kubebuilder:default=3
+	// +kubebuilder:validation:Minimum=0
 	// +optional
-	MaxConcurrentTasks int `json:"maxConcurrentTasks,omitempty"`
-	// MaxOpenTasks: Deprecated: no longer enforced. The queue bounds CONCURRENCY
-	// (QueueCapacity), not event creation; over-limit events wait in Queued.
-	// Retained for CRD backward-compatibility; ignored.
-	// +kubebuilder:default=3
+	MaxConcurrentAgents int `json:"maxConcurrentAgents,omitempty"`
+	// AgentPodTTLSeconds bounds ONE pod's life. The Task persists.
+	// +kubebuilder:default=3600
+	// +kubebuilder:validation:Minimum=300
+	// +optional
+	AgentPodTTLSeconds int `json:"agentPodTTLSeconds,omitempty"`
+	// MaxNewTasksPerSweep caps how many Tasks ONE sweep pass may mint (fix B1).
+	// +kubebuilder:default=5
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxNewTasksPerSweep int `json:"maxNewTasksPerSweep,omitempty"`
+	// MaxOpenTasks caps ACTIVE Tasks: every Task whose stage is pod-eligible
+	// (NOT parked/delivered/rejected/failed). It is a Task CREATION budget and
+	// it is NOT the same lever as MaxConcurrentAgents (a concurrency budget) -
+	// a sweep that would exceed it mints nothing this pass. PARKED backlog
+	// Tasks (stageReason=backlog-sweep) do NOT count: they hold ownership, not
+	// work. Prod runs 6 today.
+	// +kubebuilder:default=6
+	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxOpenTasks int `json:"maxOpenTasks,omitempty"`
+	// MaxBundleBytes is the HARD byte budget for a rendered context bundle
+	// (fix D1 - USER DECISION). Oldest comments elide first, behind an
+	// explicit marker. Default 400 KB (~100k tokens).
+	// +kubebuilder:default=400000
+	// +kubebuilder:validation:Minimum=50000
+	// +optional
+	MaxBundleBytes int `json:"maxBundleBytes,omitempty"`
 	// +optional
 	Agent AgentSpec `json:"agent,omitempty"`
 	// +optional
@@ -697,25 +782,25 @@ func (p *Project) BudgetSubscription() budget.Subscription {
 // QueueSpec configures the in-operator agent-work admission queue.
 type QueueSpec struct {
 	// Capacity N: max concurrently-admitted normal-class events (defaults to
-	// MaxConcurrentTasks, else 3).
+	// MaxConcurrentAgents, else 3).
 	// +optional
 	Capacity int `json:"capacity,omitempty"`
 	// AlertCapacity M: reserved concurrent slots for alert-class events (default 1).
 	// +optional
 	AlertCapacity int `json:"alertCapacity,omitempty"`
-	// QueuedAutonomousCap: Deprecated: no longer enforced. The queue bounds CONCURRENCY
-	// (QueueCapacity), not event creation; over-limit events wait in Queued.
-	// Retained for CRD backward-compatibility; ignored.
-	// +optional
-	QueuedAutonomousCap int `json:"queuedAutonomousCap,omitempty"`
 }
 
+// QueueCapacity resolves the normal-pool admission capacity (contract A.6,
+// repointed from MaxConcurrentTasks to MaxConcurrentAgents). NOTE: this
+// floors at 3 even when MaxConcurrentAgents == 0, so it must NEVER be used to
+// implement the full-project pause kill switch - that is a direct
+// proj.Spec.MaxConcurrentAgents == 0 check (see TestQueueCapacity_PauseMustNotUseFloor).
 func (p *Project) QueueCapacity() int {
 	if p.Spec.Queue != nil && p.Spec.Queue.Capacity > 0 {
 		return p.Spec.Queue.Capacity
 	}
-	if p.Spec.MaxConcurrentTasks > 0 {
-		return p.Spec.MaxConcurrentTasks
+	if p.Spec.MaxConcurrentAgents > 0 {
+		return p.Spec.MaxConcurrentAgents
 	}
 	return 3
 }
@@ -725,16 +810,6 @@ func (p *Project) AlertCapacity() int {
 		return p.Spec.Queue.AlertCapacity
 	}
 	return 1
-}
-
-func (p *Project) QueuedAutonomousCap() int {
-	if p.Spec.Queue != nil && p.Spec.Queue.QueuedAutonomousCap > 0 {
-		return p.Spec.Queue.QueuedAutonomousCap
-	}
-	if p.Spec.MaxOpenTasks > 0 {
-		return p.Spec.MaxOpenTasks
-	}
-	return 3
 }
 
 // ProjectStatus defines the observed state of a Project.

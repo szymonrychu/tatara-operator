@@ -1,0 +1,342 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: issues.tatara.dev
+spec:
+  group: tatara.dev
+  names:
+    kind: Issue
+    listKind: IssueList
+    plural: issues
+    shortNames:
+    - iss
+    singular: issue
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.ownerReferences[?(@.controller==true)].name
+      name: Task
+      type: string
+    - jsonPath: .spec.repositoryRef
+      name: Repo
+      type: string
+    - jsonPath: .spec.number
+      name: Num
+      type: integer
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .status.status
+      name: Status
+      type: string
+    - jsonPath: .status.commentCount
+      name: Comments
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Issue is a mirror of a forge issue, owned by the Task that is
+          working it.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: IssueSpec defines the desired state of an Issue.
+            properties:
+              number:
+                minimum: 1
+                type: integer
+              projectRef:
+                type: string
+              repositoryRef:
+                type: string
+              url:
+                type: string
+            required:
+            - number
+            - projectRef
+            - repositoryRef
+            - url
+            type: object
+          status:
+            description: IssueStatus defines the observed state of an Issue.
+            properties:
+              approval:
+                description: |-
+                  Approval is the single-use evidence for Status=approved. Nil means NO
+                  verified approval: the operator fails CLOSED.
+                properties:
+                  auto:
+                    description: |-
+                      Auto is the autoApproveTataraProposals path; Login is then the sentinel
+                      "<tatara:auto>" and CommentID is empty.
+                    type: boolean
+                  commentId:
+                    type: string
+                  createdAt:
+                    format: date-time
+                    type: string
+                  login:
+                    type: string
+                  phrase:
+                    type: string
+                required:
+                - commentId
+                - createdAt
+                - login
+                - phrase
+                type: object
+              author:
+                type: string
+              body:
+                maxLength: 65536
+                type: string
+              commentCount:
+                description: |-
+                  CommentCount = len(Comments) + SpilledComments. The COMMENTS printcolumn
+                  needs a scalar (kubebuilder cannot count a list).
+                type: integer
+              comments:
+                items:
+                  description: |-
+                    Comment is one comment mirrored from the forge onto an Issue or
+                    MergeRequest.
+                  properties:
+                    author:
+                      type: string
+                    body:
+                      description: |-
+                        Body is TRUNCATED AT INGEST to 8192 bytes (fix E3). GitHub allows 65,536-
+                        char bodies: 25 max-size comments = 1.6 MB = over the etcd ceiling. A 64 KB
+                        comment is not prompt-useful anyway.
+                      maxLength: 8192
+                      type: string
+                    createdAt:
+                      format: date-time
+                      type: string
+                    externalId:
+                      description: |-
+                        ExternalID is the provider's comment id as a STRING (GitHub int64,
+                        GitLab note id; the two disagree on width).
+                      type: string
+                    inReplyTo:
+                      description: |-
+                        InReplyTo is the ExternalID of the review comment this one replies to. It
+                        is the value mr_write(action=reply) takes as in_reply_to.
+                      type: string
+                    isBot:
+                      description: |-
+                        IsBot is true when Author == Project.spec.scm.botLogin. It is the
+                        STRUCTURAL bot exclusion relied on by the approval grammar (C.6) and by
+                        the pendingEvents enqueue filter (E.3).
+                      type: boolean
+                    line:
+                      description: Line is the line an inline review comment is anchored
+                        to. Zero when unset.
+                      type: integer
+                    path:
+                      description: |-
+                        Path is the file an inline review comment is anchored to. Empty for a
+                        plain issue/MR comment.
+                      type: string
+                    reviewRound:
+                      description: |-
+                        ReviewRound is the review round this comment was posted in, when the
+                        OPERATOR posted it (fix M8 - v5's C.5.3 used this field and never declared
+                        it). Zero for every comment the operator did not author. It is the MIRROR
+                        half of the idempotency story; the FORGE half is the body marker (C.5.3).
+                      type: integer
+                    truncated:
+                      description: |-
+                        Truncated is true when the ingest cut Body at 8192 bytes. The bundle
+                        renders truncated="true" on the <comment> element so the agent knows the
+                        text is partial and can pull the full body from the forge if it matters.
+                      type: boolean
+                  required:
+                  - author
+                  - body
+                  - createdAt
+                  - externalId
+                  type: object
+                maxItems: 200
+                type: array
+              commentsRetainedFrom:
+                description: |-
+                  CommentsRetainedFrom is the eviction WATERMARK (fix M18): the CreatedAt of
+                  the oldest comment still held in .comments. The mirror sync ingests ONLY
+                  comments newer than it. Without this, an evicted comment is re-fetched by
+                  the very next sweep (its ExternalID is no longer in the CR, so the dedup
+                  key is gone) and re-evicted by the next fitForWrite: an evict/re-fetch/
+                  re-evict loop that writes a duplicate spill record every hour, forever.
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              createdAt:
+                format: date-time
+                type: string
+              labels:
+                items:
+                  type: string
+                maxItems: 50
+                type: array
+              lastSyncedAt:
+                format: date-time
+                type: string
+              pendingComments:
+                description: |-
+                  PendingComments are durable comment intents (fix M8), drained by the Issue
+                  reconciler. issue_write(action=comment|edit|close) writes here and returns;
+                  issue_write(action=create) is SYNCHRONOUS (C.2.12) because the agent needs
+                  the issue NUMBER back.
+                items:
+                  description: |-
+                    PendingComment is the DURABLE INTENT to post one comment/reply (fix M8). Same
+                    contract as PendingReview: persisted first, posted by a reconciler, cleared on
+                    a verified append. RequestID is the client-supplied idempotency key.
+                  properties:
+                    action:
+                      enum:
+                      - comment
+                      - reply
+                      type: string
+                    body:
+                      maxLength: 16384
+                      type: string
+                    inReplyTo:
+                      type: string
+                    requestId:
+                      type: string
+                  required:
+                  - action
+                  - body
+                  - requestId
+                  type: object
+                maxItems: 20
+                type: array
+              spilledComments:
+                description: |-
+                  SpilledComments / SpilledCommentsRefs: oldest comments evicted to
+                  tatara-memory by the A.7 byte guard. SpilledCommentsRefs ACCUMULATES, one
+                  track_id per spill batch (fix M19): a scalar ref silently orphaned every
+                  earlier batch on the second spill.
+                type: integer
+              spilledCommentsRefs:
+                items:
+                  type: string
+                maxItems: 50
+                type: array
+              state:
+                description: State is SCM truth.
+                enum:
+                - open
+                - closed
+                type: string
+              status:
+                description: |-
+                  Status is the platform's decision state. OPERATOR-OWNED: no MCP tool and no
+                  agent-reachable REST endpoint writes it.
+
+                  The enum member "brainstormed" is REMOVED (fix M23): no F.3 transition ever
+                  set it, and an enum member nothing writes is a lie in the schema.
+
+                  APPROVAL IS COMMENT-ONLY (fix M23). v3 kept a "only the webhook may drive a
+                  label -> status transition" guard while A.6 deleted the entire label
+                  vocabulary it guarded (approvalLabel / ideaLabel / rejectedLabel) - a
+                  guarded path with nothing on it. There is NO label -> status path at all
+                  now. Labels are a one-way PROJECTION of this field (C.6).
+                enum:
+                - new
+                - approved
+                - rejected
+                - done
+                type: string
+              title:
+                type: string
+              updatedAt:
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

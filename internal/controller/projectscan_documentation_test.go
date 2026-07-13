@@ -97,54 +97,86 @@ func TestActivitySchedule_DocumentationCase(t *testing.T) {
 	}
 }
 
-// TestRunScans_DocumentationDueCreatesDocTask: a due documentation cron with a
-// source repo that advanced since LastDocumentation enqueues one documentation
-// Task repo-scoped to the docs repo, carrying the source diff annotations.
+// TestRunScans_DocumentationDueCreatesDocTask: a due documentation cron mints
+// the B.6 nightly documentation BATCH TASK (fix W2) - NOT a per-repo
+// documentation QueuedEvent (the superseded documentationScan producer) - when
+// there is at least one delivered Task whose MRs are all merged and that still
+// needs documenting. runScans on the doc cadence now calls MintDocBatch
+// directly; ListCommits/GetDefaultBranchHeadSHA are no longer consulted at all.
 func TestRunScans_DocumentationDueCreatesDocTask(t *testing.T) {
+	ctx := context.Background()
 	docsURL := "https://github.com/o/docs.git"
-	proj, _ := seedDocumentationProject(t, "doc-due", docsURL, []string{"o/a"})
+	proj, repos := seedDocumentationProject(t, "doc-due", docsURL, []string{"o/a"})
 	past := metav1.NewTime(time.Now().Add(-2 * time.Hour))
 	proj.Status.LastDocumentation = &past
-	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
+	if err := k8sClient.Status().Update(ctx, proj); err != nil {
 		t.Fatalf("seed last-documentation: %v", err)
 	}
+	srcRepo := repos[1] // repos[0] is the docs repo itself (seedDocumentationProject order)
 
-	reader := &docFakeReader{
-		headBySlug: map[string]string{"o/a": "headsha"},
-		commitsBySlug: map[string][]scm.CommitRef{
-			"o/a": {
-				{SHA: "c1", Date: time.Now().Add(-90 * time.Minute)},
-				{SHA: "c2", Date: time.Now().Add(-30 * time.Minute)},
-			},
-		},
+	// A delivered Task whose owned MR is MERGED: the exact shape MintDocBatch
+	// covers. See docbatch_test.go's deliveredWithMergedMR. Create() overwrites
+	// the object's Status with the API server's zero-value response (the real
+	// envtest apiserver splits the status subresource), so the wanted status is
+	// captured up front and RE-APPLIED after Create, then persisted separately.
+	deliveredTask, mr := deliveredWithMergedMR(t, "doc-due", srcRepo.Name, "task-a", 1, time.Now().Add(-3*time.Hour))
+	wantTaskStatus := deliveredTask.Status
+	wantMRStatus := mr.Status
+	if err := k8sClient.Create(ctx, deliveredTask); err != nil {
+		t.Fatalf("create delivered task: %v", err)
 	}
+	deliveredTask.Status = wantTaskStatus
+	if err := k8sClient.Status().Update(ctx, deliveredTask); err != nil {
+		t.Fatalf("stamp delivered task status: %v", err)
+	}
+	if err := k8sClient.Create(ctx, mr); err != nil {
+		t.Fatalf("create merged MR: %v", err)
+	}
+	mr.Status = wantMRStatus
+	if err := k8sClient.Status().Update(ctx, mr); err != nil {
+		t.Fatalf("stamp merged MR status: %v", err)
+	}
+
+	reader := &docFakeReader{}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	if _, err := r.runScans(context.Background(), proj); err != nil {
+	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 
-	qes := listDocumentationQEs(t, "doc-due")
-	if len(qes) != 1 {
-		t.Fatalf("want 1 documentation QE, got %d", len(qes))
+	if qes := listDocumentationQEs(t, "doc-due"); len(qes) != 0 {
+		t.Fatalf("want 0 documentation QueuedEvents (superseded by the B.6 batch), got %d", len(qes))
 	}
-	qe := qes[0]
-	if qe.Spec.Kind != "documentation" {
-		t.Fatalf("QE Kind = %q, want documentation", qe.Spec.Kind)
+
+	var batches []tatarav1alpha1.Task
+	for _, tk := range listScanTasks(t, "doc-due") {
+		if tk.Spec.Kind == DocBatchKind {
+			batches = append(batches, tk)
+		}
 	}
-	if qe.Spec.Payload.RepositoryRef != "doc-due-docs" {
-		t.Fatalf("QE RepositoryRef = %q, want docs repo doc-due-docs", qe.Spec.Payload.RepositoryRef)
+	if len(batches) != 1 {
+		t.Fatalf("want 1 documentation batch Task, got %d", len(batches))
 	}
-	if qe.Spec.Payload.Annotations[tatarav1alpha1.AnnSourceHeadSHA] != "headsha" {
-		t.Fatalf("head-sha annotation = %q, want headsha", qe.Spec.Payload.Annotations[tatarav1alpha1.AnnSourceHeadSHA])
+	b := batches[0]
+	if b.Spec.InitialStage != tatarav1alpha1.StageDocumenting {
+		t.Fatalf("initialStage = %q, want documenting", b.Spec.InitialStage)
 	}
-	if qe.Spec.Payload.Annotations[tatarav1alpha1.AnnSourceRepo] != "https://github.com/o/a.git" {
-		t.Fatalf("source-repo annotation = %q", qe.Spec.Payload.Annotations[tatarav1alpha1.AnnSourceRepo])
+	found := false
+	for _, name := range b.Spec.DocumentsTasks {
+		if name == "task-a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("documentsTasks = %v, want it to contain task-a", b.Spec.DocumentsTasks)
+	}
+	if b.Spec.RepositoryRef != "doc-due-docs" {
+		t.Fatalf("repositoryRef = %q, want the docs repo doc-due-docs", b.Spec.RepositoryRef)
 	}
 
 	var got tatarav1alpha1.Project
-	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "doc-due"}, &got); err != nil {
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "doc-due"}, &got); err != nil {
 		t.Fatalf("get project: %v", err)
 	}
 	if got.Status.LastDocumentation == nil || !got.Status.LastDocumentation.After(past.Time) {

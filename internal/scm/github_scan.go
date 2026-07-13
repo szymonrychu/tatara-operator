@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -15,8 +16,11 @@ type ghPR struct {
 		Login string `json:"login"`
 	} `json:"user"`
 	Head struct {
-		SHA string `json:"sha"`
-		Ref string `json:"ref"` // head branch name (source branch)
+		SHA  string `json:"sha"`
+		Ref  string `json:"ref"` // head branch name (source branch)
+		Repo *struct {
+			FullName string `json:"full_name"` // "owner/name" of the HEAD repo; differs from the base on a fork PR
+		} `json:"repo"`
 	} `json:"head"`
 	Body      string    `json:"body"`
 	Labels    []ghLabel `json:"labels"`
@@ -58,8 +62,14 @@ func (c *GitHub) ListOpenPRs(ctx context.Context, owner, repo string) ([]PRRef, 
 	slug := owner + "/" + repo
 	out := make([]PRRef, 0, len(raw))
 	for _, p := range raw {
+		// A deleted fork leaves head.repo null, so HeadRepo stays empty and the
+		// B.4 adoption guard fails closed on it.
+		headRepo := ""
+		if p.Head.Repo != nil {
+			headRepo = p.Head.Repo.FullName
+		}
 		out = append(out, PRRef{
-			Repo: slug, Number: p.Number, Author: p.User.Login,
+			Repo: slug, Number: p.Number, Author: p.User.Login, HeadRepo: headRepo,
 			HeadSHA: p.Head.SHA, HeadBranch: p.Head.Ref, Body: p.Body, Labels: ghLabelNames(p.Labels), UpdatedAt: p.UpdatedAt,
 		})
 	}
@@ -272,6 +282,7 @@ func (c *GitHub) EditIssue(ctx context.Context, token, repo string, number int, 
 
 // ghIssueComment is the JSON shape of a GitHub issue comment.
 type ghIssueComment struct {
+	ID   int64 `json:"id"`
 	User struct {
 		Login string `json:"login"`
 	} `json:"user"`
@@ -288,7 +299,12 @@ func (c *GitHub) ListIssueComments(ctx context.Context, owner, repo string, numb
 	}
 	out := make([]IssueComment, 0, len(raw))
 	for _, c := range raw {
-		out = append(out, IssueComment{Author: c.User.Login, Body: c.Body, CreatedAt: c.CreatedAt})
+		out = append(out, IssueComment{
+			ExternalID: strconv.FormatInt(c.ID, 10),
+			Author:     c.User.Login,
+			Body:       c.Body,
+			CreatedAt:  c.CreatedAt,
+		})
 	}
 	// Defensive sort: GitHub returns comments oldest-first by default, but sort
 	// guards against any ordering surprise within the fetched set.

@@ -48,7 +48,7 @@ func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 	seq := &queue.SeqSource{Client: k8sClient, Namespace: testNS}
 	for i := 0; i < 2; i++ {
 		payload := tatarav1alpha1.QueuedEventPayload{
-			Kind:         "issueLifecycle",
+			Kind:         "clarify",
 			Goal:         "pre-filled",
 			GenerateName: "prefill-",
 		}

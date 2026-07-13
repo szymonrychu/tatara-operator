@@ -3,152 +3,17 @@ package v1alpha1
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// SystemicGroup describes the systemic-improvement group a lead issue owns.
-type SystemicGroup struct {
-	SystemicID       string   `json:"systemicId"`
-	SameRepoSiblings []int    `json:"sameRepoSiblings,omitempty"` // sibling issue numbers in THIS repo, closed by the lead PR
-	CrossRepo        []string `json:"crossRepo,omitempty"`        // "owner/repo#N - title" references, context only
-}
-
-// ProposedIssueSpec is a tatara-proposed issue awaiting human approval.
-type ProposedIssueSpec struct {
-	RepositoryRef string `json:"repositoryRef"`
-	Title         string `json:"title"`
-	Body          string `json:"body"`
-	// +kubebuilder:validation:Enum=bug;improvement
-	Kind string `json:"kind"`
-	// SystemicID correlates one of several issues opened for a single systemic
-	// improvement. When set, createProposal stamps label tatara/systemic-<id>
-	// and a sibling footer; the group counts as one against maxOpenProposals.
-	// +optional
-	SystemicID string `json:"systemicId,omitempty"`
-	// Incident is true when this proposal was filed by an incident-investigation
-	// agent; createProposal then adds the incident label to the tracker issue.
-	// +optional
-	Incident bool `json:"incident,omitempty"`
-	// AlertGroup is the per-alert-group dedup identity of the incident that filed
-	// this proposal: the Spec.DedupKey of the in-flight incident Task, falling
-	// back to its descriptive AlertRule name. createProposal dedups future
-	// incident proposals by it (matching another incident Task's DedupKey and
-	// its recorded tracked issue), so a recurring alert tracks onto its existing
-	// open issue instead of spawning a near-duplicate. Empty for non-incident
-	// proposals.
-	// +optional
-	AlertGroup string `json:"alertGroup,omitempty"`
-}
-
-// Suggestion is one inline code suggestion on a PR/MR.
-type Suggestion struct {
-	Path string `json:"path"`
-	// +kubebuilder:validation:Minimum=1
-	Line int    `json:"line"`
-	Body string `json:"body"`
-}
-
-// SemverAssignment is one per-MR push-CD level the review agent assigns on
-// approval, so the release tag can be cut for EVERY MR in the stream - including
-// human/maintainer MRs that carry no bot change_significance (the review approve
-// is their ONLY stamping opportunity). Repo is the "owner/repo" slug (matches
-// WorkItemRef.Repo); Number is the PR/MR number in that repo.
-type SemverAssignment struct {
-	Repo   string `json:"repo"`
-	Number int    `json:"number"`
-	// +kubebuilder:validation:Enum=major;minor;patch
-	Level string `json:"level"`
-}
-
-// ReviewVerdict is the agent's review decision for a human-authored PR/MR.
-type ReviewVerdict struct {
-	// +kubebuilder:validation:Enum=approve;request_changes;comment
-	Decision string `json:"decision"`
-	// +optional
-	Body string `json:"body,omitempty"`
-	// +optional
-	Suggestions []Suggestion `json:"suggestions,omitempty"`
-	// Semver is the per-MR push-CD level the review agent assigns on approval so
-	// the release tag can be cut for EVERY MR in the stream (human MRs otherwise
-	// carry no change_significance -> cd-release refuses to tag). Applied
-	// best-effort in the approve writeback; an existing semver:* label on a member
-	// MR is respected (a deliberate human semver is authoritative).
-	// +optional
-	Semver []SemverAssignment `json:"semver,omitempty"`
-}
-
-// PROutcome is the agent's outcome for a tatara-authored PR/MR.
-type PROutcome struct {
-	// +kubebuilder:validation:Enum=merge;close
-	Action string `json:"action"`
-	// +optional
-	Reason string `json:"reason,omitempty"`
-}
-
-// IssueOutcome is the agent's outcome for an issue-triage task.
-type IssueOutcome struct {
-	// +kubebuilder:validation:Enum=implement;close;discuss
-	Action string `json:"action"`
-	// +optional
-	Comment string `json:"comment,omitempty"` // required when Action==close or discuss
-	// +optional
-	Plan string `json:"plan,omitempty"` // short description of what will be implemented; posted as an implementation-start message when Action==implement
-}
-
-// ImplementOutcome is the agent's declared outcome for an implement task when
-// it opens no PR (e.g. a deliberate refusal). Mirrors IssueOutcome.
-type ImplementOutcome struct {
-	// +kubebuilder:validation:Enum=declined;already_done
-	Action string `json:"action"`
-	Reason string `json:"reason"` // required; why no implementation
-}
-
-// BrainstormOutcome is the agent's declared outcome for a brainstorm task when
-// it files no proposal (a deliberate early-exit). Mirrors ImplementOutcome.
-type BrainstormOutcome struct {
-	// +kubebuilder:validation:Enum=none
-	Action string `json:"action"`
-	Reason string `json:"reason"` // required; why nothing was proposed
-}
-
-// ChangeSummary holds the scope report submitted by the agent at the end of an
-// Implement run via the change_summary MCP tool.
-type ChangeSummary struct {
-	// +optional
-	PRTitle string `json:"prTitle,omitempty"`
-	// +optional
-	PRBody string `json:"prBody,omitempty"`
-	// +optional
-	DeliveredScope string `json:"deliveredScope,omitempty"`
-	// RemainingScope, when non-empty, means the implementation is INCOMPLETE:
-	// the operator hard-fails the Task (Phase=Failed, reason=
-	// IncompleteImplementation) rather than opening a follow-up issue.
-	// Agents must implement the full scope in one PR or call
-	// decline_implementation instead. Item Request C (full-scope-or-
-	// decline); no follow-up issues are ever filed by the operator.
-	// +optional
-	RemainingScope string `json:"remainingScope,omitempty"`
-	// +optional
-	MostProblematic string `json:"mostProblematic,omitempty"` // most problematic part of the change; from the cli most_problematic field
-	// Significance is the agent's declared change significance, the lever the
-	// push-CD cascade uses to cut the next semver tag (major resets minor+patch,
-	// minor resets patch, patch increments). REQUIRED on the change_summary MCP
-	// tool and re-validated at the REST /change-summary endpoint (D2): a compliant
-	// agent that summarizes its change cannot omit it. Enforcement lives at those
-	// two layers, NOT in writeback - writeBackOpenChange still opens the PR when
-	// this is empty (a change with no change_summary at all keeps the legacy
-	// close+Done path, pushCDEligible=false), but applySemverAutoMerge stamps the
-	// semver:<level> label and enables native auto-merge only when it is present.
-	// An empty value therefore opens an unlabeled, non-cascading PR (logged WARN
-	// at writeback so the legacy path stays visible).
-	// +kubebuilder:validation:Enum=major;minor;patch
-	// +optional
-	Significance string `json:"significance,omitempty"`
-}
-
-// TaskSource records the SCM work-item that originated a webhook-born Task.
+// TaskSource records the SCM work-item that originated a Task. It is the SEED
+// IDENTITY the triaging stage mints the Issue CR from (F.2) and the base of the
+// deterministic task branch (agent.TaskBranch). It is NOT a dedup ledger: the
+// five dedup mechanisms folded into the (repo, number) natural key at the
+// cutover, and the sixth (the incident alert-group hash) lives on Spec.DedupKey.
 type TaskSource struct {
 	// +kubebuilder:validation:Enum=github;gitlab
 	Provider string `json:"provider"`
@@ -161,85 +26,47 @@ type TaskSource struct {
 	IsPR bool `json:"isPR,omitempty"`
 	// +optional
 	Number int `json:"number,omitempty"`
-	// HeadSHA is the PR/MR head commit SHA captured at enqueue. It seeds the
-	// review Task's role:reviewed ledger entry so same-head re-review dedup works
-	// on the very next scan cycle, without waiting for the cron backstop to fill
-	// it. Empty for issues.
+	// HeadSHA is the PR/MR head commit SHA captured at mint. Empty for issues.
 	// +optional
 	HeadSHA string `json:"headSHA,omitempty"`
-	// Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
+	// Title is the originating issue/PR/MR title, captured at mint. Feeds the
 	// branch slug (TaskBranch) and the no-agent PR-title fallback.
 	// +optional
 	Title string `json:"title,omitempty"`
-	// DedupNumber is the linked-issue number for bot-PR tasks. When a bot MR
-	// carries "Closes #N" in its body, this field holds N so the dedup logic can
-	// match the task against the issue slot (not the PR number). Zero means the
-	// task targets the item identified by Number (the PR/issue number itself).
-	// +optional
-	DedupNumber int `json:"dedupNumber,omitempty"`
 }
 
-// The 7-kind redesign makes every agent kind project-scoped EXCEPT
-// documentation. Three of the seven (implement, review, clarify) are
-// project-scoped umbrellas that nonetheless still carry a repo ref for stored /
-// legacy CRs and (implement) open PRs, so they are deliberately UNCONSTRAINED
-// here: the validator accepts either an empty or a non-empty RepositoryRef for
-// them, and IsProjectScopedKind returns false so the writeback project-scoped
-// fence never short-circuits implement's PR path.
-
 // repoScopedKinds are task kinds that require a non-empty RepositoryRef.
-// documentation is the ONE repo-scoped agent kind; the rest are the retired
-// legacy kinds, kept here so a stored repo-scoped legacy Task still validates.
+// documentation is the ONE repo-scoped kind.
 var repoScopedKinds = map[string]bool{
-	"documentation":  true,
-	"selfImprove":    true,
-	"triageIssue":    true,
-	"issueLifecycle": true,
+	"documentation": true,
 }
 
 // projectScopedKinds are task kinds that must have an empty RepositoryRef and
-// never open a PR/MR (IsProjectScopedKind true). implement/review/clarify are
-// project-scoped umbrellas but are NOT in this map (they are unconstrained; see
-// the note above).
+// never open a PR/MR (IsProjectScopedKind true).
 var projectScopedKinds = map[string]bool{
-	"brainstorm":  true,
-	"healthCheck": true,
-	"incident":    true,
-	"refine":      true,
+	"brainstorm": true,
+	"incident":   true,
+	"refine":     true,
 }
 
-// unconstrainedKinds are the umbrella agent kinds that validate with either an
-// empty or a non-empty RepositoryRef. They are known kinds (IsKnownKind true)
-// but neither repo- nor project-scoped for validation purposes.
+// unconstrainedKinds are the umbrella origin kinds that validate with either an
+// empty or a non-empty RepositoryRef: the sweep mints them with no repo, while
+// a proposal-born clarify carries its proposal's repo.
 var unconstrainedKinds = map[string]bool{
-	"implement": true,
-	"review":    true,
-	"clarify":   true,
+	"review":  true,
+	"clarify": true,
 }
 
 // IsProjectScopedKind reports whether a task kind is project-scoped (operates on
 // the whole Project, carries an empty RepositoryRef, and never opens a PR/MR).
-// implement/review/clarify are umbrella kinds but return false here so the
-// writeback fence does not stop implement from opening PRs.
 func IsProjectScopedKind(kind string) bool {
 	return projectScopedKinds[kind]
 }
 
-// IsChangeOpeningKind reports whether a task kind can legitimately OPEN a
-// PR/MR, i.e. reaches writeBackOpenChange in doWriteBack's kind switch. That is
-// every kind except (a) the project-scoped ones, which open no change at all,
-// and (b) review, which posts a verdict on an EXISTING PR and never opens one.
-// It gates the change_summary REST endpoint and the full-scope-or-decline
-// hard-fail: a kind that cannot open a PR can never ship an incomplete change,
-// so a change_summary (and any remainingScope on it) is meaningless there - and
-// hard-failing on one would kill a Task whose real job, e.g. posting a review
-// verdict, was still pending.
-func IsChangeOpeningKind(kind string) bool {
-	return !IsProjectScopedKind(kind) && kind != "review"
-}
-
-// IsKnownKind reports whether kind is a valid Task kind (any of the scoped,
-// project-scoped, or unconstrained sets). Used by the QueuedEvent validator.
+// IsKnownKind reports whether kind is a valid Task ORIGIN kind (any of the
+// scoped, project-scoped, or unconstrained sets). Used by the QueuedEvent
+// validator. It is NOT the agent-kind vocabulary (that is Status.AgentKind,
+// driven by the F.2 stage table).
 func IsKnownKind(kind string) bool {
 	return repoScopedKinds[kind] || projectScopedKinds[kind] || unconstrainedKinds[kind]
 }
@@ -250,12 +77,11 @@ func IsKnownKind(kind string) bool {
 //
 // Returns nil when valid. The CRD schema cannot express this kind-conditional
 // rule (a field required for some kinds and forbidden for others), so the
-// TaskReconciler calls this as a reconcile guard and terminates Tasks that
-// violate the contract.
+// TaskReconciler calls this as a reconcile guard and fails Tasks that violate it.
 func ValidateTaskSpec(spec TaskSpec) error {
 	kind := spec.Kind
 	if kind == "" {
-		kind = "implement" // matches +kubebuilder:default="implement"
+		return nil
 	}
 	if repoScopedKinds[kind] && spec.RepositoryRef == "" {
 		return fmt.Errorf("task kind %q requires a non-empty repositoryRef", kind)
@@ -270,8 +96,8 @@ func ValidateTaskSpec(spec TaskSpec) error {
 // targeting the project's core memory/storage infrastructure: the memory stack
 // (LightRAG retrieval surface, Postgres/CNPG, Neo4j) or its backing storage
 // (CephFS PVCs, WAL, quorum). Matched case-insensitively against a Task's
-// AlertRule (the alertname label). Kept intentionally narrow so only genuine
-// infra alerts qualify for the admission-gate exemption below.
+// AlertRules. Kept intentionally narrow so only genuine infra alerts qualify for
+// the admission-gate exemption below.
 var infraIncidentKeywords = []string{
 	"memory",
 	"lightrag",
@@ -309,433 +135,413 @@ func AlertTargetsCoreInfra(alertRule string) bool {
 // memory graph, so it is safe to let an infra-incident run with memory down.
 // Only incident Tasks qualify; all normal work keeps the gate.
 func InfraIncidentExempt(spec TaskSpec) bool {
-	return spec.Kind == "incident" && AlertTargetsCoreInfra(spec.AlertRule)
+	if spec.Kind != "incident" {
+		return false
+	}
+	for _, rule := range spec.AlertRules {
+		if AlertTargetsCoreInfra(rule) {
+			return true
+		}
+	}
+	return false
 }
 
 // TaskSpec defines the desired state of a Task.
 type TaskSpec struct {
 	ProjectRef string `json:"projectRef"`
+	// RepositoryRef is the PRIMARY repo, set ONLY on documentation Tasks (and on
+	// a proposal-born clarify, which carries the repo its proposal was filed in).
 	// +optional
 	RepositoryRef string `json:"repositoryRef,omitempty"`
-	Goal          string `json:"goal"`
+	// Goal is NON-EVICTABLE: the A.7 byte guard can spill comments and notes, but
+	// it can never shrink the goal. It therefore needs a hard cap of its own
+	// (fix L31) or it eats the budget the guard is defending.
+	// The same cap applies to QueuedTaskBlueprint.Goal (B.7).
+	// +kubebuilder:validation:MaxLength=16384
+	Goal string `json:"goal"`
+	// Source is the originating SCM work item. It is the seed identity triaging
+	// mints the Issue CR from and the base of the deterministic task branch.
+	// Absent on brainstorm/refine Tasks and on alert-born incidents.
 	// +optional
 	Source *TaskSource `json:"source,omitempty"`
-	// +optional
-	MaxTurns int `json:"maxTurns,omitempty"`
-	// Kind selects the agent behavior. The 7-kind model is
-	// brainstorm;incident;clarify;implement;review;documentation;refine. The
-	// strings selfImprove;triageIssue;healthCheck;issueLifecycle are RETIRED as
-	// agent kinds - inert, retained in the enum only so already-persisted terminal
-	// CRs still deserialize and read; no code path creates them anymore.
-	// +kubebuilder:validation:Enum=implement;review;selfImprove;triageIssue;brainstorm;issueLifecycle;incident;healthCheck;refine;documentation;clarify
-	// +kubebuilder:default="implement"
+	// Kind is the ORIGIN. Immutable, baked into the name. NOT the running agent
+	// kind (that is Status.AgentKind, driven by the F.2 stage table).
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation
 	// +optional
 	Kind string `json:"kind,omitempty"`
-	// ApprovalRequired is reserved for future use; no production code path reads
-	// this field for any gating decision. Approval is driven by the SCM
-	// conversation flow. Do not set this field expecting behavior - it has none.
-	// +optional
-	ApprovalRequired bool `json:"approvalRequired,omitempty"`
-	// +optional
-	ProposedIssue *ProposedIssueSpec `json:"proposedIssue,omitempty"`
-	// ReposInScope is the optional declarative list of Project Repository CR
-	// names this Task is expected to change. When set, the implement prompt tells
-	// the agent the issue spans these repos and writeback posts a WARNING comment
-	// for any in-scope repo whose branch produced no commits, instead of skipping
-	// it silently. Absent/empty = single-repo behavior (primary repo only), so
-	// existing Tasks are unaffected.
-	// +optional
-	ReposInScope []string `json:"reposInScope,omitempty"`
-	// SystemicGroup, when set, marks this Task as the lead for a brainstorm
-	// systemic group: it resolves SameRepoSiblings in one combined PR and is
-	// aware of CrossRepo siblings (reference only).
-	// +optional
-	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
-	// AlertRule names the Grafana alert rule that produced an incident Task
-	// (commonLabels.alertname, falling back to groupKey). Descriptive only.
-	// +optional
-	AlertRule string `json:"alertRule,omitempty"`
 	// DedupKey is the dedup identity for an incident Task: the alert-group hash
 	// (sha256(groupKey)[:16]) that ties re-fires of the same alert to the same
-	// tracked issue. Replaces the former tatara.dev/alert-group Task label and
-	// tatara/alert-group-<hash> issue label - dedup lookups List incident Tasks
-	// and filter by this field in Go instead of a label selector. Empty for
-	// non-incident Tasks.
+	// tracked issue. It is the ONE dedup mechanism that does NOT fold into the
+	// (repo, number) natural key: a firing alert arrives from Grafana with no
+	// Issue and no MR to key on. Empty for non-incident Tasks.
 	// +optional
 	DedupKey string `json:"dedupKey,omitempty"`
+	// MergeOrder is the sequential, dependency-ordered list of Repository CR
+	// names whose MRs merge in this order. REQUIRED (and validated to cover every
+	// owned MR's repo) whenever the Task owns MRs in MORE THAN ONE repo.
+	// THERE IS NO LEXICAL DEFAULT (fix 11): lexical order is
+	// agent-skills < cli < claude-code-wrapper < operator, i.e. it merges cli
+	// BEFORE operator - precisely the DisallowUnknownFields fleet outage this
+	// redesign exists to prevent.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	MergeOrder []string `json:"mergeOrder,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxItems=50
+	AlertRules []string `json:"alertRules,omitempty"`
+	// DocumentsTasks are the delivered Tasks this NIGHTLY DOCUMENTATION BATCH
+	// covers (fix F2 - USER DECISION). Documentation is ONE batch Task per
+	// project per night covering everything delivered in the last 24h, NOT one
+	// Task per delivery: per-delivery was a 3-5x work amplifier (doc Task -> doc
+	// MR -> review pod -> merge -> a tatara-documentation release, for every
+	// one-line patch fix) against 3 agent slots.
+	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	DocumentsTasks []string `json:"documentsTasks,omitempty"`
+	// MaxTurnsPerTask is the LIFETIME turn backstop across every pod of this
+	// Task. Zero = Project.spec.agent.maxTurnsPerTask (default 300).
+	// +optional
+	MaxTurnsPerTask int `json:"maxTurnsPerTask,omitempty"`
+	// InitialStage is the F.3 Create-edge target a mint chooses when it is NOT the
+	// default triaging: the sweep mints straight into parked(backlog-sweep) or
+	// triaging, and the nightly doc batch into documenting. It is carried in the
+	// IMMUTABLE spec so the TaskReconciler create-edge derives the stage with NO
+	// post-create status write that must win a race against the reconciler's own
+	// create-edge (fix C5). Empty = triaging.
+	// +optional
+	InitialStage string `json:"initialStage,omitempty"`
+	// InitialStageReason is the stageReason paired with InitialStage (e.g.
+	// backlog-sweep). Empty for the reason-less initial stages.
+	// +optional
+	InitialStageReason string `json:"initialStageReason,omitempty"`
 }
 
-// Task Phase string literals. Phases are bare strings on Status.Phase (there is
-// no single central enum); these consts name the ones the push-CD cascade and
-// terminal/active predicates key on so callers stop hand-typing them.
+// Stage* are the 15 members of the task-centric stage machine (contract F.1).
 const (
-	PhasePlanning  = "Planning"
-	PhaseRunning   = "Running"
-	PhaseSucceeded = "Succeeded"
-	PhaseFailed    = "Failed"
-	// PhaseDeploying is the pod-less post-merge phase: the implement PR has
-	// auto-merged and the operator (not an agent pod) drives the deploy cascade
-	// to tatara-helmfile-applied. It is non-terminal (TaskTerminal is false) and
-	// MUST be excluded from per-repo lane occupancy: no pod runs, so counting it
-	// against the lane re-creates the lane-starvation trap
-	// (operator-laneoccupancy-starves-recovery-2026-06-15). It re-acquires a lane
-	// only to spawn a fix agent.
-	PhaseDeploying = "Deploying"
-	// DeployStateDeploying is the issueLifecycle counterpart of PhaseDeploying:
-	// the durable per-issue Task carries it in Status.DeployState while the
-	// operator drives the post-merge deploy cascade. It is set together with
-	// Status.Phase=PhaseDeploying. It is NOT a terminal lifecycle state (TaskTerminal
-	// stays false) so conversation-GC / reaper / lane logic treat it as live.
-	DeployStateDeploying = "Deploying"
+	StageTriaging      = "triaging"
+	StageBrainstorming = "brainstorming"
+	StageClarifying    = "clarifying"
+	StageInvestigating = "investigating"
+	StageRefining      = "refining"
+	StageApproved      = "approved"
+	StageImplementing  = "implementing"
+	StageReviewing     = "reviewing"
+	StageMerging       = "merging"
+	StageDeploying     = "deploying"
+	StageDelivered     = "delivered"
+	StageDocumenting   = "documenting"
+	StageRejected      = "rejected"
+	StageFailed        = "failed"
+	StageParked        = "parked"
 )
 
-// TaskTerminal reports whether t has reached a terminal state, accounting for
-// the dual Phase / DeployState design: issueLifecycle tasks leave Phase
-// empty for their whole life and signal completion via DeployState. Any
-// predicate that must treat finished lifecycle tasks as terminal MUST call
-// this helper instead of testing Phase alone.
-//
-// PhaseDeploying is deliberately NOT terminal: a Task in Deploying is alive but
-// pod-less (the operator polls the cascade), so conversation-GC / reaper / lane
-// logic must treat it as live-but-podless, not finished.
-func TaskTerminal(t *Task) bool {
-	if t.Status.Phase == PhaseSucceeded || t.Status.Phase == PhaseFailed {
-		return true
-	}
-	ls := t.Status.DeployState
-	return ls == "Done" || ls == "Stopped" || ls == "Parked"
+// terminalStages is the closed set StageTerminal checks. delivered is
+// deliberately NOT here: it is quasi-terminal (reaped separately at 48h by
+// the reaper, once documentedBy is stamped or the Task provably needs no
+// coverage), not a stage machine terminal.
+var terminalStages = map[string]bool{
+	StageRejected: true,
+	StageFailed:   true,
+	StageParked:   true,
 }
 
-// TaskDeploying reports whether t is in the pod-less Deploying phase. Lane
-// occupancy, reaper, and conversation-GC use this to treat it as a live work
-// item that holds no execution lane (no agent pod runs during Deploying).
-func TaskDeploying(t *Task) bool {
-	return t.Status.Phase == PhaseDeploying
+// podlessStages is the closed set StagePodless checks: the eight stages
+// (contract F.2) that run no agent pod - triaging/approved/merging/deploying
+// are pure operator work, delivered/rejected/failed/parked spawn nothing.
+// These stages run ONLY clock 3 (WORK), measured from stageEnteredAt, and
+// never clock 1 (ADMISSION) - v6 gave merging a 24h admission clock, so the
+// bounded merge cycle (mergeReentries) could never engage.
+var podlessStages = map[string]bool{
+	StageTriaging:  true,
+	StageApproved:  true,
+	StageMerging:   true,
+	StageDeploying: true,
+	StageDelivered: true,
+	StageRejected:  true,
+	StageFailed:    true,
+	StageParked:    true,
 }
 
-// IsRecoverableGiveup reports whether a Parked reason represents an
-// implementation that gave up and may be re-rolled (vs a deliberate decline).
-// merge-timeout (parkUmbrellaMergeTimeout's mergeParkReason) is symmetric with
-// deploy-timeout: both are auto-recoverable stalls, not a human decline, so both
-// must be aged-out by recoverOrphans and spared by the reaper the same way.
-func IsRecoverableGiveup(reason string) bool {
-	switch reason {
-	case "implement-failed", "maxIterations", "refused-no-explanation", "deadline", "deploy-timeout", "merge-timeout":
-		return true
-	default:
-		return false
+// StageTerminal reports whether t's stage is one of the three closed-set
+// terminals (rejected/failed/parked). delivered is quasi-terminal and is
+// handled by the reaper, not this predicate.
+func StageTerminal(t *Task) bool {
+	return terminalStages[t.Status.Stage]
+}
+
+// StagePodless reports whether stage runs no agent pod (contract F.2). A
+// podless stage's only clock is WORK, measured from stageEnteredAt.
+func StagePodless(stage string) bool {
+	return podlessStages[stage]
+}
+
+// StageIsTerminalOutcome reports whether entering stage is a TERMINAL OUTCOME of
+// a Task, i.e. the thing operator_task_terminal_total{kind,stage,stageReason}
+// counts (contract K.1 / D1). It is StageTerminal PLUS delivered: delivered is
+// quasi-terminal for the REAPER (it is collected on its own schedule once
+// documented), but it is absolutely an outcome for the ALERTS - it is the only
+// SUCCESS outcome the platform has, and the failure-ratio rules divide by it.
+func StageIsTerminalOutcome(stage string) bool {
+	return terminalStages[stage] || stage == StageDelivered
+}
+
+// TaskDone reports whether a Task's work is over: a closed-set terminal, or
+// delivered (quasi-terminal, pod-less, collected by the reaper at 48h). It is
+// the stage-machine replacement for the deleted TaskTerminal.
+func TaskDone(t *Task) bool {
+	return StageTerminal(t) || t.Status.Stage == StageDelivered
+}
+
+// MaxTaskNameLength is the RFC-1123 label budget TaskName enforces (49
+// chars): the worst-case pod-name suffix "-documentation" is +14 against the
+// 63-char RFC-1123 label limit. CRDs cannot constrain metadata.name length
+// and there is no validating webhook, so TaskNameTooLong is the reconcile
+// guard that fails a Task whose name still exceeds it to stage=failed,
+// stageReason=name-too-long.
+const MaxTaskNameLength = 49
+
+// TaskName returns the CR name for a Task: <project>-<kind>-<YYYY-MM-DD>-
+// <uid5>, capped at MaxTaskNameLength by truncating the PROJECT segment
+// only - the kind/date/uid segments are semantically load-bearing and are
+// never truncated.
+func TaskName(project, kind string, t time.Time, uid string) string {
+	suffix := fmt.Sprintf("-%s-%s-%s", kind, t.Format("2006-01-02"), uid)
+	budget := MaxTaskNameLength - len(suffix)
+	if budget < 1 {
+		budget = 1
 	}
+	if len(project) > budget {
+		project = project[:budget]
+	}
+	project = strings.TrimRight(project, "-")
+	name := project + suffix
+	if len(name) > MaxTaskNameLength {
+		name = name[:MaxTaskNameLength]
+	}
+	return name
+}
+
+// TaskNameTooLong reports whether name exceeds the MaxTaskNameLength budget
+// TaskName enforces. The reconciler calls this as a guard on every reconcile
+// since CRDs cannot constrain metadata.name length.
+func TaskNameTooLong(name string) bool {
+	return len(name) > MaxTaskNameLength
+}
+
+// Note is one entry in a Task's append-only journal (contract A.4). Notes ARE
+// the continuation state read back by task_context(notes=all).
+type Note struct {
+	At metav1.Time `json:"at"`
+	// Agent is the WRITER. The REST layer stamps it from Status.AgentKind; an
+	// agent can NEVER produce "operator" (fix 19). The only writer of
+	// agent="operator" is the operator itself, in-process.
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement;operator
+	Agent string `json:"agent"`
+	// +kubebuilder:validation:Enum=note;plan;handoff
+	Kind string `json:"kind"`
+	// +kubebuilder:validation:MaxLength=4096
+	Body string `json:"body"`
+}
+
+// TaskStats is the running usage/token accounting for a Task (contract A.4).
+type TaskStats struct {
+	TokensInput         int64 `json:"tokensInput,omitempty"`
+	TokensOutput        int64 `json:"tokensOutput,omitempty"`
+	TokensCacheRead     int64 `json:"tokensCacheRead,omitempty"`
+	TokensCacheCreation int64 `json:"tokensCacheCreation,omitempty"`
+	Turns               int   `json:"turns,omitempty"` // LIFETIME; checked against maxTurnsPerTask
+	PodRuns             int   `json:"podRuns,omitempty"`
+	WallSeconds         int64 `json:"wallSeconds,omitempty"`
+	// +kubebuilder:validation:MaxItems=50
+	AgentsRun  []string `json:"agentsRun,omitempty"`
+	IssueCount int      `json:"issueCount,omitempty"`
+	MRCount    int      `json:"mrCount,omitempty"`
+	// PodRecreations counts pod respawns within the CURRENT stage. At
+	// maxPodRecreations the stage -> failed. Reset to 0 on EVERY transition.
+	PodRecreations int `json:"podRecreations,omitempty"`
+	// NotesSpilled / NotesSpilledRefs: notes evicted to tatara-memory by the A.7
+	// byte guard. NotesSpilledRefs ACCUMULATES, one track_id per spill batch
+	// (fix M19). They are READ BACK via task_context(notes=all) (fix H10) - notes
+	// are the continuation state, so a spilled note that cannot be read is
+	// continuity silently lost.
+	// +optional
+	NotesSpilled int `json:"notesSpilled,omitempty"`
+	// The MaxItems marker belongs on the LIST, not on the scalar above it
+	// (addendum 2 - v4 put it on NotesSpilled int, where it is meaningless).
+	// +optional
+	// +kubebuilder:validation:MaxItems=50
+	NotesSpilledRefs []string `json:"notesSpilledRefs,omitempty"`
+}
+
+// TaskEvent is one mid-flight SCM event, delivered at the TURN BOUNDARY.
+// A BOT-authored event is NEVER enqueued (fix 2): the enqueue filter drops
+// author == Project.spec.scm.botLogin, so the operator's own park comment can
+// never un-park the Task the operator just parked.
+type TaskEvent struct {
+	At metav1.Time `json:"at"`
+	// +kubebuilder:validation:Enum=issue_comment;mr_comment;mr_review;label;alert
+	Kind   string `json:"kind"`
+	Repo   string `json:"repo"`   // Repository CR name
+	Number int    `json:"number"` // 0 for kind=alert
+	Author string `json:"author"`
+	// +kubebuilder:validation:MaxLength=4096
+	Body string `json:"body"`
 }
 
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
-	// +kubebuilder:validation:Enum=Planning;Running;Succeeded;Failed;Deploying
-	// NOTE: Pending and AwaitingApproval are intentionally absent: no code path
-	// ever writes them (approval is now driven by the SCM conversation flow and
-	// projected onto labels, not a Phase transition). They are removed here to
-	// keep the CRD enum honest and prevent confusion with DeployState.
-	// Deploying is the pod-less post-merge deploy-supervision phase (PhaseDeploying).
-	// +optional
-	Phase string `json:"phase,omitempty"`
 	// +optional
 	PodName string `json:"podName,omitempty"`
-	// +optional
-	TurnsCompleted int `json:"turnsCompleted,omitempty"`
-	// +optional
-	PrURL string `json:"prURL,omitempty"`
-	// +optional
-	ResultSummary string `json:"resultSummary,omitempty"`
 	// +optional
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-	// +optional
-	DiscoveredIssues []string `json:"discoveredIssues,omitempty"`
-	// LinksSyncedURLs is the sibling issue URL set (allIssueSiblingURLs) as of
-	// the last tatara-links cross-linking sync (F5). syncAllSiblingLinksIfNeeded
-	// compares the current set against this before re-syncing, so a Task whose
-	// sibling set is unchanged skips the per-sibling SCM GetIssue sweep instead
-	// of re-reading every sibling issue on every reconcile.
-	// +optional
-	LinksSyncedURLs []string `json:"linksSyncedURLs,omitempty"`
-	// LinksSyncFailures counts consecutive INCOMPLETE tatara-links sweeps for
-	// the current sibling URL set (D2). isPermanentTargetGone only classifies
-	// 404/410 as terminal, so any other permanent failure (403 conversation-
-	// locked, a bot without issues:write, a 422 body over the 65536-char limit)
-	// would otherwise keep the sweep unclean, LinksSyncedURLs unstamped, and the
-	// per-sibling GetIssue re-read running on every reconcile forever. Bounded
-	// like Status.WritebackSkip4xxAttempts: at linksSyncFailureCap the sweep
-	// gives up, stamps the URL set anyway, and resets this to 0 - so a later
-	// CHANGE to the sibling set gets a fresh retry budget.
-	// +optional
-	LinksSyncFailures int `json:"linksSyncFailures,omitempty"`
-	// +optional
-	ReviewVerdict *ReviewVerdict `json:"reviewVerdict,omitempty"`
-	// +optional
-	PROutcome *PROutcome `json:"prOutcome,omitempty"`
-	// +optional
-	IssueOutcome *IssueOutcome `json:"issueOutcome,omitempty"`
-	// +optional
-	ImplementOutcome *ImplementOutcome `json:"implementOutcome,omitempty"`
-	// +optional
-	BrainstormOutcome *BrainstormOutcome `json:"brainstormOutcome,omitempty"`
-	// +optional
-	ChangeSummary *ChangeSummary `json:"changeSummary,omitempty"`
-	// FollowupIssueURL is DEPRECATED and vestigial: the operator no longer
-	// opens follow-up issues (item Request C, full-scope-or-decline - a
-	// non-empty ChangeSummary.RemainingScope now hard-fails the Task
-	// instead). Retained on the CRD for backward compatibility with
-	// existing Tasks/readers only; nothing writes to it anymore.
-	// +optional
-	FollowupIssueURL string `json:"followupIssueURL,omitempty"`
-	// +optional
-	GateEnteredAt *metav1.Time `json:"gateEnteredAt,omitempty"`
 
-	// Lifecycle fields (issueLifecycle kind only; empty on all other kinds).
-
-	// Deploying is the pod-less post-merge deploy-supervision lifecycle state: the
-	// issueLifecycle Task's PR auto-merged + main CI (incl. the release tag-cut +
-	// propagation) went green, and the operator now drives the push-CD cascade to a
-	// tatara-helmfile apply. It is paired with Status.Phase=Deploying so lane
-	// occupancy excludes it (no agent pod runs) and TaskTerminal keeps it live.
-	// The Go field is DeployState (agent-invisible, deploy-supervisor-only) but the
-	// JSON/CRD key stays lifecycleState so stored CRs still deserialize and the
-	// agent-visible task_list field is unchanged. The enum keeps the front-half
-	// values (Triage/Conversation/Implement/MRCI) for the drain of in-flight
-	// issueLifecycle Tasks.
-	// +kubebuilder:validation:Enum=Triage;Conversation;Implement;MRCI;Merge;MainCI;Deploying;Done;Stopped;Parked
+	// +kubebuilder:validation:Enum=triaging;brainstorming;clarifying;investigating;refining;approved;implementing;reviewing;merging;deploying;delivered;documenting;rejected;failed;parked
 	// +optional
-	DeployState string `json:"lifecycleState,omitempty"`
+	Stage string `json:"stage,omitempty"`
+	// StageEnteredAt is stamped on EVERY stage transition. It is the clock for the
+	// POD-LESS stages (F.4).
 	// +optional
-	LastActivityAt *metav1.Time `json:"lastActivityAt,omitempty"`
+	StageEnteredAt *metav1.Time `json:"stageEnteredAt,omitempty"`
+	// StageWorkStartedAt is stamped when this stage's POD BECOMES READY (fix H12).
+	// It is the clock for every POD-SPAWNING stage's deadline. StageEnteredAt is
+	// NOT, because it starts ticking the moment the Task enters the stage - which
+	// is when its QueuedEvent is ENQUEUED, not when it is admitted. With 3 agent
+	// slots and 3-4 serial pod admissions per Task, a Task could burn its entire
+	// 2h budget QUEUEING and die parked(stage-deadline) HAVING NEVER RUN A POD -
+	// and that park has no re-entry rule. The stage deadline must measure WORK,
+	// not queue wait. Cleared on every stage transition.
 	// +optional
-	DeadlineAt *metav1.Time `json:"deadlineAt,omitempty"`
+	StageWorkStartedAt *metav1.Time `json:"stageWorkStartedAt,omitempty"`
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement
 	// +optional
-	HeadBranch string `json:"headBranch,omitempty"`
+	AgentKind string `json:"agentKind,omitempty"`
+	// PodStartedAt is stamped when the pod is CREATED (not when it becomes Ready),
+	// and RE-stamped on every podRecreations respawn. It is:
+	//   - the arming condition for clock 1 vs clock 2 (F.4), and
+	//   - the base of the pod TTL: t0 = podStartedAt + agentPodTTLSeconds (G.7).
+	//
+	// LIFECYCLE, and it is LOAD-BEARING (fix V7-4):
+	//   CLEARED on EVERY stage transition. Both this and StageWorkStartedAt.
+	//
+	// v6 declared this field with no doc comment and no clearing rule, while only
+	// StageWorkStartedAt said "cleared on every stage transition". On the NORMAL
+	// re-entry edges (reviewing -> implementing, merging -> reviewing, every
+	// un-park) a STALE non-nil PodStartedAt then:
+	//   (a) DISARMS clock 1 (which is armed only when PodStartedAt == nil) while
+	//       the Task waits for admission - and clock 2 cannot run because
+	//       its evaluator needs a pod that does not exist yet. THE TASK IS COVERED
+	//       BY NO CLOCK AT ALL WHILE QUEUED: exactly the nil-case the three-clock
+	//       model claims to exclude.
+	//   (b) makes G.7's t0 = PodStartedAt + agentPodTTLSeconds ALREADY IN THE PAST
+	//       for the fresh pod, so the operator TTL-stops a pod that just started -
+	//       and under fix V6-6 the wrapper then 410s every turn it is given.
 	// +optional
-	PRNumber int `json:"prNumber,omitempty"`
+	PodStartedAt *metav1.Time `json:"podStartedAt,omitempty"`
+	// Notes: append-only journal. IT IS the continuation state. Capped at 50 in
+	// Go (drop-oldest, spilled to tatara-memory); MaxItems is a backstop only.
 	// +optional
-	MergeCommitSHA string `json:"mergeCommitSHA,omitempty"`
-	// MergedHeadSHA is the source-branch head commit SHA of the most recently
-	// merged PR/MR. Recorded on a successful Merge and deliberately preserved
-	// across clearMergedChangeState so the next MRCI cycle can detect a re-opened
-	// PR that re-proposes the already-merged commits with no new fix (the
-	// deterministic task branch is reused; if a post-merge re-implement does not
-	// advance it, writeBackOpenChange opens a duplicate of the merged change).
+	// +kubebuilder:validation:MaxItems=60
+	Notes []Note `json:"notes,omitempty"`
+	// PendingEvents: capped at 20 in Go (drop-oldest BEFORE the write; an
+	// API-server 422 is NOT retried and would hot-loop webhook redelivery).
+	// Cleared by SET-DIFFERENCE inside RetryOnConflict, never by nil-assign
+	// (fix 23).
 	// +optional
-	MergedHeadSHA string `json:"mergedHeadSHA,omitempty"`
+	// +kubebuilder:validation:MaxItems=25
+	PendingEvents []TaskEvent `json:"pendingEvents,omitempty"`
+	// +optional
+	Stats TaskStats `json:"stats,omitempty"`
+	// +optional
+	DeliveredAt *metav1.Time `json:"deliveredAt,omitempty"`
+	// DocumentedBy is the NIGHTLY BATCH documentation Task that covered this
+	// delivered Task (fix F2). Empty until a batch has covered it. The reaper
+	// holds a delivered Task until it is either covered or provably needs no
+	// coverage (zero merged MRs).
+	// +optional
+	DocumentedBy string `json:"documentedBy,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxItems=50
+	IssueRefs []string `json:"issueRefs,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxItems=50
+	MRRefs []string `json:"mrRefs,omitempty"`
+	// StageReason is the machine reason for the current stage. MANDATORY on
+	// parked/failed/rejected. Closed set: F.5.
+	// +optional
+	StageReason string `json:"stageReason,omitempty"`
+	// ParkedFromStage is OBSERVABILITY ONLY. The un-park TARGET is NEVER derived
+	// from it (fix 2); it is re-derived from Issue.status.status and the owned-MR
+	// state (F.6).
+	// +optional
+	ParkedFromStage string `json:"parkedFromStage,omitempty"`
+	// MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
+	// Persisted so a restarted operator resumes and never re-merges.
+	// +optional
+	MergeCursor int `json:"mergeCursor,omitempty"`
+	// MergeReentries / DeployReentries bound the merging<->parked and
+	// deploying<->parked 2-CYCLES (fix H7). v3 let them spin FOREVER on a red MR:
+	// F.6 re-entered the stage on timeout, EVERY transition re-stamped
+	// stageEnteredAt granting a fresh 4h, neither stage spawns a pod (so
+	// maxTurnsPerTask and maxPodRecreations never accrue), and parkRetention never
+	// fired because the Task kept LEAVING parked. The "every stage has an exit"
+	// invariant was satisfied per-stage and violated GLOBALLY.
+	// At maxMergeReentries (3): -> failed(merge-blocked) / failed(deploy-blocked).
+	// This is the treatment maxReviewRounds already gets right on the
+	// reviewing<->implementing cycle.
+	// +optional
+	MergeReentries int `json:"mergeReentries,omitempty"`
+	// +optional
+	DeployReentries int `json:"deployReentries,omitempty"`
+	// HeadMoveReentries bounds the FOURTH cycle - the one that SPAWNS PODS
+	// (fix M3-9). merging -> reviewing on a moved head does NOT touch
+	// MergeReentries (only the PARKED path does), and ReviewRounds increments
+	// only on request_changes. So reviewing -> merging -> (head moved) ->
+	// reviewing -> ... had no counter at all, and spawned a REVIEW POD every lap.
+	// H7 claimed "three cycles exist, all three bounded". There are four.
+	// Cap 3 -> failed(head-moving).
+	// +optional
+	HeadMoveReentries int `json:"headMoveReentries,omitempty"`
+	// HumanReviewRounds bounds the reviewing <-> parked(awaiting-human) cycle on a
+	// kind=review Task (fix V7-9). Cap 5, then it STAYS parked.
+	//
+	// v6 claimed that cycle was "bounded by mr.status.reviewRounds". IT IS NOT:
+	// ReviewRounds increments only on request_changes, so on the approve path the
+	// cycle spawned ONE REVIEW POD PER HUMAN COMMENT, bounded only by
+	// maxTurnsPerTask (300). It terminated - but not for the stated reason, and it
+	// is a real cost amplifier on a chatty PR thread.
+	// +optional
+	HumanReviewRounds int `json:"humanReviewRounds,omitempty"`
+	// FoldInFlight names the member Tasks a refine umbrella is mid-adoption of.
+	// The reaper SKIPS any Task named here (fix 8).
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	FoldInFlight []string `json:"foldInFlight,omitempty"`
 	// ResolvedModel is the MODEL env resolved for this Task's agent pod at spawn
 	// (modelForKind: per-kind override else project-wide). Stamped once at
 	// pod-creation; read by the token/terminal metrics so $ is priced by the
-	// model that actually ran. +optional
+	// model that actually ran.
+	// +optional
 	ResolvedModel string `json:"resolvedModel,omitempty"`
-	// +optional
-	CumulativeTokens int64 `json:"cumulativeTokens,omitempty"`
-	// +optional
-	LastTurnInputTokens int64 `json:"lastTurnInputTokens,omitempty"`
-	// CumulativeInput is the running total of uncached input tokens
-	// (turnUsage.InputTokens) across all turns of this Task. +optional
-	CumulativeInput int64 `json:"cumulativeInput,omitempty"`
-	// CumulativeOutput is the running total of output tokens across all turns
-	// of this Task. +optional
-	CumulativeOutput int64 `json:"cumulativeOutput,omitempty"`
-	// CumulativeCacheRead is the running total of cache-read input tokens
-	// across all turns of this Task. +optional
-	CumulativeCacheRead int64 `json:"cumulativeCacheRead,omitempty"`
-	// CumulativeCacheCreation is the running total of cache-creation input
-	// tokens across all turns of this Task. +optional
-	CumulativeCacheCreation int64 `json:"cumulativeCacheCreation,omitempty"`
-	// +optional
-	LifecycleIterations int `json:"lifecycleIterations,omitempty"`
-	// +optional
-	Handover string `json:"handover,omitempty"`
-	// ConversationObjectKey is the S3 object key under which the wrapper stores
-	// and restores this Task's full Claude conversation transcript (issue #114).
-	// Stable across lifecycle phases. Empty until conversation persistence is
-	// configured and the first run has reported it (or a forked key is set for a
-	// brainstorm-derived issue).
-	// +optional
-	ConversationObjectKey string `json:"conversationObjectKey,omitempty"`
-	// SessionID is the Claude session id of the persisted conversation. The
-	// operator passes it back to the next pod (as CONVERSATION_SESSION_ID) so a
-	// fresh pod resumes via `claude --resume <id>` instead of starting empty.
-	// +optional
-	SessionID string `json:"sessionID,omitempty"`
-	// ImplementContext is an optional re-entry prompt injected at the start of
-	// the next Implement agent turn (e.g. CI failure details, conflict notice).
-	// Cleared after the turn is submitted so a later fresh entry is clean.
-	// +optional
-	ImplementContext string `json:"implementContext,omitempty"`
-	// ImplementEmptyRetries counts consecutive Implement runs that finished
-	// with zero commits (no PR opened). Bounded retry guard: after the cap the
-	// task is commented + parked with reason "implement-empty" instead of
-	// silently parked as a benign no-change. Reset to 0 when a run opens a PR.
-	// +optional
-	ImplementEmptyRetries int `json:"implementEmptyRetries,omitempty"`
-	// ImplementGiveUps counts implementation attempts that gave up for this
-	// issue's durable lifecycle Task (transition Implement->Parked with a
-	// recoverable reason). Bounds the auto-reroll backstop. +optional
-	ImplementGiveUps int `json:"implementGiveUps,omitempty"`
-	// WritebackSkip4xxAttempts counts consecutive writeback sweeps that opened
-	// no PR because every project repo returned a permanent 4xx from OpenChange
-	// (issue #166: the un-triageable 4xx-skip loop). Bounded loop-breaker: once
-	// it reaches writebackSkip4xxCap the writeback gate stops re-sweeping the SCM
-	// and records a terminal WritebackFailed condition instead of churning the
-	// SCM API every reconcile. Reset to 0 when a PR opens.
-	// +optional
-	WritebackSkip4xxAttempts int `json:"writebackSkip4xxAttempts,omitempty"`
-	// DisarmFailures counts consecutive INCOMPLETE disarmOpenChanges sweeps for
-	// the full-scope-or-decline hard-fail (F2). A sweep is incomplete when any
-	// target PR could not be verifiably closed (a transient SCM error, not a
-	// permanent 404/410 "already gone"). Bounded like WritebackSkip4xxAttempts /
-	// LinksSyncFailures: the Task does NOT terminate while a sweep is dirty and
-	// under disarmFailureCap - it requeues and retries. Once the cap is spent
-	// the Task terminates anyway but records a DisarmFailed condition so an
-	// armed-PR-that-could-not-be-disarmed is alertable. Reset to 0 once a sweep
-	// verifies clean or the cap is reached.
-	// +optional
-	DisarmFailures int `json:"disarmFailures,omitempty"`
-	// PendingComments are free-form comments queued by the agent via the
-	// comment MCP tool, posted to the task's linked issue on the next
-	// reconcile and then cleared. Does not change the lifecycle state.
-	// +optional
-	PendingComments []string `json:"pendingComments,omitempty"`
-	// PendingInterjections are comment bodies queued by the webhook when a new
-	// issue/MR comment arrives while an agent turn is in flight. The reconciler
-	// delivers each to the live wrapper session (as mid-session user input) and
-	// then clears them. Does not change the lifecycle state.
-	// +optional
-	PendingInterjections []string `json:"pendingInterjections,omitempty"`
-	// WorkItems is the work-item ledger: every SCM artifact (issues, PRs,
-	// proposals) this Task spans. Carried as the single source of truth for
-	// dedup, stall recovery, and prompt-building. Seeded lazily from Spec.Source
-	// on first reconcile; maintained by the operator as the agent drives actions
-	// via MCP tools.
-	// +optional
-	WorkItems []WorkItemRef `json:"workItems,omitempty"`
-	// ParkReason is the reason string passed to the last Parked transition.
-	// Cleared when the Task transitions out of Parked. Carried for context and
-	// observability; does NOT gate re-activation.
-	// +optional
-	ParkReason string `json:"parkReason,omitempty"`
-
-	// ApprovedByMaintainer records that this issue was approved for
-	// implementation, either by a HUMAN MAINTAINER (the webhook sets it ONLY
-	// when it observes an issues.labeled{approved} event whose ACTOR is a
-	// MaintainerLogins member - never the bot: a bot/agent that sets the label
-	// itself cannot self-approve) OR by the auto-approve release path (item 4a,
-	// recordAutoApproval), which writes the audit sentinel
-	// "<tatara:auto:<kind>>" instead of a login - see AutoApproved. Both are
-	// accepted approval sources by design; consumers that need to distinguish
-	// them check AutoApproved. It is the ONLY signal that releases a
-	// front-half Task (clarify / the issueLifecycle bridge) into the
-	// autonomous implement->review->merge->deploy chain: every path that would
-	// advance a front-half issue to Implement gates on it (finishFrontHalf,
-	// the Conversation label readback, the trigger-label jump). Empty means NO
-	// recorded approval - the operator fails CLOSED (parks to Conversation)
-	// rather than trusting raw label presence, which an agent with SCM write
-	// could forge. Holds the approving maintainer's login (or the auto-approve
-	// sentinel) for audit.
-	// +optional
-	ApprovedByMaintainer string `json:"approvedByMaintainer,omitempty"`
-	// AutoApproved is true when ApprovedByMaintainer was set by the auto-approve
-	// release path (item 4a) rather than a real maintainer - the sentinel value
-	// "<tatara:auto:<kind>>" is also written to ApprovedByMaintainer for audit,
-	// but this bool is the fast structural check (avoids string-parsing the
-	// sentinel at every consumer).
-	// +optional
-	AutoApproved bool `json:"autoApproved,omitempty"`
-
-	// Deploy-supervision fields (PhaseDeploying only; empty otherwise). The
-	// implement Task does not go terminal at PR-merge: it enters Deploying and
-	// the operator drives the push-CD cascade to a tatara-helmfile apply, then
-	// resolves Done + closes the originating issue.
-
-	// DeployDeadline is the wall-clock deadline for the deploy cascade
-	// (now + Project deployBudgetSeconds, single-hop override applied per
-	// artifact). On exceed, the Task parks recoverable with reason deploy-timeout.
-	// +optional
-	DeployDeadline *metav1.Time `json:"deployDeadline,omitempty"`
-	// CascadeStage tracks how far this Task's artifact has propagated toward the
-	// terminal tatara-helmfile apply.
-	// +kubebuilder:validation:Enum=tagged;parent-pr-open;parent-merged;helmfile-applied
-	// +optional
-	CascadeStage string `json:"cascadeStage,omitempty"`
-	// DeployedVersion is the semver (vX.Y.Z) this Task's artifact published and is
-	// driving toward the cluster.
-	// +optional
-	DeployedVersion string `json:"deployedVersion,omitempty"`
-	// DeployArtifact is the deploy-ledger artifact identity (repo@vX.Y.Z) this
-	// Task records, the key the apply-outcome sweep matches against applied pins.
-	// +optional
-	DeployArtifact string `json:"deployArtifact,omitempty"`
-	// MergeWaitDeadline bounds a discrete-implement umbrella Task's wait for its
-	// member PRs to be reviewed + merged (the pre-Deploying window). When members
-	// stay unmerged past this wall clock, superviseMergedPRs parks the stream
-	// recoverable with an issue comment naming the stuck member(s) (item 3). It is
-	// distinct from DeployDeadline, which bounds the post-merge cascade.
-	// +optional
-	MergeWaitDeadline *metav1.Time `json:"mergeWaitDeadline,omitempty"`
-	// ReviewResolveDeadline bounds an umbrella review's wall-clock wait for an
-	// unresolvable member repo URL to become resolvable (un-enrolled member repo,
-	// or a projectRepoURLBySlug List error). Stamped on the first unresolvable
-	// encounter; once it elapses, writeBackReview parks the review recoverable with
-	// an issue comment naming the stuck member instead of error-looping forever
-	// (liveness finding #4).
-	// +optional
-	ReviewResolveDeadline *metav1.Time `json:"reviewResolveDeadline,omitempty"`
-
 	// ShortDescription is the first line of Spec.Goal, truncated to ~60 chars,
 	// set on reconcile so `kubectl get task` is scannable without describe.
 	// +optional
 	ShortDescription string `json:"shortDescription,omitempty"`
-
-	// Subtasks is the durable rollup of every subtask (incl. the synthetic
-	// order-0 planning entry), maintained as subtasks progress. See SubtaskRef.
-	// +optional
-	Subtasks []SubtaskRef `json:"subtasks,omitempty"`
-
-	// IssueLinks is every issue this Task touched: DiscoveredIssues,
-	// FollowupIssueURL, and issue-kind WorkItems, deduped. Full URLs where the
-	// source field carries one (DiscoveredIssues/FollowupIssueURL); "repo#N"
-	// refs where only a WorkItemRef exists (item 9).
-	// +optional
-	IssueLinks []string `json:"issueLinks,omitempty"`
-	// PRLinks is every PR/MR this Task touched: PrURL and PR-kind WorkItems,
-	// deduped. Same mixed URL/"repo#N" format as IssueLinks.
-	// +optional
-	PRLinks []string `json:"prLinks,omitempty"`
-}
-
-// SubtaskRef is a durable point-in-time snapshot of one subtask, rolled onto
-// TaskStatus.Subtasks as subtasks progress. Lets kubectl and a re-entering
-// agent read the full reasoning trail (including the synthetic order-0
-// "Planning" entry capturing turn 0's FinalText) without listing Subtask
-// objects directly (item 8).
-type SubtaskRef struct {
-	// Name is the Subtask object's name, empty for the synthetic order-0
-	// planning entry (turn 0 has no backing Subtask object).
-	// +optional
-	Name  string `json:"name,omitempty"`
-	Order int    `json:"order"`
-	Title string `json:"title"`
-	// +kubebuilder:validation:Enum=Pending;Running;Done;Failed
-	Phase string `json:"phase"`
-	// +optional
-	Result string `json:"result,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
-// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
-// +kubebuilder:printcolumn:name="Lifecycle",type=string,JSONPath=`.status.lifecycleState`
+// +kubebuilder:printcolumn:name="Stage",type=string,JSONPath=`.status.stage`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.stageReason`
+// +kubebuilder:printcolumn:name="Agent",type=string,JSONPath=`.status.agentKind`
 // +kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.kind`
 // +kubebuilder:printcolumn:name="Project",type=string,JSONPath=`.spec.projectRef`,priority=1
-// +kubebuilder:printcolumn:name="Turns",type=integer,JSONPath=`.status.turnsCompleted`
+// +kubebuilder:printcolumn:name="Turns",type=integer,JSONPath=`.status.stats.turns`
 // +kubebuilder:printcolumn:name="Description",type=string,JSONPath=`.status.shortDescription`
 
-// Task is one agent session driving a Repository toward a goal.
+// Task is one unit of agent-driven work, advanced through the F.1 stage machine.
 type Task struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

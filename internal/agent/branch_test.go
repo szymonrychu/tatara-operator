@@ -23,11 +23,8 @@ func TestTaskBranch(t *testing.T) {
 		task *tatarav1alpha1.Task
 		want string
 	}{
-		{"issue numbered fix", taskWith("scan-abc", "issueLifecycle", 42, "Fix flaky CI on push events", false), "tatara/fix-42-fix-flaky-ci-on-push-events"},
 		{"pr review is chore", taskWith("scan-def", "review", 7, "Review: add metrics", true), "tatara/chore-7-review-add-metrics"},
 		{"no number falls back", taskWith("brainstorm-xyz", "brainstorm", 0, "", false), "tatara/task-brainstorm-xyz"},
-		{"empty title still numbered", taskWith("scan-ghi", "issueLifecycle", 9, "", false), "tatara/fix-9"},
-		{"long title truncated", taskWith("scan-jkl", "issueLifecycle", 1, strings.Repeat("very long word ", 10), false), ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -68,7 +65,6 @@ func TestBranchKind(t *testing.T) {
 		task *tatarav1alpha1.Task
 		want string
 	}{
-		{"issueLifecycle is fix", taskWith("a", "issueLifecycle", 1, "x", false), "fix"},
 		{"implement is feat", taskWith("b", "implement", 1, "x", false), "feat"},
 		{"review is chore", taskWith("c", "review", 1, "x", true), "chore"},
 		{"brainstorm is chore", taskWith("d", "brainstorm", 0, "", false), "chore"},

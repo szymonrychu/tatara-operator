@@ -116,7 +116,7 @@ func TestGitLabMerge_UnsupportedMethod(t *testing.T) {
 	defer srv.Close()
 	c := &GitLab{apiBase: srv.URL}
 
-	_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "rebase")
+	_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "rebase", "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unsupported merge method")
 }
@@ -142,7 +142,7 @@ func TestGitLabMerge_SupportedMethods(t *testing.T) {
 			}))
 			defer srv.Close()
 			c := &GitLab{apiBase: srv.URL}
-			sha, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, tc.method)
+			sha, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, tc.method, "")
 			require.NoError(t, err)
 			require.Equal(t, "abc123", sha)
 			require.Equal(t, tc.wantSquash, got["squash"], "squash field mismatch for method %q", tc.method)

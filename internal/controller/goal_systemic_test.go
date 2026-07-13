@@ -21,12 +21,3 @@ func TestBrainstormGoalProject_SystemicMandate(t *testing.T) {
 		t.Fatalf("brainstorm goal must NOT contain comment_on_issue (path-2 dropped)")
 	}
 }
-
-func TestHealthCheckGoalProject_SystemicMandate(t *testing.T) {
-	goal := healthCheckGoalProject([]string{"o/a"}, "ISSUES:\nMAIN HEALTH:\no/a main CI: success", "")
-	for _, want := range []string{"systemic", "subagent", "tatara-health-check", "systemicId"} {
-		if !strings.Contains(goal, want) {
-			t.Fatalf("goal missing %q", want)
-		}
-	}
-}

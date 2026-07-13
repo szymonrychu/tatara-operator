@@ -1,0 +1,401 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: mergerequests.tatara.dev
+spec:
+  group: tatara.dev
+  names:
+    kind: MergeRequest
+    listKind: MergeRequestList
+    plural: mergerequests
+    singular: mergerequest
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .metadata.ownerReferences[?(@.controller==true)].name
+      name: Task
+      type: string
+    - jsonPath: .spec.repositoryRef
+      name: Repo
+      type: string
+    - jsonPath: .spec.number
+      name: Num
+      type: integer
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .status.status
+      name: Status
+      type: string
+    - jsonPath: .status.ciStatus
+      name: CI
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          MergeRequest is a mirror of a forge PR/MR, owned by the Task that is
+          working it.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: MergeRequestSpec defines the desired state of a MergeRequest.
+            properties:
+              number:
+                minimum: 1
+                type: integer
+              projectRef:
+                type: string
+              repositoryRef:
+                type: string
+              url:
+                type: string
+            required:
+            - number
+            - projectRef
+            - repositoryRef
+            - url
+            type: object
+          status:
+            description: MergeRequestStatus defines the observed state of a MergeRequest.
+            properties:
+              author:
+                type: string
+              body:
+                maxLength: 65536
+                type: string
+              ciStatus:
+                enum:
+                - none
+                - pending
+                - running
+                - green
+                - red
+                type: string
+              commentCount:
+                type: integer
+              comments:
+                items:
+                  description: |-
+                    Comment is one comment mirrored from the forge onto an Issue or
+                    MergeRequest.
+                  properties:
+                    author:
+                      type: string
+                    body:
+                      description: |-
+                        Body is TRUNCATED AT INGEST to 8192 bytes (fix E3). GitHub allows 65,536-
+                        char bodies: 25 max-size comments = 1.6 MB = over the etcd ceiling. A 64 KB
+                        comment is not prompt-useful anyway.
+                      maxLength: 8192
+                      type: string
+                    createdAt:
+                      format: date-time
+                      type: string
+                    externalId:
+                      description: |-
+                        ExternalID is the provider's comment id as a STRING (GitHub int64,
+                        GitLab note id; the two disagree on width).
+                      type: string
+                    inReplyTo:
+                      description: |-
+                        InReplyTo is the ExternalID of the review comment this one replies to. It
+                        is the value mr_write(action=reply) takes as in_reply_to.
+                      type: string
+                    isBot:
+                      description: |-
+                        IsBot is true when Author == Project.spec.scm.botLogin. It is the
+                        STRUCTURAL bot exclusion relied on by the approval grammar (C.6) and by
+                        the pendingEvents enqueue filter (E.3).
+                      type: boolean
+                    line:
+                      description: Line is the line an inline review comment is anchored
+                        to. Zero when unset.
+                      type: integer
+                    path:
+                      description: |-
+                        Path is the file an inline review comment is anchored to. Empty for a
+                        plain issue/MR comment.
+                      type: string
+                    reviewRound:
+                      description: |-
+                        ReviewRound is the review round this comment was posted in, when the
+                        OPERATOR posted it (fix M8 - v5's C.5.3 used this field and never declared
+                        it). Zero for every comment the operator did not author. It is the MIRROR
+                        half of the idempotency story; the FORGE half is the body marker (C.5.3).
+                      type: integer
+                    truncated:
+                      description: |-
+                        Truncated is true when the ingest cut Body at 8192 bytes. The bundle
+                        renders truncated="true" on the <comment> element so the agent knows the
+                        text is partial and can pull the full body from the forge if it matters.
+                      type: boolean
+                  required:
+                  - author
+                  - body
+                  - createdAt
+                  - externalId
+                  type: object
+                maxItems: 200
+                type: array
+              commentsRetainedFrom:
+                description: |-
+                  CommentsRetainedFrom is the eviction watermark (fix M18). Same contract as
+                  Issue.status.commentsRetainedFrom.
+                format: date-time
+                type: string
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              createdAt:
+                format: date-time
+                type: string
+              deployedAt:
+                format: date-time
+                type: string
+              deployedVersion:
+                type: string
+              headBranch:
+                type: string
+              headSHA:
+                description: |-
+                  HeadSHA is the MIRROR's last-synced head. It is NEVER trusted for a merge
+                  or an approval decision: both re-fetch the head LIVE (fix 10).
+                type: string
+              lastSyncedAt:
+                format: date-time
+                type: string
+              mergeable:
+                type: boolean
+              mergedAt:
+                format: date-time
+                type: string
+              pendingComments:
+                description: |-
+                  PendingComments are durable comment/reply intents (fix M8), drained by the
+                  same reconciler.
+                items:
+                  description: |-
+                    PendingComment is the DURABLE INTENT to post one comment/reply (fix M8). Same
+                    contract as PendingReview: persisted first, posted by a reconciler, cleared on
+                    a verified append. RequestID is the client-supplied idempotency key.
+                  properties:
+                    action:
+                      enum:
+                      - comment
+                      - reply
+                      type: string
+                    body:
+                      maxLength: 16384
+                      type: string
+                    inReplyTo:
+                      type: string
+                    requestId:
+                      type: string
+                  required:
+                  - action
+                  - body
+                  - requestId
+                  type: object
+                maxItems: 20
+                type: array
+              pendingReview:
+                description: |-
+                  PendingReview is the durable intent the MergeRequest reconciler drains
+                  (fix M8; the mechanism is H3-5 + V6-4). Non-nil means "a review is owed to
+                  the forge". THE STAGE MACHINE IS GATED ON IT BEING NIL (F.3), so a pod can
+                  never be spawned to fix findings that have not been recorded yet.
+                properties:
+                  body:
+                    description: |-
+                      There is NO Event field (fix M9): the event is ALWAYS "COMMENT" (C.5.1b),
+                      so it is a constant in the implementation, not data on the wire.
+                    maxLength: 16384
+                    type: string
+                  findings:
+                    items:
+                      description: |-
+                        ReviewFinding is one inline review comment. MaxLength is load-bearing: 30
+                        findings x an unbounded body is an A.7 byte-budget input the guard CANNOT
+                        evict (it is spec-adjacent intent, not an evictable comment) - fix M8.
+                      properties:
+                        body:
+                          maxLength: 8192
+                          type: string
+                        line:
+                          minimum: 1
+                          type: integer
+                        path:
+                          type: string
+                        severity:
+                          enum:
+                          - critical
+                          - high
+                          - medium
+                          - low
+                          type: string
+                      required:
+                      - body
+                      - line
+                      - path
+                      - severity
+                      type: object
+                    maxItems: 30
+                    type: array
+                  round:
+                    description: |-
+                      Round is the idempotency key. It appears BOTH in the forge marker
+                      (<!-- tatara-review round=N sha=... -->) and on every Comment this round
+                      produces (Comment.ReviewRound), so a crash between the forge post and the
+                      mirror append cannot double-post.
+                    type: integer
+                  sha:
+                    description: SHA is the head the review was made against (== MergeRequest.status.reviewedSHA).
+                    type: string
+                required:
+                - body
+                - round
+                - sha
+                type: object
+              reviewRounds:
+                description: |-
+                  ReviewRounds counts ACCEPTED request_changes verdicts on this MR. At
+                  Project.spec.agent.maxReviewRounds the Task parks (review-loop-exhausted).
+                type: integer
+              reviewedSHA:
+                description: |-
+                  ReviewedSHA is the LIVE head SHA read at the moment the review outcome was
+                  ACCEPTED. Merge passes it to SCMWriter.Merge as the expected head; a 409
+                  means the head moved (fix 10) -> Status=new, stage back to reviewing.
+                type: string
+              significance:
+                description: |-
+                  Significance is IMPLEMENT-OWNED (fix 12): written once from the implement
+                  Task's submit_outcome. A review outcome may only ESCALATE it (max on the
+                  ordering patch < minor < major); an attempt to LOWER it is ignored and
+                  logged WARN. The in-cluster reviewer is documented-flaky and must never be
+                  able to downgrade a major release to a patch.
+                enum:
+                - major
+                - minor
+                - patch
+                type: string
+              spilledComments:
+                description: |-
+                  SpilledComments / SpilledCommentsRefs: the MR needs the SAME spill guard the
+                  Issue has (fix E1). v2 gave it none - and a PR with 5 review rounds x 30
+                  inline findings is this platform's own NORMAL output.
+                  SpilledCommentsRefs ACCUMULATES (fix M19): each spill batch appends its own
+                  tatara-memory track_id. A single scalar ref silently orphaned every earlier
+                  batch on the second spill.
+                type: integer
+              spilledCommentsRefs:
+                items:
+                  type: string
+                maxItems: 50
+                type: array
+              state:
+                enum:
+                - open
+                - merged
+                - closed
+                type: string
+              status:
+                description: |-
+                  Status is the platform's review state. OPERATOR-OWNED: written only from
+                  an ACCEPTED review submit_outcome (C.5). No agent writes it.
+                enum:
+                - new
+                - approved
+                - needs-changes
+                - rejected
+                type: string
+              title:
+                type: string
+              updatedAt:
+                format: date-time
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

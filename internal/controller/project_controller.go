@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
@@ -31,7 +32,7 @@ import (
 )
 
 // defaultGaugeRecomputeInterval is how often updateMemoryStackCounts and
-// updateDeployStateCounts run. Both do a full ProjectList / TaskList scan;
+// updateIssueStateCounts run. Both do a full ProjectList / TaskList scan;
 // running them on every per-Project reconcile is O(N) per cycle per project.
 // 60 s is coarse-grained enough to avoid list pressure while still converging
 // the gauges quickly after any phase/state change.
@@ -43,7 +44,6 @@ type ProjectReconciler struct {
 	client.Client
 	Scheme              *runtime.Scheme
 	Metrics             *obs.OperatorMetrics
-	LifecycleMetrics    *obs.LifecycleMetrics
 	ExternalWebhookBase string
 	MemoryConfig        memory.Config
 	GrafanaConfig       grafanamcp.Config
@@ -57,7 +57,7 @@ type ProjectReconciler struct {
 	Seq *queue.SeqSource
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
-	// (updateMemoryStackCounts + updateDeployStateCounts) run. Defaults to
+	// (updateMemoryStackCounts + updateIssueStateCounts) run. Defaults to
 	// defaultGaugeRecomputeInterval when zero. MaxConcurrentReconciles=1 means
 	// this field is read/written under the controller's serialised call path;
 	// no mutex required.
@@ -95,16 +95,13 @@ type ProjectReconciler struct {
 	memoryUnhealthyCycles map[string]int
 
 	// ToolSurfaceHTTP is the client used by updateToolSurfaceProbe to probe the
-	// operator-write and chat tool backends. Nil falls back to a short-timeout
+	// operator-write tool backend. Nil falls back to a short-timeout
 	// default; tests inject an httptest-backed client.
 	ToolSurfaceHTTP *http.Client
 	// OperatorURL is the in-cluster REST base URL of the operator-write surface
 	// (the TATARA_OPERATOR_URL agent pods receive); updateToolSurfaceProbe probes
 	// a representative read here. Empty disables the operator-backend probe.
 	OperatorURL string
-	// ChatBaseURL, when set, overrides the in-cluster chat Service DNS used by
-	// updateToolSurfaceProbe (tests point it at httptest).
-	ChatBaseURL func() string
 
 	// toolSurfaceUnhealthyCycles tracks, per backend, the number of consecutive
 	// updateToolSurfaceProbe cycles that probed unhealthy. probeToolSurface only
@@ -191,6 +188,27 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	requeueAfter = soonestRequeue(requeueAfter, scanRequeue)
 
+	// THE F.6 RE-ENTRY DRIVER (fix W3). Applies stage.Unpark to every parked Task
+	// whose reason has a re-entry rule (time-based merge/deploy/no-outcome plus the
+	// comment-driven awaiting-human/backlog-sweep backstop); identity-unverified is
+	// webhook+grammar-driven and skipped. Runs every project reconcile, leader-only,
+	// regardless of cron config. A persist failure requeues.
+	if err := r.driveUnparks(ctx, &project, time.Now()); err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, fmt.Errorf("drive unparks: %w", err)
+	}
+
+	// THE B.6 TERMINAL REAPER (fix W2). Releases and GCs terminal Tasks
+	// (failed/rejected/parked/delivered) and their Issues/MRs, and stamps the
+	// tatara-parked label that keeps the M25 re-mint loop closed. It was
+	// implemented and tested but had NO production caller. A blocking step failure
+	// (e.g. a 403 on the terminal comment/label) returns an error and requeues, per
+	// B.6/M25 - the reap must not proceed without the label landing.
+	if err := r.ReapTerminal(ctx, &project); err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, fmt.Errorf("reap terminal: %w", err)
+	}
+
 	memPhase := ""
 	if project.Status.Memory != nil {
 		memPhase = project.Status.Memory.Phase
@@ -240,13 +258,13 @@ func (r *ProjectReconciler) computeProjectCounts(ctx context.Context, project *t
 		issues, incidents := 0, 0
 		for i := range tasks.Items {
 			t := &tasks.Items[i]
-			if t.Spec.ProjectRef != project.Name || tataradevv1alpha1.TaskTerminal(t) {
+			if t.Spec.ProjectRef != project.Name || tataradevv1alpha1.TaskDone(t) {
 				continue
 			}
 			switch t.Spec.Kind {
 			case "incident":
 				incidents++
-			case "issueLifecycle", "clarify":
+			case "clarify":
 				issues++
 			}
 		}
@@ -255,7 +273,7 @@ func (r *ProjectReconciler) computeProjectCounts(ctx context.Context, project *t
 	}
 }
 
-// maybeRecomputeGauges runs updateMemoryStackCounts and updateDeployStateCounts
+// maybeRecomputeGauges runs updateMemoryStackCounts and updateIssueStateCounts
 // at most once per GaugeRecomputeInterval (defaultGaugeRecomputeInterval when
 // zero). Calling it on every Reconcile is safe: it skips the expensive full
 // ProjectList + TaskList scans until the interval has elapsed.
@@ -268,8 +286,9 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 		return
 	}
 	r.updateMemoryStackCounts(ctx)
-	r.updateDeployStateCounts(ctx)
 	r.updateIssueStateCounts(ctx)
+	r.updateTaskStageGauges(ctx)
+	r.updateQueueAgeGauge(ctx)
 	r.updateLightragDocCounts(ctx)
 	r.updateMemoryRetrievalProbe(ctx)
 	r.updateToolSurfaceProbe(ctx)
@@ -394,94 +413,22 @@ func parseLightragStatusCounts(body []byte) (map[string]int, error) {
 	return payload.StatusCounts, nil
 }
 
-// lifecycleStates is the full set of issueLifecycle states the
-// tatara_lifecycle_state gauge tracks. updateDeployStateCounts Sets every one
-// each pass (including 0 for drained states) so a state that empties out reads 0
-// rather than retaining its last value.
-var lifecycleStates = []string{
-	"Triage", "Implement", "Conversation", "MRCI", "Merge", "MainCI",
-	"Done", "Stopped", "Parked",
-}
-
-// updateDeployStateCounts recomputes tatara_lifecycle_state from authoritative
-// cluster state: it lists every issueLifecycle Task, counts them by
-// Status.DeployState, and Sets the gauge for all known states (zeros
-// included). This is the sole writer of the gauge; it is restart-safe and
-// terminal-safe, unlike the per-transition deltas it replaced, and mirrors
-// updateMemoryStackCounts. Tasks of other Kinds carry an empty DeployState and
-// are naturally excluded; the explicit Kind filter guards against ever emitting a
-// state="" series.
-func (r *ProjectReconciler) updateDeployStateCounts(ctx context.Context) {
-	if r.LifecycleMetrics == nil {
-		return
-	}
-	var list tataradevv1alpha1.TaskList
-	if err := r.List(ctx, &list); err != nil {
-		return
-	}
-	counts := make(map[string]int, len(lifecycleStates))
-	for i := range list.Items {
-		t := &list.Items[i]
-		if t.Spec.Kind != "issueLifecycle" || t.Status.DeployState == "" {
-			continue
-		}
-		counts[t.Status.DeployState]++
-	}
-	for _, state := range lifecycleStates {
-		r.LifecycleMetrics.SetDeployState(state, float64(counts[state]))
-	}
-}
-
-// issueStateFor returns the tatara_issue_state "state" label for a live,
-// non-terminal Task, or "" when the Task should not appear in the gauge (terminal,
-// no supported lifecycle entry, or unsupported kind). It is a pure helper so it
-// can be unit-tested independently of the reconciler.
+// issueStateFor returns the tatara_issue_state "state" label for a live Task:
+// its STAGE. A Task whose work is over (a closed-set terminal, or delivered)
+// returns "" and drops out of the gauge. It is a pure helper so it can be
+// unit-tested independently of the reconciler.
 func issueStateFor(t *tataradevv1alpha1.Task) string {
-	// blocked: at-cap give-up must appear in the metric even though TaskTerminal
-	// classifies Parked as terminal. Check this before the terminal guard.
-	if t.Spec.Kind == "issueLifecycle" &&
-		t.Status.DeployState == "Parked" &&
-		tataradevv1alpha1.IsRecoverableGiveup(t.Status.ParkReason) &&
-		t.Status.ImplementGiveUps >= maxImplGiveUps {
-		return "blocked"
-	}
-	if tataradevv1alpha1.TaskTerminal(t) {
+	if tataradevv1alpha1.TaskDone(t) {
 		return ""
 	}
-	switch t.Spec.Kind {
-	case "issueLifecycle":
-		switch t.Status.DeployState {
-		case "Triage":
-			return "triage"
-		case "Conversation":
-			return "awaiting-approval"
-		case "Implement":
-			return "implementing"
-		case "MRCI":
-			return "mr-ci"
-		case "Merge":
-			return "merging"
-		case "MainCI":
-			return "main-ci"
-		}
-	case "review":
-		if t.Status.Phase == "Planning" || t.Status.Phase == "Running" {
-			return "reviewing"
-		}
-	case "documentation":
-		if t.Status.Phase == "Planning" || t.Status.Phase == "Running" {
-			return "documenting"
-		}
-	}
-	return ""
+	return t.Status.Stage
 }
 
 // updateIssueStateCounts recomputes tatara_issue_state from authoritative cluster
 // state by listing all non-terminal, issue-scoped Tasks and setting one gauge
 // series per live issue. A Reset() before each pass ensures stale (closed or
-// terminal) issues are not retained. This mirrors updateDeployStateCounts but
-// tracks per-issue state rather than aggregate counts, enabling the dashboard to
-// list every open issue with its current state, token usage, and turn count.
+// terminal) issues are not retained, enabling the dashboard to list every open
+// issue with its current stage, token usage, and turn count.
 func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {
 	if r.Metrics == nil {
 		return
@@ -506,6 +453,89 @@ func (r *ProjectReconciler) updateIssueStateCounts(ctx context.Context) {
 			incident = "true"
 		}
 		r.Metrics.SetIssueState(project, repo, issue, kind, state, incident)
+	}
+}
+
+// taskStageBucket keys the operator_task_stage COUNT aggregation (contract
+// K.1): the metric is low-cardinality by design, one series per (stage,kind),
+// not per-task.
+type taskStageBucket struct {
+	stage, kind string
+}
+
+// updateTaskStageGauges recomputes operator_task_stage (a COUNT per
+// (stage,kind) bucket) and operator_task_stage_age_seconds (per-task, seconds
+// since Status.StageEnteredAt) from authoritative cluster state (contract
+// K.1). A Reset() before each pass ensures a Task that left its stage or was
+// deleted does not leave a stale series behind (contract M22).
+func (r *ProjectReconciler) updateTaskStageGauges(ctx context.Context) {
+	if r.Metrics == nil {
+		return
+	}
+	var list tataradevv1alpha1.TaskList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	r.Metrics.ResetTaskStageGauges()
+	now := time.Now()
+	counts := make(map[taskStageBucket]int)
+	for i := range list.Items {
+		t := &list.Items[i]
+		stg := t.Status.Stage
+		if stg == "" {
+			continue
+		}
+		kind := t.Spec.Kind
+		counts[taskStageBucket{stage: stg, kind: kind}]++
+		if t.Status.StageEnteredAt != nil {
+			age := now.Sub(t.Status.StageEnteredAt.Time).Seconds()
+			r.Metrics.SetTaskStageAge(t.Name, stg, kind, age)
+		}
+	}
+	for b, n := range counts {
+		r.Metrics.SetTaskStage(b.stage, b.kind, float64(n))
+	}
+}
+
+// queueAgeBucket keys the operator_queue_age_seconds aggregation (contract
+// K.1): the OLDEST QueuedEvent's age per (class,priority,state) bucket.
+type queueAgeBucket struct {
+	class, priority, state string
+}
+
+// updateQueueAgeGauge recomputes operator_queue_age_seconds from authoritative
+// cluster state (contract K.1): the age of the OLDEST QueuedEvent in each
+// (class,priority,state) bucket. A Reset() before each pass ensures an emptied
+// bucket does not retain its last value.
+func (r *ProjectReconciler) updateQueueAgeGauge(ctx context.Context) {
+	if r.Metrics == nil {
+		return
+	}
+	var list tataradevv1alpha1.QueuedEventList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	r.Metrics.ResetQueueAge()
+	oldest := make(map[queueAgeBucket]time.Time)
+	for i := range list.Items {
+		q := &list.Items[i]
+		// EffectiveQueuePriority applies the CRD default (2) for a nil priority,
+		// matching how the dispatcher reads it - so a nil-priority event does NOT
+		// share a bucket with a genuine explicit-priority-0 (incident) event.
+		priority := strconv.Itoa(tataradevv1alpha1.EffectiveQueuePriority(q.Spec))
+		state := q.Status.State
+		if state == "" {
+			state = tataradevv1alpha1.QueueStateQueued
+		}
+		b := queueAgeBucket{class: q.Spec.Class, priority: priority, state: state}
+		created := q.CreationTimestamp.Time
+		if existing, ok := oldest[b]; !ok || created.Before(existing) {
+			oldest[b] = created
+		}
+	}
+	now := time.Now()
+	for b, ts := range oldest {
+		r.Metrics.SetQueueAge(b.class, b.priority, b.state, now.Sub(ts).Seconds())
 	}
 }
 

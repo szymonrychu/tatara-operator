@@ -261,7 +261,7 @@ func TestGitHubMergeConflict(t *testing.T) {
 			}))
 			defer srv.Close()
 			c := &GitHub{apiBase: srv.URL}
-			_, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash")
+			_, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash", "")
 			if !errors.Is(err, ErrMergeConflict) {
 				t.Fatalf("expected ErrMergeConflict for HTTP %d, got %v", status, err)
 			}
@@ -339,7 +339,7 @@ func TestGitHubReviewVerbs(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := &GitHub{apiBase: srv.URL}
-		if _, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash"); err != nil {
+		if _, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash", ""); err != nil {
 			t.Fatalf("Merge: %v", err)
 		}
 		if gotPath != "/repos/o/r/pulls/5/merge" || gotMethod != http.MethodPut || body["merge_method"] != "squash" {
