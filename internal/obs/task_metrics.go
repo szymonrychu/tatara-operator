@@ -10,6 +10,10 @@ type taskMetrics struct {
 	taskIssueState          *prometheus.GaugeVec
 	taskTerminalTotal       *prometheus.CounterVec
 	taskTerminalTokensTotal *prometheus.CounterVec
+	taskStage               *prometheus.GaugeVec
+	taskStageAge            *prometheus.GaugeVec
+	taskParkedTotal         *prometheus.CounterVec
+	orphanAdoptedTotal      *prometheus.CounterVec
 }
 
 // newTaskMetrics registers the task collectors on reg and returns the bundle.
@@ -29,12 +33,28 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		}, []string{"project", "repo", "issue", "kind", "state", "incident"}),
 		taskTerminalTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_terminal_total",
-			Help: "Tasks reaching a terminal phase by kind, phase (Succeeded|Failed), and condition reason.",
-		}, []string{"kind", "phase", "reason"}),
+			Help: "Tasks reaching a terminal stage by kind, stage (delivered|failed|rejected|parked), and stage reason.",
+		}, []string{"kind", "stage", "stageReason"}),
 		taskTerminalTokensTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_task_terminal_tokens_total",
 			Help: "Cumulative agent token usage of terminated Tasks by project, repo, terminal outcome (delivered|churned|abandoned), model, and type (input|output|cache_read|cache_creation). No issue label - churn is outcome-keyed, not issue-keyed.",
 		}, []string{"project", "repo", "outcome", "model", "type"}),
+		taskStage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_task_stage",
+			Help: "Live Tasks currently in a given stage, by stage and kind (contract K.1). Value is the COUNT of Tasks in that (stage,kind) bucket, not per-task.",
+		}, []string{"stage", "kind"}),
+		taskStageAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_task_stage_age_seconds",
+			Help: "Seconds since a live Task entered its current stage (contract K.1), by task, stage, and kind.",
+		}, []string{"task", "stage", "kind"}),
+		taskParkedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_task_parked_total",
+			Help: "Park transitions (contract K.1), by the stage the Task parked FROM (the stalling stage) and the park stageReason. Incremented once per park transition, never on a mint.",
+		}, []string{"stage", "stageReason"}),
+		orphanAdoptedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_orphan_adopted_total",
+			Help: "Orphan work items the sweep minted a Task for (contract K.1), by kind.",
+		}, []string{"kind"}),
 	}
 	reg.MustRegister(
 		m.taskTokensTotal,
@@ -42,6 +62,10 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.taskIssueState,
 		m.taskTerminalTotal,
 		m.taskTerminalTokensTotal,
+		m.taskStage,
+		m.taskStageAge,
+		m.taskParkedTotal,
+		m.orphanAdoptedTotal,
 	)
 	return m
 }
@@ -126,11 +150,86 @@ func (m *taskMetrics) DeleteTaskSeries(project, repo, kind, issue, model string)
 }
 
 // TaskTerminal increments operator_task_terminal_total for a Task reaching a
-// terminal phase ("Succeeded" or "Failed") with the given kind and the condition
-// reason recorded on the terminal transition. This is the uniform loop
-// success/failure denominator: every terminal transition is metered here exactly
-// once, including failure paths (PodLost, TurnTimeout, PlanningStalled, ...) that
-// the per-reason fault counters do not all cover.
-func (m *taskMetrics) TaskTerminal(kind, phase, reason string) {
-	m.taskTerminalTotal.WithLabelValues(kind, phase, reason).Inc()
+// terminal stage (delivered|failed|rejected|parked) with the given kind and
+// the stage reason recorded on the terminal transition. This is the uniform
+// loop success/failure denominator: every terminal transition is metered here
+// exactly once, including failure paths (PodLost, TurnTimeout,
+// PlanningStalled, ...) that the per-reason fault counters do not all cover.
+func (m *taskMetrics) TaskTerminal(kind, stage, stageReason string) {
+	m.taskTerminalTotal.WithLabelValues(kind, stage, stageReason).Inc()
+}
+
+// ResetTaskStageGauges clears operator_task_stage and
+// operator_task_stage_age_seconds so a recompute pass leaves no stale series
+// for a Task that left its stage or was deleted (contract M22): a per-task
+// gauge that is never explicitly reaped grows /metrics without bound, so every
+// pass Resets first and re-Sets only live series.
+func (m *OperatorMetrics) ResetTaskStageGauges() {
+	if m == nil || m.taskStage == nil || m.taskStageAge == nil {
+		return
+	}
+	m.taskStage.Reset()
+	m.taskStageAge.Reset()
+}
+
+// SetTaskStage sets operator_task_stage{stage,kind} to the live COUNT of Tasks
+// in that bucket.
+func (m *OperatorMetrics) SetTaskStage(stage, kind string, count float64) {
+	if m == nil || m.taskStage == nil {
+		return
+	}
+	m.taskStage.WithLabelValues(stage, kind).Set(count)
+}
+
+// SetTaskStageAge sets operator_task_stage_age_seconds{task,stage,kind} to
+// ageSeconds, the time since that Task entered its current stage.
+func (m *OperatorMetrics) SetTaskStageAge(task, stage, kind string, ageSeconds float64) {
+	if m == nil || m.taskStageAge == nil {
+		return
+	}
+	m.taskStageAge.WithLabelValues(task, stage, kind).Set(ageSeconds)
+}
+
+// TaskParked increments operator_task_parked_total for one park transition.
+// stage is the stage the Task parked FROM (the stalling stage); stageReason is
+// the park reason. Nil-safe: EnterStage calls it unconditionally, and a
+// reconciler wired without metrics is a test, not an outage.
+func (m *OperatorMetrics) TaskParked(stage, stageReason string) {
+	if m == nil || m.taskParkedTotal == nil {
+		return
+	}
+	m.taskParkedTotal.WithLabelValues(stage, stageReason).Inc()
+}
+
+// OrphanAdopted increments operator_orphan_adopted_total for one orphan work
+// item (issue or PR) the sweep minted a Task for.
+func (m *OperatorMetrics) OrphanAdopted(kind string) {
+	if m == nil || m.orphanAdoptedTotal == nil {
+		return
+	}
+	m.orphanAdoptedTotal.WithLabelValues(kind).Inc()
+}
+
+// TaskStageGauge returns the operator_task_stage gauge for (stage,kind) for
+// test assertions.
+func (m *OperatorMetrics) TaskStageGauge(stage, kind string) prometheus.Gauge {
+	return m.taskStage.WithLabelValues(stage, kind)
+}
+
+// TaskStageAgeGauge returns the operator_task_stage_age_seconds gauge for
+// (task,stage,kind) for test assertions.
+func (m *OperatorMetrics) TaskStageAgeGauge(task, stage, kind string) prometheus.Gauge {
+	return m.taskStageAge.WithLabelValues(task, stage, kind)
+}
+
+// TaskParkedCounter returns the operator_task_parked_total counter for
+// (stage,stageReason) for test assertions.
+func (m *OperatorMetrics) TaskParkedCounter(stage, stageReason string) prometheus.Counter {
+	return m.taskParkedTotal.WithLabelValues(stage, stageReason)
+}
+
+// OrphanAdoptedCounter returns the operator_orphan_adopted_total counter for
+// kind for test assertions.
+func (m *OperatorMetrics) OrphanAdoptedCounter(kind string) prometheus.Counter {
+	return m.orphanAdoptedTotal.WithLabelValues(kind)
 }

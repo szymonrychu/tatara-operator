@@ -56,7 +56,7 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 	if err := k8sClient.Create(context.Background(), pre); err != nil {
 		t.Fatalf("pre-create: %v", err)
 	}
-	pre.Status.Phase = "Planning"
+	pre.Status.Stage = tatarav1alpha1.StageBrainstorming
 	_ = k8sClient.Status().Update(context.Background(), pre)
 
 	reader := &perRepoFakeReader{
@@ -91,13 +91,13 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_AtCap_Skips(t *testing.T) {
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/m": {
-				{Repo: "o/m", Number: 1, Labels: []string{"tatara-idea"}},
-				{Repo: "o/m", Number: 2, Labels: []string{"tatara-idea"}},
-				{Repo: "o/m", Number: 3, Labels: []string{"tatara-idea"}},
+				{Repo: "o/m", Number: 1, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/m", Number: 2, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/m", Number: 3, Labels: []string{"tatara-brainstorming"}},
 			},
 			"o/n": {
-				{Repo: "o/n", Number: 4, Labels: []string{"tatara-idea"}},
-				{Repo: "o/n", Number: 5, Labels: []string{"tatara-idea"}},
+				{Repo: "o/n", Number: 4, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/n", Number: 5, Labels: []string{"tatara-brainstorming"}},
 			},
 		},
 	}
@@ -119,12 +119,12 @@ func TestBrainstorm_ProjectLevel_SummedBacklog_UnderCap_Creates(t *testing.T) {
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/p": {
-				{Repo: "o/p", Number: 1, Labels: []string{"tatara-idea"}},
-				{Repo: "o/p", Number: 2, Labels: []string{"tatara-idea"}},
-				{Repo: "o/p", Number: 3, Labels: []string{"tatara-idea"}},
+				{Repo: "o/p", Number: 1, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/p", Number: 2, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/p", Number: 3, Labels: []string{"tatara-brainstorming"}},
 			},
 			"o/q": {
-				{Repo: "o/q", Number: 4, Labels: []string{"tatara-idea"}},
+				{Repo: "o/q", Number: 4, Labels: []string{"tatara-brainstorming"}},
 			},
 		},
 	}
@@ -214,11 +214,11 @@ func TestBrainstorm_ProjectLevel_ShortCircuit_Backlog(t *testing.T) {
 	reader := &countingReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/sc1": {
-				{Repo: "o/sc1", Number: 1, Labels: []string{"tatara-idea"}},
-				{Repo: "o/sc1", Number: 2, Labels: []string{"tatara-idea"}},
-				{Repo: "o/sc1", Number: 3, Labels: []string{"tatara-idea"}},
+				{Repo: "o/sc1", Number: 1, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/sc1", Number: 2, Labels: []string{"tatara-brainstorming"}},
+				{Repo: "o/sc1", Number: 3, Labels: []string{"tatara-brainstorming"}},
 			},
-			"o/sc2": {{Repo: "o/sc2", Number: 4, Labels: []string{"tatara-idea"}}},
+			"o/sc2": {{Repo: "o/sc2", Number: 4, Labels: []string{"tatara-brainstorming"}}},
 			"o/sc3": {},
 		},
 		queried: queriedRepos,
@@ -305,7 +305,7 @@ func TestBrainstormDefaultProposalCapIsTen(t *testing.T) {
 
 			var issues []scm.IssueRef
 			for i := 1; i <= tc.openCount; i++ {
-				issues = append(issues, scm.IssueRef{Repo: "o/r1", Number: i, Labels: []string{"tatara-idea"}})
+				issues = append(issues, scm.IssueRef{Repo: "o/r1", Number: i, Labels: []string{"tatara-brainstorming"}})
 			}
 			reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r1": issues}}
 			r := newScanReconciler(reader)

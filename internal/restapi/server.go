@@ -3,10 +3,12 @@ package restapi
 import (
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -22,8 +24,21 @@ type Config struct {
 	// Used by the issue-comment gate to detect an existing bot comment.
 	// When nil, the gate is skipped (post proceeds).
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
-	Logger    *slog.Logger
-	Metrics   *obs.OperatorMetrics
+	// CIFor returns the live-CI capability behind GET /projects/{p}/scm/ci
+	// (contract C.2.10). When nil, that endpoint returns 501.
+	CIFor func(provider, token string) (scm.CIReader, error)
+	// Spiller sends an eviction batch (comments, notes) to tatara-memory. It is
+	// the A.7 byte guard's escape valve and the 50-note cap's drop target.
+	Spiller objbudget.Spiller
+	// Memory rehydrates spilled notes for task_context(notes=all).
+	Memory NoteFetcher
+	// Approval is the C.6 grammar. A nil verifier FAILS CLOSED: a clarify
+	// decision=implement then parks at identity-unverified.
+	Approval ApprovalVerifier
+	// Now is injectable for tests; nil means time.Now.
+	Now     func() time.Time
+	Logger  *slog.Logger
+	Metrics *obs.OperatorMetrics
 }
 
 // Server exposes OIDC-gated CRUD over the tatara CRDs, backed by the
@@ -34,6 +49,12 @@ type Server struct {
 	ns        string
 	scmFor    func(provider string) (scm.SCMWriter, error)
 	readerFor func(provider, token string) (scm.SCMReader, error)
+	ciFor     func(provider, token string) (scm.CIReader, error)
+	spiller   objbudget.Spiller
+	memory    NoteFetcher
+	approval  ApprovalVerifier
+	nowFn     func() time.Time
+	ciPacer   *ciPacer
 	log       *slog.Logger
 	metrics   *obs.OperatorMetrics
 }
@@ -44,7 +65,11 @@ func NewServer(cfg Config) *Server {
 	if l == nil {
 		l = slog.Default()
 	}
-	return &Server{c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, readerFor: cfg.ReaderFor, log: l, metrics: cfg.Metrics}
+	return &Server{
+		c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, readerFor: cfg.ReaderFor,
+		ciFor: cfg.CIFor, spiller: cfg.Spiller, memory: cfg.Memory, approval: cfg.Approval,
+		nowFn: cfg.Now, ciPacer: newCIPacer(), log: l, metrics: cfg.Metrics,
+	}
 }
 
 // Mount registers the REST routes on r. verify is the OIDC middleware;
@@ -60,32 +85,24 @@ func (s *Server) Mount(r chi.Router, verify func(http.Handler) http.Handler) {
 	})
 }
 
-// routes wires every REST endpoint. Handlers are filled in by later tasks.
+// routes wires the complete contract-C.1 endpoint table (15 routes). The 19
+// pre-redesign routes are DELETED and now 404: the whole old surface collapsed
+// into task_context / task_note / submit_outcome / scm_read / issue_write /
+// mr_write.
 func (s *Server) routes(r chi.Router) {
-	r.Get("/projects", s.listProjects)
-	r.Get("/projects/{p}", s.getProject)
-	r.Get("/projects/{p}/repositories", s.listRepositories)
-	r.Get("/projects/{p}/tasks", s.listTasks)
-	r.Get("/tasks/{t}", s.getTask)
-	r.Patch("/tasks/{t}", s.patchTask)
-	r.Get("/tasks/{t}/subtasks", s.listSubtasks)
-	r.Post("/tasks/{t}/subtasks", s.createSubtask)
-	r.Patch("/subtasks/{s}", s.patchSubtask)
-	r.Get("/projects/{p}/issues", s.listProjectIssues)
-	r.Get("/projects/{p}/commits", s.listProjectCommits)
-	r.Post("/projects/{p}/issues/{owner}/{repo}/{number}/close", s.closeProjectIssue)
-	r.Patch("/projects/{p}/issues/{owner}/{repo}/{number}", s.editProjectIssue)
-	r.Post("/projects/{p}/issues/{owner}/{repo}", s.createProjectIssue)
-	r.Post("/projects/{p}/issues", s.proposeIssue)
-	r.Post("/projects/{p}/issue-comment", s.commentOnIssue)
-	r.Post("/tasks/{t}/review", s.reviewVerdict)
-	r.Post("/tasks/{t}/pr-outcome", s.prOutcome)
-	r.Post("/tasks/{t}/issue-outcome", s.issueOutcome)
-	r.Post("/tasks/{t}/implement-outcome", s.implementOutcome)
-	r.Post("/tasks/{t}/brainstorm-outcome", s.brainstormOutcome)
-	r.Post("/tasks/{t}/comment", s.postComment)
-	r.Post("/tasks/{t}/change-summary", s.changeSummary)
-	r.Post("/tasks/{t}/handover", s.handover)
-	r.Get("/projects/{p}/harness-state/{key}", s.getHarnessState)
-	r.Post("/projects/{p}/harness-state/{key}", s.casHarnessState)
+	r.Get("/projects", s.listProjects)                      // 1
+	r.Get("/projects/{p}", s.getProject)                    // 2  project_get
+	r.Get("/projects/{p}/repositories", s.listRepositories) // 3  repo_list
+	r.Get("/projects/{p}/tasks", s.listTasks)               // 4  task_list
+	r.Get("/tasks/{t}", s.getTask)                          // 5  task_get
+	r.Get("/tasks/{t}/context", s.taskContext)              // 6  task_context
+	r.Post("/tasks/{t}/notes", s.postNote)                  // 7  task_note
+	r.Post("/tasks/{t}/outcome", s.postOutcome)             // 8  submit_outcome
+	r.Get("/projects/{p}/scm/issues", s.scmIssues)          // 9  scm_read(issues)
+	r.Get("/projects/{p}/scm/mrs", s.scmMRs)                // 10 scm_read(mr)
+	r.Get("/projects/{p}/scm/comments", s.scmComments)      // 11 scm_read(comments)
+	r.Get("/projects/{p}/scm/commits", s.scmCommits)        // 12 scm_read(commits)
+	r.Get("/projects/{p}/scm/ci", s.scmCI)                  // 13 scm_read(ci)
+	r.Post("/projects/{p}/scm/issue-write", s.issueWrite)   // 14 issue_write
+	r.Post("/projects/{p}/scm/mr-write", s.mrWrite)         // 15 mr_write
 }

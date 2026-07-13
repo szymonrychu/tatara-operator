@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -50,32 +51,31 @@ func TestProjectCronFieldsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestTaskKindEnumAndIssueOutcome(t *testing.T) {
+func TestTaskKindEnum(t *testing.T) {
 	ctx := context.Background()
-	cases := []struct {
-		name string
-		kind string
-	}{
-		{"enum-triage-issue", "triageIssue"},
-		{"enum-brainstorm", "brainstorm"},
-	}
-	for _, tc := range cases {
+	for _, kind := range []string{"brainstorm", "incident", "clarify", "refine", "review", "documentation"} {
 		tk := &tataradevv1alpha1.Task{}
-		tk.Name = tc.name
+		tk.Name = "enum-" + kind
 		tk.Namespace = testNS
+		repoRef := ""
+		if kind == "documentation" {
+			repoRef = "r"
+		}
 		tk.Spec = tataradevv1alpha1.TaskSpec{
-			ProjectRef: "p", RepositoryRef: "r", Goal: "g", Kind: tc.kind,
+			ProjectRef: "p", RepositoryRef: repoRef, Goal: "g", Kind: kind,
 		}
 		if err := k8sClient.Create(ctx, tk); err != nil {
-			t.Fatalf("create task kind=%s: %v", tc.kind, err)
+			t.Fatalf("create task kind=%s: %v", kind, err)
 		}
 	}
-	tk := &tataradevv1alpha1.Task{}
-	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "enum-triage-issue"}, tk); err != nil {
-		t.Fatalf("get task: %v", err)
-	}
-	tk.Status.IssueOutcome = &tataradevv1alpha1.IssueOutcome{Action: "close", Comment: "out of scope"}
-	if err := k8sClient.Status().Update(ctx, tk); err != nil {
-		t.Fatalf("status update issueOutcome: %v", err)
+	// The retired kinds are REJECTED by the CRD enum.
+	for _, kind := range []string{"implement", "issueLifecycle", "triageIssue", "selfImprove", "healthCheck"} {
+		tk := &tataradevv1alpha1.Task{}
+		tk.Name = "enum-bad-" + strings.ToLower(kind)
+		tk.Namespace = testNS
+		tk.Spec = tataradevv1alpha1.TaskSpec{ProjectRef: "p", RepositoryRef: "r", Goal: "g", Kind: kind}
+		if err := k8sClient.Create(ctx, tk); err == nil {
+			t.Fatalf("kind=%s must be rejected by the CRD enum", kind)
+		}
 	}
 }

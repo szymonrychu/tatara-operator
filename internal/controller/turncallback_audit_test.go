@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
@@ -68,33 +69,6 @@ func TestRecordResult_CurrentTurnIsStamped(t *testing.T) {
 	}
 }
 
-// TestRecordResult_PlanTurn_CapturesSyntheticOrderZeroEntry verifies item 8:
-// the plan turn (turn 0, no annCurrentSubtask) writes its FinalText onto a
-// synthetic order-0 "Planning" rollup entry instead of discarding it.
-func TestRecordResult_PlanTurn_CapturesSyntheticOrderZeroEntry(t *testing.T) {
-	mkTaskProject(t, "p-planturn", 3)
-	mkTaskRepository(t, "r-planturn", "p-planturn")
-	mkTask(t, "t-planturn", "p-planturn", "r-planturn")
-	annotate(t, "t-planturn", map[string]string{annCurrentTurn: "turn-0"})
-
-	cb := newCallbackServer()
-	task, err := cb.resolveTaskByTurn(context.Background(), "turn-0")
-	if err != nil {
-		t.Fatalf("resolveTaskByTurn: %v", err)
-	}
-	if err := cb.recordResult(context.Background(), agent.TurnResult{State: "completed", FinalText: "the plan text"}, task, "turn-0"); err != nil {
-		t.Fatalf("recordResult: %v", err)
-	}
-	tk := getTask(t, "t-planturn")
-	if len(tk.Status.Subtasks) != 1 {
-		t.Fatalf("Status.Subtasks = %+v, want 1 synthetic planning entry", tk.Status.Subtasks)
-	}
-	got := tk.Status.Subtasks[0]
-	if got.Name != "" || got.Order != 0 || got.Title != "Planning" || got.Phase != "Done" || got.Result != "the plan text" {
-		t.Errorf("Subtasks[0] = %+v, want {Name:\"\" Order:0 Title:Planning Phase:Done Result:\"the plan text\"}", got)
-	}
-}
-
 // --- Finding 3: expireTimedOutTurn must clear annCurrentTurn ---
 
 // TestExpireTimedOutTurn_ClearsCurrentTurnAnnotation verifies that after
@@ -104,7 +78,7 @@ func TestExpireTimedOutTurn_ClearsCurrentTurnAnnotation(t *testing.T) {
 	mkTaskProject(t, "p-exp1", 3)
 	mkTaskRepository(t, "r-exp1", "p-exp1")
 	mkTask(t, "t-exp1", "p-exp1", "r-exp1")
-	setTaskPhase(t, "t-exp1", "Running")
+	setTaskStage(t, "t-exp1", tatarav1alpha1.StageImplementing)
 	annotate(t, "t-exp1", map[string]string{
 		annCurrentTurn:   "turn-expired",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -122,8 +96,8 @@ func TestExpireTimedOutTurn_ClearsCurrentTurnAnnotation(t *testing.T) {
 	if tk.Annotations[annTurnStartedAt] != "" {
 		t.Error("expireTimedOutTurn must clear annTurnStartedAt")
 	}
-	if tk.Status.Phase != "Failed" {
-		t.Errorf("phase = %q, want Failed", tk.Status.Phase)
+	if tatarav1alpha1.TaskDone(tk) {
+		t.Error("expiring a stalled TURN must not terminate the TASK")
 	}
 }
 
@@ -133,7 +107,7 @@ func TestExpireTimedOutTurn_LateCallbackIsNoop(t *testing.T) {
 	mkTaskProject(t, "p-exp2", 3)
 	mkTaskRepository(t, "r-exp2", "p-exp2")
 	mkTask(t, "t-exp2", "p-exp2", "r-exp2")
-	setTaskPhase(t, "t-exp2", "Running")
+	setTaskStage(t, "t-exp2", tatarav1alpha1.StageImplementing)
 	annotate(t, "t-exp2", map[string]string{
 		annCurrentTurn:   "turn-late",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -155,13 +129,13 @@ func TestExpireTimedOutTurn_LateCallbackIsNoop(t *testing.T) {
 // --- Finding 4: terminal-phase guard in expireTimedOutTurn ---
 
 // TestExpireTimedOutTurn_AlreadyTerminalIsNoop verifies that calling
-// expireTimedOutTurn on a task already in a terminal phase is a no-op
-// (no second Status().Update that would conflict with the reconcile).
+// expireTimedOutTurn on a Task whose work is already over is a no-op
+// (no second Update that would conflict with the reconcile).
 func TestExpireTimedOutTurn_AlreadyTerminalIsNoop(t *testing.T) {
 	mkTaskProject(t, "p-term1", 3)
 	mkTaskRepository(t, "r-term1", "p-term1")
 	mkTask(t, "t-term1", "p-term1", "r-term1")
-	setTaskPhase(t, "t-term1", "Failed") // already terminal
+	setTaskStage(t, "t-term1", tatarav1alpha1.StageFailed) // already finished
 	annotate(t, "t-term1", map[string]string{
 		annCurrentTurn:   "turn-term",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -177,7 +151,7 @@ func TestExpireTimedOutTurn_AlreadyTerminalIsNoop(t *testing.T) {
 // --- Finding 7: nil-Metrics guard ---
 
 // TestHandleTurnComplete_NilMetricsNoPanic verifies that handleTurnComplete
-// does not panic when s.Metrics is nil, matching the LifecycleMetrics convention.
+// does not panic when s.Metrics is nil.
 func TestHandleTurnComplete_NilMetricsNoPanic(t *testing.T) {
 	mkTaskProject(t, "p-nilm1", 3)
 	mkTaskRepository(t, "r-nilm1", "p-nilm1")
@@ -208,7 +182,7 @@ func TestPollOnce_NilMetricsNoPanic(t *testing.T) {
 	mkTaskProject(t, "p-nilm2", 3)
 	mkTaskRepository(t, "r-nilm2", "p-nilm2")
 	mkTask(t, "t-nilm2", "p-nilm2", "r-nilm2")
-	setTaskPhase(t, "t-nilm2", "Running")
+	setTaskStage(t, "t-nilm2", tatarav1alpha1.StageImplementing)
 	annotate(t, "t-nilm2", map[string]string{
 		annCurrentTurn:   "turn-nilm2",
 		annTurnStartedAt: "2000-01-01T00:00:00Z",
@@ -232,11 +206,7 @@ func TestHandleTurnComplete_SingleResolveWithUsage(t *testing.T) {
 	mkTaskProject(t, "p-sr1", 3)
 	mkTaskRepository(t, "r-sr1", "p-sr1")
 	mkTask(t, "t-sr1", "p-sr1", "r-sr1")
-	mkSubtask(t, "t-sr1-s1", "t-sr1", 1)
-	annotate(t, "t-sr1", map[string]string{
-		annCurrentTurn:    "turn-sr1",
-		annCurrentSubtask: "t-sr1-s1",
-	})
+	annotate(t, "t-sr1", map[string]string{annCurrentTurn: "turn-sr1"})
 
 	cb := &CallbackServer{
 		Client:    k8sClient,
@@ -262,15 +232,13 @@ func TestHandleTurnComplete_SingleResolveWithUsage(t *testing.T) {
 	if tk.Annotations[annTurnComplete] == "" {
 		t.Error("turn-complete annotation must be set")
 	}
-	// LastTurnInputTokens = input_tokens + cache_read_input_tokens = 100 + 10 = 110
-	if tk.Status.LastTurnInputTokens != 110 {
-		t.Errorf("LastTurnInputTokens = %d, want 110", tk.Status.LastTurnInputTokens)
+	if tk.Status.Stats.TokensInput != 100 {
+		t.Errorf("stats.tokensInput = %d, want 100", tk.Status.Stats.TokensInput)
 	}
-	if tk.Status.CumulativeTokens != 50 {
-		t.Errorf("CumulativeTokens = %d, want 50", tk.Status.CumulativeTokens)
+	if tk.Status.Stats.TokensCacheRead != 10 {
+		t.Errorf("stats.tokensCacheRead = %d, want 10", tk.Status.Stats.TokensCacheRead)
 	}
-	st := getSubtask(t, "t-sr1-s1")
-	if st.Status.Result != "sr result" {
-		t.Errorf("subtask result = %q, want %q", st.Status.Result, "sr result")
+	if tk.Status.Stats.TokensOutput != 50 {
+		t.Errorf("stats.tokensOutput = %d, want 50", tk.Status.Stats.TokensOutput)
 	}
 }

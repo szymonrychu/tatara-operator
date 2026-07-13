@@ -20,14 +20,18 @@ func inflightRepo(project, name, slug string) *tatarav1.Repository {
 	return r
 }
 
-func inflightTask(name, project, issueRef string, number int) *tatarav1.Task {
+// inflightTask builds a Task that spans repoRef (a Repository CR name) via
+// Spec.RepositoryRef - the field repoHasNonTerminalTask matches implicated
+// repos against - with Stage defaulting to a non-terminal stage (TaskDone
+// false).
+func inflightTask(name, project, repoRef, issueRef string, number int) *tatarav1.Task {
 	return &tatarav1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tatara"},
 		Spec: tatarav1.TaskSpec{
-			ProjectRef: project, Kind: "implement", Goal: "g",
+			ProjectRef: project, RepositoryRef: repoRef, Kind: "implement", Goal: "g",
 			Source: &tatarav1.TaskSource{Provider: "github", IssueRef: issueRef, Number: number},
 		},
-		Status: tatarav1.TaskStatus{Phase: "Running"},
+		Status: tatarav1.TaskStatus{Stage: tatarav1.StageImplementing},
 	}
 }
 
@@ -38,7 +42,7 @@ func TestGrafana_InflightRepo_SkipsCompetingIncident(t *testing.T) {
 	r, fc := grafanaRouter(t,
 		grafanaProject("pif"), grafanaSecret("pif"),
 		inflightRepo("pif", "pif-operator", "tatara-operator"),
-		inflightTask("pif-live", "pif", "szymonrychu/tatara-operator#5", 5),
+		inflightTask("pif-live", "pif", "pif-operator", "szymonrychu/tatara-operator#5", 5),
 	)
 	w := postGrafana(r, "pif", "tok", grafanaFiringImplicatingRepo)
 	if w.Code != 202 {
@@ -70,8 +74,8 @@ func TestGrafana_InflightRepo_SpawnsWhenNoLiveTask(t *testing.T) {
 // TestGrafana_InflightRepo_TerminalTaskDoesNotBlock: a terminal Task on the
 // implicated repo does not block a new incident.
 func TestGrafana_InflightRepo_TerminalTaskDoesNotBlock(t *testing.T) {
-	done := inflightTask("pif3-done", "pif3", "szymonrychu/tatara-operator#5", 5)
-	done.Status.Phase = "Succeeded"
+	done := inflightTask("pif3-done", "pif3", "pif3-operator", "szymonrychu/tatara-operator#5", 5)
+	done.Status.Stage = tatarav1.StageDelivered
 	r, fc := grafanaRouter(t,
 		grafanaProject("pif3"), grafanaSecret("pif3"),
 		inflightRepo("pif3", "pif3-operator", "tatara-operator"),

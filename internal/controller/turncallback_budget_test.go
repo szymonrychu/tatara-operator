@@ -18,7 +18,7 @@ func mkBudgetProject(t *testing.T, name string, spec tatarav1alpha1.TokenBudgetS
 	p.Name = name
 	p.Namespace = testNS
 	p.Spec.ScmSecretRef = name + "-scm"
-	p.Spec.MaxConcurrentTasks = 3
+	p.Spec.MaxConcurrentAgents = 3
 	p.Spec.Agent = tatarav1alpha1.AgentSpec{
 		Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
 		MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,

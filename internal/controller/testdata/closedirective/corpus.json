@@ -1,0 +1,248 @@
+[
+  {
+    "name": "bare_gh_same_approved",
+    "body": "Closes #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/widgets", "number": 7, "approved": true}],
+    "want": "Closes #7 to wrap up."
+  },
+  {
+    "name": "bare_gh_same_unapproved",
+    "body": "Closes #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "#7 to wrap up."
+  },
+  {
+    "name": "bare_gh_cross_approved_elsewhere_still_stripped",
+    "body": "Closes #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/other", "number": 7, "approved": true}],
+    "want": "#7 to wrap up."
+  },
+  {
+    "name": "bare_gh_cross_unapproved",
+    "body": "Closes #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "#7 to wrap up."
+  },
+  {
+    "name": "bare_gl_same_approved",
+    "body": "Implementing #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/widgets", "number": 7, "approved": true}],
+    "want": "Implementing #7 to wrap up."
+  },
+  {
+    "name": "bare_gl_same_unapproved",
+    "body": "Implementing #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "#7 to wrap up."
+  },
+  {
+    "name": "bare_gl_cross_approved_elsewhere_still_stripped",
+    "body": "Implementing #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/other", "number": 7, "approved": true}],
+    "want": "#7 to wrap up."
+  },
+  {
+    "name": "bare_gl_cross_unapproved",
+    "body": "Implementing #7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "#7 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gh_same_approved",
+    "body": "Closes acme/widgets#7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/widgets", "number": 7, "approved": true}],
+    "want": "Closes acme/widgets#7 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gh_same_unapproved",
+    "body": "Closes acme/widgets#7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "acme/widgets#7 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gh_cross_approved",
+    "body": "Closes acme/other#9 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/other", "number": 9, "approved": true}],
+    "want": "Closes acme/other#9 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gh_cross_unapproved",
+    "body": "Closes acme/other#9 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "acme/other#9 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gl_same_approved",
+    "body": "Implementing g/p#7 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [{"repo": "g/p", "number": 7, "approved": true}],
+    "want": "Implementing g/p#7 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gl_same_unapproved",
+    "body": "Implementing g/p#7 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [],
+    "want": "g/p#7 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gl_cross_approved",
+    "body": "Implementing g/other#9 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [{"repo": "g/other", "number": 9, "approved": true}],
+    "want": "Implementing g/other#9 to wrap up."
+  },
+  {
+    "name": "ownerrepo_gl_cross_unapproved",
+    "body": "Implementing g/other#9 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [],
+    "want": "g/other#9 to wrap up."
+  },
+  {
+    "name": "ghshort_gh_same_approved",
+    "body": "Fixes GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/widgets", "number": 7, "approved": true}],
+    "want": "Fixes GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gh_same_unapproved",
+    "body": "Fixes GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gh_cross_approved_elsewhere_still_stripped",
+    "body": "Fixes GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/other", "number": 7, "approved": true}],
+    "want": "GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gh_cross_unapproved",
+    "body": "Fixes GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gl_same_approved",
+    "body": "Implementing GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/widgets", "number": 7, "approved": true}],
+    "want": "Implementing GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gl_same_unapproved",
+    "body": "Implementing GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gl_cross_approved_elsewhere_still_stripped",
+    "body": "Implementing GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/other", "number": 7, "approved": true}],
+    "want": "GH-7 to wrap up."
+  },
+  {
+    "name": "ghshort_gl_cross_unapproved",
+    "body": "Implementing GH-7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "GH-7 to wrap up."
+  },
+  {
+    "name": "url_gh_same_approved",
+    "body": "Closes https://github.com/acme/widgets/issues/7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/widgets", "number": 7, "approved": true}],
+    "want": "Closes https://github.com/acme/widgets/issues/7 to wrap up."
+  },
+  {
+    "name": "url_gh_same_unapproved",
+    "body": "Closes https://github.com/acme/widgets/issues/7 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "https://github.com/acme/widgets/issues/7 to wrap up."
+  },
+  {
+    "name": "url_gh_cross_approved",
+    "body": "Closes https://github.com/acme/other/issues/9 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [{"repo": "acme/other", "number": 9, "approved": true}],
+    "want": "Closes https://github.com/acme/other/issues/9 to wrap up."
+  },
+  {
+    "name": "url_gh_cross_unapproved",
+    "body": "Closes https://github.com/acme/other/issues/9 to wrap up.",
+    "ownRepo": "acme/widgets",
+    "allowed": [],
+    "want": "https://github.com/acme/other/issues/9 to wrap up."
+  },
+  {
+    "name": "url_gl_same_approved",
+    "body": "Implementing https://gitlab.example/g/p/-/issues/7 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [{"repo": "g/p", "number": 7, "approved": true}],
+    "want": "Implementing https://gitlab.example/g/p/-/issues/7 to wrap up."
+  },
+  {
+    "name": "url_gl_same_unapproved",
+    "body": "Implementing https://gitlab.example/g/p/-/issues/7 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [],
+    "want": "https://gitlab.example/g/p/-/issues/7 to wrap up."
+  },
+  {
+    "name": "url_gl_cross_approved",
+    "body": "Implementing https://gitlab.example/g/other/-/issues/9 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [{"repo": "g/other", "number": 9, "approved": true}],
+    "want": "Implementing https://gitlab.example/g/other/-/issues/9 to wrap up."
+  },
+  {
+    "name": "url_gl_cross_unapproved",
+    "body": "Implementing https://gitlab.example/g/other/-/issues/9 to wrap up.",
+    "ownRepo": "g/p",
+    "allowed": [],
+    "want": "https://gitlab.example/g/other/-/issues/9 to wrap up."
+  },
+  {
+    "name": "comma_list_all_approved",
+    "body": "Closes #7, #8, acme/other#9 for the batch.",
+    "ownRepo": "acme/widgets",
+    "allowed": [
+      {"repo": "acme/widgets", "number": 7, "approved": true},
+      {"repo": "acme/widgets", "number": 8, "approved": true},
+      {"repo": "acme/other", "number": 9, "approved": true}
+    ],
+    "want": "Closes #7, #8, acme/other#9 for the batch."
+  },
+  {
+    "name": "mixed_allowed_stripped_list",
+    "body": "Closes #7, #8, acme/other#9 for the batch.",
+    "ownRepo": "acme/widgets",
+    "allowed": [
+      {"repo": "acme/widgets", "number": 7, "approved": true},
+      {"repo": "acme/widgets", "number": 8, "approved": false},
+      {"repo": "acme/other", "number": 9, "approved": true}
+    ],
+    "want": "Closes #7, #8, Closes acme/other#9 for the batch."
+  }
+]

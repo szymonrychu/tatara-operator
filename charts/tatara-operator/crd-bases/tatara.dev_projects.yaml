@@ -5380,6 +5380,16 @@ spec:
                     default: 10
                     minimum: 3
                     type: integer
+                  maxPodRecreations:
+                    default: 3
+                    description: MaxPodRecreations bounds boot-crash respawns of one
+                      Task's agent pod.
+                    type: integer
+                  maxReviewRounds:
+                    default: 3
+                    description: MaxReviewRounds bounds request_changes round-trips
+                      on a kind=review Task.
+                    type: integer
                   maxTaskTokens:
                     description: |-
                       MaxTaskTokens is a per-Task cumulative output-token ceiling for the
@@ -5390,8 +5400,19 @@ spec:
                       token telemetry once a healthy-run distribution is known.
                     format: int64
                     type: integer
+                  maxTurnsPerPod:
+                    default: 40
+                    description: |-
+                      MaxTurnsPerPod bounds turns within ONE pod's life. The implement agent
+                      kind is EXEMPT (a long, healthy coding run must not be cut off mid-pod;
+                      the boot-crash and TTL watchdogs remain its runaway bounds).
+                    type: integer
                   maxTurnsPerTask:
-                    default: 50
+                    default: 300
+                    description: |-
+                      MaxTurnsPerTask is the LIFETIME turn backstop across every pod of a
+                      Task, for ALL agent kinds (contract A.6). Task.Spec.MaxTurnsPerTask
+                      overrides this per-Task when set.
                     type: integer
                   model:
                     type: string
@@ -5435,6 +5456,11 @@ spec:
                       The name is kept for CRD compatibility.
                     type: integer
                 type: object
+              agentPodTTLSeconds:
+                default: 3600
+                description: AgentPodTTLSeconds bounds ONE pod's life. The Task persists.
+                minimum: 300
+                type: integer
               autoApproveTataraProposals:
                 default: false
                 description: |-
@@ -5511,15 +5537,44 @@ spec:
                 required:
                 - enabled
                 type: object
-              maxConcurrentTasks:
-                default: 3
+              maxBundleBytes:
+                default: 400000
+                description: |-
+                  MaxBundleBytes is the HARD byte budget for a rendered context bundle
+                  (fix D1 - USER DECISION). Oldest comments elide first, behind an
+                  explicit marker. Default 400 KB (~100k tokens).
+                minimum: 50000
                 type: integer
-              maxOpenTasks:
+              maxConcurrentAgents:
                 default: 3
                 description: |-
-                  MaxOpenTasks: Deprecated: no longer enforced. The queue bounds CONCURRENCY
-                  (QueueCapacity), not event creation; over-limit events wait in Queued.
-                  Retained for CRD backward-compatibility; ignored.
+                  MaxConcurrentAgents gates AGENT PODS (the admission unit is the pod-spawn,
+                  not the Task). ZERO IS THE FULL-PROJECT PAUSE KILL SWITCH: at 0, admission
+                  short-circuits and NO QueuedEvent is ever admitted, so no pod and no Task
+                  is created. There is deliberately NO Minimum=1 (fix S2).
+
+                  It REPLACES the pre-redesign maxConcurrentTasks, which was PRUNED rather
+                  than kept alongside: a stale helmfile value for the old key would otherwise
+                  be silently ignored (structural pruning drops it) and concurrency would
+                  quietly fall back to this field's default instead of erroring.
+                minimum: 0
+                type: integer
+              maxNewTasksPerSweep:
+                default: 5
+                description: MaxNewTasksPerSweep caps how many Tasks ONE sweep pass
+                  may mint (fix B1).
+                minimum: 1
+                type: integer
+              maxOpenTasks:
+                default: 6
+                description: |-
+                  MaxOpenTasks caps ACTIVE Tasks: every Task whose stage is pod-eligible
+                  (NOT parked/delivered/rejected/failed). It is a Task CREATION budget and
+                  it is NOT the same lever as MaxConcurrentAgents (a concurrency budget) -
+                  a sweep that would exceed it mints nothing this pass. PARKED backlog
+                  Tasks (stageReason=backlog-sweep) do NOT count: they hold ownership, not
+                  work. Prod runs 6 today.
+                minimum: 1
                 type: integer
               memory:
                 description: |-
@@ -5568,26 +5623,30 @@ spec:
                   capacity:
                     description: |-
                       Capacity N: max concurrently-admitted normal-class events (defaults to
-                      MaxConcurrentTasks, else 3).
-                    type: integer
-                  queuedAutonomousCap:
-                    description: |-
-                      QueuedAutonomousCap: Deprecated: no longer enforced. The queue bounds CONCURRENCY
-                      (QueueCapacity), not event creation; over-limit events wait in Queued.
-                      Retained for CRD backward-compatibility; ignored.
+                      MaxConcurrentAgents, else 3).
                     type: integer
                 type: object
               scm:
                 description: ScmSpec binds a Project to one SCM provider and its board/merge
                   policy.
                 properties:
-                  approvalLabel:
-                    default: tatara/awaiting-approval
+                  approvalPhrases:
                     description: |-
-                      ApprovalLabel is DEPRECATED and no longer used: approval is now driven by
-                      the conversation (the triage agent reads the thread) and projected onto the
-                      idea/approved/rejected labels below. Kept only for migration tooling.
-                    type: string
+                      ApprovalPhrases is the closed, per-project wordlist an approving
+                      maintainer comment must match. The match is an ANCHORED WHOLE-LINE
+                      match, NOT a substring (fix C3 / D-B, USER DECISION): some LINE of the
+                      normalised body must match ^\s*(<phrase>)[\s.!]*$ - the comment must
+                      CONSIST OF the phrase, not merely contain it. Substring matching meant
+                      "I can't approve this until the tests pass" APPROVED - and because the
+                      grammar takes the maintainer's MOST RECENT comment, their corrective
+                      follow-up approved too. Anchored, "go ahead" approves and "don't go
+                      ahead with this" does not. Empty means the DEFAULT list
+                      (DefaultApprovalPhrases); it can NEVER mean "any text approves".
+                    items:
+                      minLength: 2
+                      type: string
+                    maxItems: 20
+                    type: array
                   approvedLabel:
                     default: tatara-approved
                     description: ApprovedLabel marks an issue approved for implementation.
@@ -5807,11 +5866,6 @@ spec:
                       Guidance is free-form project charter text appended verbatim to the
                       brainstorm and healthCheck goal context. Empty leaves the goal unchanged.
                     type: string
-                  ideaLabel:
-                    default: tatara-idea
-                    description: IdeaLabel is DEPRECATED (legacy alias for BrainstormingLabel);
-                      kept for lazy migration.
-                    type: string
                   implementationLabel:
                     default: tatara-implementation
                     description: ImplementationLabel marks an issue whose implementation
@@ -5866,11 +5920,6 @@ spec:
                     enum:
                     - github
                     - gitlab
-                    type: string
-                  rejectedLabel:
-                    default: tatara-rejected
-                    description: RejectedLabel is DEPRECATED (legacy alias for DeclinedLabel);
-                      kept for lazy migration.
                     type: string
                   reporterLogins:
                     description: |-

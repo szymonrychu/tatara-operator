@@ -107,19 +107,44 @@ func (s *httpSession) doOnce(ctx context.Context, method, url string, body any, 
 	return "ok", nil
 }
 
-func (s *httpSession) SubmitTurn(ctx context.Context, baseURL, text, callbackURL string) (string, error) {
-	body := map[string]string{"text": text, "callbackUrl": callbackURL}
+// postMessageReq is the POST /v1/messages body (contract G.5).
+//
+// Handoff admits EXACTLY ONE turn PAST the TTL deadline t0: the handoff-note
+// turn (G.7 step 3). The allowance is scoped to past t0 - before t0 a
+// handoff:true turn is an ordinary turn and does NOT consume it, so the one
+// handoff slot cannot be burned early and leave the pod unable to write its
+// handoff when the TTL actually arrives. Past t0 the wrapper accepts one such
+// turn; a second gets 410 Gone.
+type postMessageReq struct {
+	Text        string `json:"text"`
+	CallbackURL string `json:"callbackUrl"`
+	Handoff     bool   `json:"handoff,omitempty"`
+}
+
+func (s *httpSession) submitMessage(ctx context.Context, logicalMethod, baseURL string, body postMessageReq) (string, error) {
 	var out struct {
 		TurnID string `json:"turnId"`
 	}
-	if err := s.do(ctx, "submit_turn", http.MethodPost, baseURL+"/v1/messages", body, &out); err != nil {
+	if err := s.do(ctx, logicalMethod, http.MethodPost, baseURL+"/v1/messages", body, &out); err != nil {
 		return "", err
 	}
 	return out.TurnID, nil
 }
 
-func (s *httpSession) Interject(ctx context.Context, baseURL, text string) error {
-	return s.do(ctx, "interject", http.MethodPost, baseURL+"/v1/interject", map[string]string{"text": text}, nil)
+func (s *httpSession) SubmitTurn(ctx context.Context, baseURL, text, callbackURL string) (string, error) {
+	return s.submitMessage(ctx, "submit_turn", baseURL, postMessageReq{Text: text, CallbackURL: callbackURL})
+}
+
+func (s *httpSession) SubmitHandoffTurn(ctx context.Context, baseURL, text, callbackURL string) (string, error) {
+	return s.submitMessage(ctx, "submit_handoff_turn", baseURL, postMessageReq{Text: text, CallbackURL: callbackURL, Handoff: true})
+}
+
+func (s *httpSession) GetSession(ctx context.Context, baseURL string) (SessionInfo, error) {
+	var out SessionInfo
+	if err := s.do(ctx, "get_session", http.MethodGet, baseURL+"/v1/session", nil, &out); err != nil {
+		return SessionInfo{}, err
+	}
+	return out, nil
 }
 
 func (s *httpSession) GetTurn(ctx context.Context, baseURL, turnID string) (TurnResult, error) {

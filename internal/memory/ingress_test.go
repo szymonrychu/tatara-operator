@@ -76,19 +76,6 @@ func TestIngress_NoUseRegexWhenRewriteUnset(t *testing.T) {
 	}
 }
 
-func TestIngress_AddsChatPath(t *testing.T) {
-	cfg := Config{Namespace: "tatara", IngressHost: "h", MemoryPathPrefix: "/api/v1/memory", ChatPathPrefix: "/api/v1/chat"}
-	ing := Ingress(testProject("alpha"), cfg)
-	paths := ing.Spec.Rules[0].HTTP.Paths
-	if len(paths) != 2 {
-		t.Fatalf("expected memory+chat paths, got %d", len(paths))
-	}
-	// Path is project-scoped; backend is the single shared tatara-chat service.
-	if paths[1].Path != "/api/v1/chat/alpha(/|$)(.*)" || paths[1].Backend.Service.Name != ChatServiceName {
-		t.Fatalf("chat path/backend: %s %s", paths[1].Path, paths[1].Backend.Service.Name)
-	}
-}
-
 // TestIngress_NoRewriteWhenUnset asserts the nginx-specific rewrite-target
 // annotation is NOT emitted when IngressRewriteTarget is empty (cluster-agnostic,
 // rule 14): a non-nginx controller must not be handed nginx annotations.

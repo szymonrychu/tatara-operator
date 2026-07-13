@@ -42,7 +42,6 @@ type OperatorMetrics struct {
 	scanItemsTotal            *prometheus.CounterVec
 	scanTasksCreatedTotal     *prometheus.CounterVec
 	scanDurationSeconds       *prometheus.HistogramVec
-	issueOutcomeTotal         *prometheus.CounterVec
 	autoApproveTotal          *prometheus.CounterVec
 	tasksInflightKind         *prometheus.GaugeVec
 	agentBootRaceRequeue      prometheus.Counter
@@ -54,16 +53,12 @@ type OperatorMetrics struct {
 	agentBootCrashTotal       *prometheus.CounterVec
 	orphanReapedTotal         *prometheus.CounterVec
 	reapDeleteErrorTotal      *prometheus.CounterVec
-	tasksGCTotal              *prometheus.CounterVec
 	conversationGCTotal       *prometheus.CounterVec
 	turnSubmitTotal           *prometheus.CounterVec
 	turnSubmitDuration        *prometheus.HistogramVec
 	agentHTTPTotal            *prometheus.CounterVec
 	agentHTTPDuration         *prometheus.HistogramVec
 	authTotal                 *prometheus.CounterVec
-	writebackOutcomeTotal     *prometheus.CounterVec
-	writebackSkip4xxTotal     *prometheus.CounterVec
-	brainstormOutcomeTotal    *prometheus.CounterVec
 	webhookDuration           *prometheus.HistogramVec
 	restapiRequestsTotal      *prometheus.CounterVec
 	restapiRequestDuration    *prometheus.HistogramVec
@@ -74,8 +69,6 @@ type OperatorMetrics struct {
 	memoryRetrievalProbe      *prometheus.CounterVec
 	toolSurfaceProbe          *prometheus.CounterVec
 	toolSurfaceProbeDuration  *prometheus.HistogramVec
-	systemicSiblingsCollapsed *prometheus.CounterVec
-	systemicGroupsLed         *prometheus.CounterVec
 	tokenBudgetUsedRatio      *prometheus.GaugeVec
 	admissionBlockedTotal     *prometheus.CounterVec
 	memoryGateBypassTotal     *prometheus.CounterVec
@@ -141,10 +134,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help:    "Wall-clock duration of one scan activity.",
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
 		}, []string{"activity"}),
-		issueOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "tatara_issue_outcome_total",
-			Help: "Issue-triage outcomes by action.",
-		}, []string{"action"}),
 		autoApproveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_auto_approve_total",
 			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
@@ -197,10 +186,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_reap_delete_error_total",
 			Help: "Errors deleting orphan wrappers by resource kind.",
 		}, []string{"kind"}),
-		tasksGCTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_tasks_gc_total",
-			Help: "Terminal Tasks garbage-collected by the reaper past the retention window, by Task kind.",
-		}, []string{"kind"}),
 		conversationGCTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_conversation_gc_total",
 			Help: "S3 conversation objects garbage-collected by the reaper when a batch fully closed, by result.",
@@ -227,27 +212,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_auth_total",
 			Help: "Total REST API auth attempts by result.",
 		}, []string{"result"}),
-		writebackOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_writeback_outcome_total",
-			Help: "Writeback terminal outcomes by result (no_change, in_scope_no_branch, skip_4xx, no_pr, skip_4xx_capped, opened, disarm_failed, disarm_merged, links_sync_capped).",
-		}, []string{"result"}),
 		// Self-diagnosing companion to writeback_outcome_total{result="skip_4xx"}
 		// (issue #166): the un-triageable 4xx-skip loop emitted a metric that could
 		// not name the failure. status is the 4xx HTTP code, reason the skip
 		// classification. Bounded cardinality (a handful of 4xx codes x few reasons);
 		// deliberately no repo label - the repo slug lives in the writeback_skip_4xx
 		// log line, and a per-repo series would be unbounded across all projects.
-		writebackSkip4xxTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_writeback_skip_4xx_total",
-			Help: "Writeback repo-skips on a permanent 4xx from OpenChange, by HTTP status and reason (already_exists|other). Lets the skip-4xx alert annotation name the failure mode without needing the leader pod's logs (issue #166).",
-		}, []string{"status", "reason"}),
 		// Per-run brainstorm yield. The brainstorm Task itself never opens a PR, so
 		// a dedicated counter (rather than overloading writeback_outcome) keeps the
 		// "a PR/MR write was attempted" semantics of writeback_outcome clean.
-		brainstormOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_brainstorm_outcome_total",
-			Help: "Brainstorm run yield outcomes by result.",
-		}, []string{"result"}),
 		// Finding 14: webhook duration histogram so slow apiserver/secret lookups
 		// during webhook handling surface before GitHub's 10s delivery timeout.
 		webhookDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -319,14 +292,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			// a real bucket rather than +Inf.
 			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
 		}, []string{"backend", "vantage"}),
-		systemicSiblingsCollapsed: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "tatara_systemic_siblings_collapsed_total",
-			Help: "Systemic-group sibling issues collapsed (no separate agent spawned), by project.",
-		}, []string{"project"}),
-		systemicGroupsLed: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "tatara_systemic_groups_led_total",
-			Help: "Systemic-group leads elected (lead issue gets a combined-PR agent), by project.",
-		}, []string{"project"}),
 		// Token-budget admission gate (issue #189). scope is "used" (the project's
 		// current per-window usage ratio 0..1), "proactive" (the proactive-pause
 		// threshold ratio), or "emergency" (the incident-pause threshold ratio), so
@@ -397,7 +362,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.scanItemsTotal,
 		m.scanTasksCreatedTotal,
 		m.scanDurationSeconds,
-		m.issueOutcomeTotal,
 		m.autoApproveTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
@@ -411,16 +375,12 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentBootCrashTotal,
 		m.orphanReapedTotal,
 		m.reapDeleteErrorTotal,
-		m.tasksGCTotal,
 		m.conversationGCTotal,
 		m.turnSubmitTotal,
 		m.turnSubmitDuration,
 		m.agentHTTPTotal,
 		m.agentHTTPDuration,
 		m.authTotal,
-		m.writebackOutcomeTotal,
-		m.writebackSkip4xxTotal,
-		m.brainstormOutcomeTotal,
 		m.webhookDuration,
 		m.restapiRequestsTotal,
 		m.restapiRequestDuration,
@@ -431,8 +391,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryRetrievalProbe,
 		m.toolSurfaceProbe,
 		m.toolSurfaceProbeDuration,
-		m.systemicSiblingsCollapsed,
-		m.systemicGroupsLed,
 		m.tokenBudgetUsedRatio,
 		m.admissionBlockedTotal,
 		m.memoryGateBypassTotal,
@@ -461,20 +419,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.memoryStacks.WithLabelValues(phase)
 	}
 	seedLabels(func(l ...string) { m.scanItemsTotal.WithLabelValues(l...) },
-		[]string{"mrScan", "issueScan", "brainstorm"},
-		[]string{"scanned", "picked", "skipped_dedup", "skipped_cap"},
+		[]string{"issueScan", "brainstorm", "documentation"},
+		[]string{"picked", "skipped_cap", "skipped_inflight", "stamp_error"},
 	)
-	for _, action := range []string{"implement", "close", "discuss", "close-withheld"} {
-		m.issueOutcomeTotal.WithLabelValues(action)
-	}
-	// Pre-seed terminal-Task GC by kind so the series exist before the first sweep.
-	for _, kind := range []string{
-		"implement", "review", "triageIssue",
-		"brainstorm", "issueLifecycle", "incident", "documentation",
-	} {
-		m.tasksGCTotal.WithLabelValues(kind)
-	}
-	for _, source := range []string{"reconcile", "poll_backstop", "planning_watchdog"} {
+	for _, source := range []string{"reconcile", "poll_backstop"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
 	seedLabels(func(l ...string) { m.ingestJobTotal.WithLabelValues(l...) },
@@ -484,27 +432,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	for _, result := range []string{"accepted", "missing_token", "invalid_scheme", "invalid_token", "rejected"} {
 		m.authTotal.WithLabelValues(result)
 	}
-	for _, result := range []string{"no_change", "in_scope_no_branch", "skip_4xx", "no_pr", "skip_4xx_capped", "opened", "disarm_failed", "disarm_merged", "links_sync_capped"} {
-		m.writebackOutcomeTotal.WithLabelValues(result)
-	}
-	// Pre-seed the realistic skip-4xx (status, reason) combos so the diagnosing
-	// series exist at a zero baseline from startup (issue #166).
-	for _, sr := range [][2]string{{"403", "other"}, {"404", "other"}, {"422", "already_exists"}, {"422", "other"}} {
-		m.writebackSkip4xxTotal.WithLabelValues(sr[0], sr[1])
-	}
-	for _, result := range []string{"proposed", "no_yield"} {
-		m.brainstormOutcomeTotal.WithLabelValues(result)
-	}
 	// Pre-seed webhook duration by provider/result so the series exist from startup.
 	seedLabels(func(l ...string) { m.webhookDuration.WithLabelValues(l...) },
 		[]string{"github", "gitlab"},
 		[]string{"ok", "error"},
 	)
-	// Pre-seed REST API metrics for common endpoints.
+	// Pre-seed REST API metrics for the contract C.1 endpoints.
 	for _, endpoint := range []string{
-		"patch_task", "create_subtask", "patch_subtask", "propose_issue",
-		"review_verdict", "pr_outcome", "issue_outcome", "implement_outcome",
-		"post_comment", "change_summary", "handover",
+		"task_context", "task_note", "submit_outcome",
+		"scm_read", "issue_write", "mr_write",
 	} {
 		for _, result := range []string{"ok", "error"} {
 			m.restapiRequestsTotal.WithLabelValues(endpoint, result)
@@ -636,20 +572,10 @@ func (m *OperatorMetrics) ObserveScanDuration(activity string, seconds float64) 
 	m.scanDurationSeconds.WithLabelValues(activity).Observe(seconds)
 }
 
-// IssueOutcome increments tatara_issue_outcome_total for an action.
-func (m *OperatorMetrics) IssueOutcome(action string) {
-	m.issueOutcomeTotal.WithLabelValues(action).Inc()
-}
-
 // AutoApproveTotal increments operator_auto_approve_total for a proposal kind
 // (item 4a auto-approve release path).
 func (m *OperatorMetrics) AutoApproveTotal(kind string) {
 	m.autoApproveTotal.WithLabelValues(kind).Inc()
-}
-
-// IssueOutcomeTotal returns the counter for a specific action, for test assertions.
-func (m *OperatorMetrics) IssueOutcomeTotal(action string) prometheus.Counter {
-	return m.issueOutcomeTotal.WithLabelValues(action)
 }
 
 // AgentBootRaceRequeue increments operator_agent_boot_race_requeue_total: a
@@ -738,12 +664,6 @@ func (m *OperatorMetrics) ReapDeleteError(kind string) {
 	m.reapDeleteErrorTotal.WithLabelValues(kind).Inc()
 }
 
-// TasksGC increments operator_tasks_gc_total for a terminal Task of the given
-// kind garbage-collected past the retention window.
-func (m *OperatorMetrics) TasksGC(kind string) {
-	m.tasksGCTotal.WithLabelValues(kind).Inc()
-}
-
 // ConversationGC increments operator_conversation_gc_total for an S3 conversation
 // object the reaper deleted (result "deleted"), failed to delete/probe for a
 // genuine per-object reason ("error"), or skipped because the object store was
@@ -766,7 +686,7 @@ func (m *OperatorMetrics) TurnSubmit(kind, result, outcome string, seconds float
 // AgentHTTP increments operator_agent_http_total for the HTTP method and outcome
 // ("ok", "http_error", "unreachable", "timeout"), and records the call latency.
 // method is the logical operation name (e.g. "submit_turn", "get_turn",
-// "delete_session", "interject").
+// "delete_session").
 func (m *OperatorMetrics) AgentHTTP(method, outcome string, seconds float64) {
 	m.agentHTTPTotal.WithLabelValues(method, outcome).Inc()
 	m.agentHTTPDuration.WithLabelValues(method).Observe(seconds)
@@ -781,41 +701,6 @@ func (m *OperatorMetrics) RecordAuth(result string) {
 // AuthCounter returns the counter for (result) for test assertions.
 func (m *OperatorMetrics) AuthCounter(result string) prometheus.Counter {
 	return m.authTotal.WithLabelValues(result)
-}
-
-// WritebackOutcome increments operator_writeback_outcome_total for the given
-// terminal result ("no_change", "no_branch", "in_scope_no_branch", "skip_4xx",
-// "no_pr", "skip_4xx_capped", "opened", "disarm_failed", "disarm_merged").
-func (m *OperatorMetrics) WritebackOutcome(result string) {
-	m.writebackOutcomeTotal.WithLabelValues(result).Inc()
-}
-
-// WritebackOutcomeCounter returns the counter for (result) for test assertions.
-func (m *OperatorMetrics) WritebackOutcomeCounter(result string) prometheus.Counter {
-	return m.writebackOutcomeTotal.WithLabelValues(result)
-}
-
-// WritebackSkip4xx increments operator_writeback_skip_4xx_total for a repo-skip
-// on a permanent 4xx. status is the HTTP status code (e.g. "404"); reason is the
-// skip classification ("already_exists" or "other"). Issue #166.
-func (m *OperatorMetrics) WritebackSkip4xx(status, reason string) {
-	m.writebackSkip4xxTotal.WithLabelValues(status, reason).Inc()
-}
-
-// WritebackSkip4xxCounter returns the counter for (status, reason) for test assertions.
-func (m *OperatorMetrics) WritebackSkip4xxCounter(status, reason string) prometheus.Counter {
-	return m.writebackSkip4xxTotal.WithLabelValues(status, reason)
-}
-
-// BrainstormOutcome increments operator_brainstorm_outcome_total for the given
-// per-run yield result ("proposed", "no_yield").
-func (m *OperatorMetrics) BrainstormOutcome(result string) {
-	m.brainstormOutcomeTotal.WithLabelValues(result).Inc()
-}
-
-// BrainstormOutcomeCounter returns the counter for (result) for test assertions.
-func (m *OperatorMetrics) BrainstormOutcomeCounter(result string) prometheus.Counter {
-	return m.brainstormOutcomeTotal.WithLabelValues(result)
 }
 
 // ObserveWebhookDuration records the wall-clock seconds a webhook request took,
@@ -883,18 +768,6 @@ func (m *OperatorMetrics) ToolSurfaceProbe(backend, vantage, result string, seco
 	m.toolSurfaceProbeDuration.WithLabelValues(backend, vantage).Observe(seconds)
 }
 
-// SystemicSiblingCollapsed increments tatara_systemic_siblings_collapsed_total:
-// a sibling issue in a systemic group was collapsed (no separate agent spawned).
-func (m *OperatorMetrics) SystemicSiblingCollapsed(project string) {
-	m.systemicSiblingsCollapsed.WithLabelValues(project).Inc()
-}
-
-// SystemicGroupLed increments tatara_systemic_groups_led_total: a lead issue in a
-// systemic group was elected and its combined-PR agent was enqueued.
-func (m *OperatorMetrics) SystemicGroupLed(project string) {
-	m.systemicGroupsLed.WithLabelValues(project).Inc()
-}
-
 // SetTokenBudgetUsedRatio sets operator_token_budget_used_ratio for a project and
 // scope ("used", "proactive", or "emergency") to ratio (a fraction of the window
 // limit, 0..1+).
@@ -931,8 +804,13 @@ func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) promethe
 
 // RecordReviewOutcome increments operator_review_outcome_total for a review
 // Task's verdict ("approved" or "changes_requested"), keyed by the model that
-// ran the review (G4 quality-proxy signal).
+// ran the review (G4 quality-proxy signal). It is nil-safe (a reconciler
+// wired without metrics is a test, not an outage), matching
+// TaskTerminalEntry's convention.
 func (m *OperatorMetrics) RecordReviewOutcome(project, repo, model, verdict string) {
+	if m == nil {
+		return
+	}
 	m.reviewOutcomeTotal.WithLabelValues(project, repo, model, verdict).Inc()
 }
 

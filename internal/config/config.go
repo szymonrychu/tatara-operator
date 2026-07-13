@@ -61,21 +61,6 @@ type Config struct {
 	AnthropicSecretName    string
 	CLIOIDCSecretName      string
 	ImagePullSecret        string
-	// S3 conversation persistence (issue #114). Empty S3Bucket disables the
-	// feature: BuildPod injects no S3 env, so wrapper pods behave as before.
-	// S3SecretName holds the AWS creds (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY);
-	// empty means the wrapper uses the default credential chain (e.g. IRSA).
-	S3Endpoint       string
-	S3Bucket         string
-	S3Region         string
-	S3KeyPrefix      string
-	S3ForcePathStyle bool
-	S3SecretName     string
-	// S3ConversationRetention is the grace after a conversation's whole batch
-	// (brainstorm + sibling issues) goes terminal before the reaper deletes its
-	// S3 objects. Kept well under TaskRetention so conversations GC before their
-	// Tasks (which carry the keys) are reaped. Zero disables conversation GC.
-	S3ConversationRetention time.Duration
 	// Agent wrapper Pod resource + securityContext scalars (rule 6: camelCase
 	// chart value -> SCREAMING_SNAKE ConfigMap key -> manager via envFrom). Empty
 	// resource strings mean no constraint. AgentRunAsUser/AgentFSGroup are
@@ -105,8 +90,6 @@ type Config struct {
 	// annotation omitted (cluster-agnostic, rule 14).
 	IngressRewriteTarget string
 	MemoryPathPrefix     string
-	ChatPathPrefix       string
-	ChatImage            string
 	// LeaderElection guards against two managers reconciling concurrently
 	// during a rolling-update surge. Defaults on; set LEADER_ELECTION=false
 	// for envtest/local single-process runs.
@@ -123,12 +106,6 @@ type Config struct {
 	// from the ingester - issue #129). Widen it as new pushed families appear so
 	// they reach Prometheus without a receiver code change.
 	PushMetricsAllowedPrefixes []string
-	// TaskRetention is how long a terminal (Succeeded/Failed/Done/Stopped/Parked)
-	// Task is kept before the reaper garbage-collects it (its Subtasks cascade via
-	// owner reference). Loaded from TASK_RETENTION_HOURS as an integer hour count.
-	// Defaults to DefaultTaskRetention and is clamped up to MinTaskRetention so GC
-	// can never delete a Task that still anchors a dedup/cooldown window.
-	TaskRetention time.Duration
 	// IdlePodReapAfter is how long an agent pod may sit with no live turn before
 	// the reaper deletes it as a leaked wrapper (issue #237). Loaded from
 	// IDLE_POD_REAP_MINUTES as an integer minute count. Defaults to
@@ -216,33 +193,13 @@ func (c Config) BudgetDefaults() budget.Config {
 	}
 }
 
-// DefaultTaskRetention is the default age after which a terminal Task is
-// garbage-collected. A week comfortably exceeds every dedup/cooldown window the
-// loop relies on (the longest is the 1h incident-alert cooldown) and preserves a
-// week of Task history for human debugging.
-const DefaultTaskRetention = 168 * time.Hour
-
-// DefaultConversationRetention is the default grace after a conversation's batch
-// fully closes before the reaper deletes its S3 objects (issue #114 decision 5).
-// Well under DefaultTaskRetention so conversations GC before their Tasks.
-const DefaultConversationRetention = 72 * time.Hour
-
-// MinTaskRetention is the hard lower bound on TaskRetention. Terminal-Task GC
-// must never delete a Task that still anchors a dedup/cooldown window; the
-// longest such window is the 1h incident-alert cooldown (internal/webhook). A
-// 2h floor keeps GC clear of that window even if an operator configures an
-// aggressively short retention. TaskRetention is clamped up to this in Load.
-const MinTaskRetention = 2 * time.Hour
-
 // DefaultIdlePodReap is the default age past which the reaper deletes an agent
 // pod that holds no live turn (issue #237). A wrapper whose turn timed out or
 // completed parks idle in epoll waiting for the next PTY input; if the operator
-// never submits a next turn or tears it down (e.g. a memory outage traps the
-// lifecycle reconcile in the spawn gate), the pod leaks a Task slot + node
-// resources for hours. 30m comfortably exceeds any healthy between-turn gap
-// (turns are submitted back-to-back within a reconcile cycle), so only a wedged
-// pod is ever reaped. Conversation persistence lets a still-live Task re-spawn a
-// fresh pod and resume, so reaping is safe.
+// never submits a next turn or tears it down, the pod leaks a Task slot + node
+// resources for hours. 30m comfortably exceeds any healthy between-turn gap, so
+// only a wedged pod is ever reaped. The bundle IS the continuation state, so a
+// still-live Task re-spawns a fresh pod and resumes: reaping is safe.
 const DefaultIdlePodReap = 30 * time.Minute
 
 // MinIdlePodReap is the hard lower bound on IdlePodReapAfter. It keeps a
@@ -273,18 +230,6 @@ func getDurationDefault(key string, def time.Duration) (time.Duration, error) {
 
 // getHoursDefault parses key as an integer number of hours into a Duration,
 // returning def when unset and an error when present but not a valid integer.
-func getHoursDefault(key string, def time.Duration) (time.Duration, error) {
-	v := os.Getenv(key)
-	if v == "" {
-		return def, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("config: %s=%q is not a valid integer hours: %w", key, v, err)
-	}
-	return time.Duration(n) * time.Hour, nil
-}
-
 // getMinutesDefault parses key as an integer number of minutes into a Duration,
 // returning def when unset and an error when present but not a valid integer.
 func getMinutesDefault(key string, def time.Duration) (time.Duration, error) {
@@ -406,15 +351,6 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	taskRetention, err := getHoursDefault("TASK_RETENTION_HOURS", DefaultTaskRetention)
-	if err != nil {
-		return Config{}, err
-	}
-	// Clamp up to the floor: GC must never delete a Task that still anchors a
-	// dedup/cooldown window (see MinTaskRetention).
-	if taskRetention < MinTaskRetention {
-		taskRetention = MinTaskRetention
-	}
 	idlePodReapAfter, err := getMinutesDefault("IDLE_POD_REAP_MINUTES", DefaultIdlePodReap)
 	if err != nil {
 		return Config{}, err
@@ -426,14 +362,6 @@ func Load() (Config, error) {
 		idlePodReapAfter = MinIdlePodReap
 	}
 	agentRunAsNonRoot, err := getBoolDefault("AGENT_RUN_AS_NON_ROOT", false)
-	if err != nil {
-		return Config{}, err
-	}
-	conversationRetention, err := getHoursDefault("S3_CONVERSATION_RETENTION_HOURS", DefaultConversationRetention)
-	if err != nil {
-		return Config{}, err
-	}
-	s3ForcePathStyle, err := getBoolDefault("S3_FORCE_PATH_STYLE", false)
 	if err != nil {
 		return Config{}, err
 	}
@@ -500,13 +428,6 @@ func Load() (Config, error) {
 		AnthropicSecretName:        os.Getenv("ANTHROPIC_SECRET_NAME"),
 		CLIOIDCSecretName:          os.Getenv("CLI_OIDC_SECRET_NAME"),
 		ImagePullSecret:            os.Getenv("IMAGE_PULL_SECRET"),
-		S3Endpoint:                 os.Getenv("S3_ENDPOINT"),
-		S3Bucket:                   os.Getenv("S3_BUCKET"),
-		S3Region:                   os.Getenv("S3_REGION"),
-		S3KeyPrefix:                os.Getenv("S3_KEY_PREFIX"),
-		S3ForcePathStyle:           s3ForcePathStyle,
-		S3SecretName:               os.Getenv("S3_SECRET_NAME"),
-		S3ConversationRetention:    conversationRetention,
 		AgentCPURequest:            os.Getenv("AGENT_CPU_REQUEST"),
 		AgentCPULimit:              os.Getenv("AGENT_CPU_LIMIT"),
 		AgentMemoryRequest:         os.Getenv("AGENT_MEMORY_REQUEST"),
@@ -521,14 +442,11 @@ func Load() (Config, error) {
 		IngressClassName:           os.Getenv("INGRESS_CLASS_NAME"),
 		IngressRewriteTarget:       os.Getenv("INGRESS_REWRITE_TARGET"),
 		MemoryPathPrefix:           getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
-		ChatPathPrefix:             getDefault("CHAT_PATH_PREFIX", "/api/v1/chat"),
-		ChatImage:                  os.Getenv("CHAT_IMAGE"),
 		LeaderElection:             leaderElection,
 		MemoryMonitoringEnabled:    memoryMonitoringEnabled,
 		MemoryMonitorLabels:        memoryMonitorLabels,
 		PushMetricsTTL:             pushMetricsTTL,
 		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
-		TaskRetention:              taskRetention,
 		IdlePodReapAfter:           idlePodReapAfter,
 		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),

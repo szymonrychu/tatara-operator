@@ -2,9 +2,50 @@
 
 Planned work not yet started. One line per item; link to plans for detail.
 
+- [x] **THE TASK-CENTRIC REDESIGN. Shipped 2026-07-13, chart 1.0.0 (MAJOR, BREAKING).** All 22 tasks
+  of `docs/superpowers/plans/2026-07-12-task-centric-operator.md` (parent repo) against
+  `2026-07-12-task-centric-CROSS-REPO-CONTRACT.md` v7. The phase/lifecycle/WorkItems machine is
+  GONE (-27,000 LoC) and a 15-stage machine replaces it, with `Issue`/`MergeRequest` mirror CRDs,
+  a single transition choke point, F.4 deadline clocks on every stage, a sequential operator-owned
+  merge, and the B.4 sweep as the SOLE intake (the webhook mints nothing). `Subtask` and `WorkItems`
+  are deleted. **CUTOVER: `kubectl delete crd subtasks.tatara.dev` is a MANDATORY explicit step** -
+  `helm.sh/resource-policy: keep` means `helm upgrade` leaves the CRD behind. Decisions, traps and
+  errata are in `MEMORY.md` (2026-07-13 entries).
+
+Open, out of scope, deliberately not done:
+
+- [ ] **Remove the superseded `documentationScan`** (+ `createDocumentationTask`, `documentationInFlightProject`, `oldestCommitSHA`/`latestCommitSHA`, `documentation_guard_test.go`). The 2026-07-13 wiring pass swapped the documentation cron to `MintDocBatch` (F2 nightly batch); `documentationScan` (per-changed-repo diff model) is now dead in production but still test-referenced (lint-safe). Delete once its QueuedEvent doc-kind path is confirmed unused.
+- [ ] **`restapi.Config.Spiller` / `.CIFor` / `.Memory` are unset in wire.go** (adjacent to W1). Spiller nil => an over-budget `/outcome` write aborts instead of spilling; CIFor nil => `GET /projects/{p}/scm/ci` 501s; Memory nil => `task_context(notes=all)` cannot rehydrate spilled notes. Not in the W1 scope (which was `Approval`); wire per-project like the reconcilers if these paths are needed.
+- [ ] **I1 metrics have no consuming alert yet.** The four K.1 metrics (`operator_task_stage`, `operator_task_stage_age_seconds`, `operator_task_parked_total`, `operator_queue_age_seconds`) are now emitted, but the deployed tatara-observability alerts still key on the OLD vocabulary. Port the K.2 contract alerts (stage-stall, incident-starvation, merge/deploy-blocked) onto these metrics in tatara-observability.
+
+
+- [ ] RESIDUE 1: `refine`'s `mr_write(comment)` restriction (a refine agent may comment on an MR but
+  may not open/close one) is enforced by a cli-side AND an operator-side check, **not by the schema**.
+  It is the one non-uniform cell in the MCP profile table: every other capability is a whole tool the
+  profile does or does not expose, this one is an action within a tool. A schema-level fix means
+  splitting `mr_write` per action.
+- [ ] RESIDUE 2: a persistently-rejected documentation PR **disappears quietly**. The nightly doc
+  batch abandons it, logs it, and increments `operator_doc_task_abandoned_total{reason}` - but nothing
+  escalates it to a human, so a docs PR that the reviewer rejects every night is a silent no-op
+  forever. Wants an escalation path (an issue, or a park with a comment), not just a counter.
+- [ ] RESIDUE 5: there is deliberately **NO `refresh=true` escape hatch on `scm_read`**. Do not add
+  one. `scm_read` serves the mirror, and the mirror is the whole reason the platform's forge-request
+  rate is bounded by the sweep cadence instead of by agent behaviour. A refresh flag hands every agent
+  a forge-fanout button and undoes it; an agent that thinks the mirror is stale is describing a sweep
+  bug, which is a thing to fix in the sweep.
+- [ ] The `tatara-memory` spill endpoint. The A.7 byte guard spills over-budget comment batches
+  through LightRAG's **text-ingest** path, so they are semantically indexed as if they were source
+  material. It works and it is not a data leak, but it pollutes the recall index with raw comment
+  dumps. Wants a dedicated blob/archive endpoint on tatara-memory that stores without indexing.
+- [ ] Prune the metric families the reap left DECLARED with no emitter: `tatara_cd_cascade_failed`,
+  `tatara_cd_cascade_stalled`, `tatara_cd_resolved_total` (died with `cdScan`) and
+  `operator_agent_boot_crash_total` (died with `bootcrash.go`). They emit no series (labelled vecs are
+  only materialized on first write) so they are inert, but "named and never emitted" is the exact
+  defect contract K.1 calls out. No chart alert or dashboard panel references them any more.
 - [x] Post-merge documentation agent, operator half (new `documentation` Task kind, repo-scoped to a project's docs repo): CRD (Kind enum, repoScopedKinds, ProjectSpec.Documentation, ModelByKind/EffortByKind/SpawnCeilingByKind CEL+MaxProperties 9->10), webhook handlePush spawns a documentation QueuedEvent on a merge to a non-docs component repo (self-trigger guard + docs-repo-enrolled gate + head-SHA dedup; scm.WebhookEvent gained BaseSHA/HeadSHA for push events), pod.go kindProfiles row (tool/skill profile "documentation", model locked to claude-sonnet-5 via modelForKind, branch/PR-title prefix "docs", SHA-derived pod-name/branch suffix since the Task carries no Source.Number), turnloop required skill, writeback derivePRTitle, reaper gcConversations GC. Ships inert (no Project sets Documentation). Awaiting: tatara-cli `documentation` tool profile, tatara-agent-skills `tatara-documentation-workflow` skill, then a tatara-helmfile MR to enroll the docs repo + enable for tatara. Design: docs/superpowers/specs/2026-07-05-documentation-agent-design.md (parent tatara repo).
 - [x] Token budget admission gate (issue #189): pause proactive work (normal pool) at a proactive percent and incident work (alert pool) at an emergency percent of token usage within a reset window, resuming when it rolls. Two modes - customWindow (operator-meters its own per-turn tokens against a tokenLimit in a cron-anchored window, accumulator on Project.Status.TokenBudget) and claudeSubscription (gates on wrapper-reported Claude 5h/weekly percent, inert until the wrapper PR lands). internal/budget engine + ProjectSpec/Status TokenBudget + operator-wide TOKEN_BUDGET_* config + dispatcher gate + per-turn accumulation + 2 metrics + dashboard panels + TataraTokenBudgetBlocked alert. Defaults 50%/80%, off until enabled. Branch tatara/fix-189-tatara-operator-aware-of-token-budget; awaiting deploy (image+chart bump, then enable tokenBudget on the tatara + infrastructure Projects in the infra helmfile) + a sister tatara-claude-code-wrapper PR (anthropic OAuth 5h/weekly header passthrough) to activate claudeSubscription mode.
 - [x] feat/deep-architectural-research P1: brainstorm goal variant (tatara-deep-architectural-research skill named, skip_research token, ADR/RFC intent), skip_brainstorm->skip_research rename, brainstorm-outcome contract lock tests, Serena MCP env-gate (TATARA_SERENA_URL), archfitness SCM-isolation fitness function. Branch committed; await wrapper + cli sister PRs before deploy.
+- [ ] GC the zero-owner mirror CRs. Two known sources, same class (B.1 never GCs a zero-owner object by design): an orphaned BOT PR on another Task's branch keeps an ownerless MergeRequest mirror that `ClassifyPR` never re-adopts; an issue OPENED then closed before the next sweep keeps the ownerless Issue mirror `MarkWebhookOriginated` created. Both are bounded and benign (small CRs, no pods, no forge calls) - a slow leak, not a bug. Wants a reaper pass over zero-owner Issue/MergeRequest CRs whose SCM artifact is closed.
 - [ ] Phase 2: deploy Serena MCP server + wire TATARA_SERENA_URL value (helmfile); external-research MCP servers (arXiv/OpenAlex) + architectural-research egress.
 - [ ] Phase 3: SCMProvider port extraction (strangler) once the archfitness fitness function trips on a real introduced coupling.
 

@@ -13,7 +13,6 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
-	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/slug"
 )
@@ -60,7 +59,7 @@ type PodConfig struct {
 	AnthropicSecretName string
 	CLIOIDCSecretName   string
 	ImagePullSecret     string
-	OperatorURL         string // operator REST base URL for the agent's task_*/subtask_* MCP tools
+	OperatorURL         string // operator REST base URL for the agent's task_* MCP tools
 	// CallbackHMACSecretName, when non-empty, is the name of the Secret holding
 	// the callback HMAC shared secret under key config.CallbackHMACSecretKey. It
 	// is injected into the wrapper Pod as CALLBACK_HMAC_SECRET via a SecretKeyRef
@@ -112,18 +111,6 @@ type PodConfig struct {
 	// TATARA_GRAFANA_MCP_URL). Empty by default; Phase 1 wires the code path only,
 	// no server is deployed. Phase 2 sets this from tatara-helmfile.
 	SerenaURL string
-
-	// S3 conversation persistence (issue #114). Empty S3Bucket disables the
-	// feature: BuildPod injects no S3/conversation env, so the wrapper behaves
-	// exactly as before. S3SecretName holds the AWS creds
-	// (keys AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY), injected via SecretKeyRef;
-	// empty means the wrapper falls back to the default credential chain (IRSA).
-	S3Endpoint       string
-	S3Bucket         string
-	S3Region         string
-	S3KeyPrefix      string
-	S3ForcePathStyle bool
-	S3SecretName     string
 }
 
 // ValidatePodSecretRefs returns an error when any secret-name field required to
@@ -314,13 +301,13 @@ func slugifyTitle(s string) string {
 // branchKind maps a Task to a conventional branch prefix.
 func branchKind(t *tatarav1alpha1.Task) string {
 	switch t.Spec.Kind {
-	case "issueLifecycle", "incident":
+	case "incident":
 		return "fix"
 	case "implement":
 		return "feat"
 	case "documentation":
 		return "docs"
-	default: // review, brainstorm (incl. healthCheck activity), triageIssue
+	default: // review, brainstorm, clarify, refine
 		return "chore"
 	}
 }
@@ -359,49 +346,81 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 	return "tatara/task-" + t.Name
 }
 
-// ConversationKey is the stable per-Task S3 object key under which the wrapper
-// stores and restores the Claude conversation transcript (issue #114). It is
-// keyed by the issue/PR number when present (human-readable and stable across
-// the lifecycle phases, since the Task is 1:1 with the issue), else by the Task
-// name. The wrapper's storage client prepends the configured key prefix.
-// task.Status.ConversationObjectKey overrides this when set (e.g. a forked key
-// for a brainstorm-derived issue, subtask 8).
-func ConversationKey(task *tatarav1alpha1.Task) string {
-	if task.Status.ConversationObjectKey != "" {
-		return task.Status.ConversationObjectKey
-	}
-	if task.Spec.Source != nil && task.Spec.Source.Number > 0 {
-		kind := "issue"
-		if task.Spec.Source.IsPR {
-			kind = "pr"
+// branchEnvValues returns the (TASK_BRANCH, CHECKOUT_BRANCH) pair for a Task.
+// Normal tasks push to TASK_BRANCH. An MR review (issue #114 decision 4) instead
+// checks out the PR head READ-ONLY via CHECKOUT_BRANCH and leaves TASK_BRANCH
+// empty, so the wrapper never pushes and cannot clobber the user's PR.
+func branchEnvValues(task *tatarav1alpha1.Task) (taskBranch, checkoutBranch string) {
+	if task.Spec.Kind == kindReview {
+		if hb := task.Annotations[tatarav1alpha1.AnnReviewHeadBranch]; hb != "" {
+			return "", hb
 		}
-		if task.Spec.RepositoryRef != "" {
-			return fmt.Sprintf("%s/%s/%s-%d.jsonl", task.Spec.ProjectRef, task.Spec.RepositoryRef, kind, task.Spec.Source.Number)
-		}
-		return fmt.Sprintf("%s/%s-%d.jsonl", task.Spec.ProjectRef, kind, task.Spec.Source.Number)
 	}
-	return fmt.Sprintf("%s/task-%s.jsonl", task.Spec.ProjectRef, task.Name)
+	return TaskBranch(task), ""
+}
+
+// kindReview is the review Task kind (and the review agent kind - they share
+// the string).
+const kindReview = "review"
+
+// AgentKind is the kind of AGENT the pod runs as. Under the stage machine that
+// is status.agentKind, derived from the stage (contract F.2); it is NOT
+// spec.Kind, which names the Task's ORIGIN. A legacy phase-driven Task carries
+// no agentKind, so it falls back to spec.Kind and behaves exactly as before -
+// the two models coexist until the cutover.
+func AgentKind(task *tatarav1alpha1.Task) string {
+	if task.Status.AgentKind != "" {
+		return task.Status.AgentKind
+	}
+	return task.Spec.Kind
+}
+
+// agentRepoEnv is TATARA_REPO: the Repository CR name. Under the stage machine
+// it is narrowed to the documentation agent (contract G.9) - every other agent
+// kind is project-scoped and sees the whole enrolled repo set via TATARA_REPOS.
+// Legacy phase-driven Tasks (no stage) keep the un-narrowed value.
+func agentRepoEnv(task *tatarav1alpha1.Task) string {
+	if task.Status.Stage == "" {
+		return task.Spec.RepositoryRef
+	}
+	if AgentKind(task) == "documentation" {
+		return task.Spec.RepositoryRef
+	}
+	return ""
+}
+
+// AgentEnv is the contract G.9 agent-pod env block: task identity, the agent
+// kind (which the cli's MCP server and the wrapper's skill installer BOTH key
+// their profiles on), the work branch, the pod TTL, and the wire contract
+// version the wrapper is asserted against at pod-ready (G.10).
+//
+// The chat URL, the handoff register key and the conversation-persistence
+// variables do not exist any more: all three were deleted at the cutover. The
+// context bundle IS the continuation state.
+func AgentEnv(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) []corev1.EnvVar {
+	kind := AgentKind(task)
+	taskBranch, _ := branchEnvValues(task)
+	return []corev1.EnvVar{
+		{Name: "TATARA_TASK", Value: task.Name},
+		{Name: "TATARA_PROJECT", Value: project.Name},
+		{Name: "TATARA_KIND", Value: kind},
+		{Name: "TATARA_TOOL_PROFILE", Value: profileForKind(kind)},
+		{Name: "TATARA_SKILL_PROFILE", Value: profileForKind(kind)},
+		{Name: "TATARA_REPO", Value: agentRepoEnv(task)},
+		{Name: "TASK_BRANCH", Value: taskBranch},
+		{Name: "AGENT_POD_TTL_SECONDS", Value: strconv.Itoa(project.Spec.AgentPodTTLSeconds)},
+		{Name: "TATARA_CONTRACT_VERSION", Value: strconv.Itoa(ContractVersion)},
+	}
 }
 
 // BuildPod returns the wrapper Pod for a Task, owner-referenced to the Task.
 // repos is the full list of Project Repositories; the task's own repo is placed
 // first in TATARA_REPOS when repo is non-nil. When repo is nil (project-scoped
-// task such as brainstorm/healthCheck), REPO_URL and REPO_BRANCH are omitted and
+// task such as brainstorm), REPO_URL and REPO_BRANCH are omitted and
 // TATARA_REPOS is set to all repos sorted by name (deterministic, no primary).
 func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, repos []tatarav1alpha1.Repository, memoryEndpoint string, cfg PodConfig) *corev1.Pod {
 	env := []corev1.EnvVar{}
-	// Branch wiring. Normal tasks push to TASK_BRANCH. An MR review (issue #114
-	// decision 4) instead checks out the PR head READ-ONLY via CHECKOUT_BRANCH and
-	// leaves TASK_BRANCH empty so the wrapper never pushes (and cannot clobber the
-	// user's PR).
-	taskBranchVal := TaskBranch(task)
-	checkoutBranchVal := ""
-	if task.Spec.Kind == "review" {
-		if hb := task.Annotations[tatarav1alpha1.AnnReviewHeadBranch]; hb != "" {
-			taskBranchVal = ""
-			checkoutBranchVal = hb
-		}
-	}
+	_, checkoutBranchVal := branchEnvValues(task)
 	targetRepo := ""
 	if repo != nil {
 		env = append(env,
@@ -426,32 +445,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		{Name: "OPERATOR_PUSH_URL", Value: strings.TrimSuffix(cfg.CallbackURL, "/") + "/internal/metrics/push"},
 		{Name: "RUN_ID", Value: PodName(task) + "-" + strconv.Itoa(cfg.RunAttempt)},
 		{Name: "POD_NAME", Value: PodName(task)},
-		// Task identity: lets the agent address MCP tools without repeating args.
-		{Name: "TATARA_TASK", Value: task.Name},
-		{Name: "TATARA_PROJECT", Value: project.Name},
-		// Metric identity (component 6): the wrapper stamps these onto its
-		// per-turn token/cost series so fleet spend attributes to a Task kind
-		// and repo. Same values the operator uses for operator_task_tokens_total
-		// (taskTokenLabels), so the two token families align. Empty repo for
-		// project-scoped kinds (brainstorm/refine/incident; healthCheck is an
-		// activity label on a brainstorm task, not its own Kind).
-		{Name: "TATARA_KIND", Value: task.Spec.Kind},
-		{Name: "TATARA_REPO", Value: task.Spec.RepositoryRef},
-		// Work branch the wrapper checks out and pushes; the operator opens the
-		// PR from this same branch (see TaskBranch). Empty for review tasks, which
-		// check out the PR head via CHECKOUT_BRANCH and never push.
-		{Name: "TASK_BRANCH", Value: taskBranchVal},
 		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
 		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
 		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},
-		// Operator REST URL: the agent's tatara-cli task_*/subtask_* MCP tools reach
-		// the operator API at TATARA_OPERATOR_URL.
+		// Operator REST URL: the agent's tatara-cli task_* MCP tools reach the
+		// operator API at TATARA_OPERATOR_URL.
 		{Name: "TATARA_OPERATOR_URL", Value: cfg.OperatorURL},
-		// Chat endpoint: the agent's tatara-cli chat MCP tools reach the shared
-		// in-cluster chat service at TATARA_CHAT_URL instead of falling through to
-		// the public ingress default (DefaultChatBaseURL in cli config.go). Chat is
-		// a single shared tatara-chat service (not per-project like memory).
-		{Name: "TATARA_CHAT_URL", Value: memory.ChatEndpoint(cfg.Namespace)},
 		// OIDC config: the wrapper enforces bearer tokens with this issuer and audience.
 		{Name: "OIDC_ISSUER", Value: cfg.OIDCIssuer},
 		{Name: "OIDC_AUDIENCE", Value: "tatara-claude-code-wrapper"},
@@ -460,7 +459,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		secretEnv("CLI_OIDC_CLIENT_ID", cfg.CLIOIDCSecretName, "client-id"),
 		secretEnv("CLI_OIDC_CLIENT_SECRET", cfg.CLIOIDCSecretName, "client-secret"),
 	}...)
-	// Review tasks check out the PR head read-only (no push); see taskBranchVal.
+	// The G.9 contract block (task identity, agent kind, the two profiles, the
+	// pod TTL and the contract version). Placed before ExtraEnvs so the
+	// operator-set values are authoritative: first occurrence wins in a Pod env
+	// list, so a stray extra named like a required variable cannot shadow it.
+	env = append(env, AgentEnv(project, task)...)
+	// Review tasks check out the PR head read-only (no push); see branchEnvValues.
 	if checkoutBranchVal != "" {
 		env = append(env, corev1.EnvVar{Name: "CHECKOUT_BRANCH", Value: checkoutBranchVal})
 	}
@@ -471,52 +475,6 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 	// name is set so existing deployments without HMAC work unchanged.
 	if cfg.CallbackHMACSecretName != "" {
 		env = append(env, secretEnv("CALLBACK_HMAC_SECRET", cfg.CallbackHMACSecretName, CallbackHMACSecretKey))
-	}
-
-	// Conversation persistence (issue #114): inject the S3 connection config plus
-	// this Task's stable conversation object key so the wrapper uploads the
-	// transcript after each turn and restores it on boot. Gated on S3Bucket: with
-	// no bucket configured NO S3 env is emitted and the wrapper behaves as before.
-	// AWS creds come via SecretKeyRef from S3SecretName; an empty secret name
-	// leaves the wrapper on the default credential chain (IRSA).
-	//
-	// Full resume vs compaction (decision 2) is mutually exclusive and gated by
-	// the pending-handover-resume annotation, which maybeMarkHandoverResume sets
-	// when LastTurnInputTokens crosses HandoverThresholdPercent (25%) of the
-	// context window:
-	//   - annotation unset (under threshold): emit CONVERSATION_SESSION_ID so the
-	//     wrapper does a FULL conversation replay (claude --resume).
-	//   - annotation "true" (at/over threshold): SKIP CONVERSATION_SESSION_ID so
-	//     the wrapper starts fresh and implementPrompt injects the compacted
-	//     "## Resume from handover" text instead. CONVERSATION_OBJECT_KEY is still
-	//     emitted so the fresh (compacted) session is itself persisted and the
-	//     next turn-complete records its new, shorter sessionId.
-	if cfg.S3Bucket != "" {
-		env = append(env,
-			corev1.EnvVar{Name: "S3_ENDPOINT", Value: cfg.S3Endpoint},
-			corev1.EnvVar{Name: "S3_BUCKET", Value: cfg.S3Bucket},
-			corev1.EnvVar{Name: "S3_REGION", Value: cfg.S3Region},
-			corev1.EnvVar{Name: "S3_KEY_PREFIX", Value: cfg.S3KeyPrefix},
-			corev1.EnvVar{Name: "S3_FORCE_PATH_STYLE", Value: strconv.FormatBool(cfg.S3ForcePathStyle)},
-			corev1.EnvVar{Name: "CONVERSATION_OBJECT_KEY", Value: ConversationKey(task)},
-		)
-		compacting := task.Annotations[tatarav1alpha1.AnnPendingHandoverResume] == "true"
-		if task.Status.SessionID != "" && !compacting {
-			env = append(env, corev1.EnvVar{Name: "CONVERSATION_SESSION_ID", Value: task.Status.SessionID})
-		}
-		// Fork source (issue #114 decision 3): on the first run of a
-		// brainstorm-derived issue, the wrapper copies this parent conversation
-		// onto the issue's own key and resumes it. Ignored once the issue has its
-		// own conversation (CONVERSATION_SESSION_ID set, normal resume wins).
-		if fk := task.Annotations[tatarav1alpha1.AnnForkFromConversationKey]; fk != "" {
-			env = append(env, corev1.EnvVar{Name: "CONVERSATION_FORK_FROM_KEY", Value: fk})
-		}
-		if cfg.S3SecretName != "" {
-			env = append(env,
-				secretEnv("AWS_ACCESS_KEY_ID", cfg.S3SecretName, "AWS_ACCESS_KEY_ID"),
-				secretEnv("AWS_SECRET_ACCESS_KEY", cfg.S3SecretName, "AWS_SECRET_ACCESS_KEY"),
-			)
-		}
 	}
 
 	// Lifecycle hooks: emit one HOOK_<NAME> env var per non-empty command so the
@@ -553,72 +511,24 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_SERENA_URL", Value: cfg.SerenaURL})
 	}
 
-	// Work-item context: inject a human-readable ledger summary into the pod so the
-	// agent knows upfront which issues/MRs it spans, without re-deriving from SCM.
-	// Only emitted when WorkItems is non-empty to avoid a no-op env var on old Tasks.
-	if ctx := tatarav1alpha1.WorkItemsContext(task); ctx != "" {
-		env = append(env, corev1.EnvVar{Name: "TATARA_WORK_ITEMS", Value: ctx})
-	}
-
-	// Filter repos to the ledger-derived clone scope when the ledger is non-empty.
-	// Spec.ReposInScope (declarative cross-repo Repository CR names) is unioned in
-	// so a cross-repo task whose secondary repos are not yet in the ledger (they
-	// only enter WorkItems via the Phase-3 backstop AFTER PRs exist) still clones
-	// them. When the ledger is empty, fall back to the full project repo list for
-	// backward-compatibility (pre-ledger Tasks carry no WorkItems).
-	// Umbrella kinds (clarify/implement/review) always clone ALL enrolled project
-	// repos - the whole point of the project-level umbrella is that the agent sees
-	// every repo at once (the U-B fix). Skip the ledger-derived narrowing for them
-	// so a narrow ledger (e.g. only the source-issue repo) does not shrink the
-	// clone set below the full project; the enrolled `repos` list bounds it to the
-	// project so nothing outside is cloned.
-	scopedRepos := repos
-	if inScope := tatarav1alpha1.TaskReposInScope(task); !tatarav1alpha1.IsUmbrellaKind(task.Spec.Kind) && len(inScope) > 0 {
-		scopeSet := make(map[string]struct{}, len(inScope))
-		for _, s := range inScope {
-			scopeSet[s] = struct{}{}
-		}
-		// Declarative cross-repo scope is expressed as Repository CR names, a
-		// different namespace from the owner/repo ledger slugs, so match it by Name.
-		nameSet := make(map[string]struct{}, len(task.Spec.ReposInScope))
-		for _, n := range task.Spec.ReposInScope {
-			nameSet[n] = struct{}{}
-		}
-		var filtered []tatarav1alpha1.Repository
-		for i := range repos {
-			if _, ok := nameSet[repos[i].Name]; ok {
-				filtered = append(filtered, repos[i])
-				continue
-			}
-			if slug, err := scm.RepoSlugFromURL(repos[i].Spec.URL); err == nil {
-				if _, ok := scopeSet[slug]; ok {
-					filtered = append(filtered, repos[i])
-				}
-			}
-		}
-		if len(filtered) > 0 {
-			scopedRepos = filtered
-		}
-	}
-
-	if len(scopedRepos) > 0 {
+	if len(repos) > 0 {
 		var entries []repoEntry
 		if repo != nil {
 			// Primary repo first, then the rest.
 			entries = []repoEntry{{Name: repo.Name, URL: repo.Spec.URL, Branch: repo.Spec.DefaultBranch}}
-			for i := range scopedRepos {
-				if scopedRepos[i].Name != repo.Name {
+			for i := range repos {
+				if repos[i].Name != repo.Name {
 					entries = append(entries, repoEntry{
-						Name:   scopedRepos[i].Name,
-						URL:    scopedRepos[i].Spec.URL,
-						Branch: scopedRepos[i].Spec.DefaultBranch,
+						Name:   repos[i].Name,
+						URL:    repos[i].Spec.URL,
+						Branch: repos[i].Spec.DefaultBranch,
 					})
 				}
 			}
 		} else {
 			// Project-scoped (no primary): sort all repos by name for determinism.
-			sorted := make([]tatarav1alpha1.Repository, len(scopedRepos))
-			copy(sorted, scopedRepos)
+			sorted := make([]tatarav1alpha1.Repository, len(repos))
+			copy(sorted, repos)
 			// Sort by Name (stable deterministic order, same algorithm as brainstorm/healthCheck).
 			for i := 1; i < len(sorted); i++ {
 				for j := i; j > 0 && sorted[j].Name < sorted[j-1].Name; j-- {
@@ -652,17 +562,13 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		}
 	}
 
-	// Tool and skill profiles: gate the MCP tool surface and the skill set the
-	// agent sees. Placed here, before ExtraEnvs, so the operator-set values are
-	// authoritative -- a stray ExtraEnvs duplicate that comes after is ignored
-	// (first occurrence wins in a Pod env list).
-	env = append(env, corev1.EnvVar{Name: "TATARA_TOOL_PROFILE", Value: toolProfileForKind(task.Spec.Kind)})
+	// The skills repo/ref the wrapper clones. TATARA_SKILL_PROFILE (which subset
+	// of them to install) is part of the G.9 block, set by AgentEnv above.
 	skillsRef := "main"
 	if project.Spec.Agent.SkillsRef != "" {
 		skillsRef = project.Spec.Agent.SkillsRef
 	}
 	env = append(env,
-		corev1.EnvVar{Name: "TATARA_SKILL_PROFILE", Value: skillProfileForKind(task.Spec.Kind)},
 		corev1.EnvVar{Name: "TATARA_SKILLS_REPO", Value: skillsRepoDefault},
 		corev1.EnvVar{Name: "TATARA_SKILLS_REF", Value: skillsRef},
 	)
@@ -851,12 +757,16 @@ func buildPodSecurityContext(cfg PodConfig) *corev1.PodSecurityContext {
 	return &corev1.PodSecurityContext{FSGroup: cfg.FSGroup}
 }
 
-// kindProfiles maps a Task Kind to its per-kind profile value, shared by both
-// TATARA_TOOL_PROFILE (toolProfileForKind) and TATARA_SKILL_PROFILE
-// (skillProfileForKind): the cli MCP server and the wrapper key on the exact
-// same Kind->profile mapping. A missing key returns "" (fail-open: the cli
-// serves the full tool set, the wrapper installs all skills). healthCheck
-// shares Kind=brainstorm, so it is not a distinct entry.
+// kindProfiles maps an AGENT kind to its profile value, shared by both
+// TATARA_TOOL_PROFILE and TATARA_SKILL_PROFILE (contract G.9): the cli MCP
+// server and the wrapper's skill installer carry the same map and key on the
+// exact same agent kind.
+//
+// A missing key returns "". The cli then FAILS CLOSED: it serves ONLY the
+// always-on tool set and does NOT register submit_outcome, so the pod cannot
+// report a terminal outcome at all. It is not fail-open, whatever earlier
+// comments here claimed. healthCheck shares Kind=brainstorm, so it is not a
+// distinct entry.
 var kindProfiles = map[string]string{
 	"implement":     "implement",
 	"review":        "review",
@@ -865,10 +775,6 @@ var kindProfiles = map[string]string{
 	"incident":      "incident",
 	"refine":        "refine",
 	"documentation": "documentation",
-	// Retired kinds retained for in-flight legacy Tasks; dropped in Phase 4 once
-	// no path creates them.
-	"triageIssue":    "triage",
-	"issueLifecycle": "lifecycle",
 }
 
 // profileForKind looks up kind in kindProfiles, returning "" (fail-open) for
@@ -877,22 +783,8 @@ func profileForKind(kind string) string {
 	return kindProfiles[kind]
 }
 
-// toolProfileForKind maps a Task Kind to the TATARA_TOOL_PROFILE value that
-// the cli MCP server uses to gate the agent's tool surface. Returns "" for
-// unknown/empty kinds (fail-open: the cli serves the full tool set).
-func toolProfileForKind(kind string) string {
-	return profileForKind(kind)
-}
-
 // skillsRepoDefault is the canonical clone URL for the tatara-agent-skills repo.
 const skillsRepoDefault = "https://github.com/szymonrychu/tatara-agent-skills"
-
-// skillProfileForKind maps a Task Kind to the TATARA_SKILL_PROFILE value that
-// the wrapper uses to filter which skills to install at boot. Returns "" for
-// unknown/empty kinds (fail-open: the wrapper installs all skills).
-func skillProfileForKind(kind string) string {
-	return profileForKind(kind)
-}
 
 // resolveByKind resolves a per-kind override for a Task Kind+activity:
 // healthCheck shares Kind=brainstorm but is recurring classification work, a

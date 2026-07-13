@@ -1,10 +1,27 @@
 package controller
 
 import (
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 )
+
+// issueURLFromRepoURL renders the web URL of issue `number` in `repo`
+// (owner/name slug), deriving the host from the Repository's own clone URL so a
+// self-hosted forge does not render github.com/gitlab.com links.
+func issueURLFromRepoURL(repoURL, provider, repo string, number int) string {
+	base := "https://github.com"
+	if u, err := parseRepoBase(repoURL); err == nil {
+		base = u
+	} else if provider == "gitlab" {
+		base = "https://gitlab.com"
+	}
+	if provider == "gitlab" {
+		return fmt.Sprintf("%s/%s/-/issues/%d", base, repo, number)
+	}
+	return fmt.Sprintf("%s/%s/issues/%d", base, repo, number)
+}
 
 // parseIssueURL extracts the "owner/repo" slug and issue number from an issue
 // web URL. Supports both GitHub (.../owner/repo/issues/N) and GitLab

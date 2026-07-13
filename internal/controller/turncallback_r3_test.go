@@ -14,22 +14,23 @@ import (
 	"testing"
 	"time"
 
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
-// --- Finding 2: duplicate callback double-counts CumulativeTokens ---
+// --- Finding 2: duplicate callback double-counts Stats.TokensOutput ---
 
 // TestRecordUsage_SameTurnDuplicateDoesNotDoubleCount verifies that two
 // callbacks for the same in-flight turnID (e.g. wrapper retry before the
-// reconcile advances annCurrentTurn) do not double-count CumulativeTokens.
+// reconcile advances annCurrentTurn) do not double-count Stats.TokensOutput.
 // Before the fix, annCurrentTurn stayed equal to turnID between the first
 // callback and the reconcile, so both callbacks passed the guard and
-// CumulativeTokens was incremented twice.
+// Stats.TokensOutput was incremented twice.
 func TestRecordUsage_SameTurnDuplicateDoesNotDoubleCount(t *testing.T) {
 	mkTaskProject(t, "p-dup1", 3)
 	mkTaskRepository(t, "r-dup1", "p-dup1")
 	mkTask(t, "t-dup1", "p-dup1", "r-dup1")
-	setTaskCumulativeTokens(t, "t-dup1", 0)
+	setTaskTokens(t, "t-dup1", 0)
 	annotate(t, "t-dup1", map[string]string{annCurrentTurn: "turn-dup1"})
 
 	cb := newCallbackServer()
@@ -66,11 +67,11 @@ func TestRecordUsage_SameTurnDuplicateDoesNotDoubleCount(t *testing.T) {
 	w2 := httptest.NewRecorder()
 	cb.Handler().ServeHTTP(w2, req2)
 	// Duplicate callback may succeed (204) or get 404 (stale) - both OK.
-	// The key invariant is CumulativeTokens stays at 50, not 100.
+	// The key invariant is Stats.TokensOutput stays at 50, not 100.
 
 	tk2 := getTask(t, "t-dup1")
-	if tk2.Status.CumulativeTokens != 50 {
-		t.Errorf("CumulativeTokens = %d after duplicate callback, want 50 (no double-count)", tk2.Status.CumulativeTokens)
+	if tk2.Status.Stats.TokensOutput != 50 {
+		t.Errorf("Stats.TokensOutput = %d after duplicate callback, want 50 (no double-count)", tk2.Status.Stats.TokensOutput)
 	}
 }
 
@@ -147,39 +148,6 @@ func TestTurnTimedOut_FallsBackToStartedAt(t *testing.T) {
 	}
 }
 
-// TestSetDeadlineMinutes_SetsAndResets verifies that setDeadlineMinutes
-// replaces an existing deadline in a single RetryOnConflict (not two writes).
-func TestSetDeadlineMinutes_SetsAndResets(t *testing.T) {
-	mkTaskProject(t, "p-sdm1", 3)
-	mkTaskRepository(t, "r-sdm1", "p-sdm1")
-	mkTask(t, "t-sdm1", "p-sdm1", "r-sdm1")
-
-	r := newTaskReconciler(nil)
-
-	// Set initial deadline.
-	tk := getTask(t, "t-sdm1")
-	if err := r.setDeadlineMinutes(context.Background(), tk, 60); err != nil {
-		t.Fatalf("setDeadlineMinutes set: %v", err)
-	}
-	tk1 := getTask(t, "t-sdm1")
-	if tk1.Status.DeadlineAt == nil {
-		t.Fatal("DeadlineAt must be set after setDeadlineMinutes")
-	}
-	first := *tk1.Status.DeadlineAt
-
-	// Override with a shorter deadline - setDeadlineMinutes must replace it.
-	if err := r.setDeadlineMinutes(context.Background(), tk1, 5); err != nil {
-		t.Fatalf("setDeadlineMinutes reset: %v", err)
-	}
-	tk2 := getTask(t, "t-sdm1")
-	if tk2.Status.DeadlineAt == nil {
-		t.Fatal("DeadlineAt must still be set after reset")
-	}
-	if !tk2.Status.DeadlineAt.Time.Before(first.Time) {
-		t.Errorf("reset deadline %v must be before first deadline %v", tk2.Status.DeadlineAt.Time, first.Time)
-	}
-}
-
 // --- Finding 4: per-GetTurn context deadline in PollOnce ---
 
 // TestPollOnce_GetTurnContextDeadline verifies that PollOnce passes a bounded
@@ -188,7 +156,7 @@ func TestPollOnce_GetTurnContextDeadline(t *testing.T) {
 	mkTaskProject(t, "p-ctxdl1", 3)
 	mkTaskRepository(t, "r-ctxdl1", "p-ctxdl1")
 	mkTask(t, "t-ctxdl1", "p-ctxdl1", "r-ctxdl1")
-	setTaskPhase(t, "t-ctxdl1", "Running")
+	setTaskStage(t, "t-ctxdl1", tatarav1alpha1.StageImplementing)
 	startedAt := time.Now().Add(-30 * time.Second) // not yet timed out
 	annotate(t, "t-ctxdl1", map[string]string{
 		annCurrentTurn:   "turn-ctxdl1",
@@ -355,6 +323,15 @@ func (d *deadlineCapturingSession) GetTurn(ctx context.Context, _ string, _ stri
 
 func (d *deadlineCapturingSession) SubmitTurn(_ context.Context, _, _, _ string) (string, error) {
 	return "", nil
+}
+
+func (d *deadlineCapturingSession) SubmitHandoffTurn(_ context.Context, _, _, _ string) (string, error) {
+	return "", nil
+}
+
+func (d *deadlineCapturingSession) GetSession(_ context.Context, _ string) (agent.SessionInfo, error) {
+	v := agent.ContractVersion
+	return agent.SessionInfo{State: agent.SessionStateReady, ContractVersion: &v}, nil
 }
 
 func (d *deadlineCapturingSession) Interject(_ context.Context, _, _ string) error {

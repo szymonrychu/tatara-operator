@@ -223,49 +223,6 @@ func TestLoad_MemoryMonitorLabelsInvalid(t *testing.T) {
 
 // TestLoad_AgentSchedulingDefaultEmpty asserts the scheduling document defaults
 // to empty (chart stays cluster-agnostic, rule 14).
-func TestLoad_S3DefaultsOff(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.S3Bucket != "" || cfg.S3ForcePathStyle {
-		t.Fatalf("S3 must default off: bucket=%q forcePathStyle=%v", cfg.S3Bucket, cfg.S3ForcePathStyle)
-	}
-}
-
-func TestLoad_S3FromEnv(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	t.Setenv("S3_ENDPOINT", "http://rgw")
-	t.Setenv("S3_BUCKET", "conv")
-	t.Setenv("S3_REGION", "us-east-1")
-	t.Setenv("S3_KEY_PREFIX", "p")
-	t.Setenv("S3_FORCE_PATH_STYLE", "true")
-	t.Setenv("S3_SECRET_NAME", "tatara-s3")
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.S3Endpoint != "http://rgw" || cfg.S3Bucket != "conv" || cfg.S3Region != "us-east-1" ||
-		cfg.S3KeyPrefix != "p" || !cfg.S3ForcePathStyle || cfg.S3SecretName != "tatara-s3" {
-		t.Fatalf("S3 config not loaded: %+v", cfg)
-	}
-}
-
-func TestLoad_S3ForcePathStyleInvalid(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	t.Setenv("S3_FORCE_PATH_STYLE", "notabool")
-	if _, err := config.Load(); err == nil {
-		t.Fatal("Load must error on an invalid S3_FORCE_PATH_STYLE")
-	}
-}
-
 func TestLoad_AgentSchedulingDefaultEmpty(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
@@ -467,70 +424,6 @@ func TestLoad_PushMetricsAllowedPrefixes(t *testing.T) {
 		if cfg.PushMetricsAllowedPrefixes[i] != p {
 			t.Fatalf("prefixes[%d] = %q, want %q", i, cfg.PushMetricsAllowedPrefixes[i], p)
 		}
-	}
-}
-
-// TestLoad_TaskRetentionDefault asserts the terminal-Task GC retention defaults
-// to a week when TASK_RETENTION_HOURS is unset.
-func TestLoad_TaskRetentionDefault(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.TaskRetention != config.DefaultTaskRetention {
-		t.Fatalf("TaskRetention default = %v, want %v", cfg.TaskRetention, config.DefaultTaskRetention)
-	}
-}
-
-// TestLoad_TaskRetentionCustom asserts an integer-hours TASK_RETENTION_HOURS is
-// parsed into a Duration.
-func TestLoad_TaskRetentionCustom(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	t.Setenv("TASK_RETENTION_HOURS", "72")
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.TaskRetention != 72*time.Hour {
-		t.Fatalf("TaskRetention = %v, want 72h", cfg.TaskRetention)
-	}
-}
-
-// TestLoad_TaskRetentionClampedToFloor asserts a retention below the safety floor
-// is clamped up so GC can never delete a Task still anchoring a dedup/cooldown
-// window.
-func TestLoad_TaskRetentionClampedToFloor(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	t.Setenv("TASK_RETENTION_HOURS", "1") // below the 2h floor
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if cfg.TaskRetention != config.MinTaskRetention {
-		t.Fatalf("TaskRetention = %v, want clamp to floor %v", cfg.TaskRetention, config.MinTaskRetention)
-	}
-}
-
-// TestLoad_MalformedTaskRetention asserts a non-integer TASK_RETENTION_HOURS
-// fails fast rather than silently falling back to the default.
-func TestLoad_MalformedTaskRetention(t *testing.T) {
-	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
-	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
-	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	t.Setenv("TASK_RETENTION_HOURS", "7d") // not an integer
-
-	if _, err := config.Load(); err == nil {
-		t.Fatal("expected error for malformed TASK_RETENTION_HOURS=7d, got nil")
 	}
 }
 

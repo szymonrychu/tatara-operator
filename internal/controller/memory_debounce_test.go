@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -160,16 +158,19 @@ func TestTaskGate_SpawnOnly_InflightTurnNotGated(t *testing.T) {
 		t.Fatalf("set memory: %v", err)
 	}
 
-	// Give the task a Planning phase and an in-flight turn annotation (simulates
-	// an already-running agent surviving a memory blip).
+	// Give the task a live pod stage with a RUNNING pod (podStartedAt set) and an
+	// in-flight turn: an already-running agent surviving a memory blip. The gate
+	// is SPAWN-ONLY, keyed on podStartedAt == nil.
 	tk := &tatarav1alpha1.Task{}
 	if err := k8sClient.Get(context.Background(),
 		types.NamespacedName{Namespace: testNS, Name: "t-spawnonly"}, tk); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	tk.Status.Phase = "Planning"
+	started := metav1.Now()
+	tk.Status.Stage = tatarav1alpha1.StageImplementing
+	tk.Status.PodStartedAt = &started
 	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
-		t.Fatalf("set task phase: %v", err)
+		t.Fatalf("set task stage: %v", err)
 	}
 	annotate(t, "t-spawnonly", map[string]string{
 		annCurrentTurn: "turn-abc-123",
@@ -183,66 +184,5 @@ func TestTaskGate_SpawnOnly_InflightTurnNotGated(t *testing.T) {
 	}
 	if res.RequeueAfter == memGateRequeue {
 		t.Fatalf("in-flight turn must bypass memory gate (spawn-only); got memGateRequeue=%v", memGateRequeue)
-	}
-}
-
-// TestTaskGate_NoSpawn_NotStablyReadyGates verifies that a fresh task (no pod,
-// no in-flight turn) is still gated when memory is Ready but within the
-// stabilization window.
-func TestTaskGate_NoSpawn_NotStablyReadyGates(t *testing.T) {
-	mkTaskProject(t, "p-newgate", 3)
-	mkTaskRepository(t, "r-newgate", "p-newgate")
-	mkTask(t, "t-newgate", "p-newgate", "r-newgate")
-
-	// Set memory Ready but ReadySince just now (within window -> not stably ready).
-	now := metav1.Now()
-	p := &tatarav1alpha1.Project{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "p-newgate"}, p); err != nil {
-		t.Fatalf("get project: %v", err)
-	}
-	p.Status.Memory = &tatarav1alpha1.MemoryStatus{
-		Phase:      "Ready",
-		Endpoint:   "http://mem-p-newgate.tatara.svc:8080",
-		ReadySince: &now,
-	}
-	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
-		t.Fatalf("set memory: %v", err)
-	}
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	res, err := reconcileTask(t, r, "t-newgate")
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter != memGateRequeue {
-		t.Fatalf("fresh task must be gated when memory not stably ready (ReadySince within window); got %v, want %v",
-			res.RequeueAfter, memGateRequeue)
-	}
-	pod := &corev1.Pod{}
-	err = k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-newgate"}, pod)
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("memory not stably ready must not spawn a pod")
-	}
-}
-
-// TestTaskGate_NoSpawn_MemoryNilGates verifies that a nil memory status still
-// gates a fresh task (no regression on original nil check).
-func TestTaskGate_NoSpawn_MemoryNilGates(t *testing.T) {
-	mkTaskProject(t, "p-nilgate", 3)
-	mkTaskRepository(t, "r-nilgate", "p-nilgate")
-	mkTask(t, "t-nilgate", "p-nilgate", "r-nilgate")
-	// No memory status set.
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	res, err := reconcileTask(t, r, "t-nilgate")
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter != memGateRequeue {
-		t.Fatalf("nil memory must gate fresh task; got %v", res.RequeueAfter)
 	}
 }

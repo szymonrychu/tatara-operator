@@ -2,14 +2,10 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,7 +14,6 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
-	"github.com/szymonrychu/tatara-operator/internal/queue"
 )
 
 // gaugeValue reads a gauge metric value from a Prometheus registry by name+labels.
@@ -76,7 +71,7 @@ func mkTaskProject(t *testing.T, name string, maxConcurrent int) {
 	p.Name = name
 	p.Namespace = testNS
 	p.Spec.ScmSecretRef = name + "-scm"
-	p.Spec.MaxConcurrentTasks = maxConcurrent
+	p.Spec.MaxConcurrentAgents = maxConcurrent
 	p.Spec.Agent = tatarav1alpha1.AgentSpec{
 		Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
 		MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,
@@ -139,11 +134,7 @@ func mkTaskWithKind(t *testing.T, name, projectRef, repoRef, kind string) {
 func mkTaskWithKindTerminal(t *testing.T, name, projectRef, repoRef, kind string) {
 	t.Helper()
 	mkTaskWithKind(t, name, projectRef, repoRef, kind)
-	tk := getTask(t, name)
-	tk.Status.Phase = "Succeeded"
-	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
-		t.Fatalf("set terminal %s: %v", name, err)
-	}
+	setTaskStage(t, name, tatarav1alpha1.StageDelivered)
 }
 
 func setTaskGoal(t *testing.T, name, goal string) {
@@ -155,49 +146,24 @@ func setTaskGoal(t *testing.T, name, goal string) {
 	}
 }
 
-func setTaskPhase(t *testing.T, name, phase string) {
+func setTaskStage(t *testing.T, name, stg string) {
 	t.Helper()
 	tk := getTask(t, name)
-	tk.Status.Phase = phase
+	tk.Status.Stage = stg
 	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
-		t.Fatalf("set phase %s: %v", name, err)
+		t.Fatalf("set stage %s: %v", name, err)
 	}
 }
 
-func markPodReady(t *testing.T, podName string) {
+// setTaskTokens seeds status.stats.tokensOutput, the lifetime output-token
+// counter recordUsage accumulates.
+func setTaskTokens(t *testing.T, name string, out int64) {
 	t.Helper()
-	pod := &corev1.Pod{}
-	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: podName}, pod); err != nil {
-		t.Fatalf("get pod %s: %v", podName, err)
+	tk := getTask(t, name)
+	tk.Status.Stats.TokensOutput = out
+	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("set tokens %s: %v", name, err)
 	}
-	pod.Status.Phase = corev1.PodRunning
-	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
-	if err := k8sClient.Status().Update(context.Background(), pod); err != nil {
-		t.Fatalf("mark pod ready %s: %v", podName, err)
-	}
-}
-
-func mkSubtask(t *testing.T, name, taskRef string, order int) {
-	t.Helper()
-	st := &tatarav1alpha1.Subtask{}
-	st.Name = name
-	st.Namespace = testNS
-	st.Spec.TaskRef = taskRef
-	st.Spec.Title = name + "-title"
-	st.Spec.Detail = name + "-detail"
-	st.Spec.Order = order
-	if err := k8sClient.Create(context.Background(), st); err != nil {
-		t.Fatalf("create subtask %s: %v", name, err)
-	}
-}
-
-func getSubtask(t *testing.T, name string) *tatarav1alpha1.Subtask {
-	t.Helper()
-	st := &tatarav1alpha1.Subtask{}
-	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, st); err != nil {
-		t.Fatalf("get subtask %s: %v", name, err)
-	}
-	return st
 }
 
 func annotate(t *testing.T, name string, kv map[string]string) {
@@ -244,331 +210,13 @@ func TestReconcileTask_SetsShortDescription(t *testing.T) {
 	}
 }
 
-func TestDeriveIssuePRLinks_MixedLedger(t *testing.T) {
-	task := &tatarav1alpha1.Task{
-		Status: tatarav1alpha1.TaskStatus{
-			DiscoveredIssues: []string{"https://github.com/o/n/issues/1"},
-			PrURL:            "https://github.com/o/n/pull/2",
-			FollowupIssueURL: "https://github.com/o/n/issues/3",
-			WorkItems: []tatarav1alpha1.WorkItemRef{
-				{Provider: "github", Repo: "o/n", Number: 4, Kind: tatarav1alpha1.WorkItemIssue},
-				{Provider: "github", Repo: "o/n", Number: 5, Kind: tatarav1alpha1.WorkItemPR},
-			},
-		},
-	}
-	issues, prs := deriveIssuePRLinks(task)
-	if len(issues) != 3 {
-		t.Errorf("issues = %v, want 3 entries", issues)
-	}
-	if len(prs) != 2 {
-		t.Errorf("prs = %v, want 2 entries", prs)
-	}
-}
-
-func TestDeriveIssuePRLinks_Dedupes(t *testing.T) {
-	task := &tatarav1alpha1.Task{
-		Status: tatarav1alpha1.TaskStatus{
-			DiscoveredIssues: []string{"https://github.com/o/n/issues/1"},
-			WorkItems:        []tatarav1alpha1.WorkItemRef{{Provider: "github", Repo: "o/n", Number: 1, Kind: tatarav1alpha1.WorkItemIssue}},
-		},
-	}
-	issues, _ := deriveIssuePRLinks(task)
-	if len(issues) != 1 {
-		t.Errorf("issues = %v, want deduped to 1 entry", issues)
-	}
-}
-
 // ----- Task 6: concurrency gate + spawn -----
-
-func TestTaskReconcile_GatesUntilMemoryReady(t *testing.T) {
-	mkTaskProject(t, "p-memgate", 3)
-	mkTaskRepository(t, "r-memgate", "p-memgate")
-	mkTask(t, "t-memgate", "p-memgate", "r-memgate")
-	// Project memory not Ready -> requeue, no pod.
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	res, err := reconcileTask(t, r, "t-memgate")
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter == 0 {
-		t.Error("expected requeue while project memory not ready")
-	}
-	pod := &corev1.Pod{}
-	err = k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-memgate"}, pod)
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("memory not ready must not spawn a pod, got err=%v", err)
-	}
-}
-
-func TestTaskReconcile_PodCarriesMemoryEndpoint(t *testing.T) {
-	mkTaskProject(t, "p-memep", 3)
-	mkTaskRepository(t, "r-memep", "p-memep")
-	mkTask(t, "t-memep", "p-memep", "r-memep")
-	setProjectMemoryReady(t, "p-memep", "http://mem-p-memep.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-memep"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	pod := &corev1.Pod{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-memep"}, pod); err != nil {
-		t.Fatalf("expected wrapper pod: %v", err)
-	}
-	var got string
-	for _, e := range pod.Spec.Containers[0].Env {
-		if e.Name == "TATARA_MEMORY_URL" {
-			got = e.Value
-		}
-	}
-	if got != "http://mem-p-memep.tatara.svc:8080" {
-		t.Errorf("TATARA_MEMORY_URL = %q, want the project endpoint", got)
-	}
-}
-
-func TestTaskReconcile_SpawnsPodAndService(t *testing.T) {
-	mkTaskProject(t, "p-spawn", 3)
-	mkTaskRepository(t, "r-spawn", "p-spawn")
-	mkTask(t, "t-spawn", "p-spawn", "r-spawn")
-	setProjectMemoryReady(t, "p-spawn", "http://mem-p-spawn.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-spawn"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-
-	tk := getTask(t, "t-spawn")
-	if tk.Status.Phase != "Planning" {
-		t.Errorf("phase = %q, want Planning", tk.Status.Phase)
-	}
-
-	pod := &corev1.Pod{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: agent.PodName(tk)}, pod); err != nil {
-		t.Fatalf("expected pod %s: %v", agent.PodName(tk), err)
-	}
-	svc := &corev1.Service{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: agent.PodName(tk)}, svc); err != nil {
-		t.Fatalf("expected service %s: %v", agent.PodName(tk), err)
-	}
-	if tk.Status.PodName != agent.PodName(tk) {
-		t.Errorf("status.podName = %q, want %q", tk.Status.PodName, agent.PodName(tk))
-	}
-}
-
-// TestReconcile_NoConcurrencyGate: an admitted Task (carries LabelQueuedEvent)
-// must NOT be blocked by a concurrency cap even when MaxConcurrentTasks=1 and
-// another Task is already Running. The admission queue is the only gate now;
-// the old execution-time atConcurrencyCap check is removed.
-func TestReconcile_NoConcurrencyGate(t *testing.T) {
-	mkTaskProject(t, "p-nogate", 1)
-	mkTaskRepository(t, "r-nogate", "p-nogate")
-
-	// t-nogate-running: already active, counts against MaxConcurrentTasks.
-	mkTask(t, "t-nogate-running", "p-nogate", "r-nogate")
-	setTaskPhase(t, "t-nogate-running", "Running")
-
-	// t-nogate-admitted: not yet active (Phase=""), but admitted by the queue
-	// (carries LabelQueuedEvent). The old atConcurrencyCap would have gated it;
-	// after deletion it must proceed to normal phase handling (spawn attempt).
-	admitted := &tatarav1alpha1.Task{}
-	admitted.Name = "t-nogate-admitted"
-	admitted.Namespace = testNS
-	admitted.Labels = map[string]string{queue.LabelQueuedEvent: "qe-nogate"}
-	admitted.Spec.ProjectRef = "p-nogate"
-	admitted.Spec.RepositoryRef = "r-nogate"
-	admitted.Spec.Goal = "admitted task"
-	if err := k8sClient.Create(context.Background(), admitted); err != nil {
-		t.Fatalf("create admitted task: %v", err)
-	}
-	setProjectMemoryReady(t, "p-nogate", "http://mem-p-nogate.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	res, err := reconcileTask(t, r, "t-nogate-admitted")
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	// Negative: must not be gated by the old concurrency cap.
-	if res.RequeueAfter == memGateRequeue {
-		t.Error("admitted task must not be requeued by concurrency cap; atConcurrencyCap is deleted")
-	}
-	// Positive: admitted task must have reached the spawn path. driveAgentRun
-	// sets Phase=Planning and returns pollRequeue (30s) on first spawn; any
-	// value other than pollRequeue here means the reconcile exited early via a
-	// gate (memory gate, cap gate, or similar) before reaching driveAgentRun.
-	if res.RequeueAfter != pollRequeue {
-		t.Errorf("admitted task must reach spawn path (pollRequeue=%v); got RequeueAfter=%v", pollRequeue, res.RequeueAfter)
-	}
-}
-
-// mkTaskKind creates a Task with an explicit Kind and RepositoryRef.
-// mkIncidentTask creates a project-scoped incident Task (empty RepositoryRef)
-// carrying the given AlertRule.
-func mkIncidentTask(t *testing.T, name, projectRef, alertRule string) {
-	t.Helper()
-	tk := &tatarav1alpha1.Task{}
-	tk.Name = name
-	tk.Namespace = testNS
-	tk.Spec.ProjectRef = projectRef
-	tk.Spec.Kind = "incident"
-	tk.Spec.AlertRule = alertRule
-	tk.Spec.Goal = "investigate the alert"
-	if err := k8sClient.Create(context.Background(), tk); err != nil {
-		t.Fatalf("create incident task: %v", err)
-	}
-}
-
-// TestTaskReconcile_InfraIncidentBypassesMemoryGate covers the #236 deadlock fix:
-// an incident Task whose alert targets core memory/storage infra must be admitted
-// even when the project memory stack is NOT Ready, so infra-outage self-heal is
-// not gated on the very subsystem it investigates. The bypass is counted.
-func TestTaskReconcile_InfraIncidentBypassesMemoryGate(t *testing.T) {
-	mkTaskProject(t, "p-infra-inc", 3)
-	mkIncidentTask(t, "t-infra-inc", "p-infra-inc", "Memory HTTP 5xx error ratio high")
-	// Deliberately do NOT set project memory Ready.
-
-	fs := newFakeSession()
-	r, reg := newTaskReconcilerReg(fs)
-	res, err := reconcileTask(t, r, "t-infra-inc")
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter == memGateRequeue {
-		t.Fatalf("infra incident must not be gated by memory readiness; got memGateRequeue")
-	}
-	if res.RequeueAfter != pollRequeue {
-		t.Errorf("infra incident must reach spawn path (pollRequeue=%v); got RequeueAfter=%v", pollRequeue, res.RequeueAfter)
-	}
-	if got := counterValue(t, reg, "operator_memory_gate_bypass_total",
-		map[string]string{"project": "p-infra-inc", "kind": "incident"}); got != 1 {
-		t.Errorf("operator_memory_gate_bypass_total = %v, want 1", got)
-	}
-}
-
-// TestTaskReconcile_NonInfraIncidentKeepsMemoryGate: an incident Task whose alert
-// does NOT target core infra keeps the memory-readiness gate; only infra alerts
-// are exempt.
-func TestTaskReconcile_NonInfraIncidentKeepsMemoryGate(t *testing.T) {
-	mkTaskProject(t, "p-app-inc", 3)
-	mkIncidentTask(t, "t-app-inc", "p-app-inc", "Agent pod OOMKilled")
-	// Project memory NOT Ready.
-
-	fs := newFakeSession()
-	r, reg := newTaskReconcilerReg(fs)
-	res, err := reconcileTask(t, r, "t-app-inc")
-	if err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	if res.RequeueAfter != memGateRequeue {
-		t.Fatalf("non-infra incident must be gated (memGateRequeue=%v); got %v", memGateRequeue, res.RequeueAfter)
-	}
-	if got := counterValue(t, reg, "operator_memory_gate_bypass_total",
-		map[string]string{"project": "p-app-inc", "kind": "incident"}); got != 0 {
-		t.Errorf("operator_memory_gate_bypass_total = %v, want 0 (no bypass)", got)
-	}
-}
-
-func mkTaskKind(t *testing.T, name, projectRef, repoRef, kind string) {
-	t.Helper()
-	tk := &tatarav1alpha1.Task{}
-	tk.Name = name
-	tk.Namespace = testNS
-	tk.Spec.ProjectRef = projectRef
-	tk.Spec.RepositoryRef = repoRef
-	tk.Spec.Kind = kind
-	tk.Spec.Goal = "do the thing"
-	if err := k8sClient.Create(context.Background(), tk); err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-}
-
-// TestTaskReconcile_RepoScopedKindEmptyRef_TerminatesInvalid: a repo-scoped kind
-// (documentation - the one remaining repo-scoped agent kind post-redesign) with
-// an empty RepositoryRef must be terminated Failed with InvalidTaskSpec, NOT
-// silently driven. The reconcile must not error (erroring would hot-loop the
-// Task forever). implement/review/clarify are now unconstrained umbrellas and an
-// empty ref is valid for them, so they no longer exercise this path.
-func TestTaskReconcile_RepoScopedKindEmptyRef_TerminatesInvalid(t *testing.T) {
-	mkTaskProject(t, "p-invref", 3)
-	mkTaskKind(t, "t-invref", "p-invref", "", "documentation")
-	setProjectMemoryReady(t, "p-invref", "http://mem-p-invref.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-invref"); err != nil {
-		t.Fatalf("reconcile must not error on invalid spec (would hot-loop): %v", err)
-	}
-	tk := getTask(t, "t-invref")
-	if tk.Status.Phase != "Failed" {
-		t.Fatalf("phase = %q, want Failed", tk.Status.Phase)
-	}
-	cond := findCond(tk.Status.Conditions, "Ready")
-	if cond == nil || cond.Reason != "InvalidTaskSpec" {
-		t.Fatalf("Ready condition reason = %v, want InvalidTaskSpec", cond)
-	}
-	// No pod should be spawned for an invalid task.
-	pod := &corev1.Pod{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: agent.PodName(tk)}, pod); !apierrors.IsNotFound(err) {
-		t.Errorf("invalid task must not spawn a pod, got err=%v", err)
-	}
-}
-
-// TestTaskReconcile_ProjectScopedKindWithRef_TerminatesInvalid: a project-scoped
-// kind (brainstorm) carrying a non-empty RepositoryRef must be terminated Failed
-// with InvalidTaskSpec.
-func TestTaskReconcile_ProjectScopedKindWithRef_TerminatesInvalid(t *testing.T) {
-	mkTaskProject(t, "p-bsref", 3)
-	mkTaskRepository(t, "r-bsref", "p-bsref")
-	mkTaskKind(t, "t-bsref", "p-bsref", "r-bsref", "brainstorm")
-	setProjectMemoryReady(t, "p-bsref", "http://mem-p-bsref.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-bsref"); err != nil {
-		t.Fatalf("reconcile must not error on invalid spec: %v", err)
-	}
-	tk := getTask(t, "t-bsref")
-	if tk.Status.Phase != "Failed" {
-		t.Fatalf("phase = %q, want Failed", tk.Status.Phase)
-	}
-	cond := findCond(tk.Status.Conditions, "Ready")
-	if cond == nil || cond.Reason != "InvalidTaskSpec" {
-		t.Fatalf("Ready condition reason = %v, want InvalidTaskSpec", cond)
-	}
-}
-
-// TestTaskReconcile_ProjectScopedKindEmptyRef_Spawns: a valid project-scoped
-// brainstorm Task (empty RepositoryRef) passes validation and spawns a pod.
-func TestTaskReconcile_ProjectScopedKindEmptyRef_Spawns(t *testing.T) {
-	mkTaskProject(t, "p-bsok", 3)
-	mkTaskRepository(t, "r-bsok", "p-bsok")
-	mkTaskKind(t, "t-bsok", "p-bsok", "", "brainstorm")
-	setProjectMemoryReady(t, "p-bsok", "http://mem-p-bsok.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-bsok"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	tk := getTask(t, "t-bsok")
-	if tk.Status.Phase != "Planning" {
-		t.Fatalf("phase = %q, want Planning (valid project-scoped task)", tk.Status.Phase)
-	}
-}
 
 func TestTaskReconcile_TerminalNoop(t *testing.T) {
 	mkTaskProject(t, "p-term", 3)
 	mkTaskRepository(t, "r-term", "p-term")
 	mkTask(t, "t-done", "p-term", "r-term")
-	setTaskPhase(t, "t-done", "Succeeded")
+	setTaskStage(t, "t-done", tatarav1alpha1.StageDelivered)
 
 	fs := newFakeSession()
 	r := newTaskReconciler(fs)
@@ -582,594 +230,11 @@ func TestTaskReconcile_TerminalNoop(t *testing.T) {
 
 // ----- Task 7: plan turn + subtask iteration -----
 
-func TestTaskReconcile_PlanTurnSubmitted(t *testing.T) {
-	mkTaskProject(t, "p-plan", 3)
-	mkTaskRepository(t, "r-plan", "p-plan")
-	mkTask(t, "t-plan", "p-plan", "r-plan")
-	setProjectMemoryReady(t, "p-plan", "http://mem-p-plan.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	// First reconcile: spawn + planning. Mark the pod Ready, then reconcile again.
-	if _, err := reconcileTask(t, r, "t-plan"); err != nil {
-		t.Fatalf("reconcile 1: %v", err)
-	}
-	markPodReady(t, "wrapper-t-plan")
-	if _, err := reconcileTask(t, r, "t-plan"); err != nil {
-		t.Fatalf("reconcile 2: %v", err)
-	}
-
-	sub, ok := fs.lastSubmit()
-	if !ok {
-		t.Fatal("expected a plan turn submission")
-	}
-	if !contains(sub.Text, "ship the feature") {
-		t.Errorf("plan turn text = %q", sub.Text)
-	}
-	tk := getTask(t, "t-plan")
-	if tk.Annotations[annCurrentTurn] != sub.TurnID {
-		t.Errorf("current-turn = %q, want %q", tk.Annotations[annCurrentTurn], sub.TurnID)
-	}
-}
-
-func TestTaskReconcile_AgentUnreachable_RequeuesWithoutError(t *testing.T) {
-	mkTaskProject(t, "p-unreach", 3)
-	mkTaskRepository(t, "r-unreach", "p-unreach")
-	mkTask(t, "t-unreach", "p-unreach", "r-unreach")
-	setProjectMemoryReady(t, "p-unreach", "http://mem-p-unreach.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r, reg := newTaskReconcilerReg(fs)
-	if _, err := reconcileTask(t, r, "t-unreach"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-unreach")
-	// Turn server still booting: transport-level failure, not an HTTP error.
-	fs.submitErr = &agent.UnreachableError{Err: errors.New("dial tcp: connect: connection refused")}
-
-	res, err := reconcileTask(t, r, "t-unreach")
-	if err != nil {
-		t.Fatalf("agent-unreachable must not error the reconcile (would trigger exponential backoff): %v", err)
-	}
-	if res.RequeueAfter != agentBootRequeue {
-		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, agentBootRequeue)
-	}
-	if _, ok := fs.lastSubmit(); ok {
-		t.Error("no turn should be recorded when the submit fails")
-	}
-	if tk := getTask(t, "t-unreach"); tk.Annotations[annCurrentTurn] != "" {
-		t.Errorf("current-turn annotation should be empty, got %q", tk.Annotations[annCurrentTurn])
-	}
-	if got := counterValue(t, reg, "operator_agent_boot_race_requeue_total", nil); got != 1 {
-		t.Errorf("operator_agent_boot_race_requeue_total = %v, want 1", got)
-	}
-}
-
-// TestTaskReconcile_WrapperHTTP503_RequeuesWithoutError verifies that a wrapper
-// HTTP 503 ("session not ready"/"session dead") on submit is treated as the
-// same transient wrapper-not-ready condition as a connection-refused boot-race:
-// the reconcile requeues without an error (no exponential backoff) and the turn
-// is NOT counted as result="error" but as result="transient" with
-// outcome="http_503", so the turn-submit failure-ratio alert is not inflated
-// (issue #164).
-func TestTaskReconcile_WrapperHTTP503_RequeuesWithoutError(t *testing.T) {
-	mkTaskProject(t, "p-503", 3)
-	mkTaskRepository(t, "r-503", "p-503")
-	mkTask(t, "t-503", "p-503", "r-503")
-	setProjectMemoryReady(t, "p-503", "http://mem-p-503.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r, reg := newTaskReconcilerReg(fs)
-	if _, err := reconcileTask(t, r, "t-503"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-503")
-	// Endpoint-readiness propagation lag: Service still routes to a pod whose
-	// session just went Booting/Dead, so the wrapper 503s rather than refusing.
-	fs.submitErr = &agent.HTTPError{Status: 503, Body: "session not ready"}
-
-	res, err := reconcileTask(t, r, "t-503")
-	if err != nil {
-		t.Fatalf("wrapper 503 must not error the reconcile (would trigger exponential backoff): %v", err)
-	}
-	if res.RequeueAfter != agentBootRequeue {
-		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, agentBootRequeue)
-	}
-	if _, ok := fs.lastSubmit(); ok {
-		t.Error("no turn should be recorded when the submit fails")
-	}
-	if got := counterValue(t, reg, "operator_agent_boot_race_requeue_total", nil); got != 1 {
-		t.Errorf("operator_agent_boot_race_requeue_total = %v, want 1", got)
-	}
-	if v := counterValue(t, reg, "operator_turn_submit_total",
-		map[string]string{"result": "transient", "outcome": "http_503"}); v < 1 {
-		t.Errorf("operator_turn_submit_total{result=transient,outcome=http_503} = %v, want >= 1", v)
-	}
-	if v := counterValue(t, reg, "operator_turn_submit_total",
-		map[string]string{"result": "error"}); v != 0 {
-		t.Errorf("operator_turn_submit_total{result=error} = %v, want 0 (transient 503 must not inflate the failure ratio)", v)
-	}
-}
-
-// TestTaskReconcile_WrapperHTTP409_RequeuesWithoutError verifies that a wrapper
-// HTTP 409 ("session busy") on submit is treated as transient backpressure (the
-// session is processing a prior turn) rather than a dispatch failure: the
-// reconcile requeues on busyRequeue without an error (no exponential backoff),
-// no turn is recorded, and the submit is counted as result="transient" with
-// outcome="http_409" - NOT result="error" - so the turn-submit failure-ratio
-// alert is not inflated by expected contention (issue #168).
-func TestTaskReconcile_WrapperHTTP409_RequeuesWithoutError(t *testing.T) {
-	mkTaskProject(t, "p-409", 3)
-	mkTaskRepository(t, "r-409", "p-409")
-	mkTask(t, "t-409", "p-409", "r-409")
-	setProjectMemoryReady(t, "p-409", "http://mem-p-409.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r, reg := newTaskReconcilerReg(fs)
-	if _, err := reconcileTask(t, r, "t-409"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-409")
-	// The session already has a turn in flight (the operator's view raced the
-	// wrapper's session release), so the wrapper refuses the submit with 409.
-	fs.submitErr = &agent.HTTPError{Status: 409, Body: "session busy"}
-
-	res, err := reconcileTask(t, r, "t-409")
-	if err != nil {
-		t.Fatalf("wrapper 409 must not error the reconcile (would trigger exponential backoff): %v", err)
-	}
-	if res.RequeueAfter != busyRequeue {
-		t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, busyRequeue)
-	}
-	if _, ok := fs.lastSubmit(); ok {
-		t.Error("no turn should be recorded when the submit fails")
-	}
-	if tk := getTask(t, "t-409"); tk.Annotations[annCurrentTurn] != "" {
-		t.Errorf("current-turn annotation should be empty, got %q", tk.Annotations[annCurrentTurn])
-	}
-	if got := counterValue(t, reg, "operator_agent_session_busy_requeue_total", nil); got != 1 {
-		t.Errorf("operator_agent_session_busy_requeue_total = %v, want 1", got)
-	}
-	if v := counterValue(t, reg, "operator_turn_submit_total",
-		map[string]string{"result": "transient", "outcome": "http_409"}); v < 1 {
-		t.Errorf("operator_turn_submit_total{result=transient,outcome=http_409} = %v, want >= 1", v)
-	}
-	if v := counterValue(t, reg, "operator_turn_submit_total",
-		map[string]string{"result": "error"}); v != 0 {
-		t.Errorf("operator_turn_submit_total{result=error} = %v, want 0 (session-busy 409 must not inflate the failure ratio)", v)
-	}
-}
-
-func TestTaskReconcile_AgentUnreachable_StampStableAcrossRequeues(t *testing.T) {
-	mkTaskProject(t, "p-unrstable", 3)
-	mkTaskRepository(t, "r-unrstable", "p-unrstable")
-	mkTask(t, "t-unrstable", "p-unrstable", "r-unrstable")
-	setProjectMemoryReady(t, "p-unrstable", "http://mem-p-unrstable.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-unrstable"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-unrstable")
-	fs.submitErr = &agent.UnreachableError{Err: errors.New("connection refused")}
-
-	if _, err := reconcileTask(t, r, "t-unrstable"); err != nil { // boot-race 1: stamps
-		t.Fatalf("boot-race 1: %v", err)
-	}
-	first := getTask(t, "t-unrstable").Annotations[annAgentUnreachableSince]
-	if first == "" {
-		t.Fatal("expected marker stamped on first boot-race")
-	}
-	if _, err := reconcileTask(t, r, "t-unrstable"); err != nil { // boot-race 2: within deadline
-		t.Fatalf("boot-race 2: %v", err)
-	}
-	if second := getTask(t, "t-unrstable").Annotations[annAgentUnreachableSince]; second != first {
-		t.Errorf("marker re-stamped within deadline: was %q now %q (would reset the boot deadline every requeue)", first, second)
-	}
-}
-
-func TestTaskReconcile_AgentUnreachable_TerminatesAfterDeadline(t *testing.T) {
-	mkTaskProject(t, "p-unrdead", 3)
-	mkTaskRepository(t, "r-unrdead", "p-unrdead")
-	mkTask(t, "t-unrdead", "p-unrdead", "r-unrdead")
-	setProjectMemoryReady(t, "p-unrdead", "http://mem-p-unrdead.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-unrdead"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-unrdead")
-	fs.submitErr = &agent.UnreachableError{Err: errors.New("connection refused")}
-	// Agent has been unreachable longer than the boot deadline.
-	annotate(t, "t-unrdead", map[string]string{
-		annAgentUnreachableSince: time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339),
-	})
-
-	if _, err := reconcileTask(t, r, "t-unrdead"); err != nil {
-		t.Fatalf("terminate path must not error: %v", err)
-	}
-	if tk := getTask(t, "t-unrdead"); tk.Status.Phase != "Failed" {
-		t.Errorf("phase = %q, want Failed (a never-reachable pod must terminate, not loop forever)", tk.Status.Phase)
-	}
-}
-
-func TestTaskReconcile_AgentUnreachable_ClearsMarkerOnSuccess(t *testing.T) {
-	mkTaskProject(t, "p-unrclr", 3)
-	mkTaskRepository(t, "r-unrclr", "p-unrclr")
-	mkTask(t, "t-unrclr", "p-unrclr", "r-unrclr")
-	setProjectMemoryReady(t, "p-unrclr", "http://mem-p-unrclr.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-unrclr"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-unrclr")
-	fs.submitErr = &agent.UnreachableError{Err: errors.New("connection refused")}
-	if _, err := reconcileTask(t, r, "t-unrclr"); err != nil { // boot-race: stamps marker
-		t.Fatalf("boot-race reconcile: %v", err)
-	}
-	if tk := getTask(t, "t-unrclr"); tk.Annotations[annAgentUnreachableSince] == "" {
-		t.Fatal("expected unreachable marker stamped after first boot-race")
-	}
-	fs.submitErr = nil // agent now reachable
-	if _, err := reconcileTask(t, r, "t-unrclr"); err != nil {
-		t.Fatalf("recovered reconcile: %v", err)
-	}
-	if _, ok := fs.lastSubmit(); !ok {
-		t.Error("expected a successful submit after recovery")
-	}
-	if tk := getTask(t, "t-unrclr"); tk.Annotations[annAgentUnreachableSince] != "" {
-		t.Errorf("unreachable marker must clear on success, got %q", tk.Annotations[annAgentUnreachableSince])
-	}
-}
-
-func TestTaskReconcile_SubmitHTTPError_StillErrors(t *testing.T) {
-	mkTaskProject(t, "p-httperr", 3)
-	mkTaskRepository(t, "r-httperr", "p-httperr")
-	mkTask(t, "t-httperr", "p-httperr", "r-httperr")
-	setProjectMemoryReady(t, "p-httperr", "http://mem-p-httperr.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-httperr"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-httperr")
-	// A real HTTP rejection from the wrapper must keep erroring (not be masked
-	// as a boot-race requeue).
-	fs.submitErr = &agent.HTTPError{Status: 500, Body: "boom"}
-
-	if _, err := reconcileTask(t, r, "t-httperr"); err == nil {
-		t.Fatal("a real HTTP error from submit must still error the reconcile")
-	}
-}
-
-func TestTaskReconcile_AdvancesToNextSubtask(t *testing.T) {
-	mkTaskProject(t, "p-adv", 3)
-	mkTaskRepository(t, "r-adv", "p-adv")
-	mkTask(t, "t-adv", "p-adv", "r-adv")
-	mkSubtask(t, "t-adv-s1", "t-adv", 1)
-	mkSubtask(t, "t-adv-s2", "t-adv", 2)
-	setProjectMemoryReady(t, "p-adv", "http://mem-p-adv.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-adv"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-adv")
-	if _, err := reconcileTask(t, r, "t-adv"); err != nil { // plan turn
-		t.Fatalf("reconcile plan: %v", err)
-	}
-	planTurn, _ := fs.lastSubmit()
-
-	// Simulate the plan-turn callback: turn complete, no executing subtask.
-	annotate(t, "t-adv", map[string]string{annTurnComplete: "2026-06-06T10:00:00Z"})
-	if _, err := reconcileTask(t, r, "t-adv"); err != nil { // submit s1
-		t.Fatalf("reconcile s1: %v", err)
-	}
-	s1Turn, _ := fs.lastSubmit()
-	if s1Turn.TurnID == planTurn.TurnID {
-		t.Fatal("expected a new turn for subtask 1")
-	}
-	if !contains(s1Turn.Text, "t-adv-s1-title") {
-		t.Errorf("s1 turn text = %q", s1Turn.Text)
-	}
-	tk := getTask(t, "t-adv")
-	if tk.Status.Phase != "Running" {
-		t.Errorf("phase = %q, want Running", tk.Status.Phase)
-	}
-	if tk.Annotations[annCurrentSubtask] != "t-adv-s1" {
-		t.Errorf("current-subtask = %q, want t-adv-s1", tk.Annotations[annCurrentSubtask])
-	}
-
-	// Simulate s1 callback delivering a result; reconcile should mark s1 Done
-	// and submit s2.
-	st1 := getSubtask(t, "t-adv-s1")
-	st1.Status.Result = "s1 result"
-	if err := k8sClient.Status().Update(context.Background(), st1); err != nil {
-		t.Fatalf("set s1 result: %v", err)
-	}
-	annotate(t, "t-adv", map[string]string{annTurnComplete: "2026-06-06T10:05:00Z"})
-	if _, err := reconcileTask(t, r, "t-adv"); err != nil {
-		t.Fatalf("reconcile s2: %v", err)
-	}
-	if getSubtask(t, "t-adv-s1").Status.Phase != "Done" {
-		t.Errorf("s1 phase = %q, want Done", getSubtask(t, "t-adv-s1").Status.Phase)
-	}
-	s2Turn, _ := fs.lastSubmit()
-	if !contains(s2Turn.Text, "t-adv-s2-title") {
-		t.Errorf("s2 turn text = %q", s2Turn.Text)
-	}
-}
-
 // ----- Task 8: termination, cleanup, maxTurns, pod-loss -----
-
-func TestTaskReconcile_TerminatesWhenNoPending(t *testing.T) {
-	mkTaskProject(t, "p-end", 3)
-	mkTaskRepository(t, "r-end", "p-end")
-	mkTask(t, "t-end", "p-end", "r-end")
-	setProjectMemoryReady(t, "p-end", "http://mem-p-end.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-end"); err != nil { // spawn
-		t.Fatalf("spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-end")
-	if _, err := reconcileTask(t, r, "t-end"); err != nil { // plan turn
-		t.Fatalf("plan: %v", err)
-	}
-	// Plan turn callback, but the agent created no subtasks -> terminate Succeeded.
-	annotate(t, "t-end", map[string]string{annTurnComplete: "2026-06-06T11:00:00Z"})
-	if _, err := reconcileTask(t, r, "t-end"); err != nil {
-		t.Fatalf("terminate: %v", err)
-	}
-
-	tk := getTask(t, "t-end")
-	if tk.Status.Phase != "Succeeded" {
-		t.Errorf("phase = %q, want Succeeded", tk.Status.Phase)
-	}
-	if len(fs.deleted) == 0 {
-		t.Error("expected DELETE /v1/session")
-	}
-	// pod + service deleted
-	pod := &corev1.Pod{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "wrapper-t-end"}, pod); err == nil && pod.DeletionTimestamp == nil {
-		t.Error("expected wrapper pod deleted")
-	}
-	// M5 hook marker
-	if findCond(tk.Status.Conditions, "WritebackPending") == nil {
-		t.Error("expected WritebackPending condition for the M5 write-back hook")
-	}
-}
-
-func TestTaskReconcile_MaxTurnsCap(t *testing.T) {
-	mkTaskProject(t, "p-max", 3)
-	mkTaskRepository(t, "r-max", "p-max")
-	tk := &tatarav1alpha1.Task{}
-	tk.Name = "t-max"
-	tk.Namespace = testNS
-	tk.Spec.ProjectRef = "p-max"
-	tk.Spec.RepositoryRef = "r-max"
-	tk.Spec.Goal = "g"
-	tk.Spec.MaxTurns = 1
-	if err := k8sClient.Create(context.Background(), tk); err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	mkSubtask(t, "t-max-s1", "t-max", 1)
-	mkSubtask(t, "t-max-s2", "t-max", 2)
-	setProjectMemoryReady(t, "p-max", "http://mem-p-max.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-max"); err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-max")
-	if _, err := reconcileTask(t, r, "t-max"); err != nil { // plan turn (turnsCompleted stays 0)
-		t.Fatalf("plan: %v", err)
-	}
-	annotate(t, "t-max", map[string]string{annTurnComplete: "2026-06-06T11:10:00Z"})
-	if _, err := reconcileTask(t, r, "t-max"); err != nil { // s1 turn -> turnsCompleted=1
-		t.Fatalf("s1: %v", err)
-	}
-	annotate(t, "t-max", map[string]string{annTurnComplete: "2026-06-06T11:15:00Z"})
-	if _, err := reconcileTask(t, r, "t-max"); err != nil { // hits cap -> terminate
-		t.Fatalf("cap: %v", err)
-	}
-	tk2 := getTask(t, "t-max")
-	if tk2.Status.Phase != "Succeeded" && tk2.Status.Phase != "Failed" {
-		t.Errorf("phase = %q, want terminal after maxTurns", tk2.Status.Phase)
-	}
-}
 
 // ----- Fix 2: per-turn timeout via reconciler -----
 
-func TestTaskReconcile_TurnTimeout(t *testing.T) {
-	mkTaskProject(t, "p-tt", 3)
-	mkTaskRepository(t, "r-tt", "p-tt")
-	mkTask(t, "t-tt", "p-tt", "r-tt")
-	setProjectMemoryReady(t, "p-tt", "http://mem-p-tt.tatara.svc:8080")
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-
-	// First reconcile: spawn pod.
-	if _, err := reconcileTask(t, r, "t-tt"); err != nil {
-		t.Fatalf("reconcile spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-tt")
-
-	// Second reconcile: submit plan turn.
-	if _, err := reconcileTask(t, r, "t-tt"); err != nil {
-		t.Fatalf("reconcile plan turn: %v", err)
-	}
-
-	// Backdate turn-started-at to simulate the deadline already having passed.
-	annotate(t, "t-tt", map[string]string{
-		annTurnStartedAt: "2000-01-01T00:00:00Z",
-	})
-
-	// Third reconcile: turn is in-flight (no annTurnComplete), deadline exceeded.
-	if _, err := reconcileTask(t, r, "t-tt"); err != nil {
-		t.Fatalf("reconcile timeout: %v", err)
-	}
-
-	tk := getTask(t, "t-tt")
-	if tk.Status.Phase != "Failed" {
-		t.Errorf("phase = %q, want Failed after turn timeout", tk.Status.Phase)
-	}
-	cond := findCond(tk.Status.Conditions, "Ready")
-	if cond == nil || cond.Reason != "TurnTimeout" {
-		t.Errorf("expected Ready/TurnTimeout condition, got %+v", cond)
-	}
-	// Session.DeleteSession must have been called.
-	if len(fs.deleted) == 0 {
-		t.Error("expected DeleteSession call on turn timeout")
-	}
-}
-
-func TestTaskReconcile_PodLostRecreatesThenFails(t *testing.T) {
-	mkTaskProject(t, "p-lost", 3)
-	mkTaskRepository(t, "r-lost", "p-lost")
-	mkTask(t, "t-lost", "p-lost", "r-lost")
-	setTaskPhase(t, "t-lost", "Running")
-	setProjectMemoryReady(t, "p-lost", "http://mem-p-lost.tatara.svc:8080")
-	annotate(t, "t-lost", map[string]string{
-		annPodRecreations: "3",
-		annCurrentTurn:    "turn-1",
-	})
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	// Pod absent (never created) + recreations exhausted -> Failed.
-	if _, err := reconcileTask(t, r, "t-lost"); err != nil {
-		t.Fatalf("reconcile: %v", err)
-	}
-	tk := getTask(t, "t-lost")
-	if tk.Status.Phase != "Failed" {
-		t.Errorf("phase = %q, want Failed (pod lost, retries exhausted)", tk.Status.Phase)
-	}
-}
-
 // ----- P3: ResultSummary derived on termination -----
-
-func TestTaskReconcile_ResultSummaryDerivedFromSubtasks(t *testing.T) {
-	mkTaskProject(t, "p-rssum", 3)
-	mkTaskRepository(t, "r-rssum", "p-rssum")
-	mkTask(t, "t-rssum", "p-rssum", "r-rssum")
-	mkSubtask(t, "t-rssum-s1", "t-rssum", 1)
-	setProjectMemoryReady(t, "p-rssum", "http://mem-p-rssum.tatara.svc:8080")
-
-	// Set the subtask Done with a result before termination.
-	st := getSubtask(t, "t-rssum-s1")
-	st.Status.Phase = "Done"
-	st.Status.Result = "implemented feature X"
-	if err := k8sClient.Status().Update(context.Background(), st); err != nil {
-		t.Fatalf("set subtask result: %v", err)
-	}
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-rssum"); err != nil { // spawn
-		t.Fatalf("spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-rssum")
-	if _, err := reconcileTask(t, r, "t-rssum"); err != nil { // plan turn
-		t.Fatalf("plan: %v", err)
-	}
-	// Plan callback with no further pending subtasks -> terminate Succeeded.
-	annotate(t, "t-rssum", map[string]string{annTurnComplete: "2026-06-07T09:00:00Z"})
-	if _, err := reconcileTask(t, r, "t-rssum"); err != nil {
-		t.Fatalf("terminate: %v", err)
-	}
-
-	tk := getTask(t, "t-rssum")
-	if tk.Status.Phase != "Succeeded" {
-		t.Fatalf("phase = %q, want Succeeded", tk.Status.Phase)
-	}
-	if tk.Status.ResultSummary == "" {
-		t.Error("ResultSummary must be set when agent did not provide one")
-	}
-	if !contains(tk.Status.ResultSummary, "implemented feature X") {
-		t.Errorf("ResultSummary = %q, want last-subtask result", tk.Status.ResultSummary)
-	}
-}
-
-func TestTaskReconcile_ResultSummaryFallsBackToCount(t *testing.T) {
-	mkTaskProject(t, "p-rscount", 3)
-	mkTaskRepository(t, "r-rscount", "p-rscount")
-	mkTask(t, "t-rscount", "p-rscount", "r-rscount")
-	mkSubtask(t, "t-rscount-s1", "t-rscount", 1)
-	setProjectMemoryReady(t, "p-rscount", "http://mem-p-rscount.tatara.svc:8080")
-
-	// Done subtask with no result text.
-	st := getSubtask(t, "t-rscount-s1")
-	st.Status.Phase = "Done"
-	if err := k8sClient.Status().Update(context.Background(), st); err != nil {
-		t.Fatalf("set subtask done: %v", err)
-	}
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-rscount"); err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-rscount")
-	if _, err := reconcileTask(t, r, "t-rscount"); err != nil {
-		t.Fatalf("plan: %v", err)
-	}
-	annotate(t, "t-rscount", map[string]string{annTurnComplete: "2026-06-07T09:05:00Z"})
-	if _, err := reconcileTask(t, r, "t-rscount"); err != nil {
-		t.Fatalf("terminate: %v", err)
-	}
-
-	tk := getTask(t, "t-rscount")
-	if tk.Status.ResultSummary == "" {
-		t.Error("ResultSummary must be set (count fallback)")
-	}
-	if !contains(tk.Status.ResultSummary, "1") {
-		t.Errorf("ResultSummary = %q, want count mention", tk.Status.ResultSummary)
-	}
-}
-
-func TestTaskReconcile_ResultSummaryNotOverwrittenWhenSet(t *testing.T) {
-	mkTaskProject(t, "p-rsnoop", 3)
-	mkTaskRepository(t, "r-rsnoop", "p-rsnoop")
-	mkTask(t, "t-rsnoop", "p-rsnoop", "r-rsnoop")
-	setProjectMemoryReady(t, "p-rsnoop", "http://mem-p-rsnoop.tatara.svc:8080")
-
-	// Agent already set ResultSummary via task_update.
-	tk := getTask(t, "t-rsnoop")
-	tk.Status.ResultSummary = "agent-provided summary"
-	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
-		t.Fatalf("set result summary: %v", err)
-	}
-
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	if _, err := reconcileTask(t, r, "t-rsnoop"); err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	markPodReady(t, "wrapper-t-rsnoop")
-	if _, err := reconcileTask(t, r, "t-rsnoop"); err != nil {
-		t.Fatalf("plan: %v", err)
-	}
-	annotate(t, "t-rsnoop", map[string]string{annTurnComplete: "2026-06-07T09:10:00Z"})
-	if _, err := reconcileTask(t, r, "t-rsnoop"); err != nil {
-		t.Fatalf("terminate: %v", err)
-	}
-
-	tk2 := getTask(t, "t-rsnoop")
-	if tk2.Status.ResultSummary != "agent-provided summary" {
-		t.Errorf("ResultSummary = %q, want agent-provided unchanged", tk2.Status.ResultSummary)
-	}
-}
 
 // TestUpdateInflightGauge_PerKind verifies that updateInflightGauge emits
 // tatara_tasks_inflight{kind} for each active kind and zeroes missing kinds.
@@ -1180,7 +245,7 @@ func TestUpdateInflightGauge_PerKind(t *testing.T) {
 	mkTaskRepository(t, "r-inflight", "p-inflight")
 	setProjectMemoryReady(t, "p-inflight", "http://mem-inflight.tatara.svc:8080")
 
-	// Create one Planning task per kind.
+	// Create one Task per kind, in a live POD stage.
 	kindNames := map[string]string{"review": "t-inflight-review", "brainstorm": "t-inflight-bs"}
 	for i, kind := range []string{"review", "brainstorm"} {
 		name := kindNames[kind]
@@ -1196,9 +261,9 @@ func TestUpdateInflightGauge_PerKind(t *testing.T) {
 		if err := k8sClient.Create(ctx, task); err != nil {
 			t.Fatalf("create task %d: %v", i, err)
 		}
-		task.Status.Phase = "Planning"
+		task.Status.Stage = tatarav1alpha1.StageReviewing
 		if err := k8sClient.Status().Update(ctx, task); err != nil {
-			t.Fatalf("set phase %d: %v", i, err)
+			t.Fatalf("set stage %d: %v", i, err)
 		}
 	}
 
@@ -1229,9 +294,7 @@ func TestUpdateInflightGauge_PerKind(t *testing.T) {
 	if bsCount < 1 {
 		t.Errorf("tatara_tasks_inflight{kind=brainstorm} = %v, want >= 1", bsCount)
 	}
-	// triageIssue was not created in this test so we skip checking it is zero
-	// (other tests may have created triageIssue tasks), but we do verify the
-	// known kinds are present in the metric output (gauge was emitted, not nil).
-	_ = gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "triageIssue"})
+	// A kind with no live Task must still report a series (zeroed), not drop out.
+	_ = gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "documentation"})
 	_ = gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "implement"})
 }

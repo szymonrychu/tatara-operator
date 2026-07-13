@@ -1,6 +1,9 @@
 package restapi
 
 import (
+	"strings"
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -10,7 +13,10 @@ type agentDTO struct {
 	Model              string `json:"model,omitempty"`
 	Image              string `json:"image,omitempty"`
 	PermissionMode     string `json:"permissionMode,omitempty"`
+	MaxTurnsPerPod     int    `json:"maxTurnsPerPod,omitempty"`
 	MaxTurnsPerTask    int    `json:"maxTurnsPerTask,omitempty"`
+	MaxReviewRounds    int    `json:"maxReviewRounds,omitempty"`
+	MaxPodRecreations  int    `json:"maxPodRecreations,omitempty"`
 	TurnTimeoutSeconds int    `json:"turnTimeoutSeconds,omitempty"`
 }
 
@@ -19,14 +25,18 @@ type projectStatusDTO struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// ProjectDTO is the stable JSON shape for a Project CRD.
+// ProjectDTO is the stable JSON shape for a Project CRD (contract C.2.1).
 type ProjectDTO struct {
-	Name               string           `json:"name"`
-	ScmSecretRef       string           `json:"scmSecretRef,omitempty"`
-	TriggerLabel       string           `json:"triggerLabel,omitempty"`
-	MaxConcurrentTasks int              `json:"maxConcurrentTasks,omitempty"`
-	Agent              agentDTO         `json:"agent"`
-	Status             projectStatusDTO `json:"status"`
+	Name                string           `json:"name"`
+	ScmSecretRef        string           `json:"scmSecretRef,omitempty"`
+	TriggerLabel        string           `json:"triggerLabel,omitempty"`
+	MaxConcurrentAgents int              `json:"maxConcurrentAgents,omitempty"`
+	AgentPodTTLSeconds  int              `json:"agentPodTTLSeconds,omitempty"`
+	MaxNewTasksPerSweep int              `json:"maxNewTasksPerSweep,omitempty"`
+	MaxOpenTasks        int              `json:"maxOpenTasks,omitempty"`
+	MaxBundleBytes      int              `json:"maxBundleBytes,omitempty"`
+	Agent               agentDTO         `json:"agent"`
+	Status              projectStatusDTO `json:"status"`
 }
 
 type repositoryStatusDTO struct {
@@ -56,79 +66,110 @@ type taskSourceDTO struct {
 	Number      int    `json:"number,omitempty"`
 }
 
-type proposedIssueDTO struct {
-	RepositoryRef string `json:"repositoryRef,omitempty"`
-	Title         string `json:"title,omitempty"`
-	Body          string `json:"body,omitempty"`
-	Kind          string `json:"kind,omitempty"`
-	SystemicID    string `json:"systemicId,omitempty"`
-}
-
 type taskStatusDTO struct {
-	Phase             string                            `json:"phase,omitempty"`
-	PodName           string                            `json:"podName,omitempty"`
-	TurnsCompleted    int                               `json:"turnsCompleted,omitempty"`
-	PrURL             string                            `json:"prURL,omitempty"`
-	ResultSummary     string                            `json:"resultSummary,omitempty"`
-	DiscoveredIssues  []string                          `json:"discoveredIssues,omitempty"`
-	ReviewVerdict     *tatarav1alpha1.ReviewVerdict     `json:"reviewVerdict,omitempty"`
-	PROutcome         *tatarav1alpha1.PROutcome         `json:"prOutcome,omitempty"`
-	IssueOutcome      *tatarav1alpha1.IssueOutcome      `json:"issueOutcome,omitempty"`
-	ImplementOutcome  *tatarav1alpha1.ImplementOutcome  `json:"implementOutcome,omitempty"`
-	BrainstormOutcome *tatarav1alpha1.BrainstormOutcome `json:"brainstormOutcome,omitempty"`
-	ChangeSummary     *tatarav1alpha1.ChangeSummary     `json:"changeSummary,omitempty"`
-	Handover          string                            `json:"handover,omitempty"`
-	Conditions        []metav1.Condition                `json:"conditions,omitempty"`
-	PendingComments   []string                          `json:"pendingComments,omitempty"`
-	DeployState       string                            `json:"lifecycleState,omitempty"`
-	ParkReason        string                            `json:"parkReason,omitempty"`
-	ImplementGiveUps  int                               `json:"implementGiveUps,omitempty"`
-	Subtasks          []tatarav1alpha1.SubtaskRef       `json:"subtasks,omitempty"`
+	PodName    string             `json:"podName,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	Stage              string                   `json:"stage,omitempty"`
+	StageEnteredAt     string                   `json:"stageEnteredAt,omitempty"`
+	StageWorkStartedAt string                   `json:"stageWorkStartedAt,omitempty"`
+	AgentKind          string                   `json:"agentKind,omitempty"`
+	StageReason        string                   `json:"stageReason,omitempty"`
+	ParkedFromStage    string                   `json:"parkedFromStage,omitempty"`
+	Notes              []tatarav1alpha1.Note    `json:"notes,omitempty"`
+	Stats              tatarav1alpha1.TaskStats `json:"stats,omitempty"`
+	IssueRefs          []string                 `json:"issueRefs,omitempty"`
+	MRRefs             []string                 `json:"mrRefs,omitempty"`
+	MergeCursor        int                      `json:"mergeCursor,omitempty"`
+	DeliveredAt        string                   `json:"deliveredAt,omitempty"`
+	DocumentedBy       string                   `json:"documentedBy,omitempty"`
 }
 
-// TaskDTO is the stable JSON shape for a Task CRD.
+// TaskDTO is the stable JSON shape for a Task CRD (contract C.2.3, C.2.4).
 type TaskDTO struct {
-	Name             string            `json:"name"`
-	ProjectRef       string            `json:"projectRef,omitempty"`
-	RepositoryRef    string            `json:"repositoryRef,omitempty"`
-	Goal             string            `json:"goal,omitempty"`
-	Kind             string            `json:"kind,omitempty"`
-	DedupKey         string            `json:"dedupKey,omitempty"`
-	AlertRule        string            `json:"alertRule,omitempty"`
-	ApprovalRequired bool              `json:"approvalRequired,omitempty"`
-	Source           *taskSourceDTO    `json:"source,omitempty"`
-	ProposedIssue    *proposedIssueDTO `json:"proposedIssue,omitempty"`
-	MaxTurns         int               `json:"maxTurns,omitempty"`
-	Status           taskStatusDTO     `json:"status"`
-}
+	Name          string         `json:"name"`
+	ProjectRef    string         `json:"projectRef,omitempty"`
+	RepositoryRef string         `json:"repositoryRef,omitempty"`
+	Goal          string         `json:"goal,omitempty"`
+	Kind          string         `json:"kind,omitempty"`
+	DedupKey      string         `json:"dedupKey,omitempty"`
+	Source        *taskSourceDTO `json:"source,omitempty"`
+	Status        taskStatusDTO  `json:"status"`
 
-type subtaskStatusDTO struct {
-	Phase  string `json:"phase,omitempty"`
-	TurnID string `json:"turnId,omitempty"`
-	Result string `json:"result,omitempty"`
-}
-
-// SubtaskDTO is the stable JSON shape for a Subtask CRD.
-type SubtaskDTO struct {
-	Name    string           `json:"name"`
-	TaskRef string           `json:"taskRef,omitempty"`
-	Title   string           `json:"title,omitempty"`
-	Detail  string           `json:"detail,omitempty"`
-	Order   int              `json:"order"`
-	Status  subtaskStatusDTO `json:"status"`
+	// C.2.3 index fields and the C.2.4 spec additions.
+	Title           string   `json:"title,omitempty"`
+	Body            string   `json:"body,omitempty"`
+	Issues          []string `json:"issues,omitempty"`
+	MRs             []string `json:"mrs,omitempty"`
+	AgeSeconds      int64    `json:"ageSeconds,omitempty"`
+	MergeOrder      []string `json:"mergeOrder,omitempty"`
+	AlertRules      []string `json:"alertRules,omitempty"`
+	DocumentsTasks  []string `json:"documentsTasks,omitempty"`
+	MaxTurnsPerTask int      `json:"maxTurnsPerTask,omitempty"`
 }
 
 func toProjectDTO(p tatarav1alpha1.Project) ProjectDTO {
 	return ProjectDTO{
 		Name: p.Name, ScmSecretRef: p.Spec.ScmSecretRef, TriggerLabel: p.Spec.TriggerLabel,
-		MaxConcurrentTasks: p.Spec.MaxConcurrentTasks,
+		MaxConcurrentAgents: p.Spec.MaxConcurrentAgents,
+		AgentPodTTLSeconds:  p.Spec.AgentPodTTLSeconds,
+		MaxNewTasksPerSweep: p.Spec.MaxNewTasksPerSweep,
+		MaxOpenTasks:        p.Spec.MaxOpenTasks,
+		MaxBundleBytes:      p.Spec.MaxBundleBytes,
 		Agent: agentDTO{
 			Model: p.Spec.Agent.Model, Image: p.Spec.Agent.Image,
 			PermissionMode: p.Spec.Agent.PermissionMode, MaxTurnsPerTask: p.Spec.Agent.MaxTurnsPerTask,
+			MaxTurnsPerPod: p.Spec.Agent.MaxTurnsPerPod, MaxReviewRounds: p.Spec.Agent.MaxReviewRounds,
+			MaxPodRecreations:  p.Spec.Agent.MaxPodRecreations,
 			TurnTimeoutSeconds: p.Spec.Agent.TurnTimeoutSeconds,
 		},
 		Status: projectStatusDTO{WebhookURL: p.Status.WebhookURL, Conditions: p.Status.Conditions},
 	}
+}
+
+// rfc3339 renders a CRD timestamp, or "" when unset.
+func rfc3339(t *metav1.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// refKey turns an Issue/MergeRequest CR name (iss-<repo>-<n> / mr-<repo>-<n>)
+// back into the agent-facing natural key (<repo>#<n> / <repo>!<n>), the same
+// form the bundle renders and scm_read takes.
+func refKey(ref, prefix, sep string) string {
+	s := strings.TrimPrefix(ref, prefix)
+	i := strings.LastIndexByte(s, '-')
+	if i <= 0 {
+		return ref
+	}
+	return s[:i] + sep + s[i+1:]
+}
+
+func refKeys(refs []string, prefix, sep string) []string {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, refKey(r, prefix, sep))
+	}
+	return out
+}
+
+// taskTitle is the first line of spec.goal, capped; taskBody is its first 500
+// chars (C.2.3). The Task CRD carries no separate title.
+func taskTitle(goal string) string {
+	line := goal
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	return truncateValidUTF8(strings.TrimSpace(line), 120)
+}
+
+func taskBody(goal string) string {
+	return truncateValidUTF8(goal, 500)
 }
 
 func toRepositoryDTO(r tatarav1alpha1.Repository) RepositoryDTO {
@@ -150,27 +191,34 @@ func toRepositoryDTO(r tatarav1alpha1.Repository) RepositoryDTO {
 func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 	d := TaskDTO{
 		Name: task.Name, ProjectRef: task.Spec.ProjectRef, RepositoryRef: task.Spec.RepositoryRef,
-		Goal: task.Spec.Goal, MaxTurns: task.Spec.MaxTurns,
-		Kind: task.Spec.Kind, DedupKey: task.Spec.DedupKey, AlertRule: task.Spec.AlertRule,
-		ApprovalRequired: task.Spec.ApprovalRequired,
+		Goal: task.Spec.Goal, Kind: task.Spec.Kind, DedupKey: task.Spec.DedupKey,
 		Status: taskStatusDTO{
-			Phase: task.Status.Phase, PodName: task.Status.PodName,
-			TurnsCompleted: task.Status.TurnsCompleted, PrURL: task.Status.PrURL,
-			ResultSummary: task.Status.ResultSummary, Conditions: task.Status.Conditions,
-			DiscoveredIssues:  task.Status.DiscoveredIssues,
-			ReviewVerdict:     task.Status.ReviewVerdict,
-			PROutcome:         task.Status.PROutcome,
-			IssueOutcome:      task.Status.IssueOutcome,
-			ImplementOutcome:  task.Status.ImplementOutcome,
-			BrainstormOutcome: task.Status.BrainstormOutcome,
-			ChangeSummary:     task.Status.ChangeSummary,
-			Handover:          task.Status.Handover,
-			PendingComments:   task.Status.PendingComments,
-			DeployState:       task.Status.DeployState,
-			ParkReason:        task.Status.ParkReason,
-			ImplementGiveUps:  task.Status.ImplementGiveUps,
-			Subtasks:          task.Status.Subtasks,
+			PodName:    task.Status.PodName,
+			Conditions: task.Status.Conditions,
+
+			Stage:              task.Status.Stage,
+			StageEnteredAt:     rfc3339(task.Status.StageEnteredAt),
+			StageWorkStartedAt: rfc3339(task.Status.StageWorkStartedAt),
+			AgentKind:          task.Status.AgentKind,
+			StageReason:        task.Status.StageReason,
+			ParkedFromStage:    task.Status.ParkedFromStage,
+			Notes:              task.Status.Notes,
+			Stats:              task.Status.Stats,
+			IssueRefs:          task.Status.IssueRefs,
+			MRRefs:             task.Status.MRRefs,
+			MergeCursor:        task.Status.MergeCursor,
+			DeliveredAt:        rfc3339(task.Status.DeliveredAt),
+			DocumentedBy:       task.Status.DocumentedBy,
 		},
+		Title:           taskTitle(task.Spec.Goal),
+		Body:            taskBody(task.Spec.Goal),
+		Issues:          refKeys(task.Status.IssueRefs, "iss-", "#"),
+		MRs:             refKeys(task.Status.MRRefs, "mr-", "!"),
+		AgeSeconds:      int64(time.Since(task.CreationTimestamp.Time).Seconds()),
+		MergeOrder:      task.Spec.MergeOrder,
+		AlertRules:      task.Spec.AlertRules,
+		DocumentsTasks:  task.Spec.DocumentsTasks,
+		MaxTurnsPerTask: task.Spec.MaxTurnsPerTask,
 	}
 	if task.Spec.Source != nil {
 		d.Source = &taskSourceDTO{
@@ -179,22 +227,5 @@ func toTaskDTO(task tatarav1alpha1.Task) TaskDTO {
 			IsPR: task.Spec.Source.IsPR, Number: task.Spec.Source.Number,
 		}
 	}
-	if task.Spec.ProposedIssue != nil {
-		d.ProposedIssue = &proposedIssueDTO{
-			RepositoryRef: task.Spec.ProposedIssue.RepositoryRef,
-			Title:         task.Spec.ProposedIssue.Title,
-			Body:          task.Spec.ProposedIssue.Body,
-			Kind:          task.Spec.ProposedIssue.Kind,
-			SystemicID:    task.Spec.ProposedIssue.SystemicID,
-		}
-	}
 	return d
-}
-
-func toSubtaskDTO(st tatarav1alpha1.Subtask) SubtaskDTO {
-	return SubtaskDTO{
-		Name: st.Name, TaskRef: st.Spec.TaskRef, Title: st.Spec.Title,
-		Detail: st.Spec.Detail, Order: st.Spec.Order,
-		Status: subtaskStatusDTO{Phase: st.Status.Phase, TurnID: st.Status.TurnID, Result: st.Status.Result},
-	}
 }

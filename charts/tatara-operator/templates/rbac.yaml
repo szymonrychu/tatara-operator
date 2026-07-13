@@ -8,15 +8,20 @@ metadata:
     {{- include "tatara-operator.labels" . | nindent 4 }}
 rules:
   # CRDs reconciled by the manager (full CRUD on CRs + status subresource).
-  # Subtasks are created by the REST API (restapi.createSubtask, agent self-plan
-  # via POST /tasks/{t}/subtasks); delete is via owner-ref GC, but the verb is
-  # retained to match the markers and keep this rule a single coalesced block.
   - apiGroups: ["tatara.dev"]
-    resources: ["projects", "repositories", "tasks", "subtasks", "queuedevents"]
+    resources: ["projects", "repositories", "tasks", "queuedevents", "issues", "mergerequests"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["tatara.dev"]
-    resources: ["projects/status", "repositories/status", "tasks/status", "subtasks/status", "queuedevents/status"]
+    resources: ["projects/status", "repositories/status", "tasks/status", "queuedevents/status", "issues/status", "mergerequests/status"]
     verbs: ["get", "update", "patch"]
+  # tasks/finalizers update: the operator sets blockOwnerDeletion:true on every
+  # Task ownerRef of an Issue/MergeRequest (contract B.2 rule 2). A custom
+  # controller does not get blockOwnerDeletion for free - the API server checks
+  # update on the OWNER's finalizers subresource before it admits a dependent
+  # that asks for it. Without this rule every Issue/MR write is a 403.
+  - apiGroups: ["tatara.dev"]
+    resources: ["tasks/finalizers"]
+    verbs: ["update"]
   # ingest Jobs (batch).
   - apiGroups: ["batch"]
     resources: ["jobs"]
@@ -53,7 +58,7 @@ rules:
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors", "prometheusrules", "podmonitors"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Per-project Ingress (external exposure of memory + chat paths).
+  # Per-project Ingress (external exposure of the memory path).
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

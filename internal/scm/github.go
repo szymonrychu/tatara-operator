@@ -378,6 +378,9 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 		body = b
 	}
 	for attempt := 0; ; attempt++ {
+		if werr := waitEgress(ctx, "github", path); werr != nil {
+			return werr
+		}
 		var rdr io.Reader
 		if body != nil {
 			rdr = bytes.NewReader(body)
@@ -398,16 +401,22 @@ func ghDo(ctx context.Context, base, method, path, token string, in, out any) er
 		if resp.StatusCode >= 400 {
 			buf, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			if delay, retry := ghRateLimitDelay(resp, string(buf), attempt); retry && attempt < ghMaxRetries && delay <= ghMaxBackoff {
+			if !ghIsRateLimited(resp, string(buf)) {
+				return &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
+			}
+			recordRateLimited("github", path, resp, string(buf))
+			delay, _ := ghRateLimitDelay(resp, string(buf), attempt)
+			if attempt < ghMaxRetries && delay <= ghMaxBackoff {
 				slog.WarnContext(ctx, "github: rate-limited, backing off before retry",
 					"provider", "github", "method", method, "path", path,
-					"status", resp.StatusCode, "attempt", attempt+1, "delay_ms", delay.Milliseconds())
+					"status", resp.StatusCode, "limit_type", limitType(resp, string(buf)),
+					"attempt", attempt+1, "delay_ms", delay.Milliseconds())
 				if serr := ghRetrySleep(ctx, delay); serr != nil {
 					return serr
 				}
 				continue
 			}
-			return &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: path}
+			return rateLimitedError(resp.StatusCode, string(buf), path)
 		}
 		if out == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
@@ -601,10 +610,14 @@ func deriveGHCIStatus(runs []ghCheckRun) string {
 	return foldCIStatuses(statuses...)
 }
 
-func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, event, body string, comments []map[string]any) error {
+// review POSTs a review and returns the review id GitHub assigned it. The
+// response body used to be thrown away (ghDo(..., nil)), which is why no SCM
+// method returned an id at all; PostReview needs one, so it is decoded here and
+// the id-free callers simply ignore it.
+func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, event, body string, comments []map[string]any) (string, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
-		return err
+		return "", err
 	}
 	in := map[string]any{"event": event}
 	if body != "" {
@@ -614,7 +627,13 @@ func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, 
 		in["comments"] = comments
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews", owner, repo, number)
-	return ghDo(ctx, c.base(), http.MethodPost, path, token, in, nil)
+	var out struct {
+		ID int64 `json:"id"`
+	}
+	if err := ghDo(ctx, c.base(), http.MethodPost, path, token, in, &out); err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(out.ID, 10), nil
 }
 
 // Approve posts an APPROVE review.
@@ -628,7 +647,7 @@ func (c *GitHub) review(ctx context.Context, repoURL, token string, number int, 
 // managed label gates the deploy supervisor and native auto-merge, so the caller
 // proceeds to label it. Any other error (including an unrelated 422) still surfaces.
 func (c *GitHub) Approve(ctx context.Context, repoURL, token string, number int, body string) error {
-	err := c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
+	_, err := c.review(ctx, repoURL, token, number, "APPROVE", body, nil)
 	var he *HTTPError
 	if errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity &&
 		strings.Contains(he.Body, "Can not approve your own pull request") {
@@ -643,7 +662,8 @@ func (c *GitHub) RequestChanges(ctx context.Context, repoURL, token string, numb
 	if body == "" {
 		body = "Requesting changes."
 	}
-	return c.review(ctx, repoURL, token, number, "REQUEST_CHANGES", body, nil)
+	_, err := c.review(ctx, repoURL, token, number, "REQUEST_CHANGES", body, nil)
+	return err
 }
 
 // Suggest posts inline review comments with ```suggestion bodies.
@@ -656,7 +676,171 @@ func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int,
 			"body": "```suggestion\n" + s.Body + "\n```",
 		})
 	}
-	return c.review(ctx, repoURL, token, number, "COMMENT", "", comments)
+	_, err := c.review(ctx, repoURL, token, number, reviewEventComment, "", comments)
+	return err
+}
+
+// GetPRHead reads the LIVE head sha of a PR.
+func (c *GitHub) GetPRHead(ctx context.Context, repoURL, token string, number int) (string, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return "", err
+	}
+	var pr struct {
+		Head struct {
+			SHA string `json:"sha"`
+		} `json:"head"`
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)
+	if err := ghDo(ctx, c.base(), http.MethodGet, path, token, nil, &pr); err != nil {
+		return "", err
+	}
+	if pr.Head.SHA == "" {
+		return "", fmt.Errorf("github: pr %s/%s#%d returned no head sha", owner, repo, number)
+	}
+	return pr.Head.SHA, nil
+}
+
+// ListReviews returns the PR's reviews. This is the forge-side idempotency check
+// behind the review post: a body already carrying the round marker means the
+// post landed, even if the process died before recording that it had.
+func (c *GitHub) ListReviews(ctx context.Context, repoURL, token string, number int) ([]Review, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	type ghReview struct {
+		ID          int64     `json:"id"`
+		Body        string    `json:"body"`
+		State       string    `json:"state"`
+		CommitID    string    `json:"commit_id"`
+		SubmittedAt time.Time `json:"submitted_at"`
+		User        struct {
+			Login string `json:"login"`
+		} `json:"user"`
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100", owner, repo, number)
+	raw, err := ghDoPaged[ghReview](ctx, c.base(), path, token)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Review, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, Review{
+			ID:        strconv.FormatInt(r.ID, 10),
+			Body:      r.Body,
+			State:     r.State,
+			CommitID:  r.CommitID,
+			Author:    r.User.Login,
+			CreatedAt: r.SubmittedAt,
+		})
+	}
+	return out, nil
+}
+
+// PostReview posts the review body plus its inline findings in ONE atomic call
+// and returns the review id. The event is always COMMENT (reviewEventComment):
+// with one bot identity GitHub 422s both APPROVE and REQUEST_CHANGES on a
+// self-authored PR, so those events are not in the enum at all and no code path
+// can produce them.
+//
+// Because the create-review call is atomic, one round marker in the body is a
+// truthful "everything for this round landed" flag - which is what makes the
+// GitHub post crash-safe with a single marker, and why GitLab (N+1 calls) cannot
+// use the same scheme.
+//
+// The response is the REVIEW object; it does NOT carry the created inline
+// comments. Their ids come from ListReviewComments, a second, separate read.
+func (c *GitHub) PostReview(ctx context.Context, repoURL, token string, number int, body string, findings []ReviewFinding) (string, error) {
+	comments := make([]map[string]any, 0, len(findings))
+	for _, f := range findings {
+		comments = append(comments, map[string]any{
+			"path": f.Path,
+			"line": f.Line,
+			"body": f.Body,
+		})
+	}
+	if len(comments) == 0 {
+		comments = nil
+	}
+	id, err := c.review(ctx, repoURL, token, number, reviewEventComment, body, comments)
+	if err != nil {
+		return "", classifyReviewPostError(err)
+	}
+	return id, nil
+}
+
+// ListReviewComments is the SECOND read: GitHub's create-review response does
+// not carry the inline comments it created, so their ids, paths and lines are
+// fetched here. reviewID is the id PostReview returned (or the id of the review
+// the forge-side dedup check found already present).
+func (c *GitHub) ListReviewComments(ctx context.Context, repoURL, token string, number int, reviewID string) ([]PostedComment, error) {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return nil, err
+	}
+	if reviewID == "" {
+		return nil, errors.New("github: list review comments: empty review id")
+	}
+	type ghReviewComment struct {
+		ID           int64     `json:"id"`
+		Path         string    `json:"path"`
+		Line         int       `json:"line"`
+		OriginalLine int       `json:"original_line"`
+		InReplyToID  int64     `json:"in_reply_to_id"`
+		Body         string    `json:"body"`
+		CreatedAt    time.Time `json:"created_at"`
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews/%s/comments?per_page=100",
+		owner, repo, number, url.PathEscape(reviewID))
+	raw, err := ghDoPaged[ghReviewComment](ctx, c.base(), path, token)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]PostedComment, 0, len(raw))
+	for _, rc := range raw {
+		line := rc.Line
+		if line == 0 {
+			// GitHub nulls `line` for a comment on an outdated diff position and
+			// keeps the anchor in original_line. A zero line would mirror as
+			// "file-level", losing the anchor the agent needs to reply.
+			line = rc.OriginalLine
+		}
+		pc := PostedComment{
+			ExternalID: strconv.FormatInt(rc.ID, 10),
+			Path:       rc.Path,
+			Line:       line,
+			Body:       rc.Body,
+			CreatedAt:  rc.CreatedAt,
+		}
+		if rc.InReplyToID != 0 {
+			pc.InReplyTo = strconv.FormatInt(rc.InReplyToID, 10)
+		}
+		out = append(out, pc)
+	}
+	return out, nil
+}
+
+// classifyReviewPostError maps a structural 4xx from the review POST to the
+// TERMINAL ErrReviewRefused. 422 ("Can not approve your own pull request"), 401
+// and 403 cannot be fixed by retrying, and hot-requeueing them - which is what
+// writeback_review.go does today with any Approve error - spins forever. The
+// caller parks at review-post-refused instead. Any other error stays retryable.
+func classifyReviewPostError(err error) error {
+	var he *HTTPError
+	if !errors.As(err, &he) {
+		return err
+	}
+	switch he.Status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusUnprocessableEntity:
+		// A rate-limit 403 is transient, not structural: it must stay requeueable.
+		if errors.Is(err, ErrRateLimited) {
+			return err
+		}
+		return fmt.Errorf("%w: %w", ErrReviewRefused, err)
+	default:
+		return err
+	}
 }
 
 // Merge merges a PR with the given method (squash|merge|rebase).
@@ -665,19 +849,33 @@ func (c *GitHub) Suggest(ctx context.Context, repoURL, token string, number int,
 // conflict/head mismatch occurred (409 Conflict). The poll model means CI
 // must be green before this is called; use pollRequeue to avoid rate-limit
 // storms while waiting for CI rather than enabling platform auto-merge.
-func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error) {
+// expectedHeadSHA, when non-empty, is sent as `sha` so GitHub refuses the merge
+// with a 409 if the head moved between the review and the merge. That 409 maps to
+// ErrHeadMoved (NOT ErrMergeConflict): the caller re-reviews the new head rather
+// than treating a moved head as an unmergeable PR. An empty expectedHeadSHA means
+// "no pin" and preserves the pre-pin behaviour exactly.
+func (c *GitHub) Merge(ctx context.Context, repoURL, token string, number int, method, expectedHeadSHA string) (string, error) {
 	owner, repo, err := ghOwnerRepo(repoURL)
 	if err != nil {
 		return "", err
 	}
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", owner, repo, number)
+	in := map[string]string{"merge_method": method}
+	if expectedHeadSHA != "" {
+		in["sha"] = expectedHeadSHA
+	}
 	var resp struct {
 		SHA string `json:"sha"`
 	}
-	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, map[string]string{"merge_method": method}, &resp); err != nil {
+	if err := ghDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
 		var he *HTTPError
-		if errors.As(err, &he) && (he.Status == 405 || he.Status == 409) {
-			return "", ErrMergeConflict
+		if errors.As(err, &he) && !errors.Is(err, ErrRateLimited) {
+			if he.Status == http.StatusConflict && expectedHeadSHA != "" {
+				return "", fmt.Errorf("%w: %w", ErrHeadMoved, err)
+			}
+			if he.Status == http.StatusMethodNotAllowed || he.Status == http.StatusConflict {
+				return "", ErrMergeConflict
+			}
 		}
 		return "", err
 	}

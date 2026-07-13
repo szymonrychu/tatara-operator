@@ -34,10 +34,6 @@ const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
 // re-evaluate the schedule reasonably soon.
 const maxScheduleRequeue = 6 * time.Hour
 
-// backlogRequeue is the short requeue used while a scan still has open items with
-// no Task (lanes full), so freed lanes refill without waiting for the next cron fire.
-const backlogRequeue = 60 * time.Second
-
 // requeueRefineBarrier is the requeue used when scans are deferred waiting for
 // a refine Task to reach a terminal state.
 const requeueRefineBarrier = 30 * time.Second
@@ -531,13 +527,13 @@ func (r *RepositoryReconciler) computeRepoCounts(ctx context.Context, repo *tata
 	issues, incidents := 0, 0
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
-		if t.Spec.RepositoryRef != repo.Name || tataradevv1alpha1.TaskTerminal(t) {
+		if t.Spec.RepositoryRef != repo.Name || tataradevv1alpha1.TaskDone(t) {
 			continue
 		}
 		switch t.Spec.Kind {
 		case "incident":
 			incidents++
-		case "issueLifecycle", "clarify":
+		case "clarify":
 			issues++
 		}
 	}

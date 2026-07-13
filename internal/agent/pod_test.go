@@ -110,7 +110,6 @@ func TestBuildPod_PlainEnv(t *testing.T) {
 		"OIDC_AUDIENCE":        "tatara-claude-code-wrapper",
 		"TATARA_MEMORY_URL":    "http://mem-demo.tatara.svc:8080",
 		"TATARA_OPERATOR_URL":  "http://tatara-operator.tatara.svc:8080",
-		"TATARA_CHAT_URL":      "http://tatara-chat.tatara.svc:8080",
 	}
 	for k, want := range checks {
 		got, ok := envValue(c, k)
@@ -469,17 +468,6 @@ func TestValidatePodSecretRefs(t *testing.T) {
 	require.ErrorContains(t, agent.ValidatePodSecretRefs(proj, cfgNoCLI), "CLIOIDCSecretName")
 }
 
-// TestBuildPod_ChatURL asserts that BuildPod injects TATARA_CHAT_URL pointing at
-// the in-cluster chat service for the project so agent chat tools do not fall
-// through to the public ingress default.
-func TestBuildPod_ChatURL(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	got, ok := envValue(c, "TATARA_CHAT_URL")
-	require.True(t, ok, "TATARA_CHAT_URL missing from pod env")
-	require.Equal(t, "http://tatara-chat.tatara.svc:8080", got)
-}
-
 // TestValidatePodSecurityContext rejects RunAsNonRoot=true without RunAsUser.
 // Defence-in-depth mirror of ValidatePodSecretRefs: the operator fails fast at
 // config load so kubelet CreateContainerConfigError never fires per-spawn.
@@ -616,48 +604,6 @@ func TestBuildPodEgressLabel(t *testing.T) {
 	}
 }
 
-func TestBuildPod_HookEnvs(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	proj.Spec.Agent.Hooks = &tatarav1alpha1.LifecycleHooks{
-		PreClone:             "echo pre",
-		PostClone:            "echo post",
-		ConversationStart:    "echo start",
-		ConversationRestart:  "echo restart",
-		AgentTurnFinished:    "echo turn",
-		ConversationFinished: "echo finished",
-	}
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	for k, want := range map[string]string{
-		"HOOK_PRE_CLONE":             "echo pre",
-		"HOOK_POST_CLONE":            "echo post",
-		"HOOK_CONVERSATION_START":    "echo start",
-		"HOOK_CONVERSATION_RESTART":  "echo restart",
-		"HOOK_AGENT_TURN_FINISHED":   "echo turn",
-		"HOOK_CONVERSATION_FINISHED": "echo finished",
-	} {
-		got, ok := envValue(c, k)
-		require.Truef(t, ok, "hook env %s missing", k)
-		require.Equalf(t, want, got, "hook env %s", k)
-	}
-}
-
-func TestBuildPod_HookEnvs_OnlyNonEmptyEmitted(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	// Only one hook set: the other five must not appear as env vars.
-	proj.Spec.Agent.Hooks = &tatarav1alpha1.LifecycleHooks{PreClone: "echo pre"}
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	got, ok := envValue(c, "HOOK_PRE_CLONE")
-	require.True(t, ok)
-	require.Equal(t, "echo pre", got)
-	for _, k := range []string{
-		"HOOK_POST_CLONE", "HOOK_CONVERSATION_START", "HOOK_CONVERSATION_RESTART",
-		"HOOK_AGENT_TURN_FINISHED", "HOOK_CONVERSATION_FINISHED",
-	} {
-		_, ok := envValue(c, k)
-		require.Falsef(t, ok, "unset hook %s must not be emitted", k)
-	}
-}
-
 func TestBuildPod_NoHooks_NoHookEnvs(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs()
 	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
@@ -720,35 +666,6 @@ func TestBuildPod_NoExtras_EmptyByDefault(t *testing.T) {
 	require.Len(t, pod.Spec.Containers, 1, "no sidecars by default")
 }
 
-func TestConversationKey(t *testing.T) {
-	// issue-numbered task.
-	issue := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "t-issue"},
-		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef: "tatara", RepositoryRef: "tatara-operator",
-			Source: &tatarav1alpha1.TaskSource{Number: 114},
-		},
-	}
-	require.Equal(t, "tatara/tatara-operator/issue-114.jsonl", agent.ConversationKey(issue))
-
-	// PR-numbered task.
-	pr := issue.DeepCopy()
-	pr.Spec.Source.IsPR = true
-	require.Equal(t, "tatara/tatara-operator/pr-114.jsonl", agent.ConversationKey(pr))
-
-	// No source -> keyed by task name.
-	noSrc := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: "brainstorm-x"},
-		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "tatara"},
-	}
-	require.Equal(t, "tatara/task-brainstorm-x.jsonl", agent.ConversationKey(noSrc))
-
-	// Status override wins (e.g. a forked key, subtask 8).
-	forked := issue.DeepCopy()
-	forked.Status.ConversationObjectKey = "tatara/forked/issue-200.jsonl"
-	require.Equal(t, "tatara/forked/issue-200.jsonl", agent.ConversationKey(forked))
-}
-
 func TestBuildPod_S3DisabledByDefault(t *testing.T) {
 	proj, repo, task, cfg := sampleInputs() // no S3Bucket
 	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
@@ -757,85 +674,6 @@ func TestBuildPod_S3DisabledByDefault(t *testing.T) {
 		_, okSecret := envSecretRef(c, k)
 		require.False(t, ok || okSecret, "%s must NOT be set when no S3 bucket configured", k)
 	}
-}
-
-func TestBuildPod_S3EnabledInjectsEnvCredsAndKey(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	cfg.S3Endpoint = "http://rook-ceph-rgw.tatara.svc"
-	cfg.S3Bucket = "tatara-conversations"
-	cfg.S3Region = "us-east-1"
-	cfg.S3KeyPrefix = "conv"
-	cfg.S3ForcePathStyle = true
-	cfg.S3SecretName = "tatara-s3"
-	task.Spec.Source = &tatarav1alpha1.TaskSource{Number: 114}
-
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	requireEnv := func(name, want string) {
-		got, ok := envValue(c, name)
-		require.True(t, ok, "%s must be set", name)
-		require.Equal(t, want, got)
-	}
-	requireEnv("S3_ENDPOINT", "http://rook-ceph-rgw.tatara.svc")
-	requireEnv("S3_BUCKET", "tatara-conversations")
-	requireEnv("S3_REGION", "us-east-1")
-	requireEnv("S3_KEY_PREFIX", "conv")
-	requireEnv("S3_FORCE_PATH_STYLE", "true")
-	requireEnv("CONVERSATION_OBJECT_KEY", "demo/repo1/issue-114.jsonl")
-
-	// CONVERSATION_SESSION_ID only once Status.SessionID is recorded.
-	_, hasSID := envValue(c, "CONVERSATION_SESSION_ID")
-	require.False(t, hasSID, "no session id env until a prior run recorded it")
-
-	// AWS creds via SecretKeyRef, not literal env.
-	ref, ok := envSecretRef(c, "AWS_ACCESS_KEY_ID")
-	require.True(t, ok)
-	require.Equal(t, "tatara-s3", ref.Name)
-	require.Equal(t, "AWS_ACCESS_KEY_ID", ref.Key)
-	_, ok = envSecretRef(c, "AWS_SECRET_ACCESS_KEY")
-	require.True(t, ok)
-}
-
-func TestBuildPod_S3SessionIDReplay(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	cfg.S3Bucket = "tatara-conversations"
-	task.Status.SessionID = "sid-abc"
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	got, ok := envValue(c, "CONVERSATION_SESSION_ID")
-	require.True(t, ok, "CONVERSATION_SESSION_ID must be set when Status.SessionID is recorded")
-	require.Equal(t, "sid-abc", got)
-}
-
-func TestBuildPod_S3CompactionSkipsFullResume(t *testing.T) {
-	// When the pending-handover-resume annotation is set (context over threshold),
-	// BuildPod must NOT emit CONVERSATION_SESSION_ID (so the wrapper starts fresh
-	// and the operator's compacted handover is used instead) while still emitting
-	// the object key so the fresh compacted session is persisted.
-	proj, repo, task, cfg := sampleInputs()
-	cfg.S3Bucket = "tatara-conversations"
-	task.Status.SessionID = "sid-abc"
-	task.Annotations = map[string]string{tatarav1alpha1.AnnPendingHandoverResume: "true"}
-
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	_, hasSID := envValue(c, "CONVERSATION_SESSION_ID")
-	require.False(t, hasSID, "compaction must skip full resume (no CONVERSATION_SESSION_ID)")
-	_, hasKey := envValue(c, "CONVERSATION_OBJECT_KEY")
-	require.True(t, hasKey, "object key still emitted so the compacted session is persisted")
-}
-
-func TestBuildPod_S3ForkFromKey(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	cfg.S3Bucket = "tatara-conversations"
-	task.Annotations = map[string]string{tatarav1alpha1.AnnForkFromConversationKey: "demo/task-brainstorm.jsonl"}
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	got, ok := envValue(c, "CONVERSATION_FORK_FROM_KEY")
-	require.True(t, ok, "CONVERSATION_FORK_FROM_KEY must be set when the fork annotation is present")
-	require.Equal(t, "demo/task-brainstorm.jsonl", got)
-
-	// Absent annotation -> no fork env.
-	_, _, task2, _ := sampleInputs()
-	c2 := agent.BuildPod(proj, repo, task2, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	_, ok = envValue(c2, "CONVERSATION_FORK_FROM_KEY")
-	require.False(t, ok, "no fork env without the annotation")
 }
 
 func TestBuildPod_ReviewChecksOutPRHeadAndDoesNotPush(t *testing.T) {
@@ -862,16 +700,6 @@ func TestBuildPod_ReviewWithoutHeadBranchFallsBackToTaskBranch(t *testing.T) {
 	require.NotEmpty(t, tb, "without a head branch the review keeps the default task branch")
 	_, ok := envValue(c, "CHECKOUT_BRANCH")
 	require.False(t, ok, "no CHECKOUT_BRANCH without a head branch")
-}
-
-func TestBuildPod_S3NoCredsWhenSecretEmpty(t *testing.T) {
-	proj, repo, task, cfg := sampleInputs()
-	cfg.S3Bucket = "tatara-conversations" // no S3SecretName -> default cred chain (IRSA)
-	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
-	_, ok := envSecretRef(c, "AWS_ACCESS_KEY_ID")
-	require.False(t, ok, "no AWS creds injected when S3SecretName is empty")
-	_, ok = envValue(c, "S3_BUCKET")
-	require.True(t, ok, "S3 config still injected for the IRSA path")
 }
 
 func TestBuildPod_MetricIdentityEnv(t *testing.T) {
@@ -905,4 +733,44 @@ func TestBuildPod_MetricIdentityEnv_ProjectScopedEmptyRepo(t *testing.T) {
 	r, ok := envValue(c, "TATARA_REPO")
 	require.True(t, ok, "TATARA_REPO must be present even when empty")
 	require.Equal(t, "", r)
+}
+func TestBuildPod_HookEnvs(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	proj.Spec.Agent.Hooks = &tatarav1alpha1.LifecycleHooks{
+		PreClone:             "echo pre",
+		PostClone:            "echo post",
+		ConversationStart:    "echo start",
+		ConversationRestart:  "echo restart",
+		AgentTurnFinished:    "echo turn",
+		ConversationFinished: "echo finished",
+	}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	for k, want := range map[string]string{
+		"HOOK_PRE_CLONE":             "echo pre",
+		"HOOK_POST_CLONE":            "echo post",
+		"HOOK_CONVERSATION_START":    "echo start",
+		"HOOK_CONVERSATION_RESTART":  "echo restart",
+		"HOOK_AGENT_TURN_FINISHED":   "echo turn",
+		"HOOK_CONVERSATION_FINISHED": "echo finished",
+	} {
+		got, ok := envValue(c, k)
+		require.Truef(t, ok, "hook env %s missing", k)
+		require.Equalf(t, want, got, "hook env %s", k)
+	}
+}
+func TestBuildPod_HookEnvs_OnlyNonEmptyEmitted(t *testing.T) {
+	proj, repo, task, cfg := sampleInputs()
+	// Only one hook set: the other five must not appear as env vars.
+	proj.Spec.Agent.Hooks = &tatarav1alpha1.LifecycleHooks{PreClone: "echo pre"}
+	c := agent.BuildPod(proj, repo, task, nil, testMemoryEndpoint, cfg).Spec.Containers[0]
+	got, ok := envValue(c, "HOOK_PRE_CLONE")
+	require.True(t, ok)
+	require.Equal(t, "echo pre", got)
+	for _, k := range []string{
+		"HOOK_POST_CLONE", "HOOK_CONVERSATION_START", "HOOK_CONVERSATION_RESTART",
+		"HOOK_AGENT_TURN_FINISHED", "HOOK_CONVERSATION_FINISHED",
+	} {
+		_, ok := envValue(c, k)
+		require.Falsef(t, ok, "unset hook %s must not be emitted", k)
+	}
 }

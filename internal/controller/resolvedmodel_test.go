@@ -14,7 +14,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
-func TestEnsurePodAndService_StampsResolvedModel(t *testing.T) {
+func TestEnsureStagePod_StampsResolvedModel(t *testing.T) {
 	ctx := logf.IntoContext(context.Background(), logf.Log)
 
 	mkSecret(t, "rm-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
@@ -57,7 +57,7 @@ func TestEnsurePodAndService_StampsResolvedModel(t *testing.T) {
 			ProjectRef:    "rm-proj",
 			RepositoryRef: "rm-repo",
 			Goal:          "test resolved model stamp",
-			Kind:          "implement",
+			Kind:          "clarify",
 		},
 	}
 	if err := k8sClient.Create(ctx, task); err != nil {
@@ -77,8 +77,8 @@ func TestEnsurePodAndService_StampsResolvedModel(t *testing.T) {
 		},
 	}
 
-	if _, err := r.ensurePodAndService(ctx, proj, repo, task); err != nil {
-		t.Fatalf("ensurePodAndService: %v", err)
+	if err := r.ensureStagePod(ctx, proj, task); err != nil {
+		t.Fatalf("ensureStagePod: %v", err)
 	}
 
 	got := &tatarav1alpha1.Task{}

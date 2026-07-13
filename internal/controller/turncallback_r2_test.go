@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/szymonrychu/tatara-operator/internal/agent"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
 // --- Finding 1: recordUsage stale/duplicate guard ---
@@ -18,12 +18,12 @@ import (
 // a no-op when annCurrentTurn no longer matches the provided turnID.
 // Before the fix, recordUsage had no stale-turn guard so a second POST for the
 // same turnId (e.g. wrapper retry after a 500 from recordResult) would bump
-// CumulativeTokens twice.
+// Stats.TokensOutput twice.
 func TestRecordUsage_StaleCallbackDoesNotDoubleCount(t *testing.T) {
 	mkTaskProject(t, "p-ru1", 3)
 	mkTaskRepository(t, "r-ru1", "p-ru1")
 	mkTask(t, "t-ru1", "p-ru1", "r-ru1")
-	setTaskCumulativeTokens(t, "t-ru1", 0)
+	setTaskTokens(t, "t-ru1", 0)
 	annotate(t, "t-ru1", map[string]string{annCurrentTurn: "turn-ru1"})
 
 	cb := newCallbackServer()
@@ -34,8 +34,8 @@ func TestRecordUsage_StaleCallbackDoesNotDoubleCount(t *testing.T) {
 	if _, _, err := cb.recordUsage(context.Background(), task, rawUsage, "turn-ru1"); err != nil {
 		t.Fatalf("recordUsage first call: %v", err)
 	}
-	if tk := getTask(t, "t-ru1"); tk.Status.CumulativeTokens != 50 {
-		t.Fatalf("after first call CumulativeTokens = %d, want 50", tk.Status.CumulativeTokens)
+	if tk := getTask(t, "t-ru1"); tk.Status.Stats.TokensOutput != 50 {
+		t.Fatalf("after first call Stats.TokensOutput = %d, want 50", tk.Status.Stats.TokensOutput)
 	}
 
 	// Simulate reconcile advancing the turn - old turn is no longer current.
@@ -46,8 +46,8 @@ func TestRecordUsage_StaleCallbackDoesNotDoubleCount(t *testing.T) {
 	if _, _, err := cb.recordUsage(context.Background(), task2, rawUsage, "turn-ru1"); err != nil {
 		t.Fatalf("recordUsage stale call: %v", err)
 	}
-	if tk := getTask(t, "t-ru1"); tk.Status.CumulativeTokens != 50 {
-		t.Errorf("CumulativeTokens = %d after stale recordUsage, want 50 (no double-count)", tk.Status.CumulativeTokens)
+	if tk := getTask(t, "t-ru1"); tk.Status.Stats.TokensOutput != 50 {
+		t.Errorf("Stats.TokensOutput = %d after stale recordUsage, want 50 (no double-count)", tk.Status.Stats.TokensOutput)
 	}
 }
 
@@ -57,8 +57,8 @@ func TestRecordUsage_TerminalTaskIsNoop(t *testing.T) {
 	mkTaskProject(t, "p-ru2", 3)
 	mkTaskRepository(t, "r-ru2", "p-ru2")
 	mkTask(t, "t-ru2", "p-ru2", "r-ru2")
-	setTaskPhase(t, "t-ru2", "Failed")
-	setTaskCumulativeTokens(t, "t-ru2", 999)
+	setTaskStage(t, "t-ru2", tatarav1alpha1.StageFailed)
+	setTaskTokens(t, "t-ru2", 999)
 	annotate(t, "t-ru2", map[string]string{annCurrentTurn: "turn-ru2"})
 
 	cb := newCallbackServer()
@@ -67,41 +67,12 @@ func TestRecordUsage_TerminalTaskIsNoop(t *testing.T) {
 	if _, _, err := cb.recordUsage(context.Background(), task, rawUsage, "turn-ru2"); err != nil {
 		t.Fatalf("recordUsage: %v", err)
 	}
-	if tk := getTask(t, "t-ru2"); tk.Status.CumulativeTokens != 999 {
-		t.Errorf("CumulativeTokens = %d, want 999 (no-op on terminal task)", tk.Status.CumulativeTokens)
+	if tk := getTask(t, "t-ru2"); tk.Status.Stats.TokensOutput != 999 {
+		t.Errorf("Stats.TokensOutput = %d, want 999 (no-op on terminal task)", tk.Status.Stats.TokensOutput)
 	}
 }
 
 // --- Findings 2, 5: recordResult subtask write must be guarded ---
-
-// TestRecordResult_StaleSubtaskNotClobbered verifies that a stale callback
-// (turnID != fresh annCurrentTurn) does NOT overwrite the current subtask's result.
-func TestRecordResult_StaleSubtaskNotClobbered(t *testing.T) {
-	mkTaskProject(t, "p-ss1", 3)
-	mkTaskRepository(t, "r-ss1", "p-ss1")
-	mkTask(t, "t-ss1", "p-ss1", "r-ss1")
-	mkSubtask(t, "t-ss1-sub", "t-ss1", 1)
-	// Seed correct result on the subtask - the "current turn" already wrote it.
-	setSubtaskResult(t, "t-ss1-sub", "correct result from current turn")
-	// Task has advanced to a new turn.
-	annotate(t, "t-ss1", map[string]string{
-		annCurrentTurn:    "new-turn-2",
-		annCurrentSubtask: "t-ss1-sub",
-	})
-
-	cb := newCallbackServer()
-	task := getTask(t, "t-ss1")
-	// A stale callback for "old-turn" must not overwrite the subtask result.
-	if err := cb.recordResult(context.Background(),
-		agent.TurnResult{State: "completed", FinalText: "stale result"},
-		task, "old-turn"); err != nil {
-		t.Fatalf("recordResult: %v", err)
-	}
-	st := getSubtask(t, "t-ss1-sub")
-	if st.Status.Result != "correct result from current turn" {
-		t.Errorf("subtask result = %q; stale callback must NOT clobber existing result", st.Status.Result)
-	}
-}
 
 // --- Findings 4, 6: resolveTaskByTurn - direct Get when task name provided ---
 
@@ -173,11 +144,3 @@ func TestHandleTurnComplete_WithTaskName(t *testing.T) {
 // --- helpers ---
 
 // setSubtaskResult seeds a subtask's result for tests.
-func setSubtaskResult(t *testing.T, name, result string) {
-	t.Helper()
-	st := getSubtask(t, name)
-	st.Status.Result = result
-	if err := k8sClient.Status().Update(context.Background(), st); err != nil {
-		t.Fatalf("setSubtaskResult %s: %v", name, err)
-	}
-}

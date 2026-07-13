@@ -29,21 +29,71 @@ type QueuedEventPayload struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	Annotations   map[string]string `json:"annotations,omitempty"`
 	// GenerateName is used when Name is empty; Name is a fixed deterministic
-	// Task name (issueLifecycle) that makes admission idempotent.
+	// Task name that makes admission idempotent.
 	GenerateName string `json:"generateName,omitempty"`
 	Name         string `json:"name,omitempty"`
 	// Provider + PodRepo feed agent.StampPodName on the rebuilt Task.
 	Provider string `json:"provider,omitempty"`
 	PodRepo  string `json:"podRepo,omitempty"`
-	// +optional
-	SystemicGroup *SystemicGroup `json:"systemicGroup,omitempty"`
-	// AlertRule is carried from the incident webhook onto the built Task.
+	// AlertRule is carried from the incident webhook onto the built Task's
+	// Spec.AlertRules.
 	// +optional
 	AlertRule string `json:"alertRule,omitempty"`
 	// DedupKey is carried from the incident webhook onto the built Task's
-	// Spec.DedupKey (the incident dedup identity, item 6).
+	// Spec.DedupKey (the incident alert-group dedup identity).
 	// +optional
 	DedupKey string `json:"dedupKey,omitempty"`
+
+	// AgentKind is the pod to spawn for a stage-driven admission (contract
+	// B.7). It marks the ADMISSION-TICKET payload shape: when set, exactly one
+	// of TaskRef / NewTask must also be set (ValidateQueuedEventSpec enforces
+	// this). Kept +optional at the CRD level (unlike the contract's bare
+	// literal) so a flat MINT payload (the sweep/webhook producers, which fill
+	// only Kind/Goal/...) keeps validating unchanged.
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement
+	// +optional
+	AgentKind string `json:"agentKind,omitempty"`
+	// TaskRef names an EXISTING Task (a stage-driven spawn).
+	// Exactly one of TaskRef / NewTask is set when AgentKind is set.
+	// +optional
+	TaskRef string `json:"taskRef,omitempty"`
+	// NewTask is the blueprint for a Task that does not exist yet (a mint).
+	// +optional
+	NewTask *QueuedTaskBlueprint `json:"newTask,omitempty"`
+}
+
+// QueuedTaskBlueprint is the mint blueprint for a Task that does not exist
+// yet (contract B.7), carried on QueuedEventPayload.NewTask.
+type QueuedTaskBlueprint struct {
+	// Name is deterministic so admission is idempotent.
+	Name string `json:"name"`
+	// Kind is the ORIGIN kind.
+	Kind string `json:"kind"`
+	// Goal carries the SAME MaxLength=16384 cap as Task.spec.goal
+	// (task_types.go) - it is NON-EVICTABLE at the far end.
+	// +kubebuilder:validation:MaxLength=16384
+	Goal          string `json:"goal"`
+	ProjectRef    string `json:"projectRef"`
+	RepositoryRef string `json:"repositoryRef,omitempty"`
+	// +optional
+	IssueKeys []string `json:"issueKeys,omitempty"` // "<repo>#<number>"
+	// +optional
+	AlertRules  []string          `json:"alertRules,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// validAgentKinds are the 7 kinds a QueuedEventPayload.AgentKind may name
+// (contract B.7). Deliberately narrower than IsKnownKind (task_types.go),
+// which also accepts the retired legacy kinds for already-persisted Tasks.
+var validAgentKinds = map[string]bool{
+	"brainstorm":    true,
+	"incident":      true,
+	"clarify":       true,
+	"refine":        true,
+	"review":        true,
+	"documentation": true,
+	"implement":     true,
 }
 
 type QueuedEventSpec struct {
@@ -55,6 +105,31 @@ type QueuedEventSpec struct {
 	RepositoryRef string             `json:"repositoryRef,omitempty"`
 	DedupKey      string             `json:"dedupKey,omitempty"`
 	Payload       QueuedEventPayload `json:"payload"`
+
+	// Priority orders admission ahead of Seq. Lower is more urgent.
+	//   0 = incident              (redundant with the alert pool; kept for clarity)
+	//   1 = webhook-originated    (a human is waiting)
+	//   2 = cron/sweep-originated (proactive work)
+	//
+	// It is a *int, NOT an int (fix M17): Go's zero value for an int is 0, so
+	// client-go would ALWAYS serialise "priority": 0, the field would never be
+	// ABSENT from the request body, the CRD default would NEVER fire, and any
+	// producer that forgot the field would land in the MOST URGENT tier. A nil
+	// pointer is genuinely absent, so the default applies.
+	// +kubebuilder:validation:Enum=0;1;2
+	// +kubebuilder:default=2
+	// +optional
+	Priority *int `json:"priority,omitempty"`
+}
+
+// EffectiveQueuePriority returns spec.Priority, or 2 (the CRD default) when
+// nil - i.e. when the QueuedEvent was built as a Go literal (fake client,
+// tests) and never round-tripped through API-server defaulting.
+func EffectiveQueuePriority(spec QueuedEventSpec) int {
+	if spec.Priority != nil {
+		return *spec.Priority
+	}
+	return 2
 }
 
 type QueuedEventStatus struct {
@@ -109,6 +184,19 @@ func ValidateQueuedEventSpec(spec QueuedEventSpec) error {
 	}
 	if repoScopedKinds[spec.Kind] && spec.RepositoryRef == "" {
 		return fmt.Errorf("queuedevent: kind %q requires repositoryRef", spec.Kind)
+	}
+	if spec.Payload.AgentKind != "" {
+		if !validAgentKinds[spec.Payload.AgentKind] {
+			return fmt.Errorf("queuedevent: invalid payload.agentKind %q", spec.Payload.AgentKind)
+		}
+		hasTaskRef := spec.Payload.TaskRef != ""
+		hasNewTask := spec.Payload.NewTask != nil
+		if hasTaskRef == hasNewTask {
+			return fmt.Errorf("queuedevent: exactly one of payload.taskRef / payload.newTask must be set")
+		}
+		if hasNewTask && len(spec.Payload.NewTask.Goal) > 16384 {
+			return fmt.Errorf("queuedevent: payload.newTask.goal exceeds max length 16384")
+		}
 	}
 	return nil
 }

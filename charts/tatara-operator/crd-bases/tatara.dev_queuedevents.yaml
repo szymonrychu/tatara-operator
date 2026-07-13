@@ -64,9 +64,27 @@ spec:
                   rebuilds the Task from it verbatim on admission. Producers keep ownership of
                   label/goal/source construction so the dispatcher stays generic.
                 properties:
+                  agentKind:
+                    description: |-
+                      AgentKind is the pod to spawn for a stage-driven admission (contract
+                      B.7). It marks the ADMISSION-TICKET payload shape: when set, exactly one
+                      of TaskRef / NewTask must also be set (ValidateQueuedEventSpec enforces
+                      this). Kept +optional at the CRD level (unlike the contract's bare
+                      literal) so a flat MINT payload (the sweep/webhook producers, which fill
+                      only Kind/Goal/...) keeps validating unchanged.
+                    enum:
+                    - brainstorm
+                    - incident
+                    - clarify
+                    - refine
+                    - review
+                    - documentation
+                    - implement
+                    type: string
                   alertRule:
-                    description: AlertRule is carried from the incident webhook onto
-                      the built Task.
+                    description: |-
+                      AlertRule is carried from the incident webhook onto the built Task's
+                      Spec.AlertRules.
                     type: string
                   annotations:
                     additionalProperties:
@@ -75,12 +93,12 @@ spec:
                   dedupKey:
                     description: |-
                       DedupKey is carried from the incident webhook onto the built Task's
-                      Spec.DedupKey (the incident dedup identity, item 6).
+                      Spec.DedupKey (the incident alert-group dedup identity).
                     type: string
                   generateName:
                     description: |-
                       GenerateName is used when Name is empty; Name is a fixed deterministic
-                      Task name (issueLifecycle) that makes admission idempotent.
+                      Task name that makes admission idempotent.
                     type: string
                   goal:
                     type: string
@@ -92,6 +110,48 @@ spec:
                     type: object
                   name:
                     type: string
+                  newTask:
+                    description: NewTask is the blueprint for a Task that does not
+                      exist yet (a mint).
+                    properties:
+                      alertRules:
+                        items:
+                          type: string
+                        type: array
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      goal:
+                        description: |-
+                          Goal carries the SAME MaxLength=16384 cap as Task.spec.goal
+                          (task_types.go) - it is NON-EVICTABLE at the far end.
+                        maxLength: 16384
+                        type: string
+                      issueKeys:
+                        items:
+                          type: string
+                        type: array
+                      kind:
+                        description: Kind is the ORIGIN kind.
+                        type: string
+                      labels:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      name:
+                        description: Name is deterministic so admission is idempotent.
+                        type: string
+                      projectRef:
+                        type: string
+                      repositoryRef:
+                        type: string
+                    required:
+                    - goal
+                    - kind
+                    - name
+                    - projectRef
+                    type: object
                   podRepo:
                     type: string
                   provider:
@@ -101,24 +161,18 @@ spec:
                   repositoryRef:
                     type: string
                   source:
-                    description: TaskSource records the SCM work-item that originated
-                      a webhook-born Task.
+                    description: |-
+                      TaskSource records the SCM work-item that originated a Task. It is the SEED
+                      IDENTITY the triaging stage mints the Issue CR from (F.2) and the base of the
+                      deterministic task branch (agent.TaskBranch). It is NOT a dedup ledger: the
+                      five dedup mechanisms folded into the (repo, number) natural key at the
+                      cutover, and the sixth (the incident alert-group hash) lives on Spec.DedupKey.
                     properties:
                       authorLogin:
                         type: string
-                      dedupNumber:
-                        description: |-
-                          DedupNumber is the linked-issue number for bot-PR tasks. When a bot MR
-                          carries "Closes #N" in its body, this field holds N so the dedup logic can
-                          match the task against the issue slot (not the PR number). Zero means the
-                          task targets the item identified by Number (the PR/issue number itself).
-                        type: integer
                       headSHA:
-                        description: |-
-                          HeadSHA is the PR/MR head commit SHA captured at enqueue. It seeds the
-                          review Task's role:reviewed ledger entry so same-head re-review dedup works
-                          on the very next scan cycle, without waiting for the cron backstop to fill
-                          it. Empty for issues.
+                        description: HeadSHA is the PR/MR head commit SHA captured
+                          at mint. Empty for issues.
                         type: string
                       isPR:
                         type: boolean
@@ -133,7 +187,7 @@ spec:
                         type: string
                       title:
                         description: |-
-                          Title is the originating issue/PR/MR title, captured at enqueue. Feeds the
+                          Title is the originating issue/PR/MR title, captured at mint. Feeds the
                           branch slug (TaskBranch) and the no-agent PR-title fallback.
                         type: string
                       url:
@@ -142,26 +196,32 @@ spec:
                     - issueRef
                     - provider
                     type: object
-                  systemicGroup:
-                    description: SystemicGroup describes the systemic-improvement
-                      group a lead issue owns.
-                    properties:
-                      crossRepo:
-                        items:
-                          type: string
-                        type: array
-                      sameRepoSiblings:
-                        items:
-                          type: integer
-                        type: array
-                      systemicId:
-                        type: string
-                    required:
-                    - systemicId
-                    type: object
+                  taskRef:
+                    description: |-
+                      TaskRef names an EXISTING Task (a stage-driven spawn).
+                      Exactly one of TaskRef / NewTask is set when AgentKind is set.
+                    type: string
                 required:
                 - kind
                 type: object
+              priority:
+                default: 2
+                description: |-
+                  Priority orders admission ahead of Seq. Lower is more urgent.
+                    0 = incident              (redundant with the alert pool; kept for clarity)
+                    1 = webhook-originated    (a human is waiting)
+                    2 = cron/sweep-originated (proactive work)
+
+                  It is a *int, NOT an int (fix M17): Go's zero value for an int is 0, so
+                  client-go would ALWAYS serialise "priority": 0, the field would never be
+                  ABSENT from the request body, the CRD default would NEVER fire, and any
+                  producer that forgot the field would land in the MOST URGENT tier. A nil
+                  pointer is genuinely absent, so the default applies.
+                enum:
+                - 0
+                - 1
+                - 2
+                type: integer
               projectRef:
                 type: string
               repositoryRef:

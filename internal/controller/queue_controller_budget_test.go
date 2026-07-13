@@ -23,8 +23,8 @@ func mkBudgetPools(t *testing.T, ctx context.Context, name string, tb *tatarav1a
 	proj := &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec: tatarav1alpha1.ProjectSpec{
-			ScmSecretRef:       name + "-scm",
-			MaxConcurrentTasks: 5,
+			ScmSecretRef:        name + "-scm",
+			MaxConcurrentAgents: 5,
 			Agent: tatarav1alpha1.AgentSpec{
 				Model: "claude-x", Image: "wrapper:1", PermissionMode: "bypassPermissions",
 				MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,

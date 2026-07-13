@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -51,14 +52,21 @@ type CreatedIssue struct {
 
 // PRRef is one open PR/MR listed for cron MR-triage.
 type PRRef struct {
-	Repo       string    `json:"repo"`
-	Number     int       `json:"number"`
-	Author     string    `json:"author"`
-	HeadSHA    string    `json:"headSha"`
-	HeadBranch string    `json:"headBranch,omitempty"` // source/head branch; set when available from list API
-	Labels     []string  `json:"labels,omitempty"`
-	Body       string    `json:"body,omitempty"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	Repo       string `json:"repo"`
+	Number     int    `json:"number"`
+	Author     string `json:"author"`
+	HeadSHA    string `json:"headSha"`
+	HeadBranch string `json:"headBranch,omitempty"` // source/head branch; set when available from list API
+	// HeadRepo identifies the repository the HEAD branch lives in, in the same
+	// namespace as Repo (a slug on GitHub, a project path on GitLab). It is what
+	// B.4 clause 1(c) compares against Repo: a PR whose head is NOT the base repo
+	// is a FORK PR and is NEVER adopted into a Task's merge stream, whatever its
+	// head branch is named. EMPTY means the forge did not report it, and the
+	// adoption guard fails CLOSED on empty.
+	HeadRepo  string    `json:"headRepo,omitempty"`
+	Labels    []string  `json:"labels,omitempty"`
+	Body      string    `json:"body,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // IssueRef is one open issue listed for cron issue-triage.
@@ -167,7 +175,35 @@ type SCMWriter interface {
 	Approve(ctx context.Context, repoURL, token string, number int, body string) error
 	RequestChanges(ctx context.Context, repoURL, token string, number int, body string) error
 	Suggest(ctx context.Context, repoURL, token string, number int, sugg []Suggestion) error
-	Merge(ctx context.Context, repoURL, token string, number int, method string) (string, error)
+	// GetPRHead is the LIVE head read. It is used at /outcome acceptance (to
+	// stamp reviewedSHA) and immediately before EVERY Merge. The mirror's
+	// headSHA is never used for either: the mirror can be an hour stale, and a
+	// merge pinned to a stale SHA is a TOCTOU hole on the repo that deploys the
+	// cluster.
+	GetPRHead(ctx context.Context, repoURL, token string, number int) (string, error)
+	// ListReviews returns the review-shaped records already on the forge, newest
+	// or oldest order unspecified. It is the FORGE-SIDE idempotency check: if a
+	// body already carries the round marker, the post is skipped. A crash between
+	// the post and the mirror append is then a no-op on re-run.
+	ListReviews(ctx context.Context, repoURL, token string, number int) ([]Review, error)
+	// PostReview posts the review body plus its inline findings and returns ONLY
+	// the review id. There is NO event parameter: the event is always COMMENT
+	// (see reviewEventComment). The posted comments and their ids come from a
+	// separate ListReviewComments call - GitHub's create-review response does not
+	// carry them.
+	//
+	// A 422/401/403 is TERMINAL (ErrReviewRefused), never retryable.
+	PostReview(ctx context.Context, repoURL, token string, number int, body string, findings []ReviewFinding) (string, error)
+	// ListReviewComments returns the inline comments belonging to reviewID, with
+	// the ids the forge assigned them, so the mirror can be reconciled by a
+	// set-union on ExternalID.
+	ListReviewComments(ctx context.Context, repoURL, token string, number int, reviewID string) ([]PostedComment, error)
+	// Merge merges the PR/MR. expectedHeadSHA pins the merge to the head the
+	// caller verified: the forge answers 409 when the head has moved, which maps
+	// to ErrHeadMoved (distinct from ErrMergeConflict) so the caller can
+	// re-review the new head instead of failing the Task. An empty
+	// expectedHeadSHA means "no pin".
+	Merge(ctx context.Context, repoURL, token string, number int, method, expectedHeadSHA string) (string, error)
 	// EnableAutoMerge turns on the forge's native auto-merge for the PR/MR at
 	// prURL so it merges itself once required checks pass. Best-effort: a forge
 	// that disallows auto-merge returns an error callers treat as non-fatal.
@@ -194,9 +230,14 @@ type SCMWriter interface {
 
 // IssueComment is one human comment on an issue, ordered oldest-first.
 type IssueComment struct {
-	Author    string
-	Body      string
-	CreatedAt time.Time
+	// ExternalID is the provider's comment id as a STRING (GitHub int64, GitLab
+	// note id; the two disagree on width). It is the mirror's dedup key
+	// (Comment.ExternalID) and the single-use evidence id the approval grammar's
+	// clause 3d enforces against, so it is populated on every read path.
+	ExternalID string
+	Author     string
+	Body       string
+	CreatedAt  time.Time
 }
 
 // IssueContent holds the title and body of an issue fetched from the SCM.
@@ -363,32 +404,68 @@ var reClosesIssue = regexp.MustCompile(`(?i)closes\s+#(\d+)`)
 // always has - this helper does not unify that difference. The pagination
 // loop (page-advance, self-reference, and page-count guards) lives in the
 // callers and is untouched by this extraction.
+//
+// RATE LIMITING (contract C.8). The read path used to have ZERO rate-limit
+// handling: no 429 branch, no Retry-After, no X-RateLimit-Reset, no backoff, no
+// retry - it returned an *HTTPError on any status >= 400 and the caller treated
+// a throttle as a hard failure. It now reuses the SAME machinery the write path
+// has always had (ghIsRateLimited / ghRateLimitDelay), which is deliberate:
+// GitHub's SECONDARY limit answers 403, not 429, and carries no
+// X-RateLimit-Remaining, so detection must key on the response BODY's
+// "secondary rate limit" marker - and there must be exactly one implementation
+// of that rule. Every request also passes the per-project egress bucket first.
 func doPagedGET(ctx context.Context, fullURL, errPrefix, errPath string, headers map[string]string, peekHeader string, out any) (peeked string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("%s: build request: %w", errPrefix, err)
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := scmHTTPClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("%s: do request: %w", errPrefix, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	peeked = resp.Header.Get(peekHeader)
-	if resp.StatusCode >= 400 {
-		buf, _ := io.ReadAll(resp.Body)
-		return "", &HTTPError{Status: resp.StatusCode, Body: string(buf), Path: errPath}
-	}
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && err != io.EOF {
-			return "", fmt.Errorf("%s: decode response: %w", errPrefix, err)
+	for attempt := 0; ; attempt++ {
+		if werr := waitEgress(ctx, errPrefix, errPath); werr != nil {
+			return "", werr
 		}
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+		if err != nil {
+			return "", fmt.Errorf("%s: build request: %w", errPrefix, err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := scmHTTPClient.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("%s: do request: %w", errPrefix, err)
+		}
+		peeked = resp.Header.Get(peekHeader)
+		if resp.StatusCode >= 400 {
+			buf, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			body := string(buf)
+			if !ghIsRateLimited(resp, body) {
+				return "", &HTTPError{Status: resp.StatusCode, Body: body, Path: errPath}
+			}
+			recordRateLimited(errPrefix, errPath, resp, body)
+			delay, _ := ghRateLimitDelay(resp, body, attempt)
+			if attempt >= ghMaxRetries || delay > ghMaxBackoff {
+				// Out of retries, or the forge wants a wait longer than a worker
+				// goroutine should hold. Surface ErrRateLimited so the caller
+				// REQUEUES rather than failing the Task on a bare 4xx.
+				return "", rateLimitedError(resp.StatusCode, body, errPath)
+			}
+			slog.WarnContext(ctx, "scm: read rate-limited, backing off before retry",
+				"provider", errPrefix, "path", errPath, "status", resp.StatusCode,
+				"limit_type", limitType(resp, body), "attempt", attempt+1, "delay_ms", delay.Milliseconds())
+			if serr := ghRetrySleep(ctx, delay); serr != nil {
+				return "", serr
+			}
+			continue
+		}
+		if out != nil {
+			derr := json.NewDecoder(resp.Body).Decode(out)
+			_ = resp.Body.Close()
+			if derr != nil && derr != io.EOF {
+				return "", fmt.Errorf("%s: decode response: %w", errPrefix, derr)
+			}
+		} else {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		return peeked, nil
 	}
-	return peeked, nil
 }
 
 // LinkedIssueNumber parses the first "Closes #N" reference from a PR body.

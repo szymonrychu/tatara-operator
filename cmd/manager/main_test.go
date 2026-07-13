@@ -19,7 +19,7 @@ import (
 
 func TestNewScheme_RegistersAllKinds(t *testing.T) {
 	s := newScheme()
-	for _, kind := range []string{"Project", "Repository", "Task", "Subtask"} {
+	for _, kind := range []string{"Project", "Repository", "Task", "Issue", "MergeRequest", "QueuedEvent"} {
 		if !s.Recognizes(apiv1alpha1.GroupVersion.WithKind(kind)) {
 			t.Fatalf("scheme does not recognize %s", kind)
 		}

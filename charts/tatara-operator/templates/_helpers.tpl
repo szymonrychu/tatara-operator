@@ -89,14 +89,11 @@ INGRESS_HOST: {{ .Values.ingressHost | quote }}
 INGRESS_CLASS_NAME: {{ .Values.ingressClassName | quote }}
 INGRESS_REWRITE_TARGET: {{ .Values.ingressRewriteTarget | quote }}
 MEMORY_PATH_PREFIX: {{ .Values.memoryPathPrefix | quote }}
-CHAT_PATH_PREFIX: {{ .Values.chatPathPrefix | quote }}
-CHAT_IMAGE: {{ .Values.chatImage | quote }}
 GRAFANA_MCP_IMAGE: {{ .Values.grafanaMcpImage | quote }}
 {{/* Per-Project memory-stack ServiceMonitor + PrometheusRule (issue #200). additionalLabels is a JSON object (rule 6), empty default keeps the chart cluster-agnostic (rule 14). */}}
 MEMORY_MONITORING_ENABLED: {{ .Values.memoryMonitoring.enabled | quote }}
 MEMORY_MONITOR_LABELS: {{ .Values.memoryMonitoring.additionalLabels | toJson | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
-TASK_RETENTION_HOURS: {{ .Values.taskRetentionHours | quote }}
 IDLE_POD_REAP_MINUTES: {{ .Values.idlePodReapMinutes | quote }}
 PUSH_METRICS_ALLOWED_PREFIXES: {{ .Values.pushMetricsAllowedPrefixes | quote }}
 AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
@@ -111,14 +108,6 @@ AGENT_RUN_AS_USER: {{ .Values.agentRunAsUser | quote }}
 AGENT_FS_GROUP: {{ .Values.agentFsGroup | quote }}
 {{/* List-shaped placement (rule 6): one JSON document key, empty default keeps the chart cluster-agnostic (rule 14). */}}
 AGENT_SCHEDULING: {{ .Values.agentScheduling | toJson | quote }}
-{{/* S3 conversation persistence (issue #114): empty s3Bucket disables it. */}}
-S3_ENDPOINT: {{ .Values.s3Endpoint | quote }}
-S3_BUCKET: {{ .Values.s3Bucket | quote }}
-S3_REGION: {{ .Values.s3Region | quote }}
-S3_KEY_PREFIX: {{ .Values.s3KeyPrefix | quote }}
-S3_FORCE_PATH_STYLE: {{ .Values.s3ForcePathStyle | quote }}
-S3_SECRET_NAME: {{ .Values.s3SecretName | quote }}
-S3_CONVERSATION_RETENTION_HOURS: {{ .Values.s3ConversationRetentionHours | quote }}
 {{/* Token-budget admission gate (issue #189): off until tokenBudgetEnabled. */}}
 TOKEN_BUDGET_ENABLED: {{ .Values.tokenBudgetEnabled | quote }}
 TOKEN_BUDGET_MODE: {{ .Values.tokenBudgetMode | quote }}

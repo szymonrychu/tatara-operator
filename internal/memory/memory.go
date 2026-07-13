@@ -43,8 +43,6 @@ type Config struct {
 	// (rule 14): a non-nginx ingress controller is not handed nginx annotations.
 	IngressRewriteTarget string
 	MemoryPathPrefix     string
-	ChatPathPrefix       string
-	ChatImage            string
 	// MonitorEnabled gates emission of the per-Project memory-stack
 	// ServiceMonitor + PrometheusRule. Default true; set false on a cluster
 	// without the prometheus-operator CRDs so the memory reconcile does not fail
@@ -92,19 +90,6 @@ func NamesFor(project string) Names {
 // and every other component reads.
 func Endpoint(project, namespace string) string {
 	return fmt.Sprintf("http://mem-%s.%s.svc:8080", project, namespace)
-}
-
-// ChatServiceName is the shared tatara-chat Service. Unlike memory (mem-<project>,
-// one stack per Project), chat is deployed once per cluster as a single
-// tatara-chat release, so every Project's agents, ingress backend, and the
-// tool-surface probe all address this one Service.
-const ChatServiceName = "tatara-chat"
-
-// ChatEndpoint is the canonical in-cluster URL of the shared chat Service (the
-// value agent pods receive as TATARA_CHAT_URL and the tool-surface probe dials).
-// Sibling of Endpoint, but not project-scoped: chat is a single shared service.
-func ChatEndpoint(namespace string) string {
-	return fmt.Sprintf("http://%s.%s.svc:8080", ChatServiceName, namespace)
 }
 
 // labels returns the four pin-set labels carried by every object.

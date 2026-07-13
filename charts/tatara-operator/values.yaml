@@ -72,31 +72,19 @@ ingressHost: ""
 ingressClassName: ""
 ingressRewriteTarget: ""
 memoryPathPrefix: "/api/v1/memory"
-chatPathPrefix: "/api/v1/chat"
-chatImage: ""
 # Leader election guards against two managers reconciling concurrently during a
 # rolling-update surge (replicaCount: 1, maxSurge rounds up to 1). Keep on; set
 # false only for single-process local/envtest runs.
 leaderElection: true
 
-# taskRetentionHours bounds how long a terminal (Succeeded/Failed/Done/Stopped/
-# Parked) Task is kept before the reaper garbage-collects it; its Subtasks cascade
-# via owner reference. Without this the control-plane's own Task objects accumulate
-# unbounded in etcd and the operator's full-namespace Task Lists slow down over
-# time. Default 7 days (168h) preserves a week of history for debugging. The
-# operator clamps any value up to a 2h floor so GC never deletes a Task still
-# anchoring a dedup/cooldown window (the longest is the 1h incident cooldown).
-taskRetentionHours: 168
-
 # idlePodReapMinutes bounds how long an agent pod may sit with no live turn before
 # the reaper deletes it as a leaked wrapper (issue #237). When a turn times out or
 # completes the wrapper parks idle in epoll waiting for the next PTY input; if the
-# operator never submits a next turn or tears it down (e.g. a memory outage traps
-# the lifecycle reconcile in the spawn gate before it processes the completed
-# turn) the pod holds a Task slot + node resources for hours. Default 30m
-# comfortably exceeds any healthy between-turn gap; conversation persistence lets a
-# still-live Task re-spawn a fresh pod and resume, so reaping is safe. The operator
-# clamps a positive value up to a 5m floor; set 0 to disable the idle backstop.
+# operator never submits a next turn or tears it down the pod holds a Task slot +
+# node resources for hours. Default 30m comfortably exceeds any healthy
+# between-turn gap; the context bundle IS the continuation state, so a still-live
+# Task re-spawns a fresh pod and resumes - reaping is safe. The operator clamps a
+# positive value up to a 5m floor; set 0 to disable the idle backstop.
 idlePodReapMinutes: 30
 
 # pushMetricsAllowedPrefixes is the comma-separated metric-name prefix allowlist
@@ -111,25 +99,6 @@ idlePodReapMinutes: 30
 # tatara_memory_*), so memory_ matched nothing. Keep this in sync as new pushed
 # families appear; TataraPushMetricsDropped fires if a prefix is missed.
 pushMetricsAllowedPrefixes: "wrapper_,agent_,ccw_,tatara_wrapper_,ingest_,analyzer_,semantic_,scip_,llm_"
-
-# S3 conversation persistence (issue #114): the wrapper stores/restores each
-# issue's Claude conversation transcript in an S3-compatible bucket so a fresh
-# pod resumes the prior conversation. Cluster-agnostic (rule 14): all values are
-# empty here and supplied per-environment by the helmfile. The whole feature is
-# OFF until s3Bucket is set; one client targets both AWS S3 and rook-ceph (Ceph
-# RGW) via s3Endpoint + s3ForcePathStyle. s3SecretName names the Secret holding
-# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (empty = default cred chain / IRSA).
-s3Endpoint: ""
-s3Bucket: ""
-s3Region: ""
-s3KeyPrefix: ""
-s3ForcePathStyle: false
-s3SecretName: ""
-# s3ConversationRetentionHours is the grace after a conversation's whole batch
-# (brainstorm + sibling issues) goes terminal before the reaper deletes its S3
-# objects (issue #114 decision 5). Kept under taskRetentionHours so conversations
-# GC before their Tasks (which carry the keys) are reaped.
-s3ConversationRetentionHours: 72
 
 # Token-budget admission gate (issue #189): pause proactive work (brainstorm,
 # implement, review) at tokenBudgetProactivePercent and incident work at
@@ -248,13 +217,23 @@ serviceMonitor:
 # at 25.6s, so keep this well under that ceiling). ingestStaleAfterSeconds is the
 # TataraIngestStale budget: how long since a repo's last successful ingest before
 # its recall corpus is considered stale (default 93600s = 26h, comfortably over
-# the daily reingest cron). Alertmanager routing stays cluster-side.
+# the daily reingest cron). sweepStaleAfterSeconds is the TataraSweepStalled
+# budget: the B.4 sweep is the ONLY intake since the task-centric redesign (the
+# webhook mints nothing), and its heartbeat gauge is stamped only on a pass with
+# zero errors, so this must comfortably exceed the project's issueScan schedule
+# (default 10800s = 3h against an hourly scan). criticalSeverityLabel is stamped
+# on the alerts that are not "look at this soon" but "an unreviewed change may be
+# on main" - today, TataraUnexpectedMerge (accepted risk D-A: the merge gate is
+# operator logic, not a forge-enforced control, so detection is the control).
+# Alertmanager routing stays cluster-side.
 prometheusRule:
   enabled: true
   severityLabel: "warning"
+  criticalSeverityLabel: "critical"
   tasksInflightThreshold: 8
   turnSubmitP95LatencyThreshold: 5
   ingestStaleAfterSeconds: 93600
+  sweepStaleAfterSeconds: 10800
   additionalLabels: {}
 
 # dashboard ships the "Tatara Loop" Grafana dashboard as a ConfigMap labelled
@@ -268,9 +247,12 @@ dashboard:
   folder: "tatara"
   additionalLabels: {}
 
+# The operator's own ingress. className is EMPTY by default (cluster-agnostic,
+# rule 14): an empty ingressClassName lets the cluster's default IngressClass
+# apply, and the deploying helmfile sets the real class. Same for host.
 ingress:
   enabled: false
-  className: nginx
+  className: ""
   host: ""
   path: "/"
   clusterIssuer: letsencrypt-prod
@@ -280,7 +262,6 @@ ingress:
 # (selected by tatara.dev/managed-by=tatara-operator).
 managedPodNetworkPolicy:
   enabled: true
-  chatServiceName: tatara-chat
 
 rbac:
   create: true
