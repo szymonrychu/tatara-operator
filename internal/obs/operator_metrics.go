@@ -75,6 +75,7 @@ type OperatorMetrics struct {
 	repositoryIngestFailing   *prometheus.GaugeVec
 	repositoryLastIngestTime  *prometheus.GaugeVec
 	reviewOutcomeTotal        *prometheus.CounterVec
+	reviewHeadMovedTotal      *prometheus.CounterVec
 	reviewFindingsTotal       *prometheus.CounterVec
 	implementCITotal          *prometheus.CounterVec
 	cdCascadeFailed           *prometheus.GaugeVec
@@ -324,6 +325,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_review_outcome_total",
 			Help: "Review tasks by verdict (approved|changes_requested), keyed by the model that ran the review.",
 		}, []string{"project", "repo", "model", "verdict"}),
+		reviewHeadMovedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_review_head_moved_total",
+			Help: "Review submits refused because the PR/MR head moved since the agent checked out. A spike is a review stuck on a fast-moving MR - the mirror is refreshed to the live head on demand and the agent is told to re-review it.",
+		}, []string{"repo"}),
 		reviewFindingsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_review_findings_total",
 			Help: "Sum of review findings (suggestions/comments) per review, by model.",
@@ -395,6 +400,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.admissionBlockedTotal,
 		m.memoryGateBypassTotal,
 		m.reviewOutcomeTotal,
+		m.reviewHeadMovedTotal,
 		m.reviewFindingsTotal,
 		m.implementCITotal,
 		m.cdCascadeFailed,
@@ -812,6 +818,21 @@ func (m *OperatorMetrics) RecordReviewOutcome(project, repo, model, verdict stri
 		return
 	}
 	m.reviewOutcomeTotal.WithLabelValues(project, repo, model, verdict).Inc()
+}
+
+// RecordReviewHeadMoved increments operator_review_head_moved_total for the repo
+// whose review submit was refused because its head moved since checkout. A nil
+// receiver is a no-op, matching RecordReviewOutcome's convention.
+func (m *OperatorMetrics) RecordReviewHeadMoved(repo string) {
+	if m == nil {
+		return
+	}
+	m.reviewHeadMovedTotal.WithLabelValues(repo).Inc()
+}
+
+// ReviewHeadMovedCounter returns the counter for repo for test assertions.
+func (m *OperatorMetrics) ReviewHeadMovedCounter(repo string) prometheus.Counter {
+	return m.reviewHeadMovedTotal.WithLabelValues(repo)
 }
 
 // AddReviewFindings adds n to operator_review_findings_total for the model
