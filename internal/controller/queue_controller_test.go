@@ -740,11 +740,21 @@ func TestAdmit_NoAPIReader_FallsBackToPassedSlices(t *testing.T) {
 
 func TestPoolInflight_CountsAdmittedNonTerminal(t *testing.T) {
 	r := &DispatcherReconciler{}
+	// ticketFor models a live per-stage pod ticket (payload.agentKind set to
+	// the stage's agent kind), not a mint: a mint's slot is spent once its
+	// Task leaves the create/triaging bootstrap (ticketSpent), so a
+	// no-agentKind event whose Task is already at reviewing/delivered would
+	// no longer exercise "still holds a slot" - use the realistic shape.
+	ticketFor := func(name, class, taskRef, stg string) tatarav1alpha1.QueuedEvent {
+		q := qe(name, class, tatarav1alpha1.QueueStateAdmitted, taskRef)
+		q.Spec.Payload.AgentKind = stage.AgentKindFor(stg)
+		return q
+	}
 	qes := []tatarav1alpha1.QueuedEvent{
-		qe("a", tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueStateAdmitted, "t-a"), // running -> counts
-		qe("b", tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueStateAdmitted, "t-b"), // terminal -> not
-		qe("c", tatarav1alpha1.QueueClassAlert, tatarav1alpha1.QueueStateAdmitted, "t-c"),  // alert running
-		qe("d", tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueStateQueued, ""),      // queued -> not
+		ticketFor("a", tatarav1alpha1.QueueClassNormal, "t-a", tatarav1alpha1.StageReviewing), // running -> counts
+		ticketFor("b", tatarav1alpha1.QueueClassNormal, "t-b", tatarav1alpha1.StageDelivered), // terminal -> not
+		ticketFor("c", tatarav1alpha1.QueueClassAlert, "t-c", tatarav1alpha1.StageReviewing),  // alert running
+		qe("d", tatarav1alpha1.QueueClassNormal, tatarav1alpha1.QueueStateQueued, ""),         // queued -> not
 	}
 	tasks := []tatarav1alpha1.Task{
 		tk("t-a", tatarav1alpha1.StageReviewing, "a"),
@@ -1081,5 +1091,131 @@ func TestAdmit_SteadyState_QueuedFortyMinutesReachesImplementing(t *testing.T) {
 	}
 	if final.Labels[queue.LabelQueuedEvent] != waiterQE.Name {
 		t.Fatalf("admitted Task not labelled with its ticket: %v", final.Labels)
+	}
+}
+
+// --- regression: incident mint-vs-own-pod-ticket admission deadlock --------
+//
+// Production incident (2026-07-13, first live incident after cutover): a
+// mint payload (agentKind=="") never became ticketSpent, so an incident's
+// CREATE QueuedEvent (class=alert) stayed inflight forever, holding the
+// single AlertCapacity=1 slot. The Task's OWN investigating pod-ticket
+// (also class=alert, same Task) then needed that same slot to admit - the
+// Task held the slot its own pod needed, and every subsequent incident
+// queued behind it. See MEMORY.md 2026-07-13.
+
+// TestTicketSpent_MintPayload is table-driven over every stage bucket a mint
+// payload's ticketSpent switch distinguishes: still-bootstrapping ("",
+// triaging) must NOT spend the mint's slot (two incidents must not both
+// jump the alert lane while their Tasks are still being minted/triaged), and
+// every stage past bootstrap - including the Task's own investigating pod
+// stage, the deadlock's exact trigger - MUST spend it.
+func TestTicketSpent_MintPayload(t *testing.T) {
+	mint := &tatarav1alpha1.QueuedEvent{
+		Spec: tatarav1alpha1.QueuedEventSpec{Payload: tatarav1alpha1.QueuedEventPayload{AgentKind: ""}},
+	}
+	cases := []struct {
+		name  string
+		stage string
+		want  bool
+	}{
+		{"unstamped, not yet touched by the stage machine", "", false},
+		{"triaging bootstrap", tatarav1alpha1.StageTriaging, false},
+		{"investigating: the Task's OWN pod stage, the deadlock trigger", tatarav1alpha1.StageInvestigating, true},
+		{"clarifying: any other pod stage", tatarav1alpha1.StageClarifying, true},
+		{"approved: pod-less admission gate, past bootstrap", tatarav1alpha1.StageApproved, true},
+		{"delivered: quasi-terminal", tatarav1alpha1.StageDelivered, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &tatarav1alpha1.Task{Status: tatarav1alpha1.TaskStatus{Stage: tc.stage}}
+			if got := ticketSpent(mint, task); got != tc.want {
+				t.Fatalf("ticketSpent(mint, stage=%q) = %v, want %v", tc.stage, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdmit_IncidentMintReleasesAlertSlot_RegressionForDeadlock reproduces the
+// production deadlock end to end against a real envtest apiserver (not the
+// Seq==nil unit-test bypass that let this ship): a mint CREATE event admits
+// and mints an incident Task at AlertCapacity=1, the Task is driven to its
+// own investigating pod stage, and its OWN pod-ticket (same alert class, same
+// Task) is queued behind the still-Admitted mint event. Before the fix,
+// poolInflight(alert) reads 1 (AT capacity) and the pod-ticket never admits -
+// a permanent deadlock. After the fix, the mint's slot is spent the moment
+// the Task leaves triaging, poolInflight(alert) reads 0, and the pod-ticket
+// admits normally.
+func TestAdmit_IncidentMintReleasesAlertSlot_RegressionForDeadlock(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-incident-deadlock", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 2, AlertCapacity: 1}},
+	}
+	mustCreate(t, ctx, proj)
+
+	// The incident's CREATE (mint) event: class=alert, agentKind="" (payload
+	// carries no requested stage - it only brings the Task into existence).
+	mint := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-incident-create-", Namespace: testNS},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 1, Class: tatarav1alpha1.QueueClassAlert, Kind: "incident", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"},
+		},
+	}
+	mustCreate(t, ctx, mint)
+	mint.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, mint)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	qes, tasks := listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	gotMint := refreshQE(t, ctx, mint)
+	if gotMint.Status.State != tatarav1alpha1.QueueStateAdmitted || gotMint.Status.TaskRef == "" {
+		t.Fatalf("mint not admitted: %+v", gotMint.Status)
+	}
+	taskName := gotMint.Status.TaskRef
+
+	// Drive the Task to its OWN investigating pod stage (as the triaging
+	// controller would for spec.kind=incident), same alert class.
+	task := refreshTask(t, ctx, taskName)
+	task.Status.Stage = tatarav1alpha1.StageInvestigating
+	task.Status.AgentKind = stage.AgentIncident
+	entered := metav1.Now()
+	task.Status.StageEnteredAt = &entered
+	mustStatusUpdate(t, ctx, task)
+
+	// The investigating pod's OWN ticket: same alert class, same Task, the
+	// exact shape that deadlocks against the still-Admitted mint event.
+	podTicket := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-incident-pod-", Namespace: testNS},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 2, Class: tatarav1alpha1.QueueClassAlert, Kind: stage.AgentIncident, ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: stage.AgentIncident, AgentKind: stage.AgentIncident, TaskRef: taskName},
+		},
+	}
+	mustCreate(t, ctx, podTicket)
+	podTicket.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, podTicket)
+
+	// The core accounting assertion (do this BEFORE the second admit pass, so
+	// it isolates poolInflight/ticketSpent rather than the full admit flow):
+	// the mint's slot must already be spent once the Task is past triaging.
+	qes, tasks = listQEsTasks(t, ctx, proj.Name)
+	if got := r.poolInflight(qes, tasks, tatarav1alpha1.QueueClassAlert); got != 0 {
+		t.Fatalf("alert poolInflight = %d, want 0 once the Task is at investigating - "+
+			"this IS the production deadlock (the mint holds the slot its own pod-ticket needs)", got)
+	}
+
+	// End to end: the pod-ticket now admits (proves the whole admit() path,
+	// not just the accounting helpers, clears the deadlock).
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	gotTicket := refreshQE(t, ctx, podTicket)
+	if gotTicket.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("investigating pod-ticket deadlocked: state=%q (want Admitted)", gotTicket.Status.State)
 	}
 }
