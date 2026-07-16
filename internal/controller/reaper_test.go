@@ -63,6 +63,41 @@ func mkWrapperPodSvc(t *testing.T, name, taskName, taskUID string) {
 	}
 }
 
+// mkWrapperPodSvcKind is mkWrapperPodSvc plus an explicit agent.LabelAgentKind
+// label, for the superseded-stage reap tests: the reaper compares the pod's
+// stamped kind against the Task's CURRENT stage kind.
+func mkWrapperPodSvcKind(t *testing.T, name, taskName, taskUID, agentKind string) {
+	t.Helper()
+	labels := map[string]string{
+		agent.LabelManagedBy: agent.ManagedByValue,
+		agent.LabelComponent: agent.ComponentAgent,
+		agent.LabelTask:      taskName,
+	}
+	if taskUID != "" {
+		labels[agent.LabelTaskUID] = taskUID
+	}
+	if agentKind != "" {
+		labels[agent.LabelAgentKind] = agentKind
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS, Labels: labels},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers:    []corev1.Container{{Name: "wrapper", Image: "wrapper:1"}},
+		},
+	}
+	if err := k8sClient.Create(context.Background(), pod); err != nil {
+		t.Fatalf("create pod %s: %v", name, err)
+	}
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS, Labels: labels},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+	}
+	if err := k8sClient.Create(context.Background(), svc); err != nil {
+		t.Fatalf("create service %s: %v", name, err)
+	}
+}
+
 func podExists(t *testing.T, name string) bool {
 	t.Helper()
 	err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: name}, &corev1.Pod{})
@@ -155,6 +190,73 @@ func TestReapOrphans_LiveTaskKept(t *testing.T) {
 	if !podExists(t, "reap-live") {
 		t.Error("expected pod for live non-terminal task to be kept")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// SUPERSEDED-STAGE POD REAP (production bug): a finished-stage pod (e.g. the
+// investigating pod of an incident Task that has already advanced to
+// clarifying) stayed Running forever - no existing rule covered "pod's
+// stamped agent kind != the Task's CURRENT stage agent kind".
+// ---------------------------------------------------------------------------
+
+// TestReapOrphans_SupersededStagePodReaped covers the production symptom
+// directly: an incident Task's investigating pod (LabelAgentKind=incident) is
+// still around after the Task advanced to clarifying (AgentKindFor=clarify).
+// Both kinds are non-empty and disagree, so it is reaped as superseded.
+func TestReapOrphans_SupersededStagePodReaped(t *testing.T) {
+	mkTaskProject(t, "p-reap-superseded", 3)
+	mkTaskRepository(t, "r-reap-superseded", "p-reap-superseded")
+	mkTask(t, "t-reap-superseded", "p-reap-superseded", "r-reap-superseded")
+	setTaskStage(t, "t-reap-superseded", tatarav1alpha1.StageClarifying)
+	mkWrapperPodSvcKind(t, "reap-superseded", "t-reap-superseded",
+		string(getTask(t, "t-reap-superseded").UID), stage.AgentIncident)
+
+	reaperServer().ReapOrphans(context.Background())
+	if podExists(t, "reap-superseded") {
+		t.Error("expected a pod stamped for a superseded stage (incident) to be reaped once its task moved to clarifying")
+	}
+}
+
+// TestReapOrphans_MatchingStagePodKept is the safety counterpart: a pod whose
+// stamped agent kind MATCHES the Task's current stage must never be reaped by
+// the new rule.
+func TestReapOrphans_MatchingStagePodKept(t *testing.T) {
+	mkTaskProject(t, "p-reap-matching", 3)
+	mkTaskRepository(t, "r-reap-matching", "p-reap-matching")
+	mkTask(t, "t-reap-matching", "p-reap-matching", "r-reap-matching")
+	setTaskStage(t, "t-reap-matching", tatarav1alpha1.StageInvestigating)
+	mkWrapperPodSvcKind(t, "reap-matching", "t-reap-matching",
+		string(getTask(t, "t-reap-matching").UID), stage.AgentIncident)
+
+	reaperServer().ReapOrphans(context.Background())
+	if !podExists(t, "reap-matching") {
+		t.Error("expected a pod whose kind matches the current stage to be kept")
+	}
+}
+
+// TestReapOrphans_SupersededStagePodFreshKept verifies the creation-grace
+// guard still protects a freshly spawned pod even when its kind mismatches
+// the Task's current stage (the spawn-vs-advance race).
+func TestReapOrphans_SupersededStagePodFreshKept(t *testing.T) {
+	mkTaskProject(t, "p-reap-freshsup", 3)
+	mkTaskRepository(t, "r-reap-freshsup", "p-reap-freshsup")
+	mkTask(t, "t-reap-freshsup", "p-reap-freshsup", "r-reap-freshsup")
+	setTaskStage(t, "t-reap-freshsup", tatarav1alpha1.StageClarifying)
+	mkWrapperPodSvcKind(t, "reap-freshsup", "t-reap-freshsup",
+		string(getTask(t, "t-reap-freshsup").UID), stage.AgentIncident)
+
+	srv := &CallbackServer{
+		Client:    k8sClient,
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Namespace: testNS,
+		// ReaperGrace zero => uses pollRequeue default (30s); pod is fresh.
+	}
+	srv.ReapOrphans(context.Background())
+	if !podExists(t, "reap-freshsup") {
+		t.Error("expected a freshly created superseded-kind pod to be protected by the grace window")
+	}
+	// Clean up so subsequent tests see a clean fixture set.
+	reaperServer().ReapOrphans(context.Background())
 }
 
 // setTaskAnns sets metadata annotations on the named Task (a metadata Update,
