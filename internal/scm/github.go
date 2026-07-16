@@ -198,6 +198,40 @@ func (c *GitHub) Comment(ctx context.Context, token, issueRef, body string) erro
 	return ghDo(ctx, c.base(), http.MethodPost, path, token, map[string]string{"body": body}, nil)
 }
 
+// AddSubIssue makes childNumber a sub-issue of parentRef via GitHub's sub-issues
+// API. It resolves the child's numeric id (the API body param is sub_issue_id,
+// NOT the number) and pre-checks the parent's child count (<100). Any 4xx (cap,
+// 403 cross-repo/org, unique-parent conflict) surfaces so the caller can fall
+// back to a cross-reference comment.
+func (c *GitHub) AddSubIssue(ctx context.Context, token, parentRef string, childNumber int) error {
+	owner, repo, parent, err := ghIssueRef(parentRef)
+	if err != nil {
+		return err
+	}
+	var child struct {
+		ID int64 `json:"id"`
+	}
+	childPath := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, childNumber)
+	if err := ghDo(ctx, c.base(), http.MethodGet, childPath, token, nil, &child); err != nil {
+		return fmt.Errorf("github: resolve sub-issue child %s/%s#%d id: %w", owner, repo, childNumber, err)
+	}
+	if child.ID == 0 {
+		return fmt.Errorf("github: sub-issue child %s/%s#%d returned no id", owner, repo, childNumber)
+	}
+	var summary struct {
+		Total int `json:"total"`
+	}
+	sumPath := fmt.Sprintf("/repos/%s/%s/issues/%d/sub_issues_summary", owner, repo, parent)
+	if err := ghDo(ctx, c.base(), http.MethodGet, sumPath, token, nil, &summary); err != nil {
+		return fmt.Errorf("github: read parent %s/%s#%d sub-issues summary: %w", owner, repo, parent, err)
+	}
+	if summary.Total >= 100 {
+		return fmt.Errorf("github: parent %s/%s#%d already holds %d sub-issues (max 100)", owner, repo, parent, summary.Total)
+	}
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d/sub_issues", owner, repo, parent)
+	return ghDo(ctx, c.base(), http.MethodPost, path, token, map[string]int64{"sub_issue_id": child.ID}, nil)
+}
+
 // OwnerRepo parses a GitHub clone/repo URL into owner and repo name.
 func OwnerRepo(repoURL string) (string, string, error) { return ghOwnerRepo(repoURL) }
 

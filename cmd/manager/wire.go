@@ -98,11 +98,13 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 	// mirror + the identity-unverified re-verify both write through objbudget); an
 	// unset SpillerFor left reverifyParked dead (fix W1).
 	webhook.NewServer(webhook.Config{
-		Client:     mgr.GetClient(),
-		Namespace:  cfg.Namespace,
-		Metrics:    metrics,
-		Seq:        seq,
-		SpillerFor: newSpillerFor(mgr, cfg),
+		Client:                        mgr.GetClient(),
+		Namespace:                     cfg.Namespace,
+		Metrics:                       metrics,
+		Seq:                           seq,
+		SpillerFor:                    newSpillerFor(mgr, cfg),
+		IncidentDedupVolatileLabels:   cfg.IncidentDedupVolatileLabels,
+		IncidentRefireCommentCooldown: cfg.IncidentRefireCommentCooldown,
 	}).Mount(httpMux)
 
 	// M3 REST API - OIDC-gated. Discovery failures at startup are fatal so

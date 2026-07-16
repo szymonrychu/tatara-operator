@@ -132,6 +132,10 @@ type IssueState struct {
 // hard-erroring.
 var ErrMergeConflict = fmt.Errorf("scm: merge conflict or PR not mergeable")
 
+// ErrSubIssuesUnsupported is returned by AddSubIssue when the provider has no
+// sub-issue primitive (GitLab). The caller degrades to a cross-reference comment.
+var ErrSubIssuesUnsupported = fmt.Errorf("scm: sub-issues not supported by this provider")
+
 // MergeState is the provider-neutral mergeability of a PR/MR, mapped from
 // GitHub REST mergeable_state and GitLab merge_status. Callers switch on it
 // exhaustively at the merge-gate / conflict-sweep decision point.
@@ -226,6 +230,12 @@ type SCMWriter interface {
 	// GetMergeState returns the provider-neutral mergeability of the PR/MR,
 	// used by the conflict self-heal (merge gate + stranded-DIRTY-PR sweep).
 	GetMergeState(ctx context.Context, repoURL, token string, number int) (MergeState, error)
+	// AddSubIssue makes childNumber a sub-issue of parentRef (owner/repo#parent).
+	// GitHub keys the sub-issues API on the child's numeric id (NOT its number),
+	// and a parent may hold at most 100 sub-issues, so implementations resolve the
+	// id and pre-check the count. A provider without a sub-issue primitive returns
+	// ErrSubIssuesUnsupported so the caller falls back to a cross-reference comment.
+	AddSubIssue(ctx context.Context, token, parentRef string, childNumber int) error
 }
 
 // IssueComment is one human comment on an issue, ordered oldest-first.

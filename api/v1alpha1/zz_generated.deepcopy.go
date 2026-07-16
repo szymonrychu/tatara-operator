@@ -366,6 +366,10 @@ func (in *IssueStatus) DeepCopyInto(out *IssueStatus) {
 		*out = make([]PendingComment, len(*in))
 		copy(*out, *in)
 	}
+	if in.LastRefireCommentAt != nil {
+		in, out := &in.LastRefireCommentAt, &out.LastRefireCommentAt
+		*out = (*in).DeepCopy()
+	}
 	if in.LastSyncedAt != nil {
 		in, out := &in.LastSyncedAt, &out.LastSyncedAt
 		*out = (*in).DeepCopy()

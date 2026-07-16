@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -54,12 +57,23 @@ type Config struct {
 	// reader so the identity-unverified re-verify path never needs a live
 	// forge call.
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
+	// IncidentDedupVolatileLabels overrides the per-series label denylist stripped
+	// from the incident dedup key. Nil => defaultVolatileDenylist.
+	IncidentDedupVolatileLabels []string
+	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment (A4).
+	IncidentRefireCommentCooldown time.Duration
+	// Now, when set, overrides time.Now for the coalesced refire-comment cooldown
+	// (A4), so a test can drive the cooldown window deterministically. Nil (the
+	// production default) uses the real clock.
+	Now func() time.Time
 }
 
 // Server serves the SCM webhook endpoint.
 type Server struct {
-	cfg Config
-	log *slog.Logger
+	cfg           Config
+	log           *slog.Logger
+	dedupDenylist map[string]bool
+	now           func() time.Time
 }
 
 // NewServer constructs a webhook Server.
@@ -82,7 +96,11 @@ func NewServer(cfg Config) *Server {
 		single := cfg.Spiller
 		cfg.SpillerFor = func(*tatarav1.Project) objbudget.Spiller { return single }
 	}
-	return &Server{cfg: cfg, log: cfg.Logger}
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &Server{cfg: cfg, log: cfg.Logger, dedupDenylist: denylistSet(cfg.IncidentDedupVolatileLabels), now: now}
 }
 
 // Mount registers the webhook route onto an existing chi router. Use this
@@ -392,8 +410,8 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 		s.accept(w, "grafana", "alert", alert.Status, "ignored")
 		return
 	}
-	groupHash := alertGroupHash(alert)
-	created, err := s.createIncidentTask(ctx, &proj, alert, groupHash)
+	dedupKey := incidentDedupKey(alert, proj.Name, s.dedupDenylist)
+	created, err := s.createIncidentTask(ctx, &proj, alert, dedupKey)
 	if err != nil {
 		s.reject(w, http.StatusInternalServerError, "create task", "grafana", "alert", "firing", "error")
 		return
@@ -411,22 +429,22 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 // live investigation is never disrupted, yet finite so a wedged incident cannot
 // suppress escalation forever (liveness finding #5). Anchor: LastActivityAt
 // (fallback CreationTimestamp).
-func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, groupHash string) (bool, error) {
+func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project, alert GrafanaAlert, dedupKey string) (bool, error) {
 	slugs := projectRepoSlugs(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name)
 	alertCtx := renderAlertContext(alert)
 	tierRevert := alert.CommonLabels["tatara_tier_quality"] == "true"
 	// In-flight-work dedup (finding #6): a firing alert that implicates a repo which
 	// already has a non-terminal Task must not spin a competing clarify->implement
-	// cycle (e.g. a component mid-deploy throwing a symptomatic alert). The alert-
-	// group hash only catches a re-fire of the SAME alert; this catches a DIFFERENT
-	// alert on a repo that is already being worked. The tier-revert self-heal is
+	// cycle (e.g. a component mid-deploy throwing a symptomatic alert). The rule-
+	// key only catches a re-fire of the SAME rule; this catches a DIFFERENT alert
+	// on a repo that is already being worked. The tier-revert self-heal is
 	// exempt: it targets tatara-helmfile and must always proceed.
 	if !tierRevert {
 		implicated := s.alertImplicatedRepos(ctx, proj.Name, alert)
 		if len(implicated) > 0 && s.repoHasNonTerminalTask(ctx, proj.Name, implicated) {
 			s.log.InfoContext(ctx, "incident skipped: implicated repo has in-flight work",
 				"action", "incident_skip_repo_inflight", "project", proj.Name,
-				"alert_group", groupHash, "repos", strings.Join(implicated, ","))
+				"alert_group", dedupKey, "repos", strings.Join(implicated, ","))
 			return false, nil
 		}
 	}
@@ -441,12 +459,84 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 		Goal:         goal,
 		GenerateName: "incident-",
 		AlertRule:    alertRuleName(alert),
-		DedupKey:     groupHash,
+		DedupKey:     dedupKey,
 		Labels:       map[string]string{tatarav1.LabelActivity: "incident"},
 		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}
-	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, groupHash, payload)
-	return created, err
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, dedupKey, payload)
+	if err != nil || created {
+		return created, err
+	}
+	// Suppressed (finding #5.5, O5): classify WHY for the business metric. An
+	// open tracker Issue is a distinct suppression reason from a live
+	// QueuedEvent/Task - it is what keeps suppression alive after the incident
+	// Task itself has terminated (A2).
+	reason := "live_task"
+	if iss, ok, ferr := queue.FindOpenIncidentIssue(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name, dedupKey); ferr == nil && ok {
+		reason = "open_issue"
+		s.enqueueRefireComment(ctx, proj, iss, alert)
+	}
+	s.cfg.Metrics.IncidentDedupSuppressed(reason)
+	s.log.InfoContext(ctx, "incident dedup suppressed",
+		"action", "incident_dedup_suppressed", "project", proj.Name,
+		"alertname", alertRuleName(alert), "rule_key", dedupKey, "reason", reason)
+	return false, nil
+}
+
+// enqueueRefireComment records a suppressed refire on the open tracker Issue:
+// it ALWAYS increments RefireCount, and enqueues ONE PendingComment (setting
+// LastRefireCommentAt) only when the cooldown has elapsed. No agent is
+// spawned (A4) - this is an operator comment through the existing
+// Issue.status.PendingComments drain.
+func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Project, iss *tatarav1.Issue, alert GrafanaAlert) {
+	now := s.now()
+	cooldown := s.cfg.IncidentRefireCommentCooldown
+	posted := false
+	key := types.NamespacedName{Namespace: iss.Namespace, Name: iss.Name}
+	spiller := s.cfg.SpillerFor(proj)
+	err := objbudget.FitIssue(ctx, s.cfg.Client, spiller, key, func(i *tatarav1.Issue) {
+		i.Status.RefireCount++
+		if i.Status.LastRefireCommentAt != nil && now.Sub(i.Status.LastRefireCommentAt.Time) < cooldown {
+			return // coalesced: within cooldown, counter already bumped
+		}
+		body := fmt.Sprintf("Alert re-fired %s; labels {%s}; %d recurrence.",
+			now.UTC().Format(time.RFC3339), stableLabelSummary(alert, s.dedupDenylist), i.Status.RefireCount)
+		reqID := fmt.Sprintf("refire-%s-%d", iss.Name, i.Status.RefireCount)
+		if len(i.Status.PendingComments) < 20 {
+			i.Status.PendingComments = append(i.Status.PendingComments, tatarav1.PendingComment{
+				RequestID: reqID, Action: "comment", Body: body,
+			})
+			t := metav1.NewTime(now)
+			i.Status.LastRefireCommentAt = &t
+			posted = true
+		}
+	})
+	if err != nil {
+		s.log.ErrorContext(ctx, "incident refire comment enqueue failed",
+			"action", "incident_refire_comment", "issue", iss.Name, "error", err)
+		return
+	}
+	result := "coalesced"
+	if posted {
+		result = "posted"
+	}
+	s.cfg.Metrics.IncidentRefireComment(result)
+	s.log.InfoContext(ctx, "incident refire comment",
+		"action", "incident_refire_comment", "project", proj.Name,
+		"issue", iss.Name, "rule_key", iss.Labels[queue.LabelAlertRuleKey], "result", result)
+}
+
+// stableLabelSummary renders the alert's stable (non-volatile) common labels
+// for the refire comment body, matching what the dedup key hashes over.
+func stableLabelSummary(a GrafanaAlert, denylist map[string]bool) string {
+	stable := make(map[string]string, len(a.CommonLabels))
+	for k, v := range a.CommonLabels {
+		if k == "alertname" || denylist[k] {
+			continue
+		}
+		stable[k] = v
+	}
+	return sortedKV(stable)
 }
 
 // projectRepoSlugs returns the owner/repo slugs of a project's Repositories,

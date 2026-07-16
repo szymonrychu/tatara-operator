@@ -175,6 +175,15 @@ type Config struct {
 	UsageOAuthClientID string
 	UsageTokenURL      string
 	UsageRefreshMargin time.Duration
+
+	// IncidentDedupVolatileLabels overrides the per-series label denylist that is
+	// stripped from the incident dedup key (webhook.defaultVolatileDenylist).
+	// Empty (nil) means use the operator default. From INCIDENT_DEDUP_VOLATILE_LABELS
+	// (CSV).
+	IncidentDedupVolatileLabels []string
+	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment on an
+	// open incident tracker. From INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES.
+	IncidentRefireCommentCooldown time.Duration
 }
 
 // BudgetDefaults returns the operator-wide token-budget configuration as a
@@ -208,6 +217,11 @@ const DefaultIdlePodReap = 30 * time.Minute
 // IdlePodReapAfter below this floor is clamped up to it in Load; zero disables
 // the idle backstop entirely.
 const MinIdlePodReap = 5 * time.Minute
+
+// DefaultIncidentRefireCooldown is how long the operator waits between coalesced
+// refire comments on one open incident tracker (A4). The recurrence counter
+// still increments on every suppressed refire; only the COMMENT is rate-limited.
+const DefaultIncidentRefireCooldown = 30 * time.Minute
 
 func getDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -405,6 +419,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	incidentRefireCooldown, err := getMinutesDefault("INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES", DefaultIncidentRefireCooldown)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
@@ -470,6 +488,9 @@ func Load() (Config, error) {
 		UsageOAuthClientID: getDefault("USAGE_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"), // gitleaks:allow
 		UsageTokenURL:      getDefault("USAGE_TOKEN_URL", "https://platform.claude.com/v1/oauth/token"),
 		UsageRefreshMargin: usageRefreshMargin,
+
+		IncidentDedupVolatileLabels:   getCSVList("INCIDENT_DEDUP_VOLATILE_LABELS"),
+		IncidentRefireCommentCooldown: incidentRefireCooldown,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

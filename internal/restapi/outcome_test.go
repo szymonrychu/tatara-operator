@@ -1,9 +1,11 @@
 package restapi_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"testing"
 
@@ -16,6 +18,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -582,6 +585,235 @@ func TestOutcome_Incident_FileIssueCreatesTheTrackerUnderThisTask(t *testing.T) 
 	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
 	require.Equal(t, "t1", iss.OwnerReferences[0].Name)
 	require.True(t, *iss.OwnerReferences[0].Controller)
+}
+
+// After file_issue on an incident Task whose spec.dedupKey is set, the minted
+// Issue CR carries the rule-key label (queue.LabelAlertRuleKey), and the
+// forge CreateIssue call carried the tatara-alert-rule=<key> label - the O5
+// suppression lookup and the human-visible forge recovery index (O4).
+func TestOutcome_Incident_StampsRuleKeyLabel(t *testing.T) {
+	task := taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident")
+	task.Spec.DedupKey = "abc123def4567890" //gitleaks:allow // test fixture, not a secret
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace"}}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+	require.Equal(t, "abc123def4567890", iss.Labels[queue.LabelAlertRuleKey])
+
+	require.Len(t, e.forge.createdReqs, 1)
+	require.Contains(t, e.forge.createdReqs[0].Labels, "tatara-alert-rule=abc123def4567890")
+}
+
+// A genuinely-new-but-related incident issue links itself as a GitHub
+// sub-issue under the open tracker (issue.parent), plus a cross-reference
+// comment on both, and the operator records result=linked (O8/B2/B3).
+func TestOutcome_Incident_ParentLinkSuccess(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace",
+	    "parent":{"repo":"tatara-memory","number":7}}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	require.Len(t, e.forge.subIssueCalls, 1)
+	require.Equal(t, "acme/tatara-memory#7", e.forge.subIssueCalls[0].ParentRef)
+	require.Equal(t, 101, e.forge.subIssueCalls[0].ChildNumber,
+		"childNumber must be the newly-filed issue's number")
+
+	require.Len(t, e.forge.comments, 2, "cross-reference comment on both child and parent")
+	var sawChild, sawParent bool
+	for _, c := range e.forge.comments {
+		if c.Ref == "acme/tatara-operator#101" {
+			sawChild = true
+			require.Contains(t, c.Body, "acme/tatara-memory#7")
+		}
+		if c.Ref == "acme/tatara-memory#7" {
+			sawParent = true
+			require.Contains(t, c.Body, "acme/tatara-operator#101")
+		}
+	}
+	require.True(t, sawChild, "no cross-reference comment on the child issue")
+	require.True(t, sawParent, "no cross-reference comment on the parent issue")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentSublinkCounter("linked")))
+}
+
+// AddSubIssue failing with scm.ErrSubIssuesUnsupported (GitLab, or any provider
+// error) degrades to a cross-reference-comment-only fallback: the incident
+// still succeeds, the relationship is never silently lost, and the metric
+// records result=fallback_comment (O8/B3 fallback chain).
+func TestOutcome_Incident_ParentLinkFallbackOnUnsupported(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+	e.forge.addSubIssueErr = scm.ErrSubIssuesUnsupported
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace",
+	    "parent":{"repo":"tatara-memory","number":7}}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String(),
+		"a link failure must never fail the incident outcome - the issue is already filed")
+
+	require.Len(t, e.forge.subIssueCalls, 1, "AddSubIssue is still attempted")
+	require.Len(t, e.forge.comments, 2, "fallback still cross-references both issues")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentSublinkCounter("fallback_comment")))
+	require.Equal(t, float64(0), testutil.ToFloat64(metrics.IncidentSublinkCounter("linked")))
+}
+
+// A generic AddSubIssue error (100-child cap, cross-repo 403, unique-parent
+// conflict) takes the same fallback path as ErrSubIssuesUnsupported.
+func TestOutcome_Incident_ParentLinkFallbackOnGenericError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+	e.forge.addSubIssueErr = fmt.Errorf("github: parent already holds 100 sub-issues")
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace",
+	    "parent":{"repo":"tatara-memory","number":7}}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Len(t, e.forge.comments, 2)
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentSublinkCounter("fallback_comment")))
+}
+
+// When AddSubIssue fails AND the fallback cross-reference comment(s) ALSO
+// fail (the same token that lacks cross-org sub-issue perms may also lack
+// comment perms on the cross-repo parent - #328's exact failure mode), the
+// relationship must not be silently reported as recorded: the metric moves to
+// result=failed (not fallback_comment) and an ERROR is logged, while the
+// incident outcome itself still succeeds (the issue is already filed).
+func TestOutcome_Incident_ParentLinkFailedWhenSubIssueAndCommentBothFail(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	e := buildV2(t, v2Opts{metrics: metrics, logger: logger}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-memory", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+	e.forge.addSubIssueErr = fmt.Errorf("github: sub-issues cross-org create is forbidden (403)")
+	e.forge.commentErr = fmt.Errorf("github: comment forbidden (403)")
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace",
+	    "parent":{"repo":"tatara-memory","number":7}}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String(),
+		"a total link/comment failure must never fail the incident outcome - the issue is already filed")
+
+	require.Len(t, e.forge.subIssueCalls, 1, "AddSubIssue is still attempted")
+	require.Len(t, e.forge.comments, 2, "both fallback comments are still attempted, even though they fail")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentSublinkCounter("failed")),
+		"the declared failed bucket must actually be emitted when nothing landed anywhere")
+	require.Equal(t, float64(0), testutil.ToFloat64(metrics.IncidentSublinkCounter("fallback_comment")),
+		"fallback_comment must not be reported when the fallback comment itself failed")
+	require.Equal(t, float64(0), testutil.ToFloat64(metrics.IncidentSublinkCounter("linked")))
+
+	out := logBuf.String()
+	require.Contains(t, out, `"level":"ERROR"`, "total failure must be logged at ERROR, not just WARN: %s", out)
+	require.Contains(t, out, `"action":"incident_sublink"`)
+	require.Contains(t, out, `"result":"failed"`)
+}
+
+// The parent-repo-unresolvable branch (child-only comment) gets the same
+// error-capture + result classification: if even that lone fallback comment
+// fails, the relationship is recorded nowhere and must surface as
+// result=failed with an ERROR log, not a falsely-successful fallback_comment.
+func TestOutcome_Incident_ParentRepoUnresolvableAndCommentFailsRecordsFailed(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	e := buildV2(t, v2Opts{metrics: metrics, logger: logger}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), // no "tatara-memory" repo CR registered
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+	e.forge.commentErr = fmt.Errorf("github: comment forbidden (403)")
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace",
+	    "parent":{"repo":"tatara-memory","number":7}}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String(),
+		"an unresolvable parent with a failed fallback comment must never fail the incident outcome")
+
+	require.Empty(t, e.forge.subIssueCalls, "no forge ref to target AddSubIssue at")
+	require.Len(t, e.forge.comments, 1, "the lone child-only fallback comment is still attempted")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentSublinkCounter("failed")))
+	require.Equal(t, float64(0), testutil.ToFloat64(metrics.IncidentSublinkCounter("fallback_comment")))
+
+	out := logBuf.String()
+	require.Contains(t, out, `"level":"ERROR"`, "log output: %s", out)
+	require.Contains(t, out, `"result":"failed"`)
+}
+
+// A parent repo not resolvable in this project (no such Repository CR) must
+// never call AddSubIssue (no owner/repo to target) and falls back to a plain
+// comment on the CHILD only, still preserving the relationship as text.
+func TestOutcome_Incident_ParentRepoUnresolvableFallsBackToChildOnly(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{metrics: metrics}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), // no "tatara-memory" repo CR registered
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"related to open tracker",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace",
+	    "parent":{"repo":"tatara-memory","number":7}}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String(),
+		"an unresolvable parent must never fail the incident outcome")
+
+	require.Empty(t, e.forge.subIssueCalls, "no forge ref to target AddSubIssue at")
+	require.Len(t, e.forge.comments, 1, "fallback comment on the child ONLY")
+	require.Equal(t, "acme/tatara-operator#101", e.forge.comments[0].Ref)
+	require.Contains(t, e.forge.comments[0].Body, "tatara-memory#7")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentSublinkCounter("fallback_comment")))
+}
+
+// file_issue with NO parent must never call AddSubIssue or post any
+// cross-reference comment - the link path is entirely opt-in.
+func TestOutcome_Incident_NoParentNoLinkCalls(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"standalone",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace"}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	require.Empty(t, e.forge.subIssueCalls)
+	require.Empty(t, e.forge.comments)
+}
+
+// issue.parent missing repo or number is a 400: the payload is malformed, not
+// just link-worthy.
+func TestOutcome_Incident_ParentMissingFieldsRejected(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"r",
+	  "issue":{"repo":"tatara-operator","title":"t","body":"b","parent":{"repo":"tatara-memory"}}}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 func TestOutcome_Incident_FalsePositiveRejects(t *testing.T) {

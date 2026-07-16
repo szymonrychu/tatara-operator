@@ -704,6 +704,12 @@ func glIIDFromURL(mrURL string) (int, error) {
 	return strconv.Atoi(s[i+1:])
 }
 
+// AddSubIssue is unsupported on GitLab (no sub-issue primitive); the caller
+// falls back to a related-link cross-reference comment.
+func (c *GitLab) AddSubIssue(_ context.Context, _, _ string, _ int) error {
+	return ErrSubIssuesUnsupported
+}
+
 // ClosePR closes an MR (state_event=close) and posts the reason as a note.
 func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int, body string) error {
 	proj, err := glProjectPath(repoURL)

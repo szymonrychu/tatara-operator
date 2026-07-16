@@ -200,6 +200,15 @@ type IssueStatus struct {
 	// +optional
 	// +kubebuilder:validation:MaxItems=20
 	PendingComments []PendingComment `json:"pendingComments,omitempty"`
+	// RefireCount counts suppressed refires of this incident's rule while the
+	// tracker stays open (A4). Incremented on EVERY suppressed refire; the comment
+	// is separately rate-limited by LastRefireCommentAt.
+	// +optional
+	RefireCount int `json:"refireCount,omitempty"`
+	// LastRefireCommentAt is when the last coalesced refire comment was enqueued.
+	// Skips enqueue while now-LastRefireCommentAt < IncidentRefireCommentCooldown.
+	// +optional
+	LastRefireCommentAt *metav1.Time `json:"lastRefireCommentAt,omitempty"`
 	// +optional
 	LastSyncedAt *metav1.Time `json:"lastSyncedAt,omitempty"`
 	// +optional
