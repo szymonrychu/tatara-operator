@@ -23,9 +23,14 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
+
+// forgeAlertRulePrefix is the human-visible GitHub label carrying the incident
+// rule-key, a recovery index if the Issue CRs are lost. Value: <hash16>.
+const forgeAlertRulePrefix = "tatara-alert-rule="
 
 // outcomeAcceptedCondition is the DURABLE idempotency record of an accepted
 // submit_outcome. Its Message is sha256(agentKind|payload), so a TTL-stopped
@@ -110,9 +115,18 @@ type brainstormPayload struct {
 }
 
 type incidentIssue struct {
-	Repo  string `json:"repo"`
-	Title string `json:"title"`
-	Body  string `json:"body"`
+	Repo   string          `json:"repo"`
+	Title  string          `json:"title"`
+	Body   string          `json:"body"`
+	Parent *incidentParent `json:"parent,omitempty"`
+}
+
+// incidentParent identifies the open tracker a genuinely-new-but-related
+// incident issue links itself under as a GitHub sub-issue (B2/B3). Repo is a
+// Repository CR name in this project, same convention as incidentIssue.Repo.
+type incidentParent struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
 }
 
 type incidentPayload struct {
@@ -1082,7 +1096,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, pr.Body); err != nil {
+		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, pr.Body, nil); err != nil {
 			writeClientErr(o.w, err)
 			return
 		}
@@ -1152,6 +1166,10 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 			o.bad("action=file_issue requires issue.repo, issue.title and issue.body", "missing-field")
 			return
 		}
+		if p.Issue.Parent != nil && (p.Issue.Parent.Repo == "" || p.Issue.Parent.Number == 0) {
+			o.bad("issue.parent requires repo and number", "bad-parent")
+			return
+		}
 	case "false_positive":
 		if p.Issue != nil {
 			o.bad("issue is only for action=file_issue", "unexpected-field")
@@ -1197,7 +1215,12 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	if !ok {
 		return
 	}
-	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: p.Issue.Title, Body: p.Issue.Body})
+	ruleKey := o.task.Spec.DedupKey
+	issueReq := scm.IssueReq{Title: p.Issue.Title, Body: p.Issue.Body}
+	if ruleKey != "" {
+		issueReq.Labels = append(issueReq.Labels, forgeAlertRulePrefix+ruleKey)
+	}
+	created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, issueReq)
 	controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
 	if err != nil {
 		s.log.ErrorContext(ctx, "restapi: filing the incident tracker issue failed",
@@ -1210,9 +1233,17 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		writeError(o.w, http.StatusBadGateway, "scm returned no issue number")
 		return
 	}
-	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, p.Issue.Body); err != nil {
+	var crLabels map[string]string
+	if ruleKey != "" {
+		crLabels = map[string]string{queue.LabelAlertRuleKey: ruleKey}
+	}
+	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, p.Issue.Body, crLabels); err != nil {
 		writeClientErr(o.w, err)
 		return
+	}
+
+	if p.Issue.Parent != nil {
+		s.linkIncidentParent(ctx, o, writer, token, created.Ref, p.Issue.Parent)
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
@@ -1222,6 +1253,72 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 	o.ok("file_issue", "repo", repo.Name, "number", number)
+}
+
+// linkIncidentParent links the freshly-filed child issue under an open tracker
+// as a GitHub sub-issue, cross-referencing both. BEST-EFFORT: the issue is
+// already filed, so no failure here fails the incident. On any AddSubIssue error
+// (unsupported provider, 100-child cap, cross-repo 403, unique-parent conflict)
+// it degrades to a "Related to" comment on both issues, so the relationship is
+// never silently lost (the #328 failure mode).
+func (s *Server) linkIncidentParent(ctx context.Context, o *outcomeCtx, writer scm.SCMWriter, token, childRef string, parent *incidentParent) {
+	parentRepo, err := s.repoCR(ctx, o.proj.Name, parent.Repo)
+	if err != nil {
+		// The parent repo is not in this project (or otherwise unresolvable), so
+		// there is no valid forge ref to link against or comment on. Preserve the
+		// relationship as plain text on the CHILD only - a comment on the parent
+		// needs a repo URL/token this project cannot vouch for.
+		fallbackRef := fmt.Sprintf("%s#%d", parent.Repo, parent.Number)
+		commentErr := writer.Comment(ctx, token, childRef, "Related to "+fallbackRef)
+		controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", commentErr)
+		if commentErr != nil {
+			// Nothing landed anywhere: not GitHub, not the CR, not even a comment.
+			// The relationship is genuinely lost, so the failed bucket must be real
+			// and this must be loud (ERROR), not a WARN masquerading as success.
+			s.metrics.IncidentSublink("failed")
+			s.log.ErrorContext(ctx, "incident sublink: parent repo not resolvable and fallback comment failed; relationship recorded nowhere",
+				"action", "incident_sublink", "task", o.task.Name, "child", childRef,
+				"parent_repo", parent.Repo, "parent_number", parent.Number, "result", "failed",
+				"resolve_error", err, "comment_error", commentErr)
+			return
+		}
+		s.metrics.IncidentSublink("fallback_comment")
+		s.log.WarnContext(ctx, "incident sublink: parent repo not resolvable, fallback comment on child only",
+			"action", "incident_sublink", "task", o.task.Name, "child", childRef,
+			"parent_repo", parent.Repo, "parent_number", parent.Number, "result", "fallback_comment", "error", err)
+		return
+	}
+	parentRef := issueRef(parentRepo, parent.Number) // owner/repo#N
+	linkErr := writer.AddSubIssue(ctx, token, parentRef, issueRefNumber(childRef))
+	if linkErr == nil {
+		_ = writer.Comment(ctx, token, childRef, "Related to "+parentRef)
+		_ = writer.Comment(ctx, token, parentRef, "Related sub-issue: "+childRef)
+		s.metrics.IncidentSublink("linked")
+		s.log.InfoContext(ctx, "incident sublink established",
+			"action", "incident_sublink", "task", o.task.Name,
+			"child", childRef, "parent", parentRef, "result", "linked")
+		return
+	}
+	childCommentErr := writer.Comment(ctx, token, childRef, "Related to "+parentRef)
+	controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", childCommentErr)
+	parentCommentErr := writer.Comment(ctx, token, parentRef, "Related: "+childRef)
+	controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", parentCommentErr)
+	if childCommentErr != nil && parentCommentErr != nil {
+		// AddSubIssue failed (e.g. cross-org 403, the #328 failure mode) AND
+		// both fallback comments failed too (the same token commonly lacks
+		// comment perms on the cross-repo/org parent). The relationship is
+		// recorded nowhere - make the failed bucket real and alertable.
+		s.metrics.IncidentSublink("failed")
+		s.log.ErrorContext(ctx, "incident sublink: AddSubIssue and both fallback comments failed; relationship recorded nowhere",
+			"action", "incident_sublink", "task", o.task.Name,
+			"child", childRef, "parent", parentRef, "result", "failed",
+			"link_error", linkErr, "child_comment_error", childCommentErr, "parent_comment_error", parentCommentErr)
+		return
+	}
+	s.metrics.IncidentSublink("fallback_comment")
+	s.log.WarnContext(ctx, "incident sublink fell back to cross-reference comment",
+		"action", "incident_sublink", "task", o.task.Name,
+		"child", childRef, "parent", parentRef, "result", "fallback_comment", "error", linkErr)
 }
 
 // --- refine, and the B.3 fold ---------------------------------------------

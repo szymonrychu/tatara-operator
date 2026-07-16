@@ -7,7 +7,7 @@ import (
 
 func TestGoalProject(t *testing.T) {
 	g := GoalProject("groupKey=abc status=firing commonLabels={alertname=HighCPU}", []string{"o/api", "o/web"})
-	for _, kw := range []string{"o/api", "o/web", "groupKey=abc", "grafana", "propose_issue", "read-only"} {
+	for _, kw := range []string{"o/api", "o/web", "groupKey=abc", "grafana", "submit_outcome", "read-only"} {
 		if !strings.Contains(g, kw) {
 			t.Fatalf("incident goal missing %q:\n%s", kw, g)
 		}
@@ -15,6 +15,25 @@ func TestGoalProject(t *testing.T) {
 	// Must forbid remediation/write actions.
 	if !strings.Contains(g, "Do NOT") || !strings.Contains(strings.ToLower(g), "remediat") {
 		t.Fatalf("incident goal must forbid remediation:\n%s", g)
+	}
+}
+
+// TestGoalProject_NoNonexistentTools is a regression test: the incident goal
+// must never name comment_on_issue/propose_issue - tools the incident MCP
+// profile does not expose (the #328 root cause B). Linking a genuinely-new-
+// but-related issue to an open tracker is expressed through submit_outcome's
+// issue.parent, executed by the operator (O8), not a dedicated agent tool.
+func TestGoalProject_NoNonexistentTools(t *testing.T) {
+	g := GoalProject("ALERTCTX", []string{"o/r1", "o/r2"})
+	for _, bad := range []string{"comment_on_issue", "propose_issue"} {
+		if strings.Contains(g, bad) {
+			t.Fatalf("goal still names nonexistent tool %q", bad)
+		}
+	}
+	for _, want := range []string{"submit_outcome", "file_issue", "false_positive", "parent", "o/r1"} {
+		if !strings.Contains(g, want) {
+			t.Fatalf("goal missing expected guidance %q", want)
+		}
 	}
 }
 

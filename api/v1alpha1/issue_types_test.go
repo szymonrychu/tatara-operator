@@ -319,3 +319,29 @@ func TestIssueStatus_PendingCommentsField(t *testing.T) {
 		t.Fatalf("PendingComments did not round-trip")
 	}
 }
+
+// TestIssueStatus_RefireFields asserts the A4 coalesced-refire-comment fields
+// (RefireCount, LastRefireCommentAt) both DeepCopy and JSON round-trip.
+func TestIssueStatus_RefireFields(t *testing.T) {
+	now := metav1.Now()
+	in := IssueStatus{LastRefireCommentAt: &now, RefireCount: 3}
+	out := in.DeepCopy()
+	if out.RefireCount != 3 || out.LastRefireCommentAt == nil {
+		t.Fatalf("refire fields did not round-trip: %+v", out)
+	}
+
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"refireCount"`) || !strings.Contains(string(data), `"lastRefireCommentAt"`) {
+		t.Errorf("marshaled IssueStatus missing refire fields: %s", data)
+	}
+	var round IssueStatus
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if round.RefireCount != 3 || round.LastRefireCommentAt == nil {
+		t.Fatalf("refire fields did not JSON round-trip: %+v", round)
+	}
+}

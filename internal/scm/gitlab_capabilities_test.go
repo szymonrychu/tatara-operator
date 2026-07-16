@@ -173,6 +173,15 @@ func TestGitLabCapabilities(t *testing.T) {
 	})
 }
 
+// TestGitLabAddSubIssue_Unsupported verifies GitLab (no sub-issues API)
+// returns the sentinel so the caller degrades to a cross-reference comment.
+func TestGitLabAddSubIssue_Unsupported(t *testing.T) {
+	c := &GitLab{apiBase: "http://unused"}
+	if err := c.AddSubIssue(context.Background(), "tok", "g/p#7", 42); !errors.Is(err, ErrSubIssuesUnsupported) {
+		t.Fatalf("GitLab AddSubIssue must return ErrSubIssuesUnsupported, got %v", err)
+	}
+}
+
 // TestGitLabMergeConflict verifies that Merge returns ErrMergeConflict on 405/406/409.
 func TestGitLabMergeConflict(t *testing.T) {
 	for _, status := range []int{405, 406, 409} {

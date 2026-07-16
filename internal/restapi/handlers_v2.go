@@ -1031,7 +1031,7 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 		writeError(w, http.StatusBadGateway, "scm returned no issue number")
 		return
 	}
-	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, req.Title, req.Body); err != nil {
+	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, req.Title, req.Body, nil); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -1044,12 +1044,15 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 }
 
 // mintIssueCR creates the Issue CR controller-owned by task, seeds its mirror
-// status from what we just posted, and appends the ref to the Task.
+// status from what we just posted, and appends the ref to the Task. crLabels
+// is stamped on the Issue CR's metadata.labels (e.g. queue.LabelAlertRuleKey
+// for an incident tracker, O4); nil for every non-incident caller.
 func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
-	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, number int, url, title, body string) error {
+	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, number int, url, title, body string,
+	crLabels map[string]string) error {
 	name := tatarav1alpha1.IssueName(repo.Name, number)
 	iss := &tatarav1alpha1.Issue{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns, Labels: crLabels},
 		Spec: tatarav1alpha1.IssueSpec{
 			RepositoryRef: repo.Name, Number: number, URL: url, ProjectRef: proj.Name,
 		},

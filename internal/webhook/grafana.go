@@ -78,8 +78,46 @@ func alertRuleName(a GrafanaAlert) string {
 	return a.GroupKey
 }
 
-// alertGroupHash is the dedup key for an alert group (16 hex chars of sha256(groupKey)).
-func alertGroupHash(a GrafanaAlert) string {
-	h := sha256.Sum256([]byte(a.GroupKey))
+// defaultVolatileDenylist is the set of alert labels whose VALUE varies per
+// firing series (pod name, restart reason, ...) and so must NOT enter the
+// incident dedup key. Stripping them is what makes the same rule firing for a
+// different pod/reason (or escalating from one pod to a fan-out) collapse to a
+// single tracker - the #320 vs #328 bug. Overridable via
+// INCIDENT_DEDUP_VOLATILE_LABELS.
+var defaultVolatileDenylist = []string{
+	"pod", "reason", "instance", "container",
+	"endpoint", "uid", "id", "replica", "ordinal",
+}
+
+// denylistSet builds the volatile-label lookup set. An empty labels slice falls
+// back to defaultVolatileDenylist (a configured empty list means "use default").
+func denylistSet(labels []string) map[string]bool {
+	if len(labels) == 0 {
+		labels = defaultVolatileDenylist
+	}
+	set := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		set[l] = true
+	}
+	return set
+}
+
+// incidentDedupKey is the rule+workload identity of a firing alert: the project,
+// the alert rule name, and the alert's STABLE common labels (volatile per-series
+// labels stripped, alertname stripped because it already occupies its own slot).
+// Same rule + same stable workload -> same key, so a pod/reason churn or a
+// single->fan-out escalation collapses to one tracker. 16 hex chars of sha256.
+// alertname falls back to the raw groupKey only when the alertname label is
+// absent (via alertRuleName).
+func incidentDedupKey(a GrafanaAlert, project string, denylist map[string]bool) string {
+	name := alertRuleName(a)
+	stable := make(map[string]string, len(a.CommonLabels))
+	for k, v := range a.CommonLabels {
+		if k == "alertname" || denylist[k] {
+			continue
+		}
+		stable[k] = v
+	}
+	h := sha256.Sum256([]byte(project + "\x00" + name + "\x00" + sortedKV(stable)))
 	return hex.EncodeToString(h[:])[:16]
 }

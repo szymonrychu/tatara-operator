@@ -18,6 +18,12 @@ const (
 	LabelQueuedEvent = "tatara.dev/queued-event"
 	LabelDedupKey    = "tatara.dev/dedup-key"
 
+	// LabelAlertRuleKey stamps the incident rule-key (16-hex incidentDedupKey) on
+	// an Issue CR so admission (dedupExists) can suppress a same-rule refire while
+	// the open tracker Issue lives, even after its Task terminates. Same VALUE as
+	// LabelDedupKey; distinct KEY because it lives on Issues, not QE/Task.
+	LabelAlertRuleKey = "tatara.dev/alert-rule-key"
+
 	// DedupKeyIndex is the field index key for QueuedEvent.Spec.DedupKey
 	// (contract B.7 addendum 7: "queuedEventDedupKey" on QueuedEvent ->
 	// spec.dedupKey). It is the AUTHORITATIVE in-flight QueuedEvent dedup
@@ -148,7 +154,33 @@ func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey 
 			return true, nil
 		}
 	}
+	if _, ok, err := FindOpenIncidentIssue(ctx, c, ns, projectRef, dedupKey); err != nil {
+		return false, err
+	} else if ok {
+		return true, nil
+	}
 	return false, nil
+}
+
+// FindOpenIncidentIssue returns the open incident Issue CR carrying the given
+// rule-key for projectRef, if any. "Open" means Status.State != "closed" (an
+// empty State is treated as open: the CR was just minted). Used both by
+// dedupExists (suppression authority, A2) and the webhook refire path (A4).
+func FindOpenIncidentIssue(ctx context.Context, c client.Client, ns, projectRef, dedupKey string) (*tatarav1alpha1.Issue, bool, error) {
+	if dedupKey == "" {
+		return nil, false, nil
+	}
+	var il tatarav1alpha1.IssueList
+	if err := c.List(ctx, &il, client.InNamespace(ns), client.MatchingLabels{LabelAlertRuleKey: dedupLabel(dedupKey)}); err != nil {
+		return nil, false, err
+	}
+	for i := range il.Items {
+		iss := &il.Items[i]
+		if iss.Spec.ProjectRef == projectRef && iss.Status.State != "closed" {
+			return iss, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // EnqueueEvent writes a QueuedEvent (seq-assigned, owned by Project, state=Queued).

@@ -212,6 +212,107 @@ func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	}
 }
 
+// --- dedupExists scope: live QueuedEvent, live Task, open Issue -----------
+
+func TestDedupExists_LiveQueuedEventSuppresses(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
+	ns, proj, key := "tns", "p1", "abc123def4567890"
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe1", Namespace: ns, Labels: map[string]string{LabelDedupKey: dedupLabel(key)}},
+		Spec:       tatarav1alpha1.QueuedEventSpec{ProjectRef: proj, DedupKey: key},
+	}
+	require.NoError(t, c.Create(context.Background(), qe))
+	qe.Status.State = tatarav1alpha1.QueueStateQueued
+	require.NoError(t, c.Status().Update(context.Background(), qe))
+
+	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	require.NoError(t, err)
+	require.True(t, got, "a live (Queued) QueuedEvent for the dedup key must suppress")
+}
+
+func TestDedupExists_LiveTaskSuppresses(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+	ns, proj, key := "tns", "p1", "abc123def4567890"
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t1", Namespace: ns, Labels: map[string]string{LabelDedupKey: dedupLabel(key)}},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj},
+	}
+	require.NoError(t, c.Create(context.Background(), task))
+	task.Status.Stage = tatarav1alpha1.StageInvestigating
+	require.NoError(t, c.Status().Update(context.Background(), task))
+
+	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	require.NoError(t, err)
+	require.True(t, got, "a non-terminal Task for the dedup key must suppress")
+}
+
+func TestDedupExists_OpenIssueSuppresses(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Issue{}).Build()
+	ns, proj, key := "tns", "p1", "abc123def4567890"
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "iss-open", Namespace: ns,
+			Labels: map[string]string{LabelAlertRuleKey: key},
+		},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "r"},
+	}
+	require.NoError(t, c.Create(context.Background(), iss))
+	iss.Status.State = "open"
+	require.NoError(t, c.Status().Update(context.Background(), iss))
+
+	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	require.NoError(t, err)
+	require.True(t, got, "an OPEN incident Issue for the rule-key must suppress")
+}
+
+func TestDedupExists_ClosedIssueDoesNotSuppress(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Issue{}).Build()
+	ns, proj, key := "tns", "p1", "abc123def4567890"
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "iss-closed", Namespace: ns,
+			Labels: map[string]string{LabelAlertRuleKey: key},
+		},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "r"},
+	}
+	require.NoError(t, c.Create(context.Background(), iss))
+	iss.Status.State = "closed"
+	require.NoError(t, c.Status().Update(context.Background(), iss))
+
+	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	require.NoError(t, err)
+	require.False(t, got, "a CLOSED incident Issue must NOT suppress - refire is fresh")
+}
+
+func TestFindOpenIncidentIssue_EmptyKeyReturnsNotFound(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	_, ok, err := FindOpenIncidentIssue(context.Background(), c, "ns", "p", "")
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+func TestFindOpenIncidentIssue_DifferentProjectDoesNotMatch(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Issue{}).Build()
+	ns, key := "tns", "abc123def4567890"
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss1", Namespace: ns, Labels: map[string]string{LabelAlertRuleKey: key}},
+		Spec:       tatarav1alpha1.IssueSpec{ProjectRef: "other-project", RepositoryRef: "r"},
+	}
+	require.NoError(t, c.Create(context.Background(), iss))
+	iss.Status.State = "open"
+	require.NoError(t, c.Status().Update(context.Background(), iss))
+
+	_, ok, err := FindOpenIncidentIssue(context.Background(), c, ns, "p1", key)
+	require.NoError(t, err)
+	require.False(t, ok, "an open Issue under a DIFFERENT project must not match")
+}
+
 // TestDedupKeyIndexer_RoundTripsThroughSpecField verifies the NEW dedup
 // mechanism (contract B.7 addendum 7): the natural key round-trips through
 // QueuedEvent.spec.dedupKey and the DedupKeyIndex field index, with NO label

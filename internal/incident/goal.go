@@ -21,9 +21,11 @@ const toolingNoteGuidance = promptguidance.ToolingNoteGuidance
 
 // GoalProject returns the turn-0 goal for a project-scoped incident Task fired
 // by a Grafana alert. The agent investigates live (read-only) via the Grafana
-// MCP server, then files exactly one evidence issue via propose_issue, choosing
-// the repo the evidence implicates. alertCtx is a pre-rendered compact block of
-// the alert (group key, status, labels, annotations, generator/external URLs).
+// MCP server, surveys open trackers, then finishes with submit_outcome
+// (file_issue, optionally issue.parent to link a related-but-distinct issue as
+// a GitHub sub-issue under an open tracker, or false_positive). alertCtx is a
+// pre-rendered compact block of the alert (group key, status, labels,
+// annotations, generator/external URLs).
 func GoalProject(alertCtx string, slugs []string) string {
 	repoList := strings.Join(slugs, ", ")
 	return "Invoke the `tatara-incident-sre` skill FIRST and follow its phases in order; consult " +
@@ -34,21 +36,22 @@ func GoalProject(alertCtx string, slugs []string) string {
 		"Investigate LIVE using the `grafana` MCP server (read-only): query the relevant Prometheus/Loki " +
 		"datasources, read the firing alert rule (follow its generatorURL), and inspect related dashboards. " +
 		"Form a diagnosis backed by the queries you ran and their results.\n\n" +
-		"Before proposing, SURVEY for an existing tracker: (1) list open incident Tasks for this project with " +
-		"your task_list tool and check whether any carries a matching alert identity, and (2) SURVEY the " +
-		"project's EXISTING OPEN issues (use your issue-listing tool across the repos above). If this same " +
-		"problem is ALREADY tracked - by an open incident Task, a human-reported issue, a brainstorm, or an " +
-		"earlier incident - do NOT open a DUPLICATE: add your fresh evidence as a comment on the existing " +
-		"tracked issue (comment_on_issue) and finish. Only propose a new issue when nothing open already " +
-		"covers it.\n\n" +
-		"Then call propose_issue(repo, body) EXACTLY ONCE. Choose the `repo` (from the list above) that the " +
-		"evidence implicates. The body MUST contain: the alert summary, the queries/tools you ran and their " +
-		"results, your diagnosis, and the Grafana links (generatorURL/externalURL). The issue lands with the " +
-		"brainstorming label and the normal triage/brainstorm flow takes over.\n\n" +
-		"If after investigation this is a confirmed false positive, finish with a one-line note and " +
-		"do NOT open an issue.\n\n" +
+		"Then SURVEY for existing trackers: (1) list open incident Tasks for this project with your " +
+		"task_list tool, and (2) survey the project's EXISTING OPEN issues across the repos above with your " +
+		"issue-listing tool. A DUPLICATE of the SAME alert rule never reaches you - it is suppressed at " +
+		"admission - so your survey is only to find a RELATED open tracker.\n\n" +
+		"Finish with `submit_outcome` exactly once:\n" +
+		"- genuinely-new-but-RELATED to an open tracker you found: " +
+		"`submit_outcome(action=file_issue, issue.repo, issue.title, issue.body, " +
+		"issue.parent={repo, number})`. The operator links your new issue as a sub-issue under that " +
+		"tracker and cross-references both. Choose the `repo` (from the list above) the evidence implicates.\n" +
+		"- genuinely-new-and-UNRELATED: `submit_outcome(action=file_issue, ...)` with NO parent.\n" +
+		"- confirmed FALSE POSITIVE: `submit_outcome(action=false_positive, reason=...)`, open no issue.\n\n" +
+		"The issue body MUST contain: the alert summary, the queries/tools you ran and their results, your " +
+		"diagnosis, and the Grafana links (generatorURL/externalURL). The issue lands and the normal " +
+		"triage flow takes over.\n\n" +
 		"This is a READ-ONLY investigation. Do NOT take any remediation, write, or corrective action on any " +
-		"system. Your only output is the issue (or the false-positive note)." +
+		"system. Your only output is the outcome above." +
 		platformProblemGuidance + toolingNoteGuidance
 }
 

@@ -365,6 +365,95 @@ func TestGitHubReviewVerbs(t *testing.T) {
 	})
 }
 
+// TestGitHubAddSubIssue verifies the resolve-id -> cap-check -> POST sequence,
+// and that the POST body carries the child's numeric id (sub_issue_id), not
+// its number.
+func TestGitHubAddSubIssue(t *testing.T) {
+	var posted map[string]int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "number": 42})
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/issues/7/sub_issues_summary":
+			_ = json.NewEncoder(w).Encode(map[string]any{"total": 3})
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/issues/7/sub_issues":
+			_ = json.NewDecoder(r.Body).Decode(&posted)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	if err := c.AddSubIssue(context.Background(), "tok", "o/r#7", 42); err != nil {
+		t.Fatalf("AddSubIssue: %v", err)
+	}
+	if posted["sub_issue_id"] != 9001 {
+		t.Fatalf("posted sub_issue_id=%d, want 9001 (numeric id, not number)", posted["sub_issue_id"])
+	}
+}
+
+// TestGitHubAddSubIssue_CapExceeded verifies the parent's sub_issues_summary
+// pre-check refuses to POST once the parent already holds the 100-child max.
+func TestGitHubAddSubIssue_CapExceeded(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/issues/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "number": 42})
+		case "/repos/o/r/issues/7/sub_issues_summary":
+			_ = json.NewEncoder(w).Encode(map[string]any{"total": 100})
+		default:
+			t.Fatalf("must not POST when cap reached: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	if err := c.AddSubIssue(context.Background(), "tok", "o/r#7", 42); err == nil {
+		t.Fatal("expected error when parent already has 100 sub-issues")
+	}
+}
+
+// TestGitHubAddSubIssue_ChildResolveFails verifies a failure resolving the
+// child's numeric id (403/500) surfaces as an error so the caller falls back
+// to a cross-reference comment.
+func TestGitHubAddSubIssue_ChildResolveFails(t *testing.T) {
+	for _, status := range []int{403, 500} {
+		status := status
+		t.Run(fmt.Sprintf("http%d", status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+			c := &GitHub{apiBase: srv.URL}
+			if err := c.AddSubIssue(context.Background(), "tok", "o/r#7", 42); err == nil {
+				t.Fatalf("expected error for child-resolve HTTP %d", status)
+			}
+		})
+	}
+}
+
+// TestGitHubAddSubIssue_POSTFails verifies a POST failure (e.g. unique-parent
+// conflict, cross-repo 403) surfaces so the caller can fall back.
+func TestGitHubAddSubIssue_POSTFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/o/r/issues/42":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": 9001, "number": 42})
+		case r.URL.Path == "/repos/o/r/issues/7/sub_issues_summary":
+			_ = json.NewEncoder(w).Encode(map[string]any{"total": 3})
+		case r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusConflict)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+	c := &GitHub{apiBase: srv.URL}
+	if err := c.AddSubIssue(context.Background(), "tok", "o/r#7", 42); err == nil {
+		t.Fatal("expected error on POST conflict")
+	}
+}
+
 func ghSign(payload []byte, secret string) string {
 	m := hmac.New(sha256.New, []byte(secret))
 	m.Write(payload)

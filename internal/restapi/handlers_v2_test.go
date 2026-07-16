@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,11 +41,26 @@ type panicReader struct{ scm.SCMReader }
 // what proves /outcome never posts a review.
 type recordingForge struct {
 	scm.SCMWriter
-	heads       map[string]string // "<number>" -> live head sha
-	createdRefs []string
-	openedURLs  []string
-	issueStates map[int]scm.IssueState
-	nextNumber  int
+	heads          map[string]string // "<number>" -> live head sha
+	createdRefs    []string
+	createdReqs    []scm.IssueReq // the FULL CreateIssue request (incl. Labels), one per call
+	openedURLs     []string
+	issueStates    map[int]scm.IssueState
+	nextNumber     int
+	comments       []recordedComment  // every Comment call, in order
+	subIssueCalls  []recordedSubIssue // every AddSubIssue call, in order
+	addSubIssueErr error              // returned by AddSubIssue when set (e.g. scm.ErrSubIssuesUnsupported)
+	commentErr     error              // returned by Comment when set (e.g. cross-repo 403 on the parent)
+}
+
+type recordedComment struct {
+	Ref  string
+	Body string
+}
+
+type recordedSubIssue struct {
+	ParentRef   string
+	ChildNumber int
 }
 
 func newRecordingForge() *recordingForge {
@@ -65,6 +81,7 @@ func (f *recordingForge) CreateIssue(_ context.Context, repoURL, _ string, req s
 	f.nextNumber++
 	ref := fmt.Sprintf("acme/%s#%d", lastSeg(repoURL), f.nextNumber)
 	f.createdRefs = append(f.createdRefs, ref)
+	f.createdReqs = append(f.createdReqs, req)
 	return scm.CreatedIssue{Ref: ref, URL: "https://forge/issues/" + fmt.Sprint(f.nextNumber)}, nil
 }
 
@@ -77,6 +94,16 @@ func (f *recordingForge) OpenChange(_ context.Context, _, _, _, _, _, body strin
 
 func (f *recordingForge) GetIssueState(_ context.Context, _, _ string, number int) (scm.IssueState, error) {
 	return f.issueStates[number], nil
+}
+
+func (f *recordingForge) Comment(_ context.Context, _, issueRef, body string) error {
+	f.comments = append(f.comments, recordedComment{Ref: issueRef, Body: body})
+	return f.commentErr
+}
+
+func (f *recordingForge) AddSubIssue(_ context.Context, _, parentRef string, childNumber int) error {
+	f.subIssueCalls = append(f.subIssueCalls, recordedSubIssue{ParentRef: parentRef, ChildNumber: childNumber})
+	return f.addSubIssueErr
 }
 
 func lastSeg(s string) string {
@@ -165,6 +192,7 @@ type v2Opts struct {
 	memory     *fakeMemory
 	approval   *fakeApproval
 	metrics    *obs.OperatorMetrics
+	logger     *slog.Logger
 	spillerErr error
 	now        func() time.Time
 }
@@ -216,6 +244,9 @@ func buildV2(t *testing.T, opts v2Opts, objs ...client.Object) *v2Env {
 	}
 	if opts.metrics != nil {
 		cfg.Metrics = opts.metrics
+	}
+	if opts.logger != nil {
+		cfg.Logger = opts.logger
 	}
 	s := restapi.NewServer(cfg)
 	r := chi.NewRouter()

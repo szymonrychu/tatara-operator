@@ -42,14 +42,3 @@ func TestAlertRuleName_AlertnameThenGroupKey(t *testing.T) {
 		t.Fatalf("fallback: want gk-only, got %q", got)
 	}
 }
-
-func TestAlertGroupHash_StableAndDistinct(t *testing.T) {
-	a, _ := parseGrafanaAlert([]byte(grafanaFiring))
-	b, _ := parseGrafanaAlert([]byte(grafanaResolved))
-	if alertGroupHash(a) == "" || len(alertGroupHash(a)) != 16 {
-		t.Fatalf("hash must be 16 hex: %q", alertGroupHash(a))
-	}
-	if alertGroupHash(a) == alertGroupHash(b) {
-		t.Fatalf("distinct groupKeys must hash differently")
-	}
-}

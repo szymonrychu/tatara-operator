@@ -100,6 +100,11 @@ idlePodReapMinutes: 30
 # families appear; TataraPushMetricsDropped fires if a prefix is missed.
 pushMetricsAllowedPrefixes: "wrapper_,agent_,ccw_,tatara_wrapper_,ingest_,analyzer_,semantic_,scip_,llm_"
 
+# Incident dedup + refire (issue #320/#328). Empty volatile-labels CSV => the
+# operator's built-in default (pod,reason,instance,container,endpoint,uid,id,replica,ordinal).
+incidentDedupVolatileLabels: ""
+incidentRefireCommentCooldownMinutes: 30
+
 # Token-budget admission gate (issue #189): pause proactive work (brainstorm,
 # implement, review) at tokenBudgetProactivePercent and incident work at
 # tokenBudgetEmergencyPercent of the per-window usage, resuming when the window
