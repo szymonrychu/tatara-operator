@@ -77,6 +77,20 @@ type reviewPayload struct {
 	Findings           []reviewFindingPayload `json:"findings,omitempty"`
 }
 
+// headMovedResponse is the STRUCTURED, self-healing 409 body the review handler
+// returns when a reported head moved (cross-repo contract: tatara-cli keys on
+// reason=="head-moved" to render it as a NON-error tool result the agent acts
+// on, NOT a hard failure). The field names are load-bearing across repos.
+type headMovedResponse struct {
+	Reason          string `json:"reason"`
+	Repo            string `json:"repo"`
+	Number          int    `json:"number"`
+	ReviewedSHA     string `json:"reviewedSHA"`
+	LiveSHA         string `json:"liveSHA"`
+	MirrorRefreshed bool   `json:"mirrorRefreshed"`
+	Message         string `json:"message"`
+}
+
 type clarifyPayload struct {
 	Decision string `json:"decision"`
 	Reason   string `json:"reason"`
@@ -699,9 +713,42 @@ func (o *outcomeCtx) review(p reviewPayload) {
 		}
 		k := mrKey(mr.Spec.RepositoryRef, mr.Spec.Number)
 		if live != reported[k] {
-			// NOTHING IS STAMPED. The agent re-reads and re-submits.
+			// HEAD MOVED - SELF-HEAL. The agent reviewed the mirror's head, which
+			// lags (hourly sweep); for a fast-moving MR it stays stale, so a bare
+			// 409 loops - the agent re-reviews the SAME stale sha and 409s forever.
+			// Instead: PULL THE NEW COMMITS UNDERNEATH - resync THIS MR's mirror to
+			// the live head (and its thread) on demand - then return a STRUCTURED,
+			// non-fatal head-moved body the cli renders as guidance, so the agent
+			// re-syncs its workspace, re-reviews the fresh diff, and resubmits with
+			// the new sha. NOTHING is stamped (reviewedSHA/pendingReview): the
+			// review was of stale code and is NOT accepted.
+			reader, _, rok := s.projectSCMReader(o.w, o.r, o.proj)
+			if !rok {
+				return
+			}
+			if err := controller.SyncMergeRequestOnDemand(ctx, s.c, s.spiller, reader, o.proj, repo, mr, live); err != nil {
+				s.log.WarnContext(ctx, "restapi: on-demand mirror resync after head-moved hit an error; the live head was stamped, the thread may lag a sweep",
+					append(reqLogFields(o.r), "task", o.task.Name, "repo", mr.Spec.RepositoryRef,
+						"number", mr.Spec.Number, "error", err)...)
+			}
 			obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, "head-moved").Inc()
-			writeError(o.w, http.StatusConflict, "head moved since you reviewed it")
+			s.metrics.RecordReviewHeadMoved(mr.Spec.RepositoryRef)
+			s.log.InfoContext(ctx, "review head moved since checkout; mirror refreshed to the live head",
+				append(reqLogFields(o.r), "action", "review_head_moved", "task", o.task.Name,
+					"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number,
+					"reviewedSHA", reported[k], "liveSHA", live)...)
+			writeJSON(o.w, http.StatusConflict, headMovedResponse{
+				Reason:          "head-moved",
+				Repo:            mr.Spec.RepositoryRef,
+				Number:          mr.Spec.Number,
+				ReviewedSHA:     reported[k],
+				LiveSHA:         live,
+				MirrorRefreshed: true,
+				Message: fmt.Sprintf("The head of %s#%d moved from %s to %s since you checked out. "+
+					"Your review was of stale code and was NOT submitted; the mirror is refreshed to the new head. "+
+					"Re-sync your workspace (git fetch && git checkout %s), re-review the new diff, and submit again.",
+					mr.Spec.RepositoryRef, mr.Spec.Number, reported[k], live, live),
+			})
 			return
 		}
 	}

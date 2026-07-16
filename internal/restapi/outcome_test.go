@@ -2,6 +2,7 @@ package restapi_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -266,11 +267,25 @@ func TestOutcome_Review_ApprovePersistsApprovedStatus(t *testing.T) {
 	require.Equal(t, "## Review: approved", mr.Status.PendingReview.Body)
 }
 
-// THE HEAD-MOVED 409. The operator re-reads the LIVE head and refuses a verdict
-// whose reported SHA moved. NOTHING is stamped.
-func TestOutcome_Review_HeadMovedIs409AndStampsNothing(t *testing.T) {
+// emptyCommentReader is an SCMReader whose thread reads return no comments, so a
+// head-moved on-demand resync can run in-process without a live forge.
+type emptyCommentReader struct{ scm.SCMReader }
+
+func (emptyCommentReader) ListIssueComments(_ context.Context, _, _ string, _ int) ([]scm.IssueComment, error) {
+	return nil, nil
+}
+
+// THE HEAD-MOVED SELF-HEAL. The operator re-reads the LIVE head, refuses a
+// verdict whose reported SHA moved, REFRESHES the MR mirror to the live head on
+// demand, and returns a STRUCTURED reason="head-moved" body (the cross-repo
+// contract the cli keys on) - never the old plain-text "head moved" string.
+// reviewedSHA/pendingReview stay unstamped; the mirror's headSHA advances.
+func TestOutcome_Review_HeadMovedRefreshesMirrorAndReturnsStructured409(t *testing.T) {
 	forge := &reviewPanicForge{heads: map[int]string{295: "sha-NEW"}}
-	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{writer: forge, reader: emptyCommentReader{}, metrics: metrics},
+		projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
 		mrV2("tatara-operator", 295, "t1"))
@@ -278,12 +293,34 @@ func TestOutcome_Review_HeadMovedIs409AndStampsNothing(t *testing.T) {
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
 	  "verdict":"approve","reviewedSHAs":[{"repo":"tatara-operator","number":295,"sha":"sha-OLD"}]}}`)
 	require.Equal(t, http.StatusConflict, w.Code)
-	require.Contains(t, w.Body.String(), "head moved since you reviewed it")
+	require.NotContains(t, w.Body.String(), "head moved since you reviewed it",
+		"the old plain-text body must be gone")
+
+	var resp struct {
+		Reason          string `json:"reason"`
+		Repo            string `json:"repo"`
+		Number          int    `json:"number"`
+		ReviewedSHA     string `json:"reviewedSHA"`
+		LiveSHA         string `json:"liveSHA"`
+		MirrorRefreshed bool   `json:"mirrorRefreshed"`
+		Message         string `json:"message"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, "head-moved", resp.Reason)
+	require.Equal(t, "tatara-operator", resp.Repo)
+	require.Equal(t, 295, resp.Number)
+	require.Equal(t, "sha-OLD", resp.ReviewedSHA)
+	require.Equal(t, "sha-NEW", resp.LiveSHA)
+	require.True(t, resp.MirrorRefreshed)
+	require.Contains(t, resp.Message, "git fetch && git checkout sha-NEW")
 
 	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
-	require.Nil(t, mr.Status.PendingReview)
-	require.Empty(t, mr.Status.ReviewedSHA)
-	require.Equal(t, "new", mr.Status.Status)
+	require.Nil(t, mr.Status.PendingReview, "the stale review is NOT persisted")
+	require.Empty(t, mr.Status.ReviewedSHA, "reviewedSHA is NOT stamped on a stale head")
+	require.Equal(t, "sha-NEW", mr.Status.HeadSHA, "the mirror is pulled to the live head")
+
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.ReviewHeadMovedCounter("tatara-operator")),
+		"operator_review_head_moved_total{repo} must record the stuck-head signal")
 }
 
 // COVERAGE IS TOTAL. A reviewedSHAs that omits an owned MR is a 400, NOT

@@ -560,6 +560,38 @@ func SyncIssueOnDemand(ctx context.Context, c client.Client, sp objbudget.Spille
 	return syncIssueThread(ctx, c, sp, reader, proj, &repo, iss)
 }
 
+// SyncMergeRequestOnDemand re-reads ONE MergeRequest NOW - its thread from the
+// forge and the caller-supplied LIVE head - and converges the mirror, off
+// cadence. It is the MergeRequest counterpart of SyncIssueOnDemand, run from
+// /outcome when a review's reported head moved: "pull the new commits
+// underneath" so the agent's next scm_read(kind=mr) sees the live head and
+// re-reviews it, instead of re-submitting the stale sha into a permanent 409
+// loop while the mirror waits out the hourly sweep.
+//
+// liveHeadSHA is the head the CALLER already read LIVE (GetPRHead): the
+// SCMReader interface carries no head read, and re-reading it here would be a
+// second forge call for a value the caller holds. The head is stamped in its own
+// write so it converges even if the thread re-read failed - a thread error is
+// returned for the caller to log, but the load-bearing head is already durable.
+func SyncMergeRequestOnDemand(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
+	proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHeadSHA string) error {
+	threadErr := syncMergeRequestThread(ctx, c, sp, reader, proj, repo, mr)
+	now := metav1.Now()
+	key := client.ObjectKeyFromObject(mr)
+	if err := objbudget.FitMergeRequest(ctx, c, sp, key, func(cur *tatarav1alpha1.MergeRequest) {
+		cur.Status.HeadSHA = liveHeadSHA
+		cur.Status.LastSyncedAt = &now
+		meta.SetStatusCondition(&cur.Status.Conditions, syncedCondition())
+	}); err != nil {
+		obs.MirrorSyncTotal.WithLabelValues("MergeRequest", "error").Inc()
+		return fmt.Errorf("mirror: stamp live head on %s: %w", key.Name, err)
+	}
+	log.FromContext(ctx).Info("mirror: synced mergerequest to live head on demand",
+		"action", "mirror_sync_ondemand", "kind", "MergeRequest", "resource_id", key.Name,
+		"repo", repo.Name, "number", mr.Spec.Number, "head_sha", liveHeadSHA)
+	return threadErr
+}
+
 // mirrorOwnerTask resolves the controller-owning Task of an artifact, which is
 // what MirrorCadence keys on. A missing owner (an artifact the sweep has not
 // minted a Task for yet, or whose Task the reaper just collected) is not an
