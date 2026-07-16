@@ -13,9 +13,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -807,4 +810,76 @@ func turnSubmitCount(t *testing.T, reg *prometheus.Registry, kind, result string
 		}
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// TICKET CLASS BY STAGE, NOT BY TASK KIND (production bug).
+// ---------------------------------------------------------------------------
+
+// ticketMirrorClient is newMirrorClient's twin, but with QueuedEvent's status
+// subresource enabled too: EnqueueEvent does a Create then a Status().Update
+// to stamp state=Queued, which a client that does not know QueuedEvent has a
+// status subresource 404s on. newMirrorClient omits it because none of its
+// (many) other callers ever enqueue a ticket through it.
+func ticketMirrorClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(objs...).
+		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{},
+			&tatarav1alpha1.Task{}, &tatarav1alpha1.QueuedEvent{}).
+		Build()
+}
+
+// TestEnsureTicketClassByStageAgentKind covers the production symptom: an
+// incident Task's DOWNSTREAM stages (clarify, implement, ...) were classed
+// QueueClassAlert just because task.Spec.Kind == "incident", starving them
+// behind AlertCapacity=1 alongside the investigating stage they queue behind.
+// Only the investigating stage - whose agentKind IS incident - may draw from
+// the alert pool; every other stage of the same incident Task is a normal
+// downstream ticket and must use the normal pool.
+func TestEnsureTicketClassByStageAgentKind(t *testing.T) {
+	cases := []struct {
+		name      string
+		stg       string
+		wantClass string
+	}{
+		{"investigating is alert-class", tatarav1alpha1.StageInvestigating, tatarav1alpha1.QueueClassAlert},
+		{"clarifying is normal-class", tatarav1alpha1.StageClarifying, tatarav1alpha1.QueueClassNormal},
+		{"implementing is normal-class", tatarav1alpha1.StageImplementing, tatarav1alpha1.QueueClassNormal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			task := tsTask("t-"+tc.stg, "incident", tc.stg, time.Now())
+			proj := tsProject(3)
+			c := ticketMirrorClient(t, proj, mdSecret(), task)
+			r := tsReconciler(c)
+			r.Seq = &queue.SeqSource{Client: c, Namespace: mdNS}
+
+			agentKind := stage.AgentKindFor(tc.stg)
+			if _, err := r.ensureTicket(ctx, proj, task, agentKind); err != nil {
+				t.Fatalf("ensureTicket: %v", err)
+			}
+
+			var qel tatarav1alpha1.QueuedEventList
+			if err := c.List(ctx, &qel); err != nil {
+				t.Fatalf("list queuedevents: %v", err)
+			}
+			var found *tatarav1alpha1.QueuedEvent
+			for i := range qel.Items {
+				if qel.Items[i].Spec.Payload.TaskRef == task.Name {
+					found = &qel.Items[i]
+					break
+				}
+			}
+			if found == nil {
+				t.Fatalf("no admission ticket enqueued for task %s", task.Name)
+			}
+			if found.Spec.Class != tc.wantClass {
+				t.Errorf("ticket class = %q, want %q (task.Spec.Kind=incident, stage=%s, agentKind=%s)",
+					found.Spec.Class, tc.wantClass, tc.stg, agentKind)
+			}
+		})
+	}
 }

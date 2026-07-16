@@ -663,8 +663,13 @@ func (r *TaskReconciler) ensureTicket(ctx context.Context, proj *tatarav1alpha1.
 		return true, nil
 	}
 
+	// Classed by the STAGE's agent kind, not task.Spec.Kind: an incident Task's
+	// downstream stages (clarify, implement, ...) are normal-class tickets. Only
+	// investigating - whose agentKind IS incident - draws from AlertCapacity;
+	// classing every stage of an incident Task as alert starved its own
+	// downstream tickets behind AlertCapacity=1 alongside investigating itself.
 	class := tatarav1alpha1.QueueClassNormal
-	if task.Spec.Kind == stage.AgentIncident {
+	if agentKind == stage.AgentIncident {
 		class = tatarav1alpha1.QueueClassAlert
 	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, class, true,

@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/slug"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // wrapperPort is the wrapper's in-pod HTTP listener.
@@ -38,6 +39,12 @@ const (
 	LabelComponent = "app.kubernetes.io/component"
 	LabelTask      = "tatara.dev/task"
 	LabelTaskUID   = "tatara.dev/task-uid"
+	// LabelAgentKind stamps the F.2 agent kind (stage.AgentKindFor) this Pod was
+	// spawned for. The reaper compares it against the Task's CURRENT stage kind
+	// to catch a pod left running past a stage advance (e.g. an incident's
+	// investigating pod after the Task moved on to clarifying) - a class of
+	// orphan none of the terminal/gone/idle rules covers.
+	LabelAgentKind = "tatara.dev/agent-kind"
 
 	ManagedByValue = "tatara-operator"
 	ComponentAgent = "agent"
@@ -255,6 +262,13 @@ func podLabels(task *tatarav1alpha1.Task) map[string]string {
 	// UID is unset on a Task object built in unit tests).
 	if task.UID != "" {
 		l[LabelTaskUID] = string(task.UID)
+	}
+	// The agent kind this pod was built for (the CURRENT stage's kind, since
+	// BuildPod is only ever called for the stage the Task is presently in). The
+	// reaper reads this back to catch a pod left running past a stage advance;
+	// omitted when the stage is pod-less (AgentKindFor returns "").
+	if kind := stage.AgentKindFor(task.Status.Stage); kind != "" {
+		l[LabelAgentKind] = kind
 	}
 	return l
 }

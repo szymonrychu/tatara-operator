@@ -170,6 +170,20 @@ func (s *CallbackServer) orphanReason(pod *corev1.Pod, tasks map[string]*tatarav
 	if tatarav1alpha1.TaskDone(task) {
 		return fmt.Sprintf("task stage %s", task.Status.Stage), true
 	}
+	// Superseded-stage pod: the pod was built for an earlier stage (its stamped
+	// LabelAgentKind) but the Task has since advanced to a stage that wants a
+	// DIFFERENT agent kind - e.g. an incident's investigating pod still Running
+	// after the Task moved on to clarifying. None of the terminal/gone/idle
+	// rules above catch this: the Task is alive and non-terminal, so TaskDone is
+	// false, and the pod may still be doing work right up until its stale turn
+	// times out. Only fire on a DEFINITE mismatch (both kinds non-empty and
+	// different) - a pod-less current stage (AgentKindFor == "") is between
+	// stages and is left to the idle backstop instead, to stay conservative.
+	if podKind := pod.Labels[agent.LabelAgentKind]; podKind != "" {
+		if wantKind := stage.AgentKindFor(task.Status.Stage); wantKind != "" && wantKind != podKind {
+			return fmt.Sprintf("superseded: pod kind %s, stage wants %s", podKind, wantKind), true
+		}
+	}
 	// Idle backstop (issue #237): a non-terminal Task whose pod holds no live turn
 	// and whose last turn activity is older than IdlePodReapAfter is a leaked
 	// wrapper. Its turn timed out or completed and the wrapper parked idle in
