@@ -64,8 +64,13 @@ const (
 	// claim. Nothing else bounds that handler - internal/webhook/server.go sets only
 	// ReadHeaderTimeout, no http.Server in the request path sets a WriteTimeout, and
 	// the brainstorm path loops CreateIssue (~30s each in internal/scm/github.go)
-	// once per proposal, so five slow proposals would otherwise run for minutes.
-	OutcomeHandlerBudget = 2 * time.Minute
+	// once per proposal. internal/restapi/outcome.go caps brainstorm proposals at 5,
+	// so the validator's own worst case is 5 x 30s = 150s (2m30s) - the budget MUST
+	// exceed that, or a legal request gets cut mid-loop with some issues already
+	// filed. It must also stay STRICTLY under OutcomeClaimTTL (see below), so the
+	// budget can never outlive its own claim. 3m clears the 2m30s worst case with
+	// 30s to spare and stays 2m under the 5m TTL.
+	OutcomeHandlerBudget = 3 * time.Minute
 	// OutcomeClaimTTL bounds a BARE /outcome claim - one stamped by
 	// claimOutcomeFingerprint and never overwritten by a kind handler's commit.
 	// Within it, an identical retry is told the outcome is IN FLIGHT on another

@@ -98,8 +98,8 @@ func TestOutcomeClaimTTLAndHandoffDeadline(t *testing.T) {
 	if OutcomeClaimTTL != 5*time.Minute {
 		t.Fatalf("OutcomeClaimTTL = %v, want 5m", OutcomeClaimTTL)
 	}
-	if OutcomeHandlerBudget != 2*time.Minute {
-		t.Fatalf("OutcomeHandlerBudget = %v, want 2m", OutcomeHandlerBudget)
+	if OutcomeHandlerBudget != 3*time.Minute {
+		t.Fatalf("OutcomeHandlerBudget = %v, want 3m", OutcomeHandlerBudget)
 	}
 	if HandoffDeadline != 5*time.Minute {
 		t.Fatalf("HandoffDeadline = %v, want 5m", HandoffDeadline)
