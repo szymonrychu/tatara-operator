@@ -859,6 +859,103 @@ func terminalCount(t *testing.T, reg *prometheus.Registry, kind, stg, reason str
 }
 
 // ---------------------------------------------------------------------------
+// SPEC TEST 9. THE cgthv REPRODUCTION, end to end.
+//
+// 2026-07-16T18:12Z: six kind=review Tasks were minted. cgthv's review agent
+// genuinely completed - mr-tatara-agent-skills-20 carries status:approved and a
+// stamped reviewedSHA - and the Task still ended failed(pod-recreation-exhausted),
+// because while status.stage was still reviewing the caps kept driving it as an
+// ordinary live pod stage through the v1.2.0 rollout's pod-loss burst.
+//
+// The expected happy path is reviewing -> parked(awaiting-human). Zero of the six
+// reached it.
+// ---------------------------------------------------------------------------
+
+func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	stamp := metav1.NewTime(now.Add(-time.Minute))
+
+	proj := tsProject(3)
+	repo := mdRepo("tatara-agent-skills")
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "cgthv", Namespace: mdNS, UID: types.UID("uid-cgthv")},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "review", ProjectRef: "proj", Goal: "review the PR"},
+		Status: tatarav1alpha1.TaskStatus{
+			Stage:              tatarav1alpha1.StageReviewing,
+			AgentKind:          "review",
+			StageEnteredAt:     &stamp,
+			PodStartedAt:       &stamp,
+			StageWorkStartedAt: &stamp,
+			// podRuns=5 => 4 recreations => 4 > 3 => failed(pod-recreation-exhausted)
+			// under the old code, the moment the lost pod is noticed.
+			Stats: tatarav1alpha1.TaskStats{PodRuns: 5, PodRecreations: 4},
+			Conditions: []metav1.Condition{{
+				Type:               tatarav1alpha1.ConditionOutcomeAccepted,
+				Status:             metav1.ConditionTrue,
+				Reason:             tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), // COMMITTED: the review outcome landed
+				Message:            "fp-cgthv",
+				LastTransitionTime: stamp,
+			}},
+		},
+	}
+	mr := mdMR(task, "tatara-agent-skills", 20)
+	mr.Status.Status = "approved"
+	mr.Status.ReviewedSHA = "reviewedsha"
+	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{
+		Body: "## Review: approved", SHA: "reviewedsha", Round: 1,
+	}
+
+	c := newMirrorClient(t, proj, mdSecret(), repo, task, mr)
+
+	// 1. The pod is GONE and the recreation budget is spent. Under v1.3.0 this
+	//    reconcile fails the Task. It must now do nothing but wait for the drain.
+	tr := tsReconciler(c)
+	res, err := tr.reconcileStage(ctx, proj, task, now)
+	if err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+	if task.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %q(%s), want reviewing: the review LANDED, a pod that is no longer needed must not fail the Task",
+			task.Status.Stage, task.Status.StageReason)
+	}
+	if task.Status.Stats.PodRecreations != 4 {
+		t.Fatalf("podRecreations = %d, want 4: no recreation may be burned for a committed outcome",
+			task.Status.Stats.PodRecreations)
+	}
+	if res.RequeueAfter != stageRequeue {
+		t.Fatalf("requeueAfter = %s, want %s", res.RequeueAfter, stageRequeue)
+	}
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("%d pods respawned for a task whose review outcome already landed", len(pods.Items))
+	}
+
+	// 2. The drain runs (the MergeRequest reconciler's half). It posts the review,
+	//    clears pendingReview, and advanceAfterReview takes the F.3 edge.
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, c)
+	if err := d.DrainPendingReview(ctx, mdGetMR(t, c, mr.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+
+	got := mdGetTask(t, c, "cgthv")
+	if got.Status.Stage != tatarav1alpha1.StageParked {
+		t.Fatalf("stage = %q, want parked", got.Status.Stage)
+	}
+	if got.Status.StageReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("stageReason = %q, want awaiting-human: the expected happy path for a kind=review Task is a human's PR fixed and merged by the human",
+			got.Status.StageReason)
+	}
+	if got.Status.StageReason == stage.ReasonPodRecreationExhausted {
+		t.Fatalf("stageReason = pod-recreation-exhausted: this is the exact production failure being reproduced")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TURN-SUBMIT METRIC. Re-pointed from the retired machine's
 // TestTurnSubmitted_{Metric,ErrorMetric}Emitted (task_controller_audit_test.go),
 // which drove the deleted driveTurns path. operator_turn_submit_total is LIVE -
