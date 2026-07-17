@@ -607,7 +607,16 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 				Number: ev.Number, State: "open", Author: ev.ActorLogin,
 				Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
 		}
-		if _, _, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, false, s.cfg.SpillerFor(&proj)); merr != nil {
+		// webhookOriginated=true: a live, HMAC-verified, allowlisted human comment
+		// is a liveness signal exactly like issues.opened (server.go:517). Minting
+		// it PARKED would strand the Task - the same-request deliverPendingEvent ->
+		// driveCommentUnpark path below reads the informer cache, which routinely
+		// still lags this mint's just-written mirror/owner, so the promotion can
+		// silently miss and the comment gets dropped with no sweep recovery (the
+		// issue is now owned, so IsOrphanIssue skips it). MintStage still checks
+		// TataraParkedLabel FIRST, so a deliberately backlog-parked issue stays
+		// parked regardless.
+		if _, _, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
 			s.log.ErrorContext(ctx, "issue_comment: orphan mint failed", "error", merr, "issue_ref", ev.IssueRef)
 		}
 	}

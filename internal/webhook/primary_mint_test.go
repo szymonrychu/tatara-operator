@@ -168,6 +168,8 @@ func TestOrphanComment_NoMirror_MintsTask(t *testing.T) {
 	tasks := allTasks(t, c, "ocp1")
 	require.Len(t, tasks, 1, "a comment on an orphan (no-mirror) issue must mint a Task")
 	require.Equal(t, "clarify", tasks[0].Spec.Kind)
+	require.Equal(t, tatarav1.StageTriaging, tasks[0].Spec.InitialStage,
+		"a live HMAC-verified human comment is a liveness signal like issues.opened; must mint ACTIVE, not parked")
 }
 
 // A comment lands on an issue whose mirror CR already exists but carries no
@@ -194,6 +196,8 @@ func TestOrphanComment_UnownedMirror_MintsTask(t *testing.T) {
 	tasks := allTasks(t, c, projName)
 	require.Len(t, tasks, 1, "a comment on an un-owned mirror must mint a Task")
 	require.Equal(t, "clarify", tasks[0].Spec.Kind)
+	require.Equal(t, tatarav1.StageTriaging, tasks[0].Spec.InitialStage,
+		"a live HMAC-verified human comment is a liveness signal like issues.opened; must mint ACTIVE, not parked")
 }
 
 // A comment lands on an issue whose mirror IS owned by an existing Task:
