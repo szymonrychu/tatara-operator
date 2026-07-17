@@ -46,8 +46,7 @@ spec:
     #     command: ['sh', '-c', 'sleep infinity']
   memory: {pgInstances: 1, pgStorage: 10Gi, neo4jStorage: 10Gi}
   # PAT-based activation (no bot account / no Project board). botLogin == the PAT
-  # owner, so mrScan routes the owner's own PRs to selfImprove and others' to
-  # review. No `board` -> issueScan covers per-repo issues only (the Repository CRs
+  # owner. No `board`, so issueScan covers per-repo issues only (the Repository CRs
   # below). mergePolicy/prReactionScope/approvalLabel default.
   scm:
     provider: github
@@ -66,9 +65,6 @@ spec:
     # reporterLogins: [szymonrychu]
     priorityLabel: tatara/priority
     cron:
-      mrScan:
-        schedule: "0 * * * *"
-        maxPerCycle: 1
       issueScan:
         schedule: "0 * * * *"
         maxPerCycle: 1

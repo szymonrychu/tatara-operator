@@ -54,9 +54,6 @@ project:
       botLogin: szymonrychu-bot
       priorityLabel: tatara/priority
       cron:
-        mrScan:
-          schedule: "0 * * * *"
-          maxPerRepo: 1
         issueScan:
           schedule: "0 * * * *"
           maxPerRepo: 1

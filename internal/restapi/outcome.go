@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
@@ -37,7 +38,9 @@ const forgeAlertRulePrefix = "tatara-alert-rule="
 // pod's retry of an IDENTICAL outcome is recognised and answered 200 with the
 // unchanged Task - it must not 409 the Task into failure. It rides in the SAME
 // status write as the stage transition, so the record and the effect are atomic.
-const outcomeAcceptedCondition = "OutcomeAccepted"
+// The name lives in api/v1alpha1 because internal/controller reads the same
+// condition and may not import this package.
+const outcomeAcceptedCondition = tatarav1alpha1.ConditionOutcomeAccepted
 
 func sha256Sum(s string) []byte {
 	sum := sha256.Sum256([]byte(s))
@@ -179,7 +182,17 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	if !authorizeCaller(w, r) {
 		return
 	}
-	ctx := r.Context()
+	// BOUND THE HANDLER BEFORE THE CLAIM. The claim below is a LEASE with a TTL,
+	// and the lease is only sound while a handler cannot outlive its own claim:
+	// past the TTL an identical retry treats a claim as an ORPHANED STUB and
+	// re-runs every side effect. Nothing else bounds this handler - no
+	// WriteTimeout in the request path - and the brainstorm path loops CreateIssue
+	// per proposal at ~30s each. OutcomeHandlerBudget < OutcomeClaimTTL, so this
+	// deadline is what makes the lease provably safe. r is re-bound so the kind
+	// handlers, which pull the request's own context, cannot bypass it.
+	ctx, cancel := context.WithTimeout(r.Context(), tatarav1alpha1.OutcomeHandlerBudget)
+	defer cancel()
+	r = r.WithContext(ctx)
 	name := chi.URLParam(r, "t")
 
 	var env outcomeEnvelope
@@ -197,41 +210,49 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// IDEMPOTENCY FIRST, before the terminal-stage and kind gates, and CLAIMED
-	// atomically before any forge/child-mint side effect (C7): the handler
-	// runs on every replica, so a stale top-of-handler read of a stamped-only-
-	// at-commit fingerprint admits two concurrent identical POSTs straight
-	// through to the same forge write / child-mint / ReviewRounds increment.
-	// claimOutcomeFingerprint re-Gets the Task fresh and, under
-	// RetryOnConflict, either finds fp already stamped (a sequential retry,
-	// or the loser of a race - both take the SAME no-op path) or stamps it on
-	// THIS Status().Update. Exactly one of two concurrent identical POSTs can
-	// win that Update under optimistic concurrency, so the side effects that
-	// follow run at most once. A TTL-stopped pod's retry must not 409 the
-	// Task into failure - and by the time it retries, both status.stage and
-	// status.agentKind have moved on, so both gates below would refuse it.
+	// atomically before any forge/child-mint side effect (C7): the handler runs
+	// on every replica, so a stale top-of-handler read of a stamped-only-at-commit
+	// fingerprint admits two concurrent identical POSTs straight through to the
+	// same forge write / child-mint / ReviewRounds increment. The claim is a
+	// LEASE: claimOutcomeFingerprint re-Gets the Task fresh and, under
+	// RetryOnConflict, reports whether the fingerprint is COMMITTED (replay),
+	// claimed and IN FLIGHT on another replica (409 retry), or free/orphaned (it
+	// stamps and we proceed). A TTL-stopped pod's retry of a COMMITTED outcome
+	// must not 409 the Task into failure - and by the time it retries, both
+	// status.stage and status.agentKind have moved on, so both gates below would
+	// refuse it.
 	fp := outcomeFingerprint(env.Kind, env.Payload)
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
-	task, claimed, err := claimOutcomeFingerprint(ctx, s.c, key, fp, s.now())
+	task, state, err := claimOutcomeFingerprint(ctx, s.c, key, fp, s.now())
 	if err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	if !claimed {
+	switch state {
+	case claimCommitted:
 		s.log.InfoContext(ctx, "restapi: outcome replay accepted as a no-op",
 			append(reqLogFields(r), "action", "submit_outcome", "task", task.Name, "kind", env.Kind)...)
 		writeJSON(w, http.StatusOK, toTaskDTO(*task))
 		return
+	case claimInFlight:
+		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "claim-in-flight").Inc()
+		s.log.InfoContext(ctx, "restapi: an identical outcome is in flight on another replica; asking the caller to retry",
+			append(reqLogFields(r), "action", "submit_outcome", "task", task.Name, "kind", env.Kind)...)
+		writeError(w, http.StatusConflict, "outcome in flight, retry")
+		return
 	}
 
+	// oc is built BEFORE the two gates so both can release the claim they hold:
+	// they run before any kind handler and stamp nothing, so they are class B.
+	// oc.proj is nil until the lookup below; neither gate reads it.
+	oc := &outcomeCtx{s: s, w: w, r: r, task: task, fp: fp, kind: env.Kind}
 	if tatarav1alpha1.StageTerminal(task) || task.Status.Stage == tatarav1alpha1.StageDelivered {
-		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "terminal-stage").Inc()
-		writeError(w, http.StatusConflict, "task is in a terminal stage")
+		oc.conflict("task is in a terminal stage", "terminal-stage")
 		return
 	}
 	// The pod's claim is not trusted: kind MUST equal status.agentKind.
 	if env.Kind != task.Status.AgentKind {
-		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "kind-mismatch").Inc()
-		writeError(w, http.StatusConflict, "kind does not match the task's agent kind")
+		oc.conflict("kind does not match the task's agent kind", "kind-mismatch")
 		return
 	}
 
@@ -240,52 +261,49 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
+	oc.proj = proj
 
-	oc := &outcomeCtx{s: s, w: w, r: r, task: task, proj: proj, fp: fp, kind: env.Kind}
 	switch env.Kind {
 	case "implement", "documentation":
 		var p implementPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.implement(p)
 	case "review":
 		var p reviewPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.review(p)
 	case "clarify":
 		var p clarifyPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.clarify(p)
 	case "brainstorm":
 		var p brainstormPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.brainstorm(p)
 	case "incident":
 		var p incidentPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.incident(p)
 	case "refine":
 		var p refinePayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.refine(p)
 	default:
+		// Unreachable behind the kind-mismatch gate unless status.agentKind is
+		// itself bogus, but it is still a class-B rejection holding a claim.
+		oc.release()
 		writeError(w, http.StatusBadRequest, "unknown outcome kind")
 	}
 }
@@ -304,34 +322,64 @@ func outcomeFingerprint(kind string, payload []byte) string {
 	return fmt.Sprintf("%x", sha256Sum(kind+"|"+string(canon)))
 }
 
-func outcomeAlreadyAccepted(task *tatarav1alpha1.Task, fp string) bool {
-	for _, c := range task.Status.Conditions {
-		if c.Type == outcomeAcceptedCondition && c.Message == fp {
-			return true
-		}
-	}
-	return false
-}
+// outcomeClaimState is claimOutcomeFingerprint's three-state verdict. The
+// distinction it draws already existed in etcd and nothing read it: the replay
+// site matched on the fingerprint alone, so a BARE CLAIM left behind by a
+// validation 4xx or a crash was indistinguishable from a COMPLETED outcome, and
+// every identical retry got 200-and-do-nothing forever.
+type outcomeClaimState int
+
+const (
+	// claimWon: we stamped the fingerprint on THIS Status().Update (or re-claimed
+	// an orphaned stub). Proceed to validation and commit.
+	claimWon outcomeClaimState = iota
+	// claimCommitted: a kind handler's commit already overwrote the claim's
+	// Reason. Genuinely finished; replay 200 with the unchanged Task.
+	claimCommitted
+	// claimInFlight: a BARE claim younger than OutcomeClaimTTL. Another replica is
+	// between its claim and its commit. 409 "retry"; admitting this through would
+	// run the side effects twice.
+	claimInFlight
+)
 
 // claimOutcomeFingerprint atomically claims fp against a FRESH re-read of the
-// Task, before any forge/child-mint side effect (C7). Under
-// RetryOnConflict, each attempt re-Gets the Task and either observes fp
-// already stamped - a sequential retry, or the loser of a race between two
-// concurrent identical POSTs - and reports claimed=false with no write, or
-// stamps fp on THIS Status().Update and reports claimed=true. Optimistic
-// concurrency lets exactly one of two concurrent identical POSTs win the
-// Update, so the caller's side effects run at most once.
+// Task, before any forge/child-mint side effect (C7), and reports which of the
+// three states it found.
+//
+// THE CLAIM-FIRST ORDERING IS LOAD-BEARING AND MUST NOT MOVE. The handler runs on
+// every replica, so a stale top-of-handler read of a stamped-only-at-commit
+// fingerprint admits two concurrent identical POSTs straight through to the same
+// forge write / child-mint / ReviewRounds increment. Optimistic concurrency lets
+// exactly one of two concurrent identical POSTs win the Update; the loser now
+// reads back a fresh bare claim and is told to RETRY (409) rather than being
+// answered 200 with nothing done.
+//
+// The claim is a LEASE, not a tombstone: Reason carries claimed-vs-committed and
+// LastTransitionTime carries the expiry, both on fields that already existed.
 func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.NamespacedName,
-	fp string, now time.Time) (*tatarav1alpha1.Task, bool, error) {
+	fp string, now time.Time) (*tatarav1alpha1.Task, outcomeClaimState, error) {
 	fresh := &tatarav1alpha1.Task{}
-	claimed := false
+	state := claimWon
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		state = claimWon
 		if err := c.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		if outcomeAlreadyAccepted(fresh, fp) {
-			claimed = false
-			return nil
+		if cond := tatarav1alpha1.OutcomeCondition(fresh); cond != nil &&
+			cond.Status == metav1.ConditionTrue && cond.Message == fp {
+			switch {
+			case cond.Reason != tatarav1alpha1.OutcomeReasonClaimed:
+				state = claimCommitted
+				return nil
+			case now.Sub(cond.LastTransitionTime.Time) < tatarav1alpha1.OutcomeClaimTTL:
+				state = claimInFlight
+				return nil
+			}
+			// An ORPHANED STUB: the process died between the claim and the commit,
+			// so no release ever ran. RE-CLAIM it - refresh LastTransitionTime and
+			// fall through. Two replicas racing the re-claim is safe: one wins the
+			// Update, the other conflicts, re-Gets, sees a claim younger than the
+			// TTL and answers claimInFlight.
 		}
 		setCondition(fresh, metav1.Condition{
 			Type:               outcomeAcceptedCondition,
@@ -340,13 +388,9 @@ func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.Nam
 			Message:            fp,
 			LastTransitionTime: metav1.NewTime(now),
 		})
-		if err := c.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		claimed = true
-		return nil
+		return c.Status().Update(ctx, fresh)
 	})
-	return fresh, claimed, err
+	return fresh, state, err
 }
 
 // outcomeCtx carries the per-request state every payload handler needs.
@@ -360,14 +404,84 @@ type outcomeCtx struct {
 	kind string
 }
 
+// release drops OUR claim so an identical retry RE-VALIDATES immediately
+// instead of waiting out OutcomeClaimTTL.
+//
+// Every pre-execution rejection is CLASS B: it runs before any committed
+// effect, so nothing may be cached under the fingerprint. A class-A
+// (post-execution) rejection does not arise here - commit is the only thing
+// that begins execution, and it stamps its own terminal reason, which release
+// refuses to touch.
+//
+// OWNERSHIP-CHECKED under CAS: only a condition still carrying OUR fingerprint
+// AND Reason "Outcome" is released. NEVER a committed condition; NEVER another
+// request's claim - a slow handler can reach its rejection long after another
+// replica re-claimed the orphaned slot and committed it.
+//
+// WHY those two fields PROVE ownership. Reason rules out a COMMITTED condition
+// (commit stamps the kind's Reason, never "Outcome"). The fingerprint rules out
+// a DIFFERENT request's claim. What is left - another replica's claim on the
+// SAME fingerprint - is excluded by the HANDLER-BUDGET INVARIANT:
+//
+//	OutcomeHandlerBudget (3m) < OutcomeClaimTTL (5m)
+//
+// A re-claim of a live claim only happens once the claim reads as an orphaned
+// stub, i.e. older than the TTL. Our handler is hard-bounded below the TTL, so
+// it cannot still be running then: no handler outlives its own claim, so any
+// claim we still see carrying our fingerprint IS ours. Break that invariant and
+// the two-field check stops being sufficient - a slow handler could release the
+// claim of the replica that re-claimed and is actively working the same
+// fingerprint.
+//
+// A failed release is not fatal and does not change the response: the claim
+// then expires as an orphaned stub after the TTL, which is the same self-heal a
+// crashed process gets.
+func (o *outcomeCtx) release() {
+	ctx := o.r.Context()
+	key := types.NamespacedName{Namespace: o.s.ns, Name: o.task.Name}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := o.s.c.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		cond := tatarav1alpha1.OutcomeCondition(fresh)
+		if cond == nil || cond.Message != o.fp || cond.Reason != tatarav1alpha1.OutcomeReasonClaimed {
+			return nil
+		}
+		meta.RemoveStatusCondition(&fresh.Status.Conditions, outcomeAcceptedCondition)
+		return o.s.c.Status().Update(ctx, fresh)
+	})
+	if err != nil {
+		o.s.log.ErrorContext(ctx, "restapi: releasing the outcome claim failed; the retry waits out the claim TTL",
+			append(reqLogFields(o.r), "task", o.task.Name, "kind", o.kind, "error", err)...)
+		return
+	}
+	o.s.log.InfoContext(ctx, "restapi: outcome rejected before execution; the claim is released for an immediate retry",
+		append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name, "kind", o.kind)...)
+}
+
 func (o *outcomeCtx) bad(msg string, reason string) {
+	o.release()
 	obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, reason).Inc()
 	writeError(o.w, http.StatusBadRequest, msg)
 }
 
 func (o *outcomeCtx) conflict(msg string, reason string) {
+	o.release()
 	obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, reason).Inc()
 	writeError(o.w, http.StatusConflict, msg)
+}
+
+// decode parses the kind's payload, releasing the claim on a malformed one: a
+// decode failure is as class B as any other validation failure, and leaving the
+// claim would 409 the corrected resubmit for the whole TTL.
+func (o *outcomeCtx) decode(payload []byte, v any) bool {
+	if err := decodeStrict(payload, v); err != nil {
+		o.release()
+		writeDecodeError(o.w, o.r, err)
+		return false
+	}
+	return true
 }
 
 // commit applies the Task status mutation (a stage transition, notes, counters)
@@ -408,6 +522,20 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		if errors.As(mutErr, &ill) {
 			s.log.ErrorContext(ctx, "restapi: outcome asked for an illegal stage transition",
 				append(reqLogFields(o.r), "task", o.task.Name, "from", ill.From, "to", ill.To)...)
+			// RELEASING IS SAFE HERE even though commit runs AFTER non-idempotent
+			// forge writes (brainstorm propose CreateIssue, incident file_issue
+			// CreateIssue), because this branch is unreachable for a retry that
+			// could duplicate them:
+			//
+			// Enter sets AgentKind = AgentKindFor(to), so agentKind is a pure
+			// function of stage, and each kind handler only ever runs on the unique
+			// stage that maps to its kind - where the edge it requests is always in
+			// the F.3 table. An illegal transition therefore means the stage MOVED
+			// between the gate's read and commit's fresh Get. Every concurrent
+			// operator-driven exit from a pod stage lands on parked/failed
+			// (terminal) or delivered, and the retry's own terminal/delivered gate
+			// refuses all of those before the handler - hence its forge writes - can
+			// run again.
 			o.conflict(mutErr.Error(), "illegal-transition")
 			return false
 		}
@@ -438,14 +566,26 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	return true
 }
 
-// conditionReason is a CamelCase k8s condition reason.
+// conditionReason is a CamelCase k8s condition reason. The empty kind is the
+// bare CLAIM, and that Reason is what tells a committed outcome apart from a
+// claimed one everywhere else in the operator - hence the shared definition.
 func conditionReason(kind string) string {
-	if kind == "" {
-		return "Outcome"
-	}
-	return strings.ToUpper(kind[:1]) + kind[1:]
+	return tatarav1alpha1.OutcomeReasonFor(kind)
 }
 
+// setCondition upserts c by Type as a WHOLE-STRUCT OVERWRITE.
+//
+// DO NOT "TIDY" THIS INTO meta.SetStatusCondition. The overwrite is LOAD-BEARING
+// for the outcome claim's LEASE: LastTransitionTime carries the lease expiry, and
+// claimOutcomeFingerprint's re-claim of an ORPHANED STUB refreshes it by writing a
+// whole new condition. meta.SetStatusCondition only re-stamps LastTransitionTime
+// when Status CHANGES, and a re-claim goes True -> True, so it would leave the
+// orphan's expired stamp in place - minting a lease born already expired. The next
+// identical retry, a second later, would then read that claim as orphaned in turn,
+// re-claim it, and run every side effect AGAIN. No race and no second replica
+// needed: that duplicate is reachable on a single-version, single-pod cluster.
+//
+// TestOutcome_ReclaimOfAnOrphanedStubRefreshesTheLeaseClock pins the refresh.
 func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {
 	for i := range t.Status.Conditions {
 		if t.Status.Conditions[i].Type == c.Type {
@@ -526,8 +666,15 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			to, reason = tatarav1alpha1.StageDelivered, ""
 		}
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			// stage.Enter FIRST: objbudget.FitTask persists whatever this
+			// closure mutated even when it returns an error, so a note appended
+			// before a REFUSED transition would land - and, now that a class-B
+			// rejection releases the claim, land AGAIN on every retry.
+			if err := stage.Enter(t, mrs, to, reason, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "declined: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, to, reason, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -592,8 +739,11 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, mrs, tatarav1alpha1.StageReviewing, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "submitted: "+p.Title+"\n\n"+p.Body, s.now())
-		return stage.Enter(t, mrs, tatarav1alpha1.StageReviewing, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -747,6 +897,12 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			}
 			obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, "head-moved").Inc()
 			s.metrics.RecordReviewHeadMoved(mr.Spec.RepositoryRef)
+			// Head-moved writes its structured 409 body directly rather than
+			// through o.conflict, so it must release explicitly. It stamps
+			// nothing, and the agent's honest resubmit-with-the-new-sha is a
+			// DIFFERENT fingerprint anyway - but an identical retry must
+			// re-validate against the live head, not sit out the TTL.
+			o.release()
 			s.log.InfoContext(ctx, "review head moved since checkout; mirror refreshed to the live head",
 				append(reqLogFields(o.r), "action", "review_head_moved", "task", o.task.Name,
 					"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number,
@@ -899,8 +1055,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	switch p.Decision {
 	case "discuss":
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "discuss: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -922,8 +1081,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StageRejected, stage.ReasonDeclined, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "close: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, tatarav1alpha1.StageRejected, stage.ReasonDeclined, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -943,8 +1105,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues)
 	if !granted {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -967,8 +1132,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		}
 	}
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
-		return stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -1055,8 +1223,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// says "nothing novel" must not spawn a docs pod, a docs PR about
 		// nothing, a review, a merge and a release - every day.
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "skip: "+p.Reason, s.now())
-			return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+			return nil
 		}) {
 			return
 		}
@@ -1104,8 +1275,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "proposed: "+strings.Join(spawned, ", "), s.now())
-		return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -1195,8 +1369,11 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 
 	if p.Action == "false_positive" {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "false_positive: "+p.Reason, s.now())
-			return stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -1247,8 +1424,11 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageClarifying, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "file_issue: "+p.Reason, s.now())
-		return stage.Enter(t, nil, tatarav1alpha1.StageClarifying, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -1323,6 +1503,12 @@ func (s *Server) linkIncidentParent(ctx context.Context, o *outcomeCtx, writer s
 
 // --- refine, and the B.3 fold ---------------------------------------------
 
+// foldMembers is refine's point of no return: its STEP 4 DELETES the member
+// Tasks, and nothing here can put them back. Every shape check must therefore
+// run in the read-only block above it, never after - a late class-B rejection
+// releases the claim, and the retry would re-enter the liveness gate looking
+// for members that no longer exist. Making the fold resumable is the only
+// structural cure; until then, keep the ordering.
 func (o *outcomeCtx) refine(p refinePayload) {
 	ctx := o.r.Context()
 	s := o.s
@@ -1348,6 +1534,18 @@ func (o *outcomeCtx) refine(p refinePayload) {
 		}
 		if ctrl, ok := own.ControllerOwner(&iss); ok && ctrl != o.task.Name {
 			o.conflict("issue has an active task", "close-target-live")
+			return
+		}
+	}
+
+	// links[] SHAPE is checked HERE, with the other pre-execution validation, and
+	// NOT at the loop that consumes it: the fold below DELETES the member Tasks,
+	// so a rejection after it is unrecoverable. The release the rejection performs
+	// lets the identical retry re-validate at once, and that retry would find its
+	// own fold target already gone and 500 forever.
+	for _, l := range p.Links {
+		if l.Repo == "" || l.Number == 0 {
+			o.bad("every links entry requires repo and number", "bad-links")
 			return
 		}
 	}
@@ -1439,10 +1637,6 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	// links[] adopt the named artifact as a PLAIN owner of this Task: the link
 	// holds the GC open and puts the artifact in the umbrella's bundle.
 	for _, l := range p.Links {
-		if l.Repo == "" || l.Number == 0 {
-			o.bad("every links entry requires repo and number", "bad-links")
-			return
-		}
 		if err := s.linkArtifact(ctx, o.task, l); err != nil {
 			writeClientErr(o.w, err)
 			return
@@ -1450,8 +1644,11 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+			return err
+		}
 		t.Status.FoldInFlight = nil
-		return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+		return nil
 	}) {
 		return
 	}

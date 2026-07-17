@@ -4,11 +4,17 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -297,4 +303,81 @@ func TestUpdateInflightGauge_PerKind(t *testing.T) {
 	// A kind with no live Task must still report a series (zeroed), not drop out.
 	_ = gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "documentation"})
 	_ = gaugeValue(t, reg, "tatara_tasks_inflight", map[string]string{"kind": "implement"})
+}
+
+// SPEC TEST 10. THE MINT IS THE NON-IDEMPOTENT CALLER.
+//
+// reconcileStage takes the F.3 Create edge on a CACHED read of status.stage == "",
+// and EnterStage's write re-reads the Task live under RetryOnConflict. A
+// re-reconcile against a cache that has not yet observed our own mint (the mint
+// branch's own Requeue:true is the likeliest source; the ShortDescription status
+// patch is another) re-applies the Create edge, and the in-write stage.Enter
+// refuses it as triaging -> triaging. Both Tasks that hit this on 2026-07-17
+// (refine-qe-lh79w 06:00:04Z, brainstorm-qe-5snrr 06:24:30Z) progressed anyway -
+// but the counter fires, and TataraIllegalStageTransition alerts on it.
+//
+// The fix is the caller, not a self-edge in the table: a self-edge would weaken
+// the choke point's invariant for every caller and would silently re-stamp
+// stageEnteredAt and reset podRecreations.
+func TestReconcileStage_MintIsIdempotentAgainstAStaleCache(t *testing.T) {
+	before := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
+		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageTriaging))
+
+	proj := tsProject(3)
+	// THE STALE OBJECT the informer cache hands the reconciler: not yet minted.
+	// It is an in-memory value, exactly as production's is - the cache is what
+	// produced it, and nothing re-reads it.
+	stale := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "brainstorm-qe-5snrr", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "brainstorm"},
+	}
+	// THE API SERVER: already minted by our own previous pass. It backs BOTH
+	// Client and APIReader, because the illegal-transition counter fires from the
+	// in-write stage.Enter inside objbudget.FitTask, which re-Gets through
+	// r.Client. Backing r.Client with a second, stale store instead would let that
+	// re-read see stage == "" and take the LEGAL Create edge, and the counter this
+	// test asserts on could never move in its own fixture.
+	live := stale.DeepCopy()
+	live.Status.Stage = tatarav1alpha1.StageTriaging
+	live.Status.AgentKind = ""
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
+	require.NoError(t, err, "a mint the API server already has is a NO-OP, not an error")
+
+	after := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
+		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageTriaging))
+	require.Equal(t, before, after,
+		"re-entering triaging from triaging must emit no operator_illegal_stage_transition_total")
+}
+
+// A genuine mint must still mint.
+func TestReconcileStage_MintStillMintsWhenTheApiServerAgrees(t *testing.T) {
+	proj := tsProject(3)
+	fresh := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "refine-qe-lh79w", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "refine"},
+	}
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, fresh).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, fresh, time.Unix(1000, 0))
+	require.NoError(t, err)
+	require.Equal(t, tatarav1alpha1.StageTriaging, fresh.Status.Stage)
 }

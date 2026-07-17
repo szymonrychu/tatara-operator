@@ -42,6 +42,23 @@ Open, out of scope, deliberately not done:
   `operator_agent_boot_crash_total` (died with `bootcrash.go`). They emit no series (labelled vecs are
   only materialized on first write) so they are inert, but "named and never emitted" is the exact
   defect contract K.1 calls out. No chart alert or dashboard panel references them any more.
+- [ ] Sibling MergeRequest CR deleted mid-handoff: `advanceAfterReview` becomes unreachable; the Task
+  now parks `handoff-stalled` at 5m instead of hanging, but that's a bound, not a recovery.
+- [ ] Leader-election changeover mid-handoff: in-memory workqueue/rate-limiter state is not CR state;
+  the 5m deadline bounds the damage. A full fix needs the drain re-derived from CR state on every
+  reconcile.
+- [ ] `handoff-stalled` false positive on a slow-but-working drain: a >5m forge degradation parks a
+  Task whose review already posted; `advanceAfterReview` then no-ops on its `Status.Stage != reviewing`
+  guard and silently abandons the advance it still owns, recovered only by a backlog-sweep re-mint.
+  F.6 re-entry is the WRONG remedy (every F.6 rule is comment-driven, nobody will comment on this);
+  the right fix is drain-owned - teach the late drain that `parked[handoff-stalled]` is its own park
+  reason and let it take the F.3 edge from parked. Needs Task-2 edge semantics + a drain-contract change.
+- [ ] Single `OutcomeAccepted` condition slot: a second `/outcome` POST with a DIFFERENT payload
+  clobbers a committed condition with a bare claim, switching the B2 guards off. Pre-existing,
+  unreachable in the intended flow once respawn is suppressed (no second pod); surviving an
+  adversarial second POST needs a second condition type.
+- [ ] Partial-progress replay: re-claim of a genuinely orphaned stub re-files already-filed issues
+  (forge writes are not idempotent). Inherent to the lease; pre-dates this change.
 - [x] Post-merge documentation agent, operator half (new `documentation` Task kind, repo-scoped to a project's docs repo): CRD (Kind enum, repoScopedKinds, ProjectSpec.Documentation, ModelByKind/EffortByKind/SpawnCeilingByKind CEL+MaxProperties 9->10), webhook handlePush spawns a documentation QueuedEvent on a merge to a non-docs component repo (self-trigger guard + docs-repo-enrolled gate + head-SHA dedup; scm.WebhookEvent gained BaseSHA/HeadSHA for push events), pod.go kindProfiles row (tool/skill profile "documentation", model locked to claude-sonnet-5 via modelForKind, branch/PR-title prefix "docs", SHA-derived pod-name/branch suffix since the Task carries no Source.Number), turnloop required skill, writeback derivePRTitle, reaper gcConversations GC. Ships inert (no Project sets Documentation). Awaiting: tatara-cli `documentation` tool profile, tatara-agent-skills `tatara-documentation-workflow` skill, then a tatara-helmfile MR to enroll the docs repo + enable for tatara. Design: docs/superpowers/specs/2026-07-05-documentation-agent-design.md (parent tatara repo).
 - [x] Token budget admission gate (issue #189): pause proactive work (normal pool) at a proactive percent and incident work (alert pool) at an emergency percent of token usage within a reset window, resuming when it rolls. Two modes - customWindow (operator-meters its own per-turn tokens against a tokenLimit in a cron-anchored window, accumulator on Project.Status.TokenBudget) and claudeSubscription (gates on wrapper-reported Claude 5h/weekly percent, inert until the wrapper PR lands). internal/budget engine + ProjectSpec/Status TokenBudget + operator-wide TOKEN_BUDGET_* config + dispatcher gate + per-turn accumulation + 2 metrics + dashboard panels + TataraTokenBudgetBlocked alert. Defaults 50%/80%, off until enabled. Branch tatara/fix-189-tatara-operator-aware-of-token-budget; awaiting deploy (image+chart bump, then enable tokenBudget on the tatara + infrastructure Projects in the infra helmfile) + a sister tatara-claude-code-wrapper PR (anthropic OAuth 5h/weekly header passthrough) to activate claudeSubscription mode.
 - [x] feat/deep-architectural-research P1: brainstorm goal variant (tatara-deep-architectural-research skill named, skip_research token, ADR/RFC intent), skip_brainstorm->skip_research rename, brainstorm-outcome contract lock tests, Serena MCP env-gate (TATARA_SERENA_URL), archfitness SCM-isolation fitness function. Branch committed; await wrapper + cli sister PRs before deploy.
@@ -163,9 +180,25 @@ Open, out of scope, deliberately not done:
 4. [ ] helmfile -e default -l application=tatara-operator apply.
 5. [ ] Verify neo4j pod reaches Running: `kubectl -n tatara get pod -l app.kubernetes.io/component=neo4j`.
 
-## Scan stale-event cutoff (issue #285)
+## Scan stale-event cutoff (issue #285) - ABANDONED, mrScan deleted 2026-07-13
 
-- [x] Durable per-item high-water mark (ProjectStatus.ScanMarks) gates issueScan triage + issueScan implement-producer + mrScan bot-PR re-triage on activity newer than last accounted. Plan: docs/superpowers/plans/2026-07-11-operator-scan-stale-cutoff.md (in tatara-new workbench).
-- [ ] Fix mrScan priorTerminalAttempts GC reset: recovery-exhaustion counter reads live Tasks only, resets to 0 after Task GC, undermining the maxRecoveryAttempts cap. Needs a durable attempt counter (candidate: reuse ScanMarks or a status counter).
-- [ ] Gate mrScan human-PR review branch on ScanMarks (same GC-rescan gap, scoped out of initial fix; low-harm re-review of unchanged PRs).
-- [ ] buildScanMarks prunes only scanned repos - marks for removed repos leak; add size cap or periodic full reconcile if repo churn grows.
+Pre-cutover items below all targeted mrScan, which the 2026-07-13 task-centric redesign deleted
+(B.4 sweep is the sole intake now). See MEMORY.md 2026-07-17 (Task 9) for the dead-field removal
+and the ScanMarks finding.
+
+- [ ] **Delete the retired `healthCheck` cron surface** (`ScmCron.HealthCheck`,
+  `ProjectStatus.LastHealthCheck`, the unreachable `activityScheduleAndLast`/`stampScan` arms,
+  CRD + deepcopy). It was kept "inert for stored-CR back-compat", but the mrScan removal deleted an
+  identically-retired field and proved (`TestProjectCR_StaleMRScanBlockIsPrunedNotRejected`) that
+  structural-schema pruning drops a stale block silently - so the back-compat rationale is wrong and
+  the two were inconsistent. Comments corrected 2026-07-17; the deletion itself is still pending.
+- [ ] **`deploy-samples/tatara-project.yaml` sets `cron.issueScan.maxPerCycle`, which is not a
+  `CronActivity` field at all** (it has `schedule` + `maxPerRepo` only; `maxPerCycle` exists only on
+  `BrainstormActivity`, where it is deprecated and ignored). Pre-existing rot, pruned silently, so it
+  misleads readers rather than breaking. `tatara-project-values.yaml` already uses `maxPerRepo`
+  correctly. Reconcile the two samples against the real schema.
+- [ ] **NEW, replaces the items below:** `ProjectStatus.ScanMarks`/`ScanMark` have ZERO readers or
+  writers anywhere in the codebase (only the type declarations and generated deepcopy reference
+  them) - the whole per-item high-water-mark mechanism this section was built around appears to
+  have been dropped in the same redesign that deleted mrScan, without the field itself being
+  removed. Confirm and either wire a consumer or delete the dead status field + CRD surface.

@@ -1533,8 +1533,11 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// emits both (clarifying->rejected on decision=close; investigating
 		// ->rejected on submit_outcome(false_positive)), and stage.Enter
 		// validates against this set. Per contract M.3, F.3's table wins.
-		// The set has 26 members, not 24.
+		// The set has 27 members, not 24.
 		"declined", "false-positive",
+		// handoff-stalled: reviewing -> parked when the outcome COMMITTED but
+		// the phase-2 drain never advanced the Task within HandoffDeadline.
+		"handoff-stalled",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -1716,5 +1719,74 @@ func TestRejectedEdgesCarryTheirOwnReason(t *testing.T) {
 				t.Errorf("reason %q is not in the closed set", got)
 			}
 		})
+	}
+}
+
+func TestHandoffStalledIsInTheF5ClosedSet(t *testing.T) {
+	if !stage.ValidReason(stage.ReasonHandoffStalled) {
+		t.Fatal("handoff-stalled must be a member of the F.5 closed set, else Enter rejects it")
+	}
+}
+
+// Only reviewing needs the edge: every other kind's commit calls stage.Enter in
+// the SAME write as its outcome condition, so no other stage can be
+// committed-but-not-advanced.
+func TestReviewingHasTheHandoffStalledEdgeAndNothingElseDoes(t *testing.T) {
+	found := false
+	for _, e := range stage.Transitions[v1alpha1.StageReviewing] {
+		if e.To == v1alpha1.StageParked && e.Reason == stage.ReasonHandoffStalled {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("reviewing -> parked[handoff-stalled] is missing from the F.3 table")
+	}
+	for from, edges := range stage.Transitions {
+		if from == v1alpha1.StageReviewing {
+			continue
+		}
+		for _, e := range edges {
+			if e.Reason == stage.ReasonHandoffStalled {
+				t.Fatalf("%s must not carry a handoff-stalled edge: its commit advances the stage in the same write", from)
+			}
+		}
+	}
+}
+
+func TestEnterReviewingToParkedHandoffStalled(t *testing.T) {
+	task := &v1alpha1.Task{
+		Spec: v1alpha1.TaskSpec{Kind: "review"},
+		Status: v1alpha1.TaskStatus{
+			Stage:              v1alpha1.StageReviewing,
+			PodStartedAt:       &metav1.Time{Time: time.Unix(100, 0)},
+			StageWorkStartedAt: &metav1.Time{Time: time.Unix(100, 0)},
+			Stats:              v1alpha1.TaskStats{PodRecreations: 2},
+		},
+	}
+	now := time.Unix(500, 0)
+	if err := stage.Enter(task, nil, v1alpha1.StageParked, stage.ReasonHandoffStalled, now); err != nil {
+		t.Fatalf("Enter: %v", err)
+	}
+	if task.Status.Stage != v1alpha1.StageParked || task.Status.StageReason != stage.ReasonHandoffStalled {
+		t.Fatalf("stage=%q reason=%q", task.Status.Stage, task.Status.StageReason)
+	}
+	if task.Status.ParkedFromStage != v1alpha1.StageReviewing {
+		t.Fatalf("parkedFromStage = %q", task.Status.ParkedFromStage)
+	}
+}
+
+// handoff-stalled has NO F.6 re-entry: it ages out at parkRetention and the
+// reaper collects it. It must not fall into any Unpark rule by accident.
+func TestUnparkDoesNotReEnterHandoffStalled(t *testing.T) {
+	task := &v1alpha1.Task{
+		Spec: v1alpha1.TaskSpec{Kind: "review"},
+		Status: v1alpha1.TaskStatus{
+			Stage:         v1alpha1.StageParked,
+			StageReason:   stage.ReasonHandoffStalled,
+			PendingEvents: []v1alpha1.TaskEvent{{Author: "a-human"}},
+		},
+	}
+	if _, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)}); ok {
+		t.Fatal("handoff-stalled must have no F.6 re-entry")
 	}
 }

@@ -272,7 +272,7 @@ type BoardSpec struct {
 	StatusField string `json:"statusField,omitempty"`
 }
 
-// CronActivity schedules one Project scan activity (mrScan or issueScan).
+// CronActivity schedules one Project scan activity (issueScan, healthCheck).
 type CronActivity struct {
 	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables this activity.
 	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
@@ -369,13 +369,11 @@ type CDScanActivity struct {
 // ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
-	MRScan CronActivity `json:"mrScan,omitempty"`
-	// +optional
 	IssueScan CronActivity `json:"issueScan,omitempty"`
 	// CDScan is the push-CD deploy-supervision backstop cron: it sweeps Deploying
 	// Tasks whose cascade has stalled past 1.5x the deploy budget with no live
 	// watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
-	// Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+	// Empty Schedule disables it. A peer of issueScan; project-scoped.
 	//
 	// Defaulted on (every 10 min): without an explicit schedule a Project would
 	// have NO durable deploy backstop - only the in-memory 60s requeue, lost on an
@@ -390,9 +388,16 @@ type ScmCron struct {
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
 	// HealthCheck is RETIRED as a firing activity (its proposals were absorbed
-	// into brainstorm): the runScans dispatch is stripped. The field is kept
-	// inert only so stored Project CRs that still set it round-trip; it never
-	// fires a Task. Mirrors the retired-enum-string back-compat convention.
+	// into brainstorm): the runScans dispatch is stripped. It never fires a Task.
+	//
+	// IT IS NOT KEPT FOR BACK-COMPAT - that rationale does not survive contact with
+	// the mrScan removal, which deleted an identically-retired field and proved via
+	// TestProjectCR_StaleMRScanBlockIsPrunedNotRejected that structural-schema
+	// PRUNING drops a stale block from an incoming CR silently, with no error and no
+	// coordinated cutover. The same is true here: deleting HealthCheck would break
+	// no stored CR. It survives only because removing it was out of that change's
+	// scope. Delete it (field, status stamp, and the unreachable switch arms) the
+	// next time this file is opened; see ROADMAP.md.
 	// +optional
 	HealthCheck HealthCheckActivity `json:"healthCheck,omitempty"`
 	// Documentation is the scheduled documentation-sync cron (replaces the retired
@@ -455,7 +460,7 @@ type ScmSpec struct {
 	// +kubebuilder:default="afterApproval"
 	// +optional
 	MergePolicy string `json:"mergePolicy,omitempty"`
-	// PRReactionScope gates which PRs/MRs the mrScan review path reacts to.
+	// PRReactionScope gates which PRs/MRs the B.4 sweep's review path reacts to.
 	// Empty (the default) reviews every open human PR/MR (historical open
 	// behavior). "labeledOrMentioned" restricts reviews to PRs carrying the
 	// project TriggerLabel or @-mentioning the bot, so unlabeled, un-mentioned
@@ -825,13 +830,12 @@ type ProjectStatus struct {
 	// +optional
 	Grafana *GrafanaStatus `json:"grafana,omitempty"`
 	// +optional
-	LastMRScan *metav1.Time `json:"lastMRScan,omitempty"`
-	// +optional
 	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
 	// +optional
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
-	// LastHealthCheck is RETIRED (healthCheck no longer fires): read-only, kept for
-	// stored-CR back-compat. No writer remains after the cron dispatch was dropped.
+	// LastHealthCheck is RETIRED (healthCheck no longer fires): no writer remains
+	// after the cron dispatch was dropped. Pending deletion with ScmCron.HealthCheck
+	// - see the note there; pruning makes the removal safe.
 	// +optional
 	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
 	// LastDocumentation is the last time the documentation-sync cron ran; it bounds
@@ -874,7 +878,8 @@ type ProjectStatus struct {
 // accounted for on one item, keyed by (Repo, Number). It survives Task GC,
 // letting a scan skip re-triaging an item that has had no new activity since it
 // was last handled. IsPR scopes prune authority: issueScan prunes only issue
-// marks, mrScan only PR marks.
+// marks; nothing currently prunes PR marks (mrScan, the only writer, was
+// deleted in the 2026-07-13 redesign).
 type ScanMark struct {
 	Repo   string `json:"repo"`
 	Number int    `json:"number"`

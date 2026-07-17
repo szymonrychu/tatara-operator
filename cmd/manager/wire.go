@@ -402,6 +402,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 
 	if err := (&controller.TaskReconciler{
 		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
 		Scheme:        mgr.GetScheme(),
 		Metrics:       metrics,
 		SpillerFor:    spillerFor,

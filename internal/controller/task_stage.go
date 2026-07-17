@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -89,6 +90,34 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	task *tatarav1alpha1.Task, now time.Time) (res ctrl.Result, handled bool, err error) {
 
 	l := log.FromContext(ctx)
+
+	// B4: THE HANDOFF DEADLINE, evaluated BEFORE the three clocks because it is
+	// tighter than all of them.
+	//
+	// kind=review is the ONE outcome kind whose commit makes no stage transition:
+	// C.5.3 phase 1 is pure etcd with no forge write, so a forge outage cannot lose
+	// an accepted outcome, and the advance is deferred to MergeRequestReconciler ->
+	// DrainPendingReview -> advanceAfterReview. That split is deliberate and is NOT
+	// being removed. But it makes the Task's progress depend on a SECOND reconciler
+	// running, and nothing bounded that: the drain normally lands in ~1s, the
+	// reviewing work budget is 4h, the B2 guards suppress the pod caps underneath
+	// it, and a suppressed Task holds its admitted concurrency ticket for the whole
+	// window. This is the bound.
+	if cond := handoffCondition(task); cond != nil {
+		if elapsed := now.Sub(cond.LastTransitionTime.Time); elapsed > tatarav1alpha1.HandoffDeadline {
+			mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
+			if mrErr != nil {
+				return ctrl.Result{}, true, mrErr
+			}
+			l.Info("review handoff stalled: the outcome committed but the drain never advanced the task",
+				"action", "handoff_stalled", "resource_id", task.Name, "stage", task.Status.Stage,
+				"outcome_reason", cond.Reason, "deadline", tatarav1alpha1.HandoffDeadline.String(),
+				"elapsed", elapsed.String())
+			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs,
+				tatarav1alpha1.StageParked, stage.ReasonHandoffStalled, now)
+		}
+	}
+
 	paused := projectPaused(proj)
 	clock, since, budget, edge := stage.ArmedClock(task, paused)
 	if clock == stage.ClockNone {
@@ -129,6 +158,47 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		return ctrl.Result{}, true, err
 	}
 	return ctrl.Result{}, true, nil
+}
+
+// handoffCondition returns the OutcomeAccepted condition of a Task whose OWN
+// stage agent has COMMITTED its outcome and whose stage has NOT moved - i.e. the
+// cross-reconciler handoff is outstanding and its clock should be running. nil
+// otherwise. Its LastTransitionTime is when the commit stamped it, which is when
+// the handoff started - not stageEnteredAt.
+//
+// It resolves to exactly one case, kind-agnostically: the reviewing stage after a
+// review outcome commits. Every other kind's commit calls stage.Enter in the SAME
+// write, so its condition Reason can never name the NEW stage's agent kind, and
+// no other stage can be committed-but-not-advanced. That is why the scoped
+// OutcomeCommittedFor is load-bearing and a bare OutcomeCommitted would be a bug:
+// the condition is per-TASK and survives across stages, so an implement Task is
+// already committed the instant it arrives at reviewing. A bare claim (Reason
+// "Outcome") never matches either: it has no handoff outstanding.
+//
+// This is the ONE predicate for "this stage's agent is done and the handoff is
+// outstanding". All three production sites route through it - reconcileClocks'
+// deadline and the two B2 suppression guards - so the scoping holds identically
+// at each.
+func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
+	if !tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.Stage)) {
+		return nil
+	}
+	cond := tatarav1alpha1.OutcomeCondition(task)
+	// stage.Enter never clears the condition, so a commit from a PREVIOUS
+	// occupancy of this same stage is not this occupancy's handoff:
+	// merging -> reviewing (HeadMoved, cycle 4) and the kind=review
+	// awaiting-human unpark both re-enter reviewing carrying Reason=Review
+	// from the last round. This occupancy's agent has not run yet.
+	//
+	// No stage stamp is no occupancy to compare against, so no handoff to bound
+	// either - ArmedClock disarms on the same condition (stage.go:572). Every
+	// path into a stage runs stage.Enter, which always stamps it, so a nil stamp
+	// is unreachable; failing closed just keeps it that way.
+	if task.Status.StageEnteredAt == nil ||
+		cond.LastTransitionTime.Time.Before(task.Status.StageEnteredAt.Time) {
+		return nil
+	}
+	return cond
 }
 
 // clockRequeue is when to look again so a clock fires without an external event.
@@ -173,6 +243,35 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	if !ok {
 		return false, nil
 	}
+
+	// B2: an outcome COMMITTED BY THIS STAGE'S OWN AGENT means the agent's work is
+	// done and only the C.5.3 phase-2 handoff (DrainPendingReview ->
+	// advanceAfterReview) is outstanding. The pod-liveness caps read only pod
+	// liveness and stats.podRecreations - they cannot see that - so while
+	// status.stage is still reviewing they keep driving a finished Task as an
+	// ordinary live pod stage and terminate work that already landed.
+	//
+	// A BARE CLAIM is deliberately NOT guarded: handoffCondition is nil for
+	// Reason "Outcome", so a failed-validation stub stays fully subject to the
+	// caps. Guarding it would freeze it forever. A commit from a PREVIOUS
+	// occupancy of this stage is nil there too, so a re-entered reviewing Task
+	// carries no suppression from the last round.
+	//
+	// The turn budget is NOT suppressed: it is not a pod-liveness cap, and
+	// BudgetExit checks it first, so a Task over maxTurnsPerTask still fails here.
+	//
+	// handled=false lets the flow fall through to reconcilePodStage, whose own B2
+	// guard returns the poll requeue. The handoff deadline stays armed and bounds
+	// the suppression in the other direction.
+	if handoffCondition(task) != nil &&
+		(edge.Reason == stage.ReasonNoOutcome || edge.Reason == stage.ReasonPodRecreationExhausted) {
+		log.FromContext(ctx).Info("stage budget exit suppressed: the outcome is committed and the handoff is in flight",
+			"action", "cap_suppressed_committed_outcome", "resource_id", task.Name,
+			"stage", task.Status.Stage, "pod_recreations", task.Status.Stats.PodRecreations,
+			"suppressed_reason", edge.Reason)
+		return false, nil
+	}
+
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
 	if mrErr != nil {
 		return true, mrErr
@@ -337,6 +436,24 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	task *tatarav1alpha1.Task, agentKind string, now time.Time) (ctrl.Result, error) {
 
 	l := log.FromContext(ctx)
+
+	// B2: a COMMITTED outcome from THIS stage's own agent means there is nothing
+	// left for a pod to do. Do NOT respawn a lost pod, do not TTL-rotate, do not
+	// re-submit turn-0. Poll until the MergeRequest reconciler's drain advances
+	// the stage, or until the handoff deadline parks it at handoff-stalled.
+	//
+	// handoffCondition - not "is anything committed" - because the condition is
+	// per-TASK and survives across BOTH stages and stage re-entries: an implement
+	// Task arrives at reviewing with Reason=Implement already committed, and a
+	// re-entered reviewing Task (head move, awaiting-human unpark) arrives with the
+	// LAST round's Reason=Review committed. A bare committed check would gag the
+	// review pod that has not spawned yet in either case.
+	if handoffCondition(task) != nil {
+		l.Info("stage pod work suppressed: the outcome is committed and the handoff is in flight",
+			"action", "pod_stage_suppressed_committed_outcome", "resource_id", task.Name,
+			"stage", task.Status.Stage, "agent_kind", agentKind)
+		return ctrl.Result{RequeueAfter: stageRequeue}, nil
+	}
 
 	admitted, err := r.ensureTicket(ctx, proj, task, agentKind)
 	if err != nil {

@@ -681,6 +681,134 @@ func TestNoStampsIsClock1(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// B2: THE POD-LIVENESS CAPS ARE BLIND TO A COMMITTED OUTCOME.
+//
+// kind=review is the ONLY outcome kind whose commit does not call stage.Enter:
+// the advance is deferred to MergeRequestReconciler's DrainPendingReview. While
+// the Task sits at reviewing awaiting that drain, the caps and the respawn read
+// only pod liveness + stats.podRecreations, so they keep driving a FINISHED Task
+// as an ordinary live pod stage.
+// ---------------------------------------------------------------------------
+
+// tsReviewTaskWithOutcome is a kind=review Task at reviewing whose review pod
+// has RUN (stageWorkStartedAt set) and whose outcome carries the given condition
+// reason. reason=="Review" is a COMMITTED outcome; reason=="Outcome" is a BARE
+// CLAIM.
+func tsReviewTaskWithOutcome(reason string, recreations int, at time.Time) *tatarav1alpha1.Task {
+	stamp := metav1.NewTime(at)
+	task := tsTask("rev", "review", tatarav1alpha1.StageReviewing, at)
+	task.Status.PodStartedAt = &stamp
+	task.Status.StageWorkStartedAt = &stamp
+	task.Status.Stats.PodRecreations = recreations
+	task.Status.Conditions = []metav1.Condition{{
+		Type:               tatarav1alpha1.ConditionOutcomeAccepted,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            "fp",
+		LastTransitionTime: stamp,
+	}}
+	return task
+}
+
+// A COMMITTED outcome + a pod that is GONE must not respawn, must not burn a
+// recreation, and must not trip a cap. The agent's work is DONE; only the C.5.3
+// phase-2 drain is outstanding. This is exactly what re-reviewed the
+// already-merged PR four times on cfsw4/llkfb and burned the recreations that
+// killed 7k7pd/cgthv/rfzwv.
+func TestReconcile_CommittedOutcomeSuppressesRespawnAndCaps(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	// podRecreations == maxPodRecreations, so today's BudgetExit parks it
+	// no-outcome the moment the pod is seen gone.
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
+		maxPodRecreations, now.Add(-time.Minute))
+	proj := tsProject(3)
+	c := newMirrorClient(t, proj, mdSecret(), task) // no Pod object -> podGone == true
+	r := tsReconciler(c)
+
+	res, err := r.reconcileStage(ctx, proj, task, now)
+	if err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+	if res.RequeueAfter != stageRequeue {
+		t.Fatalf("requeueAfter = %s, want %s: it polls for the drain instead of acting",
+			res.RequeueAfter, stageRequeue)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %q(%s), want reviewing: a committed outcome must not be terminated by a pod-liveness cap",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	if got.Status.Stats.PodRecreations != maxPodRecreations {
+		t.Fatalf("podRecreations = %d, want %d: no recreation may be burned",
+			got.Status.Stats.PodRecreations, maxPodRecreations)
+	}
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("%d pods respawned for a task whose outcome landed", len(pods.Items))
+	}
+}
+
+// THE ARGOCD-WEDGE REGRESSION GUARD. A BARE CLAIM (Reason "Outcome") is a
+// failed-validation or crashed-mid-flight stub. It must remain FULLY subject to
+// the caps: guarding it would freeze the Task forever, reproducing ArgoCD's
+// status.operationState stuck-in-Running - the anti-pattern twin of the very bug
+// this change fixes.
+func TestReconcile_BareClaimIsStillFullySubjectToTheCaps(t *testing.T) {
+	now := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonClaimed,
+		maxPodRecreations, now.Add(-time.Minute))
+	proj := tsProject(3)
+	c := newMirrorClient(t, proj, mdSecret(), task)
+	r := tsReconciler(c)
+
+	got := tsReconcile(t, r, proj, task, now)
+
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+		t.Fatalf("stage=%q reason=%q, want parked/no-outcome: a bare claim must NOT be protected, the caps apply exactly as they do today",
+			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// The condition is per-TASK and survives across stages. An implement Task
+// arrives at reviewing with Reason=Implement ALREADY committed: its review pod
+// has not spawned yet and the guard must NOT suppress it, or every implement
+// Task wedges - a strictly worse failure than the one being fixed.
+func TestReconcile_CommittedImplementOutcomeDoesNotGagTheReviewingStagePod(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentImplement), 0, now)
+	task.Spec.Kind = stage.AgentImplement
+	task.Status.PodStartedAt = nil
+	task.Status.StageWorkStartedAt = nil
+	proj := tsProject(3)
+	readySince := metav1.NewTime(now.Add(-time.Hour))
+	proj.Status.Memory.ReadySince = &readySince
+	c := newMirrorClient(t, proj, mdSecret(), task)
+	r := tsReconciler(c)
+	r.PodConfig = agent.PodConfig{
+		Namespace:           mdNS,
+		AnthropicSecretName: "anthropic",
+		CLIOIDCSecretName:   "cli-oidc",
+	}
+
+	if _, err := r.reconcileStage(ctx, proj, task, now); err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1: the reviewing stage's OWN review pod must still spawn", len(pods.Items))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
@@ -728,6 +856,103 @@ func terminalCount(t *testing.T, reg *prometheus.Registry, kind, stg, reason str
 		}
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// SPEC TEST 9. THE cgthv REPRODUCTION, end to end.
+//
+// 2026-07-16T18:12Z: six kind=review Tasks were minted. cgthv's review agent
+// genuinely completed - mr-tatara-agent-skills-20 carries status:approved and a
+// stamped reviewedSHA - and the Task still ended failed(pod-recreation-exhausted),
+// because while status.stage was still reviewing the caps kept driving it as an
+// ordinary live pod stage through the v1.2.0 rollout's pod-loss burst.
+//
+// The expected happy path is reviewing -> parked(awaiting-human). Zero of the six
+// reached it.
+// ---------------------------------------------------------------------------
+
+func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	stamp := metav1.NewTime(now.Add(-time.Minute))
+
+	proj := tsProject(3)
+	repo := mdRepo("tatara-agent-skills")
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "cgthv", Namespace: mdNS, UID: types.UID("uid-cgthv")},
+		Spec:       tatarav1alpha1.TaskSpec{Kind: "review", ProjectRef: "proj", Goal: "review the PR"},
+		Status: tatarav1alpha1.TaskStatus{
+			Stage:              tatarav1alpha1.StageReviewing,
+			AgentKind:          "review",
+			StageEnteredAt:     &stamp,
+			PodStartedAt:       &stamp,
+			StageWorkStartedAt: &stamp,
+			// podRuns=5 => 4 recreations => 4 > 3 => failed(pod-recreation-exhausted)
+			// under the old code, the moment the lost pod is noticed.
+			Stats: tatarav1alpha1.TaskStats{PodRuns: 5, PodRecreations: 4},
+			Conditions: []metav1.Condition{{
+				Type:               tatarav1alpha1.ConditionOutcomeAccepted,
+				Status:             metav1.ConditionTrue,
+				Reason:             tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), // COMMITTED: the review outcome landed
+				Message:            "fp-cgthv",
+				LastTransitionTime: stamp,
+			}},
+		},
+	}
+	mr := mdMR(task, "tatara-agent-skills", 20)
+	mr.Status.Status = "approved"
+	mr.Status.ReviewedSHA = "reviewedsha"
+	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{
+		Body: "## Review: approved", SHA: "reviewedsha", Round: 1,
+	}
+
+	c := newMirrorClient(t, proj, mdSecret(), repo, task, mr)
+
+	// 1. The pod is GONE and the recreation budget is spent. Under v1.3.0 this
+	//    reconcile fails the Task. It must now do nothing but wait for the drain.
+	tr := tsReconciler(c)
+	res, err := tr.reconcileStage(ctx, proj, task, now)
+	if err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+	if task.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %q(%s), want reviewing: the review LANDED, a pod that is no longer needed must not fail the Task",
+			task.Status.Stage, task.Status.StageReason)
+	}
+	if task.Status.Stats.PodRecreations != 4 {
+		t.Fatalf("podRecreations = %d, want 4: no recreation may be burned for a committed outcome",
+			task.Status.Stats.PodRecreations)
+	}
+	if res.RequeueAfter != stageRequeue {
+		t.Fatalf("requeueAfter = %s, want %s", res.RequeueAfter, stageRequeue)
+	}
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("%d pods respawned for a task whose review outcome already landed", len(pods.Items))
+	}
+
+	// 2. The drain runs (the MergeRequest reconciler's half). It posts the review,
+	//    clears pendingReview, and advanceAfterReview takes the F.3 edge.
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, c)
+	if err := d.DrainPendingReview(ctx, mdGetMR(t, c, mr.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+
+	got := mdGetTask(t, c, "cgthv")
+	if got.Status.Stage != tatarav1alpha1.StageParked {
+		t.Fatalf("stage = %q, want parked", got.Status.Stage)
+	}
+	if got.Status.StageReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("stageReason = %q, want awaiting-human: the expected happy path for a kind=review Task is a human's PR fixed and merged by the human",
+			got.Status.StageReason)
+	}
+	if got.Status.StageReason == stage.ReasonPodRecreationExhausted {
+		t.Fatalf("stageReason = pod-recreation-exhausted: this is the exact production failure being reproduced")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -882,4 +1107,288 @@ func TestEnsureTicketClassByStageAgentKind(t *testing.T) {
 			}
 		})
 	}
+}
+
+// SPEC TEST 7. The B2 guard must never become an unbounded hold. A committed
+// outcome whose drain NEVER runs (the sibling MergeRequest CR was deleted, the
+// drain is broken, a leader-election changeover dropped the workqueue item) parks
+// at handoff-stalled after HandoffDeadline. The drain normally lands in ~1s; the
+// 4h reviewing work budget is far too loose to surface a broken one, and a
+// suppressed Task holds its admitted concurrency ticket for the whole window.
+func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) {
+	base := time.Unix(1000, 0)
+	committed := tatarav1alpha1.OutcomeReasonFor(stage.AgentReview)
+
+	t.Run("inside the deadline it waits", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+
+		res, err := r.reconcileStage(context.Background(), proj, task,
+			base.Add(tatarav1alpha1.HandoffDeadline-time.Second))
+		if err != nil {
+			t.Fatalf("reconcileStage: %v", err)
+		}
+		got := mdGetTask(t, r.Client, task.Name)
+		if got.Status.Stage != tatarav1alpha1.StageReviewing {
+			t.Fatalf("stage = %q(%s), want reviewing: the deadline has not elapsed yet",
+				got.Status.Stage, got.Status.StageReason)
+		}
+		if res.RequeueAfter != stageRequeue {
+			t.Fatalf("requeueAfter = %s, want %s: it must keep polling for the drain",
+				res.RequeueAfter, stageRequeue)
+		}
+	})
+
+	t.Run("past the deadline it parks handoff-stalled", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.Stage != tatarav1alpha1.StageParked ||
+			got.Status.StageReason != stage.ReasonHandoffStalled {
+			t.Fatalf("stage=%q reason=%q, want parked/handoff-stalled: the B2 suppression must be bounded",
+				got.Status.Stage, got.Status.StageReason)
+		}
+		if got.Status.ParkedFromStage != tatarav1alpha1.StageReviewing {
+			t.Fatalf("parkedFromStage = %q, want reviewing", got.Status.ParkedFromStage)
+		}
+	})
+
+	t.Run("the deadline runs from the COMMIT, not from stageEnteredAt", func(t *testing.T) {
+		// The Task has been at reviewing for an hour, but its outcome committed one
+		// minute ago: the handoff clock starts when the commit stamped the condition.
+		task := tsReviewTaskWithOutcome(committed, 0, base.Add(-time.Hour))
+		stamp := metav1.NewTime(base.Add(-time.Minute))
+		task.Status.Conditions[0].LastTransitionTime = stamp
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+
+		got := tsReconcile(t, r, proj, task, base)
+
+		if got.Status.Stage != tatarav1alpha1.StageReviewing {
+			t.Fatalf("stage = %q(%s), want reviewing: 1m since the commit is inside the 5m deadline",
+				got.Status.Stage, got.Status.StageReason)
+		}
+	})
+
+	t.Run("a BARE CLAIM never arms the handoff deadline", func(t *testing.T) {
+		// It has no handoff to wait for. It is a failed-validation stub and the
+		// ordinary caps own it.
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonClaimed, maxPodRecreations, base)
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.StageReason == stage.ReasonHandoffStalled {
+			t.Fatalf("reason = handoff-stalled: a bare claim has no handoff outstanding")
+		}
+		if got.Status.StageReason != stage.ReasonNoOutcome {
+			t.Fatalf("reason = %q, want no-outcome: the ordinary caps own a bare claim", got.Status.StageReason)
+		}
+	})
+
+	t.Run("an IMPLEMENT outcome at reviewing never arms the handoff deadline", func(t *testing.T) {
+		// The condition is per-TASK and survives across stages: an implement Task
+		// arrives at reviewing with Reason=Implement ALREADY committed. A bare
+		// OutcomeCommitted check here would park EVERY implement Task at
+		// handoff-stalled 5m after it reached reviewing.
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentImplement), 0, base)
+		task.Spec.Kind = stage.AgentImplement
+		task.Status.PodStartedAt = nil
+		task.Status.StageWorkStartedAt = nil
+		proj := tsProject(3)
+		readySince := metav1.NewTime(base.Add(-time.Hour))
+		proj.Status.Memory.ReadySince = &readySince
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+		r.PodConfig = agent.PodConfig{
+			Namespace:           mdNS,
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "cli-oidc",
+		}
+
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.Stage != tatarav1alpha1.StageReviewing ||
+			got.Status.StageReason == stage.ReasonHandoffStalled {
+			t.Fatalf("stage=%q reason=%q, want reviewing: the implement commit is not THIS stage's handoff",
+				got.Status.Stage, got.Status.StageReason)
+		}
+	})
+
+	t.Run("a PREVIOUS round's review commit never arms the handoff deadline", func(t *testing.T) {
+		// stage.Enter never clears the condition, so a Task that RE-ENTERS reviewing
+		// carries the last round's Reason=Review commit with it: merging -> reviewing
+		// on a head move (cycle 4) and the kind=review awaiting-human unpark both do
+		// exactly this. THIS occupancy's review agent has not run yet, so the handoff
+		// is not outstanding and the pod must still spawn. Without the occupancy
+		// check the first reconcile parks it at handoff-stalled - which has no F.6
+		// re-entry - and both cycles die permanently and SILENTLY, because
+		// reviewing -> parked is a legal transition.
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		reEntered := metav1.NewTime(base.Add(time.Hour))
+		task.Status.StageEnteredAt = &reEntered
+		task.Status.PodStartedAt = nil
+		task.Status.StageWorkStartedAt = nil
+		proj := tsProject(3)
+		readySince := metav1.NewTime(base.Add(-time.Hour))
+		proj.Status.Memory.ReadySince = &readySince
+		c := newMirrorClient(t, proj, mdSecret(), task)
+		r := tsReconciler(c)
+		r.PodConfig = agent.PodConfig{
+			Namespace:           mdNS,
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "cli-oidc",
+		}
+
+		got := tsReconcile(t, r, proj, task, base.Add(time.Hour+tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.Stage != tatarav1alpha1.StageReviewing ||
+			got.Status.StageReason == stage.ReasonHandoffStalled {
+			t.Fatalf("stage=%q reason=%q, want reviewing: a commit from a PREVIOUS occupancy of this stage is not this occupancy's handoff",
+				got.Status.Stage, got.Status.StageReason)
+		}
+		var pods corev1.PodList
+		if err := c.List(context.Background(), &pods, client.InNamespace(mdNS)); err != nil {
+			t.Fatalf("list pods: %v", err)
+		}
+		if len(pods.Items) != 1 {
+			t.Fatalf("pods = %d, want 1: the re-entered reviewing stage's own review pod must still spawn", len(pods.Items))
+		}
+	})
+
+	t.Run("the handoff deadline fires BEFORE clock 3's 4h reviewing budget", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task))
+
+		got := tsReconcile(t, r, proj, task, base.Add(10*time.Minute))
+
+		if got.Status.StageReason != stage.ReasonHandoffStalled {
+			t.Fatalf("reason = %q, want handoff-stalled: the 5m handoff deadline must fire first",
+				got.Status.StageReason)
+		}
+	})
+}
+
+// The reconcileCaps B2 guard must be scoped to THIS stage's agent kind exactly as
+// reconcilePodStage's is. An implement-Reason Task at reviewing whose review pod
+// RAN and vanished with its recreations exhausted must still park(no-outcome): a
+// bare OutcomeCommitted check at that site would suppress the cap on a Task whose
+// committed outcome belongs to a stage it already left.
+func TestReconcile_CapsSuppressionIsScopedToTheStagesOwnAgentKind(t *testing.T) {
+	now := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentImplement),
+		maxPodRecreations, now.Add(-time.Minute))
+	task.Spec.Kind = stage.AgentImplement
+	proj := tsProject(3)
+	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
+
+	got := tsReconcile(t, r, proj, task, now)
+
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+		t.Fatalf("stage=%q reason=%q, want parked/no-outcome: only an outcome committed BY THIS STAGE'S agent may suppress the caps",
+			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// The same scoping in the other axis: the agent kind matches, but the commit is
+// from a PREVIOUS occupancy of reviewing (a head-move re-entry, or the
+// awaiting-human unpark). THIS occupancy's pod ran and vanished with its
+// recreations spent, so the caps own it exactly as they own any other stage whose
+// agent submitted nothing.
+func TestReconcile_CapsSuppressionIsScopedToTheCurrentStageOccupancy(t *testing.T) {
+	base := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
+		maxPodRecreations, base)
+	reEntered := metav1.NewTime(base.Add(time.Hour))
+	ran := metav1.NewTime(base.Add(time.Hour + time.Minute))
+	task.Status.StageEnteredAt = &reEntered
+	task.Status.PodStartedAt = &ran
+	task.Status.StageWorkStartedAt = &ran
+	proj := tsProject(3)
+	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
+
+	got := tsReconcile(t, r, proj, task, base.Add(time.Hour+2*time.Minute))
+
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+		t.Fatalf("stage=%q reason=%q, want parked/no-outcome: a commit predating stageEnteredAt must not suppress this occupancy's caps",
+			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// The B2 suppression is scoped to the two POD-LIVENESS caps by REASON, and that
+// reason clause is the only thing holding the line. The TURN BUDGET is not a
+// pod-liveness cap - it reads stats.turns, which a committed outcome says nothing
+// about - and BudgetExit checks it FIRST, so a Task over maxTurnsPerTask must
+// still fail here even with this occupancy's own review outcome committed and the
+// handoff genuinely in flight.
+//
+// Drop the reason clause from reconcileCaps' guard (leaving a bare
+// `handoffCondition(task) != nil`) and a runaway agent that committed an outcome
+// buys itself an unbounded turn budget for the whole handoff window. Every other
+// caps test uses a Task with no committed outcome, so none of them enters the
+// guard at all and none of them would notice.
+func TestReconcile_CapsSuppressionDoesNotCoverTheTurnBudget(t *testing.T) {
+	now := time.Unix(1000, 0)
+	// THIS occupancy's own review outcome, committed at stageEnteredAt: the
+	// handoff condition is armed, so the guard IS entered.
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), 0, now)
+	task.Status.Stats.Turns = defaultMaxTurnsPerTask
+	proj := tsProject(3)
+	// A LIVE, Ready pod: podGone is false, so no-outcome cannot fire and the turn
+	// budget is the only exit BudgetExit can be reporting.
+	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task)))
+
+	got := tsReconcile(t, r, proj, task, now.Add(time.Minute))
+
+	if got.Status.Stage != tatarav1alpha1.StageFailed ||
+		got.Status.StageReason != stage.ReasonTurnBudgetExhausted {
+		t.Fatalf("stage=%q reason=%q, want failed/turn-budget-exhausted: the B2 guard suppresses the POD-LIVENESS caps only, "+
+			"never the lifetime turn budget", got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// handoffCondition FAILS CLOSED on a Task with no stage stamp. The occupancy
+// check is "did the commit land at or after stageEnteredAt", and with no
+// stageEnteredAt there is no occupancy to compare against - so there is no
+// handoff to bound either, and a suppression that cannot be bounded must never
+// be granted. Every path into a stage runs stage.Enter, which always stamps it,
+// so this is unreachable today; fail-closed is what keeps it that way.
+//
+// Invert the nil check to fail OPEN and a Task that somehow lost its stamp
+// suppresses BOTH pod-liveness caps forever: the handoff deadline reads the same
+// nil stamp and disarms, so nothing bounds it in the other direction either.
+// That is the one shape where the guard has no backstop at all, and no other test
+// constructs it.
+func TestHandoffCondition_FailsClosedWithNoStageStamp(t *testing.T) {
+	base := time.Unix(1000, 0)
+
+	t.Run("handoffCondition returns nil", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), 0, base)
+		task.Status.StageEnteredAt = nil
+
+		if got := handoffCondition(task); got != nil {
+			t.Fatalf("handoffCondition = %+v, want nil: with no stage stamp there is no occupancy to attribute the commit to, "+
+				"and no handoff deadline to bound the suppression", got)
+		}
+	})
+
+	t.Run("so the caps apply normally", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
+			maxPodRecreations, base)
+		task.Status.StageEnteredAt = nil
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
+
+		got := tsReconcile(t, r, proj, task, base.Add(time.Minute))
+
+		if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+			t.Fatalf("stage=%q reason=%q, want parked/no-outcome: an unbounded suppression must never be granted",
+				got.Status.Stage, got.Status.StageReason)
+		}
+	})
 }

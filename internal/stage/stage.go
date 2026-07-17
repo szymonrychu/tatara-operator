@@ -79,6 +79,7 @@ const (
 	ReasonDocTimeout             = "doc-timeout"
 	ReasonOperatorError          = "operator-error"
 	ReasonHeadMoving             = "head-moving"
+	ReasonHandoffStalled         = "handoff-stalled"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -113,6 +114,7 @@ var Reasons = []string{
 	ReasonDocTimeout,
 	ReasonOperatorError,
 	ReasonHeadMoving,
+	ReasonHandoffStalled,
 }
 
 var reasonSet = func() map[string]bool {
@@ -260,6 +262,7 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "submit_outcome(approve|request_changes) on a kind=review Task. The review IS posted. A human's PR is fixed and merged by the human (fixes V7-1, C3-2)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewLoopExhausted, Trigger: "request_changes at maxReviewRounds, on a non-review Task"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewPostRefused, Trigger: "a structural 4xx from PostReview (fix C1)"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m). ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced"},
 	),
 
 	// merging is POD-LESS: clock 3 ONLY, from stageEnteredAt, against ITS OWN 4h
@@ -881,7 +884,7 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// fold-adoption-unverified, doc-timeout, operator-error, triage-stalled,
 		// name-too-long, review-post-refused, object-too-large,
 		// merge-order-missing, agent-contract-mismatch, merge-blocked,
-		// deploy-blocked, head-moving.
+		// deploy-blocked, head-moving, handoff-stalled.
 		//
 		// NO re-entry. It ages out at parkRetention and is reaped, AFTER the
 		// operator posts its bot park comment. The next sweep re-mints the

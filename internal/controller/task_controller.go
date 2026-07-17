@@ -52,6 +52,18 @@ const (
 // turn through the F.1 stage machine.
 type TaskReconciler struct {
 	client.Client
+	// APIReader is the manager's UNCACHED reader, and the MINT edge is the ONE
+	// decision that may not be made on a cached read. reconcileStage takes the F.3
+	// Create edge on status.stage == "", but EnterStage's write re-reads the Task
+	// LIVE under RetryOnConflict: a re-reconcile against a cache that has not yet
+	// observed our own mint (the mint branch's own Requeue, or the
+	// ShortDescription status patch's watch event) re-applies the Create edge, and
+	// the in-write stage.Enter refuses it as triaging -> triaging, poisoning
+	// operator_illegal_stage_transition_total - which TataraIllegalStageTransition
+	// alerts on. Reconciles of one Task are serialised
+	// (MaxConcurrentReconciles: 1 + leader election), so a live read closes the
+	// window completely. Nil (unit tests) falls back to trusting the cached read.
+	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Metrics   *obs.OperatorMetrics
 	Session   agent.Session
@@ -164,6 +176,18 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 	// derives them here, with no racing post-create status write by the minter;
 	// anything else starts at triaging.
 	if task.Status.Stage == "" {
+		// status.stage == "" is a CACHED read. Confirm it against the API server
+		// before applying the Create edge: see the APIReader field's comment.
+		minted, err := r.mintedAlready(ctx, task)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if minted {
+			// Our own mint, not yet in the cache. Re-applying the Create edge here
+			// would be refused in-write as triaging -> triaging and fire the illegal
+			// transition counter for a Task that is perfectly healthy.
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 		initStage := task.Spec.InitialStage
 		if initStage == "" {
 			initStage = tatarav1alpha1.StageTriaging
@@ -244,6 +268,23 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 	}
 
 	return r.reconcilePodStage(ctx, project, task, agentKind, now)
+}
+
+// mintedAlready re-reads the Task from the API SERVER (never the cache) and
+// reports whether the F.3 Create edge has already been applied. A Task that has
+// been deleted counts as minted: there is nothing left to mint.
+func (r *TaskReconciler) mintedAlready(ctx context.Context, task *tatarav1alpha1.Task) (bool, error) {
+	if r.APIReader == nil {
+		return false, nil
+	}
+	var live tatarav1alpha1.Task
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(task), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("mint: live read of task %s: %w", task.Name, err)
+	}
+	return live.Status.Stage != "", nil
 }
 
 // patchTaskAnnotations Get-fresh + mutate + Update's a Task's annotations
