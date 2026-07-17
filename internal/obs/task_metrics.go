@@ -14,6 +14,7 @@ type taskMetrics struct {
 	taskStageAge            *prometheus.GaugeVec
 	taskParkedTotal         *prometheus.CounterVec
 	orphanAdoptedTotal      *prometheus.CounterVec
+	unparkDeclinedTotal     *prometheus.CounterVec
 }
 
 // newTaskMetrics registers the task collectors on reg and returns the bundle.
@@ -55,6 +56,12 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 			Name: "operator_orphan_adopted_total",
 			Help: "Orphan work items the sweep minted a Task for (contract K.1), by kind.",
 		}, []string{"kind"}),
+		unparkDeclinedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_unpark_declined_total",
+			Help: "F.6 re-entry declines by ApplyUnpark, by the Task's park stageReason and decline kind: " +
+				"guard (the live Task had already drifted from what the caller believed was parked - rare, " +
+				"anomalous) or rule (stage.Unpark's re-entry rule was not satisfied yet - normal steady state).",
+		}, []string{"stageReason", "kind"}),
 	}
 	reg.MustRegister(
 		m.taskTokensTotal,
@@ -66,6 +73,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.taskStageAge,
 		m.taskParkedTotal,
 		m.orphanAdoptedTotal,
+		m.unparkDeclinedTotal,
 	)
 	return m
 }
@@ -232,4 +240,21 @@ func (m *OperatorMetrics) TaskParkedCounter(stage, stageReason string) prometheu
 // kind for test assertions.
 func (m *OperatorMetrics) OrphanAdoptedCounter(kind string) prometheus.Counter {
 	return m.orphanAdoptedTotal.WithLabelValues(kind)
+}
+
+// UnparkDeclined increments operator_unpark_declined_total for one F.6
+// re-entry decline, by the Task's park stageReason and decline kind ("guard"
+// or "rule", see UnparkDecline). Nil-safe: a reconciler wired without metrics
+// is a test, not an outage.
+func (m *OperatorMetrics) UnparkDeclined(stageReason, kind string) {
+	if m == nil || m.unparkDeclinedTotal == nil {
+		return
+	}
+	m.unparkDeclinedTotal.WithLabelValues(stageReason, kind).Inc()
+}
+
+// UnparkDeclinedCounter returns the operator_unpark_declined_total counter for
+// (stageReason,kind) for test assertions.
+func (m *OperatorMetrics) UnparkDeclinedCounter(stageReason, kind string) prometheus.Counter {
+	return m.unparkDeclinedTotal.WithLabelValues(stageReason, kind)
 }
