@@ -324,12 +324,19 @@ func TestReconcileStage_MintIsIdempotentAgainstAStaleCache(t *testing.T) {
 		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageTriaging))
 
 	proj := tsProject(3)
-	// THE CACHED view: not yet minted.
+	// THE STALE OBJECT the informer cache hands the reconciler: not yet minted.
+	// It is an in-memory value, exactly as production's is - the cache is what
+	// produced it, and nothing re-reads it.
 	stale := &tatarav1alpha1.Task{
 		ObjectMeta: metav1.ObjectMeta{Name: "brainstorm-qe-5snrr", Namespace: mdNS},
 		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "brainstorm"},
 	}
-	// THE LIVE view: already minted by our own previous pass.
+	// THE API SERVER: already minted by our own previous pass. It backs BOTH
+	// Client and APIReader, because the illegal-transition counter fires from the
+	// in-write stage.Enter inside objbudget.FitTask, which re-Gets through
+	// r.Client. Backing r.Client with a second, stale store instead would let that
+	// re-read see stage == "" and take the LEGAL Create edge, and the counter this
+	// test asserts on could never move in its own fixture.
 	live := stale.DeepCopy()
 	live.Status.Stage = tatarav1alpha1.StageTriaging
 	live.Status.AgentKind = ""
@@ -337,13 +344,11 @@ func TestReconcileStage_MintIsIdempotentAgainstAStaleCache(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
-	cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, stale).
-		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
-	apiReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
 		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
 
 	r := &TaskReconciler{
-		Client: cached, APIReader: apiReader, Scheme: scheme,
+		Client: c, APIReader: c, Scheme: scheme,
 		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))

@@ -1319,3 +1319,76 @@ func TestReconcile_CapsSuppressionIsScopedToTheCurrentStageOccupancy(t *testing.
 			got.Status.Stage, got.Status.StageReason)
 	}
 }
+
+// The B2 suppression is scoped to the two POD-LIVENESS caps by REASON, and that
+// reason clause is the only thing holding the line. The TURN BUDGET is not a
+// pod-liveness cap - it reads stats.turns, which a committed outcome says nothing
+// about - and BudgetExit checks it FIRST, so a Task over maxTurnsPerTask must
+// still fail here even with this occupancy's own review outcome committed and the
+// handoff genuinely in flight.
+//
+// Drop the reason clause from reconcileCaps' guard (leaving a bare
+// `handoffCondition(task) != nil`) and a runaway agent that committed an outcome
+// buys itself an unbounded turn budget for the whole handoff window. Every other
+// caps test uses a Task with no committed outcome, so none of them enters the
+// guard at all and none of them would notice.
+func TestReconcile_CapsSuppressionDoesNotCoverTheTurnBudget(t *testing.T) {
+	now := time.Unix(1000, 0)
+	// THIS occupancy's own review outcome, committed at stageEnteredAt: the
+	// handoff condition is armed, so the guard IS entered.
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), 0, now)
+	task.Status.Stats.Turns = defaultMaxTurnsPerTask
+	proj := tsProject(3)
+	// A LIVE, Ready pod: podGone is false, so no-outcome cannot fire and the turn
+	// budget is the only exit BudgetExit can be reporting.
+	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task)))
+
+	got := tsReconcile(t, r, proj, task, now.Add(time.Minute))
+
+	if got.Status.Stage != tatarav1alpha1.StageFailed ||
+		got.Status.StageReason != stage.ReasonTurnBudgetExhausted {
+		t.Fatalf("stage=%q reason=%q, want failed/turn-budget-exhausted: the B2 guard suppresses the POD-LIVENESS caps only, "+
+			"never the lifetime turn budget", got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// handoffCondition FAILS CLOSED on a Task with no stage stamp. The occupancy
+// check is "did the commit land at or after stageEnteredAt", and with no
+// stageEnteredAt there is no occupancy to compare against - so there is no
+// handoff to bound either, and a suppression that cannot be bounded must never
+// be granted. Every path into a stage runs stage.Enter, which always stamps it,
+// so this is unreachable today; fail-closed is what keeps it that way.
+//
+// Invert the nil check to fail OPEN and a Task that somehow lost its stamp
+// suppresses BOTH pod-liveness caps forever: the handoff deadline reads the same
+// nil stamp and disarms, so nothing bounds it in the other direction either.
+// That is the one shape where the guard has no backstop at all, and no other test
+// constructs it.
+func TestHandoffCondition_FailsClosedWithNoStageStamp(t *testing.T) {
+	base := time.Unix(1000, 0)
+
+	t.Run("handoffCondition returns nil", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview), 0, base)
+		task.Status.StageEnteredAt = nil
+
+		if got := handoffCondition(task); got != nil {
+			t.Fatalf("handoffCondition = %+v, want nil: with no stage stamp there is no occupancy to attribute the commit to, "+
+				"and no handoff deadline to bound the suppression", got)
+		}
+	})
+
+	t.Run("so the caps apply normally", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
+			maxPodRecreations, base)
+		task.Status.StageEnteredAt = nil
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
+
+		got := tsReconcile(t, r, proj, task, base.Add(time.Minute))
+
+		if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+			t.Fatalf("stage=%q reason=%q, want parked/no-outcome: an unbounded suppression must never be granted",
+				got.Status.Stage, got.Status.StageReason)
+		}
+	})
+}
