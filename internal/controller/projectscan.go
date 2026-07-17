@@ -49,8 +49,9 @@ func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (str
 	case "documentation":
 		return c.Documentation.Schedule, proj.Status.LastDocumentation
 	case "healthCheck":
-		// Retired activity kept inert for stored-CR back-compat: activityDue
-		// against it never runs from runScans (the dispatch was dropped).
+		// RETIRED and unreachable: runScans never dispatches it. The arm survives
+		// only because the field does; see the note on ScmCron.HealthCheck for why
+		// that is scope, not back-compat.
 		return c.HealthCheck.Schedule, proj.Status.LastHealthCheck
 	}
 	return "", nil
@@ -1240,8 +1241,8 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	}
 
 	// healthCheck is RETIRED: its cron dispatch was removed (proposals absorbed
-	// into brainstorm). ScmCron.HealthCheck + Status.LastHealthCheck are kept
-	// inert for stored-CR back-compat; nothing fires them.
+	// into brainstorm). ScmCron.HealthCheck + Status.LastHealthCheck still exist on
+	// the CRD but nothing fires them; they are pending deletion, not load-bearing.
 
 	return soonest, nil
 }

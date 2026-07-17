@@ -5787,9 +5787,16 @@ spec:
                       healthCheck:
                         description: |-
                           HealthCheck is RETIRED as a firing activity (its proposals were absorbed
-                          into brainstorm): the runScans dispatch is stripped. The field is kept
-                          inert only so stored Project CRs that still set it round-trip; it never
-                          fires a Task. Mirrors the retired-enum-string back-compat convention.
+                          into brainstorm): the runScans dispatch is stripped. It never fires a Task.
+
+                          IT IS NOT KEPT FOR BACK-COMPAT - that rationale does not survive contact with
+                          the mrScan removal, which deleted an identically-retired field and proved via
+                          TestProjectCR_StaleMRScanBlockIsPrunedNotRejected that structural-schema
+                          PRUNING drops a stale block from an incoming CR silently, with no error and no
+                          coordinated cutover. The same is true here: deleting HealthCheck would break
+                          no stored CR. It survives only because removing it was out of that change's
+                          scope. Delete it (field, status stamp, and the unreachable switch arms) the
+                          next time this file is opened; see ROADMAP.md.
                         properties:
                           enabled:
                             type: boolean
@@ -6110,8 +6117,9 @@ spec:
                 type: string
               lastHealthCheck:
                 description: |-
-                  LastHealthCheck is RETIRED (healthCheck no longer fires): read-only, kept for
-                  stored-CR back-compat. No writer remains after the cron dispatch was dropped.
+                  LastHealthCheck is RETIRED (healthCheck no longer fires): no writer remains
+                  after the cron dispatch was dropped. Pending deletion with ScmCron.HealthCheck
+                  - see the note there; pruning makes the removal safe.
                 format: date-time
                 type: string
               lastIssueScan:

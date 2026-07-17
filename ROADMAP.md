@@ -186,6 +186,17 @@ Pre-cutover items below all targeted mrScan, which the 2026-07-13 task-centric r
 (B.4 sweep is the sole intake now). See MEMORY.md 2026-07-17 (Task 9) for the dead-field removal
 and the ScanMarks finding.
 
+- [ ] **Delete the retired `healthCheck` cron surface** (`ScmCron.HealthCheck`,
+  `ProjectStatus.LastHealthCheck`, the unreachable `activityScheduleAndLast`/`stampScan` arms,
+  CRD + deepcopy). It was kept "inert for stored-CR back-compat", but the mrScan removal deleted an
+  identically-retired field and proved (`TestProjectCR_StaleMRScanBlockIsPrunedNotRejected`) that
+  structural-schema pruning drops a stale block silently - so the back-compat rationale is wrong and
+  the two were inconsistent. Comments corrected 2026-07-17; the deletion itself is still pending.
+- [ ] **`deploy-samples/tatara-project.yaml` sets `cron.issueScan.maxPerCycle`, which is not a
+  `CronActivity` field at all** (it has `schedule` + `maxPerRepo` only; `maxPerCycle` exists only on
+  `BrainstormActivity`, where it is deprecated and ignored). Pre-existing rot, pruned silently, so it
+  misleads readers rather than breaking. `tatara-project-values.yaml` already uses `maxPerRepo`
+  correctly. Reconcile the two samples against the real schema.
 - [ ] **NEW, replaces the items below:** `ProjectStatus.ScanMarks`/`ScanMark` have ZERO readers or
   writers anywhere in the codebase (only the type declarations and generated deepcopy reference
   them) - the whole per-item high-water-mark mechanism this section was built around appears to
