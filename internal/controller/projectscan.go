@@ -42,17 +42,10 @@ func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (str
 	switch activity {
 	case "issueScan":
 		return c.IssueScan.Schedule, proj.Status.LastIssueScan
-	case "cdScan":
-		return c.CDScan.Schedule, proj.Status.LastCDScan
 	case "brainstorm":
 		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
 	case "documentation":
 		return c.Documentation.Schedule, proj.Status.LastDocumentation
-	case "healthCheck":
-		// RETIRED and unreachable: runScans never dispatches it. The arm survives
-		// only because the field does; see the note on ScmCron.HealthCheck for why
-		// that is scope, not back-compat.
-		return c.HealthCheck.Schedule, proj.Status.LastHealthCheck
 	}
 	return "", nil
 }
@@ -461,9 +454,6 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "issueScan":
 			fresh.Status.LastIssueScan = &now
 			proj.Status.LastIssueScan = &now
-		case "cdScan":
-			fresh.Status.LastCDScan = &now
-			proj.Status.LastCDScan = &now
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
@@ -1239,10 +1229,6 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "documentation")
 		}
 	}
-
-	// healthCheck is RETIRED: its cron dispatch was removed (proposals absorbed
-	// into brainstorm). ScmCron.HealthCheck + Status.LastHealthCheck still exist on
-	// the CRD but nothing fires them; they are pending deletion, not load-bearing.
 
 	return soonest, nil
 }

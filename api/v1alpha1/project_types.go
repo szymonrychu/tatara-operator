@@ -319,27 +319,6 @@ type BrainstormActivity struct {
 	Sources []string `json:"sources,omitempty"`
 }
 
-// HealthCheckActivity schedules the opt-in periodic project-health-check scan:
-// a sibling to brainstorm that surveys repo health (CI failures, coverage gaps,
-// code to simplify, pipeline steps to add, other tech-debt) and proposes one
-// targeted discovery issue per cycle via the tatara-health-check skill.
-type HealthCheckActivity struct {
-	// +optional
-	Enabled bool `json:"enabled,omitempty"`
-	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
-	// +optional
-	Schedule string `json:"schedule,omitempty"`
-	// MaxOpenProposals caps the total open, unapproved agent proposals across
-	// ALL repos in the project; at or above this the health-check cycle is
-	// skipped. Default 5.
-	// +kubebuilder:default=5
-	// +optional
-	MaxOpenProposals int `json:"maxOpenProposals,omitempty"`
-	// +kubebuilder:validation:items:Enum=docs;memory;internet
-	// +optional
-	Sources []string `json:"sources,omitempty"`
-}
-
 // RefineActivity configures the cron-cycle refiner pre-step.
 type RefineActivity struct {
 	// ClosedLookbackDays bounds how far back closed issues are loaded for
@@ -348,58 +327,12 @@ type RefineActivity struct {
 	ClosedLookbackDays int `json:"closedLookbackDays,omitempty"`
 }
 
-// CDScanActivity is the push-CD deploy-supervision backstop cron. A dedicated
-// type (vs CronActivity) so its Schedule carries a field-level default that
-// actually applies: cdScan is an always-serialized struct field, so an
-// object-level default never fires, but a defaulted string Schedule field does.
-type CDScanActivity struct {
-	// Schedule is a 5-field cron (robfig ParseStandard). Defaults to every 10 min;
-	// set it empty explicitly to disable the backstop.
-	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
-	// +kubebuilder:default="*/10 * * * *"
-	// +optional
-	Schedule string `json:"schedule,omitempty"`
-	// MaxPerRepo caps the number of in-progress Tasks per repo (one lane per repo).
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=1
-	// +optional
-	MaxPerRepo int `json:"maxPerRepo,omitempty"`
-}
-
 // ScmCron groups the cron-driven scan activities.
 type ScmCron struct {
 	// +optional
 	IssueScan CronActivity `json:"issueScan,omitempty"`
-	// CDScan is the push-CD deploy-supervision backstop cron: it sweeps Deploying
-	// Tasks whose cascade has stalled past 1.5x the deploy budget with no live
-	// watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
-	// Empty Schedule disables it. A peer of issueScan; project-scoped.
-	//
-	// Defaulted on (every 10 min): without an explicit schedule a Project would
-	// have NO durable deploy backstop - only the in-memory 60s requeue, lost on an
-	// operator restart - so a stalled cascade could sit undetected. A Project that
-	// wants it off can set an empty schedule explicitly. Its own type (not
-	// CronActivity) so the field-level Schedule default fires only for cdScan: a
-	// struct field with omitempty is always serialized, so an object-level default
-	// would never apply, but the string Schedule field IS omitted when empty, so a
-	// field default fills it.
-	// +optional
-	CDScan CDScanActivity `json:"cdScan,omitempty"`
 	// +optional
 	Brainstorm BrainstormActivity `json:"brainstorm,omitempty"`
-	// HealthCheck is RETIRED as a firing activity (its proposals were absorbed
-	// into brainstorm): the runScans dispatch is stripped. It never fires a Task.
-	//
-	// IT IS NOT KEPT FOR BACK-COMPAT - that rationale does not survive contact with
-	// the mrScan removal, which deleted an identically-retired field and proved via
-	// TestProjectCR_StaleMRScanBlockIsPrunedNotRejected that structural-schema
-	// PRUNING drops a stale block from an incoming CR silently, with no error and no
-	// coordinated cutover. The same is true here: deleting HealthCheck would break
-	// no stored CR. It survives only because removing it was out of that change's
-	// scope. Delete it (field, status stamp, and the unreachable switch arms) the
-	// next time this file is opened; see ROADMAP.md.
-	// +optional
-	HealthCheck HealthCheckActivity `json:"healthCheck,omitempty"`
 	// Documentation is the scheduled documentation-sync cron (replaces the retired
 	// per-merge push trigger): each tick spawns a documentation Task, scoped to the
 	// docs repo, for every enrolled component repo that advanced since the last run
@@ -833,18 +766,10 @@ type ProjectStatus struct {
 	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
 	// +optional
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
-	// LastHealthCheck is RETIRED (healthCheck no longer fires): no writer remains
-	// after the cron dispatch was dropped. Pending deletion with ScmCron.HealthCheck
-	// - see the note there; pruning makes the removal safe.
-	// +optional
-	LastHealthCheck *metav1.Time `json:"lastHealthCheck,omitempty"`
 	// LastDocumentation is the last time the documentation-sync cron ran; it bounds
 	// the diff-since-last-doc window each tick computes per enrolled repo.
 	// +optional
 	LastDocumentation *metav1.Time `json:"lastDocumentation,omitempty"`
-	// LastCDScan is the last time the push-CD deploy-supervision backstop ran.
-	// +optional
-	LastCDScan *metav1.Time `json:"lastCDScan,omitempty"`
 	// LastRefine is the last time the project's refine pre-step completed.
 	// +optional
 	LastRefine *metav1.Time `json:"lastRefine,omitempty"`

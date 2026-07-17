@@ -217,35 +217,3 @@ func TestRunScans_DocumentationNoChangesNoTask(t *testing.T) {
 		t.Fatalf("LastDocumentation not advanced on empty tick: %+v", got.Status.LastDocumentation)
 	}
 }
-
-// TestHealthCheckCronDropped: the healthCheck cron dispatch is stripped from
-// runScans - a due healthCheck activity fires no Task and never stamps
-// LastHealthCheck (the kind is absorbed into brainstorm; the type is kept inert
-// for stored-CR back-compat).
-func TestHealthCheckCronDropped(t *testing.T) {
-	proj, _ := seedHealthCheckProject(t, "hc-dropped", []string{"o/h"}, 3)
-	past := metav1.NewTime(time.Now().Add(-2 * time.Hour))
-	proj.Status.LastHealthCheck = &past
-	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
-		t.Fatalf("seed last-healthcheck: %v", err)
-	}
-
-	reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/h": {}}}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	if _, err := r.runScans(context.Background(), proj); err != nil {
-		t.Fatalf("runScans: %v", err)
-	}
-
-	if qes := listHealthCheckQEs(t, "hc-dropped"); len(qes) != 0 {
-		t.Fatalf("want 0 healthCheck QEs from runScans (dispatch dropped), got %d", len(qes))
-	}
-	var got tatarav1alpha1.Project
-	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "hc-dropped"}, &got); err != nil {
-		t.Fatalf("get project: %v", err)
-	}
-	if got.Status.LastHealthCheck == nil || got.Status.LastHealthCheck.After(past.Time) {
-		t.Fatalf("LastHealthCheck must not advance (dispatch dropped): %+v", got.Status.LastHealthCheck)
-	}
-}
