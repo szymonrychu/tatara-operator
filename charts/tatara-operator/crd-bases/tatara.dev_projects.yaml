@@ -5739,7 +5739,7 @@ spec:
                           CDScan is the push-CD deploy-supervision backstop cron: it sweeps Deploying
                           Tasks whose cascade has stalled past 1.5x the deploy budget with no live
                           watcher and rerolls them (parks recoverable -> recoverOrphans re-implements).
-                          Empty Schedule disables it. A peer of mrScan/issueScan; project-scoped.
+                          Empty Schedule disables it. A peer of issueScan; project-scoped.
 
                           Defaulted on (every 10 min): without an explicit schedule a Project would
                           have NO durable deploy backstop - only the in-memory 60s requeue, lost on an
@@ -5814,23 +5814,7 @@ spec:
                         type: object
                       issueScan:
                         description: CronActivity schedules one Project scan activity
-                          (mrScan or issueScan).
-                        properties:
-                          maxPerRepo:
-                            default: 1
-                            description: MaxPerRepo caps the number of in-progress
-                              Tasks per repo (one lane per repo).
-                            minimum: 1
-                            type: integer
-                          schedule:
-                            description: Schedule is a 5-field cron (robfig ParseStandard).
-                              Empty disables this activity.
-                            pattern: ^$|^(\S+\s+){4}\S+$
-                            type: string
-                        type: object
-                      mrScan:
-                        description: CronActivity schedules one Project scan activity
-                          (mrScan or issueScan).
+                          (issueScan, healthCheck).
                         properties:
                           maxPerRepo:
                             default: 1
@@ -5902,7 +5886,7 @@ spec:
                     type: string
                   prReactionScope:
                     description: |-
-                      PRReactionScope gates which PRs/MRs the mrScan review path reacts to.
+                      PRReactionScope gates which PRs/MRs the B.4 sweep's review path reacts to.
                       Empty (the default) reviews every open human PR/MR (historical open
                       behavior). "labeledOrMentioned" restricts reviews to PRs carrying the
                       project TriggerLabel or @-mentioning the bot, so unlabeled, un-mentioned
@@ -6133,9 +6117,6 @@ spec:
               lastIssueScan:
                 format: date-time
                 type: string
-              lastMRScan:
-                format: date-time
-                type: string
               lastRefine:
                 description: LastRefine is the last time the project's refine pre-step
                   completed.
@@ -6187,7 +6168,8 @@ spec:
                     accounted for on one item, keyed by (Repo, Number). It survives Task GC,
                     letting a scan skip re-triaging an item that has had no new activity since it
                     was last handled. IsPR scopes prune authority: issueScan prunes only issue
-                    marks, mrScan only PR marks.
+                    marks; nothing currently prunes PR marks (mrScan, the only writer, was
+                    deleted in the 2026-07-13 redesign).
                   properties:
                     accountedAt:
                       description: AccountedAt is the GitHub UpdatedAt the scan last

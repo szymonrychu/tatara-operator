@@ -40,8 +40,6 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (string, *metav1.Time) {
 	c := proj.Spec.Scm.Cron
 	switch activity {
-	case "mrScan":
-		return c.MRScan.Schedule, proj.Status.LastMRScan
 	case "issueScan":
 		return c.IssueScan.Schedule, proj.Status.LastIssueScan
 	case "cdScan":
@@ -459,9 +457,6 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 			return err
 		}
 		switch activity {
-		case "mrScan":
-			fresh.Status.LastMRScan = &now
-			proj.Status.LastMRScan = &now
 		case "issueScan":
 			fresh.Status.LastIssueScan = &now
 			proj.Status.LastIssueScan = &now

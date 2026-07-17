@@ -163,9 +163,14 @@ Open, out of scope, deliberately not done:
 4. [ ] helmfile -e default -l application=tatara-operator apply.
 5. [ ] Verify neo4j pod reaches Running: `kubectl -n tatara get pod -l app.kubernetes.io/component=neo4j`.
 
-## Scan stale-event cutoff (issue #285)
+## Scan stale-event cutoff (issue #285) - ABANDONED, mrScan deleted 2026-07-13
 
-- [x] Durable per-item high-water mark (ProjectStatus.ScanMarks) gates issueScan triage + issueScan implement-producer + mrScan bot-PR re-triage on activity newer than last accounted. Plan: docs/superpowers/plans/2026-07-11-operator-scan-stale-cutoff.md (in tatara-new workbench).
-- [ ] Fix mrScan priorTerminalAttempts GC reset: recovery-exhaustion counter reads live Tasks only, resets to 0 after Task GC, undermining the maxRecoveryAttempts cap. Needs a durable attempt counter (candidate: reuse ScanMarks or a status counter).
-- [ ] Gate mrScan human-PR review branch on ScanMarks (same GC-rescan gap, scoped out of initial fix; low-harm re-review of unchanged PRs).
-- [ ] buildScanMarks prunes only scanned repos - marks for removed repos leak; add size cap or periodic full reconcile if repo churn grows.
+Pre-cutover items below all targeted mrScan, which the 2026-07-13 task-centric redesign deleted
+(B.4 sweep is the sole intake now). See MEMORY.md 2026-07-17 (Task 9) for the dead-field removal
+and the ScanMarks finding.
+
+- [ ] **NEW, replaces the items below:** `ProjectStatus.ScanMarks`/`ScanMark` have ZERO readers or
+  writers anywhere in the codebase (only the type declarations and generated deepcopy reference
+  them) - the whole per-item high-water-mark mechanism this section was built around appears to
+  have been dropped in the same redesign that deleted mrScan, without the field itself being
+  removed. Confirm and either wire a consumer or delete the dead status field + CRD surface.
