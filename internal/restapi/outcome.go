@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/rand"
@@ -417,6 +418,21 @@ type outcomeCtx struct {
 // request's claim - a slow handler can reach its rejection long after another
 // replica re-claimed the orphaned slot and committed it.
 //
+// WHY those two fields PROVE ownership. Reason rules out a COMMITTED condition
+// (commit stamps the kind's Reason, never "Outcome"). The fingerprint rules out
+// a DIFFERENT request's claim. What is left - another replica's claim on the
+// SAME fingerprint - is excluded by the HANDLER-BUDGET INVARIANT:
+//
+//	OutcomeHandlerBudget (3m) < OutcomeClaimTTL (5m)
+//
+// A re-claim of a live claim only happens once the claim reads as an orphaned
+// stub, i.e. older than the TTL. Our handler is hard-bounded below the TTL, so
+// it cannot still be running then: no handler outlives its own claim, so any
+// claim we still see carrying our fingerprint IS ours. Break that invariant and
+// the two-field check stops being sufficient - a slow handler could release the
+// claim of the replica that re-claimed and is actively working the same
+// fingerprint.
+//
 // A failed release is not fatal and does not change the response: the claim
 // then expires as an orphaned stub after the TTL, which is the same self-heal a
 // crashed process gets.
@@ -432,7 +448,7 @@ func (o *outcomeCtx) release() {
 		if cond == nil || cond.Message != o.fp || cond.Reason != tatarav1alpha1.OutcomeReasonClaimed {
 			return nil
 		}
-		removeCondition(fresh, outcomeAcceptedCondition)
+		meta.RemoveStatusCondition(&fresh.Status.Conditions, outcomeAcceptedCondition)
 		return o.s.c.Status().Update(ctx, fresh)
 	})
 	if err != nil {
@@ -506,6 +522,20 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		if errors.As(mutErr, &ill) {
 			s.log.ErrorContext(ctx, "restapi: outcome asked for an illegal stage transition",
 				append(reqLogFields(o.r), "task", o.task.Name, "from", ill.From, "to", ill.To)...)
+			// RELEASING IS SAFE HERE even though commit runs AFTER non-idempotent
+			// forge writes (brainstorm propose CreateIssue, incident file_issue
+			// CreateIssue), because this branch is unreachable for a retry that
+			// could duplicate them:
+			//
+			// Enter sets AgentKind = AgentKindFor(to), so agentKind is a pure
+			// function of stage, and each kind handler only ever runs on the unique
+			// stage that maps to its kind - where the edge it requests is always in
+			// the F.3 table. An illegal transition therefore means the stage MOVED
+			// between the gate's read and commit's fresh Get. Every concurrent
+			// operator-driven exit from a pod stage lands on parked/failed
+			// (terminal) or delivered, and the retry's own terminal/delivered gate
+			// refuses all of those before the handler - hence its forge writes - can
+			// run again.
 			o.conflict(mutErr.Error(), "illegal-transition")
 			return false
 		}
@@ -541,16 +571,6 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 // claimed one everywhere else in the operator - hence the shared definition.
 func conditionReason(kind string) string {
 	return tatarav1alpha1.OutcomeReasonFor(kind)
-}
-
-func removeCondition(t *tatarav1alpha1.Task, condType string) {
-	out := t.Status.Conditions[:0]
-	for _, c := range t.Status.Conditions {
-		if c.Type != condType {
-			out = append(out, c)
-		}
-	}
-	t.Status.Conditions = out
 }
 
 func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {
@@ -1499,6 +1519,18 @@ func (o *outcomeCtx) refine(p refinePayload) {
 		}
 	}
 
+	// links[] SHAPE is checked HERE, with the other pre-execution validation, and
+	// NOT at the loop that consumes it: the fold below DELETES the member Tasks,
+	// so a rejection after it is unrecoverable. The release the rejection performs
+	// lets the identical retry re-validate at once, and that retry would find its
+	// own fold target already gone and 500 forever.
+	for _, l := range p.Links {
+		if l.Repo == "" || l.Number == 0 {
+			o.bad("every links entry requires repo and number", "bad-links")
+			return
+		}
+	}
+
 	// LIVENESS GATE on folds[] (fix 8): a member with a running pod or a live
 	// post-approved stage has work in flight.
 	members := make([]*tatarav1alpha1.Task, 0, len(p.Folds))
@@ -1586,10 +1618,6 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	// links[] adopt the named artifact as a PLAIN owner of this Task: the link
 	// holds the GC open and puts the artifact in the umbrella's bundle.
 	for _, l := range p.Links {
-		if l.Repo == "" || l.Number == 0 {
-			o.bad("every links entry requires repo and number", "bad-links")
-			return
-		}
 		if err := s.linkArtifact(ctx, o.task, l); err != nil {
 			writeClientErr(o.w, err)
 			return

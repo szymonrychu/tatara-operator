@@ -1042,6 +1042,34 @@ func TestOutcome_Refine_LinkAddsAPlainOwner(t *testing.T) {
 	require.Contains(t, e.task(t, "t1").Status.IssueRefs, iss.Name)
 }
 
+// A malformed links[] entry must be caught in the TOP validation block, BEFORE
+// foldMembers deletes anything. Validating it after the fold made the rejection
+// unrecoverable: the members were already gone, so the identical retry - which
+// release lets re-validate immediately - hit NotFound on its own fold target and
+// 500'd forever.
+func TestOutcome_Refine_MalformedLinkRejectsBeforeAnyFoldDeletes(t *testing.T) {
+	member := taskV2("t2", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "refine", tatarav1alpha1.StageRefining, "refine"),
+		member,
+		issueV2("tatara-operator", 291, "t2"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"refine","payload":{"folds":[{"task":"t2"}],"links":[{"repo":"","number":0}]}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "every links entry requires repo and number")
+
+	require.NoError(t, e.c.Get(context.Background(),
+		client.ObjectKey{Namespace: ns, Name: "t2"}, &tatarav1alpha1.Task{}),
+		"a rejected refine deletes no fold member")
+
+	// The claim was released, so the corrected retry re-validates immediately.
+	ok := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"refine","payload":{"folds":[{"task":"t2"}],"links":[{"repo":"tatara-operator","number":291}]}}`)
+	require.Equal(t, http.StatusOK, ok.Code)
+}
+
 func TestOutcome_Refine_EmptyPayloadIs400(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
@@ -1309,4 +1337,7 @@ func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
 		"a rejection must never undo the committed outcome's effect")
 	require.Equal(t, before.Status.StageReason, after.Status.StageReason)
 	require.Equal(t, before.Status.Notes, after.Status.Notes)
+	require.Nil(t, tatarav1alpha1.OutcomeCondition(after),
+		"the second outcome's claim clobbered the committed condition before the gate ran, "+
+			"and its release then removed the claim it owned: the slot ends up EMPTY")
 }
