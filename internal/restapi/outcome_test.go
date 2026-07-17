@@ -1263,6 +1263,36 @@ func TestOutcome_TopOfHandlerGatesReleaseTheClaim(t *testing.T) {
 	})
 }
 
+// The kind SWITCH's default arm is a class-B rejection holding a claim, and it is
+// REACHABLE - it is not dead code behind the kind gate. status.agentKind is a
+// plain string with no closed-set validation, and the gate only checks that the
+// pod's claimed kind EQUALS it. So a Task carrying a bogus agentKind (a hand-edited
+// status, a stored CR from a version that knew a kind this one does not, a future
+// stage whose AgentKindFor gained a value before the switch did) sails through the
+// gate on a matching bogus kind and lands here.
+//
+// Without the release it 400s while leaving a bare claim behind, and the agent's
+// every retry 409s in-flight for the whole OutcomeClaimTTL instead of getting the
+// same immediate, actionable 400.
+func TestOutcome_UnknownKindReleasesTheClaim(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		// agentKind is bogus, so the kind gate PASSES on a matching bogus kind.
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "bogus"))
+
+	body := `{"kind":"bogus","payload":{"whatever":1}}`
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusBadRequest, w.Code, "an unknown kind is a 400, not a claim swallowed in silence")
+	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")),
+		"the unknown-kind arm runs before any effect, so it is class B and must RELEASE the claim")
+
+	// The IDENTICAL retry must re-validate to the same 400, not 409 in-flight.
+	again := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusBadRequest, again.Code,
+		"an identical retry of a released fingerprint must RE-VALIDATE, not sit out the claim TTL")
+	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
+}
+
 // The head-moved 409 is the deliberate self-healing path: it stamps NOTHING and
 // tells the agent to re-review the fresh diff. Its claim must be released too,
 // or the agent's honest resubmit-with-the-new-sha would 409 in-flight for the

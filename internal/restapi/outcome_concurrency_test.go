@@ -51,6 +51,28 @@ func doRaw(e *v2Env, method, path, body string) *httptest.ResponseRecorder {
 	return w
 }
 
+// brainstormProposeBody is the one body both tests below POST. It is a
+// CreateIssue-driving outcome, which is what lets blockingCreateIssueForge park a
+// handler in the window between its claim and its commit.
+const brainstormProposeBody = `{"kind":"brainstorm","payload":{"action":"propose","proposals":[` +
+	`{"repo":"tatara-operator","title":"one","body":"b","kind":"bug"}]}}`
+
+// brainstormProposeFingerprint asks the server for the fingerprint of that body
+// rather than duplicating the hash, by POSTing once against a throwaway env and
+// reading the condition back. commit overwrites the claim's Reason but keeps its
+// Message, so the fingerprint survives the commit.
+func brainstormProposeFingerprint(t *testing.T) string {
+	t.Helper()
+	e := buildV2(t, v2Opts{writer: newRecordingForge()}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("fp", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+	w := e.do(t, http.MethodPost, "/tasks/fp/outcome", brainstormProposeBody)
+	require.Equal(t, http.StatusOK, w.Code)
+	cond := tatarav1alpha1.OutcomeCondition(e.task(t, "fp"))
+	require.NotNil(t, cond)
+	return cond.Message
+}
+
 // C7: the OutcomeAccepted fingerprint must be CLAIMED atomically, before any
 // forge/child-mint side effect, so two concurrent identical POSTs cannot both
 // perform it. Goroutine A is parked inside CreateIssue - which the fix places
@@ -75,8 +97,7 @@ func TestOutcome_ConcurrentIdenticalPOSTsClaimFingerprintOnce(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
 
-	body := `{"kind":"brainstorm","payload":{"action":"propose","proposals":[` +
-		`{"repo":"tatara-operator","title":"one","body":"b","kind":"bug"}]}}`
+	body := brainstormProposeBody
 
 	var wg sync.WaitGroup
 	var wA *httptest.ResponseRecorder
@@ -114,4 +135,65 @@ func TestOutcome_ConcurrentIdenticalPOSTsClaimFingerprintOnce(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, clarifies, "exactly one child clarify Task must be minted")
+}
+
+// THE RE-CLAIM MUST REFRESH THE LEASE'S CLOCK, and that refresh is only
+// observable in the window between the re-claim and the commit - which is why
+// this test parks a handler inside CreateIssue to look at it. Every other test of
+// the orphan re-claim asserts on state that commit() overwrote, so the claim's own
+// timestamp goes unobserved and the refresh could vanish without a single failure.
+//
+// A re-claim that keeps the ORPHANED stub's timestamp is a lease born already
+// expired: the next identical retry, 1s later, re-reads a claim older than
+// OutcomeClaimTTL, calls it orphaned in turn, re-claims it and runs every side
+// effect a SECOND time - the issue filed twice, the child Task minted twice. That
+// needs no second replica and no race; it is reachable on a SINGLE-version
+// cluster with one operator pod, purely by retrying.
+//
+// The refresh works only because setCondition (outcome.go) is a WHOLE-STRUCT
+// overwrite. meta.SetStatusCondition would leave LastTransitionTime untouched
+// here, because it only re-stamps it when Status CHANGES and this one goes
+// True -> True. See the warning on setCondition.
+func TestOutcome_ReclaimOfAnOrphanedStubRefreshesTheLeaseClock(t *testing.T) {
+	fp := brainstormProposeFingerprint(t)
+
+	base := newRecordingForge()
+	forge := &blockingCreateIssueForge{recordingForge: base, entered: make(chan struct{}), release: make(chan struct{})}
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+
+	// An ORPHANED STUB: a bare claim on our own fingerprint, older than the TTL.
+	stale := frozenNow.Add(-tatarav1alpha1.OutcomeClaimTTL - time.Second)
+	outcomeClaimStub(t, e, "t1", fp, tatarav1alpha1.OutcomeReasonClaimed, stale)
+
+	var wg sync.WaitGroup
+	var w *httptest.ResponseRecorder
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		w = doRaw(e, http.MethodPost, "/tasks/t1/outcome", brainstormProposeBody)
+	}()
+
+	select {
+	case <-forge.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached CreateIssue: the orphaned stub must be RE-CLAIMED and processed, not replayed")
+	}
+
+	// Parked inside CreateIssue: the re-claim has landed and commit has not run,
+	// so this is the claim's OWN condition, before anything overwrites it.
+	cond := tatarav1alpha1.OutcomeCondition(e.task(t, "t1"))
+	require.NotNil(t, cond, "the re-claim must leave a claim behind")
+	require.Equal(t, tatarav1alpha1.OutcomeReasonClaimed, cond.Reason,
+		"still BARE: we are parked before commit, so this is the re-claim's own condition")
+	require.True(t, cond.LastTransitionTime.Time.Equal(frozenNow),
+		"the re-claim must refresh the lease clock to NOW (got %s, want %s): keeping the orphan's %s stamp mints a lease "+
+			"that is already expired, and the next retry re-claims it and duplicates every side effect",
+		cond.LastTransitionTime.Time, frozenNow, stale)
+
+	close(forge.release)
+	wg.Wait()
+
+	require.Equal(t, http.StatusOK, w.Code, "an orphaned stub must self-heal")
+	require.Len(t, forge.createdRefs, 1, "exactly one issue for the one outcome that was actually processed")
 }

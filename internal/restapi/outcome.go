@@ -573,6 +573,19 @@ func conditionReason(kind string) string {
 	return tatarav1alpha1.OutcomeReasonFor(kind)
 }
 
+// setCondition upserts c by Type as a WHOLE-STRUCT OVERWRITE.
+//
+// DO NOT "TIDY" THIS INTO meta.SetStatusCondition. The overwrite is LOAD-BEARING
+// for the outcome claim's LEASE: LastTransitionTime carries the lease expiry, and
+// claimOutcomeFingerprint's re-claim of an ORPHANED STUB refreshes it by writing a
+// whole new condition. meta.SetStatusCondition only re-stamps LastTransitionTime
+// when Status CHANGES, and a re-claim goes True -> True, so it would leave the
+// orphan's expired stamp in place - minting a lease born already expired. The next
+// identical retry, a second later, would then read that claim as orphaned in turn,
+// re-claim it, and run every side effect AGAIN. No race and no second replica
+// needed: that duplicate is reachable on a single-version, single-pod cluster.
+//
+// TestOutcome_ReclaimOfAnOrphanedStubRefreshesTheLeaseClock pins the refresh.
 func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {
 	for i := range t.Status.Conditions {
 		if t.Status.Conditions[i].Type == c.Type {
