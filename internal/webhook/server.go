@@ -24,6 +24,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/incident"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -248,23 +249,19 @@ func (s *Server) matchRepo(ctx context.Context, projName, remote string) (*tatar
 
 // handleForgeItem routes an issue/MR webhook delivery.
 //
-// It MINTS NOTHING. The B.4 SWEEP is the only intake: it reads the forge on its
-// cadence, mirrors issues/MRs onto Issue/MergeRequest CRs, and mints the Tasks.
-// A webhook that minted its own Task would race the sweep for the same (repo,
-// number) natural key and produce a second owner.
+// The webhook is now the PRIMARY minter (Task 3): handleIssueOpened and
+// handleMROpened call the shared controller.Minter funnel IMMEDIATELY, within
+// the HTTP handler, so a new human issue/PR mints its Task on delivery rather
+// than at the next B.4 sweep tick. The sweep remains the BACKSTOP - the
+// funnel's deterministic natural-key mint makes a sweep pass over the same
+// item a no-op, so the two never race for a second owner.
 //
-// What the webhook DOES own is the two SIGNALS the sweep cannot derive from a
-// forge listing:
-//
-//   - the LOW-LATENCY side channel (contract E.3): a comment is mirrored onto its
-//     Issue/MergeRequest CR immediately and queued as a pendingEvent on the owning
-//     Task, so a maintainer's "go ahead" lands within seconds, not at the next
-//     sweep;
-//   - the LIVENESS marker (contract F.3's Create edge): an issues.opened /
-//     issues.reopened stamps tatara.dev/webhook-originated on the mirror Issue CR,
-//     and the next sweep mints an ACTIVE Task for it. Without this a brand-new
-//     human issue is byte-for-byte a cold backlog issue (open, human-authored,
-//     zero comments) and the sweep parks it - the platform's front door, shut.
+// What the webhook additionally owns is the LOW-LATENCY side channel (contract
+// E.3): a comment is mirrored onto its Issue/MergeRequest CR immediately and
+// queued as a pendingEvent on the owning Task, so a maintainer's "go ahead"
+// lands within seconds. An orphan comment (no owning Task yet) also mints
+// through the same funnel before that delivery, so a maintainer's first
+// "@bot go" spawns work immediately too.
 //
 // Everything else is accepted and ignored; the sweep converges it.
 func (s *Server) handleForgeItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
@@ -276,7 +273,40 @@ func (s *Server) handleForgeItem(ctx context.Context, w http.ResponseWriter, pro
 		s.handleIssueOpened(ctx, w, provider, proj, ev)
 		return
 	}
+	// ev.IsReview does not exist yet (Task 4 adds it); gate on the fields that
+	// do exist today. ev.IsComment is already false here (handled above).
+	if ev.Kind == "mr" && ev.IsPR && (ev.Action == "opened" || ev.Action == "reopened") {
+		s.handleMROpened(ctx, w, provider, proj, ev)
+		return
+	}
 	s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+}
+
+// minter builds the ONE shared intake funnel (internal/controller.Minter) from
+// the webhook's own dependencies. Metrics is nil: the webhook mint does not
+// double-count controller.OrphanAdopted, which the sweep's own Minter already
+// increments on its backstop pass.
+func (s *Server) minter() *controller.Minter {
+	return &controller.Minter{
+		Client:    s.cfg.Client,
+		APIReader: s.cfg.APIReader, // nil-safe: Minter falls back to Client
+		Scheme:    s.cfg.Client.Scheme(),
+		Metrics:   nil,
+	}
+}
+
+// repoSlug returns "owner/name" for a Repository URL, or "" on error. Local
+// twin of internal/controller's unexported helper of the same name - kept
+// package-local rather than exported, matching that package's KISS precedent.
+func repoSlug(repo *tatarav1.Repository) string {
+	if repo == nil {
+		return ""
+	}
+	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
+	if err != nil {
+		return ""
+	}
+	return owner + "/" + name
 }
 
 // handleIssueOpened marks a freshly opened (or reopened) issue as LIVE.
@@ -330,6 +360,61 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 		"action", "issue_webhook_originated", "resource_id", tatarav1.IssueName(repo.Name, ev.Number),
 		"project", proj.Name, "repository", repo.Name, "number", ev.Number,
 		"issue_action", ev.Action, "author", ev.ActorLogin, "marked", marked)
+
+	item := controller.ForgeItem{Issue: scm.Issue{
+		Number: ev.Number, State: "open", Author: ev.ActorLogin,
+		Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL,
+	}}
+	if _, created, merr := s.minter().MintForItem(ctx, &proj, repo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
+		s.log.ErrorContext(ctx, "issues: primary mint failed", "error", merr,
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.reject(w, http.StatusInternalServerError, "mint issue", provider, ev.Kind, ev.Action, "error")
+		return
+	} else if created {
+		s.log.InfoContext(ctx, "issues: webhook minted clarify task",
+			"action", "issue_webhook_mint", "project", proj.Name, "repository", repo.Name, "number", ev.Number)
+	}
+	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// handleMROpened mints a review Task immediately for a human-authored PR/MR
+// open (or reopen) delivery, mirroring handleIssueOpened's gates: the bot
+// self-loop guard first (an agent's own PR must never mint a review Task -
+// controller.ClassifyPR inside MintForItem already ignores a bot-authored
+// non-adoptable PR, but the explicit gate here keeps the webhook's self-loop
+// guard parallel across both handlers), then the reporter allowlist, then the
+// shared controller.Minter funnel.
+func (s *Server) handleMROpened(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	if isBotActor(&proj, ev.ActorLogin) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if err != nil {
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if repo == nil || ev.Number <= 0 {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	if !tatarav1.IsAllowedReporter(&proj, repo, ev.ActorLogin) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	item := controller.ForgeItem{IsPR: true, PR: scm.PRRef{
+		Number: ev.Number, Author: ev.ActorLogin, HeadSHA: ev.HeadSHA,
+		HeadBranch: ev.HeadBranch, Repo: repoSlug(repo), Body: ev.Body, Labels: ev.Labels,
+	}}
+	if _, created, merr := s.minter().MintForItem(ctx, &proj, repo, item, false, s.cfg.SpillerFor(&proj)); merr != nil {
+		s.log.ErrorContext(ctx, "mr: primary mint failed", "error", merr,
+			"project", proj.Name, "issue_ref", ev.IssueRef)
+		s.reject(w, http.StatusInternalServerError, "mint mr", provider, ev.Kind, ev.Action, "error")
+		return
+	} else if created {
+		s.log.InfoContext(ctx, "mr: webhook minted review task",
+			"action", "mr_webhook_mint", "project", proj.Name, "repository", repo.Name, "number", ev.Number)
+	}
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
@@ -363,8 +448,49 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
+	if s.commentIsOrphan(ctx, commentRepo, ev) {
+		var item controller.ForgeItem
+		if ev.IsPR {
+			item = controller.ForgeItem{IsPR: true, PR: scm.PRRef{
+				Number: ev.Number, Author: ev.ActorLogin, HeadBranch: ev.HeadBranch, Repo: repoSlug(commentRepo)}}
+		} else {
+			item = controller.ForgeItem{Issue: scm.Issue{
+				Number: ev.Number, State: "open", Author: ev.ActorLogin,
+				Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
+		}
+		if _, _, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, false, s.cfg.SpillerFor(&proj)); merr != nil {
+			s.log.ErrorContext(ctx, "issue_comment: orphan mint failed", "error", merr, "issue_ref", ev.IssueRef)
+		}
+	}
 	s.deliverPendingEvent(ctx, proj, commentRepo, ev)
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// commentIsOrphan reports whether the mirror CR a comment targets has no
+// owning Task yet - absent, or present but un-owned. It reads UNCACHED
+// (s.cfg.APIReader when set, else s.cfg.Client) so the orphan check never
+// races the cache behind a concurrent mint. On an error other than NotFound
+// it returns false (fail-closed on minting: do not mint on an inconclusive
+// read).
+func (s *Server) commentIsOrphan(ctx context.Context, repo *tatarav1.Repository, ev scm.WebhookEvent) bool {
+	if repo == nil || ev.Number <= 0 {
+		return false
+	}
+	name := tatarav1.IssueName(repo.Name, ev.Number)
+	var obj client.Object = &tatarav1.Issue{}
+	if ev.IsPR {
+		name = tatarav1.MergeRequestName(repo.Name, ev.Number)
+		obj = &tatarav1.MergeRequest{}
+	}
+	var rdr client.Reader = s.cfg.Client
+	if s.cfg.APIReader != nil {
+		rdr = s.cfg.APIReader
+	}
+	if err := rdr.Get(ctx, objKey(s.cfg.Namespace, name), obj); err != nil {
+		return apierrors.IsNotFound(err) // no mirror yet -> orphan; on other error, do not mint
+	}
+	_, owned := own.ControllerOwner(obj)
+	return !owned
 }
 
 // isBotActor reports whether login is the project's configured bot identity.

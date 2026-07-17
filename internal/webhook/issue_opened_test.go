@@ -50,9 +50,9 @@ func postIssueOpened(t *testing.T, h http.Handler, projName, secretVal string, b
 }
 
 // TestIssueOpened_StampsTheWebhookMarker: a human opens a NEW issue. The mirror
-// Issue CR does not exist yet, so the webhook CREATES it OWNERLESS (contract B.2
-// permits an ownerless Issue CR; the sweep's adopt-or-create path adopts it
-// rather than colliding) and stamps the marker on it.
+// Issue CR does not exist yet; the webhook stamps the marker on it AND (Task 3:
+// the webhook is now the PRIMARY minter) mints its Task immediately, adopting
+// (owning) the CR rather than leaving it ownerless for the sweep.
 func TestIssueOpened_StampsTheWebhookMarker(t *testing.T) {
 	const secretVal = "whsec-open1"
 	c := seedClient(t,
@@ -69,11 +69,10 @@ func TestIssueOpened_StampsTheWebhookMarker(t *testing.T) {
 		types.NamespacedName{Namespace: ns, Name: tatarav1.IssueName("repo-open", 7)}, &iss))
 	require.NotEmpty(t, iss.Annotations[controller.AnnWebhookOriginated],
 		"a live, HMAC-verified issues.opened must leave the durable liveness marker")
-	require.Empty(t, iss.OwnerReferences, "the webhook mints no Task and owns nothing; the sweep adopts this CR")
+	require.NotEmpty(t, iss.OwnerReferences, "the webhook now mints a Task and owns the mirror CR immediately")
 
-	// THE WEBHOOK STILL MINTS NOTHING (Task 21's call stands).
-	require.Empty(t, allTasks(t, c, "openproj"), "the webhook must not mint a Task")
-	require.Empty(t, allQEs(t, c, "openproj"), "the webhook must not enqueue a QueuedEvent")
+	// THE WEBHOOK IS NOW THE PRIMARY MINTER (Task 3 supersedes Task 21's call).
+	require.Len(t, allTasks(t, c, "openproj"), 1, "the webhook must mint a Task immediately")
 }
 
 // TestIssueReopened_StampsTheWebhookMarker: a reopen is the same live signal as
