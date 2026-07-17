@@ -52,17 +52,30 @@ const (
 // turn through the F.1 stage machine.
 type TaskReconciler struct {
 	client.Client
-	// APIReader is the manager's UNCACHED reader, and the MINT edge is the ONE
-	// decision that may not be made on a cached read. reconcileStage takes the F.3
-	// Create edge on status.stage == "", but EnterStage's write re-reads the Task
-	// LIVE under RetryOnConflict: a re-reconcile against a cache that has not yet
-	// observed our own mint (the mint branch's own Requeue, or the
-	// ShortDescription status patch's watch event) re-applies the Create edge, and
-	// the in-write stage.Enter refuses it as triaging -> triaging, poisoning
+	// APIReader is the manager's UNCACHED reader. reconcileStage makes every
+	// dispatch decision on a CACHED read of status.stage, but EnterStage's write
+	// re-reads the Task under RetryOnConflict and can observe a fresher one: a
+	// re-reconcile against a cache that has not yet caught up with our own PRIOR
+	// write (mintedAlready guards the F.3 Create edge on status.stage == "";
+	// refreshTaskFromAPI adopts the live object for every edge past it - clocks,
+	// caps, triageTarget's own edges) re-derives and re-applies an edge this Task
+	// already has, and the in-write stage.Enter refuses it as X -> X, poisoning
 	// operator_illegal_stage_transition_total - which TataraIllegalStageTransition
-	// alerts on. Reconciles of one Task are serialised
-	// (MaxConcurrentReconciles: 1 + leader election), so a live read closes the
-	// window completely. Nil (unit tests) falls back to trusting the cached read.
+	// alerts on.
+	//
+	// A live read NARROWS that window to near-zero; it does NOT close it. It
+	// closes it completely only for the MINT, which this reconciler is the sole
+	// writer of. status.stage generally has OTHER writers, none of them serialised
+	// against this one: the /outcome REST handler (which runs on all 3 replicas,
+	// not just the leader), queue_controller's admitTicket (a DIFFERENT
+	// controller - MaxConcurrentReconciles: 1 is per-controller, so it runs
+	// concurrently with this one), and StageDriver. A write from any of those
+	// between the live read here and objbudget's in-write Get reopens it, which is
+	// the residue transition.go's post-write IllegalStageTransition emit exists to
+	// catch. Reconciles of ONE Task by THIS controller are serialised
+	// (MaxConcurrentReconciles: 1 + leader election), which is what makes the
+	// dominant case - racing our own prior write - go away. Nil (unit tests) falls
+	// back to trusting the cached read.
 	APIReader client.Reader
 	Scheme    *runtime.Scheme
 	Metrics   *obs.OperatorMetrics
@@ -205,6 +218,25 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, nil
 	}
 
+	// task.Status.Stage is a CACHED read here too, and every branch below -
+	// reconcileClocks, reconcileCaps, reconcileTriaging's own edges, the
+	// pod-less and pod-stage handlers - derives its next edge from it. Take the
+	// API server's copy and work from THAT, so none of them re-derives an edge
+	// from a stage this Task has already left (issue #324, the residue after the
+	// #347 mint fix: same race, one step later in the machine). See the
+	// APIReader field's comment.
+	if err := r.refreshTaskFromAPI(ctx, task); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// The terminal check again, on the FRESH object: a Task that went terminal
+	// between the cached read and the live read belongs to the reaper, and must
+	// take the early return above rather than fall through into clocks and caps
+	// on the strength of a stage it no longer has.
+	if tatarav1alpha1.StageTerminal(task) {
+		return ctrl.Result{}, nil
+	}
+
 	// THE THREE CLOCKS (F.4). Gap 5: nothing else in production calls
 	// stage.ArmedClock, so without this every deadline in the contract is fiction.
 	res, handled, err := r.reconcileClocks(ctx, project, task, now)
@@ -285,6 +317,65 @@ func (r *TaskReconciler) mintedAlready(ctx context.Context, task *tatarav1alpha1
 		return false, fmt.Errorf("mint: live read of task %s: %w", task.Name, err)
 	}
 	return live.Status.Stage != "", nil
+}
+
+// refreshTaskFromAPI re-reads the Task from the API SERVER (never the cache)
+// and ADOPTS the result into task, so every dispatch branch past the
+// mint/terminal checks - reconcileClocks, reconcileCaps, reconcileTriaging's
+// own edges, the pod-less and pod-stage handlers - derives its next edge from
+// the stage the Task ACTUALLY has rather than the one the informer last
+// showed us. objbudget.FitTask's in-write Get can catch a fresher object than
+// the cache this reconcile started from: ownedMergeRequests, podGone and
+// mintIssueCRs each do their own I/O before the edge is applied, which is
+// enough wall-clock time for the informer to catch up on our own PRIOR
+// reconcile's write. Recomputing the same edge from the frozen cached
+// snapshot and applying it again is refused in-write as X -> X, poisoning
+// operator_illegal_stage_transition_total for a Task that is perfectly
+// healthy (issue #324: the #347 mint fix closed this window one edge earlier;
+// this closes it here, generally, for every destination triageTarget can name
+// and every clock/cap edge, instead of re-checking it at each call site).
+//
+// It ADOPTS rather than requeueing on drift, which is what mintedAlready does
+// one step earlier. Adoption is strictly better here: the live object is
+// FRESHER than the cache a requeue would be waiting for, so there is nothing
+// left to wait FOR, no wasted requeue, and no livelock - a wedged watch or a
+// dropped event would otherwise drift every single reconcile into a 1s
+// requeue that reports success and makes no progress, with the default 10h
+// SyncPeriod nowhere near close enough to rescue it. Nothing downstream needs
+// the cached object: EnterStage/FitTask re-Get and re-mutate the Task under
+// RetryOnConflict anyway, which is what makes adoption safe. The mint cannot
+// do the same - there is no live object to adopt AS, the whole question there
+// is whether our own Create edge already landed.
+//
+// A live Task gone entirely (NotFound) is deliberately NOT a bail, and this
+// too differs from mintedAlready: the reaper already owns it, or the enter
+// below surfaces a real NotFound of its own. Nil APIReader (unit tests) falls
+// back to trusting the cached read.
+func (r *TaskReconciler) refreshTaskFromAPI(ctx context.Context, task *tatarav1alpha1.Task) error {
+	if r.APIReader == nil {
+		return nil
+	}
+	var live tatarav1alpha1.Task
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(task), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("stage refresh: live read of task %s: %w", task.Name, err)
+	}
+	if live.Status.Stage != task.Status.Stage {
+		// Drift is a business action, not a silent internal detail: adoption makes
+		// it self-healing, which is exactly what makes a WEDGED watch (as opposed
+		// to an informer merely a beat behind) invisible - every reconcile would
+		// quietly adopt, do the right thing, and report success, and the default
+		// 10h SyncPeriod would not resync for hours. The counter is what tells a
+		// trickle from a wedge.
+		log.FromContext(ctx).Info("task stage drifted: the cache is behind the api server",
+			"action", "task_stage_drift", "resource_id", task.Name,
+			"cached_stage", task.Status.Stage, "live_stage", live.Status.Stage)
+		obs.StageDrift(task.Status.Stage)
+	}
+	*task = live
+	return nil
 }
 
 // patchTaskAnnotations Get-fresh + mutate + Update's a Task's annotations
