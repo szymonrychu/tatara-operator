@@ -31,32 +31,81 @@ import (
 // (ReVerifyParked), which is the webhook's job; driving it here with
 // GrammarPassed=false would never pass.
 
+// UnparkDecline classifies WHY ApplyUnpark refused to re-enter (target==""),
+// so callers can tell an anomalous drift bail from a normal steady-state
+// refusal apart (finding: guard-decline and rule-decline used to collapse
+// into the same target=="",err==nil shape, which is exactly what let the
+// cache-lag decline hide as an unremarkable steady-state outcome).
+type UnparkDecline string
+
+const (
+	// DeclineNone means ApplyUnpark did not decline (target != "").
+	DeclineNone UnparkDecline = ""
+	// DeclineGuard means the live Task's Stage/StageReason no longer matched
+	// what the caller believed was parked (raced past by another writer, or
+	// re-parked under a different reason). Rare and anomalous: the caller's
+	// view of the world had already drifted from the apiserver.
+	DeclineGuard UnparkDecline = "guard"
+	// DeclineRule means stage.Unpark's re-entry rule was evaluated against the
+	// live Task and was simply not satisfied yet. Normal steady state - most
+	// parked Tasks decline on most passes.
+	DeclineRule UnparkDecline = "rule"
+)
+
 // ApplyUnpark runs stage.Unpark for one parked Task and persists the re-entry
 // under optimistic concurrency. It is the SINGLE application of stage.Unpark,
 // shared by the project-reconcile driver (driveUnparks, the time-based reasons)
 // and the webhook comment-driven paths (awaiting-human, backlog-sweep), so every
 // F.6 re-entry flows through one place. activeTasks / maxOpen are supplied by the
 // caller (computed once per pass) so a bulk promotion cannot exceed maxOpenTasks
-// on a stale count. target is "" when the park did not re-enter.
-func ApplyUnpark(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, activeTasks, maxOpen int, grammarPassed bool, now time.Time) (string, error) {
+// on a stale count. target is "" when the park did not re-enter; decline then
+// says why (DeclineGuard vs DeclineRule) so the caller can log/count them
+// differently. decline is always DeclineNone when target != "" or err != nil.
+//
+// reader is the manager's UNCACHED APIReader (same idiom as TaskReconciler's
+// mintedAlready/refreshTaskFromAPI, #347/#348). The in-loop Get MUST use it,
+// not the cached c: driveCommentUnpark's caller just wrote a pendingEvent via
+// AppendTaskEvent's Status().Update microseconds earlier, and the cached
+// informer has not observed that write yet. A cached Get here silently threw
+// the fresh state away - fresh.Status.PendingEvents came back empty,
+// hasNonBotEvent returned false, and the un-park was refused with ok=false, a
+// normal (non-error) outcome, for a Task a human had just told to proceed
+// (issue: comment-driven unpark lost the cache-lag race 2/2 in prod). Nil
+// reader (unit tests that do not wire one) falls back to c.
+func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, activeTasks, maxOpen int, grammarPassed bool, now time.Time) (string, UnparkDecline, error) {
 
+	// c (cached) is safe here, unlike the retry-loop Task Get below: by the time
+	// driveCommentUnpark reaches this call the owning Issue CR is guaranteed to
+	// already exist (resolveMirrorTarget/deliverPendingEvent already Got it and
+	// early-returns on NotFound), the same-request write that preceded this call
+	// only touches the Issue's Status.Comments, and stage.Unpark's
+	// openIssues/allApproved read Status.State/Status.Status - fields that write
+	// never touched - so no cache-lag can make this Get see a stale approval
+	// state; a stale (or genuinely unapproved) read only ever routes into
+	// clarifying, never into the silent decline this fix is about.
 	issues, err := loadTaskIssues(ctx, c, task)
 	if err != nil {
-		return "", err
+		return "", DeclineNone, err
 	}
 	mrs, err := loadTaskMRs(ctx, c, task)
 	if err != nil {
-		return "", err
+		return "", DeclineNone, err
 	}
 	maxTurns := taskMaxTurns(proj, task)
 	botLogin := botLoginOf(proj)
 
+	getter := reader
+	if getter == nil {
+		getter = c
+	}
+
 	var target string
+	var decline UnparkDecline
 	key := client.ObjectKeyFromObject(task)
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
-		if err := c.Get(ctx, key, fresh); err != nil {
+		if err := getter.Get(ctx, key, fresh); err != nil {
 			return err
 		}
 		// Raced past this park by another writer (or already un-parked): nothing to
@@ -64,6 +113,7 @@ func ApplyUnpark(ctx context.Context, c client.Client, proj *tatarav1alpha1.Proj
 		if fresh.Status.Stage != tatarav1alpha1.StageParked ||
 			fresh.Status.StageReason != task.Status.StageReason {
 			target = ""
+			decline = DeclineGuard
 			return nil
 		}
 		to, ok := stage.Unpark(stage.UnparkInput{
@@ -79,23 +129,25 @@ func ApplyUnpark(ctx context.Context, c client.Client, proj *tatarav1alpha1.Proj
 		})
 		if !ok {
 			target = ""
+			decline = DeclineRule
 			return nil
 		}
 		if err := c.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
 		target = to
+		decline = DeclineNone
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("unpark: apply on %s: %w", task.Name, err)
+		return "", DeclineNone, fmt.Errorf("unpark: apply on %s: %w", task.Name, err)
 	}
 	if target != "" {
 		log.FromContext(ctx).Info("unparked task",
 			"action", "unpark", "resource_id", task.Name, "stage", target,
 			"reason_from", task.Status.StageReason)
 	}
-	return target, nil
+	return target, decline, nil
 }
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
@@ -128,7 +180,7 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		if t.Status.StageReason == stage.ReasonIdentityUnverified {
 			continue
 		}
-		target, err := ApplyUnpark(ctx, r.Client, proj, t, active, maxOpen, false, now)
+		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
 				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.StageReason)
@@ -136,6 +188,19 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 				firstErr = err
 			}
 			continue
+		}
+		// GUARD declines are always anomalous (the live object had already
+		// drifted from what this pass believed was parked) and worth surfacing
+		// here too, unlike RULE declines: driveUnparks sweeps every parked Task
+		// every pass, and a RULE decline is the expected steady state for most
+		// of them (e.g. merge-timeout still waiting) - logging every one would
+		// be pure log spam, not a signal.
+		if decline == DeclineGuard {
+			log.FromContext(ctx).Info("unpark: declined (drift guard)",
+				"action", "unpark_declined", "resource_id", t.Name, "reason", t.Status.StageReason, "decline", string(decline))
+		}
+		if decline != DeclineNone && r.Metrics != nil {
+			r.Metrics.UnparkDeclined(t.Status.StageReason, string(decline))
 		}
 		if target != "" {
 			active++ // the re-entered Task is now active; keep the cap honest this pass.

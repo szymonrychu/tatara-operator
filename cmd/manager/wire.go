@@ -99,6 +99,7 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 	// unset SpillerFor left reverifyParked dead (fix W1).
 	webhook.NewServer(webhook.Config{
 		Client:                        mgr.GetClient(),
+		APIReader:                     mgr.GetAPIReader(),
 		Namespace:                     cfg.Namespace,
 		Metrics:                       metrics,
 		Seq:                           seq,
@@ -277,6 +278,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
+		APIReader:           mgr.GetAPIReader(),
 		Scheme:              mgr.GetScheme(),
 		Metrics:             metrics,
 		ExternalWebhookBase: cfg.ExternalWebhookBase,

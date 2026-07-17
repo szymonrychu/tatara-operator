@@ -30,7 +30,13 @@ import (
 
 // Config holds webhook server dependencies.
 type Config struct {
-	Client    client.Client
+	Client client.Client
+	// APIReader is the manager's UNCACHED reader. driveCommentUnpark passes it
+	// through to controller.ApplyUnpark, whose F.6 re-entry Get must never be
+	// served from a cache that lags AppendTaskEvent's write microseconds
+	// earlier in the same request (same #347/#348 idiom as
+	// TaskReconciler.APIReader). Nil (unit tests) falls back to Client.
+	APIReader client.Reader
 	Namespace string
 	Metrics   *obs.OperatorMetrics
 	Logger    *slog.Logger

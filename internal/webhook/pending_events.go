@@ -126,15 +126,30 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
-	target, err := controller.ApplyUnpark(ctx, s.cfg.Client, proj, task, active, maxOpen, false, time.Now())
+	target, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, false, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: comment-driven unpark failed", "error", err, "task", task.Name)
 		return
 	}
-	if target != "" {
-		s.log.InfoContext(ctx, "pendingEvents: unparked task on human comment",
-			"action", "pending_event_unpark", "task", task.Name, "stage", target, "reason_from", task.Status.StageReason)
+	if decline != controller.DeclineNone {
+		s.cfg.Metrics.UnparkDeclined(task.Status.StageReason, string(decline))
 	}
+	if target == "" {
+		// NOT an error (a decline is a normal outcome of stage.Unpark), but this
+		// call site fires in direct reaction to a human comment the operator was
+		// just asked to act on, so a silent decline here is exactly what hid the
+		// cache-lag race (fresh.Status.PendingEvents read stale-empty) for a full
+		// day with zero errors and zero "unparked" logs to explain the silence.
+		// Both GUARD and RULE declines are logged here (unlike driveUnparks,
+		// which only surfaces GUARD): this fires once, in direct reaction to a
+		// human action, where silence - of either kind - is anomalous.
+		s.log.InfoContext(ctx, "pendingEvents: comment-driven unpark declined",
+			"action", "pending_event_unpark_declined", "task", task.Name, "stage_reason", task.Status.StageReason,
+			"decline_kind", string(decline))
+		return
+	}
+	s.log.InfoContext(ctx, "pendingEvents: unparked task on human comment",
+		"action", "pending_event_unpark", "task", task.Name, "stage", target, "reason_from", task.Status.StageReason)
 }
 
 // resolveMirrorTarget maps a webhook event onto its mirror CR (Issue or

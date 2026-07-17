@@ -1225,6 +1225,41 @@ func TestTaskParked_NilSafe(t *testing.T) {
 	m.TaskParked("implementing", "implement-declined")
 }
 
+func TestUnparkDeclined(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.UnparkDeclined("awaiting-human", "guard")
+	m.UnparkDeclined("awaiting-human", "rule")
+	m.UnparkDeclined("awaiting-human", "rule")
+
+	if got := testutil.ToFloat64(m.UnparkDeclinedCounter("awaiting-human", "guard")); got != 1 {
+		t.Fatalf("operator_unpark_declined_total{awaiting-human,guard} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.UnparkDeclinedCounter("awaiting-human", "rule")); got != 2 {
+		t.Fatalf("operator_unpark_declined_total{awaiting-human,rule} = %v, want 2", got)
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_unpark_declined_total" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("operator_unpark_declined_total not registered")
+	}
+}
+
+func TestUnparkDeclined_NilSafe(t *testing.T) {
+	var m *OperatorMetrics
+	m.UnparkDeclined("awaiting-human", "guard")
+}
+
 // operator_orphan_adopted_total increments once per orphan work item the sweep
 // mints a Task for.
 func TestOrphanAdopted(t *testing.T) {

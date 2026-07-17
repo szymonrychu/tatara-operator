@@ -42,6 +42,11 @@ const defaultGaugeRecomputeInterval = 60 * time.Second
 // webhook URL.
 type ProjectReconciler struct {
 	client.Client
+	// APIReader is the manager's UNCACHED reader. driveUnparks passes it through
+	// to ApplyUnpark, whose F.6 re-entry Get must never be served from a
+	// cache that lags an external write (same #347/#348 idiom as
+	// TaskReconciler.APIReader). Nil (unit tests) falls back to Client.
+	APIReader           client.Reader
 	Scheme              *runtime.Scheme
 	Metrics             *obs.OperatorMetrics
 	ExternalWebhookBase string
@@ -565,6 +570,13 @@ func (r *ProjectReconciler) validateSecret(ctx context.Context, project *tatarad
 // SetupWithManager registers the reconciler with the manager, watching
 // Projects and the full per-project memory stack kinds.
 func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Self-wire the uncached reader (same idiom as DispatcherReconciler,
+	// queue_controller.go): a wire.go that forgets to set APIReader must not
+	// silently fall back to the cached Client for driveUnparks' ApplyUnpark
+	// call with no compile error and no test failure.
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tataradevv1alpha1.Project{}).
 		Owns(&corev1.Secret{}).
