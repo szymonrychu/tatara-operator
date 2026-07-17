@@ -50,7 +50,7 @@ func TestApplyReviewChangesRequested_ReentersImplementing(t *testing.T) {
 	task := reviewingTask("t1", "clarify")
 	mr := ownedMR("mr-tatara-operator-42", "t1", "tatara-operator", 42)
 	c := newMirrorClient(t, proj, task, mr)
-	reentered, err := ApplyReviewChangesRequested(context.Background(), c, nil, proj, task, time.Now())
+	reentered, err := ApplyReviewChangesRequested(context.Background(), c, task, time.Now())
 	require.NoError(t, err)
 	require.True(t, reentered)
 
@@ -66,7 +66,7 @@ func TestApplyReviewChangesRequested_MergedMR_NoRewind(t *testing.T) {
 	mr := ownedMR("mr-tatara-operator-42", "t2", "tatara-operator", 42)
 	mr.Status.State = "merged"
 	c := newMirrorClient(t, proj, task, mr)
-	reentered, err := ApplyReviewChangesRequested(context.Background(), c, nil, proj, task, time.Now())
+	reentered, err := ApplyReviewChangesRequested(context.Background(), c, task, time.Now())
 	require.NoError(t, err)
 	require.False(t, reentered, "an already-merged MR is finished; no rewind")
 

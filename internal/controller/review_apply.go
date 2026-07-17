@@ -21,8 +21,8 @@ import (
 // refused by ReenterImplementingOnReview / the merged check below). It is the
 // mirror of the review pod's request_changes verdict, but sourced from a human
 // review.
-func ApplyReviewChangesRequested(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, now time.Time) (bool, error) {
+func ApplyReviewChangesRequested(ctx context.Context, c client.Client,
+	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
 	mrs, err := ownedMergeRequests(ctx, c, task)
 	if err != nil {

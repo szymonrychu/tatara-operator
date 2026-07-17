@@ -368,7 +368,7 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 		// Adopted human PRs (owning Task Kind=review) are only reviewed, never
 		// driven to implementing; ApplyReviewChangesRequested refuses kind=review,
 		// but folding to the comment path keeps the signal.
-		reentered, aerr := controller.ApplyReviewChangesRequested(ctx, s.cfg.Client, sp, &proj, task, time.Now())
+		reentered, aerr := controller.ApplyReviewChangesRequested(ctx, s.cfg.Client, task, time.Now())
 		if aerr != nil {
 			s.reject(w, http.StatusInternalServerError, "apply changes_requested", provider, ev.Kind, ev.Action, "error")
 			return
