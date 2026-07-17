@@ -272,6 +272,7 @@ var Transitions = map[string][]Edge{
 	v1alpha1.StageMerging: {
 		{To: v1alpha1.StageDeploying, Trigger: "every repo in mergeOrder merged, in order, each on green CI"},
 		{To: v1alpha1.StageReviewing, Trigger: "a live head != reviewedSHA, or Merge 409s head-moved. INCREMENTS status.headMoveReentries (the FOURTH cycle, fix M3-9)"},
+		{To: v1alpha1.StageImplementing, Trigger: "a maintainer requested changes on the still-open MR before it merged (F.6-adjacent). kind=review refused by LegalFor"},
 		{To: v1alpha1.StageFailed, Reason: ReasonHeadMoving, Trigger: "headMoveReentries at maxHeadMoveReentries"},
 		{To: v1alpha1.StageFailed, Reason: ReasonMergeBlocked, Trigger: "mergeReentries at maxMergeReentries (fix H7)"},
 		{To: v1alpha1.StageFailed, Reason: ReasonMergeOrderMissing, Trigger: "len(spec.mergeOrder) == 0 on entry (bug-catcher)"},
@@ -678,6 +679,27 @@ func RequestChanges(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxReviewRoun
 		}
 	}
 	return Edge{To: v1alpha1.StageImplementing}, true
+}
+
+// ReenterImplementingOnReview re-enters implementing after a maintainer's
+// changes_requested on a Tatara-owned, NOT-yet-merged MR. The caller has already
+// verified the MR is not merged (the merged/finished boundary is the caller's,
+// per the spec). It respects the F.3 table (only froms with an edge to
+// implementing - reviewing, merging, approved, parked - succeed) and the
+// kind=review guard (via Enter -> LegalFor). A terminal Task is never
+// resurrected, and an already-implementing Task is a redundant no-op.
+func ReenterImplementingOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now time.Time) (ok bool) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	switch t.Status.Stage {
+	case v1alpha1.StageRejected, v1alpha1.StageFailed, v1alpha1.StageDelivered, v1alpha1.StageImplementing:
+		return false
+	}
+	if err := Enter(t, mrs, v1alpha1.StageImplementing, "", now); err != nil {
+		return false
+	}
+	return true
 }
 
 // HeadMoved is the merging exit when the live head has moved off reviewedSHA (or
