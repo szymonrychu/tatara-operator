@@ -565,3 +565,72 @@ func init() {
 		return nil
 	})
 }
+
+// The /outcome idempotency condition's vocabulary. It is declared HERE, not in
+// internal/restapi, because internal/controller must read it too and must never
+// import internal/restapi. api/v1alpha1 imports nothing internal, so it is the
+// only place both can reach.
+const (
+	// ConditionOutcomeAccepted is the DURABLE idempotency record of an accepted
+	// submit_outcome. Its Message is sha256(agentKind|payload).
+	ConditionOutcomeAccepted = "OutcomeAccepted"
+	// OutcomeReasonClaimed is the Reason a bare CLAIM stamps. The kind handler's
+	// commit OVERWRITES it with the kind's own reason ("Review", "Clarify", ...),
+	// and that difference is the ONLY durable record of claimed-vs-committed.
+	// internal/restapi's conditionReason("") must return exactly this; the two
+	// may never drift, so it delegates to OutcomeReasonFor.
+	OutcomeReasonClaimed = "Outcome"
+)
+
+// OutcomeReasonFor is the condition Reason an outcome of agentKind commits. The
+// empty kind is the bare claim.
+func OutcomeReasonFor(agentKind string) string {
+	if agentKind == "" {
+		return OutcomeReasonClaimed
+	}
+	return strings.ToUpper(agentKind[:1]) + agentKind[1:]
+}
+
+// OutcomeCondition returns t's OutcomeAccepted condition, or nil.
+func OutcomeCondition(t *Task) *metav1.Condition {
+	for i := range t.Status.Conditions {
+		if t.Status.Conditions[i].Type == ConditionOutcomeAccepted {
+			return &t.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
+// OutcomeCommitted reports whether an accepted outcome has been fully APPLIED
+// (as opposed to merely CLAIMED). A bare claim stamps Reason "Outcome"; the kind
+// handler's commit overwrites it with the kind's own reason.
+func OutcomeCommitted(t *Task) bool {
+	c := OutcomeCondition(t)
+	return c != nil && c.Status == metav1.ConditionTrue && c.Reason != OutcomeReasonClaimed
+}
+
+// OutcomeCommittedFor reports whether the outcome committed on t was submitted
+// BY agentKind - i.e. the CURRENT stage's own agent has finished and its commit
+// landed.
+//
+// "Is anything committed" is NOT a safe guard and this is why the predicate is
+// stage-scoped. The condition is per-TASK and survives across stages: an
+// implement Task's commit stamps Reason=Implement AND enters reviewing in the
+// same write, so OutcomeCommitted is already true the instant it arrives at
+// reviewing. A guard keying on that alone would suppress the review pod that has
+// not spawned yet and wedge every implement Task - a strictly worse failure than
+// the one being fixed.
+//
+// It is self-scoping to kind=review at the reviewing stage, which is exactly the
+// one case that needs it: every OTHER kind's commit calls stage.Enter in the same
+// write, so its Reason can never name the NEW stage's agent kind, and no other
+// stage can be committed-but-not-advanced.
+//
+// A pod-less stage (agentKind == "") never matches: it runs no agent.
+func OutcomeCommittedFor(t *Task, agentKind string) bool {
+	if agentKind == "" {
+		return false
+	}
+	c := OutcomeCondition(t)
+	return OutcomeCommitted(t) && c.Reason == OutcomeReasonFor(agentKind)
+}

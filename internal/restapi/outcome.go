@@ -37,7 +37,9 @@ const forgeAlertRulePrefix = "tatara-alert-rule="
 // pod's retry of an IDENTICAL outcome is recognised and answered 200 with the
 // unchanged Task - it must not 409 the Task into failure. It rides in the SAME
 // status write as the stage transition, so the record and the effect are atomic.
-const outcomeAcceptedCondition = "OutcomeAccepted"
+// The name lives in api/v1alpha1 because internal/controller reads the same
+// condition and may not import this package.
+const outcomeAcceptedCondition = tatarav1alpha1.ConditionOutcomeAccepted
 
 func sha256Sum(s string) []byte {
 	sum := sha256.Sum256([]byte(s))
@@ -438,12 +440,11 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	return true
 }
 
-// conditionReason is a CamelCase k8s condition reason.
+// conditionReason is a CamelCase k8s condition reason. The empty kind is the
+// bare CLAIM, and that Reason is what tells a committed outcome apart from a
+// claimed one everywhere else in the operator - hence the shared definition.
 func conditionReason(kind string) string {
-	if kind == "" {
-		return "Outcome"
-	}
-	return strings.ToUpper(kind[:1]) + kind[1:]
+	return tatarav1alpha1.OutcomeReasonFor(kind)
 }
 
 func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {

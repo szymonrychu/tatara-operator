@@ -59,4 +59,20 @@ const (
 	// (A.7): half the ~1.5MiB etcd object ceiling, the headroom reserved for
 	// metadata.managedFields growth we do not control.
 	ObjectByteBudget = 800_000
+	// OutcomeClaimTTL bounds a BARE /outcome claim - one stamped by
+	// claimOutcomeFingerprint and never overwritten by a kind handler's commit.
+	// Within it, an identical retry is told the outcome is IN FLIGHT on another
+	// replica (409). Past it, the claim is an ORPHANED STUB - the process died
+	// between the claim and the commit - and an identical retry RE-CLAIMS it and
+	// proceeds. The handler makes no forge WRITE and at most one forge READ
+	// (GetPRHead), so 60s is far beyond its worst honest latency.
+	OutcomeClaimTTL = 60 * time.Second
+	// HandoffDeadline bounds the C.5.3 phase-2 handoff: kind=review is the ONE
+	// outcome kind whose commit makes no stage transition (the advance is
+	// deferred to MergeRequestReconciler -> DrainPendingReview ->
+	// advanceAfterReview, so that a forge outage cannot lose an accepted
+	// outcome). That drain normally lands in ~1s. The 4h reviewing work budget is
+	// far too loose to surface one that never runs, and the pod caps are
+	// suppressed underneath it, so this is what keeps the suppression bounded.
+	HandoffDeadline = 5 * time.Minute
 )
