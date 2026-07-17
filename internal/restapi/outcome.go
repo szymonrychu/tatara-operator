@@ -1490,6 +1490,12 @@ func (s *Server) linkIncidentParent(ctx context.Context, o *outcomeCtx, writer s
 
 // --- refine, and the B.3 fold ---------------------------------------------
 
+// foldMembers is refine's point of no return: its STEP 4 DELETES the member
+// Tasks, and nothing here can put them back. Every shape check must therefore
+// run in the read-only block above it, never after - a late class-B rejection
+// releases the claim, and the retry would re-enter the liveness gate looking
+// for members that no longer exist. Making the fold resumable is the only
+// structural cure; until then, keep the ordering.
 func (o *outcomeCtx) refine(p refinePayload) {
 	ctx := o.r.Context()
 	s := o.s

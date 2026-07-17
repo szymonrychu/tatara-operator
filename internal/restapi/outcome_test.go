@@ -1064,7 +1064,8 @@ func TestOutcome_Refine_MalformedLinkRejectsBeforeAnyFoldDeletes(t *testing.T) {
 		client.ObjectKey{Namespace: ns, Name: "t2"}, &tatarav1alpha1.Task{}),
 		"a rejected refine deletes no fold member")
 
-	// The claim was released, so the corrected retry re-validates immediately.
+	// A corrected retry is a different fingerprint, so it re-validates and the
+	// valid path still works end to end.
 	ok := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"refine","payload":{"folds":[{"task":"t2"}],"links":[{"repo":"tatara-operator","number":291}]}}`)
 	require.Equal(t, http.StatusOK, ok.Code)
