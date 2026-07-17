@@ -681,6 +681,134 @@ func TestNoStampsIsClock1(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// B2: THE POD-LIVENESS CAPS ARE BLIND TO A COMMITTED OUTCOME.
+//
+// kind=review is the ONLY outcome kind whose commit does not call stage.Enter:
+// the advance is deferred to MergeRequestReconciler's DrainPendingReview. While
+// the Task sits at reviewing awaiting that drain, the caps and the respawn read
+// only pod liveness + stats.podRecreations, so they keep driving a FINISHED Task
+// as an ordinary live pod stage.
+// ---------------------------------------------------------------------------
+
+// tsReviewTaskWithOutcome is a kind=review Task at reviewing whose review pod
+// has RUN (stageWorkStartedAt set) and whose outcome carries the given condition
+// reason. reason=="Review" is a COMMITTED outcome; reason=="Outcome" is a BARE
+// CLAIM.
+func tsReviewTaskWithOutcome(reason string, recreations int, at time.Time) *tatarav1alpha1.Task {
+	stamp := metav1.NewTime(at)
+	task := tsTask("rev", "review", tatarav1alpha1.StageReviewing, at)
+	task.Status.PodStartedAt = &stamp
+	task.Status.StageWorkStartedAt = &stamp
+	task.Status.Stats.PodRecreations = recreations
+	task.Status.Conditions = []metav1.Condition{{
+		Type:               tatarav1alpha1.ConditionOutcomeAccepted,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            "fp",
+		LastTransitionTime: stamp,
+	}}
+	return task
+}
+
+// A COMMITTED outcome + a pod that is GONE must not respawn, must not burn a
+// recreation, and must not trip a cap. The agent's work is DONE; only the C.5.3
+// phase-2 drain is outstanding. This is exactly what re-reviewed the
+// already-merged PR four times on cfsw4/llkfb and burned the recreations that
+// killed 7k7pd/cgthv/rfzwv.
+func TestReconcile_CommittedOutcomeSuppressesRespawnAndCaps(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	// podRecreations == maxPodRecreations, so today's BudgetExit parks it
+	// no-outcome the moment the pod is seen gone.
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
+		maxPodRecreations, now.Add(-time.Minute))
+	proj := tsProject(3)
+	c := newMirrorClient(t, proj, mdSecret(), task) // no Pod object -> podGone == true
+	r := tsReconciler(c)
+
+	res, err := r.reconcileStage(ctx, proj, task, now)
+	if err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+	if res.RequeueAfter != stageRequeue {
+		t.Fatalf("requeueAfter = %s, want %s: it polls for the drain instead of acting",
+			res.RequeueAfter, stageRequeue)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %q(%s), want reviewing: a committed outcome must not be terminated by a pod-liveness cap",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	if got.Status.Stats.PodRecreations != maxPodRecreations {
+		t.Fatalf("podRecreations = %d, want %d: no recreation may be burned",
+			got.Status.Stats.PodRecreations, maxPodRecreations)
+	}
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("%d pods respawned for a task whose outcome landed", len(pods.Items))
+	}
+}
+
+// THE ARGOCD-WEDGE REGRESSION GUARD. A BARE CLAIM (Reason "Outcome") is a
+// failed-validation or crashed-mid-flight stub. It must remain FULLY subject to
+// the caps: guarding it would freeze the Task forever, reproducing ArgoCD's
+// status.operationState stuck-in-Running - the anti-pattern twin of the very bug
+// this change fixes.
+func TestReconcile_BareClaimIsStillFullySubjectToTheCaps(t *testing.T) {
+	now := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonClaimed,
+		maxPodRecreations, now.Add(-time.Minute))
+	proj := tsProject(3)
+	c := newMirrorClient(t, proj, mdSecret(), task)
+	r := tsReconciler(c)
+
+	got := tsReconcile(t, r, proj, task, now)
+
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+		t.Fatalf("stage=%q reason=%q, want parked/no-outcome: a bare claim must NOT be protected, the caps apply exactly as they do today",
+			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// The condition is per-TASK and survives across stages. An implement Task
+// arrives at reviewing with Reason=Implement ALREADY committed: its review pod
+// has not spawned yet and the guard must NOT suppress it, or every implement
+// Task wedges - a strictly worse failure than the one being fixed.
+func TestReconcile_CommittedImplementOutcomeDoesNotGagTheReviewingStagePod(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentImplement), 0, now)
+	task.Spec.Kind = stage.AgentImplement
+	task.Status.PodStartedAt = nil
+	task.Status.StageWorkStartedAt = nil
+	proj := tsProject(3)
+	readySince := metav1.NewTime(now.Add(-time.Hour))
+	proj.Status.Memory.ReadySince = &readySince
+	c := newMirrorClient(t, proj, mdSecret(), task)
+	r := tsReconciler(c)
+	r.PodConfig = agent.PodConfig{
+		Namespace:           mdNS,
+		AnthropicSecretName: "anthropic",
+		CLIOIDCSecretName:   "cli-oidc",
+	}
+
+	if _, err := r.reconcileStage(ctx, proj, task, now); err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods, client.InNamespace(mdNS)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("pods = %d, want 1: the reviewing stage's OWN review pod must still spawn", len(pods.Items))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 

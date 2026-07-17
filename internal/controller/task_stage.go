@@ -173,6 +173,33 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	if !ok {
 		return false, nil
 	}
+
+	// B2: an outcome COMMITTED BY THIS STAGE'S OWN AGENT means the agent's work is
+	// done and only the C.5.3 phase-2 handoff (DrainPendingReview ->
+	// advanceAfterReview) is outstanding. The pod-liveness caps read only pod
+	// liveness and stats.podRecreations - they cannot see that - so while
+	// status.stage is still reviewing they keep driving a finished Task as an
+	// ordinary live pod stage and terminate work that already landed.
+	//
+	// A BARE CLAIM is deliberately NOT guarded: OutcomeCommittedFor is false for
+	// Reason "Outcome", so a failed-validation stub stays fully subject to the
+	// caps. Guarding it would freeze it forever.
+	//
+	// The turn budget is NOT suppressed: it is not a pod-liveness cap, and
+	// BudgetExit checks it first, so a Task over maxTurnsPerTask still fails here.
+	//
+	// handled=false lets the flow fall through to reconcilePodStage, whose own B2
+	// guard returns the poll requeue. The stage work clock stays armed and bounds
+	// the suppression in the other direction.
+	if tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.Stage)) &&
+		(edge.Reason == stage.ReasonNoOutcome || edge.Reason == stage.ReasonPodRecreationExhausted) {
+		log.FromContext(ctx).Info("stage budget exit suppressed: the outcome is committed and the handoff is in flight",
+			"action", "cap_suppressed_committed_outcome", "resource_id", task.Name,
+			"stage", task.Status.Stage, "pod_recreations", task.Status.Stats.PodRecreations,
+			"suppressed_reason", edge.Reason)
+		return false, nil
+	}
+
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
 	if mrErr != nil {
 		return true, mrErr
@@ -337,6 +364,22 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	task *tatarav1alpha1.Task, agentKind string, now time.Time) (ctrl.Result, error) {
 
 	l := log.FromContext(ctx)
+
+	// B2: a COMMITTED outcome from THIS stage's own agent means there is nothing
+	// left for a pod to do. Do NOT respawn a lost pod, do not TTL-rotate, do not
+	// re-submit turn-0. Poll until the MergeRequest reconciler's drain advances
+	// the stage, or until the handoff deadline parks it at handoff-stalled.
+	//
+	// OutcomeCommittedFor - not "is anything committed" - because the condition is
+	// per-TASK and survives across stages: an implement Task arrives at reviewing
+	// with Reason=Implement already committed, and a bare committed check would gag
+	// the review pod that has not spawned yet.
+	if tatarav1alpha1.OutcomeCommittedFor(task, agentKind) {
+		l.Info("stage pod work suppressed: the outcome is committed and the handoff is in flight",
+			"action", "pod_stage_suppressed_committed_outcome", "resource_id", task.Name,
+			"stage", task.Status.Stage, "agent_kind", agentKind)
+		return ctrl.Result{RequeueAfter: stageRequeue}, nil
+	}
 
 	admitted, err := r.ensureTicket(ctx, proj, task, agentKind)
 	if err != nil {
