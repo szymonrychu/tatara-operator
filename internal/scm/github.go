@@ -67,6 +67,11 @@ type ghPayload struct {
 	} `json:"comment"`
 	Issue       *ghWorkItem `json:"issue"`
 	PullRequest *ghWorkItem `json:"pull_request"`
+	Review      struct {
+		ID       int64  `json:"id"`
+		State    string `json:"state"`
+		CommitID string `json:"commit_id"`
+	} `json:"review"`
 }
 
 // DetectAndVerify verifies the X-Hub-Signature-256 HMAC and parses the payload.
@@ -97,7 +102,12 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 	case "pull_request":
 		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
 	case "pull_request_review":
-		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
+		ev := ghWorkItemEvent("mr", true, p, p.PullRequest)
+		ev.IsReview = true
+		ev.ReviewState = p.Review.State // github vocab already: approved|changes_requested|commented|dismissed
+		ev.ReviewID = strconv.FormatInt(p.Review.ID, 10)
+		ev.ReviewCommitSHA = p.Review.CommitID
+		return ev, nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
 	}

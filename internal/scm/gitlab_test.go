@@ -81,3 +81,16 @@ func TestGitLabMissingToken(t *testing.T) {
 	_, err := (&GitLab{}).DetectAndVerify(h, []byte(`{}`), "glt0ken")
 	require.Error(t, err)
 }
+
+func TestGitLab_MRApproval_MapsToReviewApproved(t *testing.T) {
+	const secret = "glt0ken"
+	body := []byte(`{"object_kind":"merge_request",
+		"user":{"username":"maint"},
+		"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},
+		"object_attributes":{"iid":42,"action":"approved","last_commit":{"id":"deadbeef"},"source_branch":"fix"}}`)
+	ev, err := (&GitLab{}).DetectAndVerify(glHeader("Merge Request Hook", secret), body, secret)
+	require.NoError(t, err)
+	require.True(t, ev.IsReview)
+	require.Equal(t, "approved", ev.ReviewState)
+	require.Equal(t, "deadbeef", ev.ReviewCommitSHA)
+}

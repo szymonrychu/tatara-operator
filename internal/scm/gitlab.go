@@ -112,7 +112,7 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 	// distinct resource-author field on the issue/MR object, so AuthorLogin
 	// falls back to the actor. This is only a hint; the authoritative
 	// authorship gate lives in the controller (which calls GetPRState).
-	return WebhookEvent{
+	ev := WebhookEvent{
 		Kind:         kind,
 		Repo:         p.Project.GitHTTPURL,
 		Labels:       labels,
@@ -129,6 +129,16 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 		HeadBranch:   p.ObjectAttributes.SourceBranch,
 		ChangedLabel: changed,
 	}
+	// GitLab has no changes_requested / commented review object - those arrive
+	// as notes and take the pending-event path. Only the approval action is
+	// surfaced as a review.
+	if kind == "mr" && p.ObjectAttributes.Action == "approved" {
+		ev.IsReview = true
+		ev.ReviewState = "approved"
+		ev.ReviewCommitSHA = p.ObjectAttributes.LastCommit.ID
+		ev.ReviewID = fmt.Sprintf("gl-approve-%d-%s", p.ObjectAttributes.IID, p.ObjectAttributes.LastCommit.ID)
+	}
+	return ev
 }
 
 // glNoteEvent builds a WebhookEvent for a Note Hook (comment). The note's own
