@@ -108,3 +108,16 @@ func TestGitHub_PullRequestReview_ParsesStateAndID(t *testing.T) {
 	require.Equal(t, 42, ev.Number)
 	require.Equal(t, "mr", ev.Kind)
 }
+
+func TestGitHub_PullRequestReview_CommentedCarriesBody(t *testing.T) {
+	const secret = "s"
+	body := []byte(`{"action":"submitted",
+		"review":{"id":901,"state":"commented","commit_id":"deadbeef","body":"please rename this var","user":{"login":"maint"}},
+		"pull_request":{"number":42,"user":{"login":"alice"},"head":{"sha":"deadbeef","ref":"fix"},"html_url":"u"},
+		"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},
+		"sender":{"login":"maint"}}`)
+	ev, err := (&GitHub{}).DetectAndVerify(ghHeader("pull_request_review", secret, body), body, secret)
+	require.NoError(t, err)
+	require.Equal(t, "commented", ev.ReviewState)
+	require.Equal(t, "please rename this var", ev.CommentBody)
+}

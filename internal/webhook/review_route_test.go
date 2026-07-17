@@ -67,10 +67,16 @@ func reviewMR(name, projName, repoName string, number int, task *tatarav1.Task) 
 // review object, id as the review id, reviewer as both the review's and the
 // event's actor, targeting PR number.
 func reviewBody(action, state string, id int, reviewer string, number int) []byte {
+	return reviewBodyWithText(action, state, id, reviewer, number, "")
+}
+
+// reviewBodyWithText is reviewBody plus an explicit review.body, for cases
+// (e.g. commented) where the review text itself matters.
+func reviewBodyWithText(action, state string, id int, reviewer string, number int, text string) []byte {
 	n := strconv.Itoa(number)
 	idStr := strconv.Itoa(id)
 	return []byte(`{"action":"` + action + `",
-		"review":{"id":` + idStr + `,"state":"` + state + `","commit_id":"deadbeef","user":{"login":"` + reviewer + `"}},
+		"review":{"id":` + idStr + `,"state":"` + state + `","commit_id":"deadbeef","body":"` + text + `","user":{"login":"` + reviewer + `"}},
 		"pull_request":{"number":` + n + `,"user":{"login":"alice"},"head":{"sha":"deadbeef","ref":"fix"},"html_url":"u"},
 		"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},
 		"sender":{"login":"` + reviewer + `"}}`)
@@ -196,6 +202,26 @@ func TestReview_DedupOnReviewIDState(t *testing.T) {
 	postReview(t, h, "rv5", secretVal, reviewBody("submitted", "changes_requested", 904, "maint", 46))
 	got2 := getTask(t, c, task.Name)
 	require.Equal(t, tatarav1.StageMerging, got2.Status.Stage, "the second identical (review.id,state) delivery must not re-fire")
+}
+
+// A maintainer's commented review folds to the pending-event path (contract
+// E.3) carrying the review TEXT along, so the review agent picking up the
+// Task's pendingEvents actually sees what the maintainer said instead of an
+// empty Body.
+func TestReview_Commented_CarriesBodyToPendingEvent(t *testing.T) {
+	const secretVal = "whsec-rv7"
+	proj := reviewProject("rv7", "rv7-scm", "tatara-bot", []string{"maint"})
+	repo := repository("repo-rv7", "rv7", "https://github.com/o/r.git", "main")
+	task := reviewTask("rv7-task", "rv7", "clarify")
+	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 48), "rv7", repo.Name, 48, task)
+	c := seedClient(t, proj, secret("rv7-scm", secretVal), repo, task, mr)
+	h, _ := newServer(t, c)
+
+	postReview(t, h, "rv7", secretVal, reviewBodyWithText("submitted", "commented", 906, "maint", 48, "please rename this var"))
+
+	got := getTask(t, c, task.Name)
+	require.Len(t, got.Status.PendingEvents, 1)
+	require.Equal(t, "please rename this var", got.Status.PendingEvents[0].Body)
 }
 
 // dismissed / edited actions are ignored (Action != submitted).

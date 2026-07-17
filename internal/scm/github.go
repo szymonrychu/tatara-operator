@@ -71,6 +71,7 @@ type ghPayload struct {
 		ID       int64  `json:"id"`
 		State    string `json:"state"`
 		CommitID string `json:"commit_id"`
+		Body     string `json:"body"`
 	} `json:"review"`
 }
 
@@ -107,6 +108,7 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 		ev.ReviewState = p.Review.State // github vocab already: approved|changes_requested|commented|dismissed
 		ev.ReviewID = strconv.FormatInt(p.Review.ID, 10)
 		ev.ReviewCommitSHA = p.Review.CommitID
+		ev.CommentBody = p.Review.Body // carries the review text through the folded pending-event path
 		return ev, nil
 	default:
 		return WebhookEvent{Kind: "other"}, nil
