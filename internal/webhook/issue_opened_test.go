@@ -2,17 +2,24 @@ package webhook_test
 
 // THE PLATFORM'S FRONT DOOR (contract F.3's Create edge, B.4's intake).
 //
-// A human opens an issue. A webhook arrives. The next sweep MUST mint an ACTIVE
-// (triaging) Task for it - not parked(backlog-sweep). The webhook mints NOTHING
-// itself (the B.4 sweep is the sole intake, and a webhook that minted its own
-// Task would race the sweep for the same natural key); what it leaves behind is
-// the DURABLE LIVENESS MARKER the sweep reads: the tatara.dev/webhook-originated
-// annotation on the mirror Issue CR.
+// A human opens an issue. THE WEBHOOK IS NOW THE PRIMARY MINTER (Task 3): it
+// mints an ACTIVE (triaging) clarify Task immediately, in-request, via the
+// shared controller.Minter funnel, and owns the mirror Issue CR right away
+// instead of leaving it ownerless for the sweep. It also stamps the DURABLE
+// LIVENESS MARKER: the tatara.dev/webhook-originated annotation on the mirror
+// Issue CR, which MintStage reads to pick triaging over parked(backlog-sweep).
 //
-// The marker is the ONLY thing that tells a freshly-opened human issue apart
-// from a three-year-old untouched backlog issue. Both are open, human-authored
-// and zero-comment. Reading the marker as "a human has the last word" instead
-// would mint the ENTIRE cutover backlog ACTIVE - the 150-issue re-triage storm
+// The B.4 sweep is now a BACKSTOP, not the sole intake: its own pass over an
+// issue the webhook already minted is a no-op, because both paths key the
+// Task off the same deterministic IntakeTaskName (project, kind, repo,
+// number) and MintForItem's adopt-or-create only mints when that natural key
+// is still unowned (see TestSweepAfterWebhook_NoDoubleMint in
+// primary_mint_test.go). The marker itself still matters for the sweep's OWN
+// cold-start pass: it is the ONLY thing that tells a freshly-opened human
+// issue apart from a three-year-old untouched backlog issue if the webhook
+// mint is ever unavailable and the sweep has to intake it cold - reading a
+// zero-comment open issue as "a human has the last word" without the marker
+// would mint the ENTIRE cutover backlog ACTIVE, the 150-issue re-triage storm
 // parked(backlog-sweep) exists to prevent.
 
 import (
