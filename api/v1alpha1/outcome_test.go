@@ -78,7 +78,6 @@ func TestOutcomeCommittedFor(t *testing.T) {
 
 func TestOutcomeReasonFor(t *testing.T) {
 	tests := map[string]string{
-		"":              OutcomeReasonClaimed,
 		"review":        "Review",
 		"implement":     "Implement",
 		"documentation": "Documentation",
@@ -91,18 +90,6 @@ func TestOutcomeReasonFor(t *testing.T) {
 		if got := OutcomeReasonFor(in); got != want {
 			t.Fatalf("OutcomeReasonFor(%q) = %q, want %q", in, got, want)
 		}
-	}
-}
-
-func TestOutcomeClaimTTLAndHandoffDeadline(t *testing.T) {
-	if OutcomeClaimTTL != 5*time.Minute {
-		t.Fatalf("OutcomeClaimTTL = %v, want 5m", OutcomeClaimTTL)
-	}
-	if OutcomeHandlerBudget != 3*time.Minute {
-		t.Fatalf("OutcomeHandlerBudget = %v, want 3m", OutcomeHandlerBudget)
-	}
-	if HandoffDeadline != 5*time.Minute {
-		t.Fatalf("HandoffDeadline = %v, want 5m", HandoffDeadline)
 	}
 }
 

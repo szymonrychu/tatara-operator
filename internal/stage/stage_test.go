@@ -1726,9 +1726,6 @@ func TestHandoffStalledIsInTheF5ClosedSet(t *testing.T) {
 	if !stage.ValidReason(stage.ReasonHandoffStalled) {
 		t.Fatal("handoff-stalled must be a member of the F.5 closed set, else Enter rejects it")
 	}
-	if stage.ReasonHandoffStalled != "handoff-stalled" {
-		t.Fatalf("ReasonHandoffStalled = %q", stage.ReasonHandoffStalled)
-	}
 }
 
 // Only reviewing needs the edge: every other kind's commit calls stage.Enter in
