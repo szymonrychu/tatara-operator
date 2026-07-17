@@ -189,7 +189,12 @@ func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
 	// merging -> reviewing (HeadMoved, cycle 4) and the kind=review
 	// awaiting-human unpark both re-enter reviewing carrying Reason=Review
 	// from the last round. This occupancy's agent has not run yet.
-	if task.Status.StageEnteredAt != nil &&
+	//
+	// No stage stamp is no occupancy to compare against, so no handoff to bound
+	// either - ArmedClock disarms on the same condition (stage.go:572). Every
+	// path into a stage runs stage.Enter, which always stamps it, so a nil stamp
+	// is unreachable; failing closed just keeps it that way.
+	if task.Status.StageEnteredAt == nil ||
 		cond.LastTransitionTime.Time.Before(task.Status.StageEnteredAt.Time) {
 		return nil
 	}
