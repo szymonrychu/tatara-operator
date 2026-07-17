@@ -20,6 +20,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // gaugeValue reads a gauge metric value from a Prometheus registry by name+labels.
@@ -424,6 +425,8 @@ func TestReconcileStage_TriagingIsIdempotentAgainstAStaleCache(t *testing.T) {
 	}
 	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
 	require.NoError(t, err, "re-triaging a Task the API server already advanced is a NO-OP, not an error")
+	require.Equal(t, tatarav1alpha1.StageRefining, stale.Status.Stage,
+		"the reconcile must ADOPT the live object it paid a quorum read for, not requeue and hope the cache catches up")
 
 	after := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
 		tatarav1alpha1.StageRefining, tatarav1alpha1.StageRefining))
@@ -452,4 +455,133 @@ func TestReconcileStage_TriagingStillTriagesWhenTheApiServerAgrees(t *testing.T)
 	_, err := r.reconcileStage(context.Background(), proj, task, time.Unix(1000, 0))
 	require.NoError(t, err)
 	require.Equal(t, tatarav1alpha1.StageRefining, task.Status.Stage)
+}
+
+// SPEC TEST 12. THE POD-STAGE CAPS ARE THE SAME NON-IDEMPOTENT CALLER, AND THE
+// ONLY THING THAT PINS THE GUARD PAST TRIAGING.
+//
+// The triaging tests above prove NOTHING about reconcileClocks/reconcileCaps:
+// their Task has no stageEnteredAt (ArmedClock returns ClockNone) and triaging
+// is podless (BudgetExit returns nothing), so neither test executes one line of
+// clock or cap edge derivation. Narrow the guard back into reconcileTriaging
+// and they both stay green while this reopens - visible in production only as
+// operator_illegal_stage_transition_total{from="failed",to="failed"}.
+//
+// This is that path: an implementing Task whose pod is gone and whose
+// podRecreations is over budget, which reconcileCaps derives
+// failed(pod-recreation-exhausted) from - off a CACHED stage our own prior
+// reconcile already advanced to failed. Adopting the live object instead makes
+// the reconcile see the terminal stage the Task actually has and hand it to the
+// reaper, emitting no refused edge.
+func TestReconcileStage_PodStageCapsAreIdempotentAgainstAStaleCache(t *testing.T) {
+	before := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
+		tatarav1alpha1.StageFailed, tatarav1alpha1.StageFailed))
+
+	proj := tsProject(3)
+	now := time.Unix(10000, 0)
+	entered := metav1.NewTime(now.Add(-10 * time.Minute))
+	// THE STALE OBJECT the informer cache hands the reconciler: still
+	// implementing, pod stamps set (so CLOCK 3 WORK is what is armed, and it has
+	// not elapsed), podRecreations over maxPodRecreations, and no Pod object
+	// exists so podGone reports the pod stopped. reconcileCaps derives
+	// failed(pod-recreation-exhausted) from exactly this.
+	stale := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "implement-qe-8k2rt", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "implement"},
+		Status: tatarav1alpha1.TaskStatus{
+			Stage:              tatarav1alpha1.StageImplementing,
+			AgentKind:          stage.AgentImplement,
+			StageEnteredAt:     &entered,
+			PodStartedAt:       &entered,
+			StageWorkStartedAt: &entered,
+			Stats:              tatarav1alpha1.TaskStats{PodRecreations: maxPodRecreations + 1},
+		},
+	}
+	// THE API SERVER: our own previous pass already applied that very edge.
+	// Backs BOTH Client and APIReader, same reason as the mint/triaging tests:
+	// the illegal-transition counter fires from the in-write stage.Enter inside
+	// objbudget.FitTask, which re-Gets through r.Client.
+	live := stale.DeepCopy()
+	live.Status.Stage = tatarav1alpha1.StageFailed
+	live.Status.StageReason = stage.ReasonPodRecreationExhausted
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, stale, now)
+	require.NoError(t, err, "re-failing a Task the API server already failed is a NO-OP, not an error")
+
+	after := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
+		tatarav1alpha1.StageFailed, tatarav1alpha1.StageFailed))
+	require.Equal(t, before, after,
+		"re-deriving the pod-recreation cap from a stale implementing cache must emit no operator_illegal_stage_transition_total")
+}
+
+// The drift the guard swallows must be VISIBLE: it returns success, logs
+// nothing louder than INFO, and the default 10h SyncPeriod will not rescue a
+// watch that is wedged rather than merely lagging.
+func TestReconcileStage_DriftIsCounted(t *testing.T) {
+	before := testutil.ToFloat64(obs.StageDriftCounter(tatarav1alpha1.StageTriaging))
+
+	proj := tsProject(3)
+	stale := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "refine-qe-drift1", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "refine"},
+		Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageTriaging},
+	}
+	live := stale.DeepCopy()
+	live.Status.Stage = tatarav1alpha1.StageRefining
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
+	require.NoError(t, err)
+
+	after := testutil.ToFloat64(obs.StageDriftCounter(tatarav1alpha1.StageTriaging))
+	require.Equal(t, before+1, after,
+		"a drifted reconcile must increment operator_stage_drift_total{stage=<cached stage>}")
+	require.Equal(t, tatarav1alpha1.StageRefining, stale.Status.Stage,
+		"the live object must be ADOPTED, not discarded in favour of a requeue")
+}
+
+// A cache that AGREES with the API server is not drift and must not be counted.
+func TestReconcileStage_NoDriftIsNotCounted(t *testing.T) {
+	before := testutil.ToFloat64(obs.StageDriftCounter(tatarav1alpha1.StageTriaging))
+
+	proj := tsProject(3)
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "refine-qe-drift2", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "refine"},
+		Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageTriaging},
+	}
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, task).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, task, time.Unix(1000, 0))
+	require.NoError(t, err)
+
+	after := testutil.ToFloat64(obs.StageDriftCounter(tatarav1alpha1.StageTriaging))
+	require.Equal(t, before, after, "an up-to-date cache is not drift")
 }

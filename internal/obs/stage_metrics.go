@@ -20,7 +20,7 @@ var IllegalStageTransitionTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 }, []string{"from", "to"})
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(IllegalStageTransitionTotal)
+	ctrlmetrics.Registry.MustRegister(IllegalStageTransitionTotal, StageDriftTotal)
 }
 
 // IllegalStageTransition increments operator_illegal_stage_transition_total.
@@ -31,6 +31,36 @@ func IllegalStageTransition(from, to string) {
 // IllegalStageTransitionCounter returns the counter for test assertions.
 func IllegalStageTransitionCounter(from, to string) prometheus.Counter {
 	return IllegalStageTransitionTotal.WithLabelValues(from, to)
+}
+
+// StageDriftTotal counts reconciles that started from an informer cache BEHIND
+// the API server: the live status.stage no longer matched the cached one the
+// reconcile was about to derive its next edge from. It is
+// IllegalStageTransitionTotal's early-warning sibling - drift DETECTED, before
+// TaskReconciler adopts the live object and carries on, versus drift
+// MATERIALIZED as a refused X -> X edge - and it lives here for that reason.
+//
+// A trickle is normal (an informer is eventually consistent, and every write
+// this operator makes races its own next reconcile). A SUSTAINED rate on one
+// stage is not: it means a wedged watch or a dropped event, which the adoption
+// path papers over silently and which the default 10h SyncPeriod will not
+// rescue for hours.
+//
+// The label is the CACHED stage - the stale one an edge would have been
+// re-derived from, which is what names the failure - not the live one.
+var StageDriftTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_stage_drift_total",
+	Help: "Reconciles whose CACHED task status.stage was behind the API server's live one, by the cached (stale) stage. A trickle is normal informer lag; a sustained rate on one stage means a wedged watch.",
+}, []string{"stage"})
+
+// StageDrift increments operator_stage_drift_total for one detected drift.
+func StageDrift(cachedStage string) {
+	StageDriftTotal.WithLabelValues(cachedStage).Inc()
+}
+
+// StageDriftCounter returns the counter for the cached stage for test assertions.
+func StageDriftCounter(cachedStage string) prometheus.Counter {
+	return StageDriftTotal.WithLabelValues(cachedStage)
 }
 
 // TaskTerminalEntry is the D1 emit: operator_task_terminal_total
