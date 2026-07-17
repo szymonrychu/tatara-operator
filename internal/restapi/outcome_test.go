@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -1010,4 +1011,102 @@ func TestOutcome_Documentation_DeclinedDeliversAndStampsDocumentedBy(t *testing.
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
 	require.Equal(t, "t1", e.task(t, "t9").Status.DocumentedBy)
+}
+
+// outcomeClaimStub seeds the exact durable state a process that DIED between
+// claimOutcomeFingerprint and commit leaves behind: the OutcomeAccepted
+// condition carrying the request's fingerprint with Reason "Outcome" (the bare
+// claim), and no effect anywhere.
+func outcomeClaimStub(t *testing.T, e *v2Env, task, fp, reason string, at time.Time) {
+	t.Helper()
+	cur := e.task(t, task)
+	cur.Status.Conditions = append(cur.Status.Conditions, metav1.Condition{
+		Type:               tatarav1alpha1.ConditionOutcomeAccepted,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            fp,
+		LastTransitionTime: metav1.NewTime(at),
+	})
+	require.NoError(t, e.c.Status().Update(context.Background(), cur))
+}
+
+// clarifyDiscussFingerprint is the fingerprint of the clarify body used below.
+// It is computed the way the handler computes it: sha256("clarify|" + canonical
+// payload JSON). The test asks the server for it rather than duplicating the
+// hash, by POSTing once against a throwaway env and reading the condition back.
+func clarifyDiscussFingerprint(t *testing.T) string {
+	t.Helper()
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("fp", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+	w := e.do(t, http.MethodPost, "/tasks/fp/outcome", clarifyDiscussBody)
+	require.Equal(t, http.StatusOK, w.Code)
+	cond := tatarav1alpha1.OutcomeCondition(e.task(t, "fp"))
+	require.NotNil(t, cond)
+	return cond.Message
+}
+
+const clarifyDiscussBody = `{"kind":"clarify","payload":{"decision":"discuss","reason":"r"}}`
+
+// SPEC TEST 2. A claim whose process died before commit is an ORPHANED STUB.
+// Inside OutcomeClaimTTL an identical retry cannot tell "in flight on another
+// replica" from "orphaned", so it is told to retry (409) rather than being
+// admitted through to a second side effect. Past the TTL it RE-CLAIMS and
+// proceeds - the self-heal that stops a 4xx stub wedging forever.
+func TestOutcome_BareClaimInsideTTLIs409_PastTTLReclaimsAndProceeds(t *testing.T) {
+	fp := clarifyDiscussFingerprint(t)
+
+	t.Run("inside the TTL: 409, the task is untouched", func(t *testing.T) {
+		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+			repoV2("tatara-operator", "tatara"),
+			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		outcomeClaimStub(t, e, "t1", fp, tatarav1alpha1.OutcomeReasonClaimed,
+			frozenNow.Add(-tatarav1alpha1.OutcomeClaimTTL+time.Second))
+
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		require.Equal(t, http.StatusConflict, w.Code, "a fresh bare claim means another replica is mid-flight")
+		require.Equal(t, tatarav1alpha1.StageClarifying, e.task(t, "t1").Status.Stage,
+			"a 409 in-flight answer must change nothing")
+	})
+
+	t.Run("past the TTL: re-claim and proceed", func(t *testing.T) {
+		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+			repoV2("tatara-operator", "tatara"),
+			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		outcomeClaimStub(t, e, "t1", fp, tatarav1alpha1.OutcomeReasonClaimed,
+			frozenNow.Add(-tatarav1alpha1.OutcomeClaimTTL-time.Second))
+
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		require.Equal(t, http.StatusOK, w.Code, "an orphaned stub must self-heal, not 409 forever")
+		got := e.task(t, "t1")
+		require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
+			"the outcome must actually be PROCESSED, not replayed as a no-op")
+		require.Equal(t, "awaiting-human", got.Status.StageReason)
+		cond := tatarav1alpha1.OutcomeCondition(got)
+		require.NotNil(t, cond)
+		require.Equal(t, "Clarify", cond.Reason, "commit must overwrite the claim's Reason")
+	})
+}
+
+// SPEC TEST 4. A COMMITTED outcome (Reason != "Outcome") still replays 200 with
+// the unchanged Task. This is the TTL-stopped pod's honest retry and it must
+// never 409 the Task into failure - the property the whole condition exists for.
+func TestOutcome_CommittedOutcomeStillReplays200(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+
+	first := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	require.Equal(t, http.StatusOK, first.Code)
+	before := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StageParked, before.Status.Stage)
+	require.Equal(t, "Clarify", tatarav1alpha1.OutcomeCondition(before).Reason)
+
+	second := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	require.Equal(t, http.StatusOK, second.Code, "an identical retry of a COMMITTED outcome replays")
+	after := e.task(t, "t1")
+	require.Equal(t, before.Status.Stage, after.Status.Stage)
+	require.Equal(t, before.Status.StageReason, after.Status.StageReason)
+	require.Len(t, after.Status.Notes, len(before.Status.Notes),
+		"a replay must not re-append the outcome note")
 }

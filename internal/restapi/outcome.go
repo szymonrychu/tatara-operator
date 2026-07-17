@@ -199,29 +199,35 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// IDEMPOTENCY FIRST, before the terminal-stage and kind gates, and CLAIMED
-	// atomically before any forge/child-mint side effect (C7): the handler
-	// runs on every replica, so a stale top-of-handler read of a stamped-only-
-	// at-commit fingerprint admits two concurrent identical POSTs straight
-	// through to the same forge write / child-mint / ReviewRounds increment.
-	// claimOutcomeFingerprint re-Gets the Task fresh and, under
-	// RetryOnConflict, either finds fp already stamped (a sequential retry,
-	// or the loser of a race - both take the SAME no-op path) or stamps it on
-	// THIS Status().Update. Exactly one of two concurrent identical POSTs can
-	// win that Update under optimistic concurrency, so the side effects that
-	// follow run at most once. A TTL-stopped pod's retry must not 409 the
-	// Task into failure - and by the time it retries, both status.stage and
-	// status.agentKind have moved on, so both gates below would refuse it.
+	// atomically before any forge/child-mint side effect (C7): the handler runs
+	// on every replica, so a stale top-of-handler read of a stamped-only-at-commit
+	// fingerprint admits two concurrent identical POSTs straight through to the
+	// same forge write / child-mint / ReviewRounds increment. The claim is a
+	// LEASE: claimOutcomeFingerprint re-Gets the Task fresh and, under
+	// RetryOnConflict, reports whether the fingerprint is COMMITTED (replay),
+	// claimed and IN FLIGHT on another replica (409 retry), or free/orphaned (it
+	// stamps and we proceed). A TTL-stopped pod's retry of a COMMITTED outcome
+	// must not 409 the Task into failure - and by the time it retries, both
+	// status.stage and status.agentKind have moved on, so both gates below would
+	// refuse it.
 	fp := outcomeFingerprint(env.Kind, env.Payload)
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
-	task, claimed, err := claimOutcomeFingerprint(ctx, s.c, key, fp, s.now())
+	task, state, err := claimOutcomeFingerprint(ctx, s.c, key, fp, s.now())
 	if err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	if !claimed {
+	switch state {
+	case claimCommitted:
 		s.log.InfoContext(ctx, "restapi: outcome replay accepted as a no-op",
 			append(reqLogFields(r), "action", "submit_outcome", "task", task.Name, "kind", env.Kind)...)
 		writeJSON(w, http.StatusOK, toTaskDTO(*task))
+		return
+	case claimInFlight:
+		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "claim-in-flight").Inc()
+		s.log.InfoContext(ctx, "restapi: an identical outcome is in flight on another replica; asking the caller to retry",
+			append(reqLogFields(r), "action", "submit_outcome", "task", task.Name, "kind", env.Kind)...)
+		writeError(w, http.StatusConflict, "outcome in flight, retry")
 		return
 	}
 
@@ -306,34 +312,64 @@ func outcomeFingerprint(kind string, payload []byte) string {
 	return fmt.Sprintf("%x", sha256Sum(kind+"|"+string(canon)))
 }
 
-func outcomeAlreadyAccepted(task *tatarav1alpha1.Task, fp string) bool {
-	for _, c := range task.Status.Conditions {
-		if c.Type == outcomeAcceptedCondition && c.Message == fp {
-			return true
-		}
-	}
-	return false
-}
+// outcomeClaimState is claimOutcomeFingerprint's three-state verdict. The
+// distinction it draws already existed in etcd and nothing read it: the replay
+// site matched on the fingerprint alone, so a BARE CLAIM left behind by a
+// validation 4xx or a crash was indistinguishable from a COMPLETED outcome, and
+// every identical retry got 200-and-do-nothing forever.
+type outcomeClaimState int
+
+const (
+	// claimWon: we stamped the fingerprint on THIS Status().Update (or re-claimed
+	// an orphaned stub). Proceed to validation and commit.
+	claimWon outcomeClaimState = iota
+	// claimCommitted: a kind handler's commit already overwrote the claim's
+	// Reason. Genuinely finished; replay 200 with the unchanged Task.
+	claimCommitted
+	// claimInFlight: a BARE claim younger than OutcomeClaimTTL. Another replica is
+	// between its claim and its commit. 409 "retry"; admitting this through would
+	// run the side effects twice.
+	claimInFlight
+)
 
 // claimOutcomeFingerprint atomically claims fp against a FRESH re-read of the
-// Task, before any forge/child-mint side effect (C7). Under
-// RetryOnConflict, each attempt re-Gets the Task and either observes fp
-// already stamped - a sequential retry, or the loser of a race between two
-// concurrent identical POSTs - and reports claimed=false with no write, or
-// stamps fp on THIS Status().Update and reports claimed=true. Optimistic
-// concurrency lets exactly one of two concurrent identical POSTs win the
-// Update, so the caller's side effects run at most once.
+// Task, before any forge/child-mint side effect (C7), and reports which of the
+// three states it found.
+//
+// THE CLAIM-FIRST ORDERING IS LOAD-BEARING AND MUST NOT MOVE. The handler runs on
+// every replica, so a stale top-of-handler read of a stamped-only-at-commit
+// fingerprint admits two concurrent identical POSTs straight through to the same
+// forge write / child-mint / ReviewRounds increment. Optimistic concurrency lets
+// exactly one of two concurrent identical POSTs win the Update; the loser now
+// reads back a fresh bare claim and is told to RETRY (409) rather than being
+// answered 200 with nothing done.
+//
+// The claim is a LEASE, not a tombstone: Reason carries claimed-vs-committed and
+// LastTransitionTime carries the expiry, both on fields that already existed.
 func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.NamespacedName,
-	fp string, now time.Time) (*tatarav1alpha1.Task, bool, error) {
+	fp string, now time.Time) (*tatarav1alpha1.Task, outcomeClaimState, error) {
 	fresh := &tatarav1alpha1.Task{}
-	claimed := false
+	state := claimWon
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		state = claimWon
 		if err := c.Get(ctx, key, fresh); err != nil {
 			return err
 		}
-		if outcomeAlreadyAccepted(fresh, fp) {
-			claimed = false
-			return nil
+		if cond := tatarav1alpha1.OutcomeCondition(fresh); cond != nil &&
+			cond.Status == metav1.ConditionTrue && cond.Message == fp {
+			switch {
+			case cond.Reason != tatarav1alpha1.OutcomeReasonClaimed:
+				state = claimCommitted
+				return nil
+			case now.Sub(cond.LastTransitionTime.Time) < tatarav1alpha1.OutcomeClaimTTL:
+				state = claimInFlight
+				return nil
+			}
+			// An ORPHANED STUB: the process died between the claim and the commit,
+			// so no release ever ran. RE-CLAIM it - refresh LastTransitionTime and
+			// fall through. Two replicas racing the re-claim is safe: one wins the
+			// Update, the other conflicts, re-Gets, sees a claim younger than the
+			// TTL and answers claimInFlight.
 		}
 		setCondition(fresh, metav1.Condition{
 			Type:               outcomeAcceptedCondition,
@@ -345,10 +381,10 @@ func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.Nam
 		if err := c.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
-		claimed = true
+		state = claimWon
 		return nil
 	})
-	return fresh, claimed, err
+	return fresh, state, err
 }
 
 // outcomeCtx carries the per-request state every payload handler needs.

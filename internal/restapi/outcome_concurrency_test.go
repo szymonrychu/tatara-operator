@@ -55,9 +55,20 @@ func doRaw(e *v2Env, method, path, body string) *httptest.ResponseRecorder {
 // forge/child-mint side effect, so two concurrent identical POSTs cannot both
 // perform it. Goroutine A is parked inside CreateIssue - which the fix places
 // AFTER the claim - so its claim has already landed. Goroutine B, fired while
-// A is still parked, must be turned away as a duplicate WITHOUT calling
-// CreateIssue itself: exactly one issue gets filed, exactly one clarify Task
-// gets minted.
+// A is still parked, must be turned away WITHOUT calling CreateIssue itself:
+// exactly one issue gets filed, exactly one clarify Task gets minted.
+//
+// THIS TEST MUST FAIL IF THE CLAIM IS EVER MOVED AFTER VALIDATION. That ordering
+// is not an accident to be tidied away: with a validate-then-claim handler,
+// B reaches CreateIssue while A is parked in it and the platform files the issue
+// twice, mints the clarify Task twice and double-increments ReviewRounds.
+//
+// B is answered 409 "outcome in flight, retry", NOT 200: A's claim is BARE
+// (Reason "Outcome" - A has not committed, it is parked in the forge call), and
+// a bare claim inside OutcomeClaimTTL is indistinguishable from an in-flight
+// replica by design. 200 here would be a lie - nothing of B's request was done.
+// The honest answer is "retry"; A's commit then makes the retry a real 200
+// replay.
 func TestOutcome_ConcurrentIdenticalPOSTsClaimFingerprintOnce(t *testing.T) {
 	base := newRecordingForge()
 	forge := &blockingCreateIssueForge{recordingForge: base, entered: make(chan struct{}), release: make(chan struct{})}
@@ -89,7 +100,8 @@ func TestOutcome_ConcurrentIdenticalPOSTsClaimFingerprintOnce(t *testing.T) {
 	wg.Wait()
 
 	require.Equal(t, http.StatusOK, wA.Code, "the winner's request succeeds")
-	require.Equal(t, http.StatusOK, wB.Code, "the loser observes the SAME idempotent no-op a sequential retry gets")
+	require.Equal(t, http.StatusConflict, wB.Code,
+		"the loser of the race sees A's BARE claim inside its TTL: the honest answer is 409 retry, not a 200 that did nothing")
 	require.Len(t, forge.createdRefs, 1,
 		"the fingerprint claim must admit exactly one side effect for two identical concurrent POSTs")
 
