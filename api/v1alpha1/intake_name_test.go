@@ -34,3 +34,14 @@ func TestIntakeTaskName_LongRepoRefStaysBounded(t *testing.T) {
 	require.LessOrEqual(t, len(n), v1alpha1.MaxTaskNameLength)
 	require.False(t, strings.HasSuffix(n, "-"))
 }
+
+func TestIntakeTaskName_UppercaseKindStaysDNSSafe(t *testing.T) {
+	n := v1alpha1.IntakeTaskName("tatara", "REVIEW", "tatara-operator", 42)
+	require.LessOrEqual(t, len(n), v1alpha1.MaxTaskNameLength)
+	require.False(t, strings.HasPrefix(n, "-"))
+	require.False(t, strings.HasSuffix(n, "-"))
+	for _, r := range n {
+		require.True(t, (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-',
+			"name must be DNS-1123-label-safe, got %q", n)
+	}
+}

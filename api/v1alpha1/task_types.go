@@ -346,7 +346,10 @@ func IntakeTaskName(project, kind, repoRef string, number int) string {
 	suffix := "-" + hex.EncodeToString(sum[:])[:8]
 	head := "mt-"
 	if kind != "" {
-		head += kind[:1] + "-"
+		ki := sanitizeNamePart(kind, 1)
+		if ki != "" {
+			head += ki + "-"
+		}
 	}
 	budget := MaxTaskNameLength - len(head) - len(suffix)
 	if budget < 0 {
