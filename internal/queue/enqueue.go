@@ -3,11 +3,13 @@ package queue
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -183,6 +185,16 @@ func FindOpenIncidentIssue(ctx context.Context, c client.Client, ns, projectRef,
 	return nil, false, nil
 }
 
+// QueuedEventName is the DETERMINISTIC name a QueuedEvent for (projectRef,
+// dedupKey) carries, so a concurrent second EnqueueEvent for the same natural
+// key collides on AlreadyExists at the apiserver rather than creating a second
+// event behind a lagging dedupExists cache read. A keyless event (dedupKey=="")
+// keeps a GenerateName-shaped random name (see EnqueueEvent).
+func QueuedEventName(projectRef, dedupKey string) string {
+	sum := sha256.Sum256([]byte(projectRef + "|" + dedupKey))
+	return "qe-" + hex.EncodeToString(sum[:])[:16]
+}
+
 // EnqueueEvent writes a QueuedEvent (seq-assigned, owned by Project, state=Queued).
 // Returns created=false when dedupKey already has live work. The per-project seq
 // is allocated durably (per-project ConfigMap CAS) AFTER the dedup check so a
@@ -205,12 +217,17 @@ func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *ta
 	if dedupKey != "" {
 		labels[LabelDedupKey] = dedupLabel(dedupKey)
 	}
+	om := metav1.ObjectMeta{
+		Namespace: proj.Namespace,
+		Labels:    labels,
+	}
+	if dedupKey != "" {
+		om.Name = QueuedEventName(proj.Name, dedupKey)
+	} else {
+		om.GenerateName = "qe-"
+	}
 	qe := &tatarav1alpha1.QueuedEvent{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "qe-",
-			Namespace:    proj.Namespace,
-			Labels:       labels,
-		},
+		ObjectMeta: om,
 		Spec: tatarav1alpha1.QueuedEventSpec{
 			Seq:           seqNum,
 			Class:         class,
@@ -226,6 +243,11 @@ func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *ta
 		return nil, false, fmt.Errorf("enqueue: set ownerref: %w", err)
 	}
 	if err := c.Create(ctx, qe); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// The natural-key backstop: a concurrent mint (or a lagging
+			// dedupExists cache read) already created this event. Not an error.
+			return nil, false, nil
+		}
 		return nil, false, fmt.Errorf("enqueue: create queuedevent: %w", err)
 	}
 	qe.Status.State = tatarav1alpha1.QueueStateQueued
