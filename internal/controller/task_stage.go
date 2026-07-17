@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -89,6 +90,34 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	task *tatarav1alpha1.Task, now time.Time) (res ctrl.Result, handled bool, err error) {
 
 	l := log.FromContext(ctx)
+
+	// B4: THE HANDOFF DEADLINE, evaluated BEFORE the three clocks because it is
+	// tighter than all of them.
+	//
+	// kind=review is the ONE outcome kind whose commit makes no stage transition:
+	// C.5.3 phase 1 is pure etcd with no forge write, so a forge outage cannot lose
+	// an accepted outcome, and the advance is deferred to MergeRequestReconciler ->
+	// DrainPendingReview -> advanceAfterReview. That split is deliberate and is NOT
+	// being removed. But it makes the Task's progress depend on a SECOND reconciler
+	// running, and nothing bounded that: the drain normally lands in ~1s, the
+	// reviewing work budget is 4h, the B2 guards suppress the pod caps underneath
+	// it, and a suppressed Task holds its admitted concurrency ticket for the whole
+	// window. This is the bound.
+	if cond := handoffCondition(task); cond != nil {
+		if elapsed := now.Sub(cond.LastTransitionTime.Time); elapsed > tatarav1alpha1.HandoffDeadline {
+			mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
+			if mrErr != nil {
+				return ctrl.Result{}, true, mrErr
+			}
+			l.Info("review handoff stalled: the outcome committed but the drain never advanced the task",
+				"action", "handoff_stalled", "resource_id", task.Name, "stage", task.Status.Stage,
+				"outcome_reason", cond.Reason, "deadline", tatarav1alpha1.HandoffDeadline.String(),
+				"elapsed", elapsed.String())
+			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs,
+				tatarav1alpha1.StageParked, stage.ReasonHandoffStalled, now)
+		}
+	}
+
 	paused := projectPaused(proj)
 	clock, since, budget, edge := stage.ArmedClock(task, paused)
 	if clock == stage.ClockNone {
@@ -129,6 +158,27 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		return ctrl.Result{}, true, err
 	}
 	return ctrl.Result{}, true, nil
+}
+
+// handoffCondition returns the OutcomeAccepted condition of a Task whose OWN
+// stage agent has COMMITTED its outcome and whose stage has NOT moved - i.e. the
+// cross-reconciler handoff is outstanding and its clock should be running. nil
+// otherwise. Its LastTransitionTime is when the commit stamped it, which is when
+// the handoff started - not stageEnteredAt.
+//
+// It resolves to exactly one case, kind-agnostically: the reviewing stage after a
+// review outcome commits. Every other kind's commit calls stage.Enter in the SAME
+// write, so its condition Reason can never name the NEW stage's agent kind, and
+// no other stage can be committed-but-not-advanced. That is why the scoped
+// OutcomeCommittedFor is load-bearing and a bare OutcomeCommitted would be a bug:
+// the condition is per-TASK and survives across stages, so an implement Task is
+// already committed the instant it arrives at reviewing. A bare claim (Reason
+// "Outcome") never matches either: it has no handoff outstanding.
+func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
+	if !tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.Stage)) {
+		return nil
+	}
+	return tatarav1alpha1.OutcomeCondition(task)
 }
 
 // clockRequeue is when to look again so a clock fires without an external event.
