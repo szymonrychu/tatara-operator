@@ -381,3 +381,75 @@ func TestReconcileStage_MintStillMintsWhenTheApiServerAgrees(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, tatarav1alpha1.StageTriaging, fresh.Status.Stage)
 }
+
+// SPEC TEST 11. TRIAGING IS THE SAME NON-IDEMPOTENT CALLER, ONE STAGE LATER.
+//
+// reconcileTriaging fires on a CACHED status.stage == triaging, computes next
+// via triageTarget(spec.kind), and calls r.enter(next). objbudget.FitTask's
+// in-write Get can catch a fresher live object than the cache this reconcile
+// started with - our own prior reconcile's triaging -> refining write, not yet
+// observed here. Recomputing "refining" from the frozen cached triaging
+// snapshot and applying it again is refused in-write as refining -> refining
+// (issue #324, the residue after the #347 mint fix: same race, one step
+// later). Every triageTarget destination shares this shape, not just
+// refining - the fix is the caller, generalized, not a per-destination
+// special case and not a self-edge in the table.
+func TestReconcileStage_TriagingIsIdempotentAgainstAStaleCache(t *testing.T) {
+	before := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
+		tatarav1alpha1.StageRefining, tatarav1alpha1.StageRefining))
+
+	proj := tsProject(3)
+	// THE STALE OBJECT the informer cache hands the reconciler: still triaging.
+	stale := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "refine-qe-zv4lp", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "refine"},
+		Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageTriaging},
+	}
+	// THE API SERVER: already advanced triaging -> refining by our own previous
+	// pass. Backs BOTH Client and APIReader, same reason as the mint test: the
+	// illegal-transition counter fires from the in-write stage.Enter inside
+	// objbudget.FitTask, which re-Gets through r.Client.
+	live := stale.DeepCopy()
+	live.Status.Stage = tatarav1alpha1.StageRefining
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
+	require.NoError(t, err, "re-triaging a Task the API server already advanced is a NO-OP, not an error")
+
+	after := testutil.ToFloat64(obs.IllegalStageTransitionCounter(
+		tatarav1alpha1.StageRefining, tatarav1alpha1.StageRefining))
+	require.Equal(t, before, after,
+		"re-entering refining from triaging's stale cache must emit no operator_illegal_stage_transition_total")
+}
+
+// A genuine triage must still triage.
+func TestReconcileStage_TriagingStillTriagesWhenTheApiServerAgrees(t *testing.T) {
+	proj := tsProject(3)
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "refine-qe-lh79w", Namespace: mdNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "refine"},
+		Status:     tatarav1alpha1.TaskStatus{Stage: tatarav1alpha1.StageTriaging},
+	}
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, task).
+		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+
+	r := &TaskReconciler{
+		Client: c, APIReader: c, Scheme: scheme,
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+	_, err := r.reconcileStage(context.Background(), proj, task, time.Unix(1000, 0))
+	require.NoError(t, err)
+	require.Equal(t, tatarav1alpha1.StageRefining, task.Status.Stage)
+}

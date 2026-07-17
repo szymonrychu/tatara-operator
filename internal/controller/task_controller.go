@@ -52,13 +52,14 @@ const (
 // turn through the F.1 stage machine.
 type TaskReconciler struct {
 	client.Client
-	// APIReader is the manager's UNCACHED reader, and the MINT edge is the ONE
-	// decision that may not be made on a cached read. reconcileStage takes the F.3
-	// Create edge on status.stage == "", but EnterStage's write re-reads the Task
-	// LIVE under RetryOnConflict: a re-reconcile against a cache that has not yet
-	// observed our own mint (the mint branch's own Requeue, or the
-	// ShortDescription status patch's watch event) re-applies the Create edge, and
-	// the in-write stage.Enter refuses it as triaging -> triaging, poisoning
+	// APIReader is the manager's UNCACHED reader. reconcileStage makes every
+	// dispatch decision on a CACHED read of status.stage, but EnterStage's write
+	// re-reads the Task under RetryOnConflict and can observe a fresher one: a
+	// re-reconcile against a cache that has not yet caught up with our own PRIOR
+	// write (mintedAlready guards the F.3 Create edge on status.stage == "";
+	// stageDrifted guards every edge past it - clocks, caps, triageTarget's own
+	// edges) re-derives and re-applies an edge this Task already has, and the
+	// in-write stage.Enter refuses it as X -> X, poisoning
 	// operator_illegal_stage_transition_total - which TataraIllegalStageTransition
 	// alerts on. Reconciles of one Task are serialised
 	// (MaxConcurrentReconciles: 1 + leader election), so a live read closes the
@@ -205,6 +206,25 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, nil
 	}
 
+	// task.Status.Stage is a CACHED read here too, and every branch below -
+	// reconcileClocks, reconcileCaps, reconcileTriaging's own edges, the
+	// pod-less and pod-stage handlers - derives its next edge from it. Confirm
+	// it against the API server before any of them re-derives an edge from a
+	// stage this Task has already left: see the APIReader field's comment.
+	drifted, err := r.stageDrifted(ctx, task)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if drifted {
+		// Our own prior reconcile already moved this Task past the stage our
+		// cache still shows. Recomputing an edge from that stale stage here
+		// would re-derive one this Task already has and get refused in-write
+		// as X -> X (issue #324, the residue after the #347 mint fix: same
+		// race, one step later in the machine). Requeue short; the next pass
+		// sees the caught-up cache.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	// THE THREE CLOCKS (F.4). Gap 5: nothing else in production calls
 	// stage.ArmedClock, so without this every deadline in the contract is fiction.
 	res, handled, err := r.reconcileClocks(ctx, project, task, now)
@@ -285,6 +305,38 @@ func (r *TaskReconciler) mintedAlready(ctx context.Context, task *tatarav1alpha1
 		return false, fmt.Errorf("mint: live read of task %s: %w", task.Name, err)
 	}
 	return live.Status.Stage != "", nil
+}
+
+// stageDrifted re-reads the Task from the API SERVER (never the cache) and
+// reports whether its status.stage has already moved past what this
+// reconcile's cached copy shows. Every dispatch branch past the mint/terminal
+// checks - reconcileClocks, reconcileCaps, reconcileTriaging's own edges -
+// derives its next edge from that CACHED stage, and objbudget.FitTask's
+// in-write Get can catch a fresher one: ownedMergeRequests, podGone and
+// mintIssueCRs each do their own I/O before the edge is applied, which is
+// enough wall-clock time for the informer to catch up on our own PRIOR
+// reconcile's write. Recomputing the same edge from the frozen cached
+// snapshot and applying it again is refused in-write as X -> X, poisoning
+// operator_illegal_stage_transition_total for a Task that is perfectly
+// healthy (issue #324: the #347 mint fix closed this window one edge
+// earlier; this closes it here, generally, for every destination
+// triageTarget can name and every clock/cap edge, instead of re-checking it
+// at each call site). A live Task gone entirely (NotFound) is not this
+// reconcile's problem to special-case: the reaper already owns it, or the
+// enter below will surface a real NotFound of its own. Nil (unit tests)
+// falls back to trusting the cached read.
+func (r *TaskReconciler) stageDrifted(ctx context.Context, task *tatarav1alpha1.Task) (bool, error) {
+	if r.APIReader == nil {
+		return false, nil
+	}
+	var live tatarav1alpha1.Task
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(task), &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stage drift check: live read of task %s: %w", task.Name, err)
+	}
+	return live.Status.Stage != task.Status.Stage, nil
 }
 
 // patchTaskAnnotations Get-fresh + mutate + Update's a Task's annotations
