@@ -17,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -265,6 +266,10 @@ func (s *Server) matchRepo(ctx context.Context, projName, remote string) (*tatar
 //
 // Everything else is accepted and ignored; the sweep converges it.
 func (s *Server) handleForgeItem(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
+	if ev.IsReview {
+		s.handleReview(ctx, w, provider, proj, ev)
+		return
+	}
 	if ev.IsComment {
 		s.handleIssueComment(ctx, w, provider, proj, ev)
 		return
@@ -273,13 +278,157 @@ func (s *Server) handleForgeItem(ctx context.Context, w http.ResponseWriter, pro
 		s.handleIssueOpened(ctx, w, provider, proj, ev)
 		return
 	}
-	// ev.IsReview does not exist yet (Task 4 adds it); gate on the fields that
-	// do exist today. ev.IsComment is already false here (handled above).
 	if ev.Kind == "mr" && ev.IsPR && (ev.Action == "opened" || ev.Action == "reopened") {
 		s.handleMROpened(ctx, w, provider, proj, ev)
 		return
 	}
 	s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+}
+
+// handleReview routes a human pull_request_review (GitHub) / MR-approval
+// (GitLab) delivery (Task 4d). Only a "submitted" review with a known
+// ReviewState acts; dismissed/edited collapse to Action "other" upstream and
+// are ignored here too. The actor must be a verified maintainer
+// (tatarav1.IsMaintainer, closed-by-default) - anyone else's review is
+// dropped without effect, same as a bot actor.
+//
+//   - changes_requested on a Tatara-owned, NOT-yet-merged MR re-enters
+//     implementing (ApplyReviewChangesRequested); a kind=review Task, a
+//     merged MR, or a terminal Task all refuse and fold to the pending-event
+//     path so the signal is never lost, just not acted on directly.
+//   - approved is authoritative and short-circuits a pending bot review
+//     (ApplyReviewApproval); it enters merging. A kind=review Task, or an
+//     approval that arrives off reviewing, refuses and folds the same way.
+//   - commented always folds to the pending-event path.
+//   - dismissed (and anything else) is ignored outright.
+//
+// (review.id, state) is deduped on the owning Task's annotations so a
+// redelivered webhook cannot re-fire an already-applied verdict.
+func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provider string,
+	proj tatarav1.Project, ev scm.WebhookEvent) {
+	if ev.Action != "submitted" || ev.ReviewState == "" {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	if isBotActor(&proj, ev.ActorLogin) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	repo, err := s.matchRepo(ctx, proj.Name, ev.Repo)
+	if err != nil {
+		s.reject(w, http.StatusInternalServerError, "list repositories", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if repo == nil || ev.Number <= 0 {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	if !tatarav1.IsMaintainer(&proj, repo, ev.ActorLogin) {
+		s.log.InfoContext(ctx, "review: actor is not a verified maintainer; ignoring",
+			"project", proj.Name, "repo", repo.Name, "actor", ev.ActorLogin)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+
+	mr := &tatarav1.MergeRequest{}
+	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, tatarav1.MergeRequestName(repo.Name, ev.Number)), mr); err != nil {
+		// No mirror yet -> not a Tatara-owned MR the operator drives. Fold to the
+		// comment path so nothing is lost, and let the sweep adopt.
+		s.deliverPendingEvent(ctx, proj, repo, ev)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	ownerName, owned := own.ControllerOwner(mr)
+	if !owned {
+		s.deliverPendingEvent(ctx, proj, repo, ev)
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	task := &tatarav1.Task{}
+	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, ownerName), task); err != nil {
+		if apierrors.IsNotFound(err) {
+			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+			return
+		}
+		s.reject(w, http.StatusInternalServerError, "get owning task", provider, ev.Kind, ev.Action, "error")
+		return
+	}
+	if reviewAlreadyProcessed(task, ev.ReviewID, ev.ReviewState) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored") // (review.id, state) dedup
+		return
+	}
+	if tatarav1.TaskDone(task) {
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored") // terminal Task not resurrected
+		return
+	}
+
+	sp := s.cfg.SpillerFor(&proj)
+	switch ev.ReviewState {
+	case "changes_requested":
+		// Adopted human PRs (owning Task Kind=review) are only reviewed, never
+		// driven to implementing; ApplyReviewChangesRequested refuses kind=review,
+		// but folding to the comment path keeps the signal.
+		reentered, aerr := controller.ApplyReviewChangesRequested(ctx, s.cfg.Client, sp, &proj, task, time.Now())
+		if aerr != nil {
+			s.reject(w, http.StatusInternalServerError, "apply changes_requested", provider, ev.Kind, ev.Action, "error")
+			return
+		}
+		if !reentered {
+			s.deliverPendingEvent(ctx, proj, repo, ev) // merged/terminal/kind=review: fold, don't lose
+		}
+	case "approved":
+		advanced, aerr := controller.ApplyReviewApproval(ctx, s.cfg.Client, sp, &proj, task, ev.ReviewCommitSHA, time.Now())
+		if aerr != nil {
+			s.reject(w, http.StatusInternalServerError, "apply approval", provider, ev.Kind, ev.Action, "error")
+			return
+		}
+		if !advanced {
+			s.deliverPendingEvent(ctx, proj, repo, ev)
+		}
+	case "commented":
+		s.deliverPendingEvent(ctx, proj, repo, ev)
+	default: // dismissed and anything else
+		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+		return
+	}
+	if err := s.stampReviewProcessed(ctx, task, ev.ReviewID, ev.ReviewState); err != nil {
+		s.log.ErrorContext(ctx, "review: stamp dedup marker failed", "error", err, "task", task.Name)
+	}
+	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// reviewKey is the Task annotation the (review.id, state) dedup is keyed on.
+func reviewKey(reviewID string) string { return "tatara.dev/reviewed-" + reviewID }
+
+// reviewAlreadyProcessed reports whether this exact (review.id, state) pair was
+// already applied to task, so a redelivered webhook cannot re-fire it.
+func reviewAlreadyProcessed(task *tatarav1.Task, reviewID, state string) bool {
+	if reviewID == "" {
+		return false
+	}
+	return task.Annotations[reviewKey(reviewID)] == state
+}
+
+// stampReviewProcessed records the dedup marker AFTER the verdict has been
+// applied (or folded to the pending path), so a crash before this write only
+// costs a harmless re-apply (both appliers are idempotent), never a silent
+// drop.
+func (s *Server) stampReviewProcessed(ctx context.Context, task *tatarav1.Task, reviewID, state string) error {
+	if reviewID == "" {
+		return nil
+	}
+	key := client.ObjectKeyFromObject(task)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		if fresh.Annotations == nil {
+			fresh.Annotations = map[string]string{}
+		}
+		fresh.Annotations[reviewKey(reviewID)] = state
+		return s.cfg.Client.Update(ctx, fresh)
+	})
 }
 
 // minter builds the ONE shared intake funnel (internal/controller.Minter) from
