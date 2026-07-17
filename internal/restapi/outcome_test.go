@@ -1171,3 +1171,142 @@ func TestOutcome_CommittedOutcomeStillReplays200(t *testing.T) {
 	require.Len(t, after.Status.Notes, len(before.Status.Notes),
 		"a replay must not re-append the outcome note")
 }
+
+// --- A2: a class-B rejection RELEASES the claim -----------------------------
+
+// SPEC TEST 1. Every kind-specific validation failure is CLASS B
+// (pre-execution): it runs before any committed effect, so NOTHING may be
+// cached under the fingerprint. The claim must be RELEASED, and an identical
+// retry must RE-VALIDATE - not take the 200 replay branch, and not sit out the
+// claim TTL as an in-flight 409.
+func TestOutcome_ValidationRejectionReleasesTheClaim(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+
+	bad := `{"kind":"clarify","payload":{"decision":"discuss","reason":"  "}}`
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", bad)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")),
+		"a class-B rejection must RELEASE the claim, not leave a stub the retry replays")
+
+	// The IDENTICAL retry must re-validate and 400 again, not 200-and-do-nothing
+	// and not 409 claim-in-flight.
+	again := e.do(t, http.MethodPost, "/tasks/t1/outcome", bad)
+	require.Equal(t, http.StatusBadRequest, again.Code,
+		"an identical retry of a released fingerprint must RE-VALIDATE")
+	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
+
+	// And a CORRECTED retry must be processed for real.
+	fixed := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	require.Equal(t, http.StatusOK, fixed.Code)
+	require.Equal(t, tatarav1alpha1.StageParked, e.task(t, "t1").Status.Stage)
+}
+
+// The two top-of-handler gates run before any kind handler and stamp nothing,
+// so they hold a claim they must not keep.
+func TestOutcome_TopOfHandlerGatesReleaseTheClaim(t *testing.T) {
+	t.Run("kind-mismatch", func(t *testing.T) {
+		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+			repoV2("tatara-operator", "tatara"),
+			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+			`{"kind":"implement","payload":{"action":"declined","reason":"nope"}}`)
+		require.Equal(t, http.StatusConflict, w.Code)
+		require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
+	})
+	t.Run("terminal-stage", func(t *testing.T) {
+		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+			repoV2("tatara-operator", "tatara"),
+			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageParked, "clarify"))
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		require.Equal(t, http.StatusConflict, w.Code)
+		require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
+	})
+	t.Run("payload decode", func(t *testing.T) {
+		e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+			repoV2("tatara-operator", "tatara"),
+			taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+			`{"kind":"clarify","payload":{"decision":"discuss","bogusField":1}}`)
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")))
+	})
+}
+
+// The head-moved 409 is the deliberate self-healing path: it stamps NOTHING and
+// tells the agent to re-review the fresh diff. Its claim must be released too,
+// or the agent's honest resubmit-with-the-new-sha would 409 in-flight for the
+// whole claim TTL.
+func TestOutcome_HeadMovedReleasesTheClaim(t *testing.T) {
+	forge := &reviewPanicForge{heads: map[int]string{295: "sha-NEW"}}
+	e := buildV2(t, v2Opts{writer: forge, reader: emptyCommentReader{}},
+		projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
+	  "verdict":"approve","reviewedSHAs":[{"repo":"tatara-operator","number":295,"sha":"sha-OLD"}]}}`)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Nil(t, tatarav1alpha1.OutcomeCondition(e.task(t, "t1")),
+		"head-moved stamps nothing, so it must hold no claim either")
+}
+
+// An ILLEGAL TRANSITION is refused inside commit's mutate closure, but
+// objbudget.FitTask persists whatever the closure already did before it
+// errored. So the closure must transition FIRST and note SECOND, or the note
+// lands on a refused outcome - and, now that the rejection releases the claim,
+// lands AGAIN on every retry.
+func TestOutcome_IllegalTransitionWritesNothingAndReleasesTheClaim(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		// triaging has no parked edge at all, so clarify's decision=discuss
+		// (-> parked[awaiting-human]) is refused by the F.3 table.
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageTriaging, "clarify"))
+
+	for i := range 3 {
+		w := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+		require.Equal(t, http.StatusConflict, w.Code, "attempt %d", i)
+		got := e.task(t, "t1")
+		require.Equal(t, tatarav1alpha1.StageTriaging, got.Status.Stage)
+		require.Empty(t, got.Status.Notes,
+			"a refused transition must leave NO note behind, on any attempt")
+		require.Nil(t, tatarav1alpha1.OutcomeCondition(got),
+			"an illegal-transition 409 is class B: it must release its claim")
+	}
+}
+
+// SPEC TEST 5, black-box half: a rejection never undoes a COMMITTED outcome.
+//
+// The invariant lives in release's ownership check and is asserted directly in
+// release_internal_test.go - through the handler it can only be observed as an
+// EFFECT, not as a condition. A DIFFERENT outcome's claim overwrites the
+// committed condition in the single OutcomeAccepted slot BEFORE any gate runs
+// (claim-first is the C7 ordering and must not move), so the committed
+// condition is already gone by the time release could look at it. What must
+// hold - and does - is that the committed stage, reason and note survive
+// untouched, and that the rejection is still a 409.
+func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+
+	ok := e.do(t, http.MethodPost, "/tasks/t1/outcome", clarifyDiscussBody)
+	require.Equal(t, http.StatusOK, ok.Code)
+	before := e.task(t, "t1")
+	require.Equal(t, "Clarify", tatarav1alpha1.OutcomeCondition(before).Reason)
+	require.Equal(t, tatarav1alpha1.StageParked, before.Status.Stage)
+
+	// A DIFFERENT outcome now arrives. The Task is parked (terminal), so it 409s
+	// at the terminal gate, which releases the claim it just took.
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"close","reason":"x"}}`)
+	require.Equal(t, http.StatusConflict, w.Code)
+
+	after := e.task(t, "t1")
+	require.Equal(t, before.Status.Stage, after.Status.Stage,
+		"a rejection must never undo the committed outcome's effect")
+	require.Equal(t, before.Status.StageReason, after.Status.StageReason)
+	require.Equal(t, before.Status.Notes, after.Status.Notes)
+}

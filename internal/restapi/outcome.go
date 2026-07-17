@@ -241,15 +241,17 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// oc is built BEFORE the two gates so both can release the claim they hold:
+	// they run before any kind handler and stamp nothing, so they are class B.
+	// oc.proj is nil until the lookup below; neither gate reads it.
+	oc := &outcomeCtx{s: s, w: w, r: r, task: task, fp: fp, kind: env.Kind}
 	if tatarav1alpha1.StageTerminal(task) || task.Status.Stage == tatarav1alpha1.StageDelivered {
-		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "terminal-stage").Inc()
-		writeError(w, http.StatusConflict, "task is in a terminal stage")
+		oc.conflict("task is in a terminal stage", "terminal-stage")
 		return
 	}
 	// The pod's claim is not trusted: kind MUST equal status.agentKind.
 	if env.Kind != task.Status.AgentKind {
-		obs.RestOutcomeRejectedTotal.WithLabelValues(env.Kind, "kind-mismatch").Inc()
-		writeError(w, http.StatusConflict, "kind does not match the task's agent kind")
+		oc.conflict("kind does not match the task's agent kind", "kind-mismatch")
 		return
 	}
 
@@ -258,52 +260,49 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
+	oc.proj = proj
 
-	oc := &outcomeCtx{s: s, w: w, r: r, task: task, proj: proj, fp: fp, kind: env.Kind}
 	switch env.Kind {
 	case "implement", "documentation":
 		var p implementPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.implement(p)
 	case "review":
 		var p reviewPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.review(p)
 	case "clarify":
 		var p clarifyPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.clarify(p)
 	case "brainstorm":
 		var p brainstormPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.brainstorm(p)
 	case "incident":
 		var p incidentPayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.incident(p)
 	case "refine":
 		var p refinePayload
-		if err := decodeStrict(env.Payload, &p); err != nil {
-			writeDecodeError(w, r, err)
+		if !oc.decode(env.Payload, &p) {
 			return
 		}
 		oc.refine(p)
 	default:
+		// Unreachable behind the kind-mismatch gate unless status.agentKind is
+		// itself bogus, but it is still a class-B rejection holding a claim.
+		oc.release()
 		writeError(w, http.StatusBadRequest, "unknown outcome kind")
 	}
 }
@@ -404,14 +403,69 @@ type outcomeCtx struct {
 	kind string
 }
 
+// release drops OUR claim so an identical retry RE-VALIDATES immediately
+// instead of waiting out OutcomeClaimTTL.
+//
+// Every pre-execution rejection is CLASS B: it runs before any committed
+// effect, so nothing may be cached under the fingerprint. A class-A
+// (post-execution) rejection does not arise here - commit is the only thing
+// that begins execution, and it stamps its own terminal reason, which release
+// refuses to touch.
+//
+// OWNERSHIP-CHECKED under CAS: only a condition still carrying OUR fingerprint
+// AND Reason "Outcome" is released. NEVER a committed condition; NEVER another
+// request's claim - a slow handler can reach its rejection long after another
+// replica re-claimed the orphaned slot and committed it.
+//
+// A failed release is not fatal and does not change the response: the claim
+// then expires as an orphaned stub after the TTL, which is the same self-heal a
+// crashed process gets.
+func (o *outcomeCtx) release() {
+	ctx := o.r.Context()
+	key := types.NamespacedName{Namespace: o.s.ns, Name: o.task.Name}
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Task{}
+		if err := o.s.c.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		cond := tatarav1alpha1.OutcomeCondition(fresh)
+		if cond == nil || cond.Message != o.fp || cond.Reason != tatarav1alpha1.OutcomeReasonClaimed {
+			return nil
+		}
+		removeCondition(fresh, outcomeAcceptedCondition)
+		return o.s.c.Status().Update(ctx, fresh)
+	})
+	if err != nil {
+		o.s.log.ErrorContext(ctx, "restapi: releasing the outcome claim failed; the retry waits out the claim TTL",
+			append(reqLogFields(o.r), "task", o.task.Name, "kind", o.kind, "error", err)...)
+		return
+	}
+	o.s.log.InfoContext(ctx, "restapi: outcome rejected before execution; the claim is released for an immediate retry",
+		append(reqLogFields(o.r), "action", "submit_outcome", "task", o.task.Name, "kind", o.kind)...)
+}
+
 func (o *outcomeCtx) bad(msg string, reason string) {
+	o.release()
 	obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, reason).Inc()
 	writeError(o.w, http.StatusBadRequest, msg)
 }
 
 func (o *outcomeCtx) conflict(msg string, reason string) {
+	o.release()
 	obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, reason).Inc()
 	writeError(o.w, http.StatusConflict, msg)
+}
+
+// decode parses the kind's payload, releasing the claim on a malformed one: a
+// decode failure is as class B as any other validation failure, and leaving the
+// claim would 409 the corrected resubmit for the whole TTL.
+func (o *outcomeCtx) decode(payload []byte, v any) bool {
+	if err := decodeStrict(payload, v); err != nil {
+		o.release()
+		writeDecodeError(o.w, o.r, err)
+		return false
+	}
+	return true
 }
 
 // commit applies the Task status mutation (a stage transition, notes, counters)
@@ -487,6 +541,16 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 // claimed one everywhere else in the operator - hence the shared definition.
 func conditionReason(kind string) string {
 	return tatarav1alpha1.OutcomeReasonFor(kind)
+}
+
+func removeCondition(t *tatarav1alpha1.Task, condType string) {
+	out := t.Status.Conditions[:0]
+	for _, c := range t.Status.Conditions {
+		if c.Type != condType {
+			out = append(out, c)
+		}
+	}
+	t.Status.Conditions = out
 }
 
 func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {
@@ -569,8 +633,15 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			to, reason = tatarav1alpha1.StageDelivered, ""
 		}
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			// stage.Enter FIRST: objbudget.FitTask persists whatever this
+			// closure mutated even when it returns an error, so a note appended
+			// before a REFUSED transition would land - and, now that a class-B
+			// rejection releases the claim, land AGAIN on every retry.
+			if err := stage.Enter(t, mrs, to, reason, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "declined: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, to, reason, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -635,8 +706,11 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, mrs, tatarav1alpha1.StageReviewing, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "submitted: "+p.Title+"\n\n"+p.Body, s.now())
-		return stage.Enter(t, mrs, tatarav1alpha1.StageReviewing, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -790,6 +864,12 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			}
 			obs.RestOutcomeRejectedTotal.WithLabelValues(o.kind, "head-moved").Inc()
 			s.metrics.RecordReviewHeadMoved(mr.Spec.RepositoryRef)
+			// Head-moved writes its structured 409 body directly rather than
+			// through o.conflict, so it must release explicitly. It stamps
+			// nothing, and the agent's honest resubmit-with-the-new-sha is a
+			// DIFFERENT fingerprint anyway - but an identical retry must
+			// re-validate against the live head, not sit out the TTL.
+			o.release()
 			s.log.InfoContext(ctx, "review head moved since checkout; mirror refreshed to the live head",
 				append(reqLogFields(o.r), "action", "review_head_moved", "task", o.task.Name,
 					"repo", mr.Spec.RepositoryRef, "number", mr.Spec.Number,
@@ -942,8 +1022,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	switch p.Decision {
 	case "discuss":
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "discuss: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -965,8 +1048,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StageRejected, stage.ReasonDeclined, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "close: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, tatarav1alpha1.StageRejected, stage.ReasonDeclined, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -986,8 +1072,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	granted, evidence := s.verifyApprovalScope(ctx, o.proj, issues)
 	if !granted {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
-			return stage.Enter(t, mrs, tatarav1alpha1.StageParked, stage.ReasonIdentityUnverified, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -1010,8 +1099,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 		}
 	}
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "implement: "+p.Reason, s.now())
-		return stage.Enter(t, mrs, tatarav1alpha1.StageApproved, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -1098,8 +1190,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// says "nothing novel" must not spawn a docs pod, a docs PR about
 		// nothing, a review, a merge and a release - every day.
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "skip: "+p.Reason, s.now())
-			return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+			return nil
 		}) {
 			return
 		}
@@ -1147,8 +1242,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "proposed: "+strings.Join(spawned, ", "), s.now())
-		return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -1238,8 +1336,11 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 
 	if p.Action == "false_positive" {
 		if !o.commit(func(t *tatarav1alpha1.Task) error {
+			if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, s.now()); err != nil {
+				return err
+			}
 			agentNote(t, o.kind, "note", "false_positive: "+p.Reason, s.now())
-			return stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonFalsePositive, s.now())
+			return nil
 		}) {
 			return
 		}
@@ -1290,8 +1391,11 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageClarifying, "", s.now()); err != nil {
+			return err
+		}
 		agentNote(t, o.kind, "note", "file_issue: "+p.Reason, s.now())
-		return stage.Enter(t, nil, tatarav1alpha1.StageClarifying, "", s.now())
+		return nil
 	}) {
 		return
 	}
@@ -1493,8 +1597,11 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now()); err != nil {
+			return err
+		}
 		t.Status.FoldInFlight = nil
-		return stage.Enter(t, nil, tatarav1alpha1.StageDelivered, "", s.now())
+		return nil
 	}) {
 		return
 	}
