@@ -59,14 +59,29 @@ const (
 	// (A.7): half the ~1.5MiB etcd object ceiling, the headroom reserved for
 	// metadata.managedFields growth we do not control.
 	ObjectByteBudget = 800_000
+	// OutcomeHandlerBudget is the maximum wall-clock a SINGLE /outcome handler may
+	// run: postOutcome bounds its request context with it, at the top, before the
+	// claim. Nothing else bounds that handler - internal/webhook/server.go sets only
+	// ReadHeaderTimeout, no http.Server in the request path sets a WriteTimeout, and
+	// the brainstorm path loops CreateIssue (~30s each in internal/scm/github.go)
+	// once per proposal, so five slow proposals would otherwise run for minutes.
+	OutcomeHandlerBudget = 2 * time.Minute
 	// OutcomeClaimTTL bounds a BARE /outcome claim - one stamped by
 	// claimOutcomeFingerprint and never overwritten by a kind handler's commit.
 	// Within it, an identical retry is told the outcome is IN FLIGHT on another
 	// replica (409). Past it, the claim is an ORPHANED STUB - the process died
 	// between the claim and the commit - and an identical retry RE-CLAIMS it and
-	// proceeds. The handler makes no forge WRITE and at most one forge READ
-	// (GetPRHead), so 60s is far beyond its worst honest latency.
-	OutcomeClaimTTL = 60 * time.Second
+	// proceeds.
+	//
+	// THE INVARIANT THAT MAKES THE LEASE SOUND: OutcomeHandlerBudget <
+	// OutcomeClaimTTL. A handler that can outlive its own lease is a handler whose
+	// identical retry finds a claim that LOOKS orphaned, is not, re-claims it, and
+	// runs every side effect a SECOND time - the exact duplicate the C7 claim-first
+	// ordering exists to prevent. With the budget strictly under the TTL a request
+	// provably cannot outlive its own claim, so no retry can steal a live request's
+	// claim. api/v1alpha1's TestOutcomeHandlerBudgetIsUnderTheClaimTTL asserts it so
+	// a future edit to either number cannot silently re-open the hole.
+	OutcomeClaimTTL = 5 * time.Minute
 	// HandoffDeadline bounds the C.5.3 phase-2 handoff: kind=review is the ONE
 	// outcome kind whose commit makes no stage transition (the advance is
 	// deferred to MergeRequestReconciler -> DrainPendingReview ->

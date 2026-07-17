@@ -51,6 +51,61 @@ func (f *reviewPanicForge) Merge(_ context.Context, _, _ string, _ int, _, _ str
 	panic("BUG: /outcome merged. Merge is the operator's, from the merging stage (C.5.2).")
 }
 
+// deadlineForge records the ctx deadline every CreateIssue call was handed, so
+// the budget test can prove the bounded context is what actually reaches the
+// forge - not the unbounded r.Context() the kind handlers pull for themselves.
+type deadlineForge struct {
+	*recordingForge
+	deadlines []time.Time
+	hadNone   bool
+}
+
+func (f *deadlineForge) CreateIssue(ctx context.Context, repoURL, token string,
+	req scm.IssueReq) (scm.CreatedIssue, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		f.deadlines = append(f.deadlines, dl)
+	} else {
+		f.hadNone = true
+	}
+	return f.recordingForge.CreateIssue(ctx, repoURL, token, req)
+}
+
+// THE LEASE IS ONLY SOUND IF A HANDLER CANNOT OUTLIVE ITS OWN CLAIM. The
+// brainstorm path loops CreateIssue once per proposal and no http.Server in the
+// request path sets a WriteTimeout, so three slow proposals could run past
+// OutcomeClaimTTL - at which point an identical retry sees an "orphaned" stub
+// that is still live, re-claims, and files every issue a SECOND time. postOutcome
+// bounds the request context with OutcomeHandlerBudget at the TOP, before the
+// claim, and OutcomeHandlerBudget < OutcomeClaimTTL, so that cannot happen. The
+// bound must reach the FORGE calls, which is what this asserts.
+func TestOutcome_HandlerContextIsBoundedByTheBudget(t *testing.T) {
+	forge := &deadlineForge{recordingForge: newRecordingForge()}
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+
+	before := time.Now()
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"brainstorm","payload":{"action":"propose","proposals":[`+
+			`{"repo":"tatara-operator","title":"one","body":"b","kind":"bug"},`+
+			`{"repo":"tatara-operator","title":"two","body":"b","kind":"bug"}]}}`)
+	after := time.Now()
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.False(t, forge.hadNone, "a forge call ran on an UNBOUNDED context: the budget does not reach it")
+	require.Len(t, forge.deadlines, 2, "every proposal's forge call must carry the deadline")
+	// The deadline is anchored at the TOP of the handler, which is somewhere
+	// between before and after, so the budget measured from either end brackets it.
+	for _, dl := range forge.deadlines {
+		require.False(t, dl.Before(before.Add(tatarav1alpha1.OutcomeHandlerBudget)),
+			"the deadline must be at least the budget away: it is anchored at the top of the handler")
+		require.False(t, dl.After(after.Add(tatarav1alpha1.OutcomeHandlerBudget)),
+			"the deadline must be no more than the budget away: some LONGER bound reached the forge instead")
+	}
+	require.Less(t, tatarav1alpha1.OutcomeHandlerBudget, tatarav1alpha1.OutcomeClaimTTL,
+		"a handler that can outlive its own lease lets an identical retry duplicate every side effect")
+}
+
 // --- kind gate + idempotency ----------------------------------------------
 
 func TestOutcome_KindMustEqualAgentKind(t *testing.T) {
@@ -1049,10 +1104,16 @@ func clarifyDiscussFingerprint(t *testing.T) string {
 const clarifyDiscussBody = `{"kind":"clarify","payload":{"decision":"discuss","reason":"r"}}`
 
 // SPEC TEST 2. A claim whose process died before commit is an ORPHANED STUB.
-// Inside OutcomeClaimTTL an identical retry cannot tell "in flight on another
-// replica" from "orphaned", so it is told to retry (409) rather than being
-// admitted through to a second side effect. Past the TTL it RE-CLAIMS and
+// Inside OutcomeClaimTTL (5m) an identical retry cannot tell "in flight on
+// another replica" from "orphaned", so it is told to retry (409) rather than
+// being admitted through to a second side effect. Past the TTL it RE-CLAIMS and
 // proceeds - the self-heal that stops a 4xx stub wedging forever.
+//
+// The two cases probe the boundary itself: just under the TTL (4m59s of age) and
+// just over it (5m1s). They are written against the constant, not the literal,
+// because the TTL's exact value is pinned in api/v1alpha1 (against
+// OutcomeHandlerBudget) and this test is about the three-state behaviour at
+// whatever the boundary is, not about the number.
 func TestOutcome_BareClaimInsideTTLIs409_PastTTLReclaimsAndProceeds(t *testing.T) {
 	fp := clarifyDiscussFingerprint(t)
 

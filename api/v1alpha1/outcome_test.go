@@ -95,10 +95,29 @@ func TestOutcomeReasonFor(t *testing.T) {
 }
 
 func TestOutcomeClaimTTLAndHandoffDeadline(t *testing.T) {
-	if OutcomeClaimTTL != 60*time.Second {
-		t.Fatalf("OutcomeClaimTTL = %v, want 60s", OutcomeClaimTTL)
+	if OutcomeClaimTTL != 5*time.Minute {
+		t.Fatalf("OutcomeClaimTTL = %v, want 5m", OutcomeClaimTTL)
+	}
+	if OutcomeHandlerBudget != 2*time.Minute {
+		t.Fatalf("OutcomeHandlerBudget = %v, want 2m", OutcomeHandlerBudget)
 	}
 	if HandoffDeadline != 5*time.Minute {
 		t.Fatalf("HandoffDeadline = %v, want 5m", HandoffDeadline)
+	}
+}
+
+// THE INVARIANT THAT MAKES THE LEASE SOUND. A handler that can outlive its own
+// claim is a handler whose identical retry re-claims an ORPHANED STUB that is not
+// orphaned at all, and runs every side effect a SECOND time - the exact duplicate
+// the C7 claim-first ordering exists to prevent. postOutcome bounds its context
+// with OutcomeHandlerBudget, so as long as the budget is STRICTLY under the TTL a
+// request provably cannot outlive its lease and no retry can steal a live
+// request's claim. Raising the budget past the TTL silently re-opens the hole,
+// which is why it is asserted rather than commented.
+func TestOutcomeHandlerBudgetIsUnderTheClaimTTL(t *testing.T) {
+	if OutcomeHandlerBudget >= OutcomeClaimTTL {
+		t.Fatalf("OutcomeHandlerBudget (%v) must be strictly under OutcomeClaimTTL (%v): "+
+			"a handler that outlives its own lease lets an identical retry re-claim a LIVE claim and duplicate every side effect",
+			OutcomeHandlerBudget, OutcomeClaimTTL)
 	}
 }

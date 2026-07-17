@@ -181,7 +181,17 @@ func (s *Server) postOutcome(w http.ResponseWriter, r *http.Request) {
 	if !authorizeCaller(w, r) {
 		return
 	}
-	ctx := r.Context()
+	// BOUND THE HANDLER BEFORE THE CLAIM. The claim below is a LEASE with a TTL,
+	// and the lease is only sound while a handler cannot outlive its own claim:
+	// past the TTL an identical retry treats a claim as an ORPHANED STUB and
+	// re-runs every side effect. Nothing else bounds this handler - no
+	// WriteTimeout in the request path - and the brainstorm path loops CreateIssue
+	// per proposal at ~30s each. OutcomeHandlerBudget < OutcomeClaimTTL, so this
+	// deadline is what makes the lease provably safe. r is re-bound so the kind
+	// handlers, which pull the request's own context, cannot bypass it.
+	ctx, cancel := context.WithTimeout(r.Context(), tatarav1alpha1.OutcomeHandlerBudget)
+	defer cancel()
+	r = r.WithContext(ctx)
 	name := chi.URLParam(r, "t")
 
 	var env outcomeEnvelope
@@ -378,11 +388,7 @@ func claimOutcomeFingerprint(ctx context.Context, c client.Client, key types.Nam
 			Message:            fp,
 			LastTransitionTime: metav1.NewTime(now),
 		})
-		if err := c.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		state = claimWon
-		return nil
+		return c.Status().Update(ctx, fresh)
 	})
 	return fresh, state, err
 }
