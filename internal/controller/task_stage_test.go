@@ -1122,6 +1122,47 @@ func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) 
 		}
 	})
 
+	t.Run("a PREVIOUS round's review commit never arms the handoff deadline", func(t *testing.T) {
+		// stage.Enter never clears the condition, so a Task that RE-ENTERS reviewing
+		// carries the last round's Reason=Review commit with it: merging -> reviewing
+		// on a head move (cycle 4) and the kind=review awaiting-human unpark both do
+		// exactly this. THIS occupancy's review agent has not run yet, so the handoff
+		// is not outstanding and the pod must still spawn. Without the occupancy
+		// check the first reconcile parks it at handoff-stalled - which has no F.6
+		// re-entry - and both cycles die permanently and SILENTLY, because
+		// reviewing -> parked is a legal transition.
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		reEntered := metav1.NewTime(base.Add(time.Hour))
+		task.Status.StageEnteredAt = &reEntered
+		task.Status.PodStartedAt = nil
+		task.Status.StageWorkStartedAt = nil
+		proj := tsProject(3)
+		readySince := metav1.NewTime(base.Add(-time.Hour))
+		proj.Status.Memory.ReadySince = &readySince
+		c := newMirrorClient(t, proj, mdSecret(), task)
+		r := tsReconciler(c)
+		r.PodConfig = agent.PodConfig{
+			Namespace:           mdNS,
+			AnthropicSecretName: "anthropic",
+			CLIOIDCSecretName:   "cli-oidc",
+		}
+
+		got := tsReconcile(t, r, proj, task, base.Add(time.Hour+tatarav1alpha1.HandoffDeadline+time.Second))
+
+		if got.Status.Stage != tatarav1alpha1.StageReviewing ||
+			got.Status.StageReason == stage.ReasonHandoffStalled {
+			t.Fatalf("stage=%q reason=%q, want reviewing: a commit from a PREVIOUS occupancy of this stage is not this occupancy's handoff",
+				got.Status.Stage, got.Status.StageReason)
+		}
+		var pods corev1.PodList
+		if err := c.List(context.Background(), &pods, client.InNamespace(mdNS)); err != nil {
+			t.Fatalf("list pods: %v", err)
+		}
+		if len(pods.Items) != 1 {
+			t.Fatalf("pods = %d, want 1: the re-entered reviewing stage's own review pod must still spawn", len(pods.Items))
+		}
+	})
+
 	t.Run("the handoff deadline fires BEFORE clock 3's 4h reviewing budget", func(t *testing.T) {
 		task := tsReviewTaskWithOutcome(committed, 0, base)
 		proj := tsProject(3)
@@ -1153,6 +1194,31 @@ func TestReconcile_CapsSuppressionIsScopedToTheStagesOwnAgentKind(t *testing.T) 
 
 	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
 		t.Fatalf("stage=%q reason=%q, want parked/no-outcome: only an outcome committed BY THIS STAGE'S agent may suppress the caps",
+			got.Status.Stage, got.Status.StageReason)
+	}
+}
+
+// The same scoping in the other axis: the agent kind matches, but the commit is
+// from a PREVIOUS occupancy of reviewing (a head-move re-entry, or the
+// awaiting-human unpark). THIS occupancy's pod ran and vanished with its
+// recreations spent, so the caps own it exactly as they own any other stage whose
+// agent submitted nothing.
+func TestReconcile_CapsSuppressionIsScopedToTheCurrentStageOccupancy(t *testing.T) {
+	base := time.Unix(1000, 0)
+	task := tsReviewTaskWithOutcome(tatarav1alpha1.OutcomeReasonFor(stage.AgentReview),
+		maxPodRecreations, base)
+	reEntered := metav1.NewTime(base.Add(time.Hour))
+	ran := metav1.NewTime(base.Add(time.Hour + time.Minute))
+	task.Status.StageEnteredAt = &reEntered
+	task.Status.PodStartedAt = &ran
+	task.Status.StageWorkStartedAt = &ran
+	proj := tsProject(3)
+	r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task)) // no Pod object -> podGone
+
+	got := tsReconcile(t, r, proj, task, base.Add(time.Hour+2*time.Minute))
+
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonNoOutcome {
+		t.Fatalf("stage=%q reason=%q, want parked/no-outcome: a commit predating stageEnteredAt must not suppress this occupancy's caps",
 			got.Status.Stage, got.Status.StageReason)
 	}
 }

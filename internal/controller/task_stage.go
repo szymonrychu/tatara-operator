@@ -174,11 +174,26 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 // the condition is per-TASK and survives across stages, so an implement Task is
 // already committed the instant it arrives at reviewing. A bare claim (Reason
 // "Outcome") never matches either: it has no handoff outstanding.
+//
+// This is the ONE predicate for "this stage's agent is done and the handoff is
+// outstanding". All three production sites route through it - reconcileClocks'
+// deadline and the two B2 suppression guards - so the scoping holds identically
+// at each.
 func handoffCondition(task *tatarav1alpha1.Task) *metav1.Condition {
 	if !tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.Stage)) {
 		return nil
 	}
-	return tatarav1alpha1.OutcomeCondition(task)
+	cond := tatarav1alpha1.OutcomeCondition(task)
+	// stage.Enter never clears the condition, so a commit from a PREVIOUS
+	// occupancy of this same stage is not this occupancy's handoff:
+	// merging -> reviewing (HeadMoved, cycle 4) and the kind=review
+	// awaiting-human unpark both re-enter reviewing carrying Reason=Review
+	// from the last round. This occupancy's agent has not run yet.
+	if task.Status.StageEnteredAt != nil &&
+		cond.LastTransitionTime.Time.Before(task.Status.StageEnteredAt.Time) {
+		return nil
+	}
+	return cond
 }
 
 // clockRequeue is when to look again so a clock fires without an external event.
@@ -231,17 +246,19 @@ func (r *TaskReconciler) reconcileCaps(ctx context.Context, proj *tatarav1alpha1
 	// status.stage is still reviewing they keep driving a finished Task as an
 	// ordinary live pod stage and terminate work that already landed.
 	//
-	// A BARE CLAIM is deliberately NOT guarded: OutcomeCommittedFor is false for
+	// A BARE CLAIM is deliberately NOT guarded: handoffCondition is nil for
 	// Reason "Outcome", so a failed-validation stub stays fully subject to the
-	// caps. Guarding it would freeze it forever.
+	// caps. Guarding it would freeze it forever. A commit from a PREVIOUS
+	// occupancy of this stage is nil there too, so a re-entered reviewing Task
+	// carries no suppression from the last round.
 	//
 	// The turn budget is NOT suppressed: it is not a pod-liveness cap, and
 	// BudgetExit checks it first, so a Task over maxTurnsPerTask still fails here.
 	//
 	// handled=false lets the flow fall through to reconcilePodStage, whose own B2
-	// guard returns the poll requeue. The stage work clock stays armed and bounds
+	// guard returns the poll requeue. The handoff deadline stays armed and bounds
 	// the suppression in the other direction.
-	if tatarav1alpha1.OutcomeCommittedFor(task, stage.AgentKindFor(task.Status.Stage)) &&
+	if handoffCondition(task) != nil &&
 		(edge.Reason == stage.ReasonNoOutcome || edge.Reason == stage.ReasonPodRecreationExhausted) {
 		log.FromContext(ctx).Info("stage budget exit suppressed: the outcome is committed and the handoff is in flight",
 			"action", "cap_suppressed_committed_outcome", "resource_id", task.Name,
@@ -420,11 +437,13 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	// re-submit turn-0. Poll until the MergeRequest reconciler's drain advances
 	// the stage, or until the handoff deadline parks it at handoff-stalled.
 	//
-	// OutcomeCommittedFor - not "is anything committed" - because the condition is
-	// per-TASK and survives across stages: an implement Task arrives at reviewing
-	// with Reason=Implement already committed, and a bare committed check would gag
-	// the review pod that has not spawned yet.
-	if tatarav1alpha1.OutcomeCommittedFor(task, agentKind) {
+	// handoffCondition - not "is anything committed" - because the condition is
+	// per-TASK and survives across BOTH stages and stage re-entries: an implement
+	// Task arrives at reviewing with Reason=Implement already committed, and a
+	// re-entered reviewing Task (head move, awaiting-human unpark) arrives with the
+	// LAST round's Reason=Review committed. A bare committed check would gag the
+	// review pod that has not spawned yet in either case.
+	if handoffCondition(task) != nil {
 		l.Info("stage pod work suppressed: the outcome is committed and the handoff is in flight",
 			"action", "pod_stage_suppressed_committed_outcome", "resource_id", task.Name,
 			"stage", task.Status.Stage, "agent_kind", agentKind)
