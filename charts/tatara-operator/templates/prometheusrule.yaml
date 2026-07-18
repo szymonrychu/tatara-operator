@@ -49,6 +49,14 @@ spec:
           annotations:
             summary: "a per-project memory stack is Failed"
             description: "{{ "{{" }} $value {{ "}}" }} per-project memory stack(s) have been in phase Failed for 15m. The lightrag/neo4j/postgres backing the whole loop's recall is degraded."
+        - alert: TataraMemoryStackDegraded
+          expr: operator_memory_stacks{phase="Degraded"} > 0
+          for: 5m
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "a per-project memory stack is stuck Provisioning past its timeout"
+            description: "{{ "{{" }} $value {{ "}}" }} per-project memory stack(s) have been reported Degraded (issue #355): the stack has sat phase=Provisioning longer than the memoryProvisioningTimeoutMinutes bound (default 45m) with no backend converging to Ready. The MemoryReady condition's message on the Project carries how long it has been stuck. The 5m for-window rides out a single scrape/reconcile-cycle flap; the gauge itself only flips once the reconcile-side timeout has already elapsed."
         - alert: TataraTasksInflightPinned
           expr: operator_tasks_inflight >= {{ .Values.prometheusRule.tasksInflightThreshold }}
           for: 2h

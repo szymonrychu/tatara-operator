@@ -339,6 +339,10 @@ func (in *IssueStatus) DeepCopyInto(out *IssueStatus) {
 		in, out := &in.LastDeployTimeoutCommentAt, &out.LastDeployTimeoutCommentAt
 		*out = (*in).DeepCopy()
 	}
+	if in.LastMemoryGateCommentAt != nil {
+		in, out := &in.LastMemoryGateCommentAt, &out.LastMemoryGateCommentAt
+		*out = (*in).DeepCopy()
+	}
 	if in.LastSyncedAt != nil {
 		in, out := &in.LastSyncedAt, &out.LastSyncedAt
 		*out = (*in).DeepCopy()
@@ -397,6 +401,10 @@ func (in *MemoryStatus) DeepCopyInto(out *MemoryStatus) {
 	*out = *in
 	if in.ReadySince != nil {
 		in, out := &in.ReadySince, &out.ReadySince
+		*out = (*in).DeepCopy()
+	}
+	if in.ProvisioningSince != nil {
+		in, out := &in.ProvisioningSince, &out.ProvisioningSince
 		*out = (*in).DeepCopy()
 	}
 }

@@ -145,7 +145,7 @@ func TestMemoryStacksGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.SetMemoryStackCounts(1, 3, 0)
+	m.SetMemoryStackCounts(1, 3, 0, 2)
 
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Provisioning")); got != 1 {
 		t.Fatalf("Provisioning stacks = %v, want 1", got)
@@ -156,6 +156,9 @@ func TestMemoryStacksGauge(t *testing.T) {
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Failed")); got != 0 {
 		t.Fatalf("Failed stacks = %v, want 0", got)
 	}
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Degraded")); got != 2 {
+		t.Fatalf("Degraded stacks = %v, want 2", got)
+	}
 }
 
 func TestMemoryStacksGauge_ZeroesStalePhase(t *testing.T) {
@@ -163,8 +166,8 @@ func TestMemoryStacksGauge_ZeroesStalePhase(t *testing.T) {
 	m := NewOperatorMetrics(reg)
 
 	// Set Ready=2, then transition: Ready=0, Provisioning=1.
-	m.SetMemoryStackCounts(0, 2, 0)
-	m.SetMemoryStackCounts(1, 0, 0)
+	m.SetMemoryStackCounts(0, 2, 0, 0)
+	m.SetMemoryStackCounts(1, 0, 0, 0)
 
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Ready")); got != 0 {
 		t.Fatalf("Ready stacks after transition = %v, want 0", got)

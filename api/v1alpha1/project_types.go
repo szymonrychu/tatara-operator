@@ -49,6 +49,15 @@ type MemoryStatus struct {
 	// leaves Ready. Controllers use it to debounce herd-release on return-to-healthy.
 	// +optional
 	ReadySince *metav1.Time `json:"readySince,omitempty"`
+	// ProvisioningSince records when the memory stack last transitioned INTO a
+	// non-Ready phase (Provisioning or Degraded). Set on the Ready/Failed/""->
+	// Provisioning edge, preserved across a Provisioning<->Degraded episode, and
+	// cleared whenever the stack reaches Ready. reconcileMemory compares it
+	// against MemoryConfig.ProvisioningTimeout to bound how long a stuck backend
+	// may sit Provisioning before reporting Degraded (issue #355 - a wedged
+	// stack sat Provisioning for 7h+ with no bounded failure signal).
+	// +optional
+	ProvisioningSince *metav1.Time `json:"provisioningSince,omitempty"`
 }
 
 // GrafanaSpec configures the optional per-project Grafana incident-response

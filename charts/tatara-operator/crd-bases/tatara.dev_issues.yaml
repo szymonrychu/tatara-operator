@@ -280,6 +280,15 @@ spec:
                   timestamp field).
                 format: date-time
                 type: string
+              lastMemoryGateCommentAt:
+                description: |-
+                  LastMemoryGateCommentAt is when the first turn-submit memory-gate hold
+                  operator comment was enqueued on this issue (issue #355). Its PRESENCE (not
+                  the value) suppresses a second comment on later holds, same one-shot
+                  cooldown shape as LastDeployTimeoutCommentAt and DISTINCT from it: a Task
+                  can hold on the memory gate independently of any deploy-timeout episode.
+                format: date-time
+                type: string
               lastRefireCommentAt:
                 description: |-
                   LastRefireCommentAt is when the last coalesced refire comment was enqueued.
