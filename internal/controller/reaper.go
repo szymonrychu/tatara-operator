@@ -911,6 +911,18 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 		!apierrors.IsNotFound(err) {
 		return fmt.Errorf("reap: delete task %s: %w", t.Name, err)
 	}
+	// operator_task_tokens_total/operator_task_turns_total are per-issue
+	// labeled counters (bounded cardinality assumes live + recently-live
+	// issues only); a Task's GC is the one point that knows it is safe to
+	// drop them. DeleteTaskSeries existed but had zero production callers
+	// before this (metric-wiring audit, issue #370) - an unbounded leak on
+	// every Task GC. DeleteTaskSeries itself no-ops when issue=="" (a
+	// project-scoped task shares that label with every other project-scoped
+	// task and must not have its series cleared by one task's GC).
+	if r.Metrics != nil {
+		project, repo, kind, issue, _ := taskTokenLabels(t)
+		r.Metrics.DeleteTaskSeries(project, repo, kind, issue)
+	}
 	log.FromContext(ctx).Info("reaped a terminal task",
 		"action", "reap_task", "resource_id", t.Name, "kind", t.Spec.Kind,
 		"stage", t.Status.Stage, "stage_reason", t.Status.StageReason)

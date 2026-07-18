@@ -1085,6 +1085,61 @@ func TestReapFailedReleasesIssuesImmediately(t *testing.T) {
 	}
 }
 
+// A Task deleted by the B.6 reaper leaves its per-issue
+// operator_task_tokens_total/operator_task_turns_total series behind forever
+// unless the reaper clears them at the same point it deletes the Task CR -
+// DeleteTaskSeries existed but had zero production callers (metric-wiring
+// audit, issue #370).
+func TestReapRejectedDeletesTaskAndClearsTokenSeries(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("tokgc")
+	repo := reapRepo("tokgc", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	// Entered `rejected` well past RejectedRetention (24h): eligible for delete.
+	task := reapTask("tokgc", "rej-task", "clarify",
+		tatarav1alpha1.StageRejected, stage.ReasonDeclined, time.Now().Add(-25*time.Hour))
+	task.Spec.RepositoryRef = repo.Name
+	task.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "tatara-operator#9"}
+	task.Status.ResolvedModel = "claude-opus-4-8"
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task)
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	r := &ProjectReconciler{
+		Client:  c,
+		Scheme:  c.Scheme(),
+		Metrics: metrics,
+		SCMFor:  func(string) (scm.SCMWriter, error) { return &reapWriter{}, nil },
+	}
+
+	metrics.AddTaskTokens("tokgc", repo.Name, "clarify", "tatara-operator#9", "claude-opus-4-8", 100, 50, 30, 10)
+	metrics.AddTaskTurn("tokgc", repo.Name, "clarify", "tatara-operator#9")
+
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	if _, ok := mustGetTask(t, c, "rej-task"); ok {
+		t.Fatal("a rejected task 25h old must be deleted (RejectedRetention is 24h)")
+	}
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_task_tokens_total" && mf.GetName() != "operator_task_turns_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "issue" && lp.GetValue() == "tatara-operator#9" {
+					t.Errorf("%s{issue=tatara-operator#9} must be cleared when the Task is reaped", mf.GetName())
+				}
+			}
+		}
+	}
+}
+
 // TestReapBacklogSweepNeverAgesOut: parked(backlog-sweep) is the durable mirror
 // anchor, not a stalled work item. It is NEVER reaped on age - only when EVERY
 // owned Issue is closed. Ageing it out would churn mint/reap forever. And it is
