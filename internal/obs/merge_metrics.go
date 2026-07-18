@@ -33,6 +33,14 @@ var MergeCursorStalledSeconds = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 //	skipped - the round marker was already on the forge; only the mirror was reconciled
 //	refused - a structural 4xx (scm.ErrReviewRefused) -> parked(review-post-refused)
 //	error   - a retryable failure; the reconciler re-runs
+//
+// Correctly wired (DrainPendingReview is called on every MergeRequest
+// reconcile, gated on the same PendingReview outcome.go sets on every
+// review submission as operator_review_outcome_total) and confirmed firing
+// across several prior pod generations via 7-day Prometheus history during
+// the metric-wiring audit (issue #370). Not on the tatara-observability
+// allowlist yet - see the companion observability PR. A flat 0 window means
+// no review has drained since the current pod became leader, not a bug.
 var ReviewPostTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_review_post_total",
 	Help: "Review posts driven by the MergeRequest reconciler, by result (contract C.5.3).",

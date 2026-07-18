@@ -72,6 +72,16 @@ type Config struct {
 	IncidentDedupVolatileLabels []string
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment (A4).
 	IncidentRefireCommentCooldown time.Duration
+	// IncidentCorrelationLabels is the alert common-label set forming the coarser
+	// incident GROUP key. Nil => defaultCorrelationLabels.
+	IncidentCorrelationLabels []string
+	// IncidentEscalateRefireThreshold re-admits a fresh incident once an open
+	// tracker suppressed this many refires. <=0 disables the refire trigger.
+	IncidentEscalateRefireThreshold int
+	// IncidentEscalateStaleAge re-admits a fresh incident once an open tracker has
+	// sat open this long, and is the minimum spacing between two escalations of
+	// one tracker. <=0 disables the age trigger.
+	IncidentEscalateStaleAge time.Duration
 	// Now, when set, overrides time.Now for the coalesced refire-comment cooldown
 	// (A4), so a test can drive the cooldown window deterministically. Nil (the
 	// production default) uses the real clock.
@@ -80,10 +90,11 @@ type Config struct {
 
 // Server serves the SCM webhook endpoint.
 type Server struct {
-	cfg           Config
-	log           *slog.Logger
-	dedupDenylist map[string]bool
-	now           func() time.Time
+	cfg               Config
+	log               *slog.Logger
+	dedupDenylist     map[string]bool
+	correlationLabels map[string]bool
+	now               func() time.Time
 }
 
 // NewServer constructs a webhook Server.
@@ -110,7 +121,8 @@ func NewServer(cfg Config) *Server {
 	if now == nil {
 		now = time.Now
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, dedupDenylist: denylistSet(cfg.IncidentDedupVolatileLabels), now: now}
+	return &Server{cfg: cfg, log: cfg.Logger, dedupDenylist: denylistSet(cfg.IncidentDedupVolatileLabels),
+		correlationLabels: correlationSet(cfg.IncidentCorrelationLabels), now: now}
 }
 
 // Mount registers the webhook route onto an existing chi router. Use this
@@ -876,6 +888,7 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 			return false, nil
 		}
 	}
+	groupKey := incidentGroupKey(alert, proj.Name, s.correlationLabels)
 	var goal string
 	if tierRevert {
 		goal = incident.GoalTierRevert(proj.Name, alert.CommonLabels["kind"], alert.CommonLabels["model"])
@@ -888,6 +901,7 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 		GenerateName: "incident-",
 		AlertRule:    alertRuleName(alert),
 		DedupKey:     dedupKey,
+		GroupKey:     groupKey,
 		Labels:       map[string]string{tatarav1.LabelActivity: "incident"},
 		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
 	}
@@ -902,7 +916,12 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 	reason := "live_task"
 	if iss, ok, ferr := queue.FindOpenIncidentIssue(ctx, s.cfg.Client, s.cfg.Namespace, proj.Name, dedupKey); ferr == nil && ok {
 		reason = "open_issue"
-		s.enqueueRefireComment(ctx, proj, iss, alert)
+		refireCount := s.enqueueRefireComment(ctx, proj, iss, alert)
+		// Liveness escape: a tracker that has absorbed too many refires or sat
+		// open too long is RE-ADMITTED as a fresh investigation rather than
+		// suppressed forever, which also catches a root cause that changed under
+		// one alert id. Best-effort; a failure only forgoes one re-investigation.
+		s.maybeEscalateIncident(ctx, proj, iss, alert, dedupKey, groupKey, alertCtx, slugs, refireCount)
 	}
 	s.cfg.Metrics.IncidentDedupSuppressed(reason)
 	s.log.InfoContext(ctx, "incident dedup suppressed",
@@ -915,15 +934,18 @@ func (s *Server) createIncidentTask(ctx context.Context, proj *tatarav1.Project,
 // it ALWAYS increments RefireCount, and enqueues ONE PendingComment (setting
 // LastRefireCommentAt) only when the cooldown has elapsed. No agent is
 // spawned (A4) - this is an operator comment through the existing
-// Issue.status.PendingComments drain.
-func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Project, iss *tatarav1.Issue, alert GrafanaAlert) {
+// Issue.status.PendingComments drain. Returns the post-increment RefireCount
+// (0 on a fit error) so the caller can decide escalation without a re-read.
+func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Project, iss *tatarav1.Issue, alert GrafanaAlert) int {
 	now := s.now()
 	cooldown := s.cfg.IncidentRefireCommentCooldown
 	posted := false
+	refireCount := 0
 	key := types.NamespacedName{Namespace: iss.Namespace, Name: iss.Name}
 	spiller := s.cfg.SpillerFor(proj)
 	err := objbudget.FitIssue(ctx, s.cfg.Client, spiller, key, func(i *tatarav1.Issue) {
 		i.Status.RefireCount++
+		refireCount = i.Status.RefireCount
 		if i.Status.LastRefireCommentAt != nil && now.Sub(i.Status.LastRefireCommentAt.Time) < cooldown {
 			return // coalesced: within cooldown, counter already bumped
 		}
@@ -942,7 +964,7 @@ func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Projec
 	if err != nil {
 		s.log.ErrorContext(ctx, "incident refire comment enqueue failed",
 			"action", "incident_refire_comment", "issue", iss.Name, "error", err)
-		return
+		return 0
 	}
 	result := "coalesced"
 	if posted {
@@ -952,6 +974,96 @@ func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Projec
 	s.log.InfoContext(ctx, "incident refire comment",
 		"action", "incident_refire_comment", "project", proj.Name,
 		"issue", iss.Name, "rule_key", iss.Labels[queue.LabelAlertRuleKey], "result", result)
+	return refireCount
+}
+
+// escalationDue reports whether a suppressed refire should re-admit a fresh
+// investigation: EITHER the refire count crossed the threshold OR the tracker
+// has been open past the stale age, AND it has not already escalated within the
+// current stale-age window (so a refire storm escalates at most once per window).
+func (s *Server) escalationDue(iss *tatarav1.Issue, refireCount int, now time.Time) bool {
+	staleAge := s.cfg.IncidentEscalateStaleAge
+	threshold := s.cfg.IncidentEscalateRefireThreshold
+	byRefire := threshold > 0 && refireCount >= threshold
+	byAge := staleAge > 0 && now.Sub(iss.CreationTimestamp.Time) >= staleAge
+	if !byRefire && !byAge {
+		return false
+	}
+	// Re-escalation gate: at most one escalation per stale-age window. If the age
+	// trigger is disabled (staleAge<=0), RefireCount never resets, so gating on a
+	// zero window would re-escalate on EVERY refire past the threshold (a storm) -
+	// bound it to one escalation per tracker lifetime instead.
+	if iss.Status.EscalatedAt != nil {
+		if staleAge <= 0 || now.Sub(iss.Status.EscalatedAt.Time) < staleAge {
+			return false
+		}
+	}
+	return true
+}
+
+// maybeEscalateIncident re-admits a fresh incident investigation for a
+// persistent/stale open tracker. It stamps EscalatedAt (gating re-escalation)
+// then mints an incident Task that BYPASSES the open-tracker suppression (the
+// tracker is what it is re-investigating) while still deduping on a live
+// QueuedEvent/Task, so a refire storm cannot spawn two escalations. Best-effort.
+func (s *Server) maybeEscalateIncident(ctx context.Context, proj *tatarav1.Project, iss *tatarav1.Issue,
+	alert GrafanaAlert, dedupKey, groupKey, alertCtx string, slugs []string, refireCount int) {
+	now := s.now()
+	if !s.escalationDue(iss, refireCount, now) {
+		return
+	}
+	staleAge := s.cfg.IncidentEscalateStaleAge
+	key := types.NamespacedName{Namespace: iss.Namespace, Name: iss.Name}
+	stamped := false
+	err := objbudget.FitIssue(ctx, s.cfg.Client, s.cfg.SpillerFor(proj), key, func(i *tatarav1.Issue) {
+		// Reset per attempt: FitIssue re-runs this closure on a write conflict, so
+		// a stamp from a losing earlier attempt must not survive into a later one
+		// that finds the window already closed by the concurrent winner.
+		stamped = false
+		// Re-check the window on the fresh object so two concurrent refires do not
+		// both stamp-and-mint (the deterministic QE name also single-flights the
+		// mint, but this keeps EscalatedAt honest).
+		if i.Status.EscalatedAt != nil && (staleAge <= 0 || now.Sub(i.Status.EscalatedAt.Time) < staleAge) {
+			return
+		}
+		t := metav1.NewTime(now)
+		i.Status.EscalatedAt = &t
+		stamped = true
+	})
+	if err != nil {
+		s.log.ErrorContext(ctx, "incident escalation stamp failed",
+			"action", "incident_escalated", "issue", iss.Name, "error", err)
+		return
+	}
+	if !stamped {
+		return // a concurrent refire won the window
+	}
+	trackerRef := fmt.Sprintf("%s#%d", iss.Spec.RepositoryRef, iss.Spec.Number)
+	goal := incident.GoalEscalation(alertCtx, slugs, trackerRef, refireCount)
+	payload := tatarav1.QueuedEventPayload{
+		Kind:         "incident",
+		Goal:         goal,
+		GenerateName: "incident-",
+		AlertRule:    alertRuleName(alert),
+		DedupKey:     dedupKey,
+		GroupKey:     groupKey,
+		Labels:       map[string]string{tatarav1.LabelActivity: "incident"},
+		Annotations:  map[string]string{tatarav1.AnnGrafanaAlert: alertCtx},
+	}
+	_, created, err := queue.EnqueueEvent(ctx, s.cfg.Client, s.cfg.Seq, proj, tatarav1.QueueClassAlert, false, dedupKey, payload, queue.WithIgnoreOpenIssueDedup())
+	result := "minted"
+	switch {
+	case err != nil:
+		result = "error"
+		s.log.ErrorContext(ctx, "incident escalation mint failed",
+			"action", "incident_escalated", "issue", iss.Name, "error", err)
+	case !created:
+		result = "in_flight" // a prior escalation Task is still live
+	}
+	s.cfg.Metrics.IncidentEscalated(result)
+	s.log.InfoContext(ctx, "incident escalated",
+		"action", "incident_escalated", "project", proj.Name, "issue", iss.Name,
+		"rule_key", dedupKey, "refire_count", refireCount, "tracker", trackerRef, "result", result)
 }
 
 // stableLabelSummary renders the alert's stable (non-volatile) common labels

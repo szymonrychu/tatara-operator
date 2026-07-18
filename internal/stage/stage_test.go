@@ -1543,6 +1543,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// issue-closed: WS3-I3 rejected(issue-closed), the human-closed-the-driving
 		// -issue stop edge from the nine live stages.
 		"issue-closed",
+		// tracked-elsewhere: investigating->rejected on submit_outcome(comment_issue),
+		// the incident agent appended evidence to an existing tracker rather than
+		// filing a new issue.
+		"tracked-elsewhere",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {

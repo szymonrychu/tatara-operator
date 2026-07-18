@@ -193,6 +193,21 @@ type Config struct {
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment on an
 	// open incident tracker. From INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES.
 	IncidentRefireCommentCooldown time.Duration
+	// IncidentCorrelationLabels is the alert common-label set whose values form
+	// the coarser incident GROUP key (project + these labels). Different alert
+	// rules that share these label values are correlated: file_issue auto-links
+	// the new tracker under the oldest open sibling. Empty (nil) means use the
+	// operator default. From INCIDENT_CORRELATION_LABELS (CSV).
+	IncidentCorrelationLabels []string
+	// IncidentEscalateRefireThreshold re-admits a fresh incident investigation
+	// once an open tracker has suppressed this many refires. From
+	// INCIDENT_ESCALATE_REFIRE_THRESHOLD.
+	IncidentEscalateRefireThreshold int
+	// IncidentEscalateStaleAge re-admits a fresh incident investigation once an
+	// open tracker has sat open this long, and also gates re-escalation (at most
+	// one escalation per window). From INCIDENT_ESCALATE_STALE_AGE (a Go duration
+	// string, e.g. "48h").
+	IncidentEscalateStaleAge time.Duration
 }
 
 // BudgetDefaults returns the operator-wide token-budget configuration as a
@@ -245,6 +260,23 @@ const MinMemoryProvisioningTimeout = 5 * time.Minute
 // refire comments on one open incident tracker (A4). The recurrence counter
 // still increments on every suppressed refire; only the COMMENT is rate-limited.
 const DefaultIncidentRefireCooldown = 30 * time.Minute
+
+// DefaultIncidentCorrelationLabels is the coarse alert-label set whose values
+// form the incident GROUP key. namespace+cluster is the conservative infra
+// default: co-firing rules for one CNPG/namespace failure share these values and
+// correlate into one linked tracker tree, while unrelated namespaces stay
+// distinct. Correlation is LINK-ONLY (never suppresses), so an over-broad group
+// costs at most a spurious sub-issue link, not a lost investigation.
+var DefaultIncidentCorrelationLabels = []string{"namespace", "cluster"}
+
+// DefaultIncidentEscalateRefires is how many suppressed refires an open tracker
+// absorbs before the operator re-admits a fresh investigation (liveness escape).
+const DefaultIncidentEscalateRefires = 10
+
+// DefaultIncidentEscalateStaleAge is how long an open tracker may sit before the
+// operator re-admits a fresh investigation, and the minimum spacing between two
+// escalations of one tracker.
+const DefaultIncidentEscalateStaleAge = 48 * time.Hour
 
 func getDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -456,6 +488,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	incidentEscalateRefires, err := getIntDefault("INCIDENT_ESCALATE_REFIRE_THRESHOLD", DefaultIncidentEscalateRefires)
+	if err != nil {
+		return Config{}, err
+	}
+	incidentEscalateStaleAge, err := getDurationDefault("INCIDENT_ESCALATE_STALE_AGE", DefaultIncidentEscalateStaleAge)
+	if err != nil {
+		return Config{}, err
+	}
+	incidentCorrelationLabels := getCSVList("INCIDENT_CORRELATION_LABELS")
+	if len(incidentCorrelationLabels) == 0 {
+		incidentCorrelationLabels = DefaultIncidentCorrelationLabels
+	}
 	cfg := Config{
 		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
@@ -523,8 +567,11 @@ func Load() (Config, error) {
 		UsageTokenURL:      getDefault("USAGE_TOKEN_URL", "https://platform.claude.com/v1/oauth/token"),
 		UsageRefreshMargin: usageRefreshMargin,
 
-		IncidentDedupVolatileLabels:   getCSVList("INCIDENT_DEDUP_VOLATILE_LABELS"),
-		IncidentRefireCommentCooldown: incidentRefireCooldown,
+		IncidentDedupVolatileLabels:     getCSVList("INCIDENT_DEDUP_VOLATILE_LABELS"),
+		IncidentRefireCommentCooldown:   incidentRefireCooldown,
+		IncidentCorrelationLabels:       incidentCorrelationLabels,
+		IncidentEscalateRefireThreshold: incidentEscalateRefires,
+		IncidentEscalateStaleAge:        incidentEscalateStaleAge,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")
