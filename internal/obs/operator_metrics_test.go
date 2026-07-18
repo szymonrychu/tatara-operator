@@ -655,6 +655,29 @@ func TestSetAccountUsageGauge(t *testing.T) {
 	}
 }
 
+// Issue #339: tatara_account_usage_poller_enabled must reflect USAGE_ENABLED
+// independently of poll_health, so the "disabled" and "unhealthy" states are
+// distinguishable at the metric level (the alert guards on this gauge).
+func TestSetAccountUsagePollerEnabled(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetAccountUsagePollerEnabled(false)
+	if v := testutil.ToFloat64(m.accountUsagePollerEnabled); v != 0 {
+		t.Fatalf("poller_enabled=%v, want 0", v)
+	}
+	// poll_health defaults to 0 (never polled) while disabled - the two gauges
+	// must stay independent so a disabled poller doesn't read as "healthy".
+	if v := testutil.ToFloat64(m.accountUsagePollHealth); v != 0 {
+		t.Fatalf("poll_health=%v, want 0 (unset)", v)
+	}
+
+	m.SetAccountUsagePollerEnabled(true)
+	if v := testutil.ToFloat64(m.accountUsagePollerEnabled); v != 1 {
+		t.Fatalf("poller_enabled=%v, want 1", v)
+	}
+}
+
 func TestSetAccountUsageResetAndOverage(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
