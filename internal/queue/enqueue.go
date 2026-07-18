@@ -26,6 +26,13 @@ const (
 	// LabelDedupKey; distinct KEY because it lives on Issues, not QE/Task.
 	LabelAlertRuleKey = "tatara.dev/alert-rule-key"
 
+	// LabelAlertGroupKey stamps the coarser incident GROUP-key (16-hex
+	// incidentGroupKey) on an Issue CR so file_issue can find the oldest open
+	// SIBLING tracker sharing a root cause (different rule, same group) and
+	// auto-link the new tracker under it. Correlation is link-only; it never
+	// suppresses.
+	LabelAlertGroupKey = "tatara.dev/alert-group-key"
+
 	// DedupKeyIndex is the field index key for QueuedEvent.Spec.DedupKey
 	// (contract B.7 addendum 7: "queuedEventDedupKey" on QueuedEvent ->
 	// spec.dedupKey). It is the AUTHORITATIVE in-flight QueuedEvent dedup
@@ -133,7 +140,13 @@ func isLabelSafe(key string) bool {
 // with dedupKey already exists for the project. In practice no QE ever reaches
 // state Done (reconcileDone GC-deletes them on Task completion), so the != Done
 // guard is defensive; do not remove it as callers may set Done in tests.
-func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey string) (bool, error) {
+//
+// checkOpenIssue folds an open tracker Issue carrying the rule-key into the
+// suppression authority (A2). The escalation path passes false: a liveness
+// re-admission MUST proceed PAST the open tracker (that tracker is the whole
+// reason it is escalating), while still deduping on a live QueuedEvent/Task so a
+// re-fire storm cannot mint a second escalation Task in flight.
+func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey string, checkOpenIssue bool) (bool, error) {
 	if dedupKey == "" {
 		return false, nil
 	}
@@ -155,6 +168,9 @@ func dedupExists(ctx context.Context, c client.Client, ns, projectRef, dedupKey 
 		if tl.Items[i].Spec.ProjectRef == projectRef && !tatarav1alpha1.TaskDone(&tl.Items[i]) {
 			return true, nil
 		}
+	}
+	if !checkOpenIssue {
+		return false, nil
 	}
 	if _, ok, err := FindOpenIncidentIssue(ctx, c, ns, projectRef, dedupKey); err != nil {
 		return false, err
@@ -185,6 +201,41 @@ func FindOpenIncidentIssue(ctx context.Context, c client.Client, ns, projectRef,
 	return nil, false, nil
 }
 
+// FindOldestOpenGroupSibling returns the OLDEST open incident Issue CR that
+// shares groupKey with a firing alert but carries a DIFFERENT rule-key than
+// excludeRuleKey - i.e. the canonical tracker of a co-firing sibling alert for
+// the same root cause. file_issue links a new tracker under it (auto-parent)
+// when the agent did not name a parent itself. "Oldest" (by CreationTimestamp)
+// is deterministic so a storm of co-firing rules converges on one root tracker.
+// Returns (nil,false,nil) when groupKey is empty or no sibling exists.
+func FindOldestOpenGroupSibling(ctx context.Context, c client.Client, ns, projectRef, groupKey, excludeRuleKey string) (*tatarav1alpha1.Issue, bool, error) {
+	if groupKey == "" {
+		return nil, false, nil
+	}
+	var il tatarav1alpha1.IssueList
+	if err := c.List(ctx, &il, client.InNamespace(ns), client.MatchingLabels{LabelAlertGroupKey: dedupLabel(groupKey)}); err != nil {
+		return nil, false, err
+	}
+	var oldest *tatarav1alpha1.Issue
+	excl := dedupLabel(excludeRuleKey)
+	for i := range il.Items {
+		iss := &il.Items[i]
+		if iss.Spec.ProjectRef != projectRef || iss.Status.State == "closed" {
+			continue
+		}
+		if excl != "" && iss.Labels[LabelAlertRuleKey] == excl {
+			continue
+		}
+		if oldest == nil || iss.CreationTimestamp.Before(&oldest.CreationTimestamp) {
+			oldest = iss
+		}
+	}
+	if oldest == nil {
+		return nil, false, nil
+	}
+	return oldest, true, nil
+}
+
 // QueuedEventName is the DETERMINISTIC name a QueuedEvent for (projectRef,
 // dedupKey) carries, so a concurrent second EnqueueEvent for the same natural
 // key collides on AlreadyExists at the apiserver rather than creating a second
@@ -195,14 +246,34 @@ func QueuedEventName(projectRef, dedupKey string) string {
 	return "qe-" + hex.EncodeToString(sum[:])[:16]
 }
 
+// EnqueueOption tunes EnqueueEvent. The zero set is the normal producer path.
+type EnqueueOption func(*enqueueOpts)
+
+type enqueueOpts struct {
+	ignoreOpenIssueDedup bool
+}
+
+// WithIgnoreOpenIssueDedup makes EnqueueEvent proceed PAST an open tracker Issue
+// carrying the same rule-key (it still dedups on a live QueuedEvent/Task). Only
+// the incident liveness-escalation path uses it: the open tracker is exactly
+// what it is escalating, so folding it into suppression would make escalation
+// impossible.
+func WithIgnoreOpenIssueDedup() EnqueueOption {
+	return func(o *enqueueOpts) { o.ignoreOpenIssueDedup = true }
+}
+
 // EnqueueEvent writes a QueuedEvent (seq-assigned, owned by Project, state=Queued).
 // Returns created=false when dedupKey already has live work. The per-project seq
 // is allocated durably (per-project ConfigMap CAS) AFTER the dedup check so a
 // deduped event never burns a sequence number.
 func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *tatarav1alpha1.Project,
-	class string, autonomous bool, dedupKey string, payload tatarav1alpha1.QueuedEventPayload) (*tatarav1alpha1.QueuedEvent, bool, error) {
+	class string, autonomous bool, dedupKey string, payload tatarav1alpha1.QueuedEventPayload, opts ...EnqueueOption) (*tatarav1alpha1.QueuedEvent, bool, error) {
 
-	dup, err := dedupExists(ctx, c, proj.Namespace, proj.Name, dedupKey)
+	var o enqueueOpts
+	for _, opt := range opts {
+		opt(&o)
+	}
+	dup, err := dedupExists(ctx, c, proj.Namespace, proj.Name, dedupKey, !o.ignoreOpenIssueDedup)
 	if err != nil {
 		return nil, false, err
 	}
@@ -292,6 +363,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 		Goal:          p.Goal,
 		Kind:          p.Kind,
 		DedupKey:      p.DedupKey,
+		GroupKey:      p.GroupKey,
 		Source:        p.Source,
 	}
 	if p.AlertRule != "" {

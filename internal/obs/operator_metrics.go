@@ -82,6 +82,9 @@ type OperatorMetrics struct {
 	incidentDedupSuppressedTotal *prometheus.CounterVec
 	incidentRefireCommentTotal   *prometheus.CounterVec
 	incidentSublinkTotal         *prometheus.CounterVec
+	incidentGroupLinkedTotal     *prometheus.CounterVec
+	incidentEscalatedTotal       *prometheus.CounterVec
+	incidentTrackerCommentTotal  *prometheus.CounterVec
 }
 
 // NewOperatorMetrics registers the operator collectors on reg and returns the
@@ -378,6 +381,18 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_incident_sublink_total",
 			Help: "Incident sub-issue link attempts, by result (linked|fallback_comment|failed).",
 		}, []string{"result"}),
+		incidentGroupLinkedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_incident_group_linked_total",
+			Help: "Incident file_issue outcomes auto-linked under an open group sibling tracker (correlation), by result (linked|no_sibling).",
+		}, []string{"result"}),
+		incidentEscalatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_incident_escalated_total",
+			Help: "Persistent/stale incident trackers re-admitted as a fresh investigation, by result (minted|in_flight|error).",
+		}, []string{"result"}),
+		incidentTrackerCommentTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_incident_tracker_comment_total",
+			Help: "Incident agent comment_issue outcomes appended to an existing tracker, by result (posted|failed).",
+		}, []string{"result"}),
 	}
 	reg.MustRegister(
 		m.reconcileTotal,
@@ -430,6 +445,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.incidentDedupSuppressedTotal,
 		m.incidentRefireCommentTotal,
 		m.incidentSublinkTotal,
+		m.incidentGroupLinkedTotal,
+		m.incidentEscalatedTotal,
+		m.incidentTrackerCommentTotal,
 	)
 	// Pre-initialise label combinations so the counter vecs appear in Gather
 	// even before any reconcile or webhook event completes.
@@ -604,6 +622,42 @@ func (m *OperatorMetrics) IncidentSublinkCounter(result string) prometheus.Count
 // comment) or "coalesced" (within cooldown, counter bumped only).
 func (m *OperatorMetrics) IncidentRefireComment(result string) {
 	m.incidentRefireCommentTotal.WithLabelValues(result).Inc()
+}
+
+// IncidentGroupLinked records a file_issue correlation outcome: "linked" (the
+// new tracker was auto-parented under an open group sibling) or "no_sibling".
+func (m *OperatorMetrics) IncidentGroupLinked(result string) {
+	if m == nil {
+		return
+	}
+	m.incidentGroupLinkedTotal.WithLabelValues(result).Inc()
+}
+
+// IncidentEscalated records a liveness-escalation result: "minted", "in_flight"
+// (a prior escalation Task is still live) or "error".
+func (m *OperatorMetrics) IncidentEscalated(result string) {
+	if m == nil {
+		return
+	}
+	m.incidentEscalatedTotal.WithLabelValues(result).Inc()
+}
+
+// IncidentTrackerComment records a comment_issue outcome: "posted" or "failed".
+func (m *OperatorMetrics) IncidentTrackerComment(result string) {
+	if m == nil {
+		return
+	}
+	m.incidentTrackerCommentTotal.WithLabelValues(result).Inc()
+}
+
+// IncidentGroupLinkedCounter returns the counter for result for test assertions.
+func (m *OperatorMetrics) IncidentGroupLinkedCounter(result string) prometheus.Counter {
+	return m.incidentGroupLinkedTotal.WithLabelValues(result)
+}
+
+// IncidentTrackerCommentCounter returns the counter for result for test assertions.
+func (m *OperatorMetrics) IncidentTrackerCommentCounter(result string) prometheus.Counter {
+	return m.incidentTrackerCommentTotal.WithLabelValues(result)
 }
 
 // AutoApproveTotal increments operator_auto_approve_total for a proposal kind

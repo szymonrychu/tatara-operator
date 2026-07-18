@@ -128,6 +128,41 @@ func TestLoad_MemoryMonitoringDefaults(t *testing.T) {
 	}
 }
 
+func TestLoad_IncidentCorrelationAndEscalationDefaults(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.IncidentCorrelationLabels; len(got) != 2 || got[0] != "namespace" || got[1] != "cluster" {
+		t.Fatalf("IncidentCorrelationLabels default = %v, want [namespace cluster]", got)
+	}
+	if cfg.IncidentEscalateRefireThreshold != config.DefaultIncidentEscalateRefires {
+		t.Fatalf("IncidentEscalateRefireThreshold = %d, want %d",
+			cfg.IncidentEscalateRefireThreshold, config.DefaultIncidentEscalateRefires)
+	}
+	if cfg.IncidentEscalateStaleAge != config.DefaultIncidentEscalateStaleAge {
+		t.Fatalf("IncidentEscalateStaleAge = %v, want %v",
+			cfg.IncidentEscalateStaleAge, config.DefaultIncidentEscalateStaleAge)
+	}
+}
+
+func TestLoad_IncidentCorrelationLabelsOverride(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("INCIDENT_CORRELATION_LABELS", "namespace,service,team")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.IncidentCorrelationLabels; len(got) != 3 || got[1] != "service" {
+		t.Fatalf("IncidentCorrelationLabels override = %v, want [namespace service team]", got)
+	}
+}
+
 // TestLoad_IdlePodReapAfter covers the issue #237 idle-backstop knob: the
 // default, an explicit override, the min-floor clamp for a short positive value,
 // and disabling via zero.

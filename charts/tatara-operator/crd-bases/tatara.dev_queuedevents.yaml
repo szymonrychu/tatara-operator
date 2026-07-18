@@ -102,6 +102,11 @@ spec:
                     type: string
                   goal:
                     type: string
+                  groupKey:
+                    description: |-
+                      GroupKey is carried from the incident webhook onto the built Task's
+                      Spec.GroupKey (the coarser incident correlation identity).
+                    type: string
                   kind:
                     type: string
                   labels:

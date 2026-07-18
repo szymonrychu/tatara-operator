@@ -121,3 +121,43 @@ func incidentDedupKey(a GrafanaAlert, project string, denylist map[string]bool) 
 	h := sha256.Sum256([]byte(project + "\x00" + name + "\x00" + sortedKV(stable)))
 	return hex.EncodeToString(h[:])[:16]
 }
+
+// defaultCorrelationLabels is the fallback alert common-label set whose values
+// form the coarser incident GROUP key. See config.DefaultIncidentCorrelationLabels.
+var defaultCorrelationLabels = []string{"namespace", "cluster"}
+
+// correlationSet builds the correlation-label lookup set. An empty labels slice
+// falls back to defaultCorrelationLabels (a configured empty list means "use
+// default").
+func correlationSet(labels []string) map[string]bool {
+	if len(labels) == 0 {
+		labels = defaultCorrelationLabels
+	}
+	set := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		set[l] = true
+	}
+	return set
+}
+
+// incidentGroupKey is the CORRELATION identity of a firing alert: the project
+// plus ONLY the alert's common labels named in the correlation set (e.g.
+// namespace, cluster). It deliberately excludes the alertname, so DIFFERENT
+// rules that fire for one shared workload/root cause hash to the SAME group key
+// while keeping DISTINCT incidentDedupKeys. It returns "" when NONE of the
+// correlation labels is present on the alert - an all-empty group would bucket
+// every unlabelled alert together, so no correlation is safer than a false one.
+// 16 hex chars of sha256.
+func incidentGroupKey(a GrafanaAlert, project string, correlation map[string]bool) string {
+	group := make(map[string]string, len(correlation))
+	for k, v := range a.CommonLabels {
+		if correlation[k] {
+			group[k] = v
+		}
+	}
+	if len(group) == 0 {
+		return ""
+	}
+	h := sha256.Sum256([]byte(project + "\x00" + "group" + "\x00" + sortedKV(group)))
+	return hex.EncodeToString(h[:])[:16]
+}
