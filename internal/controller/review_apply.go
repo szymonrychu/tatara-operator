@@ -134,6 +134,13 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, reader client.Rea
 	// authoritative; the bot review is moot. reviewing is always a pod stage
 	// (AgentReview), so there is always a pod to tear down, and this write races
 	// the driver's own reconcile loop outside EnterStage.
+	//
+	// Accepted degradation bound: if the pod delete succeeds but the subsequent
+	// clear/enter fails and the forge exhausts redelivery, recovery is bounded and
+	// self-healing. On any redelivery both appliers are idempotent (the clear and
+	// the reviewing -> merging edge re-apply cleanly), so a later delivery finishes
+	// the transition; absent redelivery, the deleted review pod is recreated by the
+	// reconciler and its fresh verdict simply overrides - the Task never strands.
 	if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
 		return false, fmt.Errorf("review: delete wrapper pod for %s: %w", task.Name, err)
 	}

@@ -747,8 +747,12 @@ func reenterParkedOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxTur
 	switch t.Status.StageReason {
 	case ReasonMergeTimeout:
 		if t.Status.MergeReentries >= v1alpha1.MaxMergeReentries {
-			// Budget spent. Fold rather than Unpark's failed(merge-blocked): a
-			// human changes_requested should not TERMINATE the Task; it ages out.
+			// Budget spent. Fold rather than replicate Unpark's failed(merge-blocked)
+			// HERE: this only keeps the REVIEW path from terminating the Task. The Task
+			// is NOT immortal - the periodic driveUnparks -> Unpark still drives
+			// parked(merge-timeout)-at-cap to failed(merge-blocked) on its own cadence,
+			// independent of any human review. Duplicating that terminal on the review
+			// path would just race it.
 			return false
 		}
 		t.Status.MergeReentries++

@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/stretchr/testify/require"
 
@@ -14,6 +16,54 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
+
+// opRecorder wraps a client.Client and records the ORDER of the operations the
+// review appliers care about: the wrapper-pod Delete and the MergeRequest
+// PendingReview-clear (a MergeRequest status Update whose PendingReview is nil).
+// It backs the F5 pod-delete-before-clear ordering assertion.
+type opRecorder struct {
+	client.Client
+	ops *[]string
+}
+
+func (r opRecorder) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*tatarav1alpha1.Task); ok {
+		*r.ops = append(*r.ops, "get-task")
+	}
+	return r.Client.Get(ctx, key, obj, opts...)
+}
+
+func (r opRecorder) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	if _, ok := obj.(*corev1.Pod); ok {
+		*r.ops = append(*r.ops, "delete-pod")
+	}
+	return r.Client.Delete(ctx, obj, opts...)
+}
+
+func (r opRecorder) Status() client.SubResourceWriter {
+	return opRecorderStatus{r.Client.Status(), r.ops}
+}
+
+type opRecorderStatus struct {
+	client.SubResourceWriter
+	ops *[]string
+}
+
+func (r opRecorderStatus) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	if mr, ok := obj.(*tatarav1alpha1.MergeRequest); ok && mr.Status.PendingReview == nil {
+		*r.ops = append(*r.ops, "clear-pendingreview")
+	}
+	return r.SubResourceWriter.Update(ctx, obj, opts...)
+}
+
+func opIndex(ops []string, want string) int {
+	for i, o := range ops {
+		if o == want {
+			return i
+		}
+	}
+	return -1
+}
 
 // reviewingTask builds a Task already in reviewing, owned by "p", for the
 // review-applier tests.
@@ -154,4 +204,79 @@ func TestApplyReviewApproval_ReviewKind_NoMerge(t *testing.T) {
 	advanced, err := ApplyReviewApproval(context.Background(), c, c, nil, proj, task, "sha", time.Now())
 	require.NoError(t, err)
 	require.False(t, advanced)
+}
+
+// F2 regression guard: with DISTINCT cached and live stores - the cached client
+// still showing the MR unmerged, the live reader showing it merged - the applier
+// must fold on the live view and NOT rewind. A same-store test would pass even if
+// the in-loop reload/merged-recheck were deleted; distinct stores catch that.
+func TestApplyReviewChangesRequested_MergedInLiveReaderOnly_Folds(t *testing.T) {
+	proj := sweepProject("p")
+
+	// Cached store: MR still open, so a cached read would wrongly re-enter.
+	cachedTask := reviewingTask("t-f2", "clarify")
+	cachedMR := ownedMR("mr-tatara-operator-42", "t-f2", "tatara-operator", 42)
+	cached := newMirrorClient(t, proj, cachedTask, cachedMR)
+
+	// Live store: same Task+MR name, but the MR has MERGED.
+	liveTask := reviewingTask("t-f2", "clarify")
+	liveMR := ownedMR("mr-tatara-operator-42", "t-f2", "tatara-operator", 42)
+	liveMR.Status.State = "merged"
+	live := newMirrorClient(t, proj, liveTask, liveMR)
+
+	reentered, err := ApplyReviewChangesRequested(context.Background(), cached, live, proj, cachedTask, time.Now())
+	require.NoError(t, err)
+	require.False(t, reentered, "the live reader shows the MR merged; must fold, not rewind")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, cached.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-f2"}, &got))
+	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "no rewind on the cached store either")
+}
+
+// F5 ordering: the review pod is deleted AFTER the live reviewing-confirm read and
+// BEFORE PendingReview is cleared, closing the /outcome re-arm window.
+func TestApplyReviewApproval_DeletesPodBeforeClearingPendingReview(t *testing.T) {
+	proj := sweepProject("p")
+	task := reviewingTask("t-f5a", "clarify")
+	mr := ownedMR("mr-tatara-operator-42", "t-f5a", "tatara-operator", 42)
+	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1}
+	base := newMirrorClient(t, proj, task, mr)
+	var ops []string
+	rec := opRecorder{Client: base, ops: &ops}
+
+	advanced, err := ApplyReviewApproval(context.Background(), rec, rec, nil, proj, task, "deadbeef", time.Now())
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	del := opIndex(ops, "delete-pod")
+	clear := opIndex(ops, "clear-pendingreview")
+	getTask := opIndex(ops, "get-task")
+	require.NotEqual(t, -1, del, "the review pod is torn down")
+	require.NotEqual(t, -1, clear, "PendingReview is cleared")
+	require.NotEqual(t, -1, getTask, "a live reviewing-confirm read happened")
+	require.Less(t, getTask, del, "the reviewing-confirm read precedes the pod delete")
+	require.Less(t, del, clear, "the pod delete precedes the PendingReview clear (F5)")
+}
+
+// F5: an approval that arrives while the owning Task is PARKED (not reviewing)
+// folds - no pod delete, no MR mutation - because the live reviewing-confirm read
+// short-circuits before either.
+func TestApplyReviewApproval_ParkedTask_FoldsWithoutPodDeleteOrMutation(t *testing.T) {
+	proj := sweepProject("p")
+	task := parkedReviewTask("t-f5b", "clarify", stage.ReasonMergeTimeout)
+	mr := ownedMR("mr-tatara-operator-42", "t-f5b", "tatara-operator", 42)
+	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1}
+	base := newMirrorClient(t, proj, task, mr)
+	var ops []string
+	rec := opRecorder{Client: base, ops: &ops}
+
+	advanced, err := ApplyReviewApproval(context.Background(), rec, rec, nil, proj, task, "deadbeef", time.Now())
+	require.NoError(t, err)
+	require.False(t, advanced, "approval off reviewing folds")
+	require.Equal(t, -1, opIndex(ops, "delete-pod"), "no pod is deleted on the fold")
+	require.Equal(t, -1, opIndex(ops, "clear-pendingreview"), "no MR mutation on the fold")
+
+	var gotMR tatarav1alpha1.MergeRequest
+	require.NoError(t, base.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "mr-tatara-operator-42"}, &gotMR))
+	require.NotNil(t, gotMR.Status.PendingReview, "PendingReview untouched")
 }
