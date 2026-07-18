@@ -225,6 +225,55 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 	return nil
 }
 
+// holdTurnOnMemoryGate enqueues ONE operator comment on each owned OPEN issue
+// the first time a Task's turn submission is held at the pre-SubmitTurn
+// memory-readiness gate (issue #355), so a held Task is surfaced to a human
+// instead of looking like a silent stall - the same first-occurrence,
+// rate-limited pattern as enqueueDeployTimeoutComment (WS3-I5), keyed on its
+// OWN cooldown marker (Issue.status.lastMemoryGateCommentAt) so it cannot
+// clobber or be clobbered by the deploy-timeout or incident-refire producers.
+// It reuses the existing PendingComments drain; it spawns no agent.
+func (r *TaskReconciler) holdTurnOnMemoryGate(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, now time.Time) error {
+
+	issues, err := loadTaskIssues(ctx, r.Client, task)
+	if err != nil {
+		return err
+	}
+	phase := "Provisioning"
+	if proj.Status.Memory != nil && proj.Status.Memory.Phase != "" {
+		phase = proj.Status.Memory.Phase
+	}
+	body := fmt.Sprintf("Project `%s` memory stack is not ready (phase `%s`); tatara is holding this task's next agent turn until it recovers, instead of spawning a pod that would immediately fail to reach memory.",
+		proj.Name, phase)
+
+	sp := r.spiller(proj)
+	stamp := metav1.NewTime(now)
+	for i := range issues {
+		iss := &issues[i]
+		if iss.Status.State != "open" || iss.Status.LastMemoryGateCommentAt != nil {
+			continue // closed, or already commented on the first hold (own cooldown).
+		}
+		key := client.ObjectKeyFromObject(iss)
+		if err := objbudget.FitIssue(ctx, r.Client, sp, key, func(cur *tatarav1alpha1.Issue) {
+			if cur.Status.LastMemoryGateCommentAt != nil || len(cur.Status.PendingComments) >= 20 {
+				return
+			}
+			cur.Status.PendingComments = append(cur.Status.PendingComments, tatarav1alpha1.PendingComment{
+				RequestID: fmt.Sprintf("memory-gate-hold-%s", task.Name),
+				Action:    "comment",
+				Body:      body,
+			})
+			cur.Status.LastMemoryGateCommentAt = &stamp
+		}); err != nil {
+			return fmt.Errorf("memory-gate-hold comment: enqueue on %s: %w", key.Name, err)
+		}
+		log.FromContext(ctx).Info("turn hold: surfaced the first memory-gate hold on an owned issue",
+			"action", "memory_gate_hold_comment", "resource_id", task.Name, "issue", key.Name, "project", proj.Name)
+	}
+	return nil
+}
+
 // handoffCondition returns the OutcomeAccepted condition of a Task whose OWN
 // stage agent has COMMITTED its outcome and whose stage has NOT moved - i.e. the
 // cross-reconciler handoff is outstanding and its clock should be running. nil
@@ -580,6 +629,24 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	marker := turn0Marker(task)
 	if task.Annotations[annStageTurn0] == marker {
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil // turn-0 already submitted for THIS pod
+	}
+
+	// Issue #355: re-check memory readiness immediately before committing to a
+	// turn submission, closing the gap between the earlier admission-time gate
+	// (task_controller.go Reconcile, which only runs while PodStartedAt==nil)
+	// and the actual SubmitTurn call below - a gap that spans pod scheduling,
+	// image pull, and the G.10 ready handshake, during which the backend can
+	// flip unhealthy. This one call site covers every turn0 submission
+	// uniformly: a Task's first pod, a respawned pod (respawnLostPod), and a
+	// TTL-rotated pod (ttlStop) all funnel through here before SubmitTurn.
+	if !tatarav1alpha1.InfraIncidentExempt(task.Spec) && !memoryStablyReady(proj, now) {
+		if err := r.holdTurnOnMemoryGate(ctx, proj, task, now); err != nil {
+			return ctrl.Result{}, err
+		}
+		l.Info("turn submission held: project memory not stably ready",
+			"action", "task_memory_gate_turn_hold", "resource_id", task.Name, "project", proj.Name)
+		r.Metrics.MemoryGateHold(proj.Name)
+		return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 	}
 
 	text, err := r.renderBundle(ctx, proj, task, agentKind)
