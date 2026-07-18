@@ -150,6 +150,38 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 	return target, decline, nil
 }
 
+// driveUnparksPaced runs driveUnparks for proj at most once per
+// UnparkDriveInterval (default defaultUnparkDriveInterval), decoupled from
+// whatever cadence Reconcile() happens to run at. Fix for the 2026-07-18
+// operator_unpark_declined_total burst (tatara-operator#368): a Project stuck
+// in memory phase=Provisioning forced Reconcile() onto a 10s-or-faster
+// cadence (tatara-operator#367), and driveUnparks - with no pacing of its
+// own - re-declined the full parked backlog on every single one of those
+// passes. Returns the requeue interval to fold into soonestRequeue so a
+// genuinely-eligible F.6 re-entry is never starved past the floor even once
+// Reconcile()'s OTHER drivers stop forcing frequent passes. Keyed per project
+// (like memoryUnhealthyCycles): two live Projects must not throttle each
+// other's floor.
+func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) (time.Duration, error) {
+	interval := r.UnparkDriveInterval
+	if interval <= 0 {
+		interval = defaultUnparkDriveInterval
+	}
+	if last, ok := r.lastDriveUnparks[proj.Name]; ok {
+		if elapsed := now.Sub(last); elapsed < interval {
+			return interval - elapsed, nil
+		}
+	}
+	if err := r.driveUnparks(ctx, proj, now); err != nil {
+		return 0, err
+	}
+	if r.lastDriveUnparks == nil {
+		r.lastDriveUnparks = map[string]time.Time{}
+	}
+	r.lastDriveUnparks[proj.Name] = now
+	return interval, nil
+}
+
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
 // reason has an F.6 re-entry rule, EXCEPT identity-unverified (webhook-driven,
 // grammar-gated). activeTasks is computed ONCE and then advanced as each Task
