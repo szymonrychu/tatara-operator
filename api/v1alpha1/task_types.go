@@ -1,7 +1,10 @@
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -326,6 +329,57 @@ func TaskName(project, kind string, t time.Time, uid string) string {
 // since CRDs cannot constrain metadata.name length.
 func TaskNameTooLong(name string) bool {
 	return len(name) > MaxTaskNameLength
+}
+
+// IntakeTaskName is the DETERMINISTIC name a natural-key intake mint (B.4 sweep
+// OR a webhook primary mint) gives its Task, so a concurrent second mint for the
+// same (project, kind, repoRef, number) natural key collides on AlreadyExists at
+// the apiserver and is swallowed rather than producing a second owner. It is the
+// mint's half of the no-lock, natural-key idempotency the reactive intake relies
+// on (the Issue/MergeRequest CR controller-ownership is the other half).
+//
+// A short human-readable prefix (kind initial + repoRef + number) aids ops; a
+// sha256 suffix disambiguates across projects/kinds and guarantees the name is
+// stable, DNS-1123-safe, and within MaxTaskNameLength even for a long repoRef.
+func IntakeTaskName(project, kind, repoRef string, number int) string {
+	sum := sha256.Sum256([]byte(project + "|" + kind + "|" + repoRef + "|" + strconv.Itoa(number)))
+	suffix := "-" + hex.EncodeToString(sum[:])[:8]
+	head := "mt-"
+	if kind != "" {
+		ki := sanitizeNamePart(kind, 1)
+		if ki != "" {
+			head += ki + "-"
+		}
+	}
+	budget := MaxTaskNameLength - len(head) - len(suffix)
+	if budget < 0 {
+		budget = 0
+	}
+	base := head + sanitizeNamePart(repoRef, budget) + suffix
+	return strings.Trim(base, "-")
+}
+
+// sanitizeNamePart lowercases s, keeps [a-z0-9-], collapses other runs to a
+// single '-', and caps the result at max chars.
+func sanitizeNamePart(s string, max int) string {
+	var b strings.Builder
+	prevDash := false
+	for _, r := range strings.ToLower(s) {
+		if b.Len() >= max {
+			break
+		}
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevDash = false
+		default:
+			if !prevDash && b.Len() > 0 {
+				b.WriteByte('-')
+				prevDash = true
+			}
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // Note is one entry in a Task's append-only journal (contract A.4). Notes ARE

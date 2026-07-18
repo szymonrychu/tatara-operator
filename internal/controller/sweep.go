@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,12 +15,9 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -678,9 +674,13 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		if !budget.allow(ctx, stg) {
 			continue
 		}
-		task, merr := r.mintTaskForIssue(ctx, proj, repo, ext, stg, reason, sp)
+		task, created, merr := r.minter().MintIssueTask(ctx, proj, repo, ext, stg, reason, sp)
 		if merr != nil {
 			fail("mint_issue_task", merr, "repo", repo.Name, "number", ref.Number)
+			continue
+		}
+		if !created {
+			// A webhook already minted this natural key; the sweep's backstop no-ops.
 			continue
 		}
 		// Spent, on the mint that read it - whichever stage that mint chose.
@@ -729,9 +729,13 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 			if !budget.allow(ctx, stg) {
 				continue
 			}
-			task, merr := r.mintReviewTaskForPR(ctx, proj, repo, pr, cr, stg, reason, sp)
+			task, created, merr := r.minter().MintReviewTask(ctx, proj, repo, pr, cr, stg, reason, sp)
 			if merr != nil {
 				fail("mint_review_task", merr, "repo", repo.Name, "number", pr.Number)
+				continue
+			}
+			if !created {
+				// A webhook already minted this natural key; the sweep's backstop no-ops.
 				continue
 			}
 			budget.record(stg)
@@ -810,34 +814,18 @@ func providerOf(proj *tatarav1alpha1.Project) string {
 	return proj.Spec.Scm.Provider
 }
 
-// issueCR returns the Issue CR for (repo, number), or nil when none exists.
+// issueCR delegates to the shared Minter (the sweep's own read path and
+// MintForItem's classify-time read must not diverge).
 func (r *ProjectReconciler) issueCR(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.Issue, error) {
-	var iss tatarav1alpha1.Issue
-	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
-	if err := r.Get(ctx, key, &iss); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &iss, nil
+	return r.minter().issueCR(ctx, proj, repo, number)
 }
 
-// mergeRequestCR returns the MergeRequest CR for (repo, number), or nil when none
-// exists. It is issueCR's MergeRequest half, and it is what lets ClassifyPR tell
+// mergeRequestCR is issueCR's MergeRequest half. It is what lets ClassifyPR tell
 // a PR we are ALREADY REVIEWING (owned CR) and the ORPHANED SURVIVOR of a reap
 // (ownerless CR) apart from a PR we have NEVER SEEN (no CR) - a distinction the
 // head branch alone can never make for a human's PR.
 func (r *ProjectReconciler) mergeRequestCR(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) (*tatarav1alpha1.MergeRequest, error) {
-	var mr tatarav1alpha1.MergeRequest
-	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.MergeRequestName(repo.Name, number)}
-	if err := r.Get(ctx, key, &mr); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &mr, nil
+	return r.minter().mergeRequestCR(ctx, proj, repo, number)
 }
 
 // taskForBranch resolves the Task an agent head branch names ("task/<name>").
@@ -885,164 +873,6 @@ func (r *ProjectReconciler) activeTaskCount(ctx context.Context, proj *tatarav1a
 	return n, nil
 }
 
-// mintTaskForIssue is ADOPT-OR-CREATE on the Issue CR, NEVER a blind Create
-// (fix M3-10):
-//
-//	task := create the Task
-//	iss  := GET iss-<repo>-<number>
-//	if iss EXISTS:  APPEND task as its controller=true owner   (an UPDATE)
-//	else:           CREATE it with task as controller owner
-//
-// A blind Create would AlreadyExists on EVERY re-mint of every previously-failed
-// Task - i.e. exactly the recovery path fix H13 was written to enable. SyncIssue
-// does the CR half (ensure-then-upsert), and ownIssue does the ownership half.
-func (r *ProjectReconciler) mintTaskForIssue(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	ext scm.Issue, stg, reason string, sp objbudget.Spiller) (*tatarav1alpha1.Task, error) {
-
-	now := time.Now()
-	task := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      tatarav1alpha1.TaskName(proj.Name, SweepIssueKind, now, rand.String(5)),
-			Namespace: proj.Namespace,
-		},
-		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:         proj.Name,
-			Kind:               SweepIssueKind,
-			Goal:               issueGoal(ext),
-			InitialStage:       stg,
-			InitialStageReason: reason,
-			Source: &tatarav1alpha1.TaskSource{
-				Provider:    providerOf(proj),
-				IssueRef:    fmt.Sprintf("%s#%d", ext.URL, ext.Number),
-				Number:      ext.Number,
-				Title:       ext.Title,
-				AuthorLogin: ext.Author,
-			},
-		},
-	}
-	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
-		return nil, fmt.Errorf("sweep: set task ownerref: %w", err)
-	}
-	if err := r.Create(ctx, task); err != nil {
-		return nil, fmt.Errorf("sweep: create task: %w", err)
-	}
-	if err := SyncIssue(ctx, r.Client, sp, proj, repo, ext); err != nil {
-		return nil, fmt.Errorf("sweep: sync issue: %w", err)
-	}
-	issName := tatarav1alpha1.IssueName(repo.Name, ext.Number)
-	if err := r.ownIssue(ctx, proj, issName, task); err != nil {
-		return nil, err
-	}
-	// The STAGE comes from Spec.InitialStage via the TaskReconciler create-edge
-	// (fix C5): NO racing post-create stage write. Only issueRefs is stamped here,
-	// under RetryOnConflict, so it survives the reconciler winning the create-edge
-	// race and stamping the stage first (its non-retrying Status().Update used to
-	// 409 and leave the swept issue actively triaged with no issueRefs).
-	if err := r.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
-		if !slices.Contains(fresh.Status.IssueRefs, issName) {
-			fresh.Status.IssueRefs = append(fresh.Status.IssueRefs, issName)
-		}
-	}); err != nil {
-		return nil, err
-	}
-	if r.Metrics != nil {
-		r.Metrics.OrphanAdopted(SweepIssueKind)
-	}
-	return task, nil
-}
-
-// stampMintStatus stamps a freshly minted Task's STATUS (issueRefs / mrRefs /
-// humanReviewRounds) under RetryOnConflict, WITHOUT touching the stage - the
-// stage is derived by the TaskReconciler create-edge from Spec.InitialStage (fix
-// C5). Because it never writes the stage, it cannot race the reconciler's
-// create-edge for it; and because it retries, the refs survive even when the
-// reconciler wins that race and bumps the resourceVersion first. mutate must be
-// idempotent (it runs on every retry against the fresh object).
-func (r *ProjectReconciler) stampMintStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task)) error {
-	key := client.ObjectKeyFromObject(task)
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, key, fresh); err != nil {
-			return err
-		}
-		mutate(fresh)
-		if err := r.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		*task = *fresh
-		return nil
-	}); err != nil {
-		return fmt.Errorf("sweep: stamp mint status on %s: %w", task.Name, err)
-	}
-	return nil
-}
-
-// mintReviewTaskForPR mints the kind=review Task for a human-authored PR in
-// reaction scope. It owns the MergeRequest CR and NO Issue: a review Task owns
-// ZERO Issues, and per fix V6-3 the empty set is not a licence for anything.
-//
-// It is ADOPT-OR-CREATE on the MergeRequest CR, exactly as mintTaskForIssue is on
-// the Issue CR (fix M3-10): cr is the OWNERLESS survivor of a reap when non-nil,
-// and bindMRToTask's SyncMergeRequest is ensure-then-upsert, so the mirrored
-// review thread is preserved and nothing ever AlreadyExists.
-//
-// stg/reason come from MintReviewStage. The Task is seeded with the V7-9 counter
-// the reaper carried onto the surviving mirror, so a re-mint resumes the cap
-// where the reaped Task left it rather than handing the PR five fresh review pods.
-func (r *ProjectReconciler) mintReviewTaskForPR(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	pr scm.PRRef, cr *tatarav1alpha1.MergeRequest, stg, reason string, sp objbudget.Spiller) (*tatarav1alpha1.Task, error) {
-
-	now := time.Now()
-	ext := mrSnapshot(proj, repo, pr)
-	task := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      tatarav1alpha1.TaskName(proj.Name, SweepReviewKind, now, rand.String(5)),
-			Namespace: proj.Namespace,
-		},
-		Spec: tatarav1alpha1.TaskSpec{
-			ProjectRef:         proj.Name,
-			Kind:               SweepReviewKind,
-			Goal:               fmt.Sprintf("Review %s", ext.URL),
-			InitialStage:       stg,
-			InitialStageReason: reason,
-			Source: &tatarav1alpha1.TaskSource{
-				Provider:    providerOf(proj),
-				IssueRef:    ext.URL,
-				Number:      pr.Number,
-				IsPR:        true,
-				HeadSHA:     pr.HeadSHA,
-				AuthorLogin: pr.Author,
-			},
-		},
-	}
-	if err := controllerutil.SetControllerReference(proj, task, r.Scheme); err != nil {
-		return nil, fmt.Errorf("sweep: set task ownerref: %w", err)
-	}
-	if err := r.Create(ctx, task); err != nil {
-		return nil, fmt.Errorf("sweep: create review task: %w", err)
-	}
-	if err := r.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
-		return nil, err
-	}
-	// Stage from Spec.InitialStage via the create-edge (fix C5); mrRefs +
-	// humanReviewRounds stamped under RetryOnConflict so they survive the reconciler
-	// winning the create-edge race.
-	mrName := tatarav1alpha1.MergeRequestName(repo.Name, pr.Number)
-	rounds := carriedHumanReviewRounds(cr)
-	if err := r.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
-		if !slices.Contains(fresh.Status.MRRefs, mrName) {
-			fresh.Status.MRRefs = append(fresh.Status.MRRefs, mrName)
-		}
-		fresh.Status.HumanReviewRounds = rounds
-	}); err != nil {
-		return nil, err
-	}
-	if r.Metrics != nil {
-		r.Metrics.OrphanAdopted(SweepReviewKind)
-	}
-	return task, nil
-}
-
 // adoptPRIntoTask is clause 1's write half: the MergeRequest CR is mirrored,
 // owned by the Task, and appended to its mrRefs.
 func (r *ProjectReconciler) adoptPRIntoTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
@@ -1063,68 +893,11 @@ func (r *ProjectReconciler) adoptPRIntoTask(ctx context.Context, proj *tatarav1a
 	})
 }
 
-// bindMRToTask mirrors the MR and hands the Task its controller ownership.
+// bindMRToTask delegates to the shared Minter (adoptPRIntoTask's mirror-and-own
+// and MintReviewTask's mirror-and-own must not diverge).
 func (r *ProjectReconciler) bindMRToTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
 	ext scm.MergeRequest, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
-
-	if err := SyncMergeRequest(ctx, r.Client, sp, proj, repo, ext); err != nil {
-		return fmt.Errorf("sweep: sync mergerequest: %w", err)
-	}
-	return r.ownMergeRequest(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), task)
-}
-
-// ownIssue appends task as the Issue CR's controller owner. It NEVER steals: an
-// artifact that already has a controller owner is not an orphan, so reaching
-// here with a different controller is a bug, not a race to paper over.
-func (r *ProjectReconciler) ownIssue(ctx context.Context, proj *tatarav1alpha1.Project, name string, task *tatarav1alpha1.Task) error {
-	key := types.NamespacedName{Namespace: proj.Namespace, Name: name}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var iss tatarav1alpha1.Issue
-		if err := r.Get(ctx, key, &iss); err != nil {
-			return err
-		}
-		if cur, ok := own.ControllerOwner(&iss); ok {
-			if cur != task.Name {
-				return fmt.Errorf("issue %s already has controller owner %s", name, cur)
-			}
-			return nil
-		}
-		own.AddPlainOwner(&iss, task)
-		if err := own.HandOverController(&iss, nil, task); err != nil {
-			return err
-		}
-		return r.Update(ctx, &iss)
-	})
-	if err != nil {
-		return fmt.Errorf("sweep: own issue %s: %w", name, err)
-	}
-	return nil
-}
-
-// ownMergeRequest is ownIssue's MergeRequest half.
-func (r *ProjectReconciler) ownMergeRequest(ctx context.Context, proj *tatarav1alpha1.Project, name string, task *tatarav1alpha1.Task) error {
-	key := types.NamespacedName{Namespace: proj.Namespace, Name: name}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var mr tatarav1alpha1.MergeRequest
-		if err := r.Get(ctx, key, &mr); err != nil {
-			return err
-		}
-		if cur, ok := own.ControllerOwner(&mr); ok {
-			if cur != task.Name {
-				return fmt.Errorf("mergerequest %s already has controller owner %s", name, cur)
-			}
-			return nil
-		}
-		own.AddPlainOwner(&mr, task)
-		if err := own.HandOverController(&mr, nil, task); err != nil {
-			return err
-		}
-		return r.Update(ctx, &mr)
-	})
-	if err != nil {
-		return fmt.Errorf("sweep: own mergerequest %s: %w", name, err)
-	}
-	return nil
+	return r.minter().bindMRToTask(ctx, proj, repo, ext, task, sp)
 }
 
 // issueGoal renders the Task goal from the issue, capped at the A.4 goal limit

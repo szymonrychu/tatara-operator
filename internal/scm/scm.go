@@ -35,6 +35,11 @@ type WebhookEvent struct {
 	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
 	HeadBranch   string // PR/MR source branch
 	ChangedLabel string // for labeled/unlabeled: the single label added/removed
+
+	IsReview        bool   // true only for pull_request_review / GitLab MR-approval
+	ReviewState     string // approved | changes_requested | commented | dismissed
+	ReviewID        string // provider review id, for (review.id, state) dedup
+	ReviewCommitSHA string // the reviewed commit sha (github review.commit_id / gitlab last_commit)
 }
 
 // IssueReq is the payload for creating an issue.

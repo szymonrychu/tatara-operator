@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -210,6 +211,44 @@ func TestEnqueueEvent_DedupAllowsAfterDone(t *testing.T) {
 	if !created {
 		t.Fatal("should allow enqueue when existing dedupKey event is Done")
 	}
+}
+
+func TestEnqueueEvent_ConcurrentSameKeyMintsOnce(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
+	seq := &SeqSource{Client: c, Namespace: "tatara"}
+	proj := testProj("p", "tatara")
+	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
+
+	const n = 8
+	var wg sync.WaitGroup
+	created := make([]bool, n)
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, ok, err := EnqueueEvent(context.Background(), c, seq, proj,
+				tatarav1alpha1.QueueClassAlert, false, "grp-race", pl)
+			created[i], errs[i] = ok, err
+		}(i)
+	}
+	wg.Wait()
+
+	wins := 0
+	for i := 0; i < n; i++ {
+		require.NoError(t, errs[i], "AlreadyExists must be swallowed, never surfaced")
+		if created[i] {
+			wins++
+		}
+	}
+	require.Equal(t, 1, wins, "exactly one concurrent mint may win")
+
+	var qel tatarav1alpha1.QueuedEventList
+	require.NoError(t, c.List(context.Background(), &qel))
+	require.Len(t, qel.Items, 1, "exactly one QueuedEvent for the natural key")
+	require.Equal(t, QueuedEventName("p", "grp-race"), qel.Items[0].Name)
 }
 
 // --- dedupExists scope: live QueuedEvent, live Task, open Issue -----------

@@ -129,18 +129,6 @@ func listBrainstormQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEven
 	return out
 }
 
-func listHealthCheckQEs(t *testing.T, project string) []tatarav1alpha1.QueuedEvent {
-	t.Helper()
-	qes := listScanQEs(t, project)
-	var out []tatarav1alpha1.QueuedEvent
-	for _, qe := range qes {
-		if qe.Spec.Payload.Labels[labelActivity] == "healthCheck" {
-			out = append(out, qe)
-		}
-	}
-	return out
-}
-
 func labelsMatch(pairs []*dto.LabelPair, want map[string]string) bool {
 	got := map[string]string{}
 	for _, p := range pairs {

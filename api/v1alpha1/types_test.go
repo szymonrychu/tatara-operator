@@ -114,17 +114,15 @@ func TestBrainstormActivity_SchedulePatternField(t *testing.T) {
 	}
 }
 
-// TestHealthCheckActivity_SchedulePatternField guards Finding 2:
-// HealthCheckActivity.Schedule must carry the Pattern marker.
-func TestHealthCheckActivity_SchedulePatternField(t *testing.T) {
-	h := HealthCheckActivity{Schedule: ""}
-	if h.Schedule != "" {
-		t.Fatalf("empty schedule not accepted: %q", h.Schedule)
-	}
-	h.Schedule = "30 8 * * *"
-	if h.Schedule != "30 8 * * *" {
-		t.Fatalf("valid schedule not round-tripped: %q", h.Schedule)
-	}
+// TestScmCron_NoDeadActivities documents the removed cron surface (cdScan,
+// healthCheck): the struct must expose only the live activities.
+func TestScmCron_NoDeadActivities(t *testing.T) {
+	var c ScmCron
+	_ = c.IssueScan
+	_ = c.Brainstorm
+	_ = c.Documentation
+	_ = c.Refine
+	// c.CDScan and c.HealthCheck are intentionally gone.
 }
 
 // TestRepositoryStatus_PhaseEnum guards Finding 3: RepositoryStatus.Phase must

@@ -7,6 +7,8 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -906,6 +908,7 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageMerging, v1alpha1.StageDeploying},
 		{v1alpha1.StageMerging, v1alpha1.StageFailed},
 		{v1alpha1.StageMerging, v1alpha1.StageParked},
+		{v1alpha1.StageMerging, v1alpha1.StageImplementing}, // maintainer changes_requested on the still-open MR (Task 4b)
 		{v1alpha1.StageDeploying, v1alpha1.StageDelivered},
 		{v1alpha1.StageDeploying, v1alpha1.StageFailed},
 		{v1alpha1.StageDeploying, v1alpha1.StageParked},
@@ -951,7 +954,6 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageImplementing, v1alpha1.StageDelivered},
 		{v1alpha1.StageReviewing, v1alpha1.StageDeploying}, // never skip merge
 		{v1alpha1.StageReviewing, v1alpha1.StageDelivered},
-		{v1alpha1.StageMerging, v1alpha1.StageImplementing}, // recreates deleted branches
 		{v1alpha1.StageMerging, v1alpha1.StageDelivered},
 		{v1alpha1.StageDeploying, v1alpha1.StageImplementing},
 		{v1alpha1.StageDeploying, v1alpha1.StageMerging},
@@ -1788,5 +1790,45 @@ func TestUnparkDoesNotReEnterHandoffStalled(t *testing.T) {
 	}
 	if _, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)}); ok {
 		t.Fatal("handoff-stalled must have no F.6 re-entry")
+	}
+}
+
+func TestReenterImplementingOnReview(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name   string
+		kind   string
+		from   string
+		wantOK bool
+	}{
+		{"from reviewing", "clarify", v1alpha1.StageReviewing, true},
+		{"from merging", "clarify", v1alpha1.StageMerging, true},
+		{"from implementing is redundant", "clarify", v1alpha1.StageImplementing, false},
+		{"kind=review never re-enters", "review", v1alpha1.StageReviewing, false},
+		{"terminal failed not resurrected", "clarify", v1alpha1.StageFailed, false},
+		{"delivered not resurrected", "clarify", v1alpha1.StageDelivered, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: tc.kind}}
+			task.Status.Stage = tc.from
+			ent := metav1.NewTime(now.Add(-time.Hour))
+			task.Status.StageEnteredAt = &ent
+			pod := metav1.NewTime(now.Add(-time.Minute))
+			task.Status.PodStartedAt = &pod
+			var mrs []v1alpha1.MergeRequest
+			if tc.from == v1alpha1.StageReviewing {
+				// A bot review still owed BLOCKS the maintainer re-entry (C.5.3
+				// reviewGateOpen), which then folds to the pending-event path
+				// (Task 4d) - documented here, not re-tested.
+				mrs = []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{}}}
+			}
+			ok := stage.ReenterImplementingOnReview(task, mrs, now)
+			require.Equal(t, tc.wantOK, ok)
+			if ok {
+				require.Equal(t, v1alpha1.StageImplementing, task.Status.Stage)
+				require.Nil(t, task.Status.PodStartedAt) // Enter's re-arm ran
+			}
+		})
 	}
 }
