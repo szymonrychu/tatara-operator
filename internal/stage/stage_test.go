@@ -1540,6 +1540,9 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// handoff-stalled: reviewing -> parked when the outcome COMMITTED but
 		// the phase-2 drain never advanced the Task within HandoffDeadline.
 		"handoff-stalled",
+		// issue-closed: WS3-I3 rejected(issue-closed), the human-closed-the-driving
+		// -issue stop edge from the nine live stages.
+		"issue-closed",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -1704,7 +1707,9 @@ func TestRejectedEdgesCarryTheirOwnReason(t *testing.T) {
 			var got string
 			var found bool
 			for _, e := range stage.Transitions[tc.from] {
-				if e.To == v1alpha1.StageRejected {
+				// Skip the shared WS3-I3 rejected(issue-closed) stop edge; this test
+				// is about each stage's OWN decline reason.
+				if e.To == v1alpha1.StageRejected && e.Reason != stage.ReasonIssueClosed {
 					got, found = e.Reason, true
 				}
 			}
@@ -1917,4 +1922,62 @@ func TestReenterOnReviewChangesRequested_NoOutcomeGuards(t *testing.T) {
 	mergedTask, mergedMRs := mk(0, true)
 	require.False(t, stage.ReenterOnReviewChangesRequested(mergedTask, mergedMRs, 300, now), "any merged MR: fold")
 	require.Equal(t, v1alpha1.StageParked, mergedTask.Status.Stage)
+}
+
+// ---------------------------------------------------------------------------
+// WS3-I3: the rejected(issue-closed) stop edge.
+// ---------------------------------------------------------------------------
+
+// TestIssueClosedStopEdge asserts the nine LIVE source stages can enter
+// rejected(issue-closed) and that deploying/documenting/terminals cannot - the
+// F.3 table half of the WS3-I3 stop edge.
+func TestIssueClosedStopEdge(t *testing.T) {
+	live := []string{
+		v1alpha1.StageTriaging, v1alpha1.StageBrainstorming, v1alpha1.StageClarifying,
+		v1alpha1.StageInvestigating, v1alpha1.StageRefining, v1alpha1.StageApproved,
+		v1alpha1.StageImplementing, v1alpha1.StageReviewing, v1alpha1.StageMerging,
+	}
+	for _, from := range live {
+		if !stage.Legal(from, v1alpha1.StageRejected) {
+			t.Errorf("Legal(%s -> rejected) = false, want true (issue-closed stop edge)", from)
+		}
+		if !stage.AllowsIssueClosedStop(from) {
+			t.Errorf("AllowsIssueClosedStop(%s) = false, want true", from)
+		}
+		task := newTask("implement", from, "")
+		if err := stage.Enter(task, nil, v1alpha1.StageRejected, stage.ReasonIssueClosed, time.Now()); err != nil {
+			t.Errorf("Enter(%s -> rejected(issue-closed)): %v", from, err)
+			continue
+		}
+		require.Equal(t, v1alpha1.StageRejected, task.Status.Stage)
+		require.Equal(t, stage.ReasonIssueClosed, task.Status.StageReason)
+	}
+
+	// deploying is EXCLUDED (merged work is not rewound); documenting has no
+	// driving issue; terminals are terminal.
+	excluded := []string{
+		v1alpha1.StageDeploying, v1alpha1.StageDocumenting, v1alpha1.StageDelivered,
+		v1alpha1.StageRejected, v1alpha1.StageFailed, v1alpha1.StageParked,
+	}
+	for _, from := range excluded {
+		if stage.AllowsIssueClosedStop(from) {
+			t.Errorf("AllowsIssueClosedStop(%s) = true, want false", from)
+		}
+		if from == v1alpha1.StageDeploying && stage.Legal(from, v1alpha1.StageRejected) {
+			t.Errorf("Legal(deploying -> rejected) = true: a late issue close must not rewind merged work")
+		}
+	}
+}
+
+// TestIssueClosedIsValidReasonWithNoReentry asserts issue-closed is a member of
+// the F.5 closed set and that a parked... no: rejected(issue-closed) is terminal
+// and Unpark never exits it.
+func TestIssueClosedIsValidReasonWithNoReentry(t *testing.T) {
+	require.True(t, stage.ValidReason(stage.ReasonIssueClosed))
+	// rejected has no exits; a Task terminal at rejected(issue-closed) never
+	// re-enters. Unpark only runs on parked Tasks, but assert the reason itself
+	// is not a resumable park reason by construction: it is a rejected reason.
+	task := newTask("clarify", v1alpha1.StageRejected, stage.ReasonIssueClosed)
+	_, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: botLogin, Now: time.Now()})
+	require.False(t, ok, "rejected(issue-closed) never re-enters")
 }

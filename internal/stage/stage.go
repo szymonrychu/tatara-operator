@@ -80,6 +80,7 @@ const (
 	ReasonOperatorError          = "operator-error"
 	ReasonHeadMoving             = "head-moving"
 	ReasonHandoffStalled         = "handoff-stalled"
+	ReasonIssueClosed            = "issue-closed"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -115,7 +116,42 @@ var Reasons = []string{
 	ReasonOperatorError,
 	ReasonHeadMoving,
 	ReasonHandoffStalled,
+	ReasonIssueClosed,
 }
+
+// issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
+const issueClosedTrigger = "a human closed the driving issue mid-flight (WS3-I3): the operator stops the work and the terminal reaper closes the bot PR"
+
+// issueClosedEdge is the rejected(issue-closed) edge added to the nine LIVE,
+// non-deploying source stages (WS3-I3). deploying is EXCLUDED on purpose: a
+// merged, deploying change is finished work and a late issue close must not
+// rewind it (the same boundary the review path enforces). documenting is a
+// nightly BATCH with no driving issue to close, so it is excluded too.
+func issueClosedEdge() Edge {
+	return Edge{To: v1alpha1.StageRejected, Reason: ReasonIssueClosed, Trigger: issueClosedTrigger}
+}
+
+// issueClosedStopStages is the closed set of LIVE stages from which a
+// human-closed driving issue stops the Task at rejected(issue-closed) (WS3-I3).
+// It is the SAME nine stages that carry the edge; ApplyIssueClosedStop reads it
+// so the webhook->leader gate and the F.3 table cannot drift apart.
+var issueClosedStopStages = map[string]bool{
+	v1alpha1.StageTriaging:      true,
+	v1alpha1.StageBrainstorming: true,
+	v1alpha1.StageClarifying:    true,
+	v1alpha1.StageInvestigating: true,
+	v1alpha1.StageRefining:      true,
+	v1alpha1.StageApproved:      true,
+	v1alpha1.StageImplementing:  true,
+	v1alpha1.StageReviewing:     true,
+	v1alpha1.StageMerging:       true,
+}
+
+// AllowsIssueClosedStop reports whether a Task in `stg` may be stopped at
+// rejected(issue-closed) by a human closing its driving issue (WS3-I3). It is
+// false for deploying (merged work is not rewound), documenting, and every
+// terminal/quasi-terminal stage.
+func AllowsIssueClosedStop(stg string) bool { return issueClosedStopStages[stg] }
 
 var reasonSet = func() map[string]bool {
 	m := make(map[string]bool, len(Reasons))
@@ -215,10 +251,12 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageFailed, Reason: ReasonNameTooLong, Trigger: "the 49-char name guard fails"},
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
+		issueClosedEdge(),
 	},
 
 	v1alpha1.StageBrainstorming: podStageEdges(
 		Edge{To: v1alpha1.StageDelivered, Trigger: "submit_outcome(propose|skip). documentedBy stays empty: no docs Task is spawned (fix 25)"},
+		issueClosedEdge(),
 	),
 
 	v1alpha1.StageClarifying: podStageEdges(
@@ -226,16 +264,19 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "decision=discuss, or the 24h clarify budget elapses"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
+		issueClosedEdge(),
 	),
 
 	v1alpha1.StageInvestigating: podStageEdges(
 		Edge{To: v1alpha1.StageClarifying, Trigger: "submit_outcome(file_issue): the tracker Issue is created under THIS Task"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonFalsePositive, Trigger: "submit_outcome(false_positive). No docs Task (fix 25)"},
+		issueClosedEdge(),
 	),
 
 	v1alpha1.StageRefining: podStageEdges(
 		Edge{To: v1alpha1.StageDelivered, Trigger: "folds/closes/links applied AND the fold VERIFIED (B.3)"},
 		Edge{To: v1alpha1.StageFailed, Reason: ReasonFoldAdoptionUnverified, Trigger: "B.3 step-3 verification fails"},
+		issueClosedEdge(),
 	),
 
 	// approved is POD-LESS (the admission gate). Its own 24h budget elapses to
@@ -247,11 +288,13 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageParked, Reason: ReasonAdmissionStarved, Trigger: "the 24h admission budget elapses (skipped when the project is PAUSED)"},
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
+		issueClosedEdge(),
 	},
 
 	v1alpha1.StageImplementing: podStageEdges(
 		Edge{To: v1alpha1.StageReviewing, Trigger: "submit_outcome(submitted) and >= 1 owned MR is open"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonImplementDeclined, Trigger: "submit_outcome(declined)"},
+		issueClosedEdge(),
 	),
 
 	v1alpha1.StageReviewing: podStageEdges(
@@ -263,6 +306,7 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewLoopExhausted, Trigger: "request_changes at maxReviewRounds, on a non-review Task"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewPostRefused, Trigger: "a structural 4xx from PostReview (fix C1)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m). ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced"},
+		issueClosedEdge(),
 	),
 
 	// merging is POD-LESS: clock 3 ONLY, from stageEnteredAt, against ITS OWN 4h
@@ -279,6 +323,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
 		{To: v1alpha1.StageParked, Reason: ReasonMergeTimeout, Trigger: "the 4h merging budget elapses"},
+		issueClosedEdge(),
 	},
 
 	v1alpha1.StageDeploying: {

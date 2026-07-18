@@ -439,7 +439,7 @@ type TaskStats struct {
 // never un-park the Task the operator just parked.
 type TaskEvent struct {
 	At metav1.Time `json:"at"`
-	// +kubebuilder:validation:Enum=issue_comment;mr_comment;mr_review;label;alert
+	// +kubebuilder:validation:Enum=issue_comment;mr_comment;mr_review;issue_edited;label;alert
 	Kind   string `json:"kind"`
 	Repo   string `json:"repo"`   // Repository CR name
 	Number int    `json:"number"` // 0 for kind=alert

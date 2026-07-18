@@ -219,6 +219,15 @@ type IssueStatus struct {
 	// Skips enqueue while now-LastRefireCommentAt < IncidentRefireCommentCooldown.
 	// +optional
 	LastRefireCommentAt *metav1.Time `json:"lastRefireCommentAt,omitempty"`
+	// LastDeployTimeoutCommentAt is when the WS3-I5 first-deploy-timeout operator
+	// comment was enqueued on this issue. Its PRESENCE (not the value) suppresses a
+	// second comment on later parked(deploy-timeout) retries. It is a DISTINCT
+	// marker from LastRefireCommentAt: an issue that is both an incident tracker and
+	// deploy-blocked must not have its incident-refire cooldown clobbered by the
+	// deploy-timeout producer (both write PendingComments; they must not share the
+	// timestamp field).
+	// +optional
+	LastDeployTimeoutCommentAt *metav1.Time `json:"lastDeployTimeoutCommentAt,omitempty"`
 	// +optional
 	LastSyncedAt *metav1.Time `json:"lastSyncedAt,omitempty"`
 	// +optional
