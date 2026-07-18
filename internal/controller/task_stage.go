@@ -79,6 +79,16 @@ func projectPaused(proj *tatarav1alpha1.Project) bool {
 	return proj != nil && proj.Spec.MaxConcurrentAgents == 0
 }
 
+// mrBindingBackstopGrace is issue #381 bug B part 2's grace window: how long
+// a Source-bearing Task may sit with zero owned MergeRequest and zero owned
+// Issue CRs before the backstop treats it as an interrupted two-phase mint
+// rather than a live, merely-slow bind. Same value as HandoffDeadline
+// (api/v1alpha1/constants.go:97) for the same reason - long enough that a
+// live write completes, short enough to catch a genuinely stuck Task inside
+// one human work session - but a DISTINCT constant: the two guard unrelated
+// predicates and must be free to diverge later.
+const mrBindingBackstopGrace = 5 * time.Minute
+
 // reconcileClocks is GAP 5: the F.4 three-clock driver. Nothing else calls
 // stage.ArmedClock in production, so without it "the 2h budget parks it", "the
 // 24h admission clock" and "merging reaches merge-timeout at 4h" are all fiction
@@ -223,6 +233,124 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 			"action", "deploy_timeout_comment", "resource_id", task.Name, "issue", key.Name, "repos", repos)
 	}
 	return nil
+}
+
+// reconcileMRBindingBackstop is issue #381 bug B part 2: a Source-bearing
+// Task (Spec.Source.Number > 0 - the same source-bearing gate
+// mintIssueCRs uses, task_stage.go:472-475) that still owns ZERO
+// MergeRequest and ZERO Issue CRs past mrBindingBackstopGrace is the residue
+// of an interrupted two-phase mint write (the Task's own Create landed, the
+// bind that would have given it an owned MR/Issue never did - #382 covers
+// the LIVE repair path on a fresh mint attempt; this is the backstop for
+// the Task that already exists and has nothing left to re-mint against).
+// Live proof: mt-r-tatara-cli-87 (issue #381 investigation).
+//
+// Guarded to fire EXACTLY ONCE: task.Status.Stage == StageParked is excluded
+// up front, both because parked->parked is not a legal F.3 edge (EnterStage
+// would refuse it and fire operator_illegal_stage_transition_total every
+// reconcile) and because it is this function's OWN rate limit for the
+// metric and the comment in Task 9 - once parked, this predicate would
+// otherwise stay permanently true (a parked Task's refs do not un-empty
+// themselves) and re-fire forever without it.
+//
+// Runs BEFORE the three clocks (F.4): those would EVENTUALLY reach the same
+// outcome via turn-budget/pod-recreation exhaustion, but only after hours of
+// wasted pod churn against a Task that can never advance - this backstop is
+// the fast, targeted path.
+func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
+
+	if task.Status.Stage == tatarav1alpha1.StageParked ||
+		task.Spec.Source == nil || task.Spec.Source.Number <= 0 ||
+		len(task.Status.MRRefs) != 0 || len(task.Status.IssueRefs) != 0 {
+		return false, nil
+	}
+	age := now.Sub(stageEnteredAt(task))
+	if age <= mrBindingBackstopGrace {
+		return false, nil
+	}
+	// issue #381 review BLOCKER: not every stage has a legal ->parked edge in
+	// the F.3 table (triaging and delivered do not - stage.go's Transitions).
+	// Without this guard r.enter below returns *stage.IllegalTransitionError
+	// for those stages every reconcile, an infinite requeue crash-loop. Fall
+	// through to normal reconcile instead: triaging's own triage-stalled clock
+	// (5m budget) owns that case, and delivered is quasi-terminal and ages out
+	// via the reaper.
+	if !stage.Legal(task.Status.Stage, tatarav1alpha1.StageParked) {
+		return false, nil
+	}
+
+	l := log.FromContext(ctx)
+	l.Error(nil, "task owns no merge-request or issue record past grace; likely an interrupted mint - parking awaiting human",
+		"action", "mr_binding_backstop_parked", "resource_id", task.Name, "kind", task.Spec.Kind,
+		"stage", task.Status.Stage, "age", age.String(), "grace", mrBindingBackstopGrace.String())
+	if err := r.enter(ctx, proj, task, nil, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, now); err != nil {
+		return true, err
+	}
+	r.Metrics.MRBindingBackstopParked(proj.Name, task.Spec.Kind)
+	r.commentMRBindingBackstopParked(ctx, proj, task)
+	return true, nil
+}
+
+// taskWriterAndToken resolves the SCMWriter + bot token for a Project,
+// mirroring ProjectReconciler.scanWriter (projectscan.go:287) - the same
+// five lines, duplicated rather than shared across the two reconciler types
+// per this repo's KISS rule (three similar lines beat a premature shared
+// abstraction across two otherwise-unrelated reconcilers).
+func (r *TaskReconciler) taskWriterAndToken(ctx context.Context, proj *tatarav1alpha1.Project) (scm.SCMWriter, string, error) {
+	if r.SCMFor == nil {
+		return nil, "", fmt.Errorf("mr-binding backstop: SCMFor not wired")
+	}
+	var sec corev1.Secret
+	key := types.NamespacedName{Namespace: proj.Namespace, Name: proj.Spec.ScmSecretRef}
+	if err := r.Get(ctx, key, &sec); err != nil {
+		return nil, "", fmt.Errorf("mr-binding backstop: get scm secret: %w", err)
+	}
+	token := string(sec.Data["token"])
+	w, err := r.SCMFor(proj.Spec.Scm.Provider)
+	if err != nil {
+		return nil, "", err
+	}
+	return w, token, nil
+}
+
+// commentMRBindingBackstopParked posts ONE notice on the Task's source
+// PR/issue when reconcileMRBindingBackstop parks it. Rate-limited by its
+// caller's own "not already parked" guard (see reconcileMRBindingBackstop's
+// doc comment) - there is no separate per-comment cooldown field because
+// the Task this backstop targets owns, by construction, zero Issue/MR CRs
+// to stamp one on. A forge failure here is logged and swallowed: the park
+// already landed and is the correctness-critical half of this backstop: it
+// must never be retried into existence by re-running the whole function on
+// a Task the guard now excludes.
+func (r *TaskReconciler) commentMRBindingBackstopParked(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) {
+	l := log.FromContext(ctx)
+	slug, number, ok := parseSourceURL(task.Spec.Source.IssueRef, task.Spec.Source.IsPR)
+	if !ok {
+		l.Error(nil, "mr-binding backstop: source ref is not a recognizable issue/PR URL; comment skipped",
+			"action", "mr_binding_backstop_comment_skipped", "resource_id", task.Name,
+			"source_ref", task.Spec.Source.IssueRef)
+		return
+	}
+	writer, token, err := r.taskWriterAndToken(ctx, proj)
+	if err != nil {
+		l.Error(err, "mr-binding backstop: resolve scm writer failed; comment skipped",
+			"action", "mr_binding_backstop_comment_skipped", "resource_id", task.Name)
+		return
+	}
+	body := fmt.Sprintf(
+		"tatara parked this task: it has not recorded an owned merge-request or issue after `%s` "+
+			"(likely an interrupted mint on the operator side). No agent will run against it until a "+
+			"human comments here to prompt a retry.",
+		mrBindingBackstopGrace.String())
+	issueRef := fmt.Sprintf("%s#%d", slug, number)
+	if err := writer.Comment(ctx, token, issueRef, body); err != nil {
+		l.Error(err, "mr-binding backstop: forge comment failed (non-fatal, task is parked)",
+			"action", "mr_binding_backstop_comment_failed", "resource_id", task.Name, "issue_ref", issueRef)
+		return
+	}
+	l.Info("mr-binding backstop: posted the park notice",
+		"action", "mr_binding_backstop_commented", "resource_id", task.Name, "issue_ref", issueRef)
 }
 
 // holdTurnOnMemoryGate enqueues ONE operator comment on each owned OPEN issue

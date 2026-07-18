@@ -237,6 +237,13 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, nil
 	}
 
+	// Issue #381 bug B part 2: an interrupted two-phase mint left this Task
+	// owning zero MergeRequest/Issue CRs. Runs before the three clocks - see
+	// reconcileMRBindingBackstop's doc comment for why this must be first.
+	if handled, err := r.reconcileMRBindingBackstop(ctx, project, task, now); err != nil || handled {
+		return ctrl.Result{}, err
+	}
+
 	// THE THREE CLOCKS (F.4). Gap 5: nothing else in production calls
 	// stage.ArmedClock, so without this every deadline in the contract is fiction.
 	res, handled, err := r.reconcileClocks(ctx, project, task, now)

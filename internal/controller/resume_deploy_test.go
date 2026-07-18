@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
@@ -35,14 +36,14 @@ func (w *resumeWriter) RemoveLabel(_ context.Context, _, issueRef, label string)
 // botMR builds an OPEN bot PR mirror owned by taskName, on the task/<taskName>
 // head branch, so ourMR matches it.
 func botMR(name, taskName, repoRef string, number int) *tatarav1alpha1.MergeRequest {
+	owner := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: taskName}}
 	mr := &tatarav1alpha1.MergeRequest{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec:       tatarav1alpha1.MergeRequestSpec{RepositoryRef: repoRef, Number: number, ProjectRef: "resume"},
 	}
 	mr.Status.State = "open"
 	mr.Status.Author = "tatara-bot"
-	mr.Status.HeadBranch = TaskBranchPrefix + taskName
-	owner := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: taskName}}
+	mr.Status.HeadBranch = agent.TaskBranch(owner)
 	own.AddPlainOwner(mr, owner)
 	if err := own.HandOverController(mr, nil, owner); err != nil {
 		panic(err)

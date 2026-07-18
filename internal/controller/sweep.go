@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
@@ -80,10 +81,6 @@ const (
 	// another door). The value is the delivery's RFC3339 timestamp, for audit; only
 	// its PRESENCE is load-bearing.
 	AnnWebhookOriginated = "tatara.dev/webhook-originated"
-
-	// TaskBranchPrefix is the head-branch namespace an agent PR lives in. B.4
-	// clause 1(b) is an EXACT match on TaskBranchPrefix + the owning Task's name.
-	TaskBranchPrefix = "task/"
 
 	// SweepActivity is the {activity} label value on the sweep heartbeat and
 	// error counters.
@@ -326,7 +323,7 @@ func botLoginOf(proj *tatarav1alpha1.Project) string {
 // AdoptPR is B.4 clause 1: adopt pr into task's mrRefs iff ALL of
 //
 //	a. pr.author     == Project.spec.scm.botLogin
-//	b. pr.headBranch == "task/<owning-task-name>"
+//	b. pr.headBranch == agent.TaskBranch(task)      (the canonical work branch)
 //	c. pr.head.repo  == pr.base.repo                (NO forks, ever)
 //
 // Clause (c) is what stops an outside contributor from injecting an MR into a
@@ -342,7 +339,7 @@ func AdoptPR(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, pr scm.PRR
 	if bot == "" || pr.Author != bot {
 		return false
 	}
-	if pr.HeadBranch != TaskBranchPrefix+task.Name {
+	if pr.HeadBranch != agent.TaskBranch(task) {
 		return false
 	}
 	return pr.HeadRepo != "" && pr.HeadRepo == pr.Repo
@@ -845,26 +842,36 @@ func (r *ProjectReconciler) mergeRequestCR(ctx context.Context, proj *tatarav1al
 	return r.minter().mergeRequestCR(ctx, proj, repo, number)
 }
 
-// taskForBranch resolves the Task an agent head branch names ("task/<name>").
-// A branch outside the namespace, a Task that no longer exists, and a Task in
-// another project all resolve to nil - which sends a bot-authored PR straight to
-// clause 2 (IGNORE), exactly as intended for an ORPHANED AGENT PR.
+// taskForBranch resolves the Task an agent head branch names, by matching
+// agent.TaskBranch(t) against branch over the project's own Tasks (the
+// TaskProjectRefIndex field index, same pattern as activeTaskCount). The
+// branch string no longer derives 1:1 from a Task's metadata.name (a
+// numbered Task's branch carries its issue/PR number and title slug, a
+// documentation Task its source SHA), so CutPrefix+Get is no longer
+// sufficient - fix A3 replaces it with a scan-and-match. A branch matching
+// no live Task in this project, and a same-named branch belonging to a
+// DIFFERENT project's Task, both resolve to nil - which sends a
+// bot-authored PR straight to clause 2 (IGNORE), exactly as intended for an
+// ORPHANED AGENT PR.
 func (r *ProjectReconciler) taskForBranch(ctx context.Context, proj *tatarav1alpha1.Project, branch string) (*tatarav1alpha1.Task, error) {
-	name, ok := strings.CutPrefix(branch, TaskBranchPrefix)
-	if !ok || name == "" {
-		return nil, nil
-	}
-	var t tatarav1alpha1.Task
-	if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &t); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
+	var tl tatarav1alpha1.TaskList
+	err := r.List(ctx, &tl, client.InNamespace(proj.Namespace), client.MatchingFields{TaskProjectRefIndex: proj.Name})
+	if err != nil {
+		if !isFieldSelectorUnsupported(err) {
+			return nil, err
 		}
-		return nil, err
+		tl = tatarav1alpha1.TaskList{}
+		if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+			return nil, err
+		}
 	}
-	if t.Spec.ProjectRef != proj.Name {
-		return nil, nil
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef == proj.Name && agent.TaskBranch(t) == branch {
+			return t, nil
+		}
 	}
-	return &t, nil
+	return nil, nil
 }
 
 // activeTaskCount counts the project's ACTIVE Tasks via the A.3 projectRef field

@@ -898,7 +898,7 @@ func TestReapClosesOwnBotMRAfterHandover(t *testing.T) {
 			Spec: tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: number, ProjectRef: "closeown"},
 		}
 		mr.Status.Author = "tatara-bot"
-		mr.Status.HeadBranch = TaskBranchPrefix + "impl-task"
+		mr.Status.HeadBranch = agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "impl-task"}})
 		mr.Status.State = "open"
 		return mr
 	}
@@ -929,8 +929,9 @@ func TestReapClosesOwnBotMRAfterHandover(t *testing.T) {
 	if len(w.closed) != 1 || w.closed[0] != 2 {
 		t.Fatalf("ClosePR calls = %v, want exactly [2] (clause (d) protects #1)", w.closed)
 	}
-	if len(w.deleted) != 1 || w.deleted[0] != TaskBranchPrefix+"impl-task" {
-		t.Fatalf("DeleteBranch calls = %v, want exactly [task/impl-task]", w.deleted)
+	wantBranch := agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "impl-task"}})
+	if len(w.deleted) != 1 || w.deleted[0] != wantBranch {
+		t.Fatalf("DeleteBranch calls = %v, want exactly [%s]", w.deleted, wantBranch)
 	}
 	if len(w.closeOrder) != 1 || w.closeOrder[0] != "sib-task" {
 		t.Fatalf("at ClosePR time MR#1's controller owner was %v, want sib-task: the close ran BEFORE the B.5 handover", w.closeOrder)
@@ -1204,7 +1205,7 @@ func TestReapDeliveredWaitsForDocumentation(t *testing.T) {
 			Spec: tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: number, ProjectRef: "delivered"},
 		}
 		mr.Status.Author = "tatara-bot"
-		mr.Status.HeadBranch = TaskBranchPrefix + owner
+		mr.Status.HeadBranch = agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: owner}})
 		mr.Status.State = "merged"
 		return mr
 	}

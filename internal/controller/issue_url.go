@@ -49,3 +49,41 @@ func parseIssueURL(itemURL string) (repoSlug string, number int, ok bool) {
 	}
 	return "", 0, false
 }
+
+// parsePRURL extracts the "owner/repo" (or group/subgroup/.../project) slug
+// and PR/MR number from a pull-request or merge-request web URL: GitHub
+// ".../owner/repo/pull/N" and GitLab ".../group[/subgroup...]/project/-/merge_requests/N".
+// Returns ok=false when itemURL is not a recognizable PR/MR URL. Sibling of
+// parseIssueURL, which deliberately does NOT match these shapes.
+func parsePRURL(itemURL string) (repoSlug string, number int, ok bool) {
+	u, err := url.Parse(itemURL)
+	if err != nil {
+		return "", 0, false
+	}
+	p := strings.Trim(u.Path, "/")
+	if idx := strings.Index(p, "/-/merge_requests/"); idx > 0 {
+		n, err := strconv.Atoi(p[idx+len("/-/merge_requests/"):])
+		if err != nil {
+			return "", 0, false
+		}
+		return p[:idx], n, true
+	}
+	if idx := strings.Index(p, "/pull/"); idx > 0 {
+		n, err := strconv.Atoi(p[idx+len("/pull/"):])
+		if err != nil {
+			return "", 0, false
+		}
+		return p[:idx], n, true
+	}
+	return "", 0, false
+}
+
+// parseSourceURL extracts the owner/repo slug and number from a Task's
+// Spec.Source item URL, which is an issue or a PR/MR web URL depending on
+// Spec.Source.IsPR.
+func parseSourceURL(itemURL string, isPR bool) (repoSlug string, number int, ok bool) {
+	if isPR {
+		return parsePRURL(itemURL)
+	}
+	return parseIssueURL(itemURL)
+}
