@@ -729,6 +729,10 @@ func (in *ProjectStatus) DeepCopyInto(out *ProjectStatus) {
 		in, out := &in.LastIssueScan, &out.LastIssueScan
 		*out = (*in).DeepCopy()
 	}
+	if in.LastSweepSuccess != nil {
+		in, out := &in.LastSweepSuccess, &out.LastSweepSuccess
+		*out = (*in).DeepCopy()
+	}
 	if in.LastBrainstorm != nil {
 		in, out := &in.LastBrainstorm, &out.LastBrainstorm
 		*out = (*in).DeepCopy()

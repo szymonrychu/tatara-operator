@@ -495,6 +495,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	if err := mgr.Add(maintenanceRunnable{srv: cbServer}); err != nil {
 		return nil, fmt.Errorf("add maintenance runnable: %w", err)
 	}
+	if err := mgr.Add(seedSweepHeartbeatRunnable{client: mgr.GetClient(), namespace: cfg.Namespace}); err != nil {
+		return nil, fmt.Errorf("add sweep-heartbeat seed runnable: %w", err)
+	}
 	return seq, nil
 }
 
@@ -526,3 +529,30 @@ func (m maintenanceRunnable) Start(ctx context.Context) error {
 }
 
 func (m maintenanceRunnable) NeedLeaderElection() bool { return true }
+
+// seedSweepHeartbeatRunnable re-seeds the sweep heartbeat gauge from the durable
+// Project status once, on leader startup, so a rollover does not blank
+// operator_sweep_last_success_timestamp_seconds into NoData until the next 4h
+// sweep. LEADER-ONLY (NeedLeaderElection true) so the gauge series exists on the
+// one replica that actually sweeps - seeding it on every replica would leave the
+// standbys exporting a frozen heartbeat that ages into a false page. A seed
+// failure is logged, never fatal: the next successful sweep stamps the gauge.
+type seedSweepHeartbeatRunnable struct {
+	client    client.Client
+	namespace string
+}
+
+func (s seedSweepHeartbeatRunnable) Start(ctx context.Context) error {
+	seeded, err := controller.SeedSweepHeartbeat(ctx, s.client, s.namespace)
+	if err != nil {
+		slog.Warn("seed sweep heartbeat failed", "action", "sweep_heartbeat_seed_error", "error", err)
+		return nil
+	}
+	if seeded != nil {
+		slog.Info("seeded sweep heartbeat from persisted status",
+			"action", "sweep_heartbeat_seed", "last_success", seeded.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+func (s seedSweepHeartbeatRunnable) NeedLeaderElection() bool { return true }

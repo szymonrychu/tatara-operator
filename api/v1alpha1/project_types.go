@@ -764,6 +764,13 @@ type ProjectStatus struct {
 	Grafana *GrafanaStatus `json:"grafana,omitempty"`
 	// +optional
 	LastIssueScan *metav1.Time `json:"lastIssueScan,omitempty"`
+	// LastSweepSuccess is the time of the last fully successful B.4 sweep pass
+	// (mirrors the operator_sweep_last_success_timestamp_seconds heartbeat gauge).
+	// It is persisted so the in-memory gauge can be re-seeded on leader restart:
+	// a rollover no longer blanks the heartbeat into NoData until the next 4h
+	// sweep. Written only on a clean pass; a failing sweep does not advance it.
+	// +optional
+	LastSweepSuccess *metav1.Time `json:"lastSweepSuccess,omitempty"`
 	// +optional
 	LastBrainstorm *metav1.Time `json:"lastBrainstorm,omitempty"`
 	// LastDocumentation is the last time the documentation-sync cron ran; it bounds

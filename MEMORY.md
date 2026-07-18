@@ -1,5 +1,19 @@
 # MEMORY - tatara-operator
 
+- 2026-07-18 (#342, durable sweep heartbeat) Added `ProjectStatus.LastSweepSuccess`,
+  stamped only on a CLEAN B.4 sweep pass (new `stampScan` "sweep" arm, gated on
+  `SweepProject` returning nil in `runScans`). A leader-only startup Runnable
+  (`seedSweepHeartbeatRunnable`, `cmd/manager/wire.go`) calls
+  `controller.SeedSweepHeartbeat`, which re-seeds the process-local
+  `operator_sweep_last_success_timestamp_seconds` gauge (a single `activity=sweep`
+  series, set to the NEWEST pass across all Projects) so an operator rollover no
+  longer blanks the heartbeat into NoData until the next 4h sweep. Seed is
+  LEADER-ONLY on purpose: seeding standby replicas would export a frozen gauge that
+  ages into a false page. The paired alerting fix (threshold 7200->18000, for
+  10m->30m) lives in tatara-observability. NOT the `RequeueAfter:0` floor-requeue
+  the original #342 body proposed - live telemetry refuted that (a single leader
+  self-re-arms and sweeps on the 4h boundaries); the recurring alert was a
+  threshold-below-cadence + non-durable-gauge alerting defect.
 - 2026-07-17 (Task 5, dead-cron cleanup) Deleted the confirmed-dead `cdScan` /
   `healthCheck` cron surface: `CDScanActivity`, `HealthCheckActivity`,
   `ScmCron.CDScan`, `ScmCron.HealthCheck`, `ProjectStatus.LastCDScan`,

@@ -114,6 +114,38 @@ func SweepEnabled(proj *tatarav1alpha1.Project) bool {
 	return proj != nil && proj.Annotations[SweepAnnotation] != SweepDisabledValue
 }
 
+// SeedSweepHeartbeat re-seeds the in-memory sweep heartbeat gauge from the
+// durable per-Project Status.LastSweepSuccess after a leader restart. The gauge
+// is process-local: without this a rollover blanks
+// operator_sweep_last_success_timestamp_seconds into NoData until the next 4h
+// sweep - the false positive that fired "Operator sweep heartbeat stale" on
+// every operator rollout. It sets the gauge (a single series, not per-project)
+// to the newest successful pass across all Projects in namespace and returns
+// that time, or nil when no Project has ever swept. Best-effort: a list error is
+// returned for the caller to log, never to fail startup.
+func SeedSweepHeartbeat(ctx context.Context, r client.Reader, namespace string) (*time.Time, error) {
+	var projects tatarav1alpha1.ProjectList
+	if err := r.List(ctx, &projects, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("seed sweep heartbeat: list projects: %w", err)
+	}
+	var newest *time.Time
+	for i := range projects.Items {
+		last := projects.Items[i].Status.LastSweepSuccess
+		if last == nil {
+			continue
+		}
+		t := last.Time
+		if newest == nil || t.After(*newest) {
+			newest = &t
+		}
+	}
+	if newest == nil {
+		return nil, nil
+	}
+	obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(float64(newest.Unix()))
+	return newest, nil
+}
+
 // IsOrphanIssue is THE orphan predicate. THREE clauses, all required:
 //
 //	a. issue.state == "open"                           (SCM truth)

@@ -1117,6 +1117,85 @@ func TestSweepHeartbeat(t *testing.T) {
 	}
 }
 
+// TestSeedSweepHeartbeat: on leader restart the process-local heartbeat gauge is
+// re-seeded from the durable Project status to the NEWEST successful pass across
+// all projects (the gauge is one series, not per-project), so a rollover does not
+// blank it into NoData until the next 4h sweep (issue #342).
+func TestSeedSweepHeartbeat(t *testing.T) {
+	newer := metav1.Time{Time: time.Unix(1784347207, 0)} // 2026-07-18T04:00:07Z
+	older := metav1.Time{Time: time.Unix(1784246408, 0)} // 2026-07-17T00:00:08Z
+	p1 := sweepProject("seed-newer")
+	p1.Status.LastSweepSuccess = &newer
+	p2 := sweepProject("seed-older")
+	p2.Status.LastSweepSuccess = &older
+	p3 := sweepProject("seed-never") // never swept: no stamp, must be ignored
+	c := newMirrorClient(t, p1, p2, p3)
+
+	obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(0)
+	got, err := SeedSweepHeartbeat(context.Background(), c, testNS)
+	if err != nil {
+		t.Fatalf("SeedSweepHeartbeat: %v", err)
+	}
+	if got == nil || got.Unix() != 1784347207 {
+		t.Fatalf("seeded time = %v, want the newest pass (unix 1784347207)", got)
+	}
+	if v := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity)); v != 1784347207 {
+		t.Fatalf("gauge = %v, want 1784347207 (newest across projects, not the older stamp or 0)", v)
+	}
+}
+
+// TestSeedSweepHeartbeatNoHistory: with no persisted success the gauge is left
+// unset so the alert's NoData path still reports a never-swept operator rather
+// than a fabricated heartbeat.
+func TestSeedSweepHeartbeatNoHistory(t *testing.T) {
+	c := newMirrorClient(t, sweepProject("seed-fresh"))
+
+	obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(0)
+	got, err := SeedSweepHeartbeat(context.Background(), c, testNS)
+	if err != nil {
+		t.Fatalf("SeedSweepHeartbeat: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("seeded time = %v, want nil when no project has ever swept", got)
+	}
+	if v := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity)); v != 0 {
+		t.Fatalf("gauge = %v, want it left at 0 (no history to seed from)", v)
+	}
+}
+
+// TestStampScanSweepPersistsLastSweepSuccess: a clean sweep pass stamps the
+// durable heartbeat field (and only it) so the seed above has something to read.
+func TestStampScanSweepPersistsLastSweepSuccess(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "sweep-stamp-proj", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "sweep-stamp-scm",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "bot"},
+		},
+	}
+	if err := k8sClient.Create(ctx, proj); err != nil {
+		t.Fatalf("create project: %v", err)
+	}
+	r := &ProjectReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	if err := r.stampScan(ctx, proj, "sweep"); err != nil {
+		t.Fatalf("stampScan sweep: %v", err)
+	}
+	if proj.Status.LastSweepSuccess == nil {
+		t.Fatal("stampScan(sweep) must set the in-memory proj.Status.LastSweepSuccess")
+	}
+	var got tatarav1alpha1.Project
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "sweep-stamp-proj"}, &got); err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	if got.Status.LastSweepSuccess == nil {
+		t.Fatal("stampScan(sweep) must persist Status.LastSweepSuccess")
+	}
+	if got.Status.LastIssueScan != nil {
+		t.Fatal("stampScan(sweep) must not stamp LastIssueScan (the two heartbeats are independent)")
+	}
+}
+
 // TestSweepEnabledByDefault: the cutover deleted issueScan/mrScan/backstop, so
 // the sweep is the ONLY intake and an ABSENT annotation cannot mean "no intake".
 // The annotation survives only as an explicit per-project break-glass OFF.

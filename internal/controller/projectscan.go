@@ -454,6 +454,9 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		case "issueScan":
 			fresh.Status.LastIssueScan = &now
 			proj.Status.LastIssueScan = &now
+		case "sweep":
+			fresh.Status.LastSweepSuccess = &now
+			proj.Status.LastSweepSuccess = &now
 		case "brainstorm":
 			fresh.Status.LastBrainstorm = &now
 			proj.Status.LastBrainstorm = &now
@@ -1114,6 +1117,13 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				if serr := r.SweepProject(ctx, proj, reader, dueRepos, nil, SweepActivity); serr != nil {
 					l.Error(serr, "scan: sweep failed",
 						"action", "scan_sweep_error", "resource_id", proj.Name, "activity", SweepActivity)
+				} else if serr := r.stampScan(ctx, proj, "sweep"); serr != nil {
+					// Persist the durable heartbeat only on a clean pass, so a leader
+					// restart re-seeds operator_sweep_last_success_timestamp_seconds
+					// instead of blanking it to NoData until the next 4h sweep.
+					l.Error(serr, "scan: persist sweep-success stamp failed",
+						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
+					r.Metrics.ScanItem("issueScan", "stamp_error")
 				}
 				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
 					l.Error(serr, "scan: persist sweep stamp failed",

@@ -6053,6 +6053,15 @@ spec:
                   completed.
                 format: date-time
                 type: string
+              lastSweepSuccess:
+                description: |-
+                  LastSweepSuccess is the time of the last fully successful B.4 sweep pass
+                  (mirrors the operator_sweep_last_success_timestamp_seconds heartbeat gauge).
+                  It is persisted so the in-memory gauge can be re-seeded on leader restart:
+                  a rollover no longer blanks the heartbeat into NoData until the next 4h
+                  sweep. Written only on a clean pass; a failing sweep does not advance it.
+                format: date-time
+                type: string
               memory:
                 description: |-
                   MemoryStatus reports the observed state of the per-Project memory stack.
