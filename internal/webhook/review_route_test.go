@@ -222,6 +222,35 @@ func TestReview_Commented_CarriesBodyToPendingEvent(t *testing.T) {
 	got := getTask(t, c, task.Name)
 	require.Len(t, got.Status.PendingEvents, 1)
 	require.Equal(t, "please rename this var", got.Status.PendingEvents[0].Body)
+	// F5-2: a folded review is tagged mr_review, NOT a plain comment - the review
+	// carries review.id, not a comment id, and the mis-tag broke mirror dedup.
+	require.Equal(t, "mr_review", got.Status.PendingEvents[0].Kind,
+		"a folded pull_request_review is an mr_review event, not mr_comment (F5-2)")
+}
+
+// F8-1: a REDELIVERED review (same review.id, state) does not re-fire the
+// verdict. The first changes_requested re-enters implementing and stamps the
+// bounded dedup annotation; the second delivery is deduped and leaves the Task
+// where the first put it.
+func TestReview_Redelivered_Deduped(t *testing.T) {
+	const secretVal = "whsec-rvdd"
+	proj := reviewProject("rvdd", "rvdd-scm", "tatara-bot", []string{"maint"})
+	repo := repository("repo-rvdd", "rvdd", "https://github.com/o/r.git", "main")
+	task := reviewTask("rvdd-task", "rvdd", "clarify")
+	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 60), "rvdd", repo.Name, 60, task)
+	c := seedClient(t, proj, secret("rvdd-scm", secretVal), repo, task, mr)
+	h, _ := newServer(t, c)
+
+	body := reviewBody("submitted", "changes_requested", 4242, "maint", 60)
+	postReview(t, h, "rvdd", secretVal, body)
+	first := getTask(t, c, task.Name)
+	require.Equal(t, tatarav1.StageImplementing, first.Status.Stage)
+	require.NotEmpty(t, first.Annotations["tatara.dev/reviewed"], "the dedup marker must persist")
+
+	// Redeliver the identical review: deduped, no second transition.
+	postReview(t, h, "rvdd", secretVal, body)
+	second := getTask(t, c, task.Name)
+	require.Equal(t, tatarav1.StageImplementing, second.Status.Stage, "a redelivery must not re-fire the verdict")
 }
 
 // A terminal (failed) owning Task is never resurrected: changes_requested on it

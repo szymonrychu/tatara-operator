@@ -172,6 +172,41 @@ func TestOrphanComment_NoMirror_MintsTask(t *testing.T) {
 		"a live HMAC-verified human comment is a liveness signal like issues.opened; must mint ACTIVE, not parked")
 }
 
+// prCommentBodyOn renders an issue_comment.created delivery on a PULL REQUEST
+// (issue.pull_request present), authored by login. GitHub routes PR comments
+// through issue_comment; the pull_request field is what flags it as a PR.
+func prCommentBodyOn(number int, login string) []byte {
+	n := strconv.Itoa(number)
+	return []byte(`{"action":"created","issue":{"number":` + n +
+		`,"title":"a PR","body":"body","pull_request":{"url":"https://github.com/o/r/pull/` + n + `"},` +
+		`"html_url":"https://github.com/o/r/pull/` + n + `"},` +
+		`"comment":{"id":9,"body":"please implement now","user":{"login":"` + login + `"}},` +
+		`"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},` +
+		`"sender":{"login":"` + login + `"}}`)
+}
+
+// F5-1: a human comment on an ORPHAN PR must NOT mint a review Task. The old code
+// built the ForgeItem with PR.Author = the COMMENTER, fabricating authorship - so
+// a comment on a reaped bot-authored PR minted a review Task ClassifyPR's
+// bot-ignore (keyed on the REAL author) would have refused. PRs are covered by
+// the mr.opened primary mint + the sweep; orphan-comment mint is issue-only now.
+func TestOrphanPRComment_NoMint(t *testing.T) {
+	const secretVal = "whsec-oc-pr"
+	const repoName = "repo-ocpr"
+	const projName = "ocpr"
+	c := seedClient(t,
+		projectWithReporters(projName, "ocpr-scm", "tatara", "tatara-bot", nil),
+		secret("ocpr-scm", secretVal),
+		repository(repoName, projName, "https://github.com/o/r.git", "main"),
+	)
+	h, _ := newServer(t, c)
+
+	postIssueComment(t, h, projName, secretVal, prCommentBodyOn(88, "alice"))
+
+	require.Empty(t, allTasks(t, c, projName),
+		"an orphan PR comment must not fabricate a PR author and mint a review Task (F5-1)")
+}
+
 // A comment lands on an issue whose mirror CR already exists but carries no
 // controller owner (e.g. a stale/partial mirror from a failed prior mint):
 // commentIsOrphan reports true and the orphan-comment path mints.

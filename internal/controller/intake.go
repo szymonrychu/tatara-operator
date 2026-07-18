@@ -239,7 +239,11 @@ func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Ta
 	if !apierrors.IsAlreadyExists(err) {
 		return false, fmt.Errorf("intake: create task %s: %w", key.Name, err)
 	}
-	if getErr := m.Client.Get(ctx, key, existing); getErr != nil {
+	// Resolve the winning twin through the UNCACHED reader (F3-1): a stale cache
+	// that showed a still-LIVE twin as terminal would cascade a Delete of its
+	// owned Issue/MR mirror. The Delete below stays on m.Client (writes go
+	// through the writer), but the terminal/deleting decision must be live.
+	if getErr := m.reader().Get(ctx, key, existing); getErr != nil {
 		return false, fmt.Errorf("intake: resolve existing task %s: %w", key.Name, getErr)
 	}
 	if existing.DeletionTimestamp != nil || tatarav1alpha1.TaskDone(existing) {

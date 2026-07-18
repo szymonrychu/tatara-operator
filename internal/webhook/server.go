@@ -2,7 +2,9 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -345,7 +347,9 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 		return
 	}
 	task := &tatarav1.Task{}
-	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, ownerName), task); err != nil {
+	// Live (uncached) read: the dedup and terminal guards below must see the
+	// freshest stage/annotations even when a sibling replica just wrote them (F6-1).
+	if err := s.reader().Get(ctx, objKey(s.cfg.Namespace, ownerName), task); err != nil {
 		if apierrors.IsNotFound(err) {
 			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 			return
@@ -369,6 +373,15 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 	}
 
 	sp := s.cfg.SpillerFor(&proj)
+	// The appliers write stage + delete the wrapper pod from this HTTP goroutine.
+	// With replicaCount:1 that is always the leader; the residual cross-replica
+	// pod-recreate race (a stale-cache leader reconcile respawns the pod a
+	// non-leader just deleted) is reachable ONLY during a rolling-deploy 2-replica
+	// overlap and is an accepted, self-healing bound: the wrapper pod is
+	// agent-agnostic (turn-0 is chosen per CURRENT stage), so once the informer
+	// cache converges the reconciler re-drives the single pod to the current stage
+	// within one reconcile; the double STAGE-apply - the real hazard - is closed by
+	// the live-read guards above. See MEMORY.md 2026-07-18 (F6-1 stance).
 	switch ev.ReviewState {
 	case "changes_requested":
 		// Adopted human PRs (owning Task Kind=review) are only reviewed, never
@@ -398,13 +411,38 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 		return
 	}
 	if err := s.stampReviewProcessed(ctx, task, ev.ReviewID, ev.ReviewState); err != nil {
-		s.log.ErrorContext(ctx, "review: stamp dedup marker failed", "error", err, "task", task.Name)
+		// A lost dedup marker is worse than a redundant re-apply: fail the request
+		// so the forge REDELIVERS and the marker is eventually persisted. Both
+		// appliers are idempotent, so the re-apply is harmless (F8-1).
+		s.log.ErrorContext(ctx, "review: stamp dedup marker failed; forcing forge redelivery",
+			"error", err, "task", task.Name)
+		s.reject(w, http.StatusInternalServerError, "stamp review dedup", provider, ev.Kind, ev.Action, "error")
+		return
 	}
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
 
-// reviewKey is the Task annotation the (review.id, state) dedup is keyed on.
-func reviewKey(reviewID string) string { return "tatara.dev/reviewed-" + reviewID }
+// annReviewed holds the human-review (review.id, state) dedup FIFO. It is ONE
+// bounded annotation (fix F8-1/F6): a per-review key "tatara.dev/reviewed-<id>"
+// (a) OVERFLOWED the k8s 63-char annotation-NAME limit for the GitLab synthesized
+// reviewID "gl-approve-<IID>-<40hexsha>" (IID>=100), so the Update silently
+// failed and GitLab dedup never persisted, and (b) grew without bound on a
+// long-lived Task. The value is a drop-oldest FIFO of up to maxReviewedEntries
+// "<hash>:<state>" records with hash = sha256(reviewID)[:12], so the annotation
+// is bounded in BOTH size and count and works for any forge id.
+const annReviewed = "tatara.dev/reviewed"
+
+// maxReviewedEntries bounds the dedup FIFO. 32 human reviews of one Task is
+// already far past any real workflow; the oldest fall off, which at worst lets a
+// very old redelivery re-apply an idempotent verdict.
+const maxReviewedEntries = 32
+
+// reviewEntry is the dedup record for one (reviewID, state) pair: a short stable
+// hash of the reviewID (bounds any forge id to 12 hex) joined to the state.
+func reviewEntry(reviewID, state string) string {
+	sum := sha256.Sum256([]byte(reviewID))
+	return hex.EncodeToString(sum[:])[:12] + ":" + state
+}
 
 // reviewAlreadyProcessed reports whether this exact (review.id, state) pair was
 // already applied to task, so a redelivered webhook cannot re-fire it.
@@ -412,17 +450,25 @@ func reviewAlreadyProcessed(task *tatarav1.Task, reviewID, state string) bool {
 	if reviewID == "" {
 		return false
 	}
-	return task.Annotations[reviewKey(reviewID)] == state
+	want := reviewEntry(reviewID, state)
+	for _, e := range strings.Split(task.Annotations[annReviewed], ",") {
+		if e == want {
+			return true
+		}
+	}
+	return false
 }
 
 // stampReviewProcessed records the dedup marker AFTER the verdict has been
-// applied (or folded to the pending path), so a crash before this write only
-// costs a harmless re-apply (both appliers are idempotent), never a silent
-// drop.
+// applied (or folded to the pending path). A crash before this write only costs
+// a harmless re-apply (both appliers are idempotent); the CALLER surfaces a
+// failure here as 5xx so the forge redelivers, so the marker is eventually
+// persisted rather than silently lost.
 func (s *Server) stampReviewProcessed(ctx context.Context, task *tatarav1.Task, reviewID, state string) error {
 	if reviewID == "" {
 		return nil
 	}
+	entry := reviewEntry(reviewID, state)
 	key := client.ObjectKeyFromObject(task)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1.Task{}
@@ -432,9 +478,39 @@ func (s *Server) stampReviewProcessed(ctx context.Context, task *tatarav1.Task, 
 		if fresh.Annotations == nil {
 			fresh.Annotations = map[string]string{}
 		}
-		fresh.Annotations[reviewKey(reviewID)] = state
+		fresh.Annotations[annReviewed] = appendReviewedEntry(fresh.Annotations[annReviewed], entry, maxReviewedEntries)
 		return s.cfg.Client.Update(ctx, fresh)
 	})
+}
+
+// appendReviewedEntry appends entry to a comma-joined FIFO, de-duplicating an
+// identical existing entry (idempotent re-stamp) and capping to max, drop-oldest.
+func appendReviewedEntry(cur, entry string, max int) string {
+	var out []string
+	for _, e := range strings.Split(cur, ",") {
+		if e == "" || e == entry {
+			continue
+		}
+		out = append(out, e)
+	}
+	out = append(out, entry)
+	if max > 0 && len(out) > max {
+		out = out[len(out)-max:]
+	}
+	return strings.Join(out, ",")
+}
+
+// reader returns the uncached APIReader when configured, else the cached Client.
+// The review guards (dedup + terminal) read the owning Task through it so they
+// are authoritative ACROSS REPLICAS (fix F6-1): the webhook runs on every replica
+// (NeedLeaderElection=false) but reconcilers are leader-only, and a cached read
+// here could miss a transition a sibling replica just wrote and double-apply a
+// human verdict.
+func (s *Server) reader() client.Reader {
+	if s.cfg.APIReader != nil {
+		return s.cfg.APIReader
+	}
+	return s.cfg.Client
 }
 
 // minter builds the ONE shared intake funnel (internal/controller.Minter) from
@@ -526,6 +602,13 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 		s.reject(w, http.StatusInternalServerError, "mint issue", provider, ev.Kind, ev.Action, "error")
 		return
 	} else if created {
+		// Consumed-exactly-once (F7-1): this mint READ the liveness marker (it
+		// minted ACTIVE), so clear it - only the sweep did before, so a webhook
+		// mint left the marker to re-activate the issue on a later reap cycle.
+		if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(repo.Name, ev.Number)); cerr != nil {
+			s.log.ErrorContext(ctx, "issues: clear webhook-originated marker failed", "error", cerr,
+				"project", proj.Name, "issue_ref", ev.IssueRef)
+		}
 		s.log.InfoContext(ctx, "issues: webhook minted clarify task",
 			"action", "issue_webhook_mint", "project", proj.Name, "repository", repo.Name, "number", ev.Number)
 	}
@@ -603,27 +686,38 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	if s.commentIsOrphan(ctx, commentRepo, ev) {
-		var item controller.ForgeItem
-		if ev.IsPR {
-			item = controller.ForgeItem{IsPR: true, PR: scm.PRRef{
-				Number: ev.Number, Author: ev.ActorLogin, HeadBranch: ev.HeadBranch, Repo: repoSlug(commentRepo)}}
-		} else {
-			item = controller.ForgeItem{Issue: scm.Issue{
-				Number: ev.Number, State: "open", Author: ev.ActorLogin,
-				Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
-		}
+	// Orphan-comment mint is ISSUE-ONLY (fix F5-1). An orphan PR comment set the
+	// ForgeItem's PR author to the COMMENTER, not the real PR author - so a human
+	// comment on a reaped bot-authored PR fabricated authorship and minted a review
+	// Task ClassifyPR's bot-ignore (keyed on the REAL author) would refuse. PRs are
+	// already covered by the mr.opened primary mint (handleMROpened) and the sweep
+	// backstop, so there is nothing to gain and an author to fabricate. Orphan
+	// ISSUE-comment mint ("@bot go" on an un-owned issue) is preserved.
+	if !ev.IsPR && s.commentIsOrphan(ctx, commentRepo, ev) {
+		item := controller.ForgeItem{Issue: scm.Issue{
+			Number: ev.Number, State: "open", Author: ev.ActorLogin,
+			Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
 		// webhookOriginated=true: a live, HMAC-verified, allowlisted human comment
-		// is a liveness signal exactly like issues.opened (server.go:517). Minting
-		// it PARKED would strand the Task - the same-request deliverPendingEvent ->
-		// driveCommentUnpark path below reads the informer cache, which routinely
-		// still lags this mint's just-written mirror/owner, so the promotion can
-		// silently miss and the comment gets dropped with no sweep recovery (the
-		// issue is now owned, so IsOrphanIssue skips it). MintStage still checks
-		// TataraParkedLabel FIRST, so a deliberately backlog-parked issue stays
-		// parked regardless.
-		if _, _, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
+		// is a liveness signal exactly like issues.opened. Minting it PARKED would
+		// strand the Task - the same-request deliverPendingEvent -> driveCommentUnpark
+		// path below reads the informer cache, which routinely still lags this mint's
+		// just-written mirror/owner, so the promotion can silently miss and the
+		// comment gets dropped with no sweep recovery (the issue is now owned, so
+		// IsOrphanIssue skips it). MintStage still checks TataraParkedLabel FIRST, so
+		// a deliberately backlog-parked issue stays parked regardless.
+		if _, created, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
+			// Parity with handleIssueOpened/handleMROpened (fix F-misc): a mint error
+			// is a 5xx so GitHub redelivers, rather than a silent 202 that waits for
+			// the next sweep.
 			s.log.ErrorContext(ctx, "issue_comment: orphan mint failed", "error", merr, "issue_ref", ev.IssueRef)
+			s.reject(w, http.StatusInternalServerError, "mint orphan issue comment", provider, ev.Kind, ev.Action, "error")
+			return
+		} else if created {
+			if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(commentRepo.Name, ev.Number)); cerr != nil {
+				s.log.ErrorContext(ctx, "issue_comment: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
+			}
+			s.log.InfoContext(ctx, "issue_comment: webhook minted clarify task",
+				"action", "issue_comment_webhook_mint", "project", proj.Name, "repository", commentRepo.Name, "number", ev.Number)
 		}
 	}
 	s.deliverPendingEvent(ctx, proj, commentRepo, ev)
