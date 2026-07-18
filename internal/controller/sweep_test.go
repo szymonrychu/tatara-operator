@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // sweepReader is the fake forge the sweep tests run against. Every method the
@@ -28,6 +31,11 @@ type sweepReader struct {
 	prs      []scm.PRRef
 	comments map[int][]scm.IssueComment
 	content  map[int]scm.IssueContent
+
+	// listCommentsErr, when set, fails EVERY comment read - the cheapest way to
+	// drive a per-item sweep error (fail("list_comments")) that leaves firstErr
+	// non-nil while the pass still structurally completes.
+	listCommentsErr error
 
 	issueCalls int
 	prCalls    int
@@ -44,6 +52,9 @@ func (s *sweepReader) ListOpenPRs(context.Context, string, string) ([]scm.PRRef,
 }
 
 func (s *sweepReader) ListIssueComments(_ context.Context, _, _ string, number int) ([]scm.IssueComment, error) {
+	if s.listCommentsErr != nil {
+		return nil, s.listCommentsErr
+	}
 	return s.comments[number], nil
 }
 
@@ -1114,6 +1125,75 @@ func TestSweepHeartbeat(t *testing.T) {
 
 	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity)); got <= 0 {
 		t.Fatalf("operator_sweep_last_success_timestamp_seconds{activity=sweep} = %v, want a stamped timestamp", got)
+	}
+}
+
+// TestSweepHeartbeatStampsDespitePerItemError: the heartbeat is a LIVENESS
+// signal, not a zero-error one. A pass that hits a per-item error (one issue's
+// comment read fails, or one stale MergeRequest CR read errors) records that
+// error separately (SweepErrorsTotal) AND still stamps the heartbeat. Coupling
+// the heartbeat to a fully-clean pass meant a single transient forge error - or
+// one missing/stale CR - silenced the heartbeat for the WHOLE pass, and with the
+// gauge reset on every restart the NoData(Alerting) alert then fired while the
+// sweep was in fact running. The error is STILL returned for the reconciler's
+// requeue; only the heartbeat is decoupled from it.
+func TestSweepHeartbeatStampsDespitePerItemError(t *testing.T) {
+	const activity = "sweep-hb-peritem-test"
+	proj := sweepProject("hb-err-proj")
+	repo := sweepRepo("hb-err-proj")
+	c := newMirrorClient(t, proj, repo)
+
+	rd := &sweepReader{
+		issues:          []scm.IssueRef{{Repo: "szymonrychu/tatara-operator", Number: 1, Author: "alice", State: "open"}},
+		listCommentsErr: errors.New("injected forge failure"),
+	}
+
+	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(0)
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, activity)
+	if err == nil {
+		t.Fatal("SweepProject returned nil, want the per-item error propagated for the reconciler requeue")
+	}
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(activity)); got <= 0 {
+		t.Fatalf("heartbeat = %v, want it stamped despite the per-item error (liveness is not zero-error)", got)
+	}
+}
+
+// TestSweepHeartbeatSuppressedOnHardFailure: the OTHER edge. When the pass
+// cannot even begin - activeTaskCount fails, so the sweep returns before the
+// repos loop - the heartbeat is NOT stamped and SweepErrorsTotal records the
+// list_tasks failure. This is the case the alert exists to catch: a sweep that
+// genuinely is not running.
+func TestSweepHeartbeatSuppressedOnHardFailure(t *testing.T) {
+	const activity = "sweep-hb-hardfail-test"
+	proj := sweepProject("hb-hard-proj")
+	repo := sweepRepo("hb-hard-proj")
+
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cli client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*tatarav1alpha1.TaskList); ok {
+					return errors.New("injected task-list failure")
+				}
+				return cli.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+
+	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(activity, "list_tasks"))
+	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(0)
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	err := r.SweepProject(context.Background(), proj, &sweepReader{}, []tatarav1alpha1.Repository{*repo}, nil, activity)
+	if err == nil {
+		t.Fatal("SweepProject returned nil, want the activeTaskCount failure")
+	}
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(activity)); got != 0 {
+		t.Fatalf("heartbeat = %v, want 0 (a sweep that cannot run must NOT stamp liveness)", got)
+	}
+	if after := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(activity, "list_tasks")); after <= before {
+		t.Fatalf("operator_sweep_errors_total{reason=list_tasks} did not increment (%v -> %v)", before, after)
 	}
 }
 
