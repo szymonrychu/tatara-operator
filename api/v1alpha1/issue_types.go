@@ -238,6 +238,13 @@ type IssueStatus struct {
 	// timestamp field).
 	// +optional
 	LastDeployTimeoutCommentAt *metav1.Time `json:"lastDeployTimeoutCommentAt,omitempty"`
+	// LastMemoryGateCommentAt is when the first turn-submit memory-gate hold
+	// operator comment was enqueued on this issue (issue #355). Its PRESENCE (not
+	// the value) suppresses a second comment on later holds, same one-shot
+	// cooldown shape as LastDeployTimeoutCommentAt and DISTINCT from it: a Task
+	// can hold on the memory gate independently of any deploy-timeout episode.
+	// +optional
+	LastMemoryGateCommentAt *metav1.Time `json:"lastMemoryGateCommentAt,omitempty"`
 	// +optional
 	LastSyncedAt *metav1.Time `json:"lastSyncedAt,omitempty"`
 	// +optional

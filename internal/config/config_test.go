@@ -224,6 +224,67 @@ func TestLoad_IdlePodReapAfter(t *testing.T) {
 	})
 }
 
+// TestLoad_MemoryProvisioningTimeout covers the issue #355 provisioning-bound
+// knob: the default, an explicit override, the min-floor clamp for a short
+// positive value, and disabling via zero.
+func TestLoad_MemoryProvisioningTimeout(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+		t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+		t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	}
+	t.Run("default", func(t *testing.T) {
+		base(t)
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != config.DefaultMemoryProvisioningTimeout {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want default %v", cfg.MemoryProvisioningTimeout, config.DefaultMemoryProvisioningTimeout)
+		}
+	})
+	t.Run("explicit", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "90")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != 90*time.Minute {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want 90m", cfg.MemoryProvisioningTimeout)
+		}
+	})
+	t.Run("clamped to floor", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "1")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != config.MinMemoryProvisioningTimeout {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want clamped %v", cfg.MemoryProvisioningTimeout, config.MinMemoryProvisioningTimeout)
+		}
+	})
+	t.Run("disabled by zero", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "0")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != 0 {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want 0 (disabled)", cfg.MemoryProvisioningTimeout)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "notanumber")
+		if _, err := config.Load(); err == nil {
+			t.Fatal("expected error for non-integer MEMORY_PROVISIONING_TIMEOUT_MINUTES, got nil")
+		}
+	})
+}
+
 // TestLoad_MemoryMonitorLabelsFromEnv asserts the JSON-object label map parses,
 // and that the enable flag can be turned off.
 func TestLoad_MemoryMonitorLabelsFromEnv(t *testing.T) {

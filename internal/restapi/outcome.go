@@ -570,6 +570,15 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		return false
 	}
 	s.metrics.TaskTerminalEntry(o.task.Spec.Kind, from, to, toReason)
+	// The same choke-point gap D1 closed for operator_task_terminal_total:
+	// this handler's stage.Enter calls (awaiting-human, identity-unverified,
+	// implement-declined, ...) never route through controller.EnterStage, the
+	// only other place TaskParked() is called - so an outcome-driven first
+	// park undercounted operator_task_parked_total. Mirrors transition.go's
+	// EnterStage condition exactly (metric-wiring audit, issue #370).
+	if to == tatarav1alpha1.StageParked && from != "" {
+		s.metrics.TaskParked(from, toReason)
+	}
 	if to != from {
 		s.log.InfoContext(ctx, "stage transition",
 			append(reqLogFields(o.r), "action", "stage_transition", "task", o.task.Name,

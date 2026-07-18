@@ -31,13 +31,19 @@ var SweepMintCapHitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Sweep passes in which a Task creation budget bound, by project and cap (contract B.4).",
 }, []string{"project", "cap"})
 
-// SweepLastSuccessTimestamp is a HEARTBEAT: the unix time of the last sweep pass
-// that completed with no error. Its alert sets noDataState: Alerting, because for
-// a heartbeat NoData IS the failure - a sweep that never runs emits nothing at
-// all, and a silent operator is exactly the state the alert exists to catch.
+// SweepLastSuccessTimestamp is a HEARTBEAT: the unix time of the last pass of
+// a scan-family activity that completed with no error. Its alert sets
+// noDataState: Alerting, because for a heartbeat NoData IS the failure - a
+// pass that never runs emits nothing at all, and a silent operator is
+// exactly the state the alert exists to catch. Covers both the B.4 sweep
+// (sweep.go, activities "sweep"/"nightlySweep") and the brainstorm/
+// documentation/issueScan crons (projectscan.go's stampScan, activities
+// "brainstorm"/"documentation"/"issueScan") - the latter's successor for
+// tatara_scan_items_total, pruned as dead-per-redesign (metric-wiring
+// audit, issue #370).
 var SweepLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "operator_sweep_last_success_timestamp_seconds",
-	Help: "Unix timestamp of the last fully successful sweep pass, by activity (contract K.1).",
+	Help: "Unix timestamp of the last fully successful pass of a scan-family activity, by activity (contract K.1).",
 }, []string{"activity"})
 
 // SweepErrorsTotal counts sweep failures by activity and reason. Every reason is
@@ -53,5 +59,21 @@ func init() {
 		SweepMintCapHitTotal,
 		SweepLastSuccessTimestamp,
 		SweepErrorsTotal,
+	)
+	// Pre-seed the closed (activity x reason) label set so a healthy sweep
+	// with zero errors still exposes a zero baseline - a CounterVec with no
+	// WithLabelValues call has NO series at all, and the TataraSweepErrors
+	// alert would undercount the first evaluation of a real error storm
+	// (metric-wiring audit, issue #370). activity/reason are literal here
+	// (not imported from internal/controller) to avoid a reverse import;
+	// keep in sync with sweep.go's SweepActivity/SweepNightlyActivity
+	// constants and its fail(reason, ...) call sites.
+	seedLabels(func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) },
+		[]string{"sweep", "nightlySweep"},
+		[]string{
+			"list_tasks", "owner_repo", "list_issues", "list_prs", "get_issue_cr",
+			"list_comments", "get_issue", "mint_issue_task", "clear_webhook_marker",
+			"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
+		},
 	)
 }
