@@ -15,8 +15,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -224,6 +226,34 @@ func (r *DispatcherReconciler) poolInflight(qes []tatarav1alpha1.QueuedEvent, ta
 	return n
 }
 
+// patchQueuedEventStatus Get-fresh + mutate + Status().Update's a QueuedEvent's
+// status, retrying on conflict. Mirrors patchTaskStatus/repository_controller.go's
+// patchStatus (issue #348): every reconcile of ONE QueuedEvent walks and admits
+// the WHOLE project pool, so a single Reconcile call can write Status().Update on
+// several QueuedEvents that were never its own req.NamespacedName - and the next
+// QueuedEvent's own reconcile, moments later, lists that same pool off a cache
+// that may not have caught up yet. That self-conflict (not a different writer)
+// was the entire source of the queuedevents.tatara.dev 409 storm: every
+// queue_admit -> queue_done cycle logged one, purely from the raw
+// r.Status().Update this replaces.
+func patchQueuedEventStatus(ctx context.Context, c client.Client, q *tatarav1alpha1.QueuedEvent, mutate func(*tatarav1alpha1.QueuedEvent) bool) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.QueuedEvent{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(q), fresh); err != nil {
+			return err
+		}
+		if !mutate(fresh) {
+			*q = *fresh
+			return nil
+		}
+		if err := c.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		*q = *fresh
+		return nil
+	})
+}
+
 // admit drains the alert pool to AlertCapacity, then the normal pool to
 // QueueCapacity, each in strict ascending seq order (pure per-project FIFO within a
 // pool; head-of-line blocking accepted). Wired in Task 8 Reconcile.
@@ -420,11 +450,13 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				}
 				taskName = task.Name
 			}
-			q.Status.State = tatarav1alpha1.QueueStateAdmitted
-			q.Status.TaskRef = taskName
 			admittedAt := metav1.Now()
-			q.Status.AdmittedAt = &admittedAt
-			if err := r.Status().Update(ctx, q); err != nil {
+			if err := patchQueuedEventStatus(ctx, r.Client, q, func(fresh *tatarav1alpha1.QueuedEvent) bool {
+				fresh.Status.State = tatarav1alpha1.QueueStateAdmitted
+				fresh.Status.TaskRef = taskName
+				fresh.Status.AdmittedAt = &admittedAt
+				return true
+			}); err != nil {
 				return err
 			}
 			inflight++
@@ -517,16 +549,22 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 	}
 
 	if task.Labels[queue.LabelQueuedEvent] != q.Name {
-		if task.Labels == nil {
-			task.Labels = map[string]string{}
-		}
-		task.Labels[queue.LabelQueuedEvent] = q.Name
-		if err := r.Update(ctx, task); err != nil {
+		if err := patchTaskAnnotations(ctx, r.Client, task, func(fresh *tatarav1alpha1.Task) bool {
+			if fresh.Labels[queue.LabelQueuedEvent] == q.Name {
+				return false
+			}
+			if fresh.Labels == nil {
+				fresh.Labels = map[string]string{}
+			}
+			fresh.Labels[queue.LabelQueuedEvent] = q.Name
+			return true
+		}); err != nil {
 			return "", ticketDeferred, err
 		}
 	}
+	entering := target != from
 	switch {
-	case target != from:
+	case entering:
 		if err := stage.Enter(task, nil, target, "", now); err != nil {
 			// Bug-catcher: approved -> implementing is the only edge that reaches
 			// here and a kind=review Task can never be approved. Drop the ticket
@@ -543,7 +581,31 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 		// an empty one 409s the agent's submit.
 		task.Status.AgentKind = agentKind
 	}
-	if err := r.Status().Update(ctx, task); err != nil {
+	// task already carries the exact final state (stage.Enter/AgentKind were
+	// applied above and already validated); patchTaskStatus just needs a
+	// conflict-safe carrier to the API, so the fresh copy is stamped with these
+	// precomputed absolute values, never re-derived (transition.go's own
+	// "ABSOLUTE ASSIGNMENTS only" rule) and never touching fields this write
+	// doesn't own (podwatch/turncallback/etc. may have moved fresh's Stats or
+	// PendingEvents in the meantime; only the entering-branch fields below and
+	// AgentKind are ours to write).
+	if err := patchTaskStatus(ctx, r.Client, task, func(fresh *tatarav1alpha1.Task) bool {
+		if entering {
+			fresh.Status.Stage = task.Status.Stage
+			fresh.Status.StageReason = task.Status.StageReason
+			fresh.Status.AgentKind = task.Status.AgentKind
+			fresh.Status.StageEnteredAt = task.Status.StageEnteredAt
+			fresh.Status.PodStartedAt = task.Status.PodStartedAt
+			fresh.Status.StageWorkStartedAt = task.Status.StageWorkStartedAt
+			fresh.Status.Stats.PodRecreations = task.Status.Stats.PodRecreations
+			return true
+		}
+		if fresh.Status.AgentKind == agentKind {
+			return false
+		}
+		fresh.Status.AgentKind = agentKind
+		return true
+	}); err != nil {
 		return "", ticketDeferred, err
 	}
 	return task.Name, ticketAdmitted, nil
@@ -809,8 +871,13 @@ func (r *DispatcherReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		return reqs
 	}
+	// MaxConcurrentReconciles: 1 is explicit here to match every sibling
+	// controller (task/project/repository) - it was already controller-runtime's
+	// implicit default (unset == 1), so this changes no behavior, only makes the
+	// serialization the #348 conflict fix relies on visible rather than assumed.
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tatarav1alpha1.QueuedEvent{}).
 		Watches(&tatarav1alpha1.Task{}, handler.EnqueueRequestsFromMapFunc(mapTaskToQE)).
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
 		Complete(r)
 }
