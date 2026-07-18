@@ -23,23 +23,40 @@
   terminating), no-outcome -> implementing behind Unpark's guards, every other
   reason folds to the pending-event path. A human review must not escape a
   cap (review-loop-exhausted, stage-deadline) one review at a time.
-- 2026-07-18 (WS1-B F6-1 stance) Human-review appliers write stage + delete the
-  wrapper pod from the webhook HTTP goroutine, which runs on EVERY replica
-  (NeedLeaderElection=false); reconcilers are leader-only. Chose LIVE-READ
-  GUARDS + DOCUMENTED BOUND over route-through-leader. The webhook now resolves
-  the owning Task through the uncached APIReader, so the `reviewAlreadyProcessed`
-  dedup and the `TaskDone` terminal guard are authoritative across replicas -
-  this closes the double STAGE-apply window (the real correctness bug). The
-  residual pod-recreate race (a stale-cache leader reconcile respawns the pod a
-  non-leader just deleted) is an ACCEPTED BOUND: with `replicaCount: 1` it is
-  only reachable during a rolling-deploy 2-replica overlap (seconds); the
-  wrapper pod is agent-agnostic (turn-0 bundle is chosen per CURRENT stage), so
-  once the informer cache converges the reconciler re-drives the single pod to
-  the current stage within one reconcile; worst case is one transient agent
-  turn, itself bounded by the handoff/TTL clocks. Route-through-leader
-  (annotate-to-poke) was rejected here because it would unwire WS1-A's
-  webhook->applier call sites and shift the whole review path off the
-  immediate-apply model for a race that a single-replica deployment never hits.
+- 2026-07-18 (WS1-B F6-1, corrected) Human-review appliers write stage + delete
+  the wrapper pod from the webhook HTTP goroutine, which runs on EVERY replica;
+  reconcilers are leader-only. Production is 3-replica HA (leaderElection: 1
+  active + 2 standby, tatara-helmfile values/tatara-operator/default.yaml:2), so
+  a non-leader applying a transition + pod-delete against the leader's reconcile
+  is PERMANENT STEADY STATE on every human review, NOT a rolling-deploy
+  transient (an earlier note claiming replicaCount:1 was factually wrong - fixed
+  at root, not documented away). Two fixes: (1) the webhook resolves the owning
+  Task through the uncached APIReader, so `reviewAlreadyProcessed` + `TaskDone`
+  are authoritative across replicas (closes double STAGE-apply). (2) The
+  pod-recreate race is closed at the controller. `refreshTaskFromAPI` already
+  live-adopts the stage at dispatch top, so the residual hole is the intermediate
+  window in ApplyReviewApproval (WS1-A F5 deletes the pod BEFORE the merging write
+  lands, so a live read there still reads reviewing): `TaskReconciler.liveStageDiffers`
+  re-reads live in the pod-absent (re)spawn branches and skips create/respawn once
+  the stage moved (narrows the phantom spawn, generic to any non-leader
+  transition), and `DrainPendingReview` now GATES on the owning Task being in
+  reviewing - if the Task advanced off reviewing (a maintainer approval enters
+  merging directly and a raced review pod re-arms PendingReview afterwards), the
+  stale pending review is dropped "refused" without posting or overwriting
+  ReviewedSHA. That gate is the load-bearing correctness guard (advanceAfterReview
+  gates the ADVANCE on the same reviewing check; this gates the POST); the pod
+  guard is spawn/cost prevention + defense. Route-through-leader (annotate-to-poke)
+  was rejected: it would unwire WS1-A's webhook->applier call sites for no
+  correctness gain over the two gates.
+- 2026-07-18 (WS1-B F5-2 follow-up) A folded review now mirrors as ExternalID
+  "review-<reviewID>"; a subsequent forge thread RE-SCAN (mirror.go cadence sync)
+  fetches the SAME comment under the forge's NUMERIC comment id, so the mirror can
+  briefly hold two rows for one review-comment until dedup/eviction converges.
+  Cosmetic (mirror is byte-budget-evicted set-union, not a source of truth for
+  dedup); revisit only if it shows up as duplicated review text in a bundle.
+  Also: handleIssueOpened's Mark-then-mint-then-Clear is a deliberate double write
+  on the happy path - Mark MUST precede the mint so a mint failure (5xx) leaves
+  the sweep its cold-start marker; do NOT "optimize" it to mint-first.
 - 2026-07-18 (WS1-B F8-1/F6 dedup scheme) Human-review (review.id,state) dedup
   is now ONE bounded annotation `tatara.dev/reviewed` (was one
   `tatara.dev/reviewed-<reviewID>` key per review). Value is a drop-oldest FIFO

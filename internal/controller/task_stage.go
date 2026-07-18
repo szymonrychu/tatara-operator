@@ -473,6 +473,11 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 			return ctrl.Result{}, gerr
 		}
 		if gone {
+			if r.liveStageDiffers(ctx, task) {
+				log.FromContext(ctx).Info("wrapper pod gone but the live stage has moved; not respawning",
+					"action", "pod_respawn_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.Stage)
+				return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
+			}
 			return r.respawnLostPod(ctx, proj, task, now)
 		}
 		// G.7 TTL STOP (fix I5). A pod past t0 = podStartedAt + agentPodTTLSeconds is
@@ -677,6 +682,28 @@ func (r *TaskReconciler) respawnLostPod(ctx context.Context, proj *tatarav1alpha
 	return ctrl.Result{RequeueAfter: agentBootRequeue}, nil
 }
 
+// liveStageDiffers re-reads the Task's stage from the API SERVER (never the
+// cache) and reports whether it has moved off the stage this reconcile is acting
+// on. It exists for the pod-(re)spawn branches (the #348/#352 live-read idiom):
+// the operator runs 3-replica HA (leaderElection: 1 active + 2 standby) and the
+// webhook serves on ALL replicas, so a non-leader can apply a human-review
+// transition and delete the wrapper pod after refreshTaskFromAPI already adopted
+// the older stage at dispatch top. Re-reading live right before a pod (re)create
+// catches a transition that landed since, so the leader does not spawn a pod for
+// a stage the Task has left. Cheap: only runs when a pod is absent (rare). A read
+// error returns false (proceed): the create/respawn paths own their own errors,
+// and a nil APIReader (unit tests) trusts the cached read.
+func (r *TaskReconciler) liveStageDiffers(ctx context.Context, task *tatarav1alpha1.Task) bool {
+	if r.APIReader == nil {
+		return false
+	}
+	live := &tatarav1alpha1.Task{}
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(task), live); err != nil {
+		return false
+	}
+	return live.Status.Stage != task.Status.Stage
+}
+
 // podGone reports whether the Task's wrapper Pod no longer exists.
 func (r *TaskReconciler) podGone(ctx context.Context, task *tatarav1alpha1.Task) (bool, error) {
 	pod := &corev1.Pod{}
@@ -718,6 +745,23 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 		return agent.DeleteWrapper(ctx, r.Client, task.Namespace, task)
 	case !apierrors.IsNotFound(err):
 		return fmt.Errorf("get wrapper pod: %w", err)
+	}
+
+	// The pod is ABSENT. Before creating one, re-read the stage LIVE: production
+	// runs the operator 3-replica HA and the webhook serves on every replica, so a
+	// NON-leader can apply a human-review transition and tear the pod down since
+	// dispatch-top's refreshTaskFromAPI adopted the older stage. Creating a pod for
+	// a stage the Task has live-left - e.g. a review pod after a maintainer approval
+	// already advanced to merging, whose /outcome would then re-arm a bot review
+	// over the human's - is the F6-1 race. Skip; the caller requeues and the
+	// converged stage drives the right pod. This does not fully close the narrow
+	// delete-pod-before-transition window in ApplyReviewApproval (live stage still
+	// reads reviewing there); DrainPendingReview's reviewing-gate is the correctness
+	// backstop for any pod that slips through.
+	if r.liveStageDiffers(ctx, task) {
+		log.FromContext(ctx).Info("wrapper pod absent but the live stage has moved; skipping create",
+			"action", "pod_create_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.Stage)
+		return nil
 	}
 
 	if err := agent.ValidatePodSecretRefs(proj, r.PodConfig); err != nil {

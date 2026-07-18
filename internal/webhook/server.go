@@ -373,15 +373,15 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 	}
 
 	sp := s.cfg.SpillerFor(&proj)
-	// The appliers write stage + delete the wrapper pod from this HTTP goroutine.
-	// With replicaCount:1 that is always the leader; the residual cross-replica
-	// pod-recreate race (a stale-cache leader reconcile respawns the pod a
-	// non-leader just deleted) is reachable ONLY during a rolling-deploy 2-replica
-	// overlap and is an accepted, self-healing bound: the wrapper pod is
-	// agent-agnostic (turn-0 is chosen per CURRENT stage), so once the informer
-	// cache converges the reconciler re-drives the single pod to the current stage
-	// within one reconcile; the double STAGE-apply - the real hazard - is closed by
-	// the live-read guards above. See MEMORY.md 2026-07-18 (F6-1 stance).
+	// The appliers write stage + delete the wrapper pod from this HTTP goroutine,
+	// which runs on EVERY replica (production is 3-replica HA); reconcilers are
+	// leader-only. The double STAGE-apply is closed by the live-read guards above.
+	// The pod-recreate race (the leader respawns a review pod a non-leader tore
+	// down, whose /outcome re-arms a bot review over the human's) is closed at the
+	// controller: TaskReconciler.liveStageDiffers skips a pod (re)create once the
+	// stage has moved, and DrainPendingReview's reviewing-gate drops any review a
+	// slipped-through pod re-arms after the Task left reviewing. See MEMORY.md
+	// 2026-07-18 (F6-1).
 	switch ev.ReviewState {
 	case "changes_requested":
 		// Adopted human PRs (owning Task Kind=review) are only reviewed, never
