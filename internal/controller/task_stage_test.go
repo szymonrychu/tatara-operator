@@ -101,11 +101,15 @@ func TestEnsureStagePod_SkipsCreateWhenLiveStageMoved(t *testing.T) {
 	r := tsReconciler(cached)
 	r.APIReader = live
 
-	if err := r.ensureStagePod(context.Background(), proj, cachedTask); err != nil {
+	skipped, err := r.ensureStagePod(context.Background(), proj, cachedTask)
+	if err != nil {
 		t.Fatalf("ensureStagePod: %v", err)
 	}
+	if !skipped {
+		t.Fatal("ensureStagePod must report skipped=true so the caller early-returns instead of submitting a turn")
+	}
 	var pod corev1.Pod
-	err := cached.Get(context.Background(),
+	err = cached.Get(context.Background(),
 		types.NamespacedName{Namespace: mdNS, Name: agent.PodName(cachedTask)}, &pod)
 	if err == nil {
 		t.Fatal("a pod was created for a stage the Task has live-left; the F6-1 guard did not fire")

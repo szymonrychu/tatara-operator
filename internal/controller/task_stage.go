@@ -490,8 +490,18 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		}
 	}
 
-	if err := r.ensureStagePod(ctx, proj, task); err != nil {
+	skipped, err := r.ensureStagePod(ctx, proj, task)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if skipped {
+		// The Task has live-moved off this stage since dispatch top (a non-leader
+		// webhook transition, F6-1); the pod was deliberately NOT created. Early-
+		// return so we never fall through to a turn submission against a pod that
+		// does not exist - do not rely on the StageWorkStartedAt/turn0-marker
+		// consistency of the stale cached view to stop us. Requeue; the converged
+		// stage drives the right pod.
+		return ctrl.Result{RequeueAfter: stageRequeue}, nil
 	}
 
 	// CLOCK 3 is armed by PodWatchReconciler at pod-Ready, and NOT BEFORE: it runs
@@ -719,32 +729,35 @@ func (r *TaskReconciler) podGone(ctx context.Context, task *tatarav1alpha1.Task)
 
 // ensureStagePod creates the wrapper Pod + Service for the CURRENT stage, and
 // tears down a pod left over from a stage this Task has already LEFT (see
-// annPodStage).
+// annPodStage). It returns skipped=true when it deliberately did NOT create a
+// pod because the live stage has moved off the one this reconcile is acting on
+// (F6-1); the caller must early-return and requeue rather than proceed to turn
+// submission.
 func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task) error {
+	task *tatarav1alpha1.Task) (skipped bool, err error) {
 
 	var repo *tatarav1alpha1.Repository
 	if task.Spec.RepositoryRef != "" {
 		var got tatarav1alpha1.Repository
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &got); err != nil {
-			return fmt.Errorf("get repository %s: %w", task.Spec.RepositoryRef, err)
+			return false, fmt.Errorf("get repository %s: %w", task.Spec.RepositoryRef, err)
 		}
 		repo = &got
 	}
 
 	existing := &corev1.Pod{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, existing)
+	getErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: agent.PodName(task)}, existing)
 	switch {
-	case err == nil:
+	case getErr == nil:
 		if existing.Annotations[annPodStage] == task.Status.Stage {
-			return nil
+			return false, nil
 		}
 		log.FromContext(ctx).Info("wrapper pod belongs to a stage this task has left; deleting",
 			"action", "stale_stage_pod_delete", "resource_id", task.Name,
 			"pod_stage", existing.Annotations[annPodStage], "stage", task.Status.Stage)
-		return agent.DeleteWrapper(ctx, r.Client, task.Namespace, task)
-	case !apierrors.IsNotFound(err):
-		return fmt.Errorf("get wrapper pod: %w", err)
+		return false, agent.DeleteWrapper(ctx, r.Client, task.Namespace, task)
+	case !apierrors.IsNotFound(getErr):
+		return false, fmt.Errorf("get wrapper pod: %w", getErr)
 	}
 
 	// The pod is ABSENT. Before creating one, re-read the stage LIVE: production
@@ -761,15 +774,15 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	if r.liveStageDiffers(ctx, task) {
 		log.FromContext(ctx).Info("wrapper pod absent but the live stage has moved; skipping create",
 			"action", "pod_create_skipped_stage_moved", "resource_id", task.Name, "acting_stage", task.Status.Stage)
-		return nil
+		return true, nil
 	}
 
 	if err := agent.ValidatePodSecretRefs(proj, r.PodConfig); err != nil {
-		return err
+		return false, err
 	}
 	repos, err := r.projectRepos(ctx, proj)
 	if err != nil {
-		return err
+		return false, err
 	}
 	memEndpoint := ""
 	if proj.Status.Memory != nil {
@@ -781,11 +794,11 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	}
 	pod.Annotations[annPodStage] = task.Status.Stage
 	if err := r.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create wrapper pod: %w", err)
+		return false, fmt.Errorf("create wrapper pod: %w", err)
 	}
 	svc := agent.BuildService(proj, repo, task, r.PodConfig)
 	if err := r.Create(ctx, svc); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create wrapper service: %w", err)
+		return false, fmt.Errorf("create wrapper service: %w", err)
 	}
 
 	repoURL := ""
@@ -793,7 +806,7 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 		repoURL = repo.Spec.URL
 	}
 	_ = r.stampResolvedModel(ctx, task, agent.ModelForKind(proj, task.Spec.Kind, task.Labels[tatarav1alpha1.LabelActivity], repoURL))
-	return nil
+	return false, nil
 }
 
 // ensureTicket ensures the ADMISSION TICKET (a QueuedEvent naming this Task) for
