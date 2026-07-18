@@ -85,10 +85,9 @@ const (
 	// clause 1(b) is an EXACT match on TaskBranchPrefix + the owning Task's name.
 	TaskBranchPrefix = "task/"
 
-	// SweepActivity / SweepNightlyActivity are the {activity} label values on the
-	// sweep heartbeat and error counters. ONE function serves both paths.
-	SweepActivity        = "sweep"
-	SweepNightlyActivity = "nightlySweep"
+	// SweepActivity is the {activity} label value on the sweep heartbeat and
+	// error counters.
+	SweepActivity = "sweep"
 
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries. F.3 has
 	// NO triaging -> implementing edge: an issue Task enters clarifying, where the
@@ -572,10 +571,9 @@ func (b *sweepBudget) capHit(ctx context.Context, cap string) {
 }
 
 // SweepProject runs ONE sweep pass over proj: mint a Task for every orphan
-// issue, dispose of every open PR/MR, and stamp the heartbeat when the pass
-// completes clean. activity is the {activity} metric label (SweepActivity for
-// the hourly path, SweepNightlyActivity for the nightly one) - ONE function,
-// both paths.
+// issue, dispose of every open PR/MR, and stamp the liveness heartbeat once the
+// pass has run to completion. activity is the {activity} metric label
+// (SweepActivity).
 //
 // sp is the A.7 spiller for the mirror writes; nil is legal (a sweep-minted
 // Issue/MergeRequest is far under the byte budget on its first write).
@@ -627,10 +625,18 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	for stg, n := range minted {
 		obs.TasksMintedPerSweep.WithLabelValues(proj.Name, stg).Observe(float64(n))
 	}
+	// The heartbeat is LIVENESS, not zero-error health: the repos loop ran to the
+	// end, so stamp it whether or not a per-item read failed. Per-item errors are
+	// already metered by SweepErrorsTotal and returned below for the requeue.
+	// Coupling the heartbeat to a fully-clean pass let one stale CR or one
+	// transient forge error silence it for the WHOLE pass, and since the gauge
+	// resets on restart the NoData(Alerting) alert then fired while the sweep was
+	// in fact running. The activeTaskCount hard-failure returns BEFORE this point,
+	// so a sweep that genuinely cannot run still leaves the heartbeat unset.
+	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
 	if firstErr != nil {
 		return firstErr
 	}
-	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
 	l.Info("sweep: pass complete",
 		"action", "sweep_pass", "resource_id", proj.Name, "activity", activity,
 		"minted_triaging", minted[tatarav1alpha1.StageTriaging],

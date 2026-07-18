@@ -32,12 +32,17 @@ var SweepMintCapHitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 }, []string{"project", "cap"})
 
 // SweepLastSuccessTimestamp is a HEARTBEAT: the unix time of the last sweep pass
-// that completed with no error. Its alert sets noDataState: Alerting, because for
-// a heartbeat NoData IS the failure - a sweep that never runs emits nothing at
-// all, and a silent operator is exactly the state the alert exists to catch.
+// that RAN TO COMPLETION (the repos loop finished). It is LIVENESS, not
+// zero-error health - a pass with per-item errors still stamps it, because those
+// errors are metered separately (SweepErrorsTotal) and one stale CR or transient
+// forge error must never silence the heartbeat for the whole pass. A sweep that
+// cannot even begin (activeTaskCount fails) returns before stamping, so it stays
+// unset. Its alert sets noDataState: Alerting, because for a heartbeat NoData IS
+// the failure - the gauge resets on restart and an absent series means the
+// operator is not sweeping at all.
 var SweepLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "operator_sweep_last_success_timestamp_seconds",
-	Help: "Unix timestamp of the last fully successful sweep pass, by activity (contract K.1).",
+	Help: "Unix timestamp of the last completed sweep pass (liveness, not zero-error), by activity (contract K.1).",
 }, []string{"activity"})
 
 // SweepErrorsTotal counts sweep failures by activity and reason. Every reason is
