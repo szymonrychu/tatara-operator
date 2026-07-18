@@ -579,6 +579,26 @@ func TestOutcome_Clarify_DiscussParksAwaitingHuman(t *testing.T) {
 	require.Equal(t, "awaiting-human", got.Status.StageReason)
 }
 
+// An /outcome-driven park (this handler's own stage.Enter call, not routed
+// through controller.EnterStage) must still count against
+// operator_task_parked_total - the same choke-point gap already closed for
+// operator_task_terminal_total (D1) via commit()'s TaskTerminalEntry call.
+// Regression coverage for the metric-wiring audit (issue #370).
+func TestOutcome_Clarify_DiscussParksAwaitingHuman_RecordsParkedMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{writer: panicForge{}, metrics: metrics}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"discuss","reason":"needs a human"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got := testutil.ToFloat64(metrics.TaskParkedCounter(tatarav1alpha1.StageClarifying, "awaiting-human"))
+	require.Equal(t, float64(1), got,
+		"operator_task_parked_total{stage=clarifying,stageReason=awaiting-human} must record the outcome-driven park")
+}
+
 func TestOutcome_Clarify_CloseRejectsAndQueuesTheIssueClose(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),

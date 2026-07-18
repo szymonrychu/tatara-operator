@@ -4,8 +4,10 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -78,4 +80,37 @@ func TestStampScanRetriesOnConflict(t *testing.T) {
 	require.NoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "stamp-retry-proj"}, &got))
 	require.NotNil(t, got.Status.LastIssueScan, "LastIssueScan must be stamped even after one conflict")
 	require.GreaterOrEqual(t, calls.Load(), int32(2), "must have retried at least once")
+}
+
+// stampScan is the successor heartbeat for the brainstorm/documentation/
+// issueScan crons now that tatara_scan_items_total is pruned (metric-wiring
+// audit, issue #370): TataraLoopStalled's deadman alert and the tatara-loop
+// dashboard panel both queried tatara_scan_items_total/
+// tatara_scan_tasks_created_total to detect a stalled scan cron, and both
+// are repointed onto obs.SweepLastSuccessTimestamp{activity=...} instead -
+// the same heartbeat gauge sweep.go's B.4 pass already sets for
+// sweep/nightlySweep, extended to the other scan activities.
+func TestStampScanSetsHeartbeatGauge(t *testing.T) {
+	ctx := context.Background()
+	mkSecret(t, "stamp-heartbeat-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "stamp-heartbeat-proj", Namespace: testNS},
+		Spec: tatarav1alpha1.ProjectSpec{
+			ScmSecretRef: "stamp-heartbeat-scm",
+			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "bot"},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, proj))
+
+	r := &ProjectReconciler{
+		Client:  k8sClient,
+		Scheme:  k8sClient.Scheme(),
+		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+	}
+
+	before := time.Now().Unix()
+	require.NoError(t, r.stampScan(ctx, proj, "brainstorm"))
+	got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("brainstorm"))
+	require.GreaterOrEqual(t, got, float64(before),
+		"obs.SweepLastSuccessTimestamp{activity=brainstorm} must be set on a successful stampScan")
 }
