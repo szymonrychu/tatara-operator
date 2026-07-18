@@ -30,6 +30,13 @@ import (
 // platform works - that the RECONCILER applies those clocks, refuses those
 // transitions, and does not kill a Task for the crime of waiting in a queue.
 
+// tsProject deliberately carries Phase=Ready but NO ReadySince, so
+// memoryStablyReady reads false (issue #355's pre-SubmitTurn gate holds any
+// PodStartedAt==nil task here). Most tsProject-based tests never intend to
+// reach a real wrapper Pod build (PodConfig carries no AnthropicSecretName),
+// so this incidental "not stably ready" is what keeps them from ever reaching
+// ensureStagePod's ValidatePodSecretRefs. A test that DOES need to submit a
+// turn must opt in explicitly via tsStablyReadyProject.
 func tsProject(maxAgents int) *tatarav1alpha1.Project {
 	return &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: "proj", Namespace: mdNS},
@@ -42,6 +49,17 @@ func tsProject(maxAgents int) *tatarav1alpha1.Project {
 			Memory: &tatarav1alpha1.MemoryStatus{Phase: "Ready", Endpoint: "http://mem"},
 		},
 	}
+}
+
+// tsStablyReadyProject is tsProject with ReadySince backdated past
+// memoryReadyStabilizationWindow, for tests that exercise an actual turn
+// submission (reconcilePodStage's pre-SubmitTurn gate, issue #355) rather than
+// admission queueing.
+func tsStablyReadyProject(maxAgents int) *tatarav1alpha1.Project {
+	p := tsProject(maxAgents)
+	readySince := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	p.Status.Memory.ReadySince = &readySince
+	return p
 }
 
 // tsTask is a Task already at a stage, with stageEnteredAt set.
@@ -1008,6 +1026,67 @@ func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
+// ISSUE #355: pre-SubmitTurn memory-readiness gate. reconcilePodStage must
+// hold turn0 (never call SubmitTurn) when the project memory stack is not
+// stably ready, even though StageWorkStartedAt/PodStartedAt are already set -
+// closing the admission-time-gate-vs-actual-submit gap (a respawned or
+// TTL-rotated pod, or a first pod that boots slowly, could otherwise submit a
+// turn against a backend that went unhealthy after admission).
+// ---------------------------------------------------------------------------
+
+func TestTurnSubmit_HeldWhenMemoryNotStablyReady(t *testing.T) {
+	now := time.Now()
+	task := tsTask("ts-gated", "implement", tatarav1alpha1.StageImplementing, now.Add(-time.Minute))
+	podAt := metav1.NewTime(now.Add(-30 * time.Second))
+	workAt := metav1.NewTime(now.Add(-10 * time.Second))
+	task.Status.PodStartedAt = &podAt
+	task.Status.StageWorkStartedAt = &workAt
+	issName := tatarav1alpha1.IssueName("tatara-operator", 1)
+	task.Status.IssueRefs = []string{issName}
+
+	proj := tsProject(3)
+	proj.Status.Memory = &tatarav1alpha1.MemoryStatus{Phase: "Provisioning", Endpoint: "http://mem"}
+	iss := ownedIssue(issName, 1, task, tatarav1alpha1.IssueStatus{State: "open"})
+
+	c := newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task), iss)
+	reg := prometheus.NewRegistry()
+	r := tsReconciler(c) // panicSession: fails the test if SubmitTurn is ever called
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	res, err := r.reconcileStage(context.Background(), proj, task, now)
+	if err != nil {
+		t.Fatalf("reconcileStage: %v", err)
+	}
+	if res.RequeueAfter != memGateRequeue {
+		t.Fatalf("RequeueAfter = %v, want memGateRequeue %v", res.RequeueAfter, memGateRequeue)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Annotations[annStageTurn0] != "" {
+		t.Fatalf("annStageTurn0 = %q, want unset: no turn was submitted", got.Annotations[annStageTurn0])
+	}
+	if v := testutil.ToFloat64(r.Metrics.MemoryGateHoldCounter("proj")); v != 1 {
+		t.Fatalf("operator_memory_gate_hold_total{project=proj} = %v, want 1", v)
+	}
+	gotIss := getIssueCR(t, c, issName)
+	if len(gotIss.Status.PendingComments) != 1 {
+		t.Fatalf("PendingComments = %d, want 1 (the held-turn surfacing comment)", len(gotIss.Status.PendingComments))
+	}
+	if gotIss.Status.LastMemoryGateCommentAt == nil {
+		t.Fatalf("LastMemoryGateCommentAt not stamped")
+	}
+
+	// A second hold on the same episode must not enqueue a duplicate comment
+	// (its own cooldown marker), same one-shot shape as deploy-timeout.
+	if _, err := r.reconcileStage(context.Background(), proj, mdGetTask(t, c, task.Name), now.Add(time.Minute)); err != nil {
+		t.Fatalf("second reconcileStage: %v", err)
+	}
+	gotIss2 := getIssueCR(t, c, issName)
+	if len(gotIss2.Status.PendingComments) != 1 {
+		t.Fatalf("PendingComments after second hold = %d, want 1 (own cooldown, no duplicate)", len(gotIss2.Status.PendingComments))
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TURN-SUBMIT METRIC. Re-pointed from the retired machine's
 // TestTurnSubmitted_{Metric,ErrorMetric}Emitted (task_controller_audit_test.go),
 // which drove the deleted driveTurns path. operator_turn_submit_total is LIVE -
@@ -1021,7 +1100,7 @@ func TestTurnSubmit_MetricEmittedOnTurnZero(t *testing.T) {
 	workAt := metav1.NewTime(now.Add(-10 * time.Second))
 	task.Status.PodStartedAt = &podAt
 	task.Status.StageWorkStartedAt = &workAt
-	proj := tsProject(3)
+	proj := tsStablyReadyProject(3)
 
 	c := newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task))
 	reg := prometheus.NewRegistry()
@@ -1047,7 +1126,7 @@ func TestTurnSubmit_ErrorMetricEmittedOnSubmitFailure(t *testing.T) {
 	workAt := metav1.NewTime(now.Add(-10 * time.Second))
 	task.Status.PodStartedAt = &podAt
 	task.Status.StageWorkStartedAt = &workAt
-	proj := tsProject(3)
+	proj := tsStablyReadyProject(3)
 
 	c := newMirrorClient(t, proj, mdSecret(), task, tsReadyPod(task))
 	reg := prometheus.NewRegistry()

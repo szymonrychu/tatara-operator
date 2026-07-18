@@ -315,7 +315,7 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 		if !apierrors.IsNotFound(e) {
 			return 0, 0, 0, 0, fmt.Errorf("get lightrag deployment: %w", e)
 		}
-	} else {
+	} else if deploymentRolloutConverged(&lightrag) {
 		lightragAvail = lightrag.Status.AvailableReplicas
 	}
 
@@ -324,11 +324,26 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 		if !apierrors.IsNotFound(e) {
 			return 0, 0, 0, 0, fmt.Errorf("get memory deployment: %w", e)
 		}
-	} else {
+	} else if deploymentRolloutConverged(&mem) {
 		memoryAvail = mem.Status.AvailableReplicas
 	}
 
 	return readyInstances, neo4jReady, lightragAvail, memoryAvail, nil
+}
+
+// deploymentRolloutConverged reports whether d's rollout has fully landed: the
+// controller has observed the latest spec generation, and every replica is on
+// the current pod template (UpdatedReplicas) and Available. Without this, a
+// Deployment mid-rollout with one stale-generation replica still Available
+// reads identically to a converged one, so memoryStackHealth would count it
+// ready while an old pod runs alongside the new one (issue #355 - the
+// mem-tatara-lightrag rollout never converged during the incident, old+new
+// pods coexisting, and nothing detected it). A never-applied/status-not-yet-
+// populated Deployment (all fields zero) is correctly NOT converged.
+func deploymentRolloutConverged(d *appsv1.Deployment) bool {
+	return d.Status.ObservedGeneration == d.Generation &&
+		d.Status.UpdatedReplicas == d.Status.Replicas &&
+		d.Status.AvailableReplicas == d.Status.Replicas
 }
 
 // memoryQuorum is the minimum number of cnpg instances that must be Ready for
@@ -429,25 +444,43 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 	}
 
 	phase := memoryPhase(readyInstances, memory.PgInstances(p), neo4jReady, lightragAvail, memoryAvail)
-	p.Status.Memory.Phase = phase
 
-	// Maintain ReadySince for the stabilization debounce (memoryStablyReady).
-	// Set once on the Provisioning->Ready edge; preserve on steady-state Ready;
-	// clear whenever the phase leaves Ready so the clock resets on re-entry.
+	// Maintain ReadySince/ProvisioningSince for the stabilization debounce
+	// (memoryStablyReady) and the Provisioning->Degraded timeout (issue #355).
+	// ReadySince is set once on the Provisioning->Ready edge and cleared
+	// whenever the phase leaves Ready. ProvisioningSince is the mirror: set on
+	// any Ready/Failed/""->Provisioning edge, PRESERVED across a
+	// Provisioning<->Degraded episode (so a stack does not get a fresh clock
+	// every 10s poll while stuck), and cleared on reaching Ready.
 	now := metav1.Now()
 	if phase == "Ready" {
 		if prevPhase != "Ready" {
 			p.Status.Memory.ReadySince = &now
 		}
 		// else preserve existing ReadySince (steady-state; do not reset the clock)
+		p.Status.Memory.ProvisioningSince = nil
 	} else {
 		p.Status.Memory.ReadySince = nil
+		if prevPhase != "Provisioning" && prevPhase != "Degraded" {
+			p.Status.Memory.ProvisioningSince = &now
+		} else if p.Status.Memory.ProvisioningSince == nil {
+			// Defensive: should be unreachable (prevPhase Provisioning/Degraded
+			// implies a prior ProvisioningSince stamp), but never leave the timeout
+			// check comparing against a nil pointer.
+			p.Status.Memory.ProvisioningSince = &now
+		}
+		if r.MemoryConfig.ProvisioningTimeout > 0 &&
+			now.Sub(p.Status.Memory.ProvisioningSince.Time) >= r.MemoryConfig.ProvisioningTimeout {
+			phase = "Degraded"
+		}
 	}
+	p.Status.Memory.Phase = phase
 
 	condStatus := metav1.ConditionFalse
 	reason := "Provisioning"
 	msg := "memory stack provisioning"
-	if phase == "Ready" {
+	switch phase {
+	case "Ready":
 		condStatus = metav1.ConditionTrue
 		reason = "Ready"
 		msg = "memory stack ready at " + p.Status.Memory.Endpoint
@@ -468,6 +501,17 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 			reason = "RetrievalUnreachable"
 			msg = "memory replicas available but retrieval surface unreachable at " + p.Status.Memory.Endpoint
 		}
+	case "Degraded":
+		// Issue #355: a stuck backend must surface as a failing condition after a
+		// bounded timeout instead of staying Provisioning indefinitely (the live
+		// incident sat Provisioning for 7h+ with no signal at all). Phase stays
+		// queryable/distinguishable from an ordinary in-flight Provisioning; the
+		// stack keeps polling at memoryRequeue so it self-clears the moment the
+		// backend actually becomes healthy.
+		elapsed := now.Sub(p.Status.Memory.ProvisioningSince.Time).Round(time.Second)
+		reason = "ProvisioningTimeout"
+		msg = fmt.Sprintf("memory stack still provisioning after %s (exceeds %s timeout)",
+			elapsed, r.MemoryConfig.ProvisioningTimeout)
 	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               "MemoryReady",

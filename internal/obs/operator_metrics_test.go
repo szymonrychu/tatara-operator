@@ -145,7 +145,7 @@ func TestMemoryStacksGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.SetMemoryStackCounts(1, 3, 0)
+	m.SetMemoryStackCounts(1, 3, 0, 2)
 
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Provisioning")); got != 1 {
 		t.Fatalf("Provisioning stacks = %v, want 1", got)
@@ -156,6 +156,9 @@ func TestMemoryStacksGauge(t *testing.T) {
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Failed")); got != 0 {
 		t.Fatalf("Failed stacks = %v, want 0", got)
 	}
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Degraded")); got != 2 {
+		t.Fatalf("Degraded stacks = %v, want 2", got)
+	}
 }
 
 func TestMemoryStacksGauge_ZeroesStalePhase(t *testing.T) {
@@ -163,8 +166,8 @@ func TestMemoryStacksGauge_ZeroesStalePhase(t *testing.T) {
 	m := NewOperatorMetrics(reg)
 
 	// Set Ready=2, then transition: Ready=0, Provisioning=1.
-	m.SetMemoryStackCounts(0, 2, 0)
-	m.SetMemoryStackCounts(1, 0, 0)
+	m.SetMemoryStackCounts(0, 2, 0, 0)
+	m.SetMemoryStackCounts(1, 0, 0, 0)
 
 	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Ready")); got != 0 {
 		t.Fatalf("Ready stacks after transition = %v, want 0", got)
@@ -232,32 +235,49 @@ func TestSCMRequestErrorByStatus(t *testing.T) {
 	}
 }
 
-func TestScanMetricsRegistered(t *testing.T) {
+func TestTasksInflightKindRegistered(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
-	m.ScanItem("issueScan", "picked")
-	m.ScanTaskCreated("issueScan", "review")
-	m.ObserveScanDuration("issueScan", 0.5)
 	m.SetTasksInflightKind("clarify", 2)
 
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather: %v", err)
 	}
-	want := map[string]bool{
-		"tatara_scan_items_total":         false,
-		"tatara_scan_tasks_created_total": false,
-		"tatara_scan_duration_seconds":    false,
-		"tatara_tasks_inflight":           false,
-	}
+	found := false
 	for _, mf := range mfs {
-		if _, ok := want[mf.GetName()]; ok {
-			want[mf.GetName()] = true
+		if mf.GetName() == "tatara_tasks_inflight" {
+			found = true
 		}
 	}
-	for name, seen := range want {
-		if !seen {
-			t.Fatalf("metric %q not registered/gathered", name)
+	if !found {
+		t.Fatalf("metric %q not registered/gathered", "tatara_tasks_inflight")
+	}
+}
+
+// tatara_scan_items_total, tatara_scan_tasks_created_total, and
+// tatara_scan_duration_seconds died with the B.4 sweep (task-centric
+// redesign): tatara-observability's own dashboards document them as
+// superseded by operator_sweep_last_success_timestamp_seconds and
+// operator_tasks_minted_per_sweep, and scripts/metrics_allowlist.txt
+// already excludes all three. This is a regression guard against
+// reintroducing the dead family (metric-wiring audit, issue #370).
+func TestScanMetricsPruned(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	NewOperatorMetrics(reg)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	dead := map[string]bool{
+		"tatara_scan_items_total":         true,
+		"tatara_scan_tasks_created_total": true,
+		"tatara_scan_duration_seconds":    true,
+	}
+	for _, mf := range mfs {
+		if dead[mf.GetName()] {
+			t.Fatalf("metric %q must be pruned, still registered", mf.GetName())
 		}
 	}
 }
@@ -1040,7 +1060,7 @@ func TestDeleteTaskSeries_RemovesTokenAndTurn(t *testing.T) {
 	// Also add a project-scoped (empty issue) series that must NOT be deleted.
 	m.AddTaskTokens("tatara", "", "brainstorm", "", "claude-sonnet-5", 200, 0, 0, 0)
 
-	m.DeleteTaskSeries("tatara", "op", "issueLifecycle", "op#7", "claude-opus-4-8")
+	m.DeleteTaskSeries("tatara", "op", "issueLifecycle", "op#7")
 
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -1084,6 +1104,57 @@ func TestDeleteTaskSeries_RemovesTokenAndTurn(t *testing.T) {
 	}
 	if !brainstormFound {
 		t.Error("operator_task_tokens_total{issue=} (brainstorm) must not be deleted")
+	}
+}
+
+// A Task's Status.ResolvedModel can change across its life (a respawn or a
+// stage change may re-resolve a different model), so per-turn token/turn
+// series for the SAME (project,repo,kind,issue) can be split across several
+// model label values. DeleteTaskSeries must clear all of them on GC, not just
+// the Task's final model - otherwise a reassigned-model task leaks its
+// earlier model's series forever (metric-wiring audit, issue #370).
+// A project-scoped Task (e.g. brainstorm) shares issue=="" with every other
+// project-scoped Task of the same (project,repo,kind); GC'ing one must not
+// wipe the others' still-live series.
+func TestDeleteTaskSeries_EmptyIssueIsANoOp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AddTaskTokens("tatara", "", "brainstorm", "", "claude-sonnet-5", 200, 0, 0, 0)
+	m.AddTaskTurn("tatara", "", "brainstorm", "")
+
+	m.DeleteTaskSeries("tatara", "", "brainstorm", "")
+
+	if got := testutil.ToFloat64(m.taskTurnsTotal.WithLabelValues("tatara", "", "brainstorm", "")); got != 1 {
+		t.Errorf("operator_task_turns_total{issue=} must survive a project-scoped DeleteTaskSeries call, got %v", got)
+	}
+}
+
+func TestDeleteTaskSeries_RemovesAcrossModels(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.AddTaskTokens("tatara", "op", "implement", "op#9", "claude-opus-4-8", 100, 50, 30, 10)
+	m.AddTaskTurn("tatara", "op", "implement", "op#9")
+	m.AddTaskTokens("tatara", "op", "implement", "op#9", "claude-sonnet-5", 40, 20, 5, 1)
+
+	m.DeleteTaskSeries("tatara", "op", "implement", "op#9")
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_task_tokens_total" && mf.GetName() != "operator_task_turns_total" {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			for _, lp := range metric.GetLabel() {
+				if lp.GetName() == "issue" && lp.GetValue() == "op#9" {
+					t.Errorf("%s{issue=op#9} must be absent after DeleteTaskSeries regardless of model", mf.GetName())
+				}
+			}
+		}
 	}
 }
 

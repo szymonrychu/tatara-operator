@@ -39,9 +39,6 @@ type OperatorMetrics struct {
 	tasksInflight                prometheus.Gauge
 	memoryProvisionDuration      prometheus.Histogram
 	memoryStacks                 *prometheus.GaugeVec
-	scanItemsTotal               *prometheus.CounterVec
-	scanTasksCreatedTotal        *prometheus.CounterVec
-	scanDurationSeconds          *prometheus.HistogramVec
 	autoApproveTotal             *prometheus.CounterVec
 	tasksInflightKind            *prometheus.GaugeVec
 	agentBootRaceRequeue         prometheus.Counter
@@ -72,6 +69,7 @@ type OperatorMetrics struct {
 	tokenBudgetUsedRatio         *prometheus.GaugeVec
 	admissionBlockedTotal        *prometheus.CounterVec
 	memoryGateBypassTotal        *prometheus.CounterVec
+	memoryGateHoldTotal          *prometheus.CounterVec
 	repositoryIngestFailing      *prometheus.GaugeVec
 	repositoryLastIngestTime     *prometheus.GaugeVec
 	reviewOutcomeTotal           *prometheus.CounterVec
@@ -125,19 +123,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_stacks",
 			Help: "Number of per-project memory stacks by phase.",
 		}, []string{"phase"}),
-		scanItemsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "tatara_scan_items_total",
-			Help: "Total scan candidates by activity and outcome.",
-		}, []string{"activity", "outcome"}),
-		scanTasksCreatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "tatara_scan_tasks_created_total",
-			Help: "Tasks created by scan activity and Task kind.",
-		}, []string{"activity", "kind"}),
-		scanDurationSeconds: prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "tatara_scan_duration_seconds",
-			Help:    "Wall-clock duration of one scan activity.",
-			Buckets: prometheus.ExponentialBuckets(0.05, 2, 10),
-		}, []string{"activity"}),
 		autoApproveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_auto_approve_total",
 			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
@@ -154,6 +139,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_agent_session_busy_requeue_total",
 			Help: "Times a turn submit hit a wrapper 409 \"session busy\" and was requeued as transient backpressure instead of erroring (issue #168).",
 		}),
+		// Set inside runProjectScopedProposalCycle (projectscan.go), which
+		// only runs when a project's brainstorm/refine CRON activity is
+		// due - not on the 60s maybeRecomputeGauges pass most other
+		// per-project gauges use. Confirmed correctly wired (real nonzero
+		// backlog counts per repo) across prior pod generations via 7-day
+		// Prometheus history during the metric-wiring audit (issue #370);
+		// a flat absence right after a pod restart just means no
+		// project's brainstorm/refine tick has come due yet, not a bug.
 		openProposals: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_open_proposals",
 			Help: "Open, unapproved agent-proposed issues per repo.",
@@ -324,6 +317,21 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_gate_bypass_total",
 			Help: "Incident Tasks admitted past the project memory-readiness gate under the infra-incident exemption, by project and Task kind.",
 		}, []string{"project", "kind"}),
+		// Issue #355: a Task about to submit a NEW turn (first spawn, respawn, or
+		// TTL rotation) is held rather than dispatched while project memory is not
+		// stably ready, so an agent pod is never launched against a backend that
+		// went unhealthy in the gap between admission and turn-submit.
+		memoryGateHoldTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_memory_gate_hold_total",
+			Help: "Turn submissions held at the memory-readiness gate immediately before SubmitTurn, by project.",
+		}, []string{"project"}),
+		// Event-driven on a review Task's /outcome submission - correctly
+		// wired (RecordReviewOutcome call site is unconditional in the
+		// open-MRs loop) and confirmed firing across several prior pod
+		// generations via 7-day Prometheus history during the
+		// metric-wiring audit (issue #370). A flat 0 window simply means
+		// no review verdict has been submitted since the current pod
+		// became leader, not a wiring gap.
 		reviewOutcomeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_review_outcome_total",
 			Help: "Review tasks by verdict (approved|changes_requested), keyed by the model that ran the review.",
@@ -379,9 +387,6 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tasksInflight,
 		m.memoryProvisionDuration,
 		m.memoryStacks,
-		m.scanItemsTotal,
-		m.scanTasksCreatedTotal,
-		m.scanDurationSeconds,
 		m.autoApproveTotal,
 		m.tasksInflightKind,
 		m.agentBootRaceRequeue,
@@ -414,6 +419,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tokenBudgetUsedRatio,
 		m.admissionBlockedTotal,
 		m.memoryGateBypassTotal,
+		m.memoryGateHoldTotal,
 		m.reviewOutcomeTotal,
 		m.reviewHeadMovedTotal,
 		m.reviewFindingsTotal,
@@ -439,13 +445,9 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		[]string{"other", "labeled", "opened", "closed", "synchronize", "create"},
 		[]string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"},
 	)
-	for _, phase := range []string{"Provisioning", "Ready", "Failed"} {
+	for _, phase := range []string{"Provisioning", "Ready", "Failed", "Degraded"} {
 		m.memoryStacks.WithLabelValues(phase)
 	}
-	seedLabels(func(l ...string) { m.scanItemsTotal.WithLabelValues(l...) },
-		[]string{"issueScan", "brainstorm", "documentation"},
-		[]string{"picked", "skipped_cap", "skipped_inflight", "stamp_error"},
-	)
 	for _, source := range []string{"reconcile", "poll_backstop"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
@@ -544,11 +546,6 @@ func (m *OperatorMetrics) AgentUnreachableTermination() {
 	m.agentUnreachableTermTotal.Inc()
 }
 
-// ScanItem increments tatara_scan_items_total for an activity + outcome.
-func (m *OperatorMetrics) ScanItem(activity, outcome string) {
-	m.scanItemsTotal.WithLabelValues(activity, outcome).Inc()
-}
-
 // SetCDCascadeFailed sets tatara_cd_cascade_failed{project} to the current count
 // of cascades in a durable failed state. Called once per cdScan with the count
 // derived from authoritative Task state, so the gauge self-clears on recovery.
@@ -609,16 +606,6 @@ func (m *OperatorMetrics) IncidentRefireComment(result string) {
 	m.incidentRefireCommentTotal.WithLabelValues(result).Inc()
 }
 
-// ScanTaskCreated increments tatara_scan_tasks_created_total for an activity + kind.
-func (m *OperatorMetrics) ScanTaskCreated(activity, kind string) {
-	m.scanTasksCreatedTotal.WithLabelValues(activity, kind).Inc()
-}
-
-// ObserveScanDuration records the seconds one scan activity took.
-func (m *OperatorMetrics) ObserveScanDuration(activity string, seconds float64) {
-	m.scanDurationSeconds.WithLabelValues(activity).Observe(seconds)
-}
-
 // AutoApproveTotal increments operator_auto_approve_total for a proposal kind
 // (item 4a auto-approve release path).
 func (m *OperatorMetrics) AutoApproveTotal(kind string) {
@@ -662,13 +649,15 @@ func (m *OperatorMetrics) ObserveMemoryProvisionDuration(seconds float64) {
 	m.memoryProvisionDuration.Observe(seconds)
 }
 
-// SetMemoryStackCounts sets the operator_memory_stacks gauge for all three
+// SetMemoryStackCounts sets the operator_memory_stacks gauge for all four
 // phases atomically to the given cluster-wide counts. Pass 0 for any phase
-// that has no stacks so stale values are cleared.
-func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed int) {
+// that has no stacks so stale values are cleared. Degraded (issue #355) is a
+// stack that has been Provisioning past MemoryConfig.ProvisioningTimeout.
+func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed, degraded int) {
 	m.memoryStacks.WithLabelValues("Provisioning").Set(float64(provisioning))
 	m.memoryStacks.WithLabelValues("Ready").Set(float64(ready))
 	m.memoryStacks.WithLabelValues("Failed").Set(float64(failed))
+	m.memoryStacks.WithLabelValues("Degraded").Set(float64(degraded))
 }
 
 // ReconcileResult increments operator_reconcile_total for the given kind and
@@ -852,6 +841,18 @@ func (m *OperatorMetrics) MemoryGateBypass(project, kind string) {
 // assertions.
 func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) prometheus.Counter {
 	return m.memoryGateBypassTotal.WithLabelValues(project, kind)
+}
+
+// MemoryGateHold increments operator_memory_gate_hold_total: reconcilePodStage
+// held a turn submission (first spawn, respawn, or TTL rotation) at the
+// memory-readiness gate immediately before SubmitTurn (issue #355).
+func (m *OperatorMetrics) MemoryGateHold(project string) {
+	m.memoryGateHoldTotal.WithLabelValues(project).Inc()
+}
+
+// MemoryGateHoldCounter returns the counter for (project) for test assertions.
+func (m *OperatorMetrics) MemoryGateHoldCounter(project string) prometheus.Counter {
+	return m.memoryGateHoldTotal.WithLabelValues(project)
 }
 
 // RecordReviewOutcome increments operator_review_outcome_total for a review
