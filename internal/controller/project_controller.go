@@ -203,6 +203,15 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("drive unparks: %w", err)
 	}
 
+	// WS3-I4: a human reply to a Task parked with a NO-RE-ENTRY reason triggers a
+	// fresh gated re-mint (sever(Orphan) + MintForItem), never a smuggled re-entry.
+	// Leader-only; the reaper is the backstop. Runs after driveUnparks so a
+	// re-entryable park has already been resumed and is no longer parked here.
+	if err := r.resumeNoReentryParks(ctx, &project, time.Now()); err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, fmt.Errorf("resume no-re-entry parks: %w", err)
+	}
+
 	// THE B.6 TERMINAL REAPER (fix W2). Releases and GCs terminal Tasks
 	// (failed/rejected/parked/delivered) and their Issues/MRs, and stamps the
 	// tatara-parked label that keeps the M25 re-mint loop closed. It was

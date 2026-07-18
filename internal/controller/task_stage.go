@@ -157,7 +157,72 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	if err := r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now); err != nil {
 		return ctrl.Result{}, true, err
 	}
+	// WS3-I5: on the FIRST entry into parked(deploy-timeout), surface the stuck
+	// deploy to the human with ONE rate-limited operator comment per owned issue.
+	if edge.To == tatarav1alpha1.StageParked && edge.Reason == stage.ReasonDeployTimeout {
+		if err := r.enqueueDeployTimeoutComment(ctx, proj, task, mrs, now); err != nil {
+			return ctrl.Result{}, true, err
+		}
+	}
 	return ctrl.Result{}, true, nil
+}
+
+// enqueueDeployTimeoutComment enqueues ONE operator comment on each owned OPEN
+// issue when a Task first parks at deploy-timeout (WS3-I5), so a stuck deploy is
+// surfaced at the FIRST timeout instead of staying silent until the terminal
+// failed(deploy-blocked). It is keyed on its OWN cooldown marker
+// (Issue.status.lastDeployTimeoutCommentAt), DISTINCT from the incident-refire
+// LastRefireCommentAt, so an issue that is both an incident tracker and
+// deploy-blocked never has one producer clobber the other's cooldown. It reuses
+// the existing PendingComments drain; it spawns no agent. Leader-only (this whole
+// reconcile is).
+func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest, now time.Time) error {
+
+	issues, err := loadTaskIssues(ctx, r.Client, task)
+	if err != nil {
+		return err
+	}
+	// Repo attribution: the MR(s) that did not reach deployedAt.
+	var stuck []string
+	for i := range mrs {
+		if mrs[i].Status.DeployedAt == nil {
+			stuck = append(stuck, mrs[i].Spec.RepositoryRef)
+		}
+	}
+	repos := strings.Join(stuck, ", ")
+	if repos == "" {
+		repos = task.Spec.RepositoryRef
+	}
+	budget, _ := stage.Budget(tatarav1alpha1.StageDeploying)
+	body := fmt.Sprintf("Deployment of `%s` has not completed after `%s`; retry `%d`/`%d`. tatara keeps retrying until it succeeds or the deploy budget is exhausted.",
+		repos, budget, task.Status.DeployReentries, tatarav1alpha1.MaxDeployReentries)
+
+	sp := r.spiller(proj)
+	stamp := metav1.NewTime(now)
+	for i := range issues {
+		iss := &issues[i]
+		if iss.Status.State != "open" || iss.Status.LastDeployTimeoutCommentAt != nil {
+			continue // closed, or already commented on the first timeout (own cooldown).
+		}
+		key := client.ObjectKeyFromObject(iss)
+		if err := objbudget.FitIssue(ctx, r.Client, sp, key, func(cur *tatarav1alpha1.Issue) {
+			if cur.Status.LastDeployTimeoutCommentAt != nil || len(cur.Status.PendingComments) >= 20 {
+				return
+			}
+			cur.Status.PendingComments = append(cur.Status.PendingComments, tatarav1alpha1.PendingComment{
+				RequestID: fmt.Sprintf("deploy-timeout-%s", task.Name),
+				Action:    "comment",
+				Body:      body,
+			})
+			cur.Status.LastDeployTimeoutCommentAt = &stamp
+		}); err != nil {
+			return fmt.Errorf("deploy-timeout comment: enqueue on %s: %w", key.Name, err)
+		}
+		log.FromContext(ctx).Info("deploy stuck: surfaced the first deploy-timeout on an owned issue",
+			"action", "deploy_timeout_comment", "resource_id", task.Name, "issue", key.Name, "repos", repos)
+	}
+	return nil
 }
 
 // handoffCondition returns the OutcomeAccepted condition of a Task whose OWN

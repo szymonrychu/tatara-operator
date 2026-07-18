@@ -280,3 +280,47 @@ func TestApplyReviewApproval_ParkedTask_FoldsWithoutPodDeleteOrMutation(t *testi
 	require.NoError(t, base.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "mr-tatara-operator-42"}, &gotMR))
 	require.NotNil(t, gotMR.Status.PendingReview, "PendingReview untouched")
 }
+
+// M5: an approval with an EMPTY commit SHA (GitLab last_commit.id empty) falls
+// back to the owned MR's mirror head, so ReviewedSHA is stamped and the Task
+// advances rather than firing a later head-moved bounce.
+func TestApplyReviewApproval_EmptySHA_FallsBackToMirrorHead(t *testing.T) {
+	proj := sweepProject("p")
+	task := reviewingTask("t-m5a", "clarify")
+	mr := ownedMR("mr-tatara-operator-42", "t-m5a", "tatara-operator", 42)
+	mr.Status.HeadSHA = "mirrorhead"
+	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1}
+	c := newMirrorClient(t, proj, task, mr)
+
+	advanced, err := ApplyReviewApproval(context.Background(), c, c, nil, proj, task, "", time.Now())
+	require.NoError(t, err)
+	require.True(t, advanced)
+
+	var gotMR tatarav1alpha1.MergeRequest
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "mr-tatara-operator-42"}, &gotMR))
+	require.Equal(t, "mirrorhead", gotMR.Status.ReviewedSHA, "empty review SHA falls back to the mirror head")
+	require.Nil(t, gotMR.Status.PendingReview)
+}
+
+// M5: an approval with an empty commit SHA AND an empty mirror head must NOT
+// half-apply: PendingReview stays, the Task stays reviewing, and the caller folds.
+func TestApplyReviewApproval_EmptySHAAndEmptyMirrorHead_NoHalfApply(t *testing.T) {
+	proj := sweepProject("p")
+	task := reviewingTask("t-m5b", "clarify")
+	mr := ownedMR("mr-tatara-operator-42", "t-m5b", "tatara-operator", 42)
+	mr.Status.HeadSHA = "" // no mirror head either
+	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1}
+	c := newMirrorClient(t, proj, task, mr)
+
+	advanced, err := ApplyReviewApproval(context.Background(), c, c, nil, proj, task, "", time.Now())
+	require.NoError(t, err)
+	require.False(t, advanced, "no head to review against: fold, do not advance")
+
+	var gotMR tatarav1alpha1.MergeRequest
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "mr-tatara-operator-42"}, &gotMR))
+	require.NotNil(t, gotMR.Status.PendingReview, "PendingReview must NOT be cleared (no half-apply)")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-m5b"}, &got))
+	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage)
+}

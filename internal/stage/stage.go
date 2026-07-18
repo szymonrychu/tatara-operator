@@ -164,6 +164,24 @@ var reasonSet = func() map[string]bool {
 // ValidReason reports whether r is a member of the F.5 closed set.
 func ValidReason(r string) bool { return reasonSet[r] }
 
+// reentryReasons is the set of PARKED reasons stage.Unpark can re-enter from
+// (comment- or time-driven F.6 rules). A parked Task carrying ANY OTHER reason is
+// a genuine dead-end with no F.6 re-entry - which is what WS3-I4 acts on: a human
+// reply to such a park triggers a fresh gated re-mint, never a smuggled re-entry.
+var reentryReasons = map[string]bool{
+	ReasonBacklogSweep:       true,
+	ReasonAwaitingHuman:      true,
+	ReasonIdentityUnverified: true,
+	ReasonMergeTimeout:       true,
+	ReasonDeployTimeout:      true,
+	ReasonNoOutcome:          true,
+}
+
+// HasReentry reports whether a parked `reason` has an F.6 re-entry rule. It is the
+// WS3-I4 discriminator: a parked Task whose reason has NO re-entry is a dead-end a
+// human reply resumes through a fresh clarify mint, not an Unpark.
+func HasReentry(reason string) bool { return reentryReasons[reason] }
+
 // Edge is one row of the F.3 transition table. To is a stage, or one of the
 // pseudo-targets Reap / Respawn. Reason is the stage reason stamped on To
 // (empty when To carries none). Trigger is the contract's own prose.

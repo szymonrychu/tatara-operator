@@ -126,6 +126,26 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, reader client.Rea
 		return false, nil
 	}
 
+	// M5: resolve the effective reviewed SHA BEFORE any mutation. GitHub's numeric
+	// review always carries commit_id; GitLab's synthesized approval can carry an
+	// empty last_commit.id. Fall back to the owned MR's mirror head (already synced,
+	// no extra forge call). If that is ALSO empty, FOLD (return false) BEFORE
+	// clearing any PendingReview - a half-apply (PendingReview cleared, Task not
+	// advanced, ReviewedSHA stale) is worse than folding to the comment path and it
+	// later fires a spurious merging->reviewing head-moved bounce.
+	effectiveSHA := reviewCommitSHA
+	if effectiveSHA == "" {
+		for i := range mrs {
+			if mrs[i].Status.HeadSHA != "" {
+				effectiveSHA = mrs[i].Status.HeadSHA
+				break
+			}
+		}
+	}
+	if effectiveSHA == "" {
+		return false, nil
+	}
+
 	// F5: delete the in-flight review pod FIRST, before clearing PendingReview.
 	// Otherwise the pod's own /outcome can re-arm PendingReview in the window
 	// between our clear and merging, and DrainPendingReview then posts a redundant
@@ -147,13 +167,10 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, reader client.Rea
 
 	for i := range mrs {
 		mrKey := client.ObjectKeyFromObject(&mrs[i])
-		thisSHA := reviewCommitSHA
 		if err := objbudget.FitMergeRequest(ctx, c, sp, mrKey, func(m *tatarav1alpha1.MergeRequest) {
 			m.Status.PendingReview = nil
 			m.Status.Status = "approved"
-			if thisSHA != "" {
-				m.Status.ReviewedSHA = thisSHA
-			}
+			m.Status.ReviewedSHA = effectiveSHA
 		}); err != nil {
 			return false, fmt.Errorf("review: settle mr %s: %w", mrKey.Name, err)
 		}
