@@ -194,7 +194,7 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 		s.log.ErrorContext(ctx, "pendingEvents: build scm reader failed", "error", err, "task", task.Name)
 		return
 	}
-	passed, err := controller.ReVerifyParked(ctx, s.cfg.Client, sp, reader, proj, task, ev)
+	passed, err := controller.ReVerifyParked(ctx, s.cfg.Client, sp, reader, proj, task, ev, s.cfg.Metrics)
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: reverify parked failed", "error", err, "task", task.Name)
 		return

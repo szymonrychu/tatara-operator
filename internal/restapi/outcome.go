@@ -1122,6 +1122,15 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	for i := range issues {
 		iss := &issues[i]
 		ev := evidence[iss.Name]
+		// Count the auto-approval TRANSITION (an issue not already approved): the
+		// last human gate is being removed, so it must be queryable without
+		// log-scraping (hard rule 13). This is the primary auto-approve site - a
+		// brainstorm/incident proposal reaching implement via clarify submit.
+		if ev != nil && ev.Auto && iss.Status.Status != "approved" {
+			if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
+				s.metrics.AutoApproveTotal(kind)
+			}
+		}
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
 		if err := objbudget.FitIssue(ctx, s.c, s.spiller, key, func(is *tatarav1alpha1.Issue) {
 			is.Status.Status = "approved"
@@ -1249,7 +1258,12 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: pr.Title, Body: pr.Body})
+		// Stamp the tatara-proposed-by provenance marker into the body the forge and
+		// the Issue CR both carry: it is the autoApproveTataraProposals carve-out's
+		// marker factor, and putting it on the SCM issue (not just the CR) keeps it
+		// alive across a mirror refresh. Harmless when the flag is off.
+		body := tatarav1alpha1.StampProposalMarker(pr.Body, tatarav1alpha1.ProposalKindBrainstorm)
+		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: pr.Title, Body: body})
 		controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
 		if err != nil {
 			s.log.ErrorContext(ctx, "restapi: filing a brainstorm proposal failed",
@@ -1267,7 +1281,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, pr.Body, nil); err != nil {
+		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, body, nil); err != nil {
 			writeClientErr(o.w, err)
 			return
 		}
@@ -1393,7 +1407,10 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 	ruleKey := o.task.Spec.DedupKey
-	issueReq := scm.IssueReq{Title: p.Issue.Title, Body: p.Issue.Body}
+	// Provenance marker for the autoApproveTataraProposals carve-out (marker factor);
+	// stamped on both the forge issue and the CR so it survives a mirror refresh.
+	body := tatarav1alpha1.StampProposalMarker(p.Issue.Body, tatarav1alpha1.ProposalKindIncident)
+	issueReq := scm.IssueReq{Title: p.Issue.Title, Body: body}
 	if ruleKey != "" {
 		issueReq.Labels = append(issueReq.Labels, forgeAlertRulePrefix+ruleKey)
 	}
@@ -1414,7 +1431,7 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	if ruleKey != "" {
 		crLabels = map[string]string{queue.LabelAlertRuleKey: ruleKey}
 	}
-	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, p.Issue.Body, crLabels); err != nil {
+	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, body, crLabels); err != nil {
 		writeClientErr(o.w, err)
 		return
 	}

@@ -529,6 +529,32 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 	require.NotNil(t, e2.issue(t, i1.Name).Status.Approval)
 }
 
+// An auto-approval through the clarify submit path (the primary auto-approve
+// site: a bot proposal reaching implement) increments operator_auto_approve_total
+// by proposal kind, so the last-gate-removed release is queryable without
+// log-scraping (hard rule 13).
+func TestOutcome_Clarify_AutoApproveIncrementsCounter(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
+		iss.Status.Author = "tatara-bot"
+		iss.Status.Body = tatarav1alpha1.StampProposalMarker("do the thing", tatarav1alpha1.ProposalKindBrainstorm)
+	})
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{
+		writer:   panicForge{},
+		metrics:  metrics,
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, auto: true},
+	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"the brainstorm was the review"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.True(t, e.issue(t, i1.Name).Status.Approval.Auto, "evidence must record Auto:true")
+	require.Equal(t, 1.0, testutil.ToFloat64(metrics.AutoApproveCounter(tatarav1alpha1.ProposalKindBrainstorm)))
+}
+
 // A nil verifier FAILS CLOSED.
 func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
@@ -611,6 +637,36 @@ func TestOutcome_Brainstorm_ProposeSpawnsAClarifyTaskPerProposal(t *testing.T) {
 	}
 }
 
+// The brainstorm propose path stamps the tatara-proposed-by:brainstorm marker on
+// BOTH the forge issue body and the minted Issue CR body - the marker factor of
+// the autoApproveTataraProposals carve-out, durable across a mirror refresh.
+func TestOutcome_Brainstorm_StampsProposalMarker(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"brainstorm","payload":{
+	  "action":"propose","proposals":[
+	    {"repo":"tatara-operator","title":"one","body":"do the thing","kind":"bug"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Len(t, e.forge.createdReqs, 1)
+	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm,
+		tatarav1alpha1.ProposalKindFromBody(e.forge.createdReqs[0].Body),
+		"forge issue body must carry the brainstorm proposal marker")
+
+	var issues tatarav1alpha1.IssueList
+	require.NoError(t, e.c.List(context.Background(), &issues, client.InNamespace(ns)))
+	require.Len(t, issues.Items, 1)
+	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm,
+		tatarav1alpha1.ProposalKindFromBody(issues.Items[0].Status.Body),
+		"Issue CR body must carry the brainstorm proposal marker")
+	require.Equal(t, tatarav1alpha1.ComputeProposalContentHash(issues.Items[0].Status.Body),
+		issues.Items[0].Spec.ProposalBodyHash,
+		"Issue CR Spec must anchor the filing-time body hash")
+	require.True(t, tatarav1alpha1.ProposalBodyMatchesAnchor(
+		issues.Items[0].Status.Body, issues.Items[0].Spec.ProposalBodyHash))
+}
+
 func TestOutcome_Brainstorm_ProposalsAreCappedAt5(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
@@ -641,6 +697,32 @@ func TestOutcome_Incident_FileIssueCreatesTheTrackerUnderThisTask(t *testing.T) 
 	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
 	require.Equal(t, "t1", iss.OwnerReferences[0].Name)
 	require.True(t, *iss.OwnerReferences[0].Controller)
+}
+
+// The incident file_issue path stamps the tatara-proposed-by:incident marker on
+// BOTH the forge issue body and the minted Issue CR body (the carve-out's marker
+// factor for alert-driven incident issues).
+func TestOutcome_Incident_StampsProposalMarker(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"incident","payload":{
+	  "action":"file_issue","alertRules":["tatara-operator-down"],"reason":"real outage",
+	  "issue":{"repo":"tatara-operator","title":"operator down","body":"trace"}}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Len(t, e.forge.createdReqs, 1)
+	require.Equal(t, tatarav1alpha1.ProposalKindIncident,
+		tatarav1alpha1.ProposalKindFromBody(e.forge.createdReqs[0].Body),
+		"forge issue body must carry the incident proposal marker")
+
+	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+	require.Equal(t, tatarav1alpha1.ProposalKindIncident,
+		tatarav1alpha1.ProposalKindFromBody(iss.Status.Body),
+		"Issue CR body must carry the incident proposal marker")
+	require.Equal(t, tatarav1alpha1.ComputeProposalContentHash(iss.Status.Body),
+		iss.Spec.ProposalBodyHash,
+		"Issue CR Spec must anchor the filing-time body hash")
 }
 
 // After file_issue on an incident Task whose spec.dedupKey is set, the minted

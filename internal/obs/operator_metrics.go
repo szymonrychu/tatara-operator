@@ -625,6 +625,11 @@ func (m *OperatorMetrics) AutoApproveTotal(kind string) {
 	m.autoApproveTotal.WithLabelValues(kind).Inc()
 }
 
+// AutoApproveCounter returns the counter for kind for test assertions.
+func (m *OperatorMetrics) AutoApproveCounter(kind string) prometheus.Counter {
+	return m.autoApproveTotal.WithLabelValues(kind)
+}
+
 // AgentBootRaceRequeue increments operator_agent_boot_race_requeue_total: a
 // turn submit reached a still-booting wrapper and was requeued (not errored).
 func (m *OperatorMetrics) AgentBootRaceRequeue() {

@@ -560,11 +560,20 @@ type ProjectSpec struct {
 	// AutoApproveTataraProposals releases a bot-authored, tatara-proposed issue
 	// (marked <!-- tatara-proposed-by:<kind> -->) straight into
 	// implement->review->auto-merge->deploy without a second human gate: the
-	// brainstorm/incident investigation that produced the proposal IS the
-	// review. Never applies to a human-authored issue, marker or not - the
-	// bot-authorship check is independent and mandatory. Defaults false;
-	// cluster-agnostic charts only flip this per-project via helmfile
-	// enrollment values.
+	// brainstorm/incident investigation that produced the proposal IS the review.
+	// Never applies to a human-authored issue, marker or not - the bot-authorship
+	// check is independent and mandatory - and never to a body edited since filing
+	// (the Issue Spec.ProposalBodyHash anchor, set at mint from the SCM-unreachable
+	// spec, must still match the current body's fingerprint).
+	//
+	// This field gates ONLY the approval carve-out, not the marker. Proposal filers
+	// stamp the marker UNCONDITIONALLY, so flipping this flag off still changes the
+	// stored issue body (the marker is present but inert) - intentional, so a later
+	// flip to on can auto-approve proposals filed while it was off. Gate BEHAVIOR
+	// with the flag off is exactly today's: the carve-out never fires, every
+	// self-proposed chain parks identity-unverified until a human approves.
+	// Defaults false; cluster-agnostic charts only flip this per-project via
+	// helmfile enrollment values.
 	// +kubebuilder:default=false
 	// +optional
 	AutoApproveTataraProposals bool `json:"autoApproveTataraProposals,omitempty"`

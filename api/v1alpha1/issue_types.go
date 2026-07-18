@@ -21,6 +21,16 @@ type IssueSpec struct {
 	Number     int    `json:"number"`
 	URL        string `json:"url"`
 	ProjectRef string `json:"projectRef"`
+	// ProposalBodyHash is the auto-approve INTEGRITY ANCHOR for a tatara-proposed
+	// issue: ComputeProposalContentHash of the issue body as FILED, written ONCE
+	// by the operator at mintIssueCR time. It lives in Spec, which the mirror
+	// never writes, so nothing SCM-side can forge it. autoApproveApplies refuses
+	// unless the current mirrored Status.Body still hashes to this value - so a
+	// forge-side body edit (scope change, marker rewrite) cannot auto-approve
+	// edited scope. Empty on non-proposal issues and on proposals filed by an
+	// older build (fail-closed: no anchor => no auto-approve).
+	// +optional
+	ProposalBodyHash string `json:"proposalBodyHash,omitempty"`
 }
 
 // Comment is one comment mirrored from the forge onto an Issue or
