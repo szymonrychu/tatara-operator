@@ -109,13 +109,18 @@ func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
 	return out
 }
 
-// NOTE: the former thirdPartyAuthor autoapprove tier (issue #56) was removed
-// when the maintainer-approval gate landed: third-party authorship is no
-// longer a release signal by itself. Three paths now release a front-half
-// issue to implement, all recorded on Status.ApprovedByMaintainer: (a) a
-// MaintainerLogins member applying the approved label, (b) a verified
-// maintainer conversational go-ahead, (c) auto-approve (item 4a) - a
-// bot-authored, tatara-proposed issue under an explicit per-project flag,
-// where the brainstorm/incident investigation itself served as the review.
-// Author-based intake gating still lives in IsAllowedReporter/IsTrustedAuthor;
-// neither releases implementation on its own.
+// NOTE: the former thirdPartyAuthor autoapprove tier (issue #56) and the label-
+// driven approval it fed were both removed. Approval is now COMMENT-ONLY (C.6):
+// there is no label -> status path and no Status.ApprovedByMaintainer field - a
+// label is a one-way PROJECTION of Issue.Status.Status, never an input. TWO paths
+// move an Issue to Status=approved, and each writes Issue.Status.Approval
+// (ApprovalEvidence), never a label: (a) the C.6 comment grammar - the MOST
+// RECENT maintainer comment CONSISTS OF an approval phrase (verifyOneIssue,
+// approval_grammar.go), recorded with the maintainer login + the consumed
+// commentId; (b) auto-approve (autoApproveTataraProposals) - a bot-authored,
+// tatara-proposed issue (tatara-proposed-by marker) under the per-project flag,
+// where the brainstorm/incident investigation itself served as the review,
+// recorded with Auto=true and the "<tatara:auto>" sentinel. Path (b) fires ONLY
+// when NO maintainer has commented; a maintainer non-approval comment falls to
+// path (a) and blocks. Author-based intake gating still lives in
+// IsAllowedReporter/IsTrustedAuthor; neither releases implementation on its own.

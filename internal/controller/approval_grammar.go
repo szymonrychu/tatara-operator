@@ -11,6 +11,7 @@ import (
 	"unicode"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -260,6 +261,15 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	}
 	cmt := mostRecentMaintainerComment(iss, proj, repo, botLogin)
 	if cmt == nil {
+		// THE AUTO-APPROVE CARVE-OUT (autoApproveTataraProposals). It sits ONLY in
+		// the no-maintainer-comment arm on purpose: it fires when the bot proposed
+		// the work and no human has spoken, but a maintainer who DID comment
+		// something that is not an approval still falls through to
+		// ApprovalRefusedNoPhrase below and blocks the release. It is fail-closed on
+		// every axis (flag / bot-authorship / marker / scope); see autoApproveApplies.
+		if autoApproveApplies(iss, proj, botLogin) {
+			return autoApprovalEvidence(), ""
+		}
 		return nil, ApprovalRefusedNoMaintainer
 	}
 	phrase, ok := MatchesApprovalPhrase(cmt.Body, phrases)
@@ -278,6 +288,43 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 		CreatedAt: cmt.CreatedAt,
 		Phrase:    phrase,
 	}, ""
+}
+
+// autoApproveApplies is the autoApproveTataraProposals carve-out predicate, and
+// EVERY branch of it is a security gate on the last human veto before prod. It is
+// fail-closed on all four axes and grants auto-approval ONLY when every one holds:
+//
+//  1. the per-project flag is on (default false => exactly today's behavior);
+//  2. the Issue is in scope - open, not done/rejected. A human's CLOSE is the
+//     veto, and a closed Issue is refused here even though the callers already
+//     filter it, so the security decision is self-contained, not caller-trusting;
+//  3. the Issue is BOT-authored: Status.Author (SCM truth, mirror-refreshed) equals
+//     a NON-EMPTY botLogin. A human-authored issue, or one whose author cannot be
+//     verified (empty author / empty botLogin), is NEVER auto-approved;
+//  4. the body carries a valid tatara-proposed-by marker (brainstorm / incident).
+//     A missing or malformed marker fails closed.
+func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) bool {
+	if !proj.Spec.AutoApproveTataraProposals {
+		return false
+	}
+	if !approvalInScope(iss) {
+		return false
+	}
+	if botLogin == "" || iss.Status.Author == "" || iss.Status.Author != botLogin {
+		return false
+	}
+	return tatarav1alpha1.ProposalKindFromBody(iss.Status.Body) != ""
+}
+
+// autoApprovalEvidence is the ApprovalEvidence the carve-out records: Auto=true,
+// the sentinel Login, and NO CommentID (there is no maintainer comment to cite).
+// The clause-2 idempotency in verifyOneIssue keeps it alive across re-verification.
+func autoApprovalEvidence() *tatarav1alpha1.ApprovalEvidence {
+	return &tatarav1alpha1.ApprovalEvidence{
+		Auto:      true,
+		Login:     tatarav1alpha1.AutoApproveLogin,
+		CreatedAt: metav1.Now(),
+	}
 }
 
 // GrammarVerifier is the PRODUCTION restapi.ApprovalVerifier (fix W1). Before it
@@ -383,7 +430,7 @@ func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.S
 			l.Info("approval verified",
 				"action", "approval_verified", "task", task.Name, "issue", name,
 				"maintainer_login", ev.Login, "comment_external_id", ev.CommentID,
-				"matched_phrase", ev.Phrase, "auto", false)
+				"matched_phrase", ev.Phrase, "auto", ev.Auto)
 		}
 		evidence[name] = ev
 	}

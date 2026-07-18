@@ -324,6 +324,181 @@ func TestVerifyApprovalSingleUseEvidence(t *testing.T) {
 	}
 }
 
+// autoProposalIssue builds a bot-authored, tatara-proposed issue (the shape a
+// brainstorm proposal / incident tracker issue has after mintIssueCR): open,
+// Author = the bot login, body carrying the provenance marker.
+func autoProposalIssue(repo, botLogin, kind string, number int, comments ...tatarav1alpha1.Comment) *tatarav1alpha1.Issue {
+	iss := approvalIssue(repo, number, comments...)
+	iss.Status.Author = botLogin
+	iss.Status.Body = tatarav1alpha1.StampProposalMarker("do the proposed work", kind)
+	return iss
+}
+
+// TestAutoApprove_FailClosedMatrix is the security-critical carve-out matrix: the
+// autoApproveTataraProposals path removes the last human gate before prod, so
+// every fail-closed branch is asserted explicitly. Auto-approval is granted ONLY
+// on the all-green row (flag on + bot author + valid marker + open + no
+// maintainer comment); every other row must refuse and leave the Task clarifying.
+func TestAutoApprove_FailClosedMatrix(t *testing.T) {
+	ctx := context.Background()
+	const bot = "tatara-bot"
+	now := time.Now()
+
+	tests := []struct {
+		name        string
+		flagOn      bool
+		mutate      func(iss *tatarav1alpha1.Issue)
+		wantAuto    bool // expect ApprovalPassed with Auto evidence
+		wantStage   string
+		wantRefusal string // "" when not asserted (auto pass)
+	}{
+		{
+			name:      "flag on + bot + marker + open => Auto:true",
+			flagOn:    true,
+			wantAuto:  true,
+			wantStage: tatarav1alpha1.StageApproved,
+		},
+		{
+			name:        "flag OFF => today's behavior, refused no-maintainer",
+			flagOn:      false,
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
+			name:        "human-authored issue is NEVER auto-approved",
+			flagOn:      true,
+			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "szymonrychu" },
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
+			name:        "unverifiable author (empty) is NEVER auto-approved",
+			flagOn:      true,
+			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Author = "" },
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
+			name:        "missing marker fails closed",
+			flagOn:      true,
+			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "no marker here" },
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
+			name:        "unknown-kind marker fails closed",
+			flagOn:      true,
+			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "<!-- tatara-proposed-by:followup -->\nbody" },
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
+			name:   "a maintainer NON-approval comment blocks auto-approve (no-phrase)",
+			flagOn: true,
+			mutate: func(iss *tatarav1alpha1.Issue) {
+				iss.Status.Comments = []tatarav1alpha1.Comment{
+					approvalComment("c1", "szymonrychu", "hold on, this is wrong", now, false),
+				}
+			},
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoPhrase,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+			proj.Spec.AutoApproveTataraProposals = tc.flagOn
+			iss := autoProposalIssue(repo.Name, bot, tatarav1alpha1.ProposalKindBrainstorm, 1)
+			if tc.mutate != nil {
+				tc.mutate(iss)
+			}
+			task := approvalTask("t-auto-matrix", iss.Name)
+			c := newMirrorClient(t, proj, repo, iss, task)
+
+			ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task)
+			if err != nil {
+				t.Fatalf("VerifyApprovalDetailed: %v", err)
+			}
+			if tc.wantAuto {
+				if !ApprovalPassed(ev) {
+					t.Fatal("the all-green row did not auto-approve")
+				}
+				got := ev[iss.Name]
+				if got == nil || !got.Auto || got.Login != tatarav1alpha1.AutoApproveLogin || got.CommentID != "" {
+					t.Fatalf("evidence = %+v, want Auto:true, Login:%q, empty CommentID", got, tatarav1alpha1.AutoApproveLogin)
+				}
+				if got := getIssueCR(t, c, iss.Name).Status.Status; got != "approved" {
+					t.Fatalf("issue status = %q, want approved", got)
+				}
+			} else {
+				if ApprovalPassed(ev) {
+					t.Fatal("a fail-closed row auto-approved")
+				}
+				if tc.wantRefusal != "" && refusals[iss.Name] != tc.wantRefusal {
+					t.Fatalf("refusal = %q, want %q", refusals[iss.Name], tc.wantRefusal)
+				}
+			}
+			if got := getTaskCR(t, c, task.Name).Status.Stage; got != tc.wantStage {
+				t.Fatalf("task stage = %q, want %q", got, tc.wantStage)
+			}
+		})
+	}
+}
+
+// TestAutoApprove_ClosedIssueVetoed: the human's CLOSE is the veto. A closed
+// bot-proposed issue with the flag on and the marker present is out of scope and
+// must never auto-approve (it is filtered before verifyOneIssue, and
+// autoApproveApplies re-checks scope as defense in depth).
+func TestAutoApprove_ClosedIssueVetoed(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+	proj.Spec.AutoApproveTataraProposals = true
+
+	iss := autoProposalIssue(repo.Name, "tatara-bot", tatarav1alpha1.ProposalKindIncident, 1)
+	iss.Status.State = "closed"
+	task := approvalTask("t-auto-closed", iss.Name)
+	c := newMirrorClient(t, proj, repo, iss, task)
+
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	if err != nil {
+		t.Fatalf("VerifyApproval: %v", err)
+	}
+	if ApprovalPassed(ev) {
+		t.Fatal("a CLOSED bot proposal was auto-approved; the human close veto was ignored")
+	}
+	if got := getTaskCR(t, c, task.Name).Status.Stage; got != tatarav1alpha1.StageClarifying {
+		t.Fatalf("task stage = %q, want clarifying", got)
+	}
+}
+
+// TestAutoApprove_HumanApprovalWins: when a real maintainer approval IS present,
+// the human evidence (Auto:false, real commentId) is recorded, not the auto
+// sentinel - the auto path is a fallback for the no-human case, never an override.
+func TestAutoApprove_HumanApprovalWins(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := approvalProject("szymonrychu"), mirrorRepo()
+	proj.Spec.AutoApproveTataraProposals = true
+	now := time.Now()
+
+	iss := autoProposalIssue(repo.Name, "tatara-bot", tatarav1alpha1.ProposalKindBrainstorm, 1,
+		approvalComment("c1", "szymonrychu", "lgtm", now, false))
+	task := approvalTask("t-auto-human", iss.Name)
+	c := newMirrorClient(t, proj, repo, iss, task)
+
+	ev, err := VerifyApproval(ctx, c, &mirrorSpiller{}, proj, task)
+	if err != nil {
+		t.Fatalf("VerifyApproval: %v", err)
+	}
+	if !ApprovalPassed(ev) {
+		t.Fatal("a maintainer lgtm on a bot proposal failed to approve")
+	}
+	got := ev[iss.Name]
+	if got == nil || got.Auto || got.Login != "szymonrychu" || got.CommentID != "c1" {
+		t.Fatalf("evidence = %+v, want human evidence {login: szymonrychu, commentId: c1, auto: false}", got)
+	}
+}
+
 // TestVerifyApprovalAutoEvidenceSurvivesAReRun: autoApproveTataraProposals is
 // the ONLY other path into approved, and it writes ApprovalEvidence{Auto: true,
 // Login: "<tatara:auto>", CommentID: ""} - evidence with NO comment to re-match.
