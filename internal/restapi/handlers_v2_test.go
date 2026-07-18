@@ -139,12 +139,19 @@ func (f *fakeMemory) Fetch(_ context.Context, trackID string) (json.RawMessage, 
 
 type fakeApproval struct {
 	grant map[string]bool // issue CR name -> granted
+	auto  bool            // when set, granted issues return Auto evidence
 }
 
 func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Project,
 	iss *tatarav1alpha1.Issue) (*tatarav1alpha1.ApprovalEvidence, bool) {
 	if !f.grant[iss.Name] {
 		return nil, false
+	}
+	if f.auto {
+		return &tatarav1alpha1.ApprovalEvidence{
+			Auto: true, Login: tatarav1alpha1.AutoApproveLogin,
+			CreatedAt: metav1.NewTime(time.Unix(0, 0)),
+		}, true
 	}
 	return &tatarav1alpha1.ApprovalEvidence{
 		Login: "maintainer", CommentID: "1", Phrase: "go ahead",

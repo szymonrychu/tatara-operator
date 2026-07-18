@@ -18,6 +18,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -301,8 +302,19 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 //  3. the Issue is BOT-authored: Status.Author (SCM truth, mirror-refreshed) equals
 //     a NON-EMPTY botLogin. A human-authored issue, or one whose author cannot be
 //     verified (empty author / empty botLogin), is NEVER auto-approved;
-//  4. the body carries a valid tatara-proposed-by marker (brainstorm / incident).
-//     A missing or malformed marker fails closed.
+//  4. the body carries a valid tatara-proposed-by marker (brainstorm / incident)
+//     AND its content fingerprint still matches the body. A missing/malformed
+//     marker fails closed; so does an EDITED body.
+//
+// Axis 4's fingerprint is the tamper guard for a coupling that is safe today but
+// will not stay that way. Auto-approve releases the body in Status.Body as
+// reviewed-by-construction. Today a human body edit is invisible: Task.Spec.Goal
+// is frozen at mint and issues.edited webhooks are ignored, so Status.Body only
+// ever holds the tatara-proposed content. A parallel workstream's approved design
+// WILL wire issue-edit body refresh, after which the mirror would carry a human
+// edit into Status.Body - and without the fingerprint, auto-approve would release
+// the EDITED scope with no human gate. The fingerprint makes that fail closed
+// NOW: any content edit since filing (or removal of the marker) refuses.
 func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) bool {
 	if !proj.Spec.AutoApproveTataraProposals {
 		return false
@@ -313,7 +325,10 @@ func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	if botLogin == "" || iss.Status.Author == "" || iss.Status.Author != botLogin {
 		return false
 	}
-	return tatarav1alpha1.ProposalKindFromBody(iss.Status.Body) != ""
+	if tatarav1alpha1.ProposalKindFromBody(iss.Status.Body) == "" {
+		return false
+	}
+	return tatarav1alpha1.ProposalBodyMatchesFingerprint(iss.Status.Body)
 }
 
 // autoApprovalEvidence is the ApprovalEvidence the carve-out records: Auto=true,
@@ -374,15 +389,19 @@ func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alph
 // takes this function's verdict as UnparkInput.GrammarPassed.
 func VerifyApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (map[string]*tatarav1alpha1.ApprovalEvidence, error) {
-	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task)
+	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, nil)
 	return evidence, err
 }
 
 // VerifyApprovalDetailed is VerifyApproval plus the per-issue refusal reason the
 // operator's park comment names (ApprovalRefusedComment). The evidence map has an
 // entry for every LIVE owned Issue; a nil value is a refusal.
+//
+// metrics may be nil; when set, an auto-approval TRANSITION (the last human gate
+// removed) increments operator_auto_approve_total{kind} so the path is queryable
+// without log-scraping (hard rule 13).
 func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, metrics *obs.OperatorMetrics) (
 	map[string]*tatarav1alpha1.ApprovalEvidence, map[string]string, error) {
 	l := log.FromContext(ctx)
 	evidence := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(task.Status.IssueRefs))
@@ -431,6 +450,11 @@ func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.S
 				"action", "approval_verified", "task", task.Name, "issue", name,
 				"maintainer_login", ev.Login, "comment_external_id", ev.CommentID,
 				"matched_phrase", ev.Phrase, "auto", ev.Auto)
+			if ev.Auto && metrics != nil {
+				if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
+					metrics.AutoApproveTotal(kind)
+				}
+			}
 		}
 		evidence[name] = ev
 	}
@@ -505,7 +529,8 @@ func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spill
 // UnparkInput.GrammarPassed. A BOT-authored event is refused before any forge
 // read: the operator's own park comment can never un-park the Task it parked.
 func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent) (bool, error) {
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
+	metrics *obs.OperatorMetrics) (bool, error) {
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
@@ -521,7 +546,10 @@ func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, 
 			}
 		}
 	}
-	evidence, err := VerifyApproval(ctx, c, sp, proj, task)
+	// VerifyApprovalDetailed (not VerifyApproval) so an auto-approval landing here
+	// - a multi-issue Task whose triggering comment approved one issue while
+	// another owned bot proposal auto-approves - still increments the counter.
+	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, metrics)
 	if err != nil {
 		return false, err
 	}

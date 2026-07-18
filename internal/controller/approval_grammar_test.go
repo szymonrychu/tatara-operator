@@ -5,7 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -214,7 +217,7 @@ func TestVerifyApprovalBotCannotApprove(t *testing.T) {
 	task := approvalTask("t-bot", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, nil)
 	if err != nil {
 		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
@@ -245,7 +248,7 @@ func TestVerifyApprovalMostRecentMaintainerCommentGoverns(t *testing.T) {
 	task := approvalTask("t-recent", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, nil)
 	if err != nil {
 		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
@@ -293,7 +296,7 @@ func TestVerifyApprovalSingleUseEvidence(t *testing.T) {
 	task := approvalTask("t-replay", i1.Name)
 	c := newMirrorClient(t, proj, repo, i1, task)
 
-	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task)
+	ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, nil)
 	if err != nil {
 		t.Fatalf("VerifyApprovalDetailed: %v", err)
 	}
@@ -348,6 +351,7 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 		name        string
 		flagOn      bool
 		mutate      func(iss *tatarav1alpha1.Issue)
+		mutateProj  func(p *tatarav1alpha1.Project)
 		wantAuto    bool // expect ApprovalPassed with Auto evidence
 		wantStage   string
 		wantRefusal string // "" when not asserted (auto pass)
@@ -379,6 +383,13 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			wantRefusal: ApprovalRefusedNoMaintainer,
 		},
 		{
+			name:        "empty botLogin (project has none) fails closed",
+			flagOn:      true,
+			mutateProj:  func(p *tatarav1alpha1.Project) { p.Spec.Scm.BotLogin = "" },
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
 			name:        "missing marker fails closed",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "no marker here" },
@@ -389,6 +400,17 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			name:        "unknown-kind marker fails closed",
 			flagOn:      true,
 			mutate:      func(iss *tatarav1alpha1.Issue) { iss.Status.Body = "<!-- tatara-proposed-by:followup -->\nbody" },
+			wantStage:   tatarav1alpha1.StageClarifying,
+			wantRefusal: ApprovalRefusedNoMaintainer,
+		},
+		{
+			name:   "body edited since filing (fingerprint mismatch) fails closed",
+			flagOn: true,
+			mutate: func(iss *tatarav1alpha1.Issue) {
+				// Marker (and its fingerprint) preserved, but the human appended
+				// scope to the body - exactly the incoming issue-edit-refresh threat.
+				iss.Status.Body += "\n\nand also delete the production database"
+			},
 			wantStage:   tatarav1alpha1.StageClarifying,
 			wantRefusal: ApprovalRefusedNoMaintainer,
 		},
@@ -409,6 +431,9 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			proj, repo := approvalProject("szymonrychu"), mirrorRepo()
 			proj.Spec.AutoApproveTataraProposals = tc.flagOn
+			if tc.mutateProj != nil {
+				tc.mutateProj(proj)
+			}
 			iss := autoProposalIssue(repo.Name, bot, tatarav1alpha1.ProposalKindBrainstorm, 1)
 			if tc.mutate != nil {
 				tc.mutate(iss)
@@ -416,11 +441,14 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			task := approvalTask("t-auto-matrix", iss.Name)
 			c := newMirrorClient(t, proj, repo, iss, task)
 
-			ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task)
+			metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+			ev, refusals, err := VerifyApprovalDetailed(ctx, c, &mirrorSpiller{}, proj, task, metrics)
 			if err != nil {
 				t.Fatalf("VerifyApprovalDetailed: %v", err)
 			}
+			wantCount := 0.0
 			if tc.wantAuto {
+				wantCount = 1.0
 				if !ApprovalPassed(ev) {
 					t.Fatal("the all-green row did not auto-approve")
 				}
@@ -441,6 +469,9 @@ func TestAutoApprove_FailClosedMatrix(t *testing.T) {
 			}
 			if got := getTaskCR(t, c, task.Name).Status.Stage; got != tc.wantStage {
 				t.Fatalf("task stage = %q, want %q", got, tc.wantStage)
+			}
+			if got := testutil.ToFloat64(metrics.AutoApproveCounter(tatarav1alpha1.ProposalKindBrainstorm)); got != wantCount {
+				t.Fatalf("operator_auto_approve_total{kind=brainstorm} = %v, want %v", got, wantCount)
 			}
 		})
 	}
@@ -712,7 +743,7 @@ func TestReVerifyParkedSyncsTheThreadFirst(t *testing.T) {
 		{ExternalID: "c9", Author: "szymonrychu", Body: "go ahead", CreatedAt: time.Now().UTC().Truncate(time.Second)},
 	}}
 
-	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev)
+	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil)
 	if err != nil {
 		t.Fatalf("ReVerifyParked: %v", err)
 	}
@@ -758,7 +789,7 @@ func TestReVerifyParkedRefusesANonApprovingComment(t *testing.T) {
 	rd := &mirrorReader{comments: []scm.IssueComment{
 		{ExternalID: "c9", Author: "szymonrychu", Body: "not yet", CreatedAt: time.Now()},
 	}}
-	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev)
+	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil)
 	if err != nil {
 		t.Fatalf("ReVerifyParked: %v", err)
 	}
@@ -790,7 +821,7 @@ func TestReVerifyParkedIgnoresABotEvent(t *testing.T) {
 	c := newMirrorClient(t, proj, repo, i1, task)
 
 	rd := &mirrorReader{}
-	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev)
+	passed, err := ReVerifyParked(ctx, c, &mirrorSpiller{}, rd, proj, task, ev, nil)
 	if err != nil {
 		t.Fatalf("ReVerifyParked: %v", err)
 	}

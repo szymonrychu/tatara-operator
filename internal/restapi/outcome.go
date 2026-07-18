@@ -1122,6 +1122,15 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	for i := range issues {
 		iss := &issues[i]
 		ev := evidence[iss.Name]
+		// Count the auto-approval TRANSITION (an issue not already approved): the
+		// last human gate is being removed, so it must be queryable without
+		// log-scraping (hard rule 13). This is the primary auto-approve site - a
+		// brainstorm/incident proposal reaching implement via clarify submit.
+		if ev != nil && ev.Auto && iss.Status.Status != "approved" {
+			if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
+				s.metrics.AutoApproveTotal(kind)
+			}
+		}
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
 		if err := objbudget.FitIssue(ctx, s.c, s.spiller, key, func(is *tatarav1alpha1.Issue) {
 			is.Status.Status = "approved"

@@ -529,6 +529,32 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 	require.NotNil(t, e2.issue(t, i1.Name).Status.Approval)
 }
 
+// An auto-approval through the clarify submit path (the primary auto-approve
+// site: a bot proposal reaching implement) increments operator_auto_approve_total
+// by proposal kind, so the last-gate-removed release is queryable without
+// log-scraping (hard rule 13).
+func TestOutcome_Clarify_AutoApproveIncrementsCounter(t *testing.T) {
+	i1 := issueV2("tatara-operator", 291, "t1", func(iss *tatarav1alpha1.Issue) {
+		iss.Status.Author = "tatara-bot"
+		iss.Status.Body = tatarav1alpha1.StampProposalMarker("do the thing", tatarav1alpha1.ProposalKindBrainstorm)
+	})
+	reg := prometheus.NewRegistry()
+	metrics := obs.NewOperatorMetrics(reg)
+	e := buildV2(t, v2Opts{
+		writer:   panicForge{},
+		metrics:  metrics,
+		approval: &fakeApproval{grant: map[string]bool{i1.Name: true}, auto: true},
+	}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), i1)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"the brainstorm was the review"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.True(t, e.issue(t, i1.Name).Status.Approval.Auto, "evidence must record Auto:true")
+	require.Equal(t, 1.0, testutil.ToFloat64(metrics.AutoApproveCounter(tatarav1alpha1.ProposalKindBrainstorm)))
+}
+
 // A nil verifier FAILS CLOSED.
 func TestOutcome_Clarify_NoVerifierFailsClosed(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
