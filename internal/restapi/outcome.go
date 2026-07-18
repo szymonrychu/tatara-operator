@@ -132,11 +132,23 @@ type incidentParent struct {
 	Number int    `json:"number"`
 }
 
+// incidentComment is the target+body of an action=comment_issue outcome: fresh
+// evidence appended to an EXISTING open incident tracker instead of filing a
+// near-duplicate. Repo is a Repository CR name in this project. The operator
+// gates it to Issue CRs carrying an incident rule/group label, so an incident
+// agent can only comment on a TRACKER, never an arbitrary human issue.
+type incidentComment struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	Body   string `json:"body"`
+}
+
 type incidentPayload struct {
-	Action     string         `json:"action"`
-	AlertRules []string       `json:"alertRules"`
-	Issue      *incidentIssue `json:"issue,omitempty"`
-	Reason     string         `json:"reason"`
+	Action     string           `json:"action"`
+	AlertRules []string         `json:"alertRules"`
+	Issue      *incidentIssue   `json:"issue,omitempty"`
+	Comment    *incidentComment `json:"comment,omitempty"`
+	Reason     string           `json:"reason"`
 }
 
 type foldRef struct {
@@ -1349,6 +1361,10 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	}
 	switch p.Action {
 	case "file_issue":
+		if p.Comment != nil {
+			o.bad("comment is only for action=comment_issue", "unexpected-field")
+			return
+		}
 		if p.Issue == nil || p.Issue.Repo == "" ||
 			strings.TrimSpace(p.Issue.Title) == "" || strings.TrimSpace(p.Issue.Body) == "" {
 			o.bad("action=file_issue requires issue.repo, issue.title and issue.body", "missing-field")
@@ -1358,13 +1374,27 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 			o.bad("issue.parent requires repo and number", "bad-parent")
 			return
 		}
+	case "comment_issue":
+		if p.Issue != nil {
+			o.bad("issue is only for action=file_issue", "unexpected-field")
+			return
+		}
+		if p.Comment == nil || p.Comment.Repo == "" || p.Comment.Number == 0 ||
+			strings.TrimSpace(p.Comment.Body) == "" {
+			o.bad("action=comment_issue requires comment.repo, comment.number and comment.body", "missing-field")
+			return
+		}
 	case "false_positive":
 		if p.Issue != nil {
 			o.bad("issue is only for action=file_issue", "unexpected-field")
 			return
 		}
+		if p.Comment != nil {
+			o.bad("comment is only for action=comment_issue", "unexpected-field")
+			return
+		}
 	default:
-		o.bad("action must be one of file_issue, false_positive", "bad-action")
+		o.bad("action must be one of file_issue, comment_issue, false_positive", "bad-action")
 		return
 	}
 
@@ -1392,6 +1422,11 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 			return
 		}
 		o.ok("false_positive")
+		return
+	}
+
+	if p.Action == "comment_issue" {
+		o.incidentComment(p)
 		return
 	}
 
@@ -1427,17 +1462,48 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		writeError(o.w, http.StatusBadGateway, "scm returned no issue number")
 		return
 	}
-	var crLabels map[string]string
+	crLabels := map[string]string{}
 	if ruleKey != "" {
-		crLabels = map[string]string{queue.LabelAlertRuleKey: ruleKey}
+		crLabels[queue.LabelAlertRuleKey] = ruleKey
+	}
+	if o.task.Spec.GroupKey != "" {
+		crLabels[queue.LabelAlertGroupKey] = o.task.Spec.GroupKey
+	}
+	if len(crLabels) == 0 {
+		crLabels = nil
 	}
 	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, body, crLabels); err != nil {
 		writeClientErr(o.w, err)
 		return
 	}
 
-	if p.Issue.Parent != nil {
-		s.linkIncidentParent(ctx, o, writer, token, created.Ref, p.Issue.Parent)
+	// Auto-correlate: when the agent named no parent but this incident shares a
+	// GROUP key with an OLDER open tracker (a different alert rule firing for one
+	// root cause), link the new tracker under that sibling so a co-firing storm
+	// collapses to one tree instead of N unrelated issues. Agent-supplied parent
+	// always wins.
+	// ruleKey != "" is required: FindOldestOpenGroupSibling excludes THIS Task's
+	// just-minted tracker by its rule-key, so an empty key could pick the new
+	// issue as its own parent. Incident Tasks always carry a DedupKey, so this is
+	// belt-and-braces.
+	parent := p.Issue.Parent
+	if parent == nil && o.task.Spec.GroupKey != "" && ruleKey != "" {
+		if sib, ok, ferr := queue.FindOldestOpenGroupSibling(ctx, s.c, s.ns, o.proj.Name, o.task.Spec.GroupKey, ruleKey); ferr == nil && ok {
+			parent = &incidentParent{Repo: sib.Spec.RepositoryRef, Number: sib.Spec.Number}
+			s.metrics.IncidentGroupLinked("linked")
+			s.log.InfoContext(ctx, "incident auto-linked under group sibling",
+				append(reqLogFields(o.r), "task", o.task.Name, "group_key", o.task.Spec.GroupKey,
+					"sibling", sib.Name)...)
+		} else {
+			if ferr != nil {
+				s.log.ErrorContext(ctx, "incident group-sibling lookup failed",
+					append(reqLogFields(o.r), "task", o.task.Name, "error", ferr)...)
+			}
+			s.metrics.IncidentGroupLinked("no_sibling")
+		}
+	}
+	if parent != nil {
+		s.linkIncidentParent(ctx, o, writer, token, created.Ref, parent)
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
@@ -1450,6 +1516,57 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 	o.ok("file_issue", "repo", repo.Name, "number", number)
+}
+
+// incidentComment appends fresh evidence to an EXISTING open incident tracker
+// (action=comment_issue) instead of filing a near-duplicate, then terminates the
+// Task at rejected(tracked-elsewhere). It is GATED: the target Issue CR must
+// carry an incident rule-key or group-key label, so an incident agent (which has
+// no issue_write tool) can comment ONLY on a tracker the platform created, never
+// an arbitrary human thread. The operator posts under the bot identity.
+func (o *outcomeCtx) incidentComment(p incidentPayload) {
+	ctx := o.r.Context()
+	s := o.s
+	repo, err := s.repoCR(ctx, o.proj.Name, p.Comment.Repo)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	var iss tatarav1alpha1.Issue
+	issName := tatarav1alpha1.IssueName(repo.Name, p.Comment.Number)
+	if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: issName}, &iss); err != nil {
+		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
+		return
+	}
+	if iss.Labels[queue.LabelAlertRuleKey] == "" && iss.Labels[queue.LabelAlertGroupKey] == "" {
+		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
+		return
+	}
+	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+	if !ok {
+		return
+	}
+	ref := issueRef(repo, p.Comment.Number)
+	cerr := writer.Comment(ctx, token, ref, p.Comment.Body)
+	controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", cerr)
+	if cerr != nil {
+		s.metrics.IncidentTrackerComment("failed")
+		s.log.ErrorContext(ctx, "restapi: appending incident evidence comment failed",
+			append(reqLogFields(o.r), "task", o.task.Name, "tracker", ref, "error", cerr)...)
+		writeError(o.w, http.StatusBadGateway, "scm comment failed")
+		return
+	}
+	s.metrics.IncidentTrackerComment("posted")
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonTrackedElsewhere, s.now()); err != nil {
+			return err
+		}
+		agentNote(t, o.kind, "note", "comment_issue "+ref+": "+p.Reason, s.now())
+		return nil
+	}) {
+		return
+	}
+	o.ok("comment_issue", "repo", repo.Name, "number", p.Comment.Number)
 }
 
 // linkIncidentParent links the freshly-filed child issue under an open tracker
