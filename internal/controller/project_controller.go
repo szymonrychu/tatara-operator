@@ -345,7 +345,7 @@ func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 	if err := r.List(ctx, &list); err != nil {
 		return
 	}
-	var provisioning, ready, failed int
+	var provisioning, ready, failed, degraded int
 	for i := range list.Items {
 		mem := list.Items[i].Status.Memory
 		if mem == nil {
@@ -358,9 +358,11 @@ func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 			ready++
 		case "Failed":
 			failed++
+		case "Degraded":
+			degraded++
 		}
 	}
-	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed)
+	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed, degraded)
 }
 
 // lightragDocStatuses is the full set of ingestion statuses lightrag reports for

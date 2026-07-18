@@ -330,6 +330,99 @@ func TestMemoryStackHealth_MissingObjectsAreNotReadyNotError(t *testing.T) {
 	}
 }
 
+func TestMemoryStackHealth_UnconvergedRolloutNotCountedReady(t *testing.T) {
+	// Issue #355: a Deployment mid-rollout can have an old-generation replica
+	// sitting Available while the new generation is still rolling out. That
+	// must NOT read as ready - AvailableReplicas alone cannot tell the two
+	// apart, so memoryStackHealth must also gate on rollout convergence
+	// (ObservedGeneration==Generation && UpdatedReplicas==Replicas==AvailableReplicas).
+	ctx := context.Background()
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "health-unconverged")
+
+	if _, err := r.ensureNeo4jPassword(ctx, p); err != nil {
+		t.Fatalf("password: %v", err)
+	}
+	if err := r.applyMemoryStack(ctx, p); err != nil {
+		t.Fatalf("applyMemoryStack: %v", err)
+	}
+
+	names := memory.NamesFor(p.Name)
+	var dep appsv1.Deployment
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.Lightrag}, &dep); err != nil {
+		t.Fatalf("get lightrag deployment: %v", err)
+	}
+	// Simulate an in-progress rollout: one OLD replica still Available and
+	// Ready, but not yet on the current pod template (UpdatedReplicas stays 0).
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas = 1
+	dep.Status.UpdatedReplicas = 0
+	dep.Status.ReadyReplicas = 1
+	dep.Status.AvailableReplicas = 1
+	if err := k8sClient.Status().Update(ctx, &dep); err != nil {
+		t.Fatalf("fake unconverged deployment status: %v", err)
+	}
+
+	_, _, lightragAvail, _, err := r.memoryStackHealth(ctx, p)
+	if err != nil {
+		t.Fatalf("memoryStackHealth: %v", err)
+	}
+	if lightragAvail != 0 {
+		t.Fatalf("lightragAvail = %d, want 0 for an unconverged rollout (old pod Available, new not yet)", lightragAvail)
+	}
+}
+
+func TestDeploymentRolloutConverged(t *testing.T) {
+	cases := []struct {
+		name string
+		dep  appsv1.Deployment
+		want bool
+	}{
+		{
+			name: "converged",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "stale observed generation",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "old and new pod coexisting",
+			dep: appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 0, AvailableReplicas: 1,
+				},
+			},
+			want: false,
+		},
+		{
+			name: "never applied, all zero",
+			dep:  appsv1.Deployment{},
+			want: true, // 0==0 for every field; caller only reaches here on a found object with zero replicas requested, a degenerate case that still reads 0 available either way
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deploymentRolloutConverged(&tc.dep); got != tc.want {
+				t.Fatalf("deploymentRolloutConverged = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestReconcile_PartialStackStaysProvisioningNotFailed(t *testing.T) {
 	// A stack where only some objects are healthy (e.g. cnpg ready but neo4j not
 	// yet visible) must read as Provisioning, never Failed.
@@ -391,6 +484,104 @@ func TestMemoryPhase_Transitions(t *testing.T) {
 				t.Fatalf("memoryPhase = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReconcileMemory_DegradesAfterProvisioningTimeout covers issue #355: a
+// stack stuck Provisioning past MemoryConfig.ProvisioningTimeout must flip to
+// Degraded with a MemoryReady=False/ProvisioningTimeout condition, instead of
+// staying Provisioning indefinitely.
+func TestReconcileMemory_DegradesAfterProvisioningTimeout(t *testing.T) {
+	r := newMemoryReconciler()
+	r.MemoryConfig.ProvisioningTimeout = time.Minute
+	p := mkMemoryProject(t, "degrade-timeout")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	got := getProject(t, p.Name)
+	if got.Status.Memory.Phase != "Provisioning" {
+		t.Fatalf("phase = %q, want Provisioning before the timeout elapses", got.Status.Memory.Phase)
+	}
+	if got.Status.Memory.ProvisioningSince == nil {
+		t.Fatalf("ProvisioningSince not stamped on entering Provisioning")
+	}
+
+	// Backdate ProvisioningSince past the 1m timeout, as if the stack has been
+	// stuck since before the configured bound.
+	ctx := logfIntoTestCtx()
+	stamp := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+	got.Status.Memory.ProvisioningSince = &stamp
+	if err := k8sClient.Status().Update(ctx, got); err != nil {
+		t.Fatalf("backdate ProvisioningSince: %v", err)
+	}
+
+	res, err := reconcileMemory(t, r, p.Name)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if res.RequeueAfter != memoryRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v (Degraded keeps polling)", res.RequeueAfter, memoryRequeue)
+	}
+	got = getProject(t, p.Name)
+	if got.Status.Memory.Phase != "Degraded" {
+		t.Fatalf("phase = %q, want Degraded", got.Status.Memory.Phase)
+	}
+	c := apimeta.FindStatusCondition(got.Status.Conditions, "MemoryReady")
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "ProvisioningTimeout" {
+		t.Fatalf("MemoryReady = %+v, want False/ProvisioningTimeout", c)
+	}
+}
+
+// TestReconcileMemory_ProvisioningTimeoutDisabledByZero verifies a zero
+// ProvisioningTimeout (the pre-#355 behaviour) never flips a stuck stack to
+// Degraded, regardless of how stale ProvisioningSince is.
+func TestReconcileMemory_ProvisioningTimeoutDisabledByZero(t *testing.T) {
+	r := newMemoryReconciler()
+	r.MemoryConfig.ProvisioningTimeout = 0
+	p := mkMemoryProject(t, "degrade-disabled")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	ctx := logfIntoTestCtx()
+	got := getProject(t, p.Name)
+	stamp := metav1.NewTime(time.Now().Add(-24 * time.Hour))
+	got.Status.Memory.ProvisioningSince = &stamp
+	if err := k8sClient.Status().Update(ctx, got); err != nil {
+		t.Fatalf("backdate ProvisioningSince: %v", err)
+	}
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got = getProject(t, p.Name)
+	if got.Status.Memory.Phase != "Provisioning" {
+		t.Fatalf("phase = %q, want Provisioning (timeout disabled)", got.Status.Memory.Phase)
+	}
+}
+
+// TestReconcileMemory_ProvisioningSinceClearedOnReady verifies ProvisioningSince
+// is cleared once the stack reaches Ready, mirroring ReadySince's clear-on-leave
+// behaviour in the other direction.
+func TestReconcileMemory_ProvisioningSinceClearedOnReady(t *testing.T) {
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "prov-since-clear")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if got := getProject(t, p.Name); got.Status.Memory.ProvisioningSince == nil {
+		t.Fatalf("ProvisioningSince not stamped while Provisioning")
+	}
+
+	fakeStackHealthy(t, p.Name)
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got := waitMemoryPhase(t, p.Name, "Ready")
+	if got.Status.Memory.ProvisioningSince != nil {
+		t.Fatalf("ProvisioningSince = %v, want nil once Ready", got.Status.Memory.ProvisioningSince)
 	}
 }
 
@@ -776,7 +967,9 @@ func fakeStackHealthy(t *testing.T, project string) {
 		if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: dn}, &dep); err != nil {
 			t.Fatalf("get deployment %s: %v", dn, err)
 		}
+		dep.Status.ObservedGeneration = dep.Generation
 		dep.Status.Replicas = 1
+		dep.Status.UpdatedReplicas = 1
 		dep.Status.ReadyReplicas = 1
 		dep.Status.AvailableReplicas = 1
 		if err := k8sClient.Status().Update(ctx, &dep); err != nil {
@@ -817,6 +1010,7 @@ func fakeStackUnhealthy(t *testing.T, project string) {
 			t.Fatalf("get deployment %s: %v", dn, err)
 		}
 		dep.Status.Replicas = 0
+		dep.Status.UpdatedReplicas = 0
 		dep.Status.ReadyReplicas = 0
 		dep.Status.AvailableReplicas = 0
 		if err := k8sClient.Status().Update(ctx, &dep); err != nil {
