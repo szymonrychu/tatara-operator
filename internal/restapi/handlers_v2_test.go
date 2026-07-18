@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -202,6 +203,12 @@ type v2Opts struct {
 	logger     *slog.Logger
 	spillerErr error
 	now        func() time.Time
+	// spillerFor and memoryFor override the default single-project resolver
+	// (which always returns env.spiller / opts.memory regardless of the
+	// Project passed in). Set these to prove per-project resolution: each
+	// entry in the map is keyed by Project name.
+	spillerFor func(proj *tatarav1alpha1.Project) objbudget.Spiller
+	memoryFor  func(proj *tatarav1alpha1.Project) restapi.NoteFetcher
 }
 
 func buildV2(t *testing.T, opts v2Opts, objs ...client.Object) *v2Env {
@@ -228,11 +235,15 @@ func buildV2(t *testing.T, opts v2Opts, objs ...client.Object) *v2Env {
 	if writer == nil {
 		writer = env.forge
 	}
+	spillerFor := opts.spillerFor
+	if spillerFor == nil {
+		spillerFor = func(*tatarav1alpha1.Project) objbudget.Spiller { return env.spiller }
+	}
 	cfg := restapi.Config{
 		Client: fc, Namespace: ns,
-		SCMFor:  func(string) (scm.SCMWriter, error) { return writer, nil },
-		Spiller: env.spiller,
-		Now:     func() time.Time { return frozenNow },
+		SCMFor:     func(string) (scm.SCMWriter, error) { return writer, nil },
+		SpillerFor: spillerFor,
+		Now:        func() time.Time { return frozenNow },
 	}
 	if opts.now != nil {
 		cfg.Now = opts.now
@@ -243,8 +254,10 @@ func buildV2(t *testing.T, opts v2Opts, objs ...client.Object) *v2Env {
 	if opts.ci != nil {
 		cfg.CIFor = func(string, string) (scm.CIReader, error) { return opts.ci, nil }
 	}
-	if opts.memory != nil {
-		cfg.Memory = opts.memory
+	if opts.memoryFor != nil {
+		cfg.MemoryFor = opts.memoryFor
+	} else if opts.memory != nil {
+		cfg.MemoryFor = func(*tatarav1alpha1.Project) restapi.NoteFetcher { return opts.memory }
 	}
 	if opts.approval != nil {
 		cfg.Approval = opts.approval

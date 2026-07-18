@@ -501,7 +501,7 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	var mutErr error
 	from := o.task.Status.Stage
 	var to, toReason string
-	err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	err := objbudget.FitTask(ctx, s.c, s.spillerForOrNil(o.proj), key, func(t *tatarav1alpha1.Task) {
 		if mutate != nil {
 			if err := mutate(t); err != nil {
 				mutErr = err
@@ -679,7 +679,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			return
 		}
 		if o.kind == "documentation" {
-			if err := s.stampDocumentedBy(ctx, o.task); err != nil {
+			if err := s.stampDocumentedBy(ctx, o.proj, o.task); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
@@ -724,7 +724,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	for i := range open {
 		mr := &open[i]
 		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
-		if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
 			m.Status.Significance = p.ChangeSignificance
 		}); err != nil {
 			writeClientErr(o.w, err)
@@ -766,8 +766,14 @@ func ownedMRRepos(mrs []tatarav1alpha1.MergeRequest) []string {
 }
 
 // stampDocumentedBy stamps status.documentedBy on every Task the batch covered
-// (F.3: either way, documented or declined).
-func (s *Server) stampDocumentedBy(ctx context.Context, batch *tatarav1alpha1.Task) error {
+// (F.3: either way, documented or declined). proj is the BATCH's own project -
+// docbatch.go's MintDocBatch only ever collects covered tasks with
+// Spec.ProjectRef == proj.Name, so every covered task shares it; passed down
+// from the caller instead of re-resolved per iteration (that Get would also
+// abort the whole loop on failure, unlike the covered-task Get above which
+// tolerates NotFound).
+func (s *Server) stampDocumentedBy(ctx context.Context, proj *tatarav1alpha1.Project, batch *tatarav1alpha1.Task) error {
+	spiller := s.spillerForOrNil(proj)
 	for _, name := range batch.Spec.DocumentsTasks {
 		key := types.NamespacedName{Namespace: s.ns, Name: name}
 		var covered tatarav1alpha1.Task
@@ -777,7 +783,7 @@ func (s *Server) stampDocumentedBy(ctx context.Context, batch *tatarav1alpha1.Ta
 			}
 			return err
 		}
-		if err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+		if err := objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 			t.Status.DocumentedBy = batch.Name
 		}); err != nil {
 			return err
@@ -890,7 +896,7 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			if !rok {
 				return
 			}
-			if err := controller.SyncMergeRequestOnDemand(ctx, s.c, s.spiller, reader, o.proj, repo, mr, live); err != nil {
+			if err := controller.SyncMergeRequestOnDemand(ctx, s.c, s.spillerForOrNil(o.proj), reader, o.proj, repo, mr, live); err != nil {
 				s.log.WarnContext(ctx, "restapi: on-demand mirror resync after head-moved hit an error; the live head was stamped, the thread may lag a sweep",
 					append(reqLogFields(o.r), "task", o.task.Name, "repo", mr.Spec.RepositoryRef,
 						"number", mr.Spec.Number, "error", err)...)
@@ -934,7 +940,7 @@ func (o *outcomeCtx) review(p reviewPayload) {
 		verdict := p.Verdict
 		sig := p.ChangeSignificance
 		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
-		if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
 			round := m.Status.ReviewRounds + 1
 			m.Status.ReviewedSHA = sha
 			m.Status.PendingReview = &tatarav1alpha1.PendingReview{
@@ -1075,7 +1081,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			return
 		}
 		for i := range issues {
-			if err := s.queueIssueClose(ctx, &issues[i], o.task.Name, p.Reason); err != nil {
+			if err := s.queueIssueClose(ctx, o.proj, &issues[i], o.task.Name, p.Reason); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
@@ -1132,7 +1138,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
-		if err := objbudget.FitIssue(ctx, s.c, s.spiller, key, func(is *tatarav1alpha1.Issue) {
+		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(is *tatarav1alpha1.Issue) {
 			is.Status.Status = "approved"
 			is.Status.Approval = ev
 		}); err != nil {
@@ -1173,10 +1179,10 @@ func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.P
 	return true, out
 }
 
-func (s *Server) queueIssueClose(ctx context.Context, iss *tatarav1alpha1.Issue, taskName, reason string) error {
+func (s *Server) queueIssueClose(ctx context.Context, proj *tatarav1alpha1.Project, iss *tatarav1alpha1.Issue, taskName, reason string) error {
 	requestID := newRequestID(taskName, "close", iss.Name, reason)
 	key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
-	return objbudget.FitIssue(ctx, s.c, s.spiller, key, func(i *tatarav1alpha1.Issue) {
+	return objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(proj), key, func(i *tatarav1alpha1.Issue) {
 		for _, e := range i.Status.PendingComments {
 			if e.RequestID == requestID {
 				return
@@ -1595,7 +1601,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	// safe and idempotent: nothing is lost, and a re-run re-adopts what it
 	// already adopted.
 	if len(members) > 0 {
-		if err := s.foldMembers(ctx, o.task, members); err != nil {
+		if err := s.foldMembers(ctx, o.proj, o.task, members); err != nil {
 			if errors.Is(err, errFoldUnverified) {
 				if !o.commit(func(t *tatarav1alpha1.Task) error {
 					return stage.Enter(t, nil, tatarav1alpha1.StageFailed,
@@ -1644,7 +1650,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 				writeClientErr(o.w, err)
 				return
 			}
-			if err := s.queueIssueClose(ctx, &iss, o.task.Name, c.Reason); err != nil {
+			if err := s.queueIssueClose(ctx, o.proj, &iss, o.task.Name, c.Reason); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
@@ -1654,7 +1660,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	// links[] adopt the named artifact as a PLAIN owner of this Task: the link
 	// holds the GC open and puts the artifact in the umbrella's bundle.
 	for _, l := range p.Links {
-		if err := s.linkArtifact(ctx, o.task, l); err != nil {
+		if err := s.linkArtifact(ctx, o.proj, o.task, l); err != nil {
 			writeClientErr(o.w, err)
 			return
 		}
@@ -1706,15 +1712,17 @@ var errFoldUnverified = errors.New("restapi: fold adoption could not be verified
 // A crash between 2 and 4 is safe and idempotent. A crash after 4 leaves
 // foldInFlight set; the reconciler clears it once the members are gone. The
 // reaper SKIPS any Task named in a live umbrella's foldInFlight.
-func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task, members []*tatarav1alpha1.Task) error {
+func (s *Server) foldMembers(ctx context.Context, proj *tatarav1alpha1.Project, umbrella *tatarav1alpha1.Task, members []*tatarav1alpha1.Task) error {
 	names := make([]string, 0, len(members))
 	for _, m := range members {
 		names = append(names, m.Name)
 	}
 
+	spiller := s.spillerForOrNil(proj)
+
 	// STEP 1.
 	key := types.NamespacedName{Namespace: s.ns, Name: umbrella.Name}
-	if err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	if err := objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.FoldInFlight = names
 	}); err != nil {
 		return err
@@ -1736,7 +1744,7 @@ func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task,
 			// consumer reads (the C.6 approval grammar, the reaper's
 			// owned-set, the agent bundle) - NOT ownerRefs. Adoption without
 			// this leaves adopted work unguarded and absent from the bundle.
-			if err := s.appendTaskRefFor(ctx, umbrella.Name, &iss); err != nil {
+			if err := s.appendTaskRefFor(ctx, proj, umbrella.Name, &iss); err != nil {
 				return err
 			}
 			adopted = append(adopted, &tatarav1alpha1.Issue{
@@ -1752,7 +1760,7 @@ func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task,
 			if err := s.adopt(ctx, &mr, m, umbrella); err != nil {
 				return err
 			}
-			if err := s.appendTaskRefFor(ctx, umbrella.Name, &mr); err != nil {
+			if err := s.appendTaskRefFor(ctx, proj, umbrella.Name, &mr); err != nil {
 				return err
 			}
 			adopted = append(adopted, &tatarav1alpha1.MergeRequest{
@@ -1781,7 +1789,7 @@ func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task,
 	}
 
 	// STEP 5.
-	return objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	return objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.FoldInFlight = nil
 	})
 }
@@ -1803,7 +1811,7 @@ func (s *Server) adopt(ctx context.Context, obj client.Object, from, to *tatarav
 // linkArtifact appends the umbrella as a PLAIN owner of a linked Issue/MR. A
 // plain owner's only job is to hold the GC open; the controller flag - and with
 // it the authorization to write to the forge - is untouched.
-func (s *Server) linkArtifact(ctx context.Context, task *tatarav1alpha1.Task, l linkRef) error {
+func (s *Server) linkArtifact(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, l linkRef) error {
 	var obj client.Object
 	if l.IsPR {
 		obj = &tatarav1alpha1.MergeRequest{}
@@ -1826,12 +1834,12 @@ func (s *Server) linkArtifact(ctx context.Context, task *tatarav1alpha1.Task, l 
 	if err := s.c.Update(ctx, obj); err != nil {
 		return fmt.Errorf("link %s onto %s: %w", obj.GetName(), task.Name, err)
 	}
-	return s.appendTaskRefFor(ctx, task.Name, obj)
+	return s.appendTaskRefFor(ctx, proj, task.Name, obj)
 }
 
-func (s *Server) appendTaskRefFor(ctx context.Context, taskName string, obj client.Object) error {
+func (s *Server) appendTaskRefFor(ctx context.Context, proj *tatarav1alpha1.Project, taskName string, obj client.Object) error {
 	if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
-		return s.appendTaskRef(ctx, taskName, "", obj.GetName())
+		return s.appendTaskRef(ctx, proj, taskName, "", obj.GetName())
 	}
-	return s.appendTaskRef(ctx, taskName, obj.GetName(), "")
+	return s.appendTaskRef(ctx, proj, taskName, obj.GetName(), "")
 }

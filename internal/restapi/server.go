@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -27,11 +28,16 @@ type Config struct {
 	// CIFor returns the live-CI capability behind GET /projects/{p}/scm/ci
 	// (contract C.2.10). When nil, that endpoint returns 501.
 	CIFor func(provider, token string) (scm.CIReader, error)
-	// Spiller sends an eviction batch (comments, notes) to tatara-memory. It is
-	// the A.7 byte guard's escape valve and the 50-note cap's drop target.
-	Spiller objbudget.Spiller
-	// Memory rehydrates spilled notes for task_context(notes=all).
-	Memory NoteFetcher
+	// SpillerFor resolves the A.7 byte guard's escape valve / the 50-note
+	// cap's drop target for a given Project. It is per-project, not a single
+	// instance, because tatara-memory is deployed once per Project
+	// (proj.Status.Memory.Endpoint) - the SAME resolver shape the webhook
+	// server and TaskReconciler use (cmd/manager/wire.go newSpillerFor).
+	SpillerFor func(proj *tatarav1alpha1.Project) objbudget.Spiller
+	// MemoryFor resolves the per-project NoteFetcher that rehydrates spilled
+	// notes for task_context(notes=all). Same per-project reasoning as
+	// SpillerFor: one tatara-memory endpoint per Project.
+	MemoryFor func(proj *tatarav1alpha1.Project) NoteFetcher
 	// Approval is the C.6 grammar. A nil verifier FAILS CLOSED: a clarify
 	// decision=implement then parks at identity-unverified.
 	Approval ApprovalVerifier
@@ -45,18 +51,18 @@ type Config struct {
 // controller-runtime client. It shares the HTTP_ADDR listener with the
 // webhook server; callers mount it onto a shared chi router.
 type Server struct {
-	c         client.Client
-	ns        string
-	scmFor    func(provider string) (scm.SCMWriter, error)
-	readerFor func(provider, token string) (scm.SCMReader, error)
-	ciFor     func(provider, token string) (scm.CIReader, error)
-	spiller   objbudget.Spiller
-	memory    NoteFetcher
-	approval  ApprovalVerifier
-	nowFn     func() time.Time
-	ciPacer   *ciPacer
-	log       *slog.Logger
-	metrics   *obs.OperatorMetrics
+	c          client.Client
+	ns         string
+	scmFor     func(provider string) (scm.SCMWriter, error)
+	readerFor  func(provider, token string) (scm.SCMReader, error)
+	ciFor      func(provider, token string) (scm.CIReader, error)
+	spillerFor func(proj *tatarav1alpha1.Project) objbudget.Spiller
+	memoryFor  func(proj *tatarav1alpha1.Project) NoteFetcher
+	approval   ApprovalVerifier
+	nowFn      func() time.Time
+	ciPacer    *ciPacer
+	log        *slog.Logger
+	metrics    *obs.OperatorMetrics
 }
 
 // NewServer constructs a Server from cfg.
@@ -67,9 +73,31 @@ func NewServer(cfg Config) *Server {
 	}
 	return &Server{
 		c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, readerFor: cfg.ReaderFor,
-		ciFor: cfg.CIFor, spiller: cfg.Spiller, memory: cfg.Memory, approval: cfg.Approval,
+		ciFor: cfg.CIFor, spillerFor: cfg.SpillerFor, memoryFor: cfg.MemoryFor, approval: cfg.Approval,
 		nowFn: cfg.Now, ciPacer: newCIPacer(), log: l, metrics: cfg.Metrics,
 	}
+}
+
+// spillerForOrNil resolves the per-project Spiller, or nil when no resolver
+// is configured (test harnesses only; the production wire.go path always
+// sets SpillerFor). Every objbudget.Fit* call site uses this instead of
+// touching s.spillerFor directly, so the nil-resolver guard lives in one
+// place.
+func (s *Server) spillerForOrNil(proj *tatarav1alpha1.Project) objbudget.Spiller {
+	if s.spillerFor == nil {
+		return nil
+	}
+	return s.spillerFor(proj)
+}
+
+// memoryForOrNil is the NoteFetcher counterpart of spillerForOrNil: resolves
+// the per-project NoteFetcher, or nil when no resolver is configured (test
+// harnesses only; the production wire.go path always sets MemoryFor).
+func (s *Server) memoryForOrNil(proj *tatarav1alpha1.Project) NoteFetcher {
+	if s.memoryFor == nil {
+		return nil
+	}
+	return s.memoryFor(proj)
 }
 
 // Mount registers the REST routes on r. verify is the OIDC middleware;
