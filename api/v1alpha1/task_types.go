@@ -179,6 +179,17 @@ type TaskSpec struct {
 	// Issue and no MR to key on. Empty for non-incident Tasks.
 	// +optional
 	DedupKey string `json:"dedupKey,omitempty"`
+	// GroupKey is the CORRELATION identity for an incident Task: a coarser hash
+	// (project + the configured correlation labels, e.g. namespace/cluster) than
+	// DedupKey. Different alert RULES that fire for one shared root cause carry
+	// the same GroupKey but DISTINCT DedupKeys, so admission does NOT suppress
+	// them (each is a real, distinct alert) yet file_issue auto-links the new
+	// tracker as a sub-issue under the oldest open sibling tracker sharing this
+	// GroupKey - collapsing a 5-alert storm into one linked tree instead of five
+	// unrelated issues. Empty for non-incident Tasks and when no correlation
+	// label was present on the alert.
+	// +optional
+	GroupKey string `json:"groupKey,omitempty"`
 	// MergeOrder is the sequential, dependency-ordered list of Repository CR
 	// names whose MRs merge in this order. REQUIRED (and validated to cover every
 	// owned MR's repo) whenever the Task owns MRs in MORE THAN ONE repo.

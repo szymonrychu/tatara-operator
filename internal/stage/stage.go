@@ -62,6 +62,7 @@ const (
 	ReasonImplementDeclined      = "implement-declined"
 	ReasonDeclined               = "declined"
 	ReasonFalsePositive          = "false-positive"
+	ReasonTrackedElsewhere       = "tracked-elsewhere"
 	ReasonReviewLoopExhausted    = "review-loop-exhausted"
 	ReasonReviewPostRefused      = "review-post-refused"
 	ReasonMergeTimeout           = "merge-timeout"
@@ -98,6 +99,7 @@ var Reasons = []string{
 	ReasonImplementDeclined,
 	ReasonDeclined,
 	ReasonFalsePositive,
+	ReasonTrackedElsewhere,
 	ReasonReviewLoopExhausted,
 	ReasonReviewPostRefused,
 	ReasonMergeTimeout,

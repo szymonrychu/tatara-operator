@@ -4,6 +4,7 @@
 package incident
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/szymonrychu/tatara-operator/internal/promptguidance"
@@ -39,8 +40,13 @@ func GoalProject(alertCtx string, slugs []string) string {
 		"Then SURVEY for existing trackers: (1) list open incident Tasks for this project with your " +
 		"task_list tool, and (2) survey the project's EXISTING OPEN issues across the repos above with your " +
 		"issue-listing tool. A DUPLICATE of the SAME alert rule never reaches you - it is suppressed at " +
-		"admission - so your survey is only to find a RELATED open tracker.\n\n" +
+		"admission - so your survey is to find a tracker for the SAME incident (a different rule firing for " +
+		"one shared root cause) or a merely RELATED open tracker.\n\n" +
 		"Finish with `submit_outcome` exactly once:\n" +
+		"- SAME incident as an open tracker you found (your evidence adds to the SAME root problem): " +
+		"`submit_outcome(action=comment_issue, comment={repo, number, body})`, where body is your fresh " +
+		"evidence (queries run, results, updated diagnosis, Grafana links). The operator appends it to that " +
+		"tracker; NO new issue is filed. Use this instead of filing a near-duplicate.\n" +
 		"- genuinely-new-but-RELATED to an open tracker you found: " +
 		"`submit_outcome(action=file_issue, issue.repo, issue.title, issue.body, " +
 		"issue.parent={repo, number})`. The operator links your new issue as a sub-issue under that " +
@@ -50,6 +56,38 @@ func GoalProject(alertCtx string, slugs []string) string {
 		"The issue body MUST contain: the alert summary, the queries/tools you ran and their results, your " +
 		"diagnosis, and the Grafana links (generatorURL/externalURL). The issue lands and the normal " +
 		"triage flow takes over.\n\n" +
+		"This is a READ-ONLY investigation. Do NOT take any remediation, write, or corrective action on any " +
+		"system. Your only output is the outcome above." +
+		platformProblemGuidance + toolingNoteGuidance
+}
+
+// GoalEscalation returns the turn-0 goal for a RE-ADMITTED incident: an alert
+// has persisted (refireCount recurrences) against an existing open tracker
+// (trackerRef, owner/repo#N-shaped from the CR's repositoryRef+number) that the
+// operator escalated for re-investigation. The agent must decide whether the
+// root cause is still the same as that tracker or has CHANGED under one alert id
+// (e.g. a password drift and a resource exhaustion hiding under one alert): same
+// root cause -> comment_issue with fresh evidence; changed -> file_issue.
+func GoalEscalation(alertCtx string, slugs []string, trackerRef string, refireCount int) string {
+	repoList := strings.Join(slugs, ", ")
+	return "Invoke the `tatara-incident-sre` skill FIRST and follow its phases in order; consult " +
+		"`tatara-incident-investigation` for evidence-gathering judgment.\n\n" +
+		"A Grafana alert has PERSISTED (" + strconv.Itoa(refireCount) + " recurrences) against the existing open " +
+		"tracker " + trackerRef + ", which the operator has ESCALATED for re-investigation. Repositories in " +
+		"this project: " + repoList + ".\n\n" +
+		"ALERT:\n" + alertCtx + "\n\n" +
+		"Investigate LIVE using the `grafana` MCP server (read-only): query the relevant Prometheus/Loki " +
+		"datasources, read the firing alert rule (follow its generatorURL), and inspect related dashboards. " +
+		"Then read tracker " + trackerRef + " and RE-EXAMINE whether its root cause is still the one firing, " +
+		"or whether a DIFFERENT root cause is now firing under the same alert.\n\n" +
+		"Finish with `submit_outcome` exactly once:\n" +
+		"- SAME root cause as " + trackerRef + " (still unresolved): " +
+		"`submit_outcome(action=comment_issue, comment={repo, number, body})` on " + trackerRef +
+		", body = your fresh evidence and why it is still the same problem.\n" +
+		"- DIFFERENT root cause under the same alert: `submit_outcome(action=file_issue, issue.repo, " +
+		"issue.title, issue.body, issue.parent={repo, number})` for a NEW issue linked under " + trackerRef +
+		" - do NOT comment a different problem onto the old tracker.\n" +
+		"- confirmed FALSE POSITIVE: `submit_outcome(action=false_positive, reason=...)`.\n\n" +
 		"This is a READ-ONLY investigation. Do NOT take any remediation, write, or corrective action on any " +
 		"system. Your only output is the outcome above." +
 		platformProblemGuidance + toolingNoteGuidance
