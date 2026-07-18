@@ -31,19 +31,24 @@ var SweepMintCapHitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Sweep passes in which a Task creation budget bound, by project and cap (contract B.4).",
 }, []string{"project", "cap"})
 
-// SweepLastSuccessTimestamp is a HEARTBEAT: the unix time of the last pass of
-// a scan-family activity that completed with no error. Its alert sets
-// noDataState: Alerting, because for a heartbeat NoData IS the failure - a
-// pass that never runs emits nothing at all, and a silent operator is
-// exactly the state the alert exists to catch. Covers both the B.4 sweep
-// (sweep.go, activities "sweep"/"nightlySweep") and the brainstorm/
-// documentation/issueScan crons (projectscan.go's stampScan, activities
-// "brainstorm"/"documentation"/"issueScan") - the latter's successor for
-// tatara_scan_items_total, pruned as dead-per-redesign (metric-wiring
-// audit, issue #370).
+// SweepLastSuccessTimestamp is a HEARTBEAT covering two different activity
+// families with two different stamp semantics, both intentional for their own
+// activity's shape. For "sweep"/"nightlySweep" (sweep.go's B.4 pass) it is
+// LIVENESS, not zero-error health: stamped whenever the repos loop RUNS TO
+// COMPLETION, even with per-item errors (those are metered separately via
+// SweepErrorsTotal) - one stale CR or transient forge error must never
+// silence the heartbeat for the whole pass. A sweep that cannot even begin
+// (activeTaskCount fails) returns before stamping, so it stays unset. For
+// "brainstorm"/"documentation"/"issueScan" (projectscan.go's stampScan) it IS
+// zero-error: each is a single Status().Update, not a multi-item loop, so
+// success-only stamping is the correct (and simplest) signal there; this is
+// also the successor for tatara_scan_items_total, pruned as dead-per-redesign
+// (metric-wiring audit, issue #370). Its alert sets noDataState: Alerting,
+// because for a heartbeat NoData IS the failure - the gauge resets on restart
+// and an absent series means that activity is not running at all.
 var SweepLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "operator_sweep_last_success_timestamp_seconds",
-	Help: "Unix timestamp of the last fully successful pass of a scan-family activity, by activity (contract K.1).",
+	Help: "Unix timestamp of the last completed pass, by activity (contract K.1): liveness (per-item-error-tolerant) for sweep/nightlySweep, zero-error for brainstorm/documentation/issueScan.",
 }, []string{"activity"})
 
 // SweepErrorsTotal counts sweep failures by activity and reason. Every reason is
