@@ -354,6 +354,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// (the Task 0 spike confirms bearer vs x-api-key). When off, usageStore stays
 	// empty and the claudeSubscription gate reads 0% = fail-open (nothing held).
 	if cfg.UsageEnabled {
+		metrics.SetAccountUsagePollerEnabled(true)
 		usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
 		if snap, err := usageMirror.Load(context.Background()); err != nil {
 			// Load already swallows a missing ConfigMap to a nil error, so a non-nil err
@@ -406,6 +407,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 			return nil, fmt.Errorf("add usage poller: %w", err)
 		}
 	} else {
+		metrics.SetAccountUsagePollerEnabled(false)
 		slog.Info("account-usage poller disabled (USAGE_ENABLED=false); claudeSubscription gate reads an empty store, fail-open",
 			"action", "usage_poller_disabled")
 	}
