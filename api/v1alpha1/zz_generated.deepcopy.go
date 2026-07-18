@@ -335,6 +335,10 @@ func (in *IssueStatus) DeepCopyInto(out *IssueStatus) {
 		in, out := &in.LastRefireCommentAt, &out.LastRefireCommentAt
 		*out = (*in).DeepCopy()
 	}
+	if in.LastDeployTimeoutCommentAt != nil {
+		in, out := &in.LastDeployTimeoutCommentAt, &out.LastDeployTimeoutCommentAt
+		*out = (*in).DeepCopy()
+	}
 	if in.LastSyncedAt != nil {
 		in, out := &in.LastSyncedAt, &out.LastSyncedAt
 		*out = (*in).DeepCopy()

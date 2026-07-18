@@ -31,6 +31,7 @@ type WebhookEvent struct {
 	Action       string // opened|labeled|unlabeled|closed|synchronize|submitted|created|other
 	Number       int    // issue/PR/MR number (github) or iid (gitlab)
 	IsPR         bool   // true for mr/pull_request events
+	Merged       bool   // true when a PR/MR-close delivery is a MERGE (GitHub pull_request.merged / GitLab action=merge)
 	HeadSHA      string // PR/MR head commit (for CI lookup); push after-SHA (documentation agent diff head)
 	BaseSHA      string // push before-SHA (documentation agent diff base); empty for non-push events
 	HeadBranch   string // PR/MR source branch

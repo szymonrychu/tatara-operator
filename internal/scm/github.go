@@ -41,6 +41,7 @@ type ghWorkItem struct {
 		SHA string `json:"sha"`
 		Ref string `json:"ref"`
 	} `json:"head"`
+	Merged      bool `json:"merged"` // pull_request.merged: true when a PR-close delivery is a merge
 	PullRequest *struct {
 		URL string `json:"url"`
 	} `json:"pull_request"`
@@ -102,6 +103,18 @@ func (*GitHub) DetectAndVerify(h http.Header, payload []byte, secret string) (We
 		return ev, nil
 	case "pull_request":
 		return ghWorkItemEvent("mr", true, p, p.PullRequest), nil
+	case "pull_request_review_comment":
+		// WS3-I1: a human reply on an inline review thread. It is a plain MR
+		// comment (mirror + pending event, NEVER a verdict), distinct from
+		// pull_request_review. Only action=created acts; edited/deleted are ignored.
+		if p.Action != "created" || p.PullRequest == nil {
+			return WebhookEvent{Kind: "other"}, nil
+		}
+		ev := ghWorkItemEvent("mr", true, p, p.PullRequest)
+		ev.CommentBody = p.Comment.Body
+		ev.CommentID = p.Comment.ID
+		ev.IsComment = true
+		return ev, nil
 	case "pull_request_review":
 		ev := ghWorkItemEvent("mr", true, p, p.PullRequest)
 		ev.IsReview = true
@@ -139,6 +152,7 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 		HeadSHA:      wi.Head.SHA,
 		HeadBranch:   wi.Head.Ref,
 		ChangedLabel: p.Label.Name,
+		Merged:       wi.Merged,
 	}
 }
 
@@ -149,7 +163,7 @@ func ghWorkItemEvent(kind string, isPR bool, p ghPayload, wi *ghWorkItem) Webhoo
 func ghNormalizeAction(action string) string {
 	switch action {
 	case "opened", "reopened", "labeled", "unlabeled", "closed",
-		"synchronize", "submitted", "created":
+		"synchronize", "submitted", "created", "edited":
 		return action
 	default:
 		return "other"

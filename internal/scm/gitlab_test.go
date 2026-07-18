@@ -94,3 +94,31 @@ func TestGitLab_MRApproval_MapsToReviewApproved(t *testing.T) {
 	require.Equal(t, "approved", ev.ReviewState)
 	require.Equal(t, "deadbeef", ev.ReviewCommitSHA)
 }
+
+// TestGitLab_MRMerge_MapsToMerged is the PR-merged-out-of-band signal on GitLab:
+// action=merge surfaces action "merged" + ev.Merged.
+func TestGitLab_MRMerge_MapsToMerged(t *testing.T) {
+	const token = "t"
+	body := []byte(`{"object_kind":"merge_request","user":{"username":"bob"},
+		"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},
+		"object_attributes":{"iid":34,"action":"merge","source_branch":"task/x","last_commit":{"id":"abc"},"url":"u"}}`)
+	ev, err := (&GitLab{}).DetectAndVerify(glHeader("Merge Request Hook", token), body, token)
+	require.NoError(t, err)
+	require.Equal(t, "merged", ev.Action)
+	require.True(t, ev.Merged)
+	require.True(t, ev.IsPR)
+}
+
+// TestGitLab_IssueUpdate_MapsToSynchronize is WS3-I2 on GitLab: an issue body
+// edit arrives as action=update -> "synchronize" (the I2 handler diffs the body).
+func TestGitLab_IssueUpdate_MapsToSynchronize(t *testing.T) {
+	const token = "t"
+	body := []byte(`{"object_kind":"issue","user":{"username":"alice"},
+		"project":{"git_http_url":"https://gitlab.com/g/p.git","path_with_namespace":"g/p"},
+		"object_attributes":{"iid":12,"title":"t","description":"edited body","action":"update","url":"u"}}`)
+	ev, err := (&GitLab{}).DetectAndVerify(glHeader("Issue Hook", token), body, token)
+	require.NoError(t, err)
+	require.Equal(t, "synchronize", ev.Action)
+	require.False(t, ev.IsPR)
+	require.Equal(t, "edited body", ev.Body)
+}

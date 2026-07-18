@@ -10,6 +10,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -118,6 +119,20 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
+	// WS3-I3: a human closed the driving issue mid-flight. Leader-only stop edge.
+	// Runs after the mirror sync so a cadence-detected close acts the same
+	// reconcile as a webhook-stamped one. When it acts, the Task is stopped (and
+	// for the stop case the mirror CR is deleted), so return early.
+	if iss.Status.State == "closed" {
+		handled, err := r.handleIssueClosed(ctx, &iss)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if handled {
+			return ctrl.Result{}, nil
+		}
+	}
+
 	// The deferred issue_write intents (C.2.12): the agent's tool call persisted
 	// one, and this is what performs it on the forge.
 	if r.Driver != nil {
@@ -212,6 +227,41 @@ func (r *IssueReconciler) projectLabels(ctx context.Context, proj *tatarav1alpha
 		}
 	}
 	return nil
+}
+
+// handleIssueClosed routes a closed, owned Issue CR through the WS3-I3 stop edge
+// (a live, non-deploying source stage) or, as the review re-sever hardening,
+// finishes a crash-interrupted SeverDeleteCR on a rejected(issue-closed) owner.
+// handled=true means the caller must stop this reconcile (the Task was stopped
+// and/or the mirror CR was deleted).
+func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1alpha1.Issue) (bool, error) {
+	ownerName, owned := own.ControllerOwner(iss)
+	if !owned {
+		return false, nil
+	}
+	var task tatarav1alpha1.Task
+	if err := r.Get(ctx, types.NamespacedName{Namespace: iss.Namespace, Name: ownerName}, &task); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("issue-closed: get owning task %s: %w", ownerName, err)
+	}
+
+	// Live, non-deploying source stage: stop the Task now.
+	if stage.AllowsIssueClosedStop(task.Status.Stage) {
+		return ApplyIssueClosedStop(ctx, r.Client, &task, iss.Name, r.now())
+	}
+
+	// Re-sever hardening: a rejected(issue-closed) owner Task with the closed CR
+	// still present means a crash interrupted the DeleteCR between clearing
+	// IssueRefs and deleting the mirror. Finish it (restores prompt reopen).
+	if task.Status.Stage == tatarav1alpha1.StageRejected && task.Status.StageReason == stage.ReasonIssueClosed {
+		if err := SeverIssueFromTask(ctx, r.Client, &task, iss.Name, SeverDeleteCR); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // SetupWithManager registers the Issue reconciler.

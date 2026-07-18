@@ -402,6 +402,7 @@ spec:
                       - issue_comment
                       - mr_comment
                       - mr_review
+                      - issue_edited
                       - label
                       - alert
                       type: string

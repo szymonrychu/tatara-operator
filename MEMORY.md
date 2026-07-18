@@ -6,6 +6,61 @@
 
 - 2026-07-18 (fix/auto-approve-proposals-wiring, security-review-fix pass, 4 items) Independent security review returned merge-ready (no Critical/Important); owner KEPT the stricter "maintainer non-approval comment blocks auto-approve" behavior. Closed 4 follow-ups. **M1 (doc):** project_types.go AutoApproveTataraProposals doc now states the marker is stamped UNCONDITIONALLY by the filers, so flag-off still changes the stored issue body (marker present but inert - intentional, lets a later flag-flip auto-approve proposals filed while off) while gate BEHAVIOR with the flag off is exactly today's. **M2 (test):** added the empty-botLogin matrix row (project Spec.Scm.BotLogin=="" => refuse; the axis-3 check existed but was untested). **M3 (audit metric):** wired the pre-existing-but-uncalled `operator_auto_approve_total{kind}` counter (obs.AutoApproveTotal) at BOTH Auto-evidence persist sites - outcome.go clarify() (primary: proposal reaches implement via clarify submit) and VerifyApprovalDetailed's persist block (secondary: multi-issue ReVerifyParked). Threaded `metrics *obs.OperatorMetrics` (nil-safe) into VerifyApprovalDetailed + ReVerifyParked; VerifyApproval keeps its signature (passes nil) to avoid churning its many test callers; webhook passes s.cfg.Metrics. Counter increments only on the transition (issue not already approved), so no double-count. Added obs.AutoApproveCounter test accessor. **M4 (tamper-evidence, NEW REQUIREMENT):** a bot-proposal body edited since filing must NOT auto-approve - guards the incoming issue-edit body-refresh workstream (today safe only because Task.Spec.Goal is frozen + issues.edited ignored). Chose an embedded content fingerprint over a CRD field: marker is now `<!-- tatara-proposed-by:<kind> content-sha256:<64hex> -->`, hash computed over the filing-time body (normalized: CRLF->LF + both-ends TrimSpace, so cosmetic reformat is tolerated, interior edits are not). `ProposalBodyMatchesFingerprint` strips the marker back out and recomputes; autoApproveApplies now requires marker present AND fingerprint match. Fail-closed: no marker / no fingerprint / mismatch / marker removal all refuse; flag-off untouched. Self-contained in api/v1alpha1 (no CRD field, so no non-refreshed-status-field problem; the fingerprint travels in the body through the mirror). New matrix rows: empty-botLogin-refused, edited-body-refused. Gate: `make generate manifests test lint build` green.
 
+- 2026-07-18 (WS3 sever operation) `SeverIssueFromTask(DeleteCR|Orphan)`
+  (internal/controller/sever.go) is the ONE detach op both I3 and I4 use so the
+  Task side (`Status.IssueRefs`), the CR side (delete / ownerRef-drop), and the
+  mirror `tatara-parked` label move together. IssueRefs is cleared FIRST: the
+  worst crash-state after step 1 is "CR still owner-reffed but not listed by the
+  Task", which keeps a valid controller owner (no B.2-rule-5 violation) and makes
+  `ownedIssues` skip it (no spurious terminal comment / label re-stamp), and the
+  leader re-reconciles step 2 idempotently. The op is CLIENT-SIDE only; the
+  FORGE-side `tatara-parked` removal (F.6 operator-on-promotion) is the I4
+  caller's job via scanWriter (the mirror-label strip inside sever is what the
+  mint decision actually reads). Rejected doing the forge write inside sever: it
+  would need a writer+token the DeleteCR (I3) path does not have.
+- 2026-07-18 (WS3-I3 stop) `ApplyIssueClosedStop` (issue_apply.go) is driven
+  LEADER-ONLY from IssueReconciler (owned+closed+live-non-deploying stage ->
+  rejected(issue-closed) + sever DeleteCR + DeleteWrapper). The webhook only
+  mirrors `State=closed` (issues.closed). `deploying`/`documenting`/terminals are
+  excluded (`stage.AllowsIssueClosedStop`): a merged/deploying change is not
+  rewound, and C.4's deploying-close is thus never mistaken for a human stop.
+  IssueReconciler ALSO finishes a crash-interrupted DeleteCR on a
+  rejected(issue-closed) owner whose closed CR is still present (re-sever
+  hardening), restoring prompt reopen after the sever crash window.
+- 2026-07-18 (WS3-I4 one-reply resume) A human reply to a NO-RE-ENTRY parked Task
+  (stage.HasReentry==false) triggers `ProjectReconciler.resumeNoReentryParks`
+  (resume.go): close the old task's bot PR FIRST (closeTaskBotMRs - a focused,
+  NO-issue-side-effect PR close, NOT releaseTerminal, so no spurious "stopped
+  working" comment), THEN sever(Orphan) the issue, THEN MintForItem from the
+  MIRROR CR (Comments end with the reply -> humanHasLastWord -> triaging ACTIVE).
+  KEY NON-OBVIOUS INTERACTION: the fresh clarify mint and the old parked task
+  share the SAME deterministic IntakeTaskName (both key on the issue), so
+  MintForItem's createTaskRaceSafe DELETES the old stale-terminal task and
+  re-mints on the NEXT pass (same mechanism the design gives I3 reopen). This is
+  why the PR must be closed BEFORE the sever: once the issue is orphaned, ANY
+  mint (resume or sweep) collides-and-deletes the old task, and a still-OPEN PR
+  would then cascade its mirror away un-closed. The design text's "old task
+  coexists / ages out as a debugging artifact" is not literally reachable under
+  deterministic naming; the intent (no leaked PR, one active fresh clarify,
+  gate-safe) is preserved. Leader-only; the reaper is the backstop.
+  RESUME READS THE ISSUE MIRROR LIVE (uncached APIReader, resume.go `liveIssue`):
+  on the DIRECT-MINT path (old kind != clarify -> no IntakeTaskName collision ->
+  fresh Task created in the SAME pass) a lagging cache would hide the webhook's
+  just-appended reply, humanHasLastWord would be false, and the fresh Task would
+  mint parked(backlog-sweep) - needing a SECOND reply. The live read preserves the
+  one-reply guarantee (#348/#352 discipline). resumeOne severs ALL open issues
+  BEFORE any MintForItem so a collision-delete of the old Task cannot hard-fault a
+  later in-loop sever; SeverIssueFromTask ALSO tolerates a gone Task (refs moot)
+  and still orphans the issue's own ownerRef so an unsevered issue never cascades.
+- 2026-07-18 (WS3 accepted-ignored inventory) Documented in handleForgeItem's
+  routing default: issues.unlabeled (no body change), pull_request.edited /
+  ready_for_review, pull_request_review state=dismissed + GitLab MR unapproved
+  (M2 - a dismissal is weak/administrative; use request_changes or close), and
+  non-default-branch push. All converge via the sweep / mirror cadence. WS3-I2
+  edit fold appends an `issue_edited` pending event and NEVER calls
+  driveCommentUnpark: the leader's driveUnparks drives the unpark, keeping the
+  edit path off the F6-1 webhook-goroutine-mutation surface entirely.
+
 - 2026-07-18 (webhook-primary architecture) Reactive intake is coordinated by
   IDEMPOTENT NATURAL-KEY dedup, NOT an in-process lock. Webhook and sweep both
   funnel through `controller.Minter.MintForItem`; the Task carries a
