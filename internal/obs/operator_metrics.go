@@ -69,6 +69,7 @@ type OperatorMetrics struct {
 	tokenBudgetUsedRatio         *prometheus.GaugeVec
 	admissionBlockedTotal        *prometheus.CounterVec
 	memoryGateBypassTotal        *prometheus.CounterVec
+	memoryGateHoldTotal          *prometheus.CounterVec
 	repositoryIngestFailing      *prometheus.GaugeVec
 	repositoryLastIngestTime     *prometheus.GaugeVec
 	reviewOutcomeTotal           *prometheus.CounterVec
@@ -316,6 +317,14 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_gate_bypass_total",
 			Help: "Incident Tasks admitted past the project memory-readiness gate under the infra-incident exemption, by project and Task kind.",
 		}, []string{"project", "kind"}),
+		// Issue #355: a Task about to submit a NEW turn (first spawn, respawn, or
+		// TTL rotation) is held rather than dispatched while project memory is not
+		// stably ready, so an agent pod is never launched against a backend that
+		// went unhealthy in the gap between admission and turn-submit.
+		memoryGateHoldTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_memory_gate_hold_total",
+			Help: "Turn submissions held at the memory-readiness gate immediately before SubmitTurn, by project.",
+		}, []string{"project"}),
 		// Event-driven on a review Task's /outcome submission - correctly
 		// wired (RecordReviewOutcome call site is unconditional in the
 		// open-MRs loop) and confirmed firing across several prior pod
@@ -410,6 +419,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.tokenBudgetUsedRatio,
 		m.admissionBlockedTotal,
 		m.memoryGateBypassTotal,
+		m.memoryGateHoldTotal,
 		m.reviewOutcomeTotal,
 		m.reviewHeadMovedTotal,
 		m.reviewFindingsTotal,
@@ -435,7 +445,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		[]string{"other", "labeled", "opened", "closed", "synchronize", "create"},
 		[]string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"},
 	)
-	for _, phase := range []string{"Provisioning", "Ready", "Failed"} {
+	for _, phase := range []string{"Provisioning", "Ready", "Failed", "Degraded"} {
 		m.memoryStacks.WithLabelValues(phase)
 	}
 	for _, source := range []string{"reconcile", "poll_backstop"} {
@@ -639,13 +649,15 @@ func (m *OperatorMetrics) ObserveMemoryProvisionDuration(seconds float64) {
 	m.memoryProvisionDuration.Observe(seconds)
 }
 
-// SetMemoryStackCounts sets the operator_memory_stacks gauge for all three
+// SetMemoryStackCounts sets the operator_memory_stacks gauge for all four
 // phases atomically to the given cluster-wide counts. Pass 0 for any phase
-// that has no stacks so stale values are cleared.
-func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed int) {
+// that has no stacks so stale values are cleared. Degraded (issue #355) is a
+// stack that has been Provisioning past MemoryConfig.ProvisioningTimeout.
+func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed, degraded int) {
 	m.memoryStacks.WithLabelValues("Provisioning").Set(float64(provisioning))
 	m.memoryStacks.WithLabelValues("Ready").Set(float64(ready))
 	m.memoryStacks.WithLabelValues("Failed").Set(float64(failed))
+	m.memoryStacks.WithLabelValues("Degraded").Set(float64(degraded))
 }
 
 // ReconcileResult increments operator_reconcile_total for the given kind and
@@ -829,6 +841,18 @@ func (m *OperatorMetrics) MemoryGateBypass(project, kind string) {
 // assertions.
 func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) prometheus.Counter {
 	return m.memoryGateBypassTotal.WithLabelValues(project, kind)
+}
+
+// MemoryGateHold increments operator_memory_gate_hold_total: reconcilePodStage
+// held a turn submission (first spawn, respawn, or TTL rotation) at the
+// memory-readiness gate immediately before SubmitTurn (issue #355).
+func (m *OperatorMetrics) MemoryGateHold(project string) {
+	m.memoryGateHoldTotal.WithLabelValues(project).Inc()
+}
+
+// MemoryGateHoldCounter returns the counter for (project) for test assertions.
+func (m *OperatorMetrics) MemoryGateHoldCounter(project string) prometheus.Counter {
+	return m.memoryGateHoldTotal.WithLabelValues(project)
 }
 
 // RecordReviewOutcome increments operator_review_outcome_total for a review

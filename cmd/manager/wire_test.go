@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
@@ -202,16 +203,17 @@ func TestMaintenanceRunnable_IsLeaderOnly(t *testing.T) {
 
 func TestMemoryConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
-		Namespace:               "tatara",
-		MemoryImage:             "harbor.example/tatara-memory:0.2.0",
-		LightragImage:           "harbor.example/lightrag:1.0.0",
-		Neo4jImage:              "neo4j:2026.04.0",
-		OpenAISecretName:        "openai-shared",
-		OIDCIssuer:              "https://keycloak.example/realms/tatara",
-		OIDCAudience:            "tatara",
-		ImagePullSecret:         "regcred",
-		MemoryMonitoringEnabled: true,
-		MemoryMonitorLabels:     map[string]string{"release": "prometheus"},
+		Namespace:                 "tatara",
+		MemoryImage:               "harbor.example/tatara-memory:0.2.0",
+		LightragImage:             "harbor.example/lightrag:1.0.0",
+		Neo4jImage:                "neo4j:2026.04.0",
+		OpenAISecretName:          "openai-shared",
+		OIDCIssuer:                "https://keycloak.example/realms/tatara",
+		OIDCAudience:              "tatara",
+		ImagePullSecret:           "regcred",
+		MemoryMonitoringEnabled:   true,
+		MemoryMonitorLabels:       map[string]string{"release": "prometheus"},
+		MemoryProvisioningTimeout: 45 * time.Minute,
 	}
 	mc := memoryConfigFromConfig(cfg)
 	if mc.Namespace != "tatara" || mc.MemoryImage != cfg.MemoryImage ||
@@ -230,5 +232,8 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 	}
 	if mc.MonitorLabels["release"] != "prometheus" {
 		t.Fatalf("MonitorLabels = %v, want release=prometheus", mc.MonitorLabels)
+	}
+	if mc.ProvisioningTimeout != 45*time.Minute {
+		t.Fatalf("ProvisioningTimeout = %v, want 45m", mc.ProvisioningTimeout)
 	}
 }

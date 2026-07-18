@@ -112,6 +112,15 @@ type Config struct {
 	// DefaultIdlePodReap and is clamped up to MinIdlePodReap when positive; a
 	// zero/negative value disables the idle backstop.
 	IdlePodReapAfter time.Duration
+	// MemoryProvisioningTimeout bounds how long a project's memory stack may
+	// stay in phase Provisioning before reconcileMemory flips it to Degraded
+	// (issue #355: a wedged backend sat Provisioning for 7h+ with no bounded
+	// failure signal). Loaded from MEMORY_PROVISIONING_TIMEOUT_MINUTES as an
+	// integer minute count. Defaults to DefaultMemoryProvisioningTimeout and is
+	// clamped up to MinMemoryProvisioningTimeout when positive; a zero/negative
+	// value disables the timeout (Provisioning stays unbounded, pre-#355
+	// behaviour).
+	MemoryProvisioningTimeout time.Duration
 	// SerenaURL, when non-empty, is the in-cluster URL of the Serena
 	// code-intelligence MCP server. Read from TATARA_SERENA_URL. Empty by default
 	// (Phase 1: code path wired, no server deployed). Passed through to PodConfig
@@ -217,6 +226,20 @@ const DefaultIdlePodReap = 30 * time.Minute
 // IdlePodReapAfter below this floor is clamped up to it in Load; zero disables
 // the idle backstop entirely.
 const MinIdlePodReap = 5 * time.Minute
+
+// DefaultMemoryProvisioningTimeout is the default bound on how long a memory
+// stack may stay Provisioning before reconcileMemory reports it Degraded
+// (issue #355). 45m comfortably exceeds a normal cnpg/neo4j/lightrag cold
+// start while still catching a wedged backend far sooner than the 7h+ the
+// live incident ran unbounded.
+const DefaultMemoryProvisioningTimeout = 45 * time.Minute
+
+// MinMemoryProvisioningTimeout is the hard lower bound on
+// MemoryProvisioningTimeout. It keeps a misconfigured short value from
+// flipping a stack to Degraded during an ordinary provisioning run. A
+// positive MemoryProvisioningTimeout below this floor is clamped up to it in
+// Load; zero disables the bound entirely.
+const MinMemoryProvisioningTimeout = 5 * time.Minute
 
 // DefaultIncidentRefireCooldown is how long the operator waits between coalesced
 // refire comments on one open incident tracker (A4). The recurrence counter
@@ -375,6 +398,16 @@ func Load() (Config, error) {
 	if idlePodReapAfter > 0 && idlePodReapAfter < MinIdlePodReap {
 		idlePodReapAfter = MinIdlePodReap
 	}
+	memoryProvisioningTimeout, err := getMinutesDefault("MEMORY_PROVISIONING_TIMEOUT_MINUTES", DefaultMemoryProvisioningTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	// Clamp up a positive value to the floor for the same reason as
+	// idlePodReapAfter: a short misconfiguration must not flip a healthy,
+	// still-provisioning stack to Degraded. Zero/negative disables the bound.
+	if memoryProvisioningTimeout > 0 && memoryProvisioningTimeout < MinMemoryProvisioningTimeout {
+		memoryProvisioningTimeout = MinMemoryProvisioningTimeout
+	}
 	agentRunAsNonRoot, err := getBoolDefault("AGENT_RUN_AS_NON_ROOT", false)
 	if err != nil {
 		return Config{}, err
@@ -466,6 +499,7 @@ func Load() (Config, error) {
 		PushMetricsTTL:             pushMetricsTTL,
 		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
 		IdlePodReapAfter:           idlePodReapAfter,
+		MemoryProvisioningTimeout:  memoryProvisioningTimeout,
 		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 		SerenaURL:                  os.Getenv("TATARA_SERENA_URL"),
