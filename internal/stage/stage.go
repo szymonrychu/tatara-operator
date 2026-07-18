@@ -681,25 +681,93 @@ func RequestChanges(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxReviewRoun
 	return Edge{To: v1alpha1.StageImplementing}, true
 }
 
-// ReenterImplementingOnReview re-enters implementing after a maintainer's
-// changes_requested on a Tatara-owned, NOT-yet-merged MR. The caller has already
-// verified the MR is not merged (the merged/finished boundary is the caller's,
-// per the spec). It respects the F.3 table (only froms with an edge to
-// implementing - reviewing, merging, approved, parked - succeed) and the
-// kind=review guard (via Enter -> LegalFor). A terminal Task is never
-// resurrected, and an already-implementing Task is a redundant no-op.
-func ReenterImplementingOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now time.Time) (ok bool) {
+// ReenterOnReviewChangesRequested routes a maintainer's changes_requested on a
+// Tatara-owned, NOT-yet-merged MR back onto the stage machine. The caller has
+// already verified no owned MR is merged (the merged/finished boundary is the
+// caller's, per the spec) and the actor is a maintainer.
+//
+// A NON-parked reviewing/merging Task re-enters implementing: the maintainer
+// wants code changes, so this is a fresh implementation cycle and it gets a
+// fresh merge/head budget (F3). Every OTHER non-parked stage folds: rejected/
+// failed/delivered are never resurrected, an already-implementing Task is a
+// redundant no-op, and earlier stages (clarifying/brainstorming/approved) have
+// no re-entry edge because that would bypass the #294 approval gate.
+//
+// A PARKED Task is routed by StageReason, mirroring Unpark EXACTLY (the target is
+// derived from the reason, never from status.parkedFromStage, which the machine
+// treats as observability only):
+//   - merge-timeout -> merging with MergeReentries accounting; NEVER implementing
+//     (that would recreate deleted branches). A real code change from the
+//     maintainer moves the head and the merging head-moved bounce re-reviews it.
+//   - no-outcome -> implementing, behind Unpark's own guards (no merged MR, turns
+//     under the lifetime cap) so it declines instead of bouncing straight into
+//     failed(turn-budget-exhausted) (F4).
+//   - every other reason folds (ok=false). awaiting-human / identity-unverified /
+//     backlog-sweep are resumed by the webhook's pending-event path
+//     (driveCommentUnpark); the exhaustion reasons (review-loop-exhausted,
+//     stage-deadline, ...) age out - re-entering them here would escape their own
+//     cap one human review at a time (F1).
+//
+// The kind=review guard (Enter -> LegalFor) still refuses implementing/merging
+// for a kind=review Task from anywhere, so an adopted human PR is never driven.
+func ReenterOnReviewChangesRequested(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxTurnsPerTask int, now time.Time) (ok bool) {
 	if now.IsZero() {
 		now = time.Now()
 	}
 	switch t.Status.Stage {
-	case v1alpha1.StageRejected, v1alpha1.StageFailed, v1alpha1.StageDelivered, v1alpha1.StageImplementing:
+	case v1alpha1.StageReviewing, v1alpha1.StageMerging:
+		return enterFreshImplementing(t, mrs, now)
+	case v1alpha1.StageParked:
+		return reenterParkedOnReview(t, mrs, maxTurnsPerTask, now)
+	default:
+		// rejected/failed/delivered (never resurrected), implementing (redundant),
+		// and every earlier stage (no re-entry edge; #294). Fold.
 		return false
 	}
+}
+
+// enterFreshImplementing applies the reviewing|merging|parked -> implementing
+// edge for a maintainer-driven fresh implementation, and on success zeroes the
+// merge and head-move budgets (F3): a fresh implementation deserves a fresh merge
+// budget, and this reset is human-gated (one maintainer changes_requested per
+// reset), so it is NOT the automatic HeadMoved bounce and cannot spin a head-move
+// loop on its own.
+func enterFreshImplementing(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, now time.Time) bool {
 	if err := Enter(t, mrs, v1alpha1.StageImplementing, "", now); err != nil {
 		return false
 	}
+	t.Status.HeadMoveReentries = 0
+	t.Status.MergeReentries = 0
 	return true
+}
+
+// reenterParkedOnReview is the parked branch of ReenterOnReviewChangesRequested,
+// routed by StageReason to mirror Unpark.
+func reenterParkedOnReview(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, maxTurnsPerTask int, now time.Time) bool {
+	switch t.Status.StageReason {
+	case ReasonMergeTimeout:
+		if t.Status.MergeReentries >= v1alpha1.MaxMergeReentries {
+			// Budget spent. Fold rather than Unpark's failed(merge-blocked): a
+			// human changes_requested should not TERMINATE the Task; it ages out.
+			return false
+		}
+		t.Status.MergeReentries++
+		if err := Enter(t, mrs, v1alpha1.StageMerging, "", now); err != nil {
+			t.Status.MergeReentries--
+			return false
+		}
+		return true
+	case ReasonNoOutcome:
+		if anyMerged(mrs) {
+			return false // a re-implement would duplicate an already-merged change
+		}
+		if t.Status.Stats.Turns >= maxTurnsPerTask {
+			return false // would bounce straight into failed(turn-budget-exhausted)
+		}
+		return enterFreshImplementing(t, mrs, now)
+	default:
+		return false
+	}
 }
 
 // HeadMoved is the merging exit when the live head has moved off reviewedSHA (or

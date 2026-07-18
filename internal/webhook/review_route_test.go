@@ -224,6 +224,65 @@ func TestReview_Commented_CarriesBodyToPendingEvent(t *testing.T) {
 	require.Equal(t, "please rename this var", got.Status.PendingEvents[0].Body)
 }
 
+// A terminal (failed) owning Task is never resurrected: changes_requested on it
+// is ignored, the stage is untouched (server.go TaskDone guard).
+func TestReview_TerminalTask_Ignored(t *testing.T) {
+	const secretVal = "whsec-rv8"
+	proj := reviewProject("rv8", "rv8-scm", "tatara-bot", []string{"maint"})
+	repo := repository("repo-rv8", "rv8", "https://github.com/o/r.git", "main")
+	task := reviewTask("rv8-task", "rv8", "clarify")
+	task.Status.Stage = tatarav1.StageFailed
+	task.Status.StageReason = "turn-budget-exhausted"
+	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 49), "rv8", repo.Name, 49, task)
+	c := seedClient(t, proj, secret("rv8-scm", secretVal), repo, task, mr)
+	h, _ := newServer(t, c)
+
+	postReview(t, h, "rv8", secretVal, reviewBody("submitted", "changes_requested", 907, "maint", 49))
+
+	got := getTask(t, c, task.Name)
+	require.Equal(t, tatarav1.StageFailed, got.Status.Stage, "a terminal Task is never resurrected")
+}
+
+// changes_requested on a parked(merge-timeout) Task resumes MERGING (F1), routed
+// by the park reason - not implementing.
+func TestReview_ChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testing.T) {
+	const secretVal = "whsec-rv9"
+	proj := reviewProject("rv9", "rv9-scm", "tatara-bot", []string{"maint"})
+	repo := repository("repo-rv9", "rv9", "https://github.com/o/r.git", "main")
+	task := reviewTask("rv9-task", "rv9", "clarify")
+	task.Status.Stage = tatarav1.StageParked
+	task.Status.StageReason = "merge-timeout"
+	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 50), "rv9", repo.Name, 50, task)
+	c := seedClient(t, proj, secret("rv9-scm", secretVal), repo, task, mr)
+	h, _ := newServer(t, c)
+
+	postReview(t, h, "rv9", secretVal, reviewBody("submitted", "changes_requested", 908, "maint", 50))
+
+	got := getTask(t, c, task.Name)
+	require.Equal(t, tatarav1.StageMerging, got.Status.Stage, "merge-timeout re-enters merging, never implementing")
+	require.Equal(t, 1, got.Status.MergeReentries)
+}
+
+// changes_requested on a parked(review-loop-exhausted) Task folds to the
+// pending-event path (the review is not lost) and does NOT re-enter (F1).
+func TestReview_ChangesRequested_ParkedReviewLoopExhausted_Folds(t *testing.T) {
+	const secretVal = "whsec-rv10"
+	proj := reviewProject("rv10", "rv10-scm", "tatara-bot", []string{"maint"})
+	repo := repository("repo-rv10", "rv10", "https://github.com/o/r.git", "main")
+	task := reviewTask("rv10-task", "rv10", "clarify")
+	task.Status.Stage = tatarav1.StageParked
+	task.Status.StageReason = "review-loop-exhausted"
+	mr := reviewMR(tatarav1.MergeRequestName(repo.Name, 51), "rv10", repo.Name, 51, task)
+	c := seedClient(t, proj, secret("rv10-scm", secretVal), repo, task, mr)
+	h, _ := newServer(t, c)
+
+	postReview(t, h, "rv10", secretVal, reviewBody("submitted", "changes_requested", 909, "maint", 51))
+
+	got := getTask(t, c, task.Name)
+	require.Equal(t, tatarav1.StageParked, got.Status.Stage, "review-loop-exhausted must not re-enter on a human review")
+	require.Len(t, got.Status.PendingEvents, 1, "the review folds to the pending-event path, not lost")
+}
+
 // dismissed / edited actions are ignored (Action != submitted).
 func TestReview_Dismissed_Ignored(t *testing.T) {
 	const secretVal = "whsec-rv6"

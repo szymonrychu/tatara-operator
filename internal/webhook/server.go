@@ -357,7 +357,13 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored") // (review.id, state) dedup
 		return
 	}
-	if tatarav1.TaskDone(task) {
+	// A truly-terminal Task (rejected/failed/delivered) is never resurrected. A
+	// PARKED Task is deliberately NOT pre-filtered here even though TaskDone counts
+	// it: the appliers route a park by its reason - a resumable park (merge-timeout
+	// -> merging, no-outcome -> implementing) re-enters, every other reason folds to
+	// the pending-event path - so a human review on a resumable park is acted on
+	// instead of dropped (F1). The applier is the authority on which parks resume.
+	if tatarav1.TaskDone(task) && task.Status.Stage != tatarav1.StageParked {
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored") // terminal Task not resurrected
 		return
 	}
@@ -368,7 +374,7 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 		// Adopted human PRs (owning Task Kind=review) are only reviewed, never
 		// driven to implementing; ApplyReviewChangesRequested refuses kind=review,
 		// but folding to the comment path keeps the signal.
-		reentered, aerr := controller.ApplyReviewChangesRequested(ctx, s.cfg.Client, task, time.Now())
+		reentered, aerr := controller.ApplyReviewChangesRequested(ctx, s.cfg.Client, s.cfg.APIReader, &proj, task, time.Now())
 		if aerr != nil {
 			s.reject(w, http.StatusInternalServerError, "apply changes_requested", provider, ev.Kind, ev.Action, "error")
 			return
@@ -377,7 +383,7 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 			s.deliverPendingEvent(ctx, proj, repo, ev) // merged/terminal/kind=review: fold, don't lose
 		}
 	case "approved":
-		advanced, aerr := controller.ApplyReviewApproval(ctx, s.cfg.Client, sp, &proj, task, ev.ReviewCommitSHA, time.Now())
+		advanced, aerr := controller.ApplyReviewApproval(ctx, s.cfg.Client, s.cfg.APIReader, sp, &proj, task, ev.ReviewCommitSHA, time.Now())
 		if aerr != nil {
 			s.reject(w, http.StatusInternalServerError, "apply approval", provider, ev.Kind, ev.Action, "error")
 			return

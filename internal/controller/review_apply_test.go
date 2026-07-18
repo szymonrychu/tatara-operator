@@ -12,6 +12,7 @@ import (
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // reviewingTask builds a Task already in reviewing, owned by "p", for the
@@ -50,13 +51,60 @@ func TestApplyReviewChangesRequested_ReentersImplementing(t *testing.T) {
 	task := reviewingTask("t1", "clarify")
 	mr := ownedMR("mr-tatara-operator-42", "t1", "tatara-operator", 42)
 	c := newMirrorClient(t, proj, task, mr)
-	reentered, err := ApplyReviewChangesRequested(context.Background(), c, task, time.Now())
+	reentered, err := ApplyReviewChangesRequested(context.Background(), c, c, proj, task, time.Now())
 	require.NoError(t, err)
 	require.True(t, reentered)
 
 	var got tatarav1alpha1.Task
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t1"}, &got))
 	require.Equal(t, tatarav1alpha1.StageImplementing, got.Status.Stage)
+}
+
+// parkedReviewTask builds a parked Task with the given reason, owned by "p".
+func parkedReviewTask(name, kind, reason string) *tatarav1alpha1.Task {
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "p", Kind: kind, Goal: "g"},
+	}
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = reason
+	ent := metav1.NewTime(time.Now().Add(-time.Hour))
+	task.Status.StageEnteredAt = &ent
+	return task
+}
+
+// changes_requested on a parked(merge-timeout) Task resumes MERGING (never
+// implementing), accounting one MergeReentries - exactly like Unpark (F1).
+func TestApplyReviewChangesRequested_ParkedMergeTimeout_ResumesMerging(t *testing.T) {
+	proj := sweepProject("p")
+	task := parkedReviewTask("t-mt", "clarify", stage.ReasonMergeTimeout)
+	mr := ownedMR("mr-tatara-operator-42", "t-mt", "tatara-operator", 42)
+	c := newMirrorClient(t, proj, task, mr)
+	reentered, err := ApplyReviewChangesRequested(context.Background(), c, c, proj, task, time.Now())
+	require.NoError(t, err)
+	require.True(t, reentered)
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-mt"}, &got))
+	require.Equal(t, tatarav1alpha1.StageMerging, got.Status.Stage)
+	require.Equal(t, 1, got.Status.MergeReentries)
+}
+
+// changes_requested on a parked(review-loop-exhausted) Task does NOT re-enter:
+// it folds to the pending-event path so a human review cannot escape
+// maxReviewRounds one review at a time (F1).
+func TestApplyReviewChangesRequested_ParkedReviewLoopExhausted_Folds(t *testing.T) {
+	proj := sweepProject("p")
+	task := parkedReviewTask("t-rle", "clarify", stage.ReasonReviewLoopExhausted)
+	mr := ownedMR("mr-tatara-operator-42", "t-rle", "tatara-operator", 42)
+	c := newMirrorClient(t, proj, task, mr)
+	reentered, err := ApplyReviewChangesRequested(context.Background(), c, c, proj, task, time.Now())
+	require.NoError(t, err)
+	require.False(t, reentered, "review-loop-exhausted must not re-enter on a human review")
+
+	var got tatarav1alpha1.Task
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "t-rle"}, &got))
+	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage)
 }
 
 // changes_requested on a Task whose owned MR is MERGED does NOT rewind.
@@ -66,7 +114,7 @@ func TestApplyReviewChangesRequested_MergedMR_NoRewind(t *testing.T) {
 	mr := ownedMR("mr-tatara-operator-42", "t2", "tatara-operator", 42)
 	mr.Status.State = "merged"
 	c := newMirrorClient(t, proj, task, mr)
-	reentered, err := ApplyReviewChangesRequested(context.Background(), c, task, time.Now())
+	reentered, err := ApplyReviewChangesRequested(context.Background(), c, c, proj, task, time.Now())
 	require.NoError(t, err)
 	require.False(t, reentered, "an already-merged MR is finished; no rewind")
 
@@ -82,7 +130,7 @@ func TestApplyReviewApproval_EntersMerging(t *testing.T) {
 	mr := ownedMR("mr-tatara-operator-42", "t3", "tatara-operator", 42)
 	mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1} // bot review still owed
 	c := newMirrorClient(t, proj, task, mr)
-	advanced, err := ApplyReviewApproval(context.Background(), c, nil, proj, task, "deadbeef", time.Now())
+	advanced, err := ApplyReviewApproval(context.Background(), c, c, nil, proj, task, "deadbeef", time.Now())
 	require.NoError(t, err)
 	require.True(t, advanced)
 
@@ -103,7 +151,7 @@ func TestApplyReviewApproval_ReviewKind_NoMerge(t *testing.T) {
 	task := reviewingTask("t4", "review")
 	mr := ownedMR("mr-tatara-operator-42", "t4", "tatara-operator", 42)
 	c := newMirrorClient(t, proj, task, mr)
-	advanced, err := ApplyReviewApproval(context.Background(), c, nil, proj, task, "sha", time.Now())
+	advanced, err := ApplyReviewApproval(context.Background(), c, c, nil, proj, task, "sha", time.Now())
 	require.NoError(t, err)
 	require.False(t, advanced)
 }
