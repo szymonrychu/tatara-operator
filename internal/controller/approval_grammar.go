@@ -303,18 +303,21 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 //     a NON-EMPTY botLogin. A human-authored issue, or one whose author cannot be
 //     verified (empty author / empty botLogin), is NEVER auto-approved;
 //  4. the body carries a valid tatara-proposed-by marker (brainstorm / incident)
-//     AND its content fingerprint still matches the body. A missing/malformed
-//     marker fails closed; so does an EDITED body.
+//     AND still matches its filing-time integrity anchor. A missing/malformed
+//     marker fails closed; so does a body that diverges from the anchor.
 //
-// Axis 4's fingerprint is the tamper guard for a coupling that is safe today but
-// will not stay that way. Auto-approve releases the body in Status.Body as
-// reviewed-by-construction. Today a human body edit is invisible: Task.Spec.Goal
-// is frozen at mint and issues.edited webhooks are ignored, so Status.Body only
-// ever holds the tatara-proposed content. A parallel workstream's approved design
-// WILL wire issue-edit body refresh, after which the mirror would carry a human
-// edit into Status.Body - and without the fingerprint, auto-approve would release
-// the EDITED scope with no human gate. The fingerprint makes that fail closed
-// NOW: any content edit since filing (or removal of the marker) refuses.
+// Axis 4 is the tamper guard for a coupling that is safe today but will not stay
+// that way. Auto-approve releases the body in Status.Body as reviewed-by-
+// construction. Today a human body edit is invisible: Task.Spec.Goal is frozen at
+// mint and issues.edited webhooks are ignored, so Status.Body only ever holds the
+// tatara-proposed content. A parallel workstream's approved design WILL wire
+// issue-edit body refresh, after which the mirror would carry a human edit into
+// Status.Body. The anchor makes that fail closed: the hash of record lives in
+// IssueSpec.ProposalBodyHash, written once by the operator at mint into the ONE
+// field the mirror never overwrites, so a party with forge write access can edit
+// the body and even rewrite the in-body marker, but cannot rewrite the CR Spec -
+// so any post-filing body change (scope edit, marker forgery) diverges from the
+// anchor and refuses. Fail-closed on a missing anchor (older-build proposal) too.
 func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project, botLogin string) bool {
 	if !proj.Spec.AutoApproveTataraProposals {
 		return false
@@ -328,7 +331,7 @@ func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	if tatarav1alpha1.ProposalKindFromBody(iss.Status.Body) == "" {
 		return false
 	}
-	return tatarav1alpha1.ProposalBodyMatchesFingerprint(iss.Status.Body)
+	return tatarav1alpha1.ProposalBodyMatchesAnchor(iss.Status.Body, iss.Spec.ProposalBodyHash)
 }
 
 // autoApprovalEvidence is the ApprovalEvidence the carve-out records: Auto=true,

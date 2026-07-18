@@ -1051,11 +1051,19 @@ func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, number int, url, title, body string,
 	crLabels map[string]string) error {
 	name := tatarav1alpha1.IssueName(repo.Name, number)
+	spec := tatarav1alpha1.IssueSpec{
+		RepositoryRef: repo.Name, Number: number, URL: url, ProjectRef: proj.Name,
+	}
+	// A tatara-proposed body (brainstorm/incident marker) gets its auto-approve
+	// integrity anchor written HERE, once, into Spec - the one place the mirror
+	// never overwrites. This is the tamper record; the in-body marker is only
+	// provenance.
+	if tatarav1alpha1.ProposalKindFromBody(body) != "" {
+		spec.ProposalBodyHash = tatarav1alpha1.ComputeProposalContentHash(body)
+	}
 	iss := &tatarav1alpha1.Issue{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns, Labels: crLabels},
-		Spec: tatarav1alpha1.IssueSpec{
-			RepositoryRef: repo.Name, Number: number, URL: url, ProjectRef: proj.Name,
-		},
+		Spec:       spec,
 	}
 	own.AddPlainOwner(iss, task)
 	if err := own.HandOverController(iss, nil, task); err != nil {

@@ -48,39 +48,38 @@ func TestStampProposalMarkerIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestProposalBodyMatchesFingerprint(t *testing.T) {
+func TestProposalBodyMatchesAnchor(t *testing.T) {
 	stamped := StampProposalMarker("implement the widget the way we discussed", ProposalKindBrainstorm)
+	anchor := ComputeProposalContentHash(stamped)
 
-	if !ProposalBodyMatchesFingerprint(stamped) {
-		t.Fatal("an unmodified stamped body did not match its own fingerprint")
+	if !ProposalBodyMatchesAnchor(stamped, anchor) {
+		t.Fatal("an unmodified stamped body did not match its own anchor")
 	}
 
 	// A cosmetic edit (CRLF, trailing newline) must NOT break the match.
 	crlf := strings.ReplaceAll(stamped, "\n", "\r\n") + "\r\n\r\n"
-	if !ProposalBodyMatchesFingerprint(crlf) {
-		t.Fatal("a whitespace-only reformat broke the fingerprint (should be content-only)")
+	if !ProposalBodyMatchesAnchor(crlf, anchor) {
+		t.Fatal("a whitespace-only reformat broke the anchor (should be content-only)")
 	}
 
 	// A content edit (marker preserved) MUST break the match.
 	edited := stamped + "\n\nand also delete the production database"
-	if ProposalBodyMatchesFingerprint(edited) {
-		t.Fatal("an edited body still matched its filing-time fingerprint")
+	if ProposalBodyMatchesAnchor(edited, anchor) {
+		t.Fatal("an edited body still matched its filing-time anchor")
 	}
 
-	// Marker removal fails closed.
-	if ProposalBodyMatchesFingerprint("no marker at all") {
-		t.Fatal("a body with no marker matched a fingerprint")
+	// A marker-rewrite attack that recomputes a hash of the edited body cannot
+	// help: the anchor of record is the CR field, not anything in the body.
+	if ProposalBodyMatchesAnchor(edited, ComputeProposalContentHash(edited)) == false {
+		// (sanity: the edited body of course matches ITS OWN hash)
+		t.Fatal("sanity check failed")
+	}
+	if ProposalBodyMatchesAnchor(edited, anchor) {
+		t.Fatal("a recomputed body hash must not override the filing-time anchor")
 	}
 
-	// A fingerprint-less marker fails closed.
-	if ProposalBodyMatchesFingerprint("<!-- tatara-proposed-by:brainstorm -->\n\nbody") {
-		t.Fatal("a marker carrying no fingerprint matched")
-	}
-
-	// A forged fingerprint over the wrong content fails closed.
-	forged := proposalMarker(ProposalKindBrainstorm, ComputeProposalContentHash("different content")) +
-		"\n\nthe real body"
-	if ProposalBodyMatchesFingerprint(forged) {
-		t.Fatal("a fingerprint computed over other content matched")
+	// Empty anchor (older build filed no anchor) fails closed.
+	if ProposalBodyMatchesAnchor(stamped, "") {
+		t.Fatal("an empty anchor matched")
 	}
 }
