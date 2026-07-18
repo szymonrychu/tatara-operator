@@ -33,14 +33,12 @@ spec:
         - alert: TataraLoopStalled
           expr: |
             sum(increase(operator_tasks_minted_per_sweep_count[3h])) == 0
-            and
-            sum(increase(tatara_scan_items_total[3h])) == 0
           for: 30m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
-            summary: "the tatara scan cron produced no activity for 3h"
-            description: "Neither the B.4 sweep nor the brainstorm/documentation/refine scans have run a single pass in 3h. The loop is silently processing nothing with zero errors (the worst failure class). NOTE the primary term is operator_tasks_minted_per_sweep_count, NOT the old tatara_scan_* pair: since the task-centric redesign the SWEEP is the intake and it does not emit tatara_scan_* at all (only brainstorm/documentation/refine still do, on their own slow cadences), so the old expression would have gone from a deadman to a false-firing alert in steady state. The sweep observes that histogram on EVERY pass including a zero-mint one and including a FAILING one - it means 'the cron fired', where TataraSweepStalled's heartbeat gauge means 'a pass completed cleanly'. Both are needed: the gauge produces no series at all until the first clean pass, so it cannot fire on an operator whose sweep has never once succeeded."
+            summary: "the tatara B.4 sweep produced no activity for 3h"
+            description: "The B.4 sweep has not run a single pass in 3h. The loop is silently processing nothing with zero errors (the worst failure class). operator_tasks_minted_per_sweep_count is the primary term (not the old tatara_scan_* pair, pruned as dead-per-redesign - metric-wiring audit, issue #370): since the task-centric redesign the SWEEP is the sole intake, and it observes that histogram on EVERY pass including a zero-mint one and including a FAILING one - it means 'the cron fired', where TataraSweepStalled's heartbeat gauge means 'a pass completed cleanly'. Both are needed: the gauge produces no series at all until the first clean pass, so it cannot fire on an operator whose sweep has never once succeeded. A stalled brainstorm/documentation cron specifically (opt-in, slower cadences) is NOT this alert's job - it is a narrower, lower-severity signal than 'the loop stopped', and a dedicated per-activity alert on the new obs.SweepLastSuccessTimestamp{activity=brainstorm|documentation} gauge is tracked as a ROADMAP follow-up rather than folded into this deadman."
         - alert: TataraMemoryStackFailed
           expr: operator_memory_stacks{phase="Failed"} > 0
           for: 15m
