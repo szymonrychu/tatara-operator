@@ -5,13 +5,14 @@ import "github.com/prometheus/client_golang/prometheus"
 // accountUsageMetrics holds the Claude account usage (claudeSubscription mode)
 // Prometheus collectors, embedded into OperatorMetrics.
 type accountUsageMetrics struct {
-	accountUsageUtil         *prometheus.GaugeVec
-	accountUsageReset        *prometheus.GaugeVec
-	accountUsagePollHealth   prometheus.Gauge
-	accountUsagePollFailures prometheus.Counter
-	accountOveragePercent    prometheus.Gauge
-	accountOverageUsed       prometheus.Gauge
-	accountOverageLimit      prometheus.Gauge
+	accountUsageUtil          *prometheus.GaugeVec
+	accountUsageReset         *prometheus.GaugeVec
+	accountUsagePollHealth    prometheus.Gauge
+	accountUsagePollerEnabled prometheus.Gauge
+	accountUsagePollFailures  prometheus.Counter
+	accountOveragePercent     prometheus.Gauge
+	accountOverageUsed        prometheus.Gauge
+	accountOverageLimit       prometheus.Gauge
 }
 
 // newAccountUsageMetrics registers the account-usage collectors on reg and
@@ -31,6 +32,14 @@ func newAccountUsageMetrics(reg prometheus.Registerer) *accountUsageMetrics {
 		accountUsagePollHealth: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "tatara_account_usage_poll_health",
 			Help: "1 when the usage poll is healthy, 0 when stale.",
+		}),
+		// Distinguishes "poller intentionally disabled" (USAGE_ENABLED=false,
+		// e.g. claudeSubscription mode's wrapper-reported path) from "poller
+		// enabled but unhealthy" - poll_health alone can't tell the two apart
+		// since it defaults to 0 whether or not a poll ever ran (issue #339).
+		accountUsagePollerEnabled: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "tatara_account_usage_poller_enabled",
+			Help: "1 when the usage poller (USAGE_ENABLED) is enabled, 0 when disabled.",
 		}),
 		// Per-fetch failure counter (issue #189). Increments on every failed poll;
 		// the poll-health gauge only flips to 0 once consecutive failures reach the
@@ -57,6 +66,7 @@ func newAccountUsageMetrics(reg prometheus.Registerer) *accountUsageMetrics {
 		m.accountUsageUtil,
 		m.accountUsageReset,
 		m.accountUsagePollHealth,
+		m.accountUsagePollerEnabled,
 		m.accountUsagePollFailures,
 		m.accountOveragePercent,
 		m.accountOverageUsed,
@@ -85,6 +95,16 @@ func (m *accountUsageMetrics) SetAccountUsagePollHealth(healthy bool) {
 		v = 1.0
 	}
 	m.accountUsagePollHealth.Set(v)
+}
+
+// SetAccountUsagePollerEnabled sets tatara_account_usage_poller_enabled to 1
+// when the poller is enabled (USAGE_ENABLED=true), 0 when disabled.
+func (m *accountUsageMetrics) SetAccountUsagePollerEnabled(enabled bool) {
+	v := 0.0
+	if enabled {
+		v = 1.0
+	}
+	m.accountUsagePollerEnabled.Set(v)
 }
 
 // IncAccountUsagePollFailure increments tatara_account_usage_poll_failures_total:
