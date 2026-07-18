@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,6 +53,7 @@ type recordingForge struct {
 	subIssueCalls  []recordedSubIssue // every AddSubIssue call, in order
 	addSubIssueErr error              // returned by AddSubIssue when set (e.g. scm.ErrSubIssuesUnsupported)
 	commentErr     error              // returned by Comment when set (e.g. cross-repo 403 on the parent)
+	openChangeErr  error              // returned by OpenChange when set (e.g. a 422 or a transport error)
 }
 
 type recordedComment struct {
@@ -87,6 +89,9 @@ func (f *recordingForge) CreateIssue(_ context.Context, repoURL, _ string, req s
 }
 
 func (f *recordingForge) OpenChange(_ context.Context, _, _, _, _, _, body string) (string, error) {
+	if f.openChangeErr != nil {
+		return "", f.openChangeErr
+	}
 	f.nextNumber++
 	url := "https://forge/pull/" + fmt.Sprint(f.nextNumber)
 	f.openedURLs = append(f.openedURLs, body)
@@ -359,6 +364,14 @@ func taskV2(name, projectRef, kind, stg, agentKind string) *tatarav1alpha1.Task 
 	}
 }
 
+// taskBranchV2 is the branch agent.TaskBranch(t) derives for a taskV2
+// fixture (no Spec.Source, so it always falls to the "tatara/task-<name>"
+// form) - the single place every v2 test computes the expected head branch,
+// so a future TaskBranch format change only needs one edit here.
+func taskBranchV2(name string) string {
+	return agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: name}})
+}
+
 func ownerRef(task string, controller bool) metav1.OwnerReference {
 	tr, fa := true, false
 	c := &fa
@@ -406,7 +419,7 @@ func mrV2(repo string, number int, owner string, opts ...func(*tatarav1alpha1.Me
 		},
 		Status: tatarav1alpha1.MergeRequestStatus{
 			Title: "an MR", Author: "tatara-bot", State: "open", Status: "new",
-			HeadBranch: "task/" + owner, HeadSHA: "sha1", CIStatus: "green",
+			HeadBranch: taskBranchV2(owner), HeadSHA: "sha1", CIStatus: "green",
 			CreatedAt: &now, UpdatedAt: &now, LastSyncedAt: &now,
 		},
 	}
@@ -860,9 +873,91 @@ func TestMRWrite_Open_Synchronous(t *testing.T) {
 	require.False(t, out.Existing)
 
 	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-cli", 101))
-	require.Equal(t, "task/t1", mr.Status.HeadBranch)
+	require.Equal(t, taskBranchV2("t1"), mr.Status.HeadBranch)
 	require.True(t, *mr.OwnerReferences[0].Controller)
 	require.Contains(t, e.task(t, "t1").Status.MRRefs, mr.Name)
+}
+
+// TestMRWrite_Open_HeadBranchMatchesAgentTaskBranch pins fix A1: mrOpen must
+// derive head from agent.TaskBranch(task), the SAME function that seeds the
+// pod's TASK_BRANCH env and what the wrapper actually pushes to - not a
+// hand-rolled "task/"+name that never exists on the forge (issue #381 bug A).
+func TestMRWrite_Open_HeadBranchMatchesAgentTaskBranch(t *testing.T) {
+	numbered := taskV2("t-num", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement")
+	numbered.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider: "github", IssueRef: "https://github.com/acme/tatara-cli/issues/42",
+		Number: 42, Title: "Fix the thing",
+	}
+	docTask := taskV2("t-doc", "tatara", "documentation", tatarav1alpha1.StageDocumenting, "documentation")
+	docTask.Annotations = map[string]string{tatarav1alpha1.AnnSourceHeadSHA: "deadbeefcafefeed"}
+	fallback := taskV2("t-fb", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify")
+
+	for _, tc := range []struct {
+		name string
+		task *tatarav1alpha1.Task
+	}{
+		{"numbered source", numbered},
+		{"documentation SHA-keyed", docTask},
+		{"no source (fallback)", fallback},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(),
+				repoV2("tatara-cli", "tatara"), tc.task)
+
+			w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+				fmt.Sprintf(`{"task":%q,"action":"open","repo":"tatara-cli","title":"T","body":"B"}`, tc.task.Name))
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+			var out struct {
+				Number int `json:"number"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+			mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-cli", out.Number))
+			require.Equal(t, agent.TaskBranch(tc.task), mr.Status.HeadBranch)
+		})
+	}
+}
+
+// TestMRWrite_Open_4xxPassesThrough pins fix A2: a 422 head-invalid from the
+// forge (exactly what mrOpen got every time before fix A1) must surface its
+// real status and an actionable trimmed message, not a blanket 502 that
+// erases the diagnostic (issue #381 bug A).
+func TestMRWrite_Open_4xxPassesThrough(t *testing.T) {
+	forge := newRecordingForge()
+	forge.openChangeErr = &scm.HTTPError{
+		Status: http.StatusUnprocessableEntity,
+		Path:   "/repos/acme/tatara-cli/pulls",
+		Body:   "{\"message\":\"Validation Failed\",\"errors\":[{\"field\":\"head\",\"code\":\"invalid\"}]}",
+	}
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+	// The message must carry the forge's raw body once, not the doubled
+	// "scm rejected open (422): scm: <path> -> 422: <body>" that firstLine(he.Error())
+	// produced (he.Error() already prefixes "scm: <path> -> <status>: <body>").
+	var out struct {
+		Error string `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &out))
+	require.Equal(t, `scm rejected open (422): {"message":"Validation Failed","errors":[{"field":"head","code":"invalid"}]}`, out.Error)
+}
+
+// TestMRWrite_Open_TransportErrorStays502 pins fix A2's other half: a
+// non-HTTPError (network/DNS/timeout - never reached the forge) still 502s,
+// but now carries the real error text instead of a generic string.
+func TestMRWrite_Open_TransportErrorStays502(t *testing.T) {
+	forge := newRecordingForge()
+	forge.openChangeErr = fmt.Errorf("dial tcp: connect: connection refused")
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"))
+
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/mr-write",
+		`{"task":"t1","action":"open","repo":"tatara-cli","title":"T","body":"B"}`)
+	require.Equal(t, http.StatusBadGateway, w.Code)
+	require.Contains(t, w.Body.String(), "connection refused")
 }
 
 // IDEMPOTENT (fix 13): an existing open MR on head branch task/<task> returns
@@ -964,7 +1059,7 @@ func TestSynchronousWrites_AreVisibleInTheMirrorWithTheSweepNeverRun(t *testing.
 
 	w = e.do(t, http.MethodGet, "/projects/tatara/scm/mrs?repo=tatara-cli", "")
 	require.Contains(t, w.Body.String(), "just opened")
-	require.Contains(t, w.Body.String(), `"headBranch":"task/t1"`)
+	require.Contains(t, w.Body.String(), fmt.Sprintf(`"headBranch":%q`, taskBranchV2("t1")))
 }
 
 // --- decode contract -------------------------------------------------------

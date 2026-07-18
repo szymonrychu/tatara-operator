@@ -70,6 +70,7 @@ type OperatorMetrics struct {
 	admissionBlockedTotal        *prometheus.CounterVec
 	memoryGateBypassTotal        *prometheus.CounterVec
 	memoryGateHoldTotal          *prometheus.CounterVec
+	mrBindingBackstopTotal       *prometheus.CounterVec
 	repositoryIngestFailing      *prometheus.GaugeVec
 	repositoryLastIngestTime     *prometheus.GaugeVec
 	reviewOutcomeTotal           *prometheus.CounterVec
@@ -328,6 +329,17 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_gate_hold_total",
 			Help: "Turn submissions held at the memory-readiness gate immediately before SubmitTurn, by project.",
 		}, []string{"project"}),
+		// Issue #381 bug B part 2: a Source-bearing Task that still owns ZERO
+		// MergeRequest and ZERO Issue CRs past a grace window - the residue of
+		// an interrupted two-phase mint write (Task created, the bind that
+		// would have given it an owned MR/Issue never landed). Distinguishes
+		// this specific backstop firing from every other route into
+		// parked(awaiting-human), which the shared TaskParked{reason} counter
+		// (EnterStage) does not.
+		mrBindingBackstopTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_mr_binding_backstop_total",
+			Help: "Tasks parked by the MR/Issue-binding backstop: a Source-bearing Task that still owns zero MergeRequest and zero Issue CRs past the grace window, by project and Task kind.",
+		}, []string{"project", "kind"}),
 		// Event-driven on a review Task's /outcome submission - correctly
 		// wired (RecordReviewOutcome call site is unconditional in the
 		// open-MRs loop) and confirmed firing across several prior pod
@@ -435,6 +447,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.admissionBlockedTotal,
 		m.memoryGateBypassTotal,
 		m.memoryGateHoldTotal,
+		m.mrBindingBackstopTotal,
 		m.reviewOutcomeTotal,
 		m.reviewHeadMovedTotal,
 		m.reviewFindingsTotal,
@@ -895,6 +908,20 @@ func (m *OperatorMetrics) MemoryGateBypass(project, kind string) {
 // assertions.
 func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) prometheus.Counter {
 	return m.memoryGateBypassTotal.WithLabelValues(project, kind)
+}
+
+// MRBindingBackstopParked increments operator_mr_binding_backstop_total:
+// issue #381's park+alert backstop caught a Source-bearing Task that still
+// owns zero MergeRequest and zero Issue CRs past the grace window - an
+// interrupted two-phase mint with nothing left to repair it automatically.
+func (m *OperatorMetrics) MRBindingBackstopParked(project, kind string) {
+	m.mrBindingBackstopTotal.WithLabelValues(project, kind).Inc()
+}
+
+// MRBindingBackstopParkedCounter returns the counter for (project, kind) for
+// test assertions.
+func (m *OperatorMetrics) MRBindingBackstopParkedCounter(project, kind string) prometheus.Counter {
+	return m.mrBindingBackstopTotal.WithLabelValues(project, kind)
 }
 
 // MemoryGateHold increments operator_memory_gate_hold_total: reconcilePodStage

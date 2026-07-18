@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -1327,7 +1328,7 @@ func (s *Server) mrWrite(w http.ResponseWriter, r *http.Request) {
 func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, req mrWriteReq) {
 	ctx := r.Context()
-	head := "task/" + task.Name
+	head := agent.TaskBranch(task)
 
 	mrs, err := s.ownedMRs(ctx, task)
 	if err != nil {
@@ -1381,7 +1382,12 @@ func (s *Server) mrOpen(w http.ResponseWriter, r *http.Request, proj *tatarav1al
 	if err != nil {
 		s.log.ErrorContext(ctx, "restapi: opening MR failed",
 			append(reqLogFields(r), "repo", repo.Name, "head", head, "error", err)...)
-		writeError(w, http.StatusBadGateway, "scm write failed")
+		var he *scm.HTTPError
+		if errors.As(err, &he) && he.Status >= 400 && he.Status < 500 {
+			writeError(w, he.Status, fmt.Sprintf("scm rejected open (%d): %s", he.Status, firstLine(he.Body)))
+			return
+		}
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("scm write failed: %s", err.Error()))
 		return
 	}
 	number := prNumberFromURL(url)
@@ -1423,6 +1429,16 @@ func allowedCloses(issues []tatarav1alpha1.Issue, repo *tatarav1alpha1.Repositor
 		}
 	}
 	return out
+}
+
+// firstLine returns s up to its first newline, trimmed - the forge error
+// body's first line is almost always the actionable summary; the rest is
+// often an HTML page or a multi-field validation dump.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 // prNumberFromURL pulls the PR/MR number off the URL the forge returned.

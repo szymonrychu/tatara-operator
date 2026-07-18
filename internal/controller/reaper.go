@@ -650,7 +650,7 @@ func terminalIssueComment(t *tatarav1alpha1.Task) string {
 // is still open on the forge.
 func ourMR(proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task, mr *tatarav1alpha1.MergeRequest) bool {
 	bot := botLoginOf(proj)
-	return bot != "" && mr.Status.Author == bot && mr.Status.HeadBranch == TaskBranchPrefix+t.Name
+	return bot != "" && mr.Status.Author == bot && mr.Status.HeadBranch == agent.TaskBranch(t)
 }
 
 // releaseOwnership is B.6 step 3 / B.5. For every artifact this Task
@@ -799,7 +799,7 @@ func (r *ProjectReconciler) carryHumanReviewRounds(ctx context.Context, t *tatar
 // branch IF AND ONLY IF ALL FOUR clauses hold:
 //
 //	a. mr.status.author     == Project.spec.scm.botLogin
-//	b. mr.status.headBranch == "task/<this-task-name>"
+//	b. mr.status.headBranch == agent.TaskBranch(this Task)
 //	c. this Task IS (WAS) its CONTROLLER owner
 //	d. NO surviving plain owner exists
 //
