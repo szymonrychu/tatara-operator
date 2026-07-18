@@ -270,10 +270,21 @@ func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1a
 func (r *ProjectReconciler) clearWebhookOriginated(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int) error {
 
-	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
+	return ClearWebhookOriginated(ctx, r.Client, proj.Namespace, tatarav1alpha1.IssueName(repo.Name, number))
+}
+
+// ClearWebhookOriginated deletes the AnnWebhookOriginated marker from the mirror
+// Issue CR (namespace, issueName), idempotently: a missing CR or missing marker
+// is a no-op. It is the "consumed exactly once" half of the liveness contract -
+// the mint that READ the marker clears it, so the marker cannot outlive its mint
+// and re-activate the issue on a later reap/re-mint cycle. Both the sweep
+// backstop and the webhook PRIMARY mint (fix F7-1) call it: before F7-1 only the
+// sweep cleared it, so a webhook mint left the marker behind forever.
+func ClearWebhookOriginated(ctx context.Context, c client.Client, namespace, issueName string) error {
+	key := types.NamespacedName{Namespace: namespace, Name: issueName}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var iss tatarav1alpha1.Issue
-		if err := r.Get(ctx, key, &iss); err != nil {
+		if err := c.Get(ctx, key, &iss); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
@@ -283,7 +294,7 @@ func (r *ProjectReconciler) clearWebhookOriginated(ctx context.Context, proj *ta
 			return nil
 		}
 		delete(iss.Annotations, AnnWebhookOriginated)
-		return r.Update(ctx, &iss)
+		return c.Update(ctx, &iss)
 	})
 	if err != nil {
 		return fmt.Errorf("webhook-originated: clear marker on %s: %w", key.Name, err)

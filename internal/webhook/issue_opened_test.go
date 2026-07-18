@@ -56,11 +56,14 @@ func postIssueOpened(t *testing.T, h http.Handler, projName, secretVal string, b
 	require.Equal(t, http.StatusAccepted, w.Code)
 }
 
-// TestIssueOpened_StampsTheWebhookMarker: a human opens a NEW issue. The mirror
-// Issue CR does not exist yet; the webhook stamps the marker on it AND (Task 3:
-// the webhook is now the PRIMARY minter) mints its Task immediately, adopting
-// (owning) the CR rather than leaving it ownerless for the sweep.
-func TestIssueOpened_StampsTheWebhookMarker(t *testing.T) {
+// TestIssueOpened_MintsAndConsumesTheWebhookMarker: a human opens a NEW issue.
+// The mirror Issue CR does not exist yet; the webhook stamps the marker, mints
+// the Task in-request (Task 3: the webhook is the PRIMARY minter), owns the CR -
+// and then CONSUMES the marker (fix F7-1). The marker's cold-start value is a
+// property of an UNOWNED issue; once this mint owns the CR the sweep skips it, so
+// a lingering marker would only re-activate the issue after a later park + reap.
+// Consumed-exactly-once: the mint that read it clears it.
+func TestIssueOpened_MintsAndConsumesTheWebhookMarker(t *testing.T) {
 	const secretVal = "whsec-open1"
 	c := seedClient(t,
 		projectWithReporters("openproj", "openproj-scm", "tatara", "tatara-bot", nil),
@@ -74,17 +77,18 @@ func TestIssueOpened_StampsTheWebhookMarker(t *testing.T) {
 	var iss tatarav1.Issue
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Namespace: ns, Name: tatarav1.IssueName("repo-open", 7)}, &iss))
-	require.NotEmpty(t, iss.Annotations[controller.AnnWebhookOriginated],
-		"a live, HMAC-verified issues.opened must leave the durable liveness marker")
 	require.NotEmpty(t, iss.OwnerReferences, "the webhook now mints a Task and owns the mirror CR immediately")
+	require.Empty(t, iss.Annotations[controller.AnnWebhookOriginated],
+		"a successful webhook mint CONSUMES the marker (F7-1: consumed-exactly-once)")
 
 	// THE WEBHOOK IS NOW THE PRIMARY MINTER (Task 3 supersedes Task 21's call).
 	require.Len(t, allTasks(t, c, "openproj"), 1, "the webhook must mint a Task immediately")
 }
 
-// TestIssueReopened_StampsTheWebhookMarker: a reopen is the same live signal as
-// an open. GitLab collapses open/reopen into "opened"; GitHub keeps them apart.
-func TestIssueReopened_StampsTheWebhookMarker(t *testing.T) {
+// TestIssueReopened_MintsAndConsumesTheWebhookMarker: a reopen is the same live
+// signal as an open. GitLab collapses open/reopen into "opened"; GitHub keeps
+// them apart. The successful mint consumes the marker either way (F7-1).
+func TestIssueReopened_MintsAndConsumesTheWebhookMarker(t *testing.T) {
 	const secretVal = "whsec-open2"
 	c := seedClient(t,
 		projectWithReporters("reopenproj", "reopenproj-scm", "tatara", "tatara-bot", nil),
@@ -98,7 +102,9 @@ func TestIssueReopened_StampsTheWebhookMarker(t *testing.T) {
 	var iss tatarav1.Issue
 	require.NoError(t, c.Get(context.Background(),
 		types.NamespacedName{Namespace: ns, Name: tatarav1.IssueName("repo-reopen", 11)}, &iss))
-	require.NotEmpty(t, iss.Annotations[controller.AnnWebhookOriginated])
+	require.NotEmpty(t, iss.OwnerReferences, "the reopen mint owns the mirror CR")
+	require.Empty(t, iss.Annotations[controller.AnnWebhookOriginated],
+		"a successful webhook mint CONSUMES the marker (F7-1)")
 }
 
 // TestIssueOpened_BotAuthoredNeverMarks: a BOT-opened issue is not a human

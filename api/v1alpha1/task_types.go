@@ -338,12 +338,18 @@ func TaskNameTooLong(name string) bool {
 // mint's half of the no-lock, natural-key idempotency the reactive intake relies
 // on (the Issue/MergeRequest CR controller-ownership is the other half).
 //
-// A short human-readable prefix (kind initial + repoRef + number) aids ops; a
-// sha256 suffix disambiguates across projects/kinds and guarantees the name is
-// stable, DNS-1123-safe, and within MaxTaskNameLength even for a long repoRef.
+// The name carries the LITERAL number so the (repo, number) natural key is
+// unique on its face - the number is unique per repo, so two distinct keys can
+// never share a name no matter how their repoRefs truncate. The 64-bit sha256
+// suffix disambiguates across projects/kinds and across repoRefs that sanitize
+// to the same truncated prefix, and keeps the name stable, DNS-1123-safe, and
+// within MaxTaskNameLength for a long repoRef. (F1-1: the old scheme hid the
+// number inside an 8-hex/32-bit suffix, so distinct keys could birthday-collide
+// and silently starve the loser's issue - it never got owned.)
 func IntakeTaskName(project, kind, repoRef string, number int) string {
 	sum := sha256.Sum256([]byte(project + "|" + kind + "|" + repoRef + "|" + strconv.Itoa(number)))
-	suffix := "-" + hex.EncodeToString(sum[:])[:8]
+	suffix := "-" + hex.EncodeToString(sum[:])[:16]
+	num := "-" + strconv.Itoa(number)
 	head := "mt-"
 	if kind != "" {
 		ki := sanitizeNamePart(kind, 1)
@@ -351,11 +357,11 @@ func IntakeTaskName(project, kind, repoRef string, number int) string {
 			head += ki + "-"
 		}
 	}
-	budget := MaxTaskNameLength - len(head) - len(suffix)
+	budget := MaxTaskNameLength - len(head) - len(num) - len(suffix)
 	if budget < 0 {
 		budget = 0
 	}
-	base := head + sanitizeNamePart(repoRef, budget) + suffix
+	base := head + sanitizeNamePart(repoRef, budget) + num + suffix
 	return strings.Trim(base, "-")
 }
 

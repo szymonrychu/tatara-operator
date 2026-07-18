@@ -35,6 +35,37 @@ func TestIntakeTaskName_LongRepoRefStaysBounded(t *testing.T) {
 	require.False(t, strings.HasSuffix(n, "-"))
 }
 
+// F1-1: the literal issue/PR number is IN the visible name, and even with the
+// repoRef truncated to nothing the name stays unique per (repo, number) and
+// DNS-safe. The number is unique per repo, so two natural keys can never share a
+// name regardless of how their repoRefs sanitize.
+func TestIntakeTaskName_NumberIsLiteralAndBounded(t *testing.T) {
+	long := strings.Repeat("z", 200)
+	// A repoRef long enough to consume the whole repo budget still leaves the
+	// number literally in the name.
+	a := v1alpha1.IntakeTaskName("tatara", "clarify", long, 353)
+	b := v1alpha1.IntakeTaskName("tatara", "clarify", long, 354)
+	require.NotEqual(t, a, b, "distinct numbers must yield distinct names even when repoRef is fully truncated")
+	require.Contains(t, a, "-353-", "the literal number must appear in the visible name")
+	require.Contains(t, b, "-354-")
+	require.LessOrEqual(t, len(a), v1alpha1.MaxTaskNameLength)
+	require.LessOrEqual(t, len(b), v1alpha1.MaxTaskNameLength)
+}
+
+// F1-1: a wide (64-bit) suffix makes a hash collision across distinct keys
+// astronomically unlikely - the old 32-bit suffix had a ~1% birthday risk at
+// 10k names. Sample distinct numbers on one repo: all names distinct.
+func TestIntakeTaskName_NoCollisionAcrossNumbers(t *testing.T) {
+	seen := map[string]int{}
+	for i := 0; i < 5000; i++ {
+		n := v1alpha1.IntakeTaskName("tatara", "clarify", "tatara-operator", i)
+		if prev, ok := seen[n]; ok {
+			t.Fatalf("collision: number %d and %d both produced %q", prev, i, n)
+		}
+		seen[n] = i
+	}
+}
+
 func TestIntakeTaskName_UppercaseKindStaysDNSSafe(t *testing.T) {
 	n := v1alpha1.IntakeTaskName("tatara", "REVIEW", "tatara-operator", 42)
 	require.LessOrEqual(t, len(n), v1alpha1.MaxTaskNameLength)

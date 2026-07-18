@@ -6,6 +6,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -85,6 +86,57 @@ func tsReconcile(t *testing.T, r *TaskReconciler, proj *tatarav1alpha1.Project,
 		t.Fatalf("reconcileStage: %v", err)
 	}
 	return mdGetTask(t, r.Client, task.Name)
+}
+
+// F6-1 (3-replica HA): the wrapper pod is absent and the LIVE stage has moved off
+// the stage this reconcile is acting on (a non-leader webhook transitioned +
+// tore the pod down). ensureStagePod must NOT create a pod for the stale stage.
+// Cached view: reviewing/no-pod; live reader: merging.
+func TestEnsureStagePod_SkipsCreateWhenLiveStageMoved(t *testing.T) {
+	cachedTask := tsTask("drift", "clarify", tatarav1alpha1.StageReviewing, time.Now())
+	proj := tsProject(3)
+	cached := newMirrorClient(t, proj, mdSecret(), cachedTask)
+	live := newMirrorClient(t, proj, mdSecret(),
+		tsTask("drift", "clarify", tatarav1alpha1.StageMerging, time.Now()))
+	r := tsReconciler(cached)
+	r.APIReader = live
+
+	skipped, err := r.ensureStagePod(context.Background(), proj, cachedTask)
+	if err != nil {
+		t.Fatalf("ensureStagePod: %v", err)
+	}
+	if !skipped {
+		t.Fatal("ensureStagePod must report skipped=true so the caller early-returns instead of submitting a turn")
+	}
+	var pod corev1.Pod
+	err = cached.Get(context.Background(),
+		types.NamespacedName{Namespace: mdNS, Name: agent.PodName(cachedTask)}, &pod)
+	if err == nil {
+		t.Fatal("a pod was created for a stage the Task has live-left; the F6-1 guard did not fire")
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error checking for pod: %v", err)
+	}
+}
+
+// liveStageDiffers: nil APIReader trusts the cache; equal live stage is not
+// stale; a live stage moved off the acting stage is stale.
+func TestLiveStageDiffers(t *testing.T) {
+	acting := tsTask("d", "clarify", tatarav1alpha1.StageReviewing, time.Now())
+	proj := tsProject(3)
+	r := tsReconciler(newMirrorClient(t, proj, acting))
+
+	if r.liveStageDiffers(context.Background(), acting) {
+		t.Fatal("nil APIReader must return false (trust the cache)")
+	}
+	r.APIReader = newMirrorClient(t, proj, tsTask("d", "clarify", tatarav1alpha1.StageReviewing, time.Now()))
+	if r.liveStageDiffers(context.Background(), acting) {
+		t.Fatal("live stage equal to the acting stage must return false")
+	}
+	r.APIReader = newMirrorClient(t, proj, tsTask("d", "clarify", tatarav1alpha1.StageMerging, time.Now()))
+	if !r.liveStageDiffers(context.Background(), acting) {
+		t.Fatal("live stage moved off the acting stage must return true")
+	}
 }
 
 // ---------------------------------------------------------------------------

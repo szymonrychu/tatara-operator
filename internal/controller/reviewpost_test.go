@@ -62,6 +62,37 @@ func pendingReviewFixture(verdict string, round int, sha string) *tatarav1alpha1
 	}
 }
 
+// F6-1: a pending bot review whose owning Task has LEFT reviewing is STALE. A
+// maintainer approval routed through the webhook enters merging directly, and a
+// review pod that raced the F6-1 teardown can re-arm PendingReview afterwards -
+// DrainPendingReview must NOT post it or overwrite the approved reviewedSHA. It is
+// dropped "refused": PendingReview cleared, zero forge posts, reviewedSHA
+// untouched.
+func TestDrainPendingReview_OwningTaskLeftReviewing_DropsStale(t *testing.T) {
+	task := mdTask("t-stale", "clarify", tatarav1alpha1.StageMerging)
+	mr := mdMR(task, "tatara-operator", 8)
+	mr.Status.PendingReview = pendingReviewFixture("approve", 1, "sha-rearmed")
+	mr.Status.ReviewedSHA = "sha-approved"
+
+	base := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, base)
+
+	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	if f.postReviewCalls != 0 {
+		t.Fatalf("PostReview calls = %d, want 0: a review whose task left reviewing must not post", f.postReviewCalls)
+	}
+	got := mdGetMR(t, base, mr.Name)
+	if got.Status.PendingReview != nil {
+		t.Fatal("PendingReview must be cleared when a stale review is dropped")
+	}
+	if got.Status.ReviewedSHA != "sha-approved" {
+		t.Fatalf("reviewedSHA = %q, want sha-approved unchanged: a stale drop must not overwrite the approval", got.Status.ReviewedSHA)
+	}
+}
+
 // ==========================================================================
 // REVIEW POST SURVIVES A CRASH (contract I, fixes V6-4, V7-5, V7-6).
 //

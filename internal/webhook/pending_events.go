@@ -43,6 +43,17 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		return
 	}
 
+	// A folded pull_request_review carries review.id, NOT a comment id (F5-2):
+	// key the mirror comment and the TaskEvent on the review so multiple folded
+	// reviews neither collide on ExternalID "0" nor mis-tag as a plain comment.
+	externalID := strconv.Itoa(ev.CommentID)
+	if ev.IsReview {
+		kind = "mr_review"
+		if ev.ReviewID != "" {
+			externalID = "review-" + ev.ReviewID
+		}
+	}
+
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
@@ -52,7 +63,7 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 	sp := s.cfg.SpillerFor(&proj)
 	if sp != nil {
 		cmt := tatarav1.Comment{
-			ExternalID: strconv.Itoa(ev.CommentID),
+			ExternalID: externalID,
 			Author:     ev.ActorLogin,
 			Body:       ev.CommentBody,
 			CreatedAt:  metav1.Now(),

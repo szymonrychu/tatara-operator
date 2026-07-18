@@ -91,8 +91,11 @@ func (d *StageDriver) forge(ctx context.Context, proj *tatarav1alpha1.Project) (
 	return writer, token, provider, nil
 }
 
-// ownedMergeRequests returns every MergeRequest the Task CONTROLLER-owns.
-func ownedMergeRequests(ctx context.Context, c client.Client, task *tatarav1alpha1.Task) ([]tatarav1alpha1.MergeRequest, error) {
+// ownedMergeRequests returns every MergeRequest the Task CONTROLLER-owns. It
+// takes a client.Reader (not client.Client) so callers can pass the manager's
+// UNCACHED APIReader for the merged-boundary read on the human-review path
+// (F2) - a cached List can lag stampMerged and rewind shipped work.
+func ownedMergeRequests(ctx context.Context, c client.Reader, task *tatarav1alpha1.Task) ([]tatarav1alpha1.MergeRequest, error) {
 	var list tatarav1alpha1.MergeRequestList
 	if err := c.List(ctx, &list, client.InNamespace(task.Namespace)); err != nil {
 		return nil, fmt.Errorf("merge: list mergerequests: %w", err)

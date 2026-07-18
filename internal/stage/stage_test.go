@@ -1793,42 +1793,128 @@ func TestUnparkDoesNotReEnterHandoffStalled(t *testing.T) {
 	}
 }
 
-func TestReenterImplementingOnReview(t *testing.T) {
+func TestReenterOnReviewChangesRequested(t *testing.T) {
 	now := time.Now()
+	const maxTurns = 300
 	cases := []struct {
-		name   string
-		kind   string
-		from   string
-		wantOK bool
+		name       string
+		kind       string
+		from       string
+		reason     string
+		wantOK     bool
+		wantTarget string
 	}{
-		{"from reviewing", "clarify", v1alpha1.StageReviewing, true},
-		{"from merging", "clarify", v1alpha1.StageMerging, true},
-		{"from implementing is redundant", "clarify", v1alpha1.StageImplementing, false},
-		{"kind=review never re-enters", "review", v1alpha1.StageReviewing, false},
-		{"terminal failed not resurrected", "clarify", v1alpha1.StageFailed, false},
-		{"delivered not resurrected", "clarify", v1alpha1.StageDelivered, false},
+		{"from reviewing", "clarify", v1alpha1.StageReviewing, "", true, v1alpha1.StageImplementing},
+		{"from merging", "clarify", v1alpha1.StageMerging, "", true, v1alpha1.StageImplementing},
+		{"from implementing is redundant", "clarify", v1alpha1.StageImplementing, "", false, ""},
+		{"kind=review never re-enters", "review", v1alpha1.StageReviewing, "", false, ""},
+		{"terminal failed not resurrected", "clarify", v1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, false, ""},
+		{"delivered not resurrected", "clarify", v1alpha1.StageDelivered, "", false, ""},
+		{"earlier stage clarifying has no re-entry edge", "clarify", v1alpha1.StageClarifying, "", false, ""},
+		// Parked-origin: routed by StageReason, mirroring Unpark.
+		{"parked merge-timeout -> merging", "clarify", v1alpha1.StageParked, stage.ReasonMergeTimeout, true, v1alpha1.StageMerging},
+		{"parked no-outcome -> implementing", "clarify", v1alpha1.StageParked, stage.ReasonNoOutcome, true, v1alpha1.StageImplementing},
+		{"parked review-loop-exhausted folds", "clarify", v1alpha1.StageParked, stage.ReasonReviewLoopExhausted, false, ""},
+		{"parked stage-deadline folds", "clarify", v1alpha1.StageParked, stage.ReasonStageDeadline, false, ""},
+		{"parked awaiting-human folds (pending-event path handles it)", "clarify", v1alpha1.StageParked, stage.ReasonAwaitingHuman, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: tc.kind}}
 			task.Status.Stage = tc.from
+			task.Status.StageReason = tc.reason
 			ent := metav1.NewTime(now.Add(-time.Hour))
 			task.Status.StageEnteredAt = &ent
 			pod := metav1.NewTime(now.Add(-time.Minute))
 			task.Status.PodStartedAt = &pod
 			var mrs []v1alpha1.MergeRequest
 			if tc.from == v1alpha1.StageReviewing {
-				// A bot review still owed BLOCKS the maintainer re-entry (C.5.3
-				// reviewGateOpen), which then folds to the pending-event path
-				// (Task 4d) - documented here, not re-tested.
+				// PendingReview nil -> reviewGateOpen; a still-owed bot review would
+				// block the reviewing edge and fold (Task 4d).
 				mrs = []v1alpha1.MergeRequest{{Status: v1alpha1.MergeRequestStatus{}}}
 			}
-			ok := stage.ReenterImplementingOnReview(task, mrs, now)
+			ok := stage.ReenterOnReviewChangesRequested(task, mrs, maxTurns, now)
 			require.Equal(t, tc.wantOK, ok)
 			if ok {
-				require.Equal(t, v1alpha1.StageImplementing, task.Status.Stage)
+				require.Equal(t, tc.wantTarget, task.Status.Stage)
 				require.Nil(t, task.Status.PodStartedAt) // Enter's re-arm ran
+			} else {
+				require.Equal(t, tc.from, task.Status.Stage) // untouched on fold
 			}
 		})
 	}
+}
+
+// F3: a maintainer-driven re-entry into implementing zeroes the merge and
+// head-move budgets, so a merging -> implementing -> merging round trip does not
+// carry a spent head-move budget into a premature failed(head-moving).
+func TestReenterOnReviewChangesRequested_ResetsMergeAndHeadBudgets(t *testing.T) {
+	now := time.Now()
+	task := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "clarify"}}
+	task.Status.Stage = v1alpha1.StageMerging
+	ent := metav1.NewTime(now.Add(-time.Hour))
+	task.Status.StageEnteredAt = &ent
+	task.Status.HeadMoveReentries = v1alpha1.MaxHeadMoveReentries
+	task.Status.MergeReentries = v1alpha1.MaxMergeReentries
+
+	require.True(t, stage.ReenterOnReviewChangesRequested(task, nil, 300, now))
+	require.Equal(t, v1alpha1.StageImplementing, task.Status.Stage)
+	require.Zero(t, task.Status.HeadMoveReentries, "fresh implementation gets a fresh head-move budget")
+	require.Zero(t, task.Status.MergeReentries, "fresh implementation gets a fresh merge budget")
+}
+
+// F1: merge-timeout re-entry accounts MergeReentries exactly like Unpark, and
+// folds (does not terminate) once the budget is spent.
+func TestReenterOnReviewChangesRequested_MergeTimeoutAccounting(t *testing.T) {
+	now := time.Now()
+	mk := func(reentries int) *v1alpha1.Task {
+		task := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "clarify"}}
+		task.Status.Stage = v1alpha1.StageParked
+		task.Status.StageReason = stage.ReasonMergeTimeout
+		ent := metav1.NewTime(now.Add(-time.Hour))
+		task.Status.StageEnteredAt = &ent
+		task.Status.MergeReentries = reentries
+		return task
+	}
+	under := mk(v1alpha1.MaxMergeReentries - 1)
+	require.True(t, stage.ReenterOnReviewChangesRequested(under, nil, 300, now))
+	require.Equal(t, v1alpha1.StageMerging, under.Status.Stage)
+	require.Equal(t, v1alpha1.MaxMergeReentries, under.Status.MergeReentries, "one merge re-entry consumed")
+
+	atCap := mk(v1alpha1.MaxMergeReentries)
+	require.False(t, stage.ReenterOnReviewChangesRequested(atCap, nil, 300, now), "budget spent: fold, do not terminate")
+	require.Equal(t, v1alpha1.StageParked, atCap.Status.Stage)
+	require.Equal(t, v1alpha1.MaxMergeReentries, atCap.Status.MergeReentries, "counter not touched on the fold")
+}
+
+// F4: no-outcome re-entry honors Unpark's guards - declines on any merged MR or
+// at the lifetime turn cap instead of bouncing into failed(turn-budget-exhausted).
+func TestReenterOnReviewChangesRequested_NoOutcomeGuards(t *testing.T) {
+	now := time.Now()
+	mk := func(turns int, merged bool) (*v1alpha1.Task, []v1alpha1.MergeRequest) {
+		task := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "clarify"}}
+		task.Status.Stage = v1alpha1.StageParked
+		task.Status.StageReason = stage.ReasonNoOutcome
+		ent := metav1.NewTime(now.Add(-time.Hour))
+		task.Status.StageEnteredAt = &ent
+		task.Status.Stats.Turns = turns
+		var mrs []v1alpha1.MergeRequest
+		if merged {
+			mr := v1alpha1.MergeRequest{}
+			mr.Status.State = "merged"
+			mrs = append(mrs, mr)
+		}
+		return task, mrs
+	}
+	ok, _ := mk(0, false)
+	require.True(t, stage.ReenterOnReviewChangesRequested(ok, nil, 300, now))
+	require.Equal(t, v1alpha1.StageImplementing, ok.Status.Stage)
+
+	atCap, _ := mk(300, false)
+	require.False(t, stage.ReenterOnReviewChangesRequested(atCap, nil, 300, now), "at turn cap: fold")
+	require.Equal(t, v1alpha1.StageParked, atCap.Status.Stage)
+
+	mergedTask, mergedMRs := mk(0, true)
+	require.False(t, stage.ReenterOnReviewChangesRequested(mergedTask, mergedMRs, 300, now), "any merged MR: fold")
+	require.Equal(t, v1alpha1.StageParked, mergedTask.Status.Stage)
 }

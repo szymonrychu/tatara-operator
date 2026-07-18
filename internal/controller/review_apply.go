@@ -15,38 +15,53 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// ApplyReviewChangesRequested re-enters implementing when a maintainer requests
-// changes on a Tatara-owned MR that is NOT yet merged. An already-merged MR is
-// finished (no rewind); a kind=review or terminal Task is not driven (both are
-// refused by ReenterImplementingOnReview / the merged check below). It is the
-// mirror of the review pod's request_changes verdict, but sourced from a human
-// review.
-func ApplyReviewChangesRequested(ctx context.Context, c client.Client,
-	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
+// ApplyReviewChangesRequested routes a maintainer's changes_requested on a
+// Tatara-owned MR that is NOT yet merged back onto the stage machine
+// (stage.ReenterOnReviewChangesRequested). A non-parked reviewing/merging Task
+// re-enters implementing with a fresh merge budget; a parked Task is routed by
+// its park reason (merge-timeout -> merging, no-outcome -> implementing behind
+// its guards, everything else folds). An already-merged MR is finished (no
+// rewind); a kind=review or terminal Task is not driven (refused by
+// ReenterOnReviewChangesRequested / the merged check below).
+//
+// reader is the manager's UNCACHED APIReader. The merged-boundary read and every
+// retry-loop Get use it, not the cached c: stampMerged writes status straight to
+// the apiserver and the informer cache can lag it, so a cached read here could
+// pass the merged gate and rewind a Task whose MR just shipped (F2). Nil reader
+// (unit tests that wire none) falls back to c.
+func ApplyReviewChangesRequested(ctx context.Context, c client.Client, reader client.Reader,
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
-	mrs, err := ownedMergeRequests(ctx, c, task)
-	if err != nil {
-		return false, err
+	rdr := reader
+	if rdr == nil {
+		rdr = c
 	}
-	// The merged/finished boundary is the MergeRequest CR's merged state, NOT the
-	// Task stage: any owned merged MR means the change shipped and must not rewind.
-	for i := range mrs {
-		if mrs[i].Status.State == "merged" || mrs[i].Status.MergedAt != nil {
-			return false, nil
-		}
-	}
+	maxTurns := taskMaxTurns(proj, task)
 
 	key := client.ObjectKeyFromObject(task)
 	reentered := false
 	var prevStage string
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		reentered = false
 		fresh := &tatarav1alpha1.Task{}
-		if err := c.Get(ctx, key, fresh); err != nil {
+		if err := rdr.Get(ctx, key, fresh); err != nil {
 			return err
 		}
+		// Reload owned MRs from the UNCACHED reader INSIDE the loop and re-check
+		// merged, so a merge landing mid-retry cannot rewind shipped work (F2). The
+		// merged/finished boundary is the MergeRequest CR's merged state, NOT the
+		// Task stage: any owned merged MR means the change shipped and must not rewind.
+		mrs, err := ownedMergeRequests(ctx, rdr, fresh)
+		if err != nil {
+			return err
+		}
+		for i := range mrs {
+			if mrs[i].Status.State == "merged" || mrs[i].Status.MergedAt != nil {
+				return nil
+			}
+		}
 		prevStage = fresh.Status.Stage
-		if !stage.ReenterImplementingOnReview(fresh, mrs, now) {
+		if !stage.ReenterOnReviewChangesRequested(fresh, mrs, maxTurns, now) {
 			return nil
 		}
 		if err := c.Status().Update(ctx, fresh); err != nil {
@@ -69,8 +84,9 @@ func ApplyReviewChangesRequested(ctx context.Context, c client.Client,
 				return true, fmt.Errorf("review: delete wrapper pod for %s: %w", task.Name, err)
 			}
 		}
-		log.FromContext(ctx).Info("review: maintainer requested changes; re-entering implementing",
-			"action", "review_reenter_implementing", "resource_id", task.Name)
+		log.FromContext(ctx).Info("review: maintainer requested changes; re-entered stage machine",
+			"action", "review_reenter_implementing", "resource_id", task.Name,
+			"from_stage", prevStage, "to_stage", task.Status.Stage)
 	}
 	return reentered, nil
 }
@@ -80,22 +96,55 @@ func ApplyReviewChangesRequested(ctx context.Context, c client.Client,
 // pending bot review: it clears PendingReview and stamps approved + reviewedSHA
 // on every owned MR, opening reviewGateOpen so the edge is legal. The actual
 // merge still waits on CI-green + mergeability in ReconcileMerging.
-func ApplyReviewApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
+func ApplyReviewApproval(ctx context.Context, c client.Client, reader client.Reader, sp objbudget.Spiller,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, reviewCommitSHA string, now time.Time) (bool, error) {
 
 	if task.Spec.Kind == "review" {
 		return false, nil // a kind=review Task never merges (LegalFor guard 1)
 	}
-	if task.Status.Stage != tatarav1alpha1.StageReviewing {
+	rdr := reader
+	if rdr == nil {
+		rdr = c
+	}
+
+	// Live-confirm reviewing BEFORE tearing anything down. A cached passed-in task
+	// could be stale; the uncached read decides whether this is genuinely the
+	// reviewing pod we may delete.
+	key := client.ObjectKeyFromObject(task)
+	live := &tatarav1alpha1.Task{}
+	if err := rdr.Get(ctx, key, live); err != nil {
+		return false, err
+	}
+	if live.Status.Stage != tatarav1alpha1.StageReviewing {
 		return false, nil // approval arrived off reviewing; fold to the comment path
 	}
-	mrs, err := ownedMergeRequests(ctx, c, task)
+	mrs, err := ownedMergeRequests(ctx, rdr, task)
 	if err != nil {
 		return false, err
 	}
 	if len(mrs) == 0 {
 		return false, nil
 	}
+
+	// F5: delete the in-flight review pod FIRST, before clearing PendingReview.
+	// Otherwise the pod's own /outcome can re-arm PendingReview in the window
+	// between our clear and merging, and DrainPendingReview then posts a redundant
+	// bot review that overwrites reviewedSHA - which fires a spurious
+	// merging -> reviewing head-moved bounce. The maintainer's approval is
+	// authoritative; the bot review is moot. reviewing is always a pod stage
+	// (AgentReview), so there is always a pod to tear down, and this write races
+	// the driver's own reconcile loop outside EnterStage.
+	//
+	// Accepted degradation bound: if the pod delete succeeds but the subsequent
+	// clear/enter fails and the forge exhausts redelivery, recovery is bounded and
+	// self-healing. On any redelivery both appliers are idempotent (the clear and
+	// the reviewing -> merging edge re-apply cleanly), so a later delivery finishes
+	// the transition; absent redelivery, the deleted review pod is recreated by the
+	// reconciler and its fresh verdict simply overrides - the Task never strands.
+	if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
+		return false, fmt.Errorf("review: delete wrapper pod for %s: %w", task.Name, err)
+	}
+
 	for i := range mrs {
 		mrKey := client.ObjectKeyFromObject(&mrs[i])
 		thisSHA := reviewCommitSHA
@@ -109,17 +158,16 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, sp objbudget.Spil
 			return false, fmt.Errorf("review: settle mr %s: %w", mrKey.Name, err)
 		}
 	}
-	fresh, err := ownedMergeRequests(ctx, c, task) // reload so reviewGateOpen sees the cleared copies
+	fresh, err := ownedMergeRequests(ctx, rdr, task) // reload so reviewGateOpen sees the cleared copies
 	if err != nil {
 		return false, err
 	}
 
-	key := client.ObjectKeyFromObject(task)
 	advanced := false
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		advanced = false
 		t := &tatarav1alpha1.Task{}
-		if err := c.Get(ctx, key, t); err != nil {
+		if err := rdr.Get(ctx, key, t); err != nil {
 			return err
 		}
 		if t.Status.Stage != tatarav1alpha1.StageReviewing {
@@ -139,12 +187,6 @@ func ApplyReviewApproval(ctx context.Context, c client.Client, sp objbudget.Spil
 		return false, fmt.Errorf("review: enter merging on %s: %w", task.Name, err)
 	}
 	if advanced {
-		// reviewing is always a pod stage (AgentReview); tear it down for the same
-		// reason ApplyReviewChangesRequested does - this write races the driver's
-		// own reconcile loop, outside EnterStage.
-		if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
-			return true, fmt.Errorf("review: delete wrapper pod for %s: %w", task.Name, err)
-		}
 		log.FromContext(ctx).Info("review: maintainer approved; entering merging",
 			"action", "review_enter_merging", "resource_id", task.Name)
 	}

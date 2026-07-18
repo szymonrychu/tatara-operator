@@ -88,6 +88,26 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	if err != nil {
 		return err
 	}
+
+	// A pending bot review is valid ONLY while the owning Task is reviewing. If the
+	// Task has advanced off reviewing by another path, this pending review is STALE
+	// and must not post. The path that matters: a maintainer approval routed through
+	// the webhook enters merging DIRECTLY (clearing PendingReview), and a review pod
+	// that raced the F6-1 teardown window can RE-ARM PendingReview afterwards -
+	// posting it would put a contradictory bot review over the human's approval and
+	// overwrite reviewedSHA, firing a spurious merging -> reviewing head-moved
+	// bounce and defeating WS1-A's F5 fix. Drop the stale intent WITHOUT stamping a
+	// verdict or SHA (verdict "refused"). advanceAfterReview gates the ADVANCE on
+	// this same reviewing check; this gates the POST. The cached owning-task read is
+	// fresh by construction: the re-arm write that triggers this reconcile lands a
+	// full review-turn AFTER the transition it raced.
+	if task != nil && task.Status.Stage != tatarav1alpha1.StageReviewing {
+		l.Info("review: owning task left reviewing; dropping the stale pending review without posting",
+			"action", "review_drain_skipped_stale", "resource_id", mr.Name,
+			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "task_stage", task.Status.Stage)
+		return d.clearPendingReview(ctx, proj, mr, pr, "refused")
+	}
+
 	writer, token, provider, err := d.forge(ctx, proj)
 	if err != nil {
 		return err

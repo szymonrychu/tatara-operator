@@ -6,6 +6,78 @@
 
 - 2026-07-18 (fix/auto-approve-proposals-wiring, security-review-fix pass, 4 items) Independent security review returned merge-ready (no Critical/Important); owner KEPT the stricter "maintainer non-approval comment blocks auto-approve" behavior. Closed 4 follow-ups. **M1 (doc):** project_types.go AutoApproveTataraProposals doc now states the marker is stamped UNCONDITIONALLY by the filers, so flag-off still changes the stored issue body (marker present but inert - intentional, lets a later flag-flip auto-approve proposals filed while off) while gate BEHAVIOR with the flag off is exactly today's. **M2 (test):** added the empty-botLogin matrix row (project Spec.Scm.BotLogin=="" => refuse; the axis-3 check existed but was untested). **M3 (audit metric):** wired the pre-existing-but-uncalled `operator_auto_approve_total{kind}` counter (obs.AutoApproveTotal) at BOTH Auto-evidence persist sites - outcome.go clarify() (primary: proposal reaches implement via clarify submit) and VerifyApprovalDetailed's persist block (secondary: multi-issue ReVerifyParked). Threaded `metrics *obs.OperatorMetrics` (nil-safe) into VerifyApprovalDetailed + ReVerifyParked; VerifyApproval keeps its signature (passes nil) to avoid churning its many test callers; webhook passes s.cfg.Metrics. Counter increments only on the transition (issue not already approved), so no double-count. Added obs.AutoApproveCounter test accessor. **M4 (tamper-evidence, NEW REQUIREMENT):** a bot-proposal body edited since filing must NOT auto-approve - guards the incoming issue-edit body-refresh workstream (today safe only because Task.Spec.Goal is frozen + issues.edited ignored). Chose an embedded content fingerprint over a CRD field: marker is now `<!-- tatara-proposed-by:<kind> content-sha256:<64hex> -->`, hash computed over the filing-time body (normalized: CRLF->LF + both-ends TrimSpace, so cosmetic reformat is tolerated, interior edits are not). `ProposalBodyMatchesFingerprint` strips the marker back out and recomputes; autoApproveApplies now requires marker present AND fingerprint match. Fail-closed: no marker / no fingerprint / mismatch / marker removal all refuse; flag-off untouched. Self-contained in api/v1alpha1 (no CRD field, so no non-refreshed-status-field problem; the fingerprint travels in the body through the mirror). New matrix rows: empty-botLogin-refused, edited-body-refused. Gate: `make generate manifests test lint build` green.
 
+- 2026-07-18 (webhook-primary architecture) Reactive intake is coordinated by
+  IDEMPOTENT NATURAL-KEY dedup, NOT an in-process lock. Webhook and sweep both
+  funnel through `controller.Minter.MintForItem`; the Task carries a
+  deterministic name (`IntakeTaskName(project,kind,repo,number)`), a live
+  (uncached APIReader) pre-check, and `IgnoreAlreadyExists` on Create - so the
+  apiserver, not a cached List, is the arbiter. Rejected the wait-lock: it only
+  coordinates within one process, breaks under leader failover / rolling
+  deploys, and adds a stuck-lock failure mode. This is the controller-runtime
+  FAQ / Flux / ArgoCD precedent. (spec 2026-07-17-webhook-primary-reactivity.)
+- 2026-07-18 (WS1-A guard, flagged for WS1-B) `handleReview`'s terminal guard
+  is `TaskDone(task) && Stage != StageParked` (server.go): a truly-terminal
+  Task is dropped, but a PARKED Task reaches the appliers, which route it by
+  park reason (`ReenterOnReviewChangesRequested`): merge-timeout -> merging
+  (MergeReentries accounting, FOLDS at `MaxMergeReentries` rather than
+  terminating), no-outcome -> implementing behind Unpark's guards, every other
+  reason folds to the pending-event path. A human review must not escape a
+  cap (review-loop-exhausted, stage-deadline) one review at a time.
+- 2026-07-18 (WS1-B F6-1, corrected) Human-review appliers write stage + delete
+  the wrapper pod from the webhook HTTP goroutine, which runs on EVERY replica;
+  reconcilers are leader-only. Production is 3-replica HA (leaderElection: 1
+  active + 2 standby, tatara-helmfile values/tatara-operator/default.yaml:2), so
+  a non-leader applying a transition + pod-delete against the leader's reconcile
+  is PERMANENT STEADY STATE on every human review, NOT a rolling-deploy
+  transient (an earlier note claiming replicaCount:1 was factually wrong - fixed
+  at root, not documented away). Two fixes: (1) the webhook resolves the owning
+  Task through the uncached APIReader, so `reviewAlreadyProcessed` + `TaskDone`
+  are authoritative across replicas (closes double STAGE-apply). (2) The
+  pod-recreate race is closed at the controller. `refreshTaskFromAPI` already
+  live-adopts the stage at dispatch top, so the residual hole is the intermediate
+  window in ApplyReviewApproval (WS1-A F5 deletes the pod BEFORE the merging write
+  lands, so a live read there still reads reviewing): `TaskReconciler.liveStageDiffers`
+  re-reads live in the pod-absent (re)spawn branches and skips create/respawn once
+  the stage moved (narrows the phantom spawn, generic to any non-leader
+  transition), and `DrainPendingReview` now GATES on the owning Task being in
+  reviewing - if the Task advanced off reviewing (a maintainer approval enters
+  merging directly and a raced review pod re-arms PendingReview afterwards), the
+  stale pending review is dropped "refused" without posting or overwriting
+  ReviewedSHA. That gate is the load-bearing correctness guard (advanceAfterReview
+  gates the ADVANCE on the same reviewing check; this gates the POST); the pod
+  guard is spawn/cost prevention + defense. Route-through-leader (annotate-to-poke)
+  was rejected: it would unwire WS1-A's webhook->applier call sites for no
+  correctness gain over the two gates.
+- 2026-07-18 (WS1-B F5-2 follow-up) A folded review now mirrors as ExternalID
+  "review-<reviewID>"; a subsequent forge thread RE-SCAN (mirror.go cadence sync)
+  fetches the SAME comment under the forge's NUMERIC comment id, so the mirror can
+  briefly hold two rows for one review-comment until dedup/eviction converges.
+  Cosmetic (mirror is byte-budget-evicted set-union, not a source of truth for
+  dedup); revisit only if it shows up as duplicated review text in a bundle.
+  Also: handleIssueOpened's Mark-then-mint-then-Clear is a deliberate double write
+  on the happy path - Mark MUST precede the mint so a mint failure (5xx) leaves
+  the sweep its cold-start marker; do NOT "optimize" it to mint-first.
+- 2026-07-18 (WS1-B F8-1/F6 dedup scheme) Human-review (review.id,state) dedup
+  is now ONE bounded annotation `tatara.dev/reviewed` (was one
+  `tatara.dev/reviewed-<reviewID>` key per review). Value is a drop-oldest FIFO
+  of up to 32 `<hash>:<state>` entries, hash = `sha256(reviewID)[:12]`. Fixes
+  both the k8s 63-char annotation-NAME overflow (GitLab synthesizes
+  `gl-approve-<IID>-<40hexsha>`, which blew the limit for IID>=100 so GitLab
+  dedup silently never persisted) and the unbounded key growth on long-lived
+  Tasks. A failed stamp now returns 5xx so the forge REDELIVERS (both appliers
+  are idempotent): a lost dedup marker is worse than a redundant re-apply.
+- 2026-07-18 (WS1-B F1-1 naming) `IntakeTaskName` now embeds the LITERAL
+  issue/PR number and a 64-bit (16-hex) sha suffix:
+  `mt-<kindInitial>-<repoRef>-<number>-<16hex>`. The old `<8hex>`-only scheme
+  hid the number inside the hash (32-bit), so distinct natural keys could
+  birthday-collide, and the loser's Issue mirror was never owned - silent
+  permanent starvation. No migration: `IntakeTaskName` is new in this branch
+  (absent on main) and the branch has never deployed, so no old-scheme Task
+  can exist. F5-1: orphan-COMMENT mint is restricted to `!ev.IsPR` - an orphan
+  PR comment used the COMMENTER as PR author (ClassifyPR's bot-ignore keys on
+  the real author), fabricating authorship; the PR-open webhook + sweep already
+  cover PRs, so orphan-issue-comment mint is preserved and PR mint is dropped.
+
 - 2026-07-17 (Task 5, dead-cron cleanup) Deleted the confirmed-dead `cdScan` /
   `healthCheck` cron surface: `CDScanActivity`, `HealthCheckActivity`,
   `ScmCron.CDScan`, `ScmCron.HealthCheck`, `ProjectStatus.LastCDScan`,

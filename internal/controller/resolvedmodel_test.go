@@ -77,7 +77,7 @@ func TestEnsureStagePod_StampsResolvedModel(t *testing.T) {
 		},
 	}
 
-	if err := r.ensureStagePod(ctx, proj, task); err != nil {
+	if _, err := r.ensureStagePod(ctx, proj, task); err != nil {
 		t.Fatalf("ensureStagePod: %v", err)
 	}
 
