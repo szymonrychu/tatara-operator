@@ -46,7 +46,15 @@ type Config struct {
 	// extra labels stamped on that ServiceMonitor + PrometheusRule so the cluster
 	// Prometheus serviceMonitorSelector / ruleSelector match them. Empty keeps the
 	// chart cluster-agnostic (rule 14); the deploying helmfile sets the label.
-	MemoryMonitorLabels      map[string]string
+	MemoryMonitorLabels map[string]string
+	// MemoryTopologyKey (MEMORY_TOPOLOGY_KEY) is the node-topology domain the
+	// per-Project memory stack (lightrag/neo4j/pg/api) spreads its pods across
+	// via pod anti-affinity + topologySpreadConstraints (issue #365). Empty
+	// (default) keeps the chart cluster-agnostic (rule 14); the memory builders
+	// resolve empty to "kubernetes.io/hostname", and the deploying helmfile can
+	// override it with a rack/zone label. Mirrors the AGENT_SCHEDULING precedent:
+	// a global operator env var, NOT a per-Project CRD field.
+	MemoryTopologyKey        string
 	OpenAISecretName         string
 	SemanticModel            string
 	IngesterImage            string
@@ -463,6 +471,7 @@ func Load() (Config, error) {
 		LeaderElection:             leaderElection,
 		MemoryMonitoringEnabled:    memoryMonitoringEnabled,
 		MemoryMonitorLabels:        memoryMonitorLabels,
+		MemoryTopologyKey:          os.Getenv("MEMORY_TOPOLOGY_KEY"),
 		PushMetricsTTL:             pushMetricsTTL,
 		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
 		IdlePodReapAfter:           idlePodReapAfter,

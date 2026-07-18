@@ -54,6 +54,14 @@ type Config struct {
 	// the chart stays cluster-agnostic (rule 14); the deploying helmfile sets the
 	// label the cluster actually matches on.
 	MonitorLabels map[string]string
+	// TopologyKey is the node-topology domain the memory-stack spreading rules
+	// (pod anti-affinity + topologySpreadConstraints) fan pods across. Empty
+	// (default) resolves to "kubernetes.io/hostname" in topologyKey(), so a
+	// zero-value Config still spreads per node. Sourced from the operator env var
+	// MEMORY_TOPOLOGY_KEY (mirrors the AGENT_SCHEDULING precedent); kept
+	// cluster-agnostic (rule 14) so the deploying helmfile picks a rack/zone label
+	// when the cluster has one.
+	TopologyKey string
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.
