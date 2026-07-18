@@ -43,6 +43,15 @@
   coexists / ages out as a debugging artifact" is not literally reachable under
   deterministic naming; the intent (no leaked PR, one active fresh clarify,
   gate-safe) is preserved. Leader-only; the reaper is the backstop.
+  RESUME READS THE ISSUE MIRROR LIVE (uncached APIReader, resume.go `liveIssue`):
+  on the DIRECT-MINT path (old kind != clarify -> no IntakeTaskName collision ->
+  fresh Task created in the SAME pass) a lagging cache would hide the webhook's
+  just-appended reply, humanHasLastWord would be false, and the fresh Task would
+  mint parked(backlog-sweep) - needing a SECOND reply. The live read preserves the
+  one-reply guarantee (#348/#352 discipline). resumeOne severs ALL open issues
+  BEFORE any MintForItem so a collision-delete of the old Task cannot hard-fault a
+  later in-loop sever; SeverIssueFromTask ALSO tolerates a gone Task (refs moot)
+  and still orphans the issue's own ownerRef so an unsevered issue never cascades.
 - 2026-07-18 (WS3 accepted-ignored inventory) Documented in handleForgeItem's
   routing default: issues.unlabeled (no body change), pull_request.edited /
   ready_for_review, pull_request_review state=dismissed + GitLab MR unapproved

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -77,13 +79,13 @@ func (r *ProjectReconciler) resumeOne(ctx context.Context, proj *tatarav1alpha1.
 	if err != nil {
 		return err
 	}
-	open := make([]tatarav1alpha1.Issue, 0, len(issues))
+	var openNames []string
 	for i := range issues {
 		if issues[i].Status.State == "open" {
-			open = append(open, issues[i])
+			openNames = append(openNames, issues[i].Name)
 		}
 	}
-	if len(open) == 0 {
+	if len(openNames) == 0 {
 		return nil // the reply is not on a live owned issue (a closed issue is the I3 path).
 	}
 
@@ -94,23 +96,69 @@ func (r *ProjectReconciler) resumeOne(ctx context.Context, proj *tatarav1alpha1.
 		return err
 	}
 
-	for i := range open {
-		iss := &open[i]
-		r.stripForgeParkedLabel(ctx, proj, iss) // best-effort operator-on-promotion (F.6)
-		if err := SeverIssueFromTask(ctx, r.Client, t, iss.Name, SeverOrphan); err != nil {
-			return err
-		}
-		repo, err := r.repositoryFor(ctx, proj.Namespace, iss.Spec.RepositoryRef)
+	// Sever ALL owned open issues BEFORE any MintForItem. On the collision path
+	// (old Task kind == clarify, same IntakeTaskName) the FIRST mint deletes the old
+	// stale-terminal Task, which would make a later in-loop sever hard-fault; doing
+	// every Task-side IssueRefs clear up front removes that window (and sever now
+	// tolerates a gone Task anyway). Each issue is LIVE-READ off the uncached
+	// APIReader so the webhook's just-appended human reply is ALWAYS visible at mint
+	// time (mirrors the #348/#352 live-read discipline): otherwise, on the
+	// direct-mint path (old Task kind != clarify, so MintForItem creates the fresh
+	// Task in THIS pass), a lagging cache hides the reply, humanHasLastWord is false,
+	// the fresh Task mints parked(backlog-sweep), and - IssueRefs already cleared -
+	// the human needs a SECOND reply. The live read preserves the one-reply guarantee.
+	type mintJob struct {
+		item ForgeItem
+		repo *tatarav1alpha1.Repository
+		name string
+	}
+	var jobs []mintJob
+	for _, name := range openNames {
+		live, err := r.liveIssue(ctx, proj.Namespace, name)
 		if err != nil {
 			return err
 		}
-		if _, _, err := r.minter().MintForItem(ctx, proj, repo, forgeItemFromMirror(iss), false, nil); err != nil {
+		if live == nil {
+			continue // already gone (concurrent reap): nothing to re-adopt.
+		}
+		r.stripForgeParkedLabel(ctx, proj, live) // best-effort operator-on-promotion (F.6)
+		if err := SeverIssueFromTask(ctx, r.Client, t, name, SeverOrphan); err != nil {
+			return err
+		}
+		repo, err := r.repositoryFor(ctx, proj.Namespace, live.Spec.RepositoryRef)
+		if err != nil {
+			return err
+		}
+		jobs = append(jobs, mintJob{item: forgeItemFromMirror(live), repo: repo, name: name})
+	}
+
+	for _, j := range jobs {
+		if _, _, err := r.minter().MintForItem(ctx, proj, j.repo, j.item, false, nil); err != nil {
 			return err
 		}
 		log.FromContext(ctx).Info("resumed a no-re-entry park from a human reply: re-minted the issue fresh",
-			"action", "resume_remint", "resource_id", iss.Name, "old_task", t.Name, "reason", t.Status.StageReason)
+			"action", "resume_remint", "resource_id", j.name, "old_task", t.Name, "reason", t.Status.StageReason)
 	}
 	return nil
+}
+
+// liveIssue reads an Issue mirror through the UNCACHED APIReader (falling back to
+// the cached Client when none is wired, as in unit tests), so the WS3-I4 re-mint
+// sees the webhook's just-appended human reply. A NotFound returns (nil, nil): the
+// issue was reaped concurrently and there is nothing to re-adopt.
+func (r *ProjectReconciler) liveIssue(ctx context.Context, ns, name string) (*tatarav1alpha1.Issue, error) {
+	var rdr client.Reader = r.Client
+	if r.APIReader != nil {
+		rdr = r.APIReader
+	}
+	iss := &tatarav1alpha1.Issue{}
+	if err := rdr.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, iss); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resume: live-read issue %s: %w", name, err)
+	}
+	return iss, nil
 }
 
 // closeTaskBotMRs closes every OPEN bot PR the Task OWNS on the forge, with NO

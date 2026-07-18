@@ -55,11 +55,18 @@ func SeverIssueFromTask(ctx context.Context, c client.Client, task *tatarav1alph
 
 	l := log.FromContext(ctx)
 
-	// STEP 1 (Task side FIRST): drop issueName from Status.IssueRefs.
+	// STEP 1 (Task side FIRST): drop issueName from Status.IssueRefs. A gone Task
+	// (NotFound) is SUCCESS, not an error: its collision-delete already ran (the I4
+	// re-mint stale-terminal path), so its refs are moot - but we STILL fall through
+	// to step 2 so the issue's OWN ownerRef is dropped and it does not cascade with
+	// the deleted Task.
 	taskKey := client.ObjectKeyFromObject(task)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
 		if err := c.Get(ctx, taskKey, fresh); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil // task gone: refs moot; step 2 still orphans the issue.
+			}
 			return err
 		}
 		before := len(fresh.Status.IssueRefs)

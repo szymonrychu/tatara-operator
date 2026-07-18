@@ -186,3 +186,80 @@ func TestEnqueueDeployTimeoutComment_DoesNotClobberRefireCooldown(t *testing.T) 
 	require.NotNil(t, got.Status.LastDeployTimeoutCommentAt, "the deploy-timeout marker is set")
 	require.Equal(t, refireAt.Unix(), got.Status.LastRefireCommentAt.Unix(), "the incident-refire cooldown must be untouched")
 }
+
+// TestResumeNoReentryPark_DirectMintActiveSamePass is the direct-mint path: the
+// old Task's kind is NOT clarify (e.g. incident), so the fresh clarify mint does
+// NOT collide on IntakeTaskName and is created ACTIVE in the SAME pass off
+// humanHasLastWord. The old Task survives (coexists / ages out).
+func TestResumeNoReentryPark_DirectMintActiveSamePass(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("resume")
+	repo := reapRepo("resume", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	issName := tatarav1alpha1.IssueName("tatara-operator", 1)
+
+	old := reapTask("resume", "inc-task", "incident", tatarav1alpha1.StageParked,
+		stage.ReasonStageDeadline, time.Now().Add(-time.Hour))
+	old.Status.IssueRefs = []string{issName}
+	old.Status.PendingEvents = []tatarav1alpha1.TaskEvent{
+		{At: metav1.Now(), Kind: "issue_comment", Author: "maintainer", Body: "please continue"},
+	}
+	iss := ownedIssue(issName, 1, old, tatarav1alpha1.IssueStatus{
+		State:    "open",
+		Comments: []tatarav1alpha1.Comment{{ExternalID: "c1", Author: "maintainer", Body: "please continue"}},
+	})
+	c := newMirrorClient(t, proj, repo, reapSecret(), old, iss)
+	r := reapReconciler(c, &resumeWriter{})
+
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+	freshName := tatarav1alpha1.IntakeTaskName("resume", SweepIssueKind, "tatara-operator", 1)
+	fresh, ok := mustGetTask(t, c, freshName)
+	require.True(t, ok, "one reply -> one fresh clarify task in the same pass (no collision)")
+	require.Equal(t, tatarav1alpha1.StageTriaging, fresh.Spec.InitialStage, "humanHasLastWord -> active, not parked")
+	_, oldOK := mustGetTask(t, c, "inc-task")
+	require.True(t, oldOK, "the non-colliding old task coexists / ages out")
+}
+
+// TestResumeNoReentryPark_DirectMintCacheLagStillActive: the CACHED mirror is
+// missing the human reply, but the uncached APIReader has it. The live read in
+// resumeOne must make the reply visible at mint time so the fresh Task still lands
+// ACTIVE - the one-reply guarantee holds under Issue-CR cache lag.
+func TestResumeNoReentryPark_DirectMintCacheLagStillActive(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("resume")
+	repo := reapRepo("resume", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	issName := tatarav1alpha1.IssueName("tatara-operator", 1)
+
+	mkTask := func() *tatarav1alpha1.Task {
+		task := reapTask("resume", "inc-task", "incident", tatarav1alpha1.StageParked,
+			stage.ReasonStageDeadline, time.Now().Add(-time.Hour))
+		task.Status.IssueRefs = []string{issName}
+		task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{
+			{At: metav1.Now(), Kind: "issue_comment", Author: "maintainer", Body: "please continue"},
+		}
+		return task
+	}
+
+	// Cached store: the reply has NOT landed in the mirror yet (bot-last / empty).
+	cachedIss := ownedIssue(issName, 1, mkTask(), tatarav1alpha1.IssueStatus{State: "open"})
+	cached := newMirrorClient(t, proj, repo, reapSecret(), mkTask(), cachedIss)
+
+	// Live store: the SAME issue, WITH the human reply as the last comment.
+	liveIss := ownedIssue(issName, 1, mkTask(), tatarav1alpha1.IssueStatus{
+		State:    "open",
+		Comments: []tatarav1alpha1.Comment{{ExternalID: "c1", Author: "maintainer", Body: "please continue"}},
+	})
+	live := newMirrorClient(t, proj, repo, reapSecret(), mkTask(), liveIss)
+
+	r := &ProjectReconciler{
+		Client: cached, APIReader: live, Scheme: cached.Scheme(),
+		SCMFor: func(string) (scm.SCMWriter, error) { return &resumeWriter{}, nil },
+	}
+	require.NoError(t, r.resumeNoReentryParks(ctx, proj, time.Now()))
+
+	freshName := tatarav1alpha1.IntakeTaskName("resume", SweepIssueKind, "tatara-operator", 1)
+	fresh, ok := mustGetTask(t, cached, freshName)
+	require.True(t, ok, "the fresh task is minted despite the cached mirror lagging the reply")
+	require.Equal(t, tatarav1alpha1.StageTriaging, fresh.Spec.InitialStage,
+		"the live read makes the reply visible -> humanHasLastWord -> ACTIVE, not a second-reply park")
+}
