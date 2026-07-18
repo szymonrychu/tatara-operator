@@ -15,7 +15,6 @@ Planned work not yet started. One line per item; link to plans for detail.
 Open, out of scope, deliberately not done:
 
 - [ ] **Remove the superseded `documentationScan`** (+ `createDocumentationTask`, `documentationInFlightProject`, `oldestCommitSHA`/`latestCommitSHA`, `documentation_guard_test.go`). The 2026-07-13 wiring pass swapped the documentation cron to `MintDocBatch` (F2 nightly batch); `documentationScan` (per-changed-repo diff model) is now dead in production but still test-referenced (lint-safe). Delete once its QueuedEvent doc-kind path is confirmed unused.
-- [ ] **`restapi.Config.Spiller` / `.CIFor` / `.Memory` are unset in wire.go** (adjacent to W1). Spiller nil => an over-budget `/outcome` write aborts instead of spilling; CIFor nil => `GET /projects/{p}/scm/ci` 501s; Memory nil => `task_context(notes=all)` cannot rehydrate spilled notes. Not in the W1 scope (which was `Approval`); wire per-project like the reconcilers if these paths are needed.
 - [ ] **#365: memory-stack anti-affinity/topologySpreadConstraints.** Follow-up from issue #355
   (memory-provisioning stream D) and #327: `internal/memory/memory_builders.go` sets no pod
   anti-affinity/topologySpreadConstraints on the cnpg PGCluster/Neo4jStatefulSet/LightragDeployment/

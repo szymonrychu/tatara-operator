@@ -8,9 +8,12 @@ import (
 	"time"
 
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
+	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/config"
 	"github.com/szymonrychu/tatara-operator/internal/ingest"
+	"github.com/szymonrychu/tatara-operator/internal/memclient"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestPodConfigFromConfig(t *testing.T) {
@@ -235,5 +238,55 @@ func TestMemoryConfigFromConfig(t *testing.T) {
 	}
 	if mc.ProvisioningTimeout != 45*time.Minute {
 		t.Fatalf("ProvisioningTimeout = %v, want 45m", mc.ProvisioningTimeout)
+	}
+}
+
+// TestNewMemoryFor_ReturnsPerProjectNoteFetcher covers issue #345 fault (3):
+// restapi.Config.MemoryFor must resolve a fresh tatara-memory client per
+// Project (mirroring newSpillerFor), not one flat instance shared across
+// every project's rehydrate call. mgr is unused by the resolver body (same
+// as newSpillerFor), so nil is safe here.
+func TestNewMemoryFor_ReturnsPerProjectNoteFetcher(t *testing.T) {
+	cfg := config.Config{
+		OIDCIssuer:               "https://kc/realms/tatara",
+		OperatorOIDCClientID:     "tatara-operator",
+		OperatorOIDCClientSecret: "secret",
+	}
+	memoryFor := newMemoryFor(nil, cfg)
+
+	projA := &tataradevv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha"},
+		Status:     tataradevv1alpha1.ProjectStatus{Memory: &tataradevv1alpha1.MemoryStatus{Endpoint: "http://tatara-memory.alpha.svc:8080"}},
+	}
+	projB := &tataradevv1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "beta"},
+		Status:     tataradevv1alpha1.ProjectStatus{Memory: &tataradevv1alpha1.MemoryStatus{Endpoint: "http://tatara-memory.beta.svc:8080"}},
+	}
+
+	a := memoryFor(projA)
+	b := memoryFor(projB)
+	if a == nil || b == nil {
+		t.Fatalf("newMemoryFor resolver returned nil: a=%v b=%v", a, b)
+	}
+	ac, ok := a.(*memclient.Client)
+	if !ok {
+		t.Fatalf("newMemoryFor(%s) did not return *memclient.Client: %T", projA.Name, a)
+	}
+	bc, ok := b.(*memclient.Client)
+	if !ok {
+		t.Fatalf("newMemoryFor(%s) did not return *memclient.Client: %T", projB.Name, b)
+	}
+	if ac == bc {
+		t.Fatal("newMemoryFor returned the SAME *memclient.Client instance for two different projects: " +
+			"per-project resolution is required because each Project has its own tatara-memory endpoint")
+	}
+
+	// A project whose memory stack is not up yet (Status.Memory nil) must not
+	// panic the resolver - it resolves to a client dialing an empty endpoint,
+	// which fails the write/fetch at request time (existing Fit*/rehydrate
+	// error handling), not at construction time.
+	projC := &tataradevv1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "gamma"}}
+	if got := memoryFor(projC); got == nil {
+		t.Fatal("newMemoryFor must not return nil for a project with no memory status yet")
 	}
 }

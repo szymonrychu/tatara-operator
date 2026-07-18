@@ -210,7 +210,7 @@ func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
 	notes := task.Status.Notes
 	notesTotal := 0
 	if r.URL.Query().Get("notes") == "all" {
-		rehydrated, err := s.rehydrateNotes(ctx, task)
+		rehydrated, err := s.rehydrateNotes(ctx, proj, task)
 		if err != nil {
 			s.log.ErrorContext(ctx, "restapi: rehydrating spilled notes failed",
 				append(reqLogFields(r), "task", task.Name, "error", err)...)
@@ -237,17 +237,18 @@ func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
 // spill order (stats.notesSpilledRefs ACCUMULATES, oldest batch first), so the
 // notes=all bundle renders the FULL history. This is the read path the
 // <notes ... fetch=...> marker names.
-func (s *Server) rehydrateNotes(ctx context.Context, task *tatarav1alpha1.Task) ([]tatarav1alpha1.Note, error) {
+func (s *Server) rehydrateNotes(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) ([]tatarav1alpha1.Note, error) {
 	refs := task.Status.Stats.NotesSpilledRefs
 	if len(refs) == 0 {
 		return nil, nil
 	}
-	if s.memory == nil {
+	memory := s.memoryForOrNil(proj)
+	if memory == nil {
 		return nil, errors.New("restapi: no tatara-memory client configured")
 	}
 	var out []tatarav1alpha1.Note
 	for _, ref := range refs {
-		raw, err := s.memory.Fetch(ctx, ref)
+		raw, err := memory.Fetch(ctx, ref)
 		if err != nil {
 			return nil, fmt.Errorf("fetch spilled notes %q: %w", ref, err)
 		}
@@ -297,6 +298,11 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 		writeClientErr(w, err)
 		return
 	}
+	proj, err := s.getProjectCR(ctx, task.Spec.ProjectRef)
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
 	if tatarav1alpha1.StageTerminal(task) {
 		writeError(w, http.StatusConflict, "task is in a terminal stage")
 		return
@@ -316,19 +322,21 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 		Body:  truncateValidUTF8(req.Body, noteBodyMaxBytes),
 	}
 
+	spiller := s.spillerForOrNil(proj)
+
 	// The 50-note cap: spill the OLDEST batch to tatara-memory ONCE, outside
 	// the retry loop (a spill is a non-idempotent network call), then let the
 	// pure trim re-run on every conflict.
 	spillN := len(task.Status.Notes) + 1 - maxNotes
 	trackID := ""
 	if spillN > 0 {
-		if s.spiller == nil {
+		if spiller == nil {
 			writeError(w, http.StatusInternalServerError, "internal error")
 			s.log.ErrorContext(ctx, "restapi: note cap reached with no spiller configured",
 				append(reqLogFields(r), "task", task.Name)...)
 			return
 		}
-		trackID, err = s.spiller.Spill(ctx, "Task", task.Name, task.Status.Notes[:spillN])
+		trackID, err = spiller.Spill(ctx, "Task", task.Name, task.Status.Notes[:spillN])
 		if err != nil {
 			s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
 				append(reqLogFields(r), "task", task.Name, "error", err)...)
@@ -338,7 +346,7 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := types.NamespacedName{Namespace: s.ns, Name: task.Name}
-	err = objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	err = objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.Notes = append(t.Status.Notes, note)
 		if spillN > 0 && len(t.Status.Notes) > maxNotes {
 			drop := len(t.Status.Notes) - maxNotes
@@ -1080,13 +1088,13 @@ func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
 	if err := s.c.Status().Update(ctx, iss); err != nil {
 		return fmt.Errorf("seed issue CR status %s: %w", name, err)
 	}
-	return s.appendTaskRef(ctx, task.Name, name, "")
+	return s.appendTaskRef(ctx, proj, task.Name, name, "")
 }
 
 // appendTaskRef appends an issue / MR CR name to the Task's ref list.
-func (s *Server) appendTaskRef(ctx context.Context, taskName, issueRef, mrRef string) error {
+func (s *Server) appendTaskRef(ctx context.Context, proj *tatarav1alpha1.Project, taskName, issueRef, mrRef string) error {
 	key := types.NamespacedName{Namespace: s.ns, Name: taskName}
-	return objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	return objbudget.FitTask(ctx, s.c, s.spillerForOrNil(proj), key, func(t *tatarav1alpha1.Task) {
 		if issueRef != "" && !contains(t.Status.IssueRefs, issueRef) {
 			t.Status.IssueRefs = append(t.Status.IssueRefs, issueRef)
 			t.Status.Stats.IssueCount = len(t.Status.IssueRefs)
@@ -1177,7 +1185,7 @@ func (s *Server) issueDeferred(w http.ResponseWriter, r *http.Request, proj *tat
 		pc.Body = editIntentBody(req.Title, req.Body)
 	}
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
-	if err := objbudget.FitIssue(ctx, s.c, s.spiller, key, func(i *tatarav1alpha1.Issue) {
+	if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(proj), key, func(i *tatarav1alpha1.Issue) {
 		for _, e := range i.Status.PendingComments {
 			if e.RequestID == requestID {
 				return
@@ -1303,13 +1311,13 @@ func (s *Server) mrWrite(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "action=comment requires number and body")
 			return
 		}
-		s.mrDeferred(w, r, repo, task, req)
+		s.mrDeferred(w, r, proj, repo, task, req)
 	case "reply":
 		if req.Number == 0 || strings.TrimSpace(req.Body) == "" || req.InReplyTo == "" {
 			writeError(w, http.StatusBadRequest, "action=reply requires number, inReplyTo and body")
 			return
 		}
-		s.mrDeferred(w, r, repo, task, req)
+		s.mrDeferred(w, r, proj, repo, task, req)
 	default:
 		writeError(w, http.StatusBadRequest, "action must be one of open, comment, reply")
 	}
@@ -1454,13 +1462,13 @@ func (s *Server) mintMRCR(ctx context.Context, proj *tatarav1alpha1.Project,
 	if err := s.c.Status().Update(ctx, mr); err != nil {
 		return fmt.Errorf("seed merge request CR status %s: %w", name, err)
 	}
-	return s.appendTaskRef(ctx, task.Name, "", name)
+	return s.appendTaskRef(ctx, proj, task.Name, "", name)
 }
 
 // mrDeferred is the DEFERRED half of mr_write (comment|reply). mr_write(comment)
 // has no DuplicateRecentBotComment guard today; the requestId marker is what
 // replaces it.
-func (s *Server) mrDeferred(w http.ResponseWriter, r *http.Request,
+func (s *Server) mrDeferred(w http.ResponseWriter, r *http.Request, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, req mrWriteReq) {
 	ctx := r.Context()
 	name := tatarav1alpha1.MergeRequestName(repo.Name, req.Number)
@@ -1480,7 +1488,7 @@ func (s *Server) mrDeferred(w http.ResponseWriter, r *http.Request,
 		RequestID: requestID, Action: req.Action, Body: req.Body, InReplyTo: req.InReplyTo,
 	}
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
-	if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+	if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(proj), key, func(m *tatarav1alpha1.MergeRequest) {
 		for _, e := range m.Status.PendingComments {
 			if e.RequestID == requestID {
 				return
