@@ -121,3 +121,64 @@ func TestGitHub_PullRequestReview_CommentedCarriesBody(t *testing.T) {
 	require.Equal(t, "commented", ev.ReviewState)
 	require.Equal(t, "please rename this var", ev.CommentBody)
 }
+
+// TestGitHub_PullRequestReviewComment_ParsesAsMRComment is WS3-I1: an inline
+// review-thread reply is a plain MR comment (mirror + pending event, no verdict),
+// distinct from pull_request_review.
+func TestGitHub_PullRequestReviewComment_ParsesAsMRComment(t *testing.T) {
+	const secret = "s"
+	body := []byte(`{"action":"created",
+		"comment":{"id":7788,"body":"i disagree, keep the lock"},
+		"pull_request":{"number":42,"user":{"login":"alice"},"head":{"sha":"deadbeef","ref":"fix"},"html_url":"u"},
+		"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},
+		"sender":{"login":"maint"}}`)
+	ev, err := (&GitHub{}).DetectAndVerify(ghHeader("pull_request_review_comment", secret, body), body, secret)
+	require.NoError(t, err)
+	require.True(t, ev.IsComment)
+	require.True(t, ev.IsPR)
+	require.False(t, ev.IsReview, "an inline reply is a comment, NOT a verdict")
+	require.Equal(t, "mr", ev.Kind)
+	require.Equal(t, 42, ev.Number)
+	require.Equal(t, "i disagree, keep the lock", ev.CommentBody)
+	require.Equal(t, 7788, ev.CommentID)
+}
+
+// TestGitHub_PullRequestReviewComment_EditedIgnored: only action=created acts.
+func TestGitHub_PullRequestReviewComment_EditedIgnored(t *testing.T) {
+	const secret = "s"
+	body := []byte(`{"action":"edited","comment":{"id":1,"body":"x"},
+		"pull_request":{"number":42,"head":{"sha":"d","ref":"f"}},
+		"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"sender":{"login":"m"}}`)
+	ev, err := (&GitHub{}).DetectAndVerify(ghHeader("pull_request_review_comment", secret, body), body, secret)
+	require.NoError(t, err)
+	require.Equal(t, "other", ev.Kind)
+}
+
+// TestGitHub_IssuesEdited_ActionSurvives is WS3-I2: issues.edited no longer
+// collapses to "other".
+func TestGitHub_IssuesEdited_ActionSurvives(t *testing.T) {
+	const secret = "s"
+	body := []byte(`{"action":"edited",
+		"issue":{"number":7,"title":"new title","body":"new body","user":{"login":"alice"},"html_url":"u"},
+		"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"sender":{"login":"alice"}}`)
+	ev, err := (&GitHub{}).DetectAndVerify(ghHeader("issues", secret, body), body, secret)
+	require.NoError(t, err)
+	require.Equal(t, "issue", ev.Kind)
+	require.Equal(t, "edited", ev.Action)
+	require.Equal(t, "new body", ev.Body)
+	require.Equal(t, "new title", ev.Title)
+}
+
+// TestGitHub_PullRequestClosedMerged_SetsMerged is the PR merged-out-of-band
+// signal: a closed delivery carrying merged=true surfaces ev.Merged.
+func TestGitHub_PullRequestClosedMerged_SetsMerged(t *testing.T) {
+	const secret = "s"
+	body := []byte(`{"action":"closed",
+		"pull_request":{"number":42,"merged":true,"head":{"sha":"d","ref":"task/x"},"html_url":"u"},
+		"repository":{"clone_url":"https://github.com/o/r.git","full_name":"o/r"},"sender":{"login":"m"}}`)
+	ev, err := (&GitHub{}).DetectAndVerify(ghHeader("pull_request", secret, body), body, secret)
+	require.NoError(t, err)
+	require.Equal(t, "closed", ev.Action)
+	require.True(t, ev.Merged)
+	require.True(t, ev.IsPR)
+}

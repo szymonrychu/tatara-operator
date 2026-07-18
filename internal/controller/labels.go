@@ -69,6 +69,13 @@ func lifecycleLabels(s *tatarav1alpha1.ScmSpec) (brainstorming, approved, implem
 	return
 }
 
+// LifecycleLabels is the exported form of lifecycleLabels: the webhook's WS3
+// trigger-label mint reads the approved/declined projection labels to exclude
+// them, so a lifecycle-projection write can never self-trigger a mint.
+func LifecycleLabels(s *tatarav1alpha1.ScmSpec) (brainstorming, approved, implementation, declined string) {
+	return lifecycleLabels(s)
+}
+
 // incidentLabel returns the additive label for incident-originated proposals.
 // It is NOT a managed phase label (never swept by setLifecycleLabel).
 func incidentLabel(s *tatarav1alpha1.ScmSpec) string {

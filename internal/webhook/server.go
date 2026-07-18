@@ -284,6 +284,40 @@ func (s *Server) handleForgeItem(ctx context.Context, w http.ResponseWriter, pro
 		s.handleMROpened(ctx, w, provider, proj, ev)
 		return
 	}
+	// WS3 mirror/pending-event reactions. Every branch here is an idempotent MIRROR
+	// write and/or a PENDING-EVENT append; NONE performs a stage mutation, an
+	// ownerRef drop, or an unpark from this HTTP goroutine (the leader-only
+	// reconcile/reaper consumes the resulting resourceVersion bump).
+	if ev.Kind == "issue" && !ev.IsPR {
+		switch ev.Action {
+		case "closed": // WS3-I3: mirror State=closed; the leader IssueReconciler stops the Task.
+			s.handleIssueClosed(ctx, w, provider, proj, ev)
+			return
+		case "labeled": // WS3 trigger-label mint + I2 body-diff fold (combined GitLab edit).
+			s.maybeTriggerLabelMint(ctx, provider, &proj, ev)
+			s.handleIssueEdited(ctx, w, provider, proj, ev)
+			return
+		case "edited", "synchronize", "unlabeled": // WS3-I2 issue edited (GitHub edited / GitLab synchronize|(un)labeled).
+			s.handleIssueEdited(ctx, w, provider, proj, ev)
+			return
+		}
+	}
+	if ev.Kind == "mr" && ev.IsPR {
+		switch ev.Action {
+		case "synchronize": // WS3-M1: refresh the mirror head; NO review restart (merge head-pin catches a real move).
+			s.handleMRSynchronize(ctx, w, provider, proj, ev)
+			return
+		case "closed", "merged": // PR closed/merged out-of-band: refresh mirror state; merge/review reconcile converges.
+			s.handleMRClosed(ctx, w, provider, proj, ev)
+			return
+		}
+	}
+	// Accepted-and-ignored inventory (WS3, documented): issues.unlabeled with no
+	// body change and no trigger-label meaning; pull_request.edited /
+	// ready_for_review; pull_request_review state=dismissed and GitLab MR
+	// action=unapproved (M2: a dismissal is a weak, often-administrative signal -
+	// use request_changes or close the issue/PR to stop a Task); non-default-branch
+	// push. The sweep and the mirror cadence converge all of these.
 	s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 }
 
@@ -351,6 +385,10 @@ func (s *Server) handleReview(ctx context.Context, w http.ResponseWriter, provid
 	// freshest stage/annotations even when a sibling replica just wrote them (F6-1).
 	if err := s.reader().Get(ctx, objKey(s.cfg.Namespace, ownerName), task); err != nil {
 		if apierrors.IsNotFound(err) {
+			// M4: the owning Task was reaped mid-flight. Fold to the pending-event
+			// path (mirror + queue) so the review is not silently lost and the sweep
+			// re-adopts, matching every other fold branch.
+			s.deliverPendingEvent(ctx, proj, repo, ev)
 			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 			return
 		}

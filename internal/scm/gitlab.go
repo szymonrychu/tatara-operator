@@ -128,6 +128,7 @@ func glWorkItemEvent(kind string, isPR bool, p glPayload) WebhookEvent {
 		HeadSHA:      p.ObjectAttributes.LastCommit.ID,
 		HeadBranch:   p.ObjectAttributes.SourceBranch,
 		ChangedLabel: changed,
+		Merged:       action == "merged",
 	}
 	// GitLab has no changes_requested / commented review object - those arrive
 	// as notes and take the pending-event path. Only the approval action is
@@ -204,6 +205,8 @@ func glActionAndLabel(p glPayload) (string, string) {
 		return "opened", ""
 	case "close":
 		return "closed", ""
+	case "merge":
+		return "merged", ""
 	case "update":
 		return "synchronize", ""
 	case "approved":
