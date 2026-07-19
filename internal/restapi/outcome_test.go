@@ -234,6 +234,40 @@ func TestOutcome_Implement_RecordsLiveBotHeadSHA(t *testing.T) {
 		"lastBotHeadSHA must be the live head fetched from SCM, not an agent-reported sha")
 }
 
+// THE HEAD-RECORD BLOCK MUST NEVER TOUCH o.w. projectSCMWriterAndToken does a
+// LIVE k8s Get for the scm secret and writes an HTTP error to whatever
+// ResponseWriter it is given when that Get fails - which can happen
+// transiently (API hiccup, secret rotation) well after the stage transition
+// already committed. Before the discardWriter fix this write landed on o.w,
+// and o.ok() then appended a SECOND JSON body after it: the client got an
+// error status with two concatenated JSON objects for an outcome that had, in
+// fact, already been accepted. Omitting scmSecretV2() reproduces exactly that
+// resolution failure (a NotFound Get, standing in for any transient one) and
+// asserts the response stays a single, cleanly-decodable 200 with the stamp
+// simply skipped.
+func TestOutcome_Implement_ScmResolutionFailureDoesNotCorruptTheResponse(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), // no scmSecretV2(): the secret Get fails
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"minor"}}`)
+	require.Equal(t, http.StatusOK, w.Code, "the accepted outcome's own response must win, not the resolver's side-effect error")
+
+	// json.Unmarshal REFUSES trailing data after the first value, so this fails
+	// if a second body got appended.
+	var dto map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &dto),
+		"the response body must be exactly ONE valid JSON object, not two concatenated ones")
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "the stage transition still committed")
+
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Empty(t, mr.Status.LastBotHeadSHA, "a resolution failure must skip the stamp, not fabricate one")
+}
+
 func TestOutcome_Implement_SubmittedWithNoOpenMRIs400(t *testing.T) {
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
