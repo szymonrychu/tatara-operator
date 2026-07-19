@@ -114,11 +114,36 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	// it, and a suppressed Task holds its admitted concurrency ticket for the whole
 	// window. This is the bound.
 	if cond := handoffCondition(task); cond != nil {
+		// The owned-MR read is LIVE (uncached APIReader), not the informer cache.
+		// /outcome persists the MR pendingReview BEFORE it stamps the Task's
+		// OutcomeAccepted condition that arms handoffCondition, so once we are here
+		// a live read is guaranteed to observe a still-owed pendingReview; a CACHED
+		// read could lag the MR watch and show a pre-/outcome nil, which would
+		// advance the Task before its review was ever posted.
+		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
+		if mrErr != nil {
+			return ctrl.Result{}, true, mrErr
+		}
+		// RE-DRIVE the deferred reviewing->advance BEFORE enforcing the deadline.
+		// The advance in DrainPendingReview is EDGE-triggered - a one-shot at the
+		// tail of the drain - and every later MergeRequest reconcile short-circuits
+		// at the already-nil pendingReview and never re-attempts it. If that one
+		// shot missed (a stale cached owned-MR read, a transient controller-owner
+		// sever, or a multi-MR ordering race), nothing else re-evaluates the advance
+		// and the Task would sit out the whole HandoffDeadline and park
+		// handoff-stalled even though its review already landed. This is the
+		// level-triggered backstop: on every reviewing reconcile, if every owned MR
+		// has drained its pendingReview, take the F.3 edge NOW. Idempotent -
+		// EnterStage refuses a redundant X->X - so a race with the MR reconciler's
+		// own advance costs at most one illegal-edge counter, never a double
+		// transition.
+		if edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj)); ready {
+			l.Info("review handoff re-driven: the deferred advance had not fired; advancing off reviewing",
+				"action", "handoff_redriven", "resource_id", task.Name, "stage", task.Status.Stage,
+				"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
+			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
+		}
 		if elapsed := now.Sub(cond.LastTransitionTime.Time); elapsed > tatarav1alpha1.HandoffDeadline {
-			mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
-			if mrErr != nil {
-				return ctrl.Result{}, true, mrErr
-			}
 			l.Info("review handoff stalled: the outcome committed but the drain never advanced the task",
 				"action", "handoff_stalled", "resource_id", task.Name, "stage", task.Status.Stage,
 				"outcome_reason", cond.Reason, "deadline", tatarav1alpha1.HandoffDeadline.String(),
