@@ -14,6 +14,7 @@ import (
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -87,6 +88,13 @@ type ProjectReconciler struct {
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
 	// SCMFor returns the SCMWriter for a provider name (token passed per call).
 	SCMFor func(provider string) (scm.SCMWriter, error)
+	// SpillerFor returns the tatara-memory spiller for a Project (its
+	// status.memory.endpoint), used by the A.7 byte-budget guard. Threaded
+	// through minter() and driver() (mirroring TaskReconciler/IssueReconciler)
+	// so a sweep-driven mint or ReconcileOwnership call spills exactly like the
+	// webhook fast path does, instead of writing an un-budgeted mirror. Nil in
+	// tests that do not exercise spilling.
+	SpillerFor func(proj *tataradevv1alpha1.Project) objbudget.Spiller
 	// Seq provides durable per-project sequence numbers for QueuedEvents created
 	// by cron scans. Wired in wire.go; tests create via &queue.SeqSource{Client, Namespace}.
 	Seq *queue.SeqSource

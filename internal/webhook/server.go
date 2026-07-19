@@ -1272,13 +1272,6 @@ func (s *Server) repoHasNonTerminalTask(ctx context.Context, projName string, im
 	return false
 }
 
-// maxPendingEvents caps Task.Status.PendingEvents (contract E.3), applied
-// Go-side, drop-oldest, BEFORE every write. The CRD's MaxItems=25 is a
-// backstop only: an API-server 422 is not retried by retry.RetryOnConflict and
-// would hot-loop webhook redelivery, so the cap here must stay strictly below
-// it.
-const maxPendingEvents = 20
-
 func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) {
 	var sec corev1.Secret
 	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, ref), &sec); err != nil {

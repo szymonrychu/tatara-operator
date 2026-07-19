@@ -343,11 +343,3 @@ func (d *StageDriver) minter() *Minter {
 		SpillerFor: d.SpillerFor,
 	}
 }
-
-// redeliverMRComments is OP12's job: replaying comments an external MR missed
-// while it had no owning Task in scope. Stubbed here so ReconcileOwnership
-// compiles and is fully testable ahead of OP12; OP12 replaces this body.
-func (d *StageDriver) redeliverMRComments(ctx context.Context, proj *tatarav1alpha1.Project,
-	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, newComments []scm.IssueComment) error {
-	return nil
-}

@@ -599,6 +599,16 @@ func (w *reapWriter) DeleteBranch(_ context.Context, repoURL, _, branch string) 
 	return w.deleteBrnch(repoURL, branch)
 }
 
+// GetPRHead is a READ, not a forge write - it never touches w.closed/deleted/
+// comments/labels, so it needs no toggle guard like the writes above. OP12's
+// sweep-driven ReconcileOwnership drift check calls it on every open PR;
+// returning "" (unknown) is a legal best-effort answer (sweepPRs treats a
+// GetPRHead error/empty result as "skip drift this pass"), so callers of
+// reapWriter that assert "ZERO forge writes" are unaffected.
+func (w *reapWriter) GetPRHead(context.Context, string, string, int) (string, error) {
+	return "", nil
+}
+
 func reapProject(name string) *tatarav1alpha1.Project {
 	return &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},

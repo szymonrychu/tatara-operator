@@ -46,7 +46,26 @@ type Minter struct {
 
 // minter builds the ONE shared intake funnel from the reconciler's own fields.
 func (r *ProjectReconciler) minter() *Minter {
-	return &Minter{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme, Metrics: r.Metrics}
+	return &Minter{
+		Client:     r.Client,
+		APIReader:  r.APIReader,
+		Scheme:     r.Scheme,
+		Metrics:    r.Metrics,
+		SpillerFor: r.SpillerFor,
+	}
+}
+
+// driver builds a StageDriver from the reconciler's own fields, so the OP12
+// sweep can call the SAME ReconcileOwnership convergence function the
+// MergeRequestReconciler's webhook fast path drives - one function, two
+// callers, per its own doc comment. Mirrors minter() above.
+func (r *ProjectReconciler) driver() *StageDriver {
+	return &StageDriver{
+		Client:     r.Client,
+		APIReader:  r.APIReader,
+		Metrics:    r.Metrics,
+		SpillerFor: r.SpillerFor,
+	}
 }
 
 // spillerFor resolves the per-project spiller EnsureTaskForMRComment mints

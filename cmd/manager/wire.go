@@ -330,6 +330,20 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		Audience:     "tatara-memory",
 	})
 
+	// The A.7 byte-budget spiller, per-project (its status.memory.endpoint), used
+	// by every reconciler that writes an Issue/MergeRequest/Task mirror -
+	// ProjectReconciler's own sweep-driven mint + OP12 ReconcileOwnership included.
+	// Hoisted above ProjectReconciler's setup (was defined further down, just
+	// above TaskReconciler's) so ProjectReconciler.SpillerFor below - and driver()/
+	// minter()'s wiring of it - has it in scope.
+	spillerFor := func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
+		endpoint := ""
+		if proj.Status.Memory != nil {
+			endpoint = proj.Status.Memory.Endpoint
+		}
+		return memclient.New(endpoint, memoryTokens.Token, nil)
+	}
+
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		APIReader:           mgr.GetAPIReader(),
@@ -350,7 +364,8 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},
-		Seq: seq,
+		SpillerFor: spillerFor,
+		Seq:        seq,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
@@ -462,14 +477,6 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		ClientSecret: cfg.OperatorOIDCClientSecret,
 		Audience:     "tatara-claude-code-wrapper",
 	})
-	spillerFor := func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
-		endpoint := ""
-		if proj.Status.Memory != nil {
-			endpoint = proj.Status.Memory.Endpoint
-		}
-		return memclient.New(endpoint, memoryTokens.Token, nil)
-	}
-
 	if err := (&controller.TaskReconciler{
 		Client:        mgr.GetClient(),
 		APIReader:     mgr.GetAPIReader(),

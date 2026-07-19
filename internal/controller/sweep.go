@@ -596,6 +596,22 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 		}
 	}
 
+	// THE OP12 DRIFT/REDELIVERY WRITER. GetPRHead (the live-head read
+	// ReconcileOwnership's drift check needs) lives on scm.SCMWriter, not
+	// scm.SCMReader, so sweepPRs needs its own token-bound writer alongside the
+	// listing reader. Resolved ONCE per pass, best-effort: an SCMFor/secret
+	// failure here must never abort the mint pipeline sweepPRs already runs off
+	// reader - it only means this pass's drift/redelivery convergence is
+	// skipped (writer nil, sweepPRs degrades liveHead to "" and treats every PR
+	// as having no new comments), same as any other missed-webhook backstop
+	// waiting for the next pass.
+	writer, token, werr := r.scanWriter(ctx, proj)
+	if werr != nil {
+		writer = nil
+		l.V(1).Info("sweep: scm writer unavailable; ownership drift/comment redelivery skipped this pass",
+			"action", "sweep_writer_unavailable", "resource_id", proj.Name, "activity", activity, "error", werr.Error())
+	}
+
 	for i := range repos {
 		repo := &repos[i]
 		owner, name, oerr := scm.OwnerRepo(repo.Spec.URL)
@@ -614,7 +630,7 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 			fail("list_prs", perr, "repo", repo.Name)
 			continue
 		}
-		r.sweepPRs(ctx, proj, repo, prs, budget, minted, sp, activity, fail)
+		r.sweepPRs(ctx, proj, repo, reader, writer, token, owner, name, prs, budget, minted, sp, activity, fail)
 	}
 
 	// EVERY pass, including the zero: a sweep that mints nothing is the signal
@@ -712,8 +728,16 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 	}
 }
 
-// sweepPRs applies the four-clause disposition to every open PR in one repo.
+// sweepPRs applies the four-clause disposition to every open PR in one repo,
+// then (OP12) drives ReconcileOwnership over the resulting MR mirror: the same
+// backfill/drift/comment-cursor-redelivery convergence the webhook fast path
+// runs on every mirror bump, so a mirror the webhook never touched (a missed
+// webhook, a pre-upgrade mirror, an MR the sweep itself just minted above)
+// still converges within one sweep period. writer/token may be nil/empty (the
+// SCM writer was unavailable this pass, see SweepProject) - drift/redelivery
+// then best-effort no-ops for every PR rather than erroring the pass.
 func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	reader scm.SCMReader, writer scm.SCMWriter, token, owner, name string,
 	prs []scm.PRRef, budget *sweepBudget, minted map[string]int, sp objbudget.Spiller, activity string,
 	fail func(string, error, ...any)) {
 
@@ -767,7 +791,82 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 				"action", "sweep_ignore_pr", "resource_id", proj.Name, "activity", activity,
 				"repo", repo.Name, "number", pr.Number, "author", pr.Author, "head_branch", pr.HeadBranch)
 		}
+
+		// OP12 convergence. Re-read the mirror rather than reusing cr above: the
+		// PRReview case just minted it (cr, fetched before the switch, is stale
+		// nil for a freshly-minted orphan) - re-Getting is what lets THIS SAME
+		// pass immediately redeliver an orphan's pending comment to the review
+		// Task the switch just bound as controller owner, instead of waiting a
+		// full extra sweep cycle for the mirror to catch up.
+		mrCR, merr := r.mergeRequestCR(ctx, proj, repo, pr.Number)
+		if merr != nil {
+			fail("get_mr_cr_post_classify", merr, "repo", repo.Name, "number", pr.Number)
+			continue
+		}
+		if mrCR == nil {
+			continue
+		}
+		liveHead := ""
+		if writer != nil {
+			if h, herr := writer.GetPRHead(ctx, repo.Spec.URL, token, pr.Number); herr == nil {
+				liveHead = h
+			} else {
+				RecordSCM(r.Metrics, providerOf(proj), "get_pr_head", herr)
+				l.V(1).Info("sweep: live head read failed; drift check skipped this pass",
+					"action", "sweep_get_pr_head_error", "resource_id", proj.Name, "activity", activity,
+					"repo", repo.Name, "number", pr.Number, "error", herr.Error())
+			}
+		}
+		// Gated on "not already known-tatara" rather than "already external": a
+		// freshly-minted orphan's mrCR is still Ownership="" here (ReconcileOwnership
+		// itself does the backfill classification below) - gating on == External
+		// would miss fetching this pass's comments for exactly the orphan case OP12
+		// exists to converge in one pass. A known-tatara (agent-owned) MR skips the
+		// read: it has no external comment to redeliver until a drift flip, which
+		// does not need newComments to happen.
+		var newComments []scm.IssueComment
+		if mrCR.Status.Ownership != tatarav1alpha1.OwnershipTatara {
+			nc, cerr := listPRCommentsAfter(ctx, reader, owner, name, pr.Number, mrCR.Status.LastMirroredCommentID)
+			if cerr != nil {
+				fail("list_pr_comments", cerr, "repo", repo.Name, "number", pr.Number)
+			} else {
+				newComments = nc
+			}
+		}
+		if _, oerr := r.driver().ReconcileOwnership(ctx, proj, repo, mrCR, liveHead, newComments); oerr != nil {
+			fail("reconcile_ownership", oerr, "repo", repo.Name, "number", pr.Number)
+		}
 	}
+}
+
+// listPRCommentsAfter lists mr number's comments and cuts the oldest-first
+// list to only what is strictly newer than cursor (an ExternalID), so the
+// sweep's redelivery pass never re-delivers a comment it already redelivered
+// on a prior pass. cursor == "" (never redelivered) returns the full list. A
+// cursor whose comment no longer appears in the listing (rare - e.g. a forge
+// trim) also returns the full list: the mirror's own set-union-on-ExternalID
+// dedup (AppendCommentToMirror) makes replaying an already-mirrored comment a
+// mirror no-op, so this fallback trades a possible duplicate TaskEvent for
+// never silently losing a comment. Returns (nil, nil) when reader carries no
+// PRCommentLister capability (a provider with no MR-specific comment read).
+func listPRCommentsAfter(ctx context.Context, reader scm.SCMReader, owner, name string, number int, cursor string) ([]scm.IssueComment, error) {
+	pl, ok := reader.(scm.PRCommentLister)
+	if !ok {
+		return nil, nil
+	}
+	all, err := pl.ListPRComments(ctx, owner, name, number)
+	if err != nil {
+		return nil, err
+	}
+	if cursor == "" {
+		return all, nil
+	}
+	for i, c := range all {
+		if c.ExternalID == cursor {
+			return all[i+1:], nil
+		}
+	}
+	return all, nil
 }
 
 // issueSnapshot builds the scm.Issue the mirror upsert consumes from a listing

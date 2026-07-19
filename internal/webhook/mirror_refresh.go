@@ -119,7 +119,7 @@ func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, p
 				Author: ev.ActorLogin,
 				Body:   ev.Title, // the goal snapshot moved; the new title is the useful summary
 			}
-			if err := AppendTaskEvent(ctx, s.cfg.Client, task, taskEv); err != nil {
+			if err := controller.AppendTaskEvent(ctx, s.cfg.Client, task, taskEv); err != nil {
 				s.log.ErrorContext(ctx, "issues: append issue_edited event failed", "error", err, "task", task.Name)
 			} else {
 				s.log.InfoContext(ctx, "issues: mirrored edit and queued issue_edited event",
