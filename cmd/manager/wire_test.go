@@ -204,6 +204,17 @@ func TestMaintenanceRunnable_IsLeaderOnly(t *testing.T) {
 	}
 }
 
+// TestDispatcherBackstopRunnable_IsLeaderOnly guards issue #395: the admission
+// backstop scan (list every Project's pending QueuedEvents) must run on the
+// elected leader only, same as maintenanceRunnable - N replicas must not each
+// run it every 60s.
+func TestDispatcherBackstopRunnable_IsLeaderOnly(t *testing.T) {
+	var d dispatcherBackstopRunnable
+	if !d.NeedLeaderElection() {
+		t.Error("dispatcherBackstopRunnable must require leader election (leader-only admission backstop, issue #395)")
+	}
+}
+
 func TestMemoryConfigFromConfig(t *testing.T) {
 	cfg := config.Config{
 		Namespace:                 "tatara",

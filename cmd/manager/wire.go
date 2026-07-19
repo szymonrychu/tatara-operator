@@ -30,6 +30,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -416,15 +417,27 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 			"action", "usage_poller_disabled")
 	}
 
-	if err := (&controller.DispatcherReconciler{
+	// BackstopEvents is the leader-only admission backstop's output channel
+	// (issue #395): DispatcherReconciler is otherwise purely watch-driven, so a
+	// QueuedEvent left queued across a rollout/leader-handoff window with no
+	// fresh watch trigger can stall admission indefinitely. Buffered so the
+	// backstop's list-and-push pass never blocks on the controller's Watch
+	// goroutine starting up.
+	backstopEvents := make(chan event.GenericEvent, 256)
+	dispatcher := &controller.DispatcherReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		Metrics:           metrics,
 		BudgetDefaults:    cfg.BudgetDefaults(),
 		Usage:             usageStore,
 		UsagePollInterval: cfg.UsagePollInterval,
-	}).SetupWithManager(mgr); err != nil {
+		BackstopEvents:    backstopEvents,
+	}
+	if err := dispatcher.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup DispatcherReconciler: %w", err)
+	}
+	if err := mgr.Add(dispatcherBackstopRunnable{dispatcher: dispatcher}); err != nil {
+		return nil, fmt.Errorf("add dispatcher backstop: %w", err)
 	}
 	if err := (&controller.RepositoryReconciler{
 		Client:       mgr.GetClient(),
@@ -574,3 +587,26 @@ func (m maintenanceRunnable) Start(ctx context.Context) error {
 }
 
 func (m maintenanceRunnable) NeedLeaderElection() bool { return true }
+
+// dispatcherBackstopInterval is the leader-only admission backstop's sweep
+// cadence (issue #395).
+const dispatcherBackstopInterval = 60 * time.Second
+
+// dispatcherBackstopRunnable is the leader-only admission backstop for issue
+// #395: DispatcherReconciler is otherwise purely watch-driven, so a
+// QueuedEvent left queued across a rollout or leader handoff with no fresh
+// watch trigger can stall alert admission indefinitely (observed 7m22s gap in
+// production). On Start and every dispatcherBackstopInterval it re-lists every
+// Project's pending QueuedEvents and pushes each into the dispatcher's
+// BackstopEvents channel, making admission deterministic instead of
+// replay-timing luck. Same LEADER-ONLY shape as maintenanceRunnable: N
+// replicas must not each run the full-namespace scan every 60s.
+type dispatcherBackstopRunnable struct {
+	dispatcher *controller.DispatcherReconciler
+}
+
+func (d dispatcherBackstopRunnable) Start(ctx context.Context) error {
+	return d.dispatcher.RunBackstop(ctx, dispatcherBackstopInterval)
+}
+
+func (d dispatcherBackstopRunnable) NeedLeaderElection() bool { return true }
