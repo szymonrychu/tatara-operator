@@ -19,15 +19,16 @@ import (
 // resumeNoReentryParks is the WS3-I4 driver. A human reply to a Task parked with a
 // NO-RE-ENTRY reason (stage-deadline, review-loop-exhausted, review-post-refused,
 // implement-declined, admission-starved, fold-adoption-unverified, doc-timeout,
-// handoff-stalled, agent-contract-mismatch, object-too-large) must not vanish and
-// must not smuggle a re-entry past the C.6 gate. Instead it triggers an immediate,
+// agent-contract-mismatch, object-too-large) must not vanish and must not
+// smuggle a re-entry past the C.6 gate. Instead it triggers an immediate,
 // gate-respecting fresh start: sever(Orphan) the owned issue and re-mint it as a
 // fresh ACTIVE clarify Task via the shared MintForItem funnel.
 //
 // LEADER-ONLY (runs from the project reconcile, alongside driveUnparks; the
 // reaper is the ultimate backstop). It never touches the F.6 re-entry surface
 // (backlog-sweep/awaiting-human/identity-unverified/merge-timeout/deploy-timeout/
-// no-outcome are stage.HasReentry and handled by driveUnparks/reverifyParked).
+// no-outcome/handoff-stalled are stage.HasReentry and handled by
+// driveUnparks/reverifyParked).
 func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {

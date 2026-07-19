@@ -34,6 +34,12 @@ import (
 // it.
 type StageDriver struct {
 	client.Client
+	// APIReader is the manager's UNCACHED reader. advanceAfterReview lists the
+	// owned MRs through it: the cached client can lag clearPendingReview's own
+	// write (or a sibling drain's) and a stale pendingReview silently vetoes
+	// the reviewing exit until the 5m handoff deadline parks the Task. Nil
+	// (unit tests) falls back to Client.
+	APIReader client.Reader
 	// SCMFor returns the provider's writer (the merge + review egress).
 	SCMFor func(provider string) (scm.SCMWriter, error)
 	// ReaderFor returns a token-bound reader: the release-job CI status at the

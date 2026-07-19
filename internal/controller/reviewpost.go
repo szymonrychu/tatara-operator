@@ -73,20 +73,25 @@ func PendingCommentMarker(requestID string) string {
 //  7. status / reviewedSHA / reviewRounds.
 //  8. pendingReview = nil, LAST.
 //  9. ONLY NOW does the Task advance (the stage machine gates on it).
-func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1.MergeRequest) error {
+//
+// The bool is "an advance off reviewing is STILL OWED": true only when step 9
+// skipped because some owned MR still carries pendingReview. The reconciler
+// requeues on a short fuse against it (see reviewSettleRequeue) instead of the
+// mirror cadence - the owning Task's 5m handoff deadline parks it otherwise.
+func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1.MergeRequest) (bool, error) {
 	pr := mr.Status.PendingReview
 	if pr == nil {
-		return nil
+		return false, nil
 	}
 	l := log.FromContext(ctx)
 
 	proj, repo, err := d.projectAndRepo(ctx, mr.Namespace, mr.Spec.ProjectRef, mr.Spec.RepositoryRef)
 	if err != nil {
-		return err
+		return false, err
 	}
 	task, err := d.owningTask(ctx, mr)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	// A pending bot review is valid ONLY while the owning Task is reviewing. If the
@@ -105,12 +110,12 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 		l.Info("review: owning task left reviewing; dropping the stale pending review without posting",
 			"action", "review_drain_skipped_stale", "resource_id", mr.Name,
 			"repo", mr.Spec.RepositoryRef, "pr", mr.Spec.Number, "task_stage", task.Status.Stage)
-		return d.clearPendingReview(ctx, proj, mr, pr, "refused")
+		return false, d.clearPendingReview(ctx, proj, mr, pr, "refused")
 	}
 
 	writer, token, provider, err := d.forge(ctx, proj)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	round := strconv.Itoa(pr.Round)
@@ -120,7 +125,7 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	existing, err := writer.ListReviews(ctx, repo.Spec.URL, token, mr.Spec.Number)
 	if err != nil {
 		obs.ReviewPostTotal.WithLabelValues("error").Inc()
-		return fmt.Errorf("review: list reviews %s!%d: %w", repo.Name, mr.Spec.Number, err)
+		return false, fmt.Errorf("review: list reviews %s!%d: %w", repo.Name, mr.Spec.Number, err)
 	}
 	reviewID := ""
 	for _, rv := range existing {
@@ -151,19 +156,19 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 				"action", "review_post_refused", "resource_id", mr.Name,
 				"repo", repo.Name, "pr", mr.Spec.Number, "round", pr.Round)
 			if err := d.clearPendingReview(ctx, proj, mr, pr, "refused"); err != nil {
-				return err
+				return false, err
 			}
 			if task == nil {
-				return nil
+				return false, nil
 			}
-			mrs, err := ownedMergeRequests(ctx, d.Client, task)
+			mrs, err := ownedMergeRequests(ctx, d.mrReader(), task)
 			if err != nil {
-				return err
+				return false, err
 			}
-			return d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonReviewPostRefused, mrs)
+			return false, d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonReviewPostRefused, mrs)
 		default:
 			obs.ReviewPostTotal.WithLabelValues("error").Inc()
-			return fmt.Errorf("review: post review %s!%d: %w", repo.Name, mr.Spec.Number, perr)
+			return false, fmt.Errorf("review: post review %s!%d: %w", repo.Name, mr.Spec.Number, perr)
 		}
 	} else {
 		obs.ReviewPostTotal.WithLabelValues("skipped").Inc()
@@ -177,7 +182,7 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	posted, err := writer.ListReviewComments(ctx, repo.Spec.URL, token, mr.Spec.Number, reviewID)
 	if err != nil {
 		obs.ReviewPostTotal.WithLabelValues("error").Inc()
-		return fmt.Errorf("review: list review comments %s!%d: %w", repo.Name, mr.Spec.Number, err)
+		return false, fmt.Errorf("review: list review comments %s!%d: %w", repo.Name, mr.Spec.Number, err)
 	}
 
 	// STEP 5: the MIRROR APPEND, a SET-UNION KEYED ON externalId. A re-run is a
@@ -199,7 +204,7 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 			ReviewRound: pr.Round,
 		}
 		if err := AppendCommentToMirror(ctx, d.Client, d.spiller(proj), mr, cmt); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -210,13 +215,13 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	if task != nil && len(pr.Findings) > 0 {
 		if err := d.appendOperatorNote(ctx, proj, task,
 			reviewBeltNote(repo.Name, mr.Spec.Number, pr)); err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	// STEPS 7 + 8: settle the MR, and clear pendingReview LAST.
 	if err := d.clearPendingReview(ctx, proj, mr, pr, reviewVerdictFromBody(pr.Body)); err != nil {
-		return err
+		return false, err
 	}
 	l.Info("review: posted",
 		"action", "review_posted", "resource_id", mr.Name, "repo", repo.Name,
@@ -225,9 +230,9 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 
 	// STEP 9: ONLY NOW does the Task advance.
 	if task == nil {
-		return nil
+		return false, nil
 	}
-	return d.advanceAfterReview(ctx, proj, task)
+	return d.advanceAfterReview(ctx, proj, task, mr)
 }
 
 // reviewVerdictFromBody reads the verdict back out of the review body. There is
@@ -257,7 +262,7 @@ func reviewBeltNote(repo string, number int, pr *tatarav1alpha1.PendingReview) s
 func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alpha1.Project,
 	mr *tatarav1alpha1.MergeRequest, pr *tatarav1alpha1.PendingReview, verdict string) error {
 	key := client.ObjectKeyFromObject(mr)
-	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, func(m *tatarav1alpha1.MergeRequest) {
+	settle := func(m *tatarav1alpha1.MergeRequest) {
 		if verdict != "refused" {
 			m.Status.Status = verdict
 			m.Status.ReviewedSHA = pr.SHA
@@ -269,10 +274,13 @@ func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alph
 			}
 		}
 		m.Status.PendingReview = nil
-	}); err != nil {
+	}
+	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, settle); err != nil {
 		return fmt.Errorf("review: settle mr %s: %w", key.Name, err)
 	}
-	mr.Status.PendingReview = nil
+	// Settle the caller's in-memory copy too: DrainPendingReview hands it to
+	// advanceAfterReview as the fresh overlay for its own stale listed copy.
+	settle(mr)
 	return nil
 }
 
@@ -281,21 +289,31 @@ func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alph
 // structurally cannot: stage.LegalFor gates reviewing -> implementing|merging on
 // that very field, and the handler had just set it.
 func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task) error {
+	task *tatarav1alpha1.Task, fresh *tatarav1alpha1.MergeRequest) (bool, error) {
 	if task.Status.Stage != tatarav1alpha1.StageReviewing {
-		return nil
+		return false, nil
 	}
-	mrs, err := ownedMergeRequests(ctx, d.Client, task)
+	mrs, err := ownedMergeRequests(ctx, d.mrReader(), task)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(mrs) == 0 {
-		return nil
+		return false, nil
+	}
+	// fresh is the MR THIS reconcile just settled. When the list came from the
+	// cached client (nil APIReader), its copy of fresh can predate
+	// clearPendingReview's write and still carry pendingReview - trusting it
+	// returned nil silently, nothing requeued, and the Task parked
+	// handoff-stalled 5 minutes later (2026-07-19, PR 389). Overlay it.
+	for i := range mrs {
+		if fresh != nil && mrs[i].Name == fresh.Name && mrs[i].Namespace == fresh.Namespace {
+			mrs[i] = *fresh.DeepCopy()
+		}
 	}
 	needsChanges := false
 	for i := range mrs {
 		if mrs[i].Status.PendingReview != nil {
-			return nil // a review is still owed to the forge
+			return true, nil // a review is still owed to the forge
 		}
 		if mrs[i].Status.Status == "needs-changes" && mrs[i].Status.State != "merged" {
 			needsChanges = true
@@ -322,7 +340,17 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 	log.FromContext(ctx).Info("review: task advancing off reviewing",
 		"action", "review_advance", "resource_id", task.Name,
 		"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
-	return d.enterStage(ctx, proj, task, edge.To, edge.Reason, mrs)
+	return false, d.enterStage(ctx, proj, task, edge.To, edge.Reason, mrs)
+}
+
+// mrReader is the reader the reviewing-exit decision lists owned MRs through:
+// the manager's UNCACHED APIReader when wired, else the cached client (unit
+// tests, older wiring).
+func (d *StageDriver) mrReader() client.Reader {
+	if d.APIReader != nil {
+		return d.APIReader
+	}
+	return d.Client
 }
 
 // DrainPendingComments is the SAME SHAPE as the review post, for

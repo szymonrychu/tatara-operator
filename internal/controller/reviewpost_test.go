@@ -78,7 +78,7 @@ func TestDrainPendingReview_OwningTaskLeftReviewing_DropsStale(t *testing.T) {
 	f := newFakeForge(t)
 	d := mdNewDriver(t, f, base)
 
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	if f.postReviewCalls != 0 {
@@ -119,7 +119,7 @@ func TestReviewPostSurvivesACrash(t *testing.T) {
 
 	// PASS 1: the forge post lands; the mirror append dies.
 	d := mdNewDriver(t, f, cc)
-	err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name))
+	_, err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name))
 	if err == nil {
 		t.Fatalf("expected the injected crash to surface; if it did not, the test has no interruption point")
 	}
@@ -135,7 +135,7 @@ func TestReviewPostSurvivesACrash(t *testing.T) {
 
 	// PASS 2: the reconciler re-runs against a healthy client.
 	d2 := mdNewDriver(t, f, base)
-	if err := d2.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
+	if _, err := d2.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
 		t.Fatalf("pass 2: DrainPendingReview: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func TestReviewPostRequestChangesGoesToImplementing(t *testing.T) {
 
 	f := newFakeForge(t)
 	d := mdNewDriver(t, f, c)
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	if f.postReviewCalls != 1 {
@@ -228,7 +228,7 @@ func TestReviewPostApproveGoesToMerging(t *testing.T) {
 
 	f := newFakeForge(t)
 	d := mdNewDriver(t, f, c)
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
@@ -256,7 +256,7 @@ func TestReviewPostRefusedParksAndDoesNotRequeue(t *testing.T) {
 
 	// It must NOT return an error: a returned error is a controller-runtime
 	// requeue, and a structural 4xx is not retryable.
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("a structural 4xx must NOT requeue, got err = %v", err)
 	}
 	got := mdGetTask(t, c, "t1")
@@ -267,7 +267,7 @@ func TestReviewPostRefusedParksAndDoesNotRequeue(t *testing.T) {
 		t.Fatalf("pendingReview must be cleared on a terminal refusal, else the reconciler hot-loops")
 	}
 	// And a re-run posts NOTHING more.
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("re-run: %v", err)
 	}
 	if f.postReviewCalls != 1 {
@@ -291,7 +291,7 @@ func TestReviewPostFailureIncrementsSCMWritesTotal(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	d.Metrics = obs.NewOperatorMetrics(reg)
 
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err == nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err == nil {
 		t.Fatalf("expected the forge failure to surface as an error")
 	}
 	got := testutil.ToFloat64(d.Metrics.SCMWriteCounter("github", "post_review", "error"))
@@ -313,7 +313,7 @@ func TestReviewPostCommentIDsComeFromASecondRead(t *testing.T) {
 
 	f := newFakeForge(t)
 	d := mdNewDriver(t, f, c)
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	if f.listReviewCommentCall == 0 {
@@ -356,7 +356,7 @@ func TestReviewPostForkPRNeverMerges(t *testing.T) {
 	f.head[7] = "sha-a"
 	d := mdNewDriver(t, f, c)
 
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 	if f.postReviewCalls != 1 {
@@ -391,7 +391,7 @@ func TestReviewPostFindingsReachTheNextPod(t *testing.T) {
 
 	f := newFakeForge(t)
 	d := mdNewDriver(t, f, c)
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 
@@ -423,7 +423,7 @@ func TestReviewPostFindingsReachTheNextPod(t *testing.T) {
 	}
 
 	// The note is written ONCE, not once per re-run.
-	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
+	if _, err := d.DrainPendingReview(context.Background(), mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("re-run: %v", err)
 	}
 	notes := 0
@@ -552,3 +552,127 @@ func TestReviewPostAutoMergeNeverArmed(t *testing.T) {
 }
 
 var _ = time.Now
+
+// --- the reviewing exit vs the stale informer cache (2026-07-19) -----------
+
+// staleListClient serves MergeRequest Lists with one MR replaced by a frozen
+// snapshot - exactly what the informer cache does in the instant after a
+// status write it has not observed yet - while Get and every write pass
+// through live.
+type staleListClient struct {
+	client.Client
+	stale *tatarav1alpha1.MergeRequest
+}
+
+func (s *staleListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := s.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if ml, ok := list.(*tatarav1alpha1.MergeRequestList); ok {
+		for i := range ml.Items {
+			if ml.Items[i].Namespace == s.stale.Namespace && ml.Items[i].Name == s.stale.Name {
+				ml.Items[i] = *s.stale.DeepCopy()
+			}
+		}
+	}
+	return nil
+}
+
+// PR 389's parking, reproduced: DrainPendingReview cleared pendingReview, then
+// advanceAfterReview re-listed the owned MRs through the CACHED client, saw its
+// OWN pre-write copy with pendingReview still set, and returned nil silently -
+// no advance, no error, no requeue; the Task parked handoff-stalled 5 minutes
+// later. The freshly-settled MR must overlay its stale listed copy.
+func TestDrainPendingReview_StaleCachedSelfDoesNotBlockAdvance(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 389)
+	pr := pendingReviewFixture("approve", 1, "sha-a")
+	pr.Findings = nil
+	mr.Status.PendingReview = pr
+	base := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, &staleListClient{Client: base, stale: mr.DeepCopy()})
+
+	owed, err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name))
+	if err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	if owed {
+		t.Fatalf("owed = true, want false: the only pending review just drained")
+	}
+	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
+		t.Fatalf("stage = %q, want merging: a stale cached copy of the just-settled MR must not veto the advance", got.Status.Stage)
+	}
+}
+
+// The same staleness on ANOTHER owned MR: A's drain settled on the server but
+// not yet in the cache when B drains. The advance decision must list through
+// the uncached APIReader when one is wired, so B's drain is not vetoed by A's
+// ghost pendingReview.
+func TestDrainPendingReview_AdvanceListsOwnedMRsUncached(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
+	mrA := mdMR(task, "tatara-operator", 7)
+	mrA.Status.Status = "approved"
+	mrA.Status.ReviewedSHA = "sha-a" // settled: its own drain already ran
+	mrB := mdMR(task, "tatara-cli", 8)
+	prB := pendingReviewFixture("approve", 1, "sha-b")
+	prB.Findings = nil
+	mrB.Status.PendingReview = prB
+	base := newMirrorClient(t, mdProject(), mdSecret(),
+		mdRepo("tatara-operator"), mdRepo("tatara-cli"), task, mrA, mrB)
+
+	// The stale cache still shows A owing its review.
+	staleA := mrA.DeepCopy()
+	staleA.Status.Status = ""
+	staleA.Status.ReviewedSHA = ""
+	staleA.Status.PendingReview = pendingReviewFixture("approve", 1, "sha-a")
+
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, &staleListClient{Client: base, stale: staleA})
+	d.APIReader = base
+
+	owed, err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mrB.Name))
+	if err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	if owed {
+		t.Fatalf("owed = true, want false: every review has settled on the server")
+	}
+	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
+		t.Fatalf("stage = %q, want merging: the uncached read must see A's settled review", got.Status.Stage)
+	}
+}
+
+// While ANOTHER owned MR genuinely still owes its review the advance correctly
+// skips - but the reconcile must come back on a short fuse, not the 1h mirror
+// cadence: the owning Task's 5m handoff deadline parks it otherwise.
+func TestMergeRequestReconciler_RequeuesSoonWhileAReviewIsStillOwed(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
+	mrA := mdMR(task, "tatara-operator", 7)
+	prA := pendingReviewFixture("approve", 1, "sha-a")
+	prA.Findings = nil
+	mrA.Status.PendingReview = prA
+	mrB := mdMR(task, "tatara-cli", 8)
+	prB := pendingReviewFixture("approve", 1, "sha-b")
+	prB.Findings = nil
+	mrB.Status.PendingReview = prB
+	c := newMirrorClient(t, mdProject(), mdSecret(),
+		mdRepo("tatara-operator"), mdRepo("tatara-cli"), task, mrA, mrB)
+
+	f := newFakeForge(t)
+	r := mdMRReconciler(c, mdNewDriver(t, f, c))
+	res, err := r.Reconcile(context.Background(), mdReq(mrA.Name))
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := mdGetTask(t, c, "t1"); got.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %q, want reviewing still: tatara-cli's review is still owed", got.Status.Stage)
+	}
+	if res.RequeueAfter != reviewSettleRequeue {
+		t.Fatalf("RequeueAfter = %v, want %v: an owed reviewing exit must not wait the mirror cadence", res.RequeueAfter, reviewSettleRequeue)
+	}
+}

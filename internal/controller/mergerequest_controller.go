@@ -43,6 +43,12 @@ type MergeRequestReconciler struct {
 	Now func() time.Time
 }
 
+// reviewSettleRequeue is the re-check interval while the owning Task's
+// reviewing exit is still owed (some owned MR still carries pendingReview
+// when a drain finishes). The mirror cadence is an hour; the Task's handoff
+// deadline is 5 minutes - waiting the cadence parks it handoff-stalled.
+const reviewSettleRequeue = 15 * time.Second
+
 func (r *MergeRequestReconciler) now() time.Time {
 	if r.Now != nil {
 		return r.Now()
@@ -109,8 +115,12 @@ func (r *MergeRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.Driver.DrainPendingComments(ctx, &mr); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.Driver.DrainPendingReview(ctx, &mr); err != nil {
+		reviewOwed, err := r.Driver.DrainPendingReview(ctx, &mr)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if reviewOwed && reviewSettleRequeue < cadence {
+			cadence = reviewSettleRequeue
 		}
 		// The H.4 semver:<level> label. It lands the moment the implement outcome
 		// stamps status.significance - not at merge time, and not on some sweep an
