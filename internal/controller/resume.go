@@ -61,6 +61,30 @@ func (r *ProjectReconciler) resumeNoReentryParks(ctx context.Context, proj *tata
 	return firstErr
 }
 
+// resumeNoReentryParksPaced runs resumeNoReentryParks for proj at most once
+// per defaultResumeNoReentryInterval, decoupled from whatever cadence
+// Reconcile() happens to run at (tatara-operator#367, mirrors
+// driveUnparksPaced/unpark.go: resumeNoReentryParks did a full-namespace Task
+// List on every single Reconcile pass, whatever cadence that happened to run
+// at). Keyed per project (like lastDriveUnparks): two live Projects must not
+// throttle each other's floor.
+func (r *ProjectReconciler) resumeNoReentryParksPaced(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) (time.Duration, error) {
+	interval := defaultResumeNoReentryInterval
+	if last, ok := r.lastResumeNoReentryParks[proj.Name]; ok {
+		if elapsed := now.Sub(last); elapsed < interval {
+			return interval - elapsed, nil
+		}
+	}
+	if err := r.resumeNoReentryParks(ctx, proj, now); err != nil {
+		return 0, err
+	}
+	if r.lastResumeNoReentryParks == nil {
+		r.lastResumeNoReentryParks = map[string]time.Time{}
+	}
+	r.lastResumeNoReentryParks[proj.Name] = now
+	return interval, nil
+}
+
 // resumeOne resumes ONE no-re-entry parked Task off a human reply.
 //
 // ORDER is load-bearing. The old Task's bot PR is closed FIRST (idempotently, WITH

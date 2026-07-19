@@ -49,6 +49,25 @@ const defaultGaugeRecomputeInterval = 60 * time.Second
 // of how fast something else forces Reconcile() to run.
 const defaultUnparkDriveInterval = 30 * time.Second
 
+// defaultComputeProjectCountsInterval floors how often computeProjectCounts
+// re-Lists Repository+Task in full to recompute RepositoryCount/
+// OpenIssuesCount/OpenIncidentsCount (tatara-operator#367): a Project pinned
+// to a fast Reconcile cadence by something ELSE (owned-memory-stack watch
+// events, reconcileMemory's 10s provisioning requeue) must not turn this
+// per-pass full-namespace List into a per-pass cost too. 60s matches
+// defaultGaugeRecomputeInterval's reasoning.
+const defaultComputeProjectCountsInterval = 60 * time.Second
+
+// defaultResumeNoReentryInterval floors how often resumeNoReentryParks
+// re-Lists Tasks in full to sweep for a human reply on a no-re-entry park
+// (tatara-operator#367), same reasoning as defaultComputeProjectCountsInterval.
+const defaultResumeNoReentryInterval = 60 * time.Second
+
+// defaultReapTerminalInterval floors how often ReapTerminal re-Lists Tasks in
+// full to reap terminal Tasks (tatara-operator#367), same reasoning as
+// defaultComputeProjectCountsInterval.
+const defaultReapTerminalInterval = 60 * time.Second
+
 // ProjectReconciler validates a Project's SCM secret and publishes its
 // webhook URL.
 type ProjectReconciler struct {
@@ -141,6 +160,16 @@ type ProjectReconciler struct {
 	// clock: two live Projects must not throttle each other.
 	UnparkDriveInterval time.Duration
 	lastDriveUnparks    map[string]time.Time
+
+	// lastComputeProjectCounts / lastResumeNoReentryParks / lastReapTerminal
+	// pace computeProjectCounts / resumeNoReentryParks / ReapTerminal, one map
+	// each, keyed per project (like lastDriveUnparks): three more full-
+	// namespace-List blocks that used to re-run on every single Reconcile pass
+	// regardless of cadence (tatara-operator#367). Read/written only on the
+	// serialised reconcile path (MaxConcurrentReconciles=1); no mutex required.
+	lastComputeProjectCounts map[string]time.Time
+	lastResumeNoReentryParks map[string]time.Time
+	lastReapTerminal         map[string]time.Time
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -196,7 +225,8 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	requeueAfter = soonestRequeue(requeueAfter, grafanaRequeueAfter)
 
-	r.computeProjectCounts(ctx, &project)
+	countsRequeue, _ := r.computeProjectCountsPaced(ctx, &project, time.Now())
+	requeueAfter = soonestRequeue(requeueAfter, countsRequeue)
 
 	// Persist the computed status under optimistic-concurrency retry. A routine
 	// 409 ("the object has been modified") - amplified during operator rollouts
@@ -265,10 +295,12 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// fresh gated re-mint (sever(Orphan) + MintForItem), never a smuggled re-entry.
 	// Leader-only; the reaper is the backstop. Runs after driveUnparks so a
 	// re-entryable park has already been resumed and is no longer parked here.
-	if err := r.resumeNoReentryParks(ctx, &project, time.Now()); err != nil {
+	resumeRequeue, err := r.resumeNoReentryParksPaced(ctx, &project, time.Now())
+	if err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, fmt.Errorf("resume no-re-entry parks: %w", err)
 	}
+	requeueAfter = soonestRequeue(requeueAfter, resumeRequeue)
 
 	// THE B.6 TERMINAL REAPER (fix W2). Releases and GCs terminal Tasks
 	// (failed/rejected/parked/delivered) and their Issues/MRs, and stamps the
@@ -276,10 +308,12 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// implemented and tested but had NO production caller. A blocking step failure
 	// (e.g. a 403 on the terminal comment/label) returns an error and requeues, per
 	// B.6/M25 - the reap must not proceed without the label landing.
-	if err := r.ReapTerminal(ctx, &project); err != nil {
+	reapRequeue, err := r.ReapTerminalPaced(ctx, &project, time.Now())
+	if err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, fmt.Errorf("reap terminal: %w", err)
 	}
+	requeueAfter = soonestRequeue(requeueAfter, reapRequeue)
 
 	memPhase := ""
 	if project.Status.Memory != nil {
@@ -343,6 +377,28 @@ func (r *ProjectReconciler) computeProjectCounts(ctx context.Context, project *t
 		project.Status.OpenIssuesCount = issues
 		project.Status.OpenIncidentsCount = incidents
 	}
+}
+
+// computeProjectCountsPaced runs computeProjectCounts for project at most once
+// per defaultComputeProjectCountsInterval, decoupled from whatever cadence
+// Reconcile() happens to run at (tatara-operator#367, mirrors
+// driveUnparksPaced/unpark.go). When skipped, project.Status's counts are left
+// exactly as read at the top of Reconcile; the persist block re-applies that
+// value verbatim, which is a no-op, not a stale write. Keyed per project (like
+// lastDriveUnparks): two live Projects must not throttle each other's floor.
+func (r *ProjectReconciler) computeProjectCountsPaced(ctx context.Context, project *tataradevv1alpha1.Project, now time.Time) (time.Duration, error) {
+	interval := defaultComputeProjectCountsInterval
+	if last, ok := r.lastComputeProjectCounts[project.Name]; ok {
+		if elapsed := now.Sub(last); elapsed < interval {
+			return interval - elapsed, nil
+		}
+	}
+	r.computeProjectCounts(ctx, project)
+	if r.lastComputeProjectCounts == nil {
+		r.lastComputeProjectCounts = map[string]time.Time{}
+	}
+	r.lastComputeProjectCounts[project.Name] = now
+	return interval, nil
 }
 
 // maybeRecomputeGauges runs updateMemoryStackCounts and updateIssueStateCounts

@@ -367,6 +367,31 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	return firstErr
 }
 
+// ReapTerminalPaced runs ReapTerminal for proj at most once per
+// defaultReapTerminalInterval, decoupled from whatever cadence Reconcile()
+// happens to run at (tatara-operator#367, mirrors driveUnparksPaced/
+// unpark.go: ReapTerminal did a full-namespace Task List on every single
+// Reconcile pass, whatever cadence that happened to run at). This is
+// CALLER-SIDE pacing only - it wraps ReapTerminal without changing its
+// signature or reapOne's internals. Keyed per project (like
+// lastDriveUnparks): two live Projects must not throttle each other's floor.
+func (r *ProjectReconciler) ReapTerminalPaced(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) (time.Duration, error) {
+	interval := defaultReapTerminalInterval
+	if last, ok := r.lastReapTerminal[proj.Name]; ok {
+		if elapsed := now.Sub(last); elapsed < interval {
+			return interval - elapsed, nil
+		}
+	}
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		return 0, err
+	}
+	if r.lastReapTerminal == nil {
+		r.lastReapTerminal = map[string]time.Time{}
+	}
+	r.lastReapTerminal[proj.Name] = now
+	return interval, nil
+}
+
 // reapOne is the B.6 table, row by row.
 func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
@@ -483,9 +508,17 @@ func (r *ProjectReconciler) reapDelivered(ctx context.Context, proj *tatarav1alp
 	}
 	if needs {
 		obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference).Inc()
+		// mrs is DIAGNOSTIC ONLY (the log's mr_states field), a second List of
+		// data needsDocumenting already fetched - a transient failure here must
+		// never fail the reap tick. Before this fix it did: an error from this
+		// fetch propagated out of reapDelivered as firstErr, blocking the whole
+		// ReapTerminal pass on a log line. WARN-and-continue instead: the
+		// counter above already landed and the pin (return nil) is unaffected.
 		mrs, err := r.ownedMRs(ctx, t)
 		if err != nil {
-			return err
+			log.FromContext(ctx).Error(err, "reap: mr_states unavailable for the doc_reference GC block log (non-blocking)",
+				"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedDocReference)
+			return nil
 		}
 		mrStates := make([]string, len(mrs))
 		for i := range mrs {
