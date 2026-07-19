@@ -14,6 +14,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -225,6 +226,115 @@ func TestMRBindingBackstop_TriagingIsNotParked(t *testing.T) {
 	}
 	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 0 {
 		t.Fatalf("operator_mr_binding_backstop_total = %v, want 0", n)
+	}
+}
+
+// TestMRBindingBackstop_RepairsUnboundMRInsteadOfParking is PR 388: the twin's
+// MergeRequest CR exists but the mint was interrupted before the bind, leaving
+// it UNBOUND (no controller owner) and the Task with empty mrRefs. The backstop
+// must run the intake funnel's own repairMRBinding instead of parking a Task a
+// transient error left behind: refs stamped, CR owned, no park, no metric, no
+// human summoned.
+func TestMRBindingBackstop_RepairsUnboundMRInsteadOfParking(t *testing.T) {
+	ctx := context.Background()
+	proj := tsProject(3)
+	task := mbTask("mt-r-tatara-cli-87", mrBindingBackstopGrace+time.Minute)
+	mr := mdMR(task, "tatara-cli", 87)
+	mr.OwnerReferences = nil // the interrupted mint's unbound stub
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-cli"), task, mr)
+	w := &mbWriter{}
+	r, m := mbReconciler(c, w)
+	r.Scheme = c.Scheme()
+
+	handled, err := r.reconcileMRBindingBackstop(ctx, proj, task, time.Now())
+	if err != nil || !handled {
+		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true (repaired), err=nil", handled, err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.Stage != tatarav1alpha1.StageReviewing {
+		t.Fatalf("stage = %s(%s), want unchanged reviewing: a repairable bind must not park",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	wantRef := tatarav1alpha1.MergeRequestName("tatara-cli", 87)
+	if len(got.Status.MRRefs) != 1 || got.Status.MRRefs[0] != wantRef {
+		t.Fatalf("mrRefs = %v, want [%s]", got.Status.MRRefs, wantRef)
+	}
+	gotMR := mdGetMR(t, c, wantRef)
+	if owner, ok := own.ControllerOwner(gotMR); !ok || owner != task.Name {
+		t.Fatalf("mr controller owner = %q, %v, want %s", owner, ok, task.Name)
+	}
+	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 0 {
+		t.Fatalf("operator_mr_binding_backstop_total = %v, want 0 (repaired, not parked)", n)
+	}
+	if len(w.comments) != 0 {
+		t.Fatalf("Comment calls = %d, want 0: no human is summoned for a repaired bind", len(w.comments))
+	}
+}
+
+// TestMRBindingBackstop_RepairsUnboundIssueInsteadOfParking is the Issue-mint
+// counterpart: an interrupted MintIssueTask left its Issue CR an unbound stub.
+func TestMRBindingBackstop_RepairsUnboundIssueInsteadOfParking(t *testing.T) {
+	ctx := context.Background()
+	proj := tsProject(3)
+	task := mbTaskAtStage("mt-i-tatara-cli-12", mrBindingBackstopGrace+time.Minute, tatarav1alpha1.StageClarifying)
+	task.Spec.Kind = "clarify"
+	task.Spec.Source = &tatarav1alpha1.TaskSource{
+		Provider: "github",
+		IssueRef: "https://github.com/szymonrychu/tatara-cli/issues/12#12",
+		Number:   12, Title: "fix the other thing",
+	}
+	iss := mdIssue(task, "tatara-cli", 12)
+	iss.OwnerReferences = nil
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-cli"), task, iss)
+	r, m := mbReconciler(c, &mbWriter{})
+	r.Scheme = c.Scheme()
+
+	handled, err := r.reconcileMRBindingBackstop(ctx, proj, task, time.Now())
+	if err != nil || !handled {
+		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true (repaired), err=nil", handled, err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.Stage != tatarav1alpha1.StageClarifying {
+		t.Fatalf("stage = %s(%s), want unchanged clarifying", got.Status.Stage, got.Status.StageReason)
+	}
+	wantRef := tatarav1alpha1.IssueName("tatara-cli", 12)
+	if len(got.Status.IssueRefs) != 1 || got.Status.IssueRefs[0] != wantRef {
+		t.Fatalf("issueRefs = %v, want [%s]", got.Status.IssueRefs, wantRef)
+	}
+	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "clarify")); n != 0 {
+		t.Fatalf("operator_mr_binding_backstop_total = %v, want 0 (repaired, not parked)", n)
+	}
+}
+
+// TestMRBindingBackstop_ForeignOwnedMRStillParks: the twin's MergeRequest CR is
+// controller-owned by ANOTHER Task. The repair must never steal (the intake
+// funnel's own rule), so this bind is unrepairable and the backstop parks
+// awaiting-human exactly as before.
+func TestMRBindingBackstop_ForeignOwnedMRStillParks(t *testing.T) {
+	ctx := context.Background()
+	proj := tsProject(3)
+	task := mbTask("mt-r-tatara-cli-87", mrBindingBackstopGrace+time.Minute)
+	other := mbTask("mt-r-tatara-cli-87-other", mrBindingBackstopGrace+time.Minute)
+	mr := mdMR(other, "tatara-cli", 87) // controller-owned by the OTHER task
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-cli"), task, mr)
+	w := &mbWriter{}
+	r, m := mbReconciler(c, w)
+	r.Scheme = c.Scheme()
+
+	handled, err := r.reconcileMRBindingBackstop(ctx, proj, task, time.Now())
+	if err != nil || !handled {
+		t.Fatalf("reconcileMRBindingBackstop = %v, %v, want handled=true, err=nil", handled, err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonAwaitingHuman {
+		t.Fatalf("stage = %s(%s), want parked(awaiting-human): an unrepairable bind falls through to the park",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	if n := testutil.ToFloat64(m.MRBindingBackstopParkedCounter(proj.Name, "review")); n != 1 {
+		t.Fatalf("operator_mr_binding_backstop_total = %v, want 1", n)
+	}
+	if len(w.comments) != 1 {
+		t.Fatalf("Comment calls = %d, want 1", len(w.comments))
 	}
 }
 

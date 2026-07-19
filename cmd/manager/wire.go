@@ -482,8 +482,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// reconciler drives the two pod-less operator stages (merging, deploying). It
 	// is the SOLE merge caller and the SOLE review poster.
 	stageDriver := &controller.StageDriver{
-		Client:  mgr.GetClient(),
-		Metrics: metrics,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Metrics:   metrics,
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},

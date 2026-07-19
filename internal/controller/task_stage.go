@@ -306,6 +306,20 @@ func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *t
 	}
 
 	l := log.FromContext(ctx)
+
+	// PR 388: a transient mint failure is REPAIRABLE, and the repair already
+	// exists (intake.go repairMRBinding/repairIssueBinding) - but its only other
+	// caller is the sweep's intake path, whose ~1h cadence always loses to this
+	// backstop. Attempt the bind repair here first; only an unrepairable bind
+	// (foreign-owned CR, unresolvable source/repo, write failure) falls through
+	// to the park below.
+	if r.repairSourceBinding(ctx, proj, task) {
+		l.Info("mr-binding backstop: repaired the interrupted mint binding instead of parking",
+			"action", "mr_binding_backstop_repaired", "resource_id", task.Name, "kind", task.Spec.Kind,
+			"stage", task.Status.Stage, "age", age.String())
+		return true, nil
+	}
+
 	l.Error(nil, "task owns no merge-request or issue record past grace; likely an interrupted mint - parking awaiting human",
 		"action", "mr_binding_backstop_parked", "resource_id", task.Name, "kind", task.Spec.Kind,
 		"stage", task.Status.Stage, "age", age.String(), "grace", mrBindingBackstopGrace.String())
@@ -315,6 +329,84 @@ func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *t
 	r.Metrics.MRBindingBackstopParked(proj.Name, task.Spec.Kind)
 	r.commentMRBindingBackstopParked(ctx, proj, task)
 	return true, nil
+}
+
+// repairSourceBinding re-runs the intake funnel's interrupted-mint bind repair
+// (repairMRBinding / repairIssueBinding) against a source-bearing Task the
+// backstop is about to park (PR 388). The ext snapshot is rebuilt from the
+// Task's own Source - the same fields the interrupted mint had in hand; the
+// mirror cadence refreshes the rest. true means the refs are now non-empty and
+// the Task must NOT be parked. Anything else - unparseable source, unresolvable
+// repo, a foreign-owned CR the repair correctly refuses to steal, a write
+// error - reports false and the caller parks exactly as before.
+func (r *TaskReconciler) repairSourceBinding(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task) bool {
+
+	l := log.FromContext(ctx)
+	src := task.Spec.Source
+	slug, number, ok := parseSourceURL(src.IssueRef, src.IsPR)
+	if !ok {
+		return false
+	}
+	repo, err := r.repositoryForSlug(ctx, proj, task, slug)
+	if err != nil {
+		l.Error(err, "mr-binding backstop: resolve repository failed; falling through to the park",
+			"action", "mr_binding_backstop_repair_failed", "resource_id", task.Name, "slug", slug)
+		return false
+	}
+	if repo == nil {
+		return false
+	}
+	m := &Minter{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme, Metrics: r.Metrics}
+	sp := r.spiller(proj)
+	if src.IsPR {
+		ext := scm.MergeRequest{Number: number, URL: src.IssueRef, Title: src.Title,
+			Author: src.AuthorLogin, State: "open", HeadSHA: src.HeadSHA}
+		err = m.repairMRBinding(ctx, proj, repo, ext, task, sp)
+	} else {
+		url, _, _ := strings.Cut(src.IssueRef, "#") // MintIssueTask stores "URL#number"
+		ext := scm.Issue{Number: number, URL: url, Title: src.Title,
+			Author: src.AuthorLogin, State: "open"}
+		err = m.repairIssueBinding(ctx, proj, repo, ext, task, sp)
+	}
+	if err != nil {
+		l.Error(err, "mr-binding backstop: bind repair failed; falling through to the park",
+			"action", "mr_binding_backstop_repair_failed", "resource_id", task.Name)
+		return false
+	}
+	return len(task.Status.MRRefs) != 0 || len(task.Status.IssueRefs) != 0
+}
+
+// repositoryForSlug resolves the Repository CR a Task's source slug names:
+// spec.repositoryRef when set, else the project repo whose remote matches the
+// slug. It is sourceRepository's slug-keyed sibling: the intake-minted Tasks
+// this backstop repairs carry no RepositoryRef and no Source.URL, only the
+// IssueRef the slug was parsed from. nil (no error) means "cannot resolve".
+func (r *TaskReconciler) repositoryForSlug(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, slug string) (*tatarav1alpha1.Repository, error) {
+
+	if task.Spec.RepositoryRef != "" {
+		var repo tatarav1alpha1.Repository
+		err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo)
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("backstop repair: get repository %s: %w", task.Spec.RepositoryRef, err)
+		}
+		return &repo, nil
+	}
+	repos, err := r.projectRepos(ctx, proj)
+	if err != nil {
+		return nil, err
+	}
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err == nil && owner+"/"+name == slug {
+			return &repos[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // taskWriterAndToken resolves the SCMWriter + bot token for a Project,

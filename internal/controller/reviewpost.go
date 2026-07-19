@@ -156,7 +156,7 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 			if task == nil {
 				return nil
 			}
-			mrs, err := ownedMergeRequests(ctx, d.Client, task)
+			mrs, err := ownedMergeRequests(ctx, d.mrReader(), task)
 			if err != nil {
 				return err
 			}
@@ -227,7 +227,7 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 	if task == nil {
 		return nil
 	}
-	return d.advanceAfterReview(ctx, proj, task)
+	return d.advanceAfterReview(ctx, proj, task, mr)
 }
 
 // reviewVerdictFromBody reads the verdict back out of the review body. There is
@@ -257,7 +257,7 @@ func reviewBeltNote(repo string, number int, pr *tatarav1alpha1.PendingReview) s
 func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alpha1.Project,
 	mr *tatarav1alpha1.MergeRequest, pr *tatarav1alpha1.PendingReview, verdict string) error {
 	key := client.ObjectKeyFromObject(mr)
-	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, func(m *tatarav1alpha1.MergeRequest) {
+	settle := func(m *tatarav1alpha1.MergeRequest) {
 		if verdict != "refused" {
 			m.Status.Status = verdict
 			m.Status.ReviewedSHA = pr.SHA
@@ -269,10 +269,13 @@ func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alph
 			}
 		}
 		m.Status.PendingReview = nil
-	}); err != nil {
+	}
+	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, settle); err != nil {
 		return fmt.Errorf("review: settle mr %s: %w", key.Name, err)
 	}
-	mr.Status.PendingReview = nil
+	// Settle the caller's in-memory copy too: DrainPendingReview hands it to
+	// advanceAfterReview as the fresh overlay for its own stale listed copy.
+	settle(mr)
 	return nil
 }
 
@@ -281,13 +284,24 @@ func (d *StageDriver) clearPendingReview(ctx context.Context, proj *tatarav1alph
 // structurally cannot: stage.LegalFor gates reviewing -> implementing|merging on
 // that very field, and the handler had just set it.
 func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task) error {
+	task *tatarav1alpha1.Task, fresh *tatarav1alpha1.MergeRequest) error {
 	if task.Status.Stage != tatarav1alpha1.StageReviewing {
 		return nil
 	}
-	mrs, err := ownedMergeRequests(ctx, d.Client, task)
+	mrs, err := ownedMergeRequests(ctx, d.mrReader(), task)
 	if err != nil {
 		return err
+	}
+	// fresh is the MR THIS reconcile just settled. When the list came from the
+	// cached client (nil APIReader), its copy of fresh can predate
+	// clearPendingReview's write and still carry pendingReview - trusting it
+	// silently vetoed the exit and left the Task to the reconciler's 30s
+	// level-triggered re-drive (2026-07-19, PR 389). Overlay it so the primary
+	// edge-triggered advance lands first try.
+	for i := range mrs {
+		if fresh != nil && mrs[i].Name == fresh.Name && mrs[i].Namespace == fresh.Namespace {
+			mrs[i] = *fresh.DeepCopy()
+		}
 	}
 	edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj))
 	if !ready {
@@ -297,6 +311,16 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 		"action", "review_advance", "resource_id", task.Name,
 		"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
 	return d.enterStage(ctx, proj, task, edge.To, edge.Reason, mrs)
+}
+
+// mrReader is the reader the reviewing-exit decision lists owned MRs through:
+// the manager's UNCACHED APIReader when wired, else the cached client (unit
+// tests, older wiring).
+func (d *StageDriver) mrReader() client.Reader {
+	if d.APIReader != nil {
+		return d.APIReader
+	}
+	return d.Client
 }
 
 // reviewAdvanceEdge is the PURE F.3 reviewing-exit decision, shared by the

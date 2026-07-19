@@ -1356,8 +1356,8 @@ func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) 
 		// on a head move (cycle 4) and the kind=review awaiting-human unpark both do
 		// exactly this. THIS occupancy's review agent has not run yet, so the handoff
 		// is not outstanding and the pod must still spawn. Without the occupancy
-		// check the first reconcile parks it at handoff-stalled - which has no F.6
-		// re-entry - and both cycles die permanently and SILENTLY, because
+		// check the first reconcile parks it at handoff-stalled - recoverable only
+		// by a human comment - and both cycles stall SILENTLY, because
 		// reviewing -> parked is a legal transition.
 		task := tsReviewTaskWithOutcome(committed, 0, base)
 		reEntered := metav1.NewTime(base.Add(time.Hour))
