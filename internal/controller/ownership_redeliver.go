@@ -42,6 +42,11 @@ func (d *StageDriver) redeliverMRComments(ctx context.Context, proj *tatarav1alp
 
 	ownerName, hasOwner := own.ControllerOwner(mr)
 	if !hasOwner && len(incoming) > 0 {
+		// incoming[0].Author is the mint's author-of-record for this belt-and-
+		// suspenders path; it relies on the sweep's prior PRReview
+		// classification (ClassifyPR -> MintReviewTask, see above) having
+		// already filtered out bot-first pages, making a bot incoming[0] here
+		// unreachable in practice.
 		newOwner, _, err := d.minter().EnsureTaskForMRComment(ctx, proj, repo, mr, incoming[0].Author)
 		if err != nil {
 			return err

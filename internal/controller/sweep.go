@@ -844,11 +844,14 @@ func (r *ProjectReconciler) sweepPRs(ctx context.Context, proj *tatarav1alpha1.P
 // sweep's redelivery pass never re-delivers a comment it already redelivered
 // on a prior pass. cursor == "" (never redelivered) returns the full list. A
 // cursor whose comment no longer appears in the listing (rare - e.g. a forge
-// trim) also returns the full list: the mirror's own set-union-on-ExternalID
+// trim) also returns the full list: ALL still-listed non-bot comments are
+// re-delivered, not just the ones after the (now-vanished) cursor. This is
+// harmless, not merely tolerated - the mirror's own set-union-on-ExternalID
 // dedup (AppendCommentToMirror) makes replaying an already-mirrored comment a
-// mirror no-op, so this fallback trades a possible duplicate TaskEvent for
-// never silently losing a comment. Returns (nil, nil) when reader carries no
-// PRCommentLister capability (a provider with no MR-specific comment read).
+// mirror no-op, and the consumer bundles redelivered comments per turn, so
+// re-delivery never surfaces as a duplicate to anything downstream. Returns
+// (nil, nil) when reader carries no PRCommentLister capability (a provider
+// with no MR-specific comment read).
 func listPRCommentsAfter(ctx context.Context, reader scm.SCMReader, owner, name string, number int, cursor string) ([]scm.IssueComment, error) {
 	pl, ok := reader.(scm.PRCommentLister)
 	if !ok {
