@@ -219,6 +219,16 @@ type IssueStatus struct {
 	// Skips enqueue while now-LastRefireCommentAt < IncidentRefireCommentCooldown.
 	// +optional
 	LastRefireCommentAt *metav1.Time `json:"lastRefireCommentAt,omitempty"`
+	// EscalatedAt is when this open tracker was last RE-ADMITTED as a fresh
+	// incident investigation (liveness escape): a persistent alert whose tracker
+	// has crossed IncidentEscalateRefireThreshold refires OR sat open past
+	// IncidentEscalateStaleAge is re-investigated rather than suppressed forever,
+	// which also catches a root cause that silently CHANGED under one alert id.
+	// Its presence gates re-escalation: no second escalation until another
+	// IncidentEscalateStaleAge has elapsed, so a re-fire storm escalates at most
+	// once per window.
+	// +optional
+	EscalatedAt *metav1.Time `json:"escalatedAt,omitempty"`
 	// LastDeployTimeoutCommentAt is when the WS3-I5 first-deploy-timeout operator
 	// comment was enqueued on this issue. Its PRESENCE (not the value) suppresses a
 	// second comment on later parked(deploy-timeout) retries. It is a DISTINCT
@@ -228,6 +238,13 @@ type IssueStatus struct {
 	// timestamp field).
 	// +optional
 	LastDeployTimeoutCommentAt *metav1.Time `json:"lastDeployTimeoutCommentAt,omitempty"`
+	// LastMemoryGateCommentAt is when the first turn-submit memory-gate hold
+	// operator comment was enqueued on this issue (issue #355). Its PRESENCE (not
+	// the value) suppresses a second comment on later holds, same one-shot
+	// cooldown shape as LastDeployTimeoutCommentAt and DISTINCT from it: a Task
+	// can hold on the memory gate independently of any deploy-timeout episode.
+	// +optional
+	LastMemoryGateCommentAt *metav1.Time `json:"lastMemoryGateCommentAt,omitempty"`
 	// +optional
 	LastSyncedAt *metav1.Time `json:"lastSyncedAt,omitempty"`
 	// +optional

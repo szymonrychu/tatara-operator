@@ -132,11 +132,23 @@ type incidentParent struct {
 	Number int    `json:"number"`
 }
 
+// incidentComment is the target+body of an action=comment_issue outcome: fresh
+// evidence appended to an EXISTING open incident tracker instead of filing a
+// near-duplicate. Repo is a Repository CR name in this project. The operator
+// gates it to Issue CRs carrying an incident rule/group label, so an incident
+// agent can only comment on a TRACKER, never an arbitrary human issue.
+type incidentComment struct {
+	Repo   string `json:"repo"`
+	Number int    `json:"number"`
+	Body   string `json:"body"`
+}
+
 type incidentPayload struct {
-	Action     string         `json:"action"`
-	AlertRules []string       `json:"alertRules"`
-	Issue      *incidentIssue `json:"issue,omitempty"`
-	Reason     string         `json:"reason"`
+	Action     string           `json:"action"`
+	AlertRules []string         `json:"alertRules"`
+	Issue      *incidentIssue   `json:"issue,omitempty"`
+	Comment    *incidentComment `json:"comment,omitempty"`
+	Reason     string           `json:"reason"`
 }
 
 type foldRef struct {
@@ -501,7 +513,7 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 	var mutErr error
 	from := o.task.Status.Stage
 	var to, toReason string
-	err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	err := objbudget.FitTask(ctx, s.c, s.spillerForOrNil(o.proj), key, func(t *tatarav1alpha1.Task) {
 		if mutate != nil {
 			if err := mutate(t); err != nil {
 				mutErr = err
@@ -558,6 +570,15 @@ func (o *outcomeCtx) commit(mutate func(*tatarav1alpha1.Task) error) bool {
 		return false
 	}
 	s.metrics.TaskTerminalEntry(o.task.Spec.Kind, from, to, toReason)
+	// The same choke-point gap D1 closed for operator_task_terminal_total:
+	// this handler's stage.Enter calls (awaiting-human, identity-unverified,
+	// implement-declined, ...) never route through controller.EnterStage, the
+	// only other place TaskParked() is called - so an outcome-driven first
+	// park undercounted operator_task_parked_total. Mirrors transition.go's
+	// EnterStage condition exactly (metric-wiring audit, issue #370).
+	if to == tatarav1alpha1.StageParked && from != "" {
+		s.metrics.TaskParked(from, toReason)
+	}
 	if to != from {
 		s.log.InfoContext(ctx, "stage transition",
 			append(reqLogFields(o.r), "action", "stage_transition", "task", o.task.Name,
@@ -679,7 +700,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			return
 		}
 		if o.kind == "documentation" {
-			if err := s.stampDocumentedBy(ctx, o.task); err != nil {
+			if err := s.stampDocumentedBy(ctx, o.proj, o.task); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
@@ -724,7 +745,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	for i := range open {
 		mr := &open[i]
 		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
-		if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
 			m.Status.Significance = p.ChangeSignificance
 		}); err != nil {
 			writeClientErr(o.w, err)
@@ -766,8 +787,14 @@ func ownedMRRepos(mrs []tatarav1alpha1.MergeRequest) []string {
 }
 
 // stampDocumentedBy stamps status.documentedBy on every Task the batch covered
-// (F.3: either way, documented or declined).
-func (s *Server) stampDocumentedBy(ctx context.Context, batch *tatarav1alpha1.Task) error {
+// (F.3: either way, documented or declined). proj is the BATCH's own project -
+// docbatch.go's MintDocBatch only ever collects covered tasks with
+// Spec.ProjectRef == proj.Name, so every covered task shares it; passed down
+// from the caller instead of re-resolved per iteration (that Get would also
+// abort the whole loop on failure, unlike the covered-task Get above which
+// tolerates NotFound).
+func (s *Server) stampDocumentedBy(ctx context.Context, proj *tatarav1alpha1.Project, batch *tatarav1alpha1.Task) error {
+	spiller := s.spillerForOrNil(proj)
 	for _, name := range batch.Spec.DocumentsTasks {
 		key := types.NamespacedName{Namespace: s.ns, Name: name}
 		var covered tatarav1alpha1.Task
@@ -777,7 +804,7 @@ func (s *Server) stampDocumentedBy(ctx context.Context, batch *tatarav1alpha1.Ta
 			}
 			return err
 		}
-		if err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+		if err := objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 			t.Status.DocumentedBy = batch.Name
 		}); err != nil {
 			return err
@@ -890,7 +917,7 @@ func (o *outcomeCtx) review(p reviewPayload) {
 			if !rok {
 				return
 			}
-			if err := controller.SyncMergeRequestOnDemand(ctx, s.c, s.spiller, reader, o.proj, repo, mr, live); err != nil {
+			if err := controller.SyncMergeRequestOnDemand(ctx, s.c, s.spillerForOrNil(o.proj), reader, o.proj, repo, mr, live); err != nil {
 				s.log.WarnContext(ctx, "restapi: on-demand mirror resync after head-moved hit an error; the live head was stamped, the thread may lag a sweep",
 					append(reqLogFields(o.r), "task", o.task.Name, "repo", mr.Spec.RepositoryRef,
 						"number", mr.Spec.Number, "error", err)...)
@@ -934,7 +961,7 @@ func (o *outcomeCtx) review(p reviewPayload) {
 		verdict := p.Verdict
 		sig := p.ChangeSignificance
 		key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
-		if err := objbudget.FitMergeRequest(ctx, s.c, s.spiller, key, func(m *tatarav1alpha1.MergeRequest) {
+		if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
 			round := m.Status.ReviewRounds + 1
 			m.Status.ReviewedSHA = sha
 			m.Status.PendingReview = &tatarav1alpha1.PendingReview{
@@ -1075,7 +1102,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			return
 		}
 		for i := range issues {
-			if err := s.queueIssueClose(ctx, &issues[i], o.task.Name, p.Reason); err != nil {
+			if err := s.queueIssueClose(ctx, o.proj, &issues[i], o.task.Name, p.Reason); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
@@ -1132,7 +1159,7 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 			}
 		}
 		key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
-		if err := objbudget.FitIssue(ctx, s.c, s.spiller, key, func(is *tatarav1alpha1.Issue) {
+		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(is *tatarav1alpha1.Issue) {
 			is.Status.Status = "approved"
 			is.Status.Approval = ev
 		}); err != nil {
@@ -1173,10 +1200,10 @@ func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.P
 	return true, out
 }
 
-func (s *Server) queueIssueClose(ctx context.Context, iss *tatarav1alpha1.Issue, taskName, reason string) error {
+func (s *Server) queueIssueClose(ctx context.Context, proj *tatarav1alpha1.Project, iss *tatarav1alpha1.Issue, taskName, reason string) error {
 	requestID := newRequestID(taskName, "close", iss.Name, reason)
 	key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
-	return objbudget.FitIssue(ctx, s.c, s.spiller, key, func(i *tatarav1alpha1.Issue) {
+	return objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(proj), key, func(i *tatarav1alpha1.Issue) {
 		for _, e := range i.Status.PendingComments {
 			if e.RequestID == requestID {
 				return
@@ -1349,6 +1376,10 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	}
 	switch p.Action {
 	case "file_issue":
+		if p.Comment != nil {
+			o.bad("comment is only for action=comment_issue", "unexpected-field")
+			return
+		}
 		if p.Issue == nil || p.Issue.Repo == "" ||
 			strings.TrimSpace(p.Issue.Title) == "" || strings.TrimSpace(p.Issue.Body) == "" {
 			o.bad("action=file_issue requires issue.repo, issue.title and issue.body", "missing-field")
@@ -1358,13 +1389,27 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 			o.bad("issue.parent requires repo and number", "bad-parent")
 			return
 		}
+	case "comment_issue":
+		if p.Issue != nil {
+			o.bad("issue is only for action=file_issue", "unexpected-field")
+			return
+		}
+		if p.Comment == nil || p.Comment.Repo == "" || p.Comment.Number == 0 ||
+			strings.TrimSpace(p.Comment.Body) == "" {
+			o.bad("action=comment_issue requires comment.repo, comment.number and comment.body", "missing-field")
+			return
+		}
 	case "false_positive":
 		if p.Issue != nil {
 			o.bad("issue is only for action=file_issue", "unexpected-field")
 			return
 		}
+		if p.Comment != nil {
+			o.bad("comment is only for action=comment_issue", "unexpected-field")
+			return
+		}
 	default:
-		o.bad("action must be one of file_issue, false_positive", "bad-action")
+		o.bad("action must be one of file_issue, comment_issue, false_positive", "bad-action")
 		return
 	}
 
@@ -1392,6 +1437,11 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 			return
 		}
 		o.ok("false_positive")
+		return
+	}
+
+	if p.Action == "comment_issue" {
+		o.incidentComment(p)
 		return
 	}
 
@@ -1427,17 +1477,48 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		writeError(o.w, http.StatusBadGateway, "scm returned no issue number")
 		return
 	}
-	var crLabels map[string]string
+	crLabels := map[string]string{}
 	if ruleKey != "" {
-		crLabels = map[string]string{queue.LabelAlertRuleKey: ruleKey}
+		crLabels[queue.LabelAlertRuleKey] = ruleKey
+	}
+	if o.task.Spec.GroupKey != "" {
+		crLabels[queue.LabelAlertGroupKey] = o.task.Spec.GroupKey
+	}
+	if len(crLabels) == 0 {
+		crLabels = nil
 	}
 	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, body, crLabels); err != nil {
 		writeClientErr(o.w, err)
 		return
 	}
 
-	if p.Issue.Parent != nil {
-		s.linkIncidentParent(ctx, o, writer, token, created.Ref, p.Issue.Parent)
+	// Auto-correlate: when the agent named no parent but this incident shares a
+	// GROUP key with an OLDER open tracker (a different alert rule firing for one
+	// root cause), link the new tracker under that sibling so a co-firing storm
+	// collapses to one tree instead of N unrelated issues. Agent-supplied parent
+	// always wins.
+	// ruleKey != "" is required: FindOldestOpenGroupSibling excludes THIS Task's
+	// just-minted tracker by its rule-key, so an empty key could pick the new
+	// issue as its own parent. Incident Tasks always carry a DedupKey, so this is
+	// belt-and-braces.
+	parent := p.Issue.Parent
+	if parent == nil && o.task.Spec.GroupKey != "" && ruleKey != "" {
+		if sib, ok, ferr := queue.FindOldestOpenGroupSibling(ctx, s.c, s.ns, o.proj.Name, o.task.Spec.GroupKey, ruleKey); ferr == nil && ok {
+			parent = &incidentParent{Repo: sib.Spec.RepositoryRef, Number: sib.Spec.Number}
+			s.metrics.IncidentGroupLinked("linked")
+			s.log.InfoContext(ctx, "incident auto-linked under group sibling",
+				append(reqLogFields(o.r), "task", o.task.Name, "group_key", o.task.Spec.GroupKey,
+					"sibling", sib.Name)...)
+		} else {
+			if ferr != nil {
+				s.log.ErrorContext(ctx, "incident group-sibling lookup failed",
+					append(reqLogFields(o.r), "task", o.task.Name, "error", ferr)...)
+			}
+			s.metrics.IncidentGroupLinked("no_sibling")
+		}
+	}
+	if parent != nil {
+		s.linkIncidentParent(ctx, o, writer, token, created.Ref, parent)
 	}
 
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
@@ -1450,6 +1531,57 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 		return
 	}
 	o.ok("file_issue", "repo", repo.Name, "number", number)
+}
+
+// incidentComment appends fresh evidence to an EXISTING open incident tracker
+// (action=comment_issue) instead of filing a near-duplicate, then terminates the
+// Task at rejected(tracked-elsewhere). It is GATED: the target Issue CR must
+// carry an incident rule-key or group-key label, so an incident agent (which has
+// no issue_write tool) can comment ONLY on a tracker the platform created, never
+// an arbitrary human thread. The operator posts under the bot identity.
+func (o *outcomeCtx) incidentComment(p incidentPayload) {
+	ctx := o.r.Context()
+	s := o.s
+	repo, err := s.repoCR(ctx, o.proj.Name, p.Comment.Repo)
+	if err != nil {
+		writeClientErr(o.w, err)
+		return
+	}
+	var iss tatarav1alpha1.Issue
+	issName := tatarav1alpha1.IssueName(repo.Name, p.Comment.Number)
+	if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: issName}, &iss); err != nil {
+		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
+		return
+	}
+	if iss.Labels[queue.LabelAlertRuleKey] == "" && iss.Labels[queue.LabelAlertGroupKey] == "" {
+		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
+		return
+	}
+	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+	if !ok {
+		return
+	}
+	ref := issueRef(repo, p.Comment.Number)
+	cerr := writer.Comment(ctx, token, ref, p.Comment.Body)
+	controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", cerr)
+	if cerr != nil {
+		s.metrics.IncidentTrackerComment("failed")
+		s.log.ErrorContext(ctx, "restapi: appending incident evidence comment failed",
+			append(reqLogFields(o.r), "task", o.task.Name, "tracker", ref, "error", cerr)...)
+		writeError(o.w, http.StatusBadGateway, "scm comment failed")
+		return
+	}
+	s.metrics.IncidentTrackerComment("posted")
+	if !o.commit(func(t *tatarav1alpha1.Task) error {
+		if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonTrackedElsewhere, s.now()); err != nil {
+			return err
+		}
+		agentNote(t, o.kind, "note", "comment_issue "+ref+": "+p.Reason, s.now())
+		return nil
+	}) {
+		return
+	}
+	o.ok("comment_issue", "repo", repo.Name, "number", p.Comment.Number)
 }
 
 // linkIncidentParent links the freshly-filed child issue under an open tracker
@@ -1595,7 +1727,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	// safe and idempotent: nothing is lost, and a re-run re-adopts what it
 	// already adopted.
 	if len(members) > 0 {
-		if err := s.foldMembers(ctx, o.task, members); err != nil {
+		if err := s.foldMembers(ctx, o.proj, o.task, members); err != nil {
 			if errors.Is(err, errFoldUnverified) {
 				if !o.commit(func(t *tatarav1alpha1.Task) error {
 					return stage.Enter(t, nil, tatarav1alpha1.StageFailed,
@@ -1644,7 +1776,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 				writeClientErr(o.w, err)
 				return
 			}
-			if err := s.queueIssueClose(ctx, &iss, o.task.Name, c.Reason); err != nil {
+			if err := s.queueIssueClose(ctx, o.proj, &iss, o.task.Name, c.Reason); err != nil {
 				writeClientErr(o.w, err)
 				return
 			}
@@ -1654,7 +1786,7 @@ func (o *outcomeCtx) refine(p refinePayload) {
 	// links[] adopt the named artifact as a PLAIN owner of this Task: the link
 	// holds the GC open and puts the artifact in the umbrella's bundle.
 	for _, l := range p.Links {
-		if err := s.linkArtifact(ctx, o.task, l); err != nil {
+		if err := s.linkArtifact(ctx, o.proj, o.task, l); err != nil {
 			writeClientErr(o.w, err)
 			return
 		}
@@ -1706,15 +1838,17 @@ var errFoldUnverified = errors.New("restapi: fold adoption could not be verified
 // A crash between 2 and 4 is safe and idempotent. A crash after 4 leaves
 // foldInFlight set; the reconciler clears it once the members are gone. The
 // reaper SKIPS any Task named in a live umbrella's foldInFlight.
-func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task, members []*tatarav1alpha1.Task) error {
+func (s *Server) foldMembers(ctx context.Context, proj *tatarav1alpha1.Project, umbrella *tatarav1alpha1.Task, members []*tatarav1alpha1.Task) error {
 	names := make([]string, 0, len(members))
 	for _, m := range members {
 		names = append(names, m.Name)
 	}
 
+	spiller := s.spillerForOrNil(proj)
+
 	// STEP 1.
 	key := types.NamespacedName{Namespace: s.ns, Name: umbrella.Name}
-	if err := objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	if err := objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.FoldInFlight = names
 	}); err != nil {
 		return err
@@ -1736,7 +1870,7 @@ func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task,
 			// consumer reads (the C.6 approval grammar, the reaper's
 			// owned-set, the agent bundle) - NOT ownerRefs. Adoption without
 			// this leaves adopted work unguarded and absent from the bundle.
-			if err := s.appendTaskRefFor(ctx, umbrella.Name, &iss); err != nil {
+			if err := s.appendTaskRefFor(ctx, proj, umbrella.Name, &iss); err != nil {
 				return err
 			}
 			adopted = append(adopted, &tatarav1alpha1.Issue{
@@ -1752,7 +1886,7 @@ func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task,
 			if err := s.adopt(ctx, &mr, m, umbrella); err != nil {
 				return err
 			}
-			if err := s.appendTaskRefFor(ctx, umbrella.Name, &mr); err != nil {
+			if err := s.appendTaskRefFor(ctx, proj, umbrella.Name, &mr); err != nil {
 				return err
 			}
 			adopted = append(adopted, &tatarav1alpha1.MergeRequest{
@@ -1781,7 +1915,7 @@ func (s *Server) foldMembers(ctx context.Context, umbrella *tatarav1alpha1.Task,
 	}
 
 	// STEP 5.
-	return objbudget.FitTask(ctx, s.c, s.spiller, key, func(t *tatarav1alpha1.Task) {
+	return objbudget.FitTask(ctx, s.c, spiller, key, func(t *tatarav1alpha1.Task) {
 		t.Status.FoldInFlight = nil
 	})
 }
@@ -1803,7 +1937,7 @@ func (s *Server) adopt(ctx context.Context, obj client.Object, from, to *tatarav
 // linkArtifact appends the umbrella as a PLAIN owner of a linked Issue/MR. A
 // plain owner's only job is to hold the GC open; the controller flag - and with
 // it the authorization to write to the forge - is untouched.
-func (s *Server) linkArtifact(ctx context.Context, task *tatarav1alpha1.Task, l linkRef) error {
+func (s *Server) linkArtifact(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, l linkRef) error {
 	var obj client.Object
 	if l.IsPR {
 		obj = &tatarav1alpha1.MergeRequest{}
@@ -1826,12 +1960,12 @@ func (s *Server) linkArtifact(ctx context.Context, task *tatarav1alpha1.Task, l 
 	if err := s.c.Update(ctx, obj); err != nil {
 		return fmt.Errorf("link %s onto %s: %w", obj.GetName(), task.Name, err)
 	}
-	return s.appendTaskRefFor(ctx, task.Name, obj)
+	return s.appendTaskRefFor(ctx, proj, task.Name, obj)
 }
 
-func (s *Server) appendTaskRefFor(ctx context.Context, taskName string, obj client.Object) error {
+func (s *Server) appendTaskRefFor(ctx context.Context, proj *tatarav1alpha1.Project, taskName string, obj client.Object) error {
 	if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
-		return s.appendTaskRef(ctx, taskName, "", obj.GetName())
+		return s.appendTaskRef(ctx, proj, taskName, "", obj.GetName())
 	}
-	return s.appendTaskRef(ctx, taskName, obj.GetName(), "")
+	return s.appendTaskRef(ctx, proj, taskName, obj.GetName(), "")
 }

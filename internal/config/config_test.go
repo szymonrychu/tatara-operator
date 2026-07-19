@@ -128,6 +128,41 @@ func TestLoad_MemoryMonitoringDefaults(t *testing.T) {
 	}
 }
 
+func TestLoad_IncidentCorrelationAndEscalationDefaults(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.IncidentCorrelationLabels; len(got) != 2 || got[0] != "namespace" || got[1] != "cluster" {
+		t.Fatalf("IncidentCorrelationLabels default = %v, want [namespace cluster]", got)
+	}
+	if cfg.IncidentEscalateRefireThreshold != config.DefaultIncidentEscalateRefires {
+		t.Fatalf("IncidentEscalateRefireThreshold = %d, want %d",
+			cfg.IncidentEscalateRefireThreshold, config.DefaultIncidentEscalateRefires)
+	}
+	if cfg.IncidentEscalateStaleAge != config.DefaultIncidentEscalateStaleAge {
+		t.Fatalf("IncidentEscalateStaleAge = %v, want %v",
+			cfg.IncidentEscalateStaleAge, config.DefaultIncidentEscalateStaleAge)
+	}
+}
+
+func TestLoad_IncidentCorrelationLabelsOverride(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("INCIDENT_CORRELATION_LABELS", "namespace,service,team")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.IncidentCorrelationLabels; len(got) != 3 || got[1] != "service" {
+		t.Fatalf("IncidentCorrelationLabels override = %v, want [namespace service team]", got)
+	}
+}
+
 // TestLoad_IdlePodReapAfter covers the issue #237 idle-backstop knob: the
 // default, an explicit override, the min-floor clamp for a short positive value,
 // and disabling via zero.
@@ -185,6 +220,67 @@ func TestLoad_IdlePodReapAfter(t *testing.T) {
 		t.Setenv("IDLE_POD_REAP_MINUTES", "notanumber")
 		if _, err := config.Load(); err == nil {
 			t.Fatal("expected error for non-integer IDLE_POD_REAP_MINUTES, got nil")
+		}
+	})
+}
+
+// TestLoad_MemoryProvisioningTimeout covers the issue #355 provisioning-bound
+// knob: the default, an explicit override, the min-floor clamp for a short
+// positive value, and disabling via zero.
+func TestLoad_MemoryProvisioningTimeout(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+		t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+		t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	}
+	t.Run("default", func(t *testing.T) {
+		base(t)
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != config.DefaultMemoryProvisioningTimeout {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want default %v", cfg.MemoryProvisioningTimeout, config.DefaultMemoryProvisioningTimeout)
+		}
+	})
+	t.Run("explicit", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "90")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != 90*time.Minute {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want 90m", cfg.MemoryProvisioningTimeout)
+		}
+	})
+	t.Run("clamped to floor", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "1")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != config.MinMemoryProvisioningTimeout {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want clamped %v", cfg.MemoryProvisioningTimeout, config.MinMemoryProvisioningTimeout)
+		}
+	})
+	t.Run("disabled by zero", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "0")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryProvisioningTimeout != 0 {
+			t.Fatalf("MemoryProvisioningTimeout = %v, want 0 (disabled)", cfg.MemoryProvisioningTimeout)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		base(t)
+		t.Setenv("MEMORY_PROVISIONING_TIMEOUT_MINUTES", "notanumber")
+		if _, err := config.Load(); err == nil {
+			t.Fatal("expected error for non-integer MEMORY_PROVISIONING_TIMEOUT_MINUTES, got nil")
 		}
 	})
 }

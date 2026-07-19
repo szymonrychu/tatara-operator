@@ -6073,6 +6073,17 @@ spec:
                     type: string
                   phase:
                     type: string
+                  provisioningSince:
+                    description: |-
+                      ProvisioningSince records when the memory stack last transitioned INTO a
+                      non-Ready phase (Provisioning or Degraded). Set on the Ready/Failed/""->
+                      Provisioning edge, preserved across a Provisioning<->Degraded episode, and
+                      cleared whenever the stack reaches Ready. reconcileMemory compares it
+                      against MemoryConfig.ProvisioningTimeout to bound how long a stuck backend
+                      may sit Provisioning before reporting Degraded (issue #355 - a wedged
+                      stack sat Provisioning for 7h+ with no bounded failure signal).
+                    format: date-time
+                    type: string
                   readySince:
                     description: |-
                       ReadySince records when the memory stack last transitioned into Phase==Ready.

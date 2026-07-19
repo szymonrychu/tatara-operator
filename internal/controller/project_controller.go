@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -37,6 +38,16 @@ import (
 // 60 s is coarse-grained enough to avoid list pressure while still converging
 // the gauges quickly after any phase/state change.
 const defaultGaugeRecomputeInterval = 60 * time.Second
+
+// defaultUnparkDriveInterval floors how often driveUnparks re-sweeps a
+// Project's parked-Task backlog (see UnparkDriveInterval, tatara-operator#368).
+// 30s keeps time-based re-entries (merge-timeout/deploy-timeout/no-outcome/
+// stage-deadline, all minutes-to-hours granularity per stage.go) and the
+// comment-driven backstop (driveCommentUnpark handles the prompt path
+// directly; this floor is only its cron-cadence fallback) unaffected in
+// practice, while capping decline volume to (parked backlog)/30s regardless
+// of how fast something else forces Reconcile() to run.
+const defaultUnparkDriveInterval = 30 * time.Second
 
 // ProjectReconciler validates a Project's SCM secret and publishes its
 // webhook URL.
@@ -116,6 +127,20 @@ type ProjectReconciler struct {
 	// only on the serialised reconcile path (MaxConcurrentReconciles=1); no mutex
 	// required.
 	toolSurfaceUnhealthyCycles map[string]int
+
+	// UnparkDriveInterval floors how often driveUnparks re-sweeps a given
+	// Project's parked-Task backlog, decoupled from whatever cadence
+	// Reconcile() otherwise runs at. Defaults to defaultUnparkDriveInterval
+	// when zero. Fix for the 2026-07-18 operator_unpark_declined_total burst
+	// (tatara-operator#368): a Project stuck in memory phase=Provisioning
+	// forces reconcileMemory's 10s RequeueAfter floor onto the WHOLE
+	// Reconcile() (amplified further by Owns() watch retriggers - see
+	// tatara-operator#367), and driveUnparks had no pacing of its own, so it
+	// re-declined the full parked backlog on every single pass. Keyed per
+	// project (like memoryUnhealthyCycles), never a single cluster-wide
+	// clock: two live Projects must not throttle each other.
+	UnparkDriveInterval time.Duration
+	lastDriveUnparks    map[string]time.Time
 }
 
 // +kubebuilder:rbac:groups=tatara.dev,resources=projects,verbs=get;list;watch;create;update;patch;delete
@@ -172,7 +197,35 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.computeProjectCounts(ctx, &project)
 
-	if err := r.Status().Update(ctx, &project); err != nil {
+	// Persist the computed status under optimistic-concurrency retry. A routine
+	// 409 ("the object has been modified") - amplified during operator rollouts
+	// when two replicaset pods reconcile the same Project - otherwise bubbles up
+	// as a "Reconciler error" log line (tatara-operator#387). Every other
+	// status-write site in this package already retries; this was the lone
+	// outlier. Only the fields THIS reconcile computes are re-applied onto the
+	// freshly-read object (WebhookURL, the Ready/Memory conditions, Memory,
+	// Grafana, the counts): fields owned by later/other write paths (LastIssueScan
+	// et al. from stampScan below, ScanMarks, TokenBudget, LastRefine) must not be
+	// reverted to the values read at the top of Reconcile. Mirrors stampScan /
+	// patchQueuedEventStatus.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tataradevv1alpha1.Project{}
+		if err := r.Get(ctx, req.NamespacedName, fresh); err != nil {
+			return err
+		}
+		fresh.Status.WebhookURL = project.Status.WebhookURL
+		fresh.Status.Conditions = project.Status.Conditions
+		fresh.Status.Memory = project.Status.Memory
+		fresh.Status.Grafana = project.Status.Grafana
+		fresh.Status.RepositoryCount = project.Status.RepositoryCount
+		fresh.Status.OpenIssuesCount = project.Status.OpenIssuesCount
+		fresh.Status.OpenIncidentsCount = project.Status.OpenIncidentsCount
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		project = *fresh
+		return nil
+	}); err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, fmt.Errorf("update project status: %w", err)
 	}
@@ -196,12 +249,16 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// THE F.6 RE-ENTRY DRIVER (fix W3). Applies stage.Unpark to every parked Task
 	// whose reason has a re-entry rule (time-based merge/deploy/no-outcome plus the
 	// comment-driven awaiting-human/backlog-sweep backstop); identity-unverified is
-	// webhook+grammar-driven and skipped. Runs every project reconcile, leader-only,
-	// regardless of cron config. A persist failure requeues.
-	if err := r.driveUnparks(ctx, &project, time.Now()); err != nil {
+	// webhook+grammar-driven and skipped. Paced independently of Reconcile()'s other
+	// drivers (tatara-operator#368: an unrelated 10s-or-faster forced cadence was
+	// hammering this path across the full parked backlog every single pass). A
+	// persist failure requeues.
+	unparkRequeue, unparkErr := r.driveUnparksPaced(ctx, &project, time.Now())
+	if unparkErr != nil {
 		r.Metrics.ReconcileResult("Project", "error")
-		return ctrl.Result{}, fmt.Errorf("drive unparks: %w", err)
+		return ctrl.Result{}, fmt.Errorf("drive unparks: %w", unparkErr)
 	}
+	requeueAfter = soonestRequeue(requeueAfter, unparkRequeue)
 
 	// WS3-I4: a human reply to a Task parked with a NO-RE-ENTRY reason triggers a
 	// fresh gated re-mint (sever(Orphan) + MintForItem), never a smuggled re-entry.
@@ -317,7 +374,7 @@ func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 	if err := r.List(ctx, &list); err != nil {
 		return
 	}
-	var provisioning, ready, failed int
+	var provisioning, ready, failed, degraded int
 	for i := range list.Items {
 		mem := list.Items[i].Status.Memory
 		if mem == nil {
@@ -330,9 +387,11 @@ func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 			ready++
 		case "Failed":
 			failed++
+		case "Degraded":
+			degraded++
 		}
 	}
-	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed)
+	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed, degraded)
 }
 
 // lightragDocStatuses is the full set of ingestion statuses lightrag reports for

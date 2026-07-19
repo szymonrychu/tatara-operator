@@ -87,6 +87,16 @@ leaderElection: true
 # positive value up to a 5m floor; set 0 to disable the idle backstop.
 idlePodReapMinutes: 30
 
+# memoryProvisioningTimeoutMinutes bounds how long a per-project memory stack
+# may sit phase=Provisioning before reconcileMemory reports it Degraded
+# (issue #355): a re-provision left mem-tatara-lightrag Running-but-never-Ready
+# for 7h+ with the phase stuck Provisioning and no bounded failure signal at
+# all. Default 45m comfortably exceeds a normal cnpg/neo4j/lightrag cold start
+# while catching a wedged backend far sooner than hours. The operator clamps a
+# positive value up to a 5m floor; set 0 to disable the bound (pre-#355
+# behaviour: Provisioning stays unbounded).
+memoryProvisioningTimeoutMinutes: 45
+
 # pushMetricsAllowedPrefixes is the comma-separated metric-name prefix allowlist
 # the push-receiver enforces on short-lived-pod metric pushes. Series whose name
 # matches no prefix are dropped (operator_push_series_dropped_total{reason=

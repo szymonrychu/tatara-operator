@@ -10,6 +10,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/promptguidance"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/refine"
@@ -124,9 +125,6 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 		// Intentional: project-scoped tasks stamp unconditionally; no backlog/fast-refire coupling,
 		// unlike createScanTask which propagates errors for per-issue deferral.
 		return false, nil
-	}
-	if created {
-		r.Metrics.ScanTaskCreated("brainstorm", "brainstorm")
 	}
 	return created, nil
 }
@@ -263,7 +261,6 @@ func (r *ProjectReconciler) createDocumentationTask(ctx context.Context, proj *t
 		return false, nil
 	}
 	if created {
-		r.Metrics.ScanTaskCreated("documentation", "documentation")
 		log.FromContext(ctx).Info("scan: enqueued documentation",
 			"action", "scan_task_created", "resource_id", proj.Name,
 			"source_repo", sourceRepo.Name, "docs_repo", docsRepo.Name, "head_sha", headSHA)
@@ -443,9 +440,17 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 // stampScan records the per-activity Last*Scan and persists status.
 // RetryOnConflict handles racing reconcile updates so the stamp always lands.
 // Returns non-nil on persistent failure so the caller can log+metric the event.
+//
+// On success it also sets obs.SweepLastSuccessTimestamp{activity} - the same
+// heartbeat gauge sweep.go's B.4 pass sets for sweep/nightlySweep, extended
+// to the brainstorm/documentation/issueScan crons. This is the successor for
+// tatara_scan_items_total, which the metric-wiring audit (issue #370) pruned
+// as dead-per-redesign; TataraLoopStalled's deadman alert and the
+// tatara-loop dashboard panel are repointed onto this gauge in the same
+// change so a stalled scan cron is still caught.
 func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string) error {
 	now := metav1.Now()
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Project{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
 			return err
@@ -463,6 +468,11 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 		}
 		return r.Status().Update(ctx, fresh)
 	})
+	if err != nil {
+		return err
+	}
+	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
+	return nil
 }
 
 // brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
@@ -479,10 +489,8 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	// Project-scoped in-flight guard: any non-terminal brainstorm Task blocks.
 	if brainstormInFlightProject(existing) {
-		r.Metrics.ScanItem("brainstorm", "skipped_inflight")
 		l.Info("brainstorm: in-flight project brainstorm task; skipping cycle",
 			"action", "scan_brainstorm", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration("brainstorm", time.Since(start).Seconds())
 		return
 	}
 
@@ -573,17 +581,14 @@ func (r *ProjectReconciler) runProjectScopedProposalCycle(
 			return false
 		}
 		l.Info(activityLabel+": no valid repos", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
 		return true
 	}
 	atCapGuard := func() bool {
 		if !atCap {
 			return false
 		}
-		r.Metrics.ScanItem(activityLabel, "skipped_cap")
 		l.Info(activityLabel+": project backlog at cap; skipping cycle",
 			"action", scanAction, "resource_id", proj.Name, "total", total, "cap", maxProp)
-		r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
 		return true
 	}
 
@@ -610,16 +615,11 @@ func (r *ProjectReconciler) runProjectScopedProposalCycle(
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
 	goal := goalBuilder(slugs, issuesCtx, scmGuidance(proj))
-	created, err := taskCreator(ctx, proj, goal, sources)
+	_, err := taskCreator(ctx, proj, goal, sources)
 	if err != nil {
 		l.Error(err, "scan: enqueue "+activityLabel+" event", "resource_id", proj.Name)
-		r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
 		return
 	}
-	if created {
-		r.Metrics.ScanItem(activityLabel, "picked")
-	}
-	r.Metrics.ObserveScanDuration(activityLabel, time.Since(start).Seconds())
 	l.Info(activityLabel+" complete", "action", scanAction, "resource_id", proj.Name,
 		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
 }
@@ -971,9 +971,6 @@ func (r *ProjectReconciler) createRefineTask(ctx context.Context, proj *tatarav1
 		log.FromContext(ctx).Error(err, "scan: enqueue refine event failed; skipping", "action", "scan_enqueue_failed", "project", proj.Name)
 		return false, nil
 	}
-	if created {
-		r.Metrics.ScanTaskCreated("refine", "refine")
-	}
 	return created, nil
 }
 
@@ -1118,7 +1115,6 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
 					l.Error(serr, "scan: persist sweep stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
-					r.Metrics.ScanItem("issueScan", "stamp_error")
 				}
 				if _, next2, ok2 := r.reposDueForScan(proj, "issueScan", repos, now); ok2 {
 					consider(next2)
@@ -1178,7 +1174,6 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
 						l.Error(serr, "scan: persist brainstorm stamp failed",
 							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
-						r.Metrics.ScanItem("brainstorm", "stamp_error")
 					}
 					if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
 						consider(next2)
@@ -1216,7 +1211,6 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				if serr := r.stampScan(ctx, proj, "documentation"); serr != nil {
 					l.Error(serr, "scan: persist documentation stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "documentation")
-					r.Metrics.ScanItem("documentation", "stamp_error")
 				}
 				if next2, ok2 := activityNextFire(cronSpec.Documentation.Schedule, now); ok2 {
 					consider(next2)

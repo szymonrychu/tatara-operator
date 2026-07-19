@@ -237,6 +237,13 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{}, nil
 	}
 
+	// Issue #381 bug B part 2: an interrupted two-phase mint left this Task
+	// owning zero MergeRequest/Issue CRs. Runs before the three clocks - see
+	// reconcileMRBindingBackstop's doc comment for why this must be first.
+	if handled, err := r.reconcileMRBindingBackstop(ctx, project, task, now); err != nil || handled {
+		return ctrl.Result{}, err
+	}
+
 	// THE THREE CLOCKS (F.4). Gap 5: nothing else in production calls
 	// stage.ArmedClock, so without this every deadline in the contract is fiction.
 	res, handled, err := r.reconcileClocks(ctx, project, task, now)
@@ -386,17 +393,23 @@ func (r *TaskReconciler) refreshTaskFromAPI(ctx context.Context, task *tatarav1a
 // one - this is what makes a "someone else already applied this" skip-write
 // branch adopt the winner's state rather than risk a 409 on the next write in
 // the same reconcile. Mirrors repository_controller.go's patchStatus.
-func (r *TaskReconciler) patchTaskAnnotations(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+//
+// Package-level (not a TaskReconciler method) so queue_controller.go's
+// DispatcherReconciler.admitTicket can reuse the exact same conflict-safe path
+// for its own Task label write instead of the raw r.Update it used to make
+// (the second, quieter half of the #348 queuedevents 409-storm fix - the same
+// stale-cache-on-shared-object shape, just on Task instead of QueuedEvent).
+func patchTaskAnnotations(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
 		}
 		if !mutate(fresh) {
 			*task = *fresh
 			return nil
 		}
-		if err := r.Update(ctx, fresh); err != nil {
+		if err := c.Update(ctx, fresh); err != nil {
 			return err
 		}
 		*task = *fresh
@@ -404,27 +417,38 @@ func (r *TaskReconciler) patchTaskAnnotations(ctx context.Context, task *tatarav
 	})
 }
 
+func (r *TaskReconciler) patchTaskAnnotations(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+	return patchTaskAnnotations(ctx, r.Client, task, mutate)
+}
+
 // patchTaskStatus Get-fresh + mutate + Status().Update's a Task's status,
 // retrying on conflict. Same skip/write copy-back contract as
 // patchTaskAnnotations (and repository_controller.go's patchStatus): the
 // unconditional `*task = *fresh` on both paths is what preserves the
 // site-153 ledger-seed resourceVersion adoption (the #175 409-storm fix).
-func (r *TaskReconciler) patchTaskStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+//
+// Package-level for the same reason as patchTaskAnnotations above: shared by
+// TaskReconciler and DispatcherReconciler.admitTicket.
+func patchTaskStatus(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Task{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
 			return err
 		}
 		if !mutate(fresh) {
 			*task = *fresh
 			return nil
 		}
-		if err := r.Status().Update(ctx, fresh); err != nil {
+		if err := c.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
 		*task = *fresh
 		return nil
 	})
+}
+
+func (r *TaskReconciler) patchTaskStatus(ctx context.Context, task *tatarav1alpha1.Task, mutate func(*tatarav1alpha1.Task) bool) error {
+	return patchTaskStatus(ctx, r.Client, task, mutate)
 }
 
 // projectRepos returns all Repositories belonging to a Project. Uses the

@@ -55,6 +55,23 @@ func ReaderByProvider(name, token string) (SCMReader, error) {
 	}
 }
 
+// CIReaderByProvider returns a token-bound CIReader for a provider name
+// behind the C.2.10 live-CI capability. GitHub and GitLab already satisfy
+// CIReader (see checks.go's compile-time assertions), so this delegates to
+// ReaderByProvider rather than duplicating its provider switch - one switch
+// stays the single source of truth for "which providers exist".
+func CIReaderByProvider(name, token string) (CIReader, error) {
+	r, err := ReaderByProvider(name, token)
+	if err != nil {
+		return nil, err
+	}
+	ci, ok := r.(CIReader)
+	if !ok {
+		return nil, fmt.Errorf("scm: provider %q does not implement CIReader", name)
+	}
+	return ci, nil
+}
+
 func normalizeRemote(raw string) (string, bool) {
 	u, err := url.Parse(raw)
 	if err != nil {

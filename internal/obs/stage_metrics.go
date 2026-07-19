@@ -21,6 +21,23 @@ var IllegalStageTransitionTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(IllegalStageTransitionTotal, StageDriftTotal)
+	// Pre-seed every stage so a healthy operator (0 drift, the expected
+	// steady state) exposes a zero baseline from startup instead of no
+	// series at all - a sustained-rate alert added later has something to
+	// evaluate against on the very first real drift (metric-wiring audit,
+	// issue #370). IllegalStageTransitionTotal is NOT pre-seeded: its
+	// {from,to} cardinality (15x15) is unbounded-by-comparison for a metric
+	// with no consuming alert yet, and K.1 cardinality discipline argues
+	// against seeding a matrix nobody reads.
+	for _, stg := range []string{
+		tatarav1alpha1.StageTriaging, tatarav1alpha1.StageBrainstorming, tatarav1alpha1.StageClarifying,
+		tatarav1alpha1.StageInvestigating, tatarav1alpha1.StageRefining, tatarav1alpha1.StageApproved,
+		tatarav1alpha1.StageImplementing, tatarav1alpha1.StageReviewing, tatarav1alpha1.StageMerging,
+		tatarav1alpha1.StageDeploying, tatarav1alpha1.StageDelivered, tatarav1alpha1.StageDocumenting,
+		tatarav1alpha1.StageRejected, tatarav1alpha1.StageFailed, tatarav1alpha1.StageParked,
+	} {
+		StageDriftTotal.WithLabelValues(stg)
+	}
 }
 
 // IllegalStageTransition increments operator_illegal_stage_transition_total.

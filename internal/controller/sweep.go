@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
@@ -81,14 +82,9 @@ const (
 	// its PRESENCE is load-bearing.
 	AnnWebhookOriginated = "tatara.dev/webhook-originated"
 
-	// TaskBranchPrefix is the head-branch namespace an agent PR lives in. B.4
-	// clause 1(b) is an EXACT match on TaskBranchPrefix + the owning Task's name.
-	TaskBranchPrefix = "task/"
-
-	// SweepActivity / SweepNightlyActivity are the {activity} label values on the
-	// sweep heartbeat and error counters. ONE function serves both paths.
-	SweepActivity        = "sweep"
-	SweepNightlyActivity = "nightlySweep"
+	// SweepActivity is the {activity} label value on the sweep heartbeat and
+	// error counters.
+	SweepActivity = "sweep"
 
 	// SweepIssueKind is the Task kind a sweep-minted ISSUE Task carries. F.3 has
 	// NO triaging -> implementing edge: an issue Task enters clarifying, where the
@@ -327,7 +323,7 @@ func botLoginOf(proj *tatarav1alpha1.Project) string {
 // AdoptPR is B.4 clause 1: adopt pr into task's mrRefs iff ALL of
 //
 //	a. pr.author     == Project.spec.scm.botLogin
-//	b. pr.headBranch == "task/<owning-task-name>"
+//	b. pr.headBranch == agent.TaskBranch(task)      (the canonical work branch)
 //	c. pr.head.repo  == pr.base.repo                (NO forks, ever)
 //
 // Clause (c) is what stops an outside contributor from injecting an MR into a
@@ -343,7 +339,7 @@ func AdoptPR(proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, pr scm.PRR
 	if bot == "" || pr.Author != bot {
 		return false
 	}
-	if pr.HeadBranch != TaskBranchPrefix+task.Name {
+	if pr.HeadBranch != agent.TaskBranch(task) {
 		return false
 	}
 	return pr.HeadRepo != "" && pr.HeadRepo == pr.Repo
@@ -572,10 +568,9 @@ func (b *sweepBudget) capHit(ctx context.Context, cap string) {
 }
 
 // SweepProject runs ONE sweep pass over proj: mint a Task for every orphan
-// issue, dispose of every open PR/MR, and stamp the heartbeat when the pass
-// completes clean. activity is the {activity} metric label (SweepActivity for
-// the hourly path, SweepNightlyActivity for the nightly one) - ONE function,
-// both paths.
+// issue, dispose of every open PR/MR, and stamp the liveness heartbeat once the
+// pass has run to completion. activity is the {activity} metric label
+// (SweepActivity).
 //
 // sp is the A.7 spiller for the mirror writes; nil is legal (a sweep-minted
 // Issue/MergeRequest is far under the byte budget on its first write).
@@ -627,10 +622,18 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	for stg, n := range minted {
 		obs.TasksMintedPerSweep.WithLabelValues(proj.Name, stg).Observe(float64(n))
 	}
+	// The heartbeat is LIVENESS, not zero-error health: the repos loop ran to the
+	// end, so stamp it whether or not a per-item read failed. Per-item errors are
+	// already metered by SweepErrorsTotal and returned below for the requeue.
+	// Coupling the heartbeat to a fully-clean pass let one stale CR or one
+	// transient forge error silence it for the WHOLE pass, and since the gauge
+	// resets on restart the NoData(Alerting) alert then fired while the sweep was
+	// in fact running. The activeTaskCount hard-failure returns BEFORE this point,
+	// so a sweep that genuinely cannot run still leaves the heartbeat unset.
+	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
 	if firstErr != nil {
 		return firstErr
 	}
-	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
 	l.Info("sweep: pass complete",
 		"action", "sweep_pass", "resource_id", proj.Name, "activity", activity,
 		"minted_triaging", minted[tatarav1alpha1.StageTriaging],
@@ -839,26 +842,36 @@ func (r *ProjectReconciler) mergeRequestCR(ctx context.Context, proj *tatarav1al
 	return r.minter().mergeRequestCR(ctx, proj, repo, number)
 }
 
-// taskForBranch resolves the Task an agent head branch names ("task/<name>").
-// A branch outside the namespace, a Task that no longer exists, and a Task in
-// another project all resolve to nil - which sends a bot-authored PR straight to
-// clause 2 (IGNORE), exactly as intended for an ORPHANED AGENT PR.
+// taskForBranch resolves the Task an agent head branch names, by matching
+// agent.TaskBranch(t) against branch over the project's own Tasks (the
+// TaskProjectRefIndex field index, same pattern as activeTaskCount). The
+// branch string no longer derives 1:1 from a Task's metadata.name (a
+// numbered Task's branch carries its issue/PR number and title slug, a
+// documentation Task its source SHA), so CutPrefix+Get is no longer
+// sufficient - fix A3 replaces it with a scan-and-match. A branch matching
+// no live Task in this project, and a same-named branch belonging to a
+// DIFFERENT project's Task, both resolve to nil - which sends a
+// bot-authored PR straight to clause 2 (IGNORE), exactly as intended for an
+// ORPHANED AGENT PR.
 func (r *ProjectReconciler) taskForBranch(ctx context.Context, proj *tatarav1alpha1.Project, branch string) (*tatarav1alpha1.Task, error) {
-	name, ok := strings.CutPrefix(branch, TaskBranchPrefix)
-	if !ok || name == "" {
-		return nil, nil
-	}
-	var t tatarav1alpha1.Task
-	if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &t); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, nil
+	var tl tatarav1alpha1.TaskList
+	err := r.List(ctx, &tl, client.InNamespace(proj.Namespace), client.MatchingFields{TaskProjectRefIndex: proj.Name})
+	if err != nil {
+		if !isFieldSelectorUnsupported(err) {
+			return nil, err
 		}
-		return nil, err
+		tl = tatarav1alpha1.TaskList{}
+		if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+			return nil, err
+		}
 	}
-	if t.Spec.ProjectRef != proj.Name {
-		return nil, nil
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef == proj.Name && agent.TaskBranch(t) == branch {
+			return t, nil
+		}
 	}
-	return &t, nil
+	return nil, nil
 }
 
 // activeTaskCount counts the project's ACTIVE Tasks via the A.3 projectRef field

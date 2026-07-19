@@ -122,12 +122,19 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
 		return nil, false, fmt.Errorf("intake: set task ownerref: %w", err)
 	}
-	created, err := m.createTaskRaceSafe(ctx, task)
+	created, existing, err := m.createTaskRaceSafe(ctx, task)
 	if err != nil {
 		return nil, false, err
 	}
 	if !created {
-		return task, false, nil // backstop: the natural-key twin already exists
+		// Backstop: repair an interrupted mint that left the twin's Issue CR an
+		// unbound stub (the MergeRequest analogue in MintReviewTask documents why).
+		if existing != nil {
+			if rerr := m.repairIssueBinding(ctx, proj, repo, ext, existing, sp); rerr != nil {
+				return nil, false, rerr
+			}
+		}
+		return task, false, nil
 	}
 	if err := SyncIssue(ctx, m.Client, sp, proj, repo, ext); err != nil {
 		return nil, false, fmt.Errorf("intake: sync issue: %w", err)
@@ -184,12 +191,24 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 	if err := controllerutil.SetControllerReference(proj, task, m.Scheme); err != nil {
 		return nil, false, fmt.Errorf("intake: set task ownerref: %w", err)
 	}
-	created, err := m.createTaskRaceSafe(ctx, task)
+	created, existing, err := m.createTaskRaceSafe(ctx, task)
 	if err != nil {
 		return nil, false, err
 	}
 	if !created {
-		return task, false, nil // backstop: the natural-key twin already exists
+		// Backstop: the natural-key twin already exists. An interrupted mint (a
+		// restart between the Task create and the bind below) can leave that twin's
+		// MergeRequest CR an UNBOUND stub - no owner, empty status - and nothing
+		// else repairs it: the cadence reconciler only re-syncs the comment thread.
+		// The twin then owns no open MR forever and its review agent's
+		// submit_outcome 400s on every retry. Repair the bind against the existing
+		// twin (a no-op once it is already bound).
+		if existing != nil {
+			if rerr := m.repairMRBinding(ctx, proj, repo, ext, existing, sp); rerr != nil {
+				return nil, false, rerr
+			}
+		}
+		return task, false, nil
 	}
 	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
 		return nil, false, err
@@ -219,42 +238,48 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 // A collision with a DEAD (terminal/deleting) twin of the same name is the
 // re-mint-after-reap case: delete the tombstone and retry, so a legitimately new
 // event is never blocked by a dead name.
-func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Task) (bool, error) {
+//
+// When created=false because a LIVE twin already holds the name, that twin is
+// returned so the caller can REPAIR an interrupted mint (the twin's Issue/MR
+// mirror may still be an unbound stub - see MintReviewTask/MintIssueTask). It is
+// nil on every other created=false path (a terminal twin just got deleted for a
+// clean re-mint; there is nothing to repair).
+func (m *Minter) createTaskRaceSafe(ctx context.Context, task *tatarav1alpha1.Task) (bool, *tatarav1alpha1.Task, error) {
 	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
 	// Live (uncached) pre-check shrinks the window before the deterministic-name
 	// collision even applies; the collision below is the actual arbiter.
 	existing := &tatarav1alpha1.Task{}
 	if err := m.reader().Get(ctx, key, existing); err == nil {
 		if existing.DeletionTimestamp == nil && !tatarav1alpha1.TaskDone(existing) {
-			return false, nil // live twin: the backstop no-ops
+			return false, existing, nil // live twin: the backstop no-ops the create but repairs the bind
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("intake: pre-check task %s: %w", key.Name, err)
+		return false, nil, fmt.Errorf("intake: pre-check task %s: %w", key.Name, err)
 	}
 
 	err := m.Client.Create(ctx, task)
 	if err == nil {
-		return true, nil
+		return true, nil, nil
 	}
 	if !apierrors.IsAlreadyExists(err) {
-		return false, fmt.Errorf("intake: create task %s: %w", key.Name, err)
+		return false, nil, fmt.Errorf("intake: create task %s: %w", key.Name, err)
 	}
 	// Resolve the winning twin through the UNCACHED reader (F3-1): a stale cache
 	// that showed a still-LIVE twin as terminal would cascade a Delete of its
 	// owned Issue/MR mirror. The Delete below stays on m.Client (writes go
 	// through the writer), but the terminal/deleting decision must be live.
 	if getErr := m.reader().Get(ctx, key, existing); getErr != nil {
-		return false, fmt.Errorf("intake: resolve existing task %s: %w", key.Name, getErr)
+		return false, nil, fmt.Errorf("intake: resolve existing task %s: %w", key.Name, getErr)
 	}
 	if existing.DeletionTimestamp != nil || tatarav1alpha1.TaskDone(existing) {
 		if delErr := m.Client.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
-			return false, fmt.Errorf("intake: delete stale terminal task %s: %w", key.Name, delErr)
+			return false, nil, fmt.Errorf("intake: delete stale terminal task %s: %w", key.Name, delErr)
 		}
 		log.FromContext(ctx).Info("intake: deleted stale terminal task on name collision; re-minting next pass",
 			"action", "intake_stale_delete", "resource_id", key.Name)
-		return false, nil // re-mint on the next tick against the freed name
+		return false, nil, nil // re-mint on the next tick against the freed name
 	}
-	return false, nil // live twin
+	return false, existing, nil // live twin
 }
 
 // issueCR returns the Issue CR for (repo, number), or nil when none exists.
@@ -315,6 +340,69 @@ func (m *Minter) bindMRToTask(ctx context.Context, proj *tatarav1alpha1.Project,
 		return fmt.Errorf("intake: sync mergerequest: %w", err)
 	}
 	return m.ownMergeRequest(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), task)
+}
+
+// repairMRBinding heals a review mint that was interrupted between the Task
+// create and bindMRToTask: the Task is live but its MergeRequest CR is an UNBOUND
+// stub (no controller owner, empty status), or was never created at all. It
+// re-runs the SAME mirror-and-own bind against the existing twin and re-stamps
+// mrRefs. It NEVER steals: a CR already controller-owned - by the twin (the
+// idempotent re-run) or, defensively, by anyone else - is left untouched, so the
+// repair is safe to run on every backstop pass and race-safe under concurrency
+// (ownMergeRequest is the real arbiter; this Get is a cheap skip for the common
+// already-bound case).
+func (m *Minter) repairMRBinding(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	ext scm.MergeRequest, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
+
+	name := tatarav1alpha1.MergeRequestName(repo.Name, ext.Number)
+	var mr tatarav1alpha1.MergeRequest
+	err := m.Client.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &mr)
+	if err == nil {
+		if _, owned := own.ControllerOwner(&mr); owned {
+			return nil // already bound (or foreign-owned): never steal, never re-mirror
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("intake: repair get mergerequest %s: %w", name, err)
+	}
+	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
+		return err
+	}
+	log.FromContext(ctx).Info("intake: repaired interrupted review mint binding",
+		"action", "intake_repair_bind", "resource_id", task.Name, "mr", name)
+	return m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
+		if !slices.Contains(fresh.Status.MRRefs, name) {
+			fresh.Status.MRRefs = append(fresh.Status.MRRefs, name)
+		}
+	})
+}
+
+// repairIssueBinding is repairMRBinding's Issue-mint counterpart.
+func (m *Minter) repairIssueBinding(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
+	ext scm.Issue, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
+
+	name := tatarav1alpha1.IssueName(repo.Name, ext.Number)
+	var iss tatarav1alpha1.Issue
+	err := m.Client.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: name}, &iss)
+	if err == nil {
+		if _, owned := own.ControllerOwner(&iss); owned {
+			return nil // already bound (or foreign-owned): never steal, never re-mirror
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("intake: repair get issue %s: %w", name, err)
+	}
+	if err := SyncIssue(ctx, m.Client, sp, proj, repo, ext); err != nil {
+		return fmt.Errorf("intake: repair sync issue: %w", err)
+	}
+	if err := ownIssueForTask(ctx, m.Client, proj.Namespace, name, task); err != nil {
+		return err
+	}
+	log.FromContext(ctx).Info("intake: repaired interrupted issue mint binding",
+		"action", "intake_repair_bind", "resource_id", task.Name, "issue", name)
+	return m.stampMintStatus(ctx, task, func(fresh *tatarav1alpha1.Task) {
+		if !slices.Contains(fresh.Status.IssueRefs, name) {
+			fresh.Status.IssueRefs = append(fresh.Status.IssueRefs, name)
+		}
+	})
 }
 
 // ownMergeRequest appends task as the MergeRequest CR's controller owner. It

@@ -79,6 +79,16 @@ func projectPaused(proj *tatarav1alpha1.Project) bool {
 	return proj != nil && proj.Spec.MaxConcurrentAgents == 0
 }
 
+// mrBindingBackstopGrace is issue #381 bug B part 2's grace window: how long
+// a Source-bearing Task may sit with zero owned MergeRequest and zero owned
+// Issue CRs before the backstop treats it as an interrupted two-phase mint
+// rather than a live, merely-slow bind. Same value as HandoffDeadline
+// (api/v1alpha1/constants.go:97) for the same reason - long enough that a
+// live write completes, short enough to catch a genuinely stuck Task inside
+// one human work session - but a DISTINCT constant: the two guard unrelated
+// predicates and must be free to diverge later.
+const mrBindingBackstopGrace = 5 * time.Minute
+
 // reconcileClocks is GAP 5: the F.4 three-clock driver. Nothing else calls
 // stage.ArmedClock in production, so without it "the 2h budget parks it", "the
 // 24h admission clock" and "merging reaches merge-timeout at 4h" are all fiction
@@ -104,11 +114,36 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	// it, and a suppressed Task holds its admitted concurrency ticket for the whole
 	// window. This is the bound.
 	if cond := handoffCondition(task); cond != nil {
+		// The owned-MR read is LIVE (uncached APIReader), not the informer cache.
+		// /outcome persists the MR pendingReview BEFORE it stamps the Task's
+		// OutcomeAccepted condition that arms handoffCondition, so once we are here
+		// a live read is guaranteed to observe a still-owed pendingReview; a CACHED
+		// read could lag the MR watch and show a pre-/outcome nil, which would
+		// advance the Task before its review was ever posted.
+		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
+		if mrErr != nil {
+			return ctrl.Result{}, true, mrErr
+		}
+		// RE-DRIVE the deferred reviewing->advance BEFORE enforcing the deadline.
+		// The advance in DrainPendingReview is EDGE-triggered - a one-shot at the
+		// tail of the drain - and every later MergeRequest reconcile short-circuits
+		// at the already-nil pendingReview and never re-attempts it. If that one
+		// shot missed (a stale cached owned-MR read, a transient controller-owner
+		// sever, or a multi-MR ordering race), nothing else re-evaluates the advance
+		// and the Task would sit out the whole HandoffDeadline and park
+		// handoff-stalled even though its review already landed. This is the
+		// level-triggered backstop: on every reviewing reconcile, if every owned MR
+		// has drained its pendingReview, take the F.3 edge NOW. Idempotent -
+		// EnterStage refuses a redundant X->X - so a race with the MR reconciler's
+		// own advance costs at most one illegal-edge counter, never a double
+		// transition.
+		if edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj)); ready {
+			l.Info("review handoff re-driven: the deferred advance had not fired; advancing off reviewing",
+				"action", "handoff_redriven", "resource_id", task.Name, "stage", task.Status.Stage,
+				"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
+			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
+		}
 		if elapsed := now.Sub(cond.LastTransitionTime.Time); elapsed > tatarav1alpha1.HandoffDeadline {
-			mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
-			if mrErr != nil {
-				return ctrl.Result{}, true, mrErr
-			}
 			l.Info("review handoff stalled: the outcome committed but the drain never advanced the task",
 				"action", "handoff_stalled", "resource_id", task.Name, "stage", task.Status.Stage,
 				"outcome_reason", cond.Reason, "deadline", tatarav1alpha1.HandoffDeadline.String(),
@@ -221,6 +256,265 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 		}
 		log.FromContext(ctx).Info("deploy stuck: surfaced the first deploy-timeout on an owned issue",
 			"action", "deploy_timeout_comment", "resource_id", task.Name, "issue", key.Name, "repos", repos)
+	}
+	return nil
+}
+
+// reconcileMRBindingBackstop is issue #381 bug B part 2: a Source-bearing
+// Task (Spec.Source.Number > 0 - the same source-bearing gate
+// mintIssueCRs uses, task_stage.go:472-475) that still owns ZERO
+// MergeRequest and ZERO Issue CRs past mrBindingBackstopGrace is the residue
+// of an interrupted two-phase mint write (the Task's own Create landed, the
+// bind that would have given it an owned MR/Issue never did - #382 covers
+// the LIVE repair path on a fresh mint attempt; this is the backstop for
+// the Task that already exists and has nothing left to re-mint against).
+// Live proof: mt-r-tatara-cli-87 (issue #381 investigation).
+//
+// Guarded to fire EXACTLY ONCE: task.Status.Stage == StageParked is excluded
+// up front, both because parked->parked is not a legal F.3 edge (EnterStage
+// would refuse it and fire operator_illegal_stage_transition_total every
+// reconcile) and because it is this function's OWN rate limit for the
+// metric and the comment in Task 9 - once parked, this predicate would
+// otherwise stay permanently true (a parked Task's refs do not un-empty
+// themselves) and re-fire forever without it.
+//
+// Runs BEFORE the three clocks (F.4): those would EVENTUALLY reach the same
+// outcome via turn-budget/pod-recreation exhaustion, but only after hours of
+// wasted pod churn against a Task that can never advance - this backstop is
+// the fast, targeted path.
+func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
+
+	if task.Status.Stage == tatarav1alpha1.StageParked ||
+		task.Spec.Source == nil || task.Spec.Source.Number <= 0 ||
+		len(task.Status.MRRefs) != 0 || len(task.Status.IssueRefs) != 0 {
+		return false, nil
+	}
+	age := now.Sub(stageEnteredAt(task))
+	if age <= mrBindingBackstopGrace {
+		return false, nil
+	}
+	// issue #381 review BLOCKER: not every stage has a legal ->parked edge in
+	// the F.3 table (triaging and delivered do not - stage.go's Transitions).
+	// Without this guard r.enter below returns *stage.IllegalTransitionError
+	// for those stages every reconcile, an infinite requeue crash-loop. Fall
+	// through to normal reconcile instead: triaging's own triage-stalled clock
+	// (5m budget) owns that case, and delivered is quasi-terminal and ages out
+	// via the reaper.
+	if !stage.Legal(task.Status.Stage, tatarav1alpha1.StageParked) {
+		return false, nil
+	}
+
+	l := log.FromContext(ctx)
+
+	// PR 388: a transient mint failure is REPAIRABLE, and the repair already
+	// exists (intake.go repairMRBinding/repairIssueBinding) - but its only other
+	// caller is the sweep's intake path, whose ~1h cadence always loses to this
+	// backstop. Attempt the bind repair here first; only an unrepairable bind
+	// (foreign-owned CR, unresolvable source/repo, write failure) falls through
+	// to the park below.
+	if r.repairSourceBinding(ctx, proj, task) {
+		l.Info("mr-binding backstop: repaired the interrupted mint binding instead of parking",
+			"action", "mr_binding_backstop_repaired", "resource_id", task.Name, "kind", task.Spec.Kind,
+			"stage", task.Status.Stage, "age", age.String())
+		return true, nil
+	}
+
+	l.Error(nil, "task owns no merge-request or issue record past grace; likely an interrupted mint - parking awaiting human",
+		"action", "mr_binding_backstop_parked", "resource_id", task.Name, "kind", task.Spec.Kind,
+		"stage", task.Status.Stage, "age", age.String(), "grace", mrBindingBackstopGrace.String())
+	if err := r.enter(ctx, proj, task, nil, tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, now); err != nil {
+		return true, err
+	}
+	r.Metrics.MRBindingBackstopParked(proj.Name, task.Spec.Kind)
+	r.commentMRBindingBackstopParked(ctx, proj, task)
+	return true, nil
+}
+
+// repairSourceBinding re-runs the intake funnel's interrupted-mint bind repair
+// (repairMRBinding / repairIssueBinding) against a source-bearing Task the
+// backstop is about to park (PR 388). The ext snapshot is rebuilt from the
+// Task's own Source - the same fields the interrupted mint had in hand; the
+// mirror cadence refreshes the rest. true means the refs are now non-empty and
+// the Task must NOT be parked. Anything else - unparseable source, unresolvable
+// repo, a foreign-owned CR the repair correctly refuses to steal, a write
+// error - reports false and the caller parks exactly as before.
+func (r *TaskReconciler) repairSourceBinding(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task) bool {
+
+	l := log.FromContext(ctx)
+	src := task.Spec.Source
+	slug, number, ok := parseSourceURL(src.IssueRef, src.IsPR)
+	if !ok {
+		return false
+	}
+	repo, err := r.repositoryForSlug(ctx, proj, task, slug)
+	if err != nil {
+		l.Error(err, "mr-binding backstop: resolve repository failed; falling through to the park",
+			"action", "mr_binding_backstop_repair_failed", "resource_id", task.Name, "slug", slug)
+		return false
+	}
+	if repo == nil {
+		return false
+	}
+	m := &Minter{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme, Metrics: r.Metrics}
+	sp := r.spiller(proj)
+	if src.IsPR {
+		ext := scm.MergeRequest{Number: number, URL: src.IssueRef, Title: src.Title,
+			Author: src.AuthorLogin, State: "open", HeadSHA: src.HeadSHA}
+		err = m.repairMRBinding(ctx, proj, repo, ext, task, sp)
+	} else {
+		url, _, _ := strings.Cut(src.IssueRef, "#") // MintIssueTask stores "URL#number"
+		ext := scm.Issue{Number: number, URL: url, Title: src.Title,
+			Author: src.AuthorLogin, State: "open"}
+		err = m.repairIssueBinding(ctx, proj, repo, ext, task, sp)
+	}
+	if err != nil {
+		l.Error(err, "mr-binding backstop: bind repair failed; falling through to the park",
+			"action", "mr_binding_backstop_repair_failed", "resource_id", task.Name)
+		return false
+	}
+	return len(task.Status.MRRefs) != 0 || len(task.Status.IssueRefs) != 0
+}
+
+// repositoryForSlug resolves the Repository CR a Task's source slug names:
+// spec.repositoryRef when set, else the project repo whose remote matches the
+// slug. It is sourceRepository's slug-keyed sibling: the intake-minted Tasks
+// this backstop repairs carry no RepositoryRef and no Source.URL, only the
+// IssueRef the slug was parsed from. nil (no error) means "cannot resolve".
+func (r *TaskReconciler) repositoryForSlug(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, slug string) (*tatarav1alpha1.Repository, error) {
+
+	if task.Spec.RepositoryRef != "" {
+		var repo tatarav1alpha1.Repository
+		err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.RepositoryRef}, &repo)
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("backstop repair: get repository %s: %w", task.Spec.RepositoryRef, err)
+		}
+		return &repo, nil
+	}
+	repos, err := r.projectRepos(ctx, proj)
+	if err != nil {
+		return nil, err
+	}
+	for i := range repos {
+		owner, name, err := scm.OwnerRepo(repos[i].Spec.URL)
+		if err == nil && owner+"/"+name == slug {
+			return &repos[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// taskWriterAndToken resolves the SCMWriter + bot token for a Project,
+// mirroring ProjectReconciler.scanWriter (projectscan.go:287) - the same
+// five lines, duplicated rather than shared across the two reconciler types
+// per this repo's KISS rule (three similar lines beat a premature shared
+// abstraction across two otherwise-unrelated reconcilers).
+func (r *TaskReconciler) taskWriterAndToken(ctx context.Context, proj *tatarav1alpha1.Project) (scm.SCMWriter, string, error) {
+	if r.SCMFor == nil {
+		return nil, "", fmt.Errorf("mr-binding backstop: SCMFor not wired")
+	}
+	var sec corev1.Secret
+	key := types.NamespacedName{Namespace: proj.Namespace, Name: proj.Spec.ScmSecretRef}
+	if err := r.Get(ctx, key, &sec); err != nil {
+		return nil, "", fmt.Errorf("mr-binding backstop: get scm secret: %w", err)
+	}
+	token := string(sec.Data["token"])
+	w, err := r.SCMFor(proj.Spec.Scm.Provider)
+	if err != nil {
+		return nil, "", err
+	}
+	return w, token, nil
+}
+
+// commentMRBindingBackstopParked posts ONE notice on the Task's source
+// PR/issue when reconcileMRBindingBackstop parks it. Rate-limited by its
+// caller's own "not already parked" guard (see reconcileMRBindingBackstop's
+// doc comment) - there is no separate per-comment cooldown field because
+// the Task this backstop targets owns, by construction, zero Issue/MR CRs
+// to stamp one on. A forge failure here is logged and swallowed: the park
+// already landed and is the correctness-critical half of this backstop: it
+// must never be retried into existence by re-running the whole function on
+// a Task the guard now excludes.
+func (r *TaskReconciler) commentMRBindingBackstopParked(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) {
+	l := log.FromContext(ctx)
+	slug, number, ok := parseSourceURL(task.Spec.Source.IssueRef, task.Spec.Source.IsPR)
+	if !ok {
+		l.Error(nil, "mr-binding backstop: source ref is not a recognizable issue/PR URL; comment skipped",
+			"action", "mr_binding_backstop_comment_skipped", "resource_id", task.Name,
+			"source_ref", task.Spec.Source.IssueRef)
+		return
+	}
+	writer, token, err := r.taskWriterAndToken(ctx, proj)
+	if err != nil {
+		l.Error(err, "mr-binding backstop: resolve scm writer failed; comment skipped",
+			"action", "mr_binding_backstop_comment_skipped", "resource_id", task.Name)
+		return
+	}
+	body := fmt.Sprintf(
+		"tatara parked this task: it has not recorded an owned merge-request or issue after `%s` "+
+			"(likely an interrupted mint on the operator side). No agent will run against it until a "+
+			"human comments here to prompt a retry.",
+		mrBindingBackstopGrace.String())
+	issueRef := fmt.Sprintf("%s#%d", slug, number)
+	if err := writer.Comment(ctx, token, issueRef, body); err != nil {
+		l.Error(err, "mr-binding backstop: forge comment failed (non-fatal, task is parked)",
+			"action", "mr_binding_backstop_comment_failed", "resource_id", task.Name, "issue_ref", issueRef)
+		return
+	}
+	l.Info("mr-binding backstop: posted the park notice",
+		"action", "mr_binding_backstop_commented", "resource_id", task.Name, "issue_ref", issueRef)
+}
+
+// holdTurnOnMemoryGate enqueues ONE operator comment on each owned OPEN issue
+// the first time a Task's turn submission is held at the pre-SubmitTurn
+// memory-readiness gate (issue #355), so a held Task is surfaced to a human
+// instead of looking like a silent stall - the same first-occurrence,
+// rate-limited pattern as enqueueDeployTimeoutComment (WS3-I5), keyed on its
+// OWN cooldown marker (Issue.status.lastMemoryGateCommentAt) so it cannot
+// clobber or be clobbered by the deploy-timeout or incident-refire producers.
+// It reuses the existing PendingComments drain; it spawns no agent.
+func (r *TaskReconciler) holdTurnOnMemoryGate(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, now time.Time) error {
+
+	issues, err := loadTaskIssues(ctx, r.Client, task)
+	if err != nil {
+		return err
+	}
+	phase := "Provisioning"
+	if proj.Status.Memory != nil && proj.Status.Memory.Phase != "" {
+		phase = proj.Status.Memory.Phase
+	}
+	body := fmt.Sprintf("Project `%s` memory stack is not ready (phase `%s`); tatara is holding this task's next agent turn until it recovers, instead of spawning a pod that would immediately fail to reach memory.",
+		proj.Name, phase)
+
+	sp := r.spiller(proj)
+	stamp := metav1.NewTime(now)
+	for i := range issues {
+		iss := &issues[i]
+		if iss.Status.State != "open" || iss.Status.LastMemoryGateCommentAt != nil {
+			continue // closed, or already commented on the first hold (own cooldown).
+		}
+		key := client.ObjectKeyFromObject(iss)
+		if err := objbudget.FitIssue(ctx, r.Client, sp, key, func(cur *tatarav1alpha1.Issue) {
+			if cur.Status.LastMemoryGateCommentAt != nil || len(cur.Status.PendingComments) >= 20 {
+				return
+			}
+			cur.Status.PendingComments = append(cur.Status.PendingComments, tatarav1alpha1.PendingComment{
+				RequestID: fmt.Sprintf("memory-gate-hold-%s", task.Name),
+				Action:    "comment",
+				Body:      body,
+			})
+			cur.Status.LastMemoryGateCommentAt = &stamp
+		}); err != nil {
+			return fmt.Errorf("memory-gate-hold comment: enqueue on %s: %w", key.Name, err)
+		}
+		log.FromContext(ctx).Info("turn hold: surfaced the first memory-gate hold on an owned issue",
+			"action", "memory_gate_hold_comment", "resource_id", task.Name, "issue", key.Name, "project", proj.Name)
 	}
 	return nil
 }
@@ -580,6 +874,24 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	marker := turn0Marker(task)
 	if task.Annotations[annStageTurn0] == marker {
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil // turn-0 already submitted for THIS pod
+	}
+
+	// Issue #355: re-check memory readiness immediately before committing to a
+	// turn submission, closing the gap between the earlier admission-time gate
+	// (task_controller.go Reconcile, which only runs while PodStartedAt==nil)
+	// and the actual SubmitTurn call below - a gap that spans pod scheduling,
+	// image pull, and the G.10 ready handshake, during which the backend can
+	// flip unhealthy. This one call site covers every turn0 submission
+	// uniformly: a Task's first pod, a respawned pod (respawnLostPod), and a
+	// TTL-rotated pod (ttlStop) all funnel through here before SubmitTurn.
+	if !tatarav1alpha1.InfraIncidentExempt(task.Spec) && !memoryStablyReady(proj, now) {
+		if err := r.holdTurnOnMemoryGate(ctx, proj, task, now); err != nil {
+			return ctrl.Result{}, err
+		}
+		l.Info("turn submission held: project memory not stably ready",
+			"action", "task_memory_gate_turn_hold", "resource_id", task.Name, "project", proj.Name)
+		r.Metrics.MemoryGateHold(proj.Name)
+		return ctrl.Result{RequeueAfter: memGateRequeue}, nil
 	}
 
 	text, err := r.renderBundle(ctx, proj, task, agentKind)

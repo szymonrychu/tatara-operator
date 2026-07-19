@@ -52,6 +52,14 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 			Name: "operator_task_parked_total",
 			Help: "Park transitions (contract K.1), by the stage the Task parked FROM (the stalling stage) and the park stageReason. Incremented once per park transition, never on a mint.",
 		}, []string{"stage", "stageReason"}),
+		// Legitimately reads 0 when webhook-primary reactivity is handling
+		// intake and the sweep finds no genuine orphan (verified via 7-day
+		// Prometheus history during the metric-wiring audit, issue #370:
+		// both webhook-driven and sweep-driven mint counts were 0 in the
+		// same window - the backlog was fully covered by the webhook path,
+		// not silently dropped by a broken sweep). Do not "fix" a flat 0
+		// here without first confirming the sweep is genuinely finding
+		// zero orphans, not silently failing to adopt real ones.
 		orphanAdoptedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_orphan_adopted_total",
 			Help: "Orphan work items the sweep minted a Task for (contract K.1), by kind.",
@@ -149,12 +157,21 @@ func (m *taskMetrics) ResetIssueState() {
 // garbage-collected. Bounds counter cardinality to live + recently-live issues.
 // Skip when issue=="" (project-scoped tasks share that label value and must not
 // be cleared on any individual task's GC).
-func (m *taskMetrics) DeleteTaskSeries(project, repo, kind, issue, model string) {
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "input")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "output")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "cache_read")
-	m.taskTokensTotal.DeleteLabelValues(project, repo, kind, issue, model, "cache_creation")
-	m.taskTurnsTotal.DeleteLabelValues(project, repo, kind, issue)
+//
+// Uses DeletePartialMatch on (project,repo,kind,issue) rather than an exact
+// DeleteLabelValues match on model+type: a Task's Status.ResolvedModel can
+// change across its life (a respawn or stage change may re-resolve a
+// different model), so a single Task's token series can be split across
+// several model label values. Matching on the model of ONLY the final resolve
+// would leak every earlier model's series forever (metric-wiring audit,
+// issue #370).
+func (m *taskMetrics) DeleteTaskSeries(project, repo, kind, issue string) {
+	if issue == "" {
+		return
+	}
+	match := prometheus.Labels{"project": project, "repo": repo, "kind": kind, "issue": issue}
+	m.taskTokensTotal.DeletePartialMatch(match)
+	m.taskTurnsTotal.DeletePartialMatch(match)
 }
 
 // TaskTerminal increments operator_task_terminal_total for a Task reaching a

@@ -8,6 +8,7 @@ package memory
 
 import (
 	"fmt"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -62,6 +63,10 @@ type Config struct {
 	// cluster-agnostic (rule 14) so the deploying helmfile picks a rack/zone label
 	// when the cluster has one.
 	TopologyKey string
+	// ProvisioningTimeout bounds how long a stack may stay phase Provisioning
+	// before reconcileMemory reports it Degraded (issue #355). Zero disables
+	// the bound. Set from config.Config.MemoryProvisioningTimeout in wire.go.
+	ProvisioningTimeout time.Duration
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -265,7 +266,7 @@ func TestDedupExists_LiveQueuedEventSuppresses(t *testing.T) {
 	qe.Status.State = tatarav1alpha1.QueueStateQueued
 	require.NoError(t, c.Status().Update(context.Background(), qe))
 
-	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	got, err := dedupExists(context.Background(), c, ns, proj, key, true)
 	require.NoError(t, err)
 	require.True(t, got, "a live (Queued) QueuedEvent for the dedup key must suppress")
 }
@@ -282,7 +283,7 @@ func TestDedupExists_LiveTaskSuppresses(t *testing.T) {
 	task.Status.Stage = tatarav1alpha1.StageInvestigating
 	require.NoError(t, c.Status().Update(context.Background(), task))
 
-	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	got, err := dedupExists(context.Background(), c, ns, proj, key, true)
 	require.NoError(t, err)
 	require.True(t, got, "a non-terminal Task for the dedup key must suppress")
 }
@@ -302,7 +303,7 @@ func TestDedupExists_OpenIssueSuppresses(t *testing.T) {
 	iss.Status.State = "open"
 	require.NoError(t, c.Status().Update(context.Background(), iss))
 
-	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	got, err := dedupExists(context.Background(), c, ns, proj, key, true)
 	require.NoError(t, err)
 	require.True(t, got, "an OPEN incident Issue for the rule-key must suppress")
 }
@@ -322,9 +323,103 @@ func TestDedupExists_ClosedIssueDoesNotSuppress(t *testing.T) {
 	iss.Status.State = "closed"
 	require.NoError(t, c.Status().Update(context.Background(), iss))
 
-	got, err := dedupExists(context.Background(), c, ns, proj, key)
+	got, err := dedupExists(context.Background(), c, ns, proj, key, true)
 	require.NoError(t, err)
 	require.False(t, got, "a CLOSED incident Issue must NOT suppress - refire is fresh")
+}
+
+// The escalation path passes checkOpenIssue=false: an open tracker Issue must
+// NOT suppress (it is what escalation re-investigates), while a live Task still
+// does.
+func TestDedupExists_IgnoreOpenIssueBypassesTrackerButNotLiveTask(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Issue{}).Build()
+	ns, proj, key := "tns", "p1", "abc123def4567890"
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-open", Namespace: ns,
+			Labels: map[string]string{LabelAlertRuleKey: key}},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "r"},
+	}
+	require.NoError(t, c.Create(context.Background(), iss))
+	iss.Status.State = "open"
+	require.NoError(t, c.Status().Update(context.Background(), iss))
+
+	got, err := dedupExists(context.Background(), c, ns, proj, key, false)
+	require.NoError(t, err)
+	require.False(t, got, "with checkOpenIssue=false, an open tracker must NOT suppress")
+
+	// But a live escalation Task still single-flights: it must suppress.
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-esc", Namespace: ns,
+			Labels: map[string]string{LabelDedupKey: dedupLabel(key)}},
+		Spec: tatarav1alpha1.TaskSpec{ProjectRef: proj},
+	}
+	require.NoError(t, c.Create(context.Background(), task))
+	got, err = dedupExists(context.Background(), c, ns, proj, key, false)
+	require.NoError(t, err)
+	require.True(t, got, "a live escalation Task must still suppress a second escalation")
+}
+
+func TestFindOldestOpenGroupSibling(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Issue{}).Build()
+	ns, proj, grp := "tns", "p1", "group0123456789a"
+
+	// An older sibling (different rule-key, same group) and our own new tracker
+	// (excluded by rule-key), both open.
+	sib := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-sibling", Namespace: ns,
+			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
+			Labels: map[string]string{
+				LabelAlertGroupKey: dedupLabel(grp), LabelAlertRuleKey: "rulekeyB0000000"}},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "tatara-memory", Number: 7},
+	}
+	self := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-self", Namespace: ns,
+			Labels: map[string]string{
+				LabelAlertGroupKey: dedupLabel(grp), LabelAlertRuleKey: "rulekeyA0000000"}},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "tatara-operator", Number: 9},
+	}
+	require.NoError(t, c.Create(context.Background(), sib))
+	require.NoError(t, c.Create(context.Background(), self))
+
+	got, ok, err := FindOldestOpenGroupSibling(context.Background(), c, ns, proj, grp, "rulekeyA0000000")
+	require.NoError(t, err)
+	require.True(t, ok, "an open sibling with a different rule-key in the same group must match")
+	require.Equal(t, "iss-sibling", got.Name)
+	require.Equal(t, 7, got.Spec.Number)
+
+	// Empty group key => no correlation.
+	_, ok, err = FindOldestOpenGroupSibling(context.Background(), c, ns, proj, "", "rulekeyA0000000")
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+func TestFindOldestOpenGroupSibling_ClosedAndSameRuleExcluded(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.Issue{}).Build()
+	ns, proj, grp := "tns", "p1", "group0123456789a"
+
+	closed := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-closed-sib", Namespace: ns,
+			Labels: map[string]string{LabelAlertGroupKey: dedupLabel(grp), LabelAlertRuleKey: "rulekeyB0000000"}},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "tatara-memory", Number: 7},
+	}
+	require.NoError(t, c.Create(context.Background(), closed))
+	closed.Status.State = "closed"
+	require.NoError(t, c.Status().Update(context.Background(), closed))
+
+	// Same-rule sibling (must be excluded even though open).
+	sameRule := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-same-rule", Namespace: ns,
+			Labels: map[string]string{LabelAlertGroupKey: dedupLabel(grp), LabelAlertRuleKey: "rulekeyA0000000"}},
+		Spec: tatarav1alpha1.IssueSpec{ProjectRef: proj, RepositoryRef: "tatara-operator", Number: 9},
+	}
+	require.NoError(t, c.Create(context.Background(), sameRule))
+
+	_, ok, err := FindOldestOpenGroupSibling(context.Background(), c, ns, proj, grp, "rulekeyA0000000")
+	require.NoError(t, err)
+	require.False(t, ok, "a closed sibling and a same-rule sibling must both be excluded")
 }
 
 func TestFindOpenIncidentIssue_EmptyKeyReturnsNotFound(t *testing.T) {

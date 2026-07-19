@@ -43,6 +43,10 @@ type QueuedEventPayload struct {
 	// Spec.DedupKey (the incident alert-group dedup identity).
 	// +optional
 	DedupKey string `json:"dedupKey,omitempty"`
+	// GroupKey is carried from the incident webhook onto the built Task's
+	// Spec.GroupKey (the coarser incident correlation identity).
+	// +optional
+	GroupKey string `json:"groupKey,omitempty"`
 
 	// AgentKind is the pod to spawn for a stage-driven admission (contract
 	// B.7). It marks the ADMISSION-TICKET payload shape: when set, exactly one
