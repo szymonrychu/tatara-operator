@@ -46,6 +46,35 @@ var ReviewPostTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Review posts driven by the MergeRequest reconciler, by result (contract C.5.3).",
 }, []string{"result"})
 
+// reviewFindingDegradedTotal counts inline review findings that could NOT be
+// anchored to a diff line and were downgraded to a plain (non-inline) note
+// instead of an anchored discussion (#394). reason distinguishes:
+//
+//	unanchorable  - the finding's (path, line) fell outside every new-side diff
+//	                hunk, or carried no line at all (a file-level finding, #398)
+//	post-refused  - the anchored POST itself was deterministically refused (a 4xx
+//	                classified terminal), so the finding fell back to a note rather
+//	                than aborting the whole round
+//
+// It is emitted from internal/scm (GitLab.PostReview), the same way SCMRateLimited
+// is, and lives here beside ReviewPostTotal because it is a review-post metric.
+var reviewFindingDegradedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_review_finding_degraded_total",
+	Help: "Inline review findings downgraded to a non-inline note, by provider and reason (contract C.5.3, #394).",
+}, []string{"provider", "reason"})
+
+// ReviewFindingDegraded increments operator_review_finding_degraded_total for one
+// finding that could not be posted as an anchored inline discussion.
+func ReviewFindingDegraded(provider, reason string) {
+	reviewFindingDegradedTotal.WithLabelValues(provider, reason).Inc()
+}
+
+// ReviewFindingDegradedCounter returns the counter for (provider, reason) for
+// test assertions.
+func ReviewFindingDegradedCounter(provider, reason string) prometheus.Counter {
+	return reviewFindingDegradedTotal.WithLabelValues(provider, reason)
+}
+
 // ClearMergeCursorStalled deletes every MergeCursorStalledSeconds series for a
 // Task. Called when the Task leaves merging, for any reason.
 func ClearMergeCursorStalled(task string) {
@@ -53,5 +82,6 @@ func ClearMergeCursorStalled(task string) {
 }
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(UnexpectedMergeTotal, MergeCursorStalledSeconds, ReviewPostTotal)
+	ctrlmetrics.Registry.MustRegister(UnexpectedMergeTotal, MergeCursorStalledSeconds,
+		ReviewPostTotal, reviewFindingDegradedTotal)
 }

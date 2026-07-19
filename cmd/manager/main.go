@@ -9,6 +9,7 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -63,11 +64,32 @@ func managerOptions(cfg config.Config, scheme *runtime.Scheme) manager.Options {
 		LeaderElection:          cfg.LeaderElection,
 		LeaderElectionID:        "tatara-operator-leader",
 		LeaderElectionNamespace: cfg.Namespace,
+		// Release the lease on graceful shutdown instead of holding it for the
+		// full lease duration. Without this the outgoing leader during a
+		// rollout holds its lease through SIGTERM, so the new leader waits out
+		// the lease before it can start dispatching - part of the 7m22s
+		// alert-admission gap in issue #395.
+		LeaderElectionReleaseOnCancel: true,
 	}
 }
 
+// getConfig is a seam over ctrl.GetConfigOrDie so tests can substitute a
+// rest.Config without a live API server or kubeconfig.
+var getConfig = ctrl.GetConfigOrDie
+
+// restConfig returns the REST config the manager is built from, raised from
+// client-go's default QPS=5/Burst=10 to QPS=50/Burst=100. The default throttles
+// the manager's cold-start informer cache fill during a rollout/leader-handoff
+// burst, contributing to the 7m22s alert-admission gap in issue #395.
+func restConfig() *rest.Config {
+	cfg := getConfig()
+	cfg.QPS = 50
+	cfg.Burst = 100
+	return cfg
+}
+
 func buildManager(cfg config.Config, scheme *runtime.Scheme) (manager.Manager, error) {
-	return ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions(cfg, scheme))
+	return ctrl.NewManager(restConfig(), managerOptions(cfg, scheme))
 }
 
 func run(ctx context.Context) error {

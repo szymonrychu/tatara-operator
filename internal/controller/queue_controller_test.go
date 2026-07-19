@@ -3,17 +3,22 @@ package controller
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/budget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func qe(name, class, state, taskRef string) tatarav1alpha1.QueuedEvent {
@@ -1217,5 +1222,228 @@ func TestAdmit_IncidentMintReleasesAlertSlot_RegressionForDeadlock(t *testing.T)
 	gotTicket := refreshQE(t, ctx, podTicket)
 	if gotTicket.Status.State != tatarav1alpha1.QueueStateAdmitted {
 		t.Fatalf("investigating pod-ticket deadlocked: state=%q (want Admitted)", gotTicket.Status.State)
+	}
+}
+
+// TestDispatcherEnqueuePending_NoWatchTrigger guards issue #395: the
+// dispatcher is otherwise purely watch-driven, so a QueuedEvent left Queued
+// with no fresh watch trigger (a rollout/leader-handoff race) can stall
+// admission indefinitely. EnqueuePending is the leader-only backstop's core
+// list-and-push step: called directly here with NO watch and NO ticker
+// running, it must still find the pending QueuedEvent and push a GenericEvent
+// for it onto BackstopEvents.
+func TestDispatcherEnqueuePending_NoWatchTrigger(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "p-backstop-", Namespace: testNS},
+	}
+	mustCreate(t, ctx, proj)
+
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-backstop-", Namespace: testNS},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "documentation", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "documentation", GenerateName: "x-"},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	// Buffered generously (matches wire.go's real 256 capacity), not the 4 this
+	// held before: this suite shares one envtest namespace/etcd across every
+	// test in the package with no per-test QueuedEvent cleanup, so by the time
+	// this test runs, dozens of Queued-state QueuedEvents from earlier tests
+	// are already live and EnqueuePending (unscoped by design - it is the
+	// leader-only backstop over ALL projects) enqueues all of them, not just
+	// this test's one. A buffer of 4 blocks forever on ctx=context.Background()
+	// once suite-wide pollution exceeds it - a deterministic full-package hang
+	// (queue_controller.go:941's select), not a rare race; reproduced twice in
+	// a row integrating this batch. This test's own assertions only care that
+	// ITS event lands somewhere in the channel, not about channel capacity.
+	events := make(chan event.GenericEvent, 256)
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics, BackstopEvents: events}
+
+	before := testutil.ToFloat64(metrics.DispatcherBackstopEnqueuedCounter(proj.Name))
+	n, err := r.EnqueuePending(ctx)
+	if err != nil {
+		t.Fatalf("EnqueuePending: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("EnqueuePending enqueued %d events, want >= 1 for the pending QueuedEvent", n)
+	}
+	// Drain up to n (not just the head): with suite-wide pollution EnqueuePending
+	// legitimately enqueues every OTHER live Queued QueuedEvent too (it is the
+	// unscoped leader-only backstop, not filtered to this test's project), and
+	// List order across projects is not guaranteed to put this test's own
+	// event first. Find q among whatever landed rather than assuming FIFO head.
+	found := false
+	for i := 0; i < n; i++ {
+		select {
+		case ev := <-events:
+			if ev.Object.GetName() == q.Name && ev.Object.GetNamespace() == q.Namespace {
+				found = true
+			}
+		default:
+			t.Fatalf("EnqueuePending reported n=%d but only %d were on BackstopEvents", n, i)
+		}
+	}
+	if !found {
+		t.Fatalf("EnqueuePending enqueued %d events but none was the pending QueuedEvent %s/%s", n, q.Namespace, q.Name)
+	}
+	if after := testutil.ToFloat64(metrics.DispatcherBackstopEnqueuedCounter(proj.Name)); after <= before {
+		t.Fatalf("operator_dispatcher_backstop_enqueued_total{project=%s} did not increment: before=%v after=%v", proj.Name, before, after)
+	}
+}
+
+// TestDispatcherEnqueuePending_CtxCancelUnblocksFullChannel guards the review
+// fix for WP9: source.Channel's consumer stops reading once the manager's
+// leader-only runnable ctx is cancelled, and producer + consumer share that
+// ctx. Without a select on ctx.Done() around the BackstopEvents send,
+// EnqueuePending would block on a full, unconsumed channel until the
+// manager's GracefulShutdownTimeout (30s) forcibly tore it down. This test
+// pre-fills a small (buffer 1) BackstopEvents channel so any send blocks,
+// then hands EnqueuePending a ctx that expires shortly after the ctx's own
+// List calls complete, and asserts it returns promptly with ctx.Err() and
+// zero newly-enqueued events instead of hanging.
+func TestDispatcherEnqueuePending_CtxCancelUnblocksFullChannel(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "p-backstop-full-", Namespace: testNS},
+	}
+	mustCreate(t, ctx, proj)
+
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-backstop-full-", Namespace: testNS},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "documentation", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "documentation", GenerateName: "x-"},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	// Buffer of 1, pre-filled and never drained: the first (and only) send
+	// EnqueuePending attempts is guaranteed to block.
+	events := make(chan event.GenericEvent, 1)
+	events <- event.GenericEvent{Object: &tatarav1alpha1.QueuedEvent{}}
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), BackstopEvents: events}
+
+	runCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := r.EnqueuePending(runCtx)
+		done <- result{n: n, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatal("EnqueuePending returned nil error against a full, unconsumed BackstopEvents channel with an expiring ctx; want ctx.Err()")
+		}
+		if res.n != 0 {
+			t.Fatalf("EnqueuePending enqueued %d events despite the channel being full and unconsumed throughout, want 0", res.n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnqueuePending did not return within 2s of a full, unconsumed BackstopEvents channel and an expired ctx - the send is not ctx-guarded")
+	}
+}
+
+// TestDispatcherEnqueuePending_NilChannelIsNoop asserts a DispatcherReconciler
+// built without BackstopEvents wired (every existing unit test in this file)
+// is unaffected: EnqueuePending must not panic or block.
+func TestDispatcherEnqueuePending_NilChannelIsNoop(t *testing.T) {
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	if _, err := r.EnqueuePending(context.Background()); err != nil {
+		t.Fatalf("EnqueuePending with nil BackstopEvents: %v", err)
+	}
+}
+
+// TestDispatcherRunBackstop_TicksIndependentlyOfWatch guards issue #395's
+// deterministic-admission requirement: RunBackstop must push a fresh
+// GenericEvent on Start AND again on every tick, with no controller, no
+// manager, and no watch event involved at all - proving the periodic backstop
+// fires on its own clock, not on replay-timing luck.
+func TestDispatcherRunBackstop_TicksIndependentlyOfWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	proj := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{GenerateName: "p-tick-", Namespace: testNS}}
+	mustCreate(t, ctx, proj)
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-tick-", Namespace: testNS},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "documentation", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "documentation", GenerateName: "x-"},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	events := make(chan event.GenericEvent, 32)
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), BackstopEvents: events}
+
+	done := make(chan error, 1)
+	go func() { done <- r.RunBackstop(ctx, 20*time.Millisecond) }()
+
+	deadline := time.After(2 * time.Second)
+	seen := 0
+	for seen < 2 {
+		select {
+		case <-events:
+			seen++
+		case <-deadline:
+			t.Fatalf("RunBackstop pushed only %d events in 2s, want >= 2 (Start pass + at least one tick)", seen)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunBackstop returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunBackstop did not return after ctx cancel")
+	}
+}
+
+// TestDispatcherRunBackstop_ReturnsOnCtxCancel mirrors
+// TestRunMaintenance_ReturnsOnCtxCancel: a pre-cancelled context must return
+// immediately with no goroutine/ticker leak, even before the Start-time pass
+// completes.
+func TestDispatcherRunBackstop_ReturnsOnCtxCancel(t *testing.T) {
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.RunBackstop(ctx, time.Minute) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunBackstop returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunBackstop did not return on cancelled context")
+	}
+}
+
+// TestDispatcherReconciler_SetupWithManager_WithBackstopChannel asserts the
+// production wiring path - a non-nil BackstopEvents channel passed into
+// SetupWithManager - registers cleanly via WatchesRawSource(source.Channel).
+func TestDispatcherReconciler_SetupWithManager_WithBackstopChannel(t *testing.T) {
+	mgr := newTestManager(t)
+	ch := make(chan event.GenericEvent, 1)
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), BackstopEvents: ch}
+	if err := r.SetupWithManager(mgr); err != nil && !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("SetupWithManager: %v", err)
 	}
 }

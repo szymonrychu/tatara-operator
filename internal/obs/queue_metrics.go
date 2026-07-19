@@ -5,10 +5,11 @@ import "github.com/prometheus/client_golang/prometheus"
 // queueMetrics holds the QueuedEvent-admission Prometheus collectors,
 // embedded into OperatorMetrics.
 type queueMetrics struct {
-	queueAdmittedTotal *prometheus.CounterVec
-	queueDepth         *prometheus.GaugeVec
-	queueInflight      *prometheus.GaugeVec
-	queueAge           *prometheus.GaugeVec
+	queueAdmittedTotal         *prometheus.CounterVec
+	queueDepth                 *prometheus.GaugeVec
+	queueInflight              *prometheus.GaugeVec
+	queueAge                   *prometheus.GaugeVec
+	dispatcherBackstopEnqueued *prometheus.CounterVec
 }
 
 // newQueueMetrics registers the queue collectors on reg and returns the bundle.
@@ -30,12 +31,23 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 			Name: "operator_queue_age_seconds",
 			Help: "Age of the OLDEST QueuedEvent per (class,priority,state) bucket (contract K.1).",
 		}, []string{"class", "priority", "state"}),
+		// The leader-only admission backstop (issue #395): DispatcherReconciler
+		// is otherwise purely watch-driven, so a QueuedEvent left Queued across a
+		// rollout/leader-handoff window with no fresh watch trigger can stall
+		// admission indefinitely. This counts backstop-driven (not watch-driven)
+		// re-enqueues per project, so a non-zero rate flags that the watch path
+		// is missing events and admission depends on the 60s backstop sweep.
+		dispatcherBackstopEnqueued: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_dispatcher_backstop_enqueued_total",
+			Help: "QueuedEvents re-enqueued by the leader-only admission backstop sweep, by project.",
+		}, []string{"project"}),
 	}
 	reg.MustRegister(
 		m.queueAdmittedTotal,
 		m.queueDepth,
 		m.queueInflight,
 		m.queueAge,
+		m.dispatcherBackstopEnqueued,
 	)
 	return m
 }
@@ -43,6 +55,19 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 // QueueAdmitted increments operator_queue_admitted_total for the pool class and event kind.
 func (m *queueMetrics) QueueAdmitted(class, kind string) {
 	m.queueAdmittedTotal.WithLabelValues(class, kind).Inc()
+}
+
+// DispatcherBackstopEnqueued increments operator_dispatcher_backstop_enqueued_total
+// for project: the leader-only backstop sweep (issue #395) pushed a
+// GenericEvent for a pending QueuedEvent that no fresh watch trigger reached.
+func (m *queueMetrics) DispatcherBackstopEnqueued(project string) {
+	m.dispatcherBackstopEnqueued.WithLabelValues(project).Inc()
+}
+
+// DispatcherBackstopEnqueuedCounter returns the counter for project, for test
+// assertions.
+func (m *queueMetrics) DispatcherBackstopEnqueuedCounter(project string) prometheus.Counter {
+	return m.dispatcherBackstopEnqueued.WithLabelValues(project)
 }
 
 // SetQueueDepth sets operator_queue_depth for a project and pool class to n (Queued-state count).

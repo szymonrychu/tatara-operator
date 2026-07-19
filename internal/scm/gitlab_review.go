@@ -7,9 +7,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
 // GitLab has NO review object. Everything below is new code, not a mapping of
@@ -68,6 +71,69 @@ func (c *GitLab) glDiffRefsOf(ctx context.Context, proj, token string, number in
 		return glDiffRefs{}, err
 	}
 	return mr.DiffRefs, nil
+}
+
+// glMRDiff is one changed file in the MR diff. Diff is the raw unified diff whose
+// @@ headers carry the new-side hunk ranges a text position can anchor to.
+type glMRDiff struct {
+	OldPath string `json:"old_path"`
+	NewPath string `json:"new_path"`
+	Diff    string `json:"diff"`
+}
+
+// glMRDiffsOf reads the MR's per-file diffs ONCE. The result feeds the hunk index
+// that decides which findings are anchorable inline (#394).
+func (c *GitLab) glMRDiffsOf(ctx context.Context, proj, token string, number int) ([]glMRDiff, error) {
+	path := "/projects/" + url.PathEscape(proj) + "/merge_requests/" + strconv.Itoa(number) + "/diffs?per_page=100"
+	return glDoPaged[glMRDiff](ctx, c.base(), path, token)
+}
+
+// glHunkIndex maps a new-side file path to the ranges of new-side line numbers
+// present in the MR diff. A GitLab text position anchors ONLY to a line inside one
+// of these ranges; a finding outside them (or with no line) has no line_code and
+// the POST 400s "line_code can't be blank" (#394), so it must not be posted as a
+// discussion.
+type glHunkIndex map[string][][2]int
+
+func (h glHunkIndex) anchorable(path string, line int) bool {
+	if line <= 0 {
+		return false
+	}
+	for _, r := range h[path] {
+		if line >= r[0] && line <= r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// glHunkHeaderRE captures the new-side start and (optional) count from a unified
+// diff hunk header: "@@ -a,b +c,d @@" -> c, d. A missing count means 1 line.
+var glHunkHeaderRE = regexp.MustCompile(`@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+func glBuildHunkIndex(diffs []glMRDiff) glHunkIndex {
+	idx := make(glHunkIndex, len(diffs))
+	for _, d := range diffs {
+		path := d.NewPath
+		if path == "" {
+			path = d.OldPath
+		}
+		for _, m := range glHunkHeaderRE.FindAllStringSubmatch(d.Diff, -1) {
+			start, err := strconv.Atoi(m[1])
+			if err != nil {
+				continue
+			}
+			count := 1
+			if m[2] != "" {
+				count, _ = strconv.Atoi(m[2])
+			}
+			if count <= 0 {
+				continue // a pure-deletion hunk has no new-side line to anchor to
+			}
+			idx[path] = append(idx[path], [2]int{start, start + count - 1})
+		}
+	}
+	return idx
 }
 
 // GetPRHead reads the LIVE head sha of an MR from .diff_refs.head_sha.
@@ -184,6 +250,20 @@ func (c *GitLab) PostReview(ctx context.Context, repoURL, token string, number i
 			proj, number, refs.BaseSHA, refs.StartSHA, refs.HeadSHA, len(findings))
 	}
 
+	// The new-side hunk ranges, read ONCE. A finding whose (path, line) falls
+	// outside every hunk - or that carries no line at all (a file-level finding,
+	// #398) - can NEVER be a GitLab text position: the discussion POST 400s
+	// "line_code can't be blank" (#394). Such findings degrade to a plain note
+	// below rather than being posted inline and looping the caller forever.
+	var hunks glHunkIndex
+	if len(findings) > 0 {
+		diffs, derr := c.glMRDiffsOf(ctx, proj, token, number)
+		if derr != nil {
+			return "", classifyReviewPostError(derr)
+		}
+		hunks = glBuildHunkIndex(diffs)
+	}
+
 	// Re-entrancy: which per-finding markers are already on the MR? A post killed
 	// after the 2nd of 5 discussions must resume at the 3rd, not re-post the first
 	// two and not skip the last three.
@@ -203,21 +283,42 @@ func (c *GitLab) PostReview(ctx context.Context, repoURL, token string, number i
 		}
 	}
 
-	// Step 1: FINDINGS FIRST.
-	posted, skipped := 0, 0
+	// Step 1: FINDINGS FIRST. Anchorable findings post as diff-anchored
+	// discussions; unanchorable ones degrade to a plain note carrying the same
+	// marker + body. A degrade is WARN + metric, never fatal: one bad finding must
+	// not block the rest of the round.
+	posted, skipped, degraded := 0, 0, 0
 	for k, f := range findings {
 		marker := findingMarker(round, sha, k)
 		if present[marker] {
 			skipped++
 			continue
 		}
-		if err := c.postDiscussion(ctx, proj, token, number, refs, marker+"\n"+f.Body, f); err != nil {
+		body := marker + "\n" + f.Body
+		if !hunks.anchorable(f.Path, f.Line) {
+			if err := c.degradeFinding(ctx, proj, token, number, body, f, round, sha, k, "unanchorable"); err != nil {
+				return "", classifyReviewPostError(err)
+			}
+			degraded++
+			continue
+		}
+		if err := c.postDiscussion(ctx, proj, token, number, refs, body, f); err != nil {
+			// A deterministically REFUSED inline post (a 4xx classified terminal, e.g.
+			// a residual line_code 400) degrades to a note so the round still lands. A
+			// RETRYABLE failure (5xx, network) still aborts WITHOUT the body note, so a
+			// re-run re-lists, skips what landed, and posts the rest.
+			cerr := classifyReviewPostError(err)
+			if errors.Is(cerr, ErrReviewRefused) {
+				if derr := c.degradeFinding(ctx, proj, token, number, body, f, round, sha, k, "post-refused"); derr != nil {
+					return "", classifyReviewPostError(derr)
+				}
+				degraded++
+				continue
+			}
 			slog.ErrorContext(ctx, "gitlab: review discussion post failed mid-round",
 				"provider", "gitlab", "action", "scm_post_review", "resource_id", fmt.Sprintf("%s!%d", proj, number),
 				"round", round, "sha", sha, "finding", k, "posted", posted, "total", len(findings), "error", err.Error())
-			// The body note is NOT posted. The round marker stays absent, so a
-			// re-run re-lists, skips what landed, and posts the rest.
-			return "", classifyReviewPostError(err)
+			return "", cerr
 		}
 		posted++
 	}
@@ -229,8 +330,27 @@ func (c *GitLab) PostReview(ctx context.Context, repoURL, token string, number i
 	}
 	slog.InfoContext(ctx, "gitlab: review posted",
 		"provider", "gitlab", "action", "scm_post_review", "resource_id", fmt.Sprintf("%s!%d", proj, number),
-		"round", round, "sha", sha, "findings_posted", posted, "findings_resumed", skipped, "note_id", noteID)
+		"round", round, "sha", sha, "findings_posted", posted, "findings_resumed", skipped,
+		"findings_degraded", degraded, "note_id", noteID)
 	return noteID, nil
+}
+
+// degradeFinding posts an unanchorable finding as a plain MR note (carrying its
+// per-finding marker + body, exactly like the inline path would) instead of a
+// diff-anchored discussion, and records the WARN + degrade metric. reason is
+// "unanchorable" (line outside every hunk / no line) or "post-refused" (the
+// inline POST was deterministically refused). The note carries the same marker,
+// so the caller's re-list dedup and mirror reconcile treat it uniformly.
+func (c *GitLab) degradeFinding(ctx context.Context, proj, token string, number int,
+	body string, f ReviewFinding, round, sha string, k int, reason string) error {
+	slog.WarnContext(ctx, "gitlab: review finding not anchorable inline; degrading to a plain note",
+		"provider", "gitlab", "action", "scm_post_review", "resource_id", fmt.Sprintf("%s!%d", proj, number),
+		"round", round, "sha", sha, "finding", k, "path", f.Path, "line", f.Line, "reason", reason)
+	if _, err := c.postMRNote(ctx, proj, token, number, body); err != nil {
+		return err
+	}
+	obs.ReviewFindingDegraded("gitlab", reason)
+	return nil
 }
 
 // postDiscussion posts one diff-anchored discussion. The position block carries

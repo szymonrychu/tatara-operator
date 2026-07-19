@@ -301,7 +301,9 @@ spec:
                           maxLength: 8192
                           type: string
                         line:
-                          minimum: 1
+                          description: |-
+                            Line is nil for a file-level finding (no single line to anchor to);
+                            non-nil values are 1-based diff line numbers.
                           type: integer
                         path:
                           type: string
@@ -314,7 +316,6 @@ spec:
                           type: string
                       required:
                       - body
-                      - line
                       - path
                       - severity
                       type: object

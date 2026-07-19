@@ -46,6 +46,8 @@ func (w *crashStatusWriter) Update(ctx context.Context, obj client.Object, opts 
 	return w.SubResourceWriter.Update(ctx, obj, opts...)
 }
 
+func reviewFindingLinePtr(v int) *int { return &v }
+
 func pendingReviewFixture(verdict string, round int, sha string) *tatarav1alpha1.PendingReview {
 	body := "## Review: changes requested"
 	if verdict == "approve" {
@@ -56,8 +58,8 @@ func pendingReviewFixture(verdict string, round int, sha string) *tatarav1alpha1
 		SHA:   sha,
 		Round: round,
 		Findings: []tatarav1alpha1.ReviewFinding{
-			{Path: "internal/controller/merge.go", Line: 42, Body: "this merge is not pinned to the reviewed head", Severity: "critical"},
-			{Path: "internal/scm/github.go", Line: 610, Body: "APPROVE 422s on a self-authored PR", Severity: "high"},
+			{Path: "internal/controller/merge.go", Line: reviewFindingLinePtr(42), Body: "this merge is not pinned to the reviewed head", Severity: "critical"},
+			{Path: "internal/scm/github.go", Line: reviewFindingLinePtr(610), Body: "APPROVE 422s on a self-authored PR", Severity: "high"},
 		},
 	}
 }
@@ -434,6 +436,31 @@ func TestReviewPostFindingsReachTheNextPod(t *testing.T) {
 	}
 	if notes != 1 {
 		t.Fatalf("the belt note was written %d times, want 1", notes)
+	}
+}
+
+// reviewBeltNote renders each finding's location for the next pod's operator
+// note. After WP2, ReviewFinding.Line is *int: a non-nil line renders "path:line",
+// and a nil line (a file-level finding, #398) renders just the path - NEVER the
+// pointer address a bare %d on a *int would print.
+func TestReviewBeltNote_RendersLineAndFileLevel(t *testing.T) {
+	pr := &tatarav1alpha1.PendingReview{
+		SHA: "sha-a",
+		Findings: []tatarav1alpha1.ReviewFinding{
+			{Path: "internal/scm/github.go", Line: reviewFindingLinePtr(42), Body: "line-anchored", Severity: "high"},
+			{Path: "docs/README.md", Line: nil, Body: "file-level", Severity: "low"},
+		},
+	}
+	note := reviewBeltNote("tatara-operator", 7, pr)
+
+	if !strings.Contains(note, "- internal/scm/github.go:42 [high] line-anchored") {
+		t.Fatalf("non-nil line did not render as path:line:\n%s", note)
+	}
+	if !strings.Contains(note, "- docs/README.md [low] file-level") {
+		t.Fatalf("nil line did not render as a bare path (file-level):\n%s", note)
+	}
+	if strings.Contains(note, "0xc0") || strings.Contains(note, "%!d") {
+		t.Fatalf("a *int was formatted as a pointer/garbage:\n%s", note)
 	}
 }
 

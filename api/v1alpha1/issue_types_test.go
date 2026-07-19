@@ -12,6 +12,8 @@ import (
 
 var rfc1123LabelRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
+func intPtr(v int) *int { return &v }
+
 func TestIssueName(t *testing.T) {
 	got := IssueName("tatara-operator", 291)
 	want := "iss-tatara-operator-291"
@@ -219,7 +221,7 @@ func TestPendingReview_JSONRoundTrip(t *testing.T) {
 	pr := PendingReview{
 		Body: "review body",
 		Findings: []ReviewFinding{
-			{Path: "main.go", Line: 10, Body: "fix this", Severity: "high"},
+			{Path: "main.go", Line: intPtr(10), Body: "fix this", Severity: "high"},
 		},
 		SHA:   "deadbeef",
 		Round: 2,
@@ -251,7 +253,7 @@ func TestPendingReview_JSONRoundTrip(t *testing.T) {
 func TestReviewFinding_JSONRoundTrip(t *testing.T) {
 	rf := ReviewFinding{
 		Path:     "internal/foo.go",
-		Line:     5,
+		Line:     intPtr(5),
 		Body:     "unhandled error",
 		Severity: "critical",
 	}
@@ -268,8 +270,32 @@ func TestReviewFinding_JSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &round); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
 	}
-	if round != rf {
+	if round.Path != rf.Path || round.Body != rf.Body || round.Severity != rf.Severity {
 		t.Errorf("round-trip mismatch: got %+v, want %+v", round, rf)
+	}
+	if round.Line == nil || rf.Line == nil || *round.Line != *rf.Line {
+		t.Errorf("Line round-trip mismatch: got %v, want %v", round.Line, rf.Line)
+	}
+}
+
+// #398: a nil Line (a file-level finding, e.g. no line reported by the
+// reviewer) must marshal with the "line" key OMITTED, not present as 0 - and
+// round-trip back to nil, not a zero value.
+func TestReviewFinding_NilLine_OmittedFromWireAndRoundTripsToNil(t *testing.T) {
+	rf := ReviewFinding{Path: "internal/foo.go", Body: "file needs a rethink", Severity: "high"}
+	data, err := json.Marshal(rf)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"line"`) {
+		t.Errorf("marshaled ReviewFinding with nil Line must omit \"line\"\ngot: %s", data)
+	}
+	var round ReviewFinding
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if round.Line != nil {
+		t.Errorf("Line must round-trip to nil, got %v", *round.Line)
 	}
 }
 

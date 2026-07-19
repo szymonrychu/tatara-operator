@@ -246,7 +246,11 @@ func reviewBeltNote(repo string, number int, pr *tatarav1alpha1.PendingReview) s
 	var b strings.Builder
 	fmt.Fprintf(&b, "Review requested changes on %s!%d @ %s:\n", repo, number, pr.SHA)
 	for _, f := range pr.Findings {
-		fmt.Fprintf(&b, "- %s:%d [%s] %s\n", f.Path, f.Line, f.Severity, f.Body)
+		loc := f.Path
+		if f.Line != nil {
+			loc = fmt.Sprintf("%s:%d", f.Path, *f.Line)
+		}
+		fmt.Fprintf(&b, "- %s [%s] %s\n", loc, f.Severity, f.Body)
 	}
 	return b.String()
 }
@@ -650,11 +654,18 @@ func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alph
 	return nil
 }
 
-// scmFindings maps the CR's findings onto the SCM shape.
+// scmFindings maps the CR's findings onto the SCM shape. Line is nil for a
+// file-level finding (#398); scm.ReviewFinding.Line stays a plain int here,
+// so nil lowers to 0 as a placeholder - WP4 teaches the forge posting path to
+// treat 0 as "no line, do not anchor inline" instead of a real diff line.
 func scmFindings(in []tatarav1alpha1.ReviewFinding) []scm.ReviewFinding {
 	out := make([]scm.ReviewFinding, 0, len(in))
 	for _, f := range in {
-		out = append(out, scm.ReviewFinding{Path: f.Path, Line: f.Line, Body: f.Body, Severity: f.Severity})
+		line := 0
+		if f.Line != nil {
+			line = *f.Line
+		}
+		out = append(out, scm.ReviewFinding{Path: f.Path, Line: line, Body: f.Body, Severity: f.Severity})
 	}
 	return out
 }

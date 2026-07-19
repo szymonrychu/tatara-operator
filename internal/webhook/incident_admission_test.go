@@ -66,7 +66,7 @@ func TestSuppressedRefire_CoalescesComment(t *testing.T) {
 	_ = corev1.AddToScheme(sch)
 
 	proj := grafanaProject("p1")
-	dedupKey := incidentDedupKey(mustParseGrafanaAlert(t, grafanaFiringA), proj.Name, denylistSet(nil))
+	dedupKey := incidentDedupKey(mustParseGrafanaAlert(t, grafanaFiringA), proj.Name)
 	iss := &tatarav1.Issue{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "iss-tatara-operator-320", Namespace: "tatara",

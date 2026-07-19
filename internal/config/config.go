@@ -193,11 +193,6 @@ type Config struct {
 	UsageTokenURL      string
 	UsageRefreshMargin time.Duration
 
-	// IncidentDedupVolatileLabels overrides the per-series label denylist that is
-	// stripped from the incident dedup key (webhook.defaultVolatileDenylist).
-	// Empty (nil) means use the operator default. From INCIDENT_DEDUP_VOLATILE_LABELS
-	// (CSV).
-	IncidentDedupVolatileLabels []string
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment on an
 	// open incident tracker. From INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES.
 	IncidentRefireCommentCooldown time.Duration
@@ -576,7 +571,6 @@ func Load() (Config, error) {
 		UsageTokenURL:      getDefault("USAGE_TOKEN_URL", "https://platform.claude.com/v1/oauth/token"),
 		UsageRefreshMargin: usageRefreshMargin,
 
-		IncidentDedupVolatileLabels:     getCSVList("INCIDENT_DEDUP_VOLATILE_LABELS"),
 		IncidentRefireCommentCooldown:   incidentRefireCooldown,
 		IncidentCorrelationLabels:       incidentCorrelationLabels,
 		IncidentEscalateRefireThreshold: incidentEscalateRefires,

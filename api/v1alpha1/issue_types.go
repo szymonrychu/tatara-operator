@@ -106,8 +106,10 @@ type PendingReview struct {
 // evict (it is spec-adjacent intent, not an evictable comment) - fix M8.
 type ReviewFinding struct {
 	Path string `json:"path"`
-	// +kubebuilder:validation:Minimum=1
-	Line int `json:"line"`
+	// +optional
+	// Line is nil for a file-level finding (no single line to anchor to);
+	// non-nil values are 1-based diff line numbers.
+	Line *int `json:"line,omitempty"`
 	// +kubebuilder:validation:MaxLength=8192
 	Body string `json:"body"`
 	// +kubebuilder:validation:Enum=critical;high;medium;low

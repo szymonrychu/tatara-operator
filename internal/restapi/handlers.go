@@ -37,11 +37,18 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// writeClientErr returns a generic 500 for non-404 errors, avoiding leaking
-// internal k8s error details to API callers.
+// writeClientErr maps k8s apiserver errors onto the right HTTP status:
+// NotFound -> 404, Invalid (a CRD/validation rejection, e.g. #398's line=0
+// failing a CRD Minimum marker) -> 422 with the validation detail surfaced
+// to the caller so it can fix and retry, anything else -> a generic 500 that
+// withholds internal k8s error details.
 func writeClientErr(w http.ResponseWriter, err error) {
 	if apierrors.IsNotFound(err) {
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if apierrors.IsInvalid(err) {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 	// Log real error server-side; return generic message to caller.

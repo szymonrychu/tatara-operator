@@ -10,6 +10,7 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/rest"
 
 	apiv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/config"
@@ -50,6 +51,35 @@ func TestManagerOptions_LeaderElectionDisabled(t *testing.T) {
 	opts := managerOptions(config.Config{Namespace: "tatara", LeaderElection: false}, newScheme())
 	if opts.LeaderElection {
 		t.Fatal("managerOptions enabled leader election when config flag was false")
+	}
+}
+
+// TestManagerOptions_LeaderElectionReleaseOnCancel guards issue #395: without
+// LeaderElectionReleaseOnCancel the outgoing leader holds its lease through
+// SIGTERM during a rollout, so the new leader waits out the full lease
+// duration before it can start dispatching - part of the observed 7m22s
+// alert-admission gap.
+func TestManagerOptions_LeaderElectionReleaseOnCancel(t *testing.T) {
+	opts := managerOptions(config.Config{Namespace: "tatara", LeaderElection: true}, newScheme())
+	if !opts.LeaderElectionReleaseOnCancel {
+		t.Fatal("managerOptions did not set LeaderElectionReleaseOnCancel: outgoing leader holds its lease through SIGTERM (issue #395)")
+	}
+}
+
+// TestRestConfig_QPSBurst guards issue #395: client-go's default QPS=5/Burst=10
+// throttles the manager's cold-start cache fill during a rollout burst. It
+// asserts via the getConfig seam (no live API server needed) that restConfig
+// raises QPS/Burst on the rest.Config the manager is built from.
+func TestRestConfig_QPSBurst(t *testing.T) {
+	orig := getConfig
+	defer func() { getConfig = orig }()
+	getConfig = func() *rest.Config { return &rest.Config{Host: "https://example.invalid:6443"} }
+	got := restConfig()
+	if got.QPS != 50 {
+		t.Fatalf("restConfig().QPS = %v, want 50", got.QPS)
+	}
+	if got.Burst != 100 {
+		t.Fatalf("restConfig().Burst = %v, want 100", got.Burst)
 	}
 }
 

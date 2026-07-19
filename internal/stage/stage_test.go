@@ -1327,6 +1327,41 @@ func TestUnpark_AwaitingHumanReviewKindBoundedByHumanReviewRounds(t *testing.T) 
 	}
 }
 
+// A pod spawned into reviewing on an already-merged MR has no legal outcome
+// (postOutcome refuses "this task owns no open MR"), so re-entry must refuse
+// rather than trap the Task. Issue #393.
+func TestUnpark_AwaitingHumanReviewKindRefusesReentryOnMergedMR(t *testing.T) {
+	t.Run("a merged MR refuses re-entry and leaves HumanReviewRounds untouched", func(t *testing.T) {
+		task := newTask("review", v1alpha1.StageParked, stage.ReasonAwaitingHuman)
+		humanEvent(task)
+		h := newHarness(t, task)
+		h.mrs = []v1alpha1.MergeRequest{mergedMR()}
+		if target, ok := h.unpark(stage.UnparkInput{ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300}); ok {
+			t.Fatalf("un-parked a merged-MR review Task into %q: no legal outcome exists from reviewing on a merged MR", target)
+		}
+		if task.Status.HumanReviewRounds != 0 {
+			t.Fatalf("HumanReviewRounds = %d, want untouched 0", task.Status.HumanReviewRounds)
+		}
+		if task.Status.Stage != v1alpha1.StageParked {
+			t.Fatalf("stage = %q, want untouched parked", task.Status.Stage)
+		}
+	})
+
+	t.Run("an open MR is unchanged: re-enters reviewing", func(t *testing.T) {
+		task := newTask("review", v1alpha1.StageParked, stage.ReasonAwaitingHuman)
+		humanEvent(task)
+		h := newHarness(t, task)
+		h.mrs = []v1alpha1.MergeRequest{openMR()}
+		target, ok := h.unpark(stage.UnparkInput{ActiveTasks: 1, MaxOpenTasks: 6, BotLogin: botLogin, MaxTurnsPerTask: 300})
+		if !ok || target != v1alpha1.StageReviewing {
+			t.Fatalf("got (%q,%v), want (reviewing,true)", target, ok)
+		}
+		if task.Status.HumanReviewRounds != 1 {
+			t.Fatalf("HumanReviewRounds = %d, want 1", task.Status.HumanReviewRounds)
+		}
+	})
+}
+
 func TestUnpark_AwaitingHumanTargetIsRederivedFromState(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1855,6 +1890,30 @@ func TestUnparkHandoffStalled(t *testing.T) {
 		}
 		if task.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
 			t.Fatalf("humanReviewRounds = %d, want unchanged %d", task.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
+		}
+	})
+
+	// A pod spawned into reviewing on an already-merged MR has no legal
+	// outcome, so re-entry must refuse rather than trap the Task. Issue #393.
+	t.Run("a merged MR refuses re-entry", func(t *testing.T) {
+		task := mk("review", human, 0)
+		target, ok := stage.Unpark(stage.UnparkInput{Task: task, MRs: []v1alpha1.MergeRequest{mergedMR()}, BotLogin: "tatara-bot", Now: time.Unix(1, 0)})
+		if ok {
+			t.Fatalf("un-parked a merged-MR Task into %q: no legal outcome exists from reviewing on a merged MR", target)
+		}
+		if task.Status.HumanReviewRounds != 0 {
+			t.Fatalf("humanReviewRounds = %d, want untouched 0", task.Status.HumanReviewRounds)
+		}
+		if task.Status.Stage != v1alpha1.StageParked {
+			t.Fatalf("stage = %q, want untouched parked", task.Status.Stage)
+		}
+	})
+
+	t.Run("an open MR is unchanged: re-enters reviewing", func(t *testing.T) {
+		task := mk("review", human, 0)
+		target, ok := stage.Unpark(stage.UnparkInput{Task: task, MRs: []v1alpha1.MergeRequest{openMR()}, BotLogin: "tatara-bot", Now: time.Unix(1, 0)})
+		if !ok || target != v1alpha1.StageReviewing {
+			t.Fatalf("Unpark = %q, %v, want reviewing, true", target, ok)
 		}
 	})
 }

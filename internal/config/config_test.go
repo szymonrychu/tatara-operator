@@ -559,10 +559,8 @@ func TestLoad_PushMetricsAllowedPrefixes(t *testing.T) {
 // unset the Go default is false, matching the chart values.yaml default (agentRunAsNonRoot:
 // false). The two must agree: a divergence means running the binary outside the chart
 // yields the opposite securityContext from what the chart intends.
-// TestLoad_IncidentDedupAndRefireDefaults asserts the incident dedup
-// volatile-labels override defaults to nil (operator built-in default applies,
-// webhook.defaultVolatileDenylist) and the refire comment cooldown defaults to
-// DefaultIncidentRefireCooldown (30m).
+// TestLoad_IncidentDedupAndRefireDefaults asserts the refire comment cooldown
+// defaults to DefaultIncidentRefireCooldown (30m).
 func TestLoad_IncidentDedupAndRefireDefaults(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
@@ -572,32 +570,21 @@ func TestLoad_IncidentDedupAndRefireDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.IncidentDedupVolatileLabels != nil {
-		t.Fatalf("default volatile labels should be nil (operator default applies), got %v", c.IncidentDedupVolatileLabels)
-	}
 	if c.IncidentRefireCommentCooldown != config.DefaultIncidentRefireCooldown {
 		t.Fatalf("cooldown default = %v, want %v", c.IncidentRefireCommentCooldown, config.DefaultIncidentRefireCooldown)
 	}
 }
 
-// TestLoad_IncidentDedupAndRefireFromEnv asserts the CSV volatile-labels
-// override trims whitespace/drops empties, and the cooldown parses minutes.
+// TestLoad_IncidentDedupAndRefireFromEnv asserts the cooldown parses minutes.
 func TestLoad_IncidentDedupAndRefireFromEnv(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
 	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
-	t.Setenv("INCIDENT_DEDUP_VOLATILE_LABELS", "pod, reason , shard")
 	t.Setenv("INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES", "15")
 
 	c, err := config.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
-	}
-	want := []string{"pod", "reason", "shard"}
-	if len(c.IncidentDedupVolatileLabels) != 3 ||
-		c.IncidentDedupVolatileLabels[0] != want[0] ||
-		c.IncidentDedupVolatileLabels[2] != want[2] {
-		t.Fatalf("volatile labels = %v, want %v", c.IncidentDedupVolatileLabels, want)
 	}
 	if c.IncidentRefireCommentCooldown != 15*time.Minute {
 		t.Fatalf("cooldown = %v, want 15m", c.IncidentRefireCommentCooldown)

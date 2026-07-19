@@ -19,9 +19,11 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // isQueued reports whether a QueuedEvent state is effectively Queued.
@@ -55,6 +57,16 @@ type DispatcherReconciler struct {
 	// mgr.GetAPIReader() when unset; nil (unit tests with no manager) falls
 	// back to the qes/tasks slices the caller already listed.
 	APIReader client.Reader
+	// BackstopEvents is the leader-only admission backstop's output channel
+	// (issue #395). DispatcherReconciler is otherwise purely watch-driven, so a
+	// QueuedEvent left Queued across a rollout/leader-handoff window with no
+	// fresh watch trigger can stall admission indefinitely. When non-nil,
+	// SetupWithManager wires it into the controller via
+	// WatchesRawSource(source.Channel), and EnqueuePending/RunBackstop push a
+	// GenericEvent per pending QueuedEvent onto it on a fixed schedule,
+	// independent of any watch event. A nil channel (every pre-existing unit
+	// test in this file) makes EnqueuePending/RunBackstop a no-op.
+	BackstopEvents chan event.GenericEvent
 }
 
 // RBAC note (Task A10, no-op): the accountusage poller/mirror (cmd/manager)
@@ -875,9 +887,94 @@ func (r *DispatcherReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// controller (task/project/repository) - it was already controller-runtime's
 	// implicit default (unset == 1), so this changes no behavior, only makes the
 	// serialization the #348 conflict fix relies on visible rather than assumed.
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&tatarav1alpha1.QueuedEvent{}).
 		Watches(&tatarav1alpha1.Task{}, handler.EnqueueRequestsFromMapFunc(mapTaskToQE)).
-		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
-		Complete(r)
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1})
+	// BackstopEvents (issue #395) is the leader-only admission backstop's
+	// output channel: wire it as an extra raw event source so a GenericEvent
+	// the backstop pushes for a pending QueuedEvent reconciles exactly like a
+	// watch trigger would. Nil (every pre-existing caller/unit test) leaves the
+	// controller purely watch-driven, unchanged.
+	if r.BackstopEvents != nil {
+		b = b.WatchesRawSource(source.Channel(r.BackstopEvents, &handler.EnqueueRequestForObject{}))
+	}
+	return b.Complete(r)
+}
+
+// EnqueuePending is the leader-only admission backstop's list-and-push step
+// (issue #395): it lists every Project and, for each, its queued/pending
+// QueuedEvents, pushing a GenericEvent per pending QE onto BackstopEvents so
+// DispatcherReconciler.Reconcile runs for it even if no watch event ever
+// fired (a rollout/leader-handoff race can otherwise strand a QueuedEvent in
+// Queued indefinitely). It returns the number of events pushed. A nil
+// BackstopEvents is a no-op returning (0, nil).
+//
+// The push is guarded by ctx: source.Channel's consumer (wired in
+// SetupWithManager) stops reading once the manager's runnable ctx is
+// cancelled (leader loss / shutdown), since producer and consumer share that
+// ctx. Without the select below, a full, now-unconsumed BackstopEvents
+// buffer would block this goroutine on the unconditional channel send until
+// the manager's GracefulShutdownTimeout forcibly tears it down. The select
+// lets ctx cancellation win instead, returning the count already pushed.
+func (r *DispatcherReconciler) EnqueuePending(ctx context.Context) (int, error) {
+	if r.BackstopEvents == nil {
+		return 0, nil
+	}
+	var pl tatarav1alpha1.ProjectList
+	if err := r.List(ctx, &pl); err != nil {
+		return 0, err
+	}
+	n := 0
+	for i := range pl.Items {
+		proj := &pl.Items[i]
+		var qel tatarav1alpha1.QueuedEventList
+		if err := r.List(ctx, &qel, client.InNamespace(proj.Namespace)); err != nil {
+			return n, err
+		}
+		qesInProject := filterQEsByProject(qel.Items, proj.Name)
+		for j := range qesInProject {
+			q := &qesInProject[j]
+			if !isQueued(q.Status.State) {
+				continue
+			}
+			select {
+			case r.BackstopEvents <- event.GenericEvent{Object: q}:
+			case <-ctx.Done():
+				return n, ctx.Err()
+			}
+			n++
+			if r.Metrics != nil {
+				r.Metrics.DispatcherBackstopEnqueued(proj.Name)
+			}
+		}
+	}
+	if n > 0 {
+		log.FromContext(ctx).Info("queue: backstop enqueue pass",
+			"action", "queue_backstop_enqueue", "enqueued", n)
+	}
+	return n, nil
+}
+
+// RunBackstop drives the leader-only admission backstop on a fixed ticker
+// until ctx is done: it runs EnqueuePending once immediately on Start (so a
+// gap that predates this replica becoming leader heals right away) and again
+// every interval, independent of any watch event. Implements manager.Runnable
+// via the thin dispatcherBackstopRunnable wrapper in cmd/manager/wire.go.
+func (r *DispatcherReconciler) RunBackstop(ctx context.Context, interval time.Duration) error {
+	if _, err := r.EnqueuePending(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "queue: backstop enqueue failed", "action", "queue_backstop_enqueue_error")
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			if _, err := r.EnqueuePending(ctx); err != nil {
+				log.FromContext(ctx).Error(err, "queue: backstop enqueue failed", "action", "queue_backstop_enqueue_error")
+			}
+		}
+	}
 }

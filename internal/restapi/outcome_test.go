@@ -422,6 +422,52 @@ func TestOutcome_Review_RequestChangesNeedsFindings(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+// #398: a file-level finding (no line - the reviewer is commenting on the
+// file as a whole, not one line of it) must not be forced to line=0, which
+// the CRD's old `+kubebuilder:validation:Minimum=1` on a bare int rejected as
+// Invalid. Omitting "line" from the envelope must round-trip to a nil
+// ReviewFinding.Line, not a zero value.
+func TestOutcome_Review_FindingLineOmitted_PersistsNilLine(t *testing.T) {
+	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
+	  "verdict":"request_changes",
+	  "reviewedSHAs":[{"repo":"tatara-operator","number":295,"sha":"sha1"}],
+	  "findings":[{"repo":"tatara-operator","number":295,"path":"internal/x.go",
+	               "body":"whole file needs a rethink","severity":"high"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Len(t, mr.Status.PendingReview.Findings, 1)
+	require.Nil(t, mr.Status.PendingReview.Findings[0].Line, "a file-level finding must persist Line == nil, not 0")
+}
+
+// The line=5 counterpart of the above: a finding that DOES carry a line must
+// round-trip to *5, not be silently dropped by the *int change.
+func TestOutcome_Review_FindingLineRoundTripsToPointer(t *testing.T) {
+	forge := &reviewPanicForge{heads: map[int]string{295: "sha1"}}
+	e := buildV2(t, v2Opts{writer: forge}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageReviewing, "review"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome", `{"kind":"review","payload":{
+	  "verdict":"request_changes",
+	  "reviewedSHAs":[{"repo":"tatara-operator","number":295,"sha":"sha1"}],
+	  "findings":[{"repo":"tatara-operator","number":295,"path":"internal/x.go","line":5,
+	               "body":"this races","severity":"critical"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Len(t, mr.Status.PendingReview.Findings, 1)
+	require.NotNil(t, mr.Status.PendingReview.Findings[0].Line)
+	require.Equal(t, 5, *mr.Status.PendingReview.Findings[0].Line)
+}
+
 // changeSignificance is IMPLEMENT-OWNED. A review may only ESCALATE it; a LOWER
 // value is IGNORED. The in-cluster reviewer is documented-flaky and must never
 // downgrade a major release to a patch.

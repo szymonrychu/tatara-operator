@@ -447,7 +447,11 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 // tatara_scan_items_total, which the metric-wiring audit (issue #370) pruned
 // as dead-per-redesign; TataraLoopStalled's deadman alert and the
 // tatara-loop dashboard panel are repointed onto this gauge in the same
-// change so a stalled scan cron is still caught.
+// change so a stalled scan cron is still caught. The gauge is process-local
+// and resets on every redeploy, so runScans also rehydrates it from the
+// persisted Status.Last* stamps at the top of every reconcile (fix #386) -
+// this stamp-on-success path is what advances it between rehydrates, not
+// the only way it ever gets set.
 func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.Project, activity string) error {
 	now := metav1.Now()
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1068,6 +1072,27 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil || r.ReaderFor == nil {
 		return 0, nil
 	}
+
+	// Rehydrate the sweep heartbeat gauge from the persisted Status.Last* stamps
+	// on every reconcile (fix #386): obs.SweepLastSuccessTimestamp is process-
+	// local and resets to unset on every pod redeploy, while these stamps are
+	// etcd-backed and survive it. Without this, a redeploy that lands faster
+	// than the next due activity leaves the gauge at NoData even though the
+	// project is scanning fine, and TataraLoopStalled's alertOnNoData fires a
+	// false positive. A never-scanned project (nil stamp) is correctly left
+	// unset - that IS true NoData.
+	if proj.Status.LastIssueScan != nil {
+		ts := float64(proj.Status.LastIssueScan.Unix())
+		obs.SweepLastSuccessTimestamp.WithLabelValues("issueScan").Set(ts)
+		obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(ts)
+	}
+	if proj.Status.LastBrainstorm != nil {
+		obs.SweepLastSuccessTimestamp.WithLabelValues("brainstorm").Set(float64(proj.Status.LastBrainstorm.Unix()))
+	}
+	if proj.Status.LastDocumentation != nil {
+		obs.SweepLastSuccessTimestamp.WithLabelValues("documentation").Set(float64(proj.Status.LastDocumentation.Unix()))
+	}
+
 	cronSpec := proj.Spec.Scm.Cron
 	now := time.Now()
 	soonest := time.Duration(0)

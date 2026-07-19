@@ -814,6 +814,17 @@ func (c *GitHub) ListReviews(ctx context.Context, repoURL, token string, number 
 func (c *GitHub) PostReview(ctx context.Context, repoURL, token string, number int, body string, findings []ReviewFinding) (string, error) {
 	comments := make([]map[string]any, 0, len(findings))
 	for _, f := range findings {
+		if f.Line <= 0 {
+			// A finding with no line (a file-level finding, #398; the CR->scm bridge
+			// lowers a nil *int to 0) can NOT be a line-anchored review comment - GitHub
+			// 422s a line=0 comment. Post it as a file-level comment instead.
+			comments = append(comments, map[string]any{
+				"path":         f.Path,
+				"subject_type": "file",
+				"body":         f.Body,
+			})
+			continue
+		}
 		comments = append(comments, map[string]any{
 			"path": f.Path,
 			"line": f.Line,
@@ -882,17 +893,19 @@ func (c *GitHub) ListReviewComments(ctx context.Context, repoURL, token string, 
 }
 
 // classifyReviewPostError maps a structural 4xx from the review POST to the
-// TERMINAL ErrReviewRefused. 422 ("Can not approve your own pull request"), 401
-// and 403 cannot be fixed by retrying, and hot-requeueing them - which is what
-// writeback_review.go does today with any Approve error - spins forever. The
-// caller parks at review-post-refused instead. Any other error stays retryable.
+// TERMINAL ErrReviewRefused. 422 ("Can not approve your own pull request"), 401,
+// 403 and 400 (GitLab's deterministic "line_code can't be blank" for a position
+// it cannot anchor, #394) cannot be fixed by retrying, and hot-requeueing them -
+// which is what writeback_review.go does today with any Approve error - spins
+// forever. The caller parks at review-post-refused instead. Any other error stays
+// retryable.
 func classifyReviewPostError(err error) error {
 	var he *HTTPError
 	if !errors.As(err, &he) {
 		return err
 	}
 	switch he.Status {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusUnprocessableEntity:
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusUnprocessableEntity:
 		// A rate-limit 403 is transient, not structural: it must stay requeueable.
 		if errors.Is(err, ErrRateLimited) {
 			return err

@@ -44,8 +44,12 @@ var SweepMintCapHitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // success-only stamping is the correct (and simplest) signal there; this is
 // also the successor for tatara_scan_items_total, pruned as dead-per-redesign
 // (metric-wiring audit, issue #370). Its alert sets noDataState: Alerting,
-// because for a heartbeat NoData IS the failure - the gauge resets on restart
-// and an absent series means that activity is not running at all.
+// because for a heartbeat NoData IS the failure - the gauge is process-local
+// and resets on restart, so it is also rehydrated from the persisted
+// Status.LastIssueScan/LastBrainstorm/LastDocumentation stamps at the top of
+// every runScans reconcile (fix #386), not only stamped on a freshly-run
+// pass; an absent series still means that activity has never completed at
+// all, never scanned or rehydrated.
 var SweepLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "operator_sweep_last_success_timestamp_seconds",
 	Help: "Unix timestamp of the last completed pass, by activity (contract K.1): liveness (per-item-error-tolerant) for sweep/nightlySweep, zero-error for brainstorm/documentation/issueScan.",

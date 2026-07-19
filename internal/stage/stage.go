@@ -955,6 +955,12 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 			// which increments only on request_changes: on the approve path that
 			// bound did not exist, and this spawned ONE REVIEW POD PER HUMAN
 			// COMMENT, capped only by maxTurnsPerTask (300).
+			if anyMerged(in.MRs) {
+				// A pod spawned into reviewing on an already-merged MR has no
+				// legal outcome (issue #393). Refuse re-entry; the Task ages
+				// out at parkRetention and is reaped.
+				return "", false
+			}
 			if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
 				return "", false // STAY PARKED. Do not spawn another review pod.
 			}
@@ -1049,6 +1055,12 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// each re-entry may spawn a review pod, and a comment storm must not
 		// spawn one per comment.
 		if !hasNonBotEvent(t, in.BotLogin) {
+			return "", false
+		}
+		if anyMerged(in.MRs) {
+			// A pod spawned into reviewing on an already-merged MR has no
+			// legal outcome (issue #393). Refuse re-entry; the Task ages out
+			// at parkRetention and is reaped.
 			return "", false
 		}
 		if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {

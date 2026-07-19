@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -604,7 +605,12 @@ func reapProject(name string) *tatarav1alpha1.Project {
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "scm-secret",
 			MaxOpenTasks: 6,
-			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"},
+			Scm: &tatarav1alpha1.ScmSpec{
+				Provider: "github", BotLogin: "tatara-bot",
+				Cron: &tatarav1alpha1.ScmCron{
+					Documentation: tatarav1alpha1.CronActivity{Schedule: "0 3 * * *"},
+				},
+			},
 			Documentation: &tatarav1alpha1.DocumentationSpec{
 				Enabled: true,
 				Repo:    "https://github.com/szymonrychu/tatara-documentation.git",
@@ -1247,6 +1253,73 @@ func TestReapDeliveredWaitsForDocumentation(t *testing.T) {
 	}
 	if _, ok := mustGetTask(t, c, "undoc-task"); ok {
 		t.Fatal("a documented delivered task past its 48h TTL was not reaped")
+	}
+}
+
+// mrGetFailAfterClient fails every MergeRequest Get from the failFrom'th call
+// onward (1-indexed), so a test can make ownedMRs succeed once and then fail -
+// simulating a transient failure of the SECOND, diagnostic-only ownedMRs read
+// in reapDelivered's doc_reference block, without touching the FIRST read
+// (inside needsDocumenting) that decides the Task is actually blocked.
+type mrGetFailAfterClient struct {
+	client.Client
+	calls    int
+	failFrom int
+}
+
+func (c *mrGetFailAfterClient) Get(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+		c.calls++
+		if c.calls >= c.failFrom {
+			return errors.New("injected: mergerequest get failure")
+		}
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// A transient failure of the doc_reference block's DIAGNOSTIC-ONLY ownedMRs
+// read (the log line's mr_states field, a second fetch of data
+// needsDocumenting already read) must WARN and continue, never fail the whole
+// reap tick: the GC-blocked counter still increments and the Task is still
+// pinned (the actual GC decision, needsDocumenting's OWN ownedMRs read,
+// already succeeded and is unaffected).
+func TestReapDeliveredDocReferenceLogFetchFailureIsNonBlocking(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("delivered-logfail")
+	repo := reapRepo("delivered-logfail", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	deliveredAt := metav1.NewTime(time.Now().Add(-72 * time.Hour)) // past the 48h TTL
+
+	undoc := reapTask("delivered-logfail", "undoc-task", "clarify", tatarav1alpha1.StageDelivered, "", deliveredAt.Time)
+	undoc.Status.DeliveredAt = &deliveredAt
+	undoc.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 11)}
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.MergeRequestName(repo.Name, 11), Namespace: testNS,
+			OwnerReferences: []metav1.OwnerReference{reapOwnerRef("undoc-task", true)},
+		},
+		Spec: tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: 11, ProjectRef: "delivered-logfail"},
+	}
+	mr.Status.Author = "tatara-bot"
+	mr.Status.HeadBranch = agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "undoc-task"}})
+	mr.Status.State = "merged"
+
+	base := newMirrorClient(t, proj, repo, reapSecret(), undoc, mr)
+	// The first MergeRequest Get is needsDocumenting's OWN read (it must
+	// succeed so the Task is genuinely blocked); the second is the
+	// diagnostic-only mr_states read in the log block, which fails.
+	c := &mrGetFailAfterClient{Client: base, failFrom: 2}
+	w := &reapWriter{}
+	r := reapReconciler(c, w)
+
+	before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference))
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal must not fail on a diagnostic-only mr_states fetch error: %v", err)
+	}
+	if _, ok := mustGetTask(t, c, "undoc-task"); !ok {
+		t.Fatal("a delivered task with a merged MR and no documentedBy was reaped despite still being blocked")
+	}
+	if got := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference)); got <= before {
+		t.Fatalf("operator_gc_blocked_total{reason=doc_reference} = %v, want > %v (must still count even when the log fetch fails)", got, before)
 	}
 }
 
