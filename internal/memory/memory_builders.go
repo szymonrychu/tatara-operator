@@ -46,7 +46,9 @@ func MemoryDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment 
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
-					ImagePullSecrets: imagePullSecrets(cfg),
+					ImagePullSecrets:          imagePullSecrets(cfg),
+					Affinity:                  componentAffinity(p.Name, "memory", cfg),
+					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "memory", cfg),
 					Containers: []corev1.Container{{
 						Name:  "tatara-memory",
 						Image: cfg.MemoryImage,

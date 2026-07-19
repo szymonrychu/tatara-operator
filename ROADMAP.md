@@ -15,8 +15,14 @@ Planned work not yet started. One line per item; link to plans for detail.
 Open, out of scope, deliberately not done:
 
 - [ ] **Remove the superseded `documentationScan`** (+ `createDocumentationTask`, `documentationInFlightProject`, `oldestCommitSHA`/`latestCommitSHA`, `documentation_guard_test.go`). The 2026-07-13 wiring pass swapped the documentation cron to `MintDocBatch` (F2 nightly batch); `documentationScan` (per-changed-repo diff model) is now dead in production but still test-referenced (lint-safe). Delete once its QueuedEvent doc-kind path is confirmed unused.
-- [ ] **`restapi.Config.Spiller` / `.CIFor` / `.Memory` are unset in wire.go** (adjacent to W1). Spiller nil => an over-budget `/outcome` write aborts instead of spilling; CIFor nil => `GET /projects/{p}/scm/ci` 501s; Memory nil => `task_context(notes=all)` cannot rehydrate spilled notes. Not in the W1 scope (which was `Approval`); wire per-project like the reconcilers if these paths are needed.
+- [ ] **#365: memory-stack anti-affinity/topologySpreadConstraints.** Follow-up from issue #355
+  (memory-provisioning stream D) and #327: `internal/memory/memory_builders.go` sets no pod
+  anti-affinity/topologySpreadConstraints on the cnpg PGCluster/Neo4jStatefulSet/LightragDeployment/
+  MemoryDeployment, so a single node can (and did, in #327) host every backend for multiple
+  projects. Chart-configurable per rule 6/14, same pattern as the existing `agentScheduling` value.
 - [ ] **I1 metrics have no consuming alert yet.** The four K.1 metrics (`operator_task_stage`, `operator_task_stage_age_seconds`, `operator_task_parked_total`, `operator_queue_age_seconds`) are now emitted, but the deployed tatara-observability alerts still key on the OLD vocabulary. Port the K.2 contract alerts (stage-stall, incident-starvation, merge/deploy-blocked) onto these metrics in tatara-observability.
+- [ ] **Per-activity scan-cron heartbeat alert** on `obs.SweepLastSuccessTimestamp{activity=brainstorm|documentation}` (metric-wiring audit, issue #370). `TataraLoopStalled` deliberately does NOT cover a stalled brainstorm/documentation cron specifically (both are opt-in with slow, project-configured cadences; a staleness check needs `absent_over_time`-aware gating so a project that never enabled the activity doesn't false-fire) - it only watches the always-on B.4 sweep via `operator_tasks_minted_per_sweep_count`. A narrower, lower-severity alert for "this project enabled brainstorm/documentation and it silently stopped running" is real alerting design, not a mechanical repoint, and was left undone here.
+- [ ] **Companion tatara-observability allowlist entries** for `operator_review_post_total` and `operator_stage_drift_total` (metric-wiring audit, issue #370) - both are correctly wired and pre-warmed operator-side but absent from `scripts/metrics_allowlist.txt` and unconsumed by any alert/dashboard. Land after streams B (#59) / E (#60)'s concurrent allowlist rewrite there merges or rebase over it.
 
 
 - [ ] RESIDUE 1: `refine`'s `mr_write(comment)` restriction (a refine agent may comment on an MR but

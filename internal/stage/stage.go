@@ -62,6 +62,7 @@ const (
 	ReasonImplementDeclined      = "implement-declined"
 	ReasonDeclined               = "declined"
 	ReasonFalsePositive          = "false-positive"
+	ReasonTrackedElsewhere       = "tracked-elsewhere"
 	ReasonReviewLoopExhausted    = "review-loop-exhausted"
 	ReasonReviewPostRefused      = "review-post-refused"
 	ReasonMergeTimeout           = "merge-timeout"
@@ -98,6 +99,7 @@ var Reasons = []string{
 	ReasonImplementDeclined,
 	ReasonDeclined,
 	ReasonFalsePositive,
+	ReasonTrackedElsewhere,
 	ReasonReviewLoopExhausted,
 	ReasonReviewPostRefused,
 	ReasonMergeTimeout,
@@ -175,6 +177,7 @@ var reentryReasons = map[string]bool{
 	ReasonMergeTimeout:       true,
 	ReasonDeployTimeout:      true,
 	ReasonNoOutcome:          true,
+	ReasonHandoffStalled:     true,
 }
 
 // HasReentry reports whether a parked `reason` has an F.6 re-entry rule. It is the
@@ -323,7 +326,7 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "submit_outcome(approve|request_changes) on a kind=review Task. The review IS posted. A human's PR is fixed and merged by the human (fixes V7-1, C3-2)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewLoopExhausted, Trigger: "request_changes at maxReviewRounds, on a non-review Task"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewPostRefused, Trigger: "a structural 4xx from PostReview (fix C1)"},
-		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m). ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m), and the reconciler's level-triggered re-drive could not either. ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced. Recoverable: a human comment re-enters reviewing (F.6)"},
 		issueClosedEdge(),
 	),
 
@@ -368,7 +371,7 @@ var Transitions = map[string][]Edge{
 	// re-entry rules, and Unpark is the ONE function that produces them.
 	v1alpha1.StageParked: {
 		{To: v1alpha1.StageTriaging, Trigger: "F.6 backlog-sweep: a non-bot pendingEvent AND ACTIVE Tasks < maxOpenTasks"},
-		{To: v1alpha1.StageReviewing, Trigger: "F.6 awaiting-human on a kind=review Task, bounded by humanReviewRounds (5)"},
+		{To: v1alpha1.StageReviewing, Trigger: "F.6 awaiting-human on a kind=review Task / handoff-stalled on a human comment (any kind). Both bounded by humanReviewRounds (5)"},
 		{To: v1alpha1.StageImplementing, Trigger: "F.6 awaiting-human (every open owned Issue approved) / identity-unverified (the C.6 grammar re-passes) / no-outcome (zero merged MRs)"},
 		{To: v1alpha1.StageClarifying, Trigger: "F.6 awaiting-human, not every open owned Issue is approved"},
 		{To: v1alpha1.StageMerging, Trigger: "F.6 merge-timeout, under maxMergeReentries. NEVER implementing"},
@@ -1034,6 +1037,30 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		}
 		return enter(v1alpha1.StageImplementing, "")
 
+	case ReasonHandoffStalled:
+		// The outcome COMMITTED but the C.5.3 phase-2 drain lost the advance
+		// (PR 389: a stale informer cache defeated advanceAfterReview). The
+		// work already landed on the forge, so this park is recoverable: a
+		// human comment re-enters reviewing, where the reconciler's
+		// level-triggered re-drive - or, failing that, a fresh review round -
+		// completes it. Stage-scoped, not kind-scoped: any kind whose review outcome
+		// committed can stall this way. Bounded by humanReviewRounds exactly
+		// like the kind=review awaiting-human rule, and for the same reason:
+		// each re-entry may spawn a review pod, and a comment storm must not
+		// spawn one per comment.
+		if !hasNonBotEvent(t, in.BotLogin) {
+			return "", false
+		}
+		if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
+			return "", false // STAY PARKED. Do not spawn another review pod.
+		}
+		t.Status.HumanReviewRounds++
+		target, ok := enter(v1alpha1.StageReviewing, "")
+		if !ok {
+			t.Status.HumanReviewRounds--
+		}
+		return target, ok
+
 	default:
 		// review-loop-exhausted, implement-declined, declined, false-positive,
 		// stage-deadline,
@@ -1041,7 +1068,7 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// fold-adoption-unverified, doc-timeout, operator-error, triage-stalled,
 		// name-too-long, review-post-refused, object-too-large,
 		// merge-order-missing, agent-contract-mismatch, merge-blocked,
-		// deploy-blocked, head-moving, handoff-stalled.
+		// deploy-blocked, head-moving.
 		//
 		// NO re-entry. It ages out at parkRetention and is reaped, AFTER the
 		// operator posts its bot park comment. The next sweep re-mints the

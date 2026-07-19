@@ -1543,6 +1543,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// issue-closed: WS3-I3 rejected(issue-closed), the human-closed-the-driving
 		// -issue stop edge from the nine live stages.
 		"issue-closed",
+		// tracked-elsewhere: investigating->rejected on submit_outcome(comment_issue),
+		// the incident agent appended evidence to an existing tracker rather than
+		// filing a new issue.
+		"tracked-elsewhere",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -1782,19 +1786,85 @@ func TestEnterReviewingToParkedHandoffStalled(t *testing.T) {
 	}
 }
 
-// handoff-stalled has NO F.6 re-entry: it ages out at parkRetention and the
-// reaper collects it. It must not fall into any Unpark rule by accident.
-func TestUnparkDoesNotReEnterHandoffStalled(t *testing.T) {
-	task := &v1alpha1.Task{
-		Spec: v1alpha1.TaskSpec{Kind: "review"},
-		Status: v1alpha1.TaskStatus{
-			Stage:         v1alpha1.StageParked,
-			StageReason:   stage.ReasonHandoffStalled,
-			PendingEvents: []v1alpha1.TaskEvent{{Author: "a-human"}},
-		},
+// handoff-stalled DOES have a comment-driven F.6 re-entry (PR 389): the park
+// means "the outcome committed but the phase-2 drain lost the advance", so a
+// human comment re-enters reviewing, where the reconciler's level-triggered
+// re-drive (or a fresh review round) completes the handoff. Without an event it stays parked
+// and ages out; the re-entry is bounded by humanReviewRounds like the
+// kind=review awaiting-human rule, so a comment storm cannot spawn unbounded
+// review pods.
+func TestUnparkHandoffStalled(t *testing.T) {
+	mk := func(kind string, events []v1alpha1.TaskEvent, rounds int) *v1alpha1.Task {
+		return &v1alpha1.Task{
+			Spec: v1alpha1.TaskSpec{Kind: kind},
+			Status: v1alpha1.TaskStatus{
+				Stage:             v1alpha1.StageParked,
+				StageReason:       stage.ReasonHandoffStalled,
+				PendingEvents:     events,
+				HumanReviewRounds: rounds,
+			},
+		}
 	}
-	if _, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)}); ok {
-		t.Fatal("handoff-stalled must have no F.6 re-entry")
+	human := []v1alpha1.TaskEvent{{Author: "a-human"}}
+
+	t.Run("a human comment re-enters reviewing", func(t *testing.T) {
+		task := mk("review", human, 0)
+		target, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)})
+		if !ok || target != v1alpha1.StageReviewing {
+			t.Fatalf("Unpark = %q, %v, want reviewing, true", target, ok)
+		}
+		if task.Status.Stage != v1alpha1.StageReviewing {
+			t.Fatalf("stage = %q, want reviewing", task.Status.Stage)
+		}
+		if task.Status.HumanReviewRounds != 1 {
+			t.Fatalf("humanReviewRounds = %d, want 1: the re-entry must consume a round", task.Status.HumanReviewRounds)
+		}
+	})
+
+	t.Run("a non-review kind re-enters reviewing too", func(t *testing.T) {
+		// The stall is stage-scoped, not kind-scoped: an implement Task whose
+		// review outcome committed can stall the same way.
+		task := mk("clarify", human, 0)
+		target, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)})
+		if !ok || target != v1alpha1.StageReviewing {
+			t.Fatalf("Unpark = %q, %v, want reviewing, true", target, ok)
+		}
+	})
+
+	t.Run("no event stays parked until retention", func(t *testing.T) {
+		task := mk("review", nil, 0)
+		if _, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)}); ok {
+			t.Fatal("handoff-stalled must not re-enter without a human comment")
+		}
+		if task.Status.Stage != v1alpha1.StageParked {
+			t.Fatalf("stage = %q, want untouched parked", task.Status.Stage)
+		}
+	})
+
+	t.Run("a bot event never un-parks", func(t *testing.T) {
+		task := mk("review", []v1alpha1.TaskEvent{{Author: "tatara-bot"}}, 0)
+		if _, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)}); ok {
+			t.Fatal("the operator's own park comment must not un-park the Task it parked")
+		}
+	})
+
+	t.Run("bounded by humanReviewRounds", func(t *testing.T) {
+		task := mk("review", human, v1alpha1.MaxHumanReviewRounds)
+		if _, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: "tatara-bot", Now: time.Unix(1, 0)}); ok {
+			t.Fatal("handoff-stalled at the humanReviewRounds cap must stay parked")
+		}
+		if task.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
+			t.Fatalf("humanReviewRounds = %d, want unchanged %d", task.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
+		}
+	})
+}
+
+// handoff-stalled is a member of the F.6 re-entry set (HasReentry), so the
+// WS3-I4 no-re-entry resume path (sever + fresh re-mint) leaves it to the
+// unpark drivers instead of severing a Task whose work already landed.
+func TestHandoffStalledHasReentry(t *testing.T) {
+	if !stage.HasReentry(stage.ReasonHandoffStalled) {
+		t.Fatal("handoff-stalled must be in the F.6 re-entry set")
 	}
 }
 

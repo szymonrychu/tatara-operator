@@ -52,6 +52,8 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		MemoryPathPrefix:     cfg.MemoryPathPrefix,
 		MonitorEnabled:       cfg.MemoryMonitoringEnabled,
 		MonitorLabels:        cfg.MemoryMonitorLabels,
+		TopologyKey:          cfg.MemoryTopologyKey,
+		ProvisioningTimeout:  cfg.MemoryProvisioningTimeout,
 	}
 }
 
@@ -98,14 +100,17 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 	// mirror + the identity-unverified re-verify both write through objbudget); an
 	// unset SpillerFor left reverifyParked dead (fix W1).
 	webhook.NewServer(webhook.Config{
-		Client:                        mgr.GetClient(),
-		APIReader:                     mgr.GetAPIReader(),
-		Namespace:                     cfg.Namespace,
-		Metrics:                       metrics,
-		Seq:                           seq,
-		SpillerFor:                    newSpillerFor(mgr, cfg),
-		IncidentDedupVolatileLabels:   cfg.IncidentDedupVolatileLabels,
-		IncidentRefireCommentCooldown: cfg.IncidentRefireCommentCooldown,
+		Client:                          mgr.GetClient(),
+		APIReader:                       mgr.GetAPIReader(),
+		Namespace:                       cfg.Namespace,
+		Metrics:                         metrics,
+		Seq:                             seq,
+		SpillerFor:                      newSpillerFor(mgr, cfg),
+		IncidentDedupVolatileLabels:     cfg.IncidentDedupVolatileLabels,
+		IncidentRefireCommentCooldown:   cfg.IncidentRefireCommentCooldown,
+		IncidentCorrelationLabels:       cfg.IncidentCorrelationLabels,
+		IncidentEscalateRefireThreshold: cfg.IncidentEscalateRefireThreshold,
+		IncidentEscalateStaleAge:        cfg.IncidentEscalateStaleAge,
 	}).Mount(httpMux)
 
 	// M3 REST API - OIDC-gated. Discovery failures at startup are fatal so
@@ -126,8 +131,25 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
 			return scm.ReaderByProvider(provider, token)
 		},
-		Logger:  slog.Default(),
-		Metrics: metrics,
+		// CIFor is the C.2.10 live-CI capability behind GET
+		// /projects/{p}/scm/ci. Before this was wired the field was nil, so
+		// the endpoint always 501'd (issue #345 fault 2) - scm_read(kind=ci)
+		// was advertised to agents but entirely dead.
+		CIFor: func(provider, token string) (scm.CIReader, error) {
+			return scm.CIReaderByProvider(provider, token)
+		},
+		// SpillerFor/MemoryFor close the A.7 byte-budget loop on the REST
+		// surface. Before this was wired both fields were nil, asymmetric
+		// with the webhook server (SpillerFor above) and TaskReconciler
+		// (addReconcilers' spillerFor): an over-budget agent write panicked
+		// instead of spilling (issue #345 fault 1), and notes=all could never
+		// rehydrate what the webhook/reconciler side had already spilled
+		// (fault 3). Both resolvers are per-project - SAME reasoning as
+		// newSpillerFor - because tatara-memory is deployed once per Project.
+		SpillerFor: newSpillerFor(mgr, cfg),
+		MemoryFor:  newMemoryFor(mgr, cfg),
+		Logger:     slog.Default(),
+		Metrics:    metrics,
 		// Approval is the C.6 grammar seam. Before this was wired the field was
 		// nil, so verifyApprovalScope FAILED CLOSED on every clarify
 		// decision=implement and the platform could never implement anything
@@ -152,6 +174,30 @@ func newSpillerFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.
 		Audience:     "tatara-memory",
 	})
 	return func(proj *tataradevv1alpha1.Project) objbudget.Spiller {
+		endpoint := ""
+		if proj.Status.Memory != nil {
+			endpoint = proj.Status.Memory.Endpoint
+		}
+		return memclient.New(endpoint, memoryTokens.Token, nil)
+	}
+}
+
+// newMemoryFor builds the per-project restapi.NoteFetcher resolver: the
+// tatara-memory client that rehydrates spilled notes for task_context
+// (notes=all). Same per-project reasoning as newSpillerFor - one
+// tatara-memory endpoint per Project - and the SAME memclient.New
+// construction; kept as its own small function (rather than reusing
+// newSpillerFor's return value) because objbudget.Spiller and
+// restapi.NoteFetcher are distinct interfaces and Go does not convert
+// between them implicitly.
+func newMemoryFor(mgr ctrl.Manager, cfg config.Config) func(*tataradevv1alpha1.Project) restapi.NoteFetcher {
+	memoryTokens := auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
+		ClientID:     cfg.OperatorOIDCClientID,
+		ClientSecret: cfg.OperatorOIDCClientSecret,
+		Audience:     "tatara-memory",
+	})
+	return func(proj *tataradevv1alpha1.Project) restapi.NoteFetcher {
 		endpoint := ""
 		if proj.Status.Memory != nil {
 			endpoint = proj.Status.Memory.Endpoint
@@ -313,6 +359,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// (the Task 0 spike confirms bearer vs x-api-key). When off, usageStore stays
 	// empty and the claudeSubscription gate reads 0% = fail-open (nothing held).
 	if cfg.UsageEnabled {
+		metrics.SetAccountUsagePollerEnabled(true)
 		usageMirror := &accountusage.Mirror{Client: mgr.GetClient(), Namespace: cfg.Namespace, Name: "tatara-account-usage"}
 		if snap, err := usageMirror.Load(context.Background()); err != nil {
 			// Load already swallows a missing ConfigMap to a nil error, so a non-nil err
@@ -365,6 +412,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 			return nil, fmt.Errorf("add usage poller: %w", err)
 		}
 	} else {
+		metrics.SetAccountUsagePollerEnabled(false)
 		slog.Info("account-usage poller disabled (USAGE_ENABLED=false); claudeSubscription gate reads an empty store, fail-open",
 			"action", "usage_poller_disabled")
 	}
@@ -435,8 +483,9 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 	// reconciler drives the two pod-less operator stages (merging, deploying). It
 	// is the SOLE merge caller and the SOLE review poster.
 	stageDriver := &controller.StageDriver{
-		Client:  mgr.GetClient(),
-		Metrics: metrics,
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Metrics:   metrics,
 		SCMFor: func(provider string) (scm.SCMWriter, error) {
 			return scm.ByProvider(provider)
 		},

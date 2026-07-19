@@ -21,3 +21,34 @@ func TestParseIssueURL_NotAnIssueURL(t *testing.T) {
 		t.Fatal("parseIssueURL() must reject non-issue URLs")
 	}
 }
+
+func TestParsePRURL_GitHub(t *testing.T) {
+	repo, num, ok := parsePRURL("https://github.com/owner/repo/pull/87")
+	if !ok || repo != "owner/repo" || num != 87 {
+		t.Fatalf("parsePRURL() = (%q, %d, %v), want (owner/repo, 87, true)", repo, num, ok)
+	}
+}
+
+func TestParsePRURL_GitLabWithSubgroup(t *testing.T) {
+	repo, num, ok := parsePRURL("https://gitlab.com/group/subgroup/project/-/merge_requests/9")
+	if !ok || repo != "group/subgroup/project" || num != 9 {
+		t.Fatalf("parsePRURL() = (%q, %d, %v), want (group/subgroup/project, 9, true)", repo, num, ok)
+	}
+}
+
+func TestParsePRURL_NotAPRURL(t *testing.T) {
+	if _, _, ok := parsePRURL("https://github.com/owner/repo/issues/1"); ok {
+		t.Fatal("parsePRURL() must reject non-PR URLs")
+	}
+}
+
+func TestParseSourceURL_RoutesOnIsPR(t *testing.T) {
+	repo, num, ok := parseSourceURL("https://github.com/owner/repo/pull/87", true)
+	if !ok || repo != "owner/repo" || num != 87 {
+		t.Fatalf("parseSourceURL(isPR=true) = (%q, %d, %v), want (owner/repo, 87, true)", repo, num, ok)
+	}
+	repo, num, ok = parseSourceURL("https://github.com/owner/repo/issues/42", false)
+	if !ok || repo != "owner/repo" || num != 42 {
+		t.Fatalf("parseSourceURL(isPR=false) = (%q, %d, %v), want (owner/repo, 42, true)", repo, num, ok)
+	}
+}

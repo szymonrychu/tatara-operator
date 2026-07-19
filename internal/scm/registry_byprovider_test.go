@@ -32,6 +32,32 @@ func TestReaderByProvider(t *testing.T) {
 	}
 }
 
+func TestCIReaderByProvider(t *testing.T) {
+	cases := []struct {
+		name     string
+		provider string
+		wantErr  bool
+	}{
+		{"github", "github", false},
+		{"gitlab", "gitlab", false},
+		{"unknown", "bitbucket", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ci, err := CIReaderByProvider(tc.provider, "tok")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error for %q", tc.provider)
+				}
+				return
+			}
+			if err != nil || ci == nil {
+				t.Fatalf("CIReaderByProvider(%q): %v", tc.provider, err)
+			}
+		})
+	}
+}
+
 func TestByProvider(t *testing.T) {
 	gh, err := ByProvider("github")
 	require.NoError(t, err)

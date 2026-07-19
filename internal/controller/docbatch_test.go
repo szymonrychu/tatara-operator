@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
@@ -35,7 +36,7 @@ func deliveredWithMergedMR(t *testing.T, proj, repo, name string, number int, at
 		Spec: tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo, Number: number, ProjectRef: proj},
 	}
 	mr.Status.Author = "tatara-bot"
-	mr.Status.HeadBranch = TaskBranchPrefix + name
+	mr.Status.HeadBranch = agent.TaskBranch(tk)
 	mr.Status.State = "merged"
 	return tk, mr
 }

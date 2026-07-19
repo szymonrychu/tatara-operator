@@ -46,7 +46,15 @@ type Config struct {
 	// extra labels stamped on that ServiceMonitor + PrometheusRule so the cluster
 	// Prometheus serviceMonitorSelector / ruleSelector match them. Empty keeps the
 	// chart cluster-agnostic (rule 14); the deploying helmfile sets the label.
-	MemoryMonitorLabels      map[string]string
+	MemoryMonitorLabels map[string]string
+	// MemoryTopologyKey (MEMORY_TOPOLOGY_KEY) is the node-topology domain the
+	// per-Project memory stack (lightrag/neo4j/pg/api) spreads its pods across
+	// via pod anti-affinity + topologySpreadConstraints (issue #365). Empty
+	// (default) keeps the chart cluster-agnostic (rule 14); the memory builders
+	// resolve empty to "kubernetes.io/hostname", and the deploying helmfile can
+	// override it with a rack/zone label. Mirrors the AGENT_SCHEDULING precedent:
+	// a global operator env var, NOT a per-Project CRD field.
+	MemoryTopologyKey        string
 	OpenAISecretName         string
 	SemanticModel            string
 	IngesterImage            string
@@ -112,6 +120,15 @@ type Config struct {
 	// DefaultIdlePodReap and is clamped up to MinIdlePodReap when positive; a
 	// zero/negative value disables the idle backstop.
 	IdlePodReapAfter time.Duration
+	// MemoryProvisioningTimeout bounds how long a project's memory stack may
+	// stay in phase Provisioning before reconcileMemory flips it to Degraded
+	// (issue #355: a wedged backend sat Provisioning for 7h+ with no bounded
+	// failure signal). Loaded from MEMORY_PROVISIONING_TIMEOUT_MINUTES as an
+	// integer minute count. Defaults to DefaultMemoryProvisioningTimeout and is
+	// clamped up to MinMemoryProvisioningTimeout when positive; a zero/negative
+	// value disables the timeout (Provisioning stays unbounded, pre-#355
+	// behaviour).
+	MemoryProvisioningTimeout time.Duration
 	// SerenaURL, when non-empty, is the in-cluster URL of the Serena
 	// code-intelligence MCP server. Read from TATARA_SERENA_URL. Empty by default
 	// (Phase 1: code path wired, no server deployed). Passed through to PodConfig
@@ -184,6 +201,21 @@ type Config struct {
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment on an
 	// open incident tracker. From INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES.
 	IncidentRefireCommentCooldown time.Duration
+	// IncidentCorrelationLabels is the alert common-label set whose values form
+	// the coarser incident GROUP key (project + these labels). Different alert
+	// rules that share these label values are correlated: file_issue auto-links
+	// the new tracker under the oldest open sibling. Empty (nil) means use the
+	// operator default. From INCIDENT_CORRELATION_LABELS (CSV).
+	IncidentCorrelationLabels []string
+	// IncidentEscalateRefireThreshold re-admits a fresh incident investigation
+	// once an open tracker has suppressed this many refires. From
+	// INCIDENT_ESCALATE_REFIRE_THRESHOLD.
+	IncidentEscalateRefireThreshold int
+	// IncidentEscalateStaleAge re-admits a fresh incident investigation once an
+	// open tracker has sat open this long, and also gates re-escalation (at most
+	// one escalation per window). From INCIDENT_ESCALATE_STALE_AGE (a Go duration
+	// string, e.g. "48h").
+	IncidentEscalateStaleAge time.Duration
 }
 
 // BudgetDefaults returns the operator-wide token-budget configuration as a
@@ -218,10 +250,41 @@ const DefaultIdlePodReap = 30 * time.Minute
 // the idle backstop entirely.
 const MinIdlePodReap = 5 * time.Minute
 
+// DefaultMemoryProvisioningTimeout is the default bound on how long a memory
+// stack may stay Provisioning before reconcileMemory reports it Degraded
+// (issue #355). 45m comfortably exceeds a normal cnpg/neo4j/lightrag cold
+// start while still catching a wedged backend far sooner than the 7h+ the
+// live incident ran unbounded.
+const DefaultMemoryProvisioningTimeout = 45 * time.Minute
+
+// MinMemoryProvisioningTimeout is the hard lower bound on
+// MemoryProvisioningTimeout. It keeps a misconfigured short value from
+// flipping a stack to Degraded during an ordinary provisioning run. A
+// positive MemoryProvisioningTimeout below this floor is clamped up to it in
+// Load; zero disables the bound entirely.
+const MinMemoryProvisioningTimeout = 5 * time.Minute
+
 // DefaultIncidentRefireCooldown is how long the operator waits between coalesced
 // refire comments on one open incident tracker (A4). The recurrence counter
 // still increments on every suppressed refire; only the COMMENT is rate-limited.
 const DefaultIncidentRefireCooldown = 30 * time.Minute
+
+// DefaultIncidentCorrelationLabels is the coarse alert-label set whose values
+// form the incident GROUP key. namespace+cluster is the conservative infra
+// default: co-firing rules for one CNPG/namespace failure share these values and
+// correlate into one linked tracker tree, while unrelated namespaces stay
+// distinct. Correlation is LINK-ONLY (never suppresses), so an over-broad group
+// costs at most a spurious sub-issue link, not a lost investigation.
+var DefaultIncidentCorrelationLabels = []string{"namespace", "cluster"}
+
+// DefaultIncidentEscalateRefires is how many suppressed refires an open tracker
+// absorbs before the operator re-admits a fresh investigation (liveness escape).
+const DefaultIncidentEscalateRefires = 10
+
+// DefaultIncidentEscalateStaleAge is how long an open tracker may sit before the
+// operator re-admits a fresh investigation, and the minimum spacing between two
+// escalations of one tracker.
+const DefaultIncidentEscalateStaleAge = 48 * time.Hour
 
 func getDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -375,6 +438,16 @@ func Load() (Config, error) {
 	if idlePodReapAfter > 0 && idlePodReapAfter < MinIdlePodReap {
 		idlePodReapAfter = MinIdlePodReap
 	}
+	memoryProvisioningTimeout, err := getMinutesDefault("MEMORY_PROVISIONING_TIMEOUT_MINUTES", DefaultMemoryProvisioningTimeout)
+	if err != nil {
+		return Config{}, err
+	}
+	// Clamp up a positive value to the floor for the same reason as
+	// idlePodReapAfter: a short misconfiguration must not flip a healthy,
+	// still-provisioning stack to Degraded. Zero/negative disables the bound.
+	if memoryProvisioningTimeout > 0 && memoryProvisioningTimeout < MinMemoryProvisioningTimeout {
+		memoryProvisioningTimeout = MinMemoryProvisioningTimeout
+	}
 	agentRunAsNonRoot, err := getBoolDefault("AGENT_RUN_AS_NON_ROOT", false)
 	if err != nil {
 		return Config{}, err
@@ -423,6 +496,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	incidentEscalateRefires, err := getIntDefault("INCIDENT_ESCALATE_REFIRE_THRESHOLD", DefaultIncidentEscalateRefires)
+	if err != nil {
+		return Config{}, err
+	}
+	incidentEscalateStaleAge, err := getDurationDefault("INCIDENT_ESCALATE_STALE_AGE", DefaultIncidentEscalateStaleAge)
+	if err != nil {
+		return Config{}, err
+	}
+	incidentCorrelationLabels := getCSVList("INCIDENT_CORRELATION_LABELS")
+	if len(incidentCorrelationLabels) == 0 {
+		incidentCorrelationLabels = DefaultIncidentCorrelationLabels
+	}
 	cfg := Config{
 		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
 		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
@@ -463,9 +548,11 @@ func Load() (Config, error) {
 		LeaderElection:             leaderElection,
 		MemoryMonitoringEnabled:    memoryMonitoringEnabled,
 		MemoryMonitorLabels:        memoryMonitorLabels,
+		MemoryTopologyKey:          os.Getenv("MEMORY_TOPOLOGY_KEY"),
 		PushMetricsTTL:             pushMetricsTTL,
 		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
 		IdlePodReapAfter:           idlePodReapAfter,
+		MemoryProvisioningTimeout:  memoryProvisioningTimeout,
 		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
 		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
 		SerenaURL:                  os.Getenv("TATARA_SERENA_URL"),
@@ -489,8 +576,11 @@ func Load() (Config, error) {
 		UsageTokenURL:      getDefault("USAGE_TOKEN_URL", "https://platform.claude.com/v1/oauth/token"),
 		UsageRefreshMargin: usageRefreshMargin,
 
-		IncidentDedupVolatileLabels:   getCSVList("INCIDENT_DEDUP_VOLATILE_LABELS"),
-		IncidentRefireCommentCooldown: incidentRefireCooldown,
+		IncidentDedupVolatileLabels:     getCSVList("INCIDENT_DEDUP_VOLATILE_LABELS"),
+		IncidentRefireCommentCooldown:   incidentRefireCooldown,
+		IncidentCorrelationLabels:       incidentCorrelationLabels,
+		IncidentEscalateRefireThreshold: incidentEscalateRefires,
+		IncidentEscalateStaleAge:        incidentEscalateStaleAge,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

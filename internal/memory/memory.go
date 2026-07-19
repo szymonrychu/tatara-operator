@@ -8,6 +8,7 @@ package memory
 
 import (
 	"fmt"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -54,6 +55,18 @@ type Config struct {
 	// the chart stays cluster-agnostic (rule 14); the deploying helmfile sets the
 	// label the cluster actually matches on.
 	MonitorLabels map[string]string
+	// TopologyKey is the node-topology domain the memory-stack spreading rules
+	// (pod anti-affinity + topologySpreadConstraints) fan pods across. Empty
+	// (default) resolves to "kubernetes.io/hostname" in topologyKey(), so a
+	// zero-value Config still spreads per node. Sourced from the operator env var
+	// MEMORY_TOPOLOGY_KEY (mirrors the AGENT_SCHEDULING precedent); kept
+	// cluster-agnostic (rule 14) so the deploying helmfile picks a rack/zone label
+	// when the cluster has one.
+	TopologyKey string
+	// ProvisioningTimeout bounds how long a stack may stay phase Provisioning
+	// before reconcileMemory reports it Degraded (issue #355). Zero disables
+	// the bound. Set from config.Config.MemoryProvisioningTimeout in wire.go.
+	ProvisioningTimeout time.Duration
 }
 
 // Names holds every object name in the mem-<proj>-* family for one Project.

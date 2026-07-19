@@ -339,3 +339,97 @@ func TestFitTask_ObjectTooLarge_MinimalFailPatch(t *testing.T) {
 		t.Fatalf("patch .status has %d fields %v, want exactly 2 (stage, stageReason)", len(statusFields), statusFields)
 	}
 }
+
+// notFoundThenSucceed intercepts Get: the first n calls for the named object
+// return NotFound (the informer cache has not seen a just-created CR yet),
+// every call after that passes through to the real client.
+func notFoundThenSucceed(n int, name string, calls *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == name {
+				*calls++
+				if *calls <= n {
+					return apierrors.NewNotFound(schema.GroupResource{Group: "tatara.dev", Resource: "mergerequests"}, key.Name)
+				}
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+// TestFitMergeRequest_RetriesGetThroughInformerCacheLag reproduces the
+// 2026-07-19 mint failure: mirror.SyncMergeRequest Creates the CR and
+// immediately calls FitMergeRequest through the CACHED client, whose informer
+// had not observed the create yet - the unretried Get returned NotFound for an
+// object that exists on the server ("objbudget: get mergerequest
+// mr-tatara-operator-388 not found") and the whole webhook mint 500'd. The Get
+// must wait out the cache lag with a short bounded retry.
+func TestFitMergeRequest_RetriesGetThroughInformerCacheLag(t *testing.T) {
+	ctx := context.Background()
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: "mr-repo-388", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.MergeRequestSpec{RepositoryRef: "repo", Number: 388, URL: "https://example.invalid/388"},
+	}
+	s := newTestScheme(t)
+	getCalls := 0
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(mr).
+		WithStatusSubresource(&tatarav1alpha1.MergeRequest{}).
+		WithInterceptorFuncs(notFoundThenSucceed(2, "mr-repo-388", &getCalls)).Build()
+
+	key := types.NamespacedName{Name: "mr-repo-388", Namespace: "tatara"}
+	err := FitMergeRequest(ctx, c, &fakeSpiller{}, key, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.Title = "written through cache lag"
+	})
+	if err != nil {
+		t.Fatalf("FitMergeRequest: %v (a NotFound that is informer cache lag after a Create must be retried)", err)
+	}
+	got := &tatarav1alpha1.MergeRequest{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.Title != "written through cache lag" {
+		t.Fatalf("Status.Title = %q, want the mutation persisted", got.Status.Title)
+	}
+}
+
+// TestFitIssue_RetriesGetThroughInformerCacheLag holds the same guarantee on
+// the Issue sibling: SyncIssue has the identical Create-then-Fit shape.
+func TestFitIssue_RetriesGetThroughInformerCacheLag(t *testing.T) {
+	ctx := context.Background()
+	iss := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{Name: "iss-repo-41", Namespace: "tatara"},
+		Spec:       tatarav1alpha1.IssueSpec{RepositoryRef: "repo", Number: 41, URL: "https://example.invalid/41"},
+	}
+	s := newTestScheme(t)
+	getCalls := 0
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(iss).
+		WithStatusSubresource(&tatarav1alpha1.Issue{}).
+		WithInterceptorFuncs(notFoundThenSucceed(2, "iss-repo-41", &getCalls)).Build()
+
+	key := types.NamespacedName{Name: "iss-repo-41", Namespace: "tatara"}
+	if err := FitIssue(ctx, c, &fakeSpiller{}, key, func(i *tatarav1alpha1.Issue) {
+		i.Status.Title = "written through cache lag"
+	}); err != nil {
+		t.Fatalf("FitIssue: %v", err)
+	}
+	got := &tatarav1alpha1.Issue{}
+	if err := c.Get(ctx, key, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status.Title != "written through cache lag" {
+		t.Fatalf("Status.Title = %q, want the mutation persisted", got.Status.Title)
+	}
+}
+
+// TestFitMergeRequest_PersistentNotFoundStillSurfaces bounds the retry: a
+// genuinely deleted object must come back as NotFound, not hang.
+func TestFitMergeRequest_PersistentNotFoundStillSurfaces(t *testing.T) {
+	ctx := context.Background()
+	s := newTestScheme(t)
+	c := newFakeClient(t, s) // the MR never exists
+	key := types.NamespacedName{Name: "mr-gone-1", Namespace: "tatara"}
+	err := FitMergeRequest(ctx, c, &fakeSpiller{}, key, func(*tatarav1alpha1.MergeRequest) {})
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("err = %v, want NotFound after the bounded retry", err)
+	}
+}

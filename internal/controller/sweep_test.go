@@ -537,6 +537,7 @@ func TestAdoptPR(t *testing.T) {
 	proj := sweepProject("adopt-pr-proj")
 	task := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "t-1", Namespace: testNS}}
 	base := "szymonrychu/tatara-operator"
+	wantBranch := agent.TaskBranch(task)
 
 	tests := map[string]struct {
 		pr   scm.PRRef
@@ -544,11 +545,11 @@ func TestAdoptPR(t *testing.T) {
 		want bool
 	}{
 		"bot, task branch, same repo": {
-			pr:   scm.PRRef{Repo: base, HeadRepo: base, Author: "tatara-bot", HeadBranch: "task/t-1"},
+			pr:   scm.PRRef{Repo: base, HeadRepo: base, Author: "tatara-bot", HeadBranch: wantBranch},
 			task: task, want: true,
 		},
 		"clause a: a human on the Task's own branch is NOT adopted": {
-			pr:   scm.PRRef{Repo: base, HeadRepo: base, Author: "mallory", HeadBranch: "task/t-1"},
+			pr:   scm.PRRef{Repo: base, HeadRepo: base, Author: "mallory", HeadBranch: wantBranch},
 			task: task, want: false,
 		},
 		"clause b: the bot on some other branch is NOT adopted": {
@@ -556,15 +557,15 @@ func TestAdoptPR(t *testing.T) {
 			task: task, want: false,
 		},
 		"clause c: a FORK PR on a task/* branch is NOT adopted": {
-			pr:   scm.PRRef{Repo: base, HeadRepo: "mallory/tatara-operator", Author: "tatara-bot", HeadBranch: "task/t-1"},
+			pr:   scm.PRRef{Repo: base, HeadRepo: "mallory/tatara-operator", Author: "tatara-bot", HeadBranch: wantBranch},
 			task: task, want: false,
 		},
 		"clause c: an UNKNOWN head repo fails CLOSED": {
-			pr:   scm.PRRef{Repo: base, HeadRepo: "", Author: "tatara-bot", HeadBranch: "task/t-1"},
+			pr:   scm.PRRef{Repo: base, HeadRepo: "", Author: "tatara-bot", HeadBranch: wantBranch},
 			task: task, want: false,
 		},
 		"no owning Task": {
-			pr:   scm.PRRef{Repo: base, HeadRepo: base, Author: "tatara-bot", HeadBranch: "task/t-1"},
+			pr:   scm.PRRef{Repo: base, HeadRepo: base, Author: "tatara-bot", HeadBranch: wantBranch},
 			task: nil, want: false,
 		},
 	}
@@ -574,6 +575,58 @@ func TestAdoptPR(t *testing.T) {
 				t.Fatalf("AdoptPR = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTaskForBranch pins fix A3's rewrite: taskForBranch now resolves a
+// branch by SCANNING the project's Tasks and matching agent.TaskBranch(t) ==
+// branch (TaskBranchPrefix + CutPrefix is gone - the branch string no longer
+// maps 1:1 to a Task's own metadata.name for a numbered or documentation
+// Task). N tasks, an unknown branch, and a same-name Task in a DIFFERENT
+// project must all still resolve correctly (issue #381 bug A).
+func TestTaskForBranch(t *testing.T) {
+	ctx := context.Background()
+	proj := sweepProject("branch-proj")
+	other := sweepProject("branch-proj-2")
+
+	numbered := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "branch-proj-review-tatara-cli-87", Namespace: testNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: proj.Name, Kind: "review",
+			Source: &tatarav1alpha1.TaskSource{Provider: "github", IssueRef: "https://github.com/acme/tatara-cli/pull/87", Number: 87, IsPR: true, Title: "fix the thing"},
+		},
+	}
+	fallback := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "branch-proj-clarify-x", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: proj.Name, Kind: "clarify"},
+	}
+	crossProject := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "branch-proj-2-clarify-y", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: other.Name, Kind: "clarify"},
+	}
+	c := newMirrorClient(t, proj, other, numbered, fallback, crossProject)
+	// No standalone reconciler constructor exists for this package's sweep
+	// tests - runSweep (sweep_test.go:104) builds one inline the same way;
+	// taskForBranch needs no SCMReader, so Metrics is the only field it touches.
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+
+	got, err := r.taskForBranch(ctx, proj, agent.TaskBranch(numbered))
+	if err != nil || got == nil || got.Name != numbered.Name {
+		t.Fatalf("taskForBranch(numbered) = %v, %v, want %s", got, err, numbered.Name)
+	}
+	got, err = r.taskForBranch(ctx, proj, agent.TaskBranch(fallback))
+	if err != nil || got == nil || got.Name != fallback.Name {
+		t.Fatalf("taskForBranch(fallback) = %v, %v, want %s", got, err, fallback.Name)
+	}
+	got, err = r.taskForBranch(ctx, proj, "tatara/task-does-not-exist")
+	if err != nil || got != nil {
+		t.Fatalf("taskForBranch(unknown) = %v, %v, want nil, nil", got, err)
+	}
+	// crossProject's branch resolves to nil when queried against `proj`, not
+	// `other`: a same-named branch in a sibling project must never leak in.
+	got, err = r.taskForBranch(ctx, proj, agent.TaskBranch(crossProject))
+	if err != nil || got != nil {
+		t.Fatalf("taskForBranch(cross-project) = %v, %v, want nil, nil", got, err)
 	}
 }
 
@@ -590,7 +643,7 @@ func TestSweepAdoptsBotPRIntoOwningTask(t *testing.T) {
 	c := newMirrorClient(t, proj, repo, owner)
 	rd := &sweepReader{prs: []scm.PRRef{{
 		Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
-		Number: 11, Author: "tatara-bot", HeadBranch: "task/" + owner.Name, HeadSHA: "deadbeef",
+		Number: 11, Author: "tatara-bot", HeadBranch: agent.TaskBranch(owner), HeadSHA: "deadbeef",
 	}}}
 
 	runSweep(t, c, proj, repo, rd)
@@ -628,7 +681,7 @@ func TestSweepForkPROnTaskBranchIsNotAdopted(t *testing.T) {
 	c := newMirrorClient(t, proj, repo, owner)
 	rd := &sweepReader{prs: []scm.PRRef{{
 		Repo: "szymonrychu/tatara-operator", HeadRepo: "mallory/tatara-operator",
-		Number: 12, Author: "tatara-bot", HeadBranch: "task/" + owner.Name,
+		Number: 12, Author: "tatara-bot", HeadBranch: agent.TaskBranch(owner),
 	}}}
 
 	runSweep(t, c, proj, repo, rd)
@@ -660,7 +713,7 @@ func TestSweepBotPRNotAdoptableIsIgnored(t *testing.T) {
 	tests := map[string]scm.PRRef{
 		"an orphaned agent PR whose Task is gone": {
 			Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",
-			Number: 20, Author: "tatara-bot", HeadBranch: "task/a-task-that-no-longer-exists",
+			Number: 20, Author: "tatara-bot", HeadBranch: "tatara/task-a-task-that-no-longer-exists",
 		},
 		"a CI pin-bump PR": {
 			Repo: "szymonrychu/tatara-operator", HeadRepo: "szymonrychu/tatara-operator",

@@ -30,10 +30,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -80,6 +83,24 @@ func SetMetrics(m Metrics) {
 		m = noopMetrics{}
 	}
 	metricsRecorder = m
+}
+
+// createLagBackoff bounds how long a Fit* Get waits out informer cache lag.
+// The mirror upserts Create an Issue/MergeRequest CR and immediately Fit* it
+// through the CACHED client; a Get that races the watch event reports
+// NotFound for an object that exists on the server, and an unretried NotFound
+// here failed a whole webhook mint in production (2026-07-19,
+// mr-tatara-operator-388: NotFound in the same second as the CR's
+// creationTimestamp). ~3s of total sleep across 5 attempts, then the
+// NotFound is real and surfaces.
+var createLagBackoff = wait.Backoff{Steps: 5, Duration: 100 * time.Millisecond, Factor: 2}
+
+// getWaitingOutCreateLag is the initial Fit* read: a Get that retries
+// NotFound on createLagBackoff.
+func getWaitingOutCreateLag(ctx context.Context, c client.Client, key types.NamespacedName, obj client.Object) error {
+	return retry.OnError(createLagBackoff, apierrors.IsNotFound, func() error {
+		return c.Get(ctx, key, obj)
+	})
 }
 
 // sizeOf returns the marshalled JSON size of obj in bytes.
@@ -148,7 +169,7 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 	const kind = "Issue"
 
 	cur := &tatarav1alpha1.Issue{}
-	if err := c.Get(ctx, key, cur); err != nil {
+	if err := getWaitingOutCreateLag(ctx, c, key, cur); err != nil {
 		return fmt.Errorf("objbudget: get issue %s: %w", key, err)
 	}
 	candidate := cur.DeepCopy()
@@ -215,7 +236,7 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 	const kind = "MergeRequest"
 
 	cur := &tatarav1alpha1.MergeRequest{}
-	if err := c.Get(ctx, key, cur); err != nil {
+	if err := getWaitingOutCreateLag(ctx, c, key, cur); err != nil {
 		return fmt.Errorf("objbudget: get mergerequest %s: %w", key, err)
 	}
 	candidate := cur.DeepCopy()
@@ -285,7 +306,7 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 	const kind = "Task"
 
 	cur := &tatarav1alpha1.Task{}
-	if err := c.Get(ctx, key, cur); err != nil {
+	if err := getWaitingOutCreateLag(ctx, c, key, cur); err != nil {
 		return fmt.Errorf("objbudget: get task %s: %w", key, err)
 	}
 	candidate := cur.DeepCopy()

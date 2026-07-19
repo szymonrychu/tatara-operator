@@ -96,6 +96,18 @@ spec:
                   The same cap applies to QueuedTaskBlueprint.Goal (B.7).
                 maxLength: 16384
                 type: string
+              groupKey:
+                description: |-
+                  GroupKey is the CORRELATION identity for an incident Task: a coarser hash
+                  (project + the configured correlation labels, e.g. namespace/cluster) than
+                  DedupKey. Different alert RULES that fire for one shared root cause carry
+                  the same GroupKey but DISTINCT DedupKeys, so admission does NOT suppress
+                  them (each is a real, distinct alert) yet file_issue auto-links the new
+                  tracker as a sub-issue under the oldest open sibling tracker sharing this
+                  GroupKey - collapsing a 5-alert storm into one linked tree instead of five
+                  unrelated issues. Empty for non-incident Tasks and when no correlation
+                  label was present on the alert.
+                type: string
               initialStage:
                 description: |-
                   InitialStage is the F.3 Create-edge target a mint chooses when it is NOT the

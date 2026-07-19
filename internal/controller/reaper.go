@@ -650,7 +650,7 @@ func terminalIssueComment(t *tatarav1alpha1.Task) string {
 // is still open on the forge.
 func ourMR(proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task, mr *tatarav1alpha1.MergeRequest) bool {
 	bot := botLoginOf(proj)
-	return bot != "" && mr.Status.Author == bot && mr.Status.HeadBranch == TaskBranchPrefix+t.Name
+	return bot != "" && mr.Status.Author == bot && mr.Status.HeadBranch == agent.TaskBranch(t)
 }
 
 // releaseOwnership is B.6 step 3 / B.5. For every artifact this Task
@@ -799,7 +799,7 @@ func (r *ProjectReconciler) carryHumanReviewRounds(ctx context.Context, t *tatar
 // branch IF AND ONLY IF ALL FOUR clauses hold:
 //
 //	a. mr.status.author     == Project.spec.scm.botLogin
-//	b. mr.status.headBranch == "task/<this-task-name>"
+//	b. mr.status.headBranch == agent.TaskBranch(this Task)
 //	c. this Task IS (WAS) its CONTROLLER owner
 //	d. NO surviving plain owner exists
 //
@@ -910,6 +910,18 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 	if err := r.Delete(ctx, t.DeepCopy(), &client.DeleteOptions{PropagationPolicy: &policy}); err != nil &&
 		!apierrors.IsNotFound(err) {
 		return fmt.Errorf("reap: delete task %s: %w", t.Name, err)
+	}
+	// operator_task_tokens_total/operator_task_turns_total are per-issue
+	// labeled counters (bounded cardinality assumes live + recently-live
+	// issues only); a Task's GC is the one point that knows it is safe to
+	// drop them. DeleteTaskSeries existed but had zero production callers
+	// before this (metric-wiring audit, issue #370) - an unbounded leak on
+	// every Task GC. DeleteTaskSeries itself no-ops when issue=="" (a
+	// project-scoped task shares that label with every other project-scoped
+	// task and must not have its series cleared by one task's GC).
+	if r.Metrics != nil {
+		project, repo, kind, issue, _ := taskTokenLabels(t)
+		r.Metrics.DeleteTaskSeries(project, repo, kind, issue)
 	}
 	log.FromContext(ctx).Info("reaped a terminal task",
 		"action", "reap_task", "resource_id", t.Name, "kind", t.Spec.Kind,
