@@ -276,7 +276,10 @@ func (r *TaskReconciler) enqueueDeployTimeoutComment(ctx context.Context, proj *
 // reconcile) and because it is this function's OWN rate limit for the
 // metric and the comment in Task 9 - once parked, this predicate would
 // otherwise stay permanently true (a parked Task's refs do not un-empty
-// themselves) and re-fire forever without it.
+// themselves) and re-fire forever without it. The ALREADY-parked case is
+// owned by reconcileParkedBindingRepair (repair-and-unpark: no re-park, no
+// metric, no comment), which reconcileStage runs before its terminal
+// early-return.
 //
 // Runs BEFORE the three clocks (F.4): those would EVENTUALLY reach the same
 // outcome via turn-budget/pod-recreation exhaustion, but only after hours of
@@ -329,6 +332,82 @@ func (r *TaskReconciler) reconcileMRBindingBackstop(ctx context.Context, proj *t
 	r.Metrics.MRBindingBackstopParked(proj.Name, task.Spec.Kind)
 	r.commentMRBindingBackstopParked(ctx, proj, task)
 	return true, nil
+}
+
+// reconcileParkedBindingRepair is the parked-side completion of
+// reconcileMRBindingBackstop (2026-07-19 production deadlock, task
+// mt-r-tatara-operator-388-6e7958617d9d0119): a Task the watchdog ALREADY
+// parked awaiting-human - by an operator version predating the PR 388 repair,
+// or because the repair failed transiently before the park - was excluded
+// forever by the backstop's own StageParked guard, and the pending-events
+// comment path dead-ended too (the unowned mirror stub has no controller
+// owner to route by). Both recovery paths dead, the Task was parked for good.
+//
+// This runs BEFORE reconcileStage's terminal early-return hands parked Tasks
+// to the reaper. The predicate is the watchdog's park and ONLY the watchdog's
+// park: parked(awaiting-human) + parkedFromStage recorded + Source.Number>0 +
+// ZERO owned refs. Any awaiting-human park with refs is a genuine human wait
+// (a review verdict on a human PR, a clarify discuss) and is never touched;
+// every other reason (identity-unverified above all) is never touched.
+//
+// On a successful repair the Task un-parks straight back to its
+// parkedFromStage via stage.UnparkTargetForBindingRepair (the narrow,
+// documented F.6-adjacent edge) applied through the EnterStage choke point.
+// On a failed repair (foreign-owned CR, unresolvable source, write error) it
+// stays parked exactly as before - a later human comment can still drive the
+// normal F.6 re-entry now that the webhook's owner fallback routes it.
+func (r *TaskReconciler) reconcileParkedBindingRepair(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, now time.Time) (bool, error) {
+
+	if !parkedBindingRepairEligible(task) {
+		return false, nil
+	}
+	// The predicate matched on a CACHED read; confirm against the API server
+	// before repairing and unparking, so a Task another writer already moved is
+	// not re-entered off a stale snapshot (same idiom as the mint/terminal
+	// checks in reconcileStage).
+	if err := r.refreshTaskFromAPI(ctx, task); err != nil {
+		return false, err
+	}
+	if !parkedBindingRepairEligible(task) {
+		return false, nil
+	}
+	l := log.FromContext(ctx)
+	if !r.repairSourceBinding(ctx, proj, task) {
+		// Unrepairable (foreign-owned CR, unresolvable source, write error): the
+		// Task stays parked and the park notice stands.
+		l.Info("parked binding repair: repair failed, task stays parked",
+			"action", "parked_binding_repair_failed", "resource_id", task.Name,
+			"kind", task.Spec.Kind, "parked_from", task.Status.ParkedFromStage)
+		return false, nil
+	}
+	target, ok := stage.UnparkTargetForBindingRepair(task)
+	if !ok {
+		// Repaired but no legal re-entry edge back to the parked-from stage: the
+		// refs are stamped and the CR owned, so a human comment now drives the
+		// normal F.6 re-entry; nothing more to do here.
+		l.Info("parked binding repair: repaired the interrupted mint binding; no re-entry edge, staying parked",
+			"action", "mr_binding_backstop_repaired_parked", "resource_id", task.Name,
+			"kind", task.Spec.Kind, "parked_from", task.Status.ParkedFromStage)
+		return true, nil
+	}
+	if err := r.enter(ctx, proj, task, nil, target, "", now); err != nil {
+		return true, err
+	}
+	l.Info("parked binding repair: repaired the interrupted mint binding and unparked",
+		"action", "mr_binding_backstop_unparked", "resource_id", task.Name,
+		"kind", task.Spec.Kind, "stage", target)
+	return true, nil
+}
+
+// parkedBindingRepairEligible is reconcileParkedBindingRepair's predicate: the
+// MR-binding watchdog's park flavor, and nothing else.
+func parkedBindingRepairEligible(task *tatarav1alpha1.Task) bool {
+	return task.Status.Stage == tatarav1alpha1.StageParked &&
+		task.Status.StageReason == stage.ReasonAwaitingHuman &&
+		task.Status.ParkedFromStage != "" &&
+		task.Spec.Source != nil && task.Spec.Source.Number > 0 &&
+		len(task.Status.MRRefs) == 0 && len(task.Status.IssueRefs) == 0
 }
 
 // repairSourceBinding re-runs the intake funnel's interrupted-mint bind repair

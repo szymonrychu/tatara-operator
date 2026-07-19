@@ -2051,3 +2051,41 @@ func TestIssueClosedIsValidReasonWithNoReentry(t *testing.T) {
 	_, ok := stage.Unpark(stage.UnparkInput{Task: task, BotLogin: botLogin, Now: time.Now()})
 	require.False(t, ok, "rejected(issue-closed) never re-enters")
 }
+
+// TestUnparkTargetForBindingRepair asserts the ONE documented
+// parkedFromStage-derived edge (the MR-binding watchdog's interrupted-mint
+// self-heal) is exactly as narrow as claimed: awaiting-human only, a recorded
+// parkedFromStage only, and only where the F.3 table has a legal parked->
+// edge back. Everything else refuses with the Task untouched.
+func TestUnparkTargetForBindingRepair(t *testing.T) {
+	cases := []struct {
+		name       string
+		stg        string
+		reason     string
+		parkedFrom string
+		want       string
+		ok         bool
+	}{
+		{"watchdog park from reviewing re-enters reviewing",
+			v1alpha1.StageParked, stage.ReasonAwaitingHuman, v1alpha1.StageReviewing, v1alpha1.StageReviewing, true},
+		{"watchdog park from clarifying re-enters clarifying",
+			v1alpha1.StageParked, stage.ReasonAwaitingHuman, v1alpha1.StageClarifying, v1alpha1.StageClarifying, true},
+		{"no legal parked-> edge back refuses",
+			v1alpha1.StageParked, stage.ReasonAwaitingHuman, v1alpha1.StageInvestigating, "", false},
+		{"no recorded parkedFromStage refuses",
+			v1alpha1.StageParked, stage.ReasonAwaitingHuman, "", "", false},
+		{"any other park reason refuses",
+			v1alpha1.StageParked, stage.ReasonIdentityUnverified, v1alpha1.StageReviewing, "", false},
+		{"a non-parked task refuses",
+			v1alpha1.StageReviewing, "", v1alpha1.StageReviewing, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := newTask("review", tc.stg, tc.reason)
+			task.Status.ParkedFromStage = tc.parkedFrom
+			target, ok := stage.UnparkTargetForBindingRepair(task)
+			require.Equal(t, tc.ok, ok)
+			require.Equal(t, tc.want, target)
+		})
+	}
+}
