@@ -4,6 +4,7 @@ min_version = "2026.6.3"
 go = "1.26.3"
 golangci-lint = "2.12.2"
 helm = "4.2.1"
+make = "4.4.1"
 pre-commit = "4.6.0"
 yq = "4.53.3"
 
