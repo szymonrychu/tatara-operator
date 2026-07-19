@@ -73,6 +73,77 @@ func TestReconcileOwnership_BotAttributableHeadDoesNotFlip(t *testing.T) {
 	}
 }
 
+// TestReconcileOwnership_FlipsNormalImplementOwner is the controller
+// adjudication's coverage: flipToExternal's park guard is kind != review (any
+// pushing-capable owner), not kind == takeover. A NORMAL full-lifecycle Task
+// (kind=clarify, the SweepIssueKind an issue-originated Task carries end to
+// end - see sweep.go) sitting in implementing must park ownership-lost on an
+// unattributable drift exactly like a takeover Task does, and hand-back to
+// the review Task must still happen.
+func TestReconcileOwnership_FlipsNormalImplementOwner(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithNormalTask(t, ctx, proj, repo, 6, "tatara/feat-6", "bot-head")
+
+	flipped, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil)
+	if err != nil || !flipped {
+		t.Fatalf("expected flip, got flipped=%v err=%v", flipped, err)
+	}
+	got := getMR(t, ctx, proj, repo, 6)
+	if got.Status.Ownership != tatarav1alpha1.OwnershipExternal {
+		t.Fatalf("ownership = %q, want external", got.Status.Ownership)
+	}
+
+	implName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepIssueKind, repo.Name, 6)
+	var implTask tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: implName}, &implTask); err != nil {
+		t.Fatalf("get normal owner task %s: %v", implName, err)
+	}
+	if implTask.Status.Stage != tatarav1alpha1.StageParked || implTask.Status.StageReason != stage.ReasonOwnershipLost {
+		t.Fatalf("normal owner task not parked ownership-lost: %q/%q", implTask.Status.Stage, implTask.Status.StageReason)
+	}
+
+	reviewName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepReviewKind, repo.Name, 6)
+	if ctrl, ok := ownerControllerName(got); !ok || ctrl != reviewName {
+		t.Fatalf("controller must move to the review task %q; got ctrl=%q ok=%v", reviewName, ctrl, ok)
+	}
+}
+
+// TestFlipToExternal_OldOwnerSurvivesAsPlainRef covers demoteMRController's
+// contract directly: reMintReviewOwner's demote-then-remint must leave the
+// PREVIOUS controller (the takeover Task, now parked ownership-lost) as a
+// plain (non-controller) owner ref, not remove it - the artifact must stay
+// GC-open against it (own package invariant) even though it no longer drives
+// the MR.
+func TestFlipToExternal_OldOwnerSurvivesAsPlainRef(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 7, "tatara/feat-7", "bot-head")
+	takeoverName := takeoverTaskName(proj, repo, 7)
+
+	if _, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil); err != nil {
+		t.Fatal(err)
+	}
+	got := getMR(t, ctx, proj, repo, 7)
+
+	var oldRef *metav1.OwnerReference
+	for i, r := range got.GetOwnerReferences() {
+		if r.Name == takeoverName {
+			oldRef = &got.GetOwnerReferences()[i]
+			break
+		}
+	}
+	if oldRef == nil {
+		t.Fatalf("old owner %s must survive hand-back as a plain ref (GC-open), not be removed", takeoverName)
+	}
+	if oldRef.Controller != nil && *oldRef.Controller {
+		t.Fatalf("old owner %s must be demoted to controller=false after hand-back", takeoverName)
+	}
+	if ctrl, ok := ownerControllerName(got); !ok || ctrl == takeoverName {
+		t.Fatalf("controller must have moved off the old owner %s; got ctrl=%q ok=%v", takeoverName, ctrl, ok)
+	}
+}
+
 func TestReconcileOwnership_TerminalMRFrozen(t *testing.T) {
 	ctx := context.Background()
 	d, proj, repo := newOwnershipDriver(t, ctx)
@@ -151,19 +222,44 @@ func seedOpenMR(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project,
 func seedTataraOwnedMRWithTakeoverTask(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, headBranch, lastBotHeadSHA string) *tatarav1alpha1.MergeRequest {
 	t.Helper()
+	return seedTataraOwnedMRWithOwnerTask(t, ctx, proj, repo, number, headBranch, lastBotHeadSHA,
+		takeoverKind, takeoverTaskName(proj, repo, number))
+}
+
+// seedTataraOwnedMRWithNormalTask is seedTataraOwnedMRWithTakeoverTask's
+// counterpart for a NORMAL, non-takeover, non-review, full-lifecycle Task:
+// kind=clarify (SweepIssueKind), the kind an issue-originated Task carries
+// end to end through implementing/reviewing/merging (sweep.go). The
+// controller-adjudicated fix to flipToExternal (park guard is kind != review,
+// not kind == takeover) means this shape must park exactly like a takeover
+// Task does on an unattributable drift.
+func seedTataraOwnedMRWithNormalTask(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, headBranch, lastBotHeadSHA string) *tatarav1alpha1.MergeRequest {
+	t.Helper()
+	name := tatarav1alpha1.IntakeTaskName(proj.Name, SweepIssueKind, repo.Name, number)
+	return seedTataraOwnedMRWithOwnerTask(t, ctx, proj, repo, number, headBranch, lastBotHeadSHA, SweepIssueKind, name)
+}
+
+// seedTataraOwnedMRWithOwnerTask is the shared body behind
+// seedTataraOwnedMRWithTakeoverTask and seedTataraOwnedMRWithNormalTask: a
+// tatara-owned, open MergeRequest whose controller owner is a Task of kind,
+// named taskName, sitting in stage=implementing.
+func seedTataraOwnedMRWithOwnerTask(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, headBranch, lastBotHeadSHA, kind, taskName string) *tatarav1alpha1.MergeRequest {
+	t.Helper()
 
 	task := &tatarav1alpha1.Task{
-		ObjectMeta: metav1.ObjectMeta{Name: takeoverTaskName(proj, repo, number), Namespace: proj.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: taskName, Namespace: proj.Namespace},
 		Spec: tatarav1alpha1.TaskSpec{
 			ProjectRef:    proj.Name,
 			RepositoryRef: repo.Name,
-			Kind:          takeoverKind,
-			Goal:          "take over and push",
+			Kind:          kind,
+			Goal:          "push to the MR",
 			MergeOrder:    []string{repo.Name},
 		},
 	}
 	if err := k8sClient.Create(ctx, task); err != nil {
-		t.Fatalf("create takeover task: %v", err)
+		t.Fatalf("create owner task: %v", err)
 	}
 	stampTaskStatus(t, ctx, task, tatarav1alpha1.StageImplementing, "")
 
@@ -191,7 +287,7 @@ func seedTataraOwnedMRWithTakeoverTask(t *testing.T, ctx context.Context, proj *
 		HeadBranch:      headBranch,
 		HeadSHA:         lastBotHeadSHA,
 		Ownership:       tatarav1alpha1.OwnershipTatara,
-		OwnershipReason: "takeover",
+		OwnershipReason: "seed",
 		LastBotHeadSHA:  lastBotHeadSHA,
 	}
 	if err := k8sClient.Status().Update(ctx, mr); err != nil {
