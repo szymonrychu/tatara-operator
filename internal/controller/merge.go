@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -132,6 +133,20 @@ func ownedIssueCRs(ctx context.Context, c client.Client, task *tatarav1alpha1.Ta
 	return out, nil
 }
 
+// mergeAllowedForOwnership reports whether the operator may merge mr given its
+// ownership (spec Section 1). tatara MRs always. An external MR merges ONLY if
+// it was stood down AFTER a takeover (ownershipReason prefix "external-push:"):
+// per the approved stand-down decision, review AND merge-on-approve continue
+// for the human's new head. A never-taken-over external MR (reason "initial")
+// is human-merged only.
+func mergeAllowedForOwnership(mr *tatarav1alpha1.MergeRequest) bool {
+	if mr.Status.Ownership == tatarav1alpha1.OwnershipTatara {
+		return true
+	}
+	return mr.Status.Ownership == tatarav1alpha1.OwnershipExternal &&
+		strings.HasPrefix(mr.Status.OwnershipReason, "external-push:")
+}
+
 func mrForRepo(mrs []tatarav1alpha1.MergeRequest, repo string) *tatarav1alpha1.MergeRequest {
 	for i := range mrs {
 		if mrs[i].Spec.RepositoryRef == repo && mrs[i].Status.State != "closed" {
@@ -255,6 +270,10 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 		if mr.Status.State == "merged" {
 			cursor = i + 1
 			continue
+		}
+
+		if !mergeAllowedForOwnership(mr) {
+			return ctrl.Result{}, fmt.Errorf("merge: refusing to merge %s: ownership %q reason %q is not mergeable (contract: MR ownership design)", mr.Name, mr.Status.Ownership, mr.Status.OwnershipReason)
 		}
 
 		var repo tatarav1alpha1.Repository
