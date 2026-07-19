@@ -97,7 +97,6 @@ LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 IDLE_POD_REAP_MINUTES: {{ .Values.idlePodReapMinutes | quote }}
 MEMORY_PROVISIONING_TIMEOUT_MINUTES: {{ .Values.memoryProvisioningTimeoutMinutes | quote }}
 PUSH_METRICS_ALLOWED_PREFIXES: {{ .Values.pushMetricsAllowedPrefixes | quote }}
-INCIDENT_DEDUP_VOLATILE_LABELS: {{ .Values.incidentDedupVolatileLabels | quote }}
 INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES: {{ .Values.incidentRefireCommentCooldownMinutes | quote }}
 AGENT_CPU_REQUEST: {{ .Values.agentCpuRequest | quote }}
 AGENT_CPU_LIMIT: {{ .Values.agentCpuLimit | quote }}

@@ -680,3 +680,39 @@ in spirit; prune only when a decision is reversed.
   `INCIDENT_DEDUP_VOLATILE_LABELS` (config.go + webhook.Config +
   cmd/manager/wire.go wiring). `correlationSet`/`incidentGroupKey` (the
   separate GROUP key) are untouched.
+- 2026-07-19 (#386): `obs.SweepLastSuccessTimestamp` is process-local and
+  resets to unset on every pod redeploy, while `Status.LastIssueScan` /
+  `LastBrainstorm` / `LastDocumentation` are etcd-backed and survive it. The
+  issueScan cron (`0 */4 * * *`) is slower than the push-CD redeploy cadence,
+  so a fresh pod almost never re-stamps before the next replacement and
+  `TataraLoopStalled`'s NoData-is-failure alert false-positived. Fix:
+  `runScans` (projectscan.go) now rehydrates the issueScan/sweep/brainstorm/
+  documentation gauges from the persisted `Status.Last*` stamps at the top of
+  every reconcile, before any due-check - success-only stamping (`stampScan`)
+  was a false liveness proxy across redeploys, it advances the gauge between
+  rehydrates but was never the only way it gets set. A never-scanned project
+  (nil stamp) is correctly left unset - that is true NoData, not a bug.
+- 2026-07-19: `internal/controller`'s `suite_test.go` shares ONE envtest
+  namespace/etcd across every test in the package with no per-test cleanup -
+  a package test that lists-all (like the WP9 backstop's `EnqueuePending`,
+  unscoped by design across every Project) must tolerate suite-wide
+  pollution from every earlier test that left state behind, not just its own
+  fixtures. `TestDispatcherEnqueuePending_NoWatchTrigger` hung deterministically
+  (not a rare race - reproduced twice in a row) on a buffer-4 test channel
+  once accumulated Queued-state QueuedEvents from ~20 earlier tests exceeded
+  it and the blocking send never unblocked (`ctx=context.Background()`,
+  never cancelled). Fixed by sizing the test channel to match production's
+  real 256 (`wire.go:426`) and reading back by searching the drained batch
+  for the expected event instead of assuming it is first in List order.
+- 2026-07-19 (#392): `docBatchingConfigured` (docbatch.go) hand-duplicates the
+  `MintDocBatch` gate predicate in `projectscan.go` (`cronSpec.Documentation.
+  Schedule != "" && doc != nil && doc.Enabled && doc.Repo != ""`) - it exists
+  so `needsDocumenting`'s exemption (d) can tell "documentation configured but
+  never mints a batch" apart from "will eventually mint and cover this Task",
+  since a project with `documentation.enabled` but no cron schedule
+  structurally never fires MintDocBatch and would otherwise pin every
+  delivered Task on it in the reaper's doc_reference GC gate forever. The two
+  predicates are NOT unified behind one shared function (would require
+  threading projectscan.go's cron-tick context into docbatch.go's reaper-gate
+  context, a bigger refactor than this fix's scope) - keep them in sync by
+  hand on any `DocumentationSpec`/`ScmCron` schema change.

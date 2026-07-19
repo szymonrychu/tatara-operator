@@ -52,7 +52,12 @@ Open, out of scope, deliberately not done:
   now parks `handoff-stalled` at 5m instead of hanging, but that's a bound, not a recovery.
 - [ ] Leader-election changeover mid-handoff: in-memory workqueue/rate-limiter state is not CR state;
   the 5m deadline bounds the damage. A full fix needs the drain re-derived from CR state on every
-  reconcile.
+  reconcile. Partially addressed for QueuedEvent admission by the 2026-07-19 issue-batch's WP9
+  (#395, `DispatcherReconciler` leadership-acquired backstop closing the rollout/leader-handoff
+  alert-admission gap) - the review-handoff drain half of this residue already had its level-triggered
+  re-drive (2026-07-19 incident #379 entry above); the general in-memory-workqueue case remains open.
+- [x] 2026-07-19 issue-batch (issues #367/#369/#386/#392/#393/#394/#395/#397/#398) shipped via branch
+  `fix-issue-batch`: see the dated 2026-07-19 `MEMORY.md` entries for the per-issue detail.
 - [ ] `handoff-stalled` false positive on a slow-but-working drain: a >5m forge degradation parks a
   Task whose review already posted; `advanceAfterReview` then no-ops on its `Status.Stage != reviewing`
   guard and silently abandons the advance it still owns, recovered only by a backlog-sweep re-mint.

@@ -1250,7 +1250,18 @@ func TestDispatcherEnqueuePending_NoWatchTrigger(t *testing.T) {
 	q.Status.State = tatarav1alpha1.QueueStateQueued
 	mustStatusUpdate(t, ctx, q)
 
-	events := make(chan event.GenericEvent, 4)
+	// Buffered generously (matches wire.go's real 256 capacity), not the 4 this
+	// held before: this suite shares one envtest namespace/etcd across every
+	// test in the package with no per-test QueuedEvent cleanup, so by the time
+	// this test runs, dozens of Queued-state QueuedEvents from earlier tests
+	// are already live and EnqueuePending (unscoped by design - it is the
+	// leader-only backstop over ALL projects) enqueues all of them, not just
+	// this test's one. A buffer of 4 blocks forever on ctx=context.Background()
+	// once suite-wide pollution exceeds it - a deterministic full-package hang
+	// (queue_controller.go:941's select), not a rare race; reproduced twice in
+	// a row integrating this batch. This test's own assertions only care that
+	// ITS event lands somewhere in the channel, not about channel capacity.
+	events := make(chan event.GenericEvent, 256)
 	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics, BackstopEvents: events}
 
@@ -1262,13 +1273,24 @@ func TestDispatcherEnqueuePending_NoWatchTrigger(t *testing.T) {
 	if n < 1 {
 		t.Fatalf("EnqueuePending enqueued %d events, want >= 1 for the pending QueuedEvent", n)
 	}
-	select {
-	case ev := <-events:
-		if ev.Object.GetName() != q.Name || ev.Object.GetNamespace() != q.Namespace {
-			t.Fatalf("enqueued object = %s/%s, want %s/%s", ev.Object.GetNamespace(), ev.Object.GetName(), q.Namespace, q.Name)
+	// Drain up to n (not just the head): with suite-wide pollution EnqueuePending
+	// legitimately enqueues every OTHER live Queued QueuedEvent too (it is the
+	// unscoped leader-only backstop, not filtered to this test's project), and
+	// List order across projects is not guaranteed to put this test's own
+	// event first. Find q among whatever landed rather than assuming FIFO head.
+	found := false
+	for i := 0; i < n; i++ {
+		select {
+		case ev := <-events:
+			if ev.Object.GetName() == q.Name && ev.Object.GetNamespace() == q.Namespace {
+				found = true
+			}
+		default:
+			t.Fatalf("EnqueuePending reported n=%d but only %d were on BackstopEvents", n, i)
 		}
-	default:
-		t.Fatal("EnqueuePending reported events but pushed none onto BackstopEvents")
+	}
+	if !found {
+		t.Fatalf("EnqueuePending enqueued %d events but none was the pending QueuedEvent %s/%s", n, q.Namespace, q.Name)
 	}
 	if after := testutil.ToFloat64(metrics.DispatcherBackstopEnqueuedCounter(proj.Name)); after <= before {
 		t.Fatalf("operator_dispatcher_backstop_enqueued_total{project=%s} did not increment: before=%v after=%v", proj.Name, before, after)
