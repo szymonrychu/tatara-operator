@@ -52,6 +52,7 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		MemoryPathPrefix:     cfg.MemoryPathPrefix,
 		MonitorEnabled:       cfg.MemoryMonitoringEnabled,
 		MonitorLabels:        cfg.MemoryMonitorLabels,
+		TopologyKey:          cfg.MemoryTopologyKey,
 		ProvisioningTimeout:  cfg.MemoryProvisioningTimeout,
 	}
 }

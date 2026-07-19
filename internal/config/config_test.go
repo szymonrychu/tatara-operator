@@ -335,6 +335,38 @@ func TestLoad_AgentSchedulingDefaultEmpty(t *testing.T) {
 	}
 }
 
+// TestLoad_MemoryTopologyKey asserts MEMORY_TOPOLOGY_KEY is empty by default
+// (the memory builders then resolve it to kubernetes.io/hostname) and is passed
+// through verbatim when the deploying helmfile sets it (issue #365).
+func TestLoad_MemoryTopologyKey(t *testing.T) {
+	t.Run("default empty", func(t *testing.T) {
+		t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+		t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+		t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryTopologyKey != "" {
+			t.Fatalf("MemoryTopologyKey default = %q, want empty", cfg.MemoryTopologyKey)
+		}
+	})
+
+	t.Run("from env", func(t *testing.T) {
+		t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+		t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+		t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+		t.Setenv("MEMORY_TOPOLOGY_KEY", "topology.kubernetes.io/zone")
+		cfg, err := config.Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.MemoryTopologyKey != "topology.kubernetes.io/zone" {
+			t.Fatalf("MemoryTopologyKey = %q, want topology.kubernetes.io/zone", cfg.MemoryTopologyKey)
+		}
+	})
+}
+
 // TestLoad_AgentSchedulingParsedIntoStruct asserts that Load parses
 // AGENT_SCHEDULING once and stores the result in cfg.Scheduling so callers
 // never re-parse the raw string and cannot silently discard a parse error.

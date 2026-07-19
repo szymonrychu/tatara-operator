@@ -152,6 +152,18 @@ func PGCluster(p *tatarav1alpha1.Project, cfg Config) *cnpgv1.Cluster {
 		Spec: cnpgv1.ClusterSpec{
 			Instances:        PgInstances(p),
 			ImagePullSecrets: pgImagePullSecrets(cfg),
+			// Spread the pg stack the same way as the native workloads (issue #365).
+			// cnpg owns the WITHIN-cluster anti-affinity (this project's own pg
+			// instances) via PodAntiAffinityType "preferred" on the shared
+			// topologyKey - soft, so a single-node dev cluster still schedules.
+			// AdditionalPodAntiAffinity carries the CROSS-project term so a
+			// different project's pg cluster avoids co-locating too (the #327 fix,
+			// which a single node hosting both projects' backends caused).
+			Affinity: cnpgv1.AffinityConfiguration{
+				TopologyKey:               topologyKey(cfg),
+				PodAntiAffinityType:       "preferred",
+				AdditionalPodAntiAffinity: crossProjectAntiAffinity(p.Name, cfg),
+			},
 			StorageConfiguration: cnpgv1.StorageConfiguration{
 				Size: pgStorage(p),
 			},

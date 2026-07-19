@@ -75,7 +75,9 @@ func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deploymen
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
-					ImagePullSecrets: imagePullSecrets(cfg),
+					ImagePullSecrets:          imagePullSecrets(cfg),
+					Affinity:                  componentAffinity(p.Name, "lightrag", cfg),
+					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "lightrag", cfg),
 					Containers: []corev1.Container{{
 						Name:  "lightrag",
 						Image: cfg.LightragImage,
