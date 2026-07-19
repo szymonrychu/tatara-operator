@@ -289,40 +289,67 @@ func (d *StageDriver) advanceAfterReview(ctx context.Context, proj *tatarav1alph
 	if err != nil {
 		return err
 	}
-	if len(mrs) == 0 {
+	edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj))
+	if !ready {
 		return nil
-	}
-	needsChanges := false
-	for i := range mrs {
-		if mrs[i].Status.PendingReview != nil {
-			return nil // a review is still owed to the forge
-		}
-		if mrs[i].Status.Status == "needs-changes" && mrs[i].Status.State != "merged" {
-			needsChanges = true
-		}
-	}
-
-	maxRounds := 3
-	if proj.Spec.Agent.MaxReviewRounds > 0 {
-		maxRounds = proj.Spec.Agent.MaxReviewRounds
-	}
-
-	var edge stage.Edge
-	switch {
-	case task.Spec.Kind == "review":
-		// A kind=review Task NEVER reaches implementing or merging - not on
-		// approve, not on request_changes, not from anywhere. Fixing and merging a
-		// human's PR is a HUMAN action.
-		edge = stage.Edge{To: tatarav1alpha1.StageParked, Reason: stage.ReasonAwaitingHuman}
-	case needsChanges:
-		edge, _ = stage.RequestChanges(task, mrs, maxRounds)
-	default:
-		edge = stage.Edge{To: tatarav1alpha1.StageMerging}
 	}
 	log.FromContext(ctx).Info("review: task advancing off reviewing",
 		"action", "review_advance", "resource_id", task.Name,
 		"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
 	return d.enterStage(ctx, proj, task, edge.To, edge.Reason, mrs)
+}
+
+// reviewAdvanceEdge is the PURE F.3 reviewing-exit decision, shared by the
+// edge-triggered advance here (advanceAfterReview, off the tail of a successful
+// DrainPendingReview) and the level-triggered re-drive in the Task reconciler
+// (reconcileClocks). ready is false while the handoff is still outstanding - no
+// owned MR at all, or an owned MR whose pendingReview has not drained - so the
+// caller must NOT advance yet.
+//
+// It is extracted BECAUSE the edge-triggered advance is a ONE-SHOT: DrainPendingReview
+// calls advanceAfterReview only on the reconcile that clears pendingReview
+// (its tail), and every later MergeRequest reconcile short-circuits at the nil
+// pendingReview and never re-attempts it. If that one shot missed - a stale
+// cached owned-MR List that still showed pendingReview, a transient
+// controller-owner sever (#369) that made owningTask return nil so the advance
+// was skipped, or a multi-MR ordering race - nothing re-evaluated the advance and
+// the Task waited out the whole HandoffDeadline and parked handoff-stalled. The
+// Task reconciler re-runs this same decision every reviewing reconcile as the
+// level-triggered backstop.
+func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
+	maxRounds int) (stage.Edge, bool) {
+	if len(mrs) == 0 {
+		return stage.Edge{}, false
+	}
+	needsChanges := false
+	for i := range mrs {
+		if mrs[i].Status.PendingReview != nil {
+			return stage.Edge{}, false // a review is still owed to the forge
+		}
+		if mrs[i].Status.Status == "needs-changes" && mrs[i].Status.State != "merged" {
+			needsChanges = true
+		}
+	}
+	switch {
+	case task.Spec.Kind == "review":
+		// A kind=review Task NEVER reaches implementing or merging - not on
+		// approve, not on request_changes, not from anywhere. Fixing and merging a
+		// human's PR is a HUMAN action.
+		return stage.Edge{To: tatarav1alpha1.StageParked, Reason: stage.ReasonAwaitingHuman}, true
+	case needsChanges:
+		edge, _ := stage.RequestChanges(task, mrs, maxRounds)
+		return edge, true
+	default:
+		return stage.Edge{To: tatarav1alpha1.StageMerging}, true
+	}
+}
+
+// maxReviewRounds is the project's request_changes cap, defaulting to 3.
+func maxReviewRounds(proj *tatarav1alpha1.Project) int {
+	if proj.Spec.Agent.MaxReviewRounds > 0 {
+		return proj.Spec.Agent.MaxReviewRounds
+	}
+	return 3
 }
 
 // DrainPendingComments is the SAME SHAPE as the review post, for
