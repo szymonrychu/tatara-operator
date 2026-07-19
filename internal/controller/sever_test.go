@@ -83,6 +83,38 @@ func TestSeverIssueFromTask_CrashBetweenStepsBenign(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(err))
 }
 
+// TestSeverIssueFromTask_Orphan_HandsOverToSurvivingOwner asserts the B.2
+// rule-5 fix: when a second, still-live Task holds a plain ownerRef on the
+// Issue, SeverOrphan must NOT leave the CR with zero controller owners. It
+// hands the controller flag to that surviving Task instead of bare-dropping
+// the severed Task's ref.
+func TestSeverIssueFromTask_Orphan_HandsOverToSurvivingOwner(t *testing.T) {
+	ctx := context.Background()
+	issName := tatarav1alpha1.IssueName("tatara-operator", 5)
+	taskA := severTask(tatarav1alpha1.StageParked, "review-loop-exhausted", issName)
+	taskB := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-2", Namespace: testNS},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj"},
+	}
+	iss := ownedIssue(issName, 5, taskA, tatarav1alpha1.IssueStatus{
+		State: "open", Labels: []string{TataraParkedLabel, "bug"},
+	})
+	require.True(t, own.AddPlainOwner(iss, taskB))
+	c := newMirrorClient(t, taskA, taskB, iss)
+
+	require.NoError(t, SeverIssueFromTask(ctx, c, taskA.DeepCopy(), issName, SeverOrphan))
+
+	fresh := getTaskCR(t, c, taskA.Name)
+	require.NotContains(t, fresh.Status.IssueRefs, issName)
+
+	got := getIssueCR(t, c, issName)
+	owner, owned := own.ControllerOwner(got)
+	require.True(t, owned, "Orphan must hand the controller flag to the surviving owner, not leave the CR ownerless")
+	require.Equal(t, taskB.Name, owner)
+	require.NotContains(t, got.Status.Labels, TataraParkedLabel, "Orphan must strip the mirror tatara-parked label")
+	require.Contains(t, got.Status.Labels, "bug", "other labels are preserved")
+}
+
 func TestSeverIssueFromTask_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	issName := tatarav1alpha1.IssueName("tatara-operator", 4)

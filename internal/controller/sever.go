@@ -6,12 +6,14 @@ import (
 	"slices"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/own"
 )
 
 // SeverMode is how SeverIssueFromTask detaches an Issue CR from its owning Task.
@@ -23,8 +25,12 @@ const (
 	// the leak fix: a bare ownerRef drop would leave the closed CR un-owned AND
 	// un-cascadable, leaking forever with the IssueReconciler mirror-syncing it.
 	SeverDeleteCR SeverMode = iota
-	// SeverOrphan drops the Task's ownerRef and strips the mirror's tatara-parked
-	// label (WS3-I4), leaving the still-OPEN CR the ownerless orphan the fresh
+	// SeverOrphan detaches the Task from the Issue and strips the mirror's
+	// tatara-parked label (WS3-I4). If task is the CONTROLLER owner and another
+	// live Task still holds a plain ownerRef, the controller flag is handed over
+	// to the oldest surviving owner FIRST (B.2 rule 5: never leave the CR with
+	// zero controller owners) - the bare drop only happens when no live heir
+	// exists, leaving the still-OPEN CR the ownerless orphan the fresh
 	// MintForItem re-adopts.
 	SeverOrphan
 )
@@ -107,6 +113,38 @@ func SeverIssueFromTask(ctx context.Context, c client.Client, task *tatarav1alph
 			var iss tatarav1alpha1.Issue
 			if err := c.Get(ctx, issKey, &iss); err != nil {
 				return err
+			}
+			owner, ok := own.ControllerOwner(&iss)
+			if !ok || owner != task.Name {
+				// task holds no controller flag to hand over: a bare drop of its
+				// (plain, or absent) ref cannot orphan a controller owner.
+				dropOwnerRef(&iss, task.Name)
+				return c.Update(ctx, &iss)
+			}
+			live := make(map[string]bool)
+			for _, r := range iss.GetOwnerReferences() {
+				if r.Kind != "Task" || r.APIVersion != tatarav1alpha1.GroupVersion.String() || r.Name == task.Name {
+					continue
+				}
+				var other tatarav1alpha1.Task
+				err := c.Get(ctx, types.NamespacedName{Namespace: iss.Namespace, Name: r.Name}, &other)
+				switch {
+				case err == nil:
+					live[r.Name] = true
+				case apierrors.IsNotFound(err):
+					live[r.Name] = false
+				default:
+					return err
+				}
+			}
+			heir, hasHeir := own.OldestSurvivingOwner(&iss, live)
+			if hasHeir {
+				if err := own.HandOverController(&iss, task, &tatarav1alpha1.Task{
+					ObjectMeta: metav1.ObjectMeta{Name: heir, Namespace: iss.Namespace},
+				}); err != nil {
+					return err
+				}
+				return c.Update(ctx, &iss)
 			}
 			dropOwnerRef(&iss, task.Name)
 			return c.Update(ctx, &iss)
