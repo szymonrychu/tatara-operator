@@ -51,6 +51,7 @@ batch|jobs
 ""|configmaps
 ""|secrets
 ""|events
+events.k8s.io|events
 ""|persistentvolumeclaims
 apps|deployments
 apps|statefulsets
@@ -152,6 +153,30 @@ report_diff() {
 
 report_diff "namespaced Role" "$GEN_ROLE" "$CHART_ROLE"
 report_diff "crd-reader ClusterRole" "$GEN_CRDREADER" "$CHART_CRDREADER"
+
+# Required-rule guard (issue #384). The parity checks above only prove the
+# chart and markers AGREE - they pass even when both are wrong in the same way,
+# which is exactly how #384 shipped: recorder writes to events.k8s.io/v1
+# (mgr.GetEventRecorder -> k8s.io/client-go/tools/events) but both chart and
+# markers granted events only in the core group "". This guard independently
+# asserts each required group|resource|verb tuple is present in the namespaced
+# Role, tying the RBAC to the recorder the operator actually constructs. Verbs
+# are pinned (not "any verb"): a get/list/watch-only grant would still 403 the
+# recorder's create/patch, so the guard must demand the exact write verbs.
+# Matched with grep -qxF (literal, whole-line) against the canonicalized
+# group|resource|verb tuples, so a near-miss group string cannot regex-match.
+REQUIRED_ROLE_TUPLES='
+events.k8s.io|events|create
+events.k8s.io|events|patch
+'
+while IFS= read -r tuple; do
+	[ -z "$tuple" ] && continue
+	if ! grep -qxF "$tuple" <<<"$CHART_ROLE"; then
+		fail=1
+		echo "rbac-drift: required rule missing from namespaced Role: $tuple" >&2
+		echo "  the operator constructs an events.k8s.io/v1 recorder; RBAC must grant this (issue #384)." >&2
+	fi
+done <<<"$REQUIRED_ROLE_TUPLES"
 
 if [ "$fail" -ne 0 ]; then
 	echo "rbac-drift: FAILED. The chart Role/ClusterRole and +kubebuilder:rbac markers have diverged." >&2

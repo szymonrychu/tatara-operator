@@ -70,6 +70,14 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # The controllers record Events through the events.k8s.io/v1 sink
+  # (mgr.GetEventRecorder -> k8s.io/client-go/tools/events), so the SA needs
+  # events in the events.k8s.io group too; a core-group-only grant 403-drops
+  # every Event (issue #384). The core "" grant above stays for any
+  # legacy-recorder emitters (e.g. leader election).
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   # Leader-election lease: a single manager acquires this Lease so that during a
   # rolling-update surge only the elected pod reconciles (avoids duplicate PRs,
   # comments, agent pods). Lease lives in the operator namespace.
