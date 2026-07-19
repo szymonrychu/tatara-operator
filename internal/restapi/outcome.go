@@ -768,6 +768,35 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}) {
 		return
 	}
+
+	// Record the LIVE MR head as the last bot-pushed SHA (never trust an
+	// agent-reported SHA). This is the machine signal ReconcileOwnership uses to
+	// detect a later external push. Best-effort: an SCM read failure here must
+	// not turn an already-accepted outcome into an error response, so every
+	// failure just skips that MR - the tiny race with a same-instant human push,
+	// or a mirror left stale, settles via the sweep.
+	if writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj); ok {
+		for i := range open {
+			mr := &open[i]
+			repo, err := s.repoCR(ctx, o.proj.Name, mr.Spec.RepositoryRef)
+			if err != nil {
+				continue
+			}
+			live, err := writer.GetPRHead(ctx, repo.Spec.URL, token, mr.Spec.Number)
+			if err != nil || live == "" {
+				continue
+			}
+			key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
+			if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
+				m.Status.LastBotHeadSHA = live
+			}); err != nil {
+				continue
+			}
+			s.log.InfoContext(ctx, "restapi: recorded live bot head at implement accept",
+				"action", "record_bot_head", "task", o.task.Name, "mr", mr.Name, "sha", live)
+		}
+	}
+
 	o.ok("submitted", "merge_order", strings.Join(p.MergeOrder, ","),
 		"change_significance", p.ChangeSignificance)
 }

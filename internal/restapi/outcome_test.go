@@ -166,7 +166,7 @@ func TestOutcome_IdenticalRepeatIs200NotA409(t *testing.T) {
 // C.5.2's `for i := mergeCursor; i < len(spec.mergeOrder)` ran ZERO times, and
 // delivered was unreachable.
 func TestOutcome_Implement_SingleRepoMergeOrderIsResolved(t *testing.T) {
-	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head"}}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
 		mrV2("tatara-operator", 295, "t1"))
@@ -208,11 +208,30 @@ func TestOutcome_Implement_MultiRepoRequiresMergeOrder(t *testing.T) {
 	require.Contains(t, w.Body.String(), "mergeOrder does not cover repo tatara-operator")
 
 	// The correct, dependency-ordered answer: operator FIRST, then cli.
-	e3 := buildV2(t, v2Opts{writer: panicForge{}}, objs...)
+	e3 := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head", 80: "live-head-cli"}}}, objs...)
 	w = e3.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"minor","mergeOrder":["tatara-operator","tatara-cli"]}}`)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, []string{"tatara-operator", "tatara-cli"}, e3.task(t, "t1").Spec.MergeOrder)
+}
+
+// THE MACHINE SIGNAL. At implement accept the operator fetches the LIVE MR
+// head from the SCM - never the agent-reported one - and records it as
+// status.lastBotHeadSHA. ReconcileOwnership (OP8) reads this cursor to detect
+// an unattributable external push.
+func TestOutcome_Implement_RecordsLiveBotHeadSHA(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{295: "live-head-999"}}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement"),
+		mrV2("tatara-operator", 295, "t1"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"implement","payload":{"action":"submitted","title":"T","body":"B","changeSignificance":"minor"}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	mr := e.mr(t, tatarav1alpha1.MergeRequestName("tatara-operator", 295))
+	require.Equal(t, "live-head-999", mr.Status.LastBotHeadSHA,
+		"lastBotHeadSHA must be the live head fetched from SCM, not an agent-reported sha")
 }
 
 func TestOutcome_Implement_SubmittedWithNoOpenMRIs400(t *testing.T) {

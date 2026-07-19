@@ -192,9 +192,16 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
-	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA) {
+	// A verified bot-push webhook advances the bot-head cursor immediately, so a
+	// push webhook that races ahead of the implement-outcome record still reads
+	// as attributable (no false external-push flip). A non-bot pusher advances
+	// only the HeadSHA mirror, leaving LastBotHeadSHA stale - ReconcileOwnership
+	// sees the drift and flips.
+	bot := isBotActor(&proj, ev.ActorLogin)
+	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA, bot) {
 		s.log.InfoContext(ctx, "mr: mirrored new head on synchronize; no review restart",
-			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name, "number", ev.Number, "head_sha", ev.HeadSHA)
+			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name,
+			"number", ev.Number, "head_sha", ev.HeadSHA, "bot_push", bot)
 	}
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
@@ -244,9 +251,18 @@ func (s *Server) stampIssueState(ctx context.Context, proj *tatarav1.Project, re
 	return true
 }
 
-// stampMRHead upserts MergeRequest.Status.HeadSHA on the mirror CR.
-func (s *Server) stampMRHead(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, number int, headSHA string) bool {
-	return s.fitMR(ctx, proj, repo, number, func(m *tatarav1.MergeRequest) { m.Status.HeadSHA = headSHA })
+// stampMRHead upserts MergeRequest.Status.HeadSHA on the mirror CR, and - when
+// botPush is true (the pusher is the project's configured bot identity) -
+// also advances Status.LastBotHeadSHA to the same sha. A non-bot push leaves
+// LastBotHeadSHA untouched: that staleness is the drift ReconcileOwnership
+// (OP8) detects.
+func (s *Server) stampMRHead(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, number int, headSHA string, botPush bool) bool {
+	return s.fitMR(ctx, proj, repo, number, func(m *tatarav1.MergeRequest) {
+		m.Status.HeadSHA = headSHA
+		if botPush {
+			m.Status.LastBotHeadSHA = headSHA
+		}
+	})
 }
 
 // stampMRState upserts MergeRequest.Status.State (+ MergedAt on a merge) on the
