@@ -156,6 +156,14 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		// (fix W1). GrammarVerifier runs the real maintainer-identity + anchored-
 		// phrase check against the Issue CR's mirrored comments.
 		Approval: &controller.GrammarVerifier{Client: mgr.GetClient()},
+		// Minter mints/unparks the OP5 takeover Task behind OP9's
+		// POST /projects/{p}/scm/mr-takeover, via the SAME intake funnel every
+		// other mint path uses (SpillerFor per-project, matching newSpillerFor
+		// above).
+		Minter: &controller.Minter{
+			Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), Scheme: mgr.GetScheme(),
+			Metrics: metrics, SpillerFor: newSpillerFor(mgr, cfg),
+		},
 	}).Mount(httpMux, auth.Middleware(verifier, metrics))
 
 	return mgr.Add(webhook.NewHandlerRunnable(httpMux, cfg.HTTPAddr))

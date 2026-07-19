@@ -252,10 +252,26 @@ func (d *StageDriver) reMintReviewOwner(ctx context.Context, proj *tatarav1alpha
 // ref, if any, leaving it as a plain owner. It is a no-op when mr carries no
 // controller owner.
 func (d *StageDriver) demoteMRController(ctx context.Context, mr *tatarav1alpha1.MergeRequest) error {
+	return DemoteMRController(ctx, d.Client, mr)
+}
+
+// DemoteMRController is the exported form of demoteMRController: it clears the
+// controller=true flag on mr's current owner ref, if any, leaving it as a
+// plain owner (a no-op when mr carries no controller owner). It exists at
+// package level, not just as a StageDriver method, because OP9's takeover REST
+// endpoint (internal/restapi) needs the identical demote-before-remint step
+// flipToExternal's own hand-back uses (reMintReviewOwner), just running in the
+// opposite direction: MintOrUnparkTakeoverTask's fresh-mint path binds the
+// takeover Task as controller through the SAME intake funnel a review mint
+// uses (Minter.ownMergeRequest), which REFUSES to steal a controller ref it
+// does not already recognize as its own Task's - so the caller's existing
+// controller ref (the review Task) must be demoted first, or the mint
+// hard-fails with "already has controller owner".
+func DemoteMRController(ctx context.Context, c client.Client, mr *tatarav1alpha1.MergeRequest) error {
 	if _, ok := own.ControllerOwner(mr); !ok {
 		return nil
 	}
-	return d.mutateOwnerRefs(ctx, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+	return MutateOwnerRefs(ctx, c, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
 		refs := fresh.GetOwnerReferences()
 		for i := range refs {
 			if refs[i].Controller != nil && *refs[i].Controller {
@@ -280,17 +296,28 @@ func (d *StageDriver) demoteMRController(ctx context.Context, mr *tatarav1alpha1
 // is overwritten with the server's fresh post-write copy.
 func (d *StageDriver) mutateOwnerRefs(ctx context.Context, mr *tatarav1alpha1.MergeRequest,
 	mutate func(fresh *tatarav1alpha1.MergeRequest) error) error {
+	return MutateOwnerRefs(ctx, d.Client, mr, mutate)
+}
+
+// MutateOwnerRefs is the exported, client-only form of mutateOwnerRefs (see
+// its docs for why a fresh-Get+RetryOnConflict loop is required instead of a
+// bare Update on a possibly-stale mr). OP9's takeover REST endpoint uses this
+// directly - it has no StageDriver, only a client.Client - to move the MR
+// mirror's controller ownership onto the takeover Task under the exact same
+// conflict-safe discipline every other owner-ref write in this package uses.
+func MutateOwnerRefs(ctx context.Context, c client.Client, mr *tatarav1alpha1.MergeRequest,
+	mutate func(fresh *tatarav1alpha1.MergeRequest) error) error {
 
 	key := client.ObjectKeyFromObject(mr)
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh tatarav1alpha1.MergeRequest
-		if err := d.Get(ctx, key, &fresh); err != nil {
+		if err := c.Get(ctx, key, &fresh); err != nil {
 			return err
 		}
 		if err := mutate(&fresh); err != nil {
 			return err
 		}
-		if err := d.Update(ctx, &fresh); err != nil {
+		if err := c.Update(ctx, &fresh); err != nil {
 			return err
 		}
 		*mr = fresh

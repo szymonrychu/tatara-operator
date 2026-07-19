@@ -32,6 +32,15 @@ func takeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 	return tatarav1alpha1.IntakeTaskName(proj.Name, takeoverKind, repo.Name, number)
 }
 
+// TakeoverTaskName is the exported form of takeoverTaskName. OP9's takeover
+// REST endpoint (internal/restapi) needs the identical deterministic name to
+// reason about the takeover Task without re-deriving the "takeover" kind
+// string itself, which would risk the two packages drifting on the naming
+// scheme.
+func TakeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int) string {
+	return takeoverTaskName(proj, repo, number)
+}
+
 // MintOrUnparkTakeoverTask is the ONE entry point a maintainer's "take over"
 // comment drives (OP9's takeover endpoint calls this). It returns the single
 // full-lifecycle takeover Task bound to mr:

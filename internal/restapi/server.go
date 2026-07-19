@@ -9,6 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -41,6 +42,11 @@ type Config struct {
 	// Approval is the C.6 grammar. A nil verifier FAILS CLOSED: a clarify
 	// decision=implement then parks at identity-unverified.
 	Approval ApprovalVerifier
+	// Minter mints/unparks the OP5 takeover Task behind OP9's
+	// POST /projects/{p}/scm/mr-takeover. A nil Minter fails the endpoint at
+	// 500 rather than silently no-oping the flip - mirroring how a nil
+	// Approval fails closed rather than granting.
+	Minter *controller.Minter
 	// Now is injectable for tests; nil means time.Now.
 	Now     func() time.Time
 	Logger  *slog.Logger
@@ -59,6 +65,7 @@ type Server struct {
 	spillerFor func(proj *tatarav1alpha1.Project) objbudget.Spiller
 	memoryFor  func(proj *tatarav1alpha1.Project) NoteFetcher
 	approval   ApprovalVerifier
+	minter     *controller.Minter
 	nowFn      func() time.Time
 	ciPacer    *ciPacer
 	log        *slog.Logger
@@ -74,7 +81,7 @@ func NewServer(cfg Config) *Server {
 	return &Server{
 		c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, readerFor: cfg.ReaderFor,
 		ciFor: cfg.CIFor, spillerFor: cfg.SpillerFor, memoryFor: cfg.MemoryFor, approval: cfg.Approval,
-		nowFn: cfg.Now, ciPacer: newCIPacer(), log: l, metrics: cfg.Metrics,
+		minter: cfg.Minter, nowFn: cfg.Now, ciPacer: newCIPacer(), log: l, metrics: cfg.Metrics,
 	}
 }
 
@@ -113,10 +120,10 @@ func (s *Server) Mount(r chi.Router, verify func(http.Handler) http.Handler) {
 	})
 }
 
-// routes wires the complete contract-C.1 endpoint table (15 routes). The 19
-// pre-redesign routes are DELETED and now 404: the whole old surface collapsed
-// into task_context / task_note / submit_outcome / scm_read / issue_write /
-// mr_write.
+// routes wires the complete contract-C.1 endpoint table (16 routes: the
+// original 15 plus OP9's mr-takeover). The 19 pre-redesign routes are DELETED
+// and now 404: the whole old surface collapsed into task_context / task_note /
+// submit_outcome / scm_read / issue_write / mr_write / mr_takeover_request.
 func (s *Server) routes(r chi.Router) {
 	r.Get("/projects", s.listProjects)                      // 1
 	r.Get("/projects/{p}", s.getProject)                    // 2  project_get
@@ -133,4 +140,5 @@ func (s *Server) routes(r chi.Router) {
 	r.Get("/projects/{p}/scm/ci", s.scmCI)                  // 13 scm_read(ci)
 	r.Post("/projects/{p}/scm/issue-write", s.issueWrite)   // 14 issue_write
 	r.Post("/projects/{p}/scm/mr-write", s.mrWrite)         // 15 mr_write
+	r.Post("/projects/{p}/scm/mr-takeover", s.mrTakeover)   // 16 mr_takeover_request
 }
