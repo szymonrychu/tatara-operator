@@ -477,12 +477,23 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 func (r *ProjectReconciler) reapDelivered(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
 
-	needs, err := r.needsDocumenting(ctx, t)
+	needs, err := r.needsDocumenting(ctx, proj, t)
 	if err != nil {
 		return err
 	}
 	if needs {
 		obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference).Inc()
+		mrs, err := r.ownedMRs(ctx, t)
+		if err != nil {
+			return err
+		}
+		mrStates := make([]string, len(mrs))
+		for i := range mrs {
+			mrStates[i] = mrs[i].Status.State
+		}
+		log.FromContext(ctx).Info("reap: delivered task pinned by the doc_reference GC block",
+			"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedDocReference,
+			"mr_states", mrStates)
 		return nil
 	}
 	delivered := stageEnteredAt(t)

@@ -604,7 +604,12 @@ func reapProject(name string) *tatarav1alpha1.Project {
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "scm-secret",
 			MaxOpenTasks: 6,
-			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", BotLogin: "tatara-bot"},
+			Scm: &tatarav1alpha1.ScmSpec{
+				Provider: "github", BotLogin: "tatara-bot",
+				Cron: &tatarav1alpha1.ScmCron{
+					Documentation: tatarav1alpha1.CronActivity{Schedule: "0 3 * * *"},
+				},
+			},
 			Documentation: &tatarav1alpha1.DocumentationSpec{
 				Enabled: true,
 				Repo:    "https://github.com/szymonrychu/tatara-documentation.git",

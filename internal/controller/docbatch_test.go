@@ -392,3 +392,144 @@ func TestDocBatchIsNeverItsOwnParent(t *testing.T) {
 		t.Fatal("a delivered documentation batch past its 48h TTL was pinned by its own documentedBy gate")
 	}
 }
+
+// TestNeedsDocumentingRequiresConfiguredCron is issue #392: a project with
+// documentation.enabled but NO cron schedule structurally never mints a nightly
+// batch, so without this exemption a delivered Task with all its MRs merged is
+// pinned by the doc_reference GC block forever. needsDocumenting must agree with
+// docsRepository/MintDocBatch on what "doc batching is actually configured" means,
+// symmetric to the existing zero-merged-MR exemption.
+func TestNeedsDocumentingRequiresConfiguredCron(t *testing.T) {
+	ctx := context.Background()
+
+	newProj := func(mutate func(p *tatarav1alpha1.Project)) *tatarav1alpha1.Project {
+		p := reapProject("cronreq")
+		if mutate != nil {
+			mutate(p)
+		}
+		return p
+	}
+
+	cases := []struct {
+		name string
+		proj *tatarav1alpha1.Project
+		noMR bool
+		want bool
+	}{
+		{
+			name: "docs disabled: nil Documentation",
+			proj: newProj(func(p *tatarav1alpha1.Project) { p.Spec.Documentation = nil }),
+			want: false,
+		},
+		{
+			name: "docs disabled: Enabled false",
+			proj: newProj(func(p *tatarav1alpha1.Project) { p.Spec.Documentation.Enabled = false }),
+			want: false,
+		},
+		{
+			name: "docs disabled: empty Repo",
+			proj: newProj(func(p *tatarav1alpha1.Project) { p.Spec.Documentation.Repo = "" }),
+			want: false,
+		},
+		{
+			name: "docs enabled + repo but no cron schedule (issue #392)",
+			proj: newProj(func(p *tatarav1alpha1.Project) { p.Spec.Scm.Cron.Documentation.Schedule = "" }),
+			want: false,
+		},
+		{
+			name: "docs enabled + repo but nil Cron",
+			proj: newProj(func(p *tatarav1alpha1.Project) { p.Spec.Scm.Cron = nil }),
+			want: false,
+		},
+		{
+			name: "fully configured: still blocked (regression)",
+			proj: newProj(nil),
+			want: true,
+		},
+		{
+			name: "fully configured but zero merged MRs: unaffected",
+			proj: newProj(nil),
+			noMR: true,
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := reapRepo(tc.proj.Name, "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+			var c client.Client
+			var tk *tatarav1alpha1.Task
+			if tc.noMR {
+				tk = reapTask(tc.proj.Name, "task-a", "brainstorm", tatarav1alpha1.StageDelivered, "", time.Now())
+				stamp := metav1.NewTime(time.Now())
+				tk.Status.DeliveredAt = &stamp
+				c = newMirrorClient(t, tc.proj, src, reapSecret(), tk)
+			} else {
+				var mr *tatarav1alpha1.MergeRequest
+				tk, mr = deliveredWithMergedMR(t, tc.proj.Name, src.Name, "task-a", 1, time.Now())
+				c = newMirrorClient(t, tc.proj, src, reapSecret(), tk, mr)
+			}
+			r := reapReconciler(c, &reapWriter{})
+
+			got, err := r.needsDocumenting(ctx, tc.proj, tk)
+			if err != nil {
+				t.Fatalf("needsDocumenting: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("needsDocumenting = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMintDocBatchSkipsUnconfiguredProject covers the MintDocBatch caller: a
+// project whose documentation.enabled+repo are set but whose cron schedule is
+// empty must never cover a delivered Task, even though docsRepository (which
+// only checks enabled+repo) resolves the docs repo fine.
+func TestMintDocBatchSkipsUnconfiguredProject(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("cronmint")
+	proj.Spec.Scm.Cron.Documentation.Schedule = ""
+	src := reapRepo("cronmint", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	docs := reapRepo("cronmint", "tatara-documentation", docsRepoURL)
+
+	t1, m1 := deliveredWithMergedMR(t, "cronmint", src.Name, "task-a", 1, time.Now())
+
+	c := newMirrorClient(t, proj, src, docs, reapSecret(), t1, m1)
+	r := reapReconciler(c, &reapWriter{})
+
+	if err := r.MintDocBatch(ctx, proj); err != nil {
+		t.Fatalf("MintDocBatch: %v", err)
+	}
+	if got := len(docBatches(t, c, "cronmint")); got != 0 {
+		t.Fatalf("minted %d documentation batches for an unconfigured (no cron schedule) project, want 0", got)
+	}
+}
+
+// TestReapDeliveredNotBlockedWhenDocBatchingNotConfigured covers the reapDelivered
+// caller: on a project whose doc batching never runs, a delivered Task with all
+// its MRs merged must reap on its 48h TTL, not sit pinned by doc_reference
+// forever (issue #392).
+func TestReapDeliveredNotBlockedWhenDocBatchingNotConfigured(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("cronreap")
+	proj.Spec.Scm.Cron.Documentation.Schedule = ""
+	src := reapRepo("cronreap", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	deliveredAt := time.Now().Add(-72 * time.Hour) // past the 48h TTL
+
+	tk, mr := deliveredWithMergedMR(t, "cronreap", src.Name, "task-a", 1, deliveredAt)
+
+	c := newMirrorClient(t, proj, src, reapSecret(), tk, mr)
+	r := reapReconciler(c, &reapWriter{})
+
+	before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference))
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	if got := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference)); got != before {
+		t.Fatalf("operator_gc_blocked_total{reason=doc_reference} = %v, want unchanged at %v: an unconfigured project must never be reported as blocked", got, before)
+	}
+	if _, ok := mustGetTask(t, c, "task-a"); ok {
+		t.Fatal("a delivered task on a project with no doc-batch cron schedule was pinned by the doc_reference GC block instead of reaping at its 48h TTL")
+	}
+}

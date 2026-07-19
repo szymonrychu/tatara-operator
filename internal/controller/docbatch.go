@@ -65,7 +65,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 		// A batch already in flight OWNS this night's parents. Minting a second one
 		// would put the same Tasks in two batches, race two docs PRs at the same
 		// docs repo, and double the release train.
-		needs, err := r.needsDocumenting(ctx, t)
+		needs, err := r.needsDocumenting(ctx, proj, t)
 		if err != nil {
 			return err
 		}
@@ -242,8 +242,18 @@ func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, batch *tatarav1
 //	                                ZERO merged MRs. They are never documented and
 //	                                documentedBy stays permanently empty.
 //	c. documentedBy == ""           not covered yet.
-func (r *ProjectReconciler) needsDocumenting(ctx context.Context, t *tatarav1alpha1.Task) (bool, error) {
+//	d. docBatchingConfigured(proj)  a project with documentation.enabled but no
+//	                                cron schedule structurally never mints a
+//	                                batch (issue #392). Without this exemption
+//	                                every delivered Task on it satisfies (a)-(c)
+//	                                and is pinned by the reaper's doc_reference
+//	                                gate forever, since nothing will ever stamp
+//	                                documentedBy. Symmetric to the (b) exemption.
+func (r *ProjectReconciler) needsDocumenting(ctx context.Context, proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task) (bool, error) {
 	if t.Spec.Kind == DocBatchKind || t.Status.DocumentedBy != "" || len(t.Status.MRRefs) == 0 {
+		return false, nil
+	}
+	if !docBatchingConfigured(proj) {
 		return false, nil
 	}
 	mrs, err := r.ownedMRs(ctx, t)
@@ -259,6 +269,22 @@ func (r *ProjectReconciler) needsDocumenting(ctx context.Context, t *tatarav1alp
 		}
 	}
 	return true, nil
+}
+
+// docBatchingConfigured reports whether proj actually mints nightly documentation
+// batches: documentation enabled with a repo, AND a non-empty cron schedule. The
+// first half mirrors docsRepository's own enabled+repo check; the schedule half
+// is the missing piece issue #392 found - documentation.enabled+repo alone does
+// NOT mean a batch is ever minted, since MintDocBatch only runs on the cron tick.
+func docBatchingConfigured(proj *tatarav1alpha1.Project) bool {
+	doc := proj.Spec.Documentation
+	if doc == nil || !doc.Enabled || doc.Repo == "" {
+		return false
+	}
+	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
+		return false
+	}
+	return proj.Spec.Scm.Cron.Documentation.Schedule != ""
 }
 
 // docBatchInFlight returns the name of a documentation batch that has not settled
