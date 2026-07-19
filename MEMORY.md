@@ -660,3 +660,23 @@ in spirit; prune only when a decision is reversed.
   the F.3 table and fall through untouched (triaging's own triage-stalled
   clock, and delivered's reaper age-out, own those cases instead), closing
   the illegal-transition infinite-requeue crash-loop the un-gated version hit.
+- 2026-07-19 (#398): `incidentDedupKey` dropped its CommonLabels hashing
+  entirely - key is now sha256(project + rule name) only, no denylist. Root
+  cause: Grafana's CommonLabels is the intersection of whatever instances
+  co-fire in one evaluation, so the member set (and therefore the label
+  intersection) churns run to run even though the rule itself hasn't
+  changed; the #320/#328 "stable labels" denylist still let that churn
+  change the key and bypass the open tracker, re-spawning full
+  investigations 4x ~35min apart on one rule. Trade-off accepted: same rule
+  + different co-firing workload now collapses onto ONE tracker (a coarser
+  key than #320/#328's), so workload distinction is no longer in the dedup
+  key - it now rests on the refire comment (`labelSummary`, full
+  CommonLabels, replaces the old volatile-stripped `stableLabelSummary`),
+  the escalation valve (refire threshold 10 / stale age 48h re-admits a
+  fresh investigation), and cross-rule group linking (`incidentGroupKey`,
+  untouched, still project+correlation-labels). Removed as dead:
+  `defaultVolatileDenylist`/`denylistSet` (grafana.go),
+  `Server.dedupDenylist` (server.go), `Config.IncidentDedupVolatileLabels` +
+  `INCIDENT_DEDUP_VOLATILE_LABELS` (config.go + webhook.Config +
+  cmd/manager/wire.go wiring). `correlationSet`/`incidentGroupKey` (the
+  separate GROUP key) are untouched.

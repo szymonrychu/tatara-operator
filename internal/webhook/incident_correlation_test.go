@@ -38,8 +38,7 @@ func TestIncidentGroupKey(t *testing.T) {
 	}
 	// Their DEDUP keys stay distinct (different alertname), so admission does not
 	// suppress the second - correlation is link-only.
-	den := denylistSet(nil)
-	if incidentDedupKey(a, "tatara", den) == incidentDedupKey(b, "tatara", den) {
+	if incidentDedupKey(a, "tatara") == incidentDedupKey(b, "tatara") {
 		t.Fatal("distinct alert rules must keep distinct dedup keys")
 	}
 
@@ -76,7 +75,7 @@ func escalationHarness(t *testing.T, refireCount int, escalatedAt *metav1.Time, 
 	_ = corev1.AddToScheme(sch)
 
 	proj := grafanaProject("p1")
-	dedupKey := incidentDedupKey(mustParseGrafanaAlert(t, grafanaFiringA), proj.Name, denylistSet(nil))
+	dedupKey := incidentDedupKey(mustParseGrafanaAlert(t, grafanaFiringA), proj.Name)
 	iss := &tatarav1.Issue{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "iss-tatara-operator-320", Namespace: "tatara",

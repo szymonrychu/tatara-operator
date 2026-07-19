@@ -67,9 +67,6 @@ type Config struct {
 	// reader so the identity-unverified re-verify path never needs a live
 	// forge call.
 	ReaderFor func(provider, token string) (scm.SCMReader, error)
-	// IncidentDedupVolatileLabels overrides the per-series label denylist stripped
-	// from the incident dedup key. Nil => defaultVolatileDenylist.
-	IncidentDedupVolatileLabels []string
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment (A4).
 	IncidentRefireCommentCooldown time.Duration
 	// IncidentCorrelationLabels is the alert common-label set forming the coarser
@@ -92,7 +89,6 @@ type Config struct {
 type Server struct {
 	cfg               Config
 	log               *slog.Logger
-	dedupDenylist     map[string]bool
 	correlationLabels map[string]bool
 	now               func() time.Time
 }
@@ -121,7 +117,7 @@ func NewServer(cfg Config) *Server {
 	if now == nil {
 		now = time.Now
 	}
-	return &Server{cfg: cfg, log: cfg.Logger, dedupDenylist: denylistSet(cfg.IncidentDedupVolatileLabels),
+	return &Server{cfg: cfg, log: cfg.Logger,
 		correlationLabels: correlationSet(cfg.IncidentCorrelationLabels), now: now}
 }
 
@@ -850,7 +846,7 @@ func (s *Server) handleGrafanaAlert(w http.ResponseWriter, r *http.Request) {
 		s.accept(w, "grafana", "alert", alert.Status, "ignored")
 		return
 	}
-	dedupKey := incidentDedupKey(alert, proj.Name, s.dedupDenylist)
+	dedupKey := incidentDedupKey(alert, proj.Name)
 	created, err := s.createIncidentTask(ctx, &proj, alert, dedupKey)
 	if err != nil {
 		s.reject(w, http.StatusInternalServerError, "create task", "grafana", "alert", "firing", "error")
@@ -950,7 +946,7 @@ func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Projec
 			return // coalesced: within cooldown, counter already bumped
 		}
 		body := fmt.Sprintf("Alert re-fired %s; labels {%s}; %d recurrence.",
-			now.UTC().Format(time.RFC3339), stableLabelSummary(alert, s.dedupDenylist), i.Status.RefireCount)
+			now.UTC().Format(time.RFC3339), labelSummary(alert), i.Status.RefireCount)
 		reqID := fmt.Sprintf("refire-%s-%d", iss.Name, i.Status.RefireCount)
 		if len(i.Status.PendingComments) < 20 {
 			i.Status.PendingComments = append(i.Status.PendingComments, tatarav1.PendingComment{
@@ -1066,17 +1062,20 @@ func (s *Server) maybeEscalateIncident(ctx context.Context, proj *tatarav1.Proje
 		"rule_key", dedupKey, "refire_count", refireCount, "tracker", trackerRef, "result", result)
 }
 
-// stableLabelSummary renders the alert's stable (non-volatile) common labels
-// for the refire comment body, matching what the dedup key hashes over.
-func stableLabelSummary(a GrafanaAlert, denylist map[string]bool) string {
-	stable := make(map[string]string, len(a.CommonLabels))
+// labelSummary renders the alert's common labels (alertname excluded, it is
+// already reported separately) for the refire comment body. The dedup key no
+// longer hashes over labels (#398), so a same-rule tracker can now cover
+// several distinct workloads; this summary is what lets a human reading the
+// tracker tell them apart.
+func labelSummary(a GrafanaAlert) string {
+	labels := make(map[string]string, len(a.CommonLabels))
 	for k, v := range a.CommonLabels {
-		if k == "alertname" || denylist[k] {
+		if k == "alertname" {
 			continue
 		}
-		stable[k] = v
+		labels[k] = v
 	}
-	return sortedKV(stable)
+	return sortedKV(labels)
 }
 
 // projectRepoSlugs returns the owner/repo slugs of a project's Repositories,
