@@ -74,6 +74,70 @@ func TestMintOrUnparkTakeoverTask_UnparksExisting(t *testing.T) {
 	}
 }
 
+// TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged
+// covers the fall-through branch (takeover_mint.go's `return &existing, nil`
+// with no re-enter): a Task already exists for this MR and is EITHER live
+// (any non-parked stage) OR parked for some OTHER reason than ownership-lost.
+// OP9's takeover endpoint relies on this being a pure no-op - repeat calls
+// (e.g. a maintainer posting "take over" twice, or once while the Task is
+// mid-flight) must never re-enter, re-mint, or otherwise mutate the Task.
+func TestMintOrUnparkTakeoverTask_ExistingNotOwnershipLostPark_ReturnedUnchanged(t *testing.T) {
+	cases := []struct {
+		name   string
+		stg    string
+		reason string
+	}{
+		{"live approved task is returned unchanged", tatarav1alpha1.StageApproved, ""},
+		{"parked for a non-ownership-lost reason is returned unchanged", tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj, repo := seedProjectRepo(t, ctx)
+			mr := seedOpenExternalMR(t, ctx, proj, repo, 20+i, "renovate/qux", "octocat")
+			m := newTestMinter(t)
+
+			first, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over", testSpiller(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stampTaskStatus(t, ctx, first, tc.stg, tc.reason)
+
+			second, err := m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, "alice", "take over again", testSpiller(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.Name != first.Name || second.UID != first.UID {
+				t.Fatalf("fall-through must return the SAME task: first=%s/%s second=%s/%s",
+					first.Name, first.UID, second.Name, second.UID)
+			}
+
+			got := getTask(t, second.Name)
+			if got.Status.Stage != tc.stg {
+				t.Fatalf("stage mutated: got %q, want unchanged %q", got.Status.Stage, tc.stg)
+			}
+			if got.Status.StageReason != tc.reason {
+				t.Fatalf("stage reason mutated: got %q, want unchanged %q", got.Status.StageReason, tc.reason)
+			}
+
+			// No second takeover Task was minted for this MR.
+			var list tatarav1alpha1.TaskList
+			if err := k8sClient.List(ctx, &list); err != nil {
+				t.Fatalf("list tasks: %v", err)
+			}
+			count := 0
+			for j := range list.Items {
+				if list.Items[j].Spec.ProjectRef == proj.Name && list.Items[j].Spec.Kind == takeoverKind {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("expected exactly 1 takeover task for %s, got %d", proj.Name, count)
+			}
+		})
+	}
+}
+
 // --- envtest fixtures local to the takeover minter tests ---
 
 // takeoverTestSlug derives a short, valid k8s name segment from the running
@@ -188,18 +252,29 @@ func ownerControllerName(obj client.Object) (string, bool) {
 // exercising the same edges a second time under a different test's name.
 func parkTaskOwnershipLost(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task) {
 	t.Helper()
+	stampTaskStatus(t, ctx, task, tatarav1alpha1.StageParked, stage.ReasonOwnershipLost)
+}
+
+// stampTaskStatus is parkTaskOwnershipLost's general form: it writes stg/reason
+// straight onto task's status, bypassing stage.Enter's legality checks, for
+// tests that need to PLACE a Task in some state without re-deriving how it got
+// there (that derivation is each state's own edge's coverage elsewhere).
+func stampTaskStatus(t *testing.T, ctx context.Context, task *tatarav1alpha1.Task, stg, reason string) {
+	t.Helper()
 	var fresh tatarav1alpha1.Task
 	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(task), &fresh); err != nil {
 		t.Fatalf("get task %s: %v", task.Name, err)
 	}
 	now := metav1.Now()
-	fresh.Status.Stage = tatarav1alpha1.StageParked
-	fresh.Status.StageReason = stage.ReasonOwnershipLost
-	fresh.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
+	fresh.Status.Stage = stg
+	fresh.Status.StageReason = reason
+	if stg == tatarav1alpha1.StageParked {
+		fresh.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
+	}
 	fresh.Status.StageEnteredAt = &now
 	fresh.Status.PodStartedAt = nil
 	if err := k8sClient.Status().Update(ctx, &fresh); err != nil {
-		t.Fatalf("park task %s: %v", task.Name, err)
+		t.Fatalf("stamp task %s stage=%s reason=%s: %v", task.Name, stg, reason, err)
 	}
 	*task = fresh
 }
