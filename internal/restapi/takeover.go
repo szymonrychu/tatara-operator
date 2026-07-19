@@ -38,9 +38,10 @@ func takeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // already reached a review Task - which, by the time this endpoint is called,
 // controller-owns the MR mirror - and the review agent judged intent and
 // called mr_takeover_request. This endpoint NEVER trusts that judgment: the
-// referenced comment must exist in the MR CR mirror, its recorded author must
-// be an explicitly trusted human (never the bot, never an unlisted login),
-// and the caller Task must currently controller-own the MR. Only then does it
+// referenced comment must exist in the MR CR mirror, and its recorded author
+// must be a verified MAINTAINER (never the bot, never merely a listed
+// reporter - takeover is a privilege grant, not intake trust), and the caller
+// Task must currently controller-own the MR. Only then does it
 // flip ownership external -> tatara, mint/unpark the single full-lifecycle
 // takeover Task (OP5's Minter.MintOrUnparkTakeoverTask), and move the MR
 // mirror's controller ownership onto it. The stand-down/takeover announcement
@@ -98,8 +99,12 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Server-side authz: the comment must exist in the mirror, and its
-	// recorded author must be a trusted human - never the bot, never an
-	// unlisted login. The agent's own judgment carries no weight here.
+	// recorded author must be a verified human MAINTAINER - never the bot,
+	// never an unlisted login, and NOT merely a listed reporter. Takeover
+	// grants the bot push+merge agency over a human's own MR: a privilege
+	// grant, gated on the maintainer tier (IsMaintainer), not the weaker
+	// intake-tier trust IsTrustedAuthor/IsAllowedReporter extend to listed
+	// reporters. The agent's own judgment carries no weight here.
 	var cmt *tatarav1alpha1.Comment
 	for i := range mr.Status.Comments {
 		if mr.Status.Comments[i].ExternalID == req.CommentExternalID {
@@ -112,8 +117,8 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cmt.IsBot || cmt.Author == "" || cmt.Author == botLogin(proj) ||
-		!tatarav1alpha1.IsTrustedAuthor(proj, repo, cmt.Author) {
-		writeError(w, http.StatusForbidden, "only a project maintainer may hand this merge request over")
+		!tatarav1alpha1.IsMaintainer(proj, repo, cmt.Author) {
+		writeError(w, http.StatusForbidden, "author not in maintainer set: only a project maintainer may hand this merge request over")
 		return
 	}
 
@@ -134,6 +139,17 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 
 	sp := s.spillerForOrNil(proj)
 
+	// Checked BEFORE the demote below: a misconfigured nil minter must fail
+	// before any owner-ref write happens, never after - leaving the MR
+	// demoted to no controller owner (controllerless) behind a 500 would be
+	// worse than refusing up front.
+	if s.minter == nil {
+		s.log.ErrorContext(ctx, "restapi: takeover called with no minter configured",
+			append(reqLogFields(r), "mr", mr.Name)...)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
 	// MintOrUnparkTakeoverTask's fresh-mint path binds the takeover Task as
 	// the MR's controller owner through the SAME intake funnel a review mint
 	// uses (Minter.ownMergeRequest), which REFUSES to steal a controller ref
@@ -149,12 +165,6 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.minter == nil {
-		s.log.ErrorContext(ctx, "restapi: takeover called with no minter configured",
-			append(reqLogFields(r), "mr", mr.Name)...)
-		writeError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
 	tk, err := s.minter.MintOrUnparkTakeoverTask(ctx, proj, repo, &mr, cmt.Author, cmt.Body, sp)
 	if err != nil {
 		s.log.ErrorContext(ctx, "restapi: mint/unpark takeover task failed",
@@ -184,10 +194,22 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 
 	now := metav1.Now()
 	key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
+	// LastBotHeadSHA is set to the CURRENT head at the takeover point, not left
+	// at its prior (possibly empty, possibly stale) value: ReconcileOwnership's
+	// drift check fires whenever ownership==tatara && liveHead != LastBotHeadSHA
+	// (internal/controller/ownership.go). A never-bot-pushed MR (the headline
+	// Renovate takeover case) has LastBotHeadSHA=="" - left unset here, the very
+	// next reconcile would read liveHead != "" and flip this MR straight back to
+	// external, parking the takeover Task before its agent ever runs. A re-take
+	// after a stand-down has the same bug with a STALE old bot head. A later
+	// real human push still moves the live head off this baseline and stands
+	// the MR down correctly; the takeover agent's own push refreshes this same
+	// field again at outcome accept.
 	if err := objbudget.FitMergeRequest(ctx, s.c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.Ownership = tatarav1alpha1.OwnershipTatara
 		m.Status.OwnershipReason = "takeover-requested-by:" + cmt.Author
 		m.Status.OwnershipChangedAt = &now
+		m.Status.LastBotHeadSHA = mr.Status.HeadSHA
 	}); err != nil {
 		s.log.ErrorContext(ctx, "restapi: record ownership flip failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)

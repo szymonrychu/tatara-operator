@@ -86,7 +86,12 @@ func newTakeoverHarness(t *testing.T) *takeoverHarness {
 			ScmSecretRef: "tatara-scm",
 			Scm: &tatarav1alpha1.ScmSpec{
 				Provider: "github", Owner: "acme", BotLogin: h.botLogin,
-				ReporterLogins: []string{"alice"},
+				// "alice" is a MAINTAINER (takeover is a privilege grant, gated
+				// on IsMaintainer). "bob" is deliberately reporter-only: listed
+				// for intake trust but NOT for the takeover grant - see
+				// TestMRTakeover_RejectsReporterOnlyAuthor.
+				MaintainerLogins: []string{"alice"},
+				ReporterLogins:   []string{"bob"},
 			},
 		},
 	}
@@ -237,6 +242,24 @@ func TestMRTakeover_RejectsNonMaintainerAuthor(t *testing.T) {
 	}
 }
 
+// TestMRTakeover_RejectsReporterOnlyAuthor is the regression test for the
+// authz gap flagged in whole-branch review: takeover grants the bot
+// push+merge agency over a human's own MR - a privilege grant - and must gate
+// on IsMaintainer, not the weaker IsTrustedAuthor (which also accepts a
+// listed REPORTER). "bob" is reporter-listed but not a maintainer (see
+// newTakeoverHarness); before the fix this comment would have been ACCEPTED.
+func TestMRTakeover_RejectsReporterOnlyAuthor(t *testing.T) {
+	h := newTakeoverHarness(t)
+	h.addComment(t, 9, "13", "bob", false) // reporter-listed, NOT a maintainer
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"13","task":"review-task"}`)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("reporter-only author must be forbidden (maintainer-only grant), got %d", rr.Code)
+	}
+	if h.getMR(t, 9).Status.Ownership == "tatara" {
+		t.Fatalf("no flip on rejection")
+	}
+}
+
 func TestMRTakeover_RejectsBotAuthoredComment(t *testing.T) {
 	h := newTakeoverHarness(t)
 	h.addComment(t, 9, "12", h.botLogin, true) // IsBot
@@ -317,5 +340,71 @@ func TestMRTakeover_AlreadyTataraIsIdempotent(t *testing.T) {
 	ctrl, ok := ownerControllerName(got)
 	if !ok || ctrl != "review-task" {
 		t.Fatalf("idempotent no-op must not move controller ownership, got %q", ctrl)
+	}
+}
+
+// TestMRTakeover_SurvivesNextReconcileOwnership is the OP9->OP8 crossing
+// regression test flagged in whole-branch review: the endpoint alone cannot
+// see the bug because it never calls ReconcileOwnership, and OP8's own tests
+// (internal/controller/ownership_test.go) pre-seed LastBotHeadSHA rather than
+// going through a real takeover. The headline case is a never-bot-pushed MR
+// (a Renovate PR) - exactly what newTakeoverHarness seeds: LastBotHeadSHA
+// starts empty. Before the fix, the takeover endpoint left it empty, so the
+// very next ReconcileOwnership convergence (webhook fast path or the OP12
+// sweep) would see ownership==tatara && liveHead(unchanged) != "" and flip
+// the just-taken-over MR straight back to external - parking the takeover
+// Task before its agent pod ever ran.
+func TestMRTakeover_SurvivesNextReconcileOwnership(t *testing.T) {
+	h := newTakeoverHarness(t)
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid takeover must 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	mr := h.getMR(t, 9)
+	if mr.Status.Ownership != tatarav1alpha1.OwnershipTatara {
+		t.Fatalf("precondition: takeover must have flipped to tatara, got %q", mr.Status.Ownership)
+	}
+	liveHead := mr.Status.HeadSHA // unchanged since takeover: no new push happened
+	if liveHead == "" || mr.Status.LastBotHeadSHA != liveHead {
+		t.Fatalf("takeover must stamp LastBotHeadSHA to the current head, got head=%q lastBotHeadSHA=%q",
+			liveHead, mr.Status.LastBotHeadSHA)
+	}
+
+	// Stamp the takeover Task into a live (non-parked) stage, as the real
+	// controller would have on create, so "not parked" is a meaningful
+	// assertion below rather than trivially true on a Status.Stage the fake
+	// client never touched.
+	tkName := takeoverTaskName(h.proj, h.repo, 9)
+	var tk tatarav1alpha1.Task
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: takeoverNS, Name: tkName}, &tk); err != nil {
+		t.Fatalf("get takeover task %s: %v", tkName, err)
+	}
+	tk.Status.Stage = tatarav1alpha1.StageApproved
+	if err := h.c.Status().Update(context.Background(), &tk); err != nil {
+		t.Fatalf("stamp takeover task stage: %v", err)
+	}
+
+	// Run the SAME convergence function the webhook fast path / OP12 sweep
+	// call on every reconcile, with the live head unchanged from takeover.
+	d := &controller.StageDriver{Client: h.c, APIReader: h.c}
+	flipped, err := d.ReconcileOwnership(context.Background(), h.proj, h.repo, mr, liveHead, nil)
+	if err != nil {
+		t.Fatalf("ReconcileOwnership: %v", err)
+	}
+	if flipped {
+		t.Fatalf("ReconcileOwnership must NOT flip a just-taken-over MR whose head has not moved")
+	}
+
+	after := h.getMR(t, 9)
+	if after.Status.Ownership != tatarav1alpha1.OwnershipTatara {
+		t.Fatalf("MR must stay tatara-owned, got %q", after.Status.Ownership)
+	}
+
+	var tkAfter tatarav1alpha1.Task
+	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: takeoverNS, Name: tkName}, &tkAfter); err != nil {
+		t.Fatalf("get takeover task %s: %v", tkName, err)
+	}
+	if tkAfter.Status.Stage == tatarav1alpha1.StageParked {
+		t.Fatalf("takeover task must not be parked by the next reconcile")
 	}
 }
