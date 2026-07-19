@@ -881,6 +881,7 @@ func TestTransitionTable(t *testing.T) {
 		{stage.Create, v1alpha1.StageTriaging},
 		{stage.Create, v1alpha1.StageParked},      // parked(backlog-sweep)
 		{stage.Create, v1alpha1.StageDocumenting}, // the nightly batch mint
+		{stage.Create, v1alpha1.StageApproved},    // a maintainer-gated takeover mint (MR ownership)
 		{v1alpha1.StageParked, v1alpha1.StageTriaging},
 		{v1alpha1.StageTriaging, v1alpha1.StageBrainstorming},
 		{v1alpha1.StageTriaging, v1alpha1.StageClarifying},
@@ -919,6 +920,7 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageParked, v1alpha1.StageClarifying},
 		{v1alpha1.StageParked, v1alpha1.StageMerging},
 		{v1alpha1.StageParked, v1alpha1.StageDeploying},
+		{v1alpha1.StageParked, v1alpha1.StageApproved}, // takeover re-take (ownership-lost)
 		{v1alpha1.StageParked, v1alpha1.StageFailed},
 	}
 	for _, e := range legal {
@@ -970,7 +972,6 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageParked, v1alpha1.StageInvestigating},
 		{v1alpha1.StageParked, v1alpha1.StageRefining},
 		{v1alpha1.StageParked, v1alpha1.StageDocumenting},
-		{v1alpha1.StageParked, v1alpha1.StageApproved},
 		{v1alpha1.StageParked, v1alpha1.StageDelivered},
 		{v1alpha1.StageParked, v1alpha1.StageRejected},
 		// Self-loops are not transitions.
@@ -1582,6 +1583,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// the incident agent appended evidence to an existing tracker rather than
 		// filing a new issue.
 		"tracked-elsewhere",
+		// ownership-lost: implementing/reviewing -> parked when an external commit
+		// lands on the owned MR (MR ownership design); also the reason on both
+		// parked(ownership-lost) re-entries (-> approved, -> merging).
+		"ownership-lost",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -2146,5 +2151,40 @@ func TestUnparkTargetForBindingRepair(t *testing.T) {
 			require.Equal(t, tc.ok, ok)
 			require.Equal(t, tc.want, target)
 		})
+	}
+}
+
+// TestTakeoverEdges_Legal pins the F.3 edges the MR-ownership takeover flow
+// needs: a takeover Task mints straight into approved (the maintainer-gated
+// comment IS the approval), implementing/reviewing park on ownership-lost
+// when an external commit lands on the owned MR, and a parked(ownership-lost)
+// takeover Task has BOTH re-entries - approved (a fresh takeover comment
+// resumes pushing) and merging (an approved review on the stood-down MR
+// completes the human's work).
+func TestTakeoverEdges_Legal(t *testing.T) {
+	cases := []struct{ from, to string }{
+		{stage.Create, v1alpha1.StageApproved}, // takeover Task mints into approved
+		{v1alpha1.StageImplementing, v1alpha1.StageParked},
+		{v1alpha1.StageReviewing, v1alpha1.StageParked},
+		{v1alpha1.StageParked, v1alpha1.StageApproved}, // "take over" comment re-drives resume-push
+		{v1alpha1.StageParked, v1alpha1.StageMerging},  // approved review on a stood-down MR re-drives to merge
+	}
+	for _, c := range cases {
+		if !stage.Legal(c.from, c.to) {
+			t.Errorf("edge %s->%s must be legal", c.from, c.to)
+		}
+	}
+	if stage.ReasonOwnershipLost != "ownership-lost" {
+		t.Fatalf("reason const = %q", stage.ReasonOwnershipLost)
+	}
+}
+
+// TestTakeoverKind_NotBarredFromImplementing asserts LegalFor's guard 1
+// (which bars ONLY kind=review from implementing/merging) does not also
+// catch kind=takeover: a takeover Task must reach implementing normally.
+func TestTakeoverKind_NotBarredFromImplementing(t *testing.T) {
+	tk := &v1alpha1.Task{Spec: v1alpha1.TaskSpec{Kind: "takeover"}}
+	if !stage.LegalFor(tk, nil, v1alpha1.StageApproved, v1alpha1.StageImplementing) {
+		t.Fatalf("a kind=takeover Task must be allowed approved->implementing")
 	}
 }
