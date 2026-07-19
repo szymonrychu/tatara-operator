@@ -32,11 +32,34 @@ type Minter struct {
 	APIReader client.Reader // uncached; nil falls back to Client
 	Scheme    *runtime.Scheme
 	Metrics   *obs.OperatorMetrics
+	// SpillerFor resolves the A.7 byte-budget spiller for a Project. Every OTHER
+	// Minter mint method (MintForItem/MintReviewTask/MintIssueTask) takes sp as an
+	// explicit parameter from its caller, which already has one in hand (the
+	// webhook's per-request s.cfg.SpillerFor, or the sweep's per-scan spiller).
+	// EnsureTaskForMRComment is the exception: its signature is fixed by the
+	// general comment->task pipeline contract (the webhook fast path AND the
+	// OP12 sweep backstop call the exact same 5-arg signature), so it resolves
+	// its own spiller here instead. Nil-safe (see spillerFor) for callers built
+	// before this field existed, or in unit tests.
+	SpillerFor func(proj *tatarav1alpha1.Project) objbudget.Spiller
 }
 
 // minter builds the ONE shared intake funnel from the reconciler's own fields.
 func (r *ProjectReconciler) minter() *Minter {
 	return &Minter{Client: r.Client, APIReader: r.APIReader, Scheme: r.Scheme, Metrics: r.Metrics}
+}
+
+// spillerFor resolves the per-project spiller EnsureTaskForMRComment mints
+// with. A nil SpillerFor yields a nil Spiller: safe for a genuinely fresh
+// mint (the synced MR snapshot carries no comments to evict yet), and matches
+// the nil-safe SpillerFor idiom the other reconcilers already use for unit
+// tests. Production wiring (the webhook's s.minter()) always sets a real,
+// never-nil resolver.
+func (m *Minter) spillerFor(proj *tatarav1alpha1.Project) objbudget.Spiller {
+	if m.SpillerFor == nil || proj == nil {
+		return nil
+	}
+	return m.SpillerFor(proj)
 }
 
 func (m *Minter) reader() client.Reader {

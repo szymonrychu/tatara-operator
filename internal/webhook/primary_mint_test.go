@@ -185,12 +185,14 @@ func prCommentBodyOn(number int, login string) []byte {
 		`"sender":{"login":"` + login + `"}}`)
 }
 
-// F5-1: a human comment on an ORPHAN PR must NOT mint a review Task. The old code
-// built the ForgeItem with PR.Author = the COMMENTER, fabricating authorship - so
-// a comment on a reaped bot-authored PR minted a review Task ClassifyPR's
-// bot-ignore (keyed on the REAL author) would have refused. PRs are covered by
-// the mr.opened primary mint + the sweep; orphan-comment mint is issue-only now.
-func TestOrphanPRComment_NoMint(t *testing.T) {
+// OP6 closes F5-1's drop: an orphan PR comment now MINTS a review Task via
+// controller.Minter.EnsureTaskForMRComment instead of being dropped outright.
+// F5-1's original bug (ForgeItem.PR.Author set to the COMMENTER, fabricating
+// authorship) is closed at its root - EnsureTaskForMRComment never touches
+// ForgeItem/MintForItem, it classifies straight off the mirror CR (or, absent
+// one, the comment event's own resource fields). Renamed from
+// TestOrphanPRComment_NoMint, whose assertion this task's fix inverts.
+func TestOrphanPRComment_MintsReviewTask(t *testing.T) {
 	const secretVal = "whsec-oc-pr"
 	const repoName = "repo-ocpr"
 	const projName = "ocpr"
@@ -203,8 +205,10 @@ func TestOrphanPRComment_NoMint(t *testing.T) {
 
 	postIssueComment(t, h, projName, secretVal, prCommentBodyOn(88, "alice"))
 
-	require.Empty(t, allTasks(t, c, projName),
-		"an orphan PR comment must not fabricate a PR author and mint a review Task (F5-1)")
+	tasks := allTasks(t, c, projName)
+	require.Len(t, tasks, 1, "an orphan PR comment must mint a review task (F5-1 drop closed)")
+	require.Equal(t, "review", tasks[0].Spec.Kind)
+	require.Len(t, tasks[0].Status.PendingEvents, 1, "the mr_comment must be delivered to the freshly minted task")
 }
 
 // A comment lands on an issue whose mirror CR already exists but carries no
