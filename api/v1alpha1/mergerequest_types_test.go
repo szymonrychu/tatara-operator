@@ -104,6 +104,33 @@ func TestMergeRequest_JSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMergeRequestStatus_OwnershipFields(t *testing.T) {
+	now := metav1.Now()
+	in := MergeRequestStatus{
+		Ownership:             OwnershipTatara,
+		LastBotHeadSHA:        "abc123",
+		OwnershipChangedAt:    &now,
+		OwnershipReason:       "takeover-requested-by:alice",
+		LastMirroredCommentID: "42",
+	}
+	out := in.DeepCopy()
+	if out.Ownership != OwnershipTatara || out.LastBotHeadSHA != "abc123" ||
+		out.OwnershipReason != "takeover-requested-by:alice" || out.LastMirroredCommentID != "42" {
+		t.Fatalf("deepcopy dropped ownership scalars: %+v", out)
+	}
+	if out.OwnershipChangedAt == nil || !out.OwnershipChangedAt.Equal(&now) {
+		t.Fatalf("deepcopy did not clone OwnershipChangedAt")
+	}
+	// Mutating the copy's time pointer must not touch the original (deep, not shallow).
+	out.OwnershipChangedAt = nil
+	if in.OwnershipChangedAt == nil {
+		t.Fatalf("deepcopy shared the time pointer")
+	}
+	if OwnershipTatara == OwnershipExternal {
+		t.Fatalf("ownership constants must differ")
+	}
+}
+
 func TestMergeRequestStatus_PendingReviewNilMeansNoReviewOwed(t *testing.T) {
 	st := MergeRequestStatus{}
 	data, err := json.Marshal(st)

@@ -30,6 +30,9 @@ spec:
     - jsonPath: .status.status
       name: Status
       type: string
+    - jsonPath: .status.ownership
+      name: Own
+      type: string
     - jsonPath: .status.ciStatus
       name: CI
       type: string
@@ -240,6 +243,19 @@ spec:
                   HeadSHA is the MIRROR's last-synced head. It is NEVER trusted for a merge
                   or an approval decision: both re-fetch the head LIVE (fix 10).
                 type: string
+              lastBotHeadSHA:
+                description: |-
+                  LastBotHeadSHA is the head SHA after the last tatara-agent push. Recorded
+                  LIVE at implement-outcome accept (never trusted from the agent) and by a
+                  verified bot-push webhook. Head drift away from it on a tatara-owned MR is
+                  the external-push signal.
+                type: string
+              lastMirroredCommentID:
+                description: |-
+                  LastMirroredCommentID is the sweep's redelivery cursor: the ExternalID of
+                  the newest MR comment already mirrored and delivered as a TaskEvent. The
+                  sweep redelivers only comments newer than it.
+                type: string
               lastSyncedAt:
                 format: date-time
                 type: string
@@ -247,6 +263,25 @@ spec:
                 type: boolean
               mergedAt:
                 format: date-time
+                type: string
+              ownership:
+                description: |-
+                  Ownership is who drives this MR: "tatara" (the platform may push, review,
+                  and merge it) or "external" (review rounds only, awaiting-human, no agent
+                  push, no operator merge). OPERATOR-OWNED, derived by ReconcileOwnership from
+                  the last bot-pushed head SHA and gated takeover comments. The merge gate
+                  reads it. Empty until the first reconcile classifies the MR.
+                enum:
+                - tatara
+                - external
+                type: string
+              ownershipChangedAt:
+                format: date-time
+                type: string
+              ownershipReason:
+                description: |-
+                  OwnershipReason is the audit trail for the last flip: "initial",
+                  "takeover-requested-by:<user>", or "external-push:<sha>".
                 type: string
               pendingComments:
                 description: |-
