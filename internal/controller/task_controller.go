@@ -211,9 +211,18 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	// A Task the MR-binding watchdog parked awaiting-human with an interrupted
+	// mint's empty refs is repairable-and-unparkable (2026-07-19 deadlock), and
+	// it MUST be inspected before the terminal early-return below hands every
+	// parked Task to the reaper - that early return is exactly what stranded it.
+	if handled, err := r.reconcileParkedBindingRepair(ctx, project, task, now); err != nil || handled {
+		return ctrl.Result{}, err
+	}
+
 	// The REAPER owns a terminal Task (B.6). This reconciler never deletes one and
 	// never resurrects one: a parked Task's ONLY exits are the narrow F.6 re-entry
-	// rules, which stage.Unpark applies from the webhook and the sweep.
+	// rules, which stage.Unpark applies from the webhook and the sweep - plus the
+	// parked binding repair above, the one narrow self-heal that may run first.
 	if tatarav1alpha1.StageTerminal(task) {
 		return ctrl.Result{}, nil
 	}

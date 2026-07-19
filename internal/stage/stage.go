@@ -1079,6 +1079,30 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 	}
 }
 
+// UnparkTargetForBindingRepair derives the re-entry target for EXACTLY ONE
+// park flavor: the MR-binding watchdog's parked(awaiting-human), taken when an
+// interrupted mint left a Source-bearing Task with zero owned refs (the caller
+// verifies that empty-refs half of the predicate BEFORE running the bind
+// repair, since a successful repair un-empties them). This is the one
+// documented exception to "the un-park target is never derived from
+// status.parkedFromStage": every normal F.6 rule re-derives its target from
+// owned Issue/MR state, but for this park that state IS the stub that was just
+// repaired - there is nothing else to derive from, and parkedFromStage names
+// the exact stage the mint interruption yanked the Task out of. The edge
+// itself still goes through the F.3 table: a parkedFromStage with no legal
+// parked-> edge refuses (ok=false, Task untouched), and the caller's
+// Enter/EnterStage application re-validates with the kind guard.
+func UnparkTargetForBindingRepair(t *v1alpha1.Task) (target string, ok bool) {
+	if t.Status.Stage != v1alpha1.StageParked || t.Status.StageReason != ReasonAwaitingHuman {
+		return "", false
+	}
+	from := t.Status.ParkedFromStage
+	if from == "" || !Legal(v1alpha1.StageParked, from) {
+		return "", false
+	}
+	return from, true
+}
+
 // hasNonBotEvent reports whether a HUMAN commented. The E.3 enqueue filter
 // already drops bot events, but the operator's own park comment must never be
 // able to un-park the Task it parked, so the check is repeated here where the

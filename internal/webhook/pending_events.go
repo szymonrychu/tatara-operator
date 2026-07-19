@@ -84,15 +84,8 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		return
 	}
 
-	ownerName, ok := own.ControllerOwner(obj)
-	if !ok {
-		return // no owning Task yet; the sweep (B.4) adopts this artifact later.
-	}
-	task := &tatarav1.Task{}
-	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, ownerName), task); err != nil {
-		if !apierrors.IsNotFound(err) {
-			s.log.ErrorContext(ctx, "pendingEvents: get owning task failed", "error", err, "task", ownerName)
-		}
+	task := s.resolveOwningTask(ctx, &proj, repo, obj, ev)
+	if task == nil {
 		return
 	}
 
@@ -118,6 +111,73 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		(task.Status.StageReason == stage.ReasonAwaitingHuman || task.Status.StageReason == stage.ReasonBacklogSweep) {
 		s.driveCommentUnpark(ctx, &proj, task)
 	}
+}
+
+// resolveOwningTask maps a mirror CR onto the Task the pending event belongs
+// to. The normal path is the mirror's controller ownerRef. The fallback is the
+// 2026-07-19 deadlock fix (task mt-r-tatara-operator-388-...): a mint
+// interrupted between the Task create and the bind leaves the mirror CR an
+// UNOWNED stub, and the old silent early return here dropped the very human
+// comment the watchdog's park notice asked for - the parked Task stayed parked
+// forever. When the mirror has no controller owner, resolve the Task by the
+// SAME deterministic natural key intake mints under (IntakeTaskName with the
+// sweep kind for this artifact type) - the identity that produced this exact
+// stub. Only a LIVE Task is returned: parked counts as live (delivering the
+// event is precisely what can unpark it); failed/rejected/delivered do not
+// (they have no F.6 re-entry). A miss keeps the early return, but at INFO
+// instead of silently.
+func (s *Server) resolveOwningTask(ctx context.Context, proj *tatarav1.Project,
+	repo *tatarav1.Repository, obj client.Object, ev scm.WebhookEvent) *tatarav1.Task {
+
+	if ownerName, ok := own.ControllerOwner(obj); ok {
+		task := &tatarav1.Task{}
+		if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, ownerName), task); err != nil {
+			if !apierrors.IsNotFound(err) {
+				s.log.ErrorContext(ctx, "pendingEvents: get owning task failed", "error", err, "task", ownerName)
+			}
+			return nil
+		}
+		return task
+	}
+
+	intakeKind := controller.SweepIssueKind
+	if ev.IsPR {
+		intakeKind = controller.SweepReviewKind
+	}
+	name := tatarav1.IntakeTaskName(proj.Name, intakeKind, repo.Name, ev.Number)
+	task := &tatarav1.Task{}
+	if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, name), task); err != nil {
+		if apierrors.IsNotFound(err) {
+			s.log.InfoContext(ctx, "pendingEvents: mirror has no controller owner and no intake task matches; dropping event",
+				"action", "pending_event_owner_fallback_miss", "mirror", obj.GetName(), "task", name,
+				"repo", repo.Name, "number", ev.Number)
+		} else {
+			s.log.ErrorContext(ctx, "pendingEvents: get fallback intake task failed", "error", err, "task", name)
+		}
+		return nil
+	}
+	if task.DeletionTimestamp != nil || task.Status.Stage == tatarav1.StageFailed ||
+		task.Status.Stage == tatarav1.StageRejected || task.Status.Stage == tatarav1.StageDelivered {
+		s.log.InfoContext(ctx, "pendingEvents: mirror has no controller owner and its intake task is not live; dropping event",
+			"action", "pending_event_owner_fallback_miss", "mirror", obj.GetName(), "task", name,
+			"stage", task.Status.Stage)
+		return nil
+	}
+	// The natural key encodes (project, kind, repo, number), but the Task under
+	// that name is only trusted if its OWN source identity agrees with the
+	// event: a Task minted by something other than intake (or with a stale
+	// source) must not receive deliveries it never asked for. Source carries no
+	// repo field (IssueRef is a URL), so number is the comparable part.
+	if task.Spec.Source == nil || task.Spec.Source.Number != ev.Number {
+		s.log.InfoContext(ctx, "pendingEvents: mirror has no controller owner and its natural-key task does not match the event source; dropping event",
+			"action", "pending_event_owner_fallback_miss", "mirror", obj.GetName(), "task", name,
+			"repo", repo.Name, "number", ev.Number)
+		return nil
+	}
+	s.log.InfoContext(ctx, "pendingEvents: mirror has no controller owner; routed to its intake task by natural key",
+		"action", "pending_event_owner_fallback", "mirror", obj.GetName(), "task", name,
+		"repo", repo.Name, "number", ev.Number, "stage", task.Status.Stage)
+	return task
 }
 
 // driveCommentUnpark is the F.6 comment-driven re-entry for parked(awaiting-human)
