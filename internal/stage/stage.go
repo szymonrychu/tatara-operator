@@ -326,7 +326,7 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "submit_outcome(approve|request_changes) on a kind=review Task. The review IS posted. A human's PR is fixed and merged by the human (fixes V7-1, C3-2)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewLoopExhausted, Trigger: "request_changes at maxReviewRounds, on a non-review Task"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewPostRefused, Trigger: "a structural 4xx from PostReview (fix C1)"},
-		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m), and the detector's own retried advance did not either. ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced. Recoverable: a human comment re-enters reviewing (F.6)"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m), and the reconciler's level-triggered re-drive could not either. ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced. Recoverable: a human comment re-enters reviewing (F.6)"},
 		issueClosedEdge(),
 	),
 
@@ -1041,9 +1041,9 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// The outcome COMMITTED but the C.5.3 phase-2 drain lost the advance
 		// (PR 389: a stale informer cache defeated advanceAfterReview). The
 		// work already landed on the forge, so this park is recoverable: a
-		// human comment re-enters reviewing, where the handoff detector's
-		// retried advance - or, failing that, a fresh review round - completes
-		// it. Stage-scoped, not kind-scoped: any kind whose review outcome
+		// human comment re-enters reviewing, where the reconciler's
+		// level-triggered re-drive - or, failing that, a fresh review round -
+		// completes it. Stage-scoped, not kind-scoped: any kind whose review outcome
 		// committed can stall this way. Bounded by humanReviewRounds exactly
 		// like the kind=review awaiting-human rule, and for the same reason:
 		// each re-entry may spawn a review pod, and a comment storm must not

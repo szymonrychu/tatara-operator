@@ -157,3 +157,14 @@ func (r *TaskReconciler) spiller(proj *tatarav1alpha1.Project) objbudget.Spiller
 	}
 	return r.SpillerFor(proj)
 }
+
+// mrReader is the UNCACHED API reader when wired, else the cached client. The
+// review-handoff re-drive reads owned MergeRequests through it so it never
+// advances a Task off a cache that lags a fresh /outcome's pendingReview write.
+// Nil APIReader (unit tests) falls back to the cached client.
+func (r *TaskReconciler) mrReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}

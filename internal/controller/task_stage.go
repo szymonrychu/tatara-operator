@@ -114,30 +114,36 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	// it, and a suppressed Task holds its admitted concurrency ticket for the whole
 	// window. This is the bound.
 	if cond := handoffCondition(task); cond != nil {
+		// The owned-MR read is LIVE (uncached APIReader), not the informer cache.
+		// /outcome persists the MR pendingReview BEFORE it stamps the Task's
+		// OutcomeAccepted condition that arms handoffCondition, so once we are here
+		// a live read is guaranteed to observe a still-owed pendingReview; a CACHED
+		// read could lag the MR watch and show a pre-/outcome nil, which would
+		// advance the Task before its review was ever posted.
+		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
+		if mrErr != nil {
+			return ctrl.Result{}, true, mrErr
+		}
+		// RE-DRIVE the deferred reviewing->advance BEFORE enforcing the deadline.
+		// The advance in DrainPendingReview is EDGE-triggered - a one-shot at the
+		// tail of the drain - and every later MergeRequest reconcile short-circuits
+		// at the already-nil pendingReview and never re-attempts it. If that one
+		// shot missed (a stale cached owned-MR read, a transient controller-owner
+		// sever, or a multi-MR ordering race), nothing else re-evaluates the advance
+		// and the Task would sit out the whole HandoffDeadline and park
+		// handoff-stalled even though its review already landed. This is the
+		// level-triggered backstop: on every reviewing reconcile, if every owned MR
+		// has drained its pendingReview, take the F.3 edge NOW. Idempotent -
+		// EnterStage refuses a redundant X->X - so a race with the MR reconciler's
+		// own advance costs at most one illegal-edge counter, never a double
+		// transition.
+		if edge, ready := reviewAdvanceEdge(task, mrs, maxReviewRounds(proj)); ready {
+			l.Info("review handoff re-driven: the deferred advance had not fired; advancing off reviewing",
+				"action", "handoff_redriven", "resource_id", task.Name, "stage", task.Status.Stage,
+				"to", edge.To, "reason", edge.Reason, "kind", task.Spec.Kind)
+			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
+		}
 		if elapsed := now.Sub(cond.LastTransitionTime.Time); elapsed > tatarav1alpha1.HandoffDeadline {
-			// PR 389 belt-and-braces: before parking, re-run the phase-2 advance
-			// ONCE against FRESH state. The stall's root cause was a stale
-			// informer cache defeating advanceAfterReview inside the drain; the
-			// advance itself is idempotent and cheap, so a lost advance is
-			// completed here instead of stranding a finished Task on a human.
-			// A retry error is logged, not returned: the park below is the
-			// bounded fallback either way, and its own write surfaces a
-			// persistent apiserver failure.
-			advanced, aerr := r.retryStalledHandoff(ctx, proj, task)
-			if aerr != nil {
-				l.Error(aerr, "review handoff retry failed; falling through to the park",
-					"action", "handoff_retry_error", "resource_id", task.Name)
-			}
-			if advanced {
-				l.Info("review handoff completed by the detector's retried advance",
-					"action", "handoff_retry_advanced", "resource_id", task.Name,
-					"outcome_reason", cond.Reason, "elapsed", elapsed.String())
-				return ctrl.Result{}, true, nil
-			}
-			mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
-			if mrErr != nil {
-				return ctrl.Result{}, true, mrErr
-			}
 			l.Info("review handoff stalled: the outcome committed but the drain never advanced the task",
 				"action", "handoff_stalled", "resource_id", task.Name, "stage", task.Status.Stage,
 				"outcome_reason", cond.Reason, "deadline", tatarav1alpha1.HandoffDeadline.String(),
@@ -194,38 +200,6 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		}
 	}
 	return ctrl.Result{}, true, nil
-}
-
-// retryStalledHandoff is the handoff detector's ONE direct attempt to complete
-// a stalled C.5.3 phase-2 advance before parking at handoff-stalled (PR 389).
-// It re-reads the Task LIVE (an advance that already landed but is hidden by
-// cache lag must not be "completed" into a park) and re-runs the drain's OWN
-// advanceAfterReview - no drain logic is duplicated - through a StageDriver
-// carrying the same uncached APIReader (mrReader), so the stale-cache failure
-// that caused the stall cannot defeat the retry too. fresh=nil: the detector
-// holds no just-settled MR. advanced=true means the Task is no longer at
-// reviewing and the caller must not park. The C.5.3 pendingReview gate holds
-// unchanged: a review still owed to the forge leaves advanceAfterReview a no-op
-// and the caller parks as before.
-func (r *TaskReconciler) retryStalledHandoff(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task) (advanced bool, err error) {
-
-	reader := client.Reader(r.Client)
-	if r.APIReader != nil {
-		reader = r.APIReader
-	}
-	fresh := &tatarav1alpha1.Task{}
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(task), fresh); err != nil {
-		return false, fmt.Errorf("handoff retry: get task: %w", err)
-	}
-	if fresh.Status.Stage != tatarav1alpha1.StageReviewing {
-		return true, nil // the advance already landed; the cache just lags it
-	}
-	d := &StageDriver{Client: r.Client, APIReader: r.APIReader, SpillerFor: r.SpillerFor, Metrics: r.Metrics}
-	if _, err := d.advanceAfterReview(ctx, proj, fresh, nil); err != nil {
-		return false, fmt.Errorf("handoff retry: advance: %w", err)
-	}
-	return fresh.Status.Stage != tatarav1alpha1.StageReviewing, nil
 }
 
 // enqueueDeployTimeoutComment enqueues ONE operator comment on each owned OPEN

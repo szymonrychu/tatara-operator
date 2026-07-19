@@ -1008,7 +1008,7 @@ func TestReviewTask_CommittedOutcomePlusLostPodReachesAwaitingHuman(t *testing.T
 	//    clears pendingReview, and advanceAfterReview takes the F.3 edge.
 	f := newFakeForge(t)
 	d := mdNewDriver(t, f, c)
-	if _, err := d.DrainPendingReview(ctx, mdGetMR(t, c, mr.Name)); err != nil {
+	if err := d.DrainPendingReview(ctx, mdGetMR(t, c, mr.Name)); err != nil {
 		t.Fatalf("DrainPendingReview: %v", err)
 	}
 
@@ -1405,90 +1405,93 @@ func TestReconcile_CommittedOutcomeWithNoDrainParksHandoffStalled(t *testing.T) 
 	})
 }
 
-// PR 389 (belt-and-braces half): the handoff-stalled detector must not park a
-// Task whose phase-2 drain COMPLETED the forge work but LOST the advance (the
-// root cause was a stale informer cache defeating advanceAfterReview). Before
-// parking, the detector re-runs the same advance against fresh state; it parks
-// only when that attempt still leaves the Task un-advanced.
-func TestReconcile_HandoffStalledDetectorRetriesAdvanceBeforeParking(t *testing.T) {
+// #379: the reviewing->advance in DrainPendingReview is EDGE-triggered - a
+// one-shot at the tail of the drain - and once pendingReview is cleared every
+// later MergeRequest reconcile short-circuits and never re-attempts it. If that
+// one shot missed (a stale cached owned-MR read, a transient controller-owner
+// sever, a multi-MR ordering race) the review already landed but the Task sat out
+// the whole HandoffDeadline and parked handoff-stalled instead of advancing. The
+// Task reconciler must LEVEL-trigger the advance: on every reviewing reconcile,
+// if every owned MR has drained its pendingReview, take the F.3 edge NOW.
+func TestReconcile_ReviewHandoffReDrivesTheDroppedAdvance(t *testing.T) {
 	base := time.Unix(1000, 0)
 	committed := tatarav1alpha1.OutcomeReasonFor(stage.AgentReview)
-	past := base.Add(tatarav1alpha1.HandoffDeadline + time.Second)
 
-	t.Run("a lost advance completes to merging instead of parking", func(t *testing.T) {
+	// A DRAINED owned MR (pendingReview == nil) whose advance was dropped must be
+	// re-driven INSIDE the deadline - not left to wait it out and park. A
+	// kind=review Task advances to parked/awaiting-human (fixing/merging a human's
+	// PR is a human action).
+	t.Run("a drained MR advances inside the deadline instead of waiting", func(t *testing.T) {
 		task := tsReviewTaskWithOutcome(committed, 0, base)
-		task.Spec.Kind = stage.AgentImplement
-		// The drain settled the MR (pendingReview nil, verdict approved) but the
-		// reviewing -> merging advance was lost.
-		mr := mdMR(task, "tatara-cli", 87)
-		mr.Status.Status = "approved"
+		mr := mdMR(task, "tatara-operator", 364)
+		mr.Status.Status = "approved" // the drain settled it
 		proj := tsProject(3)
 		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, mr))
 
-		got := tsReconcile(t, r, proj, task, past)
-
-		if got.Status.Stage != tatarav1alpha1.StageMerging {
-			t.Fatalf("stage = %q(%s), want merging: the detector must complete the lost advance, not park it",
-				got.Status.Stage, got.Status.StageReason)
-		}
-	})
-
-	t.Run("a kind=review task completes to parked(awaiting-human)", func(t *testing.T) {
-		// The PR 389 incident shape: review approved on a human PR, drain settled
-		// the MR, advance lost. The correct terminal is the drain's own
-		// parked(awaiting-human) - comment-recoverable - not handoff-stalled.
-		task := tsReviewTaskWithOutcome(committed, 0, base)
-		mr := mdMR(task, "tatara-cli", 87)
-		mr.Status.Status = "approved"
-		proj := tsProject(3)
-		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, mr))
-
-		got := tsReconcile(t, r, proj, task, past)
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline-time.Second))
 
 		if got.Status.Stage != tatarav1alpha1.StageParked ||
 			got.Status.StageReason != stage.ReasonAwaitingHuman {
-			t.Fatalf("stage=%q reason=%q, want parked(awaiting-human): the drain's own advance edge",
+			t.Fatalf("stage=%q reason=%q, want parked/awaiting-human: the dropped advance must be re-driven, not waited out",
 				got.Status.Stage, got.Status.StageReason)
 		}
 	})
 
-	t.Run("a drain still owed to the forge parks handoff-stalled as before", func(t *testing.T) {
-		// pendingReview non-nil means the review is still owed to the forge: the
-		// retry must not advance through the closed C.5.3 gate.
+	// The incident case: past the deadline, a drained MR must reach its CORRECT
+	// terminal (awaiting-human), NOT the spurious handoff-stalled park.
+	t.Run("a drained MR reaches awaiting-human past the deadline, not handoff-stalled", func(t *testing.T) {
 		task := tsReviewTaskWithOutcome(committed, 0, base)
-		mr := mdMR(task, "tatara-cli", 87)
-		mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1, SHA: "abc", Body: "## Review: approved"}
+		mr := mdMR(task, "tatara-operator", 366)
+		mr.Status.Status = "approved"
 		proj := tsProject(3)
 		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, mr))
 
-		got := tsReconcile(t, r, proj, task, past)
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline+time.Second))
 
+		if got.Status.StageReason == stage.ReasonHandoffStalled {
+			t.Fatalf("reason = handoff-stalled: a review that already landed must advance, not park stalled")
+		}
 		if got.Status.Stage != tatarav1alpha1.StageParked ||
-			got.Status.StageReason != stage.ReasonHandoffStalled {
-			t.Fatalf("stage=%q reason=%q, want parked(handoff-stalled): the retry must not bypass the pendingReview gate",
+			got.Status.StageReason != stage.ReasonAwaitingHuman {
+			t.Fatalf("stage=%q reason=%q, want parked/awaiting-human",
 				got.Status.Stage, got.Status.StageReason)
 		}
 	})
 
-	t.Run("the retry reads the task LIVE: an already-advanced task is not parked", func(t *testing.T) {
-		// The cache staleness can also hide an advance that ALREADY landed: the
-		// cached view still says reviewing while the apiserver says merging.
-		// Parking off the stale view would rewind a task that is fine.
-		cachedTask := tsReviewTaskWithOutcome(committed, 0, base)
-		cachedTask.Spec.Kind = stage.AgentImplement
-		liveTask := cachedTask.DeepCopy()
-		liveTask.Status.Stage = tatarav1alpha1.StageMerging
+	// The re-drive must NOT advance while the drain is genuinely outstanding: an
+	// owned MR still carrying a pendingReview means the review has NOT been posted
+	// yet, so the Task must stay reviewing (the one signal that distinguishes a
+	// requested-not-posted review from a drained one is pendingReview itself).
+	t.Run("an UNdrained MR does not advance", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		mr := mdMR(task, "tatara-operator", 364)
+		mr.Status.Status = "approved"
+		mr.Status.PendingReview = &tatarav1alpha1.PendingReview{Round: 1, SHA: "deadbeef"}
 		proj := tsProject(3)
-		cached := newMirrorClient(t, proj, mdSecret(), cachedTask)
-		r := tsReconciler(cached)
-		r.APIReader = newMirrorClient(t, proj, mdSecret(), liveTask)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, mr))
 
-		if _, err := r.reconcileStage(context.Background(), proj, cachedTask, past); err != nil {
-			t.Fatalf("reconcileStage: %v", err)
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline-time.Second))
+
+		if got.Status.Stage != tatarav1alpha1.StageReviewing {
+			t.Fatalf("stage=%q reason=%q, want reviewing: an undrained pendingReview must not advance the Task",
+				got.Status.Stage, got.Status.StageReason)
 		}
-		got := mdGetTask(t, cached, cachedTask.Name)
-		if got.Status.Stage == tatarav1alpha1.StageParked {
-			t.Fatalf("stage = %q(%s): a live-advanced task must not be parked off the stale cache",
+	})
+
+	// The implement-review flow: an approved, drained MR on a non-review Task
+	// advances to merging (the operator then merges on green CI).
+	t.Run("an approved drained MR on an implement Task advances to merging", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		task.Spec.Kind = stage.AgentImplement
+		mr := mdMR(task, "tatara-operator", 364)
+		mr.Status.Status = "approved"
+		proj := tsProject(3)
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), task, mr))
+
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline-time.Second))
+
+		if got.Status.Stage != tatarav1alpha1.StageMerging {
+			t.Fatalf("stage=%q reason=%q, want merging: an approved drained MR must advance an implement Task to merging",
 				got.Status.Stage, got.Status.StageReason)
 		}
 	})

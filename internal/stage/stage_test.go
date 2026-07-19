@@ -1788,8 +1788,8 @@ func TestEnterReviewingToParkedHandoffStalled(t *testing.T) {
 
 // handoff-stalled DOES have a comment-driven F.6 re-entry (PR 389): the park
 // means "the outcome committed but the phase-2 drain lost the advance", so a
-// human comment re-enters reviewing, where the detector's retried advance (or a
-// fresh review round) completes the handoff. Without an event it stays parked
+// human comment re-enters reviewing, where the reconciler's level-triggered
+// re-drive (or a fresh review round) completes the handoff. Without an event it stays parked
 // and ages out; the re-entry is bounded by humanReviewRounds like the
 // kind=review awaiting-human rule, so a comment storm cannot spawn unbounded
 // review pods.
