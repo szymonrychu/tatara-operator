@@ -17,10 +17,10 @@ func TestOwnershipFlip_Increments(t *testing.T) {
 
 func TestOwnershipFlip_PreseededZeroBaseline(t *testing.T) {
 	// Both real flip label sets exist at zero from startup so a rate alert has a
-	// series to evaluate on the first flip.
-	for _, lbl := range [][2]string{{"to-tatara", "takeover"}, {"to-external", "external-push"}} {
-		if got := testutil.ToFloat64(OwnershipFlipCounter(lbl[0], lbl[1])); got < 0 {
-			t.Fatalf("missing preseed for %v", lbl)
-		}
+	// series to evaluate on the first flip. CollectAndCount does not lazily
+	// create series (unlike OwnershipFlipCounter), so this genuinely fails if
+	// the init() pre-seed is removed.
+	if got := testutil.CollectAndCount(OwnershipFlipTotal); got != 2 {
+		t.Fatalf("operator_mr_ownership_flip_total has %d series, want 2 (pre-seeded)", got)
 	}
 }

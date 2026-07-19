@@ -6,7 +6,10 @@ import (
 )
 
 // OwnershipFlipTotal counts MR ownership transitions (MR ownership design
-// 2026-07-19), by direction and reason:
+// 2026-07-19), by direction and reason. Not to be confused with
+// own_metrics.go, which covers controller owner-refs (contract B.2); this
+// file is about who last pushed a MergeRequest's head (tatara vs. an
+// external human), an unrelated notion of "ownership". Labels:
 //
 //	direction: to-tatara (external -> tatara, a gated takeover) or
 //	           to-external (tatara -> external, an unattributable human push)
