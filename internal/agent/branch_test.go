@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
@@ -56,6 +58,35 @@ func TestSlugifyTitle(t *testing.T) {
 				t.Fatalf("slugifyTitle(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBranchEnvValues_TakeoverPushesAnnotatedBranch(t *testing.T) {
+	tk := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{tatarav1alpha1.AnnTakeoverHeadBranch: "renovate/foo-1.x"},
+		},
+		Spec: tatarav1alpha1.TaskSpec{Kind: "takeover", Source: &tatarav1alpha1.TaskSource{Number: 12, Title: "bump"}},
+	}
+	task, checkout := branchEnvValues(tk)
+	if task != "renovate/foo-1.x" {
+		t.Fatalf("TASK_BRANCH = %q, want the annotated head branch", task)
+	}
+	if checkout != "" {
+		t.Fatalf("CHECKOUT_BRANCH = %q, want empty (push, not read-only)", checkout)
+	}
+}
+
+func TestBranchEnvValues_ReviewStillReadOnly(t *testing.T) {
+	tk := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{tatarav1alpha1.AnnReviewHeadBranch: "feature/x"},
+		},
+		Spec: tatarav1alpha1.TaskSpec{Kind: "review"},
+	}
+	task, checkout := branchEnvValues(tk)
+	if task != "" || checkout != "feature/x" {
+		t.Fatalf("review must stay read-only: task=%q checkout=%q", task, checkout)
 	}
 }
 
