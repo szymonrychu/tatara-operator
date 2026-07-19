@@ -2156,16 +2156,20 @@ func TestUnparkTargetForBindingRepair(t *testing.T) {
 
 // TestTakeoverEdges_Legal pins the F.3 edges the MR-ownership takeover flow
 // needs: a takeover Task mints straight into approved (the maintainer-gated
-// comment IS the approval), implementing/reviewing park on ownership-lost
-// when an external commit lands on the owned MR, and a parked(ownership-lost)
-// takeover Task has BOTH re-entries - approved (a fresh takeover comment
-// resumes pushing) and merging (an approved review on the stood-down MR
-// completes the human's work).
+// comment IS the approval), approved/implementing/reviewing/merging all park
+// on ownership-lost when an external commit lands on the owned MR (OP11: a
+// takeover Task can controller-own the MR from approved, before ever reaching
+// implementing, and a Task can still be controller-owning mid-merge), and a
+// parked(ownership-lost) takeover Task has BOTH re-entries - approved (a
+// fresh takeover comment resumes pushing) and merging (an approved review on
+// the stood-down MR completes the human's work).
 func TestTakeoverEdges_Legal(t *testing.T) {
 	cases := []struct{ from, to string }{
 		{stage.Create, v1alpha1.StageApproved}, // takeover Task mints into approved
+		{v1alpha1.StageApproved, v1alpha1.StageParked},
 		{v1alpha1.StageImplementing, v1alpha1.StageParked},
 		{v1alpha1.StageReviewing, v1alpha1.StageParked},
+		{v1alpha1.StageMerging, v1alpha1.StageParked},
 		{v1alpha1.StageParked, v1alpha1.StageApproved}, // "take over" comment re-drives resume-push
 		{v1alpha1.StageParked, v1alpha1.StageMerging},  // approved review on a stood-down MR re-drives to merge
 	}

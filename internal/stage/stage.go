@@ -310,6 +310,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageImplementing, Trigger: "a QueuedEvent for the implement pod is ADMITTED"},
 		{To: v1alpha1.StageClarifying, Trigger: "the Task ACQUIRES a new Issue after approval. Approval is not sticky (fix H9)"},
 		{To: v1alpha1.StageParked, Reason: ReasonAdmissionStarved, Trigger: "the 24h admission budget elapses (skipped when the project is PAUSED)"},
+		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while approved: a takeover Task mints straight into approved already controller-owning the MR (MintOrUnparkTakeoverTask), so it can be flipped before ever reaching implementing"},
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
 		issueClosedEdge(),
@@ -349,6 +350,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
 		{To: v1alpha1.StageParked, Reason: ReasonMergeTimeout, Trigger: "the 4h merging budget elapses"},
+		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while merging: the controller-owning Task (takeover or normal) can still be mid-merge when a further unattributable push races it"},
 		issueClosedEdge(),
 	},
 

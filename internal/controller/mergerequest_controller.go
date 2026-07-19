@@ -112,6 +112,23 @@ func (r *MergeRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		if err := r.Driver.DrainPendingReview(ctx, &mr); err != nil {
 			return ctrl.Result{}, err
 		}
+		// The webhook fast path for MR ownership convergence: mr.Status.HeadSHA is
+		// the webhook-stamped mirror head (OP7), so a human push that moves it off
+		// LastBotHeadSHA drives the flip right here, not just on the cron sweep.
+		// newComments is nil - comment redelivery (OP12) is the sweep's own job.
+		if _, err := r.Driver.ReconcileOwnership(ctx, &proj, &repo, &mr, mr.Status.HeadSHA, nil); err != nil {
+			return ctrl.Result{}, err
+		}
+		// DrainOwnershipAnnouncement/DrainStandDownMerge run AFTER DrainPendingReview
+		// so a review Task's approve verdict - which settles status.status/reviewedSHA
+		// - is already visible on mr before DrainStandDownMerge decides whether to
+		// re-drive the parked owner Task into merging.
+		if err := r.Driver.DrainOwnershipAnnouncement(ctx, &proj, &repo, &mr); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Driver.DrainStandDownMerge(ctx, &proj, &repo, &mr); err != nil {
+			return ctrl.Result{}, err
+		}
 		// The H.4 semver:<level> label. It lands the moment the implement outcome
 		// stamps status.significance - not at merge time, and not on some sweep an
 		// hour later: it is what CI cuts the release tag from, and a human looking

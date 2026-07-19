@@ -141,9 +141,15 @@ func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.P
 					}
 				} else {
 					// The F.3 table (OP3) carries no parked(ownership-lost) edge from
-					// this stage (e.g. approved, merging, deploying): entering it
-					// anyway would be a transition nobody reasoned about for THIS
-					// stage's own invariants (merge cursor, admission clocks, ...).
+					// this stage: entering it anyway would be a transition nobody
+					// reasoned about for THIS stage's own invariants (merge cursor,
+					// admission clocks, ...). approved and merging DO carry the edge
+					// (OP11: a takeover Task mints straight into approved already
+					// controller-owning the MR, and a Task can still be mid-merge when
+					// a further push races it) - only a pod-less/mint-adjacent stage
+					// with no reachable controller-owning window (e.g. deploying, where
+					// the owned MR is already merged/closed and ReconcileOwnership's
+					// open-state guard never re-enters this branch) is left without one.
 					// Flip the MR's ownership regardless (already done above) and
 					// leave the Task running; a human sees the stand-down on the MR.
 					log.FromContext(ctx).Error(nil, "flip: owner task has no ownership-lost park edge from its current stage; ownership flipped but the task was left running",
