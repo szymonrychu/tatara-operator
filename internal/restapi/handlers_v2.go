@@ -405,23 +405,24 @@ type issueMirrorDTO struct {
 }
 
 type mrMirrorDTO struct {
-	Repo         string `json:"repo"`
-	Number       int    `json:"number"`
-	Title        string `json:"title"`
-	Body         string `json:"body,omitempty"`
-	Author       string `json:"author,omitempty"`
-	State        string `json:"state,omitempty"`
-	Status       string `json:"status,omitempty"`
-	HeadBranch   string `json:"headBranch,omitempty"`
-	HeadSHA      string `json:"headSHA,omitempty"`
-	CIStatus     string `json:"ciStatus,omitempty"`
-	Mergeable    bool   `json:"mergeable"`
-	Significance string `json:"significance,omitempty"`
-	ReviewedSHA  string `json:"reviewedSHA"`
-	ReviewRounds int    `json:"reviewRounds"`
-	URL          string `json:"url,omitempty"`
-	TaskRef      string `json:"taskRef"`
-	LastSyncedAt string `json:"lastSyncedAt,omitempty"`
+	Repo           string `json:"repo"`
+	Number         int    `json:"number"`
+	Title          string `json:"title"`
+	Body           string `json:"body,omitempty"`
+	Author         string `json:"author,omitempty"`
+	State          string `json:"state,omitempty"`
+	Status         string `json:"status,omitempty"`
+	HeadBranch     string `json:"headBranch,omitempty"`
+	HeadSHA        string `json:"headSHA,omitempty"`
+	LastBotHeadSHA string `json:"lastBotHeadSHA,omitempty"`
+	CIStatus       string `json:"ciStatus,omitempty"`
+	Mergeable      bool   `json:"mergeable"`
+	Significance   string `json:"significance,omitempty"`
+	ReviewedSHA    string `json:"reviewedSHA"`
+	ReviewRounds   int    `json:"reviewRounds"`
+	URL            string `json:"url,omitempty"`
+	TaskRef        string `json:"taskRef"`
+	LastSyncedAt   string `json:"lastSyncedAt,omitempty"`
 }
 
 type commentMirrorDTO struct {
@@ -597,7 +598,8 @@ func (s *Server) scmMRs(w http.ResponseWriter, r *http.Request) {
 			Title: mr.Status.Title, Body: mr.Status.Body, Author: mr.Status.Author,
 			State: mr.Status.State, Status: mr.Status.Status,
 			HeadBranch: mr.Status.HeadBranch, HeadSHA: mr.Status.HeadSHA,
-			CIStatus: mr.Status.CIStatus, Mergeable: mr.Status.Mergeable,
+			LastBotHeadSHA: mr.Status.LastBotHeadSHA,
+			CIStatus:       mr.Status.CIStatus, Mergeable: mr.Status.Mergeable,
 			Significance: mr.Status.Significance, ReviewedSHA: mr.Status.ReviewedSHA,
 			ReviewRounds: mr.Status.ReviewRounds, URL: mr.Spec.URL,
 			TaskRef: controllerTaskRef(mr), LastSyncedAt: rfc3339(mr.Status.LastSyncedAt),

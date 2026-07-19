@@ -130,6 +130,7 @@ type mrView struct {
 	State, Status, CI   string
 	Mergeable           bool
 	HeadBranch, HeadSHA string
+	LastBotHeadSHA      string
 	URL                 string
 	Title, Author, Body string
 	BodyTruncated       bool
@@ -201,7 +202,7 @@ const bundleTmpl = `{{define "bundle"}}{{if .Events}}<events count="{{.Events.Co
   </issue>
 {{- end}}
 {{- range .MRs}}
-  <merge_request repo="{{x .Repo}}" number="{{.Number}}" state="{{x .State}}" status="{{x .Status}}" ci="{{x .CI}}" mergeable="{{.Mergeable}}" head_branch="{{x .HeadBranch}}" head_sha="{{x .HeadSHA}}" url="{{x .URL}}">
+  <merge_request repo="{{x .Repo}}" number="{{.Number}}" state="{{x .State}}" status="{{x .Status}}" ci="{{x .CI}}" mergeable="{{.Mergeable}}" head_branch="{{x .HeadBranch}}" head_sha="{{x .HeadSHA}}"{{if .LastBotHeadSHA}} last_bot_head_sha="{{x .LastBotHeadSHA}}"{{end}} url="{{x .URL}}">
     <title>{{x .Title}}</title>
     <author>{{x .Author}}</author>
     <body{{if .BodyTruncated}} truncated="true"{{end}}>{{x .Body}}</body>
@@ -484,20 +485,21 @@ func buildView(in Input, issues []v1alpha1.Issue, mrs []v1alpha1.MergeRequest, t
 		i := len(issues) + j
 		body, trunc := truncBody(mr.Status.Body, p.bodyLimit)
 		v.MRs = append(v.MRs, mrView{
-			Repo:          mr.Spec.RepositoryRef,
-			Number:        mr.Spec.Number,
-			State:         mr.Status.State,
-			Status:        mr.Status.Status,
-			CI:            mr.Status.CIStatus,
-			Mergeable:     mr.Status.Mergeable,
-			HeadBranch:    mr.Status.HeadBranch,
-			HeadSHA:       mr.Status.HeadSHA,
-			URL:           mr.Spec.URL,
-			Title:         mr.Status.Title,
-			Author:        mr.Status.Author,
-			Body:          body,
-			BodyTruncated: trunc,
-			Comments:      buildComments(threads[i], p.keep[i]),
+			Repo:           mr.Spec.RepositoryRef,
+			Number:         mr.Spec.Number,
+			State:          mr.Status.State,
+			Status:         mr.Status.Status,
+			CI:             mr.Status.CIStatus,
+			Mergeable:      mr.Status.Mergeable,
+			HeadBranch:     mr.Status.HeadBranch,
+			HeadSHA:        mr.Status.HeadSHA,
+			LastBotHeadSHA: mr.Status.LastBotHeadSHA,
+			URL:            mr.Spec.URL,
+			Title:          mr.Status.Title,
+			Author:         mr.Status.Author,
+			Body:           body,
+			BodyTruncated:  trunc,
+			Comments:       buildComments(threads[i], p.keep[i]),
 		})
 	}
 

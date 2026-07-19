@@ -591,6 +591,38 @@ func TestPostNote_UnknownFieldIs400(t *testing.T) {
 
 // --- 9/10/11. the MIRROR reads make ZERO forge requests --------------------
 
+// The implement-profile takeover skill must diff the remote head against the
+// LAST BOT-PUSHED head, never the (possibly stale) mirror HeadSHA, before
+// pushing on a taken-over MR. lastBotHeadSHA is how that field reaches the
+// agent pod.
+func TestScmRead_MRs_CarriesLastBotHeadSHAWhenSet(t *testing.T) {
+	mr := mrV2("tatara-cli", 80, "t1", func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.LastBotHeadSHA = "bot-sha-1"
+	})
+	e := buildV2(t, v2Opts{},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		mr,
+	)
+
+	w := e.do(t, http.MethodGet, "/projects/tatara/scm/mrs?repo=tatara-cli", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Body.String(), `"lastBotHeadSHA":"bot-sha-1"`)
+}
+
+func TestScmRead_MRs_OmitsLastBotHeadSHAWhenEmpty(t *testing.T) {
+	mr := mrV2("tatara-cli", 80, "t1")
+	e := buildV2(t, v2Opts{},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"),
+		mr,
+	)
+
+	w := e.do(t, http.MethodGet, "/projects/tatara/scm/mrs?repo=tatara-cli", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotContains(t, w.Body.String(), "lastBotHeadSHA")
+}
+
 func TestScmRead_Mirror_MakesZeroForgeRequests(t *testing.T) {
 	created := metav1.NewTime(frozenNow.Add(-time.Hour))
 	iss := issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
