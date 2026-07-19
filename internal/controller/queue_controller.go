@@ -909,6 +909,14 @@ func (r *DispatcherReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // fired (a rollout/leader-handoff race can otherwise strand a QueuedEvent in
 // Queued indefinitely). It returns the number of events pushed. A nil
 // BackstopEvents is a no-op returning (0, nil).
+//
+// The push is guarded by ctx: source.Channel's consumer (wired in
+// SetupWithManager) stops reading once the manager's runnable ctx is
+// cancelled (leader loss / shutdown), since producer and consumer share that
+// ctx. Without the select below, a full, now-unconsumed BackstopEvents
+// buffer would block this goroutine on the unconditional channel send until
+// the manager's GracefulShutdownTimeout forcibly tears it down. The select
+// lets ctx cancellation win instead, returning the count already pushed.
 func (r *DispatcherReconciler) EnqueuePending(ctx context.Context) (int, error) {
 	if r.BackstopEvents == nil {
 		return 0, nil
@@ -924,12 +932,17 @@ func (r *DispatcherReconciler) EnqueuePending(ctx context.Context) (int, error) 
 		if err := r.List(ctx, &qel, client.InNamespace(proj.Namespace)); err != nil {
 			return n, err
 		}
-		for j := range qel.Items {
-			q := &qel.Items[j]
-			if q.Spec.ProjectRef != proj.Name || !isQueued(q.Status.State) {
+		qesInProject := filterQEsByProject(qel.Items, proj.Name)
+		for j := range qesInProject {
+			q := &qesInProject[j]
+			if !isQueued(q.Status.State) {
 				continue
 			}
-			r.BackstopEvents <- event.GenericEvent{Object: q}
+			select {
+			case r.BackstopEvents <- event.GenericEvent{Object: q}:
+			case <-ctx.Done():
+				return n, ctx.Err()
+			}
 			n++
 			if r.Metrics != nil {
 				r.Metrics.DispatcherBackstopEnqueued(proj.Name)

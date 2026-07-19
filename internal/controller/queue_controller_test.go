@@ -1275,6 +1275,66 @@ func TestDispatcherEnqueuePending_NoWatchTrigger(t *testing.T) {
 	}
 }
 
+// TestDispatcherEnqueuePending_CtxCancelUnblocksFullChannel guards the review
+// fix for WP9: source.Channel's consumer stops reading once the manager's
+// leader-only runnable ctx is cancelled, and producer + consumer share that
+// ctx. Without a select on ctx.Done() around the BackstopEvents send,
+// EnqueuePending would block on a full, unconsumed channel until the
+// manager's GracefulShutdownTimeout (30s) forcibly tore it down. This test
+// pre-fills a small (buffer 1) BackstopEvents channel so any send blocks,
+// then hands EnqueuePending a ctx that expires shortly after the ctx's own
+// List calls complete, and asserts it returns promptly with ctx.Err() and
+// zero newly-enqueued events instead of hanging.
+func TestDispatcherEnqueuePending_CtxCancelUnblocksFullChannel(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "p-backstop-full-", Namespace: testNS},
+	}
+	mustCreate(t, ctx, proj)
+
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-backstop-full-", Namespace: testNS},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "documentation", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "documentation", GenerateName: "x-"},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+
+	// Buffer of 1, pre-filled and never drained: the first (and only) send
+	// EnqueuePending attempts is guaranteed to block.
+	events := make(chan event.GenericEvent, 1)
+	events <- event.GenericEvent{Object: &tatarav1alpha1.QueuedEvent{}}
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), BackstopEvents: events}
+
+	runCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := r.EnqueuePending(runCtx)
+		done <- result{n: n, err: err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatal("EnqueuePending returned nil error against a full, unconsumed BackstopEvents channel with an expiring ctx; want ctx.Err()")
+		}
+		if res.n != 0 {
+			t.Fatalf("EnqueuePending enqueued %d events despite the channel being full and unconsumed throughout, want 0", res.n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnqueuePending did not return within 2s of a full, unconsumed BackstopEvents channel and an expired ctx - the send is not ctx-guarded")
+	}
+}
+
 // TestDispatcherEnqueuePending_NilChannelIsNoop asserts a DispatcherReconciler
 // built without BackstopEvents wired (every existing unit test in this file)
 // is unaffected: EnqueuePending must not panic or block.
