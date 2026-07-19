@@ -183,6 +183,18 @@ func hasOwnershipLostParkEdge(from string) bool {
 // kind=review Task for this MR (re-minting it if it was never minted, or was
 // reaped), so an external MR's review rounds and its next "take over" comment
 // route to the review agent.
+//
+// The owner-ref write goes through mutateOwnerRefs, NOT a direct Update on
+// the caller's mr: by the time flipToExternal calls this, it has already
+// written mr's Status via objbudget.FitMergeRequest, which Gets, mutates, and
+// Status().Updates a FRESH server copy - bumping the object's resourceVersion
+// without ever touching the caller's local mr. A direct d.Update(ctx, mr)
+// here would carry that now-stale resourceVersion and 409 DETERMINISTICALLY
+// on the mainline path (a normal bot MR already controller-owned by its
+// review Task): the flip would return an error before obs.OwnershipFlip
+// fires, yet the server's Ownership status is already external, so the next
+// reconcile's `Ownership == tatara` guard is false and hand-back never
+// retries. mutateOwnerRefs re-Gets before mutating, sidestepping this.
 func (d *StageDriver) handBackToReviewTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
 
@@ -197,16 +209,18 @@ func (d *StageDriver) handBackToReviewTask(ctx context.Context, proj *tatarav1al
 		// bypasses it entirely). Re-mint via the shared intake funnel below.
 		return d.reMintReviewOwner(ctx, proj, repo, mr)
 	}
-	prev, _ := own.ControllerOwner(mr)
-	var from *tatarav1alpha1.Task
-	if prev != "" && prev != reviewName {
-		from = &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: prev, Namespace: proj.Namespace}}
-	}
-	own.AddPlainOwner(mr, &review)
-	if err := own.HandOverController(mr, from, &review); err != nil {
+	if err := d.mutateOwnerRefs(ctx, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+		prev, _ := own.ControllerOwner(fresh)
+		var from *tatarav1alpha1.Task
+		if prev != "" && prev != reviewName {
+			from = &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: prev, Namespace: proj.Namespace}}
+		}
+		own.AddPlainOwner(fresh, &review)
+		return own.HandOverController(fresh, from, &review)
+	}); err != nil {
 		return fmt.Errorf("flip: hand back to review task: %w", err)
 	}
-	return d.Update(ctx, mr)
+	return nil
 }
 
 // reMintReviewOwner mints the MR's review Task via the shared intake funnel
@@ -241,12 +255,7 @@ func (d *StageDriver) demoteMRController(ctx context.Context, mr *tatarav1alpha1
 	if _, ok := own.ControllerOwner(mr); !ok {
 		return nil
 	}
-	key := client.ObjectKeyFromObject(mr)
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var fresh tatarav1alpha1.MergeRequest
-		if err := d.Get(ctx, key, &fresh); err != nil {
-			return err
-		}
+	return d.mutateOwnerRefs(ctx, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
 		refs := fresh.GetOwnerReferences()
 		for i := range refs {
 			if refs[i].Controller != nil && *refs[i].Controller {
@@ -255,6 +264,32 @@ func (d *StageDriver) demoteMRController(ctx context.Context, mr *tatarav1alpha1
 			}
 		}
 		fresh.SetOwnerReferences(refs)
+		return nil
+	})
+}
+
+// mutateOwnerRefs re-Gets mr FRESH from the server, applies mutate to that
+// fresh copy's owner refs, and writes it back under RetryOnConflict - so an
+// owner-ref handover always lands on a CURRENT resourceVersion, never a
+// caller's possibly-stale local copy. It is the shared primitive behind
+// demoteMRController and handBackToReviewTask's existing-review-Task branch:
+// both mutate owner refs on an mr whose Status a sibling call (flipToExternal's
+// objbudget.FitMergeRequest) may have JUST written server-side, which bumps
+// resourceVersion without the caller's local copy knowing - a direct
+// d.Update(ctx, mr) in that situation 409s deterministically. On success, *mr
+// is overwritten with the server's fresh post-write copy.
+func (d *StageDriver) mutateOwnerRefs(ctx context.Context, mr *tatarav1alpha1.MergeRequest,
+	mutate func(fresh *tatarav1alpha1.MergeRequest) error) error {
+
+	key := client.ObjectKeyFromObject(mr)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.MergeRequest
+		if err := d.Get(ctx, key, &fresh); err != nil {
+			return err
+		}
+		if err := mutate(&fresh); err != nil {
+			return err
+		}
 		if err := d.Update(ctx, &fresh); err != nil {
 			return err
 		}

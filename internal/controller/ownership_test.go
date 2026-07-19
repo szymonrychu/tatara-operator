@@ -144,6 +144,69 @@ func TestFlipToExternal_OldOwnerSurvivesAsPlainRef(t *testing.T) {
 	}
 }
 
+// TestReconcileOwnership_FlipsMainlineWithExistingReviewTask exercises the
+// MAINLINE flip path a reviewer flagged as missing coverage for: a normal bot
+// MR controller-owned by a NON-review owner Task, where a review-kind Task
+// ALREADY exists for the same MR (handBackToReviewTask's EXISTS branch, never
+// reMintReviewOwner - every other flip test above only seeds an MR with no
+// pre-existing review Task, so only the re-mint branch got exercised).
+//
+// Before the fix, that EXISTS branch mutated owner refs directly on the
+// caller's local mr and called d.Update(ctx, mr) with no fresh Get and no
+// RetryOnConflict. By the time handBackToReviewTask runs, flipToExternal has
+// already written mr's Status via objbudget.FitMergeRequest - which Gets,
+// mutates, and Status().Updates a FRESH server copy, bumping resourceVersion
+// without the caller's local mr ever finding out. The direct Update then
+// carried mr's now-stale resourceVersion and 409ed deterministically: the
+// flip returned an error BEFORE obs.OwnershipFlip fired, yet the server's
+// Ownership status was already external, so the next reconcile's
+// `Ownership == tatara` guard was false and hand-back never got retried.
+func TestReconcileOwnership_FlipsMainlineWithExistingReviewTask(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr, reviewName := seedTataraOwnedMRWithOwnerAndReviewTask(t, ctx, proj, repo, 8, "tatara/feat-8", "bot-head")
+	implName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepIssueKind, repo.Name, 8)
+	before := testutil.ToFloat64(obs.OwnershipFlipCounter("to-external", "external-push"))
+
+	flipped, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil)
+	if err != nil || !flipped {
+		t.Fatalf("expected flip, got flipped=%v err=%v", flipped, err)
+	}
+	got := getMR(t, ctx, proj, repo, 8)
+	if got.Status.Ownership != tatarav1alpha1.OwnershipExternal {
+		t.Fatalf("ownership = %q, want external", got.Status.Ownership)
+	}
+	if after := testutil.ToFloat64(obs.OwnershipFlipCounter("to-external", "external-push")); after-before != 1 {
+		t.Fatalf("flip counter not incremented")
+	}
+
+	var implTask tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: implName}, &implTask); err != nil {
+		t.Fatalf("get owner task %s: %v", implName, err)
+	}
+	if implTask.Status.Stage != tatarav1alpha1.StageParked || implTask.Status.StageReason != stage.ReasonOwnershipLost {
+		t.Fatalf("owner task not parked ownership-lost: %q/%q", implTask.Status.Stage, implTask.Status.StageReason)
+	}
+
+	if ctrl, ok := ownerControllerName(got); !ok || ctrl != reviewName {
+		t.Fatalf("controller must move to the pre-existing review task %q; got ctrl=%q ok=%v", reviewName, ctrl, ok)
+	}
+
+	found, stillController := false, true
+	for _, r := range got.GetOwnerReferences() {
+		if r.Name == implName {
+			found = true
+			stillController = r.Controller != nil && *r.Controller
+		}
+	}
+	if !found {
+		t.Fatalf("old owner %s must survive hand-back as a plain ref", implName)
+	}
+	if stillController {
+		t.Fatalf("old owner %s must be demoted to controller=false after hand-back", implName)
+	}
+}
+
 func TestReconcileOwnership_TerminalMRFrozen(t *testing.T) {
 	ctx := context.Background()
 	d, proj, repo := newOwnershipDriver(t, ctx)
@@ -294,6 +357,37 @@ func seedTataraOwnedMRWithOwnerTask(t *testing.T, ctx context.Context, proj *tat
 		t.Fatalf("update mergerequest %s status: %v", mr.Name, err)
 	}
 	return mr
+}
+
+// seedTataraOwnedMRWithOwnerAndReviewTask is
+// seedTataraOwnedMRWithNormalTask's mainline-flip counterpart: the normal
+// (kind=clarify) owner Task controller-owns the MR as usual, AND a
+// review-kind Task already exists for the same MR (the shape left behind by
+// an earlier human comment via EnsureTaskForMRComment, say), so
+// handBackToReviewTask's EXISTS branch runs on flip instead of
+// reMintReviewOwner. Returns the MR and the review Task's deterministic
+// name.
+func seedTataraOwnedMRWithOwnerAndReviewTask(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, headBranch, lastBotHeadSHA string) (*tatarav1alpha1.MergeRequest, string) {
+	t.Helper()
+
+	implName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepIssueKind, repo.Name, number)
+	mr := seedTataraOwnedMRWithOwnerTask(t, ctx, proj, repo, number, headBranch, lastBotHeadSHA, SweepIssueKind, implName)
+
+	reviewName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepReviewKind, repo.Name, number)
+	review := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: reviewName, Namespace: proj.Namespace},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef:    proj.Name,
+			RepositoryRef: repo.Name,
+			Kind:          SweepReviewKind,
+			Goal:          "review the MR",
+		},
+	}
+	if err := k8sClient.Create(ctx, review); err != nil {
+		t.Fatalf("create review task: %v", err)
+	}
+	return mr, reviewName
 }
 
 // ownerTaskOf fetches the takeover Task BOUND to mr by its deterministic
