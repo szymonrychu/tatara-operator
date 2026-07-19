@@ -650,11 +650,18 @@ func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alph
 	return nil
 }
 
-// scmFindings maps the CR's findings onto the SCM shape.
+// scmFindings maps the CR's findings onto the SCM shape. Line is nil for a
+// file-level finding (#398); scm.ReviewFinding.Line stays a plain int here,
+// so nil lowers to 0 as a placeholder - WP4 teaches the forge posting path to
+// treat 0 as "no line, do not anchor inline" instead of a real diff line.
 func scmFindings(in []tatarav1alpha1.ReviewFinding) []scm.ReviewFinding {
 	out := make([]scm.ReviewFinding, 0, len(in))
 	for _, f := range in {
-		out = append(out, scm.ReviewFinding{Path: f.Path, Line: f.Line, Body: f.Body, Severity: f.Severity})
+		line := 0
+		if f.Line != nil {
+			line = *f.Line
+		}
+		out = append(out, scm.ReviewFinding{Path: f.Path, Line: line, Body: f.Body, Severity: f.Severity})
 	}
 	return out
 }

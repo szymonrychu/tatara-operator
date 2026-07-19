@@ -46,6 +46,8 @@ func (w *crashStatusWriter) Update(ctx context.Context, obj client.Object, opts 
 	return w.SubResourceWriter.Update(ctx, obj, opts...)
 }
 
+func reviewFindingLinePtr(v int) *int { return &v }
+
 func pendingReviewFixture(verdict string, round int, sha string) *tatarav1alpha1.PendingReview {
 	body := "## Review: changes requested"
 	if verdict == "approve" {
@@ -56,8 +58,8 @@ func pendingReviewFixture(verdict string, round int, sha string) *tatarav1alpha1
 		SHA:   sha,
 		Round: round,
 		Findings: []tatarav1alpha1.ReviewFinding{
-			{Path: "internal/controller/merge.go", Line: 42, Body: "this merge is not pinned to the reviewed head", Severity: "critical"},
-			{Path: "internal/scm/github.go", Line: 610, Body: "APPROVE 422s on a self-authored PR", Severity: "high"},
+			{Path: "internal/controller/merge.go", Line: reviewFindingLinePtr(42), Body: "this merge is not pinned to the reviewed head", Severity: "critical"},
+			{Path: "internal/scm/github.go", Line: reviewFindingLinePtr(610), Body: "APPROVE 422s on a self-authored PR", Severity: "high"},
 		},
 	}
 }

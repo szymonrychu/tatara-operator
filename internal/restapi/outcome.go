@@ -73,7 +73,7 @@ type reviewFindingPayload struct {
 	Repo     string `json:"repo"`
 	Number   int    `json:"number"`
 	Path     string `json:"path,omitempty"`
-	Line     int    `json:"line,omitempty"`
+	Line     *int   `json:"line,omitempty"`
 	Body     string `json:"body"`
 	Severity string `json:"severity"`
 }

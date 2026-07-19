@@ -46,7 +46,7 @@ func TestMergeRequest_JSONRoundTrip(t *testing.T) {
 			PendingReview: &PendingReview{
 				Body: "review body",
 				Findings: []ReviewFinding{
-					{Path: "main.go", Line: 1, Body: "issue", Severity: "medium"},
+					{Path: "main.go", Line: intPtr(1), Body: "issue", Severity: "medium"},
 				},
 				SHA:   "deadbeef",
 				Round: 1,
