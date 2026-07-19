@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -197,7 +198,35 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.computeProjectCounts(ctx, &project)
 
-	if err := r.Status().Update(ctx, &project); err != nil {
+	// Persist the computed status under optimistic-concurrency retry. A routine
+	// 409 ("the object has been modified") - amplified during operator rollouts
+	// when two replicaset pods reconcile the same Project - otherwise bubbles up
+	// as a "Reconciler error" log line (tatara-operator#387). Every other
+	// status-write site in this package already retries; this was the lone
+	// outlier. Only the fields THIS reconcile computes are re-applied onto the
+	// freshly-read object (WebhookURL, the Ready/Memory conditions, Memory,
+	// Grafana, the counts): fields owned by later/other write paths (LastIssueScan
+	// et al. from stampScan below, ScanMarks, TokenBudget, LastRefine) must not be
+	// reverted to the values read at the top of Reconcile. Mirrors stampScan /
+	// patchQueuedEventStatus.
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tataradevv1alpha1.Project{}
+		if err := r.Get(ctx, req.NamespacedName, fresh); err != nil {
+			return err
+		}
+		fresh.Status.WebhookURL = project.Status.WebhookURL
+		fresh.Status.Conditions = project.Status.Conditions
+		fresh.Status.Memory = project.Status.Memory
+		fresh.Status.Grafana = project.Status.Grafana
+		fresh.Status.RepositoryCount = project.Status.RepositoryCount
+		fresh.Status.OpenIssuesCount = project.Status.OpenIssuesCount
+		fresh.Status.OpenIncidentsCount = project.Status.OpenIncidentsCount
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		project = *fresh
+		return nil
+	}); err != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, fmt.Errorf("update project status: %w", err)
 	}

@@ -552,3 +552,89 @@ func TestReviewPostAutoMergeNeverArmed(t *testing.T) {
 }
 
 var _ = time.Now
+
+// --- the reviewing exit vs the stale informer cache (2026-07-19) -----------
+
+// staleListClient serves MergeRequest Lists with one MR replaced by a frozen
+// snapshot - exactly what the informer cache does in the instant after a
+// status write it has not observed yet - while Get and every write pass
+// through live.
+type staleListClient struct {
+	client.Client
+	stale *tatarav1alpha1.MergeRequest
+}
+
+func (s *staleListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if err := s.Client.List(ctx, list, opts...); err != nil {
+		return err
+	}
+	if ml, ok := list.(*tatarav1alpha1.MergeRequestList); ok {
+		for i := range ml.Items {
+			if ml.Items[i].Namespace == s.stale.Namespace && ml.Items[i].Name == s.stale.Name {
+				ml.Items[i] = *s.stale.DeepCopy()
+			}
+		}
+	}
+	return nil
+}
+
+// PR 389's stall, reproduced: DrainPendingReview cleared pendingReview, then
+// advanceAfterReview re-listed the owned MRs through the CACHED client, saw its
+// OWN pre-write copy with pendingReview still set, and returned nil silently -
+// leaving the primary edge-triggered advance to the reconciler's 30s
+// level-triggered re-drive. The freshly-settled MR must overlay its stale
+// listed copy so the advance lands first try.
+func TestDrainPendingReview_StaleCachedSelfDoesNotBlockAdvance(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 389)
+	pr := pendingReviewFixture("approve", 1, "sha-a")
+	pr.Findings = nil
+	mr.Status.PendingReview = pr
+	base := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, &staleListClient{Client: base, stale: mr.DeepCopy()})
+
+	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mr.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
+		t.Fatalf("stage = %q, want merging: a stale cached copy of the just-settled MR must not veto the advance", got.Status.Stage)
+	}
+}
+
+// The same staleness on ANOTHER owned MR: A's drain settled on the server but
+// not yet in the cache when B drains. The advance decision must list through
+// the uncached APIReader when one is wired, so B's drain is not vetoed by A's
+// ghost pendingReview.
+func TestDrainPendingReview_AdvanceListsOwnedMRsUncached(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageReviewing)
+	task.Spec.MergeOrder = []string{"tatara-operator", "tatara-cli"}
+	mrA := mdMR(task, "tatara-operator", 7)
+	mrA.Status.Status = "approved"
+	mrA.Status.ReviewedSHA = "sha-a" // settled: its own drain already ran
+	mrB := mdMR(task, "tatara-cli", 8)
+	prB := pendingReviewFixture("approve", 1, "sha-b")
+	prB.Findings = nil
+	mrB.Status.PendingReview = prB
+	base := newMirrorClient(t, mdProject(), mdSecret(),
+		mdRepo("tatara-operator"), mdRepo("tatara-cli"), task, mrA, mrB)
+
+	// The stale cache still shows A owing its review.
+	staleA := mrA.DeepCopy()
+	staleA.Status.Status = ""
+	staleA.Status.ReviewedSHA = ""
+	staleA.Status.PendingReview = pendingReviewFixture("approve", 1, "sha-a")
+
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, &staleListClient{Client: base, stale: staleA})
+	d.APIReader = base
+
+	if err := d.DrainPendingReview(context.Background(), mdGetMR(t, base, mrB.Name)); err != nil {
+		t.Fatalf("DrainPendingReview: %v", err)
+	}
+	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
+		t.Fatalf("stage = %q, want merging: the uncached read must see A's settled review", got.Status.Stage)
+	}
+}
