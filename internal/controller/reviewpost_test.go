@@ -439,6 +439,31 @@ func TestReviewPostFindingsReachTheNextPod(t *testing.T) {
 	}
 }
 
+// reviewBeltNote renders each finding's location for the next pod's operator
+// note. After WP2, ReviewFinding.Line is *int: a non-nil line renders "path:line",
+// and a nil line (a file-level finding, #398) renders just the path - NEVER the
+// pointer address a bare %d on a *int would print.
+func TestReviewBeltNote_RendersLineAndFileLevel(t *testing.T) {
+	pr := &tatarav1alpha1.PendingReview{
+		SHA: "sha-a",
+		Findings: []tatarav1alpha1.ReviewFinding{
+			{Path: "internal/scm/github.go", Line: reviewFindingLinePtr(42), Body: "line-anchored", Severity: "high"},
+			{Path: "docs/README.md", Line: nil, Body: "file-level", Severity: "low"},
+		},
+	}
+	note := reviewBeltNote("tatara-operator", 7, pr)
+
+	if !strings.Contains(note, "- internal/scm/github.go:42 [high] line-anchored") {
+		t.Fatalf("non-nil line did not render as path:line:\n%s", note)
+	}
+	if !strings.Contains(note, "- docs/README.md [low] file-level") {
+		t.Fatalf("nil line did not render as a bare path (file-level):\n%s", note)
+	}
+	if strings.Contains(note, "0xc0") || strings.Contains(note, "%!d") {
+		t.Fatalf("a *int was formatted as a pointer/garbage:\n%s", note)
+	}
+}
+
 // --- the pending-comment drain (C.5.3, same shape) ------------------------
 
 // mr_write(comment) / issue_write(comment) post ONCE: the requestId marker is

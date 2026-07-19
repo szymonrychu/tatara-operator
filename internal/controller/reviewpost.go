@@ -246,7 +246,11 @@ func reviewBeltNote(repo string, number int, pr *tatarav1alpha1.PendingReview) s
 	var b strings.Builder
 	fmt.Fprintf(&b, "Review requested changes on %s!%d @ %s:\n", repo, number, pr.SHA)
 	for _, f := range pr.Findings {
-		fmt.Fprintf(&b, "- %s:%d [%s] %s\n", f.Path, f.Line, f.Severity, f.Body)
+		loc := f.Path
+		if f.Line != nil {
+			loc = fmt.Sprintf("%s:%d", f.Path, *f.Line)
+		}
+		fmt.Fprintf(&b, "- %s [%s] %s\n", loc, f.Severity, f.Body)
 	}
 	return b.String()
 }

@@ -12,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 )
 
 func readJSON(t *testing.T, r *http.Request) map[string]any {
@@ -59,6 +62,37 @@ func TestGitHubPostReview_AlwaysCommentEvent_BothVerdicts(t *testing.T) {
 	}
 }
 
+// A file-level finding (no line; the CR->scm bridge lowers a nil *int to 0, #398)
+// must NOT be sent as a line=0 review comment - GitHub 422s that. It posts as a
+// file-level comment (subject_type=file, no line key) instead, so the finding
+// lands and the review does not park.
+func TestGitHubPostReview_FileLevelFindingPostsSubjectTypeFile(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/repos/o/r/pulls/5/reviews", r.URL.Path)
+		in := readJSON(t, r)
+		comments, _ := in["comments"].([]any)
+		require.Len(t, comments, 2)
+		fileLevel := comments[0].(map[string]any)
+		require.Equal(t, "docs/README.md", fileLevel["path"])
+		require.Equal(t, "file", fileLevel["subject_type"])
+		_, hasLine := fileLevel["line"]
+		require.False(t, hasLine, "a file-level comment must carry NO line key: GitHub 422s line=0")
+		lineLevel := comments[1].(map[string]any)
+		require.Equal(t, float64(12), lineLevel["line"])
+		_, hasSubj := lineLevel["subject_type"]
+		require.False(t, hasSubj, "a line-anchored comment carries no subject_type")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":7,"state":"COMMENTED"}`))
+	})
+	findings := []ReviewFinding{
+		{Path: "docs/README.md", Line: 0, Body: "file-level note", Severity: "medium"},
+		{Path: "a.go", Line: 12, Body: "line note", Severity: "high"},
+	}
+	id, err := c.PostReview(context.Background(), "https://github.com/o/r", "tok", 5, "body", findings)
+	require.NoError(t, err)
+	require.Equal(t, "7", id)
+}
+
 // ---------------------------------------------------------------------------
 // 422 / 401 / 403 are TERMINAL, not retryable
 // ---------------------------------------------------------------------------
@@ -76,6 +110,7 @@ func TestGitHubPostReview_StructuralFourXXIsTerminal(t *testing.T) {
 		{"self-approve 422", http.StatusUnprocessableEntity, `{"message":"Can not approve your own pull request."}`},
 		{"401", http.StatusUnauthorized, `{"message":"Bad credentials"}`},
 		{"403", http.StatusForbidden, `{"message":"Resource not accessible by integration"}`},
+		{"gitlab-style 400 line_code", http.StatusBadRequest, `{"message":"line_code can't be blank, ..."}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -347,12 +382,24 @@ func TestGetPRHead(t *testing.T) {
 type glForge struct {
 	mu          sync.Mutex
 	diffRefs    string // raw JSON for the diff_refs object, or "" for none
+	diffs       []glMRDiff
 	discussions []glDiscussion
 	notes       []glReviewNote
 	nextID      int
 	positions   []map[string]any // every position block the forge received
 	failDiscOn  int              // fail the Nth (1-based) discussion POST; 0 = never
 	discPosts   int
+}
+
+// glWideDiffs makes each path fully anchorable: one hunk covering new-side lines
+// 1..10000, so any positive line resolves. Tests that exercise UNanchorable
+// findings supply their own narrow diffs instead.
+func glWideDiffs(paths ...string) []glMRDiff {
+	out := make([]glMRDiff, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, glMRDiff{NewPath: p, OldPath: p, Diff: "@@ -1,10000 +1,10000 @@\n"})
+	}
+	return out
 }
 
 func (f *glForge) handler(t *testing.T) http.HandlerFunc {
@@ -368,6 +415,9 @@ func (f *glForge) handler(t *testing.T) http.HandlerFunc {
 				refs = `null`
 			}
 			_, _ = fmt.Fprintf(w, `{"sha":"stale","diff_refs":%s}`, refs)
+
+		case r.Method == http.MethodGet && p == "/projects/g%2Fp/merge_requests/5/diffs":
+			require.NoError(t, json.NewEncoder(w).Encode(f.diffs))
 
 		case r.Method == http.MethodGet && p == "/projects/g%2Fp/merge_requests/5/discussions":
 			require.NoError(t, json.NewEncoder(w).Encode(f.discussions))
@@ -434,7 +484,7 @@ const glGoodRefs = `{"base_sha":"base1","start_sha":"start1","head_sha":"head1"}
 // had no position handling at all: Suggest() posted plain notes with the path and
 // line baked into the body as markdown text, anchored to nothing.
 func TestGitLabPostReview_PositionCarriesAllThreeSHAs(t *testing.T) {
-	f := &glForge{diffRefs: glGoodRefs}
+	f := &glForge{diffRefs: glGoodRefs, diffs: glWideDiffs("a.go", "b.go")}
 	c := newGitLab(t, f.handler(t))
 
 	body := ReviewMarker("1", "head1") + "\n## Review: changes requested\n\ndetail"
@@ -492,7 +542,11 @@ func TestGitLabPostReview_NoDiffRefsIsHardError(t *testing.T) {
 // goes LAST. A post killed after the 2nd of 5 discussions and re-run must end
 // with EXACTLY 5 discussions and 1 body note.
 func TestGitLabPostReview_KilledAfterSecondOfFive_ResumesToExactlyFiveAndOne(t *testing.T) {
-	f := &glForge{diffRefs: glGoodRefs, failDiscOn: 3} // die on the 3rd discussion
+	f := &glForge{
+		diffRefs:   glGoodRefs,
+		diffs:      glWideDiffs("f0.go", "f1.go", "f2.go", "f3.go", "f4.go"),
+		failDiscOn: 3, // die on the 3rd discussion
+	}
 	c := newGitLab(t, f.handler(t))
 
 	body := ReviewMarker("2", "head1") + "\n## Review: changes requested\n\nfive things"
@@ -550,7 +604,7 @@ func TestGitLabPostReview_KilledAfterSecondOfFive_ResumesToExactlyFiveAndOne(t *
 // marker) exists. This test pins the half that lives in the SCM layer: the
 // findings are never duplicated.
 func TestGitLabPostReview_ReRunDoesNotDuplicateFindings(t *testing.T) {
-	f := &glForge{diffRefs: glGoodRefs}
+	f := &glForge{diffRefs: glGoodRefs, diffs: glWideDiffs("a.go")}
 	c := newGitLab(t, f.handler(t))
 	body := ReviewMarker("1", "head1") + "\nbody"
 	findings := []ReviewFinding{{Path: "a.go", Line: 3, Body: "f0"}}
@@ -561,6 +615,60 @@ func TestGitLabPostReview_ReRunDoesNotDuplicateFindings(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, f.discussions, 1, "the per-finding marker makes a re-run a no-op on the discussions")
+}
+
+// A finding whose line cannot be anchored to any new-side diff hunk - or that
+// carries no line at all (a file-level finding, #398) - must NOT be posted as a
+// discussion (GitLab 400s "line_code can't be blank", #394, and the caller then
+// retries the identical POST forever). It DEGRADES to a plain MR note, the round
+// still completes, and PostReview does NOT abort. One anchorable finding in the
+// same round still lands inline, proving one bad finding does not block the round.
+func TestGitLabPostReview_UnanchorableFindingDegradesToNoteAndRoundCompletes(t *testing.T) {
+	before := testutil.ToFloat64(obs.ReviewFindingDegradedCounter("gitlab", "unanchorable"))
+
+	f := &glForge{
+		diffRefs: glGoodRefs,
+		// a.go has a hunk at lines 5..14; b.go is not in the diff at all.
+		diffs: []glMRDiff{{NewPath: "a.go", OldPath: "a.go", Diff: "@@ -5,10 +5,10 @@\n"}},
+	}
+	c := newGitLab(t, f.handler(t))
+
+	body := ReviewMarker("1", "head1") + "\n## Review: changes requested\n\ndetail"
+	findings := []ReviewFinding{
+		{Path: "a.go", Line: 10, Body: "anchorable", Severity: "high"}, // inside the hunk
+		{Path: "a.go", Line: 999, Body: "line off the hunk", Severity: "low"},
+		{Path: "b.go", Line: 3, Body: "file not in the diff", Severity: "low"},
+		{Path: "c.go", Line: 0, Body: "file-level, no line", Severity: "medium"},
+	}
+	id, err := c.PostReview(context.Background(), "https://gitlab.com/g/p", "tok", 5, body, findings)
+	require.NoError(t, err, "an unanchorable finding must NOT abort the round")
+	require.NotEmpty(t, id)
+
+	// Exactly ONE inline discussion: only the anchorable finding.
+	require.Len(t, f.discussions, 1, "only the anchorable finding is posted inline")
+	require.Equal(t, "a.go", f.positions[0]["new_path"])
+	require.Equal(t, float64(10), f.positions[0]["new_line"])
+
+	// The three unanchorable findings + the body note are all plain notes.
+	require.Len(t, f.notes, 4, "3 degraded findings + 1 body note")
+	require.True(t, containsBodyWith(f.notes, "line off the hunk"))
+	require.True(t, containsBodyWith(f.notes, "file not in the diff"))
+	require.True(t, containsBodyWith(f.notes, "file-level, no line"))
+	// The body note (carrying the ROUND marker) is posted LAST, after the degrades.
+	require.True(t, HasReviewMarker(f.notes[len(f.notes)-1].Body, "1", "head1"))
+
+	// The degrade metric fired once per degraded finding.
+	after := testutil.ToFloat64(obs.ReviewFindingDegradedCounter("gitlab", "unanchorable"))
+	require.Equal(t, float64(3), after-before, "one degrade metric per unanchorable finding")
+}
+
+func containsBodyWith(notes []glReviewNote, want string) bool {
+	for _, n := range notes {
+		if strings.Contains(n.Body, want) {
+			return true
+		}
+	}
+	return false
 }
 
 // UNAPPROVE IS NOT SENT. The bot never approves on GitLab either: the merge is
