@@ -251,6 +251,7 @@ type EnqueueOption func(*enqueueOpts)
 
 type enqueueOpts struct {
 	ignoreOpenIssueDedup bool
+	priority             *int
 }
 
 // WithIgnoreOpenIssueDedup makes EnqueueEvent proceed PAST an open tracker Issue
@@ -260,6 +261,14 @@ type enqueueOpts struct {
 // impossible.
 func WithIgnoreOpenIssueDedup() EnqueueOption {
 	return func(o *enqueueOpts) { o.ignoreOpenIssueDedup = true }
+}
+
+// WithPriority overrides EnqueueEvent's class-derived Spec.Priority default
+// (issue #402). Callers use this when a ticket's stage-agent-kind, not its
+// class, decides urgency - e.g. an incident Task's downstream normal-class
+// tickets must still outrank sweep work.
+func WithPriority(p int) EnqueueOption {
+	return func(o *enqueueOpts) { o.priority = &p }
 }
 
 // EnqueueEvent writes a QueuedEvent (seq-assigned, owned by Project, state=Queued).
@@ -297,6 +306,14 @@ func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *ta
 	} else {
 		om.GenerateName = "qe-"
 	}
+	priority := o.priority
+	if priority == nil {
+		p := 2
+		if class == tatarav1alpha1.QueueClassAlert {
+			p = 0
+		}
+		priority = &p
+	}
 	qe := &tatarav1alpha1.QueuedEvent{
 		ObjectMeta: om,
 		Spec: tatarav1alpha1.QueuedEventSpec{
@@ -308,6 +325,7 @@ func EnqueueEvent(ctx context.Context, c client.Client, seq *SeqSource, proj *ta
 			RepositoryRef: payload.RepositoryRef,
 			DedupKey:      dedupKey,
 			Payload:       payload,
+			Priority:      priority,
 		},
 	}
 	if err := controllerutil.SetControllerReference(proj, qe, c.Scheme()); err != nil {

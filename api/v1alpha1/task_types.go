@@ -543,9 +543,11 @@ type TaskStatus struct {
 	// parked/failed/rejected. Closed set: F.5.
 	// +optional
 	StageReason string `json:"stageReason,omitempty"`
-	// ParkedFromStage is OBSERVABILITY ONLY. The un-park TARGET is NEVER derived
+	// ParkedFromStage is mostly OBSERVABILITY: the un-park TARGET is NEVER derived
 	// from it (fix 2); it is re-derived from Issue.status.status and the owned-MR
-	// state (F.6).
+	// state (F.6). It IS load-bearing for one gate: ReasonNoOutcome unpark
+	// eligibility requires it to be implementing or reviewing (#406), so a park
+	// from a pre-implement stage cannot auto-escalate straight into implementing.
 	// +optional
 	ParkedFromStage string `json:"parkedFromStage,omitempty"`
 	// MergeCursor is the index into Spec.MergeOrder the sequential merge reached.

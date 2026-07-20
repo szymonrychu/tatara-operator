@@ -603,6 +603,59 @@ func TestLoad_IncidentRefireCooldownMalformed(t *testing.T) {
 	}
 }
 
+// TestLoad_IncidentInvestigationCommentCooldownDefault asserts the Fix 7
+// (#400) comment_issue SCM-write cooldown defaults to
+// DefaultIncidentInvestigationCommentCooldown (30m) and is a DISTINCT knob
+// from IncidentRefireCommentCooldown.
+func TestLoad_IncidentInvestigationCommentCooldownDefault(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+
+	c, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.IncidentInvestigationCommentCooldown != config.DefaultIncidentInvestigationCommentCooldown {
+		t.Fatalf("investigation comment cooldown default = %v, want %v",
+			c.IncidentInvestigationCommentCooldown, config.DefaultIncidentInvestigationCommentCooldown)
+	}
+}
+
+// TestLoad_IncidentInvestigationCommentCooldownFromEnv asserts the cooldown
+// parses minutes from INCIDENT_INVESTIGATION_COMMENT_COOLDOWN_MINUTES,
+// independently of INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES.
+func TestLoad_IncidentInvestigationCommentCooldownFromEnv(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("INCIDENT_INVESTIGATION_COMMENT_COOLDOWN_MINUTES", "45")
+
+	c, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.IncidentInvestigationCommentCooldown != 45*time.Minute {
+		t.Fatalf("investigation comment cooldown = %v, want 45m", c.IncidentInvestigationCommentCooldown)
+	}
+	if c.IncidentRefireCommentCooldown != config.DefaultIncidentRefireCooldown {
+		t.Fatalf("refire cooldown must stay at its own default when only the investigation cooldown is overridden: got %v",
+			c.IncidentRefireCommentCooldown)
+	}
+}
+
+// TestLoad_IncidentInvestigationCommentCooldownMalformed asserts a
+// non-integer minutes value fails startup loudly.
+func TestLoad_IncidentInvestigationCommentCooldownMalformed(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("INCIDENT_INVESTIGATION_COMMENT_COOLDOWN_MINUTES", "soon")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected error for non-integer INCIDENT_INVESTIGATION_COMMENT_COOLDOWN_MINUTES, got nil")
+	}
+}
+
 func TestLoad_AgentRunAsNonRootDefaultFalse(t *testing.T) {
 	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
 	t.Setenv("OIDC_AUDIENCE", "tatara-operator")

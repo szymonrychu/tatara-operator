@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 // sweepReader is the fake forge the sweep tests run against. Every method the
@@ -1658,5 +1659,66 @@ func TestSweepOrphanExternalMRCommentConvergesInOnePass(t *testing.T) {
 	}
 	if tk.Status.PendingEvents[0].Kind != "mr_comment" || tk.Status.PendingEvents[0].Author != "octocat" {
 		t.Fatalf("delivered event = %+v, want kind=mr_comment author=octocat", tk.Status.PendingEvents[0])
+	}
+}
+
+// sweepErrorsTotalSeries reports whether operator_sweep_errors_total currently
+// exposes a series for the given (activity, reason) pair, gathered straight
+// from the controller-runtime metrics registry. A *prometheus.CounterVec child
+// only exists in Gather() output once WithLabelValues has been called for that
+// exact label combination somewhere (init-time seeding or a real increment) -
+// calling WithLabelValues ourselves here would lazily create it and defeat the
+// point of the check, so this walks the gathered families instead.
+func sweepErrorsTotalSeries(t *testing.T, activity, reason string) bool {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, fam := range families {
+		if fam.GetName() != "operator_sweep_errors_total" {
+			continue
+		}
+		for _, m := range fam.GetMetric() {
+			var gotActivity, gotReason string
+			for _, lp := range m.GetLabel() {
+				switch lp.GetName() {
+				case "activity":
+					gotActivity = lp.GetValue()
+				case "reason":
+					gotReason = lp.GetValue()
+				}
+			}
+			if gotActivity == activity && gotReason == reason {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestSweepErrorsSeededForBrainstormReasons: the projectscan.go refine-barrier
+// instrumentation (issue #401) adds a closed reason set that must be
+// pre-seeded at startup for brainstorm/documentation/issueScan, same rationale
+// as the sweep/nightlySweep seeding above (obs/sweep_metrics.go init) - a
+// CounterVec with no WithLabelValues call has NO series at all, and the first
+// real evaluation of a TataraSweepErrors-style alert would undercount an
+// error storm that started before any of these reasons had fired once.
+func TestSweepErrorsSeededForBrainstormReasons(t *testing.T) {
+	activities := []string{"brainstorm", "documentation", "issueScan"}
+	reasons := []string{
+		"refine_barrier_held",
+		"refine_check_failed",
+		"refine_inflight_check_failed",
+		"invalid_cron",
+		"stamp_failed",
+		"refine_barrier_timeout",
+	}
+	for _, activity := range activities {
+		for _, reason := range reasons {
+			if !sweepErrorsTotalSeries(t, activity, reason) {
+				t.Errorf("SweepErrorsTotal{activity=%s,reason=%s} has no series; want it pre-seeded at init", activity, reason)
+			}
+		}
 	}
 }

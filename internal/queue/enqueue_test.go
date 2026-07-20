@@ -47,6 +47,56 @@ func TestEnqueueEvent_AssignsSeqAndFields(t *testing.T) {
 	if qe.Labels[LabelDedupKey] != "grp1" || qe.Status.State != tatarav1alpha1.QueueStateQueued {
 		t.Fatalf("bad labels/state: %v %q", qe.Labels, qe.Status.State)
 	}
+	if qe.Spec.Priority == nil {
+		t.Fatal("Spec.Priority must be set on the default path, not left nil")
+	}
+}
+
+// TestEnqueueEvent_AlertClassDefaultsPriorityZero and its Normal-class sibling
+// prove issue #402's fix: EnqueueEvent must explicitly stamp Spec.Priority from
+// class rather than leaving it nil (nil silently defaults to 2 via
+// EffectiveQueuePriority, starving incident downstream stages behind sweep
+// work at admission time).
+func TestEnqueueEvent_AlertClassDefaultsPriorityZero(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
+	seq := &SeqSource{Client: c, Namespace: "tatara"}
+	proj := testProj("p", "tatara")
+	pl := tatarav1alpha1.QueuedEventPayload{Kind: "incident", GenerateName: "incident-"}
+
+	qe, created, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassAlert, false, "grp-alert", pl)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NotNil(t, qe.Spec.Priority)
+	require.Equal(t, 0, *qe.Spec.Priority, "Alert-class enqueue must default Priority=0")
+}
+
+func TestEnqueueEvent_NormalClassDefaultsPriorityTwo(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
+	seq := &SeqSource{Client: c, Namespace: "tatara"}
+	proj := testProj("p", "tatara")
+	pl := tatarav1alpha1.QueuedEventPayload{Kind: "review", GenerateName: "review-"}
+
+	qe, created, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassNormal, false, "grp-normal", pl)
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NotNil(t, qe.Spec.Priority)
+	require.Equal(t, 2, *qe.Spec.Priority, "Normal-class enqueue must default Priority=2")
+}
+
+func TestEnqueueEvent_WithPriorityOverride(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&tatarav1alpha1.QueuedEvent{}).Build()
+	seq := &SeqSource{Client: c, Namespace: "tatara"}
+	proj := testProj("p", "tatara")
+	pl := tatarav1alpha1.QueuedEventPayload{Kind: "review", GenerateName: "review-"}
+
+	qe, created, err := EnqueueEvent(context.Background(), c, seq, proj, tatarav1alpha1.QueueClassNormal, false, "grp-override", pl, WithPriority(0))
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NotNil(t, qe.Spec.Priority)
+	require.Equal(t, 0, *qe.Spec.Priority, "WithPriority(0) must override the Normal-class default of 2")
 }
 
 func TestEnqueueEvent_DedupSkips(t *testing.T) {

@@ -85,6 +85,7 @@ const (
 	ReasonOwnershipLost          = "ownership-lost"
 	ReasonMRMergedExternally     = "mr-merged-externally"
 	ReasonMRClosedExternally     = "mr-closed-externally"
+	ReasonMergeAuthRefused       = "merge-auth-refused"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -125,6 +126,7 @@ var Reasons = []string{
 	ReasonOwnershipLost,
 	ReasonMRMergedExternally,
 	ReasonMRClosedExternally,
+	ReasonMergeAuthRefused,
 }
 
 // issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
@@ -357,6 +359,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
 		{To: v1alpha1.StageParked, Reason: ReasonMergeTimeout, Trigger: "the 4h merging budget elapses"},
 		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while merging: the controller-owning Task (takeover or normal) can still be mid-merge when a further unattributable push races it"},
+		{To: v1alpha1.StageParked, Reason: ReasonMergeAuthRefused, Trigger: "the forge returned 401/403 (invalid/insufficient credential) on Merge (#404); a bad token never fixes itself on retry, so this fails fast instead of hot-requeueing until merge-timeout"},
 		issueClosedEdge(),
 	},
 
@@ -1095,6 +1098,16 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		return target, ok
 
 	case ReasonNoOutcome:
+		// #406: only a park reached FROM implementing or reviewing may re-drive.
+		// A no-outcome park from investigating/brainstorming/clarifying/refining/
+		// documenting means a pre-implement stage never terminated (the real
+		// mechanism: an SCM-comment error left the outcome claim unreleased,
+		// pod-liveness respawned the pod until PodRecreations exhausted) - such a
+		// Task must NOT be auto-escalated straight into implementing.
+		if t.Status.ParkedFromStage != v1alpha1.StageImplementing &&
+			t.Status.ParkedFromStage != v1alpha1.StageReviewing {
+			return "", false
+		}
 		if anyMerged(in.MRs) {
 			// A re-implement would duplicate an already-merged change.
 			return "", false

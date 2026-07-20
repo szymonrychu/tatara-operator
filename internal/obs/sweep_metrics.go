@@ -85,4 +85,19 @@ func init() {
 			"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
 		},
 	)
+	// Second closed (activity x reason) set for the projectscan.go cron
+	// activities (brainstorm/documentation/issueScan), added for the
+	// refine-barrier stall fix (issue #401). Cross-seeded for all three
+	// activities even though refine_barrier_* / refine_*_check_failed only
+	// ever fire for brainstorm (the refine pre-scan barrier is brainstorm-only)
+	// - a permanently-zero series for documentation/issueScan on those reasons
+	// is a harmless baseline, and a single seedLabels call here is simpler than
+	// splitting the cross product per-activity.
+	seedLabels(func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) },
+		[]string{"brainstorm", "documentation", "issueScan"},
+		[]string{
+			"refine_barrier_held", "refine_check_failed", "refine_inflight_check_failed",
+			"invalid_cron", "stamp_failed", "refine_barrier_timeout",
+		},
+	)
 }

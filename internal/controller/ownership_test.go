@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -110,9 +111,9 @@ func TestReconcileOwnership_FlipsNormalImplementOwner(t *testing.T) {
 	}
 }
 
-// TestFlipToExternal_OldOwnerSurvivesAsPlainRef covers demoteMRController's
-// contract directly: reMintReviewOwner's demote-then-remint must leave the
-// PREVIOUS controller (the takeover Task, now parked ownership-lost) as a
+// TestFlipToExternal_OldOwnerSurvivesAsPlainRef covers handBackToReviewTask's
+// contract directly: reMintReviewOwner's atomic hand-over (fix #408) must leave
+// the PREVIOUS controller (the takeover Task, now parked ownership-lost) as a
 // plain (non-controller) owner ref, not remove it - the artifact must stay
 // GC-open against it (own package invariant) even though it no longer drives
 // the MR.
@@ -142,6 +143,52 @@ func TestFlipToExternal_OldOwnerSurvivesAsPlainRef(t *testing.T) {
 	}
 	if ctrl, ok := ownerControllerName(got); !ok || ctrl == takeoverName {
 		t.Fatalf("controller must have moved off the old owner %s; got ctrl=%q ok=%v", takeoverName, ctrl, ok)
+	}
+}
+
+// TestReMintReviewOwner_SingleMRUpdate is fix #408's direct unit coverage on
+// reMintReviewOwner: capturing prevOwner (own.ControllerOwner) BEFORE minting
+// and threading it through MintReviewTask -> bindMRToTask -> ownMergeRequest
+// as expectFrom must cost exactly ONE MergeRequest Update - no standalone
+// demoteMRController Update racing a separate later promote, which used to
+// leave a zero-controller window a RepairZeroController race could jump into.
+func TestReMintReviewOwner_SingleMRUpdate(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := seedProjectRepo(t, ctx)
+	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 20, "tatara/feat-20", "bot-head")
+	takeoverName := takeoverTaskName(proj, repo, 20)
+
+	c, mrUpdates := wrapMRUpdateCounting(k8sClient)
+	d := &StageDriver{
+		Client:     c,
+		APIReader:  k8sClient,
+		SpillerFor: func(*tatarav1alpha1.Project) objbudget.Spiller { return &mirrorSpiller{} },
+	}
+
+	if err := d.reMintReviewOwner(ctx, proj, repo, mr); err != nil {
+		t.Fatalf("reMintReviewOwner: %v", err)
+	}
+	if got := atomic.LoadInt32(mrUpdates); got != 1 {
+		t.Fatalf("MR updates across reMintReviewOwner = %d, want exactly 1 (no demote-then-remint window)", got)
+	}
+
+	got := getMR(t, ctx, proj, repo, 20)
+	reviewName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepReviewKind, repo.Name, 20)
+	if ctrl, ok := ownerControllerName(got); !ok || ctrl != reviewName {
+		t.Fatalf("controller must move to the newly minted review task %q; got ctrl=%q ok=%v", reviewName, ctrl, ok)
+	}
+	found, stillController := false, true
+	for _, ref := range got.GetOwnerReferences() {
+		if ref.Name == takeoverName {
+			found = true
+			stillController = ref.Controller != nil && *ref.Controller
+		}
+	}
+	if !found {
+		t.Fatalf("old owner %s must survive as a plain ref", takeoverName)
+	}
+	if stillController {
+		t.Fatalf("old owner %s must be demoted to controller=false", takeoverName)
 	}
 }
 

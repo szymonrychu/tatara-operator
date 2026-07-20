@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -545,11 +546,16 @@ func TestMRTakeover_FallsBackToMirroredHeadOnLiveReadError(t *testing.T) {
 
 // takeoverErrStage counts obs.RestTakeoverErrorTotal{stage} before/after a
 // takeover call and asserts it moved by exactly +1 for stage and +0 for every
-// other of the four stages - so a wiring bug that increments the wrong stage
+// other of the three stages - so a wiring bug that increments the wrong stage
 // (or double-counts) fails loudly instead of passing on a coincidental total.
+//
+// Only three stages exist: fix #408 dropped the standalone DemoteMRController
+// call this endpoint used to make - the fresh-mint handover is now atomic
+// inside MintOrUnparkTakeoverTask's own bindMRToTask Update, gated on
+// expectFrom.
 func assertTakeoverErrorInc(t *testing.T, stage string, before map[string]float64) {
 	t.Helper()
-	for _, s := range []string{"demote", "mint", "ownerref", "stamp"} {
+	for _, s := range []string{"mint", "ownerref", "stamp"} {
 		want := before[s]
 		if s == stage {
 			want++
@@ -561,8 +567,8 @@ func assertTakeoverErrorInc(t *testing.T, stage string, before map[string]float6
 }
 
 func snapshotTakeoverErrors() map[string]float64 {
-	snap := make(map[string]float64, 4)
-	for _, s := range []string{"demote", "mint", "ownerref", "stamp"} {
+	snap := make(map[string]float64, 3)
+	for _, s := range []string{"mint", "ownerref", "stamp"} {
 		snap[s] = testutil.ToFloat64(obs.RestTakeoverErrorTotal.WithLabelValues(s))
 	}
 	return snap
@@ -571,37 +577,6 @@ func snapshotTakeoverErrors() map[string]float64 {
 // errInjected is the sentinel every failure-injection interceptor below
 // returns, so a 500 body can be told apart from an unrelated fake-client bug.
 var errInjected = errors.New("injected failure")
-
-// TestMRTakeover_DemoteFailureIncrementsErrorMetric forces DemoteMRController
-// (the first write mrTakeover makes past authz) to fail: the interceptor
-// fails the FIRST Update on a MergeRequest object issued AFTER the harness
-// finishes its own setup writes.
-func TestMRTakeover_DemoteFailureIncrementsErrorMetric(t *testing.T) {
-	armed := false
-	mrUpdates := 0
-	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
-		interceptor: interceptor.Funcs{
-			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-				if armed {
-					if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
-						mrUpdates++
-						if mrUpdates == 1 {
-							return errInjected
-						}
-					}
-				}
-				return c.Update(ctx, obj, opts...)
-			},
-		},
-	})
-	before := snapshotTakeoverErrors()
-	armed = true
-	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("demote failure must 500, got %d: %s", rr.Code, rr.Body.String())
-	}
-	assertTakeoverErrorInc(t, "demote", before)
-}
 
 // TestMRTakeover_MintFailureIncrementsErrorMetric forces
 // MintOrUnparkTakeoverTask's Create of the (not-yet-existing) takeover Task
@@ -632,14 +607,13 @@ func TestMRTakeover_MintFailureIncrementsErrorMetric(t *testing.T) {
 	assertTakeoverErrorInc(t, "mint", before)
 }
 
-// TestMRTakeover_OwnerRefFailureIncrementsErrorMetric forces the SECOND
-// post-arm MergeRequest Update (demote is the first and must succeed; the
-// owner-ref move onto the takeover Task is takeover.go's own explicit second
-// one) to fail. A RE-TAKE (the takeover Task already parked ownership-lost,
-// via seedParkedTakeoverTask) is required to isolate this: on a FRESH mint,
-// MintOrUnparkTakeoverTask's own bindMRToTask ALSO writes the MR (sync +
-// own) as part of minting, which would otherwise land as the "2nd" Update and
-// misattribute the failure to the mint stage instead of this one.
+// TestMRTakeover_OwnerRefFailureIncrementsErrorMetric forces the ONE
+// post-arm MergeRequest Update - the idempotent reassert's MutateOwnerRefs
+// call - to fail. A RE-TAKE (the takeover Task already parked
+// ownership-lost, via seedParkedTakeoverTask) is required to isolate this:
+// MintOrUnparkTakeoverTask's UNPARK branch never touches owner refs (unlike a
+// fresh mint, whose OWN bindMRToTask would otherwise land as this same "1st"
+// Update and misattribute the failure to the mint stage instead of this one).
 func TestMRTakeover_OwnerRefFailureIncrementsErrorMetric(t *testing.T) {
 	armed := false
 	mrUpdates := 0
@@ -649,7 +623,7 @@ func TestMRTakeover_OwnerRefFailureIncrementsErrorMetric(t *testing.T) {
 				if armed {
 					if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
 						mrUpdates++
-						if mrUpdates == 2 {
+						if mrUpdates == 1 {
 							return errInjected
 						}
 					}
@@ -697,4 +671,81 @@ func TestMRTakeover_StampFailureIncrementsErrorMetric(t *testing.T) {
 		t.Fatalf("stamp failure must 500, got %d: %s", rr.Code, rr.Body.String())
 	}
 	assertTakeoverErrorInc(t, "stamp", before)
+}
+
+// --- FIX #408: atomic owner handover, no standalone demote window ---
+
+// TestTakeover_SingleMRUpdateNoDemoteWindow is fix #408's REST-level coverage:
+// a FRESH mint must move controller ownership from the caller (review) Task
+// to the newly minted takeover Task in exactly ONE MergeRequest Update - no
+// standalone DemoteMRController Update racing MintOrUnparkTakeoverTask's own
+// promote (the zero-controller window a RepairZeroController race could
+// jump into). A RE-TAKE (an existing parked(ownership-lost) takeover Task,
+// whose unpark branch never touches owner refs) still needs - and gets - the
+// idempotent reassert to move ownership: exactly one MORE Update for that
+// case, proving the reassert still works even though the mint's own
+// bindMRToTask never ran on that branch.
+func TestTakeover_SingleMRUpdateNoDemoteWindow(t *testing.T) {
+	var mrUpdates int32
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		interceptor: interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+					atomic.AddInt32(&mrUpdates, 1)
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		},
+	})
+
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid takeover must 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := atomic.LoadInt32(&mrUpdates); got != 1 {
+		t.Fatalf("fresh-mint MR updates = %d, want exactly 1 (no standalone demote window)", got)
+	}
+	takeoverName := takeoverTaskName(h.proj, h.repo, 9)
+	mr := h.getMR(t, 9)
+	if ctrl, ok := ownerControllerName(mr); !ok || ctrl != takeoverName {
+		t.Fatalf("controller must be the takeover task, got %q ok=%v", ctrl, ok)
+	}
+	if !isPlainOwner(mr, "review-task") {
+		t.Fatalf("review task must survive as a plain owner")
+	}
+
+	// Simulate a stand-down back to external (as ReconcileOwnership's flip
+	// would do) and a re-take: MintOrUnparkTakeoverTask's UNPARK branch never
+	// touches owner refs, so the idempotent reassert - not the mint's own
+	// bindMRToTask - must move ownership, in exactly one more Update.
+	mr2 := h.getMR(t, 9)
+	if err := controller.MutateOwnerRefs(context.Background(), h.c, mr2, func(fresh *tatarav1alpha1.MergeRequest) error {
+		return own.HandOverController(fresh, nil, h.task(t, "review-task"))
+	}); err != nil {
+		t.Fatalf("simulate stand-down hand-back: %v", err)
+	}
+	mr2.Status.Ownership = tatarav1alpha1.OwnershipExternal
+	if err := h.c.Status().Update(context.Background(), mr2); err != nil {
+		t.Fatalf("simulate stand-down ownership stamp: %v", err)
+	}
+	tk := h.task(t, takeoverName)
+	tk.Status.Stage = tatarav1alpha1.StageParked
+	tk.Status.StageReason = stage.ReasonOwnershipLost
+	if err := h.c.Status().Update(context.Background(), tk); err != nil {
+		t.Fatalf("simulate stand-down park: %v", err)
+	}
+	h.addComment(t, 9, "11", "alice", false)
+
+	atomic.StoreInt32(&mrUpdates, 0)
+	rr2 := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"11","task":"review-task"}`)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("re-take must 200, got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	if got := atomic.LoadInt32(&mrUpdates); got != 1 {
+		t.Fatalf("re-take MR updates = %d, want exactly 1 (the idempotent reassert)", got)
+	}
+	after := h.getMR(t, 9)
+	if ctrl, ok := ownerControllerName(after); !ok || ctrl != takeoverName {
+		t.Fatalf("controller must move back to the takeover task on re-take, got %q ok=%v", ctrl, ok)
+	}
 }

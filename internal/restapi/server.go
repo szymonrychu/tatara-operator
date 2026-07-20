@@ -51,6 +51,11 @@ type Config struct {
 	Now     func() time.Time
 	Logger  *slog.Logger
 	Metrics *obs.OperatorMetrics
+	// IncidentInvestigationCommentCooldown rate-limits the SCM write behind an
+	// incident agent's action=comment_issue outcome on one open tracker (Fix 7,
+	// issue #400). From config.Config.IncidentInvestigationCommentCooldown
+	// (cmd/manager/wire.go). Zero means never suppress.
+	IncidentInvestigationCommentCooldown time.Duration
 }
 
 // Server exposes OIDC-gated CRUD over the tatara CRDs, backed by the
@@ -70,6 +75,8 @@ type Server struct {
 	ciPacer    *ciPacer
 	log        *slog.Logger
 	metrics    *obs.OperatorMetrics
+	// incidentInvestigationCommentCooldown mirrors Config.IncidentInvestigationCommentCooldown (Fix 7, #400).
+	incidentInvestigationCommentCooldown time.Duration
 }
 
 // NewServer constructs a Server from cfg.
@@ -82,6 +89,7 @@ func NewServer(cfg Config) *Server {
 		c: cfg.Client, ns: cfg.Namespace, scmFor: cfg.SCMFor, readerFor: cfg.ReaderFor,
 		ciFor: cfg.CIFor, spillerFor: cfg.SpillerFor, memoryFor: cfg.MemoryFor, approval: cfg.Approval,
 		minter: cfg.Minter, nowFn: cfg.Now, ciPacer: newCIPacer(), log: l, metrics: cfg.Metrics,
+		incidentInvestigationCommentCooldown: cfg.IncidentInvestigationCommentCooldown,
 	}
 }
 

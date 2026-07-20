@@ -142,6 +142,12 @@ var ErrMergeConflict = fmt.Errorf("scm: merge conflict or PR not mergeable")
 // sub-issue primitive (GitLab). The caller degrades to a cross-reference comment.
 var ErrSubIssuesUnsupported = fmt.Errorf("scm: sub-issues not supported by this provider")
 
+// ErrAuthFailed is returned by Merge when the SCM signals the credential is
+// invalid or lacks permission (401/403, excluding a rate-limit 403). Callers
+// should use errors.Is(err, ErrAuthFailed) and park rather than hot-requeue:
+// a bad token never fixes itself on retry.
+var ErrAuthFailed = fmt.Errorf("scm: merge auth refused")
+
 // MergeState is the provider-neutral mergeability of a PR/MR, mapped from
 // GitHub REST mergeable_state and GitLab merge_status. Callers switch on it
 // exhaustively at the merge-gate / conflict-sweep decision point.

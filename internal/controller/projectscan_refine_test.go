@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
@@ -299,5 +300,104 @@ func TestLatestTerminalRefineTask_ScopedToCycle(t *testing.T) {
 	}
 	if laterCycle != nil {
 		t.Fatalf("want stale terminal task NOT to satisfy a later cycle's barrier, got %s", laterCycle.Name)
+	}
+}
+
+// TestRefineBarrier_HeldEmitsMetricPerTick: issue #401 instrumentation. Every
+// scan tick the refine barrier holds brainstorm (refine never terminates)
+// must increment SweepErrorsTotal{brainstorm,refine_barrier_held} exactly
+// once - previously this early-return emitted zero log/metric, which is how
+// the underlying stall went unnoticed until an on-call escalation.
+func TestRefineBarrier_HeldEmitsMetricPerTick(t *testing.T) {
+	proj := seedRefineProject(t, "refine-held-metric")
+	reader := &fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 1, Title: "open issue"}}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	ctx := context.Background()
+
+	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held"))
+
+	if _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans round 1: %v", err)
+	}
+	afterFirst := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held"))
+	if afterFirst != before+1 {
+		t.Fatalf("refine_barrier_held after tick 1 = %v, want %v", afterFirst, before+1)
+	}
+
+	if _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans round 2: %v", err)
+	}
+	afterSecond := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held"))
+	if afterSecond != afterFirst+1 {
+		t.Fatalf("refine_barrier_held after tick 2 = %v, want %v (once per tick, not cumulative per-repo)", afterSecond, afterFirst+1)
+	}
+}
+
+// TestRefineBarrier_MaxHoldReleasesBrainstorm: issue #401 release valve. Once
+// the refine barrier has held for longer than requeueRefineBarrierMaxHold
+// (2h), runScans proceeds to brainstorm anyway - LastBrainstorm advances and a
+// brainstorm QueuedEvent is created - even though the refine Task never
+// reached a terminal stage, and records refine_barrier_timeout (not
+// refine_barrier_held) for that tick.
+func TestRefineBarrier_MaxHoldReleasesBrainstorm(t *testing.T) {
+	proj := seedRefineProject(t, "refine-maxhold")
+	stale := metav1.NewTime(time.Now().Add(-3 * time.Hour))
+	proj.Status.LastBrainstorm = &stale
+	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
+		t.Fatalf("stamp stale LastBrainstorm: %v", err)
+	}
+	reader := &fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 1, Title: "open issue"}}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	ctx := context.Background()
+
+	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout"))
+
+	if _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+
+	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout")); got != beforeTimeout+1 {
+		t.Fatalf("refine_barrier_timeout = %v, want %v (max-hold release)", got, beforeTimeout+1)
+	}
+	if len(listBrainstormQEs(t, "refine-maxhold")) == 0 {
+		t.Fatalf("want brainstorm QE created once the max hold releases the barrier")
+	}
+	var fresh tatarav1alpha1.Project
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "refine-maxhold"}, &fresh); err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	if fresh.Status.LastBrainstorm == nil || !fresh.Status.LastBrainstorm.After(stale.Time) {
+		t.Fatalf("want LastBrainstorm advanced past the stale stamp, got %v", fresh.Status.LastBrainstorm)
+	}
+}
+
+// TestRefineBarrier_JustUnderMaxHoldDoesNotRelease: a barrier held for just
+// under requeueRefineBarrierMaxHold must NOT release prematurely - brainstorm
+// stays deferred and refine_barrier_timeout does not increment.
+func TestRefineBarrier_JustUnderMaxHoldDoesNotRelease(t *testing.T) {
+	proj := seedRefineProject(t, "refine-justunder")
+	justUnder := metav1.NewTime(time.Now().Add(-(requeueRefineBarrierMaxHold - time.Minute)))
+	proj.Status.LastBrainstorm = &justUnder
+	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
+		t.Fatalf("stamp near-max LastBrainstorm: %v", err)
+	}
+	reader := &fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 1, Title: "open issue"}}}
+	r := newScanReconciler(reader)
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	ctx := context.Background()
+
+	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout"))
+
+	if _, err := r.runScans(ctx, proj); err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+
+	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout")); got != beforeTimeout {
+		t.Fatalf("refine_barrier_timeout = %v, want unchanged at %v (must not release early)", got, beforeTimeout)
+	}
+	if len(listBrainstormQEs(t, "refine-justunder")) != 0 {
+		t.Fatalf("want brainstorm still held just under the max hold")
 	}
 }

@@ -587,6 +587,41 @@ func TestMergeHeadMoved409ReReviews(t *testing.T) {
 	}
 }
 
+// A 401/403 from Merge (#404) is TERMINAL: it fails fast to
+// parked(merge-auth-refused) rather than hot-requeueing at merge-timeout, and
+// the MR is left exactly as reviewed (no reset, no cursor advance) so a human
+// fixing the credential can resume from where it stopped.
+func TestMergeAuthFailureParks(t *testing.T) {
+	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 7)
+	mr.Status.ReviewedSHA = "sha-a"
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	f.head[7] = "sha-a"
+	f.mergeErr = fmt.Errorf("merge: %w", scm.ErrAuthFailed)
+	d := mdNewDriver(t, f, c)
+
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+		t.Fatalf("ReconcileMerging: %v", err)
+	}
+	got := mdGetTask(t, c, "t1")
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonMergeAuthRefused {
+		t.Fatalf("stage = %q/%q, want parked/merge-auth-refused", got.Status.Stage, got.Status.StageReason)
+	}
+	if got.Status.MergeCursor != 0 {
+		t.Fatalf("mergeCursor = %d, want 0 (unmoved)", got.Status.MergeCursor)
+	}
+	gm := mdGetMR(t, c, mr.Name)
+	if gm.Status.State == "merged" {
+		t.Fatalf("mr stamped merged after an auth failure")
+	}
+	if gm.Status.ReviewedSHA != "sha-a" {
+		t.Fatalf("reviewedSHA = %q, want unchanged sha-a", gm.Status.ReviewedSHA)
+	}
+}
+
 // The head-move cycle is BOUNDED: the fourth lap is refused.
 func TestMergeHeadMovingExhausted(t *testing.T) {
 	task := mdTask("t1", "implement", tatarav1alpha1.StageMerging)

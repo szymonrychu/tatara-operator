@@ -371,3 +371,56 @@ func TestIssueStatus_RefireFields(t *testing.T) {
 		t.Fatalf("refire fields did not JSON round-trip: %+v", round)
 	}
 }
+
+// TestIssueStatus_InvestigationCommentFields asserts the Fix 7 (#400)
+// comment_issue cooldown markers (LastInvestigationCommentAt,
+// SuppressedInvestigationCount) both DeepCopy and JSON round-trip, and that
+// they are DISTINCT fields from LastRefireCommentAt / LastDeployTimeoutCommentAt
+// - setting one must never read back through another.
+func TestIssueStatus_InvestigationCommentFields(t *testing.T) {
+	refireAt := metav1.NewTime(time.Unix(100, 0))
+	deployAt := metav1.NewTime(time.Unix(200, 0))
+	investigationAt := metav1.NewTime(time.Unix(300, 0))
+	in := IssueStatus{
+		LastRefireCommentAt:          &refireAt,
+		LastDeployTimeoutCommentAt:   &deployAt,
+		LastInvestigationCommentAt:   &investigationAt,
+		SuppressedInvestigationCount: 2,
+	}
+	out := in.DeepCopy()
+	if out.SuppressedInvestigationCount != 2 || out.LastInvestigationCommentAt == nil {
+		t.Fatalf("investigation comment fields did not DeepCopy round-trip: %+v", out)
+	}
+	if !out.LastInvestigationCommentAt.Time.Equal(investigationAt.Time) {
+		t.Fatalf("LastInvestigationCommentAt DeepCopy value mismatch: got %v want %v",
+			out.LastInvestigationCommentAt.Time, investigationAt.Time)
+	}
+	if !out.LastRefireCommentAt.Time.Equal(refireAt.Time) {
+		t.Fatalf("LastInvestigationCommentAt must not clobber LastRefireCommentAt: got %v want %v",
+			out.LastRefireCommentAt.Time, refireAt.Time)
+	}
+	if !out.LastDeployTimeoutCommentAt.Time.Equal(deployAt.Time) {
+		t.Fatalf("LastInvestigationCommentAt must not clobber LastDeployTimeoutCommentAt: got %v want %v",
+			out.LastDeployTimeoutCommentAt.Time, deployAt.Time)
+	}
+
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"suppressedInvestigationCount"`) ||
+		!strings.Contains(string(data), `"lastInvestigationCommentAt"`) {
+		t.Errorf("marshaled IssueStatus missing investigation comment fields: %s", data)
+	}
+	var round IssueStatus
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if round.SuppressedInvestigationCount != 2 || round.LastInvestigationCommentAt == nil {
+		t.Fatalf("investigation comment fields did not JSON round-trip: %+v", round)
+	}
+	if !round.LastRefireCommentAt.Time.Equal(refireAt.Time) ||
+		!round.LastDeployTimeoutCommentAt.Time.Equal(deployAt.Time) {
+		t.Fatalf("sibling marker fields corrupted by round-trip: %+v", round)
+	}
+}

@@ -60,9 +60,16 @@ func TakeoverTaskName(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Reposit
 // DrainStandDownMerge (OP11) on an approved review; that is a different
 // trigger (a maintainer's REVIEW, not a maintainer's COMMENT) and does not
 // belong on this path, which always targets approved (RESUME PUSHING).
+// expectFrom (optional, see MintReviewTask/bindMRToTask) is forwarded to the
+// fresh-mint path's bindMRToTask call unchanged - fix #408: the takeover REST
+// endpoint's caller Task is the MR's current controller owner by the time
+// this runs (its own gate already proved it), so it passes its own name here
+// to let bindMRToTask -> Minter.ownMergeRequest hand the controller flag over
+// atomically, in one Update, instead of the endpoint demoting it standalone
+// first.
 func (m *Minter) MintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, requestingUser, commentBody string,
-	sp objbudget.Spiller) (*tatarav1alpha1.Task, error) {
+	sp objbudget.Spiller, expectFrom ...string) (*tatarav1alpha1.Task, error) {
 
 	name := takeoverTaskName(proj, repo, mr.Spec.Number)
 
@@ -129,11 +136,11 @@ func (m *Minter) MintOrUnparkTakeoverTask(ctx context.Context, proj *tatarav1alp
 		// tombstone (its "re-mint on the next tick" case). There is no "next
 		// tick" on this endpoint-driven path: retry once against the now-freed
 		// name rather than surfacing a false negative to the caller.
-		return m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, requestingUser, commentBody, sp)
+		return m.MintOrUnparkTakeoverTask(ctx, proj, repo, mr, requestingUser, commentBody, sp, expectFrom...)
 	}
 
 	ext := mrExtFromMR(mr)
-	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
+	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp, expectFrom...); err != nil {
 		return nil, err
 	}
 	mrName := tatarav1alpha1.MergeRequestName(repo.Name, mr.Spec.Number)

@@ -347,6 +347,10 @@ func (in *IssueStatus) DeepCopyInto(out *IssueStatus) {
 		in, out := &in.LastMemoryGateCommentAt, &out.LastMemoryGateCommentAt
 		*out = (*in).DeepCopy()
 	}
+	if in.LastInvestigationCommentAt != nil {
+		in, out := &in.LastInvestigationCommentAt, &out.LastInvestigationCommentAt
+		*out = (*in).DeepCopy()
+	}
 	if in.LastSyncedAt != nil {
 		in, out := &in.LastSyncedAt, &out.LastSyncedAt
 		*out = (*in).DeepCopy()

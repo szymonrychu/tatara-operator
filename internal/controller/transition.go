@@ -64,6 +64,18 @@ func EnterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 		from = stage.Create
 	}
 
+	// A to==from re-entry is a silent no-op (issue #403), not an illegal edge:
+	// stage.Enter's side effects (re-stamping StageEnteredAt, clearing
+	// PodStartedAt/PodRecreations) are non-idempotent, so re-applying them here
+	// would corrupt clocks already in flight. No self-edges are added to the F.3
+	// table for this - it is handled entirely at this choke point.
+	if to == from {
+		l.Info("stage re-entry is a no-op",
+			"action", "stage_reentry_noop", "resource_id", task.Name,
+			"stage", to, "stage_reason", reason, "kind", task.Spec.Kind)
+		return nil
+	}
+
 	// Validate BEFORE the write, so an illegal edge costs one counter and zero
 	// API calls, and the Task is left exactly as it was.
 	if !stage.LegalFor(task, mrs, from, to) {
@@ -90,6 +102,16 @@ func EnterStage(ctx context.Context, c client.Client, sp objbudget.Spiller, m *o
 	if enterErr != nil {
 		var ill *stage.IllegalTransitionError
 		if errors.As(enterErr, &ill) {
+			if ill.From == ill.To {
+				// The actual production race (issue #403): another writer
+				// committed this exact target stage between our pre-check and
+				// the write, so the fresh read inside FitTask derives a
+				// redundant from==to edge. Still a silent no-op, not a bug.
+				l.Info("stage re-entry is a no-op",
+					"action", "stage_reentry_noop", "resource_id", task.Name,
+					"stage", to, "stage_reason", reason, "kind", task.Spec.Kind)
+				return nil
+			}
 			// Reachable only when another writer moved the stage between the
 			// pre-check and the write. It is still an illegal edge and still a bug.
 			obs.IllegalStageTransition(ill.From, ill.To)

@@ -10,16 +10,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/queue"
+	"github.com/szymonrychu/tatara-operator/internal/restapi"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
 
@@ -1090,6 +1097,254 @@ func TestOutcome_Incident_AlertRulesRequiredOnBothActions(t *testing.T) {
 	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
 		`{"kind":"incident","payload":{"action":"false_positive","alertRules":[],"reason":"r"}}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// --- Fix 7 (#400): investigation-comment cooldown -------------------------
+
+// buildV2WithCooldown mirrors buildV2 (handlers_v2_test.go) but also wires
+// IncidentInvestigationCommentCooldown and an overridable now(), neither of
+// which v2Opts exposes. Defined here rather than adding a field to v2Opts, to
+// keep this workstream's edits confined to outcome.go/outcome_test.go.
+func buildV2WithCooldown(t *testing.T, metrics *obs.OperatorMetrics, cooldown time.Duration,
+	nowFn func() time.Time, objs ...client.Object) *v2Env {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&tatarav1alpha1.Project{}, &tatarav1alpha1.Repository{},
+			&tatarav1alpha1.Task{}, &tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{}).
+		Build()
+
+	env := &v2Env{c: fc, now: frozenNow}
+	env.forge = newRecordingForge()
+	env.spiller = &fakeSpiller{}
+
+	s := restapi.NewServer(restapi.Config{
+		Client: fc, Namespace: ns,
+		SCMFor:                               func(string) (scm.SCMWriter, error) { return env.forge, nil },
+		SpillerFor:                           func(*tatarav1alpha1.Project) objbudget.Spiller { return env.spiller },
+		Now:                                  nowFn,
+		Metrics:                              metrics,
+		IncidentInvestigationCommentCooldown: cooldown,
+	})
+	r := chi.NewRouter()
+	s.Mount(r, nil)
+	env.r = r
+	return env
+}
+
+// buildV2WithCooldownAndInterceptor mirrors buildV2WithCooldown but also
+// wires a fake-client interceptor, so a test can fail a SPECIFIC downstream
+// write (e.g. the reset-FitIssue Update after a comment has already posted)
+// without touching the others.
+func buildV2WithCooldownAndInterceptor(t *testing.T, metrics *obs.OperatorMetrics, cooldown time.Duration,
+	nowFn func() time.Time, funcs interceptor.Funcs, objs ...client.Object) *v2Env {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	fc := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&tatarav1alpha1.Project{}, &tatarav1alpha1.Repository{},
+			&tatarav1alpha1.Task{}, &tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+
+	env := &v2Env{c: fc, now: frozenNow}
+	env.forge = newRecordingForge()
+	env.spiller = &fakeSpiller{}
+
+	s := restapi.NewServer(restapi.Config{
+		Client: fc, Namespace: ns,
+		SCMFor:                               func(string) (scm.SCMWriter, error) { return env.forge, nil },
+		SpillerFor:                           func(*tatarav1alpha1.Project) objbudget.Spiller { return env.spiller },
+		Now:                                  nowFn,
+		Metrics:                              metrics,
+		IncidentInvestigationCommentCooldown: cooldown,
+	})
+	r := chi.NewRouter()
+	s.Mount(r, nil)
+	env.r = r
+	return env
+}
+
+// incidentTrackerV2 builds an open tracker Issue CR carrying the alert
+// rule-key label incidentComment gates comment_issue on (queue.LabelAlertRuleKey).
+func incidentTrackerV2(repo string, number int) *tatarav1alpha1.Issue {
+	return issueV2(repo, number, "tracker-task", func(i *tatarav1alpha1.Issue) {
+		i.Labels = map[string]string{queue.LabelAlertRuleKey: "rule-1"}
+	})
+}
+
+// TestOutcome_IncidentComment_ZeroCooldownConfigNeverSuppresses proves the
+// cooldown gate actually reads Config.IncidentInvestigationCommentCooldown
+// (D2 wiring) rather than a hardcoded constant: with cooldown=0, two
+// comment_issue outcomes at the SAME instant both reach the forge.
+func TestOutcome_IncidentComment_ZeroCooldownConfigNeverSuppresses(t *testing.T) {
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	e := buildV2WithCooldown(t, metrics, 0, func() time.Time { return frozenNow },
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		incidentTrackerV2("tatara-operator", 101),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"one"}}}`)
+	require.Equal(t, http.StatusOK, w1.Code, w1.Body.String())
+	w2 := e.do(t, http.MethodPost, "/tasks/t2/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"two"}}}`)
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+	require.Len(t, e.forge.comments, 2,
+		"Config.IncidentInvestigationCommentCooldown=0 must reach the handler and never suppress")
+}
+
+// TestIncidentComment_CooldownSuppressesAndCounts is the 3-call sequence:
+// post, then (within cooldown) suppress-and-count, then (after cooldown)
+// post-with-prefix and counter reset. The suppressed call still terminates
+// its Task at rejected(tracked-elsewhere) - only the forge write is skipped.
+func TestIncidentComment_CooldownSuppressesAndCounts(t *testing.T) {
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	cur := frozenNow
+	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return cur },
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		incidentTrackerV2("tatara-operator", 101),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+		taskV2("t3", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"first",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence one"}}}`)
+	require.Equal(t, http.StatusOK, w1.Code, w1.Body.String())
+	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
+	require.Len(t, e.forge.comments, 1)
+	require.Equal(t, "evidence one", e.forge.comments[0].Body)
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentTrackerCommentCounter("posted")))
+
+	cur = cur.Add(5 * time.Minute) // well within the 30m cooldown
+	w2 := e.do(t, http.MethodPost, "/tasks/t2/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"second",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence two"}}}`)
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t2").Status.Stage,
+		"the suppressed path must still terminate the Task at rejected(tracked-elsewhere)")
+	require.Len(t, e.forge.comments, 1, "the SCM write itself must be suppressed")
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.IncidentTrackerCommentCounter("suppressed")))
+
+	tracked := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+	require.Equal(t, 1, tracked.Status.SuppressedInvestigationCount)
+
+	cur = cur.Add(30 * time.Minute) // now 35m past t1's post: cooldown cleared
+	w3 := e.do(t, http.MethodPost, "/tasks/t3/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"third",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence three"}}}`)
+	require.Equal(t, http.StatusOK, w3.Code, w3.Body.String())
+	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t3").Status.Stage)
+	require.Len(t, e.forge.comments, 2)
+	require.Contains(t, e.forge.comments[1].Body, "1 prior evidence comment")
+	require.Contains(t, e.forge.comments[1].Body, "evidence three")
+	require.Equal(t, float64(2), testutil.ToFloat64(metrics.IncidentTrackerCommentCounter("posted")))
+
+	tracked2 := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+	require.Equal(t, 0, tracked2.Status.SuppressedInvestigationCount,
+		"the counter resets once the comment actually posts")
+	require.NotNil(t, tracked2.Status.LastInvestigationCommentAt)
+	require.Nil(t, tracked2.Status.LastRefireCommentAt, "must never share the refire marker field")
+	require.Nil(t, tracked2.Status.LastDeployTimeoutCommentAt, "must never share the deploy-timeout marker field")
+}
+
+// TestIncidentComment_CooldownExactThresholdIsNotSuppressed: elapsed exactly
+// equal to the cooldown must NOT be suppressed (strict "<", matching the
+// IncidentRefireCommentCooldown precedent).
+func TestIncidentComment_CooldownExactThresholdIsNotSuppressed(t *testing.T) {
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	cur := frozenNow
+	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return cur },
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		incidentTrackerV2("tatara-operator", 101),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"one"}}}`)
+	require.Equal(t, http.StatusOK, w1.Code, w1.Body.String())
+
+	cur = cur.Add(30 * time.Minute) // elapsed == cooldown, exactly
+	w2 := e.do(t, http.MethodPost, "/tasks/t2/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"two"}}}`)
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String())
+	require.Len(t, e.forge.comments, 2, "exactly-at-threshold must NOT be suppressed")
+}
+
+// TestIncidentComment_CommentErrorReleasesClaim is Fix 5b (#406):
+// incidentComment's SCM-comment-error branch must release the outcome claim
+// so an immediate identical retry re-validates (claimWon) instead of 409ing
+// for the rest of the claim TTL.
+func TestIncidentComment_CommentErrorReleasesClaim(t *testing.T) {
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return frozenNow },
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		incidentTrackerV2("tatara-operator", 101),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+	e.forge.commentErr = fmt.Errorf("github: comment failed transiently")
+
+	body := `{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+	  "comment":{"repo":"tatara-operator","number":101,"body":"evidence"}}}`
+
+	w1 := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusBadGateway, w1.Code)
+	require.Equal(t, tatarav1alpha1.StageInvestigating, e.task(t, "t1").Status.Stage,
+		"a failed SCM comment must not move the stage")
+
+	e.forge.commentErr = nil
+	w2 := e.do(t, http.MethodPost, "/tasks/t1/outcome", body)
+	require.Equal(t, http.StatusOK, w2.Code, w2.Body.String(),
+		"a held claim (missing o.release()) would 409 this identical retry instead of re-validating")
+	require.Len(t, e.forge.comments, 2, "both attempts must have reached the forge")
+	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
+}
+
+// TestIncidentComment_ResetFitIssueFailureIsBestEffort proves the post-comment
+// FitIssue (cooldown-marker reset) is best-effort: the forge comment has
+// already landed by the time it runs, so a failure there must not fail the
+// whole request - that would leave the Task unterminated and duplicate the
+// comment on retry. The Task must still terminate rejected(tracked-elsewhere)
+// with exactly one forge comment.
+func TestIncidentComment_ResetFitIssueFailureIsBestEffort(t *testing.T) {
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	funcs := interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if iss, ok := obj.(*tatarav1alpha1.Issue); ok && subResourceName == "status" &&
+				iss.Status.LastInvestigationCommentAt != nil {
+				// Only the reset call stamps LastInvestigationCommentAt; the
+				// suppressed-increment call never touches this field.
+				return fmt.Errorf("injected: status update failed")
+			}
+			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+		},
+	}
+	e := buildV2WithCooldownAndInterceptor(t, metrics, 30*time.Minute, func() time.Time { return frozenNow }, funcs,
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		incidentTrackerV2("tatara-operator", 101),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":101,"body":"evidence"}}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String(),
+		"a failed cooldown-marker reset must not fail the request; the comment already posted")
+	require.Len(t, e.forge.comments, 1, "the comment reaches the forge exactly once")
+	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage,
+		"the Task must still terminate despite the reset failure")
 }
 
 // --- refine, and the B.3 fold ---------------------------------------------

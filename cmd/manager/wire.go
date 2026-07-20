@@ -150,6 +150,10 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		MemoryFor:  newMemoryFor(mgr, cfg),
 		Logger:     slog.Default(),
 		Metrics:    metrics,
+		// IncidentInvestigationCommentCooldown is Fix 7's (#400) comment_issue
+		// SCM-write rate limit, mirroring the webhook server's
+		// IncidentRefireCommentCooldown wiring above.
+		IncidentInvestigationCommentCooldown: cfg.IncidentInvestigationCommentCooldown,
 		// Approval is the C.6 grammar seam. Before this was wired the field was
 		// nil, so verifyApprovalScope FAILED CLOSED on every clarify
 		// decision=implement and the platform could never implement anything

@@ -311,6 +311,61 @@ func TestGitHubMerge_SendsSHAAndMapsConflictToErrHeadMoved(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Merge auth failures (401/403) fail fast, not hot-requeue (#404)
+// ---------------------------------------------------------------------------
+
+func TestGitHubMerge_401MapsToErrAuthFailed(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
+	})
+	_, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash", "")
+	require.True(t, errors.Is(err, ErrAuthFailed), "a 401 on merge must be TERMINAL (park at merge-auth-refused)")
+}
+
+func TestGitHubMerge_403MapsToErrAuthFailed(t *testing.T) {
+	c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+	})
+	_, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash", "")
+	require.True(t, errors.Is(err, ErrAuthFailed), "a 403 on merge must be TERMINAL (park at merge-auth-refused)")
+}
+
+func TestGitHubMerge_RateLimit403IsNotAuthFailed(t *testing.T) {
+	orig := ghRetrySleep
+	ghRetrySleep = func(context.Context, time.Duration) error { return nil }
+	t.Cleanup(func() { ghRetrySleep = orig })
+
+	c := newGitHub(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit."}`))
+	})
+	_, err := c.Merge(context.Background(), "https://github.com/o/r", "tok", 5, "squash", "")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrRateLimited))
+	require.False(t, errors.Is(err, ErrAuthFailed), "a throttle is not an auth refusal")
+}
+
+func TestGitLabMerge_401MapsToErrAuthFailed(t *testing.T) {
+	c := newGitLab(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"message":"401 Unauthorized"}`))
+	})
+	_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash", "")
+	require.True(t, errors.Is(err, ErrAuthFailed), "a 401 on merge must be TERMINAL (park at merge-auth-refused)")
+}
+
+func TestGitLabMerge_403MapsToErrAuthFailed(t *testing.T) {
+	c := newGitLab(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"message":"403 Forbidden"}`))
+	})
+	_, err := c.Merge(context.Background(), "https://gitlab.com/g/p", "tok", 5, "squash", "")
+	require.True(t, errors.Is(err, ErrAuthFailed), "a 403 on merge must be TERMINAL (park at merge-auth-refused)")
+}
+
 func TestGitLabMerge_SendsSHAAndMapsConflictToErrHeadMoved(t *testing.T) {
 	t.Run("sends sha", func(t *testing.T) {
 		c := newGitLab(t, func(w http.ResponseWriter, r *http.Request) {

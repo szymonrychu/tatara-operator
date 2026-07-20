@@ -196,6 +196,15 @@ type Config struct {
 	// IncidentRefireCommentCooldown rate-limits the coalesced refire comment on an
 	// open incident tracker. From INCIDENT_REFIRE_COMMENT_COOLDOWN_MINUTES.
 	IncidentRefireCommentCooldown time.Duration
+	// IncidentInvestigationCommentCooldown rate-limits the SCM write behind an
+	// incident agent's action=comment_issue outcome on one open tracker (Fix 7,
+	// issue #400). From INCIDENT_INVESTIGATION_COMMENT_COOLDOWN_MINUTES. DISTINCT
+	// knob (and distinct marker fields, LastInvestigationCommentAt /
+	// SuppressedInvestigationCount) from IncidentRefireCommentCooldown /
+	// LastRefireCommentAt: that pair rate-limits the operator's ALERT-refire
+	// comment, this pair rate-limits the AGENT's own evidence comment on the
+	// same tracker.
+	IncidentInvestigationCommentCooldown time.Duration
 	// IncidentCorrelationLabels is the alert common-label set whose values form
 	// the coarser incident GROUP key (project + these labels). Different alert
 	// rules that share these label values are correlated: file_issue auto-links
@@ -263,6 +272,13 @@ const MinMemoryProvisioningTimeout = 5 * time.Minute
 // refire comments on one open incident tracker (A4). The recurrence counter
 // still increments on every suppressed refire; only the COMMENT is rate-limited.
 const DefaultIncidentRefireCooldown = 30 * time.Minute
+
+// DefaultIncidentInvestigationCommentCooldown is how long the operator waits
+// between an incident agent's action=comment_issue SCM writes on one open
+// tracker (Fix 7, issue #400). SuppressedInvestigationCount still increments on
+// every suppressed comment; only the forge WRITE is rate-limited - the calling
+// Task still terminates at rejected(tracked-elsewhere) either way.
+const DefaultIncidentInvestigationCommentCooldown = 30 * time.Minute
 
 // DefaultIncidentCorrelationLabels is the coarse alert-label set whose values
 // form the incident GROUP key. namespace+cluster is the conservative infra
@@ -491,6 +507,11 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	incidentInvestigationCommentCooldown, err := getMinutesDefault(
+		"INCIDENT_INVESTIGATION_COMMENT_COOLDOWN_MINUTES", DefaultIncidentInvestigationCommentCooldown)
+	if err != nil {
+		return Config{}, err
+	}
 	incidentEscalateRefires, err := getIntDefault("INCIDENT_ESCALATE_REFIRE_THRESHOLD", DefaultIncidentEscalateRefires)
 	if err != nil {
 		return Config{}, err
@@ -571,10 +592,11 @@ func Load() (Config, error) {
 		UsageTokenURL:      getDefault("USAGE_TOKEN_URL", "https://platform.claude.com/v1/oauth/token"),
 		UsageRefreshMargin: usageRefreshMargin,
 
-		IncidentRefireCommentCooldown:   incidentRefireCooldown,
-		IncidentCorrelationLabels:       incidentCorrelationLabels,
-		IncidentEscalateRefireThreshold: incidentEscalateRefires,
-		IncidentEscalateStaleAge:        incidentEscalateStaleAge,
+		IncidentRefireCommentCooldown:        incidentRefireCooldown,
+		IncidentInvestigationCommentCooldown: incidentInvestigationCommentCooldown,
+		IncidentCorrelationLabels:            incidentCorrelationLabels,
+		IncidentEscalateRefireThreshold:      incidentEscalateRefires,
+		IncidentEscalateStaleAge:             incidentEscalateStaleAge,
 	}
 	if cfg.OIDCIssuer == "" {
 		return Config{}, fmt.Errorf("config: OIDC_ISSUER is required")

@@ -3,9 +3,11 @@ package controller
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -14,6 +16,38 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
+
+// mrUpdateCountingClient wraps a client.Client, counting real (non-status)
+// Update calls against a *MergeRequest object - the atomic controller-handover
+// write fix #408 needs counted exactly, across ownMergeRequest, reMintReviewOwner,
+// and the takeover endpoint's fresh mint.
+type mrUpdateCountingClient struct {
+	client.Client
+	mrUpdates *int32
+}
+
+func (c *mrUpdateCountingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+		atomic.AddInt32(c.mrUpdates, 1)
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+// wrapMRUpdateCounting wraps ANY client.Client (a fake mirror client or the
+// envtest-backed k8sClient) with mrUpdateCountingClient, for asserting an
+// atomic ownership handover costs exactly one MR Update (fix #408) regardless
+// of which backing store the test otherwise seeds through.
+func wrapMRUpdateCounting(c client.Client) (client.Client, *int32) {
+	n := new(int32)
+	return &mrUpdateCountingClient{Client: c, mrUpdates: n}, n
+}
+
+// newMRUpdateCountingClient builds a fake mirror client (newMirrorClient) that
+// also counts MergeRequest Update calls.
+func newMRUpdateCountingClient(t *testing.T, objs ...client.Object) (client.Client, *int32) {
+	t.Helper()
+	return wrapMRUpdateCounting(newMirrorClient(t, objs...))
+}
 
 func minterFor(t *testing.T, objs ...client.Object) (*Minter, client.Client) {
 	t.Helper()
@@ -131,4 +165,71 @@ func TestMintForItem_ConcurrentSameKey_OneTask(t *testing.T) {
 	var tl tatarav1alpha1.TaskList
 	require.NoError(t, c.List(context.Background(), &tl))
 	require.Len(t, tl.Items, 1)
+}
+
+// TestOwnMergeRequest_ExpectFromAtomicHandover is fix #408's unit coverage on
+// ownMergeRequest directly: a hand-over from a KNOWN current controller
+// (expectFrom) must land in exactly ONE MergeRequest Update - no standalone
+// Controller=false demote Update followed by a separate promote, which would
+// leave a zero-controller window a RepairZeroController race could jump into.
+// An unexpected current owner (set, != task, != expectFrom) must refuse with
+// NO mutation at all.
+func TestOwnMergeRequest_ExpectFromAtomicHandover(t *testing.T) {
+	proj := sweepProject("p")
+	repo := sweepRepo("p")
+	taskA := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "task-a", Namespace: testNS}}
+	taskB := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "task-b", Namespace: testNS}}
+	taskC := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "task-c", Namespace: testNS}}
+
+	mrName := tatarav1alpha1.MergeRequestName(repo.Name, 55)
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: mrName, Namespace: testNS},
+		Spec:       tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, ProjectRef: proj.Name, Number: 55},
+	}
+	own.AddPlainOwner(mr, taskA)
+	require.NoError(t, own.HandOverController(mr, nil, taskA))
+
+	c, mrUpdates := newMRUpdateCountingClient(t, proj, repo, mr)
+	m := &Minter{Client: c, APIReader: c, Scheme: c.Scheme()}
+
+	// Hand from A to B: exactly ONE Update, B is controller, A survives as a
+	// plain (non-controller) ref.
+	require.NoError(t, m.ownMergeRequest(context.Background(), proj, mrName, taskB, "task-a"))
+	require.EqualValues(t, 1, atomic.LoadInt32(mrUpdates), "atomic handover must cost exactly one MR Update")
+
+	var got tatarav1alpha1.MergeRequest
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: mrName}, &got))
+	ctrl, ok := own.ControllerOwner(&got)
+	require.True(t, ok)
+	require.Equal(t, "task-b", ctrl)
+	foundA := false
+	for _, ref := range got.GetOwnerReferences() {
+		if ref.Name == "task-a" {
+			foundA = true
+			require.False(t, ref.Controller != nil && *ref.Controller, "task-a must be demoted to controller=false, not removed")
+		}
+	}
+	require.True(t, foundA, "task-a must survive hand-back as a plain ref")
+
+	// An unexpected current owner (C, neither task nor expectFrom) refuses
+	// with no mutation at all.
+	mr2Name := tatarav1alpha1.MergeRequestName(repo.Name, 56)
+	mr2 := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{Name: mr2Name, Namespace: testNS},
+		Spec:       tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, ProjectRef: proj.Name, Number: 56},
+	}
+	own.AddPlainOwner(mr2, taskC)
+	require.NoError(t, own.HandOverController(mr2, nil, taskC))
+	require.NoError(t, c.Create(context.Background(), mr2))
+
+	atomic.StoreInt32(mrUpdates, 0)
+	err := m.ownMergeRequest(context.Background(), proj, mr2Name, taskB, "task-a")
+	require.Error(t, err)
+	require.EqualValues(t, 0, atomic.LoadInt32(mrUpdates), "a refused handover must not mutate the MR at all")
+
+	var after tatarav1alpha1.MergeRequest
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: mr2Name}, &after))
+	ctrl2, ok2 := own.ControllerOwner(&after)
+	require.True(t, ok2)
+	require.Equal(t, "task-c", ctrl2, "controller must remain unchanged on refusal")
 }
