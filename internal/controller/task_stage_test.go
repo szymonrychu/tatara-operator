@@ -13,6 +13,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -1614,4 +1615,56 @@ func TestHandoffCondition_FailsClosedWithNoStageStamp(t *testing.T) {
 				got.Status.Stage, got.Status.StageReason)
 		}
 	})
+}
+
+// #33 SHAPE: a kind=review Task sitting in reviewing whose PR a human merged,
+// with NO outcome ever committed (no handoffCondition armed), is finalized to
+// delivered(mr-merged-externally) by reconcileClocks - not respawn-looped.
+func TestReconcileClocks_ReviewMergedExternally_FinalizesDelivered(t *testing.T) {
+	proj := mdProject()
+	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	mr := mdMR(task, "tatara-operator", 33)
+	mr.Status.State = "merged"
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-operator"), task, mr)
+	r := tsReconciler(c)
+
+	_, handled, err := r.reconcileClocks(context.Background(), proj, task, time.Now())
+	require.NoError(t, err)
+	require.True(t, handled)
+	got := mdGetTask(t, c, "t1")
+	require.Equal(t, tatarav1alpha1.StageDelivered, got.Status.Stage)
+	require.Equal(t, stage.ReasonMRMergedExternally, got.Status.StageReason)
+}
+
+func TestReconcileClocks_ReviewClosedExternally_FinalizesRejected(t *testing.T) {
+	proj := mdProject()
+	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	mr := mdMR(task, "tatara-operator", 33)
+	mr.Status.State = "closed"
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-operator"), task, mr)
+	r := tsReconciler(c)
+
+	_, handled, err := r.reconcileClocks(context.Background(), proj, task, time.Now())
+	require.NoError(t, err)
+	require.True(t, handled)
+	got := mdGetTask(t, c, "t1")
+	require.Equal(t, tatarav1alpha1.StageRejected, got.Status.Stage)
+	require.Equal(t, stage.ReasonMRClosedExternally, got.Status.StageReason)
+}
+
+// An OPEN MR must NOT finalize: the normal reviewing path continues.
+func TestReconcileClocks_ReviewOpenMR_DoesNotFinalize(t *testing.T) {
+	proj := mdProject()
+	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	mr := mdMR(task, "tatara-operator", 33) // mdMR defaults State "open"
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-operator"), task, mr)
+	r := tsReconciler(c)
+
+	_, _, err := r.reconcileClocks(context.Background(), proj, task, time.Now())
+	require.NoError(t, err)
+	got := mdGetTask(t, c, "t1")
+	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "an open MR must not finalize")
 }

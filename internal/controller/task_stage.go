@@ -101,6 +101,27 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 
 	l := log.FromContext(ctx)
 
+	// EXTERNAL-TERMINAL FINALIZE (fixes #33). A kind=review Task sitting IN
+	// reviewing whose owned PR was merged/closed by a human has NO legal outcome:
+	// submit_outcome 400s "no open MR", the claim releases, the idle pod is reaped
+	// and respawned, and it re-reviews the terminal PR until the 4h budget parks it.
+	// This runs UNCONDITIONALLY - it must fire even when no outcome ever committed
+	// (so no handoffCondition is armed), which is exactly the #33 shape - and it
+	// reuses terminalMREdge so the endpoint no-op, the pre-dispatch guard and this
+	// path can never disagree.
+	if task.Status.Stage == tatarav1alpha1.StageReviewing && task.Spec.Kind == "review" {
+		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
+		if mrErr != nil {
+			return ctrl.Result{}, true, mrErr
+		}
+		if edge, ok := terminalMREdge(task, mrs); ok {
+			l.Info("review task finalized: every owned MR reached a terminal forge state externally",
+				"action", "review_finalize_terminal_mr", "resource_id", task.Name,
+				"to", edge.To, "reason", edge.Reason)
+			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
+		}
+	}
+
 	// B4: THE HANDOFF DEADLINE, evaluated BEFORE the three clocks because it is
 	// tighter than all of them.
 	//
