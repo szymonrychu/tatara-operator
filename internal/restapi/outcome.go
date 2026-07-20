@@ -636,6 +636,34 @@ func setCondition(t *tatarav1alpha1.Task, c metav1.Condition) {
 	t.Status.Conditions = append(t.Status.Conditions, c)
 }
 
+// mrTerminalStates reports whether the Task owns >= 1 MR and EVERY owned MR is
+// terminal (state not in openMRs' open set), plus the per-MR states for logging.
+// An empty slice is NOT terminal.
+func mrTerminalStates(mrs []tatarav1alpha1.MergeRequest) (states []string, allTerminal bool) {
+	if len(mrs) == 0 {
+		return nil, false
+	}
+	for i := range mrs {
+		states = append(states, mrs[i].Status.State)
+	}
+	return states, len(openMRs(mrs)) == 0
+}
+
+// terminalNoop answers a review submit_outcome whose review target already went
+// terminal with an explicit 2xx no-op (never a silent success: the body and the
+// log both name the discard). The claim is released as any pre-execution class-B
+// path is - nothing committed - so an identical retry re-validates and no-ops
+// again, instead of the doomed 400 that respawn-looped the pod.
+func (o *outcomeCtx) terminalNoop(states []string) {
+	o.release()
+	ctx := o.r.Context()
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, "mr-terminal-noop").Inc()
+	o.s.log.InfoContext(ctx, "restapi: submit_outcome no-op: kind=review task owns only terminal MRs; the review target already merged/closed",
+		append(reqLogFields(o.r), "action", "submit_outcome_noop", "task", o.task.Name,
+			"resource_id", o.task.Name, "kind", o.kind, "mr_states", strings.Join(states, ","))...)
+	writeJSON(o.w, http.StatusOK, map[string]any{"noop": true, "reason": "mr-terminal"})
+}
+
 // ok writes the accepted 200 with the fresh Task.
 func (o *outcomeCtx) ok(action string, fields ...any) {
 	ctx := o.r.Context()
@@ -735,6 +763,12 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	repos := ownedMRRepos(open)
 	switch {
 	case len(repos) == 0:
+		if o.task.Spec.Kind == "review" {
+			if states, term := mrTerminalStates(mrs); term {
+				o.terminalNoop(states)
+				return
+			}
+		}
 		o.bad("action=submitted but this task owns no open MR", "no-open-mr")
 		return
 	case len(repos) == 1:
@@ -915,6 +949,12 @@ func (o *outcomeCtx) review(p reviewPayload) {
 	}
 	open := openMRs(all)
 	if len(open) == 0 {
+		if o.task.Spec.Kind == "review" {
+			if states, term := mrTerminalStates(all); term {
+				o.terminalNoop(states)
+				return
+			}
+		}
 		o.bad("this task owns no open MR", "no-open-mr")
 		return
 	}

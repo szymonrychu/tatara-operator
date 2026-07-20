@@ -585,3 +585,20 @@ func TestReconcileStage_NoDriftIsNotCounted(t *testing.T) {
 	after := testutil.ToFloat64(obs.StageDriftCounter(tatarav1alpha1.StageTriaging))
 	require.Equal(t, before, after, "an up-to-date cache is not drift")
 }
+
+// The Task controller must WATCH MergeRequest so an MR status flip (merge/close)
+// requeues the owning Task immediately, not on the next hourly mirror sweep. A
+// built controller hides its Owns set, so this is a registration guard; the
+// requeue's EFFECT is covered by TestReconcileClocks_ReviewMergedExternally_*.
+func TestTaskReconciler_SetupWithManager_WatchesMergeRequests(t *testing.T) {
+	mgr := newTestManager(t)
+	r := &TaskReconciler{
+		Client:    mgr.GetClient(),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Session:   newFakeSession(),
+		PodConfig: agent.PodConfig{Namespace: mdNS},
+	}
+	if err := r.SetupWithManager(mgr); err != nil && !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("SetupWithManager: %v", err)
+	}
+}

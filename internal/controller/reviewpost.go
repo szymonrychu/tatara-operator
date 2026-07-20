@@ -344,8 +344,31 @@ func (d *StageDriver) mrReader() client.Reader {
 // the Task waited out the whole HandoffDeadline and parked handoff-stalled. The
 // Task reconciler re-runs this same decision every reviewing reconcile as the
 // level-triggered backstop.
+
+// terminalMREdge is the SHARED external-terminal reviewing-exit decision, used
+// by reviewAdvanceEdge (the deferred/level re-drive), reconcileClocks (the #33
+// unconditional finalize), and ensureStagePod (the pre-dispatch guard). It is
+// the single source of truth: a kind=review Task whose EVERY owned MR reached a
+// terminal forge state has no legal outcome to post, so the operator finalizes
+// it pod-lessly - delivered if all merged, rejected if any closed-unmerged.
+func terminalMREdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest) (stage.Edge, bool) {
+	if task == nil || task.Spec.Kind != "review" || !stage.AllMRsTerminal(mrs) {
+		return stage.Edge{}, false
+	}
+	if stage.AllMRsMerged(mrs) {
+		return stage.Edge{To: tatarav1alpha1.StageDelivered, Reason: stage.ReasonMRMergedExternally}, true
+	}
+	return stage.Edge{To: tatarav1alpha1.StageRejected, Reason: stage.ReasonMRClosedExternally}, true
+}
+
 func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
 	maxRounds int) (stage.Edge, bool) {
+	// A merged/closed MR can no longer be reviewed, so a stale pendingReview must
+	// not veto finalization: check the external-terminal edge BEFORE the
+	// pendingReview-owed gate below.
+	if edge, ok := terminalMREdge(task, mrs); ok {
+		return edge, true
+	}
 	if len(mrs) == 0 {
 		return stage.Edge{}, false
 	}

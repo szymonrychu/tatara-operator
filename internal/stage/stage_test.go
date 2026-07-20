@@ -175,9 +175,45 @@ func mergedMR() v1alpha1.MergeRequest {
 	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{State: "merged", MergedAt: &now}}
 }
 
+func closedMR() v1alpha1.MergeRequest {
+	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{State: "closed"}}
+}
+
 func ptime(t time.Time) *metav1.Time {
 	mt := metav1.NewTime(t)
 	return &mt
+}
+
+func TestMRStateHelpers(t *testing.T) {
+	merged := mergedMR()
+	closed := closedMR()
+	open := openMR()
+
+	// mrTerminal
+	require.True(t, stage.MRTerminal(merged))
+	require.True(t, stage.MRTerminal(closed))
+	require.False(t, stage.MRTerminal(open))
+	require.False(t, stage.MRTerminal(v1alpha1.MergeRequest{}), "blank state is NOT terminal")
+
+	// allMRsTerminal
+	require.False(t, stage.AllMRsTerminal(nil), "empty slice is NOT terminal")
+	require.False(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{}), "empty slice is NOT terminal")
+	require.True(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{merged}))
+	require.True(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{merged, closed}))
+	require.False(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{merged, open}), "one open MR is not all-terminal")
+
+	// allMRsMerged
+	require.False(t, stage.AllMRsMerged(nil), "empty slice is NOT all-merged")
+	require.True(t, stage.AllMRsMerged([]v1alpha1.MergeRequest{merged}))
+	require.False(t, stage.AllMRsMerged([]v1alpha1.MergeRequest{merged, closed}), "a closed MR is not merged")
+	require.False(t, stage.AllMRsMerged([]v1alpha1.MergeRequest{merged, open}))
+}
+
+func TestMRExternalTerminalReasonsAreInTheClosedSet(t *testing.T) {
+	require.True(t, stage.ValidReason(stage.ReasonMRMergedExternally))
+	require.True(t, stage.ValidReason(stage.ReasonMRClosedExternally))
+	require.Equal(t, "mr-merged-externally", stage.ReasonMRMergedExternally)
+	require.Equal(t, "mr-closed-externally", stage.ReasonMRClosedExternally)
 }
 
 const botLogin = "tatara-bot"
@@ -716,11 +752,20 @@ func TestEveryTransitionClearsBothTimestampsAndPodRecreations(t *testing.T) {
 			t.Run(from+"->"+e.To+"("+e.Reason+")", func(t *testing.T) {
 				// A non-review kind so no kind guard interferes; MRs with no
 				// pendingReview so the C.5.3 gate is open.
-				task := newTask("implement", from, "")
+				kind := "implement"
+				mrs := []v1alpha1.MergeRequest{openMR()}
+				if from == v1alpha1.StageReviewing && e.To == v1alpha1.StageDelivered &&
+					e.Reason == stage.ReasonMRMergedExternally {
+					// The LegalFor delivered gate requires kind=review and every
+					// owned MR merged; every OTHER row in this table tolerates the
+					// generic implement/openMR fixture, but this one is gated.
+					kind = "review"
+					mrs = []v1alpha1.MergeRequest{mergedMR()}
+				}
+				task := newTask(kind, from, "")
 				task.Status.PodStartedAt = ptime(stale)
 				task.Status.StageWorkStartedAt = ptime(stale)
 				task.Status.Stats.PodRecreations = 2
-				mrs := []v1alpha1.MergeRequest{openMR()}
 
 				if err := stage.Enter(task, mrs, e.To, e.Reason, now); err != nil {
 					t.Fatalf("Enter: %v", err)
@@ -905,6 +950,7 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageReviewing, v1alpha1.StageImplementing},
 		{v1alpha1.StageReviewing, v1alpha1.StageMerging},
 		{v1alpha1.StageReviewing, v1alpha1.StageParked},
+		{v1alpha1.StageReviewing, v1alpha1.StageDelivered}, // kind=review, every owned MR merged externally
 		{v1alpha1.StageMerging, v1alpha1.StageReviewing},
 		{v1alpha1.StageMerging, v1alpha1.StageDeploying},
 		{v1alpha1.StageMerging, v1alpha1.StageFailed},
@@ -955,7 +1001,6 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageImplementing, v1alpha1.StageDeploying},
 		{v1alpha1.StageImplementing, v1alpha1.StageDelivered},
 		{v1alpha1.StageReviewing, v1alpha1.StageDeploying}, // never skip merge
-		{v1alpha1.StageReviewing, v1alpha1.StageDelivered},
 		{v1alpha1.StageMerging, v1alpha1.StageDelivered},
 		{v1alpha1.StageDeploying, v1alpha1.StageImplementing},
 		{v1alpha1.StageDeploying, v1alpha1.StageMerging},
@@ -1571,7 +1616,7 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// emits both (clarifying->rejected on decision=close; investigating
 		// ->rejected on submit_outcome(false_positive)), and stage.Enter
 		// validates against this set. Per contract M.3, F.3's table wins.
-		// The set has 27 members, not 24.
+		// The set has 29 members, not 24.
 		"declined", "false-positive",
 		// handoff-stalled: reviewing -> parked when the outcome COMMITTED but
 		// the phase-2 drain never advanced the Task within HandoffDeadline.
@@ -1587,6 +1632,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// lands on the owned MR (MR ownership design); also the reason on both
 		// parked(ownership-lost) re-entries (-> approved, -> merging).
 		"ownership-lost",
+		// mr-merged-externally / mr-closed-externally: reviewing -> delivered /
+		// reviewing -> rejected when every owned MR reached a terminal forge state
+		// externally (a human merged/closed the review target). kind=review only.
+		"mr-merged-externally", "mr-closed-externally",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -2191,4 +2240,53 @@ func TestTakeoverKind_NotBarredFromImplementing(t *testing.T) {
 	if !stage.LegalFor(tk, nil, v1alpha1.StageApproved, v1alpha1.StageImplementing) {
 		t.Fatalf("a kind=takeover Task must be allowed approved->implementing")
 	}
+}
+
+func TestReviewingHasExternalTerminalEdges(t *testing.T) {
+	// Both new edges are present in the F.3 table out of reviewing.
+	var toDelivered, toRejectedMR bool
+	for _, e := range stage.Transitions[v1alpha1.StageReviewing] {
+		if e.To == v1alpha1.StageDelivered && e.Reason == stage.ReasonMRMergedExternally {
+			toDelivered = true
+		}
+		if e.To == v1alpha1.StageRejected && e.Reason == stage.ReasonMRClosedExternally {
+			toRejectedMR = true
+		}
+	}
+	require.True(t, toDelivered, "reviewing -> delivered(mr-merged-externally) edge missing")
+	require.True(t, toRejectedMR, "reviewing -> rejected(mr-closed-externally) edge missing")
+
+	// Structurally legal pairs.
+	require.True(t, stage.Legal(v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	require.True(t, stage.Legal(v1alpha1.StageReviewing, v1alpha1.StageRejected))
+}
+
+func TestLegalFor_ReviewingToDelivered_OnlyReviewKindAllMerged(t *testing.T) {
+	review := newTask("review", v1alpha1.StageReviewing, "")
+	impl := newTask("implement", v1alpha1.StageReviewing, "")
+	merged := []v1alpha1.MergeRequest{mergedMR()}
+	mixed := []v1alpha1.MergeRequest{mergedMR(), openMR()}
+	closed := []v1alpha1.MergeRequest{mergedMR(), closedMR()}
+
+	// Legal: review kind, every owned MR merged.
+	require.True(t, stage.LegalFor(review, merged, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: an open MR remains.
+	require.False(t, stage.LegalFor(review, mixed, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: a closed-unmerged MR is terminal but not merged -> not delivered.
+	require.False(t, stage.LegalFor(review, closed, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: not review kind.
+	require.False(t, stage.LegalFor(impl, merged, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: empty MR set.
+	require.False(t, stage.LegalFor(review, nil, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+}
+
+// REGRESSION GUARD: the issue-closed stop (issue_apply.go:45) enters
+// reviewing -> rejected with mrs == nil. LegalFor must NOT tighten that pair, or
+// the human-closed-issue stop breaks for review Tasks.
+func TestLegalFor_ReviewingToRejected_IssueClosedStillLegalWithNilMRs(t *testing.T) {
+	review := newTask("review", v1alpha1.StageReviewing, "")
+	require.True(t, stage.LegalFor(review, nil, v1alpha1.StageReviewing, v1alpha1.StageRejected),
+		"reviewing -> rejected must stay legal (issue-closed shares this pair)")
+	impl := newTask("implement", v1alpha1.StageReviewing, "")
+	require.True(t, stage.LegalFor(impl, nil, v1alpha1.StageReviewing, v1alpha1.StageRejected))
 }

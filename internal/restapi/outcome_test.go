@@ -1573,3 +1573,49 @@ func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
 		"the second outcome's claim clobbered the committed condition before the gate ran, "+
 			"and its release then removed the claim it owned: the slot ends up EMPTY")
 }
+
+// A kind=review submit_outcome(review) against an already-MERGED PR is a 2xx
+// no-op (the review target landed), NOT a 400 that respawn-loops the pod.
+func TestOutcome_Review_MergedMR_NoOpNot400(t *testing.T) {
+	mr := mrV2("tatara-agent-skills", 33, "t1")
+	mr.Status.State = "merged"
+	before := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-terminal-noop"))
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-agent-skills", "tatara"),
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Body.String(), `"noop":true`)
+	require.Contains(t, w.Body.String(), `"reason":"mr-terminal"`)
+	after := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-terminal-noop"))
+	require.Equal(t, before+1, after,
+		"operator_rest_outcome_accepted_total{kind=review,outcome=mr-terminal-noop} must record the terminal no-op")
+}
+
+func TestOutcome_Review_ClosedMR_NoOpNot400(t *testing.T) {
+	mr := mrV2("tatara-agent-skills", 33, "t1")
+	mr.Status.State = "closed"
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-agent-skills", "tatara"),
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Body.String(), `"reason":"mr-terminal"`)
+}
+
+// An OPEN MR is unchanged: the review handler proceeds through the normal
+// live-head-read path, never the terminal no-op. reviewPanicForge (not the
+// bare panicForge{} the brief sketched) answers GetPRHead with the reviewed
+// SHA so the normal path completes instead of nil-pointer-panicking the whole
+// test binary on the live head read every open-MR review legitimately makes.
+func TestOutcome_Review_OpenMR_NotNoOp(t *testing.T) {
+	mr := mrV2("tatara-agent-skills", 33, "t1") // open
+	e := buildV2(t, v2Opts{writer: &reviewPanicForge{heads: map[int]string{33: "s"}}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-agent-skills", "tatara"),
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
+	require.NotContains(t, w.Body.String(), `"reason":"mr-terminal"`, "an open MR is never the terminal no-op")
+}
