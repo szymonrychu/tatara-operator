@@ -175,9 +175,45 @@ func mergedMR() v1alpha1.MergeRequest {
 	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{State: "merged", MergedAt: &now}}
 }
 
+func closedMR() v1alpha1.MergeRequest {
+	return v1alpha1.MergeRequest{Status: v1alpha1.MergeRequestStatus{State: "closed"}}
+}
+
 func ptime(t time.Time) *metav1.Time {
 	mt := metav1.NewTime(t)
 	return &mt
+}
+
+func TestMRStateHelpers(t *testing.T) {
+	merged := mergedMR()
+	closed := closedMR()
+	open := openMR()
+
+	// mrTerminal
+	require.True(t, stage.MRTerminal(merged))
+	require.True(t, stage.MRTerminal(closed))
+	require.False(t, stage.MRTerminal(open))
+	require.False(t, stage.MRTerminal(v1alpha1.MergeRequest{}), "blank state is NOT terminal")
+
+	// allMRsTerminal
+	require.False(t, stage.AllMRsTerminal(nil), "empty slice is NOT terminal")
+	require.False(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{}), "empty slice is NOT terminal")
+	require.True(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{merged}))
+	require.True(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{merged, closed}))
+	require.False(t, stage.AllMRsTerminal([]v1alpha1.MergeRequest{merged, open}), "one open MR is not all-terminal")
+
+	// allMRsMerged
+	require.False(t, stage.AllMRsMerged(nil), "empty slice is NOT all-merged")
+	require.True(t, stage.AllMRsMerged([]v1alpha1.MergeRequest{merged}))
+	require.False(t, stage.AllMRsMerged([]v1alpha1.MergeRequest{merged, closed}), "a closed MR is not merged")
+	require.False(t, stage.AllMRsMerged([]v1alpha1.MergeRequest{merged, open}))
+}
+
+func TestMRExternalTerminalReasonsAreInTheClosedSet(t *testing.T) {
+	require.True(t, stage.ValidReason(stage.ReasonMRMergedExternally))
+	require.True(t, stage.ValidReason(stage.ReasonMRClosedExternally))
+	require.Equal(t, "mr-merged-externally", stage.ReasonMRMergedExternally)
+	require.Equal(t, "mr-closed-externally", stage.ReasonMRClosedExternally)
 }
 
 const botLogin = "tatara-bot"
@@ -1571,7 +1607,7 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// emits both (clarifying->rejected on decision=close; investigating
 		// ->rejected on submit_outcome(false_positive)), and stage.Enter
 		// validates against this set. Per contract M.3, F.3's table wins.
-		// The set has 27 members, not 24.
+		// The set has 29 members, not 24.
 		"declined", "false-positive",
 		// handoff-stalled: reviewing -> parked when the outcome COMMITTED but
 		// the phase-2 drain never advanced the Task within HandoffDeadline.
@@ -1587,6 +1623,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// lands on the owned MR (MR ownership design); also the reason on both
 		// parked(ownership-lost) re-entries (-> approved, -> merging).
 		"ownership-lost",
+		// mr-merged-externally / mr-closed-externally: reviewing -> delivered /
+		// reviewing -> rejected when every owned MR reached a terminal forge state
+		// externally (a human merged/closed the review target). kind=review only.
+		"mr-merged-externally", "mr-closed-externally",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {

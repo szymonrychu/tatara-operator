@@ -83,6 +83,8 @@ const (
 	ReasonHandoffStalled         = "handoff-stalled"
 	ReasonIssueClosed            = "issue-closed"
 	ReasonOwnershipLost          = "ownership-lost"
+	ReasonMRMergedExternally     = "mr-merged-externally"
+	ReasonMRClosedExternally     = "mr-closed-externally"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -121,6 +123,8 @@ var Reasons = []string{
 	ReasonHandoffStalled,
 	ReasonIssueClosed,
 	ReasonOwnershipLost,
+	ReasonMRMergedExternally,
+	ReasonMRClosedExternally,
 }
 
 // issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
@@ -466,6 +470,41 @@ func reviewGateOpen(mrs []v1alpha1.MergeRequest) bool {
 	}
 	for i := range mrs {
 		if mrs[i].Status.PendingReview != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// MRTerminal reports whether an MR has reached a terminal forge state:
+// Status.State in {"merged","closed"}. This is the complement of openMRs' open
+// set {"", "open"}; a blank or open state is NOT terminal.
+func MRTerminal(mr v1alpha1.MergeRequest) bool {
+	return mr.Status.State == "merged" || mr.Status.State == "closed"
+}
+
+// AllMRsTerminal reports whether EVERY owned MR is terminal. An empty slice is
+// NOT terminal: a Task with no MR refs is a different, pre-existing condition
+// and out of scope for the external-terminal finalize.
+func AllMRsTerminal(mrs []v1alpha1.MergeRequest) bool {
+	if len(mrs) == 0 {
+		return false
+	}
+	for i := range mrs {
+		if !MRTerminal(mrs[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// AllMRsMerged reports whether EVERY owned MR merged. An empty slice is false.
+func AllMRsMerged(mrs []v1alpha1.MergeRequest) bool {
+	if len(mrs) == 0 {
+		return false
+	}
+	for i := range mrs {
+		if mrs[i].Status.State != "merged" {
 			return false
 		}
 	}
