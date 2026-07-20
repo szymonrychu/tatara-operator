@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/prompt"
@@ -664,4 +665,50 @@ func TestDrainPendingReview_AdvanceListsOwnedMRsUncached(t *testing.T) {
 	if got := mdGetTask(t, base, "t1"); got.Status.Stage != tatarav1alpha1.StageMerging {
 		t.Fatalf("stage = %q, want merging: the uncached read must see A's settled review", got.Status.Stage)
 	}
+}
+
+func TestTerminalMREdge(t *testing.T) {
+	review := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	impl := mdTask("t2", "implement", tatarav1alpha1.StageReviewing)
+	merged := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{State: "merged"}}
+	closed := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{State: "closed"}}
+	open := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{State: "open"}}
+
+	// All merged -> delivered(mr-merged-externally).
+	edge, ok := terminalMREdge(review, []tatarav1alpha1.MergeRequest{merged})
+	require.True(t, ok)
+	require.Equal(t, tatarav1alpha1.StageDelivered, edge.To)
+	require.Equal(t, stage.ReasonMRMergedExternally, edge.Reason)
+
+	// All terminal, one closed-unmerged -> rejected(mr-closed-externally).
+	edge, ok = terminalMREdge(review, []tatarav1alpha1.MergeRequest{merged, closed})
+	require.True(t, ok)
+	require.Equal(t, tatarav1alpha1.StageRejected, edge.To)
+	require.Equal(t, stage.ReasonMRClosedExternally, edge.Reason)
+
+	// An open MR -> no finalize.
+	_, ok = terminalMREdge(review, []tatarav1alpha1.MergeRequest{merged, open})
+	require.False(t, ok)
+
+	// Empty set -> no finalize.
+	_, ok = terminalMREdge(review, nil)
+	require.False(t, ok)
+
+	// Non-review kind, all merged -> no finalize (implement keeps its lifecycle).
+	_, ok = terminalMREdge(impl, []tatarav1alpha1.MergeRequest{merged})
+	require.False(t, ok)
+}
+
+// A merged/closed MR carrying a STALE pendingReview must still finalize:
+// terminalMREdge runs BEFORE the pendingReview-owed gate in reviewAdvanceEdge.
+func TestReviewAdvanceEdge_TerminalMRBeatsStalePendingReview(t *testing.T) {
+	review := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	merged := tatarav1alpha1.MergeRequest{Status: tatarav1alpha1.MergeRequestStatus{
+		State:         "merged",
+		PendingReview: &tatarav1alpha1.PendingReview{},
+	}}
+	edge, ok := reviewAdvanceEdge(review, []tatarav1alpha1.MergeRequest{merged}, 3)
+	require.True(t, ok, "a merged MR must finalize even with a stale pendingReview")
+	require.Equal(t, tatarav1alpha1.StageDelivered, edge.To)
+	require.Equal(t, stage.ReasonMRMergedExternally, edge.Reason)
 }
