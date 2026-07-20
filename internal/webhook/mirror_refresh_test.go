@@ -178,6 +178,51 @@ func TestMRSynchronize_MirrorsHeadNoTransition(t *testing.T) {
 	require.Equal(t, tatarav1.StageReviewing, getPETask(t, c, task.Name).Status.Stage, "no review restart on synchronize")
 }
 
+// TestMRSynchronize_BotPushStampsLastBotHeadSHA proves a verified bot-push
+// webhook advances the bot-head cursor immediately: OP8's ReconcileOwnership
+// must not read a push webhook that races ahead of the implement-outcome
+// record as an unattributable external push.
+func TestMRSynchronize_BotPushStampsLastBotHeadSHA(t *testing.T) {
+	task := peTask("t-rev", tatarav1.StageReviewing, "", tatarav1.IssueName("pe-repo", 7))
+	task.Status.MRRefs = []string{tatarav1.MergeRequestName("pe-repo", 34)}
+	mr := peMR(34, task, tatarav1.MergeRequestStatus{State: "open", HeadSHA: "oldhead"})
+	proj := peProject("tatara-bot", "maintainer")
+	c := peClient(t, proj, peRepo(), task, mr)
+	s := peServer(c, &stubSpiller{}, nil)
+
+	ev := scm.WebhookEvent{Kind: "mr", IsPR: true, Action: "synchronize", Number: 34, Repo: peRepoURL,
+		HeadSHA: "bot-head-abc", ActorLogin: "tatara-bot"}
+	w := httptest.NewRecorder()
+	s.handleMRSynchronize(context.Background(), w, "github", *proj, ev)
+
+	var got tatarav1.MergeRequest
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: peNS, Name: mr.Name}, &got))
+	require.Equal(t, "bot-head-abc", got.Status.HeadSHA)
+	require.Equal(t, "bot-head-abc", got.Status.LastBotHeadSHA, "a verified bot push must stamp lastBotHeadSHA")
+}
+
+// TestMRSynchronize_HumanPushDoesNotStampLastBotHeadSHA proves a non-bot
+// pusher advances only the HeadSHA mirror, leaving LastBotHeadSHA stale so
+// ReconcileOwnership (OP8) sees the drift and flips.
+func TestMRSynchronize_HumanPushDoesNotStampLastBotHeadSHA(t *testing.T) {
+	task := peTask("t-rev2", tatarav1.StageReviewing, "", tatarav1.IssueName("pe-repo", 7))
+	task.Status.MRRefs = []string{tatarav1.MergeRequestName("pe-repo", 35)}
+	mr := peMR(35, task, tatarav1.MergeRequestStatus{State: "open", HeadSHA: "oldhead", LastBotHeadSHA: "old-bot-head"})
+	proj := peProject("tatara-bot", "maintainer")
+	c := peClient(t, proj, peRepo(), task, mr)
+	s := peServer(c, &stubSpiller{}, nil)
+
+	ev := scm.WebhookEvent{Kind: "mr", IsPR: true, Action: "synchronize", Number: 35, Repo: peRepoURL,
+		HeadSHA: "human-head-xyz", ActorLogin: "octocat"}
+	w := httptest.NewRecorder()
+	s.handleMRSynchronize(context.Background(), w, "github", *proj, ev)
+
+	var got tatarav1.MergeRequest
+	require.NoError(t, c.Get(context.Background(), client.ObjectKey{Namespace: peNS, Name: mr.Name}, &got))
+	require.Equal(t, "human-head-xyz", got.Status.HeadSHA, "the HeadSHA mirror still advances")
+	require.Equal(t, "old-bot-head", got.Status.LastBotHeadSHA, "a human push must NOT move lastBotHeadSHA")
+}
+
 // --- PR closed/merged out-of-band ------------------------------------------
 
 func TestMRClosed_Merged_MirrorsMergedState(t *testing.T) {

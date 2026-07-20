@@ -11,6 +11,15 @@ import (
 // The compile-time check is: if the symbol were present the code below that
 // uses reflect would see it; since we removed it we verify the struct fields
 // that used to depend on it are untouched and the package builds clean.
+func TestTakeoverKind_IsUnconstrained(t *testing.T) {
+	if !unconstrainedKinds["takeover"] {
+		t.Fatalf("takeover must be an unconstrained kind")
+	}
+	if repoScopedKinds["takeover"] || projectScopedKinds["takeover"] {
+		t.Fatalf("takeover must not be repo- or project-scoped")
+	}
+}
+
 func TestConditionApprovalApprovedAbsent(t *testing.T) {
 	// Verify via reflect that no exported const named "ApprovalApproved" is
 	// reachable through the zero-value TaskStatus (it was a condition type string).

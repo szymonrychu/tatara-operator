@@ -23,6 +23,13 @@ const (
 	// so its pod checks out the PR head read-only and can run/test it (issue #114
 	// decision 4). The review agent never pushes (its TASK_BRANCH stays empty).
 	AnnReviewHeadBranch = "tatara.dev/review-head-branch"
+	// AnnTakeoverHeadBranch carries the existing MR head (source) branch on a
+	// takeover Task so its implement pod PUSHES to that exact branch via
+	// TASK_BRANCH. Unlike AnnReviewHeadBranch (read-only CHECKOUT_BRANCH, review
+	// kind only), this drives the PUSH checkout, so an arbitrary human/other-bot
+	// MR branch (e.g. renovate/*) can be worked without reproducing the derived
+	// tatara/* branch name.
+	AnnTakeoverHeadBranch = "tatara.dev/takeover-head-branch"
 )
 
 // AnnBrainstormSources is the annotation key carrying the comma-separated

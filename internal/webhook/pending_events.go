@@ -97,7 +97,7 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		Author: ev.ActorLogin,
 		Body:   ev.CommentBody,
 	}
-	if err := AppendTaskEvent(ctx, s.cfg.Client, task, taskEv); err != nil {
+	if err := controller.AppendTaskEvent(ctx, s.cfg.Client, task, taskEv); err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: append task event failed", "error", err, "task", task.Name)
 		return
 	}
@@ -347,36 +347,6 @@ func (s *Server) scmReader(ctx context.Context, proj *tatarav1.Project) (scm.SCM
 	return reader, nil
 }
 
-// AppendTaskEvent appends ev to task.Status.PendingEvents (contract E.3),
-// capping Go-side at maxPendingEvents, drop-oldest, BEFORE the write. The
-// CRD's MaxItems=25 is a backstop only: an API-server 422 is NOT retried by
-// retry.RetryOnConflict and would hot-loop webhook redelivery, so the cap
-// here must stay strictly below it.
-//
-// The E.3 enqueue filter (drop a bot-authored event) is the CALLER's
-// responsibility, applied BEFORE this function is ever invoked - a
-// bot-authored ev must never reach it.
-//
-// On success task is updated in place to the freshly persisted object, so a
-// caller that goes on to inspect task.Status sees the write it just made.
-func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1.Task, ev tatarav1.TaskEvent) error {
-	key := client.ObjectKeyFromObject(task)
-	fresh := &tatarav1.Task{}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh = &tatarav1.Task{}
-		if err := c.Get(ctx, key, fresh); err != nil {
-			return err
-		}
-		fresh.Status.PendingEvents = appendEventCapped(fresh.Status.PendingEvents, ev, maxPendingEvents)
-		return c.Status().Update(ctx, fresh)
-	})
-	if err != nil {
-		return fmt.Errorf("webhook: append task event on %s: %w", task.Name, err)
-	}
-	*task = *fresh
-	return nil
-}
-
 // ClearDeliveredEvents removes exactly the delivered events from
 // task.Status.PendingEvents - a SET-DIFFERENCE keyed on (Kind, Repo, Number,
 // At), inside RetryOnConflict, NEVER a blind PendingEvents = nil.
@@ -403,18 +373,6 @@ func ClearDeliveredEvents(ctx context.Context, c client.Client, task *tatarav1.T
 	}
 	*task = *fresh
 	return nil
-}
-
-// appendEventCapped appends ev to events, keeping at most max entries by
-// dropping the oldest. It never mutates the input slice's backing array.
-func appendEventCapped(events []tatarav1.TaskEvent, ev tatarav1.TaskEvent, max int) []tatarav1.TaskEvent {
-	out := make([]tatarav1.TaskEvent, 0, len(events)+1)
-	out = append(out, events...)
-	out = append(out, ev)
-	if max > 0 && len(out) > max {
-		out = out[len(out)-max:]
-	}
-	return out
 }
 
 // eventKey is the delivery identity contract E.3's clear step keys on:

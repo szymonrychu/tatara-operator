@@ -321,6 +321,8 @@ func branchKind(t *tatarav1alpha1.Task) string {
 		return "feat"
 	case "documentation":
 		return "docs"
+	case "takeover":
+		return "feat"
 	default: // review, brainstorm, clarify, refine
 		return "chore"
 	}
@@ -363,12 +365,18 @@ func TaskBranch(t *tatarav1alpha1.Task) string {
 // branchEnvValues returns the (TASK_BRANCH, CHECKOUT_BRANCH) pair for a Task.
 // Normal tasks push to TASK_BRANCH. An MR review (issue #114 decision 4) instead
 // checks out the PR head READ-ONLY via CHECKOUT_BRANCH and leaves TASK_BRANCH
-// empty, so the wrapper never pushes and cannot clobber the user's PR.
+// empty, so the wrapper never pushes and cannot clobber the user's PR. A
+// takeover Task pushes to the EXISTING MR head branch (AnnTakeoverHeadBranch)
+// instead of the synthetic tatara/... branch, so the wrapper's bootstrap
+// resumes and pushes back onto the same branch the abandoned MR already has.
 func branchEnvValues(task *tatarav1alpha1.Task) (taskBranch, checkoutBranch string) {
 	if task.Spec.Kind == kindReview {
 		if hb := task.Annotations[tatarav1alpha1.AnnReviewHeadBranch]; hb != "" {
 			return "", hb
 		}
+	}
+	if hb := task.Annotations[tatarav1alpha1.AnnTakeoverHeadBranch]; hb != "" {
+		return hb, ""
 	}
 	return TaskBranch(task), ""
 }

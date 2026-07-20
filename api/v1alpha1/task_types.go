@@ -56,8 +56,9 @@ var projectScopedKinds = map[string]bool{
 // empty or a non-empty RepositoryRef: the sweep mints them with no repo, while
 // a proposal-born clarify carries its proposal's repo.
 var unconstrainedKinds = map[string]bool{
-	"review":  true,
-	"clarify": true,
+	"review":   true,
+	"clarify":  true,
+	"takeover": true,
 }
 
 // IsProjectScopedKind reports whether a task kind is project-scoped (operates on
@@ -169,7 +170,7 @@ type TaskSpec struct {
 	Source *TaskSource `json:"source,omitempty"`
 	// Kind is the ORIGIN. Immutable, baked into the name. NOT the running agent
 	// kind (that is Status.AgentKind, driven by the F.2 stage table).
-	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;takeover
 	// +optional
 	Kind string `json:"kind,omitempty"`
 	// DedupKey is the dedup identity for an incident Task: the alert-group hash

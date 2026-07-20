@@ -96,6 +96,31 @@ type MergeRequestStatus struct {
 	// Project.spec.agent.maxReviewRounds the Task parks (review-loop-exhausted).
 	// +optional
 	ReviewRounds int `json:"reviewRounds,omitempty"`
+	// Ownership is who drives this MR: "tatara" (the platform may push, review,
+	// and merge it) or "external" (review rounds only, awaiting-human, no agent
+	// push, no operator merge). OPERATOR-OWNED, derived by ReconcileOwnership from
+	// the last bot-pushed head SHA and gated takeover comments. The merge gate
+	// reads it. Empty until the first reconcile classifies the MR.
+	// +kubebuilder:validation:Enum=tatara;external
+	// +optional
+	Ownership string `json:"ownership,omitempty"`
+	// LastBotHeadSHA is the head SHA after the last tatara-agent push. Recorded
+	// LIVE at implement-outcome accept (never trusted from the agent) and by a
+	// verified bot-push webhook. Head drift away from it on a tatara-owned MR is
+	// the external-push signal.
+	// +optional
+	LastBotHeadSHA string `json:"lastBotHeadSHA,omitempty"`
+	// +optional
+	OwnershipChangedAt *metav1.Time `json:"ownershipChangedAt,omitempty"`
+	// OwnershipReason is the audit trail for the last flip: "initial",
+	// "takeover-requested-by:<user>", or "external-push:<sha>".
+	// +optional
+	OwnershipReason string `json:"ownershipReason,omitempty"`
+	// LastMirroredCommentID is the sweep's redelivery cursor: the ExternalID of
+	// the newest MR comment already mirrored and delivered as a TaskEvent. The
+	// sweep redelivers only comments newer than it.
+	// +optional
+	LastMirroredCommentID string `json:"lastMirroredCommentID,omitempty"`
 	// PendingReview is the durable intent the MergeRequest reconciler drains
 	// (fix M8; the mechanism is H3-5 + V6-4). Non-nil means "a review is owed to
 	// the forge". THE STAGE MACHINE IS GATED ON IT BEING NIL (F.3), so a pod can
@@ -115,6 +140,14 @@ type MergeRequestStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
+// Ownership* are the two MergeRequestStatus.Ownership values (contract: MR
+// ownership design 2026-07-19). Bare-string members, matching the Status
+// review-state enum's no-type-alias pattern.
+const (
+	OwnershipTatara   = "tatara"
+	OwnershipExternal = "external"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
@@ -123,6 +156,7 @@ type MergeRequestStatus struct {
 // +kubebuilder:printcolumn:name="Num",type=integer,JSONPath=`.spec.number`
 // +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.status`
+// +kubebuilder:printcolumn:name="Own",type=string,JSONPath=`.status.ownership`
 // +kubebuilder:printcolumn:name="CI",type=string,JSONPath=`.status.ciStatus`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

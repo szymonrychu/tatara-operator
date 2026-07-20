@@ -42,6 +42,25 @@ const forgeAlertRulePrefix = "tatara-alert-rule="
 // condition and may not import this package.
 const outcomeAcceptedCondition = tatarav1alpha1.ConditionOutcomeAccepted
 
+// discardWriter satisfies http.ResponseWriter by throwing away everything
+// written to it. Some helpers (projectSCMWriterAndToken) write an HTTP error
+// as a side effect of a resolution failure; handing them a discardWriter
+// instead of the request's real ResponseWriter is how a caller that has
+// already committed to sending its OWN single response - and only wants the
+// resolved value, not a competing write - can still call them.
+type discardWriter struct{ h http.Header }
+
+func (d *discardWriter) Header() http.Header {
+	if d.h == nil {
+		d.h = http.Header{}
+	}
+	return d.h
+}
+
+func (d *discardWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+func (d *discardWriter) WriteHeader(int) {}
+
 func sha256Sum(s string) []byte {
 	sum := sha256.Sum256([]byte(s))
 	return sum[:]
@@ -768,6 +787,54 @@ func (o *outcomeCtx) implement(p implementPayload) {
 	}) {
 		return
 	}
+
+	// Record the LIVE MR head as the last bot-pushed SHA (never trust an
+	// agent-reported SHA). This is the machine signal ReconcileOwnership uses to
+	// detect a later external push. Best-effort: the stage transition already
+	// committed above, so nothing here may touch o.w - projectSCMWriterAndToken
+	// writes an HTTP error to whatever ResponseWriter it is given on failure
+	// (a live k8s Get for the scm secret, which can transiently fail), and o.w
+	// must carry exactly the ONE response o.ok() sends below. A discardWriter
+	// throws that side-effect response away; every failure here just skips the
+	// stamp - the tiny race with a same-instant human push, or a mirror left
+	// stale, settles via the sweep - and is logged at WARN so a stuck cursor is
+	// debuggable instead of silently stale.
+	if writer, token, ok := s.projectSCMWriterAndToken(&discardWriter{}, o.r, o.proj); ok {
+		for i := range open {
+			mr := &open[i]
+			repo, err := s.repoCR(ctx, o.proj.Name, mr.Spec.RepositoryRef)
+			if err != nil {
+				s.log.WarnContext(ctx, "restapi: record_bot_head skipped: repository lookup failed",
+					"action", "record_bot_head_skip", "reason", "repo_lookup", "task", o.task.Name, "mr", mr.Name, "error", err)
+				continue
+			}
+			live, err := writer.GetPRHead(ctx, repo.Spec.URL, token, mr.Spec.Number)
+			if err != nil {
+				s.log.WarnContext(ctx, "restapi: record_bot_head skipped: live head read failed",
+					"action", "record_bot_head_skip", "reason", "get_pr_head", "task", o.task.Name, "mr", mr.Name, "error", err)
+				continue
+			}
+			if live == "" {
+				s.log.WarnContext(ctx, "restapi: record_bot_head skipped: scm returned an empty head",
+					"action", "record_bot_head_skip", "reason", "empty_head", "task", o.task.Name, "mr", mr.Name)
+				continue
+			}
+			key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
+			if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
+				m.Status.LastBotHeadSHA = live
+			}); err != nil {
+				s.log.WarnContext(ctx, "restapi: record_bot_head skipped: mirror write failed",
+					"action", "record_bot_head_skip", "reason", "fit_conflict", "task", o.task.Name, "mr", mr.Name, "error", err)
+				continue
+			}
+			s.log.InfoContext(ctx, "restapi: recorded live bot head at implement accept",
+				"action", "record_bot_head", "task", o.task.Name, "mr", mr.Name, "sha", live)
+		}
+	} else {
+		s.log.WarnContext(ctx, "restapi: record_bot_head skipped: scm writer/token resolution failed",
+			"action", "record_bot_head_skip", "reason", "scm_resolution", "task", o.task.Name)
+	}
+
 	o.ok("submitted", "merge_order", strings.Join(p.MergeOrder, ","),
 		"change_significance", p.ChangeSignificance)
 }

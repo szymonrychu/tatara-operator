@@ -365,7 +365,11 @@ func mdMR(task *tatarav1alpha1.Task, repo string, number int) *tatarav1alpha1.Me
 			RepositoryRef: repo, Number: number, ProjectRef: "proj",
 			URL: fmt.Sprintf("https://github.com/szymonrychu/%s/pull/%d", repo, number),
 		},
-		Status: tatarav1alpha1.MergeRequestStatus{State: "open"},
+		Status: tatarav1alpha1.MergeRequestStatus{
+			State:           "open",
+			Ownership:       tatarav1alpha1.OwnershipTatara,
+			OwnershipReason: "initial",
+		},
 	}
 }
 
@@ -657,6 +661,79 @@ func TestMergeUnexpectedMergeDetector(t *testing.T) {
 	RecordUnexpectedMerge(task, merged)
 	if after := testutil.ToFloat64(obs.UnexpectedMergeTotal.WithLabelValues("tatara-cli")); after != before+1 {
 		t.Fatalf("operator_unexpected_merge_total{repo=tatara-cli} = %v, want %v", after, before+1)
+	}
+}
+
+// --- ownership gate (MR ownership design 2026-07-19) ----------------------
+
+// A never-taken-over external MR (ownershipReason=initial) is human-merged
+// only: the operator refuses, and no forge merge occurs.
+func TestMerge_RefusesExternalInitialMR(t *testing.T) {
+	task := mdTask("t1", takeoverKind, tatarav1alpha1.StageMerging)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 7)
+	mr.Status.ReviewedSHA = "sha-a"
+	mr.Status.Ownership = tatarav1alpha1.OwnershipExternal
+	mr.Status.OwnershipReason = "initial"
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	f.head[7] = "sha-a"
+	d := mdNewDriver(t, f, c)
+
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err == nil {
+		t.Fatalf("merging a never-taken-over external MR (reason=initial) must be refused")
+	}
+	if f.mergeCalls != 0 {
+		t.Fatalf("merge calls = %d, want 0: no forge merge may occur for an external+initial MR", f.mergeCalls)
+	}
+	if gm := mdGetMR(t, c, mr.Name); gm.Status.State == "merged" {
+		t.Fatalf("mr stamped merged for an external+initial MR")
+	}
+}
+
+// A stood-down-after-takeover MR (ownershipReason has prefix "external-push:")
+// keeps merge-on-approve: the approved human head still merges.
+func TestMerge_AllowsExternalPushStandDownMR(t *testing.T) {
+	task := mdTask("t1", takeoverKind, tatarav1alpha1.StageMerging)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 7)
+	mr.Status.ReviewedSHA = "sha-a"
+	mr.Status.Ownership = tatarav1alpha1.OwnershipExternal
+	mr.Status.OwnershipReason = "external-push:human-head"
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	f.head[7] = "sha-a"
+	d := mdNewDriver(t, f, c)
+
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+		t.Fatalf("external + external-push MR must merge on approve: %v", err)
+	}
+	if f.mergeCalls != 1 {
+		t.Fatalf("merge calls = %d, want 1", f.mergeCalls)
+	}
+}
+
+// A tatara-owned MR always merges, regardless of ownershipReason.
+func TestMerge_AllowsTataraOwnedMR(t *testing.T) {
+	task := mdTask("t1", takeoverKind, tatarav1alpha1.StageMerging)
+	task.Spec.MergeOrder = []string{"tatara-operator"}
+	mr := mdMR(task, "tatara-operator", 7)
+	mr.Status.ReviewedSHA = "sha-a"
+	mr.Status.Ownership = tatarav1alpha1.OwnershipTatara
+	mr.Status.OwnershipReason = "initial"
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, mr)
+
+	f := newFakeForge(t)
+	f.head[7] = "sha-a"
+	d := mdNewDriver(t, f, c)
+
+	if _, err := d.ReconcileMerging(context.Background(), mdProject(), task); err != nil {
+		t.Fatalf("tatara-owned MR must merge: %v", err)
+	}
+	if f.mergeCalls != 1 {
+		t.Fatalf("merge calls = %d, want 1", f.mergeCalls)
 	}
 }
 

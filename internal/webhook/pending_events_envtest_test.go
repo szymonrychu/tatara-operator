@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/webhook"
 )
 
@@ -148,7 +149,7 @@ func TestAppendTaskEvent_CapNeverTripsBackstop422(t *testing.T) {
 	// Half 2: AppendTaskEvent, called far past 20 times, never trips it.
 	task := mkPETask(t, "pe-cap-capped")
 	for i := 0; i < 30; i++ {
-		if err := webhook.AppendTaskEvent(ctx, peK8sClient, task, peEv(i)); err != nil {
+		if err := controller.AppendTaskEvent(ctx, peK8sClient, task, peEv(i)); err != nil {
 			t.Fatalf("AppendTaskEvent call %d: %v (the Go-side cap must keep every write under the API-server MaxItems=25 backstop)", i, err)
 		}
 	}
@@ -207,7 +208,7 @@ func TestClearDeliveredEvents_ConcurrentAppendSurvives(t *testing.T) {
 	// Seed two "already delivered" events - what a render just bundled up.
 	delivered := []tatarav1.TaskEvent{peEv(1), peEv(2)}
 	for _, ev := range delivered {
-		if err := webhook.AppendTaskEvent(ctx, peK8sClient, task, ev); err != nil {
+		if err := controller.AppendTaskEvent(ctx, peK8sClient, task, ev); err != nil {
 			t.Fatalf("seed delivered event: %v", err)
 		}
 	}
@@ -237,7 +238,7 @@ func TestClearDeliveredEvents_ConcurrentAppendSurvives(t *testing.T) {
 
 	// A NEW webhook event arrives concurrently, on the REAL unblocked client.
 	arriving := peEv(3)
-	if err := webhook.AppendTaskEvent(ctx, peK8sClient, task, arriving); err != nil {
+	if err := controller.AppendTaskEvent(ctx, peK8sClient, task, arriving); err != nil {
 		t.Fatalf("concurrent AppendTaskEvent: %v", err)
 	}
 

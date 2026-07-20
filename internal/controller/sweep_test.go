@@ -32,6 +32,11 @@ type sweepReader struct {
 	comments map[int][]scm.IssueComment
 	content  map[int]scm.IssueContent
 
+	// prComments backs ListPRComments (OP12's PRCommentLister capability),
+	// keyed by PR number - a SEPARATE map from comments (issue comments), so a
+	// test seeding one never accidentally feeds the other.
+	prComments map[int][]scm.IssueComment
+
 	// listCommentsErr, when set, fails EVERY comment read - the cheapest way to
 	// drive a per-item sweep error (fail("list_comments")) that leaves firstErr
 	// non-nil while the pass still structurally completes.
@@ -63,6 +68,13 @@ func (s *sweepReader) GetIssue(_ context.Context, _, _ string, number int) (scm.
 		return c, nil
 	}
 	return scm.IssueContent{}, nil
+}
+
+// ListPRComments implements scm.PRCommentLister (OP12): the sweep's
+// listPRCommentsAfter type-asserts the reader for it, exactly like
+// syncMergeRequestThread already does for the mirror's cadence sync.
+func (s *sweepReader) ListPRComments(_ context.Context, _, _ string, number int) ([]scm.IssueComment, error) {
+	return s.prComments[number], nil
 }
 
 func sweepProject(name string) *tatarav1alpha1.Project {
@@ -1578,5 +1590,73 @@ func TestWebhookOpenedIssueTriagesAndSpawnsAPod(t *testing.T) {
 	}
 	if pod.Annotations[annPodStage] != tatarav1alpha1.StageClarifying {
 		t.Fatalf("pod stage annotation = %q, want clarifying", pod.Annotations[annPodStage])
+	}
+}
+
+// TestSweepOrphanExternalMRCommentConvergesInOnePass is OP12's headline
+// convergence test: an orphan external MR (never seen before - no MergeRequest
+// CR yet) that ALSO already carries a pending human comment. ONE sweep pass
+// must both (a) mint its review Task on the PRReview classification (the
+// existing ClassifyPR->MintReviewTask rule) AND (b) redeliver that comment to
+// the JUST-MINTED owner - not wait a further sweep cycle for the mirror to
+// catch up. This is the "Convergence with OP6" amendment: sweepPRs re-reads
+// the MR CR after the classify/mint switch specifically so this lands in one
+// pass, and redeliverMRComments' belt-and-suspenders EnsureTaskForMRComment
+// call is provably not needed here (the switch's own mint already bound the
+// owner) - proving the two paths agree without duplicating the mint.
+func TestSweepOrphanExternalMRCommentConvergesInOnePass(t *testing.T) {
+	ctx := context.Background()
+	base := "szymonrychu/tatara-operator"
+	proj := sweepProject("op12-orphan-proj")
+	repo := sweepRepo("op12-orphan-proj")
+	c := newMirrorClient(t, proj, repo) // no MergeRequest CR seeded: a true orphan
+
+	rd := &sweepReader{
+		prs: []scm.PRRef{{
+			Repo: base, HeadRepo: base, Number: 60, Author: "octocat",
+			HeadBranch: "octocat/feature-x", HeadSHA: "sha-60",
+		}},
+		prComments: map[int][]scm.IssueComment{
+			60: {{ExternalID: "500", Author: "octocat", Body: "please take a look", CreatedAt: fixedTime(1)}},
+		},
+	}
+
+	runSweep(t, c, proj, repo, rd)
+
+	tasks := sweepTasks(t, c, proj.Name)
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %d, want 1 (the orphan's review task)", len(tasks))
+	}
+	if tasks[0].Spec.Kind != SweepReviewKind {
+		t.Fatalf("kind = %q, want review", tasks[0].Spec.Kind)
+	}
+
+	var mr tatarav1alpha1.MergeRequest
+	mrKey := types.NamespacedName{Namespace: testNS, Name: tatarav1alpha1.MergeRequestName(repo.Name, 60)}
+	if err := c.Get(ctx, mrKey, &mr); err != nil {
+		t.Fatalf("get mergerequest: %v", err)
+	}
+	if ctrl, ok := ownerControllerName(&mr); !ok || ctrl != tasks[0].Name {
+		t.Fatalf("MR controller owner = %q (ok=%v), want the minted review task %q", ctrl, ok, tasks[0].Name)
+	}
+	if mr.Status.Ownership != tatarav1alpha1.OwnershipExternal {
+		t.Fatalf("ownership = %q, want external (backfilled from the non-bot author)", mr.Status.Ownership)
+	}
+	if mr.Status.LastMirroredCommentID != "500" {
+		t.Fatalf("cursor = %q, want 500 - the pending comment must redeliver in THIS SAME pass", mr.Status.LastMirroredCommentID)
+	}
+	if !mirrorHasComment(&mr, "500") {
+		t.Fatalf("comment 500 not mirrored onto the MR CR")
+	}
+
+	var tk tatarav1alpha1.Task
+	if err := c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: tasks[0].Name}, &tk); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if len(tk.Status.PendingEvents) != 1 {
+		t.Fatalf("pendingEvents = %d, want 1 (the redelivered mr_comment)", len(tk.Status.PendingEvents))
+	}
+	if tk.Status.PendingEvents[0].Kind != "mr_comment" || tk.Status.PendingEvents[0].Author != "octocat" {
+		t.Fatalf("delivered event = %+v, want kind=mr_comment author=octocat", tk.Status.PendingEvents[0])
 	}
 }

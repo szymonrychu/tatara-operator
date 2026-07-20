@@ -532,6 +532,10 @@ func (in *MergeRequestStatus) DeepCopyInto(out *MergeRequestStatus) {
 		in, out := &in.DeployedAt, &out.DeployedAt
 		*out = (*in).DeepCopy()
 	}
+	if in.OwnershipChangedAt != nil {
+		in, out := &in.OwnershipChangedAt, &out.OwnershipChangedAt
+		*out = (*in).DeepCopy()
+	}
 	if in.PendingReview != nil {
 		in, out := &in.PendingReview, &out.PendingReview
 		*out = new(PendingReview)

@@ -565,10 +565,11 @@ func (s *Server) reader() client.Reader {
 // increments on its backstop pass.
 func (s *Server) minter() *controller.Minter {
 	return &controller.Minter{
-		Client:    s.cfg.Client,
-		APIReader: s.cfg.APIReader, // nil-safe: Minter falls back to Client
-		Scheme:    s.cfg.Client.Scheme(),
-		Metrics:   nil,
+		Client:     s.cfg.Client,
+		APIReader:  s.cfg.APIReader, // nil-safe: Minter falls back to Client
+		Scheme:     s.cfg.Client.Scheme(),
+		Metrics:    nil,
+		SpillerFor: s.cfg.SpillerFor, // EnsureTaskForMRComment resolves its own spiller (OP6)
 	}
 }
 
@@ -732,42 +733,129 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 
-	// Orphan-comment mint is ISSUE-ONLY (fix F5-1). An orphan PR comment set the
-	// ForgeItem's PR author to the COMMENTER, not the real PR author - so a human
-	// comment on a reaped bot-authored PR fabricated authorship and minted a review
-	// Task ClassifyPR's bot-ignore (keyed on the REAL author) would refuse. PRs are
-	// already covered by the mr.opened primary mint (handleMROpened) and the sweep
-	// backstop, so there is nothing to gain and an author to fabricate. Orphan
-	// ISSUE-comment mint ("@bot go" on an un-owned issue) is preserved.
-	if !ev.IsPR && s.commentIsOrphan(ctx, commentRepo, ev) {
-		item := controller.ForgeItem{Issue: scm.Issue{
-			Number: ev.Number, State: "open", Author: ev.ActorLogin,
-			Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
-		// webhookOriginated=true: a live, HMAC-verified, allowlisted human comment
-		// is a liveness signal exactly like issues.opened. Minting it PARKED would
-		// strand the Task - the same-request deliverPendingEvent -> driveCommentUnpark
-		// path below reads the informer cache, which routinely still lags this mint's
-		// just-written mirror/owner, so the promotion can silently miss and the
-		// comment gets dropped with no sweep recovery (the issue is now owned, so
-		// IsOrphanIssue skips it). MintStage still checks TataraParkedLabel FIRST, so
-		// a deliberately backlog-parked issue stays parked regardless.
-		if _, created, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
-			// Parity with handleIssueOpened/handleMROpened (fix F-misc): a mint error
-			// is a 5xx so GitHub redelivers, rather than a silent 202 that waits for
-			// the next sweep.
-			s.log.ErrorContext(ctx, "issue_comment: orphan mint failed", "error", merr, "issue_ref", ev.IssueRef)
-			s.reject(w, http.StatusInternalServerError, "mint orphan issue comment", provider, ev.Kind, ev.Action, "error")
-			return
-		} else if created {
-			if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(commentRepo.Name, ev.Number)); cerr != nil {
-				s.log.ErrorContext(ctx, "issue_comment: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
+	// General comment->task intake (OP6): every human comment on an issue OR an
+	// MR must yield a Task update or creation (user invariant). The ISSUE arm
+	// mints inline below via MintForItem's orphan-issue branch, unchanged since
+	// fix F5-1. The MR arm USED TO DROP an orphan PR comment outright (F5-1): an
+	// orphan PR comment handed straight to MintForItem's PR item fabricated
+	// authorship (ForgeItem.PR.Author would have been the COMMENTER, not the
+	// real PR author), so a human comment on a reaped bot-authored PR minted a
+	// review Task ClassifyPR's bot-ignore (keyed on the REAL author) would have
+	// refused. That gap is closed by controller.Minter.EnsureTaskForMRComment,
+	// which classifies against the REAL author/state on the mirror CR (or, for
+	// an MR this platform has never mirrored, the comment event's own resource
+	// author - GitHub's issue_comment payload reports the ISSUE/PR's user there,
+	// not the sender) and mints the SAME PRReview rule the sweep's ClassifyPR
+	// uses, race-safe with the sweep via createTaskRaceSafe. F5-1's authorship
+	// bug is closed at its root: EnsureTaskForMRComment never touches
+	// ForgeItem/MintForItem at all.
+	if !ev.IsPR {
+		if s.commentIsOrphan(ctx, commentRepo, ev) {
+			item := controller.ForgeItem{Issue: scm.Issue{
+				Number: ev.Number, State: "open", Author: ev.ActorLogin,
+				Title: ev.Title, Body: ev.Body, Labels: ev.Labels, URL: ev.URL}}
+			// webhookOriginated=true: a live, HMAC-verified, allowlisted human comment
+			// is a liveness signal exactly like issues.opened. Minting it PARKED would
+			// strand the Task - the same-request deliverPendingEvent -> driveCommentUnpark
+			// path below reads the informer cache, which routinely still lags this mint's
+			// just-written mirror/owner, so the promotion can silently miss and the
+			// comment gets dropped with no sweep recovery (the issue is now owned, so
+			// IsOrphanIssue skips it). MintStage still checks TataraParkedLabel FIRST, so
+			// a deliberately backlog-parked issue stays parked regardless.
+			if _, created, merr := s.minter().MintForItem(ctx, &proj, commentRepo, item, true, s.cfg.SpillerFor(&proj)); merr != nil {
+				// Parity with handleIssueOpened/handleMROpened (fix F-misc): a mint error
+				// is a 5xx so GitHub redelivers, rather than a silent 202 that waits for
+				// the next sweep.
+				s.log.ErrorContext(ctx, "issue_comment: orphan mint failed", "error", merr, "issue_ref", ev.IssueRef)
+				s.reject(w, http.StatusInternalServerError, "mint orphan issue comment", provider, ev.Kind, ev.Action, "error")
+				return
+			} else if created {
+				if cerr := controller.ClearWebhookOriginated(ctx, s.cfg.Client, s.cfg.Namespace, tatarav1.IssueName(commentRepo.Name, ev.Number)); cerr != nil {
+					s.log.ErrorContext(ctx, "issue_comment: clear webhook-originated marker failed", "error", cerr, "issue_ref", ev.IssueRef)
+				}
+				s.log.InfoContext(ctx, "issue_comment: webhook minted clarify task",
+					"action", "issue_comment_webhook_mint", "project", proj.Name, "repository", commentRepo.Name, "number", ev.Number)
 			}
-			s.log.InfoContext(ctx, "issue_comment: webhook minted clarify task",
-				"action", "issue_comment_webhook_mint", "project", proj.Name, "repository", commentRepo.Name, "number", ev.Number)
+		}
+	} else if commentRepo != nil && ev.Number > 0 {
+		mrCR, mrErr := s.mrForComment(ctx, &proj, commentRepo, ev)
+		if mrErr != nil {
+			// Fail-closed, matching commentIsOrphan: an INCONCLUSIVE read (something
+			// other than NotFound) must never fall back to an unowned stub - that
+			// would blind EnsureTaskForMRComment to a real owner (e.g. a takeover
+			// Task, a different kind under a different natural key) it just failed to
+			// read, and mint a colliding review Task alongside it.
+			s.log.ErrorContext(ctx, "issue_comment: read mergerequest for comment failed", "error", mrErr, "issue_ref", ev.IssueRef)
+			s.reject(w, http.StatusInternalServerError, "read mergerequest for comment", provider, ev.Kind, ev.Action, "error")
+			return
+		}
+		owner, minted, merr := s.minter().EnsureTaskForMRComment(ctx, &proj, commentRepo, mrCR, ev.ActorLogin)
+		if merr != nil {
+			s.log.ErrorContext(ctx, "issue_comment: ensure task for mr comment failed", "error", merr, "issue_ref", ev.IssueRef)
+			s.reject(w, http.StatusInternalServerError, "ensure task for mr comment", provider, ev.Kind, ev.Action, "error")
+			return
+		}
+		if owner == "" {
+			// A closed/merged MR or a PR outside reaction scope (a bot author never
+			// reaches here - the top-of-function isBotActor gate already returned):
+			// nothing warranted minting and nothing owns it to deliver to.
+			s.accept(w, provider, ev.Kind, ev.Action, "ignored")
+			return
+		}
+		if minted {
+			s.log.InfoContext(ctx, "issue_comment: webhook minted review task for orphan mr comment",
+				"action", "mr_comment_webhook_mint", "project", proj.Name, "repository", commentRepo.Name, "number", ev.Number)
 		}
 	}
 	s.deliverPendingEvent(ctx, proj, commentRepo, ev)
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
+}
+
+// mrForComment resolves the MergeRequest CR EnsureTaskForMRComment classifies
+// against. The persisted mirror, read UNCACHED (matching commentIsOrphan) so
+// this same-request mint never races the informer cache behind a concurrent
+// mint, wins when one exists. A NotFound means this is genuinely the FIRST
+// signal this platform has ever seen for the MR: an unpersisted stub is built
+// straight from the comment event's own fields. issue_comment carries no head
+// SHA/branch (GitHub only reports that on pull_request/pull_request_review
+// deliveries), so a stub-born mint's MergeRequest.status.headBranch/headSHA
+// starts empty and the review Task's own cadence resync backfills it, same as
+// any other freshly-adopted PR classified from partial data. State is assumed
+// "open": GitHub does not report issue.state on issue_comment either, and a
+// human commenting on something this platform cannot yet see is exactly the
+// live signal EnsureTaskForMRComment exists to catch, not to second-guess. Any
+// OTHER error is returned to the caller, which fails closed (matching
+// commentIsOrphan): an inconclusive read must never fall back to an unowned
+// stub and blind EnsureTaskForMRComment to a real owner it merely failed to
+// read.
+func (s *Server) mrForComment(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, ev scm.WebhookEvent) (*tatarav1.MergeRequest, error) {
+	mr := &tatarav1.MergeRequest{}
+	err := s.reader().Get(ctx, objKey(s.cfg.Namespace, tatarav1.MergeRequestName(repo.Name, ev.Number)), mr)
+	if err == nil {
+		return mr, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	return &tatarav1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tatarav1.MergeRequestName(repo.Name, ev.Number),
+			Namespace: s.cfg.Namespace,
+		},
+		Spec: tatarav1.MergeRequestSpec{
+			RepositoryRef: repo.Name,
+			ProjectRef:    proj.Name,
+			Number:        ev.Number,
+			URL:           ev.URL,
+		},
+		Status: tatarav1.MergeRequestStatus{
+			Author:     ev.AuthorLogin,
+			State:      "open",
+			HeadBranch: ev.HeadBranch,
+			HeadSHA:    ev.HeadSHA,
+			Body:       ev.Body,
+		},
+	}, nil
 }
 
 // commentIsOrphan reports whether the mirror CR a comment targets has no
@@ -1183,13 +1271,6 @@ func (s *Server) repoHasNonTerminalTask(ctx context.Context, projName string, im
 	}
 	return false
 }
-
-// maxPendingEvents caps Task.Status.PendingEvents (contract E.3), applied
-// Go-side, drop-oldest, BEFORE every write. The CRD's MaxItems=25 is a
-// backstop only: an API-server 422 is not retried by retry.RetryOnConflict and
-// would hot-loop webhook redelivery, so the cap here must stay strictly below
-// it.
-const maxPendingEvents = 20
 
 func (s *Server) webhookSecret(ctx context.Context, ref string) (string, error) {
 	var sec corev1.Secret

@@ -82,6 +82,7 @@ const (
 	ReasonHeadMoving             = "head-moving"
 	ReasonHandoffStalled         = "handoff-stalled"
 	ReasonIssueClosed            = "issue-closed"
+	ReasonOwnershipLost          = "ownership-lost"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -119,6 +120,7 @@ var Reasons = []string{
 	ReasonHeadMoving,
 	ReasonHandoffStalled,
 	ReasonIssueClosed,
+	ReasonOwnershipLost,
 }
 
 // issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
@@ -259,6 +261,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageTriaging, Trigger: "Task minted ACTIVE: webhook-originated, or a human has the last word on the thread (B.4)"},
 		{To: v1alpha1.StageParked, Reason: ReasonBacklogSweep, Trigger: "Task minted from a SWEEP-discovered backlog issue (B.4). Spawns no pod, enqueues nothing"},
 		{To: v1alpha1.StageDocumenting, Trigger: "the NIGHTLY documentation batch is minted (F.3)"},
+		{To: v1alpha1.StageApproved, Trigger: "a maintainer-gated takeover mints a full-lifecycle Task bound to an existing MR (MR ownership design)"},
 	},
 
 	v1alpha1.StageTriaging: {
@@ -307,6 +310,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageImplementing, Trigger: "a QueuedEvent for the implement pod is ADMITTED"},
 		{To: v1alpha1.StageClarifying, Trigger: "the Task ACQUIRES a new Issue after approval. Approval is not sticky (fix H9)"},
 		{To: v1alpha1.StageParked, Reason: ReasonAdmissionStarved, Trigger: "the 24h admission budget elapses (skipped when the project is PAUSED)"},
+		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while approved: a takeover Task mints straight into approved already controller-owning the MR (MintOrUnparkTakeoverTask), so it can be flipped before ever reaching implementing"},
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
 		issueClosedEdge(),
@@ -315,6 +319,7 @@ var Transitions = map[string][]Edge{
 	v1alpha1.StageImplementing: podStageEdges(
 		Edge{To: v1alpha1.StageReviewing, Trigger: "submit_outcome(submitted) and >= 1 owned MR is open"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonImplementDeclined, Trigger: "submit_outcome(declined)"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on this MR while implementing: ownership flipped to external"},
 		issueClosedEdge(),
 	),
 
@@ -327,6 +332,7 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewLoopExhausted, Trigger: "request_changes at maxReviewRounds, on a non-review Task"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonReviewPostRefused, Trigger: "a structural 4xx from PostReview (fix C1)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m), and the reconciler's level-triggered re-drive could not either. ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced. Recoverable: a human comment re-enters reviewing (F.6)"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on this MR while reviewing: ownership flipped to external"},
 		issueClosedEdge(),
 	),
 
@@ -344,6 +350,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
 		{To: v1alpha1.StageFailed, Reason: ReasonObjectTooLarge, Trigger: "the A.7 byte-budget pre-write guard refuses"},
 		{To: v1alpha1.StageParked, Reason: ReasonMergeTimeout, Trigger: "the 4h merging budget elapses"},
+		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while merging: the controller-owning Task (takeover or normal) can still be mid-merge when a further unattributable push races it"},
 		issueClosedEdge(),
 	},
 
@@ -378,6 +385,8 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageDeploying, Trigger: "F.6 deploy-timeout, under maxDeployReentries. NEVER implementing"},
 		{To: v1alpha1.StageFailed, Reason: ReasonMergeBlocked, Trigger: "F.6 merge-timeout at maxMergeReentries"},
 		{To: v1alpha1.StageFailed, Reason: ReasonDeployBlocked, Trigger: "F.6 deploy-timeout at maxDeployReentries"},
+		{To: v1alpha1.StageApproved, Reason: ReasonOwnershipLost, Trigger: "a maintainer re-took ownership via a takeover comment; the parked takeover Task re-enters the lifecycle at approved to resume pushing"},
+		{To: v1alpha1.StageMerging, Reason: ReasonOwnershipLost, Trigger: "an approved review landed on a stood-down (external-push) MR; the parked takeover Task re-enters at merging so the operator merges the approved human head"},
 	},
 
 	// rejected and failed are TERMINAL. They have no exits: they age out and the

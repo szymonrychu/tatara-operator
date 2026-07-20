@@ -1,0 +1,431 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
+)
+
+// externalPushReasonPrefix tags an OwnershipReason stamped by flipToExternal
+// (reason is this prefix plus the drifted head SHA). ReconcileOwnership's
+// resumeFlipToExternal greps for it to recognize its OWN flip - as opposed to
+// an external-owned MR that was never tatara's to begin with (reason
+// "initial") - and knows it is safe to resume that flip's park+hand-back.
+const externalPushReasonPrefix = "external-push:"
+
+// ownershipForAuthor classifies a never-seen MR: bot author -> tatara,
+// anything else (human, Renovate, other bot, or an unknown/empty author) ->
+// external.
+func ownershipForAuthor(proj *tatarav1alpha1.Project, author string) string {
+	if author != "" && author == botLoginOf(proj) {
+		return tatarav1alpha1.OwnershipTatara
+	}
+	return tatarav1alpha1.OwnershipExternal
+}
+
+// ReconcileOwnership is the single convergence function for MR ownership,
+// called from the leader MergeRequestReconciler (webhook fast path, via the
+// mirror resourceVersion bump) and the cron sweep (convergence path). It:
+//
+//  1. backfills ownership on a never-classified or pre-upgrade mirror,
+//  2. flips tatara -> external on unattributable head drift, and
+//  3. redelivers missed comments on an external MR (sweep only; newComments
+//     nil on the webhook path).
+//
+// It NEVER flips external -> tatara: that is the gated takeover REST
+// endpoint's job (agent judgment alone can never flip state). Terminal MRs
+// are frozen.
+func (d *StageDriver) ReconcileOwnership(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string,
+	newComments []scm.IssueComment) (bool, error) {
+
+	if mr.Status.State != "open" {
+		return false, nil
+	}
+	key := client.ObjectKeyFromObject(mr)
+	sp := d.spiller(proj)
+
+	if mr.Status.Ownership == "" {
+		cls := ownershipForAuthor(proj, mr.Status.Author)
+		// A backfilled tatara classification also seeds LastBotHeadSHA to the
+		// current live head: there is no bot-push history to compare against
+		// before this point (pre-upgrade mirror, or a mirror never reconciled
+		// through OP7's stamp points yet), so the best available baseline is
+		// "whatever is on the branch right now was put there by the bot". Without
+		// this, the very next check below would read an EMPTY LastBotHeadSHA,
+		// see liveHead != "", and immediately flip a freshly classified bot MR to
+		// external on its own backfill - which is not a drift, it is day one.
+		botHead := mr.Status.LastBotHeadSHA
+		if cls == tatarav1alpha1.OwnershipTatara && liveHead != "" {
+			botHead = liveHead
+		}
+		if err := objbudget.FitMergeRequest(ctx, d.Client, sp, key, func(m *tatarav1alpha1.MergeRequest) {
+			if m.Status.Ownership == "" {
+				m.Status.Ownership = cls
+				m.Status.OwnershipReason = "initial"
+				if cls == tatarav1alpha1.OwnershipTatara && liveHead != "" {
+					m.Status.LastBotHeadSHA = botHead
+				}
+			}
+		}); err != nil {
+			return false, err
+		}
+		mr.Status.Ownership = cls
+		mr.Status.OwnershipReason = "initial"
+		if cls == tatarav1alpha1.OwnershipTatara && liveHead != "" {
+			mr.Status.LastBotHeadSHA = botHead
+		}
+		log.FromContext(ctx).Info("ownership classified", "action", "ownership_initial",
+			"resource_id", mr.Name, "ownership", cls)
+		// Initial classification is not a flip; do not announce or count.
+	}
+
+	if mr.Status.Ownership == tatarav1alpha1.OwnershipTatara &&
+		liveHead != "" && liveHead != mr.Status.LastBotHeadSHA {
+		return d.flipToExternal(ctx, proj, repo, mr, liveHead)
+	}
+
+	if mr.Status.Ownership == tatarav1alpha1.OwnershipExternal {
+		// Convergence hole fix: flipToExternal stamps Status.Ownership=external
+		// BEFORE parking the owner Task and handing control to the review Task.
+		// A non-conflict error partway through that second half leaves the
+		// stamp committed but the park+hand-back unfinished - and, once
+		// committed, this function's own tatara->external trigger above never
+		// fires again for this MR, so nothing would otherwise retry it. Detect
+		// that half-completed state (reason carries this flip's own prefix, and
+		// the current controller owner is still a pushing-capable, non-review
+		// Task - the review hand-back has not landed) and resume it. Gated on
+		// the reason prefix, not unconditionally re-run: park+handBackToReviewTask
+		// both always write, so running them on every reconcile of every
+		// external MR would churn a resourceVersion for nothing once converged.
+		if strings.HasPrefix(mr.Status.OwnershipReason, externalPushReasonPrefix) {
+			if err := d.resumeFlipToExternal(ctx, proj, repo, mr); err != nil {
+				return false, err
+			}
+		}
+		if len(newComments) > 0 {
+			return false, d.redeliverMRComments(ctx, proj, repo, mr, newComments) // OP12
+		}
+	}
+	return false, nil
+}
+
+// resumeFlipToExternal finishes an interrupted flipToExternal's park+hand-back
+// half. It is a no-op (zero API calls beyond the one Get) once the MR's
+// controller owner is already the review Task - the steady state after a
+// clean flip - so calling it on every reconcile of an external-push MR costs
+// nothing once converged.
+func (d *StageDriver) resumeFlipToExternal(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
+
+	ownerName, ok := own.ControllerOwner(mr)
+	if !ok {
+		return nil
+	}
+	var task tatarav1alpha1.Task
+	err := d.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: ownerName}, &task)
+	if err == nil && task.Spec.Kind == SweepReviewKind {
+		return nil // hand-back already completed; nothing to resume
+	}
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("resume flip: get owner task %s: %w", ownerName, err)
+	}
+	return d.parkAndHandBack(ctx, proj, repo, mr)
+}
+
+// flipToExternal records the tatara -> external flip, parks the bound
+// pushing-capable owner Task ownership-lost, and hands the MR mirror's
+// controller ownership back to the review Task so review rounds and
+// hand-back comments continue to route. The stand-down announcement is
+// posted by the drain (OP11), keyed on the ownershipChangedAt marker this
+// stamps. The parked owner Task is RETAINED (not reaped while its MR is
+// open) as the durable merge-driver: an approved review on this stood-down
+// MR re-drives it parked(ownership-lost) -> merging via DrainStandDownMerge
+// (OP11), because merge-on-approve CONTINUES after a stand-down (spec
+// Section 1: external + external-push keeps review + merge).
+func (d *StageDriver) flipToExternal(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest, liveHead string) (bool, error) {
+
+	now := metav1.Now()
+	reason := externalPushReasonPrefix + liveHead
+	key := client.ObjectKeyFromObject(mr)
+	if err := objbudget.FitMergeRequest(ctx, d.Client, d.spiller(proj), key, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.Ownership = tatarav1alpha1.OwnershipExternal
+		m.Status.OwnershipReason = reason
+		m.Status.OwnershipChangedAt = &now
+	}); err != nil {
+		return false, err
+	}
+	mr.Status.Ownership = tatarav1alpha1.OwnershipExternal
+	mr.Status.OwnershipReason = reason
+	mr.Status.OwnershipChangedAt = &now
+
+	// Park the bound owner Task and hand control to the review Task. Shared
+	// with resumeFlipToExternal (above), which re-runs this exact step to
+	// converge a flip interrupted between the Status write above and here.
+	if err := d.parkAndHandBack(ctx, proj, repo, mr); err != nil {
+		return false, err
+	}
+
+	obs.OwnershipFlip("to-external", "external-push")
+	log.FromContext(ctx).Info("ownership flipped to external", "action", "ownership_flip",
+		"resource_id", mr.Name, "direction", "to-external", "reason", reason)
+	return true, nil
+}
+
+// parkAndHandBack parks mr's current controller-owning Task (if any,
+// pushing-capable) ownership-lost, then hands the MR mirror's controller
+// ownership to the review Task. It is the shared body behind flipToExternal's
+// own park+hand-back and resumeFlipToExternal's convergent retry of it -
+// factored out so the two never drift, and so the retry inherits exactly the
+// idempotency parkOwnerTask and handBackToReviewTask already carry.
+func (d *StageDriver) parkAndHandBack(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
+
+	// Park the bound owner Task (the current controller owner, if any) when it
+	// is pushing-capable - i.e. any kind EXCEPT review: a kind=review Task never
+	// pushes to the MR it owns (LegalFor structurally refuses it implementing or
+	// merging), so it is never the thing an external push displaces and is never
+	// parked here. A takeover-kind Task and a normal full-lifecycle (kind=clarify
+	// -> implementing) Task both push, and both get the same "parked
+	// ownership-lost, retained as the durable merge driver" treatment - the spec
+	// draws the line on push-capability, not on takeover-vs-normal provenance.
+	if ownerName, ok := own.ControllerOwner(mr); ok {
+		var task tatarav1alpha1.Task
+		if err := d.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: ownerName}, &task); err == nil {
+			if err := d.parkOwnerTask(ctx, proj, &task); err != nil {
+				return err
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("flip: get owner task %s: %w", ownerName, err)
+		}
+		if err := d.handBackToReviewTask(ctx, proj, repo, mr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parkOwnerTask parks task ownership-lost when it is pushing-capable
+// (kind != review), not terminal, and not ALREADY parked(ownership-lost) - the
+// last check is what makes a retry (resumeFlipToExternal) safe: re-entering
+// the SAME to=parked/reason=ownership-lost edge on an already-parked task is
+// illegal (stage.Transitions["parked"] carries no self edge) and would log a
+// spurious "no park edge from its current stage" error instead of the
+// no-op this is meant to be.
+func (d *StageDriver) parkOwnerTask(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) error {
+	if task.Spec.Kind == SweepReviewKind || tatarav1alpha1.StageTerminal(task) {
+		return nil
+	}
+	if task.Status.Stage == tatarav1alpha1.StageParked && task.Status.StageReason == stage.ReasonOwnershipLost {
+		return nil
+	}
+	if !hasOwnershipLostParkEdge(task.Status.Stage) {
+		// The F.3 table (OP3) carries no parked(ownership-lost) edge from this
+		// stage: entering it anyway would be a transition nobody reasoned about
+		// for THIS stage's own invariants (merge cursor, admission clocks, ...).
+		// approved and merging DO carry the edge (OP11: a takeover Task mints
+		// straight into approved already controller-owning the MR, and a Task
+		// can still be mid-merge when a further push races it) - only a
+		// pod-less/mint-adjacent stage with no reachable controller-owning
+		// window (e.g. deploying, where the owned MR is already merged/closed
+		// and ReconcileOwnership's open-state guard never re-enters this
+		// branch) is left without one. Flip the MR's ownership regardless
+		// (already done by the caller) and leave the Task running; a human
+		// sees the stand-down on the MR.
+		log.FromContext(ctx).Error(nil, "flip: owner task has no ownership-lost park edge from its current stage; ownership flipped but the task was left running",
+			"action", "ownership_flip_park_skipped", "resource_id", task.Name,
+			"kind", task.Spec.Kind, "stage", task.Status.Stage)
+		return nil
+	}
+	if err := d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonOwnershipLost, nil); err != nil {
+		return fmt.Errorf("flip: park owner task: %w", err)
+	}
+	return nil
+}
+
+// hasOwnershipLostParkEdge reports whether stage's F.3 edge table (OP3)
+// carries a documented To=parked, Reason=ownership-lost transition. Queries
+// stage.Transitions directly rather than hardcoding "implementing" and
+// "reviewing" (the only two rows that carry it today), so this stays correct
+// if OP3's edges ever add or remove one.
+func hasOwnershipLostParkEdge(from string) bool {
+	for _, e := range stage.Transitions[from] {
+		if e.To == tatarav1alpha1.StageParked && e.Reason == stage.ReasonOwnershipLost {
+			return true
+		}
+	}
+	return false
+}
+
+// handBackToReviewTask moves the MR mirror's controller ownership to the
+// kind=review Task for this MR (re-minting it if it was never minted, or was
+// reaped), so an external MR's review rounds and its next "take over" comment
+// route to the review agent.
+//
+// The owner-ref write goes through mutateOwnerRefs, NOT a direct Update on
+// the caller's mr: by the time flipToExternal calls this, it has already
+// written mr's Status via objbudget.FitMergeRequest, which Gets, mutates, and
+// Status().Updates a FRESH server copy - bumping the object's resourceVersion
+// without ever touching the caller's local mr. A direct d.Update(ctx, mr)
+// here would carry that now-stale resourceVersion and 409 DETERMINISTICALLY
+// on the mainline path (a normal bot MR already controller-owned by its
+// review Task): the flip would return an error before obs.OwnershipFlip
+// fires, yet the server's Ownership status is already external, so the next
+// reconcile's `Ownership == tatara` guard is false and hand-back never
+// retries. mutateOwnerRefs re-Gets before mutating, sidestepping this.
+func (d *StageDriver) handBackToReviewTask(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
+
+	reviewName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepReviewKind, repo.Name, mr.Spec.Number)
+	var review tatarav1alpha1.Task
+	err := d.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: reviewName}, &review)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("flip: get review task %s: %w", reviewName, err)
+		}
+		// No review Task has ever been minted for this MR (the takeover path
+		// bypasses it entirely). Re-mint via the shared intake funnel below.
+		return d.reMintReviewOwner(ctx, proj, repo, mr)
+	}
+	if err := d.mutateOwnerRefs(ctx, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+		prev, _ := own.ControllerOwner(fresh)
+		var from *tatarav1alpha1.Task
+		if prev != "" && prev != reviewName {
+			from = &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: prev, Namespace: proj.Namespace}}
+		}
+		own.AddPlainOwner(fresh, &review)
+		return own.HandOverController(fresh, from, &review)
+	}); err != nil {
+		return fmt.Errorf("flip: hand back to review task: %w", err)
+	}
+	return nil
+}
+
+// reMintReviewOwner mints the MR's review Task via the shared intake funnel
+// (Minter.MintReviewTask, reusing MintReviewStage exactly as the sweep/webhook
+// do) when handBackToReviewTask finds none. MintReviewTask's own bind
+// (Minter.ownMergeRequest) refuses to steal a controller ref it does not
+// recognize as its own Task's - a guard built for the ORPHAN-mint case, where
+// an unrecognized controller owner is a bug, not this flip's hand-back case,
+// where the CURRENT controller (the takeover Task just parked above) is
+// expected and about to be superseded. demoteMRController clears that
+// controller flag first (leaving the old owner as a plain ref, same end state
+// own.HandOverController's demote-then-promote would leave it in), so the
+// funnel's own guard sees no existing controller and proceeds normally.
+func (d *StageDriver) reMintReviewOwner(ctx context.Context, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
+
+	if err := d.demoteMRController(ctx, mr); err != nil {
+		return fmt.Errorf("flip: demote controller before review re-mint: %w", err)
+	}
+	pr := prRefFromMR(repo, mr)
+	stg, reason := MintReviewStage(mr)
+	if _, _, err := d.minter().MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, d.spiller(proj)); err != nil {
+		return fmt.Errorf("flip: re-mint review task: %w", err)
+	}
+	return nil
+}
+
+// demoteMRController clears the controller=true flag on mr's current owner
+// ref, if any, leaving it as a plain owner. It is a no-op when mr carries no
+// controller owner.
+func (d *StageDriver) demoteMRController(ctx context.Context, mr *tatarav1alpha1.MergeRequest) error {
+	return DemoteMRController(ctx, d.Client, mr)
+}
+
+// DemoteMRController is the exported form of demoteMRController: it clears the
+// controller=true flag on mr's current owner ref, if any, leaving it as a
+// plain owner (a no-op when mr carries no controller owner). It exists at
+// package level, not just as a StageDriver method, because OP9's takeover REST
+// endpoint (internal/restapi) needs the identical demote-before-remint step
+// flipToExternal's own hand-back uses (reMintReviewOwner), just running in the
+// opposite direction: MintOrUnparkTakeoverTask's fresh-mint path binds the
+// takeover Task as controller through the SAME intake funnel a review mint
+// uses (Minter.ownMergeRequest), which REFUSES to steal a controller ref it
+// does not already recognize as its own Task's - so the caller's existing
+// controller ref (the review Task) must be demoted first, or the mint
+// hard-fails with "already has controller owner".
+func DemoteMRController(ctx context.Context, c client.Client, mr *tatarav1alpha1.MergeRequest) error {
+	if _, ok := own.ControllerOwner(mr); !ok {
+		return nil
+	}
+	return MutateOwnerRefs(ctx, c, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+		refs := fresh.GetOwnerReferences()
+		for i := range refs {
+			if refs[i].Controller != nil && *refs[i].Controller {
+				f := false
+				refs[i].Controller = &f
+			}
+		}
+		fresh.SetOwnerReferences(refs)
+		return nil
+	})
+}
+
+// mutateOwnerRefs re-Gets mr FRESH from the server, applies mutate to that
+// fresh copy's owner refs, and writes it back under RetryOnConflict - so an
+// owner-ref handover always lands on a CURRENT resourceVersion, never a
+// caller's possibly-stale local copy. It is the shared primitive behind
+// demoteMRController and handBackToReviewTask's existing-review-Task branch:
+// both mutate owner refs on an mr whose Status a sibling call (flipToExternal's
+// objbudget.FitMergeRequest) may have JUST written server-side, which bumps
+// resourceVersion without the caller's local copy knowing - a direct
+// d.Update(ctx, mr) in that situation 409s deterministically. On success, *mr
+// is overwritten with the server's fresh post-write copy.
+func (d *StageDriver) mutateOwnerRefs(ctx context.Context, mr *tatarav1alpha1.MergeRequest,
+	mutate func(fresh *tatarav1alpha1.MergeRequest) error) error {
+	return MutateOwnerRefs(ctx, d.Client, mr, mutate)
+}
+
+// MutateOwnerRefs is the exported, client-only form of mutateOwnerRefs (see
+// its docs for why a fresh-Get+RetryOnConflict loop is required instead of a
+// bare Update on a possibly-stale mr). OP9's takeover REST endpoint uses this
+// directly - it has no StageDriver, only a client.Client - to move the MR
+// mirror's controller ownership onto the takeover Task under the exact same
+// conflict-safe discipline every other owner-ref write in this package uses.
+func MutateOwnerRefs(ctx context.Context, c client.Client, mr *tatarav1alpha1.MergeRequest,
+	mutate func(fresh *tatarav1alpha1.MergeRequest) error) error {
+
+	key := client.ObjectKeyFromObject(mr)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh tatarav1alpha1.MergeRequest
+		if err := c.Get(ctx, key, &fresh); err != nil {
+			return err
+		}
+		if err := mutate(&fresh); err != nil {
+			return err
+		}
+		if err := c.Update(ctx, &fresh); err != nil {
+			return err
+		}
+		*mr = fresh
+		return nil
+	})
+}
+
+// minter builds a Minter from this StageDriver's own fields, so flip-driven
+// hand-back can re-mint a review Task through the SAME shared intake funnel
+// the sweep and webhook use, instead of duplicating Task construction here.
+func (d *StageDriver) minter() *Minter {
+	return &Minter{
+		Client:     d.Client,
+		APIReader:  d.APIReader,
+		Scheme:     d.Scheme(),
+		Metrics:    d.Metrics,
+		SpillerFor: d.SpillerFor,
+	}
+}

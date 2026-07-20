@@ -119,7 +119,7 @@ func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, p
 				Author: ev.ActorLogin,
 				Body:   ev.Title, // the goal snapshot moved; the new title is the useful summary
 			}
-			if err := AppendTaskEvent(ctx, s.cfg.Client, task, taskEv); err != nil {
+			if err := controller.AppendTaskEvent(ctx, s.cfg.Client, task, taskEv); err != nil {
 				s.log.ErrorContext(ctx, "issues: append issue_edited event failed", "error", err, "task", task.Name)
 			} else {
 				s.log.InfoContext(ctx, "issues: mirrored edit and queued issue_edited event",
@@ -192,9 +192,25 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")
 		return
 	}
-	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA) {
+	// A verified bot-push webhook advances the bot-head cursor immediately, so a
+	// push webhook that races ahead of the implement-outcome record still reads
+	// as attributable (no false external-push flip). A non-bot pusher advances
+	// only the HeadSHA mirror, leaving LastBotHeadSHA stale - ReconcileOwnership
+	// sees the drift and flips.
+	//
+	// isBotActor is a string-equality check against Scm.BotLogin - the FAST
+	// PATH only, not the authoritative signal: the actual identity gate lives
+	// at outcome accept (/outcome's record_bot_head, restapi/outcome.go), which
+	// re-stamps LastBotHeadSHA from a LIVE forge read (GetPRHead) rather than
+	// trusting the webhook's reported actor. A spoofed or mismatched
+	// BotLogin/push-identity here can only cause a spurious flip whose window
+	// is bounded by the next accept - it self-corrects there, it never
+	// compounds.
+	bot := isBotActor(&proj, ev.ActorLogin)
+	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA, bot) {
 		s.log.InfoContext(ctx, "mr: mirrored new head on synchronize; no review restart",
-			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name, "number", ev.Number, "head_sha", ev.HeadSHA)
+			"action", "mr_synchronize_mirror", "project", proj.Name, "repository", repo.Name,
+			"number", ev.Number, "head_sha", ev.HeadSHA, "bot_push", bot)
 	}
 	s.accept(w, provider, ev.Kind, ev.Action, "accepted")
 }
@@ -244,9 +260,18 @@ func (s *Server) stampIssueState(ctx context.Context, proj *tatarav1.Project, re
 	return true
 }
 
-// stampMRHead upserts MergeRequest.Status.HeadSHA on the mirror CR.
-func (s *Server) stampMRHead(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, number int, headSHA string) bool {
-	return s.fitMR(ctx, proj, repo, number, func(m *tatarav1.MergeRequest) { m.Status.HeadSHA = headSHA })
+// stampMRHead upserts MergeRequest.Status.HeadSHA on the mirror CR, and - when
+// botPush is true (the pusher is the project's configured bot identity) -
+// also advances Status.LastBotHeadSHA to the same sha. A non-bot push leaves
+// LastBotHeadSHA untouched: that staleness is the drift ReconcileOwnership
+// (OP8) detects.
+func (s *Server) stampMRHead(ctx context.Context, proj *tatarav1.Project, repo *tatarav1.Repository, number int, headSHA string, botPush bool) bool {
+	return s.fitMR(ctx, proj, repo, number, func(m *tatarav1.MergeRequest) {
+		m.Status.HeadSHA = headSHA
+		if botPush {
+			m.Status.LastBotHeadSHA = headSHA
+		}
+	})
 }
 
 // stampMRState upserts MergeRequest.Status.State (+ MergedAt on a merge) on the

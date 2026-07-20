@@ -327,12 +327,13 @@ type xIssue struct {
 }
 
 type xMergeRequest struct {
-	Repo       string     `xml:"repo,attr"`
-	Status     string     `xml:"status,attr"`
-	HeadBranch string     `xml:"head_branch,attr"`
-	Attrs      []xml.Attr `xml:",any,attr"`
-	Body       xBody      `xml:"body"`
-	Comments   *xComments `xml:"comments"`
+	Repo           string     `xml:"repo,attr"`
+	Status         string     `xml:"status,attr"`
+	HeadBranch     string     `xml:"head_branch,attr"`
+	LastBotHeadSHA string     `xml:"last_bot_head_sha,attr"`
+	Attrs          []xml.Attr `xml:",any,attr"`
+	Body           xBody      `xml:"body"`
+	Comments       *xComments `xml:"comments"`
 }
 
 type xRawEvent struct {
@@ -929,6 +930,35 @@ func TestRender_TruncatedCommentCarriesAttribute(t *testing.T) {
 	}
 	if !strings.Contains(got, `external_id="1234501" truncated="true"`) {
 		t.Fatalf("truncated comment carries no truncated=\"true\":\n%s", got)
+	}
+}
+
+// The implement-profile takeover skill needs LastBotHeadSHA (the operator-
+// stamped last-bot-pushed head, never trusted from the agent) to diff
+// against the remote head before pushing on a taken-over MR: HeadSHA alone
+// is mirror-stale and false-positives right after the agent's own push.
+func TestRender_MergeRequest_CarriesLastBotHeadSHAWhenSet(t *testing.T) {
+	in := canonicalInput(t)
+	in.MergeRequests[0].Status.LastBotHeadSHA = "bot-sha-9"
+	got, err := prompt.Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	tc := parseBundle(t, got)
+	if tc.MRs[0].LastBotHeadSHA != "bot-sha-9" {
+		t.Fatalf("last_bot_head_sha = %q, want %q", tc.MRs[0].LastBotHeadSHA, "bot-sha-9")
+	}
+}
+
+func TestRender_MergeRequest_OmitsLastBotHeadSHAWhenEmpty(t *testing.T) {
+	in := canonicalInput(t)
+	in.MergeRequests[0].Status.LastBotHeadSHA = ""
+	got, err := prompt.Render(in)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(got, "last_bot_head_sha") {
+		t.Fatalf("last_bot_head_sha attribute present though LastBotHeadSHA is empty:\n%s", got)
 	}
 }
 
