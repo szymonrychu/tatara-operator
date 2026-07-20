@@ -338,6 +338,8 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonHandoffStalled, Trigger: "the outcome COMMITTED but the C.5.3 phase-2 drain (DrainPendingReview -> advanceAfterReview) never advanced the Task within HandoffDeadline (5m), and the reconciler's level-triggered re-drive could not either. ONLY reviewing carries it: every other kind's commit calls stage.Enter in the SAME write, so no other stage can be committed-but-not-advanced. Recoverable: a human comment re-enters reviewing (F.6)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on this MR while reviewing: ownership flipped to external"},
 		issueClosedEdge(),
+		Edge{To: v1alpha1.StageDelivered, Reason: ReasonMRMergedExternally, Trigger: "kind=review Task, every owned MR merged externally before/while reviewing - no open MR to post an outcome against, so the operator finalizes the honest finished work"},
+		Edge{To: v1alpha1.StageRejected, Reason: ReasonMRClosedExternally, Trigger: "kind=review Task, every owned MR terminal with at least one closed-unmerged: the review target was abandoned, recorded rejected not delivered"},
 	),
 
 	// merging is POD-LESS: clock 3 ONLY, from stageEnteredAt, against ITS OWN 4h
@@ -460,6 +462,17 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		(to == v1alpha1.StageImplementing || to == v1alpha1.StageMerging) &&
 		!reviewGateOpen(mrs) {
 		return false
+	}
+	// reviewing -> delivered is the kind=review external-merge finalize. It is a
+	// brand-new pair, so gating it here is safe (no other edge uses it). NOTE:
+	// reviewing -> rejected is deliberately NOT gated - it is shared with the
+	// issue-closed stop (issue_apply.go enters it with mrs == nil), and the
+	// mr-closed-externally terminal predicate is enforced by terminalMREdge, its
+	// only caller.
+	if from == v1alpha1.StageReviewing && to == v1alpha1.StageDelivered {
+		if t == nil || t.Spec.Kind != kindReview || !AllMRsMerged(mrs) {
+			return false
+		}
 	}
 	return true
 }

@@ -752,11 +752,20 @@ func TestEveryTransitionClearsBothTimestampsAndPodRecreations(t *testing.T) {
 			t.Run(from+"->"+e.To+"("+e.Reason+")", func(t *testing.T) {
 				// A non-review kind so no kind guard interferes; MRs with no
 				// pendingReview so the C.5.3 gate is open.
-				task := newTask("implement", from, "")
+				kind := "implement"
+				mrs := []v1alpha1.MergeRequest{openMR()}
+				if from == v1alpha1.StageReviewing && e.To == v1alpha1.StageDelivered &&
+					e.Reason == stage.ReasonMRMergedExternally {
+					// The LegalFor delivered gate requires kind=review and every
+					// owned MR merged; every OTHER row in this table tolerates the
+					// generic implement/openMR fixture, but this one is gated.
+					kind = "review"
+					mrs = []v1alpha1.MergeRequest{mergedMR()}
+				}
+				task := newTask(kind, from, "")
 				task.Status.PodStartedAt = ptime(stale)
 				task.Status.StageWorkStartedAt = ptime(stale)
 				task.Status.Stats.PodRecreations = 2
-				mrs := []v1alpha1.MergeRequest{openMR()}
 
 				if err := stage.Enter(task, mrs, e.To, e.Reason, now); err != nil {
 					t.Fatalf("Enter: %v", err)
@@ -941,6 +950,7 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageReviewing, v1alpha1.StageImplementing},
 		{v1alpha1.StageReviewing, v1alpha1.StageMerging},
 		{v1alpha1.StageReviewing, v1alpha1.StageParked},
+		{v1alpha1.StageReviewing, v1alpha1.StageDelivered}, // kind=review, every owned MR merged externally
 		{v1alpha1.StageMerging, v1alpha1.StageReviewing},
 		{v1alpha1.StageMerging, v1alpha1.StageDeploying},
 		{v1alpha1.StageMerging, v1alpha1.StageFailed},
@@ -991,7 +1001,6 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageImplementing, v1alpha1.StageDeploying},
 		{v1alpha1.StageImplementing, v1alpha1.StageDelivered},
 		{v1alpha1.StageReviewing, v1alpha1.StageDeploying}, // never skip merge
-		{v1alpha1.StageReviewing, v1alpha1.StageDelivered},
 		{v1alpha1.StageMerging, v1alpha1.StageDelivered},
 		{v1alpha1.StageDeploying, v1alpha1.StageImplementing},
 		{v1alpha1.StageDeploying, v1alpha1.StageMerging},
@@ -2231,4 +2240,53 @@ func TestTakeoverKind_NotBarredFromImplementing(t *testing.T) {
 	if !stage.LegalFor(tk, nil, v1alpha1.StageApproved, v1alpha1.StageImplementing) {
 		t.Fatalf("a kind=takeover Task must be allowed approved->implementing")
 	}
+}
+
+func TestReviewingHasExternalTerminalEdges(t *testing.T) {
+	// Both new edges are present in the F.3 table out of reviewing.
+	var toDelivered, toRejectedMR bool
+	for _, e := range stage.Transitions[v1alpha1.StageReviewing] {
+		if e.To == v1alpha1.StageDelivered && e.Reason == stage.ReasonMRMergedExternally {
+			toDelivered = true
+		}
+		if e.To == v1alpha1.StageRejected && e.Reason == stage.ReasonMRClosedExternally {
+			toRejectedMR = true
+		}
+	}
+	require.True(t, toDelivered, "reviewing -> delivered(mr-merged-externally) edge missing")
+	require.True(t, toRejectedMR, "reviewing -> rejected(mr-closed-externally) edge missing")
+
+	// Structurally legal pairs.
+	require.True(t, stage.Legal(v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	require.True(t, stage.Legal(v1alpha1.StageReviewing, v1alpha1.StageRejected))
+}
+
+func TestLegalFor_ReviewingToDelivered_OnlyReviewKindAllMerged(t *testing.T) {
+	review := newTask("review", v1alpha1.StageReviewing, "")
+	impl := newTask("implement", v1alpha1.StageReviewing, "")
+	merged := []v1alpha1.MergeRequest{mergedMR()}
+	mixed := []v1alpha1.MergeRequest{mergedMR(), openMR()}
+	closed := []v1alpha1.MergeRequest{mergedMR(), closedMR()}
+
+	// Legal: review kind, every owned MR merged.
+	require.True(t, stage.LegalFor(review, merged, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: an open MR remains.
+	require.False(t, stage.LegalFor(review, mixed, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: a closed-unmerged MR is terminal but not merged -> not delivered.
+	require.False(t, stage.LegalFor(review, closed, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: not review kind.
+	require.False(t, stage.LegalFor(impl, merged, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+	// Illegal: empty MR set.
+	require.False(t, stage.LegalFor(review, nil, v1alpha1.StageReviewing, v1alpha1.StageDelivered))
+}
+
+// REGRESSION GUARD: the issue-closed stop (issue_apply.go:45) enters
+// reviewing -> rejected with mrs == nil. LegalFor must NOT tighten that pair, or
+// the human-closed-issue stop breaks for review Tasks.
+func TestLegalFor_ReviewingToRejected_IssueClosedStillLegalWithNilMRs(t *testing.T) {
+	review := newTask("review", v1alpha1.StageReviewing, "")
+	require.True(t, stage.LegalFor(review, nil, v1alpha1.StageReviewing, v1alpha1.StageRejected),
+		"reviewing -> rejected must stay legal (issue-closed shares this pair)")
+	impl := newTask("implement", v1alpha1.StageReviewing, "")
+	require.True(t, stage.LegalFor(impl, nil, v1alpha1.StageReviewing, v1alpha1.StageRejected))
 }
