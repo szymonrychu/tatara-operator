@@ -657,6 +657,7 @@ func mrTerminalStates(mrs []tatarav1alpha1.MergeRequest) (states []string, allTe
 func (o *outcomeCtx) terminalNoop(states []string) {
 	o.release()
 	ctx := o.r.Context()
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, "mr-terminal-noop").Inc()
 	o.s.log.InfoContext(ctx, "restapi: submit_outcome no-op: kind=review task owns only terminal MRs; the review target already merged/closed",
 		append(reqLogFields(o.r), "action", "submit_outcome_noop", "task", o.task.Name,
 			"resource_id", o.task.Name, "kind", o.kind, "mr_states", strings.Join(states, ","))...)

@@ -1579,6 +1579,7 @@ func TestOutcome_RejectionNeverUndoesACommittedOutcome(t *testing.T) {
 func TestOutcome_Review_MergedMR_NoOpNot400(t *testing.T) {
 	mr := mrV2("tatara-agent-skills", 33, "t1")
 	mr.Status.State = "merged"
+	before := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-terminal-noop"))
 	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
 		repoV2("tatara-agent-skills", "tatara"),
 		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"), mr)
@@ -1587,6 +1588,9 @@ func TestOutcome_Review_MergedMR_NoOpNot400(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Contains(t, w.Body.String(), `"noop":true`)
 	require.Contains(t, w.Body.String(), `"reason":"mr-terminal"`)
+	after := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-terminal-noop"))
+	require.Equal(t, before+1, after,
+		"operator_rest_outcome_accepted_total{kind=review,outcome=mr-terminal-noop} must record the terminal no-op")
 }
 
 func TestOutcome_Review_ClosedMR_NoOpNot400(t *testing.T) {

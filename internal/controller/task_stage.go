@@ -107,8 +107,8 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 	// and respawned, and it re-reviews the terminal PR until the 4h budget parks it.
 	// This runs UNCONDITIONALLY - it must fire even when no outcome ever committed
 	// (so no handoffCondition is armed), which is exactly the #33 shape - and it
-	// reuses terminalMREdge so the endpoint no-op, the pre-dispatch guard and this
-	// path can never disagree.
+	// reuses terminalMREdge so this path, the pre-dispatch guard and reviewAdvanceEdge
+	// can never disagree with each other.
 	if task.Status.Stage == tatarav1alpha1.StageReviewing && task.Spec.Kind == "review" {
 		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
 		if mrErr != nil {
@@ -1258,8 +1258,8 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	// building a review pod, if every owned MR already reached a terminal forge
 	// state, finalize the Task pod-lessly and spawn NOTHING: re-reviewing a
 	// merged/closed PR can only 400 on submit_outcome and respawn-loop. Reuses
-	// terminalMREdge so this can never disagree with reconcileClocks or the
-	// endpoint no-op.
+	// terminalMREdge so this can never disagree with reconcileClocks or
+	// reviewAdvanceEdge.
 	if task.Spec.Kind == "review" {
 		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
 		if mrErr != nil {
