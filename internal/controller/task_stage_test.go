@@ -1668,3 +1668,51 @@ func TestReconcileClocks_ReviewOpenMR_DoesNotFinalize(t *testing.T) {
 	got := mdGetTask(t, c, "t1")
 	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "an open MR must not finalize")
 }
+
+// #33 SHAPE AT THE SOURCE: ensureStagePod must never build a review pod for a
+// Task whose owned MR already reached a terminal forge state - reconcileClocks
+// finalizing it on the NEXT reconcile is too late if a pod was already spawned
+// this reconcile. tsReconciler's Session is a panicking pod factory, so "no pod
+// spawned" is provable by the absence of a panic plus the finalize below.
+func TestEnsureStagePod_ReviewMRTerminal_SpawnsNoPodAndFinalizes(t *testing.T) {
+	proj := mdProject()
+	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	mr := mdMR(task, "tatara-operator", 33)
+	mr.Status.State = "merged"
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-operator"), task, mr)
+	r := tsReconciler(c)
+
+	skipped, err := r.ensureStagePod(context.Background(), proj, task)
+	require.NoError(t, err)
+	require.True(t, skipped, "a terminal-MR review Task must spawn no pod")
+	got := mdGetTask(t, c, "t1")
+	require.Equal(t, tatarav1alpha1.StageDelivered, got.Status.Stage)
+	require.Equal(t, stage.ReasonMRMergedExternally, got.Status.StageReason)
+
+	// No wrapper pod was created.
+	var pod corev1.Pod
+	err = c.Get(context.Background(), types.NamespacedName{Namespace: mdNS, Name: agent.PodName(task)}, &pod)
+	require.True(t, apierrors.IsNotFound(err), "no wrapper pod may exist")
+}
+
+func TestEnsureStagePod_ReviewMROpen_ProceedsNormally(t *testing.T) {
+	proj := mdProject()
+	task := mdTask("t1", "review", tatarav1alpha1.StageReviewing)
+	mr := mdMR(task, "tatara-operator", 33) // open
+	c := newMirrorClient(t, proj, mdSecret(), mdRepo("tatara-operator"), task, mr)
+	r := tsReconciler(c)
+	// Reaching normal pod creation past the guard needs a satisfiable
+	// PodConfig (tsReconciler's default has no AnthropicSecretName/
+	// CLIOIDCSecretName, matching the neighboring pod-creation tests' pattern).
+	r.PodConfig = agent.PodConfig{
+		Namespace:           mdNS,
+		AnthropicSecretName: "anthropic",
+		CLIOIDCSecretName:   "cli-oidc",
+	}
+
+	skipped, err := r.ensureStagePod(context.Background(), proj, task)
+	require.NoError(t, err)
+	require.False(t, skipped, "an open-MR review Task must proceed to normal pod creation")
+	got := mdGetTask(t, c, "t1")
+	require.Equal(t, tatarav1alpha1.StageReviewing, got.Status.Stage, "no finalize on an open MR")
+}

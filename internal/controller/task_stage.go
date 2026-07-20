@@ -1254,6 +1254,28 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 		return true, nil
 	}
 
+	// PRE-DISPATCH EXTERNAL-TERMINAL GUARD (fixes #33 at the source). Before
+	// building a review pod, if every owned MR already reached a terminal forge
+	// state, finalize the Task pod-lessly and spawn NOTHING: re-reviewing a
+	// merged/closed PR can only 400 on submit_outcome and respawn-loop. Reuses
+	// terminalMREdge so this can never disagree with reconcileClocks or the
+	// endpoint no-op.
+	if task.Spec.Kind == "review" {
+		mrs, mrErr := ownedMergeRequests(ctx, r.mrReader(), task)
+		if mrErr != nil {
+			return false, mrErr
+		}
+		if edge, ok := terminalMREdge(task, mrs); ok {
+			log.FromContext(ctx).Info("review pod not spawned: every owned MR reached a terminal forge state externally",
+				"action", "review_finalize_terminal_mr", "resource_id", task.Name,
+				"to", edge.To, "reason", edge.Reason)
+			if err := r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, time.Now()); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+
 	if err := agent.ValidatePodSecretRefs(proj, r.PodConfig); err != nil {
 		return false, err
 	}
