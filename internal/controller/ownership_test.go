@@ -13,6 +13,7 @@ import (
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
+	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -204,6 +205,91 @@ func TestReconcileOwnership_FlipsMainlineWithExistingReviewTask(t *testing.T) {
 	}
 	if stillController {
 		t.Fatalf("old owner %s must be demoted to controller=false after hand-back", implName)
+	}
+}
+
+// TestReconcileOwnership_ResumesHalfCompletedFlip is the convergence-hole
+// regression test flagged by the in-cluster review agent: flipToExternal
+// stamps Status.Ownership=external BEFORE parking the owner Task and handing
+// control to the review Task. If that second half fails with a non-conflict
+// error, the reconcile requeues but the `Ownership == tatara` drift guard
+// (ReconcileOwnership's own flip trigger) is now false forever - park+hand-
+// back never re-run, leaving the owner Task unparked and the review Task
+// never controller.
+//
+// This simulates exactly that half-completed state (real flip, then manually
+// un-park the owner task and restore its controller ref) and asserts a
+// SUBSEQUENT ReconcileOwnership call - the requeue - finishes the job: owner
+// re-parked, review Task controller again. It also asserts
+// OwnershipChangedAt is untouched by the resume, so the announcement drain
+// (OP11, keyed on that timestamp) does not double-post.
+func TestReconcileOwnership_ResumesHalfCompletedFlip(t *testing.T) {
+	ctx := context.Background()
+	d, proj, repo := newOwnershipDriver(t, ctx)
+	mr := seedTataraOwnedMRWithTakeoverTask(t, ctx, proj, repo, 10, "tatara/feat-10", "bot-head")
+	takeoverName := takeoverTaskName(proj, repo, 10)
+	reviewName := tatarav1alpha1.IntakeTaskName(proj.Name, SweepReviewKind, repo.Name, 10)
+
+	// A real flip: stamps external, parks the takeover Task, hands control to
+	// a freshly re-minted review Task.
+	flipped, err := d.ReconcileOwnership(ctx, proj, repo, mr, "human-head", nil)
+	if err != nil || !flipped {
+		t.Fatalf("expected flip, got flipped=%v err=%v", flipped, err)
+	}
+	flippedAt := getMR(t, ctx, proj, repo, 10).Status.OwnershipChangedAt
+	if flippedAt == nil {
+		t.Fatalf("precondition: flip must stamp OwnershipChangedAt")
+	}
+
+	// Simulate the crash: un-park the owner task...
+	var task tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: takeoverName}, &task); err != nil {
+		t.Fatalf("get takeover task: %v", err)
+	}
+	task.Status.Stage = tatarav1alpha1.StageImplementing
+	task.Status.StageReason = ""
+	if err := k8sClient.Status().Update(ctx, &task); err != nil {
+		t.Fatalf("un-park owner task: %v", err)
+	}
+	// ...and restore its controller ref on the MR mirror (it survived the
+	// first flip as a plain owner - own.HandOverController just needs it
+	// already listed as an owner, which it is).
+	got := getMR(t, ctx, proj, repo, 10)
+	if err := MutateOwnerRefs(ctx, k8sClient, got, func(fresh *tatarav1alpha1.MergeRequest) error {
+		return own.HandOverController(fresh, nil, &task)
+	}); err != nil {
+		t.Fatalf("restore controller ref: %v", err)
+	}
+	if ctrl, ok := own.ControllerOwner(getMR(t, ctx, proj, repo, 10)); !ok || ctrl != takeoverName {
+		t.Fatalf("precondition: controller must be back on the takeover task, got %q ok=%v", ctrl, ok)
+	}
+
+	// The requeue: ReconcileOwnership must notice the half-completed flip and
+	// finish it, without treating it as a NEW flip.
+	mr2 := getMR(t, ctx, proj, repo, 10)
+	resumed, err := d.ReconcileOwnership(ctx, proj, repo, mr2, "human-head", nil)
+	if err != nil {
+		t.Fatalf("resume reconcile: %v", err)
+	}
+	if resumed {
+		t.Fatalf("resuming a half-completed flip is not itself a new flip")
+	}
+
+	var taskAfter tatarav1alpha1.Task
+	if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: proj.Namespace, Name: takeoverName}, &taskAfter); err != nil {
+		t.Fatalf("get takeover task after resume: %v", err)
+	}
+	if taskAfter.Status.Stage != tatarav1alpha1.StageParked || taskAfter.Status.StageReason != stage.ReasonOwnershipLost {
+		t.Fatalf("owner task must be re-parked ownership-lost by the resume: %q/%q", taskAfter.Status.Stage, taskAfter.Status.StageReason)
+	}
+
+	after := getMR(t, ctx, proj, repo, 10)
+	if ctrl, ok := own.ControllerOwner(after); !ok || ctrl != reviewName {
+		t.Fatalf("controller must be handed back to the review task %q; got ctrl=%q ok=%v", reviewName, ctrl, ok)
+	}
+	if after.Status.OwnershipChangedAt == nil || !after.Status.OwnershipChangedAt.Equal(flippedAt) {
+		t.Fatalf("resume must not restamp OwnershipChangedAt (would double-post the announcement): got %v, want %v",
+			after.Status.OwnershipChangedAt, flippedAt)
 	}
 }
 

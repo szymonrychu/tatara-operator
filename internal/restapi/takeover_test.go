@@ -2,6 +2,7 @@ package restapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,11 +10,13 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
@@ -21,6 +24,8 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
+	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // takeoverNS / takeoverFrozenNow are this file's own namespace/clock fixtures:
@@ -65,16 +70,34 @@ type takeoverHarness struct {
 	botLogin string
 }
 
+// takeoverHarnessOpts configures the parts of newTakeoverHarness that most
+// tests don't need: an injectable SCM writer (FIX 2's live-head read) and a
+// client interceptor (FIX 3's failure-injection tests). Both are wired in
+// AFTER the fixture's own setup writes so intercepted/stubbed behavior only
+// ever affects the request under test, never the harness building itself.
+type takeoverHarnessOpts struct {
+	scmWriter   scm.SCMWriter
+	interceptor interceptor.Funcs
+}
+
 func newTakeoverHarness(t *testing.T) *takeoverHarness {
+	return newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{})
+}
+
+func newTakeoverHarnessWithOpts(t *testing.T, opts takeoverHarnessOpts) *takeoverHarness {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := tatarav1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add scheme: %v", err)
 	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
 	fc := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&tatarav1alpha1.Project{}, &tatarav1alpha1.Repository{},
 			&tatarav1alpha1.Task{}, &tatarav1alpha1.MergeRequest{}).
+		WithInterceptorFuncs(opts.interceptor).
 		Build()
 
 	h := &takeoverHarness{t: t, c: fc, botLogin: "tatara-bot"}
@@ -137,6 +160,23 @@ func newTakeoverHarness(t *testing.T) *takeoverHarness {
 	}
 	h.addComment(t, 9, "10", "alice", false)
 
+	// The scm secret backing ScmSecretRef is always seeded (harmless when no
+	// scmWriter is configured: scmFor stays nil below, so projectSCMWriterAndToken
+	// never resolves the secret's token in the first place).
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: h.proj.Spec.ScmSecretRef, Namespace: takeoverNS},
+		Data:       map[string][]byte{"token": []byte("tok")},
+	}
+	if err := fc.Create(ctx, secret); err != nil {
+		t.Fatalf("create scm secret: %v", err)
+	}
+
+	var scmFor func(string) (scm.SCMWriter, error)
+	if opts.scmWriter != nil {
+		w := opts.scmWriter
+		scmFor = func(string) (scm.SCMWriter, error) { return w, nil }
+	}
+
 	// SpillerFor is deliberately left unset: these fixtures never approach the
 	// A.7 byte budget, so objbudget never calls Spill, and spillerForOrNil
 	// already handles a nil resolver.
@@ -144,11 +184,43 @@ func newTakeoverHarness(t *testing.T) *takeoverHarness {
 		Client: fc, Namespace: takeoverNS,
 		Minter: &controller.Minter{Client: fc, APIReader: fc, Scheme: scheme},
 		Now:    func() time.Time { return takeoverFrozenNow },
+		SCMFor: scmFor,
 	})
 	r := chi.NewRouter()
 	s.Mount(r, nil)
 	h.r = r
 	return h
+}
+
+// seedParkedTakeoverTask creates the deterministic-named takeover Task for
+// (h.repo, number) already parked(ownership-lost) - the "re-take" shape
+// MintOrUnparkTakeoverTask's UNPARK branch expects (see
+// internal/controller/takeover_mint_test.go's identically-purposed
+// TestMintOrUnparkTakeoverTask_UnparksExisting). Unlike a fresh mint, the
+// unpark branch never touches the MR's owner refs - it only re-enters the
+// Task's OWN stage - so tests that need to isolate takeover.go's OWN
+// owner-ref-move / ownership-stamp writes from MintOrUnparkTakeoverTask's
+// internal bindMRToTask writes (which a fresh mint also performs) seed this
+// first.
+func (h *takeoverHarness) seedParkedTakeoverTask(t *testing.T, number int) {
+	t.Helper()
+	ctx := context.Background()
+	name := takeoverTaskName(h.proj, h.repo, number)
+	task := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: takeoverNS},
+		Spec: tatarav1alpha1.TaskSpec{
+			ProjectRef: h.proj.Name, RepositoryRef: h.repo.Name, Kind: "takeover",
+			Goal: "take over", MergeOrder: []string{h.repo.Name},
+		},
+	}
+	if err := h.c.Create(ctx, task); err != nil {
+		t.Fatalf("create parked takeover task: %v", err)
+	}
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonOwnershipLost
+	if err := h.c.Status().Update(ctx, task); err != nil {
+		t.Fatalf("park takeover task: %v", err)
+	}
 }
 
 // ensureTask creates a minimal live Task CR named name if it does not already
@@ -407,4 +479,222 @@ func TestMRTakeover_SurvivesNextReconcileOwnership(t *testing.T) {
 	if tkAfter.Status.Stage == tatarav1alpha1.StageParked {
 		t.Fatalf("takeover task must not be parked by the next reconcile")
 	}
+}
+
+// --- FIX 2: seed LastBotHeadSHA from the LIVE forge head, not the mirror ---
+
+// stubForge answers ONLY GetPRHead with a canned (sha, err); every other
+// scm.SCMWriter method panics via the nil embedded interface (the same
+// pattern package restapi_test's panicForge uses) - the takeover endpoint's
+// live-head read is the only forge call these tests exercise.
+type stubForge struct {
+	scm.SCMWriter
+	head    string
+	headErr error
+}
+
+func (f *stubForge) GetPRHead(_ context.Context, _, _ string, _ int) (string, error) {
+	return f.head, f.headErr
+}
+
+// TestMRTakeover_SeedsLastBotHeadFromLiveForgeRead is the stale-mirror
+// regression test: newTakeoverHarness seeds MR #9's mirrored HeadSHA to
+// "sha-9", but the LIVE forge head (what mrTakeover now reads before the flip
+// write) is different - simulating a mirror that lagged behind a push that
+// landed between the last webhook/sweep sync and this takeover. Before the
+// fix, LastBotHeadSHA seeded from the STALE mirror value; the very next
+// ReconcileOwnership sweep would then see liveHead("live-sha-fresh") !=
+// LastBotHeadSHA("sha-9") and instantly flip the fresh takeover back to
+// external.
+func TestMRTakeover_SeedsLastBotHeadFromLiveForgeRead(t *testing.T) {
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		scmWriter: &stubForge{head: "live-sha-fresh"},
+	})
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("valid takeover must 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	mr := h.getMR(t, 9)
+	if mr.Status.LastBotHeadSHA != "live-sha-fresh" {
+		t.Fatalf("LastBotHeadSHA must seed from the LIVE forge head, not the stale mirror (sha-9); got %q", mr.Status.LastBotHeadSHA)
+	}
+	if mr.Status.HeadSHA != "live-sha-fresh" {
+		t.Fatalf("HeadSHA mirror must also refresh to the live head; got %q", mr.Status.HeadSHA)
+	}
+}
+
+// TestMRTakeover_FallsBackToMirroredHeadOnLiveReadError proves the live-head
+// read is best-effort: a transient forge error must never fail the takeover
+// itself, and the seed falls back to the (possibly stale) mirrored HeadSHA
+// exactly as before this fix.
+func TestMRTakeover_FallsBackToMirroredHeadOnLiveReadError(t *testing.T) {
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		scmWriter: &stubForge{headErr: errors.New("transient forge error")},
+	})
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("a transient live-head read failure must never fail the takeover, got %d: %s", rr.Code, rr.Body.String())
+	}
+	mr := h.getMR(t, 9)
+	if mr.Status.LastBotHeadSHA != "sha-9" { // the mirrored HeadSHA seeded by newTakeoverHarness
+		t.Fatalf("fallback must seed from the mirrored head, got %q", mr.Status.LastBotHeadSHA)
+	}
+}
+
+// --- FIX 3: operator_rest_takeover_error_total, one internal-error branch per stage ---
+
+// takeoverErrStage counts obs.RestTakeoverErrorTotal{stage} before/after a
+// takeover call and asserts it moved by exactly +1 for stage and +0 for every
+// other of the four stages - so a wiring bug that increments the wrong stage
+// (or double-counts) fails loudly instead of passing on a coincidental total.
+func assertTakeoverErrorInc(t *testing.T, stage string, before map[string]float64) {
+	t.Helper()
+	for _, s := range []string{"demote", "mint", "ownerref", "stamp"} {
+		want := before[s]
+		if s == stage {
+			want++
+		}
+		if got := testutil.ToFloat64(obs.RestTakeoverErrorTotal.WithLabelValues(s)); got != want {
+			t.Fatalf("operator_rest_takeover_error_total{stage=%q} = %v, want %v (asserting stage=%q incremented)", s, got, want, stage)
+		}
+	}
+}
+
+func snapshotTakeoverErrors() map[string]float64 {
+	snap := make(map[string]float64, 4)
+	for _, s := range []string{"demote", "mint", "ownerref", "stamp"} {
+		snap[s] = testutil.ToFloat64(obs.RestTakeoverErrorTotal.WithLabelValues(s))
+	}
+	return snap
+}
+
+// errInjected is the sentinel every failure-injection interceptor below
+// returns, so a 500 body can be told apart from an unrelated fake-client bug.
+var errInjected = errors.New("injected failure")
+
+// TestMRTakeover_DemoteFailureIncrementsErrorMetric forces DemoteMRController
+// (the first write mrTakeover makes past authz) to fail: the interceptor
+// fails the FIRST Update on a MergeRequest object issued AFTER the harness
+// finishes its own setup writes.
+func TestMRTakeover_DemoteFailureIncrementsErrorMetric(t *testing.T) {
+	armed := false
+	mrUpdates := 0
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		interceptor: interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if armed {
+					if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+						mrUpdates++
+						if mrUpdates == 1 {
+							return errInjected
+						}
+					}
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		},
+	})
+	before := snapshotTakeoverErrors()
+	armed = true
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("demote failure must 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	assertTakeoverErrorInc(t, "demote", before)
+}
+
+// TestMRTakeover_MintFailureIncrementsErrorMetric forces
+// MintOrUnparkTakeoverTask's Create of the (not-yet-existing) takeover Task
+// to fail, gated on the deterministic takeover Task name so the harness's own
+// "review-task" Create (during setup, before arming) is never touched.
+func TestMRTakeover_MintFailureIncrementsErrorMetric(t *testing.T) {
+	armed := false
+	var takeoverName string
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		interceptor: interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if armed {
+					if tk, ok := obj.(*tatarav1alpha1.Task); ok && tk.Name == takeoverName {
+						return errInjected
+					}
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		},
+	})
+	takeoverName = takeoverTaskName(h.proj, h.repo, 9)
+	before := snapshotTakeoverErrors()
+	armed = true
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("mint failure must 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	assertTakeoverErrorInc(t, "mint", before)
+}
+
+// TestMRTakeover_OwnerRefFailureIncrementsErrorMetric forces the SECOND
+// post-arm MergeRequest Update (demote is the first and must succeed; the
+// owner-ref move onto the takeover Task is takeover.go's own explicit second
+// one) to fail. A RE-TAKE (the takeover Task already parked ownership-lost,
+// via seedParkedTakeoverTask) is required to isolate this: on a FRESH mint,
+// MintOrUnparkTakeoverTask's own bindMRToTask ALSO writes the MR (sync +
+// own) as part of minting, which would otherwise land as the "2nd" Update and
+// misattribute the failure to the mint stage instead of this one.
+func TestMRTakeover_OwnerRefFailureIncrementsErrorMetric(t *testing.T) {
+	armed := false
+	mrUpdates := 0
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		interceptor: interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if armed {
+					if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+						mrUpdates++
+						if mrUpdates == 2 {
+							return errInjected
+						}
+					}
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		},
+	})
+	h.seedParkedTakeoverTask(t, 9)
+	before := snapshotTakeoverErrors()
+	armed = true
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("owner-ref move failure must 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	assertTakeoverErrorInc(t, "ownerref", before)
+}
+
+// TestMRTakeover_StampFailureIncrementsErrorMetric forces the final
+// ownership-flip status write (objbudget.FitMergeRequest's Status().Update)
+// to fail - the SubResourceUpdate hook. A RE-TAKE (seedParkedTakeoverTask) is
+// required for the same reason as the ownerref test: on a fresh mint,
+// bindMRToTask's own SyncMergeRequest ALSO does a status Update on the MR as
+// part of minting, which would otherwise be the first (and misattributed)
+// SubResourceUpdate hit.
+func TestMRTakeover_StampFailureIncrementsErrorMetric(t *testing.T) {
+	armed := false
+	h := newTakeoverHarnessWithOpts(t, takeoverHarnessOpts{
+		interceptor: interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if armed && subResourceName == "status" {
+					if _, ok := obj.(*tatarav1alpha1.MergeRequest); ok {
+						return errInjected
+					}
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		},
+	})
+	h.seedParkedTakeoverTask(t, 9)
+	before := snapshotTakeoverErrors()
+	armed = true
+	rr := h.post(t, `{"repo":"repo-a","number":9,"commentExternalId":"10","task":"review-task"}`)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("stamp failure must 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	assertTakeoverErrorInc(t, "stamp", before)
 }

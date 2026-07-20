@@ -197,6 +197,15 @@ func (s *Server) handleMRSynchronize(ctx context.Context, w http.ResponseWriter,
 	// as attributable (no false external-push flip). A non-bot pusher advances
 	// only the HeadSHA mirror, leaving LastBotHeadSHA stale - ReconcileOwnership
 	// sees the drift and flips.
+	//
+	// isBotActor is a string-equality check against Scm.BotLogin - the FAST
+	// PATH only, not the authoritative signal: the actual identity gate lives
+	// at outcome accept (/outcome's record_bot_head, restapi/outcome.go), which
+	// re-stamps LastBotHeadSHA from a LIVE forge read (GetPRHead) rather than
+	// trusting the webhook's reported actor. A spoofed or mismatched
+	// BotLogin/push-identity here can only cause a spurious flip whose window
+	// is bounded by the next accept - it self-corrects there, it never
+	// compounds.
 	bot := isBotActor(&proj, ev.ActorLogin)
 	if s.stampMRHead(ctx, &proj, repo, ev.Number, ev.HeadSHA, bot) {
 		s.log.InfoContext(ctx, "mr: mirrored new head on synchronize; no review restart",

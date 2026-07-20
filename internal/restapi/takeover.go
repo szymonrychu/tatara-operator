@@ -161,6 +161,7 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	if err := controller.DemoteMRController(ctx, s.c, &mr); err != nil {
 		s.log.ErrorContext(ctx, "restapi: takeover demote controller failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+		obs.RestTakeoverErrorTotal.WithLabelValues("demote").Inc()
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -169,6 +170,7 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.log.ErrorContext(ctx, "restapi: mint/unpark takeover task failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+		obs.RestTakeoverErrorTotal.WithLabelValues("mint").Inc()
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
@@ -188,31 +190,58 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		s.log.ErrorContext(ctx, "restapi: move merge request ownership failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+		obs.RestTakeoverErrorTotal.WithLabelValues("ownerref").Inc()
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
+	// Seed LastBotHeadSHA (and the HeadSHA mirror) from the LIVE PR head, not
+	// mr.Status.HeadSHA - the mirror can lag the forge (the last webhook/sweep
+	// sync may predate this exact instant). A stale seed reproduces the same
+	// bug the comment below already fixed once: the very next
+	// ReconcileOwnership sweep would see liveHead != LastBotHeadSHA and flip
+	// this fresh takeover straight back to external. Best-effort: a transient
+	// read failure must never fail the takeover itself, so it falls back to
+	// the mirrored head exactly as before this fetch existed - same reasoning
+	// as the discardWriter fallback at /outcome's record_bot_head (outcome.go).
+	liveHead := mr.Status.HeadSHA
+	if writer, token, ok := s.projectSCMWriterAndToken(&discardWriter{}, r, proj); ok {
+		if live, herr := writer.GetPRHead(ctx, repo.Spec.URL, token, req.Number); herr != nil {
+			s.log.WarnContext(ctx, "restapi: takeover live head read failed; falling back to the mirrored head",
+				append(reqLogFields(r), "mr", mr.Name, "error", herr)...)
+		} else if live != "" {
+			liveHead = live
+		}
+	} else {
+		s.log.WarnContext(ctx, "restapi: takeover scm writer/token resolution failed; falling back to the mirrored head",
+			append(reqLogFields(r), "mr", mr.Name)...)
+	}
+
 	now := metav1.Now()
 	key := types.NamespacedName{Namespace: s.ns, Name: mr.Name}
-	// LastBotHeadSHA is set to the CURRENT head at the takeover point, not left
-	// at its prior (possibly empty, possibly stale) value: ReconcileOwnership's
-	// drift check fires whenever ownership==tatara && liveHead != LastBotHeadSHA
-	// (internal/controller/ownership.go). A never-bot-pushed MR (the headline
-	// Renovate takeover case) has LastBotHeadSHA=="" - left unset here, the very
-	// next reconcile would read liveHead != "" and flip this MR straight back to
-	// external, parking the takeover Task before its agent ever runs. A re-take
-	// after a stand-down has the same bug with a STALE old bot head. A later
-	// real human push still moves the live head off this baseline and stands
-	// the MR down correctly; the takeover agent's own push refreshes this same
-	// field again at outcome accept.
+	// LastBotHeadSHA is set to the CURRENT (live) head at the takeover point,
+	// not left at its prior (possibly empty, possibly stale) value:
+	// ReconcileOwnership's drift check fires whenever ownership==tatara &&
+	// liveHead != LastBotHeadSHA (internal/controller/ownership.go). A
+	// never-bot-pushed MR (the headline Renovate takeover case) has
+	// LastBotHeadSHA=="" - left unset here, the very next reconcile would read
+	// liveHead != "" and flip this MR straight back to external, parking the
+	// takeover Task before its agent ever runs. A re-take after a stand-down
+	// has the same bug with a STALE old bot head. HeadSHA is refreshed to the
+	// same value so the mirror does not itself go stale relative to the SHA
+	// this flip is keyed on. A later real human push still moves the live
+	// head off this baseline and stands the MR down correctly; the takeover
+	// agent's own push refreshes this same field again at outcome accept.
 	if err := objbudget.FitMergeRequest(ctx, s.c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
 		m.Status.Ownership = tatarav1alpha1.OwnershipTatara
 		m.Status.OwnershipReason = "takeover-requested-by:" + cmt.Author
 		m.Status.OwnershipChangedAt = &now
-		m.Status.LastBotHeadSHA = mr.Status.HeadSHA
+		m.Status.LastBotHeadSHA = liveHead
+		m.Status.HeadSHA = liveHead
 	}); err != nil {
 		s.log.ErrorContext(ctx, "restapi: record ownership flip failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+		obs.RestTakeoverErrorTotal.WithLabelValues("stamp").Inc()
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
