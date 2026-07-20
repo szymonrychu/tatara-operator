@@ -784,6 +784,12 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&tatarav1alpha1.Task{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{}).
+		// MR CRs carry a controller ownerRef to their Task; watching them requeues
+		// the owner the moment its MR flips merged/closed, so a kind=review Task
+		// whose PR a human merges is finalized (reconcileClocks) without waiting for
+		// the hourly mirror sweep. Reconcile is idempotent (EnterStage refuses a
+		// redundant X->X) and tolerates the update-event double-enqueue.
+		Owns(&tatarav1alpha1.MergeRequest{}).
 		// MaxConcurrentReconciles: 1 serialises Task reconciles to avoid races in
 		// read-then-write sequences (pod creation, status updates, seq accounting
 		// in the admission queue). The admission queue is the sole concurrency gate.
