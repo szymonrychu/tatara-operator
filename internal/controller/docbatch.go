@@ -48,6 +48,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 		return err
 	}
 	if docsRepo == nil {
+		obs.DocBatchMintTotal.WithLabelValues(obs.DocMintNoDocsRepo).Inc()
 		return nil // docs not enabled, or the docs repo is not enrolled: nowhere to write.
 	}
 
@@ -74,11 +75,13 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 		}
 	}
 	if len(covered) == 0 {
+		obs.DocBatchMintTotal.WithLabelValues(obs.DocMintEmpty).Inc()
 		l.V(1).Info("docbatch: nothing delivered needs documenting; minting nothing",
 			"action", "doc_batch_empty", "resource_id", proj.Name)
 		return nil
 	}
 	if inFlight := docBatchInFlight(tl.Items, proj.Name); inFlight != "" {
+		obs.DocBatchMintTotal.WithLabelValues(obs.DocMintDeferred).Inc()
 		l.Info("docbatch: a batch is already in flight; deferring this night's mint",
 			"action", "doc_batch_inflight", "resource_id", proj.Name, "batch", inFlight)
 		return nil
@@ -112,6 +115,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 	if err := r.Create(ctx, batch); err != nil {
 		return fmt.Errorf("docbatch: create batch task: %w", err)
 	}
+	obs.DocBatchMintTotal.WithLabelValues(obs.DocMintMinted).Inc()
 	// Create -> documenting is an F.3 edge in its own right: the batch is minted
 	// STRAIGHT into its agent stage, with no triage. The stage is carried in
 	// Spec.InitialStage and applied by the reconciler create-edge (fix C5), so no

@@ -1266,6 +1266,100 @@ func TestReapDeliveredWaitsForDocumentation(t *testing.T) {
 	}
 }
 
+// TestReapDeliveredDoesNotCountFreshDocHold: a delivered+merged Task inside its
+// legitimate documentation-hold window (just delivered, waiting for tonight's
+// batch) stays PINNED but must NOT increment operator_gc_blocked_total{
+// doc_reference} nor the distinct-blocked gauge. Counting the routine daily hold
+// is exactly what tripped the recurring warning alert (issue #423, recurrence of
+// #392): the reaper re-scanned two Tasks that were healthily waiting for their
+// nightly cover and reported them as GC-blocked every reconcile.
+func TestReapDeliveredDoesNotCountFreshDocHold(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("freshhold") // documentation cron "0 3 * * *" => 24h period
+	repo := reapRepo("freshhold", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	// Delivered 1h ago: inside the window, waiting for the next nightly mint.
+	tk, mr := deliveredWithMergedMR(t, "freshhold", repo.Name, "fresh-task", 11, time.Now().Add(-1*time.Hour))
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), tk, mr)
+	r := reapReconciler(c, &reapWriter{})
+
+	before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference))
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	// GC behaviour is unchanged: a fresh delivered+merged Task is still pinned.
+	if _, ok := mustGetTask(t, c, "fresh-task"); !ok {
+		t.Fatal("a fresh delivered+merged task was reaped before it could be documented")
+	}
+	if got := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference)); got != before {
+		t.Fatalf("operator_gc_blocked_total{doc_reference} = %v, want unchanged %v: a fresh in-window doc hold must not be counted", got, before)
+	}
+	if g := testutil.ToFloat64(obs.DocReferenceBlockedTasks.WithLabelValues("freshhold")); g != 0 {
+		t.Fatalf("operator_doc_reference_blocked_tasks{freshhold} = %v, want 0", g)
+	}
+}
+
+// TestReapDeliveredCountsStalledDocHold: a delivered+merged Task uncovered for
+// longer than one documentation-cron period, with NO live batch carrying it, is
+// genuinely stuck - the mint that should have covered it never produced a batch.
+// It stays pinned AND is counted, so a real stall still alerts.
+func TestReapDeliveredCountsStalledDocHold(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("stalledhold")
+	repo := reapRepo("stalledhold", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	// Delivered 30h ago (> 24h cron period), still < 48h TTL: a full nightly
+	// window passed with no covering batch minted.
+	tk, mr := deliveredWithMergedMR(t, "stalledhold", repo.Name, "stalled-task", 11, time.Now().Add(-30*time.Hour))
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), tk, mr)
+	r := reapReconciler(c, &reapWriter{})
+
+	before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference))
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	if _, ok := mustGetTask(t, c, "stalled-task"); !ok {
+		t.Fatal("a stalled delivered task must stay pinned, not be reaped")
+	}
+	if got := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference)); got <= before {
+		t.Fatalf("operator_gc_blocked_total{doc_reference} = %v, want > %v: a stalled hold must be counted", got, before)
+	}
+	if g := testutil.ToFloat64(obs.DocReferenceBlockedTasks.WithLabelValues("stalledhold")); g != 1 {
+		t.Fatalf("operator_doc_reference_blocked_tasks{stalledhold} = %v, want 1", g)
+	}
+}
+
+// TestReapDeliveredNotCountedWhileLiveBatchCovers: a delivered+merged Task
+// uncovered longer than one cron period is NOT stuck if a live (not-yet-resolved)
+// documentation batch names it - the batch is carrying it through
+// documenting/review/merge and will stamp it on settle. This is the review/merge
+// tail the fixed-duration bound would have false-alerted on.
+func TestReapDeliveredNotCountedWhileLiveBatchCovers(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("coveredhold")
+	repo := reapRepo("coveredhold", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	tk, mr := deliveredWithMergedMR(t, "coveredhold", repo.Name, "covered-task", 11, time.Now().Add(-30*time.Hour))
+	// A live batch, minted 30 min ago (well within DocStageBudget so it stays in
+	// documenting through this pass), covering the task.
+	batch := reapTask("coveredhold", "doc-batch-live", DocBatchKind, tatarav1alpha1.StageDocumenting, "", time.Now().Add(-30*time.Minute))
+	batch.Spec.DocumentsTasks = []string{"covered-task"}
+	batch.Spec.RepositoryRef = "tatara-documentation"
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), tk, mr, batch)
+	r := reapReconciler(c, &reapWriter{})
+
+	before := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference))
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	if got := testutil.ToFloat64(obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference)); got != before {
+		t.Fatalf("operator_gc_blocked_total{doc_reference} = %v, want unchanged %v while a live batch covers the task", got, before)
+	}
+	if g := testutil.ToFloat64(obs.DocReferenceBlockedTasks.WithLabelValues("coveredhold")); g != 0 {
+		t.Fatalf("operator_doc_reference_blocked_tasks{coveredhold} = %v, want 0 while covered", g)
+	}
+}
+
 // mrGetFailAfterClient fails every MergeRequest Get from the failFrom'th call
 // onward (1-indexed), so a test can make ownedMRs succeed once and then fail -
 // simulating a transient failure of the SECOND, diagnostic-only ownedMRs read

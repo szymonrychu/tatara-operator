@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -331,13 +332,24 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	now := time.Now()
 
 	// live is EVERY Task that currently exists, and fold is the SKIP list: any
-	// Task named in a live Task's status.foldInFlight.
+	// Task named in a live Task's status.foldInFlight. ds.activeBatchMembers is
+	// the set of Tasks a not-yet-resolved documentation batch is carrying: they
+	// are being actively covered and must not be reported as doc_reference-stuck
+	// however long they have waited (issue #423).
 	live := make(map[string]bool, len(tl.Items))
 	fold := map[string]bool{}
+	ds := &docReapState{activeBatchMembers: map[string]bool{}}
 	for i := range tl.Items {
-		live[tl.Items[i].Name] = true
-		for _, member := range tl.Items[i].Status.FoldInFlight {
+		t := &tl.Items[i]
+		live[t.Name] = true
+		for _, member := range t.Status.FoldInFlight {
 			fold[member] = true
+		}
+		if t.Spec.Kind == DocBatchKind && len(t.Spec.DocumentsTasks) > 0 &&
+			t.Annotations[AnnDocBatchResolved] != "true" {
+			for _, member := range t.Spec.DocumentsTasks {
+				ds.activeBatchMembers[member] = true
+			}
 		}
 	}
 
@@ -356,7 +368,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 				"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedFoldInFlight)
 			continue
 		}
-		if err := r.reapOne(ctx, proj, t, live, now); err != nil {
+		if err := r.reapOne(ctx, proj, t, live, now, ds); err != nil {
 			l.Error(err, "reap: terminal task", "action", "reap_error",
 				"resource_id", t.Name, "stage", t.Status.Stage, "stage_reason", t.Status.StageReason)
 			if firstErr == nil {
@@ -364,7 +376,23 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 			}
 		}
 	}
+	// The DISTINCT count of Tasks genuinely stuck past their doc-hold window this
+	// pass - set every pass (including to 0) so a drained backlog clears the gauge.
+	obs.DocReferenceBlockedTasks.WithLabelValues(proj.Name).Set(float64(ds.blocked))
 	return firstErr
+}
+
+// docReapState carries per-pass documentation-hold bookkeeping through reapOne so
+// a single ReapTerminal pass can (a) skip counting a delivered Task a live batch
+// is still carrying, and (b) report the DISTINCT count of genuinely-stuck Tasks
+// on the operator_doc_reference_blocked_tasks gauge.
+type docReapState struct {
+	// activeBatchMembers is the set of Task names named by a documentation batch
+	// that has not yet resolved its members. Such a Task is being actively
+	// covered and is NOT stuck, however long it has waited.
+	activeBatchMembers map[string]bool
+	// blocked counts Tasks found genuinely stuck past their doc-hold window.
+	blocked int
 }
 
 // ReapTerminalPaced runs ReapTerminal for proj at most once per
@@ -394,7 +422,7 @@ func (r *ProjectReconciler) ReapTerminalPaced(ctx context.Context, proj *tatarav
 
 // reapOne is the B.6 table, row by row.
 func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState) error {
 
 	// A documentation batch reaching delivered or parked THROUGH THE NORMAL
 	// review/merge/deploy path (reason "") never goes through forceDocTimeout, so
@@ -446,7 +474,7 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 		return nil
 
 	case tatarav1alpha1.StageDelivered:
-		return r.reapDelivered(ctx, proj, t, live, now)
+		return r.reapDelivered(ctx, proj, t, live, now, ds)
 	}
 	return nil
 }
@@ -500,13 +528,25 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 // Task with one merged MR and one closed one satisfies neither, and would be
 // pinned in the cluster forever. One predicate, both places, no gap.
 func (r *ProjectReconciler) reapDelivered(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState) error {
 
 	needs, err := r.needsDocumenting(ctx, proj, t)
 	if err != nil {
 		return err
 	}
 	if needs {
+		// The pin is UNCHANGED (return nil): an undocumented delivered+merged Task
+		// is held until it is covered, exactly as before. What changed (issue #423,
+		// recurrence of #392) is WHEN we call it "GC blocked". A Task simply waiting
+		// for tonight's batch - or one a live batch is already carrying through
+		// review/merge - is in its LEGITIMATE hold window, not stuck, and counting
+		// it every reconcile tripped the warning alert on every routine daily batch.
+		// Only a hold that outlived a full nightly window with no covering batch is
+		// a real leak worth counting and alerting.
+		if !r.docHoldStuck(proj, t, ds.activeBatchMembers, now) {
+			return nil
+		}
+		ds.blocked++
 		obs.GCBlockedTotal.WithLabelValues(obs.GCBlockedDocReference).Inc()
 		// mrs is DIAGNOSTIC ONLY (the log's mr_states field), a second List of
 		// data needsDocumenting already fetched - a transient failure here must
@@ -524,20 +564,70 @@ func (r *ProjectReconciler) reapDelivered(ctx context.Context, proj *tatarav1alp
 		for i := range mrs {
 			mrStates[i] = mrs[i].Status.State
 		}
-		log.FromContext(ctx).Info("reap: delivered task pinned by the doc_reference GC block",
+		log.FromContext(ctx).Info("reap: delivered task stuck past its documentation-hold window",
 			"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedDocReference,
 			"mr_states", mrStates)
 		return nil
 	}
-	delivered := stageEnteredAt(t)
-	if t.Status.DeliveredAt != nil {
-		delivered = t.Status.DeliveredAt.Time
-	}
-	if !now.After(delivered.Add(tatarav1alpha1.DeliveredRetention)) {
+	if !now.After(deliveredTime(t).Add(tatarav1alpha1.DeliveredRetention)) {
 		return nil
 	}
-	_ = proj
 	return r.deleteReapedTask(ctx, proj, t, live)
+}
+
+// deliveredTime is when a Task entered delivered, preferring the explicit stamp
+// over the generic stage-entered clock.
+func deliveredTime(t *tatarav1alpha1.Task) time.Time {
+	if t.Status.DeliveredAt != nil {
+		return t.Status.DeliveredAt.Time
+	}
+	return stageEnteredAt(t)
+}
+
+// docHoldStuck reports whether a delivered+merged, still-uncovered Task has been
+// held by the doc_reference GC gate LONGER than its legitimate documentation-hold
+// window - i.e. genuinely stuck, not merely waiting for its nightly cover.
+//
+// The hold is HEALTHY, and must not be counted or alerted, while EITHER:
+//   - a live (not-yet-resolved) documentation batch names the Task: it is being
+//     carried through documenting/review/merge and will stamp documentedBy when
+//     it settles (the several-hour review+merge tail a fixed duration bound would
+//     have false-alerted on), OR
+//   - less than one documentation-cron period has elapsed since delivery: the
+//     next nightly mint tick has not even been due yet.
+//
+// Only past BOTH is the hold a real leak: a full nightly window went by and no
+// batch ever picked the Task up (the mint is stalled, or the docs repo is not
+// enrolled). Counting inside the window (the pre-#423 behaviour) tripped the
+// warning alert on every routine daily batch of delivered+merged Tasks.
+func (r *ProjectReconciler) docHoldStuck(proj *tatarav1alpha1.Project, t *tatarav1alpha1.Task,
+	active map[string]bool, now time.Time) bool {
+
+	if active[t.Name] {
+		return false
+	}
+	delivered := deliveredTime(t)
+	return now.After(delivered.Add(documentationCronPeriod(proj, delivered)))
+}
+
+// documentationCronPeriod is the nominal gap between two documentation-batch mint
+// ticks - the worst-case healthy wait between a Task's delivery and the next
+// mint. It falls back to 24h when the schedule is absent or unparseable; callers
+// reach here only for a docBatchingConfigured project, so the schedule is
+// normally a valid nightly cron.
+func documentationCronPeriod(proj *tatarav1alpha1.Project, base time.Time) time.Duration {
+	const fallback = 24 * time.Hour
+	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
+		return fallback
+	}
+	sched, err := cron.ParseStandard(proj.Spec.Scm.Cron.Documentation.Schedule)
+	if err != nil {
+		return fallback
+	}
+	if p := cronPeriod(sched, base); p > 0 {
+		return p
+	}
+	return fallback
 }
 
 // releaseTerminal is THE TERMINAL SEQUENCE (B.6), and the ORDER IS THE FIX:

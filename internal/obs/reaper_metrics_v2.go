@@ -24,6 +24,24 @@ const (
 	GCBlockedDocReference = "doc_reference"
 )
 
+// Doc-batch mint outcomes (issue #423). A stalled nightly mint used to be
+// invisible until the DOWNSTREAM operator_gc_blocked_total{doc_reference} counter
+// tripped an alert. These make the mint itself observable: a firing cron that
+// merely has nothing to do (result=empty) is indistinguishable from a cron that
+// is not firing at all unless the attempt is counted.
+const (
+	// DocMintMinted: a documentation batch Task was created this tick.
+	DocMintMinted = "minted"
+	// DocMintEmpty: the tick fired but nothing delivered needed documenting.
+	DocMintEmpty = "empty"
+	// DocMintDeferred: a batch was already in flight, so this tick's mint was
+	// deferred to avoid racing two docs PRs over the same parents.
+	DocMintDeferred = "deferred"
+	// DocMintNoDocsRepo: documentation is disabled or the docs repo is not
+	// enrolled as a Repository CR, so there is nowhere to write.
+	DocMintNoDocsRepo = "no_docs_repo"
+)
+
 // Doc-batch abandonment reasons (contract K.1, fixes L29 and M21).
 const (
 	// DocAbandonedNeverRan: the batch reached its terminal with stats.podRuns
@@ -44,6 +62,30 @@ var GCBlockedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Help: "Terminal-stage reaps refused, by reason (contract B.6/K.1).",
 }, []string{"reason"})
 
+// DocBatchMintTotal counts nightly documentation-batch mint attempts by outcome
+// (issue #423). It is the observability half of MintDocBatch: rate == 0 across
+// ALL results means the cron is not firing at all; a steady result=empty is a
+// healthy quiet night; a sustained result=deferred means a batch is wedged
+// in flight. Any of these is a stalled mint that this counter surfaces BEFORE
+// the downstream operator_gc_blocked_total{doc_reference} counter trips.
+var DocBatchMintTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_doc_batch_mint_total",
+	Help: "Nightly documentation-batch mint attempts, by outcome (issue #423).",
+}, []string{"result"})
+
+// DocReferenceBlockedTasks is the number of delivered+merged Tasks currently held
+// PAST their legitimate documentation-hold window by the doc_reference GC gate,
+// per project - the true DISTINCT stuck-object count. operator_gc_blocked_total
+// counts one EVENT per reconcile pass per held Task, so it cannot answer "how
+// many objects are actually stuck" (the alert's "35 object(s)" was 35 re-scan
+// events of 2 objects). A routine daily hold - a Task simply waiting for
+// tonight's batch, or one a live batch is carrying through review/merge - is NOT
+// counted here; only a genuinely stalled mint is (issue #423).
+var DocReferenceBlockedTasks = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "operator_doc_reference_blocked_tasks",
+	Help: "Delivered Tasks stuck past their documentation-hold window, by project (issue #423).",
+}, []string{"project"})
+
 // DocTaskAbandonedTotal counts nightly documentation batches that reached their
 // terminal without delivering docs.
 //
@@ -57,5 +99,6 @@ var DocTaskAbandonedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 }, []string{"reason"})
 
 func init() {
-	ctrlmetrics.Registry.MustRegister(GCBlockedTotal, DocTaskAbandonedTotal)
+	ctrlmetrics.Registry.MustRegister(GCBlockedTotal, DocTaskAbandonedTotal,
+		DocBatchMintTotal, DocReferenceBlockedTasks)
 }
