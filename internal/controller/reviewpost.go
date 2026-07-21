@@ -439,16 +439,38 @@ func (d *StageDriver) DrainPendingComments(ctx context.Context, obj client.Objec
 	if err != nil {
 		return fmt.Errorf("review: repo slug for %s: %w", repo.Name, err)
 	}
+	reader, err := d.reader(provider, token)
+	if err != nil {
+		return err
+	}
+	owner, name, err := scm.OwnerRepo(repo.Spec.URL)
+	if err != nil {
+		return fmt.Errorf("review: owner/repo for %s: %w", repo.Name, err)
+	}
 
 	drained := make([]string, 0, len(pending))
 	for _, pc := range pending {
 		body := pc.Body
 		switch {
 		case strings.HasPrefix(body, closeIntentMarker):
-			// issue_write(close), deferred as a comment intent (C.2.12).
+			// issue_write(close), deferred as a comment intent (C.2.12). The
+			// close comment carries the requestId marker and is dedup'd on
+			// the forge thread exactly like postThreadComment - CloseIssue's
+			// PATCH-to-closed is idempotent on its own, but its comment is
+			// not, so a re-drain (crash between CloseIssue and
+			// removePendingComments) must not re-post it.
 			reason := strings.TrimPrefix(body, closeIntentMarker)
 			reason = strings.TrimPrefix(reason, "\n")
-			closeErr := writer.CloseIssue(ctx, token, slug, number, reason)
+			marker := PendingCommentMarker(pc.RequestID)
+			thread, threadErr := listThreadComments(ctx, reader, obj, owner, name, number)
+			if threadErr != nil {
+				return threadErr
+			}
+			comment := ""
+			if !threadCarriesMarker(thread, marker) {
+				comment = marker + "\n" + reason
+			}
+			closeErr := writer.CloseIssue(ctx, token, slug, number, comment)
 			RecordSCM(d.Metrics, provider, "close_issue", closeErr)
 			if closeErr != nil {
 				return fmt.Errorf("review: close issue %s#%d: %w", slug, number, closeErr)

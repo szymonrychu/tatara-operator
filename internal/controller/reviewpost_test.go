@@ -542,8 +542,11 @@ func TestDrainPendingCommentsEditAndClose(t *testing.T) {
 	if len(f.closedIssues) != 1 {
 		t.Fatalf("closed %d issues, want 1", len(f.closedIssues))
 	}
-	if !strings.HasSuffix(f.closedIssues[0], "|superseded by #99") {
+	if !strings.HasSuffix(f.closedIssues[0], "\nsuperseded by #99") {
 		t.Fatalf("close comment = %q", f.closedIssues[0])
+	}
+	if !strings.Contains(f.closedIssues[0], PendingCommentMarker("req-close")) {
+		t.Fatalf("the close comment carries no requestId marker: %q", f.closedIssues[0])
 	}
 	for _, pc := range f.postedComments {
 		if strings.Contains(pc, "tatara-edit") || strings.Contains(pc, "tatara-close") {
@@ -556,6 +559,56 @@ func TestDrainPendingCommentsEditAndClose(t *testing.T) {
 	}
 	if len(got.Status.PendingComments) != 0 {
 		t.Fatalf("pendingComments not drained")
+	}
+}
+
+// #420: closing an issue posted the SAME close comment twice on a re-drain
+// (a crash/requeue between CloseIssue and removePendingComments leaves the
+// close intent in PendingComments, and the drain re-ran CloseIssue with no
+// forge-side check). The close comment must carry the requestId marker, and
+// a re-drain must find it on the thread and NOT post it again - same shape
+// as postThreadComment, contract C.5.3.
+func TestDrainPendingCommentsCloseIsIdempotent(t *testing.T) {
+	task := mdTask("t1", "clarify", tatarav1alpha1.StageClarifying)
+	iss := mdIssue(task, "tatara-operator", 41)
+	iss.Status.PendingComments = []tatarav1alpha1.PendingComment{
+		{RequestID: "req-close", Action: "comment", Body: "<!-- tatara-close -->\nsuperseded by #99"},
+	}
+	c := newMirrorClient(t, mdProject(), mdSecret(), mdRepo("tatara-operator"), task, iss)
+
+	f := newFakeForge(t)
+	d := mdNewDriver(t, f, c)
+	if err := d.DrainPendingComments(context.Background(), mdGetIssue(t, c, iss.Name)); err != nil {
+		t.Fatalf("DrainPendingComments: %v", err)
+	}
+	if len(f.closedIssues) != 1 {
+		t.Fatalf("closed %d issues, want 1", len(f.closedIssues))
+	}
+	if !strings.Contains(f.closedIssues[0], PendingCommentMarker("req-close")) {
+		t.Fatalf("the close comment carries no requestId marker: %q", f.closedIssues[0])
+	}
+
+	// Re-queue the SAME requestId (a crash between CloseIssue and the
+	// PendingComments drain): the forge thread already carries the marker, so
+	// the close comment must NOT be posted a second time.
+	fresh := mdGetIssue(t, c, iss.Name)
+	fresh.Status.PendingComments = []tatarav1alpha1.PendingComment{
+		{RequestID: "req-close", Action: "comment", Body: "<!-- tatara-close -->\nsuperseded by #99"},
+	}
+	if err := c.Status().Update(context.Background(), fresh); err != nil {
+		t.Fatalf("re-queue: %v", err)
+	}
+	if err := d.DrainPendingComments(context.Background(), mdGetIssue(t, c, iss.Name)); err != nil {
+		t.Fatalf("DrainPendingComments (re-run): %v", err)
+	}
+	marked := 0
+	for _, tc := range f.thread[41] {
+		if strings.Contains(tc.Body, PendingCommentMarker("req-close")) {
+			marked++
+		}
+	}
+	if marked != 1 {
+		t.Fatalf("the forge thread carries %d copies of the close comment; the requestId marker must dedup the POST", marked)
 	}
 }
 

@@ -217,6 +217,15 @@ func (f *fakeForge) CloseIssue(_ context.Context, _, repo string, number int, co
 		f.closeHook()
 	}
 	f.closedIssues = append(f.closedIssues, fmt.Sprintf("%s#%d|%s", repo, number, comment))
+	if comment != "" {
+		f.nextCommentID++
+		f.thread[number] = append(f.thread[number], scm.IssueComment{
+			ExternalID: fmt.Sprintf("tc-%d", f.nextCommentID),
+			Author:     "tatara-bot",
+			Body:       comment,
+			CreatedAt:  time.Date(2026, 7, 12, 10, 30, 0, 0, time.UTC),
+		})
+	}
 	return nil
 }
 
