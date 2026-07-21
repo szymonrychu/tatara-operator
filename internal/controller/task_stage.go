@@ -120,6 +120,26 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 				"to", edge.To, "reason", edge.Reason)
 			return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs, edge.To, edge.Reason, now)
 		}
+		// TAKEN-OVER PARENT FINALIZE (the takeover sibling of the #33 shape). A
+		// maintainer takeover moved the MR mirror's controller ownership onto a
+		// takeover Task, so this parent review controller-owns zero MRs (terminalMREdge
+		// above cannot fire on the empty set) yet its status.mrRefs are now owned by a
+		// different live Task. It has no outcome to post and no lifecycle left: retire
+		// it pod-lessly at rejected(mr-taken-over). Runs UNCONDITIONALLY, like the #33
+		// finalize, so it fires even when no outcome ever committed.
+		if len(mrs) == 0 {
+			over, oerr := TaskTakenOver(ctx, r.mrReader(), task)
+			if oerr != nil {
+				return ctrl.Result{}, true, oerr
+			}
+			if over {
+				l.Info("review task finalized: its review target was taken over by a maintainer; the takeover task now owns it",
+					"action", "review_finalize_taken_over", "resource_id", task.Name,
+					"to", tatarav1alpha1.StageRejected, "reason", stage.ReasonMRTakenOver)
+				return ctrl.Result{}, true, r.enter(ctx, proj, task, mrs,
+					tatarav1alpha1.StageRejected, stage.ReasonMRTakenOver, now)
+			}
+		}
 	}
 
 	// B4: THE HANDOFF DEADLINE, evaluated BEFORE the three clocks because it is
@@ -1273,6 +1293,26 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 				return false, err
 			}
 			return true, nil
+		}
+		// Takeover sibling of the guard above: a taken-over parent controller-owns zero
+		// MRs, so terminalMREdge cannot fire, but re-spawning its review pod only 400s
+		// on submit_outcome and respawn-loops. Finalize pod-lessly at
+		// rejected(mr-taken-over) and spawn nothing.
+		if len(mrs) == 0 {
+			over, oerr := TaskTakenOver(ctx, r.mrReader(), task)
+			if oerr != nil {
+				return false, oerr
+			}
+			if over {
+				log.FromContext(ctx).Info("review pod not spawned: the review target was taken over by a maintainer",
+					"action", "review_finalize_taken_over", "resource_id", task.Name,
+					"to", tatarav1alpha1.StageRejected, "reason", stage.ReasonMRTakenOver)
+				if err := r.enter(ctx, proj, task, mrs,
+					tatarav1alpha1.StageRejected, stage.ReasonMRTakenOver, time.Now()); err != nil {
+					return false, err
+				}
+				return true, nil
+			}
 		}
 	}
 

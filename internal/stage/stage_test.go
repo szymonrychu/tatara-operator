@@ -1688,6 +1688,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// Merge (#404). Parked disposition, no unpark re-entry (human deals with
 		// the credential).
 		"merge-auth-refused",
+		// mr-taken-over: reviewing -> rejected when a maintainer takeover moved the
+		// MR mirror's controller ownership onto a takeover Task, leaving this parent
+		// review controller-owning zero MRs. kind=review only.
+		"mr-taken-over",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -1898,6 +1902,43 @@ func TestMergeAuthRefusedIsLegalAndInTheF5ClosedSet(t *testing.T) {
 	}
 	if task.Status.StageReason != stage.ReasonMergeAuthRefused {
 		t.Errorf("stageReason = %q, want %q", task.Status.StageReason, stage.ReasonMergeAuthRefused)
+	}
+}
+
+// TestMRTakenOverIsLegalAndInTheF5ClosedSet is the two-place reason edit for the
+// takeover parent-finalize: mr-taken-over must be both a StageReviewing ->
+// StageRejected edge (F.3) AND a member of the closed Reasons set (F.5), or Enter
+// rejects it. Crucially it is entered with an EMPTY owned-MR set (the parent
+// controller-owns zero after the handover), and reviewing -> rejected is ungated
+// in LegalFor - unlike reviewing -> delivered, which requires AllMRsMerged and
+// would refuse the empty set.
+func TestMRTakenOverIsLegalAndInTheF5ClosedSet(t *testing.T) {
+	if !stage.ValidReason(stage.ReasonMRTakenOver) {
+		t.Fatal("mr-taken-over must be a member of the F.5 closed set, else Enter rejects it")
+	}
+	var found bool
+	for _, e := range stage.Transitions[v1alpha1.StageReviewing] {
+		if e.To == v1alpha1.StageRejected && e.Reason == stage.ReasonMRTakenOver {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("StageReviewing has no -> rejected(mr-taken-over) edge in the F.3 table")
+	}
+
+	task := newTask("review", v1alpha1.StageReviewing, "")
+	if err := stage.Enter(task, nil, v1alpha1.StageRejected, stage.ReasonMRTakenOver, time.Now()); err != nil {
+		t.Errorf("Enter(reviewing -> rejected(mr-taken-over)) with nil owned MRs = %v, want nil", err)
+	}
+	if task.Status.Stage != v1alpha1.StageRejected || task.Status.StageReason != stage.ReasonMRTakenOver {
+		t.Errorf("stage/reason = %q/%q, want rejected/mr-taken-over", task.Status.Stage, task.Status.StageReason)
+	}
+
+	// reviewing -> delivered would NOT be legal for the same empty set: it needs
+	// every owned MR merged. This is why the takeover disposition is rejected.
+	del := newTask("review", v1alpha1.StageReviewing, "")
+	if err := stage.Enter(del, nil, v1alpha1.StageDelivered, stage.ReasonMRTakenOver, time.Now()); err == nil {
+		t.Error("Enter(reviewing -> delivered) with nil owned MRs must be refused by the LegalFor AllMRsMerged gate")
 	}
 }
 

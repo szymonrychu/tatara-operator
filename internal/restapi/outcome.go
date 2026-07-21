@@ -664,6 +664,24 @@ func (o *outcomeCtx) terminalNoop(states []string) {
 	writeJSON(o.w, http.StatusOK, map[string]any{"noop": true, "reason": "mr-terminal"})
 }
 
+// takenOverNoop answers a review submit_outcome whose review target a maintainer
+// took over (the parent review Task controller-owns zero MRs, its refs now owned
+// by a takeover Task) with an explicit 2xx no-op, mirroring terminalNoop: the
+// in-flight agent turn ends cleanly instead of hitting the doomed 400 that
+// respawn-looped the pod. The convergent reconciler-side finalize
+// (rejected(mr-taken-over)) is what actually retires the Task; this only stops
+// the pod re-submitting. The claim is released like any pre-execution class-B
+// path so an identical retry re-validates and no-ops again.
+func (o *outcomeCtx) takenOverNoop() {
+	o.release()
+	ctx := o.r.Context()
+	obs.RestOutcomeAcceptedTotal.WithLabelValues(o.kind, "mr-taken-over-noop").Inc()
+	o.s.log.InfoContext(ctx, "restapi: submit_outcome no-op: kind=review task owns zero MRs; its review target was taken over by a maintainer",
+		append(reqLogFields(o.r), "action", "submit_outcome_noop", "task", o.task.Name,
+			"resource_id", o.task.Name, "kind", o.kind)...)
+	writeJSON(o.w, http.StatusOK, map[string]any{"noop": true, "reason": "mr-taken-over"})
+}
+
 // ok writes the accepted 200 with the fresh Task.
 func (o *outcomeCtx) ok(action string, fields ...any) {
 	ctx := o.r.Context()
@@ -766,6 +784,15 @@ func (o *outcomeCtx) implement(p implementPayload) {
 		if o.task.Spec.Kind == "review" {
 			if states, term := mrTerminalStates(mrs); term {
 				o.terminalNoop(states)
+				return
+			}
+			over, err := controller.TaskTakenOver(ctx, s.c, o.task)
+			if err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+			if over {
+				o.takenOverNoop()
 				return
 			}
 		}
@@ -952,6 +979,15 @@ func (o *outcomeCtx) review(p reviewPayload) {
 		if o.task.Spec.Kind == "review" {
 			if states, term := mrTerminalStates(all); term {
 				o.terminalNoop(states)
+				return
+			}
+			over, err := controller.TaskTakenOver(ctx, s.c, o.task)
+			if err != nil {
+				writeClientErr(o.w, err)
+				return
+			}
+			if over {
+				o.takenOverNoop()
 				return
 			}
 		}
