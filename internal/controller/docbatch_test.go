@@ -533,3 +533,58 @@ func TestReapDeliveredNotBlockedWhenDocBatchingNotConfigured(t *testing.T) {
 		t.Fatal("a delivered task on a project with no doc-batch cron schedule was pinned by the doc_reference GC block instead of reaping at its 48h TTL")
 	}
 }
+
+// TestMintDocBatchRecordsOutcome: every MintDocBatch tick records its outcome on
+// operator_doc_batch_mint_total, so a stalled mint is visible directly instead of
+// only via the downstream GC-block counter (issue #423). A firing-but-empty tick
+// (the common quiet night) must be distinguishable from a cron that never fires.
+func TestMintDocBatchRecordsOutcome(t *testing.T) {
+	ctx := context.Background()
+
+	// minted: one delivered+merged uncovered Task.
+	proj := reapProject("mintobs")
+	src := reapRepo("mintobs", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	docs := reapRepo("mintobs", "tatara-documentation", docsRepoURL)
+	t1, m1 := deliveredWithMergedMR(t, "mintobs", src.Name, "task-a", 1, time.Now().Add(-3*time.Hour))
+	c := newMirrorClient(t, proj, src, docs, reapSecret(), t1, m1)
+	r := reapReconciler(c, &reapWriter{})
+	beforeMint := testutil.ToFloat64(obs.DocBatchMintTotal.WithLabelValues(obs.DocMintMinted))
+	if err := r.MintDocBatch(ctx, proj); err != nil {
+		t.Fatalf("MintDocBatch (minted): %v", err)
+	}
+	if got := testutil.ToFloat64(obs.DocBatchMintTotal.WithLabelValues(obs.DocMintMinted)); got <= beforeMint {
+		t.Fatalf("result=minted = %v, want > %v", got, beforeMint)
+	}
+
+	// empty: nothing delivered needs documenting.
+	proj2 := reapProject("mintempty")
+	src2 := reapRepo("mintempty", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	docs2 := reapRepo("mintempty", "tatara-documentation", docsRepoURL)
+	c2 := newMirrorClient(t, proj2, src2, docs2, reapSecret())
+	r2 := reapReconciler(c2, &reapWriter{})
+	beforeEmpty := testutil.ToFloat64(obs.DocBatchMintTotal.WithLabelValues(obs.DocMintEmpty))
+	if err := r2.MintDocBatch(ctx, proj2); err != nil {
+		t.Fatalf("MintDocBatch (empty): %v", err)
+	}
+	if got := testutil.ToFloat64(obs.DocBatchMintTotal.WithLabelValues(obs.DocMintEmpty)); got <= beforeEmpty {
+		t.Fatalf("result=empty = %v, want > %v", got, beforeEmpty)
+	}
+
+	// deferred: a batch is already in flight over the same parents.
+	proj3 := reapProject("mintdefer")
+	src3 := reapRepo("mintdefer", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+	docs3 := reapRepo("mintdefer", "tatara-documentation", docsRepoURL)
+	t3, m3 := deliveredWithMergedMR(t, "mintdefer", src3.Name, "task-a", 1, time.Now().Add(-3*time.Hour))
+	inflight := reapTask("mintdefer", "doc-inflight", DocBatchKind, tatarav1alpha1.StageDocumenting, "", time.Now())
+	inflight.Spec.DocumentsTasks = []string{"task-a"}
+	inflight.Spec.RepositoryRef = "tatara-documentation"
+	c3 := newMirrorClient(t, proj3, src3, docs3, reapSecret(), t3, m3, inflight)
+	r3 := reapReconciler(c3, &reapWriter{})
+	beforeDefer := testutil.ToFloat64(obs.DocBatchMintTotal.WithLabelValues(obs.DocMintDeferred))
+	if err := r3.MintDocBatch(ctx, proj3); err != nil {
+		t.Fatalf("MintDocBatch (deferred): %v", err)
+	}
+	if got := testutil.ToFloat64(obs.DocBatchMintTotal.WithLabelValues(obs.DocMintDeferred)); got <= beforeDefer {
+		t.Fatalf("result=deferred = %v, want > %v", got, beforeDefer)
+	}
+}
