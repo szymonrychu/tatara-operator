@@ -656,6 +656,9 @@ func (c *GitLab) Merge(ctx context.Context, repoURL, token string, number int, m
 	if err := glDo(ctx, c.base(), http.MethodPut, path, token, in, &resp); err != nil {
 		var he *HTTPError
 		if errors.As(err, &he) && !errors.Is(err, ErrRateLimited) {
+			if he.Status == http.StatusUnauthorized || he.Status == http.StatusForbidden {
+				return "", fmt.Errorf("%w: %w", ErrAuthFailed, err)
+			}
 			if he.Status == http.StatusConflict && expectedHeadSHA != "" {
 				return "", fmt.Errorf("%w: %w", ErrHeadMoved, err)
 			}

@@ -205,8 +205,14 @@ func (m *Minter) MintIssueTask(ctx context.Context, proj *tatarav1alpha1.Project
 // MintReviewTask is mintReviewTaskForPR's race-safe body (unchanged ADOPT-OR-
 // CREATE on the MergeRequest CR): deterministic IntakeTaskName + createTaskRaceSafe
 // in place of the random-suffixed TaskName + blind Create.
+// expectFrom optionally names the controller owner this mint's MR bind is
+// allowed to hand over FROM atomically (fix #408: reMintReviewOwner's
+// captured prevOwner, threaded down to bindMRToTask -> ownMergeRequest, so
+// the demote and the promote land in the SAME Update). Omit it (or pass "")
+// for the ordinary fresh-mint case, where no prior controller is expected -
+// every call site except reMintReviewOwner.
 func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	pr scm.PRRef, cr *tatarav1alpha1.MergeRequest, stg, reason string, sp objbudget.Spiller) (*tatarav1alpha1.Task, bool, error) {
+	pr scm.PRRef, cr *tatarav1alpha1.MergeRequest, stg, reason string, sp objbudget.Spiller, expectFrom ...string) (*tatarav1alpha1.Task, bool, error) {
 
 	ext := mrSnapshot(proj, repo, pr)
 	task := &tatarav1alpha1.Task{
@@ -252,7 +258,7 @@ func (m *Minter) MintReviewTask(ctx context.Context, proj *tatarav1alpha1.Projec
 		}
 		return task, false, nil
 	}
-	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp); err != nil {
+	if err := m.bindMRToTask(ctx, proj, repo, ext, task, sp, expectFrom...); err != nil {
 		return nil, false, err
 	}
 	// Stage from Spec.InitialStage via the create-edge (fix C5); mrRefs +
@@ -375,13 +381,19 @@ func (m *Minter) stampMintStatus(ctx context.Context, task *tatarav1alpha1.Task,
 }
 
 // bindMRToTask mirrors the MR and hands the Task its controller ownership.
+// expectFrom (optional, see MintReviewTask) is forwarded to ownMergeRequest
+// unchanged; omitted or "" for the ordinary fresh-mint case.
 func (m *Minter) bindMRToTask(ctx context.Context, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository,
-	ext scm.MergeRequest, task *tatarav1alpha1.Task, sp objbudget.Spiller) error {
+	ext scm.MergeRequest, task *tatarav1alpha1.Task, sp objbudget.Spiller, expectFrom ...string) error {
 
 	if err := SyncMergeRequest(ctx, m.Client, sp, proj, repo, ext); err != nil {
 		return fmt.Errorf("intake: sync mergerequest: %w", err)
 	}
-	return m.ownMergeRequest(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), task)
+	ef := ""
+	if len(expectFrom) > 0 {
+		ef = expectFrom[0]
+	}
+	return m.ownMergeRequest(ctx, proj, tatarav1alpha1.MergeRequestName(repo.Name, ext.Number), task, ef)
 }
 
 // repairMRBinding heals a review mint that was interrupted between the Task
@@ -448,24 +460,38 @@ func (m *Minter) repairIssueBinding(ctx context.Context, proj *tatarav1alpha1.Pr
 }
 
 // ownMergeRequest appends task as the MergeRequest CR's controller owner. It
-// NEVER steals: an artifact that already has a controller owner is not an
-// orphan, so reaching here with a different controller is a bug, not a race to
-// paper over.
-func (m *Minter) ownMergeRequest(ctx context.Context, proj *tatarav1alpha1.Project, name string, task *tatarav1alpha1.Task) error {
+// NEVER steals: an artifact controller-owned by anyone other than task itself
+// or expectFrom is not this call's to take, so reaching here in that state is
+// a bug, not a race to paper over.
+//
+// expectFrom names the ONE other controller this call is allowed to hand the
+// flag over FROM, atomically, in this same RetryOnConflict Update - fix #408:
+// no standalone Controller=false demote Update followed by a separate
+// promote, which left a zero-controller window RepairZeroController could
+// race and promote the wrong owner into. Pass "" for the ordinary fresh-mint
+// case, where no prior controller is expected at all.
+func (m *Minter) ownMergeRequest(ctx context.Context, proj *tatarav1alpha1.Project, name string, task *tatarav1alpha1.Task, expectFrom string) error {
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: name}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var mr tatarav1alpha1.MergeRequest
 		if err := m.Client.Get(ctx, key, &mr); err != nil {
 			return err
 		}
-		if cur, ok := own.ControllerOwner(&mr); ok {
-			if cur != task.Name {
+		cur, ok := own.ControllerOwner(&mr)
+		if ok {
+			if cur == task.Name {
+				return nil // already owns it: idempotent no-op
+			}
+			if cur != expectFrom {
 				return fmt.Errorf("mergerequest %s already has controller owner %s", name, cur)
 			}
-			return nil
 		}
 		own.AddPlainOwner(&mr, task)
-		if err := own.HandOverController(&mr, nil, task); err != nil {
+		var from *tatarav1alpha1.Task
+		if ok {
+			from = &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: cur, Namespace: proj.Namespace}}
+		}
+		if err := own.HandOverController(&mr, from, task); err != nil {
 			return err
 		}
 		return m.Client.Update(ctx, &mr)

@@ -318,70 +318,33 @@ func (d *StageDriver) handBackToReviewTask(ctx context.Context, proj *tatarav1al
 // reMintReviewOwner mints the MR's review Task via the shared intake funnel
 // (Minter.MintReviewTask, reusing MintReviewStage exactly as the sweep/webhook
 // do) when handBackToReviewTask finds none. MintReviewTask's own bind
-// (Minter.ownMergeRequest) refuses to steal a controller ref it does not
-// recognize as its own Task's - a guard built for the ORPHAN-mint case, where
-// an unrecognized controller owner is a bug, not this flip's hand-back case,
-// where the CURRENT controller (the takeover Task just parked above) is
-// expected and about to be superseded. demoteMRController clears that
-// controller flag first (leaving the old owner as a plain ref, same end state
-// own.HandOverController's demote-then-promote would leave it in), so the
-// funnel's own guard sees no existing controller and proceeds normally.
+// (Minter.ownMergeRequest) refuses to hand the controller flag over from
+// anyone it is not explicitly told to expect - a guard built for the
+// ORPHAN-mint case, where an unrecognized controller owner is a bug, not this
+// flip's hand-back case, where the CURRENT controller (the takeover Task just
+// parked above) is expected and about to be superseded. Fix #408: capture
+// that owner as prevOwner BEFORE minting and thread it through as
+// expectFrom, so ownMergeRequest hands the flag over atomically in its own
+// single Update - no standalone Controller=false demote Update first, so no
+// zero-controller window a RepairZeroController race could jump into.
 func (d *StageDriver) reMintReviewOwner(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, mr *tatarav1alpha1.MergeRequest) error {
 
-	if err := d.demoteMRController(ctx, mr); err != nil {
-		return fmt.Errorf("flip: demote controller before review re-mint: %w", err)
-	}
+	prevOwner, _ := own.ControllerOwner(mr) // "" when mr carries no controller yet
 	pr := prRefFromMR(repo, mr)
 	stg, reason := MintReviewStage(mr)
-	if _, _, err := d.minter().MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, d.spiller(proj)); err != nil {
+	if _, _, err := d.minter().MintReviewTask(ctx, proj, repo, pr, mr, stg, reason, d.spiller(proj), prevOwner); err != nil {
 		return fmt.Errorf("flip: re-mint review task: %w", err)
 	}
 	return nil
-}
-
-// demoteMRController clears the controller=true flag on mr's current owner
-// ref, if any, leaving it as a plain owner. It is a no-op when mr carries no
-// controller owner.
-func (d *StageDriver) demoteMRController(ctx context.Context, mr *tatarav1alpha1.MergeRequest) error {
-	return DemoteMRController(ctx, d.Client, mr)
-}
-
-// DemoteMRController is the exported form of demoteMRController: it clears the
-// controller=true flag on mr's current owner ref, if any, leaving it as a
-// plain owner (a no-op when mr carries no controller owner). It exists at
-// package level, not just as a StageDriver method, because OP9's takeover REST
-// endpoint (internal/restapi) needs the identical demote-before-remint step
-// flipToExternal's own hand-back uses (reMintReviewOwner), just running in the
-// opposite direction: MintOrUnparkTakeoverTask's fresh-mint path binds the
-// takeover Task as controller through the SAME intake funnel a review mint
-// uses (Minter.ownMergeRequest), which REFUSES to steal a controller ref it
-// does not already recognize as its own Task's - so the caller's existing
-// controller ref (the review Task) must be demoted first, or the mint
-// hard-fails with "already has controller owner".
-func DemoteMRController(ctx context.Context, c client.Client, mr *tatarav1alpha1.MergeRequest) error {
-	if _, ok := own.ControllerOwner(mr); !ok {
-		return nil
-	}
-	return MutateOwnerRefs(ctx, c, mr, func(fresh *tatarav1alpha1.MergeRequest) error {
-		refs := fresh.GetOwnerReferences()
-		for i := range refs {
-			if refs[i].Controller != nil && *refs[i].Controller {
-				f := false
-				refs[i].Controller = &f
-			}
-		}
-		fresh.SetOwnerReferences(refs)
-		return nil
-	})
 }
 
 // mutateOwnerRefs re-Gets mr FRESH from the server, applies mutate to that
 // fresh copy's owner refs, and writes it back under RetryOnConflict - so an
 // owner-ref handover always lands on a CURRENT resourceVersion, never a
 // caller's possibly-stale local copy. It is the shared primitive behind
-// demoteMRController and handBackToReviewTask's existing-review-Task branch:
-// both mutate owner refs on an mr whose Status a sibling call (flipToExternal's
+// handBackToReviewTask's existing-review-Task branch: it mutates owner refs
+// on an mr whose Status a sibling call (flipToExternal's
 // objbudget.FitMergeRequest) may have JUST written server-side, which bumps
 // resourceVersion without the caller's local copy knowing - a direct
 // d.Update(ctx, mr) in that situation 409s deterministically. On success, *mr

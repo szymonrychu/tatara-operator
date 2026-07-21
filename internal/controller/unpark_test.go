@@ -138,3 +138,27 @@ func TestApplyUnpark_StageReasonGuardStillShortCircuitsOnLiveRead(t *testing.T) 
 		t.Fatalf("guard must leave the live object untouched; got stage=%s(%s)", got.Status.Stage, got.Status.StageReason)
 	}
 }
+
+// #406: the real no-outcome escalation hole. An incident Task's pod-liveness
+// respawn loop turns 0 into investigating (never implementing), so once
+// PodRecreations hits the budget it parks at no-outcome with
+// ParkedFromStage=investigating. Before the Fix 5a guard, driveUnparks'
+// unconditional no-outcome re-entry drove it straight into implementing
+// anyway; it must now stay parked, since no agent turn ever ran.
+func TestDriveUnparks_IncidentNoOutcomeStaysParked(t *testing.T) {
+	task := wfParkedTask("t-incident-no-outcome", "incident", stage.ReasonNoOutcome)
+	task.Status.ParkedFromStage = tatarav1alpha1.StageInvestigating
+	task.Status.Stats.PodRecreations = 3
+	c := newMirrorClient(t, task)
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+	if err := r.driveUnparks(context.Background(), wfProject(), time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+	got := mdGetTask(t, c, task.Name)
+	if got.Status.Stage != tatarav1alpha1.StageParked {
+		t.Fatalf("incident parked(no-outcome) from investigating re-entered %s, want parked", got.Status.Stage)
+	}
+	if got.Status.StageReason != stage.ReasonNoOutcome {
+		t.Fatalf("stageReason = %q, want unchanged no-outcome", got.Status.StageReason)
+	}
+}

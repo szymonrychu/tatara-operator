@@ -352,6 +352,12 @@ func (d *StageDriver) ReconcileMerging(ctx context.Context, proj *tatarav1alpha1
 			l.Info("merge: PR not mergeable; waiting",
 				"action", "merge_blocked", "resource_id", task.Name, "repo", repoRef, "pr", mr.Spec.Number)
 			return d.stallMerge(ctx, proj, task, repoRef, cursor, "merge-conflict")
+		case errors.Is(mergeErr, scm.ErrAuthFailed):
+			// A bad/insufficient credential never fixes itself on retry (#404):
+			// fail fast to parked instead of hot-requeueing until merge-timeout.
+			l.Info("merge: forge refused the merge credential; parking",
+				"action", "merge_auth_refused", "resource_id", task.Name, "repo", repoRef, "pr", mr.Spec.Number)
+			return ctrl.Result{}, d.enterStage(ctx, proj, task, tatarav1alpha1.StageParked, stage.ReasonMergeAuthRefused, mrs)
 		default:
 			return ctrl.Result{}, fmt.Errorf("merge: %s!%d: %w", repoRef, mr.Spec.Number, mergeErr)
 		}

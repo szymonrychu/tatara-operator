@@ -1525,6 +1525,7 @@ func TestUnpark_IdentityUnverified(t *testing.T) {
 func TestUnpark_NoOutcome(t *testing.T) {
 	t.Run("zero merged MRs and turns under budget -> implementing", func(t *testing.T) {
 		task := newTask("implement", v1alpha1.StageParked, stage.ReasonNoOutcome)
+		task.Status.ParkedFromStage = v1alpha1.StageImplementing
 		task.Status.Stats.Turns = 10
 		h := newHarness(t, task)
 		h.mrs = []v1alpha1.MergeRequest{openMR()}
@@ -1536,6 +1537,7 @@ func TestUnpark_NoOutcome(t *testing.T) {
 
 	t.Run("ONE merged MR does NOT re-enter", func(t *testing.T) {
 		task := newTask("implement", v1alpha1.StageParked, stage.ReasonNoOutcome)
+		task.Status.ParkedFromStage = v1alpha1.StageImplementing
 		task.Status.Stats.Turns = 10
 		h := newHarness(t, task)
 		h.mrs = []v1alpha1.MergeRequest{mergedMR(), openMR()}
@@ -1546,6 +1548,7 @@ func TestUnpark_NoOutcome(t *testing.T) {
 
 	t.Run("turn budget spent does NOT re-enter", func(t *testing.T) {
 		task := newTask("implement", v1alpha1.StageParked, stage.ReasonNoOutcome)
+		task.Status.ParkedFromStage = v1alpha1.StageImplementing
 		task.Status.Stats.Turns = 300
 		h := newHarness(t, task)
 		if _, ok := h.unpark(stage.UnparkInput{MaxTurnsPerTask: 300, MaxOpenTasks: 6, BotLogin: botLogin}); ok {
@@ -1556,11 +1559,56 @@ func TestUnpark_NoOutcome(t *testing.T) {
 	t.Run("a kind=review Task NEVER re-enters implementing on no-outcome", func(t *testing.T) {
 		// F.6's no-outcome case has NO kind guard of its own. LegalFor closes it.
 		task := newTask("review", v1alpha1.StageParked, stage.ReasonNoOutcome)
+		task.Status.ParkedFromStage = v1alpha1.StageImplementing
 		task.Status.Stats.Turns = 10
 		h := newHarness(t, task)
 		h.mrs = []v1alpha1.MergeRequest{openMR()}
 		if target, ok := h.unpark(stage.UnparkInput{MaxTurnsPerTask: 300, MaxOpenTasks: 6, BotLogin: botLogin}); ok {
 			t.Fatalf("a kind=review Task un-parked from no-outcome into %q", target)
+		}
+	})
+
+	// #406: a no-outcome park with ParkedFromStage in {implementing, reviewing}
+	// unconditionally re-drove into implementing, EVEN when the original park
+	// happened long before any implement pod ever ran (investigating,
+	// brainstorming, clarifying, refining, documenting). Only the two stages
+	// that actually run an agent-turn pod may re-drive.
+	t.Run("ParkedFromStage not implementing/reviewing declines", func(t *testing.T) {
+		for _, from := range []string{
+			v1alpha1.StageInvestigating,
+			v1alpha1.StageBrainstorming,
+			v1alpha1.StageClarifying,
+			v1alpha1.StageRefining,
+			v1alpha1.StageDocumenting,
+		} {
+			for _, kind := range []string{"implement", "incident", "review"} {
+				t.Run(from+"/"+kind, func(t *testing.T) {
+					task := newTask(kind, v1alpha1.StageParked, stage.ReasonNoOutcome)
+					task.Status.ParkedFromStage = from
+					task.Status.Stats.Turns = 10
+					h := newHarness(t, task)
+					h.mrs = []v1alpha1.MergeRequest{openMR()}
+					if target, ok := h.unpark(stage.UnparkInput{MaxTurnsPerTask: 300, MaxOpenTasks: 6, BotLogin: botLogin}); ok {
+						t.Fatalf("parked(no-outcome) from %s (kind=%s) re-entered %q: only implementing/reviewing may re-drive", from, kind, target)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("ParkedFromStage implementing/reviewing, non-review kind, still re-enters implementing", func(t *testing.T) {
+		for _, from := range []string{v1alpha1.StageImplementing, v1alpha1.StageReviewing} {
+			t.Run(from, func(t *testing.T) {
+				task := newTask("implement", v1alpha1.StageParked, stage.ReasonNoOutcome)
+				task.Status.ParkedFromStage = from
+				task.Status.Stats.Turns = 10
+				h := newHarness(t, task)
+				h.mrs = []v1alpha1.MergeRequest{openMR()}
+				target, ok := h.unpark(stage.UnparkInput{MaxTurnsPerTask: 300, MaxOpenTasks: 6, BotLogin: botLogin})
+				if !ok || target != v1alpha1.StageImplementing {
+					t.Fatalf("got (%q,%v), want (implementing,true)", target, ok)
+				}
+			})
 		}
 	})
 }
@@ -1636,6 +1684,10 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// reviewing -> rejected when every owned MR reached a terminal forge state
 		// externally (a human merged/closed the review target). kind=review only.
 		"mr-merged-externally", "mr-closed-externally",
+		// merge-auth-refused: merging -> parked when the forge returns 401/403 on
+		// Merge (#404). Parked disposition, no unpark re-entry (human deals with
+		// the credential).
+		"merge-auth-refused",
 	}
 	for _, r := range want {
 		if !stage.ValidReason(r) {
@@ -1819,6 +1871,33 @@ func TestRejectedEdgesCarryTheirOwnReason(t *testing.T) {
 				t.Errorf("reason %q is not in the closed set", got)
 			}
 		})
+	}
+}
+
+// TestMergeAuthRefusedIsLegalAndInTheF5ClosedSet is the two-place reason edit
+// for #404: merge-auth-refused must be both a StageMerging -> StageParked
+// edge (F.3) AND a member of the closed Reasons set (F.5), or Enter rejects
+// it with UnknownReasonError even though the edge exists.
+func TestMergeAuthRefusedIsLegalAndInTheF5ClosedSet(t *testing.T) {
+	if !stage.ValidReason(stage.ReasonMergeAuthRefused) {
+		t.Fatal("merge-auth-refused must be a member of the F.5 closed set, else Enter rejects it")
+	}
+	var found bool
+	for _, e := range stage.Transitions[v1alpha1.StageMerging] {
+		if e.To == v1alpha1.StageParked && e.Reason == stage.ReasonMergeAuthRefused {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("StageMerging has no -> parked(merge-auth-refused) edge in the F.3 table")
+	}
+
+	task := newTask("implement", v1alpha1.StageMerging, "")
+	if err := stage.Enter(task, nil, v1alpha1.StageParked, stage.ReasonMergeAuthRefused, time.Now()); err != nil {
+		t.Errorf("Enter(merging -> parked(merge-auth-refused)) = %v, want nil", err)
+	}
+	if task.Status.StageReason != stage.ReasonMergeAuthRefused {
+		t.Errorf("stageReason = %q, want %q", task.Status.StageReason, stage.ReasonMergeAuthRefused)
 	}
 }
 

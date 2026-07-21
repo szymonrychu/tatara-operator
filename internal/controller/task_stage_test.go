@@ -478,6 +478,14 @@ func TestEveryIllegalTransitionIsRefusedAndCounted(t *testing.T) {
 	refused := 0
 	for _, from := range stages {
 		for _, to := range stages {
+			if from == to {
+				// Self-transitions are a silent no-op (issue #403), covered by
+				// TestSelfTransitionIsANoOpNotCounted, not an illegal-and-counted
+				// edge: they never appear in the F.3 table (stage.Legal(x,x) is
+				// always false), so without this skip every one of the 15 stages
+				// would be double-counted as "illegal" here too.
+				continue
+			}
 			if stage.Legal(from, to) {
 				continue
 			}
@@ -501,6 +509,103 @@ func TestEveryIllegalTransitionIsRefusedAndCounted(t *testing.T) {
 	}
 	if refused == 0 {
 		t.Fatal("the F.3 table has no illegal pairs at all; the table test is vacuous")
+	}
+}
+
+// TestSelfTransitionIsANoOpNotCounted proves issue #403's fix: a to==from
+// EnterStage call is a silent no-op, not a refused-and-counted illegal edge.
+// stage.Enter's side effects (re-stamping StageEnteredAt, clearing
+// PodStartedAt/PodRecreations) are non-idempotent (ref #348, no self-edges
+// added to the F.3 table), so re-applying them on a same-stage re-entry would
+// corrupt clocks already in flight; the fix must short-circuit before any of
+// that runs.
+func TestSelfTransitionIsANoOpNotCounted(t *testing.T) {
+	ctx := context.Background()
+	// time.Unix (not time.Now) deliberately: metav1.Time round-trips through
+	// the fake client's JSON-based tracker at second precision with no
+	// monotonic reading, same as a real apiserver; a sub-second/monotonic
+	// "now" would make the unchanged-clock assertions below flaky.
+	now := time.Unix(50000, 0)
+	enteredAt := now.Add(-time.Hour)
+	podAt := now.Add(-30 * time.Minute)
+
+	for _, stg := range stage.AllStages() {
+		t.Run(stg, func(t *testing.T) {
+			task := tsTask("t", "implement", stg, enteredAt)
+			if stage.AgentKindFor(stg) != "" {
+				pa := metav1.NewTime(podAt)
+				task.Status.PodStartedAt = &pa
+			}
+			proj := tsProject(3)
+			c := newMirrorClient(t, proj, mdSecret(), task)
+			r := tsReconciler(c)
+
+			before := illegalCount(t, obs.IllegalStageTransitionCounter(stg, stg))
+			if err := r.enter(ctx, proj, task, nil, stg, stage.ReasonOperatorError, now); err != nil {
+				t.Fatalf("self-transition %s -> %s returned error: %v", stg, stg, err)
+			}
+			if after := illegalCount(t, obs.IllegalStageTransitionCounter(stg, stg)); after != before {
+				t.Fatalf("operator_illegal_stage_transition_total{%s,%s} = %v, want unchanged", stg, stg, after-before)
+			}
+
+			got := mdGetTask(t, c, task.Name)
+			if got.Status.StageEnteredAt == nil || !got.Status.StageEnteredAt.Time.Equal(enteredAt) {
+				t.Fatalf("StageEnteredAt was re-stamped on self-transition %s -> %s: got %v, want unchanged %v",
+					stg, stg, got.Status.StageEnteredAt, enteredAt)
+			}
+			if stage.AgentKindFor(stg) != "" {
+				if got.Status.PodStartedAt == nil || !got.Status.PodStartedAt.Time.Equal(podAt) {
+					t.Fatalf("PodStartedAt was cleared/re-stamped on self-transition %s -> %s: got %v, want unchanged %v",
+						stg, stg, got.Status.PodStartedAt, podAt)
+				}
+			}
+		})
+	}
+}
+
+// TestEnterStage_StaleCacheSelfIllegalIsNoOp is the actual production bug Fix 3
+// targets: the caller's in-memory Task copy is stale (still reviewing) because
+// another writer already committed the SAME target stage (parked). The fresh
+// read inside objbudget.FitTask sees that committed stage, and stage.Enter's OWN
+// from-derivation (fresh.Status.Stage) reports a from==to edge as illegal - this
+// must still be a silent no-op, not a counted illegal transition. Modeled on
+// TestReconcileStage_PodStageCapsAreIdempotentAgainstAStaleCache
+// (task_controller_test.go).
+func TestEnterStage_StaleCacheSelfIllegalIsNoOp(t *testing.T) {
+	before := illegalCount(t, obs.IllegalStageTransitionCounter(tatarav1alpha1.StageParked, tatarav1alpha1.StageParked))
+
+	proj := tsProject(3)
+	now := time.Unix(20000, 0)
+	entered := metav1.NewTime(now.Add(-10 * time.Minute))
+
+	// The caller's IN-MEMORY copy: still reviewing.
+	staleCopy := &tatarav1alpha1.Task{
+		ObjectMeta: metav1.ObjectMeta{Name: "t-stale", Namespace: mdNS, UID: types.UID("uid-t-stale")},
+		Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Kind: "implement"},
+		Status: tatarav1alpha1.TaskStatus{
+			Stage:          tatarav1alpha1.StageReviewing,
+			AgentKind:      stage.AgentReview,
+			StageEnteredAt: &entered,
+		},
+	}
+	// THE API SERVER: another writer already committed this Task to parked.
+	live := staleCopy.DeepCopy()
+	live.Status.Stage = tatarav1alpha1.StageParked
+	live.Status.StageReason = stage.ReasonReviewLoopExhausted
+
+	c := newMirrorClient(t, proj, mdSecret(), live)
+
+	err := EnterStage(context.Background(), c, nil, obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		staleCopy, nil, tatarav1alpha1.StageParked, stage.ReasonReviewLoopExhausted, now, nil)
+	require.NoError(t, err, "a stale-cache self-illegal race must be a no-op, not an error")
+
+	after := illegalCount(t, obs.IllegalStageTransitionCounter(tatarav1alpha1.StageParked, tatarav1alpha1.StageParked))
+	require.Equal(t, before, after,
+		"the stale-cache self-illegal race must not bump operator_illegal_stage_transition_total")
+
+	got := mdGetTask(t, c, "t-stale")
+	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonReviewLoopExhausted {
+		t.Fatalf("persisted stage got re-stamped: %+v", got.Status)
 	}
 }
 
@@ -1241,6 +1346,61 @@ func TestEnsureTicketClassByStageAgentKind(t *testing.T) {
 	}
 }
 
+// TestEnsureTicket_IncidentKindGetsPriorityZero covers issue #402's real
+// starvation fix: an incident Task's downstream ticket (clarify/implement/
+// review, class=Normal) must still be stamped Priority=0 so it outranks
+// sweep-originated Normal-class tickets at admission (admitPool sorts by
+// (priority, seq)); a non-incident Task's ticket is left at the class default
+// (nil override -> Priority=2 via EffectiveQueuePriority).
+func TestEnsureTicket_IncidentKindGetsPriorityZero(t *testing.T) {
+	ctx := context.Background()
+
+	incidentTask := tsTask("t-incident", "incident", tatarav1alpha1.StageClarifying, time.Now())
+	proj := tsProject(3)
+	c := ticketMirrorClient(t, proj, mdSecret(), incidentTask)
+	r := tsReconciler(c)
+	r.Seq = &queue.SeqSource{Client: c, Namespace: mdNS}
+
+	agentKind := stage.AgentKindFor(tatarav1alpha1.StageClarifying)
+	if _, err := r.ensureTicket(ctx, proj, incidentTask, agentKind); err != nil {
+		t.Fatalf("ensureTicket: %v", err)
+	}
+	found := findTicketForTask(t, c, incidentTask.Name)
+	if found.Spec.Priority == nil || *found.Spec.Priority != 0 {
+		t.Fatalf("incident-kind Task's ticket priority = %v, want 0", found.Spec.Priority)
+	}
+
+	normalTask := tsTask("t-normal", "implement", tatarav1alpha1.StageClarifying, time.Now())
+	c2 := ticketMirrorClient(t, proj, mdSecret(), normalTask)
+	r2 := tsReconciler(c2)
+	r2.Seq = &queue.SeqSource{Client: c2, Namespace: mdNS}
+
+	if _, err := r2.ensureTicket(ctx, proj, normalTask, agentKind); err != nil {
+		t.Fatalf("ensureTicket: %v", err)
+	}
+	foundNormal := findTicketForTask(t, c2, normalTask.Name)
+	if foundNormal.Spec.Priority == nil || *foundNormal.Spec.Priority != 2 {
+		t.Fatalf("non-incident Task's ticket priority = %v, want 2 (Normal-class default, no override)", foundNormal.Spec.Priority)
+	}
+}
+
+// findTicketForTask is TestEnsureTicketClassByStageAgentKind's list-and-find
+// helper, factored out for reuse.
+func findTicketForTask(t *testing.T, c client.Client, taskName string) *tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	var qel tatarav1alpha1.QueuedEventList
+	if err := c.List(context.Background(), &qel); err != nil {
+		t.Fatalf("list queuedevents: %v", err)
+	}
+	for i := range qel.Items {
+		if qel.Items[i].Spec.Payload.TaskRef == taskName {
+			return &qel.Items[i]
+		}
+	}
+	t.Fatalf("no admission ticket enqueued for task %s", taskName)
+	return nil
+}
+
 // SPEC TEST 7. The B2 guard must never become an unbounded hold. A committed
 // outcome whose drain NEVER runs (the sibling MergeRequest CR was deleted, the
 // drain is broken, a leader-election changeover dropped the workqueue item) parks
@@ -1494,6 +1654,35 @@ func TestReconcile_ReviewHandoffReDrivesTheDroppedAdvance(t *testing.T) {
 		if got.Status.Stage != tatarav1alpha1.StageMerging {
 			t.Fatalf("stage=%q reason=%q, want merging: an approved drained MR must advance an implement Task to merging",
 				got.Status.Stage, got.Status.StageReason)
+		}
+	})
+
+	// Issue #403: the MR reconciler's OWN advance already fired (the level-
+	// triggered comment above reviewAdvanceEdge's call site says this costs "at
+	// most one illegal-edge counter" pre-fix) - the PERSISTED Task is already at
+	// the re-drive's target stage, but this reconcile runs against the
+	// pre-advance in-memory copy (still reviewing). The redundant X->X must be a
+	// silent no-op: no error, no illegal-transition counter bump, stage
+	// unchanged at its already-correct value.
+	t.Run("already-at-target: a redundant re-drive is a no-op, not a counted illegal edge", func(t *testing.T) {
+		task := tsReviewTaskWithOutcome(committed, 0, base)
+		task.Spec.Kind = stage.AgentImplement
+		mr := mdMR(task, "tatara-operator", 364)
+		mr.Status.Status = "approved"
+		proj := tsProject(3)
+		live := task.DeepCopy()
+		live.Status.Stage = tatarav1alpha1.StageMerging
+		r := tsReconciler(newMirrorClient(t, proj, mdSecret(), live, mr))
+
+		before := illegalCount(t, obs.IllegalStageTransitionCounter(tatarav1alpha1.StageMerging, tatarav1alpha1.StageMerging))
+		got := tsReconcile(t, r, proj, task, base.Add(tatarav1alpha1.HandoffDeadline-time.Second))
+		after := illegalCount(t, obs.IllegalStageTransitionCounter(tatarav1alpha1.StageMerging, tatarav1alpha1.StageMerging))
+
+		if got.Status.Stage != tatarav1alpha1.StageMerging {
+			t.Fatalf("stage=%q, want merging (already at target, unchanged)", got.Status.Stage)
+		}
+		if after != before {
+			t.Fatalf("operator_illegal_stage_transition_total{merging,merging} = %v, want unchanged", after-before)
 		}
 	})
 }

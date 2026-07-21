@@ -1345,6 +1345,15 @@ func (r *TaskReconciler) ensureTicket(ctx context.Context, proj *tatarav1alpha1.
 	if agentKind == stage.AgentIncident {
 		class = tatarav1alpha1.QueueClassAlert
 	}
+	var opts []queue.EnqueueOption
+	if task.Spec.Kind == "incident" {
+		// An incident Task's downstream stages (clarify, implement, ...) are
+		// normal-class tickets (see the comment above), but they must still
+		// outrank sweep-originated normal-class work: admitPool sorts by
+		// (priority, seq), so without this a stuck incident could starve
+		// behind 150 sweep events (issue #402).
+		opts = append(opts, queue.WithPriority(0))
+	}
 	_, created, err := queue.EnqueueEvent(ctx, r.Client, r.Seq, proj, class, true,
 		fmt.Sprintf("ticket|%s|%s", task.Name, agentKind),
 		tatarav1alpha1.QueuedEventPayload{
@@ -1352,7 +1361,7 @@ func (r *TaskReconciler) ensureTicket(ctx context.Context, proj *tatarav1alpha1.
 			RepositoryRef: task.Spec.RepositoryRef,
 			AgentKind:     agentKind,
 			TaskRef:       task.Name,
-		})
+		}, opts...)
 	if err != nil {
 		return false, fmt.Errorf("enqueue admission ticket for %s: %w", task.Name, err)
 	}

@@ -247,6 +247,24 @@ type IssueStatus struct {
 	// can hold on the memory gate independently of any deploy-timeout episode.
 	// +optional
 	LastMemoryGateCommentAt *metav1.Time `json:"lastMemoryGateCommentAt,omitempty"`
+	// LastInvestigationCommentAt is when the operator last posted an incident
+	// agent's action=comment_issue evidence comment on this tracker (Fix 7,
+	// issue #400). Skips a further SCM write while
+	// now-LastInvestigationCommentAt < IncidentInvestigationCommentCooldown; the
+	// suppressed write still terminates the calling Task at
+	// rejected(tracked-elsewhere), only the forge write is skipped. A DISTINCT
+	// marker from LastRefireCommentAt (that one gates the ALERT-refire comment,
+	// not the agent's own evidence comment) and from LastDeployTimeoutCommentAt -
+	// same one-shot-cooldown shape, never shared, per the LastDeployTimeoutCommentAt
+	// note above.
+	// +optional
+	LastInvestigationCommentAt *metav1.Time `json:"lastInvestigationCommentAt,omitempty"`
+	// SuppressedInvestigationCount counts action=comment_issue evidence comments
+	// suppressed by the cooldown above while this tracker stays open. The next
+	// comment that clears the cooldown is prefixed with this count (when >0) so
+	// the suppressed evidence is never silently lost, then it resets to 0.
+	// +optional
+	SuppressedInvestigationCount int `json:"suppressedInvestigationCount,omitempty"`
 	// +optional
 	LastSyncedAt *metav1.Time `json:"lastSyncedAt,omitempty"`
 	// +optional

@@ -41,13 +41,12 @@ var (
 	}, []string{"result"})
 
 	// RestTakeoverErrorTotal counts the internal-error (500) branches inside
-	// the OP9 takeover endpoint (mrTakeover), by stage: demote
-	// (DemoteMRController before the mint), mint (MintOrUnparkTakeoverTask),
-	// ownerref (moving the MR mirror's controller ownership onto the takeover
-	// Task), stamp (the ownership-flip status write). Every one of these was
-	// log-only before this counter - a real operator-side failure on the
-	// takeover hot path (the caller already got a 500) was otherwise
-	// invisible.
+	// the OP9 takeover endpoint (mrTakeover), by stage: mint
+	// (MintOrUnparkTakeoverTask), ownerref (moving the MR mirror's controller
+	// ownership onto the takeover Task), stamp (the ownership-flip status
+	// write). Every one of these was log-only before this counter - a real
+	// operator-side failure on the takeover hot path (the caller already got
+	// a 500) was otherwise invisible.
 	RestTakeoverErrorTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "operator_rest_takeover_error_total",
 		Help: "Internal errors in the OP9 mr-takeover endpoint, by stage.",
@@ -62,11 +61,10 @@ func init() {
 		RestCIReadTotal,
 		RestTakeoverErrorTotal,
 	)
-	// Pre-seed the four real takeover-error stage label sets so a healthy
+	// Pre-seed the three real takeover-error stage label sets so a healthy
 	// operator exposes a zero baseline from startup (metric-wiring audit
 	// convention, issue #370) rather than a rate alert with no series to
 	// evaluate on the first real failure.
-	RestTakeoverErrorTotal.WithLabelValues("demote")
 	RestTakeoverErrorTotal.WithLabelValues("mint")
 	RestTakeoverErrorTotal.WithLabelValues("ownerref")
 	RestTakeoverErrorTotal.WithLabelValues("stamp")

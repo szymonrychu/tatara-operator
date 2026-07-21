@@ -108,6 +108,11 @@ func TestDriveUnparks_TimeBasedReasonsReEnter(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task := wfParkedTask("t-"+tc.name, "implement", tc.reason)
+			if tc.reason == stage.ReasonNoOutcome {
+				// #406: no-outcome only re-drives when parked FROM implementing
+				// or reviewing (a real pod ran a turn). This is exactly that case.
+				task.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
+			}
 			objs := []client.Object{task}
 			if tc.withMR {
 				mr := wfMR("mr-"+tc.name, tc.mrState, task)

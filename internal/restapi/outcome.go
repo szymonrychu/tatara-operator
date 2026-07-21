@@ -1664,21 +1664,66 @@ func (o *outcomeCtx) incidentComment(p incidentPayload) {
 		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
 		return
 	}
-	writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
-	if !ok {
-		return
-	}
 	ref := issueRef(repo, p.Comment.Number)
-	cerr := writer.Comment(ctx, token, ref, p.Comment.Body)
-	controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", cerr)
-	if cerr != nil {
-		s.metrics.IncidentTrackerComment("failed")
-		s.log.ErrorContext(ctx, "restapi: appending incident evidence comment failed",
-			append(reqLogFields(o.r), "task", o.task.Name, "tracker", ref, "error", cerr)...)
-		writeError(o.w, http.StatusBadGateway, "scm comment failed")
-		return
+	// Fix 7 (#400): rate-limit the SCM WRITE, not the outcome itself. The
+	// decision reads the Issue snapshot already fetched above (iss); the
+	// suppressed increment and the post-success reset each go through their
+	// own objbudget.FitIssue call against a FRESH re-read, because FitIssue's
+	// mutate closure runs at least twice (a sizing pass plus the
+	// retry-on-conflict pass) and must stay pure - the same shape as
+	// enqueueRefireComment (internal/webhook/server.go). The SCM write itself
+	// must never live inside that closure.
+	now := s.now()
+	cooldown := s.incidentInvestigationCommentCooldown
+	suppressed := iss.Status.LastInvestigationCommentAt != nil &&
+		now.Sub(iss.Status.LastInvestigationCommentAt.Time) < cooldown
+	priorSuppressed := iss.Status.SuppressedInvestigationCount
+	key := types.NamespacedName{Namespace: s.ns, Name: iss.Name}
+
+	if suppressed {
+		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(i *tatarav1alpha1.Issue) {
+			i.Status.SuppressedInvestigationCount++
+		}); err != nil {
+			o.release()
+			writeClientErr(o.w, err)
+			return
+		}
+		s.metrics.IncidentTrackerComment("suppressed")
+	} else {
+		writer, token, ok := s.projectSCMWriterAndToken(o.w, o.r, o.proj)
+		if !ok {
+			return
+		}
+		body := p.Comment.Body
+		if priorSuppressed > 0 {
+			body = fmt.Sprintf("(%d prior evidence comment(s) suppressed by the investigation-comment cooldown)\n\n%s",
+				priorSuppressed, body)
+		}
+		cerr := writer.Comment(ctx, token, ref, body)
+		controller.RecordSCM(s.metrics, providerOf(o.proj), "comment", cerr)
+		if cerr != nil {
+			s.metrics.IncidentTrackerComment("failed")
+			s.log.ErrorContext(ctx, "restapi: appending incident evidence comment failed",
+				append(reqLogFields(o.r), "task", o.task.Name, "tracker", ref, "error", cerr)...)
+			o.release()
+			writeError(o.w, http.StatusBadGateway, "scm comment failed")
+			return
+		}
+		s.metrics.IncidentTrackerComment("posted")
+		// Best-effort: the comment already landed on the forge, so a failure here
+		// must not fail the whole request - that would leave the Task unterminated
+		// and duplicate the comment on retry. Log loudly and fall through to commit
+		// regardless; worst case the cooldown/counter reset is lost, not the Task.
+		if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(o.proj), key, func(i *tatarav1alpha1.Issue) {
+			i.Status.SuppressedInvestigationCount = 0
+			t := metav1.NewTime(now)
+			i.Status.LastInvestigationCommentAt = &t
+		}); err != nil {
+			s.log.ErrorContext(ctx, "restapi: resetting incident comment cooldown after posted comment failed",
+				append(reqLogFields(o.r), "action", "comment_issue", "issue", key.Name, "error", err)...)
+		}
 	}
-	s.metrics.IncidentTrackerComment("posted")
+
 	if !o.commit(func(t *tatarav1alpha1.Task) error {
 		if err := stage.Enter(t, nil, tatarav1alpha1.StageRejected, stage.ReasonTrackedElsewhere, s.now()); err != nil {
 			return err
@@ -1688,7 +1733,8 @@ func (o *outcomeCtx) incidentComment(p incidentPayload) {
 	}) {
 		return
 	}
-	o.ok("comment_issue", "repo", repo.Name, "number", p.Comment.Number)
+	o.ok("comment_issue", "repo", repo.Name, "number", p.Comment.Number, "suppressed", suppressed,
+		"suppressed_count", priorSuppressed)
 }
 
 // linkIncidentParent links the freshly-filed child issue under an open tracker

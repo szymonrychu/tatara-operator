@@ -139,10 +139,8 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 
 	sp := s.spillerForOrNil(proj)
 
-	// Checked BEFORE the demote below: a misconfigured nil minter must fail
-	// before any owner-ref write happens, never after - leaving the MR
-	// demoted to no controller owner (controllerless) behind a 500 would be
-	// worse than refusing up front.
+	// Checked BEFORE the mint below: a misconfigured nil minter must fail
+	// before any owner-ref write happens, never after.
 	if s.minter == nil {
 		s.log.ErrorContext(ctx, "restapi: takeover called with no minter configured",
 			append(reqLogFields(r), "mr", mr.Name)...)
@@ -150,23 +148,17 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// MintOrUnparkTakeoverTask's fresh-mint path binds the takeover Task as
-	// the MR's controller owner through the SAME intake funnel a review mint
-	// uses (Minter.ownMergeRequest), which REFUSES to steal a controller ref
-	// it does not already recognize as its own Task's. The caller Task
-	// (review) is still that controller here, so the mint would hard-fail
-	// with "already has controller owner" unless that flag is cleared first -
-	// the same demote-before-remint step flipToExternal's own hand-back uses
-	// (reMintReviewOwner), just running in the opposite direction.
-	if err := controller.DemoteMRController(ctx, s.c, &mr); err != nil {
-		s.log.ErrorContext(ctx, "restapi: takeover demote controller failed",
-			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
-		obs.RestTakeoverErrorTotal.WithLabelValues("demote").Inc()
-		writeError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
+	// expectFrom captures the CURRENT controller owner - the ownership gate
+	// above already proved it is task.Name - BEFORE any mutation. Fix #408:
+	// MintOrUnparkTakeoverTask's fresh-mint path (bindMRToTask ->
+	// Minter.ownMergeRequest) is handed this so it can swap the controller
+	// flag straight to the takeover Task inside that call's own single
+	// Update, instead of this endpoint demoting it standalone first and
+	// promoting separately - the two-Update window that let
+	// RepairZeroController race in and promote the wrong owner.
+	expectFrom := task.Name
 
-	tk, err := s.minter.MintOrUnparkTakeoverTask(ctx, proj, repo, &mr, cmt.Author, cmt.Body, sp)
+	tk, err := s.minter.MintOrUnparkTakeoverTask(ctx, proj, repo, &mr, cmt.Author, cmt.Body, sp, expectFrom)
 	if err != nil {
 		s.log.ErrorContext(ctx, "restapi: mint/unpark takeover task failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
@@ -176,23 +168,36 @@ func (s *Server) mrTakeover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Move (or re-assert) the MR mirror's controller ownership onto the
-	// takeover Task. A fresh mint above may already have done this (via
-	// bindMRToTask); a re-take (an existing parked(ownership-lost) Task just
-	// re-entered approved) has not - MintOrUnparkTakeoverTask never touches
-	// owner refs on that branch. Both own.AddPlainOwner and
-	// own.HandOverController are idempotent, so doing this unconditionally is
-	// safe either way, and it is what leaves the review Task behind as a
-	// plain owner (HandOverController only ever demotes a controller flag; it
-	// never drops the ref).
-	if err := controller.MutateOwnerRefs(ctx, s.c, &mr, func(fresh *tatarav1alpha1.MergeRequest) error {
-		own.AddPlainOwner(fresh, tk)
-		return own.HandOverController(fresh, task, tk)
-	}); err != nil {
-		s.log.ErrorContext(ctx, "restapi: move merge request ownership failed",
+	// takeover Task. A fresh mint above already did this atomically (via
+	// bindMRToTask, handed expectFrom); a re-take (an existing
+	// parked(ownership-lost) Task just re-entered approved) has not -
+	// MintOrUnparkTakeoverTask never touches owner refs on that branch. Re-Get
+	// and skip when already converged, so the fresh-mint path costs exactly
+	// the one Update the mint itself made - no redundant second Update on top
+	// of an atomic handover that already landed.
+	var current tatarav1alpha1.MergeRequest
+	if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: mr.Name}, &current); err != nil {
+		s.log.ErrorContext(ctx, "restapi: re-get merge request before ownerref reassert failed",
 			append(reqLogFields(r), "mr", mr.Name, "error", err)...)
 		obs.RestTakeoverErrorTotal.WithLabelValues("ownerref").Inc()
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return
+	}
+	if ctrl, ok := own.ControllerOwner(&current); !ok || ctrl != tk.Name {
+		// Both own.AddPlainOwner and own.HandOverController are idempotent, so
+		// this is safe to run whenever not-yet-converged; it is also what
+		// leaves the review Task behind as a plain owner (HandOverController
+		// only ever demotes a controller flag; it never drops the ref).
+		if err := controller.MutateOwnerRefs(ctx, s.c, &mr, func(fresh *tatarav1alpha1.MergeRequest) error {
+			own.AddPlainOwner(fresh, tk)
+			return own.HandOverController(fresh, task, tk)
+		}); err != nil {
+			s.log.ErrorContext(ctx, "restapi: move merge request ownership failed",
+				append(reqLogFields(r), "mr", mr.Name, "error", err)...)
+			obs.RestTakeoverErrorTotal.WithLabelValues("ownerref").Inc()
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
 	}
 
 	// Seed LastBotHeadSHA (and the HeadSHA mirror) from the LIVE PR head, not
