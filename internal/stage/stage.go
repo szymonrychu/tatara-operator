@@ -86,6 +86,7 @@ const (
 	ReasonMRMergedExternally     = "mr-merged-externally"
 	ReasonMRClosedExternally     = "mr-closed-externally"
 	ReasonMergeAuthRefused       = "merge-auth-refused"
+	ReasonMRTakenOver            = "mr-taken-over"
 )
 
 // Reasons is the F.5 closed set. A reason not in it is REJECTED by Enter.
@@ -127,6 +128,7 @@ var Reasons = []string{
 	ReasonMRMergedExternally,
 	ReasonMRClosedExternally,
 	ReasonMergeAuthRefused,
+	ReasonMRTakenOver,
 }
 
 // issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
@@ -342,6 +344,7 @@ var Transitions = map[string][]Edge{
 		issueClosedEdge(),
 		Edge{To: v1alpha1.StageDelivered, Reason: ReasonMRMergedExternally, Trigger: "kind=review Task, every owned MR merged externally before/while reviewing - no open MR to post an outcome against, so the operator finalizes the honest finished work"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonMRClosedExternally, Trigger: "kind=review Task, every owned MR terminal with at least one closed-unmerged: the review target was abandoned, recorded rejected not delivered"},
+		Edge{To: v1alpha1.StageRejected, Reason: ReasonMRTakenOver, Trigger: "kind=review Task whose review target a maintainer TOOK OVER: the MR's controller ownership moved to a takeover Task (own.HandOverController demoted this parent to a plain owner), leaving it controller-owning zero MRs with no outcome to post; it is retired and the takeover Task now owns delivery. NOT delivered: the takeover Task itself reaches delivered for the MR, so the superseded parent must not double-count the one shipped MR as two deliveries. reviewing -> rejected is ungated in LegalFor, unlike reviewing -> delivered which requires AllMRsMerged(ownedMRs) and this parent owns none"},
 	),
 
 	// merging is POD-LESS: clock 3 ONLY, from stageEnteredAt, against ITS OWN 4h

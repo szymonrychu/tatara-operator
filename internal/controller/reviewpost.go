@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -359,6 +360,63 @@ func terminalMREdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest
 		return stage.Edge{To: tatarav1alpha1.StageDelivered, Reason: stage.ReasonMRMergedExternally}, true
 	}
 	return stage.Edge{To: tatarav1alpha1.StageRejected, Reason: stage.ReasonMRClosedExternally}, true
+}
+
+// TaskTakenOver reports whether task is a kind=review Task in reviewing whose
+// review target a maintainer TOOK OVER. It is the companion to terminalMREdge for
+// the ONE MR-ownership transition #33 did not cover: a takeover moves the MR
+// mirror's controller ownership off the parent review Task and onto a fresh
+// takeover Task via own.HandOverController, which DEMOTES the parent to a plain
+// owner rather than dropping it. Post-handover the parent controller-owns ZERO
+// MRs, so terminalMREdge / mrTerminalStates (both empty-slice-is-not-terminal by
+// design) never fire and the parent sits in reviewing forever.
+//
+// The predicate is: kind=review, EVERY status.mrRefs entry resolves to an
+// existing MergeRequest, and every one is controller-owned by a DIFFERENT,
+// still-existing Task. A ref whose CR is GONE refuses the whole predicate: a
+// dangling ref is not proof of takeover, and external deletion must never
+// finalize the task. The "different, still-existing controller on
+// every ref" clause is what distinguishes a genuine takeover from the
+// reMintReviewOwner / RepairZeroController seam (#408): a mid-handover MR in the
+// transient no-controller window yields ControllerOwner ok=false and returns
+// false here, so this never misfires while a fresh review owner is being minted.
+// It reads through c (the UNCACHED APIReader in production) so a lagging cache
+// cannot make it fire on a handover the server has not committed.
+func TaskTakenOver(ctx context.Context, c client.Reader, task *tatarav1alpha1.Task) (bool, error) {
+	if task == nil || task.Spec.Kind != "review" || len(task.Status.MRRefs) == 0 {
+		return false, nil
+	}
+	for _, name := range task.Status.MRRefs {
+		var mr tatarav1alpha1.MergeRequest
+		err := c.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, &mr)
+		if apierrors.IsNotFound(err) {
+			// The ref'd CR is GONE. A dangling ref is not proof of takeover;
+			// external deletion must not finalize the task. Refuse the predicate.
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("takeover check: get mergerequest %s: %w", name, err)
+		}
+		owner, ok := own.ControllerOwner(&mr)
+		if !ok || owner == task.Name {
+			// No controller (the mid-handover no-controller window) or still ours:
+			// NOT a completed takeover. Refuse the whole predicate.
+			return false, nil
+		}
+		var ownerTask tatarav1alpha1.Task
+		switch err := c.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: owner}, &ownerTask); {
+		case apierrors.IsNotFound(err):
+			// The controller ref names a Task that no longer exists: a reap dropped
+			// the flag and RepairZeroController has not re-owned the MR yet. Let that
+			// converge; do not finalize on a dead controller.
+			return false, nil
+		case err != nil:
+			return false, fmt.Errorf("takeover check: get controller task %s: %w", owner, err)
+		}
+	}
+	// Every ref resolved and every one is controller-owned by a different live
+	// Task; len(MRRefs) > 0 was checked above, so this is a completed takeover.
+	return true, nil
 }
 
 func reviewAdvanceEdge(task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,

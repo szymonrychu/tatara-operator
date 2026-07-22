@@ -1848,6 +1848,49 @@ func TestOutcome_Review_MergedMR_NoOpNot400(t *testing.T) {
 		"operator_rest_outcome_accepted_total{kind=review,outcome=mr-terminal-noop} must record the terminal no-op")
 }
 
+// A kind=review submit_outcome against an MR a maintainer TOOK OVER (the parent
+// review Task controller-owns zero MRs; the MR's controller flag moved to a
+// takeover Task, this Task demoted to a plain owner) is a 2xx no-op, NOT the 400
+// that respawn-loops the pod. The reconciler-side finalize is what actually
+// retires the Task; this only ends the in-flight turn cleanly.
+func TestOutcome_Review_TakenOverMR_NoOpNot400(t *testing.T) {
+	// The MR's controller is the takeover Task; the review Task t1 is a demoted
+	// plain owner, so it controller-owns zero MRs.
+	mr := mrV2("tatara-agent-skills", 33, "tk1", func(m *tatarav1alpha1.MergeRequest) {
+		m.OwnerReferences = []metav1.OwnerReference{ownerRef("t1", false), ownerRef("tk1", true)}
+		m.Status.Ownership = tatarav1alpha1.OwnershipTatara
+		m.Status.OwnershipReason = "takeover-requested-by:maintainer"
+	})
+	review := taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review")
+	review.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName("tatara-agent-skills", 33)}
+	takeover := taskV2("tk1", "tatara", "takeover", tatarav1alpha1.StageImplementing, "implement")
+
+	before := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-taken-over-noop"))
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-agent-skills", "tatara"), review, takeover, mr)
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Contains(t, w.Body.String(), `"noop":true`)
+	require.Contains(t, w.Body.String(), `"reason":"mr-taken-over"`)
+	after := testutil.ToFloat64(obs.RestOutcomeAcceptedTotal.WithLabelValues("review", "mr-taken-over-noop"))
+	require.Equal(t, before+1, after,
+		"operator_rest_outcome_accepted_total{kind=review,outcome=mr-taken-over-noop} must record the takeover no-op")
+}
+
+// A kind=review Task that never owned any MR (mrRefs empty, zero owned MRs) must
+// KEEP the pre-existing 400: neither terminalNoop (empty slice is not terminal)
+// nor the takeover no-op (TaskTakenOver is false with no mrRefs) may swallow it.
+func TestOutcome_Review_NoMRsAtAll_Still400(t *testing.T) {
+	e := buildV2(t, v2Opts{writer: panicForge{}}, projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-agent-skills", "tatara"),
+		taskV2("t1", "tatara", "review", tatarav1alpha1.StageReviewing, "review"))
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"review","payload":{"verdict":"approve","reviewedSHAs":[{"repo":"tatara-agent-skills","number":33,"sha":"s"}]}}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "this task owns no open MR")
+}
+
 func TestOutcome_Review_ClosedMR_NoOpNot400(t *testing.T) {
 	mr := mrV2("tatara-agent-skills", 33, "t1")
 	mr.Status.State = "closed"
