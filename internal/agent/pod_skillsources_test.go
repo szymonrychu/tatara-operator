@@ -11,7 +11,7 @@ import (
 func TestBuildPod_ExtraSkillSources_WhenSet(t *testing.T) {
 	p := &tatarav1alpha1.Project{ObjectMeta: metav1.ObjectMeta{Name: "mtg"}}
 	p.Spec.Agent.SkillSources = []tatarav1alpha1.AgentSkillSource{
-		{Name: "mtg-decks", URL: "https://github.com/szymonrychu/mtg-decks", Ref: "main", Subdir: ".claude/skills"},
+		{Name: "example-skills", URL: "https://github.com/example/example-skills", Ref: "main", Subdir: ".claude/skills"},
 	}
 	m := podEnvMap(t, p)
 	raw, ok := m["TATARA_EXTRA_SKILL_SOURCES"]
@@ -22,8 +22,8 @@ func TestBuildPod_ExtraSkillSources_WhenSet(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatalf("env is not JSON: %v (%q)", err, raw)
 	}
-	if len(got) != 1 || got[0]["name"] != "mtg-decks" ||
-		got[0]["url"] != "https://github.com/szymonrychu/mtg-decks" ||
+	if len(got) != 1 || got[0]["name"] != "example-skills" ||
+		got[0]["url"] != "https://github.com/example/example-skills" ||
 		got[0]["ref"] != "main" || got[0]["subdir"] != ".claude/skills" {
 		t.Fatalf("bad payload: %v", got)
 	}
