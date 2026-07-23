@@ -533,6 +533,25 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_SERENA_URL", Value: cfg.SerenaURL})
 	}
 
+	if len(project.Spec.Agent.MCPServers) > 0 {
+		type extraMCP struct {
+			Name string `json:"name"`
+			URL  string `json:"url"`
+			Type string `json:"type"`
+		}
+		out := make([]extraMCP, 0, len(project.Spec.Agent.MCPServers))
+		for _, s := range project.Spec.Agent.MCPServers {
+			typ := s.Type
+			if typ == "" {
+				typ = "http"
+			}
+			out = append(out, extraMCP{Name: s.Name, URL: s.URL, Type: typ})
+		}
+		// String-only fields: json.Marshal cannot fail.
+		buf, _ := json.Marshal(out)
+		env = append(env, corev1.EnvVar{Name: "TATARA_EXTRA_MCP_SERVERS", Value: string(buf)})
+	}
+
 	if len(repos) > 0 {
 		var entries []repoEntry
 		if repo != nil {
