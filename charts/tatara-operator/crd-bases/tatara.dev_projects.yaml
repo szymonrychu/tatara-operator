@@ -5414,6 +5414,40 @@ spec:
                       Task, for ALL agent kinds (contract A.6). Task.Spec.MaxTurnsPerTask
                       overrides this per-Task when set.
                     type: integer
+                  mcpServers:
+                    description: |-
+                      MCPServers are extra MCP servers merged into the agent's .mcp.json by the
+                      wrapper, after repo overlay fragments but before the platform-owned
+                      servers (tatara/grafana/serena), which always win a name collision.
+                    items:
+                      description: |-
+                        AgentMCPServer declares one extra MCP server injected into the agent's
+                        .mcp.json by the wrapper. Fully generic: the operator neither knows nor
+                        validates which servers exist. Reserved-name collisions with platform-owned
+                        servers are resolved by the wrapper, not here.
+                      properties:
+                        name:
+                          description: Name is the .mcp.json server key. Must match
+                            ^[a-z0-9-]+$.
+                          maxLength: 63
+                          pattern: ^[a-z0-9-]+$
+                          type: string
+                        type:
+                          default: http
+                          description: Type is the MCP transport; defaults to http.
+                          enum:
+                          - http
+                          - sse
+                          type: string
+                        url:
+                          description: URL is the server endpoint (e.g. http://svc.ns.svc.cluster.local:8080/mcp).
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - url
+                      type: object
+                    type: array
                   model:
                     type: string
                   modelByKind:
