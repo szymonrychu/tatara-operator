@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -154,6 +155,28 @@ type AgentMCPServer struct {
 	Type string `json:"type,omitempty"`
 }
 
+// AgentSkillSource declares one extra skill repository the wrapper clones and
+// installs skills from, into every agent pod of the project. Fully generic
+// (mirrors AgentMCPServer): the operator neither knows nor validates which
+// skills exist. Same-host private sources authenticate with the project's
+// scmSecretRef token via the wrapper's global GIT_TOKEN credential helper - the
+// same auth path as the repo clones - so no extra secret wiring is needed here.
+type AgentSkillSource struct {
+	// Name is a stable identifier (clone dir + logs). Must match ^[a-z0-9-]+$.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9-]+$`
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// URL is the git repository URL to clone.
+	// +kubebuilder:validation:MinLength=1
+	URL string `json:"url"`
+	// Ref is the git ref (branch, tag, or SHA) to clone; empty defaults to main.
+	// +optional
+	Ref string `json:"ref,omitempty"`
+	// Subdir is the path within the clone holding the skill dirs; empty = repo root.
+	// +optional
+	Subdir string `json:"subdir,omitempty"`
+}
+
 // AgentSpec configures the wrapper agent session a Task runs.
 type AgentSpec struct {
 	// +optional
@@ -272,6 +295,21 @@ type AgentSpec struct {
 	// servers (tatara/grafana/serena), which always win a name collision.
 	// +optional
 	MCPServers []AgentMCPServer `json:"mcpServers,omitempty"`
+	// SkillSources are extra skill repositories installed into every agent pod
+	// of the project (into <workspace>/.claude/skills), alongside the baked
+	// tatara-agent-skills. Serialized to TATARA_EXTRA_SKILL_SOURCES for the wrapper.
+	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	SkillSources []AgentSkillSource `json:"skillSources,omitempty"`
+	// PromptAppendByKind appends project-specific instruction text AFTER the
+	// built-in per-kind agentJob prompt (internal/controller/assignment.go). Keys
+	// are agent kinds (implement, review, clarify, brainstorm, incident, refine,
+	// documentation) plus the "*" wildcard, which is appended to every kind BEFORE
+	// that kind's own entry. This is TRUSTED project config (maintainer-supplied
+	// via helmfile), never user/issue text, so assignment.go may interpolate it.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=12
+	PromptAppendByKind map[string]string `json:"promptAppendByKind,omitempty"`
 }
 
 // ModelFor resolves the model for the given AGENT kind (brainstorm, incident,
@@ -292,6 +330,20 @@ func (a AgentSpec) EffortFor(agentKind string) string {
 		return e
 	}
 	return a.Effort
+}
+
+// PromptAppendFor returns the wildcard ("*") append text followed by the kind-
+// specific append text, separated by a blank line, skipping empty entries. Empty
+// string when neither is set (the common case; no behavior change).
+func (a AgentSpec) PromptAppendFor(agentKind string) string {
+	var parts []string
+	if w := a.PromptAppendByKind["*"]; w != "" {
+		parts = append(parts, w)
+	}
+	if k := a.PromptAppendByKind[agentKind]; k != "" {
+		parts = append(parts, k)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // BoardSpec configures the project board tatara participates in.

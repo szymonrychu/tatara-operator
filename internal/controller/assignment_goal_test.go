@@ -33,7 +33,7 @@ func TestAdversarial_AssignmentNeverEchoesRawGoal(t *testing.T) {
 		},
 	}
 
-	got := assignmentFor(stage.AgentImplement, task)
+	got := assignmentFor(stage.AgentImplement, task, &tatarav1alpha1.Project{})
 
 	if strings.Contains(got, evil) {
 		t.Fatalf("assignmentFor echoed the raw hostile goal verbatim:\n%s", got)
@@ -69,7 +69,7 @@ func TestAssignmentFor_NeverEmbedsGoalField(t *testing.T) {
 		stage.AgentBrainstorm, stage.AgentIncident,
 	} {
 		t.Run(kind, func(t *testing.T) {
-			got := assignmentFor(kind, task)
+			got := assignmentFor(kind, task, &tatarav1alpha1.Project{})
 			if strings.Contains(got, goal) {
 				t.Fatalf("assignmentFor(%q) embedded task.Spec.Goal verbatim:\n%s", kind, got)
 			}

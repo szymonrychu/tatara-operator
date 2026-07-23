@@ -5476,6 +5476,56 @@ spec:
                   permissionMode:
                     default: bypassPermissions
                     type: string
+                  promptAppendByKind:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      PromptAppendByKind appends project-specific instruction text AFTER the
+                      built-in per-kind agentJob prompt (internal/controller/assignment.go). Keys
+                      are agent kinds (implement, review, clarify, brainstorm, incident, refine,
+                      documentation) plus the "*" wildcard, which is appended to every kind BEFORE
+                      that kind's own entry. This is TRUSTED project config (maintainer-supplied
+                      via helmfile), never user/issue text, so assignment.go may interpolate it.
+                    maxProperties: 12
+                    type: object
+                  skillSources:
+                    description: |-
+                      SkillSources are extra skill repositories installed into every agent pod
+                      of the project (into <workspace>/.claude/skills), alongside the baked
+                      tatara-agent-skills. Serialized to TATARA_EXTRA_SKILL_SOURCES for the wrapper.
+                    items:
+                      description: |-
+                        AgentSkillSource declares one extra skill repository the wrapper clones and
+                        installs skills from, into every agent pod of the project. Fully generic
+                        (mirrors AgentMCPServer): the operator neither knows nor validates which
+                        skills exist. Same-host private sources authenticate with the project's
+                        scmSecretRef token via the wrapper's global GIT_TOKEN credential helper - the
+                        same auth path as the repo clones - so no extra secret wiring is needed here.
+                      properties:
+                        name:
+                          description: Name is a stable identifier (clone dir + logs).
+                            Must match ^[a-z0-9-]+$.
+                          maxLength: 63
+                          pattern: ^[a-z0-9-]+$
+                          type: string
+                        ref:
+                          description: Ref is the git ref (branch, tag, or SHA) to
+                            clone; empty defaults to main.
+                          type: string
+                        subdir:
+                          description: Subdir is the path within the clone holding
+                            the skill dirs; empty = repo root.
+                          type: string
+                        url:
+                          description: URL is the git repository URL to clone.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - url
+                      type: object
+                    maxItems: 16
+                    type: array
                   skillsRef:
                     description: |-
                       SkillsRef is the git ref (branch, tag, or SHA) of the tatara-agent-skills

@@ -44,6 +44,21 @@ project:
           mountPath: /etc/wrapper/skills/deploy
       hooks:
         conversationStart: "echo 'agent conversation starting'"
+      # skillSources: extra skill repositories the wrapper clones and installs
+      # skills from, into every agent pod (alongside the baked
+      # tatara-agent-skills). Auth reuses the project's scmSecretRef token via
+      # the wrapper's global GIT_TOKEN credential helper.
+      # skillSources:
+      #   - name: example-skills
+      #     url: https://github.com/szymonrychu/example-skills
+      #     ref: main
+      #     subdir: .claude/skills
+      # promptAppendByKind: project-specific text appended AFTER the built-in
+      # per-kind assignment prompt. "*" is appended to every kind BEFORE that
+      # kind's own entry.
+      # promptAppendByKind:
+      #   "*": "All work in this repo MUST go through its own workflow skills."
+      #   review: "As reviewer, be critical but fair."
     memory:
       pgInstances: 1
       pgStorage: 10Gi
