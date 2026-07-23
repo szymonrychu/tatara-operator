@@ -135,6 +135,25 @@ type LifecycleHooks struct {
 	ConversationFinished string `json:"conversationFinished,omitempty"`
 }
 
+// AgentMCPServer declares one extra MCP server injected into the agent's
+// .mcp.json by the wrapper. Fully generic: the operator neither knows nor
+// validates which servers exist. Reserved-name collisions with platform-owned
+// servers are resolved by the wrapper, not here.
+type AgentMCPServer struct {
+	// Name is the .mcp.json server key. Must match ^[a-z0-9-]+$.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9-]+$`
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// URL is the server endpoint (e.g. http://svc.ns.svc.cluster.local:8080/mcp).
+	// +kubebuilder:validation:MinLength=1
+	URL string `json:"url"`
+	// Type is the MCP transport; defaults to http.
+	// +kubebuilder:validation:Enum=http;sse
+	// +kubebuilder:default=http
+	// +optional
+	Type string `json:"type,omitempty"`
+}
+
 // AgentSpec configures the wrapper agent session a Task runs.
 type AgentSpec struct {
 	// +optional
@@ -248,6 +267,11 @@ type AgentSpec struct {
 	// ExtraInitContainers populate the agent Pod's initContainers.
 	// +optional
 	ExtraInitContainers []corev1.Container `json:"extraInitContainers,omitempty"`
+	// MCPServers are extra MCP servers merged into the agent's .mcp.json by the
+	// wrapper, after repo overlay fragments but before the platform-owned
+	// servers (tatara/grafana/serena), which always win a name collision.
+	// +optional
+	MCPServers []AgentMCPServer `json:"mcpServers,omitempty"`
 }
 
 // ModelFor resolves the model for the given AGENT kind (brainstorm, incident,
