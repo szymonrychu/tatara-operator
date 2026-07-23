@@ -55,9 +55,12 @@ never repeat it (an explicit `projectRef` still wins if set).
 ### Agent customization
 
 The Project `agent` block accepts whatever the `tatara.dev` Project CRD
-exposes; on current `main` that is `model`, `effort`, `permissionMode`,
-`hooks`, `extraEnvs`/`extraEnvsFrom`, `extraVolumes`/`extraVolumeMounts`, and
-`extraSidecarContainers`/`extraInitContainers`. First-class per-ask fields
-(`systemPrompt`, `mcpServers`, `plugins`, `skills`, `settings`) are still under
-design discussion in operator#74; this chart renders the spec verbatim, so it
-gains them automatically once the CRD does.
+exposes; on current `main` that is `model`/`modelByKind`, `effort`, `permissionMode`,
+`hooks`, `extraEnvs`/`extraEnvsFrom`, `extraVolumes`/`extraVolumeMounts`,
+`extraSidecarContainers`/`extraInitContainers`, `mcpServers` (extra MCP
+servers merged into `.mcp.json`), `skillSources` (extra skill repos the
+wrapper clones and installs alongside the baked `tatara-agent-skills`), and
+`promptAppendByKind` (project-specific text appended after the built-in
+per-kind assignment prompt, keyed by agent kind plus a `"*"` wildcard). This
+chart renders the spec verbatim, so it gains any future CRD field
+automatically.
