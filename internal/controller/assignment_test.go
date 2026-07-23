@@ -50,7 +50,7 @@ func TestAssignmentSkillsDirectiveUsesAgentKind(t *testing.T) {
 				},
 			}
 
-			assignment := assignmentFor(tt.agentKind, task)
+			assignment := assignmentFor(tt.agentKind, task, &tatarav1alpha1.Project{})
 
 			// Assignment must contain the required skill for this agent kind
 			if !strings.Contains(assignment, tt.requiredSkill) {

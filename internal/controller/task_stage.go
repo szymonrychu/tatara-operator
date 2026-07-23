@@ -1152,7 +1152,7 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 		MergeRequests:  mrs,
 		Events:         task.Status.PendingEvents,
 		Notes:          task.Status.Notes,
-		Assignment:     assignmentFor(agentKind, task),
+		Assignment:     assignmentFor(agentKind, task, proj),
 		MaxBundleBytes: proj.Spec.MaxBundleBytes,
 		Metrics:        r.BundleMetrics,
 	})
