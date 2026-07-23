@@ -552,6 +552,22 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		env = append(env, corev1.EnvVar{Name: "TATARA_EXTRA_MCP_SERVERS", Value: string(buf)})
 	}
 
+	if len(project.Spec.Agent.SkillSources) > 0 {
+		type extraSkillSource struct {
+			Name   string `json:"name"`
+			URL    string `json:"url"`
+			Ref    string `json:"ref"`
+			Subdir string `json:"subdir"`
+		}
+		out := make([]extraSkillSource, 0, len(project.Spec.Agent.SkillSources))
+		for _, s := range project.Spec.Agent.SkillSources {
+			out = append(out, extraSkillSource{Name: s.Name, URL: s.URL, Ref: s.Ref, Subdir: s.Subdir})
+		}
+		// String-only fields: json.Marshal cannot fail.
+		buf, _ := json.Marshal(out)
+		env = append(env, corev1.EnvVar{Name: "TATARA_EXTRA_SKILL_SOURCES", Value: string(buf)})
+	}
+
 	if len(repos) > 0 {
 		var entries []repoEntry
 		if repo != nil {
