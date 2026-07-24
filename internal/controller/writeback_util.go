@@ -26,6 +26,18 @@ func repoSlugFromURL(repoURL, provider string) (string, string, error) {
 	return slug, "", err
 }
 
+// commentRef renders the Comment() ref for a thread write. GitHub routes both
+// issues and PRs through the same issues/<n>/comments endpoint (isPR is
+// irrelevant), but GitLab sigils on '!' for merge requests vs '#' for issues -
+// a '#' ref on an MR resolves the wrong (or absent) issue with the same iid,
+// which is the reviewpost.go/ownership_announce.go 404 this helper closes.
+func commentRef(slug, provider string, number int, isPR bool) string {
+	if isPR && provider == "gitlab" {
+		return fmt.Sprintf("%s!%d", slug, number)
+	}
+	return fmt.Sprintf("%s#%d", slug, number)
+}
+
 // parseRepoBase returns the scheme+host of repoURL (e.g. "https://gitlab.example.com").
 func parseRepoBase(repoURL string) (string, error) {
 	if i := strings.Index(repoURL, "://"); i >= 0 {

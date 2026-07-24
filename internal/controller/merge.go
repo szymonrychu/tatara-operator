@@ -460,6 +460,14 @@ func (d *StageDriver) releaseGreen(ctx context.Context, proj *tatarav1alpha1.Pro
 	if err != nil {
 		return false, fmt.Errorf("merge: owner/repo for %s: %w", repo.Name, err)
 	}
+	// GitLab's CI status read wants the full project path as the single "owner"
+	// argument (its notion of a project id), not a split owner/repo pair - see
+	// gatherRepoCIState in projectscan.go for the same resolution.
+	if provider == "gitlab" {
+		if pp, perr := scm.GitLabProjectPath(repo.Spec.URL); perr == nil {
+			owner, name = pp, ""
+		}
+	}
 	status, err := reader.GetCommitCIStatus(ctx, owner, name, sha)
 	if err != nil {
 		return false, fmt.Errorf("merge: release job status at %s: %w", sha, err)

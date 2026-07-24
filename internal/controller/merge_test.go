@@ -47,6 +47,8 @@ type fakeForge struct {
 
 	// postReviewErr, when set, is what PostReview returns.
 	postReviewErr error
+	// commentErr, when set, is what Comment returns instead of posting.
+	commentErr error
 	// mergeErr, when set, is what Merge returns.
 	mergeErr error
 	// mergePanics makes Merge panic. The fork-PR test uses it: a kind=review
@@ -200,6 +202,9 @@ func parseIssueRef(ref string) (string, int) {
 // the id comes from a SECOND read of the thread, which is also where the
 // requestId marker dedups a re-run.
 func (f *fakeForge) Comment(_ context.Context, _, issueRef, body string) error {
+	if f.commentErr != nil {
+		return f.commentErr
+	}
 	f.postedComments = append(f.postedComments, issueRef+"|"+body)
 	_, number := parseIssueRef(issueRef)
 	f.nextCommentID++

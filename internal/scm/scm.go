@@ -393,6 +393,15 @@ func ErrorStatus(err error) string {
 	return "network"
 }
 
+// IsNotFound reports whether err is (or wraps) an HTTPError with a 404 status -
+// a PERMANENT forge response (the project/issue/MR is gone), never a transient
+// one. Callers use this to stop requeuing on a 404 instead of backing off
+// forever waiting for a response that will never change.
+func IsNotFound(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && he.Status == http.StatusNotFound
+}
+
 // GitHub implements Client for GitHub.
 type GitHub struct {
 	apiBase     string

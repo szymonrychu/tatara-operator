@@ -78,7 +78,7 @@ func (d *StageDriver) DrainOwnershipAnnouncement(ctx context.Context, proj *tata
 	if err != nil {
 		return fmt.Errorf("ownership announce: repo slug for %s: %w", repo.Name, err)
 	}
-	if err := writer.Comment(ctx, token, fmt.Sprintf("%s#%d", slug, mr.Spec.Number), marker+"\n"+body); err != nil {
+	if err := writer.Comment(ctx, token, commentRef(slug, provider, mr.Spec.Number, true), marker+"\n"+body); err != nil {
 		RecordSCM(d.Metrics, provider, "comment", err)
 		return fmt.Errorf("ownership announce %s: %w", mr.Name, err)
 	}
