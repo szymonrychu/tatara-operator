@@ -595,7 +595,8 @@ func (d *StageDriver) postThreadComment(ctx context.Context, proj *tatarav1alpha
 		return err
 	}
 	if !threadCarriesMarker(thread, marker) {
-		commentErr := writer.Comment(ctx, token, fmt.Sprintf("%s#%d", slug, number), marker+"\n"+pc.Body)
+		_, isPR := obj.(*tatarav1alpha1.MergeRequest)
+		commentErr := writer.Comment(ctx, token, commentRef(slug, provider, number, isPR), marker+"\n"+pc.Body)
 		RecordSCM(d.Metrics, provider, "comment", commentErr)
 		if commentErr != nil {
 			return fmt.Errorf("review: comment on %s#%d: %w", slug, number, commentErr)

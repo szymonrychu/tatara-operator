@@ -67,3 +67,11 @@ func TestErrorStatus(t *testing.T) {
 	require.Equal(t, "429", ErrorStatus(fmt.Errorf("wrapped: %w", &HTTPError{Status: 429, Path: "/x"})))
 	require.Equal(t, "network", ErrorStatus(errors.New("dial tcp: connection refused")))
 }
+
+func TestIsNotFound(t *testing.T) {
+	require.False(t, IsNotFound(nil))
+	require.False(t, IsNotFound(errors.New("dial tcp: connection refused")))
+	require.False(t, IsNotFound(&HTTPError{Status: 500, Path: "/x"}))
+	require.True(t, IsNotFound(&HTTPError{Status: 404, Path: "/x"}))
+	require.True(t, IsNotFound(fmt.Errorf("wrapped: %w", &HTTPError{Status: 404, Path: "/x"})))
+}

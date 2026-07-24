@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // MergeRequestReconciler keeps one MergeRequest CR - one mirrored forge PR/MR -
@@ -105,40 +106,66 @@ func (r *MergeRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// THE DURABLE INTENTS (C.5.3 phase 2). /outcome and the MCP writes are pure
 	// etcd: they persist an intent and return. THIS is what performs it, and it is
 	// the only thing that does.
+	//
+	// Steps run in order: DrainOwnershipAnnouncement/DrainStandDownMerge run AFTER
+	// DrainPendingReview so a review Task's approve verdict - which settles
+	// status.status/reviewedSHA - is already visible on mr before
+	// DrainStandDownMerge decides whether to re-drive the parked owner Task into
+	// merging. ReconcileOwnership is the webhook fast path for MR ownership
+	// convergence: mr.Status.HeadSHA is the webhook-stamped mirror head (OP7), so
+	// a human push that moves it off LastBotHeadSHA drives the flip right here,
+	// not just on the cron sweep (newComments is nil - comment redelivery (OP12)
+	// is the sweep's own job).
 	if r.Driver != nil {
-		if err := r.Driver.DrainPendingComments(ctx, &mr); err != nil {
-			return ctrl.Result{}, err
+		steps := []func() error{
+			func() error { return r.Driver.DrainPendingComments(ctx, &mr) },
+			func() error { return r.Driver.DrainPendingReview(ctx, &mr) },
+			func() error {
+				_, err := r.Driver.ReconcileOwnership(ctx, &proj, &repo, &mr, mr.Status.HeadSHA, nil)
+				return err
+			},
+			func() error { return r.Driver.DrainOwnershipAnnouncement(ctx, &proj, &repo, &mr) },
+			func() error { return r.Driver.DrainStandDownMerge(ctx, &proj, &repo, &mr) },
+			// The H.4 semver:<level> label. It lands the moment the implement outcome
+			// stamps status.significance - not at merge time, and not on some sweep
+			// an hour later: it is what CI cuts the release tag from, and a human
+			// looking at the PR is entitled to see the level the agent declared.
+			func() error { return r.Driver.ProjectSemverLabel(ctx, &proj, &repo, &mr) },
 		}
-		if err := r.Driver.DrainPendingReview(ctx, &mr); err != nil {
-			return ctrl.Result{}, err
-		}
-		// The webhook fast path for MR ownership convergence: mr.Status.HeadSHA is
-		// the webhook-stamped mirror head (OP7), so a human push that moves it off
-		// LastBotHeadSHA drives the flip right here, not just on the cron sweep.
-		// newComments is nil - comment redelivery (OP12) is the sweep's own job.
-		if _, err := r.Driver.ReconcileOwnership(ctx, &proj, &repo, &mr, mr.Status.HeadSHA, nil); err != nil {
-			return ctrl.Result{}, err
-		}
-		// DrainOwnershipAnnouncement/DrainStandDownMerge run AFTER DrainPendingReview
-		// so a review Task's approve verdict - which settles status.status/reviewedSHA
-		// - is already visible on mr before DrainStandDownMerge decides whether to
-		// re-drive the parked owner Task into merging.
-		if err := r.Driver.DrainOwnershipAnnouncement(ctx, &proj, &repo, &mr); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.Driver.DrainStandDownMerge(ctx, &proj, &repo, &mr); err != nil {
-			return ctrl.Result{}, err
-		}
-		// The H.4 semver:<level> label. It lands the moment the implement outcome
-		// stamps status.significance - not at merge time, and not on some sweep an
-		// hour later: it is what CI cuts the release tag from, and a human looking
-		// at the PR is entitled to see the level the agent declared.
-		if err := r.Driver.ProjectSemverLabel(ctx, &proj, &repo, &mr); err != nil {
-			return ctrl.Result{}, err
+		for _, step := range steps {
+			if err := step(); err != nil {
+				// A permanent 404 (the upstream MR was deleted at the forge) never
+				// clears on retry: returning it would requeue with exponential
+				// backoff forever (tatara-operator#426). Mark the mirror closed -
+				// the same terminal state a real forge close would leave - and stop
+				// draining this pass instead of looping.
+				if scm.IsNotFound(err) {
+					if serr := markMergeRequestGone(ctx, r.Client, r.spiller(&proj), &mr); serr != nil {
+						return ctrl.Result{}, serr
+					}
+					log.FromContext(ctx).Info("mergerequest: upstream permanently gone (404); marked closed, stopped forge drains",
+						"action", "mr_gone_404", "resource_id", mr.Name)
+					return ctrl.Result{RequeueAfter: cadence}, nil
+				}
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
 	return ctrl.Result{RequeueAfter: cadence}, nil
+}
+
+// markMergeRequestGone stamps a permanently-404ing MergeRequest's mirror as
+// closed, the same terminal state a real forge close leaves. Idempotent: a
+// second 404 on an already-closed mirror is a no-op write.
+func markMergeRequestGone(ctx context.Context, c client.Client, sp objbudget.Spiller, mr *tatarav1alpha1.MergeRequest) error {
+	if mr.Status.State == "closed" {
+		return nil
+	}
+	key := client.ObjectKeyFromObject(mr)
+	return objbudget.FitMergeRequest(ctx, c, sp, key, func(m *tatarav1alpha1.MergeRequest) {
+		m.Status.State = "closed"
+	})
 }
 
 // SetupWithManager registers the MergeRequest reconciler.
