@@ -8,7 +8,7 @@ import "testing"
 // fails at runtime until controller-gen regenerates the map-copy loops.
 func TestAgentSpecDeepCopy_ByKindMapsIndependent(t *testing.T) {
 	in := &AgentSpec{
-		Model:        "claude-opus-4-8",
+		Model:        "claude-opus-5",
 		Effort:       "high",
 		ModelByKind:  map[string]string{"review": "claude-sonnet-5"},
 		EffortByKind: map[string]string{"review": "medium"},

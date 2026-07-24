@@ -23,7 +23,7 @@ const sessionJSON = `{
   "state": "ready",
   "turnsCompleted": 3,
   "turnsFinished": 4,
-  "model": "claude-opus-4-8",
+  "model": "claude-opus-5",
   "repo": "tatara-operator",
   "lastActivityAt": "2026-07-12T10:00:00Z",
   "contractVersion": 2
@@ -46,7 +46,7 @@ func TestGetSession_KeepsAllSixExistingFields(t *testing.T) {
 	require.Equal(t, "ready", info.State)
 	require.Equal(t, 3, info.TurnsCompleted)
 	require.Equal(t, 4, info.TurnsFinished)
-	require.Equal(t, "claude-opus-4-8", info.Model)
+	require.Equal(t, "claude-opus-5", info.Model)
 	require.Equal(t, "tatara-operator", info.Repo)
 	require.Equal(t, time.Date(2026, 7, 12, 10, 0, 0, 0, time.UTC), info.LastActivityAt.UTC())
 	require.NotNil(t, info.ContractVersion)
