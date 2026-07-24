@@ -870,11 +870,11 @@ func resolveByKind(byKind map[string]string, kind, activity, fallback string) st
 // wins (resolveByKind precedence). Kinds absent here (retired legacy kinds) fall
 // back to the project-wide Model as before.
 var kindDefaultModel = map[string]string{
-	"brainstorm":    "claude-opus-4-8",
-	"incident":      "claude-opus-4-8",
-	"clarify":       "claude-opus-4-8",
-	"implement":     "claude-opus-4-8",
-	"review":        "claude-opus-4-8",
+	"brainstorm":    "claude-opus-5",
+	"incident":      "claude-opus-5",
+	"clarify":       "claude-opus-5",
+	"implement":     "claude-opus-5",
+	"review":        "claude-opus-5",
 	"documentation": "claude-sonnet-5",
 	"refine":        "claude-sonnet-5",
 }

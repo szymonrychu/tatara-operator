@@ -25,7 +25,7 @@ func TestEnsureStagePod_StampsResolvedModel(t *testing.T) {
 			ScmSecretRef: "rm-scm",
 			Scm:          &tatarav1alpha1.ScmSpec{Provider: "github", Owner: "o", BotLogin: "bot"},
 			Agent: tatarav1alpha1.AgentSpec{
-				Model: "claude-opus-4-8", Image: "wrapper:1", PermissionMode: "bypassPermissions",
+				Model: "claude-opus-5", Image: "wrapper:1", PermissionMode: "bypassPermissions",
 				MaxTurnsPerTask: 50, TurnTimeoutSeconds: 1800,
 			},
 		},
@@ -85,7 +85,7 @@ func TestEnsureStagePod_StampsResolvedModel(t *testing.T) {
 	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "rm-task"}, got); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if got.Status.ResolvedModel != "claude-opus-4-8" {
-		t.Fatalf("Status.ResolvedModel = %q, want claude-opus-4-8", got.Status.ResolvedModel)
+	if got.Status.ResolvedModel != "claude-opus-5" {
+		t.Fatalf("Status.ResolvedModel = %q, want claude-opus-5", got.Status.ResolvedModel)
 	}
 }
