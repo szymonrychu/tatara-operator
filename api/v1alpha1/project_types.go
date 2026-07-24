@@ -249,7 +249,7 @@ type AgentSpec struct {
 	// key first (falling back to the brainstorm entry when absent), letting
 	// healthCheck's recurring classification work be tiered separately from
 	// brainstorm's creative work. A missing or empty entry falls back to Model.
-	// Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
+	// Values are authoritative model IDs (claude-opus-5, claude-sonnet-5).
 	// +kubebuilder:validation:MaxProperties=11
 	// +kubebuilder:validation:XValidation:rule="self.all(k, k in ['implement','review','clarify','triageIssue','brainstorm','issueLifecycle','incident','selfImprove','refine','healthCheck','documentation'])",message="modelByKind keys must be one of: implement, review, clarify, triageIssue, brainstorm, issueLifecycle, incident, selfImprove, refine, healthCheck, documentation"
 	// +kubebuilder:validation:XValidation:rule="self.all(k, self[k].startsWith('claude-') && self[k].size() <= 64)",message="modelByKind values must be a claude model ID (start with 'claude-', max 64 chars)"

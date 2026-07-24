@@ -5461,7 +5461,7 @@ spec:
                       key first (falling back to the brainstorm entry when absent), letting
                       healthCheck's recurring classification work be tiered separately from
                       brainstorm's creative work. A missing or empty entry falls back to Model.
-                      Values are authoritative model IDs (claude-opus-4-8, claude-sonnet-5).
+                      Values are authoritative model IDs (claude-opus-5, claude-sonnet-5).
                     maxProperties: 11
                     type: object
                     x-kubernetes-validations:

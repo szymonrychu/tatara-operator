@@ -11,7 +11,7 @@ import (
 
 func TestModelForKind(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
-	proj.Spec.Agent.Model = "claude-opus-4-8"
+	proj.Spec.Agent.Model = "claude-opus-5"
 	proj.Spec.Agent.ModelByKind = map[string]string{
 		"review":      "claude-sonnet-5",
 		"triageIssue": "claude-sonnet-5",
@@ -21,9 +21,9 @@ func TestModelForKind(t *testing.T) {
 	}{
 		{"override present review", "review", "claude-sonnet-5"},
 		{"override present triage", "triageIssue", "claude-sonnet-5"},
-		{"override absent falls back", "implement", "claude-opus-4-8"},
-		{"unknown kind falls back", "bogus", "claude-opus-4-8"},
-		{"empty kind falls back", "", "claude-opus-4-8"},
+		{"override absent falls back", "implement", "claude-opus-5"},
+		{"unknown kind falls back", "bogus", "claude-opus-5"},
+		{"empty kind falls back", "", "claude-opus-5"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -36,19 +36,19 @@ func TestModelForKind(t *testing.T) {
 
 func TestModelForKind_NilAndEmptyOverride(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
-	proj.Spec.Agent.Model = "claude-opus-4-8"
-	if got := modelForKind(proj, "review", ""); got != "claude-opus-4-8" {
-		t.Fatalf("nil map: modelForKind = %q, want claude-opus-4-8", got)
+	proj.Spec.Agent.Model = "claude-opus-5"
+	if got := modelForKind(proj, "review", ""); got != "claude-opus-5" {
+		t.Fatalf("nil map: modelForKind = %q, want claude-opus-5", got)
 	}
 	proj.Spec.Agent.ModelByKind = map[string]string{"review": ""}
-	if got := modelForKind(proj, "review", ""); got != "claude-opus-4-8" {
-		t.Fatalf("empty override treated as set: modelForKind = %q, want claude-opus-4-8", got)
+	if got := modelForKind(proj, "review", ""); got != "claude-opus-5" {
+		t.Fatalf("empty override treated as set: modelForKind = %q, want claude-opus-5", got)
 	}
 }
 
 func TestModelForKind_Exported(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
-	proj.Spec.Agent.Model = "claude-opus-4-8"
+	proj.Spec.Agent.Model = "claude-opus-5"
 	proj.Spec.Agent.ModelByKind = map[string]string{"review": "claude-sonnet-5"}
 	if got, want := ModelForKind(proj, "review", "", ""), modelForKind(proj, "review", ""); got != want {
 		t.Fatalf("ModelForKind(review) = %q, want %q", got, want)
@@ -69,8 +69,8 @@ func TestModelForKind_PerKindDefaults(t *testing.T) {
 	opusKinds := []string{"brainstorm", "incident", "clarify", "implement", "review"}
 	for _, k := range opusKinds {
 		t.Run("opus/"+k, func(t *testing.T) {
-			if got := modelForKind(proj, k, ""); got != "claude-opus-4-8" {
-				t.Fatalf("modelForKind(%q) = %q, want claude-opus-4-8", k, got)
+			if got := modelForKind(proj, k, ""); got != "claude-opus-5" {
+				t.Fatalf("modelForKind(%q) = %q, want claude-opus-5", k, got)
 			}
 		})
 	}
@@ -132,11 +132,11 @@ func TestEffortForKind_NilAndEmptyOverride(t *testing.T) {
 // or the project default, splitting healthCheck's tier from brainstorm's.
 func TestModelForKind_HealthCheckActivity(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
-	proj.Spec.Agent.Model = "claude-opus-4-8"
+	proj.Spec.Agent.Model = "claude-opus-5"
 	proj.Spec.Agent.Effort = "high"
 	proj.Spec.Agent.ModelByKind = map[string]string{
 		"healthCheck": "claude-sonnet-5",
-		"brainstorm":  "claude-opus-4-8",
+		"brainstorm":  "claude-opus-5",
 	}
 	proj.Spec.Agent.EffortByKind = map[string]string{
 		"healthCheck": "medium",
@@ -152,8 +152,8 @@ func TestModelForKind_HealthCheckActivity(t *testing.T) {
 
 	// Plain brainstorm (no healthCheck activity) still resolves to the
 	// brainstorm entry.
-	if got := modelForKind(proj, "brainstorm", ""); got != "claude-opus-4-8" {
-		t.Fatalf("modelForKind(brainstorm, \"\") = %q, want claude-opus-4-8", got)
+	if got := modelForKind(proj, "brainstorm", ""); got != "claude-opus-5" {
+		t.Fatalf("modelForKind(brainstorm, \"\") = %q, want claude-opus-5", got)
 	}
 	if got := effortForKind(proj, "brainstorm", ""); got != "high" {
 		t.Fatalf("effortForKind(brainstorm, \"\") = %q, want high", got)
@@ -166,13 +166,13 @@ func TestModelForKind_HealthCheckActivity(t *testing.T) {
 // matching P0's original kept-on-Opus behavior for unconfigured projects.
 func TestModelForKind_HealthCheckActivity_FallsBackToKind(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
-	proj.Spec.Agent.Model = "claude-opus-4-8"
+	proj.Spec.Agent.Model = "claude-opus-5"
 	proj.Spec.Agent.Effort = "high"
-	proj.Spec.Agent.ModelByKind = map[string]string{"brainstorm": "claude-opus-4-8"}
+	proj.Spec.Agent.ModelByKind = map[string]string{"brainstorm": "claude-opus-5"}
 	proj.Spec.Agent.EffortByKind = map[string]string{"brainstorm": "high"}
 
-	if got := modelForKind(proj, "brainstorm", "healthCheck"); got != "claude-opus-4-8" {
-		t.Fatalf("modelForKind(brainstorm, healthCheck) fallback = %q, want claude-opus-4-8", got)
+	if got := modelForKind(proj, "brainstorm", "healthCheck"); got != "claude-opus-5" {
+		t.Fatalf("modelForKind(brainstorm, healthCheck) fallback = %q, want claude-opus-5", got)
 	}
 	if got := effortForKind(proj, "brainstorm", "healthCheck"); got != "high" {
 		t.Fatalf("effortForKind(brainstorm, healthCheck) fallback = %q, want high", got)
@@ -185,7 +185,7 @@ func TestBuildPod_ModelEffortByKind(t *testing.T) {
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "demo-scm",
 			Agent: tatarav1alpha1.AgentSpec{
-				Model:              "claude-opus-4-8",
+				Model:              "claude-opus-5",
 				Effort:             "high",
 				Image:              "wrapper:1",
 				PermissionMode:     "bypassPermissions",
@@ -220,8 +220,8 @@ func TestBuildPod_ModelEffortByKind(t *testing.T) {
 	}{
 		{"review", "review", "", "claude-sonnet-5", "medium"},
 		{"triageIssue", "triageIssue", "", "claude-sonnet-5", "low"},
-		{"implement", "implement", "", "claude-opus-4-8", "high"},
-		{"brainstorm", "brainstorm", "", "claude-opus-4-8", "high"},
+		{"implement", "implement", "", "claude-opus-5", "high"},
+		{"brainstorm", "brainstorm", "", "claude-opus-5", "high"},
 		{"healthCheck activity", "brainstorm", "healthCheck", "claude-sonnet-5", "medium"},
 	}
 	for _, tc := range cases {

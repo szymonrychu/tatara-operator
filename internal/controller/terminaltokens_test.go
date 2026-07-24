@@ -101,7 +101,7 @@ func TestEnterStage_EmitsTerminalTokens(t *testing.T) {
 	})
 
 	t.Run("no emit on a non-terminal entry", func(t *testing.T) {
-		task := seedTerminalTokensTask(t, "tt-task-live", "tt-proj-live", "tt-repo-live", "claude-opus-4-8", 700, 200, 100, 10)
+		task := seedTerminalTokensTask(t, "tt-task-live", "tt-proj-live", "tt-repo-live", "claude-opus-5", 700, 200, 100, 10)
 
 		reg := prometheus.NewRegistry()
 		m := obs.NewOperatorMetrics(reg)
@@ -109,7 +109,7 @@ func TestEnterStage_EmitsTerminalTokens(t *testing.T) {
 			tatarav1alpha1.StageReviewing, "", time.Now(), nil); err != nil {
 			t.Fatalf("EnterStage: %v", err)
 		}
-		got := testutil.ToFloat64(m.TaskTerminalTokensCounter("tt-proj-live", "tt-repo-live", tatarav1alpha1.StageReviewing, "claude-opus-4-8", "input"))
+		got := testutil.ToFloat64(m.TaskTerminalTokensCounter("tt-proj-live", "tt-repo-live", tatarav1alpha1.StageReviewing, "claude-opus-5", "input"))
 		if got != 0 {
 			t.Errorf("a non-terminal stage entry must not emit terminal tokens, got %v", got)
 		}

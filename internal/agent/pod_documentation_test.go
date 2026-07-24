@@ -15,11 +15,11 @@ import (
 // ModelByKind.
 func TestModelForKind_DocumentationDefaultsToSonnet5(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
-	proj.Spec.Agent.Model = "claude-opus-4-8"
+	proj.Spec.Agent.Model = "claude-opus-5"
 	require.Equal(t, "claude-sonnet-5", modelForKind(proj, "documentation", ""))
 
-	proj.Spec.Agent.ModelByKind = map[string]string{"documentation": "claude-opus-4-8"}
-	require.Equal(t, "claude-opus-4-8", modelForKind(proj, "documentation", ""),
+	proj.Spec.Agent.ModelByKind = map[string]string{"documentation": "claude-opus-5"}
+	require.Equal(t, "claude-opus-5", modelForKind(proj, "documentation", ""),
 		"explicit ModelByKind override must still win over the locked default")
 }
 
@@ -78,7 +78,7 @@ func TestBuildPod_Documentation(t *testing.T) {
 		Spec: tatarav1alpha1.ProjectSpec{
 			ScmSecretRef: "demo-scm",
 			Agent: tatarav1alpha1.AgentSpec{
-				Model:              "claude-opus-4-8",
+				Model:              "claude-opus-5",
 				Image:              "wrapper:1",
 				PermissionMode:     "bypassPermissions",
 				TurnTimeoutSeconds: 1800,

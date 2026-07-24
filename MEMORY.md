@@ -735,3 +735,18 @@ in spirit; prune only when a decision is reversed.
   helper - no new secret path needed. `assignmentFor` gained a third `*Project`
   arg; all call sites (task_stage.go, assignment_test.go,
   assignment_goal_test.go) updated.
+- 2026-07-24: Moved the locked opus tier from `claude-opus-4-8` to
+  `claude-opus-5` across `kindDefaultModel` (pod.go), the tier-revert goal
+  text (incident/goal.go) and the CRD doc comment; `claude-sonnet-5` and the
+  `documentation`/`refine` entries are unchanged. No enum constrains a model
+  ID value anywhere in the CRD - the only guard is the CEL rule
+  `self.all(k, self[k].startsWith('claude-') && self[k].size() <= 64)` at
+  `api/v1alpha1/project_types.go`, which only rejects non-`claude-` values,
+  so `internal/controller/project_tiermap_validation_test.go` deliberately
+  keeps its `claude-opus-4-8` literals (it tests that guard, not the tier)
+  and is the sole remaining occurrence of the old ID in the repo. The tests
+  that had to move (not just cosmetic renames) are the ones asserting the
+  LOCKED per-kind default itself: `modelForKind` resolves
+  `kindDefaultModel[kind]` ahead of `Spec.Agent.Model` whenever the kind has
+  an entry, so any project-wide `Model` literal left at the old value in a
+  test would have been silently shadowed rather than exercised.

@@ -398,7 +398,7 @@ func TestApprovalPhrases_EmptyNeverMeansAny(t *testing.T) {
 // Opus/high default.
 func TestModelFor(t *testing.T) {
 	a := v1alpha1.AgentSpec{
-		Model:  "claude-opus-4-8",
+		Model:  "claude-opus-5",
 		Effort: "xhigh",
 		ModelByKind: map[string]string{
 			"review":      "claude-sonnet-5",
@@ -417,8 +417,8 @@ func TestModelFor(t *testing.T) {
 	}
 	// implement has no explicit key -> falls back to Model/Effort, and must NOT
 	// pick up the dead "triageIssue" entry.
-	if got := a.ModelFor("implement"); got != "claude-opus-4-8" {
-		t.Fatalf("ModelFor(implement) = %q, want fallback claude-opus-4-8 (must not match triageIssue)", got)
+	if got := a.ModelFor("implement"); got != "claude-opus-5" {
+		t.Fatalf("ModelFor(implement) = %q, want fallback claude-opus-5 (must not match triageIssue)", got)
 	}
 	if got := a.EffortFor("implement"); got != "xhigh" {
 		t.Fatalf("EffortFor(implement) = %q, want fallback xhigh (must not match triageIssue)", got)

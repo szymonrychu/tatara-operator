@@ -1117,7 +1117,7 @@ func TestReapRejectedDeletesTaskAndClearsTokenSeries(t *testing.T) {
 		tatarav1alpha1.StageRejected, stage.ReasonDeclined, time.Now().Add(-25*time.Hour))
 	task.Spec.RepositoryRef = repo.Name
 	task.Spec.Source = &tatarav1alpha1.TaskSource{IssueRef: "tatara-operator#9"}
-	task.Status.ResolvedModel = "claude-opus-4-8"
+	task.Status.ResolvedModel = "claude-opus-5"
 
 	c := newMirrorClient(t, proj, repo, reapSecret(), task)
 	reg := prometheus.NewRegistry()
@@ -1129,7 +1129,7 @@ func TestReapRejectedDeletesTaskAndClearsTokenSeries(t *testing.T) {
 		SCMFor:  func(string) (scm.SCMWriter, error) { return &reapWriter{}, nil },
 	}
 
-	metrics.AddTaskTokens("tokgc", repo.Name, "clarify", "tatara-operator#9", "claude-opus-4-8", 100, 50, 30, 10)
+	metrics.AddTaskTokens("tokgc", repo.Name, "clarify", "tatara-operator#9", "claude-opus-5", 100, 50, 30, 10)
 	metrics.AddTaskTurn("tokgc", repo.Name, "clarify", "tatara-operator#9")
 
 	if err := r.ReapTerminal(ctx, proj); err != nil {

@@ -820,24 +820,24 @@ func TestAddTaskTokens(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.AddTaskTokens("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-4-8", 1200, 300, 400, 50)
-	m.AddTaskTokens("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-4-8", 800, 100, 0, 0)
+	m.AddTaskTokens("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-5", 1200, 300, 400, 50)
+	m.AddTaskTokens("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-5", 800, 100, 0, 0)
 	// Project-scoped task: empty repo and issue labels, and zero cache/output deltas are skipped.
 	m.AddTaskTokens("tatara", "", "brainstorm", "", "claude-sonnet-5", 500, 0, 0, 0)
 
-	in := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-4-8", "input"))
+	in := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-5", "input"))
 	if in != 2000 {
 		t.Fatalf("issue input tokens = %v, want 2000", in)
 	}
-	out := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-4-8", "output"))
+	out := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-5", "output"))
 	if out != 400 {
 		t.Fatalf("issue output tokens = %v, want 400", out)
 	}
-	cacheRead := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-4-8", "cache_read"))
+	cacheRead := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-5", "cache_read"))
 	if cacheRead != 400 {
 		t.Fatalf("issue cache_read tokens = %v, want 400", cacheRead)
 	}
-	cacheCreation := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-4-8", "cache_creation"))
+	cacheCreation := testutil.ToFloat64(m.taskTokensTotal.WithLabelValues("tatara", "tatara-operator", "issueLifecycle", "szymonrychu/tatara-operator#68", "claude-opus-5", "cache_creation"))
 	if cacheCreation != 50 {
 		t.Fatalf("issue cache_creation tokens = %v, want 50", cacheCreation)
 	}
@@ -910,18 +910,18 @@ func TestAddTerminalTokens(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.AddTerminalTokens("tatara", "tatara-operator", "churned", "claude-opus-4-8", 2000, 500, 800, 100)
+	m.AddTerminalTokens("tatara", "tatara-operator", "churned", "claude-opus-5", 2000, 500, 800, 100)
 
-	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "input")); got != 2000 {
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-5", "input")); got != 2000 {
 		t.Fatalf("input = %v, want 2000", got)
 	}
-	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "output")); got != 500 {
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-5", "output")); got != 500 {
 		t.Fatalf("output = %v, want 500", got)
 	}
-	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "cache_read")); got != 800 {
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-5", "cache_read")); got != 800 {
 		t.Fatalf("cache_read = %v, want 800", got)
 	}
-	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-4-8", "cache_creation")); got != 100 {
+	if got := testutil.ToFloat64(m.taskTerminalTokensTotal.WithLabelValues("tatara", "tatara-operator", "churned", "claude-opus-5", "cache_creation")); got != 100 {
 		t.Fatalf("cache_creation = %v, want 100", got)
 	}
 
@@ -1054,7 +1054,7 @@ func TestDeleteTaskSeries_RemovesTokenAndTurn(t *testing.T) {
 	m := NewOperatorMetrics(reg)
 
 	// Add tokens and a turn for an issue-scoped task.
-	m.AddTaskTokens("tatara", "op", "issueLifecycle", "op#7", "claude-opus-4-8", 100, 50, 30, 10)
+	m.AddTaskTokens("tatara", "op", "issueLifecycle", "op#7", "claude-opus-5", 100, 50, 30, 10)
 	m.AddTaskTurn("tatara", "op", "issueLifecycle", "op#7")
 
 	// Also add a project-scoped (empty issue) series that must NOT be deleted.
@@ -1134,7 +1134,7 @@ func TestDeleteTaskSeries_RemovesAcrossModels(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.AddTaskTokens("tatara", "op", "implement", "op#9", "claude-opus-4-8", 100, 50, 30, 10)
+	m.AddTaskTokens("tatara", "op", "implement", "op#9", "claude-opus-5", 100, 50, 30, 10)
 	m.AddTaskTurn("tatara", "op", "implement", "op#9")
 	m.AddTaskTokens("tatara", "op", "implement", "op#9", "claude-sonnet-5", 40, 20, 5, 1)
 
@@ -1211,7 +1211,7 @@ func TestQualityMetrics_Emit(t *testing.T) {
 	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "approved")
 	m.RecordReviewOutcome("tatara", "op", "claude-sonnet-5", "changes_requested")
 	m.AddReviewFindings("tatara", "op", "claude-sonnet-5", 3)
-	m.RecordImplementCI("tatara", "op", "issueLifecycle", "claude-opus-4-8", "fail")
+	m.RecordImplementCI("tatara", "op", "issueLifecycle", "claude-opus-5", "fail")
 
 	if got := testutil.ToFloat64(m.reviewOutcomeTotal.WithLabelValues("tatara", "op", "claude-sonnet-5", "approved")); got != 1 {
 		t.Fatalf("reviewOutcomeTotal approved = %v, want 1", got)
@@ -1222,7 +1222,7 @@ func TestQualityMetrics_Emit(t *testing.T) {
 	if got := testutil.ToFloat64(m.reviewFindingsTotal.WithLabelValues("tatara", "op", "claude-sonnet-5")); got != 3 {
 		t.Fatalf("reviewFindingsTotal = %v, want 3", got)
 	}
-	if got := testutil.ToFloat64(m.implementCITotal.WithLabelValues("tatara", "op", "issueLifecycle", "claude-opus-4-8", "fail")); got != 1 {
+	if got := testutil.ToFloat64(m.implementCITotal.WithLabelValues("tatara", "op", "issueLifecycle", "claude-opus-5", "fail")); got != 1 {
 		t.Fatalf("implementCITotal fail = %v, want 1", got)
 	}
 

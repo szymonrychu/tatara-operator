@@ -18,7 +18,7 @@ project:
     maxOpenTasks: 4
     agent:
       image: harbor.szymonrichert.pl/containers/tatara-claude-code-wrapper:latest
-      model: claude-opus-4-8
+      model: claude-opus-5
       permissionMode: bypassPermissions
       maxTurnsPerTask: 100
       turnTimeoutSeconds: 1800
