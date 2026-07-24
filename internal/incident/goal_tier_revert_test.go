@@ -11,7 +11,7 @@ func TestGoalTierRevert(t *testing.T) {
 		"review",
 		"claude-sonnet-5",
 		"tatara",
-		"claude-opus-4-8",
+		"claude-opus-5",
 		"values/project-tatara/common.yaml",
 		"agent.modelByKind",
 		"agent.effortByKind",

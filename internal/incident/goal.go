@@ -101,6 +101,6 @@ func GoalTierRevert(project, kind, model string) string {
 	return "A quality-proxy alert is FIRING: kind \"" + kind + "\" on model \"" + model +
 		"\" has regressed in project \"" + project + "\". Propose reverting this kind's tier: in " +
 		"tatara-helmfile values/project-" + project + "/common.yaml, set agent.modelByKind[" + kind +
-		"] back to claude-opus-4-8 and raise agent.effortByKind[" + kind + "] (to high). Open ONE MR " +
+		"] back to claude-opus-5 and raise agent.effortByKind[" + kind + "] (to high). Open ONE MR " +
 		"against tatara-helmfile with only that change and a short rationale citing the alert. Do NOT merge."
 }
