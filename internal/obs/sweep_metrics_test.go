@@ -19,6 +19,13 @@ func TestSweepLastSuccessTimestampLabels(t *testing.T) {
 		[]string{"activity", "project"})
 }
 
+func TestSweepNextExpectedTimestampLabels(t *testing.T) {
+	SweepNextExpectedTimestamp.WithLabelValues("label-test-proj", "documentation").Set(1)
+	assertLabelNames(t, gatheredLabelNames(t, SweepNextExpectedTimestamp,
+		"operator_sweep_next_expected_timestamp_seconds"),
+		[]string{"activity", "project"})
+}
+
 func TestSweepErrorsTotalLabels(t *testing.T) {
 	SweepErrorsTotal.WithLabelValues("label-test-proj", "issueScan", "invalid_cron").Inc()
 	assertLabelNames(t, gatheredLabelNames(t, SweepErrorsTotal,

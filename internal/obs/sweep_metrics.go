@@ -64,6 +64,25 @@ var SweepLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Unix timestamp of the last completed pass, by project and activity (contract K.1): liveness (per-item-error-tolerant) for sweep/nightlySweep, zero-error for brainstorm/documentation/issueScan.",
 }, []string{"project", "activity"})
 
+// SweepNextExpectedTimestamp is the CADENCE half of the heartbeat: the absolute
+// unix timestamp of the next expected run for one project's activity, computed
+// by the operator from that activity's own cron in the Project CR. It exists so
+// the alert rule carries a single grace period instead of a per-activity
+// threshold table - one flat 6h threshold breached for ~18h of every 24 on the
+// 0 3 * * * / 0 6 * * * nightly crons (tatara-observability#65). This is
+// kube-state-metrics' kube_cronjob_next_schedule_time pattern, the only prior art
+// that survives adding an activity or a Project without editing the alert rule.
+//
+// A series exists ONLY for an activity that is actually enabled: publishing one
+// for a configured-but-off activity would page for a run that is never going to
+// happen. It is refreshed on every Project reconcile from the same persisted
+// Status.Last* stamps the heartbeat rehydrates from, so it survives a leader
+// change and a pod restart.
+var SweepNextExpectedTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "operator_sweep_next_expected_timestamp_seconds",
+	Help: "Unix timestamp of the next expected run for one project's activity, computed from its cron (contract K.1).",
+}, []string{"project", "activity"})
+
 // SweepErrorsTotal counts sweep failures by project, activity and reason. Every
 // reason is a closed-set string, so the label never takes a forge error message.
 var SweepErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -116,6 +135,7 @@ func init() {
 		TasksMintedPerSweep,
 		SweepMintCapHitTotal,
 		SweepLastSuccessTimestamp,
+		SweepNextExpectedTimestamp,
 		SweepErrorsTotal,
 	)
 }
