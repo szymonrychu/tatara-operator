@@ -837,3 +837,22 @@ in spirit; prune only when a decision is reversed.
   gets independently noticed. The companion alert-rule changes are
   tatara-observability `fix/sweep-heartbeat-and-alert-false-positives`, which
   MUST merge after this.
+
+  **Final-review fixup (same branch):** point (7)'s teardown had one hole
+  left: `runScans`' `Spec.Scm == nil || Spec.Scm.Cron == nil` guard (both
+  `+optional`) returns BEFORE the `publishNextExpected` defer is registered,
+  so a Project whose `spec.scm.cron` is cleared after publishing series never
+  retracts them. Fixed by an explicit
+  `SweepNextExpectedTimestamp.DeletePartialMatch` in that early return, NOT by
+  nil-guarding `publishNextExpected` and moving the defer above the guard:
+  `publishNextExpected` unconditionally dereferences `proj.Spec.Scm.Cron` on
+  its first line, so that route needs its own rewrite for no added safety over
+  mirroring the already-established `IsNotFound` precedent one function up.
+  Also: the operator's OWN chart (`prometheusrule.yaml`'s `TataraSweepStalled`)
+  still read `max by (activity)` post-relabel - the exact masking bug #441
+  fixed everywhere else, missed in the one place shipped in this repo's own
+  release; regrouped to `(project, activity)` and the stale "zero-error"
+  description corrected to the #325 liveness semantics. `nightlySweep` (dead
+  since #325, zero producers) dropped from `SeedSweepErrorsForProject`'s
+  seed list: 13 of 44 seeded series per Project were permanently-zero
+  fiction, now 13 of 31.

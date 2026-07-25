@@ -482,6 +482,47 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 	})
 }
 
+// TestRunScans_CronClearedRetractsNextExpected: a Project whose spec.scm.cron
+// (or spec.scm itself) transitions to nil - both +optional pointers - hits
+// runScans' early-return guard, which returns BEFORE the publishNextExpected
+// defer is registered. Without an explicit retraction there, series published
+// while the cron was configured freeze at their last value forever: the
+// consumer is a time()-minus-gauge alert, so a frozen series grows
+// ever-more-overdue and never stops paging, the same failure mode round-2
+// review already closed for the disable-via-annotation transition
+// (publishNextExpected's own else branches) and for Project deletion
+// (project_controller.go's IsNotFound branch). This is the one remaining
+// teardown hole a spec edit reaches instead of a disable flag or a delete.
+func TestRunScans_CronClearedRetractsNextExpected(t *testing.T) {
+	cronSpec := &tatarav1alpha1.ScmCron{
+		IssueScan:  tatarav1alpha1.CronActivity{Schedule: "0 */4 * * *"},
+		Brainstorm: tatarav1alpha1.BrainstormActivity{Enabled: true, Schedule: "0 0 1 1 *"},
+	}
+	proj, _ := seedScanProject(t, "nx-cron-cleared", cronSpec)
+
+	r := newScanReconciler(&fakeReader{})
+	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	if _, err := r.runScans(context.Background(), proj); err != nil {
+		t.Fatalf("runScans (healthy pass): %v", err)
+	}
+	for _, activity := range []string{"issueScan", SweepActivity, "brainstorm"} {
+		if !nextExpectedSeriesExists(t, "nx-cron-cleared", activity) {
+			t.Fatalf("setup: expected next expected{%s} series after a healthy pass", activity)
+		}
+	}
+
+	// Clear spec.scm.cron exactly as a human editing the Project spec would.
+	proj.Spec.Scm.Cron = nil
+	if _, err := r.runScans(context.Background(), proj); err != nil {
+		t.Fatalf("runScans (cron cleared pass): %v", err)
+	}
+	for _, activity := range []string{"issueScan", SweepActivity, "brainstorm"} {
+		if nextExpectedSeriesExists(t, "nx-cron-cleared", activity) {
+			t.Errorf("next expected{%s} series still exists after spec.scm.cron cleared, want retracted", activity)
+		}
+	}
+}
+
 // TestProjectReconcile_NotFound_RetractsNextExpected: finding 2 named four
 // disable paths (brainstorm off, sweep-disabled annotation, documentation off,
 // documentation repo cleared) and the round-1 fix covered all four inside

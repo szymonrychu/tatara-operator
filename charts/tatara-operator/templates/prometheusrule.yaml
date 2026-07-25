@@ -173,20 +173,20 @@ spec:
             summary: "a PR merged with no semver label: CI cut no release tag"
             description: "operator_semver_label_missing_total{repo=\"{{ "{{" }} $labels.repo {{ "}}" }}\"} increased in 1h: the operator merged a MergeRequest that carried no declared change significance, so no semver:<level> label was on the PR at the merge commit and the push-CD pipeline cuts NO tag from it (contract H.4). No tag means no publish, no pin, and the deploying stage never resolves. The merge is deliberately NOT stalled on this (that would strand a reviewed, approved change behind an operator bug); a human must tag the merged commit."
         - alert: TataraSweepStalled
-          expr: (time() - max by (activity) (operator_sweep_last_success_timestamp_seconds)) > {{ .Values.prometheusRule.sweepStaleAfterSeconds }}
+          expr: (time() - max by (project, activity) (operator_sweep_last_success_timestamp_seconds)) > {{ .Values.prometheusRule.sweepStaleAfterSeconds }}
           for: 15m
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "the B.4 sweep has not completed a clean pass"
-            description: "No fully successful sweep pass for activity {{ "{{" }} $labels.activity {{ "}}" }} in {{ "{{" }} $value | humanizeDuration {{ "}}" }} (budget {{ .Values.prometheusRule.sweepStaleAfterSeconds }}s). SINCE THE REDESIGN THE SWEEP IS THE ONLY INTAKE - the webhook mints nothing - so a sweep that errors on every pass means the platform silently takes in no work at all while looking healthy. The heartbeat gauge is only stamped when a pass completes with zero errors, so a single failing repo suppresses it; break down operator_sweep_errors_total by (activity, reason) for which step failed. Tune via prometheusRule.sweepStaleAfterSeconds (must exceed the project's issueScan schedule)."
+            description: "No fully successful sweep pass for project {{ "{{" }} $labels.project {{ "}}" }} activity {{ "{{" }} $labels.activity {{ "}}" }} in {{ "{{" }} $value | humanizeDuration {{ "}}" }} (budget {{ .Values.prometheusRule.sweepStaleAfterSeconds }}s). SINCE THE REDESIGN THE SWEEP IS THE ONLY INTAKE - the webhook mints nothing - so a sweep that errors on every pass means the platform silently takes in no work at all while looking healthy. The heartbeat gauge is LIVENESS, not zero-error health (issue #325): it is stamped whenever the repos loop runs to completion, even with per-item errors, so only a pass that cannot even begin leaves it unset; break down operator_sweep_errors_total by (project, activity, reason) for which step failed. Grouped by (project, activity) since issue #441: without `project` in the grouping, one healthy Project's fresh timestamp masked a sibling Project's genuinely dead cron. Tune via prometheusRule.sweepStaleAfterSeconds (must exceed the project's issueScan schedule)."
         - alert: TataraSweepErrors
           expr: increase(operator_sweep_errors_total[1h]) > 0
           labels:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "the B.4 sweep is erroring"
-            description: "operator_sweep_errors_total{activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased in 1h: the only intake path is failing on at least one repo (list_issues, list_prs, owner_repo, mint, ...). Work on the forge is not being picked up."
+            description: "operator_sweep_errors_total{project=\"{{ "{{" }} $labels.project {{ "}}" }}\",activity=\"{{ "{{" }} $labels.activity {{ "}}" }}\",reason=\"{{ "{{" }} $labels.reason {{ "}}" }}\"} increased in 1h: the only intake path is failing on at least one repo (list_issues, list_prs, owner_repo, mint, ...). Work on the forge is not being picked up."
         - alert: TataraObjectTooLarge
           expr: increase(operator_object_too_large_total[1h]) > 0
           labels:

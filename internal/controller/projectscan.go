@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/robfig/cron/v3"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
@@ -36,26 +37,32 @@ func activityNextFire(schedule string, base time.Time) (time.Time, bool) {
 	return parsed.Next(base), true
 }
 
-// nextExpectedUnix returns the unix timestamp of the next expected fire for one
-// activity: its cron applied to that activity's persisted last-success stamp, or
-// to the Project's creation timestamp when it has never run - a never-run
-// activity must read OVERDUE rather than invisible. ok=false for an empty
-// (disabled) OR an unparseable schedule; callers publish no series either way and
-// meter invalid_cron only for the unparseable case, which they distinguish by
-// re-checking schedule != "".
-func nextExpectedUnix(proj *tatarav1alpha1.Project, schedule string, last *metav1.Time) (float64, bool) {
-	if schedule == "" {
-		return 0, false
-	}
-	sched, err := cron.ParseStandard(schedule)
-	if err != nil {
-		return 0, false
-	}
-	base := proj.CreationTimestamp.Time
+// dueBase resolves the base time every cron computation in this file anchors
+// on: the activity's persisted last-run stamp, or the Project's creation
+// timestamp when it has never run - a never-run activity must read OVERDUE
+// rather than invisible. Shared by activityDue, reposDueForScan,
+// nextExpectedUnix and earliestIssueScanFire, which all repeated this same
+// (proj, last) fallback inline (review finding: four copies is past this
+// repo's "three similar lines" threshold).
+func dueBase(proj *tatarav1alpha1.Project, last *metav1.Time) time.Time {
 	if last != nil {
-		base = last.Time
+		return last.Time
 	}
-	return float64(sched.Next(base).Unix()), true
+	return proj.CreationTimestamp.Time
+}
+
+// nextExpectedUnix returns the unix timestamp of the next expected fire for one
+// activity: its cron applied via activityNextFire to dueBase(proj, last).
+// ok=false for an empty (disabled) OR an unparseable schedule (activityNextFire's
+// own contract); callers publish no series either way and meter invalid_cron
+// only for the unparseable case, which they distinguish by re-checking
+// schedule != "".
+func nextExpectedUnix(proj *tatarav1alpha1.Project, schedule string, last *metav1.Time) (float64, bool) {
+	next, ok := activityNextFire(schedule, dueBase(proj, last))
+	if !ok {
+		return 0, false
+	}
+	return float64(next.Unix()), true
 }
 
 // activityScheduleAndLast returns the cron schedule string and last-scan stamp
@@ -408,10 +415,7 @@ func (r *ProjectReconciler) existingScanTasks(ctx context.Context, proj *tatarav
 // Last*Scan|creationTimestamp; ok=false on empty/bad cron.
 func (r *ProjectReconciler) activityDue(proj *tatarav1alpha1.Project, activity string) (time.Time, bool, time.Time, bool) {
 	schedule, last := activityScheduleAndLast(proj, activity)
-	base := proj.CreationTimestamp.Time
-	if last != nil {
-		base = last.Time
-	}
+	base := dueBase(proj, last)
 	next, ok := activityNextFire(schedule, base)
 	if !ok {
 		return base, false, time.Time{}, false
@@ -435,10 +439,7 @@ func (r *ProjectReconciler) reposDueForScan(proj *tatarav1alpha1.Project, activi
 	if err != nil {
 		return nil, time.Time{}, false
 	}
-	base := proj.CreationTimestamp.Time
-	if last != nil {
-		base = last.Time
-	}
+	base := dueBase(proj, last)
 	period := cronPeriod(sched, base)
 	var due []tatarav1alpha1.Repository
 	var soonest time.Time
@@ -1116,10 +1117,7 @@ func earliestIssueScanFire(proj *tatarav1alpha1.Project, schedule string, repos 
 	if len(repos) == 0 {
 		return 0, false, nil
 	}
-	base := proj.CreationTimestamp.Time
-	if last != nil {
-		base = last.Time
-	}
+	base := dueBase(proj, last)
 	period := cronPeriod(sched, base)
 	var earliest time.Time
 	for i := range repos {
@@ -1224,6 +1222,21 @@ func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, re
 func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.Project) (time.Duration, error) {
 	l := log.FromContext(ctx)
 	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil || r.ReaderFor == nil {
+		// spec.scm and spec.scm.cron are +optional pointers: a Project that had
+		// published next-expected series while cron was configured and then has
+		// either cleared can no longer compute a next fire for any activity, but
+		// this guard returns BEFORE the publishNextExpected defer below is
+		// registered, so without an explicit retraction here the series freeze
+		// at their last value forever - the consumer is a time()-minus-gauge
+		// alert, so a frozen series ages toward "ever more overdue" and never
+		// stops paging. Same failure mode already closed for the
+		// disable-via-annotation transition (publishNextExpected's own else
+		// branches) and for Project deletion (project_controller.go's
+		// IsNotFound branch); this mirrors that precedent's DeletePartialMatch
+		// rather than restructuring publishNextExpected (which dereferences
+		// proj.Spec.Scm.Cron and cannot run before this guard without its own
+		// nil-guard rewrite, review finding).
+		obs.SweepNextExpectedTimestamp.DeletePartialMatch(prometheus.Labels{"project": proj.Name})
 		return 0, nil
 	}
 	// repos is populated below (after the reader/list-repos calls) but must be
