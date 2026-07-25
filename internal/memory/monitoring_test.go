@@ -4,8 +4,18 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 )
+
+// testProjectWithInstances is testProject plus an explicit pgInstances, so
+// replication-topology tests can exercise a multi-instance HA cluster instead
+// of the single-instance default.
+func testProjectWithInstances(name string, n int) *tatarav1alpha1.Project {
+	p := testProject(name)
+	p.Spec.Memory = &tatarav1alpha1.MemorySpec{PgInstances: n}
+	return p
+}
 
 func testMonitorCfg() memory.Config {
 	cfg := testCfg()
@@ -113,6 +123,110 @@ func TestMemoryPrometheusRule(t *testing.T) {
 	for _, a := range []string{"MemoryPostgresVolumeFilling", "MemoryPostgresInstanceRestarting"} {
 		require.Equal(t, "warning", bySeverity[a], "alert %s must be warning", a)
 	}
+	// The replication alerts (added for issues #442, #444, #448) must be present.
+	// MemoryPostgresInstancesBelowDeclared applies at any instance count (including
+	// the single-instance default "acme" project used here) and is critical: it is
+	// the general redundancy-count safety net.
+	require.Equal(t, "critical", bySeverity["MemoryPostgresInstancesBelowDeclared"], "MemoryPostgresInstancesBelowDeclared must be critical")
+}
+
+// A single-instance project (the CR default, PgInstances unset/1) has no
+// standbys and therefore no replication slots or streaming replicas to alert
+// on. The four replication-topology alerts must NOT be generated for it - a
+// literal "< 0" or absent-series expression would be inert-by-construction
+// tech debt (hard rule 4), not a real guard. Only the general
+// MemoryPostgresInstancesBelowDeclared alert, which is meaningful even at
+// instances=1 (the lone instance itself disappearing), must be present.
+func TestMemoryPrometheusRule_SingleInstance_NoReplicationTopologyAlerts(t *testing.T) {
+	p := testProject("acme") // defaults to PgInstances=1
+	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())
+
+	names := map[string]bool{}
+	for _, r := range pr.Spec.Groups[0].Rules {
+		names[r.Alert] = true
+	}
+
+	require.True(t, names["MemoryPostgresInstancesBelowDeclared"], "MemoryPostgresInstancesBelowDeclared must exist even for a single-instance project")
+	for _, a := range []string{
+		"MemoryPostgresReplicationSlotInactive",
+		"MemoryPostgresStreamingReplicasBelowExpected",
+		"MemoryPostgresReplicationLagHigh",
+		"MemoryPostgresReplicationSlotWalRetentionHigh",
+	} {
+		require.False(t, names[a], "alert %s must NOT be generated for a single-instance project (no standbys, no slots)", a)
+	}
+
+	// The declared-count expression must compare against the literal instance
+	// count (1 here), not a hardcoded multi-instance assumption.
+	byName := map[string]string{}
+	for _, r := range pr.Spec.Groups[0].Rules {
+		byName[r.Alert] = r.Expr.StrVal
+	}
+	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "< 1", "single-instance project must compare against 1, not a multi-instance default")
+}
+
+// A multi-instance (HA) project must get the full replication alert set,
+// correctly scoped to this cluster and thresholded off its declared instance
+// count - the mechanism and metric names are lifted directly from the
+// evidence in issues #442, #444 and #448.
+func TestMemoryPrometheusRule_ReplicationAlerts_MultiInstance(t *testing.T) {
+	p := testProjectWithInstances("acme", 3)
+	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())
+
+	byName := map[string]string{}
+	bySeverity := map[string]string{}
+	byFor := map[string]string{}
+	for _, r := range pr.Spec.Groups[0].Rules {
+		byName[r.Alert] = r.Expr.StrVal
+		bySeverity[r.Alert] = r.Labels["severity"]
+		if r.For != nil {
+			byFor[r.Alert] = string(*r.For)
+		}
+	}
+
+	// MemoryPostgresInstancesBelowDeclared: fewer live cnpg instances than the
+	// Project declares (3), sustained. Guards with `or vector(0)` so a
+	// wholly-absent metric set (every instance gone) still compares as 0.
+	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "cnpg_pg_replication_in_recovery")
+	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], `pod=~"mem-acme-pg-.*"`)
+	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "or vector(0)")
+	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "< 3")
+	require.Equal(t, "30m", byFor["MemoryPostgresInstancesBelowDeclared"])
+	require.Equal(t, "critical", bySeverity["MemoryPostgresInstancesBelowDeclared"])
+
+	// MemoryPostgresReplicationSlotInactive: a declared standby's slot reads
+	// inactive - the exact #442/#444/#448 signature. Read on the primary's view
+	// of the slot (slot_name label), not on the sick standby's own status.
+	require.Contains(t, byName["MemoryPostgresReplicationSlotInactive"], "cnpg_pg_replication_slots_active")
+	require.Contains(t, byName["MemoryPostgresReplicationSlotInactive"], `slot_name=~"_cnpg_mem_acme_pg_.*"`)
+	require.Contains(t, byName["MemoryPostgresReplicationSlotInactive"], "== 0")
+	require.Equal(t, "30m", byFor["MemoryPostgresReplicationSlotInactive"])
+	require.Equal(t, "critical", bySeverity["MemoryPostgresReplicationSlotInactive"])
+
+	// MemoryPostgresStreamingReplicasBelowExpected: primary-side streaming
+	// count below instances-1 (2 standbys expected for 3 instances).
+	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], "cnpg_pg_replication_streaming_replicas")
+	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], `pod=~"mem-acme-pg-.*"`)
+	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], "or vector(0)")
+	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], "< 2")
+	require.Equal(t, "30m", byFor["MemoryPostgresStreamingReplicasBelowExpected"])
+	require.Equal(t, "critical", bySeverity["MemoryPostgresStreamingReplicasBelowExpected"])
+
+	// MemoryPostgresReplicationLagHigh: a connected-but-struggling standby.
+	require.Contains(t, byName["MemoryPostgresReplicationLagHigh"], "cnpg_pg_replication_lag")
+	require.Contains(t, byName["MemoryPostgresReplicationLagHigh"], `pod=~"mem-acme-pg-.*"`)
+	require.Contains(t, byName["MemoryPostgresReplicationLagHigh"], "> 300")
+	require.Equal(t, "15m", byFor["MemoryPostgresReplicationLagHigh"])
+	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationLagHigh"])
+
+	// MemoryPostgresReplicationSlotWalRetentionHigh: the N1 latent
+	// disk-exhaustion trap - a slot pinning WAL beyond a quarter of the
+	// project's configured (default 8Gi) WAL volume.
+	require.Contains(t, byName["MemoryPostgresReplicationSlotWalRetentionHigh"], "cnpg_pg_replication_slots_pg_wal_lsn_diff")
+	require.Contains(t, byName["MemoryPostgresReplicationSlotWalRetentionHigh"], `slot_name=~"_cnpg_mem_acme_pg_.*"`)
+	require.Contains(t, byName["MemoryPostgresReplicationSlotWalRetentionHigh"], "> 2147483648") // 8Gi / 4
+	require.Equal(t, "15m", byFor["MemoryPostgresReplicationSlotWalRetentionHigh"])
+	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationSlotWalRetentionHigh"])
 }
 
 // The postgres-layer alerts must scope their series to THIS Project's cnpg

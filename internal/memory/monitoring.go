@@ -2,9 +2,11 @@ package memory
 
 import (
 	"fmt"
+	"strings"
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -22,6 +24,12 @@ const (
 	memorySeverityCritical    = "critical"
 	memoryScrapeInterval      = monitoringv1.Duration("30s")
 	memoryScrapeTimeout       = monitoringv1.Duration("10s")
+
+	// memoryReplicationLagThresholdSeconds is how far behind (in replayed WAL
+	// time) a connected standby may sit before MemoryPostgresReplicationLagHigh
+	// fires. 5 minutes sustained for 15m is well above the sub-minute blips a
+	// routine restart/reconnect produces on this stack's write volume.
+	memoryReplicationLagThresholdSeconds = "300"
 )
 
 // dur returns a *monitoringv1.Duration for a rule "for"/group "interval" field.
@@ -127,7 +135,7 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 		Spec: monitoringv1.PrometheusRuleSpec{
 			Groups: []monitoringv1.RuleGroup{{
 				Name:  "tatara-memory.rules",
-				Rules: memoryAlertRules(n.PGCluster, cfg.Namespace),
+				Rules: memoryAlertRules(p, n.PGCluster, cfg.Namespace),
 			}},
 		},
 	}
@@ -156,16 +164,85 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 // cnpg_* metrics: those cluster-standard series are already scraped and present,
 // so the rules are live immediately and do not depend on the cnpg PodMonitor
 // (PGPodMonitor) scrape, whose cnpg_* series were still absent from Prometheus
-// during the issue #252 investigation. Replication-slot / streaming-standby
-// alerting (the wedged-standby signature of #252) is deferred until cnpg_*
-// metrics are confirmed flowing - adding rules against absent series would be
-// silently inert (hard rule 4). cluster is the cnpg Cluster name (mem-<proj>-pg)
-// and its pods/PVCs are named <cluster>-<n>[-wal]; namespace scopes the series
-// to this Project's cluster since several Projects' clusters share a namespace.
-func memoryAlertRules(cluster, namespace string) []monitoringv1.Rule {
+// during the issue #252 investigation.
+//
+// The replication-topology rules below (issues #442, #444, #448) key off
+// cnpg_* metrics directly: the deferral note that used to live here is
+// resolved - #442/#444/#448 each independently confirmed cnpg_pg_replication_*
+// series flowing live off PGPodMonitor's scrape. mem-infrastructure-pg-2 sat
+// as a permanently diverged standby - up, crash-looping 165 times, its
+// replication slot inactive and its slot's retained WAL flat rather than
+// draining - for 8h42m before anything paged, because the only existing
+// related alert (in tatara-observability, not here) keys off
+// kube_pod_container_status_waiting_reason, which cannot see a standby that is
+// up and silently not replicating. Upstream CNPG's own remediation cannot
+// self-diagnose this either: its decision is gated on reading the sick
+// instance's HTTP status endpoint, which never comes up while the container
+// is fatally exiting ~1.5s into every start (issue #448 N2). So every rule
+// below is read on metrics observable from the SURVIVING side of the
+// connection - the primary's view of its replication slots and streaming
+// replica count - never from the sick instance itself:
+//
+//   - MemoryPostgresInstancesBelowDeclared: fewer cnpg instances are reporting
+//     replication-role metrics at all than this Project declares
+//     (memory.PgInstances). Catches an instance that is fully down or
+//     crash-looping (no cnpg_* series whatsoever - #448's own evidence for
+//     mem-infrastructure-pg-2's crash-looping phase). Meaningful even for a
+//     single-instance project (the lone instance disappearing).
+//   - MemoryPostgresReplicationSlotInactive: a declared standby's replication
+//     slot reads inactive, read via the primary's pg_replication_slots view.
+//     This is the exact #442/#444/#448 signature and would have paged at the
+//     true start of the incident (18:48Z) instead of 8h42m later (03:45Z),
+//     when the standby was still up and silently failing to stream. Only
+//     generated for instances > 1 (a single-instance cluster has no slots).
+//   - MemoryPostgresStreamingReplicasBelowExpected: the primary's own
+//     streaming-replica count falls short of instances-1. A second,
+//     primary-side corroboration of the same signature, independent of
+//     whether the sick standby's own metrics exist at all. Only generated for
+//     instances > 1.
+//   - MemoryPostgresReplicationLagHigh: a standby that IS connected and
+//     streaming but is genuinely falling behind - the "still attached but
+//     struggling" case the slot/count checks above do not cover, since a
+//     lagging-but-active slot reads active=1. Only generated for instances > 1.
+//   - MemoryPostgresReplicationSlotWalRetentionHigh: a slot pinning more than a
+//     quarter of the Project's configured WAL volume (half of
+//     pgMaxSlotWalKeepSize, memory.go) - the N1 latent disk-exhaustion trap:
+//     WAL a dead/stuck slot pins reads flat only because the database is idle,
+//     and grows unbounded the moment write traffic resumes, well before
+//     MemoryPostgresVolumeFilling's 15%-free threshold or cnpg's own
+//     max_slot_wal_keep_size would forcibly invalidate the slot. Only
+//     generated for instances > 1.
+//
+// Deliberately NOT added: a per-standby cnpg_pg_replication_is_wal_receiver_up
+// check. It is materially redundant with MemoryPostgresReplicationSlotInactive
+// (both attribute to the same standby) but, unlike the slot check, requires
+// the sick instance itself to be alive enough to report it - exactly the
+// signal source issue #448 says cannot be trusted.
+//
+// A rolling restart or a deliberate scale change must not trip any of these:
+// CNPG bounces or (re)clones one instance at a time, and each rule's "for"
+// (30m for the hard down/inactive/below-expected states, 15m for the two
+// early-warning ones) rides out a single instance's restart or a freshly
+// scaled-up standby's initial base backup. instances is read from THIS
+// Project's current spec at render time, so a scale change moves the
+// threshold and the actual desired pod count together in the same reconcile -
+// there is no window where the alert compares against a stale target.
+//
+// cluster is the cnpg Cluster name (mem-<proj>-pg) and its pods/PVCs are named
+// <cluster>-<n>[-wal]; namespace scopes the series to this Project's cluster
+// since several Projects' clusters share a namespace. cnpg_* series carry no
+// "container" label (unlike the kubelet/kube-state-metrics series above), so
+// they get their own selector without container="postgres" - reusing podSelector
+// there would silently match zero series.
+func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []monitoringv1.Rule {
 	pgSelector := fmt.Sprintf(`namespace=%q, persistentvolumeclaim=~%q`, namespace, cluster+"-.*")
 	podSelector := fmt.Sprintf(`namespace=%q, pod=~%q, container="postgres"`, namespace, cluster+"-.*")
-	return []monitoringv1.Rule{
+	cnpgPodSelector := fmt.Sprintf(`namespace=%q, pod=~%q`, namespace, cluster+"-.*")
+	slotSelector := fmt.Sprintf(`namespace=%q, slot_name=~%q`, namespace, "_cnpg_"+strings.ReplaceAll(cluster, "-", "_")+"_.*")
+	instances := PgInstances(p)
+	walRetentionWarnBytes := pgSlotWalRetentionWarnBytes(p)
+
+	rules := []monitoringv1.Rule{
 		{
 			// Class-A deadman: the recall backbone has no scrape target up.
 			Alert:  "MemoryDown",
@@ -269,5 +346,125 @@ func memoryAlertRules(cluster, namespace string) []monitoringv1.Rule {
 				"description": "A cnpg postgres instance of cluster " + cluster + " has restarted more than twice in 15m. A crash-looping primary drives failover thrash and 503s on the memory write path (issues #238, #240).",
 			},
 		},
+		{
+			// count() over cnpg_pg_replication_in_recovery is a presence check: an
+			// instance that is fully down or crash-looping never runs postgres long
+			// enough to expose ANY cnpg_* metric (issue #448's own evidence: "no
+			// cnpg_* series at all for mem-infrastructure-pg-2 - it never starts").
+			// `or vector(0)` guards the case where every instance of the cluster is
+			// gone at once - count() over an empty vector yields no sample, which
+			// would otherwise silently swallow a whole-cluster outage instead of
+			// comparing it against the declared count.
+			Alert: "MemoryPostgresInstancesBelowDeclared",
+			Expr: intstr.FromString(fmt.Sprintf(
+				`(count(cnpg_pg_replication_in_recovery{%s}) or vector(0)) < %d`,
+				cnpgPodSelector, instances,
+			)),
+			For:    dur("30m"),
+			Labels: map[string]string{"severity": memorySeverityCritical},
+			Annotations: map[string]string{
+				"summary":     "postgres cluster " + cluster + " has fewer live instances than declared",
+				"description": fmt.Sprintf("Fewer than the declared %d cnpg instance(s) of cluster %s have reported replication metrics for 30m - one or more instances are down, crash-looping, or unreachable (issues #442, #444, #448).", instances, cluster),
+			},
+		},
 	}
+
+	if instances > 1 {
+		rules = append(rules,
+			monitoringv1.Rule{
+				// max by (slot_name) collapses the per-reporting-instance duplicate
+				// series (every running instance's pg_replication_slots view reports
+				// the same slot) down to one signal per standby. A slot inactive for
+				// 30m sustained is the #442/#444/#448 signature: the standby's
+				// walreceiver never attaches while the pod and the primary both look
+				// healthy elsewhere. Read via the slot_name label on whichever
+				// instance reports it (in practice the primary), so it stays
+				// observable even while the sick standby is fully dark.
+				Alert: "MemoryPostgresReplicationSlotInactive",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`max by (slot_name) (cnpg_pg_replication_slots_active{%s}) == 0`,
+					slotSelector,
+				)),
+				For:    dur("30m"),
+				Labels: map[string]string{"severity": memorySeverityCritical},
+				Annotations: map[string]string{
+					"summary":     "a replication slot of postgres cluster " + cluster + " is inactive",
+					"description": "A declared replication slot of cluster " + cluster + " has been inactive for 30m - its standby is not streaming (issues #442, #444, #448). 30m rides out a routine standby restart or a freshly scaled-up standby's initial base backup.",
+				},
+			},
+			monitoringv1.Rule{
+				// Read on the primary rather than counted per-standby, so it stays
+				// meaningful even when a standby is too dead to report anything of
+				// its own (issue #448's design note: detection must key off metrics
+				// readable on the primary, not the sick instance). `or vector(0)`
+				// covers the primary itself reporting no series at all, which must
+				// still compare as 0 streaming replicas rather than no data.
+				Alert: "MemoryPostgresStreamingReplicasBelowExpected",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`(max(cnpg_pg_replication_streaming_replicas{%s}) or vector(0)) < %d`,
+					cnpgPodSelector, instances-1,
+				)),
+				For:    dur("30m"),
+				Labels: map[string]string{"severity": memorySeverityCritical},
+				Annotations: map[string]string{
+					"summary":     "postgres cluster " + cluster + " has fewer streaming replicas than expected",
+					"description": fmt.Sprintf("The primary of cluster %s has reported fewer than %d streaming replica(s) for 30m, the count implied by its declared %d instances (issues #442, #444, #448).", cluster, instances-1, instances),
+				},
+			},
+			monitoringv1.Rule{
+				// A standby that IS connected and streaming but genuinely falling
+				// behind - the "still attached but struggling" case the slot/count
+				// checks above do not cover (a lagging-but-active slot reads active=1).
+				Alert: "MemoryPostgresReplicationLagHigh",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`max(cnpg_pg_replication_lag{%s}) > %s`,
+					cnpgPodSelector, memoryReplicationLagThresholdSeconds,
+				)),
+				For:    dur("15m"),
+				Labels: map[string]string{"severity": memorySeverityWarning},
+				Annotations: map[string]string{
+					"summary":     "a standby of postgres cluster " + cluster + " is falling behind",
+					"description": "A standby of cluster " + cluster + " has replayed WAL more than " + memoryReplicationLagThresholdSeconds + "s behind the primary, sustained for 15m - it is connected and streaming but not keeping up.",
+				},
+			},
+			monitoringv1.Rule{
+				// The N1 latent disk-exhaustion trap: a slot's retained WAL reads
+				// flat only because the database is idle, and grows unbounded the
+				// moment write traffic resumes. Thresholded off this Project's own
+				// configured WAL volume (a quarter of it - half of
+				// pgMaxSlotWalKeepSize, memory.go) rather than a hardcoded absolute,
+				// so it scales with a custom pgWalStorage and gives lead time before
+				// cnpg's own max_slot_wal_keep_size would forcibly invalidate the slot.
+				Alert: "MemoryPostgresReplicationSlotWalRetentionHigh",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`max by (slot_name) (cnpg_pg_replication_slots_pg_wal_lsn_diff{%s}) > %d`,
+					slotSelector, walRetentionWarnBytes,
+				)),
+				For:    dur("15m"),
+				Labels: map[string]string{"severity": memorySeverityWarning},
+				Annotations: map[string]string{
+					"summary":     "a replication slot of postgres cluster " + cluster + " is pinning growing WAL",
+					"description": fmt.Sprintf("A replication slot of cluster %s has retained more than %d bytes of WAL for 15m, a quarter of its configured WAL volume - the latent disk-exhaustion trap of issue #448's N1 finding, ahead of the point cnpg's own max_slot_wal_keep_size would forcibly invalidate the slot.", cluster, walRetentionWarnBytes),
+				},
+			},
+		)
+	}
+
+	return rules
+}
+
+// pgSlotWalRetentionWarnBytes is the early-warning threshold for a single
+// replication slot's retained WAL: one quarter of the Project's configured WAL
+// volume, i.e. half of pgMaxSlotWalKeepSize (memory.go) - the point at which
+// cnpg itself invalidates a slot rather than let it fill the volume (issue
+// #240). Warning here gives an operator time to intervene (drop the stale
+// slot, fix the standby) before that self-protection forces a disruptive
+// re-clone. Falls back to a quarter of the 8Gi default if the configured size
+// cannot be parsed, mirroring pgMaxSlotWalKeepSize's own fallback.
+func pgSlotWalRetentionWarnBytes(p *tatarav1alpha1.Project) int64 {
+	q, err := resource.ParseQuantity(pgWalStorage(p))
+	if err != nil {
+		q = resource.MustParse(defaultPgWalStorage)
+	}
+	return q.Value() / 4
 }
