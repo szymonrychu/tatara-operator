@@ -243,12 +243,16 @@ func TestMemoryPrometheusRule_ReplicationAlerts_MultiInstance(t *testing.T) {
 	require.Equal(t, "30m", byFor["MemoryPostgresStreamingReplicasBelowExpected"])
 	require.Equal(t, "critical", bySeverity["MemoryPostgresStreamingReplicasBelowExpected"])
 
-	// MemoryPostgresReplicationLagHigh does not exist: tried and removed after
-	// live-verifying it false-fires on a write-idle-but-healthy standby
-	// (cnpg_pg_replication_lag climbs unbounded with wall-clock time whenever
-	// there is nothing new to replay, independent of replication health). See
-	// MEMORY.md 2026-07-26 for the full evidence and the redundancy argument
-	// against a byte-diff-gated version.
+	// MemoryPostgresReplicationLagHigh does not exist: tried and removed on
+	// STRUCTURAL grounds (cnpg_pg_replication_lag computes now() minus the
+	// standby's own last-replay timestamp, which grows unbounded with
+	// wall-clock time on a genuinely write-idle stream, independent of
+	// replication health) - not because it was observed misfiring on this
+	// cluster. Re-examined: this cluster was never actually write-idle during
+	// the periods checked, and the metric's one sustained non-zero reading
+	// here was a real, ongoing standby stall (the same one
+	// MemoryPostgresStandbyReplayStalled below now targets), a true positive,
+	// not noise. See MEMORY.md 2026-07-26 for the full evidence.
 	require.NotContains(t, byName, "MemoryPostgresReplicationLagHigh")
 
 	// MemoryPostgresReplicationSlotWalRetentionHigh: the N1 latent

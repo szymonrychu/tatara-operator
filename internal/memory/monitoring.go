@@ -28,11 +28,16 @@ const (
 	// memoryReplayStalledThresholdSeconds is how long a standby may show zero
 	// replay progress (cnpg_pg_stat_replication_replay_lag_seconds, read on the
 	// PRIMARY via pg_stat_replication) before MemoryPostgresStandbyReplayStalled
-	// fires. Unlike the removed standby-self-reported lag metric, this one reads
-	// 0 through genuine idle periods (live-verified across the full 24h
-	// retention window, including the exact idle stretch that broke the old
-	// metric), so the threshold only needs to bound a REAL stall, not guard
-	// against idle drift.
+	// fires. The removed standby-self-reported lag metric was structurally
+	// unsafe (it computes now() - pg_last_xact_replay_timestamp(), which grows
+	// without bound on a truly write-idle stream regardless of replication
+	// health) - but this stack's live data never actually exercised that idle
+	// growth: every non-zero reading found was either a genuine sub-scrape
+	// promotion blip or the real ongoing stall this rule now targets. This
+	// metric reads 0 for as long as a standby has no pending replication work
+	// (live-verified across the ~20.2h retention window this cluster carries),
+	// which is a stronger, structural guarantee than "happened to be 0 in the
+	// window checked" - so the threshold only needs to bound a REAL stall.
 	memoryReplayStalledThresholdSeconds = "300"
 )
 
@@ -270,35 +275,59 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 // MemoryPostgresStreamingReplicasBelowExpected's outer `or vector(0)` fires
 // anyway (needed so a wholly-gone cluster still compares as 0) with a
 // misleading "fewer streaming replicas than expected" message when the real
-// fault is "the primary's collector is down." One page, two dark rules.
-// Verified NOT to have occurred, in the operationally meaningful sense, on
-// either live multi-instance cluster: cnpg_collector_up has read a
-// continuous 1 on every reporting pod across the full 24h window checked
-// (the only 0 samples are single-sample edge artifacts at the exact
-// boundary of the query window, consistent with a pod's series not yet
-// having history at that instant, not a mid-window outage). So this is
-// recorded as a known trade-off, not fixed here - closing it needs a
-// collector-health precondition on all four rules, a
-// larger change than this alerting-only pass.
+// fault is "the primary's collector is down." One page, two dark rules. THIS
+// FAILURE CLASS IS LIVE ON THIS CLUSTER RIGHT NOW, just not on an instance
+// count where the coupling currently bites: mem-mtg-pg-1's cnpg_collector_up
+// has read a sustained 0 for ~11h (live-verified: 1 until ~12:40Z, 0
+// continuously from there to now), a genuine mid-window outage, not an edge
+// artifact - but mem-mtg-pg is single-instance, so none of the three
+// affected rules are generated for it and no misleading page results today.
+// The part of this claim that IS load-bearing for the multi-instance rules
+// above - that both CURRENT PRIMARIES of the live multi-instance clusters
+// (mem-tatara-pg-2, mem-infrastructure-pg-1) have stayed continuously
+// scrapeable with a healthy collector for the full window checked - is true
+// and separately confirmed. So the gap is real, its risk is not
+// hypothetical (a real project on this cluster is in exactly this state
+// today), and it is recorded as a known trade-off, not fixed here - closing
+// it needs a collector-health precondition on all four cnpg_pg_*-keyed
+// rules, a larger change than this alerting-only pass.
 //
 // Deliberately NOT added: a per-standby cnpg_pg_replication_is_wal_receiver_up
 // check (redundant with MemoryPostgresReplicationSlotInactive, but unlike the
 // slot check requires the sick instance itself to be alive enough to report -
 // exactly the signal source issue #448 says cannot be trusted), and a
 // standby-side cnpg_pg_replication_lag ("time since last replay",
-// self-reported by the standby) rule. That metric was tried and REMOVED:
-// live-verified false-firing on mem-tatara-pg during a write-idle window (it
-// grows unbounded with wall-clock time whenever there is simply nothing new
-// to replay, independent of replication health - not a sustained-window
-// fluke, since a PRIOR flat-zero 3h idle observation had wrongly been taken
-// as proof the metric was safe). MemoryPostgresStandbyReplayStalled above
-// replaces it with a DIFFERENT metric family - cnpg_pg_stat_replication_*,
-// read on the primary via pg_stat_replication rather than self-reported by
-// the standby - live-verified flat 0 for the full 24h retention window on
-// every healthy standby, including through the exact idle stretch that broke
-// the removed metric, because it measures pending replication WORK (bytes/
-// time actually behind), not wall-clock time since an arbitrary last event.
-// Full evidence trail: MEMORY.md, 2026-07-26.
+// self-reported by the standby) rule. That metric was tried and REMOVED, on
+// STRUCTURAL grounds: CNPG's `pg_replication` collector computes it as
+// `now() - pg_last_xact_replay_timestamp()`, which genuinely does grow
+// without bound on a truly write-idle stream regardless of replication
+// health, because "no new transaction" and "stopped replaying" are
+// indistinguishable to that formula. NOT because this stack's own data
+// showed it misfiring: re-examined, this stack was never actually
+// write-idle during the observation window (this cluster's primary kept
+// generating new WAL throughout - see the corollary below), and every
+// non-zero reading the removed metric produced here was either a genuine
+// sub-scrape post-promotion blip (mem-infrastructure-pg-3, one 30s sample at
+// 591s, gone by the next scrape, invisible at the rule's own 120s+ scrape
+// cadence) or the SAME real, ongoing standby stall MemoryPostgresStandbyReplayStalled
+// now targets (mem-tatara-pg-1's reading tracked
+// cnpg_pg_stat_replication_replay_lag_seconds in lockstep once the stall
+// began) - i.e. the removed rule's one sustained exceedance in this data was
+// a TRUE positive, not noise. The removal stands on the structural argument
+// alone, which needs no cherry-picked incident to justify it.
+// MemoryPostgresStandbyReplayStalled above replaces it with a DIFFERENT
+// metric family - cnpg_pg_stat_replication_*, read on the primary via
+// pg_stat_replication rather than self-reported by the standby - which is
+// safe by construction rather than merely safe in the window checked: it
+// measures pending replication WORK (bytes/time actually behind), so it
+// reads 0 whenever a standby has nothing outstanding, with no dependency on
+// wall-clock time since an arbitrary last event. Corollary worth recording:
+// this project is NOT write-idle - cnpg_pg_stat_replication_sent_diff_bytes
+// for mem-tatara-pg-1 read a flat 0 throughout (the primary has transmitted
+// everything it has generated) while replay_diff_bytes climbed from ~1.2GB
+// to ~2.8GB across the same hour, meaning the primary kept producing new WAL
+// continuously; the gap is entirely in the standby's own replay/apply step,
+// not in write volume. Full evidence trail: MEMORY.md, 2026-07-26.
 //
 // A rolling restart or a deliberate scale change must not trip any of these:
 // CNPG bounces or (re)clones one instance at a time. MemoryPostgresInstancesBelowDeclared
@@ -550,12 +579,14 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 				// slot metrics above it needs no `and on(pod)` guard: there is no
 				// non-primary reporter to be wrong. Chose the TIME form over the
 				// sibling cnpg_pg_stat_replication_replay_diff_bytes metric: both
-				// are live-verified idle-immune (flat 0 for the full 24h window
-				// including the idle stretch that broke the removed self-reported
-				// lag metric), so the choice is legibility, not safety - "no replay
-				// progress for N minutes" reads directly in an alert annotation
-				// without needing to know this project's WAL volume or write rate,
-				// where a byte threshold would need the same per-project scaling
+				// are live-verified idle-immune BY CONSTRUCTION (they measure
+				// pending replication work, not wall-clock time since an event),
+				// confirmed flat 0 on every healthy standby across the full
+				// ~20.2h retention window this cluster carries, so the choice
+				// between them is legibility, not safety - "no replay progress
+				// for N minutes" reads directly in an alert annotation without
+				// needing to know this project's WAL volume or write rate, where
+				// a byte threshold would need the same per-project scaling
 				// pgSlotWalRetentionWarnBytes already does for a different metric.
 				Alert: "MemoryPostgresStandbyReplayStalled",
 				Expr: intstr.FromString(fmt.Sprintf(
