@@ -1086,6 +1086,51 @@ func (r *ProjectReconciler) projectRepoSlugs(ctx context.Context, proj *tatarav1
 	return slugs
 }
 
+// earliestIssueScanFire computes the TRUE next-expected issueScan/sweep fire:
+// the earliest, across every enrolled repo, of that repo's phase-shifted fire -
+// the exact scanOffset/repoNextFire arithmetic reposDueForScan itself drives
+// issueScan/sweep through (issue #181's fan-out spread: each repo fires at
+// sched.Next(base-offset)+offset, offset = a deterministic hash in [0, period)
+// of (project, repo, activity), not at the raw unshifted cron boundary).
+// nextExpectedUnix's plain sched.Next(base) is correct for brainstorm and
+// documentation, which run through activityDue with no per-repo offset, but it
+// is NOT when issueScan/sweep runs - a project whose minimum hashed offset
+// exceeds the consumer's grace period would otherwise false-page every cycle
+// (review finding, tatara-observability#65 follow-up).
+//
+// ok=false, no series to publish, in the same three cases nextExpectedUnix
+// covers plus one: empty (disabled) schedule; unparseable schedule (cronErr
+// non-nil, so the caller can meter invalid_cron - the only ok=false case that
+// is an error); and zero enrolled repos, where a valid cron simply has no
+// repo to ever fire for. That third case is new here (nextExpectedUnix has no
+// repo-shaped input to be missing) and is deliberately NOT metered as
+// invalid_cron: an empty repo list is a configuration state, not a broken one.
+func earliestIssueScanFire(proj *tatarav1alpha1.Project, schedule string, repos []tatarav1alpha1.Repository, last *metav1.Time) (value float64, ok bool, cronErr error) {
+	if schedule == "" {
+		return 0, false, nil
+	}
+	sched, err := cron.ParseStandard(schedule)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(repos) == 0 {
+		return 0, false, nil
+	}
+	base := proj.CreationTimestamp.Time
+	if last != nil {
+		base = last.Time
+	}
+	period := cronPeriod(sched, base)
+	var earliest time.Time
+	for i := range repos {
+		off := scanOffset(proj.Name, repos[i].Name, "issueScan", period)
+		if fire := repoNextFire(sched, off, base); earliest.IsZero() || fire.Before(earliest) {
+			earliest = fire
+		}
+	}
+	return float64(earliest.Unix()), true, nil
+}
+
 // publishNextExpected republishes obs.SweepNextExpectedTimestamp for every
 // ENABLED activity of proj, and meters invalid_cron for an unparseable one. It is
 // the single site that meters invalid_cron for a cron activity: the three
@@ -1095,38 +1140,64 @@ func (r *ProjectReconciler) projectRepoSlugs(ctx context.Context, proj *tatarav1
 // Enablement is re-checked exactly as runScans checks it below. An activity that
 // is configured but switched off must publish NO series - a next-expected-run for
 // a run that is never going to happen is the false page this metric exists to
-// remove.
+// remove. That covers the never-enabled case; it is not sufficient on its own
+// for the enabled-then-disabled transition, because a GaugeVec child, once
+// created, stays exported at its last value for the life of the process -
+// disabling brainstorm, clearing the sweep-disabled annotation on, or clearing
+// Documentation.Repo would otherwise leave a frozen timestamp that reads as
+// ever-more-overdue and false-pages forever (review finding). Every branch below
+// therefore has an explicit else that actively retracts its series via
+// DeleteLabelValues, the same idiom used at
+// internal/obs/task_metrics.go:DeleteTaskSeries and
+// internal/obs/merge_metrics.go:ClearMergeCursorStalled.
 //
 // runScans defers this so it runs on every exit path AND reads the Status.Last*
 // stamps stampScan has already advanced in place this tick. Publishing at the top
 // instead would leave the gauge stale for up to maxScheduleRequeue (6h), longer
 // than the alert's 3h grace.
-func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project) {
+func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository) {
 	c := proj.Spec.Scm.Cron
 
 	if SweepEnabled(proj) {
-		if next, ok := nextExpectedUnix(proj, c.IssueScan.Schedule, proj.Status.LastIssueScan); ok {
+		if next, ok, cronErr := earliestIssueScanFire(proj, c.IssueScan.Schedule, repos, proj.Status.LastIssueScan); ok {
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "issueScan").Set(next)
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, SweepActivity).Set(next)
-		} else if c.IssueScan.Schedule != "" {
-			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "invalid_cron").Inc()
+		} else {
+			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "issueScan")
+			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, SweepActivity)
+			if cronErr != nil {
+				obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "invalid_cron").Inc()
+			}
 		}
+	} else {
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "issueScan")
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, SweepActivity)
 	}
 
 	if c.Brainstorm.Enabled {
 		if next, ok := nextExpectedUnix(proj, c.Brainstorm.Schedule, proj.Status.LastBrainstorm); ok {
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "brainstorm").Set(next)
-		} else if c.Brainstorm.Schedule != "" {
-			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "invalid_cron").Inc()
+		} else {
+			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "brainstorm")
+			if c.Brainstorm.Schedule != "" {
+				obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "invalid_cron").Inc()
+			}
 		}
+	} else {
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "brainstorm")
 	}
 
 	if doc := proj.Spec.Documentation; doc != nil && doc.Enabled && doc.Repo != "" {
 		if next, ok := nextExpectedUnix(proj, c.Documentation.Schedule, proj.Status.LastDocumentation); ok {
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "documentation").Set(next)
-		} else if c.Documentation.Schedule != "" {
-			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "documentation", "invalid_cron").Inc()
+		} else {
+			obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "documentation")
+			if c.Documentation.Schedule != "" {
+				obs.SweepErrorsTotal.WithLabelValues(proj.Name, "documentation", "invalid_cron").Inc()
+			}
 		}
+	} else {
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "documentation")
 	}
 }
 
@@ -1138,7 +1209,16 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil || r.ReaderFor == nil {
 		return 0, nil
 	}
-	defer r.publishNextExpected(proj)
+	// repos is populated below (after the reader/list-repos calls) but must be
+	// in scope for the defer now: publishNextExpected's issueScan/sweep branch
+	// needs the enrolled repo list to compute the true phase-shifted next fire
+	// (review finding: the raw unshifted cron boundary is not when issueScan
+	// actually runs). Captured by the closure, not passed by value, so the
+	// defer sees whatever repos holds at return time - nil on an early return
+	// before the list call succeeds, which publishNextExpected treats the same
+	// as a genuinely repo-less project: no series for that tick.
+	var repos []tatarav1alpha1.Repository
+	defer func() { r.publishNextExpected(proj, repos) }()
 
 	// Rehydrate the sweep heartbeat gauge from the persisted Status.Last* stamps
 	// on every reconcile (fix #386): obs.SweepLastSuccessTimestamp is process-
@@ -1187,7 +1267,8 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		l.Error(rerr, "scan: resolve reader", "action", "scan_reader_error", "resource_id", proj.Name)
 		return maxScheduleRequeue, nil
 	}
-	repos, err := r.projectReposForScan(ctx, proj)
+	var err error
+	repos, err = r.projectReposForScan(ctx, proj)
 	if err != nil {
 		return 0, err
 	}
