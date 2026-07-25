@@ -110,7 +110,7 @@ func TestStampScanSetsHeartbeatGauge(t *testing.T) {
 
 	before := time.Now().Unix()
 	require.NoError(t, r.stampScan(ctx, proj, "brainstorm"))
-	got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("brainstorm"))
+	got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("stamp-heartbeat-proj", "brainstorm"))
 	require.GreaterOrEqual(t, got, float64(before),
-		"obs.SweepLastSuccessTimestamp{activity=brainstorm} must be set on a successful stampScan")
+		"obs.SweepLastSuccessTimestamp{project=stamp-heartbeat-proj,activity=brainstorm} must be set on a successful stampScan")
 }

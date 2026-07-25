@@ -475,7 +475,7 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 	if err != nil {
 		return err
 	}
-	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
+	obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, activity).Set(float64(now.Unix()))
 	return nil
 }
 
@@ -1081,16 +1081,20 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// project is scanning fine, and TataraLoopStalled's alertOnNoData fires a
 	// false positive. A never-scanned project (nil stamp) is correctly left
 	// unset - that IS true NoData.
+	//
+	// Every write here is per-PROJECT (issue #441). This block runs on EVERY
+	// Project's reconcile, so before `project` joined the label set the three
+	// Projects overwrote one series in turn.
 	if proj.Status.LastIssueScan != nil {
 		ts := float64(proj.Status.LastIssueScan.Unix())
-		obs.SweepLastSuccessTimestamp.WithLabelValues("issueScan").Set(ts)
-		obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(ts)
+		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "issueScan").Set(ts)
+		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, SweepActivity).Set(ts)
 	}
 	if proj.Status.LastBrainstorm != nil {
-		obs.SweepLastSuccessTimestamp.WithLabelValues("brainstorm").Set(float64(proj.Status.LastBrainstorm.Unix()))
+		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "brainstorm").Set(float64(proj.Status.LastBrainstorm.Unix()))
 	}
 	if proj.Status.LastDocumentation != nil {
-		obs.SweepLastSuccessTimestamp.WithLabelValues("documentation").Set(float64(proj.Status.LastDocumentation.Unix()))
+		obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, "documentation").Set(float64(proj.Status.LastDocumentation.Unix()))
 	}
 
 	cronSpec := proj.Spec.Scm.Cron
@@ -1140,7 +1144,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				if serr := r.stampScan(ctx, proj, "issueScan"); serr != nil {
 					l.Error(serr, "scan: persist sweep stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", SweepActivity)
-					obs.SweepErrorsTotal.WithLabelValues("issueScan", "stamp_failed").Inc()
+					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "stamp_failed").Inc()
 				}
 				if _, next2, ok2 := r.reposDueForScan(proj, "issueScan", repos, now); ok2 {
 					consider(next2)
@@ -1151,7 +1155,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		} else if cronSpec.IssueScan.Schedule != "" {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.IssueScan.Schedule), "scan: invalid issueScan cron, disabling",
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "issueScan")
-			obs.SweepErrorsTotal.WithLabelValues("issueScan", "invalid_cron").Inc()
+			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "invalid_cron").Inc()
 		}
 	}
 
@@ -1170,7 +1174,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					terminal, terr := r.latestTerminalRefineTask(ctx, proj, base)
 					if terr != nil {
 						l.Error(terr, "scan: check terminal refine task", "action", "scan_refine_error", "resource_id", proj.Name)
-						obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_check_failed").Inc()
+						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_check_failed").Inc()
 					}
 					if terminal != nil {
 						// Stamp LastRefine and fall through to brainstorm.
@@ -1182,7 +1186,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 						inflight, ierr := r.inflightRefineTask(ctx, proj)
 						if ierr != nil {
 							l.Error(ierr, "scan: check inflight refine task", "action", "scan_refine_error", "resource_id", proj.Name)
-							obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_inflight_check_failed").Inc()
+							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_inflight_check_failed").Inc()
 						}
 						if inflight == nil {
 							slugs := r.projectRepoSlugs(ctx, proj, repos)
@@ -1203,13 +1207,13 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 							l.Info("scan: brainstorm refine barrier max-hold exceeded; releasing",
 								"action", "scan_refine_barrier_timeout", "resource_id", proj.Name,
 								"held_duration", held.String())
-							obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout").Inc()
+							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_barrier_timeout").Inc()
 						} else {
 							// Defer brainstorm until refine is terminal; poll at the barrier cadence.
 							l.Info("scan: brainstorm deferred by refine barrier",
 								"action", "scan_brainstorm_refine_barrier_held", "resource_id", proj.Name,
 								"held_duration", held.String())
-							obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held").Inc()
+							obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "refine_barrier_held").Inc()
 							proceed = false
 							consider(now.Add(requeueRefineBarrier))
 						}
@@ -1220,7 +1224,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
 						l.Error(serr, "scan: persist brainstorm stamp failed",
 							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
-						obs.SweepErrorsTotal.WithLabelValues("brainstorm", "stamp_failed").Inc()
+						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "stamp_failed").Inc()
 					}
 					if next2, ok2 := activityNextFire(cronSpec.Brainstorm.Schedule, now); ok2 {
 						consider(next2)
@@ -1232,7 +1236,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		} else if cronSpec.Brainstorm.Schedule != "" {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Brainstorm.Schedule), "scan: invalid brainstorm cron, disabling",
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "brainstorm")
-			obs.SweepErrorsTotal.WithLabelValues("brainstorm", "invalid_cron").Inc()
+			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "invalid_cron").Inc()
 		}
 	}
 
@@ -1259,7 +1263,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 				if serr := r.stampScan(ctx, proj, "documentation"); serr != nil {
 					l.Error(serr, "scan: persist documentation stamp failed",
 						"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "documentation")
-					obs.SweepErrorsTotal.WithLabelValues("documentation", "stamp_failed").Inc()
+					obs.SweepErrorsTotal.WithLabelValues(proj.Name, "documentation", "stamp_failed").Inc()
 				}
 				if next2, ok2 := activityNextFire(cronSpec.Documentation.Schedule, now); ok2 {
 					consider(next2)
@@ -1270,7 +1274,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		} else {
 			l.Error(fmt.Errorf("invalid cron %q", cronSpec.Documentation.Schedule), "scan: invalid documentation cron, disabling",
 				"action", "scan_cron_invalid", "resource_id", proj.Name, "activity", "documentation")
-			obs.SweepErrorsTotal.WithLabelValues("documentation", "invalid_cron").Inc()
+			obs.SweepErrorsTotal.WithLabelValues(proj.Name, "documentation", "invalid_cron").Inc()
 		}
 	}
 

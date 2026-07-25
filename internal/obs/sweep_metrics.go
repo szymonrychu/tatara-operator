@@ -50,17 +50,66 @@ var SweepMintCapHitTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 // every runScans reconcile (fix #386), not only stamped on a freshly-run
 // pass; an absent series still means that activity has never completed at
 // all, never scanned or rehydrated.
+//
+// `project` is positionally FIRST and is always proj.Name. Without it (issue
+// #441) all three Projects wrote one series: the rehydration below runs on every
+// Project's reconcile, so the series moved backward and forward - one activity
+// cycled through three values within 8 seconds and then held for four hours -
+// and a Project whose cron was genuinely dead was masked by a healthy sibling's
+// write. The fix is the label set, not backward-movement detection; that is the
+// confirmed practice (temporalio/temporal#9600) and no source supports alerting
+// on non-monotonicity.
 var SweepLastSuccessTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "operator_sweep_last_success_timestamp_seconds",
-	Help: "Unix timestamp of the last completed pass, by activity (contract K.1): liveness (per-item-error-tolerant) for sweep/nightlySweep, zero-error for brainstorm/documentation/issueScan.",
-}, []string{"activity"})
+	Help: "Unix timestamp of the last completed pass, by project and activity (contract K.1): liveness (per-item-error-tolerant) for sweep/nightlySweep, zero-error for brainstorm/documentation/issueScan.",
+}, []string{"project", "activity"})
 
-// SweepErrorsTotal counts sweep failures by activity and reason. Every reason is
-// a closed-set string, so the label never takes a forge error message.
+// SweepErrorsTotal counts sweep failures by project, activity and reason. Every
+// reason is a closed-set string, so the label never takes a forge error message.
 var SweepErrorsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "operator_sweep_errors_total",
-	Help: "Sweep errors, by activity and reason (contract K.1).",
-}, []string{"activity", "reason"})
+	Help: "Sweep errors, by project, activity and reason (contract K.1).",
+}, []string{"project", "activity", "reason"})
+
+// sweepSeedReasons is the closed fail(reason, ...) set for sweep.go's B.4 pass
+// (SweepActivity/SweepNightlyActivity), plus list_tasks. Literal here (not
+// imported from internal/controller) to avoid a reverse import; keep in sync
+// with sweep.go's constants and its fail(reason, ...) call sites.
+var sweepSeedReasons = []string{
+	"list_tasks", "owner_repo", "list_issues", "list_prs", "get_issue_cr",
+	"list_comments", "get_issue", "mint_issue_task", "clear_webhook_marker",
+	"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
+}
+
+// scanSeedReasons is the second closed reason set, for projectscan.go's cron
+// activities (issue #401's refine-barrier stall fix). Cross-seeded for all three
+// activities even though refine_barrier_* / refine_*_check_failed only ever fire
+// for brainstorm (the refine pre-scan barrier is brainstorm-only) - a
+// permanently-zero series for documentation/issueScan on those reasons is a
+// harmless baseline, and one seedLabels call is simpler than splitting the cross
+// product per-activity.
+var scanSeedReasons = []string{
+	"refine_barrier_held", "refine_check_failed", "refine_inflight_check_failed",
+	"invalid_cron", "stamp_failed", "refine_barrier_timeout",
+}
+
+// SeedSweepErrorsForProject pre-seeds the closed (activity x reason) label set of
+// SweepErrorsTotal for ONE project, so a healthy sweep with zero errors still
+// exposes a zero baseline and increase(operator_sweep_errors_total[1h]) is
+// well-defined from that project's first reconcile rather than from its first
+// error (a CounterVec with no WithLabelValues call has NO series at all;
+// metric-wiring audit, issue #370).
+//
+// This used to run in init(). It cannot any more: `project` joined the label set
+// in issue #441 and project names are not known at process start. The Project
+// reconciler calls this on every pass; WithLabelValues returns the existing child
+// for an already-seeded combination, so it is idempotent and cheap (44 map
+// lookups per Project per reconcile).
+func SeedSweepErrorsForProject(project string) {
+	seed := func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) }
+	seedLabels(seed, []string{project}, []string{"sweep", "nightlySweep"}, sweepSeedReasons)
+	seedLabels(seed, []string{project}, []string{"brainstorm", "documentation", "issueScan"}, scanSeedReasons)
+}
 
 func init() {
 	ctrlmetrics.Registry.MustRegister(
@@ -68,36 +117,5 @@ func init() {
 		SweepMintCapHitTotal,
 		SweepLastSuccessTimestamp,
 		SweepErrorsTotal,
-	)
-	// Pre-seed the closed (activity x reason) label set so a healthy sweep
-	// with zero errors still exposes a zero baseline - a CounterVec with no
-	// WithLabelValues call has NO series at all, and the TataraSweepErrors
-	// alert would undercount the first evaluation of a real error storm
-	// (metric-wiring audit, issue #370). activity/reason are literal here
-	// (not imported from internal/controller) to avoid a reverse import;
-	// keep in sync with sweep.go's SweepActivity/SweepNightlyActivity
-	// constants and its fail(reason, ...) call sites.
-	seedLabels(func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) },
-		[]string{"sweep", "nightlySweep"},
-		[]string{
-			"list_tasks", "owner_repo", "list_issues", "list_prs", "get_issue_cr",
-			"list_comments", "get_issue", "mint_issue_task", "clear_webhook_marker",
-			"get_owning_task", "get_mr_cr", "adopt_pr", "mint_review_task",
-		},
-	)
-	// Second closed (activity x reason) set for the projectscan.go cron
-	// activities (brainstorm/documentation/issueScan), added for the
-	// refine-barrier stall fix (issue #401). Cross-seeded for all three
-	// activities even though refine_barrier_* / refine_*_check_failed only
-	// ever fire for brainstorm (the refine pre-scan barrier is brainstorm-only)
-	// - a permanently-zero series for documentation/issueScan on those reasons
-	// is a harmless baseline, and a single seedLabels call here is simpler than
-	// splitting the cross product per-activity.
-	seedLabels(func(l ...string) { SweepErrorsTotal.WithLabelValues(l...) },
-		[]string{"brainstorm", "documentation", "issueScan"},
-		[]string{
-			"refine_barrier_held", "refine_check_failed", "refine_inflight_check_failed",
-			"invalid_cron", "stamp_failed", "refine_barrier_timeout",
-		},
 	)
 }

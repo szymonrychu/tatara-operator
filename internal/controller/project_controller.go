@@ -210,6 +210,12 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("get project: %w", err)
 	}
 
+	// Seed this Project's closed (activity x reason) SweepErrorsTotal set. The
+	// seeding used to run in obs.init(); `project` joined that metric's label set
+	// in issue #441 and project names are not known at process start, so it moved
+	// here. Idempotent: WithLabelValues returns the existing child.
+	obs.SeedSweepErrorsForProject(project.Name)
+
 	reason, message, ready := r.validateSecret(ctx, &project)
 
 	project.Status.WebhookURL = fmt.Sprintf("%s/%s", r.ExternalWebhookBase, project.Name)

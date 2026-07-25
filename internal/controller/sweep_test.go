@@ -1186,10 +1186,10 @@ func TestSweepHeartbeat(t *testing.T) {
 	repo := sweepRepo("hb-proj")
 	c := newMirrorClient(t, proj, repo)
 
-	obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(0)
+	obs.SweepLastSuccessTimestamp.WithLabelValues("hb-proj", SweepActivity).Set(0)
 	runSweep(t, c, proj, repo, &sweepReader{})
 
-	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity)); got <= 0 {
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("hb-proj", SweepActivity)); got <= 0 {
 		t.Fatalf("operator_sweep_last_success_timestamp_seconds{activity=sweep} = %v, want a stamped timestamp", got)
 	}
 }
@@ -1214,13 +1214,13 @@ func TestSweepHeartbeatStampsDespitePerItemError(t *testing.T) {
 		listCommentsErr: errors.New("injected forge failure"),
 	}
 
-	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(0)
+	obs.SweepLastSuccessTimestamp.WithLabelValues("hb-err-proj", activity).Set(0)
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
 	err := r.SweepProject(context.Background(), proj, rd, []tatarav1alpha1.Repository{*repo}, nil, activity)
 	if err == nil {
 		t.Fatal("SweepProject returned nil, want the per-item error propagated for the reconciler requeue")
 	}
-	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(activity)); got <= 0 {
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("hb-err-proj", activity)); got <= 0 {
 		t.Fatalf("heartbeat = %v, want it stamped despite the per-item error (liveness is not zero-error)", got)
 	}
 }
@@ -1248,17 +1248,17 @@ func TestSweepHeartbeatSuppressedOnHardFailure(t *testing.T) {
 		}).
 		Build()
 
-	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(activity, "list_tasks"))
-	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(0)
+	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("hb-hard-proj", activity, "list_tasks"))
+	obs.SweepLastSuccessTimestamp.WithLabelValues("hb-hard-proj", activity).Set(0)
 	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
 	err := r.SweepProject(context.Background(), proj, &sweepReader{}, []tatarav1alpha1.Repository{*repo}, nil, activity)
 	if err == nil {
 		t.Fatal("SweepProject returned nil, want the activeTaskCount failure")
 	}
-	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(activity)); got != 0 {
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("hb-hard-proj", activity)); got != 0 {
 		t.Fatalf("heartbeat = %v, want 0 (a sweep that cannot run must NOT stamp liveness)", got)
 	}
-	if after := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues(activity, "list_tasks")); after <= before {
+	if after := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("hb-hard-proj", activity, "list_tasks")); after <= before {
 		t.Fatalf("operator_sweep_errors_total{reason=list_tasks} did not increment (%v -> %v)", before, after)
 	}
 }
@@ -1669,7 +1669,7 @@ func TestSweepOrphanExternalMRCommentConvergesInOnePass(t *testing.T) {
 // exact label combination somewhere (init-time seeding or a real increment) -
 // calling WithLabelValues ourselves here would lazily create it and defeat the
 // point of the check, so this walks the gathered families instead.
-func sweepErrorsTotalSeries(t *testing.T, activity, reason string) bool {
+func sweepErrorsTotalSeries(t *testing.T, project, activity, reason string) bool {
 	t.Helper()
 	families, err := ctrlmetrics.Registry.Gather()
 	if err != nil {
@@ -1680,16 +1680,18 @@ func sweepErrorsTotalSeries(t *testing.T, activity, reason string) bool {
 			continue
 		}
 		for _, m := range fam.GetMetric() {
-			var gotActivity, gotReason string
+			var gotProject, gotActivity, gotReason string
 			for _, lp := range m.GetLabel() {
 				switch lp.GetName() {
+				case "project":
+					gotProject = lp.GetValue()
 				case "activity":
 					gotActivity = lp.GetValue()
 				case "reason":
 					gotReason = lp.GetValue()
 				}
 			}
-			if gotActivity == activity && gotReason == reason {
+			if gotProject == project && gotActivity == activity && gotReason == reason {
 				return true
 			}
 		}
@@ -1697,14 +1699,16 @@ func sweepErrorsTotalSeries(t *testing.T, activity, reason string) bool {
 	return false
 }
 
-// TestSweepErrorsSeededForBrainstormReasons: the projectscan.go refine-barrier
-// instrumentation (issue #401) adds a closed reason set that must be
-// pre-seeded at startup for brainstorm/documentation/issueScan, same rationale
-// as the sweep/nightlySweep seeding above (obs/sweep_metrics.go init) - a
-// CounterVec with no WithLabelValues call has NO series at all, and the first
-// real evaluation of a TataraSweepErrors-style alert would undercount an
-// error storm that started before any of these reasons had fired once.
-func TestSweepErrorsSeededForBrainstormReasons(t *testing.T) {
+// TestSweepErrorsSeededForProject: the seeding that used to run at init() moved
+// to the Project reconcile path when `project` joined the label set (issue
+// #441) - project names are not known at process start. A CounterVec with no
+// WithLabelValues call has NO series at all, so without this the first real
+// evaluation of the sweep-error alert would undercount an error storm that
+// started before any of these reasons had fired once.
+func TestSweepErrorsSeededForProject(t *testing.T) {
+	const project = "seeded-scan-proj"
+	obs.SeedSweepErrorsForProject(project)
+
 	activities := []string{"brainstorm", "documentation", "issueScan"}
 	reasons := []string{
 		"refine_barrier_held",
@@ -1716,9 +1720,50 @@ func TestSweepErrorsSeededForBrainstormReasons(t *testing.T) {
 	}
 	for _, activity := range activities {
 		for _, reason := range reasons {
-			if !sweepErrorsTotalSeries(t, activity, reason) {
-				t.Errorf("SweepErrorsTotal{activity=%s,reason=%s} has no series; want it pre-seeded at init", activity, reason)
+			if !sweepErrorsTotalSeries(t, project, activity, reason) {
+				t.Errorf("SweepErrorsTotal{project=%s,activity=%s,reason=%s} has no series; want it seeded per project",
+					project, activity, reason)
 			}
 		}
+	}
+	if !sweepErrorsTotalSeries(t, project, SweepActivity, "list_tasks") {
+		t.Errorf("SweepErrorsTotal{project=%s,activity=%s,reason=list_tasks} has no series; want the sweep reason set seeded too",
+			project, SweepActivity)
+	}
+	if sweepErrorsTotalSeries(t, "never-seeded-proj", "brainstorm", "invalid_cron") {
+		t.Errorf("SweepErrorsTotal has a series for a project that was never seeded; seeding must be per-project")
+	}
+}
+
+// TestSweepHeartbeatIsPerProject is the issue #441 regression test. Before
+// `project` joined the label set, the three Projects on this cluster
+// (tatara, infrastructure, mtg) all wrote ONE heartbeat series: it moved
+// backward and forward last-write-wins, the alert read whichever value was
+// current, and a Project whose cron was genuinely dead was masked by a healthy
+// sibling's write. Two Projects stamping the SAME activity must now produce two
+// independent series.
+func TestSweepHeartbeatIsPerProject(t *testing.T) {
+	const activity = "sweep-hb-perproject-test"
+	const stale = 1000.0
+
+	projA := sweepProject("hb-multi-a")
+	projB := sweepProject("hb-multi-b")
+	repoB := sweepRepo("hb-multi-b")
+	c := newMirrorClient(t, projB, repoB)
+
+	// Project A last swept long ago and is NOT swept in this test.
+	obs.SweepLastSuccessTimestamp.WithLabelValues(projA.Name, activity).Set(stale)
+
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry())}
+	if err := r.SweepProject(context.Background(), projB, &sweepReader{},
+		[]tatarav1alpha1.Repository{*repoB}, nil, activity); err != nil {
+		t.Fatalf("SweepProject(hb-multi-b): %v", err)
+	}
+
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(projA.Name, activity)); got != stale {
+		t.Fatalf("project hb-multi-a heartbeat = %v, want %v unchanged - project hb-multi-b's sweep clobbered it (issue #441)", got, stale)
+	}
+	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(projB.Name, activity)); got <= stale {
+		t.Fatalf("project hb-multi-b heartbeat = %v, want a fresh stamp above %v", got, stale)
 	}
 }
