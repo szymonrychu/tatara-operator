@@ -132,7 +132,7 @@ func TestMemoryPrometheusRule(t *testing.T) {
 
 // A single-instance project (the CR default, PgInstances unset/1) has no
 // standbys and therefore no replication slots or streaming replicas to alert
-// on. The four replication-topology alerts must NOT be generated for it - a
+// on. The three replication-topology alerts must NOT be generated for it - a
 // literal "< 0" or absent-series expression would be inert-by-construction
 // tech debt (hard rule 4), not a real guard. Only the general
 // MemoryPostgresInstancesBelowDeclared alert, which is meaningful even at
@@ -150,11 +150,14 @@ func TestMemoryPrometheusRule_SingleInstance_NoReplicationTopologyAlerts(t *test
 	for _, a := range []string{
 		"MemoryPostgresReplicationSlotInactive",
 		"MemoryPostgresStreamingReplicasBelowExpected",
-		"MemoryPostgresReplicationLagHigh",
 		"MemoryPostgresReplicationSlotWalRetentionHigh",
 	} {
 		require.False(t, names[a], "alert %s must NOT be generated for a single-instance project (no standbys, no slots)", a)
 	}
+	// MemoryPostgresReplicationLagHigh was tried and removed entirely (not
+	// merely instance-guarded) - see MEMORY.md 2026-07-26 - so it must never
+	// appear regardless of instance count.
+	require.False(t, names["MemoryPostgresReplicationLagHigh"], "MemoryPostgresReplicationLagHigh was removed and must never be generated")
 
 	// Full expression equality, not a substring check: `Contains(..., "< 1")`
 	// would also pass on "< 10" or "< 12", silently letting a wrong threshold
@@ -212,11 +215,19 @@ func TestMemoryPrometheusRule_ReplicationAlerts_MultiInstance(t *testing.T) {
 	require.Equal(t, "10m", byFor["MemoryPostgresInstancesBelowDeclared"])
 	require.Equal(t, "critical", bySeverity["MemoryPostgresInstancesBelowDeclared"])
 
+	// primaryGuard is the `and on(pod) (...)` clause every slot/streaming-
+	// replica rule now carries, restricting the read to whichever pod is
+	// CURRENTLY the primary. Live-verified necessary, not gold-plating: an
+	// unscoped read picked up a non-primary standby's stale/wrong view of a
+	// sibling's slot at >2GiB on a cluster whose real primary reported 0 -
+	// see MEMORY.md 2026-07-26 for the live evidence.
+	primaryGuard := `and on(pod) (cnpg_pg_replication_in_recovery{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"} == 0)`
+
 	// MemoryPostgresReplicationSlotInactive: a declared standby's slot reads
 	// inactive - the exact #442/#444/#448 signature. Read on the primary's view
 	// of the slot (slot_name label), not on the sick standby's own status.
 	require.Equal(t,
-		`max by (slot_name) (cnpg_pg_replication_slots_active{namespace="tatara", slot_name=~"_cnpg_mem_acme_pg_.*"}) == 0`,
+		`max by (slot_name) (cnpg_pg_replication_slots_active{namespace="tatara", slot_name=~"_cnpg_mem_acme_pg_.*"} `+primaryGuard+`) == 0`,
 		byName["MemoryPostgresReplicationSlotInactive"],
 	)
 	require.Equal(t, "30m", byFor["MemoryPostgresReplicationSlotInactive"])
@@ -225,29 +236,52 @@ func TestMemoryPrometheusRule_ReplicationAlerts_MultiInstance(t *testing.T) {
 	// MemoryPostgresStreamingReplicasBelowExpected: primary-side streaming
 	// count below instances-1 (2 standbys expected for 3 instances).
 	require.Equal(t,
-		`(max(cnpg_pg_replication_streaming_replicas{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"}) or vector(0)) < 2`,
+		`(max(cnpg_pg_replication_streaming_replicas{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"} `+primaryGuard+`) or vector(0)) < 2`,
 		byName["MemoryPostgresStreamingReplicasBelowExpected"],
 	)
 	require.Equal(t, "30m", byFor["MemoryPostgresStreamingReplicasBelowExpected"])
 	require.Equal(t, "critical", bySeverity["MemoryPostgresStreamingReplicasBelowExpected"])
 
-	// MemoryPostgresReplicationLagHigh: a connected-but-struggling standby.
-	require.Equal(t,
-		`max(cnpg_pg_replication_lag{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"}) > 300`,
-		byName["MemoryPostgresReplicationLagHigh"],
-	)
-	require.Equal(t, "15m", byFor["MemoryPostgresReplicationLagHigh"])
-	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationLagHigh"])
+	// MemoryPostgresReplicationLagHigh does not exist: tried and removed after
+	// live-verifying it false-fires on a write-idle-but-healthy standby
+	// (cnpg_pg_replication_lag climbs unbounded with wall-clock time whenever
+	// there is nothing new to replay, independent of replication health). See
+	// MEMORY.md 2026-07-26 for the full evidence and the redundancy argument
+	// against a byte-diff-gated version.
+	require.NotContains(t, byName, "MemoryPostgresReplicationLagHigh")
 
 	// MemoryPostgresReplicationSlotWalRetentionHigh: the N1 latent
 	// disk-exhaustion trap - a slot pinning WAL beyond a quarter of the
 	// project's configured (default 8Gi) WAL volume. 8Gi/4 = 2147483648 bytes.
 	require.Equal(t,
-		`max by (slot_name) (cnpg_pg_replication_slots_pg_wal_lsn_diff{namespace="tatara", slot_name=~"_cnpg_mem_acme_pg_.*"}) > 2147483648`,
+		`max by (slot_name) (cnpg_pg_replication_slots_pg_wal_lsn_diff{namespace="tatara", slot_name=~"_cnpg_mem_acme_pg_.*"} `+primaryGuard+`) > 2147483648`,
 		byName["MemoryPostgresReplicationSlotWalRetentionHigh"],
 	)
 	require.Equal(t, "15m", byFor["MemoryPostgresReplicationSlotWalRetentionHigh"])
 	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationSlotWalRetentionHigh"])
+}
+
+// Regression test for the reviewer-found trap: an earlier cut of the two
+// slot-keyed rules read cnpg_pg_replication_slots_active /
+// _pg_wal_lsn_diff unscoped across every reporting instance, which
+// live-verification showed picks up a non-primary standby's stale/wrong view
+// of a slot (2GiB+ on mem-tatara-pg-1 for a sibling's slot the real primary
+// reported 0 for). Both rules must intersect with the primary's own
+// in_recovery==0 report so a future edit cannot silently drop that guard.
+func TestMemoryPrometheusRule_SlotAlerts_ScopedToPrimaryOnly(t *testing.T) {
+	p := testProjectWithInstances("acme", 3)
+	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())
+
+	byName := map[string]string{}
+	for _, r := range pr.Spec.Groups[0].Rules {
+		byName[r.Alert] = r.Expr.StrVal
+	}
+
+	for _, a := range []string{"MemoryPostgresReplicationSlotInactive", "MemoryPostgresReplicationSlotWalRetentionHigh", "MemoryPostgresStreamingReplicasBelowExpected"} {
+		require.Contains(t, byName[a], "and on(pod)", "alert %s must scope to the primary's own report", a)
+		require.Contains(t, byName[a], "cnpg_pg_replication_in_recovery", "alert %s must join against in_recovery to identify the primary", a)
+		require.Contains(t, byName[a], "== 0)", "alert %s must require the joined pod to be in_recovery==0 (the primary)", a)
+	}
 }
 
 // MemoryPostgresInstancesBelowDeclared must catch a genuinely dead instance
