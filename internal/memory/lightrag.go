@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"fmt"
+
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -78,20 +80,28 @@ func lightragEnv(p *tatarav1alpha1.Project, cfg Config) []corev1.EnvVar {
 // "Application startup failed. Exiting." - which is the actual root cause and
 // the only thing a probe on the main container cannot compensate for (the
 // process is already dead, not merely unready).
-const neo4jWaitScript = `set -eu
+const (
+	// maxNeo4jWaitAttempts and neo4jWaitIntervalSeconds are interpolated into
+	// neo4jWaitScript below, so the comment above and the shell text can never
+	// drift out of sync with each other again.
+	maxNeo4jWaitAttempts     = 60
+	neo4jWaitIntervalSeconds = 5
+)
+
+var neo4jWaitScript = fmt.Sprintf(`set -eu
 attempt=0
-max_attempts=60
+max_attempts=%d
 until python3 -c "import socket; socket.create_connection(('${NEO4J_HOST}', 7687), timeout=5).close()" 2>/dev/null; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge "$max_attempts" ]; then
     echo "wait-for-neo4j: giving up after ${attempt} attempts, ${NEO4J_HOST}:7687 still unreachable" >&2
     exit 1
   fi
-  echo "wait-for-neo4j: ${NEO4J_HOST}:7687 not reachable yet (attempt ${attempt}/${max_attempts}), retrying in 5s"
-  sleep 5
+  echo "wait-for-neo4j: ${NEO4J_HOST}:7687 not reachable yet (attempt ${attempt}/${max_attempts}), retrying in %ds"
+  sleep %d
 done
 echo "wait-for-neo4j: ${NEO4J_HOST}:7687 reachable after ${attempt} attempt(s)"
-`
+`, maxNeo4jWaitAttempts, neo4jWaitIntervalSeconds, neo4jWaitIntervalSeconds)
 
 // lightragInitContainers gates lightrag's startup on Neo4j being reachable.
 // See neo4jWaitScript for the mechanism and why only Neo4j (not Postgres) is
