@@ -750,6 +750,112 @@ in spirit; prune only when a decision is reversed.
   `kindDefaultModel[kind]` ahead of `Spec.Agent.Model` whenever the kind has
   an entry, so any project-wide `Model` literal left at the old value in a
   test would have been silently shadowed rather than exercised.
+- 2026-07-25 (fix/sweep-heartbeat-and-alert-false-positives, #441/#446) **The
+  sweep heartbeat gauge had three writers and one series.**
+  `operator_sweep_last_success_timestamp_seconds` was declared
+  `[]string{"activity"}` only while `runScans` rehydrates it from EVERY
+  Project's persisted status on every reconcile - measured on a single scrape
+  target, `issueScan` cycled through exactly three values within 8 seconds and
+  then held for four hours (#446 Q3), so the alert paged critical and
+  self-resolved eight minutes later with no sweep having run, and a Project
+  whose cron was genuinely dead was masked by a healthy sibling's write. Fixed
+  by COMPLETING THE LABEL SET (`project` first on both
+  `SweepLastSuccessTimestamp` and `SweepErrorsTotal`), not by detecting
+  backward movement: that is the confirmed practice (temporalio/temporal#9600
+  was fixed the same way) and no source supports alerting on non-monotonicity.
+  Metric NAMES are unchanged, preserving the naming-stability discipline of the
+  2026-07-18 #325 entry. (1) `SweepErrorsTotal`'s `init()` pre-seeding could
+  not survive - project names are unknown at process start - so it moved to
+  `obs.SeedSweepErrorsForProject`, called from `ProjectReconciler.Reconcile` on
+  every pass (idempotent; `WithLabelValues` returns the existing child),
+  keeping `increase(operator_sweep_errors_total[1h])` well-defined from a
+  Project's first reconcile rather than its first error. (2) New gauge
+  `operator_sweep_next_expected_timestamp_seconds{project,activity}` moves
+  cadence knowledge into the PRODUCER (the kube-state-metrics
+  `kube_cronjob_next_schedule_time` pattern), not the alert rule: the obvious
+  alternative, a `group_left` companion-interval join in the alert expression
+  itself, ships in no mainstream OSS project found in review and carries two
+  sharp runtime failure modes (`multiple matches for labels` when the join is
+  not exactly one-to-one, and a missing series on either side silently killing
+  the whole alert) - the interim flat 6h threshold was breached for ~18h of
+  every 24 by the `0 3 * * *` / `0 6 * * *` nightly crons. It is published only
+  for activities that are ACTUALLY ENABLED (`SweepEnabled`,
+  `Brainstorm.Enabled`, `Documentation.Enabled && .Repo != ""`), not merely
+  scheduled - a next-expected-run for a run that will never happen is the same
+  false page one level down. Publish is `defer`red from the top of `runScans`
+  (not called eagerly) because `stampScan` mutates `proj.Status.Last*` in place
+  partway through the same function - publishing at the top would leave the
+  gauge stale for up to `maxScheduleRequeue` = 6h, longer than the consuming
+  alert's 3h grace. (3) `invalid_cron` is now metered in exactly ONE place,
+  `publishNextExpected`; the three per-activity branches in `runScans` keep
+  their logs and lost their increments, closing the gaps where a bad cron on a
+  disabled-feature path was never metered at all. (4)
+  `agent_internal_issue_total{category,severity}` added at the
+  `action=agent_internal_issue` log site so tatara-observability#63 can move
+  that alert off a `pattern | line_format | json` LogQL pipeline that took
+  ~9.6s over ~50 lines and paged on its own query timeout; the free-text
+  `description` stays a log field, deliberately not a label. Not pre-seeded -
+  the category enum lives in the wrapper and the consuming rule is `> 0` with
+  no `or vector(0)`, so an absent series is correctly NoData -> OK. (5)
+  issueScan/sweep do NOT publish the raw cron boundary: `reposDueForScan`
+  phase-shifts each enrolled repo by `fnv32a(project\0repo\0activity) mod
+  period` (issue #181) so per-repo fires spread across the interval instead of
+  bunching at one boundary, and the raw `sched.Next(base)` the gauge first
+  shipped with was a deterministic false page for any low-repo-count project -
+  the true earliest fire can land up to a full period later. Fixed with
+  `earliestIssueScanFire`, which reuses
+  `cronPeriod`/`scanOffset`/`repoNextFire` verbatim (the exact helpers
+  `reposDueForScan` itself calls) rather than reimplementing the arithmetic, so
+  the two paths cannot re-diverge; `brainstorm`/`documentation` run through the
+  unshifted `activityDue` and are correctly unshifted as-is - do not unify the
+  two formulas without re-deriving which runtime path each activity actually
+  uses (a test literal that agreed with the wrong formula is exactly how this
+  shipped once already). (6) The deferred publish threads `repos` and a
+  `reposLoaded bool` through a closure (both predeclared before the `defer`,
+  since `repos` does not exist yet at defer-statement time); a `scanReader`
+  failure (dead/renamed `scmSecretRef`) or a repo-list failure both leave
+  `repos` at its nil zero value - indistinguishable from a Project that
+  genuinely enrolled zero repos - and `runScans` returns a NIL error on the
+  `scanReader` path, so no other metric catches it either. `reposLoaded`, set
+  true only after `projectReposForScan` succeeds, disambiguates the two:
+  not-loaded leaves the previously published series INTACT (retracting it would
+  silence the alert exactly when the sweep is broken), loaded-and-empty still
+  retracts (a genuinely repo-less Project is a config state, not a broken one).
+  (7) A `prometheus.GaugeVec` child, once created via `WithLabelValues`, is
+  exported at its last `.Set()` value for the life of the process with no
+  implicit expiry, so `ProjectReconciler.Reconcile`'s `IsNotFound` branch now
+  calls
+  `obs.SweepNextExpectedTimestamp.DeletePartialMatch(prometheus.Labels{"project":
+  req.Name})` before returning - the only place a deleted Project's per-project
+  gauge children CAN be retracted, since nothing else in the reconcile graph
+  runs for an object that no longer exists. Known remaining gap:
+  `SweepLastSuccessTimestamp` and `SweepErrorsTotal` are torn down NOWHERE on
+  Project deletion and leak a frozen child per deleted Project until pod
+  restart; only `SweepNextExpectedTimestamp` got teardown here, because only it
+  feeds a `time() - gauge` alert rule that would page - the other two should be
+  swept up together in one follow-up rather than patched one at a time as each
+  gets independently noticed. The companion alert-rule changes are
+  tatara-observability `fix/sweep-heartbeat-and-alert-false-positives`, which
+  MUST merge after this.
+
+  **Final-review fixup (same branch):** point (7)'s teardown had one hole
+  left: `runScans`' `Spec.Scm == nil || Spec.Scm.Cron == nil` guard (both
+  `+optional`) returns BEFORE the `publishNextExpected` defer is registered,
+  so a Project whose `spec.scm.cron` is cleared after publishing series never
+  retracts them. Fixed by an explicit
+  `SweepNextExpectedTimestamp.DeletePartialMatch` in that early return, NOT by
+  nil-guarding `publishNextExpected` and moving the defer above the guard:
+  `publishNextExpected` unconditionally dereferences `proj.Spec.Scm.Cron` on
+  its first line, so that route needs its own rewrite for no added safety over
+  mirroring the already-established `IsNotFound` precedent one function up.
+  Also: the operator's OWN chart (`prometheusrule.yaml`'s `TataraSweepStalled`)
+  still read `max by (activity)` post-relabel - the exact masking bug #441
+  fixed everywhere else, missed in the one place shipped in this repo's own
+  release; regrouped to `(project, activity)` and the stale "zero-error"
+  description corrected to the #325 liveness semantics. `nightlySweep` (dead
+  since #325, zero producers) dropped from `SeedSweepErrorsForProject`'s
+  seed list: 13 of 44 seeded series per Project were permanently-zero
+  fiction, now 13 of 31.
 - 2026-07-25 (#428) Upstream LightRAG retries Postgres ~10x on boot but exits
   fatally (no retry) if Neo4j is unreachable, so a readiness probe on
   `internal/memory/lightrag.go`'s container cannot help - the process is
