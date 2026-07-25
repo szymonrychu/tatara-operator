@@ -183,12 +183,20 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 // connection - the primary's view of its replication slots and streaming
 // replica count - never from the sick instance itself:
 //
-//   - MemoryPostgresInstancesBelowDeclared: fewer cnpg instances are reporting
-//     replication-role metrics at all than this Project declares
-//     (memory.PgInstances). Catches an instance that is fully down or
-//     crash-looping (no cnpg_* series whatsoever - #448's own evidence for
-//     mem-infrastructure-pg-2's crash-looping phase). Meaningful even for a
-//     single-instance project (the lone instance disappearing).
+//   - MemoryPostgresInstancesBelowDeclared: fewer instances of this cluster's
+//     scrape target report up{}==1 than this Project declares
+//     (memory.PgInstances). Deliberately reads the raw Prometheus scrape-health
+//     primitive, NOT a cnpg_pg_* metric: cnpg_pg_* series are produced by CNPG's
+//     USER-QUERY collector and disappear whenever that collector's query fails,
+//     even while the instance itself is up and perfectly scrapeable (confirmed
+//     live: the unrelated single-instance mem-mtg-pg cluster reads
+//     cnpg_collector_up=0 with zero cnpg_pg_* series at all, while its pod is
+//     Ready and up{}=1) - using one as a liveness proxy would page forever on a
+//     healthy instance whose collector query merely errors. up{}==1 has no such
+//     dependency: it is Prometheus's own record of whether the scrape target
+//     answered, independent of anything the target's payload contains.
+//     Meaningful even for a single-instance project (the lone instance
+//     disappearing).
 //   - MemoryPostgresReplicationSlotInactive: a declared standby's replication
 //     slot reads inactive, read via the primary's pg_replication_slots view.
 //     This is the exact #442/#444/#448 signature and would have paged at the
@@ -220,24 +228,28 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 // signal source issue #448 says cannot be trusted.
 //
 // A rolling restart or a deliberate scale change must not trip any of these:
-// CNPG bounces or (re)clones one instance at a time, and each rule's "for"
-// (30m for the hard down/inactive/below-expected states, 15m for the two
-// early-warning ones) rides out a single instance's restart or a freshly
-// scaled-up standby's initial base backup. instances is read from THIS
+// CNPG bounces or (re)clones one instance at a time. MemoryPostgresInstancesBelowDeclared
+// only measures scrape reachability (up{}==1), which a fresh pod satisfies as
+// soon as its container starts and opens the metrics port - well before any
+// base backup completes - so its "for" (10m) only needs to ride out a single
+// instance's restart bounce, not a resync. The other four measure actual
+// replication convergence (a slot activating, streaming replicas catching up),
+// which a freshly cloned standby only reaches once its base backup finishes;
+// their "for" (30m for the hard down/inactive/below-expected states, 15m for
+// the two early-warning ones) rides that out too. instances is read from THIS
 // Project's current spec at render time, so a scale change moves the
 // threshold and the actual desired pod count together in the same reconcile -
 // there is no window where the alert compares against a stale target.
 //
 // cluster is the cnpg Cluster name (mem-<proj>-pg) and its pods/PVCs are named
 // <cluster>-<n>[-wal]; namespace scopes the series to this Project's cluster
-// since several Projects' clusters share a namespace. cnpg_* series carry no
-// "container" label (unlike the kubelet/kube-state-metrics series above), so
-// they get their own selector without container="postgres" - reusing podSelector
-// there would silently match zero series.
+// since several Projects' clusters share a namespace. Every metric used here -
+// kube-state-metrics, kubelet, and cnpg_* alike - carries container="postgres"
+// on these pods (verified live), so podSelector is shared across all of them;
+// there is no separate cnpg selector.
 func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []monitoringv1.Rule {
 	pgSelector := fmt.Sprintf(`namespace=%q, persistentvolumeclaim=~%q`, namespace, cluster+"-.*")
 	podSelector := fmt.Sprintf(`namespace=%q, pod=~%q, container="postgres"`, namespace, cluster+"-.*")
-	cnpgPodSelector := fmt.Sprintf(`namespace=%q, pod=~%q`, namespace, cluster+"-.*")
 	slotSelector := fmt.Sprintf(`namespace=%q, slot_name=~%q`, namespace, "_cnpg_"+strings.ReplaceAll(cluster, "-", "_")+"_.*")
 	instances := PgInstances(p)
 	walRetentionWarnBytes := pgSlotWalRetentionWarnBytes(p)
@@ -347,24 +359,28 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 			},
 		},
 		{
-			// count() over cnpg_pg_replication_in_recovery is a presence check: an
-			// instance that is fully down or crash-looping never runs postgres long
-			// enough to expose ANY cnpg_* metric (issue #448's own evidence: "no
-			// cnpg_* series at all for mem-infrastructure-pg-2 - it never starts").
-			// `or vector(0)` guards the case where every instance of the cluster is
-			// gone at once - count() over an empty vector yields no sample, which
-			// would otherwise silently swallow a whole-cluster outage instead of
-			// comparing it against the declared count.
+			// count(up{...}==1) is a pure scrape-reachability check on Prometheus's
+			// own primitive, deliberately NOT a cnpg_pg_* metric: cnpg_pg_* series
+			// come from CNPG's user-query collector and vanish whenever that
+			// collector's query fails, even while the instance is up and perfectly
+			// scrapeable - verified live against the unrelated single-instance
+			// mem-mtg-pg cluster, whose pod is Ready and up{}=1 but which reports
+			// cnpg_collector_up=0 and zero cnpg_pg_* series. A rule keyed on any
+			// cnpg_pg_* metric here would have paged on that healthy instance
+			// forever. `or vector(0)` guards the case where every instance of the
+			// cluster is gone at once - count() over an empty vector yields no
+			// sample, which would otherwise silently swallow a whole-cluster outage
+			// instead of comparing it against the declared count.
 			Alert: "MemoryPostgresInstancesBelowDeclared",
 			Expr: intstr.FromString(fmt.Sprintf(
-				`(count(cnpg_pg_replication_in_recovery{%s}) or vector(0)) < %d`,
-				cnpgPodSelector, instances,
+				`(count(up{%s} == 1) or vector(0)) < %d`,
+				podSelector, instances,
 			)),
-			For:    dur("30m"),
+			For:    dur("10m"),
 			Labels: map[string]string{"severity": memorySeverityCritical},
 			Annotations: map[string]string{
 				"summary":     "postgres cluster " + cluster + " has fewer live instances than declared",
-				"description": fmt.Sprintf("Fewer than the declared %d cnpg instance(s) of cluster %s have reported replication metrics for 30m - one or more instances are down, crash-looping, or unreachable (issues #442, #444, #448).", instances, cluster),
+				"description": fmt.Sprintf("Fewer than the declared %d cnpg instance(s) of cluster %s have had a healthy scrape target for 10m - one or more instances are down, crash-looping, or unreachable (issues #442, #444, #448).", instances, cluster),
 			},
 		},
 	}
@@ -402,7 +418,7 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 				Alert: "MemoryPostgresStreamingReplicasBelowExpected",
 				Expr: intstr.FromString(fmt.Sprintf(
 					`(max(cnpg_pg_replication_streaming_replicas{%s}) or vector(0)) < %d`,
-					cnpgPodSelector, instances-1,
+					podSelector, instances-1,
 				)),
 				For:    dur("30m"),
 				Labels: map[string]string{"severity": memorySeverityCritical},
@@ -418,7 +434,7 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 				Alert: "MemoryPostgresReplicationLagHigh",
 				Expr: intstr.FromString(fmt.Sprintf(
 					`max(cnpg_pg_replication_lag{%s}) > %s`,
-					cnpgPodSelector, memoryReplicationLagThresholdSeconds,
+					podSelector, memoryReplicationLagThresholdSeconds,
 				)),
 				For:    dur("15m"),
 				Labels: map[string]string{"severity": memorySeverityWarning},

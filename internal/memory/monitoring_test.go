@@ -156,13 +156,19 @@ func TestMemoryPrometheusRule_SingleInstance_NoReplicationTopologyAlerts(t *test
 		require.False(t, names[a], "alert %s must NOT be generated for a single-instance project (no standbys, no slots)", a)
 	}
 
-	// The declared-count expression must compare against the literal instance
-	// count (1 here), not a hardcoded multi-instance assumption.
+	// Full expression equality, not a substring check: `Contains(..., "< 1")`
+	// would also pass on "< 10" or "< 12", silently letting a wrong threshold
+	// through. up{}==1 is the scrape-reachability primitive (not a cnpg_pg_*
+	// metric - see memoryAlertRules' doc comment for why), so it stays live
+	// even for a single-instance project with no replication topology at all.
 	byName := map[string]string{}
 	for _, r := range pr.Spec.Groups[0].Rules {
 		byName[r.Alert] = r.Expr.StrVal
 	}
-	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "< 1", "single-instance project must compare against 1, not a multi-instance default")
+	require.Equal(t,
+		`(count(up{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"} == 1) or vector(0)) < 1`,
+		byName["MemoryPostgresInstancesBelowDeclared"],
+	)
 }
 
 // A multi-instance (HA) project must get the full replication alert set,
@@ -184,49 +190,90 @@ func TestMemoryPrometheusRule_ReplicationAlerts_MultiInstance(t *testing.T) {
 		}
 	}
 
-	// MemoryPostgresInstancesBelowDeclared: fewer live cnpg instances than the
-	// Project declares (3), sustained. Guards with `or vector(0)` so a
-	// wholly-absent metric set (every instance gone) still compares as 0.
-	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "cnpg_pg_replication_in_recovery")
-	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], `pod=~"mem-acme-pg-.*"`)
-	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "or vector(0)")
-	require.Contains(t, byName["MemoryPostgresInstancesBelowDeclared"], "< 3")
-	require.Equal(t, "30m", byFor["MemoryPostgresInstancesBelowDeclared"])
+	// Full expression equality throughout, not substring checks: a `Contains`
+	// check on e.g. "< 2" would also pass on "< 20" or "< 25", silently letting
+	// a wrong threshold or a malformed expression through - exactly the
+	// "silently never fires" failure class this whole change exists to fix.
+	// No PromQL parser is available in this module's dependency graph (checked
+	// go.mod/go.sum and the module cache for prometheus/prometheus's
+	// promql/parser or an equivalent; none vendored), so expression validity is
+	// asserted via exact string equality against a known-good expression
+	// instead of a parse check.
+
+	// MemoryPostgresInstancesBelowDeclared: fewer instances of this cluster
+	// have a healthy scrape target (up{}==1) than the Project declares (3).
+	// Deliberately NOT a cnpg_pg_* metric (see the doc comment on
+	// memoryAlertRules for the live-verified reason). `or vector(0)` guards a
+	// wholly-absent metric set (every instance gone) comparing as 0.
+	require.Equal(t,
+		`(count(up{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"} == 1) or vector(0)) < 3`,
+		byName["MemoryPostgresInstancesBelowDeclared"],
+	)
+	require.Equal(t, "10m", byFor["MemoryPostgresInstancesBelowDeclared"])
 	require.Equal(t, "critical", bySeverity["MemoryPostgresInstancesBelowDeclared"])
 
 	// MemoryPostgresReplicationSlotInactive: a declared standby's slot reads
 	// inactive - the exact #442/#444/#448 signature. Read on the primary's view
 	// of the slot (slot_name label), not on the sick standby's own status.
-	require.Contains(t, byName["MemoryPostgresReplicationSlotInactive"], "cnpg_pg_replication_slots_active")
-	require.Contains(t, byName["MemoryPostgresReplicationSlotInactive"], `slot_name=~"_cnpg_mem_acme_pg_.*"`)
-	require.Contains(t, byName["MemoryPostgresReplicationSlotInactive"], "== 0")
+	require.Equal(t,
+		`max by (slot_name) (cnpg_pg_replication_slots_active{namespace="tatara", slot_name=~"_cnpg_mem_acme_pg_.*"}) == 0`,
+		byName["MemoryPostgresReplicationSlotInactive"],
+	)
 	require.Equal(t, "30m", byFor["MemoryPostgresReplicationSlotInactive"])
 	require.Equal(t, "critical", bySeverity["MemoryPostgresReplicationSlotInactive"])
 
 	// MemoryPostgresStreamingReplicasBelowExpected: primary-side streaming
 	// count below instances-1 (2 standbys expected for 3 instances).
-	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], "cnpg_pg_replication_streaming_replicas")
-	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], `pod=~"mem-acme-pg-.*"`)
-	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], "or vector(0)")
-	require.Contains(t, byName["MemoryPostgresStreamingReplicasBelowExpected"], "< 2")
+	require.Equal(t,
+		`(max(cnpg_pg_replication_streaming_replicas{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"}) or vector(0)) < 2`,
+		byName["MemoryPostgresStreamingReplicasBelowExpected"],
+	)
 	require.Equal(t, "30m", byFor["MemoryPostgresStreamingReplicasBelowExpected"])
 	require.Equal(t, "critical", bySeverity["MemoryPostgresStreamingReplicasBelowExpected"])
 
 	// MemoryPostgresReplicationLagHigh: a connected-but-struggling standby.
-	require.Contains(t, byName["MemoryPostgresReplicationLagHigh"], "cnpg_pg_replication_lag")
-	require.Contains(t, byName["MemoryPostgresReplicationLagHigh"], `pod=~"mem-acme-pg-.*"`)
-	require.Contains(t, byName["MemoryPostgresReplicationLagHigh"], "> 300")
+	require.Equal(t,
+		`max(cnpg_pg_replication_lag{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"}) > 300`,
+		byName["MemoryPostgresReplicationLagHigh"],
+	)
 	require.Equal(t, "15m", byFor["MemoryPostgresReplicationLagHigh"])
 	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationLagHigh"])
 
 	// MemoryPostgresReplicationSlotWalRetentionHigh: the N1 latent
 	// disk-exhaustion trap - a slot pinning WAL beyond a quarter of the
-	// project's configured (default 8Gi) WAL volume.
-	require.Contains(t, byName["MemoryPostgresReplicationSlotWalRetentionHigh"], "cnpg_pg_replication_slots_pg_wal_lsn_diff")
-	require.Contains(t, byName["MemoryPostgresReplicationSlotWalRetentionHigh"], `slot_name=~"_cnpg_mem_acme_pg_.*"`)
-	require.Contains(t, byName["MemoryPostgresReplicationSlotWalRetentionHigh"], "> 2147483648") // 8Gi / 4
+	// project's configured (default 8Gi) WAL volume. 8Gi/4 = 2147483648 bytes.
+	require.Equal(t,
+		`max by (slot_name) (cnpg_pg_replication_slots_pg_wal_lsn_diff{namespace="tatara", slot_name=~"_cnpg_mem_acme_pg_.*"}) > 2147483648`,
+		byName["MemoryPostgresReplicationSlotWalRetentionHigh"],
+	)
 	require.Equal(t, "15m", byFor["MemoryPostgresReplicationSlotWalRetentionHigh"])
 	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationSlotWalRetentionHigh"])
+}
+
+// MemoryPostgresInstancesBelowDeclared must catch a genuinely dead instance
+// even on a single-instance project, and must NOT fire on a merely
+// collector-degraded one. Regression test for the reviewer-found trap: the
+// first cut of this rule keyed on cnpg_pg_replication_in_recovery, which
+// disappears whenever CNPG's user-query collector fails - as confirmed live
+// on the single-instance mem-mtg-pg cluster, whose pod is up and scrapeable
+// (up{}=1) but which reports cnpg_collector_up=0 and zero cnpg_pg_* series.
+// That made the rule fire permanently on a healthy instance. This test does
+// not re-run PromQL (no evaluator in this module), but pins the exact
+// expression so a future edit cannot silently reintroduce a cnpg_pg_* liveness
+// dependency without failing a byte-for-byte comparison.
+func TestMemoryPrometheusRule_InstancesBelowDeclared_UsesScrapeHealthNotCollectorMetric(t *testing.T) {
+	p := testProject("acme")
+	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())
+
+	var expr string
+	for _, r := range pr.Spec.Groups[0].Rules {
+		if r.Alert == "MemoryPostgresInstancesBelowDeclared" {
+			expr = r.Expr.StrVal
+		}
+	}
+	require.NotContains(t, expr, "cnpg_pg_", "must not depend on CNPG's user-query collector output, which vanishes independent of instance health")
+	require.Contains(t, expr, `up{`, "must key off the raw Prometheus scrape-health primitive")
+	require.Contains(t, expr, "== 1", "must count targets that ARE up, not merely present")
 }
 
 // The postgres-layer alerts must scope their series to THIS Project's cnpg
