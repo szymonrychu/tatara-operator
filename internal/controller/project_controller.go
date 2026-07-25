@@ -11,6 +11,7 @@ import (
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
+	"github.com/prometheus/client_golang/prometheus"
 	tataradevv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/grafanamcp"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
@@ -204,6 +205,15 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var project tataradevv1alpha1.Project
 	if err := r.Get(ctx, req.NamespacedName, &project); err != nil {
 		if apierrors.IsNotFound(err) {
+			// Retract this deleted Project's obs.SweepNextExpectedTimestamp
+			// children (round-2 review finding): the gauge is a `time() - gauge`
+			// alert input, so a frozen series left behind by a deleted Project
+			// pages permanently until the pod restarts, same failure mode as an
+			// enabled-then-disabled activity (finding 2) but via deletion instead
+			// of a spec flip. Scoped to ONLY this metric on purpose -
+			// SweepLastSuccessTimestamp and SweepErrorsTotal have the identical
+			// leak but tearing them down too is out of scope here (see MEMORY.md).
+			obs.SweepNextExpectedTimestamp.DeletePartialMatch(prometheus.Labels{"project": req.Name})
 			return ctrl.Result{}, nil
 		}
 		r.Metrics.ReconcileResult("Project", "error")

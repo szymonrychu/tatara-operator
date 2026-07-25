@@ -1151,14 +1151,34 @@ func earliestIssueScanFire(proj *tatarav1alpha1.Project, schedule string, repos 
 // internal/obs/task_metrics.go:DeleteTaskSeries and
 // internal/obs/merge_metrics.go:ClearMergeCursorStalled.
 //
+// reposLoaded distinguishes "runScans successfully listed the enrolled repos
+// this tick" from "it never got that far" (scanReader/projectReposForScan
+// failure): the two look identical as an empty repos slice, but they must NOT
+// be treated the same (review finding, round 2). A genuinely repo-less
+// Project is a configuration state that should retract the issueScan/sweep
+// series; a Project whose reader/repo-list call is broken (e.g. a deleted
+// scmSecretRef) is exactly the case this gauge exists to keep paging on -
+// retracting there would silence the alert on every tick the sweep cannot
+// even start, which is a regression from "pages correctly on a stale
+// boundary" to "never pages again" for the one scenario that matters most.
+// When reposLoaded is false the issueScan/sweep branch is skipped entirely:
+// neither published nor retracted, so the last real value (or lack of one)
+// stands and ages normally toward the alert's threshold.
+//
 // runScans defers this so it runs on every exit path AND reads the Status.Last*
 // stamps stampScan has already advanced in place this tick. Publishing at the top
 // instead would leave the gauge stale for up to maxScheduleRequeue (6h), longer
 // than the alert's 3h grace.
-func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository) {
+func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, repos []tatarav1alpha1.Repository, reposLoaded bool) {
 	c := proj.Spec.Scm.Cron
 
-	if SweepEnabled(proj) {
+	switch {
+	case !SweepEnabled(proj):
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "issueScan")
+		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, SweepActivity)
+	case !reposLoaded:
+		// Repo list unknown this tick: leave whatever was already published.
+	default:
 		if next, ok, cronErr := earliestIssueScanFire(proj, c.IssueScan.Schedule, repos, proj.Status.LastIssueScan); ok {
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, "issueScan").Set(next)
 			obs.SweepNextExpectedTimestamp.WithLabelValues(proj.Name, SweepActivity).Set(next)
@@ -1169,9 +1189,6 @@ func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, re
 				obs.SweepErrorsTotal.WithLabelValues(proj.Name, "issueScan", "invalid_cron").Inc()
 			}
 		}
-	} else {
-		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, "issueScan")
-		obs.SweepNextExpectedTimestamp.DeleteLabelValues(proj.Name, SweepActivity)
 	}
 
 	if c.Brainstorm.Enabled {
@@ -1214,11 +1231,20 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// needs the enrolled repo list to compute the true phase-shifted next fire
 	// (review finding: the raw unshifted cron boundary is not when issueScan
 	// actually runs). Captured by the closure, not passed by value, so the
-	// defer sees whatever repos holds at return time - nil on an early return
-	// before the list call succeeds, which publishNextExpected treats the same
-	// as a genuinely repo-less project: no series for that tick.
+	// defer sees whatever repos/reposLoaded hold at return time.
+	//
+	// reposLoaded is set true ONLY after projectReposForScan actually succeeds
+	// (below). It stays false on the two pre-list early returns - a
+	// scanReader failure or a projectReposForScan failure - so
+	// publishNextExpected can tell "genuinely zero repos" (retract) apart from
+	// "repos never fetched this tick" (leave the existing series alone; round-2
+	// review finding: retracting there silenced the alert on exactly the
+	// tick the sweep is broken, e.g. a deleted scmSecretRef, since
+	// scanReader's failure path returns a requeue with a NIL error - no other
+	// metric or reconcile-error signal fires).
 	var repos []tatarav1alpha1.Repository
-	defer func() { r.publishNextExpected(proj, repos) }()
+	var reposLoaded bool
+	defer func() { r.publishNextExpected(proj, repos, reposLoaded) }()
 
 	// Rehydrate the sweep heartbeat gauge from the persisted Status.Last* stamps
 	// on every reconcile (fix #386): obs.SweepLastSuccessTimestamp is process-
@@ -1272,6 +1298,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	if err != nil {
 		return 0, err
 	}
+	reposLoaded = true
 	existing, err := r.existingScanTasks(ctx, proj)
 	if err != nil {
 		return 0, err

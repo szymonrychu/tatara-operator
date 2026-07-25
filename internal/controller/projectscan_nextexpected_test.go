@@ -403,4 +403,105 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 			t.Error("next expected{brainstorm} series still exists after Enabled flipped to false, want retracted")
 		}
 	})
+
+	// Round-2 review finding: repos was nil on both pre-list early returns
+	// (scanReader failure, projectReposForScan failure), and earliestIssueScanFire
+	// cannot tell "never fetched this tick" from "genuinely zero repos" - both
+	// look like an empty slice - so publishNextExpected retracted the series on
+	// EVERY tick a Project's reader is broken (e.g. a deleted scmSecretRef),
+	// silencing the exact alert this gauge exists to raise. reposLoaded now
+	// distinguishes the two; these two subtests keep them distinguished.
+	t.Run("scanReader failure leaves an existing issueScan/sweep series intact", func(t *testing.T) {
+		cronSpec := &tatarav1alpha1.ScmCron{
+			IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 */4 * * *"},
+		}
+		proj, _ := seedScanProject(t, "nx-reader-fail", cronSpec)
+
+		r := newScanReconciler(&fakeReader{})
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+		if _, err := r.runScans(context.Background(), proj); err != nil {
+			t.Fatalf("runScans (healthy pass): %v", err)
+		}
+		before := testutil.ToFloat64(obs.SweepNextExpectedTimestamp.WithLabelValues("nx-reader-fail", "issueScan"))
+		if before == 0 {
+			t.Fatalf("setup: expected a published issueScan series after a healthy pass")
+		}
+
+		// Break the reader exactly like a deleted/renamed scmSecretRef would:
+		// scanReader's r.Get on the secret now fails, so runScans returns a
+		// requeue with a NIL error (no reconcile-error metric, just a log line)
+		// before repos is ever listed - the concrete scenario the review named.
+		proj.Spec.ScmSecretRef = "does-not-exist"
+		if _, err := r.runScans(context.Background(), proj); err != nil {
+			t.Fatalf("runScans (broken reader pass): %v", err)
+		}
+
+		if !nextExpectedSeriesExists(t, "nx-reader-fail", "issueScan") {
+			t.Fatal("next expected{issueScan} series was retracted on a reader failure, want it left intact")
+		}
+		if got := testutil.ToFloat64(obs.SweepNextExpectedTimestamp.WithLabelValues("nx-reader-fail", "issueScan")); got != before {
+			t.Errorf("next expected{issueScan} = %v after a reader failure, want unchanged %v", got, before)
+		}
+		if !nextExpectedSeriesExists(t, "nx-reader-fail", SweepActivity) {
+			t.Error("next expected{sweep} series was retracted on a reader failure, want it left intact")
+		}
+	})
+
+	t.Run("genuinely zero enrolled repos still retracts (distinct from a reader failure)", func(t *testing.T) {
+		cronSpec := &tatarav1alpha1.ScmCron{
+			IssueScan: tatarav1alpha1.CronActivity{Schedule: "0 */4 * * *"},
+		}
+		proj, repo := seedScanProject(t, "nx-zero-repos", cronSpec)
+
+		r := newScanReconciler(&fakeReader{})
+		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+		if _, err := r.runScans(context.Background(), proj); err != nil {
+			t.Fatalf("runScans (healthy pass): %v", err)
+		}
+		if !nextExpectedSeriesExists(t, "nx-zero-repos", "issueScan") {
+			t.Fatalf("setup: expected a published issueScan series after a healthy pass")
+		}
+
+		// Delete the one enrolled repo: projectReposForScan now succeeds
+		// (reposLoaded=true) but returns an empty list - a genuinely repo-less
+		// Project, which must still retract, unlike the reader-failure case above
+		// (reposLoaded=false) where the list call never even ran.
+		if err := k8sClient.Delete(context.Background(), repo); err != nil {
+			t.Fatalf("delete fixture repo: %v", err)
+		}
+		if _, err := r.runScans(context.Background(), proj); err != nil {
+			t.Fatalf("runScans (zero-repo pass): %v", err)
+		}
+
+		if nextExpectedSeriesExists(t, "nx-zero-repos", "issueScan") {
+			t.Error("next expected{issueScan} series exists after enrolling zero repos, want retracted")
+		}
+		if nextExpectedSeriesExists(t, "nx-zero-repos", SweepActivity) {
+			t.Error("next expected{sweep} series exists after enrolling zero repos, want retracted")
+		}
+	})
+}
+
+// TestProjectReconcile_NotFound_RetractsNextExpected: finding 2 named four
+// disable paths (brainstorm off, sweep-disabled annotation, documentation off,
+// documentation repo cleared) and the round-1 fix covered all four inside
+// publishNextExpected - but a DELETED Project never reaches publishNextExpected
+// at all, since runScans is never called for an object that no longer exists.
+// ProjectReconciler.Reconcile returns immediately on IsNotFound; without explicit
+// teardown there a deleted Project's series stays frozen in the past forever,
+// and the consumer rule is a time()-minus-gauge comparison, so this pages
+// permanently until the pod restarts (round-2 review finding).
+func TestProjectReconcile_NotFound_RetractsNextExpected(t *testing.T) {
+	obs.SweepNextExpectedTimestamp.WithLabelValues("nx-gone", "issueScan").Set(1700000000)
+	obs.SweepNextExpectedTimestamp.WithLabelValues("nx-gone", SweepActivity).Set(1700000000)
+
+	if _, err := reconcileProject(t, "nx-gone"); err != nil {
+		t.Fatalf("reconcile deleted project: %v", err)
+	}
+
+	for _, activity := range []string{"issueScan", SweepActivity} {
+		if nextExpectedSeriesExists(t, "nx-gone", activity) {
+			t.Errorf("next expected{%s} series exists after reconciling a deleted Project, want retracted", activity)
+		}
+	}
 }
