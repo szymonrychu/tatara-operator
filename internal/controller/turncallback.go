@@ -235,10 +235,15 @@ func (s *CallbackServer) handleTurnComplete(w http.ResponseWriter, r *http.Reque
 		l.Error(err, "update project token budget (non-fatal)", "turn_id", p.TurnID)
 	}
 	l.Info("recorded turn result", "action", "turn_complete", "turn_id", p.TurnID, "state", p.State)
-	// Re-log each internal-issue report on the operator's own (Loki-collected)
+	// Meter each internal-issue report on the operator's own counter (the
+	// alertable signal) and re-log it on the operator's own (Loki-collected)
 	// stdout: agent pods are not scraped, so this is the only path the
-	// description reaches an alertable log stream. One line per issue.
+	// free-text description reaches a log stream. One line per issue.
 	for _, ii := range p.InternalIssues {
+		// The ALERTABLE signal (tatara-observability#63). category/severity are the
+		// wrapper's clamped enum values, so this label set is closed; description
+		// stays out of it and stays in the log line below, which is the drill-down.
+		obs.AgentInternalIssueTotal.WithLabelValues(ii.Category, ii.Severity).Inc()
 		fields := []any{
 			"action", "agent_internal_issue",
 			"category", ii.Category,
