@@ -56,6 +56,57 @@ func lightragEnv(p *tatarav1alpha1.Project, cfg Config) []corev1.EnvVar {
 	}
 }
 
+// neo4jWaitScript polls Neo4j's bolt port with a plain python3 TCP connect
+// attempt until it accepts a connection, or gives up after maxNeo4jWaitAttempts
+// and exits non-zero. python3 ships inside the lightrag image itself (it is
+// LightRAG's own runtime), so this deliberately reuses cfg.LightragImage as the
+// initContainer image rather than pulling in a new tool/image for the wait.
+//
+// Bounded failure mode: this does NOT poll forever. After maxNeo4jWaitAttempts
+// (5s apart, ~5 minutes total) it exits 1, which leaves the initContainer -
+// and therefore the whole pod - in a standard, diagnosable Init:CrashLoopBackOff
+// rather than hanging silently forever. `kubectl get pods` shows that state
+// directly and `kubectl logs -c wait-for-neo4j <pod>` (or `--previous`) shows
+// exactly which attempt failed and against which host:port, because every
+// attempt (success or failure) is logged.
+//
+// Only Neo4j is gated. Upstream LightRAG already retries Postgres ~10 times on
+// boot (the incident's own Loki evidence shows those retries working: 9
+// attempts over ~3 minutes before Postgres came back), so a Postgres wait here
+// would duplicate behaviour that already works rather than fixing anything.
+// Neo4j has no retry at all - one failed connection is a fatal
+// "Application startup failed. Exiting." - which is the actual root cause and
+// the only thing a probe on the main container cannot compensate for (the
+// process is already dead, not merely unready).
+const neo4jWaitScript = `set -eu
+attempt=0
+max_attempts=60
+until python3 -c "import socket; socket.create_connection(('${NEO4J_HOST}', 7687), timeout=5).close()" 2>/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge "$max_attempts" ]; then
+    echo "wait-for-neo4j: giving up after ${attempt} attempts, ${NEO4J_HOST}:7687 still unreachable" >&2
+    exit 1
+  fi
+  echo "wait-for-neo4j: ${NEO4J_HOST}:7687 not reachable yet (attempt ${attempt}/${max_attempts}), retrying in 5s"
+  sleep 5
+done
+echo "wait-for-neo4j: ${NEO4J_HOST}:7687 reachable after ${attempt} attempt(s)"
+`
+
+// lightragInitContainers gates lightrag's startup on Neo4j being reachable.
+// See neo4jWaitScript for the mechanism and why only Neo4j (not Postgres) is
+// gated.
+func lightragInitContainers(n Names, cfg Config) []corev1.Container {
+	return []corev1.Container{{
+		Name:                     "wait-for-neo4j",
+		Image:                    cfg.LightragImage,
+		Command:                  []string{"/bin/sh", "-c"},
+		Args:                     []string{neo4jWaitScript},
+		Env:                      []corev1.EnvVar{{Name: "NEO4J_HOST", Value: n.Neo4j}},
+		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+	}}
+}
+
 // LightragDeployment builds the per-Project lightrag Deployment (port 9621,
 // Recreate strategy because the data PVC is RWO with one replica).
 func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deployment {
@@ -78,6 +129,7 @@ func LightragDeployment(p *tatarav1alpha1.Project, cfg Config) *appsv1.Deploymen
 					ImagePullSecrets:          imagePullSecrets(cfg),
 					Affinity:                  componentAffinity(p.Name, "lightrag", cfg),
 					TopologySpreadConstraints: topologySpreadConstraints(p.Name, "lightrag", cfg),
+					InitContainers:            lightragInitContainers(n, cfg),
 					Containers: []corev1.Container{{
 						Name:  "lightrag",
 						Image: cfg.LightragImage,

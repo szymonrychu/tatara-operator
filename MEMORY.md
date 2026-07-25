@@ -750,3 +750,18 @@ in spirit; prune only when a decision is reversed.
   `kindDefaultModel[kind]` ahead of `Spec.Agent.Model` whenever the kind has
   an entry, so any project-wide `Model` literal left at the old value in a
   test would have been silently shadowed rather than exercised.
+- 2026-07-25 (#428) Upstream LightRAG retries Postgres ~10x on boot but exits
+  fatally (no retry) if Neo4j is unreachable, so a readiness probe on
+  `internal/memory/lightrag.go`'s container cannot help - the process is
+  already dead by the time a probe would fail, not merely unready. Fixed with
+  a `wait-for-neo4j` initContainer (reuses `cfg.LightragImage`, which already
+  ships python3, rather than a new tool image) that TCP-polls
+  `bolt://<neo4j>:7687` and exits 1 after ~5 minutes if it never comes up,
+  which surfaces as a bounded, diagnosable Init:CrashLoopBackOff instead of a
+  silent hang. Postgres is deliberately NOT gated - the incident's own Loki
+  evidence shows the upstream 10x retry already working in practice, so
+  gating it too would duplicate behaviour that isn't broken. The sibling
+  `tatara-memory` container (`memory_builders.go:76-80`) solved the analogous
+  slow-dependency-boot problem with a StartupProbe instead, because its own
+  failure mode is different: it blocks in `waitForDB` but never exits, so
+  liveness (not a dead process) was the risk there.
