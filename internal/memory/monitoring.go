@@ -24,6 +24,16 @@ const (
 	memorySeverityCritical    = "critical"
 	memoryScrapeInterval      = monitoringv1.Duration("30s")
 	memoryScrapeTimeout       = monitoringv1.Duration("10s")
+
+	// memoryReplayStalledThresholdSeconds is how long a standby may show zero
+	// replay progress (cnpg_pg_stat_replication_replay_lag_seconds, read on the
+	// PRIMARY via pg_stat_replication) before MemoryPostgresStandbyReplayStalled
+	// fires. Unlike the removed standby-self-reported lag metric, this one reads
+	// 0 through genuine idle periods (live-verified across the full 24h
+	// retention window, including the exact idle stretch that broke the old
+	// metric), so the threshold only needs to bound a REAL stall, not guard
+	// against idle drift.
+	memoryReplayStalledThresholdSeconds = "300"
 )
 
 // dur returns a *monitoringv1.Duration for a rule "for"/group "interval" field.
@@ -211,59 +221,102 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 //     MemoryPostgresVolumeFilling's 15%-free threshold or cnpg's own
 //     max_slot_wal_keep_size would forcibly invalidate the slot. Only
 //     generated for instances > 1.
+//   - MemoryPostgresStandbyReplayStalled: a standby that IS up, IS counted,
+//     and has an ACTIVE slot, yet has made zero replay progress - precisely
+//     the #442/#444/#448 signature (a standby that looks healthy on every
+//     coarse signal while silently not applying WAL) and the one none of the
+//     four rules above can see, because they all read the slot's FLUSH
+//     frontier (cnpg_pg_replication_slots_pg_wal_lsn_diff /
+//     cnpg_pg_replication_streaming_replicas), which stays genuinely 0 when
+//     only REPLAY (apply) has stalled. Reads
+//     cnpg_pg_stat_replication_replay_lag_seconds instead - a DIFFERENT
+//     metric family (pg_stat_replication on the primary), keyed by
+//     application_name=<standby pod>, tracking the REPLAY frontier. Only
+//     generated for instances > 1.
 //
 // primarySelector: cnpg_pg_replication_slots_active/_pg_wal_lsn_diff are NOT
 // primary-exclusive metrics - every RUNNING instance's local
 // pg_replication_slots view gets scraped, including a standby's, and a
-// standby's view can be stale or simply wrong (live-verified: mem-tatara-pg-1,
-// a continuously-in-recovery standby, reported cnpg_pg_replication_slots_pg_wal_lsn_diff
-// for a SIBLING standby's slot growing past 2GiB while the actual primary
-// reported 0 for that same slot_name - an unscoped `max by (slot_name)` over
-// ALL reporters would have picked up pg-1's number and false-fired
-// MemoryPostgresReplicationSlotWalRetentionHigh on a healthy cluster). Both
-// slot-keyed rules therefore intersect the slot metric with
+// BROKEN standby's view of a SIBLING's slot can be stale (this does NOT hold
+// for standbys generally: mem-tatara-pg's OTHER, healthy standby reports the
+// same sibling's slot accurately at 0 the whole time - only the stalled one
+// diverges). Live-verified: mem-tatara-pg-1 (itself stalled - see
+// MemoryPostgresStandbyReplayStalled above) reported
+// cnpg_pg_replication_slots_pg_wal_lsn_diff for a SIBLING standby's slot
+// climbing past 2GiB while the actual primary reported 0 for that same
+// slot_name. This is NOT an invented false positive on a healthy cluster -
+// mem-tatara-pg is NOT healthy, and the 2GiB+ pg-1 reported is a real
+// downstream symptom of pg-1's OWN replay stall (its local slot-sync view is
+// frozen at the pre-stall LSN while its receive position keeps advancing). An
+// unscoped `max by (slot_name)` over ALL reporters picks up that distorted
+// reading and would have alarmed on the WRONG symptom (WAL retention) instead
+// of the real one (replay stall) - misdiagnosis, not noise. Both slot-keyed
+// rules therefore intersect the slot metric with
 // `cnpg_pg_replication_in_recovery{...} == 0` via `and on(pod)`, restricting
 // the read to whichever pod is CURRENTLY the primary and discarding every
-// other reporter's view as non-authoritative, live-verified quiet on
-// mem-tatara-pg's actual primary (0 for both slots) and still firing
-// correctly on mem-infrastructure-pg's genuinely orphaned slot.
+// other reporter's distorted view, live-verified quiet on mem-tatara-pg's
+// actual primary (0 for both slots) and still firing correctly on
+// mem-infrastructure-pg's genuinely orphaned slot.
+//
+// KNOWN, ACCEPTED gap (not redesigned, documented): if a PRIMARY's own
+// user-query collector degrades (the same failure class
+// MemoryPostgresInstancesBelowDeclared's doc entry describes for mem-mtg-pg,
+// but on the CURRENT primary of a multi-instance cluster), every cnpg_pg_*
+// series - including the `and on(pod)` join partner - disappears from that
+// primary. MemoryPostgresReplicationSlotInactive,
+// MemoryPostgresReplicationSlotWalRetentionHigh, and
+// MemoryPostgresStandbyReplayStalled all go silently dark (their expressions
+// evaluate to no data, not a firing alert), while
+// MemoryPostgresStreamingReplicasBelowExpected's outer `or vector(0)` fires
+// anyway (needed so a wholly-gone cluster still compares as 0) with a
+// misleading "fewer streaming replicas than expected" message when the real
+// fault is "the primary's collector is down." One page, two dark rules.
+// Verified NOT to have occurred, in the operationally meaningful sense, on
+// either live multi-instance cluster: cnpg_collector_up has read a
+// continuous 1 on every reporting pod across the full 24h window checked
+// (the only 0 samples are single-sample edge artifacts at the exact
+// boundary of the query window, consistent with a pod's series not yet
+// having history at that instant, not a mid-window outage). So this is
+// recorded as a known trade-off, not fixed here - closing it needs a
+// collector-health precondition on all four rules, a
+// larger change than this alerting-only pass.
 //
 // Deliberately NOT added: a per-standby cnpg_pg_replication_is_wal_receiver_up
 // check (redundant with MemoryPostgresReplicationSlotInactive, but unlike the
 // slot check requires the sick instance itself to be alive enough to report -
 // exactly the signal source issue #448 says cannot be trusted), and a
-// standby-side cnpg_pg_replication_lag ("time since last replay") rule.
-// The lag metric was tried and REMOVED: live-verified false-firing on
-// mem-tatara-pg during a write-idle window (a standby's "time since last
-// replayed transaction" grows unbounded with wall-clock time whenever there
-// is simply nothing new to replay, independent of replication health - not a
-// sustained-window fluke, since a PRIOR flat-zero 3h idle observation had
-// wrongly been taken as proof the metric was safe). The only design that
-// stays quiet during idle periods - gating the time-lag on the primary
-// ALSO reporting non-zero retained WAL for that slot - collapses to a strict
-// subset of MemoryPostgresReplicationSlotWalRetentionHigh's own signal (both
-// key off the same primary-side byte-diff; the extra time qualifier adds
-// complexity without adding coverage), and would ALSO have missed the one
-// live anomaly this investigation surfaced (mem-tatara-pg-1 self-reporting
-// growing lag while the primary's byte-diff for its slot stayed genuinely
-// zero - plausibly a standby-local replay stall, unconfirmed, flagged for a
-// human, not remediated here). Four honestly-scoped rules beat five where one
-// cries wolf. Full evidence trail: MEMORY.md, 2026-07-26.
+// standby-side cnpg_pg_replication_lag ("time since last replay",
+// self-reported by the standby) rule. That metric was tried and REMOVED:
+// live-verified false-firing on mem-tatara-pg during a write-idle window (it
+// grows unbounded with wall-clock time whenever there is simply nothing new
+// to replay, independent of replication health - not a sustained-window
+// fluke, since a PRIOR flat-zero 3h idle observation had wrongly been taken
+// as proof the metric was safe). MemoryPostgresStandbyReplayStalled above
+// replaces it with a DIFFERENT metric family - cnpg_pg_stat_replication_*,
+// read on the primary via pg_stat_replication rather than self-reported by
+// the standby - live-verified flat 0 for the full 24h retention window on
+// every healthy standby, including through the exact idle stretch that broke
+// the removed metric, because it measures pending replication WORK (bytes/
+// time actually behind), not wall-clock time since an arbitrary last event.
+// Full evidence trail: MEMORY.md, 2026-07-26.
 //
 // A rolling restart or a deliberate scale change must not trip any of these:
 // CNPG bounces or (re)clones one instance at a time. MemoryPostgresInstancesBelowDeclared
 // only measures scrape reachability (up{}==1), which a fresh pod satisfies as
 // soon as its container starts and opens the metrics port - well before any
 // base backup completes - so its "for" (10m) only needs to ride out a single
-// instance's restart bounce, not a resync. The other three measure actual
-// replication convergence (a slot activating, streaming replicas catching up),
-// which a freshly cloned standby only reaches once its base backup finishes;
-// their "for" (30m for the hard down/inactive/below-expected states, 15m for
-// the WAL-retention early-warning one) rides that out too. instances is read
-// from THIS Project's current spec at render time, so a scale change moves
-// the threshold and the actual desired pod count together in the same
-// reconcile - there is no window where the alert compares against a stale
-// target.
+// instance's restart bounce, not a resync. The other four measure actual
+// replication convergence (a slot activating, streaming replicas catching up,
+// replay actually progressing), which a freshly cloned standby only reaches
+// once its base backup finishes; their "for" (30m for the hard down/inactive/
+// below-expected states, 15m for the two early-warning/progress ones) rides
+// that out too - MemoryPostgresStandbyReplayStalled does not need the fuller
+// 30m because a routine restart's replay backlog clears in seconds once
+// reconnected (no base-backup wait), unlike a slot activating from cold.
+// instances is read from THIS Project's current spec at render time, so a
+// scale change moves the threshold and the actual desired pod count together
+// in the same reconcile - there is no window where the alert compares against
+// a stale target.
 //
 // cluster is the cnpg Cluster name (mem-<proj>-pg) and its pods/PVCs are named
 // <cluster>-<n>[-wal]; namespace scopes the series to this Project's cluster
@@ -466,10 +519,12 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 				// so it scales with a custom pgWalStorage and gives lead time before
 				// cnpg's own max_slot_wal_keep_size would forcibly invalidate the
 				// slot. Scoped onPrimary: LIVE-VERIFIED NECESSARY, not defensive
-				// gold-plating - an unscoped max by (slot_name) picked up a
-				// non-primary standby's stale/wrong view of a sibling's slot at
-				// >2GiB on a cluster whose actual primary reported 0 for that slot,
-				// which would have false-fired this exact rule within ~15 minutes.
+				// gold-plating - an unscoped max by (slot_name) picked up a BROKEN
+				// standby's distorted view of a sibling's slot at >2GiB while the
+				// actual primary reported 0 for that slot - a real symptom
+				// misattributed to the wrong slot/cause, which would have alarmed
+				// on "WAL retention" within ~15 minutes instead of the real fault
+				// (see MemoryPostgresStandbyReplayStalled below).
 				Alert: "MemoryPostgresReplicationSlotWalRetentionHigh",
 				Expr: intstr.FromString(fmt.Sprintf(
 					`max by (slot_name) (cnpg_pg_replication_slots_pg_wal_lsn_diff{%s} %s) > %d`,
@@ -480,6 +535,38 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 				Annotations: map[string]string{
 					"summary":     "a replication slot of postgres cluster " + cluster + " is pinning growing WAL",
 					"description": fmt.Sprintf("A replication slot of cluster %s has retained more than %d bytes of WAL for 15m, a quarter of its configured WAL volume - the latent disk-exhaustion trap of issue #448's N1 finding, ahead of the point cnpg's own max_slot_wal_keep_size would forcibly invalidate the slot.", cluster, walRetentionWarnBytes),
+				},
+			},
+			monitoringv1.Rule{
+				// The gap none of the other four rules can see: a standby that is
+				// up (up{}==1), counted (streaming_replicas), and has an active
+				// slot, yet has made zero REPLAY progress - the FLUSH frontier the
+				// other rules read stays genuinely 0 because the standby is still
+				// receiving and flushing WAL fine; only its apply/replay process has
+				// stalled. Reads cnpg_pg_stat_replication_replay_lag_seconds -
+				// pg_stat_replication on the PRIMARY, keyed by
+				// application_name=<standby pod> - which is emitted ONLY by
+				// primaries (absent on every standby, live-verified), so unlike the
+				// slot metrics above it needs no `and on(pod)` guard: there is no
+				// non-primary reporter to be wrong. Chose the TIME form over the
+				// sibling cnpg_pg_stat_replication_replay_diff_bytes metric: both
+				// are live-verified idle-immune (flat 0 for the full 24h window
+				// including the idle stretch that broke the removed self-reported
+				// lag metric), so the choice is legibility, not safety - "no replay
+				// progress for N minutes" reads directly in an alert annotation
+				// without needing to know this project's WAL volume or write rate,
+				// where a byte threshold would need the same per-project scaling
+				// pgSlotWalRetentionWarnBytes already does for a different metric.
+				Alert: "MemoryPostgresStandbyReplayStalled",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`max by (application_name) (cnpg_pg_stat_replication_replay_lag_seconds{%s}) > %s`,
+					podSelector, memoryReplayStalledThresholdSeconds,
+				)),
+				For:    dur("15m"),
+				Labels: map[string]string{"severity": memorySeverityCritical},
+				Annotations: map[string]string{
+					"summary":     "a standby of postgres cluster " + cluster + " has stopped applying WAL",
+					"description": "A standby of cluster " + cluster + " has made zero replay progress for more than " + memoryReplayStalledThresholdSeconds + "s - it is up, counted, and its slot is active, but it is silently not applying WAL (issues #442, #444, #448). 15m rides out a routine restart's catch-up, which clears in seconds once reconnected.",
 				},
 			},
 		)

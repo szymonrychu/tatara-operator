@@ -151,6 +151,7 @@ func TestMemoryPrometheusRule_SingleInstance_NoReplicationTopologyAlerts(t *test
 		"MemoryPostgresReplicationSlotInactive",
 		"MemoryPostgresStreamingReplicasBelowExpected",
 		"MemoryPostgresReplicationSlotWalRetentionHigh",
+		"MemoryPostgresStandbyReplayStalled",
 	} {
 		require.False(t, names[a], "alert %s must NOT be generated for a single-instance project (no standbys, no slots)", a)
 	}
@@ -259,6 +260,45 @@ func TestMemoryPrometheusRule_ReplicationAlerts_MultiInstance(t *testing.T) {
 	)
 	require.Equal(t, "15m", byFor["MemoryPostgresReplicationSlotWalRetentionHigh"])
 	require.Equal(t, "warning", bySeverity["MemoryPostgresReplicationSlotWalRetentionHigh"])
+
+	// MemoryPostgresStandbyReplayStalled: closes the third-review-round gap -
+	// a standby up/counted/slot-active yet making zero REPLAY progress, which
+	// none of the four rules above can see (they all read the FLUSH frontier).
+	// cnpg_pg_stat_replication_replay_lag_seconds is emitted ONLY by primaries
+	// (live-verified: absent on every standby), so it needs no `and on(pod)`
+	// guard - there is no non-primary reporter to be wrong.
+	require.Equal(t,
+		`max by (application_name) (cnpg_pg_stat_replication_replay_lag_seconds{namespace="tatara", pod=~"mem-acme-pg-.*", container="postgres"}) > 300`,
+		byName["MemoryPostgresStandbyReplayStalled"],
+	)
+	require.Equal(t, "15m", byFor["MemoryPostgresStandbyReplayStalled"])
+	require.Equal(t, "critical", bySeverity["MemoryPostgresStandbyReplayStalled"])
+}
+
+// Regression test for the third-review-round Critical finding: a standby can
+// be up (up{}==1), counted (streaming_replicas), and slot-active, yet have
+// made zero replay progress, because the flush frontier every other rule
+// reads stays genuinely 0 while only the apply/replay process has stalled.
+// Live evidence: mem-tatara-pg-1 read replay_diff_bytes=2266627752 (2.1GiB)
+// and a still-climbing replay_lag_seconds on the primary's pg_stat_replication
+// view, while every other cnpg_pg_* signal (up, slots_active,
+// streaming_replicas, slots_pg_wal_lsn_diff) read healthy. Pins the metric
+// family (pg_stat_replication, not the slot/count metrics) and that it
+// carries no `and on(pod)` guard, since it is structurally primary-exclusive.
+func TestMemoryPrometheusRule_StandbyReplayStalled_UsesReplicationReplayMetric(t *testing.T) {
+	p := testProjectWithInstances("acme", 3)
+	pr := memory.MemoryPrometheusRule(p, testMonitorCfg())
+
+	var expr string
+	for _, r := range pr.Spec.Groups[0].Rules {
+		if r.Alert == "MemoryPostgresStandbyReplayStalled" {
+			expr = r.Expr.StrVal
+		}
+	}
+	require.Contains(t, expr, "cnpg_pg_stat_replication_replay_lag_seconds", "must read the primary's pg_stat_replication replay frontier, not the slot flush frontier")
+	require.Contains(t, expr, "application_name", "must aggregate by application_name for per-standby attribution")
+	require.NotContains(t, expr, "and on(pod)", "must NOT need the primary-scoping guard: this metric is structurally primary-exclusive")
+	require.NotContains(t, expr, "cnpg_pg_replication_in_recovery", "must not join against in_recovery: no non-primary reporter exists to guard against")
 }
 
 // Regression test for the reviewer-found trap: an earlier cut of the two
