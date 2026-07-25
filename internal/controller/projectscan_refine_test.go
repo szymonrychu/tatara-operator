@@ -315,12 +315,12 @@ func TestRefineBarrier_HeldEmitsMetricPerTick(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 	ctx := context.Background()
 
-	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held"))
+	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-held-metric", "brainstorm", "refine_barrier_held"))
 
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 1: %v", err)
 	}
-	afterFirst := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held"))
+	afterFirst := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-held-metric", "brainstorm", "refine_barrier_held"))
 	if afterFirst != before+1 {
 		t.Fatalf("refine_barrier_held after tick 1 = %v, want %v", afterFirst, before+1)
 	}
@@ -328,7 +328,7 @@ func TestRefineBarrier_HeldEmitsMetricPerTick(t *testing.T) {
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
 	}
-	afterSecond := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_held"))
+	afterSecond := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-held-metric", "brainstorm", "refine_barrier_held"))
 	if afterSecond != afterFirst+1 {
 		t.Fatalf("refine_barrier_held after tick 2 = %v, want %v (once per tick, not cumulative per-repo)", afterSecond, afterFirst+1)
 	}
@@ -352,13 +352,13 @@ func TestRefineBarrier_MaxHoldReleasesBrainstorm(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 	ctx := context.Background()
 
-	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout"))
+	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-maxhold", "brainstorm", "refine_barrier_timeout"))
 
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 
-	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout")); got != beforeTimeout+1 {
+	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-maxhold", "brainstorm", "refine_barrier_timeout")); got != beforeTimeout+1 {
 		t.Fatalf("refine_barrier_timeout = %v, want %v (max-hold release)", got, beforeTimeout+1)
 	}
 	if len(listBrainstormQEs(t, "refine-maxhold")) == 0 {
@@ -388,13 +388,13 @@ func TestRefineBarrier_JustUnderMaxHoldDoesNotRelease(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 	ctx := context.Background()
 
-	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout"))
+	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-justunder", "brainstorm", "refine_barrier_timeout"))
 
 	if _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 
-	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("brainstorm", "refine_barrier_timeout")); got != beforeTimeout {
+	if got := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-justunder", "brainstorm", "refine_barrier_timeout")); got != beforeTimeout {
 		t.Fatalf("refine_barrier_timeout = %v, want unchanged at %v (must not release early)", got, beforeTimeout)
 	}
 	if len(listBrainstormQEs(t, "refine-justunder")) != 0 {

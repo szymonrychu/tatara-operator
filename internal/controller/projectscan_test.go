@@ -24,8 +24,8 @@ func TestRunScans_SweepGaugeRehydrate(t *testing.T) {
 		// Every schedule on the seeded cron is empty, so no activity runs a
 		// fresh pass either - this isolates the top-of-runScans rehydrate.
 		proj, _ := seedScanProject(t, "gauge-never", &tatarav1alpha1.ScmCron{})
-		obs.SweepLastSuccessTimestamp.WithLabelValues("issueScan").Set(0)
-		obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(0)
+		obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-never", "issueScan").Set(0)
+		obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-never", SweepActivity).Set(0)
 
 		r := newScanReconciler(reader)
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
@@ -33,10 +33,10 @@ func TestRunScans_SweepGaugeRehydrate(t *testing.T) {
 			t.Fatalf("runScans: %v", err)
 		}
 
-		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("issueScan")); got != 0 {
+		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-never", "issueScan")); got != 0 {
 			t.Fatalf("issueScan gauge = %v, want 0 (unset, true NoData for a never-scanned project)", got)
 		}
-		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity)); got != 0 {
+		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-never", SweepActivity)); got != 0 {
 			t.Fatalf("sweep gauge = %v, want 0 (unset, true NoData for a never-scanned project)", got)
 		}
 	})
@@ -53,8 +53,8 @@ func TestRunScans_SweepGaugeRehydrate(t *testing.T) {
 		if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
 			t.Fatalf("seed LastIssueScan: %v", err)
 		}
-		obs.SweepLastSuccessTimestamp.WithLabelValues("issueScan").Set(0)
-		obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity).Set(0)
+		obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-issuescan", "issueScan").Set(0)
+		obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-issuescan", SweepActivity).Set(0)
 
 		r := newScanReconciler(reader)
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
@@ -63,10 +63,10 @@ func TestRunScans_SweepGaugeRehydrate(t *testing.T) {
 		}
 
 		wantUnix := float64(want.Unix())
-		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("issueScan")); got != wantUnix {
+		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-issuescan", "issueScan")); got != wantUnix {
 			t.Fatalf("issueScan gauge = %v, want rehydrated %v (persisted LastIssueScan)", got, wantUnix)
 		}
-		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(SweepActivity)); got != wantUnix {
+		if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-issuescan", SweepActivity)); got != wantUnix {
 			t.Fatalf("sweep gauge = %v, want rehydrated %v (persisted LastIssueScan)", got, wantUnix)
 		}
 	})
@@ -80,8 +80,8 @@ func TestRunScans_SweepGaugeRehydrate(t *testing.T) {
 		if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
 			t.Fatalf("seed LastBrainstorm/LastDocumentation: %v", err)
 		}
-		obs.SweepLastSuccessTimestamp.WithLabelValues("brainstorm").Set(0)
-		obs.SweepLastSuccessTimestamp.WithLabelValues("documentation").Set(0)
+		obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-brainstormdoc", "brainstorm").Set(0)
+		obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-brainstormdoc", "documentation").Set(0)
 
 		r := newScanReconciler(reader)
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
@@ -89,10 +89,10 @@ func TestRunScans_SweepGaugeRehydrate(t *testing.T) {
 			t.Fatalf("runScans: %v", err)
 		}
 
-		if got, want := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("brainstorm")), float64(wantBrainstorm.Unix()); got != want {
+		if got, want := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-brainstormdoc", "brainstorm")), float64(wantBrainstorm.Unix()); got != want {
 			t.Fatalf("brainstorm gauge = %v, want rehydrated %v (persisted LastBrainstorm)", got, want)
 		}
-		if got, want := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("documentation")), float64(wantDocumentation.Unix()); got != want {
+		if got, want := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues("gauge-brainstormdoc", "documentation")), float64(wantDocumentation.Unix()); got != want {
 			t.Fatalf("documentation gauge = %v, want rehydrated %v (persisted LastDocumentation)", got, want)
 		}
 	})

@@ -581,14 +581,14 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 
 	active, err := r.activeTaskCount(ctx, proj)
 	if err != nil {
-		obs.SweepErrorsTotal.WithLabelValues(activity, "list_tasks").Inc()
+		obs.SweepErrorsTotal.WithLabelValues(proj.Name, activity, "list_tasks").Inc()
 		return fmt.Errorf("sweep: count active tasks: %w", err)
 	}
 	budget := newSweepBudget(proj, active)
 	minted := map[string]int{tatarav1alpha1.StageTriaging: 0, tatarav1alpha1.StageParked: 0}
 	var firstErr error
 	fail := func(reason string, err error, kv ...any) {
-		obs.SweepErrorsTotal.WithLabelValues(activity, reason).Inc()
+		obs.SweepErrorsTotal.WithLabelValues(proj.Name, activity, reason).Inc()
 		l.Error(err, "sweep: "+reason, append([]any{"action", "sweep_error",
 			"resource_id", proj.Name, "activity", activity, "reason", reason}, kv...)...)
 		if firstErr == nil {
@@ -646,7 +646,7 @@ func (r *ProjectReconciler) SweepProject(ctx context.Context, proj *tatarav1alph
 	// resets on restart the NoData(Alerting) alert then fired while the sweep was
 	// in fact running. The activeTaskCount hard-failure returns BEFORE this point,
 	// so a sweep that genuinely cannot run still leaves the heartbeat unset.
-	obs.SweepLastSuccessTimestamp.WithLabelValues(activity).Set(float64(now.Unix()))
+	obs.SweepLastSuccessTimestamp.WithLabelValues(proj.Name, activity).Set(float64(now.Unix()))
 	if firstErr != nil {
 		return firstErr
 	}
