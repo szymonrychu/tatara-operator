@@ -363,17 +363,17 @@ func TestIngestJobResultTotal(t *testing.T) {
 func TestSetRepositoryIngestFailing(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
-	m.SetRepositoryIngestFailing("repo-a", true)
-	m.SetRepositoryIngestFailing("repo-b", false)
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("repo-a")); got != 1 {
+	m.SetRepositoryIngestFailing("mtg", "repo-a", true)
+	m.SetRepositoryIngestFailing("mtg", "repo-b", false)
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("mtg", "repo-a")); got != 1 {
 		t.Fatalf("ingest_failing{repo-a} = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("repo-b")); got != 0 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("mtg", "repo-b")); got != 0 {
 		t.Fatalf("ingest_failing{repo-b} = %v, want 0", got)
 	}
 	// Recovery: setting back to false must clear the gauge (no monotonicity).
-	m.SetRepositoryIngestFailing("repo-a", false)
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("repo-a")); got != 0 {
+	m.SetRepositoryIngestFailing("mtg", "repo-a", false)
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("mtg", "repo-a")); got != 0 {
 		t.Fatalf("ingest_failing{repo-a} after recovery = %v, want 0", got)
 	}
 }
@@ -384,12 +384,12 @@ func TestSetRepositoryIngestFailing(t *testing.T) {
 func TestSetRepositoryIngestGated(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
-	m.SetRepositoryIngestGated("repo-a", true)
-	if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("repo-a")); got != 1 {
+	m.SetRepositoryIngestGated("mtg", "repo-a", true)
+	if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("mtg", "repo-a")); got != 1 {
 		t.Fatalf("ingest_gated{repo-a} = %v, want 1", got)
 	}
-	m.SetRepositoryIngestGated("repo-a", false)
-	if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("repo-a")); got != 0 {
+	m.SetRepositoryIngestGated("mtg", "repo-a", false)
+	if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("mtg", "repo-a")); got != 0 {
 		t.Fatalf("ingest_gated{repo-a} after clear = %v, want 0", got)
 	}
 }
@@ -397,9 +397,135 @@ func TestSetRepositoryIngestGated(t *testing.T) {
 func TestSetRepositoryLastIngestTimestamp(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
-	m.SetRepositoryLastIngestTimestamp("repo-a", 1750000000)
-	if got := testutil.ToFloat64(m.RepositoryLastIngestTimestampGauge("repo-a")); got != 1750000000 {
+	m.SetRepositoryLastIngestTimestamp("mtg", "repo-a", 1750000000)
+	if got := testutil.ToFloat64(m.RepositoryLastIngestTimestampGauge("mtg", "repo-a")); got != 1750000000 {
 		t.Fatalf("last_ingest_timestamp{repo-a} = %v, want 1750000000", got)
+	}
+}
+
+// TestRepositoryGaugesCarryProjectLabel guards issue #457's routing defect: the
+// per-repo ingest gauges were labelled by repo only, so the alert selected the
+// operator's namespace and an mtg-project repo paged the tatara project's
+// incident agent. The label must be present and the existing
+// `max by (repo) (...)` / `sum(...)` alert expressions must keep working, which
+// they do for a pure label addition.
+func TestRepositoryGaugesCarryProjectLabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetRepositoryIngestFailing("mtg", "mtg-decks", true)
+	m.SetRepositoryIngestGated("mtg", "mtg-decks", true)
+	m.SetRepositoryLastIngestTimestamp("mtg", "mtg-decks", 1750000000)
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	want := map[string]bool{
+		"operator_repository_ingest_failing":                false,
+		"operator_repository_ingest_gated":                  false,
+		"operator_repository_last_ingest_timestamp_seconds": false,
+	}
+	for _, mf := range mfs {
+		if _, ok := want[mf.GetName()]; !ok {
+			continue
+		}
+		for _, metric := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range metric.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["repo"] != "mtg-decks" {
+				continue
+			}
+			if labels["project"] != "mtg" {
+				t.Errorf("%s{repo=mtg-decks} project label = %q, want %q", mf.GetName(), labels["project"], "mtg")
+			}
+			want[mf.GetName()] = true
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Errorf("%s carries no project-labelled series", name)
+		}
+	}
+}
+
+// gatherCount returns the number of live series for one metric name.
+func gatherCount(t *testing.T, g prometheus.Gatherer, name string) int {
+	t.Helper()
+	n, err := testutil.GatherAndCount(g, name)
+	if err != nil {
+		t.Fatalf("gather %s: %v", name, err)
+	}
+	return n
+}
+
+// TestForgetRepositoryDropsStaleSeries guards the stale-series half of the
+// project label (issue #457), the analogue of the per-pass Reset the
+// per-project memory-stack gauge uses (issue #425): a repo that is deleted, or
+// moved to another project, must not leave a series behind that pins an alert
+// on a repo/project pair that no longer exists.
+func TestForgetRepositoryDropsStaleSeries(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+
+	m.SetRepositoryIngestFailing("mtg", "moving", true)
+	m.SetRepositoryIngestGated("mtg", "moving", true)
+	m.SetRepositoryLastIngestTimestamp("mtg", "moving", 1750000000)
+	m.SetRepositoryIngestFailing("tatara", "staying", true)
+
+	// Re-publishing the repo under a NEW project must retire the old series
+	// rather than leaving both projects reporting it.
+	m.SetRepositoryIngestFailing("infrastructure", "moving", false)
+	m.SetRepositoryIngestGated("infrastructure", "moving", false)
+	m.SetRepositoryLastIngestTimestamp("infrastructure", "moving", 1750000001)
+	if got := gatherCount(t, reg, "operator_repository_ingest_failing"); got != 2 {
+		t.Errorf("ingest_failing series after project move = %d, want 2 (moving under one project + staying)", got)
+	}
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("infrastructure", "moving")); got != 0 {
+		t.Errorf("ingest_failing{infrastructure,moving} = %v, want 0", got)
+	}
+
+	// A deleted Repository drops every one of its series, whatever the project.
+	m.ForgetRepository("moving")
+	if got := gatherCount(t, reg, "operator_repository_ingest_failing"); got != 1 {
+		t.Errorf("ingest_failing series after forget = %d, want 1 (only staying)", got)
+	}
+	if got := gatherCount(t, reg, "operator_repository_ingest_gated"); got != 0 {
+		t.Errorf("ingest_gated series after forget = %d, want 0", got)
+	}
+	if got := gatherCount(t, reg, "operator_repository_last_ingest_timestamp_seconds"); got != 0 {
+		t.Errorf("last_ingest_timestamp series after forget = %d, want 0", got)
+	}
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("tatara", "staying")); got != 1 {
+		t.Errorf("forgetting one repo must not touch another: staying = %v, want 1", got)
+	}
+}
+
+// operator_repository_phase_repaired_total counts the desynchronised
+// (Phase=Failed, IngestFailureCount=0) states the reconciler had to repair
+// (issue #457). The guard makes the state self-repairing; this counter is how
+// we learn whether anything is still producing it.
+func TestRepositoryPhaseRepaired(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.RepositoryPhaseRepaired("mtg", "mtg-decks")
+	m.RepositoryPhaseRepaired("mtg", "mtg-decks")
+	if got := testutil.ToFloat64(m.repositoryPhaseRepairedTotal.WithLabelValues("mtg", "mtg-decks")); got != 2 {
+		t.Fatalf("phase_repaired_total = %v, want 2", got)
+	}
+}
+
+// operator_ingest_job_deduplicated_total counts the ingest Job creations that
+// the deterministic Job name collapsed into an adoption of an existing Job
+// (issue #457). Non-zero means the duplicate-launch race is still being run
+// into, and the idempotent name is what is holding it.
+func TestIngestJobDeduplicated(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.IngestJobDeduplicated("mtg", "mtg-decks")
+	if got := testutil.ToFloat64(m.ingestJobDedupTotal.WithLabelValues("mtg", "mtg-decks")); got != 1 {
+		t.Fatalf("ingest_job_deduplicated_total = %v, want 1", got)
 	}
 }
 
@@ -418,9 +544,11 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 	// Touch counters/vecs that require a label-value observation to appear.
 	m.OrphanReaped("test")
 	m.ReapDeleteError("pod")
-	m.SetRepositoryIngestFailing("touch", false)
-	m.SetRepositoryIngestGated("touch", false)
-	m.SetRepositoryLastIngestTimestamp("touch", 1)
+	m.SetRepositoryIngestFailing("touch-project", "touch", false)
+	m.SetRepositoryIngestGated("touch-project", "touch", false)
+	m.SetRepositoryLastIngestTimestamp("touch-project", "touch", 1)
+	m.RepositoryPhaseRepaired("touch-project", "touch")
+	m.IngestJobDeduplicated("touch-project", "touch")
 	// operator_memory_stacks is per-project (issue #425), so it cannot be
 	// pre-seeded at construction and needs a touch to appear in Gather.
 	m.SetMemoryStackPhase("touch", "Ready", 0)
@@ -438,6 +566,8 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 		"operator_repository_ingest_failing":                false,
 		"operator_repository_ingest_gated":                  false,
 		"operator_repository_last_ingest_timestamp_seconds": false,
+		"operator_repository_phase_repaired_total":          false,
+		"operator_ingest_job_deduplicated_total":            false,
 		"operator_agent_unreachable_termination_total":      false,
 		"operator_orphan_reaped_total":                      false,
 		"operator_reap_delete_error_total":                  false,

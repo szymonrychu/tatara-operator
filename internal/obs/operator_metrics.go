@@ -1,6 +1,10 @@
 package obs
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"sync"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // seedLabels walks the cartesian product of dims and calls set with each
 // combination, in the same nested-loop order the pre-seed blocks used before
@@ -74,6 +78,13 @@ type OperatorMetrics struct {
 	repositoryIngestFailing      *prometheus.GaugeVec
 	repositoryIngestGated        *prometheus.GaugeVec
 	repositoryLastIngestTime     *prometheus.GaugeVec
+	repositoryPhaseRepairedTotal *prometheus.CounterVec
+	ingestJobDedupTotal          *prometheus.CounterVec
+	// repoProjectMu guards repoProject, the last project label published for
+	// each repo. A Repository's projectRef is mutable, so without it a repo
+	// moved between projects would keep reporting under both.
+	repoProjectMu                sync.Mutex
+	repoProject                  map[string]string
 	reviewOutcomeTotal           *prometheus.CounterVec
 	reviewHeadMovedTotal         *prometheus.CounterVec
 	reviewFindingsTotal          *prometheus.CounterVec
@@ -93,6 +104,7 @@ type OperatorMetrics struct {
 // bundle. Names and labels are pinned by the shared-contracts pin set.
 func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 	m := &OperatorMetrics{
+		repoProject:         map[string]string{},
 		scmMetrics:          newSCMMetrics(reg),
 		queueMetrics:        newQueueMetrics(reg),
 		taskMetrics:         newTaskMetrics(reg),
@@ -170,10 +182,16 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_ingest_job_total",
 			Help: "Finished ingest Jobs by terminal result and ingest mode (incremental|full).",
 		}, []string{"result", "mode"}),
+		// The project label (issue #457) is what lets an alert page the project
+		// that owns the repo. The rule selected the operator's NAMESPACE, so a
+		// firing mtg-decks (projectRef mtg) was routed to the tatara project's
+		// incident agent, whose repo list does not contain it. It is a pure label
+		// addition, so `max by (repo) (...)` and `sum(...)` expressions keep
+		// working unchanged.
 		repositoryIngestFailing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_ingest_failing",
-			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0), else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138).",
-		}, []string{"repo"}),
+			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0), else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138). Labelled by owning project (issue #457).",
+		}, []string{"project", "repo"}),
 		// Issue #434: a Repository whose re-ingest is held by the project
 		// memory-readiness gate is neither Failed nor accumulating failures, so
 		// repositoryIngestFailing reads 0 for it indefinitely. Without this gauge
@@ -181,12 +199,29 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// fires.
 		repositoryIngestGated: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_ingest_gated",
-			Help: "1 while a Repository's re-ingest is held by the project memory-readiness gate, else 0. Distinct from operator_repository_ingest_failing, which stays 0 for a gated repo because nothing has failed (issue #434).",
-		}, []string{"repo"}),
+			Help: "1 while a Repository's re-ingest is held by the project memory-readiness gate, else 0. Distinct from operator_repository_ingest_failing, which stays 0 for a gated repo because nothing has failed (issue #434). Labelled by owning project (issue #457).",
+		}, []string{"project", "repo"}),
 		repositoryLastIngestTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_last_ingest_timestamp_seconds",
-			Help: "Unix timestamp (seconds) of a Repository's last successful ingest (status LastIngestTime). Compute staleness in PromQL as time() - this (issue #138).",
-		}, []string{"repo"}),
+			Help: "Unix timestamp (seconds) of a Repository's last successful ingest (status LastIngestTime). Compute staleness in PromQL as time() - this (issue #138). Labelled by owning project (issue #457).",
+		}, []string{"project", "repo"}),
+		// Issue #457: (Phase="Failed", IngestFailureCount=0) is a state nothing
+		// repaired and nothing re-ingested - one repo sat in it for 20.8h with zero
+		// actual ingest failures. The reconciler now repairs it on sight; the
+		// origin of the desync could not be proven from logs, so this counter is
+		// how we learn whether anything is still producing it.
+		repositoryPhaseRepairedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_repository_phase_repaired_total",
+			Help: "Repository status repairs of the desynchronised (Phase=Failed, IngestFailureCount=0) state, by project and repo (issue #457).",
+		}, []string{"project", "repo"}),
+		// Issue #457: two ingest Jobs were created for one Repository 16ms and
+		// 21ms apart from the same pod. Non-zero here means the read-then-create
+		// race is still being run into and the deterministic Job name is what is
+		// holding it.
+		ingestJobDedupTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_ingest_job_deduplicated_total",
+			Help: "Ingest Job creations collapsed into adopting an existing Job of the same deterministic name, by project and repo (issue #457).",
+		}, []string{"project", "repo"}),
 		agentUnreachableTermTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "operator_agent_unreachable_termination_total",
 			Help: "Tasks terminated because the wrapper agent stayed unreachable past the boot deadline.",
@@ -443,6 +478,8 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.repositoryIngestFailing,
 		m.repositoryIngestGated,
 		m.repositoryLastIngestTime,
+		m.repositoryPhaseRepairedTotal,
+		m.ingestJobDedupTotal,
 		m.agentUnreachableTermTotal,
 		m.agentBootCrashTotal,
 		m.orphanReapedTotal,
@@ -562,50 +599,110 @@ func (m *OperatorMetrics) IngestJobResult(result, mode string) {
 	m.ingestJobTotal.WithLabelValues(result, mode).Inc()
 }
 
+// trackRepoProject records the project a repo's series are published under and
+// retires the series it carried under a previous project. projectRef is a
+// mutable Repository field, so without this a repo moved between projects would
+// report under both forever - the per-repo analogue of the per-pass Reset the
+// per-project memory-stack gauge uses (issue #425). ForgetRepository covers the
+// other stale case, a Repository that is deleted outright.
+func (m *OperatorMetrics) trackRepoProject(project, repo string) {
+	m.repoProjectMu.Lock()
+	defer m.repoProjectMu.Unlock()
+	prev, ok := m.repoProject[repo]
+	if ok && prev == project {
+		return
+	}
+	if ok {
+		m.deleteRepoSeries(prev, repo)
+	}
+	m.repoProject[repo] = project
+}
+
+// deleteRepoSeries drops all three per-repo ingest gauges for one project/repo pair.
+func (m *OperatorMetrics) deleteRepoSeries(project, repo string) {
+	m.repositoryIngestFailing.DeleteLabelValues(project, repo)
+	m.repositoryIngestGated.DeleteLabelValues(project, repo)
+	m.repositoryLastIngestTime.DeleteLabelValues(project, repo)
+}
+
+// ForgetRepository drops every per-repo ingest gauge series for repo, whatever
+// project it was published under. Called when the Repository is gone so a
+// deleted repo does not leave a series pinning an alert on a repo/project pair
+// that no longer exists (issue #457).
+func (m *OperatorMetrics) ForgetRepository(repo string) {
+	m.repoProjectMu.Lock()
+	defer m.repoProjectMu.Unlock()
+	if prev, ok := m.repoProject[repo]; ok {
+		m.deleteRepoSeries(prev, repo)
+		delete(m.repoProject, repo)
+	}
+	labels := prometheus.Labels{"repo": repo}
+	m.repositoryIngestFailing.DeletePartialMatch(labels)
+	m.repositoryIngestGated.DeletePartialMatch(labels)
+	m.repositoryLastIngestTime.DeletePartialMatch(labels)
+}
+
 // SetRepositoryIngestFailing sets operator_repository_ingest_failing for a repo
 // to 1 when its ingest is currently failing, else 0. Unlike the monotonic
 // operator_ingest_job_total counter, this reflects the CURRENT ingest health and
 // clears as soon as a re-ingest succeeds, so alerting on it does not keep firing
 // for an hour after a self-healed transient burst (issue #138).
-func (m *OperatorMetrics) SetRepositoryIngestFailing(repo string, failing bool) {
+func (m *OperatorMetrics) SetRepositoryIngestFailing(project, repo string, failing bool) {
+	m.trackRepoProject(project, repo)
 	v := 0.0
 	if failing {
 		v = 1.0
 	}
-	m.repositoryIngestFailing.WithLabelValues(repo).Set(v)
+	m.repositoryIngestFailing.WithLabelValues(project, repo).Set(v)
 }
 
 // SetRepositoryIngestGated sets operator_repository_ingest_gated for a repo to
 // 1 while its re-ingest is held by the project memory-readiness gate, else 0.
 // The gate is a silent hold - nothing fails, nothing retries - so
 // operator_repository_ingest_failing cannot see it (issue #434).
-func (m *OperatorMetrics) SetRepositoryIngestGated(repo string, gated bool) {
+func (m *OperatorMetrics) SetRepositoryIngestGated(project, repo string, gated bool) {
+	m.trackRepoProject(project, repo)
 	v := 0.0
 	if gated {
 		v = 1.0
 	}
-	m.repositoryIngestGated.WithLabelValues(repo).Set(v)
+	m.repositoryIngestGated.WithLabelValues(project, repo).Set(v)
 }
 
 // SetRepositoryLastIngestTimestamp sets operator_repository_last_ingest_timestamp_seconds
 // for a repo to the Unix seconds of its last successful ingest.
-func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(repo string, unixSeconds float64) {
-	m.repositoryLastIngestTime.WithLabelValues(repo).Set(unixSeconds)
+func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(project, repo string, unixSeconds float64) {
+	m.trackRepoProject(project, repo)
+	m.repositoryLastIngestTime.WithLabelValues(project, repo).Set(unixSeconds)
+}
+
+// RepositoryPhaseRepaired increments operator_repository_phase_repaired_total:
+// the reconciler found a Repository in the desynchronised (Phase=Failed,
+// IngestFailureCount=0) state and repaired it (issue #457).
+func (m *OperatorMetrics) RepositoryPhaseRepaired(project, repo string) {
+	m.repositoryPhaseRepairedTotal.WithLabelValues(project, repo).Inc()
+}
+
+// IngestJobDeduplicated increments operator_ingest_job_deduplicated_total: an
+// ingest Job creation hit AlreadyExists on its deterministic name and adopted
+// the existing Job instead of launching a duplicate (issue #457).
+func (m *OperatorMetrics) IngestJobDeduplicated(project, repo string) {
+	m.ingestJobDedupTotal.WithLabelValues(project, repo).Inc()
 }
 
 // RepositoryIngestFailingGauge returns the gauge for a repo, for test assertions.
-func (m *OperatorMetrics) RepositoryIngestFailingGauge(repo string) prometheus.Gauge {
-	return m.repositoryIngestFailing.WithLabelValues(repo)
+func (m *OperatorMetrics) RepositoryIngestFailingGauge(project, repo string) prometheus.Gauge {
+	return m.repositoryIngestFailing.WithLabelValues(project, repo)
 }
 
 // RepositoryIngestGatedGauge returns the gauge for a repo, for test assertions.
-func (m *OperatorMetrics) RepositoryIngestGatedGauge(repo string) prometheus.Gauge {
-	return m.repositoryIngestGated.WithLabelValues(repo)
+func (m *OperatorMetrics) RepositoryIngestGatedGauge(project, repo string) prometheus.Gauge {
+	return m.repositoryIngestGated.WithLabelValues(project, repo)
 }
 
 // RepositoryLastIngestTimestampGauge returns the gauge for a repo, for test assertions.
-func (m *OperatorMetrics) RepositoryLastIngestTimestampGauge(repo string) prometheus.Gauge {
-	return m.repositoryLastIngestTime.WithLabelValues(repo)
+func (m *OperatorMetrics) RepositoryLastIngestTimestampGauge(project, repo string) prometheus.Gauge {
+	return m.repositoryLastIngestTime.WithLabelValues(project, repo)
 }
 
 // AgentUnreachableTermination increments
