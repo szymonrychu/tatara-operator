@@ -562,3 +562,48 @@ func TestBuildJob_DegenerateURLFallsBackToRepoName(t *testing.T) {
 		})
 	}
 }
+
+// TestJobName_DeterministicPerAttempt guards issue #457: two reconciles that
+// decide on the SAME ingest attempt must build the same Job name so the second
+// Create returns AlreadyExists instead of launching a duplicate Job. Two
+// duplicate ingest Jobs were observed for mtg-decks 16ms and 21ms apart, from
+// one pod under different reconcileIDs; only the last was adopted into status
+// and the orphan's outcome was never reconciled.
+func TestJobName_DeterministicPerAttempt(t *testing.T) {
+	repo := testRepository()
+	if a, b := JobName(repo, ""), JobName(repo, ""); a != b {
+		t.Fatalf("same attempt produced different names: %q vs %q", a, b)
+	}
+	if got := BuildJob(testProject(), repo, "", testBaseURL, testConfig()).Name; got != JobName(repo, "") {
+		t.Fatalf("BuildJob name = %q, want the deterministic JobName %q", got, JobName(repo, ""))
+	}
+	if !strings.HasPrefix(JobName(repo, ""), repo.Name+"-ingest-") {
+		t.Fatalf("job name %q must keep the <repo>-ingest- prefix", JobName(repo, ""))
+	}
+}
+
+// TestJobName_DistinctPerNewAttempt guards the other half of #457: a genuinely
+// new attempt must NOT collide with its predecessor's name, or a retry would be
+// permanently blocked by the AlreadyExists guard. A new re-ingest trigger stamp,
+// a different since-SHA, and one more recorded failure each mint a new name.
+func TestJobName_DistinctPerNewAttempt(t *testing.T) {
+	base := testRepository()
+	baseName := JobName(base, "")
+
+	withSince := JobName(testRepository(), "abc1234")
+	if withSince == baseName {
+		t.Errorf("a different since-SHA must change the job name (%q)", baseName)
+	}
+
+	stamped := testRepository()
+	stamped.Annotations = map[string]string{tataradevv1alpha1.ReingestRequestedAnnotation: "2026-07-26T03:46:32Z"}
+	if JobName(stamped, "") == baseName {
+		t.Errorf("a new reingest-requested stamp must change the job name (%q)", baseName)
+	}
+
+	failed := testRepository()
+	failed.Status.IngestFailureCount = 1
+	if JobName(failed, "") == baseName {
+		t.Errorf("one more recorded failure must change the job name (%q), else the retry is blocked forever", baseName)
+	}
+}

@@ -3,6 +3,8 @@
 package ingest
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -12,8 +14,33 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/rand"
 )
+
+// JobName returns the deterministic name of the ingest Job for ONE ingest
+// attempt of repo. It is a hash of everything that distinguishes one attempt
+// from the next: the since-SHA, the re-ingest trigger stamp, and the number of
+// consecutive failures recorded so far.
+//
+// Determinism is the duplicate-Job fix (issue #457). Two reconciles that decide
+// on the same attempt - which happens when the second reads the Repository from
+// an informer cache that does not yet carry status.jobName - build the same
+// name, so the second Create returns AlreadyExists and the caller adopts the
+// existing Job instead of launching a second one. Two duplicate ingest Jobs
+// were observed for one repo 16ms and 21ms apart; only the last was adopted and
+// the orphan's outcome was never reconciled.
+//
+// Equally important is the other direction: every genuinely new attempt must
+// mint a NEW name, or a retry would be blocked forever by its predecessor. A
+// re-ingest stamp, a since-SHA and a failure count all change across real
+// attempts, which is why all three are hashed.
+func JobName(repo *tataradevv1alpha1.Repository, since string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		since,
+		repo.Annotations[tataradevv1alpha1.ReingestRequestedAnnotation],
+		strconv.Itoa(repo.Status.IngestFailureCount),
+	}, "\x00")))
+	return repo.Name + "-ingest-" + hex.EncodeToString(sum[:4])
+}
 
 // Config is the subset of operator configuration the Job builder needs.
 type Config struct {
@@ -148,8 +175,8 @@ func BuildJob(project *tataradevv1alpha1.Project, repo *tataradevv1alpha1.Reposi
 
 	// jobName is computed once and reused as both the Job's name and the
 	// metrics-push run_id so the BackoffLimit pod retries of one Job overwrite a
-	// single run's pushed series.
-	jobName := repo.Name + "-ingest-" + rand.String(5)
+	// single run's pushed series. It is deterministic per attempt (issue #457).
+	jobName := JobName(repo, since)
 
 	// Clone into a directory that mirrors the repo namespace (owner/.../repo),
 	// not a flat "/workspace/repo", so concurrent clones never collide.

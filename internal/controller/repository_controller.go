@@ -107,10 +107,21 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	var repo tataradevv1alpha1.Repository
 	if err := r.Get(ctx, req.NamespacedName, &repo); err != nil {
 		if apierrors.IsNotFound(err) {
+			// The Repository is gone: retire its gauges so no series outlives it
+			// (issue #457). Now that they carry a project label, a leftover series
+			// would keep naming a repo/project pair that no longer exists.
+			r.Metrics.ForgetRepository(req.Name)
 			return ctrl.Result{}, nil
 		}
 		r.Metrics.ReconcileResult("Repository", "error")
 		return ctrl.Result{}, fmt.Errorf("get repository: %w", err)
+	}
+
+	// Repair the desynchronised phase BEFORE publishing health, so the gauge
+	// reports the repaired state in the same pass rather than one reconcile late.
+	if err := r.repairStaleFailedPhase(ctx, &repo); err != nil {
+		r.Metrics.ReconcileResult("Repository", "error")
+		return ctrl.Result{}, fmt.Errorf("repair stale Failed phase: %w", err)
 	}
 
 	// Publish the live per-repo ingest-health gauges every reconcile so alerting
@@ -188,13 +199,13 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		// the reconcile records "success" - so operator_repository_ingest_failing
 		// reads 0 for a gated repo indefinitely. This gauge is the only live signal
 		// that the gate is what is holding ingest.
-		r.Metrics.SetRepositoryIngestGated(repo.Name, true)
+		r.Metrics.SetRepositoryIngestGated(repo.Spec.ProjectRef, repo.Name, true)
 		l.Info("ingest gated: project memory not stably ready",
 			"action", "ingest_gate", "resource_id", repo.Name, "project", project.Name)
 		r.Metrics.ReconcileResult("Repository", "success")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
-	r.Metrics.SetRepositoryIngestGated(repo.Name, false)
+	r.Metrics.SetRepositoryIngestGated(repo.Spec.ProjectRef, repo.Name, false)
 
 	// Memory is Ready: clear the provisioning condition if it lingers from an
 	// earlier not-ready reconcile. Persist immediately when it flips, so it clears
@@ -282,10 +293,23 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("ensure result configmap: %w", err)
 	}
 
+	// The Job name is deterministic per ingest attempt (ingest.JobName), which is
+	// what makes this launch idempotent: a second reconcile that decided on the
+	// same attempt - because it read the Repository before status.jobName landed
+	// in its cache - gets AlreadyExists and ADOPTS that Job below instead of
+	// launching a duplicate. Two duplicate ingest Jobs were observed for one repo
+	// 16ms and 21ms apart from the same pod; only the last was adopted into
+	// status, and the orphan ran to completion with its outcome never reconciled
+	// (issue #457). The mirror of the Create/AlreadyExists mint in queue_controller.
 	job := ingest.BuildJob(&project, &repo, since, project.Status.Memory.Endpoint, r.IngestConfig)
 	if err := r.Create(ctx, job); err != nil {
-		r.Metrics.ReconcileResult("Repository", "error")
-		return ctrl.Result{}, fmt.Errorf("create ingest job: %w", err)
+		if !apierrors.IsAlreadyExists(err) {
+			r.Metrics.ReconcileResult("Repository", "error")
+			return ctrl.Result{}, fmt.Errorf("create ingest job: %w", err)
+		}
+		r.Metrics.IngestJobDeduplicated(repo.Spec.ProjectRef, repo.Name)
+		l.Info("ingest job already exists, adopting instead of duplicating",
+			"action", "ingest_dedup", "resource_id", repo.Name, "job", job.Name)
 	}
 
 	if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
@@ -329,45 +353,113 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *RepositoryReconciler) publishIngestHealth(repo *tataradevv1alpha1.Repository) {
 	enabled := tataradevv1alpha1.BoolVal(repo.Spec.IngestEnabled, true)
 	failing := enabled && (repo.Status.Phase == "Failed" || repo.Status.IngestFailureCount > 0)
-	r.Metrics.SetRepositoryIngestFailing(repo.Name, failing)
+	r.Metrics.SetRepositoryIngestFailing(repo.Spec.ProjectRef, repo.Name, failing)
 	if repo.Status.LastIngestTime != nil {
-		r.Metrics.SetRepositoryLastIngestTimestamp(repo.Name, float64(repo.Status.LastIngestTime.Unix()))
+		r.Metrics.SetRepositoryLastIngestTimestamp(repo.Spec.ProjectRef, repo.Name,
+			float64(repo.Status.LastIngestTime.Unix()))
 	}
+}
+
+// repairStaleFailedPhase enforces the invariant that Status.Phase=="Failed"
+// implies an unresolved ingest failure (IngestFailureCount>0).
+//
+// (Phase="Failed", IngestFailureCount=0) was reachable and NOTHING repaired it
+// (issue #457): Status.Phase is written only on Job completion, so once the
+// failure counter was back at 0 while the phase still read Failed, the pair
+// could not resynchronise. publishIngestHealth derives
+// operator_repository_ingest_failing from (Phase=="Failed" || count>0), so the
+// gauge latched at 1 - one repo held the alert for 20.8h with zero ingest
+// failures in 7 days of logs, and escaped only on an unrelated cron tick.
+//
+// The repair also carries the re-ingest trigger below: because Failed now
+// implies count>0, making Phase=="Failed" a reason to re-ingest can never
+// bypass the exponential back-off gate, which keys on exactly that counter.
+//
+// The repaired phase is derived from what the status actually records: a repo
+// with a LastIngestedCommit has a completed ingest, so it is Ingested; a repo
+// that never ingested has no phase to claim and is cleared, which lets the
+// ordinary first-full-ingest path take over.
+func (r *RepositoryReconciler) repairStaleFailedPhase(ctx context.Context, repo *tataradevv1alpha1.Repository) error {
+	if repo.Status.Phase != "Failed" || repo.Status.IngestFailureCount != 0 {
+		return nil
+	}
+	repaired := false
+	if err := r.patchStatus(ctx, repo, func(fresh *tataradevv1alpha1.Repository) bool {
+		// Re-check on the fresh object (and on every conflict retry): a concurrent
+		// failure write may have raised the count, in which case Failed is honest.
+		repaired = false
+		if fresh.Status.Phase != "Failed" || fresh.Status.IngestFailureCount != 0 {
+			return false
+		}
+		fresh.Status.Phase = ""
+		if fresh.Status.LastIngestedCommit != "" {
+			fresh.Status.Phase = "Ingested"
+		}
+		repaired = true
+		return true
+	}); err != nil {
+		return err
+	}
+	if !repaired {
+		return nil
+	}
+	r.Metrics.RepositoryPhaseRepaired(repo.Spec.ProjectRef, repo.Name)
+	log.FromContext(ctx).Info("repaired desynchronised ingest phase",
+		"action", "ingest_phase_repair", "resource_id", repo.Name,
+		"project", repo.Spec.ProjectRef, "phase", repo.Status.Phase)
+	return nil
 }
 
 // ingestDecision returns (sinceSHA, wantIngest). Full ingest (empty since)
 // when lastIngestedCommit is empty. Incremental (since=lastIngestedCommit)
-// when the reingest-requested annotation is newer than lastIngestTime.
+// when the reingest-requested annotation is newer than lastIngestTime, or when
+// the repo is left in a Failed phase.
 // Finding 4: when IngestFailureCount has reached incrementalFallbackThreshold,
 // the since SHA is cleared so the Job performs a full ingest; this self-heals
 // repos whose LastIngestedCommit was removed from history (force-push/rewrite).
+//
+// Phase=="Failed" is a first-class trigger (issue #457). Before that, an
+// already-ingested repo wanted an ingest only while a newer re-ingest
+// annotation was pending, so a Failed repo that lost its annotation - the
+// Repository CR is helm-managed and an apply strips the annotation - waited for
+// the next ReingestSchedule cron tick while its recall corpus went stale. It
+// cannot hot-loop: repairStaleFailedPhase guarantees Phase=="Failed" implies
+// IngestFailureCount>0, which is exactly what the exponential back-off gate in
+// Reconcile keys on, so a repeatedly failing repo backs off to maxIngestBackoff
+// rather than launching a Job per reconcile.
 func (r *RepositoryReconciler) ingestDecision(repo *tataradevv1alpha1.Repository) (string, bool) {
 	if repo.Status.LastIngestedCommit == "" {
 		return "", true
 	}
+	if !reingestRequested(repo) && repo.Status.Phase != "Failed" {
+		return "", false
+	}
+	// Fall back to a full ingest after repeated incremental failures so a
+	// force-pushed branch (where the since-SHA no longer exists in history)
+	// can self-heal rather than looping forever.
+	if repo.Status.IngestFailureCount >= incrementalFallbackThreshold {
+		return "", true
+	}
+	return repo.Status.LastIngestedCommit, true
+}
+
+// reingestRequested reports whether the reingest-requested annotation carries a
+// parseable timestamp newer than the last successful ingest.
+func reingestRequested(repo *tataradevv1alpha1.Repository) bool {
 	raw := repo.Annotations[ReingestAnnotation]
 	if raw == "" {
-		return "", false
+		return false
 	}
 	requested, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
-		return "", false
+		return false
 	}
 	// LastIngestTime is *metav1.Time; treat nil as zero time (always older).
 	var lastIngestTime time.Time
 	if repo.Status.LastIngestTime != nil {
 		lastIngestTime = repo.Status.LastIngestTime.Time
 	}
-	if requested.After(lastIngestTime) {
-		// Fall back to a full ingest after repeated incremental failures so a
-		// force-pushed branch (where the since-SHA no longer exists in history)
-		// can self-heal rather than looping forever.
-		if repo.Status.IngestFailureCount >= incrementalFallbackThreshold {
-			return "", true
-		}
-		return repo.Status.LastIngestedCommit, true
-	}
-	return "", false
+	return requested.After(lastIngestTime)
 }
 
 // scheduleNextReingest applies the per-Repository cron schedule for an
