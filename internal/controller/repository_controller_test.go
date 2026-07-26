@@ -429,6 +429,59 @@ func TestRepoReconcile_GatesUntilMemoryReady(t *testing.T) {
 	}
 }
 
+// TestRepoReconcile_IngestGatedGauge guards issue #434: the memory-readiness
+// ingest gate is invisible to alerting. A gated repo is neither Failed nor
+// accumulating failures, so operator_repository_ingest_failing reads 0 for it
+// forever - a 37h ingest freeze across all 9 repos was caught only by the 24h
+// staleness backstop. operator_repository_ingest_gated is 1 while the gate
+// holds and clears the moment memory is stably Ready.
+func TestRepoReconcile_IngestGatedGauge(t *testing.T) {
+	mkProject(t, "rp-gauge", "rp-gauge-scm")
+	mkSecret(t, "rp-gauge-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "gaugerepo", "rp-gauge")
+
+	// One reconciler across both passes so the gauge survives between them.
+	r := newRepoReconciler()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "gaugerepo"}}
+	reconcile := func() {
+		t.Helper()
+		if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+
+	// Memory Ready but INSIDE the stabilization window: the gate holds.
+	p := &tataradevv1alpha1.Project{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: "rp-gauge"}, p); err != nil {
+		t.Fatalf("get project: %v", err)
+	}
+	readySince := metav1.NewTime(time.Now())
+	p.Status.Memory = &tataradevv1alpha1.MemoryStatus{
+		Phase:      "Ready",
+		Endpoint:   "http://mem-rp-gauge.tatara.svc:8080",
+		ReadySince: &readySince,
+	}
+	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
+		t.Fatalf("set memory ready-but-unstable: %v", err)
+	}
+
+	reconcile()
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("gaugerepo")); got != 1 {
+		t.Fatalf("ingest_gated while inside stabilization window = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("gaugerepo")); got != 0 {
+		t.Fatalf("ingest_failing while gated = %v, want 0 (this is exactly why the gated gauge exists)", got)
+	}
+
+	// Backdate ReadySince past the stabilization window: the gate clears.
+	setProjectMemoryReady(t, "rp-gauge", "http://mem-rp-gauge.tatara.svc:8080")
+	reconcile()
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("gaugerepo")); got != 0 {
+		t.Fatalf("ingest_gated after memory stably Ready = %v, want 0", got)
+	}
+}
+
 func TestRepoReconcile_UsesProjectEndpointWhenReady(t *testing.T) {
 	mkProject(t, "rp-ep", "rp-ep-scm")
 	mkSecret(t, "rp-ep-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})

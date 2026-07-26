@@ -46,7 +46,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "a per-project memory stack is Failed"
-            description: "{{ "{{" }} $value {{ "}}" }} per-project memory stack(s) have been in phase Failed for 15m. The lightrag/neo4j/postgres backing the whole loop's recall is degraded."
+            description: "Project {{ "{{" }} $labels.project {{ "}}" }}'s memory stack has been in phase Failed for 15m. The lightrag/neo4j/postgres backing that project's recall is degraded. Since issue #425 operator_memory_stacks carries a project label, so this alert fires once per affected project and names it instead of reporting an anonymous cluster-wide count."
         - alert: TataraMemoryStackDegraded
           expr: operator_memory_stacks{phase="Degraded"} > 0
           for: 5m
@@ -54,7 +54,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "a per-project memory stack is stuck Provisioning past its timeout"
-            description: "{{ "{{" }} $value {{ "}}" }} per-project memory stack(s) have been reported Degraded (issue #355): the stack has sat phase=Provisioning longer than the memoryProvisioningTimeoutMinutes bound (default 45m) with no backend converging to Ready. The MemoryReady condition's message on the Project carries how long it has been stuck. The 5m for-window rides out a single scrape/reconcile-cycle flap; the gauge itself only flips once the reconcile-side timeout has already elapsed."
+            description: "Project {{ "{{" }} $labels.project {{ "}}" }}'s memory stack has been reported Degraded (issue #355): the stack has sat phase=Provisioning longer than the memoryProvisioningTimeoutMinutes bound (default 45m) with no backend converging to Ready. The MemoryReady condition's message on the Project carries how long it has been stuck. The 5m for-window rides out a single scrape/reconcile-cycle flap; the gauge itself only flips once the reconcile-side timeout has already elapsed."
         - alert: TataraTasksInflightPinned
           expr: operator_tasks_inflight >= {{ .Values.prometheusRule.tasksInflightThreshold }}
           for: 2h
@@ -115,6 +115,14 @@ spec:
           annotations:
             summary: "memory re-ingest is failing for a repo"
             description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 15m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138)."
+        - alert: TataraIngestGated
+          expr: operator_repository_ingest_gated > 0
+          for: 1h
+          labels:
+            severity: {{ .Values.prometheusRule.severityLabel | quote }}
+          annotations:
+            summary: "memory re-ingest is held by the memory-readiness gate"
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} has had its re-ingest held by the project memory-readiness gate for 1h. The gate is a SILENT hold - nothing fails and nothing retries - so operator_repository_ingest_failing reads 0 throughout and TataraIngestJobFailing cannot see it; a 37h fleet-wide freeze was previously caught only by TataraIngestStale's 26h backstop (issue #434). The gate normally clears within the 3m memory-Ready stabilization window, so an hour of it means the project's memory stack is not converging - check operator_memory_stacks for that project."
         - alert: TataraIngestStale
           expr: (time() - operator_repository_last_ingest_timestamp_seconds) > {{ .Values.prometheusRule.ingestStaleAfterSeconds }}
           for: 30m
