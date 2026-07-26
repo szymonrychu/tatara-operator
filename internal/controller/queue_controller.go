@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -160,6 +161,43 @@ func (r *DispatcherReconciler) listProjectVia(ctx context.Context, reader client
 		return nil, nil, err
 	}
 	return filterQEsByProject(qel.Items, proj.Name), filterTasksByProject(tl.Items, proj.Name), nil
+}
+
+// mintedTask returns the Task q has ALREADY minted, or nil when it has minted
+// none. It is the mint-idempotency primitive that replaces the AlreadyExists
+// collision a deterministic Task name used to give the admit path for free
+// (issue #443).
+//
+// The link is queue.LabelMintedBy - the minting event's UID, stamped by
+// BuildTaskFromQueuedEvent and never rewritten. LabelQueuedEvent is not usable
+// for this: admitTicket moves it onto the CURRENT per-stage ticket as soon as
+// the Task takes its first stage step, and its value (the event NAME) repeats
+// across cycles of the same dedup key.
+//
+// The read goes through APIReader when one is wired, for the same reason the
+// inflight recount does (fix M28): a Task this dispatcher created moments ago
+// may not be in the informer cache yet, and a cache miss here mints a duplicate.
+func (r *DispatcherReconciler) mintedTask(ctx context.Context, q *tatarav1alpha1.QueuedEvent) (*tatarav1alpha1.Task, error) {
+	if q.UID == "" {
+		return nil, nil
+	}
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	var tl tatarav1alpha1.TaskList
+	if err := reader.List(ctx, &tl, client.InNamespace(q.Namespace),
+		client.MatchingLabels{queue.LabelMintedBy: string(q.UID)}); err != nil {
+		return nil, fmt.Errorf("queue: list tasks minted by %s: %w", q.Name, err)
+	}
+	var found *tatarav1alpha1.Task
+	for i := range tl.Items {
+		// Oldest wins, so two passes racing on the same event agree on one Task.
+		if t := &tl.Items[i]; found == nil || t.CreationTimestamp.Before(&found.CreationTimestamp) {
+			found = t
+		}
+	}
+	return found, nil
 }
 
 // queueTaskDone reports whether a Task's work is over: a closed-set terminal
@@ -429,38 +467,53 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 				}
 				taskName = name
 			} else {
-				task, err := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
+				// MINT IDEMPOTENCY (issue #443). Ask FIRST whether this event has
+				// already minted its Task, and adopt it if so. Do NOT delete this
+				// guard as redundant: a mint is GenerateName-named now, so Create
+				// can never collide and AlreadyExists is no longer the idempotency
+				// primitive it was. A failure anywhere between the Create below and
+				// the Admitted status patch further down leaves the event Queued,
+				// and without this lookup the next pass would mint a SECOND Task -
+				// a second pod, a second branch, a second token spend.
+				existing, err := r.mintedTask(ctx, q)
 				if err != nil {
 					return err
 				}
-				if err := r.Create(ctx, task); err != nil {
-					if !apierrors.IsAlreadyExists(err) {
-						// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
-						return err
+				if existing == nil {
+					task, buildErr := queue.BuildTaskFromQueuedEvent(q, proj, r.Scheme)
+					if buildErr != nil {
+						return buildErr
 					}
-					// AlreadyExists: get the existing Task to determine if it is terminal.
-					existing := &tatarav1alpha1.Task{}
-					if getErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, existing); getErr != nil {
-						return getErr
-					}
-					if queueTaskDone(existing) {
-						// Name collision with a dead Task: delete it and signal a prompt
-						// requeue so the next pass creates a fresh Task. Continue processing
-						// the rest of the pool's queued events in this same pass so sibling
-						// events are not abandoned.
-						if delErr := r.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
-							return delErr
+					createErr := r.Create(ctx, task)
+					switch {
+					case createErr == nil:
+						existing = task // the API server filled in the minted name
+					case apierrors.IsAlreadyExists(createErr):
+						// Only an explicitly NAMED mint (payload.name) can still collide.
+						existing = &tatarav1alpha1.Task{}
+						if getErr := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, existing); getErr != nil {
+							return getErr
 						}
-						log.FromContext(ctx).Info("queue: deleted stale terminal task on name collision",
-							"action", "queue_stale_delete", "resource_id", q.Name, "task", task.Name)
-						requeue = true
-						continue
+					default:
+						// Leave Queued; requeue. Slot not consumed (inflight derives from Admitted).
+						return createErr
 					}
-					// Non-terminal Task with this name already exists: genuine idempotent
-					// re-admit (e.g. Status().Update failed on a prior pass). Fall through
-					// to mark Admitted pointing at the existing Task.
 				}
-				taskName = task.Name
+				if queueTaskDone(existing) {
+					// The Task this event owns is DEAD (a named mint colliding with a
+					// corpse, or our own mint that ran and terminated before the status
+					// patch landed). Delete it and signal a prompt requeue so the next
+					// pass mints a fresh one. Continue processing the rest of the pool's
+					// queued events in this same pass so sibling events are not abandoned.
+					if delErr := r.Delete(ctx, existing); delErr != nil && !apierrors.IsNotFound(delErr) {
+						return delErr
+					}
+					log.FromContext(ctx).Info("queue: deleted stale terminal task on re-admit",
+						"action", "queue_stale_delete", "resource_id", q.Name, "task", existing.Name)
+					requeue = true
+					continue
+				}
+				taskName = existing.Name
 			}
 			admittedAt := metav1.Now()
 			if err := patchQueuedEventStatus(ctx, r.Client, q, func(fresh *tatarav1alpha1.QueuedEvent) bool {

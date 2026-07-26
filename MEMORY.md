@@ -876,3 +876,33 @@ in spirit; prune only when a decision is reversed.
   slow-dependency-boot problem with a StartupProbe instead, because its own
   failure mode is different: it blocks in `waitForDB` but never exits, so
   liveness (not a dead process) was the risk there.
+- 2026-07-26 (#443) Task names are now GenerateName-minted
+  (`queue.BuildTaskFromQueuedEvent`), which fixes the branch collision - a
+  project-scoped dedup key ("brainstorm-<project>") produced ONE constant
+  QueuedEvent name, ONE constant Task name and therefore ONE constant
+  `tatara/task-*` branch per project+kind, forever, so every cycle collided
+  with the last cycle's abandoned branch. The non-obvious part is the
+  REPLACEMENT it forced: `admit` used `Create` returning `AlreadyExists` as
+  BOTH its idempotency and its self-heal primitive, and a GenerateName mint
+  can never collide, so a failure between the `Create` and the Admitted status
+  patch would have minted a SECOND Task (second pod, second branch, second
+  token spend) on the next pass. `DispatcherReconciler.mintedTask` replaces
+  it: adopt-by-label before minting. DO NOT DELETE IT AS REDUNDANT - it looks
+  redundant precisely because it is doing the job `AlreadyExists` used to.
+  Two details are load-bearing: the label is `tatara.dev/minted-by`, NOT
+  `tatara.dev/queued-event` (which `admitTicket` rewrites onto the current
+  per-stage ticket at the Task's first stage step), and its value is the
+  event's UID, NOT its name (`QueuedEventName` repeats every cycle, so a name
+  match would let a new cycle adopt - and, if terminal, DELETE - the previous
+  cycle's Task). The read goes through `APIReader` for the same cache-lag
+  reason as fix M28. Also: `*scm.GitHub`/`*scm.GitLab` finally implement
+  `DeleteBranch`, so the reaper's B.6 step-4 branch delete stopped being a
+  logged no-op; GitHub answers a missing ref with 422 "Reference does not
+  exist" on that endpoint alone, normalized to 404 in the adapter because the
+  operator's permanent-gone vocabulary is 404/410. The delete is gated on
+  `liveTaskPushingTo`, which asks `agent.PushBranch` and NOT
+  `agent.TaskBranch`: a takeover Task pushes to the abandoned MR's existing
+  head branch (derived from a DIFFERENT Task's name), so a TaskBranch scan
+  answers "nobody pushes here" for the one case where deleting destroys live
+  work - and parked counts as LIVE there, because a parked(ownership-lost)
+  takeover Task is unparked straight back into approved.
