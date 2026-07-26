@@ -68,8 +68,7 @@ type OperatorMetrics struct {
 	toolSurfaceProbeDuration     *prometheus.HistogramVec
 	tokenBudgetUsedRatio         *prometheus.GaugeVec
 	admissionBlockedTotal        *prometheus.CounterVec
-	memoryGateBypassTotal        *prometheus.CounterVec
-	memoryGateHoldTotal          *prometheus.CounterVec
+	agentPodDegradedTotal        *prometheus.CounterVec
 	mrBindingBackstopTotal       *prometheus.CounterVec
 	repositoryIngestFailing      *prometheus.GaugeVec
 	repositoryIngestGated        *prometheus.GaugeVec
@@ -331,23 +330,16 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_admission_blocked_total",
 			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling|pool_full).",
 		}, []string{"project", "class", "kind", "reason"}),
-		// Infra-incident admission-gate exemptions (#236): an incident Task whose
-		// alert targets core memory/storage infra was admitted with the project
-		// memory stack not Ready, instead of being gated. A nonzero rate means
-		// the memory subsystem is degraded and self-heal is running through the
-		// deadlock-breaking bypass; worth alerting on.
-		memoryGateBypassTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_memory_gate_bypass_total",
-			Help: "Incident Tasks admitted past the project memory-readiness gate under the infra-incident exemption, by project and Task kind.",
-		}, []string{"project", "kind"}),
-		// Issue #355: a Task about to submit a NEW turn (first spawn, respawn, or
-		// TTL rotation) is held rather than dispatched while project memory is not
-		// stably ready, so an agent pod is never launched against a backend that
-		// went unhealthy in the gap between admission and turn-submit.
-		memoryGateHoldTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "operator_memory_gate_hold_total",
-			Help: "Turn submissions held at the memory-readiness gate immediately before SubmitTurn, by project.",
-		}, []string{"project"}),
+		// An agent pod was spawned while one of its supporting subsystems was
+		// unavailable, so the agent runs DEGRADED rather than not at all. This is
+		// distinct from "the subsystem is down" (operator_memory_stacks) and from
+		// "ingest is gated" (operator_repository_ingest_gated): it is the count of
+		// real work that went out with reduced capability, and it does not depend
+		// on the agent noticing or self-reporting. subsystem is "memory" today.
+		agentPodDegradedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_agent_pod_degraded_total",
+			Help: "Agent pods spawned with a supporting subsystem unavailable, by project, Task kind and subsystem (memory).",
+		}, []string{"project", "kind", "subsystem"}),
 		// Issue #381 bug B part 2: a Source-bearing Task that still owns ZERO
 		// MergeRequest and ZERO Issue CRs past a grace window - the residue of
 		// an interrupted two-phase mint write (Task created, the bind that
@@ -465,8 +457,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.toolSurfaceProbeDuration,
 		m.tokenBudgetUsedRatio,
 		m.admissionBlockedTotal,
-		m.memoryGateBypassTotal,
-		m.memoryGateHoldTotal,
+		m.agentPodDegradedTotal,
 		m.mrBindingBackstopTotal,
 		m.reviewOutcomeTotal,
 		m.reviewHeadMovedTotal,
@@ -940,17 +931,21 @@ func (m *OperatorMetrics) AdmissionBlockedCounter(project, class, kind, reason s
 	return m.admissionBlockedTotal.WithLabelValues(project, class, kind, reason)
 }
 
-// MemoryGateBypass increments operator_memory_gate_bypass_total: an incident Task
-// targeting core infra was admitted past the memory-readiness gate (#236) while
-// the project memory stack was not Ready.
-func (m *OperatorMetrics) MemoryGateBypass(project, kind string) {
-	m.memoryGateBypassTotal.WithLabelValues(project, kind).Inc()
+// AgentPodDegraded increments operator_agent_pod_degraded_total: an agent pod
+// was spawned with a supporting subsystem unavailable (subsystem "memory": the
+// project memory stack was not stably ready, so recall fails for the whole
+// turn). Nil-safe, matching TaskTerminalEntry's convention.
+func (m *OperatorMetrics) AgentPodDegraded(project, kind, subsystem string) {
+	if m == nil {
+		return
+	}
+	m.agentPodDegradedTotal.WithLabelValues(project, kind, subsystem).Inc()
 }
 
-// MemoryGateBypassCounter returns the counter for (project, kind) for test
-// assertions.
-func (m *OperatorMetrics) MemoryGateBypassCounter(project, kind string) prometheus.Counter {
-	return m.memoryGateBypassTotal.WithLabelValues(project, kind)
+// AgentPodDegradedCounter returns the counter for (project, kind, subsystem)
+// for test assertions.
+func (m *OperatorMetrics) AgentPodDegradedCounter(project, kind, subsystem string) prometheus.Counter {
+	return m.agentPodDegradedTotal.WithLabelValues(project, kind, subsystem)
 }
 
 // MRBindingBackstopParked increments operator_mr_binding_backstop_total:
@@ -965,18 +960,6 @@ func (m *OperatorMetrics) MRBindingBackstopParked(project, kind string) {
 // test assertions.
 func (m *OperatorMetrics) MRBindingBackstopParkedCounter(project, kind string) prometheus.Counter {
 	return m.mrBindingBackstopTotal.WithLabelValues(project, kind)
-}
-
-// MemoryGateHold increments operator_memory_gate_hold_total: reconcilePodStage
-// held a turn submission (first spawn, respawn, or TTL rotation) at the
-// memory-readiness gate immediately before SubmitTurn (issue #355).
-func (m *OperatorMetrics) MemoryGateHold(project string) {
-	m.memoryGateHoldTotal.WithLabelValues(project).Inc()
-}
-
-// MemoryGateHoldCounter returns the counter for (project) for test assertions.
-func (m *OperatorMetrics) MemoryGateHoldCounter(project string) prometheus.Counter {
-	return m.memoryGateHoldTotal.WithLabelValues(project)
 }
 
 // RecordReviewOutcome increments operator_review_outcome_total for a review

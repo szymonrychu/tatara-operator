@@ -170,7 +170,11 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("get owning project %q: %w", repo.Spec.ProjectRef, err)
 	}
 
-	if !memoryStablyReady(&project, time.Now()) {
+	// THE ONE REMAINING MEMORY GATE. Ingest is the only path that WRITES to the
+	// memory stack, so a not-ready backend here means a partial corpus, not just
+	// reduced recall. Agent spawn and turn submission are deliberately NOT gated
+	// (see v1alpha1.MemoryStablyReady).
+	if !tataradevv1alpha1.MemoryStablyReady(&project, time.Now()) {
 		if err := r.patchStatus(ctx, &repo, func(fresh *tataradevv1alpha1.Repository) bool {
 			meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
 				Type:               "MemoryNotReady",

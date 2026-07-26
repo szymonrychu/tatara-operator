@@ -96,60 +96,6 @@ func ValidateTaskSpec(spec TaskSpec) error {
 	return nil
 }
 
-// infraIncidentKeywords are lower-case substrings that mark a Grafana alert as
-// targeting the project's core memory/storage infrastructure: the memory stack
-// (LightRAG retrieval surface, Postgres/CNPG, Neo4j) or its backing storage
-// (CephFS PVCs, WAL, quorum). Matched case-insensitively against a Task's
-// AlertRules. Kept intentionally narrow so only genuine infra alerts qualify for
-// the admission-gate exemption below.
-var infraIncidentKeywords = []string{
-	"memory",
-	"lightrag",
-	"postgres",
-	"cnpg",
-	"neo4j",
-	"pvc",
-	"cephfs",
-	"quorum",
-	"wal",
-}
-
-// AlertTargetsCoreInfra reports whether a Grafana alert-rule name implicates the
-// project's core memory/storage infrastructure, by case-insensitive substring
-// match against infraIncidentKeywords.
-func AlertTargetsCoreInfra(alertRule string) bool {
-	lower := strings.ToLower(alertRule)
-	for _, kw := range infraIncidentKeywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-// InfraIncidentExempt reports whether a Task is an incident-kind Task whose alert
-// targets the core memory/storage infrastructure, and is therefore exempt from
-// the project memory-readiness admission gate.
-//
-// Rationale (tatara-operator#236): when the memory stack is down, every Task is
-// gated on Memory.Phase == Ready. Applying that gate to the very incident Task
-// created to investigate the memory outage is a deadlock: the self-heal agent
-// can never run, never opens a tracker issue, and cannot escalate. Incident
-// agents investigate live via Grafana (k8s/CNPG/storage) and do not need the
-// memory graph, so it is safe to let an infra-incident run with memory down.
-// Only incident Tasks qualify; all normal work keeps the gate.
-func InfraIncidentExempt(spec TaskSpec) bool {
-	if spec.Kind != "incident" {
-		return false
-	}
-	for _, rule := range spec.AlertRules {
-		if AlertTargetsCoreInfra(rule) {
-			return true
-		}
-	}
-	return false
-}
-
 // TaskSpec defines the desired state of a Task.
 type TaskSpec struct {
 	ProjectRef string `json:"projectRef"`
@@ -654,6 +600,18 @@ const (
 	// internal/restapi's conditionReason("") must return exactly this; the two
 	// may never drift, so it delegates to OutcomeReasonFor.
 	OutcomeReasonClaimed = "Outcome"
+)
+
+const (
+	// ConditionMemoryDegraded records that this Task's agent pod was spawned
+	// while the project memory stack was not stably ready, so the agent runs
+	// with no recall: the memory and code-graph tools fail for its whole turn.
+	// The work is NOT held (a memory outage must not stop the platform) - this
+	// condition is the per-Task drill-down a human reads after the memory-stack
+	// alert fires, and operator_agent_pod_degraded_total is its fleet-wide view.
+	ConditionMemoryDegraded = "MemoryDegraded"
+	// ReasonSpawnedWithoutRecall is ConditionMemoryDegraded's only Reason.
+	ReasonSpawnedWithoutRecall = "SpawnedWithoutRecall"
 )
 
 // OutcomeReasonFor is the condition Reason an outcome of agentKind commits. The
