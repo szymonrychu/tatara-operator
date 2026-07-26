@@ -28,7 +28,6 @@ import (
 )
 
 const (
-	memGateRequeue    = 15 * time.Second
 	pollRequeue       = 30 * time.Second
 	agentBootRequeue  = 5 * time.Second
 	agentBootDeadline = 5 * time.Minute
@@ -299,22 +298,14 @@ func (r *TaskReconciler) reconcileStage(ctx context.Context, project *tatarav1al
 		return res, nil
 	}
 
-	// The memory gate is SPAWN-ONLY: a pod already working must not be torn down by
-	// a memory blip, and a Task that has not been admitted has nothing to gate.
-	if task.Status.PodStartedAt == nil && !memoryStablyReady(project, now) {
-		if !tatarav1alpha1.InfraIncidentExempt(task.Spec) {
-			l.Info("task gated: project memory not stably ready",
-				"action", "task_memory_gate", "resource_id", task.Name, "project", project.Name)
-			return ctrl.Result{RequeueAfter: memGateRequeue}, nil
-		}
-		// #236: an incident investigating the memory stack must not be gated on that
-		// same stack being Ready, or infra-outage self-heal deadlocks.
-		l.Info("task memory gate bypassed for infra incident",
-			"action", "task_memory_gate_bypass", "resource_id", task.Name,
-			"project", project.Name, "alert_rules", strings.Join(task.Spec.AlertRules, ","))
-		r.Metrics.MemoryGateBypass(project.Name, task.Spec.Kind)
-	}
-
+	// NO MEMORY GATE. Memory readiness used to hold every un-spawned Task here at
+	// a 15s poll with no timeout and no escape hatch (the #236 bypass only ever
+	// fired for infra incidents), so a memory outage stopped the platform rather
+	// than degrading it - the documented one ran 7h+. An agent now spawns
+	// regardless, learns the state from TATARA_MEMORY_DEGRADED and the degraded
+	// turn-0 appendix, and completes its work with reduced recall. The stably-
+	// ready predicate still gates repository INGEST, where a partial corpus would
+	// actually be written.
 	return r.reconcilePodStage(ctx, project, task, agentKind, now)
 }
 

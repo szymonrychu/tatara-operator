@@ -83,6 +83,35 @@ type MemoryStatus struct {
 	PgPrimary string `json:"pgPrimary,omitempty"`
 }
 
+// MemoryReadyStabilizationWindow is how long the memory stack must hold
+// Phase==Ready before callers treat it as stably ready. It mirrors the
+// retrieval probe's unhealthy threshold (3 cycles x 60s), so a freshly elected
+// leader does not declare the retrieval surface healthy before it has been
+// confirmed.
+const MemoryReadyStabilizationWindow = 3 * time.Minute
+
+// MemoryStablyReady reports whether p's memory stack has been continuously
+// Ready for at least MemoryReadyStabilizationWindow.
+//
+// It is NOT a spawn gate. Agent pods spawn and submit turns whatever the memory
+// stack's phase; a memory outage that could not be bounded held every Task
+// indefinitely and the platform stopped instead of degrading. What this
+// predicate drives is (a) the repository INGEST gate, where a partial corpus
+// would actually be written, (b) the TATARA_MEMORY_DEGRADED pod env, and (c)
+// the degraded turn-0 prompt appendix.
+//
+// It lives in the API package - like InfraIncidentExempt did - because
+// internal/agent builds the pod env and cannot import internal/controller.
+func MemoryStablyReady(p *Project, now time.Time) bool {
+	if p == nil || p.Status.Memory == nil || p.Status.Memory.Phase != "Ready" {
+		return false
+	}
+	if p.Status.Memory.ReadySince == nil {
+		return false
+	}
+	return now.Sub(p.Status.Memory.ReadySince.Time) >= MemoryReadyStabilizationWindow
+}
+
 // GrafanaSpec configures the optional per-project Grafana incident-response
 // feature: an operator-provisioned read-only grafana-mcp and an alert-webhook
 // receiver. The feature is inert unless Enabled.

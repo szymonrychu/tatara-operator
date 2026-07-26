@@ -397,7 +397,7 @@ func setProjectMemoryReady(t *testing.T, name, endpoint string) {
 	}
 	// Set ReadySince well before the stabilization window so that memoryStablyReady
 	// returns true for tests that rely on memory being ready immediately.
-	readySince := metav1.NewTime(time.Now().Add(-(memoryReadyStabilizationWindow + time.Minute)))
+	readySince := metav1.NewTime(time.Now().Add(-(tataradevv1alpha1.MemoryReadyStabilizationWindow + time.Minute)))
 	p.Status.Memory = &tataradevv1alpha1.MemoryStatus{
 		Phase:      "Ready",
 		Endpoint:   endpoint,

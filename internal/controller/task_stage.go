@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -590,55 +591,6 @@ func (r *TaskReconciler) commentMRBindingBackstopParked(ctx context.Context, pro
 		"action", "mr_binding_backstop_commented", "resource_id", task.Name, "issue_ref", issueRef)
 }
 
-// holdTurnOnMemoryGate enqueues ONE operator comment on each owned OPEN issue
-// the first time a Task's turn submission is held at the pre-SubmitTurn
-// memory-readiness gate (issue #355), so a held Task is surfaced to a human
-// instead of looking like a silent stall - the same first-occurrence,
-// rate-limited pattern as enqueueDeployTimeoutComment (WS3-I5), keyed on its
-// OWN cooldown marker (Issue.status.lastMemoryGateCommentAt) so it cannot
-// clobber or be clobbered by the deploy-timeout or incident-refire producers.
-// It reuses the existing PendingComments drain; it spawns no agent.
-func (r *TaskReconciler) holdTurnOnMemoryGate(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, now time.Time) error {
-
-	issues, err := loadTaskIssues(ctx, r.Client, task)
-	if err != nil {
-		return err
-	}
-	phase := "Provisioning"
-	if proj.Status.Memory != nil && proj.Status.Memory.Phase != "" {
-		phase = proj.Status.Memory.Phase
-	}
-	body := fmt.Sprintf("Project `%s` memory stack is not ready (phase `%s`); tatara is holding this task's next agent turn until it recovers, instead of spawning a pod that would immediately fail to reach memory.",
-		proj.Name, phase)
-
-	sp := r.spiller(proj)
-	stamp := metav1.NewTime(now)
-	for i := range issues {
-		iss := &issues[i]
-		if iss.Status.State != "open" || iss.Status.LastMemoryGateCommentAt != nil {
-			continue // closed, or already commented on the first hold (own cooldown).
-		}
-		key := client.ObjectKeyFromObject(iss)
-		if err := objbudget.FitIssue(ctx, r.Client, sp, key, func(cur *tatarav1alpha1.Issue) {
-			if cur.Status.LastMemoryGateCommentAt != nil || len(cur.Status.PendingComments) >= 20 {
-				return
-			}
-			cur.Status.PendingComments = append(cur.Status.PendingComments, tatarav1alpha1.PendingComment{
-				RequestID: fmt.Sprintf("memory-gate-hold-%s", task.Name),
-				Action:    "comment",
-				Body:      body,
-			})
-			cur.Status.LastMemoryGateCommentAt = &stamp
-		}); err != nil {
-			return fmt.Errorf("memory-gate-hold comment: enqueue on %s: %w", key.Name, err)
-		}
-		log.FromContext(ctx).Info("turn hold: surfaced the first memory-gate hold on an owned issue",
-			"action", "memory_gate_hold_comment", "resource_id", task.Name, "issue", key.Name, "project", proj.Name)
-	}
-	return nil
-}
-
 // handoffCondition returns the OutcomeAccepted condition of a Task whose OWN
 // stage agent has COMMITTED its outcome and whose stage has NOT moved - i.e. the
 // cross-reconciler handoff is outstanding and its clock should be running. nil
@@ -996,24 +948,6 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil // turn-0 already submitted for THIS pod
 	}
 
-	// Issue #355: re-check memory readiness immediately before committing to a
-	// turn submission, closing the gap between the earlier admission-time gate
-	// (task_controller.go Reconcile, which only runs while PodStartedAt==nil)
-	// and the actual SubmitTurn call below - a gap that spans pod scheduling,
-	// image pull, and the G.10 ready handshake, during which the backend can
-	// flip unhealthy. This one call site covers every turn0 submission
-	// uniformly: a Task's first pod, a respawned pod (respawnLostPod), and a
-	// TTL-rotated pod (ttlStop) all funnel through here before SubmitTurn.
-	if !tatarav1alpha1.InfraIncidentExempt(task.Spec) && !memoryStablyReady(proj, now) {
-		if err := r.holdTurnOnMemoryGate(ctx, proj, task, now); err != nil {
-			return ctrl.Result{}, err
-		}
-		l.Info("turn submission held: project memory not stably ready",
-			"action", "task_memory_gate_turn_hold", "resource_id", task.Name, "project", proj.Name)
-		r.Metrics.MemoryGateHold(proj.Name)
-		return ctrl.Result{RequeueAfter: memGateRequeue}, nil
-	}
-
 	text, err := r.renderBundle(ctx, proj, task, agentKind)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -1338,6 +1272,34 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 	svc := agent.BuildService(proj, repo, task, r.PodConfig)
 	if err := r.Create(ctx, svc); err != nil && !apierrors.IsAlreadyExists(err) {
 		return false, fmt.Errorf("create wrapper service: %w", err)
+	}
+
+	// This pod runs DEGRADED: it will spawn, work and submit an outcome, but its
+	// recall tools fail for the whole turn. Do not rely on the agent noticing -
+	// record it here, where the spawn actually happens. The counter is the fleet
+	// signal; the Task condition is what a human reads on the CR. Deliberately
+	// NO issue comment: the memory-stack alert is the human-facing signal, and a
+	// comment per Task was noise-per-task.
+	if !tatarav1alpha1.MemoryStablyReady(proj, time.Now()) {
+		r.Metrics.AgentPodDegraded(proj.Name, task.Spec.Kind, "memory")
+		log.FromContext(ctx).Info("agent pod spawned with memory recall unavailable",
+			"action", "agent_pod_degraded", "resource_id", task.Name,
+			"project", proj.Name, "subsystem", "memory")
+		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
+			return meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+				Type:               tatarav1alpha1.ConditionMemoryDegraded,
+				Status:             metav1.ConditionTrue,
+				Reason:             tatarav1alpha1.ReasonSpawnedWithoutRecall,
+				Message:            "project memory stack is not stably ready; the agent runs with no recall",
+				ObservedGeneration: fresh.Generation,
+			})
+		}); err != nil {
+			// Non-fatal, exactly like stampResolvedModel below: the pod is already
+			// created and failing the reconcile here would only re-enter on a path
+			// that early-returns on the existing pod, losing the condition anyway.
+			log.FromContext(ctx).Error(err, "could not record the MemoryDegraded condition",
+				"action", "agent_pod_degraded_condition_failed", "resource_id", task.Name)
+		}
 	}
 
 	repoURL := ""

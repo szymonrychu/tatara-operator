@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/promptguidance"
@@ -92,6 +93,12 @@ func assignmentFor(agentKind string, task *tatarav1alpha1.Task, proj *tatarav1al
 		b.WriteString(d)
 	}
 	b.WriteString(promptguidance.PlatformProblemGuidance)
+	// LAST, so it overrides PlatformProblemGuidance's stop-on-blocked rule for
+	// the memory tools. Only when recall is actually down: a healthy turn must
+	// not be told to expect failures it will not see.
+	if !tatarav1alpha1.MemoryStablyReady(proj, time.Now()) {
+		b.WriteString(promptguidance.MemoryDegradedGuidance)
+	}
 	return b.String()
 }
 
