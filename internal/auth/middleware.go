@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -26,6 +27,10 @@ func ContextWithClaims(ctx context.Context, claims *Claims) context.Context {
 
 const wwwAuthenticate = `Bearer realm="tatara-operator"`
 
+// retryAfterSeconds is the Retry-After hint sent with a 503 while the issuer is
+// unreachable. Short, because discovery is retried on the very next request.
+const retryAfterSeconds = "5"
+
 // Middleware returns a chi-compatible middleware that verifies the Bearer token,
 // injects parsed Claims into the request context, and records auth outcomes via m.
 func Middleware(v *Verifier, m *obs.OperatorMetrics) func(http.Handler) http.Handler {
@@ -41,6 +46,17 @@ func Middleware(v *Verifier, m *obs.OperatorMetrics) func(http.Handler) http.Han
 			}
 			claims, err := v.Verify(r.Context(), raw)
 			if err != nil {
+				// An unreachable issuer is OUR problem, not the caller's: answer
+				// 503 so the caller can retry, instead of a 401 that says "your
+				// token is bad" and makes it throw a valid token away (#456).
+				if errors.Is(err, ErrDiscovery) {
+					slog.ErrorContext(r.Context(), "auth: identity provider unreachable",
+						"reason", "discovery_unavailable", "error", err.Error())
+					m.RecordAuth("discovery_unavailable")
+					w.Header().Set("Retry-After", retryAfterSeconds)
+					http.Error(w, "identity provider unavailable", http.StatusServiceUnavailable)
+					return
+				}
 				slog.WarnContext(r.Context(), "auth: rejected", "reason", "invalid_token")
 				m.RecordAuth("invalid_token")
 				w.Header().Set("WWW-Authenticate", wwwAuthenticate)

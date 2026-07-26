@@ -17,7 +17,7 @@ func TestVerifier_ValidToken(t *testing.T) {
 	srv := testjwks.NewServer(t)
 	ctx := context.Background()
 
-	v, err := auth.NewVerifier(ctx, auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
+	v, err := auth.NewVerifier(auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
 	require.NoError(t, err)
 
 	tok := srv.SignTypedToken(t, testjwks.Claims{
@@ -36,7 +36,7 @@ func TestVerifier_ValidToken(t *testing.T) {
 func TestVerifier_Rejections(t *testing.T) {
 	srv := testjwks.NewServer(t)
 	ctx := context.Background()
-	v, err := auth.NewVerifier(ctx, auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
+	v, err := auth.NewVerifier(auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
 	require.NoError(t, err)
 
 	foreign, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -105,6 +105,72 @@ func TestVerifier_Rejections(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+// TestVerifier_ConstructionDoesNotDialIssuer is the core of issue #456: building
+// the verifier must not touch the network, so an issuer that is down at startup
+// cannot take the manager (reconcilers, HMAC webhooks) with it.
+func TestVerifier_ConstructionDoesNotDialIssuer(t *testing.T) {
+	// 127.0.0.1:1 is a reserved port nothing listens on: connection refused.
+	v, err := auth.NewVerifier(auth.Config{Issuer: "http://127.0.0.1:1/realms/master", Audience: "tatara-operator"})
+	require.NoError(t, err)
+	require.NotNil(t, v)
+
+	// Static misconfiguration is still caught, and still without dialing.
+	_, err = auth.NewVerifier(auth.Config{Audience: "tatara-operator"})
+	require.Error(t, err)
+}
+
+// TestVerifier_RetriesDiscoveryAfterIssuerRecovers proves the failed discovery
+// is NOT memoized: the first Verify fails while the issuer is down and a later
+// Verify succeeds once it is back, with no restart and no new Verifier.
+func TestVerifier_RetriesDiscoveryAfterIssuerRecovers(t *testing.T) {
+	srv := testjwks.NewServer(t)
+	ctx := context.Background()
+	srv.SetDown(true)
+
+	v, err := auth.NewVerifier(auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
+	require.NoError(t, err)
+	require.ErrorIs(t, v.WarmUp(ctx), auth.ErrDiscovery, "warm-up must report a reachability failure, not succeed")
+
+	tok := srv.SignTypedToken(t, testjwks.Claims{
+		Issuer:   srv.Issuer(),
+		Audience: []string{"tatara-operator"},
+		Subject:  "agent-1",
+		Extra:    map[string]any{"preferred_username": "agent"},
+	})
+
+	_, err = v.Verify(ctx, tok)
+	require.ErrorIs(t, err, auth.ErrDiscovery, "issuer down must surface as a discovery error, not a bad token")
+
+	srv.SetDown(false)
+
+	claims, err := v.Verify(ctx, tok)
+	require.NoError(t, err, "discovery must be retried after the earlier failure")
+	require.Equal(t, "agent-1", claims.Subject)
+
+	// And once discovered it stays memoized: the issuer going away again does
+	// not break verification of an already-fetched key set.
+	claims, err = v.Verify(ctx, tok)
+	require.NoError(t, err)
+	require.Equal(t, "agent-1", claims.Subject)
+}
+
+// TestVerifier_BadTokenIsNotADiscoveryError guards the distinction the
+// middleware relies on to choose 503 over 401.
+func TestVerifier_BadTokenIsNotADiscoveryError(t *testing.T) {
+	srv := testjwks.NewServer(t)
+	ctx := context.Background()
+	v, err := auth.NewVerifier(auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
+	require.NoError(t, err)
+
+	_, err = v.Verify(ctx, srv.SignTypedToken(t, testjwks.Claims{
+		Issuer:   srv.Issuer(),
+		Audience: []string{"some-other-app"},
+		Subject:  "agent-1",
+	}))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, auth.ErrDiscovery)
 }
 
 func TestConfig_Validate(t *testing.T) {
