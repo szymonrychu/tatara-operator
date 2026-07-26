@@ -843,7 +843,11 @@ func (m *OperatorMetrics) AgentHTTP(method, outcome string, seconds float64) {
 }
 
 // RecordAuth increments operator_auth_total for the given result.
-// Valid results: "accepted", "missing_token", "invalid_scheme", "invalid_token".
+// Valid results: "accepted", "missing_token", "invalid_scheme", "invalid_token",
+// "discovery_unavailable" (the OIDC issuer could not be reached - the request
+// got a 503, not a 401; also emitted once at startup when the discovery
+// warm-up fails, so a permanently bad issuer is visible with zero traffic),
+// "rejected" (HMAC callback signature check).
 func (m *OperatorMetrics) RecordAuth(result string) {
 	m.authTotal.WithLabelValues(result).Inc()
 }

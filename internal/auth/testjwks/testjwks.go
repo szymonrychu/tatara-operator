@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,11 @@ type Server struct {
 	kid    string
 	issuer string
 
+	// down makes every endpoint answer 503 without changing the listen
+	// address, so a test can take the issuer away and bring it back while
+	// keeping the issuer URL (and therefore the "iss" claim) stable.
+	down atomic.Bool
+
 	closeOnce sync.Once
 }
 
@@ -36,6 +42,10 @@ func NewServer(t *testing.T) *Server {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		if s.down.Load() {
+			http.Error(w, "issuer down", http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"issuer":   s.issuer,
@@ -43,6 +53,10 @@ func NewServer(t *testing.T) *Server {
 		})
 	})
 	mux.HandleFunc("/jwks.json", func(w http.ResponseWriter, r *http.Request) {
+		if s.down.Load() {
+			http.Error(w, "issuer down", http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]any{{
@@ -71,6 +85,10 @@ func (s *Server) Close() {
 
 // Issuer returns the base URL of the test server (acts as OIDC issuer).
 func (s *Server) Issuer() string { return s.issuer }
+
+// SetDown makes the server answer 503 on every endpoint while down is true,
+// simulating an unreachable IdP without moving the issuer URL.
+func (s *Server) SetDown(down bool) { s.down.Store(down) }
 
 // Claims holds parameters for signing a test token.
 type Claims struct {

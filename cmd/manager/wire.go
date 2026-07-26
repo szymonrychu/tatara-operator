@@ -113,14 +113,29 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 		IncidentEscalateStaleAge:        cfg.IncidentEscalateStaleAge,
 	}).Mount(httpMux)
 
-	// M3 REST API - OIDC-gated. Discovery failures at startup are fatal so
-	// misconfiguration is caught before the manager starts accepting requests.
-	verifier, err := auth.NewVerifier(ctx, auth.Config{
+	// M3 REST API - OIDC-gated. Discovery is LAZY and retried on every verify
+	// (issue #456). It used to dial here and a failure was fatal, so a 5-minute
+	// Keycloak blip crash-looped the entire control plane - reconcilers and the
+	// HMAC webhook paths included, none of which need OIDC at all. Only static
+	// misconfiguration (empty issuer or audience) is fatal now.
+	verifier, err := auth.NewVerifier(auth.Config{
 		Issuer:   cfg.OIDCIssuer,
 		Audience: cfg.OIDCAudience,
 	})
 	if err != nil {
 		return fmt.Errorf("build OIDC verifier: %w", err)
+	}
+	// One non-fatal warm-up keeps misconfiguration loud: a permanently wrong
+	// issuer shows up at startup as a WARN plus an operator_auth_total
+	// {result="discovery_unavailable"} sample, rather than silently degrading
+	// until the first request arrives. It never blocks manager start.
+	if err := verifier.WarmUp(ctx); err != nil {
+		slog.WarnContext(ctx, "oidc discovery warm-up failed; REST API answers 503 until the issuer is reachable",
+			slog.String("action", "oidc_discovery_warmup"),
+			slog.String("issuer", cfg.OIDCIssuer),
+			slog.String("error", err.Error()),
+		)
+		metrics.RecordAuth("discovery_unavailable")
 	}
 	restapi.NewServer(restapi.Config{
 		Client:    mgr.GetClient(),
