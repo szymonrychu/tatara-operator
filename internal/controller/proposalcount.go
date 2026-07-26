@@ -120,3 +120,48 @@ func (r *ProjectReconciler) projectProposalIssues(ctx context.Context, proj *tat
 		"pending", pendingProposalCount(out), "issues_seen", len(out))
 	return out, nil
 }
+
+// TriggerEvent and TriggerCron name the two refill paths. They are the value of
+// the "trigger" log field and the operator_brainstorm_refill_total label.
+const (
+	TriggerEvent = "event"
+	TriggerCron  = "cron"
+)
+
+// brainstormDeficit is the control law:
+//
+//	deficit = max(0, target - pending - inflight)
+//
+// It is CLAMPED AT 0 on purpose. When pending exceeds the target - after
+// lowering N, or a long stretch with no maintainer verdicts - the controller
+// stops refilling and lets the backlog drain naturally. It NEVER closes
+// proposals to reconcile downward: autonomously destroying work product a human
+// has not read is out of scope, and a level-triggered controller in both
+// directions is the wrong shape when the "replicas" are human-reviewable
+// artifacts.
+func brainstormDeficit(target, pending, inflight int) int {
+	return max(target-pending-inflight, 0)
+}
+
+// brainstormRefillDecision applies the control law plus the skip circuit
+// breaker. quota is the number of proposals the session may file, clamped to
+// [1, MaxProposalsPerOutcome] when refill is true. reason is "" when refilling,
+// otherwise the log-and-metric reason the cycle was suppressed.
+//
+// The breaker suppresses ONLY the event path. The cron tick is the backstop that
+// repairs the backlog after a dropped event or a tripped breaker, and it resets
+// the counter, so a genuinely dry idea space costs one session per cron period
+// instead of one per reconcile.
+func brainstormRefillDecision(act tatarav1alpha1.BrainstormActivity,
+	pending, inflight, consecutiveSkips int, trigger string) (quota int, refill bool, reason string) {
+
+	if maxSkips := act.ResolveMaxConsecutiveSkips(); trigger == TriggerEvent &&
+		maxSkips > 0 && consecutiveSkips >= maxSkips {
+		return 0, false, "breaker-tripped"
+	}
+	deficit := brainstormDeficit(act.ResolveTarget(), pending, inflight)
+	if deficit <= 0 {
+		return 0, false, "at-target"
+	}
+	return min(deficit, tatarav1alpha1.MaxProposalsPerOutcome), true, ""
+}
