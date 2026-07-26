@@ -39,8 +39,35 @@ func newMemoryReconcilerWithReg() (*ProjectReconciler, *prometheus.Registry) {
 	return r, reg
 }
 
-// gatherMemoryStackCount reads operator_memory_stacks{phase=phase} from reg.
+// gatherMemoryStackCount sums operator_memory_stacks{phase=phase} across every
+// project, i.e. the cluster-wide count of stacks in that phase. Since issue
+// #425 the gauge is per (project,phase) and each project contributes 1 for its
+// current phase and 0 for the others, so the sum is the count.
 func gatherMemoryStackCount(t *testing.T, reg *prometheus.Registry, phase string) float64 {
+	t.Helper()
+	var total float64
+	forEachMemoryStackSeries(t, reg, func(seriesProject, seriesPhase string, v float64) {
+		if seriesPhase == phase {
+			total += v
+		}
+	})
+	return total
+}
+
+// gatherMemoryStackProjectPhase reads operator_memory_stacks{project,phase} from
+// reg, returning 0 when the series is absent.
+func gatherMemoryStackProjectPhase(t *testing.T, reg *prometheus.Registry, project, phase string) float64 {
+	t.Helper()
+	var got float64
+	forEachMemoryStackSeries(t, reg, func(seriesProject, seriesPhase string, v float64) {
+		if seriesProject == project && seriesPhase == phase {
+			got = v
+		}
+	})
+	return got
+}
+
+func forEachMemoryStackSeries(t *testing.T, reg *prometheus.Registry, fn func(project, phase string, v float64)) {
 	t.Helper()
 	mfs, err := reg.Gather()
 	if err != nil {
@@ -51,14 +78,18 @@ func gatherMemoryStackCount(t *testing.T, reg *prometheus.Registry, phase string
 			continue
 		}
 		for _, m := range mf.GetMetric() {
+			var project, phase string
 			for _, lp := range m.GetLabel() {
-				if lp.GetName() == "phase" && lp.GetValue() == phase {
-					return m.GetGauge().GetValue()
+				switch lp.GetName() {
+				case "project":
+					project = lp.GetValue()
+				case "phase":
+					phase = lp.GetValue()
 				}
 			}
+			fn(project, phase, m.GetGauge().GetValue())
 		}
 	}
-	return 0
 }
 
 func mkMemoryProject(t *testing.T, name string) *tataradevv1alpha1.Project {

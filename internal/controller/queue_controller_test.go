@@ -79,6 +79,59 @@ func TestAdmit_AlertBeforeNormal_AndCapacity(t *testing.T) {
 	}
 }
 
+// TestAdmit_PoolFull_EmitsMetricAndLog guards issue #440: a pool that runs out
+// of capacity with work still Queued used to break silently, with no metric and
+// no log, unlike every sibling refusal path (project_paused, token_budget,
+// kind_ceiling). It must emit operator_admission_blocked_total once per class
+// per pass, and must not change what gets admitted.
+func TestAdmit_PoolFull_EmitsMetricAndLog(t *testing.T) {
+	ctx := context.Background()
+	ns := "tatara"
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-poolfull", Namespace: ns},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 1, AlertCapacity: 1}},
+	}
+	mustCreate(t, ctx, proj)
+
+	mkQE := func(seq int64) *tatarav1alpha1.QueuedEvent {
+		q := &tatarav1alpha1.QueuedEvent{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "qe-pf-", Namespace: ns},
+			Spec: tatarav1alpha1.QueuedEventSpec{
+				Seq: seq, Class: tatarav1alpha1.QueueClassNormal, Kind: "review", ProjectRef: proj.Name,
+				Payload: tatarav1alpha1.QueuedEventPayload{Kind: "review", GenerateName: "pf-"},
+			},
+		}
+		mustCreate(t, ctx, q)
+		q.Status.State = tatarav1alpha1.QueueStateQueued
+		mustStatusUpdate(t, ctx, q)
+		return q
+	}
+	first, second := mkQE(1), mkQE(2)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Metrics: metrics}
+	qes, tasks := listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Behaviour is unchanged: capacity 1 admits the first, leaves the second Queued.
+	if got := refreshQE(t, ctx, first); got.Status.State != tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("first QE state = %q, want Admitted", got.Status.State)
+	}
+	if got := refreshQE(t, ctx, second); got.Status.State != tatarav1alpha1.QueueStateQueued {
+		t.Fatalf("second QE state = %q, want Queued", got.Status.State)
+	}
+
+	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassNormal, "", "pool_full")); got != 1 {
+		t.Fatalf("admission_blocked{normal,pool_full} = %v, want 1", got)
+	}
+	// The alert pool has nothing queued, so it never reports a full pool.
+	if got := testutil.ToFloat64(metrics.AdmissionBlockedCounter(proj.Name, tatarav1alpha1.QueueClassAlert, "", "pool_full")); got != 0 {
+		t.Fatalf("admission_blocked{alert,pool_full} = %v, want 0 (nothing queued)", got)
+	}
+}
+
 func TestAdmit_IdempotentOnReadmit(t *testing.T) {
 	ctx := context.Background()
 	ns := "tatara"

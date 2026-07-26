@@ -27,10 +27,13 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 			Name: "operator_queue_inflight",
 			Help: "Number of admitted in-flight QueuedEvents per project and pool class.",
 		}, []string{"project", "class"}),
+		// The project label (issue #418) matches queueDepth/queueInflight: without
+		// it an alert-class backlog in project infrastructure or mtg pages as if
+		// it were tatara's, because every project shares one bucket.
 		queueAge: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_queue_age_seconds",
-			Help: "Age of the OLDEST QueuedEvent per (class,priority,state) bucket (contract K.1).",
-		}, []string{"class", "priority", "state"}),
+			Help: "Age of the OLDEST QueuedEvent per (project,class,priority,state) bucket (contract K.1).",
+		}, []string{"project", "class", "priority", "state"}),
 		// The leader-only admission backstop (issue #395): DispatcherReconciler
 		// is otherwise purely watch-driven, so a QueuedEvent left Queued across a
 		// rollout/leader-handoff window with no fresh watch trigger can stall
@@ -81,8 +84,8 @@ func (m *queueMetrics) SetQueueInflight(project, class string, n int) {
 }
 
 // ResetQueueAge clears operator_queue_age_seconds so a recompute pass leaves
-// no stale bucket for a class/priority/state combination with no QueuedEvents
-// left (contract M22). Nil-safe.
+// no stale bucket for a project/class/priority/state combination with no
+// QueuedEvents left (contract M22). Nil-safe.
 func (m *OperatorMetrics) ResetQueueAge() {
 	if m == nil || m.queueAge == nil {
 		return
@@ -90,17 +93,17 @@ func (m *OperatorMetrics) ResetQueueAge() {
 	m.queueAge.Reset()
 }
 
-// SetQueueAge sets operator_queue_age_seconds{class,priority,state} to
+// SetQueueAge sets operator_queue_age_seconds{project,class,priority,state} to
 // ageSeconds, the age of the OLDEST QueuedEvent in that bucket. Nil-safe.
-func (m *OperatorMetrics) SetQueueAge(class, priority, state string, ageSeconds float64) {
+func (m *OperatorMetrics) SetQueueAge(project, class, priority, state string, ageSeconds float64) {
 	if m == nil || m.queueAge == nil {
 		return
 	}
-	m.queueAge.WithLabelValues(class, priority, state).Set(ageSeconds)
+	m.queueAge.WithLabelValues(project, class, priority, state).Set(ageSeconds)
 }
 
 // QueueAgeGauge returns the operator_queue_age_seconds gauge for
-// (class,priority,state) for test assertions.
-func (m *OperatorMetrics) QueueAgeGauge(class, priority, state string) prometheus.Gauge {
-	return m.queueAge.WithLabelValues(class, priority, state)
+// (project,class,priority,state) for test assertions.
+func (m *OperatorMetrics) QueueAgeGauge(project, class, priority, state string) prometheus.Gauge {
+	return m.queueAge.WithLabelValues(project, class, priority, state)
 }

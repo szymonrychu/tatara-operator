@@ -141,23 +141,52 @@ func TestMemoryProvisionDuration(t *testing.T) {
 	}
 }
 
+// hasMemoryStackSeries reports whether reg carries an operator_memory_stacks
+// series for the given project label value.
+func hasMemoryStackSeries(t *testing.T, reg *prometheus.Registry, project string) bool {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_memory_stacks" {
+			continue
+		}
+		for _, mtc := range mf.GetMetric() {
+			for _, lp := range mtc.GetLabel() {
+				if lp.GetName() == "project" && lp.GetValue() == project {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// operator_memory_stacks carries a project label (issue #425) so a Provisioning
+// or Failed stack names the project it belongs to instead of aggregating every
+// project into one indistinguishable count.
 func TestMemoryStacksGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.SetMemoryStackCounts(1, 3, 0, 2)
+	m.SetMemoryStackPhase("tatara", "Ready", 1)
+	m.SetMemoryStackPhase("tatara", "Provisioning", 0)
+	m.SetMemoryStackPhase("infrastructure", "Provisioning", 1)
+	m.SetMemoryStackPhase("infrastructure", "Ready", 0)
 
-	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Provisioning")); got != 1 {
-		t.Fatalf("Provisioning stacks = %v, want 1", got)
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("tatara", "Ready")); got != 1 {
+		t.Fatalf("tatara/Ready = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Ready")); got != 3 {
-		t.Fatalf("Ready stacks = %v, want 3", got)
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("tatara", "Provisioning")); got != 0 {
+		t.Fatalf("tatara/Provisioning = %v, want 0", got)
 	}
-	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Failed")); got != 0 {
-		t.Fatalf("Failed stacks = %v, want 0", got)
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("infrastructure", "Provisioning")); got != 1 {
+		t.Fatalf("infrastructure/Provisioning = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Degraded")); got != 2 {
-		t.Fatalf("Degraded stacks = %v, want 2", got)
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("infrastructure", "Ready")); got != 0 {
+		t.Fatalf("infrastructure/Ready = %v, want 0", got)
 	}
 }
 
@@ -165,15 +194,23 @@ func TestMemoryStacksGauge_ZeroesStalePhase(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	// Set Ready=2, then transition: Ready=0, Provisioning=1.
-	m.SetMemoryStackCounts(0, 2, 0, 0)
-	m.SetMemoryStackCounts(1, 0, 0, 0)
+	m.SetMemoryStackPhase("tatara", "Ready", 1)
+	m.SetMemoryStackPhase("gone", "Ready", 1)
 
-	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Ready")); got != 0 {
-		t.Fatalf("Ready stacks after transition = %v, want 0", got)
+	// A recompute pass Resets, then re-sets only the projects that still exist:
+	// tatara moved Ready -> Provisioning, and project "gone" was deleted.
+	m.ResetMemoryStacks()
+	m.SetMemoryStackPhase("tatara", "Provisioning", 1)
+	m.SetMemoryStackPhase("tatara", "Ready", 0)
+
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("tatara", "Ready")); got != 0 {
+		t.Fatalf("tatara/Ready after transition = %v, want 0", got)
 	}
-	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("Provisioning")); got != 1 {
-		t.Fatalf("Provisioning stacks = %v, want 1", got)
+	if got := testutil.ToFloat64(m.memoryStacks.WithLabelValues("tatara", "Provisioning")); got != 1 {
+		t.Fatalf("tatara/Provisioning = %v, want 1", got)
+	}
+	if hasMemoryStackSeries(t, reg, "gone") {
+		t.Fatal("deleted project 'gone' still has an operator_memory_stacks series after Reset")
 	}
 }
 
@@ -341,6 +378,22 @@ func TestSetRepositoryIngestFailing(t *testing.T) {
 	}
 }
 
+// operator_repository_ingest_gated (issue #434) makes the memory-readiness
+// ingest gate visible: a gated repo is neither failing nor ingesting, so
+// operator_repository_ingest_failing reads 0 for it forever.
+func TestSetRepositoryIngestGated(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewOperatorMetrics(reg)
+	m.SetRepositoryIngestGated("repo-a", true)
+	if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("repo-a")); got != 1 {
+		t.Fatalf("ingest_gated{repo-a} = %v, want 1", got)
+	}
+	m.SetRepositoryIngestGated("repo-a", false)
+	if got := testutil.ToFloat64(m.RepositoryIngestGatedGauge("repo-a")); got != 0 {
+		t.Fatalf("ingest_gated{repo-a} after clear = %v, want 0", got)
+	}
+}
+
 func TestSetRepositoryLastIngestTimestamp(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
@@ -366,7 +419,11 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 	m.OrphanReaped("test")
 	m.ReapDeleteError("pod")
 	m.SetRepositoryIngestFailing("touch", false)
+	m.SetRepositoryIngestGated("touch", false)
 	m.SetRepositoryLastIngestTimestamp("touch", 1)
+	// operator_memory_stacks is per-project (issue #425), so it cannot be
+	// pre-seeded at construction and needs a touch to appear in Gather.
+	m.SetMemoryStackPhase("touch", "Ready", 0)
 	mfs, _ := reg.Gather()
 	want := map[string]bool{
 		"operator_reconcile_total":                          false,
@@ -379,6 +436,7 @@ func TestOperatorMetricsNamesStable(t *testing.T) {
 		"operator_turn_timeout_total":                       false,
 		"operator_ingest_job_total":                         false,
 		"operator_repository_ingest_failing":                false,
+		"operator_repository_ingest_gated":                  false,
 		"operator_repository_last_ingest_timestamp_seconds": false,
 		"operator_agent_unreachable_termination_total":      false,
 		"operator_orphan_reaped_total":                      false,
@@ -1378,25 +1436,31 @@ func TestOrphanAdopted_NilSafe(t *testing.T) {
 }
 
 // operator_queue_age_seconds is the age of the OLDEST QueuedEvent per
-// (class,priority,state) bucket. ResetQueueAge clears stale buckets each pass.
+// (project,class,priority,state) bucket. The project label (issue #418) keeps
+// an alert-class backlog in one project from reading as another's.
+// ResetQueueAge clears stale buckets each pass.
 func TestQueueAgeGauge(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewOperatorMetrics(reg)
 
-	m.SetQueueAge("normal", "2", "Queued", 45)
-	if got := testutil.ToFloat64(m.QueueAgeGauge("normal", "2", "Queued")); got != 45 {
-		t.Fatalf("operator_queue_age_seconds = %v, want 45", got)
+	m.SetQueueAge("tatara", "normal", "2", "Queued", 45)
+	m.SetQueueAge("infrastructure", "normal", "2", "Queued", 900)
+	if got := testutil.ToFloat64(m.QueueAgeGauge("tatara", "normal", "2", "Queued")); got != 45 {
+		t.Fatalf("operator_queue_age_seconds{tatara} = %v, want 45", got)
+	}
+	if got := testutil.ToFloat64(m.QueueAgeGauge("infrastructure", "normal", "2", "Queued")); got != 900 {
+		t.Fatalf("operator_queue_age_seconds{infrastructure} = %v, want 900", got)
 	}
 
 	m.ResetQueueAge()
-	if got := testutil.ToFloat64(m.QueueAgeGauge("normal", "2", "Queued")); got != 0 {
+	if got := testutil.ToFloat64(m.QueueAgeGauge("tatara", "normal", "2", "Queued")); got != 0 {
 		t.Fatalf("operator_queue_age_seconds after Reset = %v, want 0 (series gone)", got)
 	}
 }
 
 func TestQueueAgeGauge_NilSafe(t *testing.T) {
 	var m *OperatorMetrics
-	m.SetQueueAge("normal", "2", "Queued", 45)
+	m.SetQueueAge("tatara", "normal", "2", "Queued", 45)
 	m.ResetQueueAge()
 }
 
@@ -1409,7 +1473,7 @@ func TestK1MetricsNamesRegistered(t *testing.T) {
 	m.SetTaskStageAge("task-1", "implementing", "implement", 1)
 	m.TaskParked("implementing", "implement-declined")
 	m.OrphanAdopted("clarify")
-	m.SetQueueAge("normal", "2", "Queued", 1)
+	m.SetQueueAge("tatara", "normal", "2", "Queued", 1)
 
 	mfs, err := reg.Gather()
 	if err != nil {
