@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -132,18 +133,23 @@ func hasLabel(labels []string, want string) bool {
 }
 
 // createBrainstormTask enqueues a project-scoped brainstorm QueuedEvent.
-// Returns created=true when a new event was enqueued.
-func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (bool, error) {
+// Returns created=true when a new event was enqueued. quota is the resolved
+// per-session proposal allowance; it rides as AnnBrainstormQuota, which
+// internal/restapi/outcome.go truncates submit_outcome against.
+func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string, quota int) (bool, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
 	dedupKey := "brainstorm-" + proj.Name
 	payload := tatarav1alpha1.QueuedEventPayload{
-		Kind:         "brainstorm",
-		Goal:         goal,
-		Labels:       map[string]string{labelActivity: "brainstorm"},
-		Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
+		Kind:   "brainstorm",
+		Goal:   goal,
+		Labels: map[string]string{labelActivity: "brainstorm"},
+		Annotations: map[string]string{
+			tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ","),
+			tatarav1alpha1.AnnBrainstormQuota:   strconv.Itoa(quota),
+		},
 		GenerateName: "brainstorm-",
 		Provider:     provider,
 		PodRepo:      "",
@@ -502,76 +508,103 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 	return nil
 }
 
-// brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
-// QueuedEvent per cycle for the whole project. BrainstormActivity.MaxPerCycle is
-// deprecated and ignored; the hard cap of one per cycle is enforced here.
-// Concurrency is bounded solely by the dispatcher's QueueCapacity.
-func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
+// brainstorm runs one brainstorm refill decision at PROJECT scope. trigger is
+// TriggerCron (the schedule backstop, which also resets the skip breaker) or
+// TriggerEvent (a maintainer verdict landed on a proposal Issue). It returns
+// whether a brainstorm QueuedEvent was created.
+//
+// The backlog level is read from Issue CRs in etcd, never from the forge: see
+// proposalPending. Concurrency is unchanged at one brainstorm Task per project -
+// only the TRIGGER and the QUOTA changed. BrainstormActivity.MaxPerCycle stays
+// deprecated and ignored.
+func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project,
+	reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task,
+	act tatarav1alpha1.BrainstormActivity, trigger string) bool {
+
 	l := log.FromContext(ctx)
 	start := time.Now()
-	// TODO(O4): this call site still reads the pre-target ceiling directly and
-	// keeps the unreachable maxProp<1 fallback (plan conflict C7); it is rewired
-	// onto act.ResolveTarget() when the brainstorm cycle itself is rewired onto
-	// the target control law.
-	maxProp := act.MaxOpenProposals //nolint:staticcheck // transitional; replaced in O4
-	if maxProp < 1 {
-		maxProp = 10
+
+	issues, err := r.projectProposalIssues(ctx, proj)
+	if err != nil {
+		l.Error(err, "brainstorm: list proposal issues",
+			"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+		return false
+	}
+	pending := pendingProposalCount(issues)
+	for slug, n := range pendingProposalCountByRepo(issues) {
+		r.Metrics.SetOpenProposals(slug, float64(n))
 	}
 
-	// Project-scoped in-flight guard: any non-terminal brainstorm Task blocks.
+	// The in-flight guard doubles as the read-your-writes ledger: a reconcile
+	// storm between "Task created" and "issues filed" sees inflight == 1 and
+	// cannot double-spawn.
+	inflight := 0
 	if brainstormInFlightProject(existing) {
-		l.Info("brainstorm: in-flight project brainstorm task; skipping cycle",
-			"action", "scan_brainstorm", "resource_id", proj.Name)
-		return
+		inflight = 1
 	}
 
-	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
+	target := act.ResolveTarget()
+	deficit := brainstormDeficit(target, pending, inflight)
+	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
+		proj.Status.BrainstormConsecutiveSkips, trigger)
 
-	// Deterministic primary repo: sort by name, first valid slug wins.
+	if !refill {
+		l.Info("brainstorm: no refill this pass",
+			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
+			"target", target, "pending", pending, "inflight", inflight,
+			"deficit", deficit, "trigger", trigger, "reason", reason,
+			"consecutive_skips", proj.Status.BrainstormConsecutiveSkips)
+		return false
+	}
+
+	// Deterministic repo order: sort by name, first valid slug wins.
 	sortedRepos := make([]tatarav1alpha1.Repository, len(repos))
 	copy(sortedRepos, repos)
-	sort.Slice(sortedRepos, func(i, j int) bool {
-		return sortedRepos[i].Name < sortedRepos[j].Name
-	})
+	sort.Slice(sortedRepos, func(i, j int) bool { return sortedRepos[i].Name < sortedRepos[j].Name })
 
-	// no-valid-repos is checked before at-cap here (2026-06-13 flooding-incident
-	// ordering).
-	r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos, existing,
-		brainstormingLabel, maxProp, "brainstorm", "scan_brainstorm", start, act.Sources,
-		false, brainstormGoalProject, r.createBrainstormTask)
+	created := r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos,
+		"brainstorm", "scan_brainstorm", act.Sources, quota)
+	if !created {
+		// Decided to refill, nothing enqueued: no valid repos, an enqueue error,
+		// or the dedup key already holds a queued event. All three are logged in
+		// place; this line is what ties them back to the decision that led here.
+		l.Info("brainstorm: refill decided but no event enqueued",
+			"action", "scan_brainstorm_not_enqueued", "resource_id", proj.Name,
+			"target", target, "pending", pending, "inflight", inflight,
+			"deficit", deficit, "quota", quota, "trigger", trigger)
+		return false
+	}
+	l.Info("brainstorm: refill dispatched",
+		"action", "scan_brainstorm", "resource_id", proj.Name,
+		"target", target, "pending", pending, "inflight", inflight,
+		"deficit", deficit, "quota", quota, "trigger", trigger, "reason", reason,
+		"duration_ms", time.Since(start).Milliseconds())
+	return true
 }
 
-// runProjectScopedProposalCycle runs the shared 90%-identical middle of
-// brainstorm() and healthCheck(): resolve per-repo slugs, accumulate the
-// proposal backlog (SCM issue count),
-// gather CI state, build the rich repo-state context, build the activity goal
-// text, and create the scan task - emitting the same log fields and metric
-// calls both callers previously duplicated.
+// runProjectScopedProposalCycle resolves per-repo slugs, gathers CI/MR state,
+// builds the rich repo-state context, builds the goal, and enqueues the
+// brainstorm event. It no longer counts a backlog: the caller owns the control
+// law (brainstormRefillDecision) and passes the resolved quota. The former
+// shared-with-healthCheck shape (goalBuilder/taskCreator function params plus a
+// checkCapFirst order flag) is gone with healthCheck and the cap - one caller
+// does not justify two function-valued parameters and an order flag.
 //
-// The two post-loop early-return guards (no-valid-repos / at-cap) are checked
-// in checkCapFirst order: brainstorm checks no-valid-repos first, healthCheck
-// checks at-cap first. This order is preserved verbatim per caller (do not let
-// this helper pick a single order - it touches the 2026-06-13 flooding-
-// incident path).
+// The at-cap guard whose ordering against no-valid-repos was caller-specific
+// (2026-06-13 flooding incident) no longer exists here: the caller decides
+// whether to refill at all BEFORE any repo work, and no-valid-repos is now the
+// only post-loop guard, so there is no ordering left to get wrong.
 func (r *ProjectReconciler) runProjectScopedProposalCycle(
 	ctx context.Context,
 	proj *tatarav1alpha1.Project,
 	reader scm.SCMReader,
 	sortedRepos []tatarav1alpha1.Repository,
-	existing []tatarav1alpha1.Task,
-	brainstormingLabel string,
-	maxProp int,
 	activityLabel, scanAction string,
-	start time.Time,
 	sources []string,
-	checkCapFirst bool,
-	goalBuilder func(slugs []string, repoStateCtx, guidance string) string,
-	taskCreator func(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (bool, error),
-) {
+	quota int,
+) bool {
 	l := log.FromContext(ctx)
 	issuesBySlug := make(map[string][]scm.IssueRef)
-	scmTotal := 0
-	scmAtCap := false
 	var slugs []string
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
@@ -580,63 +613,21 @@ func (r *ProjectReconciler) runProjectScopedProposalCycle(
 			continue
 		}
 		slugs = append(slugs, slug)
-		if scmAtCap {
-			// SCM backlog already at cap; skip the issue list for remaining repos
-			// (best-effort: their per-repo gauge keeps last cycle's value). Still
-			// collect slugs for the goal text.
-			continue
-		}
 		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
 		if err != nil {
 			continue
 		}
 		iss, err := reader.ListOpenIssues(ctx, owner, name)
 		if err != nil {
-			l.Info(activityLabel+": backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
+			l.Info(activityLabel+": open-issue read failed (non-fatal)",
+				"resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
 		}
 		issuesBySlug[slug] = iss
-		backlog := proposalBacklogCount(iss, brainstormingLabel)
-		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		scmTotal += backlog
-		if scmTotal >= maxProp {
-			scmAtCap = true
-		}
 	}
-	total := scmTotal
-	atCap := total >= maxProp
-	noValidRepos := len(slugs) == 0
-
-	noValidReposGuard := func() bool {
-		if !noValidRepos {
-			return false
-		}
-		l.Info(activityLabel+": no valid repos", "resource_id", proj.Name)
-		return true
-	}
-	atCapGuard := func() bool {
-		if !atCap {
-			return false
-		}
-		l.Info(activityLabel+": project backlog at cap; skipping cycle",
-			"action", scanAction, "resource_id", proj.Name, "total", total, "cap", maxProp)
-		return true
-	}
-
-	if checkCapFirst {
-		if atCapGuard() {
-			return
-		}
-		if noValidReposGuard() {
-			return
-		}
-	} else {
-		if noValidReposGuard() {
-			return
-		}
-		if atCapGuard() {
-			return
-		}
+	if len(slugs) == 0 {
+		l.Info(activityLabel+": no valid repos", "action", scanAction, "resource_id", proj.Name)
+		return false
 	}
 
 	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
@@ -645,14 +636,13 @@ func (r *ProjectReconciler) runProjectScopedProposalCycle(
 	// Build rich context from already-fetched data + bounded MR/main reads.
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
-	goal := goalBuilder(slugs, issuesCtx, scmGuidance(proj))
-	_, err := taskCreator(ctx, proj, goal, sources)
+	goal := brainstormGoalProject(slugs, issuesCtx, scmGuidance(proj), quota)
+	created, err := r.createBrainstormTask(ctx, proj, goal, sources, quota)
 	if err != nil {
 		l.Error(err, "scan: enqueue "+activityLabel+" event", "resource_id", proj.Name)
-		return
+		return false
 	}
-	l.Info(activityLabel+" complete", "action", scanAction, "resource_id", proj.Name,
-		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
+	return created
 }
 
 // appendGuidance appends a PROJECT CHARTER block when guidance is non-empty.
@@ -674,20 +664,25 @@ func scmGuidance(proj *tatarav1alpha1.Project) string {
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
 // task. repoStateCtx is the rich three-block string built by buildRepoStateContext
 // (ISSUES / OPEN MRs / MAIN HEALTH). When empty a fallback note is substituted.
-func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string) string {
+// quota is the resolved per-session proposal allowance; the PROPOSAL QUOTA line
+// is the agent-visible half of AnnBrainstormQuota and is a cross-repo interface
+// contract: the brainstorm skills quote the phrase "PROPOSAL QUOTA" to find it.
+func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string, quota int) string {
 	repoList := strings.Join(slugs, ", ")
 	stateBlock := "No live repo state available."
 	if repoStateCtx != "" {
 		stateBlock = repoStateCtx
 	}
-	goal := "Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
+	goal := fmt.Sprintf("PROPOSAL QUOTA: file AT MOST %d proposal(s) in this session. "+
+		"The operator truncates anything beyond %d.\n\n", quota, quota) +
+		"Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
 		"order; it owns the whole turn and emits the single terminal action itself (`propose_issue`, or " +
 		"`skip_research` when nothing clears the bar or the idea duplicates an open issue), grounded per " +
 		"the `tatara-code-quality-proposal` skill.\n\n" +
 		"HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
 		"still describes live, unfinished work, call `get_handoff` and propose continuing it (a `propose_issue` framed " +
 		"as resuming that work) before generating fresh ideas. Skip stale/superseded/delivered handoffs. Continuation " +
-		"proposals count against the same MaxOpenProposals cap as fresh ideas.\n\n" +
+		"proposals count against the same quota as fresh ideas.\n\n" +
 		"MANDATE: propose the highest-leverage code-quality, simplification, or robustness improvement across ALL " +
 		"repositories: " + repoList + ". Ground every claim in REAL code.\n\n" +
 		"READ REAL CODE (two signals, use both): (1) every listed repo is shallow-cloned read-only into " +
@@ -710,10 +705,10 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string)
 		"DECOMPOSITION into sub-problems; (c) for EACH sub-problem, 2-3 concrete OPTIONS with one-line tradeoffs and " +
 		"your recommended pick; (d) the maintainer's decision framed as choosing one option per sub-problem. No flat " +
 		"list of open questions.\n\n" +
-		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY " +
-		"emit one propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` you " +
-		"generate. State which path and scope you chose before executing. You are a read-only proposer: never " +
-		"implement, never push, never open a PR."
+		"ACTION RULE: emit exactly ONE `submit_outcome`, carrying between 1 and your quota of proposals. Each " +
+		"proposal becomes its own issue and its own clarify Task; there is no umbrella and no systemic group. " +
+		"State which scope you chose before executing. You are a read-only proposer: never implement, never push, " +
+		"never open a PR."
 	return appendGuidance(goal+promptguidance.PlatformProblemGuidance+promptguidance.ToolingNoteGuidance, guidance)
 }
 
@@ -948,37 +943,6 @@ func documentationInFlightProject(existing []tatarav1alpha1.Task) bool {
 		}
 	}
 	return false
-}
-
-// proposalBacklogCount counts open, undecided ideas in a pre-fetched issue
-// slice: non-PR issues bearing the brainstorming label.
-// Issues sharing a tatara/systemic-<id> label count as a single entry so that
-// a multi-repo systemic improvement does not inflate the backlog cap.
-func proposalBacklogCount(issues []scm.IssueRef, brainstormingLabel string) int {
-	const systemicPrefix = "tatara/systemic-"
-	groups := map[string]bool{}
-	standalone := 0
-	for _, iss := range issues {
-		if iss.IsPR {
-			continue
-		}
-		if !hasLabel(iss.Labels, brainstormingLabel) {
-			continue
-		}
-		sid := ""
-		for _, l := range iss.Labels {
-			if strings.HasPrefix(l, systemicPrefix) {
-				sid = l
-				break
-			}
-		}
-		if sid != "" {
-			groups[sid] = true
-		} else {
-			standalone++
-		}
-	}
-	return standalone + len(groups)
 }
 
 // createRefineTask enqueues a project-scoped refine QueuedEvent.
@@ -1412,7 +1376,16 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					}
 				}
 				if proceed {
-					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
+					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, TriggerCron)
+					// The cron tick is the ONLY thing that re-enables the event-driven
+					// refill path after the skip breaker trips. Reset unconditionally,
+					// refill or not: a dry spell must cost one session per cron period,
+					// never wedge brainstorm permanently.
+					if rerr := r.resetBrainstormSkips(ctx, proj); rerr != nil {
+						l.Error(rerr, "scan: reset brainstorm skip breaker",
+							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
+						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "skip_reset_failed").Inc()
+					}
 					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
 						l.Error(serr, "scan: persist brainstorm stamp failed",
 							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")

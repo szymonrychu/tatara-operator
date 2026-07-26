@@ -7,7 +7,7 @@ import (
 )
 
 func TestBrainstormGoalProject_CodeQualityGrounding(t *testing.T) {
-	goal := brainstormGoalProject([]string{"szymonrychu/tatara-operator", "szymonrychu/tatara-cli"}, "ISSUES: none", "")
+	goal := brainstormGoalProject([]string{"szymonrychu/tatara-operator", "szymonrychu/tatara-cli"}, "ISSUES: none", "", 3)
 	for _, want := range []string{
 		"workspace/",     // on-disk clone layout
 		"code_search",    // code-graph grounding

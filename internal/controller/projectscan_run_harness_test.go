@@ -164,16 +164,17 @@ func (f *perRepoFakeReader) ListOpenIssues(_ context.Context, owner, repo string
 }
 
 // seedBrainstormProject creates a Project with ApprovalLabel set and a brainstorm
-// cron, plus the requested repositories (by slug "owner/repo").
-func seedBrainstormProject(t *testing.T, name string, repoSlugs []string, maxOpenProposals int) (*tatarav1alpha1.Project, []tatarav1alpha1.Repository) {
+// cron, plus the requested repositories (by slug "owner/repo"). target is the
+// backlog TargetOpenProposals pointer: nil exercises the resolver default.
+func seedBrainstormProject(t *testing.T, name string, repoSlugs []string, target *int) (*tatarav1alpha1.Project, []tatarav1alpha1.Repository) {
 	t.Helper()
 	ctx := context.Background()
 	mkSecret(t, name+"-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
 	cron := &tatarav1alpha1.ScmCron{
 		Brainstorm: tatarav1alpha1.BrainstormActivity{
-			Enabled:          true,
-			Schedule:         "0 * * * *",
-			MaxOpenProposals: maxOpenProposals,
+			Enabled:             true,
+			Schedule:            "0 * * * *",
+			TargetOpenProposals: target,
 		},
 	}
 	proj := &tatarav1alpha1.Project{}

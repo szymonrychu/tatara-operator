@@ -6,8 +6,9 @@ import (
 	"strings"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // systemicLabelPrefix marks a multi-repo proposal group. Issues sharing one
@@ -103,7 +104,10 @@ func pendingProposalCountByRepo(issues []tatarav1alpha1.Issue) map[string]int {
 // (merge.go): the Issue CR set per namespace is small and there is no
 // projectRef field index to piggyback on.
 //
-//nolint:unused // transitional; wired into the brainstorm cycle in O4 (rewire onto target law)
+// It logs nothing on purpose. Listing is not a business action; the refill
+// DECISION is, and brainstorm() logs that one with the full input set
+// (target/pending/inflight/deficit/trigger/reason). A second INFO line here
+// would fire on every list and read as a decision that was never made.
 func (r *ProjectReconciler) projectProposalIssues(ctx context.Context, proj *tatarav1alpha1.Project) ([]tatarav1alpha1.Issue, error) {
 	var list tatarav1alpha1.IssueList
 	if err := r.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
@@ -115,10 +119,30 @@ func (r *ProjectReconciler) projectProposalIssues(ctx context.Context, proj *tat
 			out = append(out, list.Items[i])
 		}
 	}
-	log.FromContext(ctx).Info("brainstorm: counted pending proposals",
-		"action", "brainstorm_backlog_counted", "resource_id", proj.Name,
-		"pending", pendingProposalCount(out), "issues_seen", len(out))
 	return out, nil
+}
+
+// resetBrainstormSkips zeroes the skip breaker. The cron tick is the ONLY thing
+// that re-enables the event-driven refill path after the breaker trips, so this
+// is the liveness guarantee of the whole design: a dry idea space costs one
+// session per cron period instead of wedging brainstorm forever.
+func (r *ProjectReconciler) resetBrainstormSkips(ctx context.Context, proj *tatarav1alpha1.Project) error {
+	if proj.Status.BrainstormConsecutiveSkips == 0 {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Project{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: proj.Namespace, Name: proj.Name}, fresh); err != nil {
+			return fmt.Errorf("brainstorm: get project %s: %w", proj.Name, err)
+		}
+		if fresh.Status.BrainstormConsecutiveSkips == 0 {
+			proj.Status.BrainstormConsecutiveSkips = 0
+			return nil
+		}
+		fresh.Status.BrainstormConsecutiveSkips = 0
+		proj.Status.BrainstormConsecutiveSkips = 0
+		return r.Status().Update(ctx, fresh)
+	})
 }
 
 // TriggerEvent and TriggerCron name the two refill paths. They are the value of

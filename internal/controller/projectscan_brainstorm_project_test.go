@@ -1,8 +1,13 @@
 package controller
 
-// Project-level brainstorm tests (TDD - written before implementation).
-// These tests define the NEW behavior: one brainstorm Task per project per
-// cycle, not one per repo. They must FAIL until the implementation lands.
+// Project-level brainstorm tests: one brainstorm Task per project per cycle,
+// not one per repo, and project-scoped (no repo pinned).
+//
+// The former SCM-label backlog cases (summed-backlog at/under cap, the
+// short-circuit that stopped listing issues once the cap was hit, and the
+// default-cap-of-ten case) are gone with the cap itself. The backlog level now
+// comes from Issue CRs and the refill decision is the control law's, so their
+// replacements live in projectscan_brainstorm_target_test.go.
 
 import (
 	"context"
@@ -18,7 +23,7 @@ import (
 // TestBrainstorm_ProjectLevel_MultiRepo_OneTask: 2 repos, 0 proposals across
 // the project -> exactly ONE brainstorm Task created, not two.
 func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-one", []string{"o/alpha", "o/beta"}, 5)
+	proj, repos := seedBrainstormProject(t, "bs-proj-one", []string{"o/alpha", "o/beta"}, intPtr(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/alpha": {},
@@ -28,8 +33,7 @@ func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
 
 	qes := listBrainstormQEs(t, "bs-proj-one")
 	if len(qes) != 1 {
@@ -40,7 +44,7 @@ func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
 // TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks: a non-terminal
 // brainstorm Task for ANY repo in the project blocks a new one.
 func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-inflight", []string{"o/x", "o/y"}, 5)
+	proj, repos := seedBrainstormProject(t, "bs-proj-inflight", []string{"o/x", "o/y"}, intPtr(1))
 
 	// Pre-create an in-flight brainstorm Task for repo x (not y).
 	pre := &tatarav1alpha1.Task{}
@@ -69,11 +73,11 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
 	existing := []tatarav1alpha1.Task{*pre}
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, existing, act)
+	r.brainstorm(context.Background(), proj, reader, repos, existing, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
 
 	tasks := listBrainstormTasks(t, "bs-proj-inflight")
-	// Only the pre-existing Task; no new QE created because ANY inflight Task blocks.
+	// Only the pre-existing Task; no new QE created because the in-flight Task
+	// consumes the only slot of a target-1 project.
 	if len(tasks) != 1 {
 		t.Fatalf("want 1 task (pre-existing only; project-level in-flight guard), got %d", len(tasks))
 	}
@@ -83,69 +87,12 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 	}
 }
 
-// TestBrainstorm_ProjectLevel_SummedBacklog_AtCap_Skips: ideas are spread
-// across repos but their sum >= maxOpenProposals -> no new task.
-func TestBrainstorm_ProjectLevel_SummedBacklog_AtCap_Skips(t *testing.T) {
-	// maxOpenProposals=5; spread 3+2 ideas across two repos = 5 total -> skip.
-	proj, repos := seedBrainstormProject(t, "bs-proj-sumcap", []string{"o/m", "o/n"}, 5)
-	reader := &perRepoFakeReader{
-		issuesByRepo: map[string][]scm.IssueRef{
-			"o/m": {
-				{Repo: "o/m", Number: 1, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/m", Number: 2, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/m", Number: 3, Labels: []string{"tatara-brainstorming"}},
-			},
-			"o/n": {
-				{Repo: "o/n", Number: 4, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/n", Number: 5, Labels: []string{"tatara-brainstorming"}},
-			},
-		},
-	}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
-
-	qes := listBrainstormQEs(t, "bs-proj-sumcap")
-	if len(qes) != 0 {
-		t.Fatalf("want 0 brainstorm QEs (summed backlog >= maxOpenProposals), got %d", len(qes))
-	}
-}
-
-// TestBrainstorm_ProjectLevel_SummedBacklog_UnderCap_Creates: 3+1 = 4 < 5 -> create 1.
-func TestBrainstorm_ProjectLevel_SummedBacklog_UnderCap_Creates(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-undersum", []string{"o/p", "o/q"}, 5)
-	reader := &perRepoFakeReader{
-		issuesByRepo: map[string][]scm.IssueRef{
-			"o/p": {
-				{Repo: "o/p", Number: 1, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/p", Number: 2, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/p", Number: 3, Labels: []string{"tatara-brainstorming"}},
-			},
-			"o/q": {
-				{Repo: "o/q", Number: 4, Labels: []string{"tatara-brainstorming"}},
-			},
-		},
-	}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
-
-	qes := listBrainstormQEs(t, "bs-proj-undersum")
-	if len(qes) != 1 {
-		t.Fatalf("want 1 brainstorm QE (sum=4 < maxOpenProposals=5), got %d", len(qes))
-	}
-}
-
 // TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo: brainstorm tasks are
 // project-scoped (empty RepositoryRef); the goal encodes all repos sorted by
 // name for determinism across cycles.
 func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	// Seed repos with names that have a non-trivial sort order.
-	proj, repos := seedBrainstormProject(t, "bs-proj-det", []string{"o/zzz", "o/aaa", "o/mmm"}, 5)
+	proj, repos := seedBrainstormProject(t, "bs-proj-det", []string{"o/zzz", "o/aaa", "o/mmm"}, intPtr(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/zzz": {},
@@ -157,8 +104,7 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
 
 	qes := listBrainstormQEs(t, "bs-proj-det")
 	if len(qes) != 1 {
@@ -181,7 +127,7 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 // to pick the best repo via propose_issue's repo arg.
 func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 	slugs := []string{"o/alpha", "o/beta", "o/gamma"}
-	g := brainstormGoalProject(slugs, "", "")
+	g := brainstormGoalProject(slugs, "", "", 3)
 
 	// Must mention all repos.
 	for _, slug := range slugs {
@@ -204,45 +150,10 @@ func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 	}
 }
 
-// TestBrainstorm_ProjectLevel_ShortCircuit_Backlog: backlog summation stops
-// early once total >= maxProp (avoids unnecessary SCM calls for remaining repos).
-func TestBrainstorm_ProjectLevel_ShortCircuit_Backlog(t *testing.T) {
-	// 3 repos; first alone has maxProp=3 ideas -> short-circuit, never query others.
-	proj, repos := seedBrainstormProject(t, "bs-proj-sc", []string{"o/sc1", "o/sc2", "o/sc3"}, 3)
-
-	queriedRepos := map[string]int{}
-	reader := &countingReader{
-		issuesByRepo: map[string][]scm.IssueRef{
-			"o/sc1": {
-				{Repo: "o/sc1", Number: 1, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/sc1", Number: 2, Labels: []string{"tatara-brainstorming"}},
-				{Repo: "o/sc1", Number: 3, Labels: []string{"tatara-brainstorming"}},
-			},
-			"o/sc2": {{Repo: "o/sc2", Number: 4, Labels: []string{"tatara-brainstorming"}}},
-			"o/sc3": {},
-		},
-		queried: queriedRepos,
-	}
-	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 3}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
-
-	// sc1 hits cap -> sc2 and sc3 should NOT be queried.
-	if queriedRepos["o/sc2"] > 0 || queriedRepos["o/sc3"] > 0 {
-		t.Fatalf("short-circuit failed: queried %v after hitting cap on sc1", queriedRepos)
-	}
-	qes := listBrainstormQEs(t, "bs-proj-sc")
-	if len(qes) != 0 {
-		t.Fatalf("want 0 QEs (at cap after sc1), got %d", len(qes))
-	}
-}
-
 // TestBrainstorm_ProjectLevel_EmptyRepositoryRef: brainstorm creates a Task with
 // an empty RepositoryRef (project-scoped, no single-repo pin).
 func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-emptyref", []string{"o/alpha", "o/beta"}, 5)
+	proj, repos := seedBrainstormProject(t, "bs-proj-emptyref", []string{"o/alpha", "o/beta"}, intPtr(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/alpha": {},
@@ -252,8 +163,7 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
 
 	qes := listBrainstormQEs(t, "bs-proj-emptyref")
 	if len(qes) != 1 {
@@ -267,15 +177,14 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 // TestBrainstorm_ProjectLevel_ProjectScopedPodName: brainstorm QE is project-scoped.
 // PodRepo is empty because pod-name is stamped at admit time, not at enqueue time.
 func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-podname", []string{"o/alpha", "o/beta"}, 5)
+	proj, repos := seedBrainstormProject(t, "bs-proj-podname", []string{"o/alpha", "o/beta"}, intPtr(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{"o/alpha": {}, "o/beta": {}},
 	}
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 5}
-	r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+	r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
 
 	qes := listBrainstormQEs(t, "bs-proj-podname")
 	if len(qes) != 1 {
@@ -287,57 +196,44 @@ func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
 	}
 }
 
-// TestBrainstormDefaultProposalCapIsTen: MaxOpenProposals=0 (unset) should
-// default to 10. 9 open proposals must NOT cap-skip; 10 must cap-skip.
-func TestBrainstormDefaultProposalCapIsTen(t *testing.T) {
+// TestBrainstormUnsetTargetFallsBackToTheDeprecatedAlias: an unmigrated Project
+// leaves TargetOpenProposals unset, and the CRD defaults MaxOpenProposals to 5,
+// so ResolveTarget yields 5 - the documented default. It is emphatically NOT the
+// unreachable 10 fallback the old cycle carried (plan conflict C7), which this
+// task deleted: at 5 pending there is no refill, where a 10 ceiling would give
+// a deficit of 5.
+func TestBrainstormUnsetTargetFallsBackToTheDeprecatedAlias(t *testing.T) {
 	tests := []struct {
 		name      string
 		projName  string
-		openCount int
-		wantSkip  bool
+		pending   int
+		wantQuota string
+		wantQE    int
 	}{
-		{"nine_under_default_cap", "bs-defcap-9", 9, false},
-		{"ten_at_default_cap", "bs-defcap-10", 10, true},
+		{"one_below_the_alias_default", "bs-defcap-4", 4, "1", 1},
+		{"at_the_alias_default", "bs-defcap-5", 5, "", 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			proj, repos := seedBrainstormProject(t, tc.projName, []string{"o/r1"}, 0)
-
-			var issues []scm.IssueRef
-			for i := 1; i <= tc.openCount; i++ {
-				issues = append(issues, scm.IssueRef{Repo: "o/r1", Number: i, Labels: []string{"tatara-brainstorming"}})
-			}
-			reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r1": issues}}
+			proj, repos := seedBrainstormProject(t, tc.projName, []string{"o/r1"}, nil)
+			reader := &perRepoFakeReader{issuesByRepo: map[string][]scm.IssueRef{"o/r1": nil}}
 			r := newScanReconciler(reader)
 			r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+			for i := 1; i <= tc.pending; i++ {
+				seedProposalIssue(t, r, proj, tc.projName+"-r1", i, "brainstorm", "open", "new")
+			}
 
-			// MaxOpenProposals=0 -> falls back to default.
-			act := tatarav1alpha1.BrainstormActivity{Enabled: true, MaxOpenProposals: 0}
-			r.brainstorm(context.Background(), proj, reader, repos, nil, act)
+			r.brainstorm(context.Background(), proj, reader, repos, nil, proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
 
 			qes := listBrainstormQEs(t, tc.projName)
-			if tc.wantSkip && len(qes) != 0 {
-				t.Fatalf("want cap-skip (0 QEs), got %d", len(qes))
+			if len(qes) != tc.wantQE {
+				t.Fatalf("want %d QE, got %d", tc.wantQE, len(qes))
 			}
-			if !tc.wantSkip && len(qes) != 1 {
-				t.Fatalf("want 1 QE (under cap), got %d", len(qes))
+			if tc.wantQE == 1 {
+				if got := qes[0].Spec.Payload.Annotations[tatarav1alpha1.AnnBrainstormQuota]; got != tc.wantQuota {
+					t.Fatalf("quota annotation = %q, want %q", got, tc.wantQuota)
+				}
 			}
 		})
 	}
-}
-
-// countingReader wraps perRepoFakeReader and records which repos were queried.
-type countingReader struct {
-	issuesByRepo map[string][]scm.IssueRef
-	queried      map[string]int
-	fakeReader
-}
-
-func (c *countingReader) ListOpenIssues(_ context.Context, owner, repo string) ([]scm.IssueRef, error) {
-	slug := owner + "/" + repo
-	c.queried[slug]++
-	if iss, ok := c.issuesByRepo[slug]; ok {
-		return iss, nil
-	}
-	return nil, nil
 }

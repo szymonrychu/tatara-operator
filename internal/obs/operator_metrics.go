@@ -161,14 +161,17 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_agent_session_busy_requeue_total",
 			Help: "Times a turn submit hit a wrapper 409 \"session busy\" and was requeued as transient backpressure instead of erroring (issue #168).",
 		}),
-		// Set inside runProjectScopedProposalCycle (projectscan.go), which
-		// only runs when a project's brainstorm/refine CRON activity is
-		// due - not on the 60s maybeRecomputeGauges pass most other
+		// Set inside brainstorm() (projectscan.go) from
+		// pendingProposalCountByRepo, the UNCOLLAPSED per-repo pending count
+		// over Issue CRs: the project-wide count collapses systemic groups,
+		// which span repos, so splitting THAT per repo is undefined. It is
+		// written on every brainstorm refill decision (cron tick or Issue
+		// event), not on the 60s maybeRecomputeGauges pass most other
 		// per-project gauges use. Confirmed correctly wired (real nonzero
 		// backlog counts per repo) across prior pod generations via 7-day
 		// Prometheus history during the metric-wiring audit (issue #370);
-		// a flat absence right after a pod restart just means no
-		// project's brainstorm/refine tick has come due yet, not a bug.
+		// a flat absence right after a pod restart just means no project has
+		// had a brainstorm decision yet, not a bug.
 		openProposals: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_open_proposals",
 			Help: "Open, unapproved agent-proposed issues per repo.",
