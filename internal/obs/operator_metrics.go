@@ -72,6 +72,7 @@ type OperatorMetrics struct {
 	memoryGateHoldTotal          *prometheus.CounterVec
 	mrBindingBackstopTotal       *prometheus.CounterVec
 	repositoryIngestFailing      *prometheus.GaugeVec
+	repositoryIngestGated        *prometheus.GaugeVec
 	repositoryLastIngestTime     *prometheus.GaugeVec
 	reviewOutcomeTotal           *prometheus.CounterVec
 	reviewHeadMovedTotal         *prometheus.CounterVec
@@ -123,10 +124,16 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help:    "Wall-clock duration of a per-project memory stack reaching Ready.",
 			Buckets: prometheus.ExponentialBuckets(5, 2, 8),
 		}),
+		// Per (project,phase): 1 for the project's current phase, 0 for the other
+		// three. The project label (issue #425) is what makes a Provisioning or
+		// Failed stack name the project it belongs to; the old cluster-wide count
+		// left tatara, infrastructure and mtg indistinguishable. Summing over
+		// project recovers the old count, so `max(operator_memory_stacks{...})`
+		// and `sum by (phase) (...)` both keep working.
 		memoryStacks: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_memory_stacks",
-			Help: "Number of per-project memory stacks by phase.",
-		}, []string{"phase"}),
+			Help: "Per-project memory stack phase: 1 for the project's current phase, 0 for the others.",
+		}, []string{"project", "phase"}),
 		autoApproveTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_auto_approve_total",
 			Help: "Auto-approve releases (item 4a) by proposal kind (brainstorm|incident|refine).",
@@ -166,6 +173,15 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		repositoryIngestFailing: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_ingest_failing",
 			Help: "1 when a Repository is currently in a failing ingest state (status Phase=Failed or IngestFailureCount>0), else 0. Current-state, recovery-aware signal that clears the moment a re-ingest succeeds, unlike the monotonic operator_ingest_job_total counter (issue #138).",
+		}, []string{"repo"}),
+		// Issue #434: a Repository whose re-ingest is held by the project
+		// memory-readiness gate is neither Failed nor accumulating failures, so
+		// repositoryIngestFailing reads 0 for it indefinitely. Without this gauge
+		// a fleet-wide ingest freeze is invisible until the 24h staleness backstop
+		// fires.
+		repositoryIngestGated: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_repository_ingest_gated",
+			Help: "1 while a Repository's re-ingest is held by the project memory-readiness gate, else 0. Distinct from operator_repository_ingest_failing, which stays 0 for a gated repo because nothing has failed (issue #434).",
 		}, []string{"repo"}),
 		repositoryLastIngestTime: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_repository_last_ingest_timestamp_seconds",
@@ -304,13 +320,16 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Help: "Token-budget usage as a fraction of the window limit, by project and scope (used|proactive|emergency); used is current usage, proactive/emergency are the active pause thresholds.",
 		}, []string{"project", "scope"}),
 		// Work the admission gate held back rather than admitting. reason is
-		// "token_budget"|"project_paused"|"kind_ceiling"; class is the pool
-		// (normal|alert); kind is the Task kind for a per-kind account-usage hold,
-		// "" for pool-class blocks (project_paused, token_budget). Bounded by live
-		// projects x classes x kinds x reasons; set live (not pre-seeded).
+		// "token_budget"|"project_paused"|"kind_ceiling"|"pool_full"; class is the
+		// pool (normal|alert); kind is the Task kind for a per-kind account-usage
+		// hold, "" for pool-class blocks (project_paused, token_budget,
+		// pool_full). Bounded by live projects x classes x kinds x reasons; set
+		// live (not pre-seeded). pool_full (issue #440) is the ordinary
+		// concurrency cap: it is emitted at most once per pool per pass, and only
+		// when work was actually left Queued behind it.
 		admissionBlockedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_admission_blocked_total",
-			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling).",
+			Help: "QueuedEvents the dispatcher declined to admit for a pool, by project, pool class (normal|alert), Task kind (empty for pool-class blocks), and reason (token_budget|project_paused|kind_ceiling|pool_full).",
 		}, []string{"project", "class", "kind", "reason"}),
 		// Infra-incident admission-gate exemptions (#236): an incident Task whose
 		// alert targets core memory/storage infra was admitted with the project
@@ -422,6 +441,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
 		m.repositoryIngestFailing,
+		m.repositoryIngestGated,
 		m.repositoryLastIngestTime,
 		m.agentUnreachableTermTotal,
 		m.agentBootCrashTotal,
@@ -476,9 +496,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		[]string{"other", "labeled", "opened", "closed", "synchronize", "create"},
 		[]string{"accepted", "rejected", "ignored", "error", "task_created", "duplicate", "unknown_project", "bad_signature", "provider_mismatch", "too_large", "bad_request", "reactivated"},
 	)
-	for _, phase := range []string{"Provisioning", "Ready", "Failed", "Degraded"} {
-		m.memoryStacks.WithLabelValues(phase)
-	}
+	// operator_memory_stacks is NOT pre-seeded: its project label is only known
+	// at recompute time, and updateMemoryStackCounts Resets the vec each pass
+	// anyway (that Reset is what drops a deleted project's series), so any seed
+	// would be wiped within one recompute interval.
 	for _, source := range []string{"reconcile", "poll_backstop"} {
 		m.turnTimeoutTotal.WithLabelValues(source)
 	}
@@ -554,6 +575,18 @@ func (m *OperatorMetrics) SetRepositoryIngestFailing(repo string, failing bool) 
 	m.repositoryIngestFailing.WithLabelValues(repo).Set(v)
 }
 
+// SetRepositoryIngestGated sets operator_repository_ingest_gated for a repo to
+// 1 while its re-ingest is held by the project memory-readiness gate, else 0.
+// The gate is a silent hold - nothing fails, nothing retries - so
+// operator_repository_ingest_failing cannot see it (issue #434).
+func (m *OperatorMetrics) SetRepositoryIngestGated(repo string, gated bool) {
+	v := 0.0
+	if gated {
+		v = 1.0
+	}
+	m.repositoryIngestGated.WithLabelValues(repo).Set(v)
+}
+
 // SetRepositoryLastIngestTimestamp sets operator_repository_last_ingest_timestamp_seconds
 // for a repo to the Unix seconds of its last successful ingest.
 func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(repo string, unixSeconds float64) {
@@ -563,6 +596,11 @@ func (m *OperatorMetrics) SetRepositoryLastIngestTimestamp(repo string, unixSeco
 // RepositoryIngestFailingGauge returns the gauge for a repo, for test assertions.
 func (m *OperatorMetrics) RepositoryIngestFailingGauge(repo string) prometheus.Gauge {
 	return m.repositoryIngestFailing.WithLabelValues(repo)
+}
+
+// RepositoryIngestGatedGauge returns the gauge for a repo, for test assertions.
+func (m *OperatorMetrics) RepositoryIngestGatedGauge(repo string) prometheus.Gauge {
+	return m.repositoryIngestGated.WithLabelValues(repo)
 }
 
 // RepositoryLastIngestTimestampGauge returns the gauge for a repo, for test assertions.
@@ -716,15 +754,19 @@ func (m *OperatorMetrics) ObserveMemoryProvisionDuration(seconds float64) {
 	m.memoryProvisionDuration.Observe(seconds)
 }
 
-// SetMemoryStackCounts sets the operator_memory_stacks gauge for all four
-// phases atomically to the given cluster-wide counts. Pass 0 for any phase
-// that has no stacks so stale values are cleared. Degraded (issue #355) is a
-// stack that has been Provisioning past MemoryConfig.ProvisioningTimeout.
-func (m *OperatorMetrics) SetMemoryStackCounts(provisioning, ready, failed, degraded int) {
-	m.memoryStacks.WithLabelValues("Provisioning").Set(float64(provisioning))
-	m.memoryStacks.WithLabelValues("Ready").Set(float64(ready))
-	m.memoryStacks.WithLabelValues("Failed").Set(float64(failed))
-	m.memoryStacks.WithLabelValues("Degraded").Set(float64(degraded))
+// ResetMemoryStacks clears operator_memory_stacks so a recompute pass leaves no
+// stale series behind for a project that was deleted since the last pass.
+func (m *OperatorMetrics) ResetMemoryStacks() {
+	m.memoryStacks.Reset()
+}
+
+// SetMemoryStackPhase sets operator_memory_stacks{project,phase} to n. Callers
+// set every known phase per project (1 for the current one, 0 for the rest) so
+// a phase a project has left reads 0 rather than retaining its last value.
+// Degraded (issue #355) is a stack that has been Provisioning past
+// MemoryConfig.ProvisioningTimeout.
+func (m *OperatorMetrics) SetMemoryStackPhase(project, phase string, n float64) {
+	m.memoryStacks.WithLabelValues(project, phase).Set(n)
 }
 
 // ReconcileResult increments operator_reconcile_total for the given kind and
@@ -890,7 +932,8 @@ func (m *OperatorMetrics) SetTokenBudgetUsedRatio(project, scope string, ratio f
 // AdmissionBlocked increments operator_admission_blocked_total: the dispatcher
 // declined to admit a pool's work for the given project, pool class
 // ("normal"|"alert"), Task kind (empty for pool-class blocks that are not tied
-// to one kind), and reason ("token_budget"|"project_paused"|"kind_ceiling").
+// to one kind), and reason
+// ("token_budget"|"project_paused"|"kind_ceiling"|"pool_full").
 func (m *OperatorMetrics) AdmissionBlocked(project, class, kind, reason string) {
 	m.admissionBlockedTotal.WithLabelValues(project, class, kind, reason).Inc()
 }
