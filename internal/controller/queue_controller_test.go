@@ -1500,3 +1500,191 @@ func TestDispatcherReconciler_SetupWithManager_WithBackstopChannel(t *testing.T)
 		t.Fatalf("SetupWithManager: %v", err)
 	}
 }
+
+// ============================================================================
+// Issue #443: mint idempotency under GenerateName-minted Task names.
+// ============================================================================
+
+// mintQE creates a Queued, mint-shaped QueuedEvent for proj.
+func mintQE(t *testing.T, ctx context.Context, proj *tatarav1alpha1.Project, name, generateName string, seq int64) *tatarav1alpha1.QueuedEvent {
+	t.Helper()
+	q := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: proj.Namespace},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Seq: seq, Class: tatarav1alpha1.QueueClassNormal, Kind: "brainstorm", ProjectRef: proj.Name,
+			Payload: tatarav1alpha1.QueuedEventPayload{Kind: "brainstorm", GenerateName: generateName},
+		},
+	}
+	mustCreate(t, ctx, q)
+	q.Status.State = tatarav1alpha1.QueueStateQueued
+	mustStatusUpdate(t, ctx, q)
+	return q
+}
+
+// tasksMintedBy lists the Tasks carrying q's mint label.
+func tasksMintedBy(t *testing.T, ctx context.Context, q *tatarav1alpha1.QueuedEvent) []tatarav1alpha1.Task {
+	t.Helper()
+	var tl tatarav1alpha1.TaskList
+	if err := k8sClient.List(ctx, &tl, client.InNamespace(q.Namespace),
+		client.MatchingLabels{queue.LabelMintedBy: string(q.UID)}); err != nil {
+		t.Fatalf("list tasks minted by %s: %v", q.Name, err)
+	}
+	return tl.Items
+}
+
+// TestAdmit_MintGuard_NoDuplicateAfterStatusPatchCrash is the regression the
+// GenerateName mint (issue #443) would otherwise introduce: a failure between
+// the Create and the Admitted status patch leaves the event Queued, and the
+// next pass must ADOPT the Task it already minted instead of minting a second
+// one. The Task's LabelQueuedEvent is rewritten first, exactly as admitTicket
+// rewrites it once the Task takes its first stage step - which is why the mint
+// link is a separate, never-rewritten label.
+func TestAdmit_MintGuard_NoDuplicateAfterStatusPatchCrash(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-mint-crash", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 3, AlertCapacity: 3}},
+	}
+	mustCreate(t, ctx, proj)
+	q := mintQE(t, ctx, proj, "qe-mint-crash", "brainstorm-", 1)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	qes, tasks := listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	first := refreshQE(t, ctx, q)
+	if first.Status.TaskRef == "" {
+		t.Fatal("first admit did not mint a Task")
+	}
+	minted := taskForQE(t, ctx, first)
+	if minted.Name == "brainstorm-"+q.Name {
+		t.Fatalf("task name %q is the old deterministic name; it must be GenerateName-minted", minted.Name)
+	}
+
+	// The per-stage ticket rewrites LabelQueuedEvent off the mint.
+	minted.Labels[queue.LabelQueuedEvent] = "qe-some-later-ticket"
+	if err := k8sClient.Update(ctx, minted); err != nil {
+		t.Fatalf("rewrite queued-event label: %v", err)
+	}
+	// The crash: the Admitted status patch never landed.
+	first.Status.State = tatarav1alpha1.QueueStateQueued
+	first.Status.TaskRef = ""
+	first.Status.AdmittedAt = nil
+	if err := k8sClient.Status().Update(ctx, first); err != nil {
+		t.Fatalf("reset to Queued: %v", err)
+	}
+
+	qes, tasks = listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("second admit: %v", err)
+	}
+	got := tasksMintedBy(t, ctx, q)
+	if len(got) != 1 {
+		names := make([]string, 0, len(got))
+		for i := range got {
+			names = append(names, got[i].Name)
+		}
+		t.Fatalf("mint guard failed: %d Tasks minted by %s (%v), want exactly 1", len(got), q.Name, names)
+	}
+	if after := refreshQE(t, ctx, q); after.Status.TaskRef != minted.Name {
+		t.Fatalf("re-admit taskRef = %q, want the adopted mint %q", after.Status.TaskRef, minted.Name)
+	}
+}
+
+// TestAdmit_MintGuard_NewCycleMintsItsOwnTask is the point of issue #443: a
+// project-scoped dedup key ("brainstorm-<project>") yields the SAME
+// QueuedEvent name every cycle, so a re-created event must mint a Task with a
+// NEW name (and therefore a new agent branch) and must not touch the previous
+// cycle's Task.
+func TestAdmit_MintGuard_NewCycleMintsItsOwnTask(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-mint-cycle", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 3, AlertCapacity: 3}},
+	}
+	mustCreate(t, ctx, proj)
+
+	const fixedQEName = "qe-cycle-fixed" // what queue.QueuedEventName returns every cycle
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+	q1 := mintQE(t, ctx, proj, fixedQEName, "brainstorm-", 1)
+	qes, tasks := listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("cycle 1 admit: %v", err)
+	}
+	firstTask := taskForQE(t, ctx, refreshQE(t, ctx, q1))
+
+	// Cycle 1 finishes: its QueuedEvent is GC'd, its Task lingers as an artifact.
+	if err := k8sClient.Delete(ctx, q1); err != nil {
+		t.Fatalf("delete cycle-1 event: %v", err)
+	}
+	q2 := mintQE(t, ctx, proj, fixedQEName, "brainstorm-", 2)
+
+	qes, tasks = listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("cycle 2 admit: %v", err)
+	}
+	secondTask := taskForQE(t, ctx, refreshQE(t, ctx, q2))
+	if secondTask.Name == firstTask.Name {
+		t.Fatalf("cycle 2 reused the cycle-1 Task name %q: the branch collision is back", firstTask.Name)
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: firstTask.Name, Namespace: testNS}, &tatarav1alpha1.Task{}); err != nil {
+		t.Fatalf("cycle 2 must not touch the cycle-1 Task %s: %v", firstTask.Name, err)
+	}
+}
+
+// TestAdmit_MintGuard_StaleTerminalOwnMint keeps the self-heal the AlreadyExists
+// path used to own: when the Task this event already minted is TERMINAL, delete
+// it and requeue so the next pass mints a fresh one.
+func TestAdmit_MintGuard_StaleTerminalOwnMint(t *testing.T) {
+	ctx := context.Background()
+	proj := &tatarav1alpha1.Project{
+		ObjectMeta: metav1.ObjectMeta{Name: "p-mint-stale", Namespace: testNS},
+		Spec:       tatarav1alpha1.ProjectSpec{Queue: &tatarav1alpha1.QueueSpec{Capacity: 3, AlertCapacity: 3}},
+	}
+	mustCreate(t, ctx, proj)
+	q := mintQE(t, ctx, proj, "qe-mint-stale", "brainstorm-", 1)
+
+	r := &DispatcherReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	qes, tasks := listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("first admit: %v", err)
+	}
+	admitted := refreshQE(t, ctx, q)
+	dead := taskForQE(t, ctx, admitted)
+	dead.Status.Stage = tatarav1alpha1.StageDelivered
+	mustStatusUpdate(t, ctx, dead)
+
+	admitted.Status.State = tatarav1alpha1.QueueStateQueued
+	admitted.Status.TaskRef = ""
+	admitted.Status.AdmittedAt = nil
+	if err := k8sClient.Status().Update(ctx, admitted); err != nil {
+		t.Fatalf("reset to Queued: %v", err)
+	}
+
+	qes, tasks = listQEsTasks(t, ctx, proj.Name)
+	requeue, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now())
+	if err != nil {
+		t.Fatalf("second admit: %v", err)
+	}
+	if !requeue {
+		t.Fatal("deleting a stale terminal mint must signal a requeue")
+	}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: dead.Name, Namespace: testNS}, &tatarav1alpha1.Task{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("stale terminal mint %s should be deleted, got err=%v", dead.Name, err)
+	}
+	if got := refreshQE(t, ctx, q); got.Status.State == tatarav1alpha1.QueueStateAdmitted {
+		t.Fatalf("event must stay Queued after the stale delete, got %q", got.Status.State)
+	}
+
+	// Third pass: a fresh, live Task.
+	qes, tasks = listQEsTasks(t, ctx, proj.Name)
+	if _, _, err := r.admit(ctx, proj, qes, tasks, budget.Decision{}, budget.Config{}, budget.Subscription{}, time.Now()); err != nil {
+		t.Fatalf("third admit: %v", err)
+	}
+	fresh := taskForQE(t, ctx, refreshQE(t, ctx, q))
+	if fresh.Name == dead.Name || tatarav1alpha1.TaskDone(fresh) {
+		t.Fatalf("want a fresh live Task, got name=%q stage=%q", fresh.Name, fresh.Status.Stage)
+	}
+}
