@@ -13,4 +13,5 @@ jobs:
       runner-label: tatara-operator
       # tatara-operator has no smoke binary; it ships two charts (looped over).
       has-chart: true
+      chart-validate: true
     secrets: inherit
