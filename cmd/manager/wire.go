@@ -55,6 +55,15 @@ func memoryConfigFromConfig(cfg config.Config) memory.Config {
 		MonitorLabels:        cfg.MemoryMonitorLabels,
 		TopologyKey:          cfg.MemoryTopologyKey,
 		ProvisioningTimeout:  cfg.MemoryProvisioningTimeout,
+		Backup: memory.BackupConfig{
+			Enabled:               cfg.MemoryBackupEnabled,
+			EndpointURL:           cfg.MemoryBackupEndpointURL,
+			Bucket:                cfg.MemoryBackupBucket,
+			PathPrefix:            cfg.MemoryBackupPathPrefix,
+			CredentialsSecretName: cfg.MemoryBackupCredentialsSecretName,
+			RetentionPolicy:       cfg.MemoryBackupRetentionPolicy,
+			ScheduleCron:          cfg.MemoryBackupScheduleCron,
+		},
 	}
 }
 

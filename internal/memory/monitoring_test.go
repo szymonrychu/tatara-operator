@@ -3,6 +3,7 @@ package memory_test
 import (
 	"testing"
 
+	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/stretchr/testify/require"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/memory"
@@ -388,4 +389,77 @@ func TestMemoryMonitoring_NoExtraLabelsByDefault(t *testing.T) {
 	require.NotContains(t, pr.Labels, "release")
 	// Pin-set labels still present.
 	require.Equal(t, "tatara-memory", sm.Labels["app.kubernetes.io/name"])
+}
+
+// The WAL-archiving alerts (issue #432) exist only once an object store is
+// actually configured: with no store, cnpg's archive_command is a local no-op
+// that always succeeds, so the rules would be permanently inert and
+// permanently meaningless.
+func TestMemoryPrometheusRule_WALArchiveAlerts_OnlyWhenBackupEnabled(t *testing.T) {
+	p := testProject("acme")
+
+	off := ruleNames(memory.MemoryPrometheusRule(p, testMonitorCfg()))
+	require.NotContains(t, off, "MemoryPostgresWALArchiveFailing")
+	require.NotContains(t, off, "MemoryPostgresWALArchiveBacklog")
+
+	cfg := testBackupCfg()
+	cfg.MonitorEnabled = true
+	cfg.MonitorLabels = map[string]string{"release": "prometheus"}
+	on := ruleNames(memory.MemoryPrometheusRule(p, cfg))
+	require.Contains(t, on, "MemoryPostgresWALArchiveFailing")
+	require.Contains(t, on, "MemoryPostgresWALArchiveBacklog")
+}
+
+// A rule whose metric name does not exist is syntactically valid and matches
+// nothing forever - the inert-rule failure mode issue #453 was created to
+// avoid. Every name below was verified live against this cluster's Prometheus,
+// and traced back to cnpg v1.29.1 config/manager/default-monitoring.yaml (query
+// pg_stat_archiver, columns last_failed_time / last_archived_time) and the
+// cnpg_collector_* built-ins.
+func TestMemoryPrometheusRule_WALArchiveAlerts_MetricNamesAndShape(t *testing.T) {
+	cfg := testBackupCfg()
+	cfg.MonitorEnabled = true
+	byName := rulesByName(memory.MemoryPrometheusRule(testProject("acme"), cfg))
+
+	failing := byName["MemoryPostgresWALArchiveFailing"]
+	require.Equal(t, "critical", failing.Labels["severity"])
+	require.Equal(t, "15m", string(*failing.For))
+	// The comparison is between two members of the SAME family, so the pod/job
+	// labels pair up one-to-one with no explicit vector matching.
+	require.Contains(t, failing.Expr.StrVal, "cnpg_pg_stat_archiver_last_failed_time{")
+	require.Contains(t, failing.Expr.StrVal, "> cnpg_pg_stat_archiver_last_archived_time{")
+	// Never keyed on cluster phase: cnpg keeps reporting Healthy throughout an
+	// archiving outage, only the ContinuousArchiving condition flips.
+	require.NotContains(t, failing.Expr.StrVal, "phase")
+
+	backlog := byName["MemoryPostgresWALArchiveBacklog"]
+	require.Equal(t, "warning", backlog.Labels["severity"])
+	require.Equal(t, "30m", string(*backlog.For))
+	require.Contains(t, backlog.Expr.StrVal, `cnpg_collector_pg_wal_archive_status{`)
+	require.Contains(t, backlog.Expr.StrVal, `value="ready"`)
+	require.Contains(t, backlog.Expr.StrVal, "> 100")
+
+	// Both must be scoped to this Project's own cluster; several Projects'
+	// clusters share a namespace.
+	for _, r := range []monitoringv1.Rule{failing, backlog} {
+		require.Contains(t, r.Expr.StrVal, `namespace="tatara"`)
+		require.Contains(t, r.Expr.StrVal, `pod=~"mem-acme-pg-.*"`)
+		require.Contains(t, r.Expr.StrVal, `container="postgres"`)
+	}
+}
+
+func ruleNames(pr *monitoringv1.PrometheusRule) []string {
+	var names []string
+	for _, r := range pr.Spec.Groups[0].Rules {
+		names = append(names, r.Alert)
+	}
+	return names
+}
+
+func rulesByName(pr *monitoringv1.PrometheusRule) map[string]monitoringv1.Rule {
+	out := map[string]monitoringv1.Rule{}
+	for _, r := range pr.Spec.Groups[0].Rules {
+		out[r.Alert] = r
+	}
+	return out
 }

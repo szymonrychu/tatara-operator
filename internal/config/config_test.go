@@ -670,3 +670,66 @@ func TestLoad_AgentRunAsNonRootDefaultFalse(t *testing.T) {
 		t.Fatal("AgentRunAsNonRoot default = true, want false (must match chart agentRunAsNonRoot: false)")
 	}
 }
+
+// The whole object-store backup surface must default off and empty so a cluster
+// with no object store is unaffected and the chart stays cluster-agnostic
+// (rule 14, issue #432).
+func TestLoad_MemoryBackupDefaultsOff(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MemoryBackupEnabled {
+		t.Fatal("MemoryBackupEnabled must default false")
+	}
+	for name, got := range map[string]string{
+		"MemoryBackupEndpointURL":           cfg.MemoryBackupEndpointURL,
+		"MemoryBackupBucket":                cfg.MemoryBackupBucket,
+		"MemoryBackupPathPrefix":            cfg.MemoryBackupPathPrefix,
+		"MemoryBackupCredentialsSecretName": cfg.MemoryBackupCredentialsSecretName,
+		"MemoryBackupRetentionPolicy":       cfg.MemoryBackupRetentionPolicy,
+		"MemoryBackupScheduleCron":          cfg.MemoryBackupScheduleCron,
+	} {
+		if got != "" {
+			t.Fatalf("%s must default empty, got %q", name, got)
+		}
+	}
+}
+
+func TestLoad_MemoryBackupFromEnv(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://kc/realms/tatara")
+	t.Setenv("OIDC_AUDIENCE", "tatara-operator")
+	t.Setenv("OPERATOR_OIDC_SECRET_NAME", "tatara-operator")
+	t.Setenv("MEMORY_BACKUP_ENABLED", "true")
+	t.Setenv("MEMORY_BACKUP_ENDPOINT_URL", "https://rgw.rook-ceph.svc")
+	t.Setenv("MEMORY_BACKUP_BUCKET", "tatara-pg-backups-4f2a")
+	t.Setenv("MEMORY_BACKUP_PATH_PREFIX", "cnpg")
+	t.Setenv("MEMORY_BACKUP_CREDENTIALS_SECRET_NAME", "tatara-pg-backups")
+	t.Setenv("MEMORY_BACKUP_RETENTION_POLICY", "7d")
+	t.Setenv("MEMORY_BACKUP_SCHEDULE_CRON", "0 0 2 * * *")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.MemoryBackupEnabled {
+		t.Fatal("MEMORY_BACKUP_ENABLED=true must enable backups")
+	}
+	if cfg.MemoryBackupBucket != "tatara-pg-backups-4f2a" {
+		t.Fatalf("MemoryBackupBucket = %q", cfg.MemoryBackupBucket)
+	}
+	if cfg.MemoryBackupCredentialsSecretName != "tatara-pg-backups" {
+		t.Fatalf("MemoryBackupCredentialsSecretName = %q", cfg.MemoryBackupCredentialsSecretName)
+	}
+	if cfg.MemoryBackupScheduleCron != "0 0 2 * * *" {
+		t.Fatalf("MemoryBackupScheduleCron = %q", cfg.MemoryBackupScheduleCron)
+	}
+	if cfg.MemoryBackupEndpointURL != "https://rgw.rook-ceph.svc" {
+		t.Fatalf("MemoryBackupEndpointURL = %q", cfg.MemoryBackupEndpointURL)
+	}
+	if cfg.MemoryBackupPathPrefix != "cnpg" || cfg.MemoryBackupRetentionPolicy != "7d" {
+		t.Fatalf("prefix=%q retention=%q", cfg.MemoryBackupPathPrefix, cfg.MemoryBackupRetentionPolicy)
+	}
+}

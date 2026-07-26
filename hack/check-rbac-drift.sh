@@ -57,6 +57,7 @@ apps|deployments
 apps|statefulsets
 postgresql.cnpg.io|clusters
 postgresql.cnpg.io|clusters/status
+postgresql.cnpg.io|scheduledbackups
 monitoring.coreos.com|servicemonitors
 monitoring.coreos.com|prometheusrules
 monitoring.coreos.com|podmonitors

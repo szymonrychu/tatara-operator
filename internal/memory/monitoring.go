@@ -39,6 +39,15 @@ const (
 	// which is a stronger, structural guarantee than "happened to be 0 in the
 	// window checked" - so the threshold only needs to bound a REAL stall.
 	memoryReplayStalledThresholdSeconds = "300"
+
+	// memoryWALArchiveBacklogFiles is how many WAL segments may sit in
+	// pg_wal/archive_status marked .ready (generated, not yet shipped to the
+	// object store) before MemoryPostgresWALArchiveBacklog fires. Segments are
+	// 16MiB, so 100 files is ~1.6GiB - a fifth of the 8Gi default WAL volume,
+	// i.e. a clear, sustained pileup rather than a write burst, and still far
+	// ahead of MemoryPostgresVolumeFilling's 15%-free threshold. Live-verified
+	// this reads a flat 0 on every instance of all three clusters today.
+	memoryWALArchiveBacklogFiles = "100"
 )
 
 // dur returns a *monitoringv1.Duration for a rule "for"/group "interval" field.
@@ -135,6 +144,7 @@ func PGPodMonitor(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.PodMonito
 // loaded rather than silently dropped.
 func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.PrometheusRule {
 	n := NamesFor(p.Name)
+	backupEnabled, _ := PGBackupStatus(cfg)
 	return &monitoringv1.PrometheusRule{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: monitoringv1.SchemeGroupVersion.String(),
@@ -144,7 +154,7 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 		Spec: monitoringv1.PrometheusRuleSpec{
 			Groups: []monitoringv1.RuleGroup{{
 				Name:  "tatara-memory.rules",
-				Rules: memoryAlertRules(p, n.PGCluster, cfg.Namespace),
+				Rules: memoryAlertRules(p, n.PGCluster, cfg.Namespace, backupEnabled),
 			}},
 		},
 	}
@@ -353,7 +363,7 @@ func MemoryPrometheusRule(p *tatarav1alpha1.Project, cfg Config) *monitoringv1.P
 // kube-state-metrics, kubelet, and cnpg_* alike - carries container="postgres"
 // on these pods (verified live), so podSelector is shared across all of them;
 // there is no separate cnpg selector.
-func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []monitoringv1.Rule {
+func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string, backupEnabled bool) []monitoringv1.Rule {
 	pgSelector := fmt.Sprintf(`namespace=%q, persistentvolumeclaim=~%q`, namespace, cluster+"-.*")
 	podSelector := fmt.Sprintf(`namespace=%q, pod=~%q, container="postgres"`, namespace, cluster+"-.*")
 	slotSelector := fmt.Sprintf(`namespace=%q, slot_name=~%q`, namespace, "_cnpg_"+strings.ReplaceAll(cluster, "-", "_")+"_.*")
@@ -598,6 +608,89 @@ func memoryAlertRules(p *tatarav1alpha1.Project, cluster, namespace string) []mo
 				Annotations: map[string]string{
 					"summary":     "a standby of postgres cluster " + cluster + " has stopped applying WAL",
 					"description": "A standby of cluster " + cluster + " has made zero replay progress for more than " + memoryReplayStalledThresholdSeconds + "s - it is up, counted, and its slot is active, but it is silently not applying WAL (issues #442, #444, #448). 15m rides out a routine restart's catch-up, which clears in seconds once reconnected.",
+				},
+			},
+		)
+	}
+
+	// Object-store WAL archiving (issue #432). Only generated once the operator
+	// is actually configured with a store: with no store cnpg's archive_command
+	// is a local no-op that always succeeds, so these would be permanently inert
+	// and permanently meaningless.
+	//
+	// Turning archiving ON is what CREATES the need for them. archive_command
+	// failures do not degrade the cluster in any way the existing rules can see:
+	// PostgreSQL simply keeps every un-shipped segment in pg_wal indefinitely,
+	// and the cnpg Cluster PHASE STAYS Healthy the whole time - only the cnpg
+	// ContinuousArchiving CONDITION flips (cnpg v1.29.1
+	// pkg/management/postgres/webserver/local.go), and no rule here keys off
+	// cluster phase for exactly that reason. Left alone this fills the WAL volume
+	// and reproduces the ~3.5h disk-full write outage of issue #240 on all three
+	// clusters at once. max_slot_wal_keep_size (pg.go, added for #240) does NOT
+	// help: it bounds only what a REPLICATION SLOT may pin, not what an
+	// un-archived segment pins.
+	//
+	// Both rules key off metrics LIVE-VERIFIED present on this cluster's
+	// Prometheus, not off names read from documentation - the failure mode issue
+	// #453 exists to prevent is a rule that is syntactically fine and matches
+	// nothing forever:
+	//   - cnpg_pg_stat_archiver_{last_failed_time,last_archived_time} are cnpg's
+	//     user-query collector rendering of pg_stat_archiver (query name
+	//     pg_stat_archiver, columns last_failed_time / last_archived_time in
+	//     config/manager/default-monitoring.yaml). Both are epoch seconds, with
+	//     -1 as the "never happened" sentinel, and cnpg's predicate_query on that
+	//     query restricts the series to the primary (or a replica with
+	//     archive_mode=always), so no non-primary reporter can distort them -
+	//     confirmed live: exactly one pod per cluster reports them.
+	//   - cnpg_collector_pg_wal_archive_status{value="ready"} is the count of
+	//     segments in pg_wal/archive_status still awaiting shipment.
+	//
+	// The two are NOT redundant. WALArchiveFailing catches an archive_command
+	// that ERRORS (bad credentials, wrong bucket, denied) - barman records a
+	// failure and last_failed_time overtakes last_archived_time. WALArchiveBacklog
+	// catches an archive_command that HANGS or merely runs slower than WAL is
+	// generated (an endpoint blackholing connections, a saturated store): nothing
+	// ever records a failure, both timestamps just stop moving, and the first
+	// rule stays quiet forever while pg_wal grows without bound. Only the .ready
+	// backlog sees that.
+	if backupEnabled {
+		rules = append(rules,
+			monitoringv1.Rule{
+				// Binary comparison between two members of the same metric family:
+				// every other label (pod, instance, job, namespace, container) is
+				// identical on both sides, so the default one-to-one vector matching
+				// pairs them per instance with no explicit on()/ignoring() needed.
+				// The -1 "never" sentinel is safe on both sides: a cluster that has
+				// never failed reads -1 and can never exceed a real epoch, while a
+				// cluster that has never successfully archived reads -1 on the right
+				// and fires correctly on the first failure.
+				Alert: "MemoryPostgresWALArchiveFailing",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`cnpg_pg_stat_archiver_last_failed_time{%[1]s} > cnpg_pg_stat_archiver_last_archived_time{%[1]s}`,
+					podSelector,
+				)),
+				For:    dur("15m"),
+				Labels: map[string]string{"severity": memorySeverityCritical},
+				Annotations: map[string]string{
+					"summary":     "WAL archiving for postgres cluster " + cluster + " is failing",
+					"description": "The most recent WAL archive attempt for cluster " + cluster + " failed and has not succeeded since, for 15m. The cnpg Cluster phase stays Healthy while this happens, but PostgreSQL retains every un-archived segment in pg_wal until the WAL volume fills and the write path stops (issues #432, #240). Backups are also not recoverable past the last archived segment.",
+				},
+			},
+			monitoringv1.Rule{
+				// max() over the cluster's instances: on a primary this is the real
+				// backlog; on a standby with archive_mode=on no .ready files are
+				// produced at all, so a standby cannot inflate it (live-verified 0 on
+				// every instance of all three clusters).
+				Alert: "MemoryPostgresWALArchiveBacklog",
+				Expr: intstr.FromString(fmt.Sprintf(
+					`max(cnpg_collector_pg_wal_archive_status{%s, value="ready"}) > %s`,
+					podSelector, memoryWALArchiveBacklogFiles,
+				)),
+				For:    dur("30m"),
+				Labels: map[string]string{"severity": memorySeverityWarning},
+				Annotations: map[string]string{
+					"summary":     "WAL archiving for postgres cluster " + cluster + " is falling behind",
+					"description": "More than " + memoryWALArchiveBacklogFiles + " WAL segments of cluster " + cluster + " have been waiting to be shipped to the object store for 30m. Unlike MemoryPostgresWALArchiveFailing this also catches an archive command that hangs or is simply slower than WAL is generated, which records no failure at all while pg_wal grows without bound (issue #432).",
 				},
 			},
 		)

@@ -85,10 +85,20 @@ const memoryFieldOwner = "tatara-operator"
 // separately by ensureNeo4jPassword and is NOT applied here, so it is never
 // rotated.
 func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1alpha1.Project) error {
+	l := log.FromContext(ctx)
 	cfg := r.MemoryConfig
 	pgCluster, err := r.guardPGStorageShrink(ctx, p, memory.PGCluster(p, cfg))
 	if err != nil {
 		return err
+	}
+	// A half-configured object store renders NO backup stanza at all
+	// (memory.PGBackupStatus fails closed, because a broken archive_command fills
+	// the WAL volume - issue #240). Surface it loudly: the alternative is a
+	// cluster the deployer believes is backed up and that silently is not.
+	if warning := memoryBackupWarning(cfg); warning != "" {
+		l.Error(nil, warning,
+			"action", "memory_backup_misconfigured",
+			"resource_id", p.Name)
 	}
 	objs := []client.Object{
 		pgCluster,
@@ -103,6 +113,16 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 	}
 	if ing := memory.Ingress(p, cfg); ing != nil {
 		objs = append(objs, ing)
+	}
+	// The ScheduledBackup is what actually TAKES base backups; the Cluster's
+	// spec.backup retention policy only prunes an existing catalogue. When the
+	// feature is off the object must be DELETED, not merely skipped: a leftover
+	// ScheduledBackup would keep firing against a cluster that no longer has an
+	// object store, failing every run forever.
+	if sb := memory.PGScheduledBackup(p, cfg); sb != nil {
+		objs = append(objs, sb)
+	} else if err := r.deleteScheduledBackup(ctx, p); err != nil {
+		return err
 	}
 	// ServiceMonitor + PrometheusRule are gated behind MonitorEnabled: a cluster
 	// without the prometheus-operator CRDs must not have the whole memory
@@ -127,6 +147,39 @@ func (r *ProjectReconciler) applyMemoryStack(ctx context.Context, p *tataradevv1
 		}
 	}
 	return nil
+}
+
+// memoryBackupWarning returns the operator-level backup misconfiguration
+// warning, or "" when the config is either cleanly off or complete.
+func memoryBackupWarning(cfg memory.Config) string {
+	_, warning := memory.PGBackupStatus(cfg)
+	return warning
+}
+
+// deleteScheduledBackup removes the Project's cnpg ScheduledBackup, tolerating
+// an already-absent object. Called on every reconcile where the object-store
+// backup config is off or incomplete, which is the steady state on a cluster
+// with no object store - so the "nothing to delete" path is the normal one, not
+// the exception. Issued as a direct Delete rather than a cached Get-then-Delete
+// deliberately: a Get would spin up an informer (and a permanent watch) on
+// ScheduledBackup just to answer "still absent?" on every reconcile.
+//
+// A no-kind-match is tolerated alongside NotFound. The scheduledbackups CRD is
+// absent on any cluster whose cnpg install predates it or that has no cnpg at
+// all, and there a Delete returns "no matches for kind" rather than NotFound. A
+// missing CRD means there is definitively no object to remove, so failing the
+// whole memory reconcile over it would take the entire stack down for a feature
+// that is switched off - which is exactly what envtest (no cnpg CRDs installed)
+// reproduced.
+func (r *ProjectReconciler) deleteScheduledBackup(ctx context.Context, p *tataradevv1alpha1.Project) error {
+	sb := &cnpgv1.ScheduledBackup{}
+	sb.Name = memory.NamesFor(p.Name).PGScheduledBackup
+	sb.Namespace = r.MemoryConfig.Namespace
+	err := r.Delete(ctx, sb)
+	if err == nil || apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+		return nil
+	}
+	return fmt.Errorf("delete scheduled backup %s: %w", sb.Name, err)
 }
 
 // guardPGStorageShrink clamps the rendered cnpg Cluster's PGDATA and WAL storage

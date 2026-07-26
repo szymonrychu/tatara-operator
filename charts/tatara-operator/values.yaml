@@ -43,6 +43,42 @@ grafanaMcpImage: ""
 memoryMonitoring:
   enabled: true
   additionalLabels: {}
+# memoryBackup turns on continuous WAL archiving + a daily base backup to an
+# S3-compatible object store for every per-Project cnpg cluster (issue #432).
+# Consumed by the operator at runtime (it provisions the cnpg Cluster and
+# ScheduledBackup per Project), so the values flow through the ConfigMap as
+# scalars (rule 6). Off by default and every field empty, so the chart stays
+# cluster-agnostic (rule 14): a cluster with no object store renders exactly the
+# cnpg Cluster it renders today, with no backup stanza at all.
+#
+# enabled alone does nothing: bucket and credentialsSecretName are both
+# required, and a partial config fails CLOSED (no archiving) with a warning in
+# the operator log, because a broken archive command makes PostgreSQL retain
+# every WAL segment until the volume fills (issue #240).
+#
+# The bucket is created and owned by tatara-helmfile (an ObjectBucketClaim),
+# never by the operator: the rook-ceph-bucket StorageClass reclaims on delete
+# and the memory stack carries the Project ownerRef, so an operator-created OBC
+# would be garbage-collected with its Project and take every backup with it.
+#
+# credentialsSecretName must name a Secret carrying AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY (the ObjectBucketClaim/S3 convention).
+#
+# scheduleCron is a cnpg schedule: SIX fields (seconds minutes hours
+# day-of-month month day-of-week), NOT the five-field Kubernetes CronJob form.
+# "0 0 2 * * *" is 02:00 daily. A five-field value is silently something else,
+# so the operator rejects it and falls back to this default with a warning.
+#
+# retentionPolicy / pathPrefix / scheduleCron mirror the operator's own
+# defaults; an empty value resolves to the same thing.
+memoryBackup:
+  enabled: false
+  endpointUrl: ""
+  bucket: ""
+  pathPrefix: "cnpg"
+  credentialsSecretName: ""
+  retentionPolicy: "7d"
+  scheduleCron: "0 0 2 * * *"
 externalWebhookBase: ""
 operatorOidcClientId: "tatara-operator"
 # operatorOidcSecretName overrides the Secret that holds OPERATOR_OIDC_CLIENT_SECRET.
