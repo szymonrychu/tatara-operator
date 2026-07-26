@@ -1692,8 +1692,16 @@ func (o *outcomeCtx) incidentComment(p incidentPayload) {
 	}
 	var iss tatarav1alpha1.Issue
 	issName := tatarav1alpha1.IssueName(repo.Name, p.Comment.Number)
+	// Fix (#445): a Get failure here means the Issue CR is absent from the
+	// operator's mirror (e.g. legitimately GC'd via SeverDeleteCR when its
+	// owning Task was reaped, internal/controller/issue_apply.go,
+	// internal/controller/reaper.go), NOT that the target is some other
+	// non-tracker thread - that is the label-check branch below. Collapsing
+	// both into one reason/message previously made a validly GC'd tracker
+	// indistinguishable from a deliberate not-a-tracker rejection, which sent
+	// the same fault back through file_issue and re-filed it repeatedly.
 	if err := s.c.Get(ctx, types.NamespacedName{Namespace: s.ns, Name: issName}, &iss); err != nil {
-		o.bad("comment target is not a tracked incident issue", "not-a-tracker")
+		o.bad("comment target issue is not present in the operator's mirror", "not-mirrored")
 		return
 	}
 	if iss.Labels[queue.LabelAlertRuleKey] == "" && iss.Labels[queue.LabelAlertGroupKey] == "" {
