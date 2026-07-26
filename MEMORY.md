@@ -882,6 +882,66 @@ in spirit; prune only when a decision is reversed.
   slow-dependency-boot problem with a StartupProbe instead, because its own
   failure mode is different: it blocks in `waitForDB` but never exits, so
   liveness (not a dead process) was the risk there.
+- 2026-07-26 (#432) `Cluster.spec.bootstrap` is WRITE-ONCE and fails SILENTLY.
+  No webhook rejects a change to it and no condition or event records one, but
+  cnpg reads it only inside `createPrimaryInstance`, which the cluster
+  controller calls solely when `Status.Instances == 0` (cnpg v1.29.1
+  `internal/controller/cluster_controller.go:1063`) - so adding
+  `bootstrap.recovery` to a LIVE cluster is accepted by the API server and then
+  ignored forever. Consequence for the WAL-archiving work: the steady-state
+  `PGCluster()` render MUST keep `bootstrap.initdb`. Swapping in a recovery
+  stanza would be a no-op on all three existing clusters AND would become
+  active on the next FRESH Project, where recovery would fail against an empty
+  archive instead of running InitDB. Restore therefore lives in a separate
+  builder (`PGClusterFromBackup`) with no automatic caller, driven by a human
+  after the PVCs are gone. That builder also has to give the recovered cluster
+  a DIFFERENT `backup.barmanObjectStore.serverName` from the
+  `externalClusters[]` source, or the fresh cluster writes its own timeline
+  into the very archive folder it is restoring from.
+- 2026-07-26 (#432) Turning on WAL archiving CREATES a new disk-full risk that
+  none of the existing alerts can see, which is why the alerting shipped in the
+  same change rather than as a follow-up. When `archive_command` fails,
+  PostgreSQL retains every un-shipped segment in `pg_wal` indefinitely and the
+  cnpg Cluster PHASE STAYS Healthy throughout - only the `ContinuousArchiving`
+  CONDITION flips - so a phase-keyed rule is structurally blind to it. Left
+  alone it reproduces the ~3.5h #240 disk-full write outage on all three
+  clusters at once, and `max_slot_wal_keep_size` (added for #240) does NOT
+  help: it bounds only what a REPLICATION SLOT may pin, not what an un-archived
+  segment pins. Two rules, both metric names live-verified against this
+  cluster's Prometheus: `MemoryPostgresWALArchiveFailing`
+  (`cnpg_pg_stat_archiver_last_failed_time > ..._last_archived_time`, epoch
+  seconds with -1 as the never-happened sentinel, primary-scoped by cnpg's own
+  `predicate_query`) for an archive command that ERRORS, and
+  `MemoryPostgresWALArchiveBacklog`
+  (`cnpg_collector_pg_wal_archive_status{value="ready"} > 100`) for one that
+  HANGS or is merely slower than WAL is generated - the second is not
+  redundant, because a hang records no failure at all and leaves both
+  timestamps frozen, keeping the first rule quiet forever.
+- 2026-07-26 (#432) Two cnpg API traps worth remembering, both verified against
+  the vendored source rather than docs. (1) The barman compression enums are
+  NOT symmetric: `wal.compression` accepts bzip2|gzip|lz4|snappy|xz|zstd but
+  `data.compression` accepts bzip2|gzip|snappy ONLY (barman-cloud v0.5.0
+  `pkg/api/config.go`), so lz4/xz/zstd on `data` is a CRD rejection at apply
+  time and nothing catches it before the cluster. Proven empirically by
+  temporarily setting zstd and watching envtest reject it against the vendored
+  CRD; `postgresql.cnpg.io_scheduledbackups.yaml` was vendored beside the
+  existing Cluster CRD so the ScheduledBackup path gets the same real-schema
+  validation. gzip is used on both sides: the only value legal in both enums,
+  and certain to exist in the operand image (a missing codec would fail
+  `archive_command`, i.e. cause the exact outage this feature guards against).
+  (2) `ScheduledBackup.spec.schedule` is robfig/cron with a leading SECONDS
+  field - SIX fields, not the five-field Kubernetes CronJob form. A five-field
+  value is accepted and silently means something else ("0 2 * * *" becomes
+  hourly), so `pgBackupSchedule` rejects any non-six-field value and falls back
+  to the default with a warning. `backupOwnerReference` likewise defaults to
+  `none`, which orphans every Backup object produced; set to `cluster`.
+- 2026-07-26 (#432) `deleteScheduledBackup` must tolerate a NO-KIND-MATCH as
+  well as NotFound. On a cluster whose cnpg install lacks the scheduledbackups
+  CRD, a Delete returns "no matches for kind" rather than NotFound, and since
+  the delete runs on every reconcile where backups are off (the default), a
+  strict NotFound-only check took the ENTIRE memory stack down for a feature
+  nobody enabled. Caught by envtest, which installs only the vendored Cluster
+  CRD - that red was a real production failure mode, not a test artefact.
 - 2026-07-26 (#443) Task names are now GenerateName-minted
   (`queue.BuildTaskFromQueuedEvent`), which fixes the branch collision - a
   project-scoped dedup key ("brainstorm-<project>") produced ONE constant

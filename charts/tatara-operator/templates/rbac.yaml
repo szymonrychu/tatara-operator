@@ -40,6 +40,14 @@ rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters/status"]
     verbs: ["get", "list", "watch"]
+  # Per-Project cnpg base-backup cadence (issue #432): the operator applies a
+  # ScheduledBackup alongside the Cluster when an object store is configured and
+  # deletes it when the feature is turned off. Backup objects themselves are
+  # created by cnpg's own ScheduledBackup controller under cnpg's ServiceAccount,
+  # so the operator needs no grant on them.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["scheduledbackups"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
