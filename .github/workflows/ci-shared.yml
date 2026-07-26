@@ -183,23 +183,27 @@ jobs:
           CHART_NEEDS_CNPG: ${{ inputs.chart-needs-cnpg }}
           CHART_RENDER_ARGS: ${{ inputs.chart-validate-render-args }}
         run: |
-          NAME="$(basename "$(ls -d charts/*/)")"
           if [ "${CHART_NEEDS_CNPG}" = "true" ]; then
             # helm dependency build needs the classic (non-OCI) cnpg repo
             # registered locally, else it errors "no repository definition
             # for https://cloudnative-pg.github.io/charts".
             helm repo add cloudnative-pg https://cloudnative-pg.github.io/charts
           fi
-          helm dependency build "charts/$NAME"
-          helm lint "charts/$NAME"
-          helm template release "charts/$NAME" >/dev/null
-          if [ -n "${CHART_RENDER_ARGS}" ]; then
-            # Second render exercising opt-in templates the defaults never hit
-            # (e.g. ingress / networkPolicy), so a break there is caught before
-            # main. Word-splitting of the flags is intentional.
-            # shellcheck disable=SC2086
-            helm template release "charts/$NAME" ${CHART_RENDER_ARGS} >/dev/null
-          fi
+          for dir in charts/*/; do
+            NAME="$(basename "$dir")"
+            if [ "${CHART_NEEDS_CNPG}" = "true" ]; then
+              helm dependency build "$dir"
+            fi
+            helm lint "$dir"
+            helm template release "$dir" >/dev/null
+            if [ -n "${CHART_RENDER_ARGS}" ]; then
+              # Second render exercising opt-in templates the defaults never hit
+              # (e.g. ingress / networkPolicy), so a break there is caught before
+              # main. Word-splitting of the flags is intentional.
+              # shellcheck disable=SC2086
+              helm template release "$dir" ${CHART_RENDER_ARGS} >/dev/null
+            fi
+          done
 
   image:
     needs: [build, smoke, chart-validate]
