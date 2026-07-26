@@ -877,3 +877,22 @@ in spirit; prune only when a decision is reversed.
   slow-dependency-boot problem with a StartupProbe instead, because its own
   failure mode is different: it blocks in `waitForDB` but never exits, so
   liveness (not a dead process) was the risk there.
+- 2026-07-26 (#442, #425) CNPG's own remediation cannot see a diverged standby,
+  because its decision is gated on reading that instance's instance-manager HTTP
+  endpoint (`:8000/pg/status`) - which is exactly what is NOT up when the
+  container is crash-looping. Same trap one level down: the whole `cnpg_pg_*`
+  metric family is produced by CNPG's user-query collector, so those series
+  vanish whenever the collector's query fails, independent of whether the
+  instance is up and scrapeable. Anything meant to DETECT a dead or diverged
+  member must therefore key off a signal that survives the member being dead:
+  `Cluster.Status.{CurrentPrimary,ReadyInstances,InstancesStatus,DanglingPVC}`
+  (written by the operator, not the sick pod) on the control-plane side, or
+  `up{}` / the surviving PRIMARY's view of its slots on the metrics side. Never
+  off the sick instance's own status or its own `cnpg_pg_*` series.
+  `internal/controller/project_memory.go` reads the Cluster-status set and
+  surfaces it as `MemoryReady=False/PostgresDegraded` with the phase left
+  Ready - deliberately NOT a phase gate: #215 and #355 exist precisely because
+  tightening the quorum gate flaps the whole fleet, and a degraded-but-quorate
+  cluster is still serving. `status.memory.notReady` names which of
+  postgres/neo4j/lightrag/memory-api is holding a Provisioning stack, whose
+  absence is what made #425 undiagnosable from the Project alone.
