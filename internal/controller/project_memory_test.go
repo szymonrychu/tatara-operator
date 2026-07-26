@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,14 +320,14 @@ func TestMemoryStackHealth_MissingObjectsAreNotReadyNotError(t *testing.T) {
 	r := newMemoryReconciler()
 	p := mkMemoryProject(t, "health-missing")
 
-	ready, neo4j, lightrag, mem, err := r.memoryStackHealth(ctx, p)
+	h, err := r.memoryStackHealth(ctx, p)
 	if err != nil {
 		t.Fatalf("memoryStackHealth on a never-applied stack returned error: %v", err)
 	}
-	if ready != 0 || neo4j != 0 || lightrag != 0 || mem != 0 {
-		t.Fatalf("expected all-zero readiness, got %d/%d/%d/%d", ready, neo4j, lightrag, mem)
+	if h.pgReady != 0 || h.neo4jReady != 0 || h.lightragAvail != 0 || h.memoryAvail != 0 {
+		t.Fatalf("expected all-zero readiness, got %d/%d/%d/%d", h.pgReady, h.neo4jReady, h.lightragAvail, h.memoryAvail)
 	}
-	if got := memoryPhase(ready, memory.PgInstances(p), neo4j, lightrag, mem); got != "Provisioning" {
+	if got := memoryPhase(h.pgReady, h.pgWant, h.neo4jReady, h.lightragAvail, h.memoryAvail); got != "Provisioning" {
 		t.Fatalf("memoryPhase = %q, want Provisioning", got)
 	}
 }
@@ -363,12 +365,12 @@ func TestMemoryStackHealth_UnconvergedRolloutNotCountedReady(t *testing.T) {
 		t.Fatalf("fake unconverged deployment status: %v", err)
 	}
 
-	_, _, lightragAvail, _, err := r.memoryStackHealth(ctx, p)
+	h, err := r.memoryStackHealth(ctx, p)
 	if err != nil {
 		t.Fatalf("memoryStackHealth: %v", err)
 	}
-	if lightragAvail != 0 {
-		t.Fatalf("lightragAvail = %d, want 0 for an unconverged rollout (old pod Available, new not yet)", lightragAvail)
+	if h.lightragAvail != 0 {
+		t.Fatalf("lightragAvail = %d, want 0 for an unconverged rollout (old pod Available, new not yet)", h.lightragAvail)
 	}
 }
 
@@ -948,6 +950,10 @@ func fakeStackHealthy(t *testing.T, project string) {
 		t.Fatalf("get cluster: %v", err)
 	}
 	cluster.Status.ReadyInstances = 1
+	cluster.Status.Instances = 1
+	// CNPG always names a primary once an instance is ready; a ready-but-
+	// primary-less cluster is the #442 anomaly, so the healthy fake must set it.
+	cluster.Status.CurrentPrimary = names.PGCluster + "-1"
 	if err := k8sClient.Status().Update(ctx, &cluster); err != nil {
 		t.Fatalf("fake cluster status: %v", err)
 	}
@@ -1017,4 +1023,335 @@ func fakeStackUnhealthy(t *testing.T, project string) {
 			t.Fatalf("fake deployment %s unhealthy status: %v", dn, err)
 		}
 	}
+}
+
+// mkMemoryProjectHA creates a Project whose memory stack declares n cnpg
+// instances, so the degraded-but-quorate paths (#442) can be exercised.
+func mkMemoryProjectHA(t *testing.T, name string, n int) *tataradevv1alpha1.Project {
+	t.Helper()
+	p := mkMemoryProject(t, name)
+	p.Spec.Memory = &tataradevv1alpha1.MemorySpec{PgInstances: n}
+	if err := k8sClient.Update(context.Background(), p); err != nil {
+		t.Fatalf("set pgInstances=%d on %s: %v", n, name, err)
+	}
+	return getProject(t, name)
+}
+
+// fakePGStatus overwrites the project's cnpg Cluster status with the given
+// replication-visible fields. These are exactly the signals observable while an
+// instance's container is dead - CNPG's own instance-manager HTTP endpoint is
+// not (see MEMORY.md), which is why detection keys off Cluster.Status.
+func fakePGStatus(t *testing.T, project string, ready int, primary string, unhealthy, dangling []string) {
+	t.Helper()
+	ctx := context.Background()
+	names := memory.NamesFor(project)
+	var cluster cnpgv1.Cluster
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: names.PGCluster}, &cluster); err != nil {
+		t.Fatalf("get cluster: %v", err)
+	}
+	cluster.Status.ReadyInstances = ready
+	cluster.Status.Instances = ready + len(unhealthy)
+	cluster.Status.CurrentPrimary = primary
+	cluster.Status.DanglingPVC = dangling
+	cluster.Status.InstancesStatus = map[cnpgv1.PodStatus][]string{}
+	if len(unhealthy) > 0 {
+		cluster.Status.InstancesStatus[cnpgv1.PodFailed] = unhealthy
+	}
+	if err := k8sClient.Status().Update(ctx, &cluster); err != nil {
+		t.Fatalf("fake cluster status: %v", err)
+	}
+}
+
+func TestPgDegradedReason(t *testing.T) {
+	cases := []struct {
+		name string
+		h    memoryHealth
+		want string
+	}{
+		{
+			name: "single instance fully healthy",
+			h:    memoryHealth{pgReady: 1, pgWant: 1, pgPrimary: "mem-x-pg-1"},
+			want: "",
+		},
+		{
+			name: "ha fully healthy",
+			h:    memoryHealth{pgReady: 3, pgWant: 3, pgPrimary: "mem-x-pg-1"},
+			want: "",
+		},
+		{
+			name: "quorate but no primary",
+			h:    memoryHealth{pgReady: 2, pgWant: 3, pgPrimary: ""},
+			want: "no primary elected; 2/3 instances ready",
+		},
+		{
+			name: "2 of 3 diverged",
+			h:    memoryHealth{pgReady: 2, pgWant: 3, pgPrimary: "mem-x-pg-1", pgUnhealthy: []string{"mem-x-pg-2"}},
+			want: "2/3 instances ready (not healthy: mem-x-pg-2)",
+		},
+		{
+			name: "dangling pvc on an otherwise full cluster",
+			h:    memoryHealth{pgReady: 3, pgWant: 3, pgPrimary: "mem-x-pg-1", pgDanglingPVC: []string{"mem-x-pg-2"}},
+			want: "dangling PVCs: mem-x-pg-2",
+		},
+		{
+			name: "single instance up but no primary",
+			h:    memoryHealth{pgReady: 1, pgWant: 1, pgPrimary: ""},
+			want: "no primary elected",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pgDegradedReason(tc.h); got != tc.want {
+				t.Fatalf("pgDegradedReason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMemoryHealthNotReadyComponents(t *testing.T) {
+	cases := []struct {
+		name string
+		h    memoryHealth
+		want string
+	}{
+		{
+			name: "everything ready",
+			h:    memoryHealth{pgReady: 1, pgWant: 1, neo4jReady: 1, lightragAvail: 1, memoryAvail: 1},
+			want: "",
+		},
+		{
+			name: "nothing ready",
+			h:    memoryHealth{pgWant: 1},
+			want: "postgres,neo4j,lightrag,memory-api",
+		},
+		{
+			name: "only lightrag missing",
+			h:    memoryHealth{pgReady: 1, pgWant: 1, neo4jReady: 1, memoryAvail: 1},
+			want: "lightrag",
+		},
+		{
+			name: "ha pg above quorum is not blocking",
+			h:    memoryHealth{pgReady: 2, pgWant: 3, neo4jReady: 1, lightragAvail: 1, memoryAvail: 1},
+			want: "",
+		},
+		{
+			name: "ha pg below quorum blocks",
+			h:    memoryHealth{pgReady: 1, pgWant: 3, neo4jReady: 1, lightragAvail: 1, memoryAvail: 1},
+			want: "postgres",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.Join(tc.h.notReadyComponents(), ","); got != tc.want {
+				t.Fatalf("notReadyComponents = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMemoryStackHealth_ReadsPrimaryUnhealthyAndDanglingPVC(t *testing.T) {
+	ctx := logfIntoTestCtx()
+	r := newMemoryReconciler()
+	p := mkMemoryProjectHA(t, "health-repl", 3)
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	fakePGStatus(t, p.Name, 2, "mem-health-repl-pg-1", []string{"mem-health-repl-pg-2"}, []string{"mem-health-repl-pg-3"})
+
+	h, err := r.memoryStackHealth(ctx, getProject(t, p.Name))
+	if err != nil {
+		t.Fatalf("memoryStackHealth: %v", err)
+	}
+	if h.pgReady != 2 || h.pgWant != 3 {
+		t.Fatalf("pgReady/pgWant = %d/%d, want 2/3", h.pgReady, h.pgWant)
+	}
+	if h.pgPrimary != "mem-health-repl-pg-1" {
+		t.Fatalf("pgPrimary = %q, want mem-health-repl-pg-1", h.pgPrimary)
+	}
+	if strings.Join(h.pgUnhealthy, ",") != "mem-health-repl-pg-2" {
+		t.Fatalf("pgUnhealthy = %v, want [mem-health-repl-pg-2]", h.pgUnhealthy)
+	}
+	if strings.Join(h.pgDanglingPVC, ",") != "mem-health-repl-pg-3" {
+		t.Fatalf("pgDanglingPVC = %v, want [mem-health-repl-pg-3]", h.pgDanglingPVC)
+	}
+}
+
+// TestReconcileMemory_DegradedPgDemotesConditionNotPhase is the core of issue
+// #442: a standby that is diverged, or a cluster with no elected primary, must
+// surface as MemoryReady=False/PostgresDegraded while the phase STAYS Ready.
+// Tightening the phase instead would flap the whole fleet (issues #215, #355).
+func TestReconcileMemory_DegradedPgDemotesConditionNotPhase(t *testing.T) {
+	cases := []struct {
+		name      string
+		instances int
+		ready     int
+		primary   string
+		unhealthy []string
+		dangling  []string
+		wantMsg   string
+	}{
+		{
+			name:      "quorate but no primary",
+			instances: 3,
+			ready:     3,
+			primary:   "",
+			wantMsg:   "no primary elected",
+		},
+		{
+			name:      "2 of 3 diverged",
+			instances: 3,
+			ready:     2,
+			primary:   "primary-pod",
+			unhealthy: []string{"diverged-pod"},
+			wantMsg:   "2/3 instances ready (not healthy: diverged-pod)",
+		},
+		{
+			name:      "dangling pvc",
+			instances: 3,
+			ready:     3,
+			primary:   "primary-pod",
+			dangling:  []string{"orphan-pvc"},
+			wantMsg:   "dangling PVCs: orphan-pvc",
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newMemoryReconciler()
+			p := mkMemoryProjectHA(t, fmt.Sprintf("pg-degraded-%d", i), tc.instances)
+
+			if _, err := reconcileMemory(t, r, p.Name); err != nil {
+				t.Fatalf("first reconcile: %v", err)
+			}
+			fakeStackHealthy(t, p.Name)
+			fakePGStatus(t, p.Name, tc.ready, tc.primary, tc.unhealthy, tc.dangling)
+
+			if _, err := reconcileMemory(t, r, p.Name); err != nil {
+				t.Fatalf("second reconcile: %v", err)
+			}
+			got := waitMemoryPhase(t, p.Name, "Ready")
+
+			c := apimeta.FindStatusCondition(got.Status.Conditions, "MemoryReady")
+			if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "PostgresDegraded" {
+				t.Fatalf("MemoryReady = %+v, want False/PostgresDegraded", c)
+			}
+			if !strings.Contains(c.Message, tc.wantMsg) {
+				t.Fatalf("MemoryReady message = %q, want it to contain %q", c.Message, tc.wantMsg)
+			}
+			if got.Status.Memory.PgReadyInstances != tc.ready || got.Status.Memory.PgWantInstances != tc.instances {
+				t.Fatalf("status pg counts = %d/%d, want %d/%d",
+					got.Status.Memory.PgReadyInstances, got.Status.Memory.PgWantInstances, tc.ready, tc.instances)
+			}
+			if got.Status.Memory.PgPrimary != tc.primary {
+				t.Fatalf("status pgPrimary = %q, want %q", got.Status.Memory.PgPrimary, tc.primary)
+			}
+			// Postgres is above quorum in every case here, so it never blocks the phase.
+			if len(got.Status.Memory.NotReady) != 0 {
+				t.Fatalf("status notReady = %v, want empty (stack is Ready)", got.Status.Memory.NotReady)
+			}
+		})
+	}
+}
+
+// TestReconcileMemory_HealthyPgKeepsConditionTrue guards the inverse: a fully
+// healthy cluster with an elected primary must not be demoted.
+func TestReconcileMemory_HealthyPgKeepsConditionTrue(t *testing.T) {
+	r := newMemoryReconciler()
+	p := mkMemoryProjectHA(t, "pg-healthy-cond", 3)
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	fakeStackHealthy(t, p.Name)
+	fakePGStatus(t, p.Name, 3, "primary-pod", nil, nil)
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got := waitMemoryPhase(t, p.Name, "Ready")
+	c := apimeta.FindStatusCondition(got.Status.Conditions, "MemoryReady")
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "Ready" {
+		t.Fatalf("MemoryReady = %+v, want True/Ready", c)
+	}
+}
+
+// TestReconcileMemory_NotReadyNamesTheBlockingComponent covers issue #425: a
+// stack sitting Provisioning must record WHICH component holds it, both in
+// status.memory.notReady and in the condition message.
+func TestReconcileMemory_NotReadyNamesTheBlockingComponent(t *testing.T) {
+	r := newMemoryReconciler()
+	p := mkMemoryProject(t, "notready-names")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	// Everything healthy except postgres, which never elects a primary and has
+	// no ready instance.
+	fakeStackHealthy(t, p.Name)
+	fakePGStatus(t, p.Name, 0, "", []string{"mem-notready-names-pg-1"}, nil)
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	got := getProject(t, p.Name)
+	if got.Status.Memory.Phase != "Provisioning" {
+		t.Fatalf("phase = %q, want Provisioning", got.Status.Memory.Phase)
+	}
+	if strings.Join(got.Status.Memory.NotReady, ",") != "postgres" {
+		t.Fatalf("status notReady = %v, want [postgres]", got.Status.Memory.NotReady)
+	}
+	c := apimeta.FindStatusCondition(got.Status.Conditions, "MemoryReady")
+	if c == nil || !strings.Contains(c.Message, "postgres") {
+		t.Fatalf("MemoryReady message = %+v, want it to name postgres", c)
+	}
+}
+
+// TestMemoryProvisionDuration_MeasuresEpisodeNotProjectLifetime covers the
+// boy-scout half of #425: the histogram used to record time-since-Project-
+// creation, so any Provisioning->Ready RE-transition logged the Project's whole
+// lifetime instead of the provisioning episode.
+func TestMemoryProvisionDuration_MeasuresEpisodeNotProjectLifetime(t *testing.T) {
+	r, reg := newMemoryReconcilerWithReg()
+	p := mkMemoryProject(t, "dur-episode")
+
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	// Backdate ProvisioningSince by 10 minutes. The Project itself was created
+	// seconds ago, so the old CreationTimestamp-based measurement reads ~0 and
+	// the episode-based one reads >= 600s.
+	got := getProject(t, p.Name)
+	stamp := metav1.NewTime(time.Now().Add(-10 * time.Minute))
+	got.Status.Memory.ProvisioningSince = &stamp
+	if err := k8sClient.Status().Update(logfIntoTestCtx(), got); err != nil {
+		t.Fatalf("backdate ProvisioningSince: %v", err)
+	}
+
+	fakeStackHealthy(t, p.Name)
+	fakePGStatus(t, p.Name, 1, "mem-dur-episode-pg-1", nil, nil)
+	if _, err := reconcileMemory(t, r, p.Name); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	waitMemoryPhase(t, p.Name, "Ready")
+
+	if sum := provisionDurationSum(t, reg); sum < 600 {
+		t.Fatalf("provision duration sum = %v, want >= 600 (measured from ProvisioningSince, not Project creation)", sum)
+	}
+}
+
+// provisionDurationSum returns the summed seconds recorded in
+// operator_memory_provision_duration_seconds.
+func provisionDurationSum(t *testing.T, reg *prometheus.Registry) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "operator_memory_provision_duration_seconds" {
+			return mf.GetMetric()[0].GetHistogram().GetSampleSum()
+		}
+	}
+	t.Fatalf("operator_memory_provision_duration_seconds not found in registry")
+	return 0
 }

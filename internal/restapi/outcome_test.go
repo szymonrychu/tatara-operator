@@ -1312,6 +1312,82 @@ func TestIncidentComment_CommentErrorReleasesClaim(t *testing.T) {
 	require.Equal(t, tatarav1alpha1.StageRejected, e.task(t, "t1").Status.Stage)
 }
 
+// TestIncidentComment_GateReasons is #445: the comment_issue gate must
+// distinguish an Issue CR that is simply absent from the operator's mirror
+// (e.g. validly GC'd by the reaper once its owning Task was cleaned up) from
+// an Issue CR that exists but was never labelled as an incident tracker.
+// Before this fix both cases returned the identical reason/message
+// ("not-a-tracker"), which made a legitimately GC'd tracker indistinguishable
+// from a deliberate non-tracker rejection and drove agents to re-file the
+// same fault as a fresh internal issue.
+func TestIncidentComment_GateReasons(t *testing.T) {
+	tests := []struct {
+		name        string
+		extraObjs   []client.Object
+		wantReason  string
+		wantMessage string
+	}{
+		{
+			name:        "issue CR absent from mirror",
+			extraObjs:   nil,
+			wantReason:  "not-mirrored",
+			wantMessage: "not present in the operator's mirror",
+		},
+		{
+			name:        "issue CR present but unlabelled",
+			extraObjs:   []client.Object{issueV2("tatara-operator", 101, "tracker-task")},
+			wantReason:  "not-a-tracker",
+			wantMessage: "not a tracked incident issue",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+			objs := append([]client.Object{
+				projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+				taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+			}, tt.extraObjs...)
+			e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return frozenNow }, objs...)
+
+			before := testutil.ToFloat64(obs.RestOutcomeRejectedTotal.WithLabelValues("incident", tt.wantReason))
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+				  "comment":{"repo":"tatara-operator","number":101,"body":"evidence"}}}`)
+
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			require.Contains(t, w.Body.String(), tt.wantMessage)
+			require.Len(t, e.forge.comments, 0, "a rejected gate must never reach the forge")
+			after := testutil.ToFloat64(obs.RestOutcomeRejectedTotal.WithLabelValues("incident", tt.wantReason))
+			require.Equal(t, before+1, after,
+				"the rejection must be counted under its own distinct reason label")
+		})
+	}
+
+	// The two branches must never share a reason: run both in one build so a
+	// regression that reintroduces one shared reason string is caught even if
+	// each subtest's before/after delta alone would not see it.
+	metrics := obs.NewOperatorMetrics(prometheus.NewRegistry())
+	e := buildV2WithCooldown(t, metrics, 30*time.Minute, func() time.Time { return frozenNow },
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		issueV2("tatara-operator", 102, "tracker-task"),
+		taskV2("t1", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"),
+		taskV2("t2", "tatara", "incident", tatarav1alpha1.StageInvestigating, "incident"))
+
+	wAbsent := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":999,"body":"evidence"}}}`)
+	wUnlabelled := e.do(t, http.MethodPost, "/tasks/t2/outcome",
+		`{"kind":"incident","payload":{"action":"comment_issue","alertRules":["rule-1"],"reason":"r",
+		  "comment":{"repo":"tatara-operator","number":102,"body":"evidence"}}}`)
+
+	require.Equal(t, http.StatusBadRequest, wAbsent.Code)
+	require.Equal(t, http.StatusBadRequest, wUnlabelled.Code)
+	require.NotEqual(t, wAbsent.Body.String(), wUnlabelled.Body.String(),
+		"CR-absent and CR-present-but-unlabelled must produce distinguishable messages")
+}
+
 // TestIncidentComment_ResetFitIssueFailureIsBestEffort proves the post-comment
 // FitIssue (cooldown-marker reset) is best-effort: the forge comment has
 // already landed by the time it runs, so a failure there must not fail the

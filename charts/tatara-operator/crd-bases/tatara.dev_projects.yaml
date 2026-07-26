@@ -6155,6 +6155,33 @@ spec:
                     type: string
                   externalEndpoint:
                     type: string
+                  notReady:
+                    description: |-
+                      NotReady names the stack components currently below their readiness gate
+                      ("postgres", "neo4j", "lightrag", "memory-api"), in a stable order. Empty
+                      when the stack is Ready. Issue #425: a stack could sit Provisioning for
+                      hours with no record of WHICH of the four backends was holding it, which
+                      made the incident undiagnosable from the Project alone.
+                    items:
+                      type: string
+                    type: array
+                  pgPrimary:
+                    description: |-
+                      PgPrimary is the pod CNPG currently reports as the primary. An empty value
+                      on an otherwise-quorate cluster means no primary is elected - the cluster
+                      accepts no writes. Read from Cluster.Status.CurrentPrimary because it stays
+                      observable while an instance's container is dead, unlike CNPG's own
+                      instance-manager endpoint (see MEMORY.md 2026-07-26).
+                    type: string
+                  pgReadyInstances:
+                    description: |-
+                      PgReadyInstances / PgWantInstances are the observed and declared CNPG
+                      instance counts. They are recorded even while the stack reads Ready, so a
+                      degraded-but-quorate cluster (2 of 3 instances, issue #442) is visible
+                      without querying CNPG directly.
+                    type: integer
+                  pgWantInstances:
+                    type: integer
                   phase:
                     type: string
                   provisioningSince:
