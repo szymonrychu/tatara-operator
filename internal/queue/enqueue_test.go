@@ -121,7 +121,7 @@ func TestBuildTaskFromQueuedEvent(t *testing.T) {
 	scheme := newEnqueueTestScheme(t)
 	proj := testProj("p", "tatara")
 	qe := &tatarav1alpha1.QueuedEvent{
-		ObjectMeta: metav1.ObjectMeta{Name: "qe-1", Namespace: "tatara"},
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-1", Namespace: "tatara", UID: "uid-qe-1"},
 		Spec: tatarav1alpha1.QueuedEventSpec{
 			Seq: 1, Class: tatarav1alpha1.QueueClassNormal, Kind: "review", ProjectRef: "p", RepositoryRef: "r",
 			Payload: tatarav1alpha1.QueuedEventPayload{
@@ -140,11 +140,66 @@ func TestBuildTaskFromQueuedEvent(t *testing.T) {
 	if task.Labels[LabelQueuedEvent] != "qe-1" || task.Labels["x"] != "y" {
 		t.Fatalf("missing labels: %v", task.Labels)
 	}
-	if task.Name != "scan-qe-1" {
-		t.Fatalf("expected task.Name == GenerateName+qe.Name, got %q", task.Name)
+	if task.Labels[LabelMintedBy] != "uid-qe-1" {
+		t.Fatalf("mint label = %q, want the QueuedEvent UID", task.Labels[LabelMintedBy])
 	}
-	if task.GenerateName != "" {
-		t.Fatalf("expected empty generateName, got %q", task.GenerateName)
+	// Issue #443: a mint is GENERATENAME'd, so every cycle of a constant dedup
+	// key gets its own Task name and therefore its own agent branch.
+	if task.GenerateName != "scan-qe-1-" {
+		t.Fatalf("expected generateName == payload.GenerateName+qe.Name+\"-\", got %q", task.GenerateName)
+	}
+	if task.Name != "" {
+		t.Fatalf("expected empty name (the API server mints it), got %q", task.Name)
+	}
+}
+
+// TestBuildTaskFromQueuedEvent_BlueprintWithoutName covers the B.7 blueprint
+// shape that names no Task: it must keep the GenerateName mint rather than
+// blanking both fields and handing the API server a nameless Create.
+func TestBuildTaskFromQueuedEvent_BlueprintWithoutName(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-bp", Namespace: "ns", UID: "uid-qe-bp"},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Payload: tatarav1alpha1.QueuedEventPayload{
+				GenerateName: "impl-",
+				NewTask:      &tatarav1alpha1.QueuedTaskBlueprint{Kind: "implement", Goal: "g"},
+			},
+		},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if task.Name != "" || task.GenerateName != "impl-qe-bp-" {
+		t.Fatalf("name=%q generateName=%q, want generateName impl-qe-bp-", task.Name, task.GenerateName)
+	}
+	if task.Labels[LabelMintedBy] != "uid-qe-bp" {
+		t.Fatalf("mint label = %q, want the QueuedEvent UID", task.Labels[LabelMintedBy])
+	}
+}
+
+// TestBuildTaskFromQueuedEvent_BlueprintName pins the named-blueprint shape:
+// an explicit name WINS and clears the GenerateName mint.
+func TestBuildTaskFromQueuedEvent_BlueprintName(t *testing.T) {
+	scheme := newEnqueueTestScheme(t)
+	proj := testProj("p", "ns")
+	qe := &tatarav1alpha1.QueuedEvent{
+		ObjectMeta: metav1.ObjectMeta{Name: "qe-bpn", Namespace: "ns"},
+		Spec: tatarav1alpha1.QueuedEventSpec{
+			Payload: tatarav1alpha1.QueuedEventPayload{
+				GenerateName: "impl-",
+				NewTask:      &tatarav1alpha1.QueuedTaskBlueprint{Name: "fixed-task", Kind: "implement"},
+			},
+		},
+	}
+	task, err := BuildTaskFromQueuedEvent(qe, proj, scheme)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if task.Name != "fixed-task" || task.GenerateName != "" {
+		t.Fatalf("name=%q generateName=%q, want fixed-task with no generateName", task.Name, task.GenerateName)
 	}
 }
 

@@ -304,14 +304,11 @@ const (
 
 // BranchDeleter is an OPTIONAL SCMWriter capability, in the same spirit as
 // scm.PRCommentLister and scm.DeployWatcher: a writer that can delete a head
-// branch implements it, one that cannot does not.
-//
-// IT IS OPTIONAL BY NECESSITY, NOT BY CHOICE: scm.SCMWriter has NO DeleteBranch
-// method and neither *scm.GitHub nor *scm.GitLab implements one - the platform
-// has never deleted a branch (see closeExhaustedPR's comment). B.6 step 4 is the
-// first rule that needs it. Until the adapters grow the method, the branch half
-// of step 4 is a logged no-op; the CLOSE half is fully live. A type assertion
-// keeps the reaper honest instead of silently pretending the branch is gone.
+// branch implements it, one that cannot does not. Both *scm.GitHub and
+// *scm.GitLab do (issue #443); it stays off scm.SCMWriter for the reason
+// scm/checks.go states - adding a method there breaks every fake in the tree -
+// and the type assertion below keeps the reaper honest about a writer that
+// cannot, instead of silently pretending the branch is gone.
 type BranchDeleter interface {
 	DeleteBranch(ctx context.Context, repoURL, token, branch string) error
 }
@@ -997,12 +994,27 @@ func (r *ProjectReconciler) closeOwnMRs(ctx context.Context, proj *tatarav1alpha
 
 		deleter, ok := writer.(BranchDeleter)
 		if !ok {
-			// scm.SCMWriter has no DeleteBranch and neither adapter implements one.
-			// The branch is preserved, exactly as closeExhaustedPR has always
-			// preserved it. Logged, never silently assumed done.
+			// A writer with no DeleteBranch. The branch is preserved, exactly as
+			// closeExhaustedPR has always preserved it. Logged, never silently
+			// assumed done.
 			l.Info("reap: this SCM writer cannot delete branches; the head branch is preserved",
 				"action", "reap_delete_branch", "resource_id", t.Name,
 				"repo", repo.Name, "head_branch", mr.Status.HeadBranch, "result", "unsupported")
+			continue
+		}
+		// LAST GATE before the platform's only destructive forge call. Clause (b)
+		// proved this branch is the DYING Task's own; this proves no OTHER, still
+		// LIVE Task pushes to it. The case that makes it necessary: a takeover
+		// Task adopts an abandoned MR and pushes to its EXISTING head branch
+		// (agent.PushBranch), which is the very branch the abandoned Task derived
+		// from its own name - so reaping that Task would delete the branch a live
+		// agent is committing to.
+		if live, lerr := r.liveTaskPushingTo(ctx, proj, mr.Status.HeadBranch, t.Name); lerr != nil {
+			return lerr
+		} else if live != "" {
+			l.Info("reap: head branch preserved; a live task still pushes to it",
+				"action", "reap_delete_branch", "resource_id", t.Name, "repo", repo.Name,
+				"head_branch", mr.Status.HeadBranch, "live_task", live, "result", "refused")
 			continue
 		}
 		deleteErr := deleter.DeleteBranch(ctx, repo.Spec.URL, token, mr.Status.HeadBranch)

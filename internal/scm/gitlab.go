@@ -742,6 +742,21 @@ func (c *GitLab) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.mrNote(ctx, c.base(), proj, number, token, body)
 }
 
+// DeleteBranch deletes a head branch. It is the GitLab half of the B.6 reaper's
+// branch delete (issue #443); the reaper only ever calls it for a branch its own
+// terminal Task pushed. GitLab answers 404 for a branch that is already gone, so
+// nothing needs normalizing here (compare GitHub.DeleteBranch). The branch is a
+// PATH SEGMENT, not a query value, so it is escaped: "tatara/task-x" would
+// otherwise address a different route.
+func (c *GitLab) DeleteBranch(ctx context.Context, repoURL, token, branch string) error {
+	proj, err := glProjectPath(repoURL)
+	if err != nil {
+		return err
+	}
+	path := "/projects/" + url.PathEscape(proj) + "/repository/branches/" + url.PathEscape(branch)
+	return glDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
+}
+
 // GetMergeState reads the MR's merge_status + has_conflicts and maps them to a
 // provider-neutral MergeState. cannot_be_merged with conflicts is a real merge
 // conflict (dirty); without conflicts it is mergeable-blocked; unchecked and

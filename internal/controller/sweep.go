@@ -976,6 +976,49 @@ func (r *ProjectReconciler) taskForBranch(ctx context.Context, proj *tatarav1alp
 	return nil, nil
 }
 
+// liveTaskPushingTo returns the name of a Task OTHER than exclude that still
+// PUSHES to branch, or "" when none does. It is the reaper's last gate before
+// deleting a branch on the forge (issue #443).
+//
+// It asks agent.PushBranch, not agent.TaskBranch (taskForBranch's question): a
+// takeover Task pushes to the abandoned MR's EXISTING head branch, which is
+// derived from a DIFFERENT Task's name, so the TaskBranch scan would answer
+// "nobody" for the one case where deleting destroys live work.
+//
+// parked counts as LIVE even though TaskDone calls it terminal: a
+// parked(ownership-lost) takeover Task is re-entered into approved by a
+// maintainer's "take over" comment and RESUMES PUSHING to that same branch.
+// Only delivered/failed/rejected are past pushing.
+func (r *ProjectReconciler) liveTaskPushingTo(ctx context.Context, proj *tatarav1alpha1.Project, branch, exclude string) (string, error) {
+	if branch == "" {
+		return "", nil
+	}
+	var tl tatarav1alpha1.TaskList
+	err := r.List(ctx, &tl, client.InNamespace(proj.Namespace), client.MatchingFields{TaskProjectRefIndex: proj.Name})
+	if err != nil {
+		if !isFieldSelectorUnsupported(err) {
+			return "", err
+		}
+		tl = tatarav1alpha1.TaskList{}
+		if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
+			return "", err
+		}
+	}
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Name == exclude || t.Spec.ProjectRef != proj.Name {
+			continue
+		}
+		if tatarav1alpha1.TaskDone(t) && t.Status.Stage != tatarav1alpha1.StageParked {
+			continue
+		}
+		if agent.PushBranch(t) == branch {
+			return t.Name, nil
+		}
+	}
+	return "", nil
+}
+
 // activeTaskCount counts the project's ACTIVE Tasks via the A.3 projectRef field
 // index - never a label selector.
 func (r *ProjectReconciler) activeTaskCount(ctx context.Context, proj *tatarav1alpha1.Project) (int, error) {
