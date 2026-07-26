@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
@@ -281,12 +283,90 @@ func maxSizeString(current, candidate string) (string, error) {
 	return current, nil
 }
 
+// memoryHealth carries the readiness inputs memoryPhase gates on, plus the
+// CNPG-side detail the MemoryReady condition and status.memory surface for
+// diagnosis. Everything read here is observable while an instance's container is
+// dead - CNPG's own remediation is gated on the instance-manager HTTP endpoint
+// (:8000/pg/status), which is never up on a crash-looping member, so a diverged
+// standby is invisible to it by construction (issue #442).
+type memoryHealth struct {
+	pgReady       int
+	pgWant        int
+	pgPrimary     string
+	pgUnhealthy   []string
+	pgDanglingPVC []string
+	neo4jReady    int32
+	lightragAvail int32
+	memoryAvail   int32
+}
+
+// notReadyComponents names the stack components below their readiness gate, in
+// a stable order. It is empty exactly when memoryPhase would return "Ready".
+// Issue #425: a stack could sit Provisioning for hours with no record of WHICH
+// of the four backends held it.
+func (h memoryHealth) notReadyComponents() []string {
+	var out []string
+	if h.pgReady < memoryQuorum(h.pgWant) {
+		out = append(out, "postgres")
+	}
+	if h.neo4jReady < 1 {
+		out = append(out, "neo4j")
+	}
+	if h.lightragAvail < 1 {
+		out = append(out, "lightrag")
+	}
+	if h.memoryAvail < 1 {
+		out = append(out, "memory-api")
+	}
+	return out
+}
+
+// pgDegradedReason describes how the CNPG cluster is impaired, or "" when it is
+// fully healthy. It is deliberately independent of memoryQuorum: a cluster can
+// be quorate (so memoryPhase reads Ready and the fleet keeps serving) while a
+// standby sits permanently diverged, which is the exact state that went
+// undetected for 8h42m in issue #442. Callers surface this on the MemoryReady
+// condition, never on the phase - tightening the phase gate flaps the whole
+// fleet (issues #215, #355).
+func pgDegradedReason(h memoryHealth) string {
+	var parts []string
+	if h.pgPrimary == "" {
+		parts = append(parts, "no primary elected")
+	}
+	if h.pgReady < h.pgWant {
+		s := fmt.Sprintf("%d/%d instances ready", h.pgReady, h.pgWant)
+		if len(h.pgUnhealthy) > 0 {
+			s += " (not healthy: " + strings.Join(h.pgUnhealthy, ", ") + ")"
+		}
+		parts = append(parts, s)
+	}
+	if len(h.pgDanglingPVC) > 0 {
+		parts = append(parts, "dangling PVCs: "+strings.Join(h.pgDanglingPVC, ", "))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// pgUnhealthyInstances returns the names CNPG lists under any status other than
+// healthy, sorted so the derived condition message does not churn on Go's
+// randomised map iteration order.
+func pgUnhealthyInstances(st map[cnpgv1.PodStatus][]string) []string {
+	var out []string
+	for status, names := range st {
+		if status == cnpgv1.PodHealthy {
+			continue
+		}
+		out = append(out, names...)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // memoryStackHealth reads the owned objects' statuses and returns the readiness
-// inputs for memoryPhase: cnpg readyInstances, neo4j readyReplicas, lightrag
-// availableReplicas, memory availableReplicas.
-func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv1alpha1.Project) (readyInstances int, neo4jReady, lightragAvail, memoryAvail int32, err error) {
+// inputs for memoryPhase plus the CNPG replication detail.
+func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv1alpha1.Project) (memoryHealth, error) {
 	names := memory.NamesFor(p.Name)
 	ns := r.MemoryConfig.Namespace
+	h := memoryHealth{pgWant: memory.PgInstances(p)}
 
 	// A NotFound read means the object was SSA-applied moments ago and is not
 	// yet visible in the informer cache (or has not been created yet). That is
@@ -295,40 +375,43 @@ func (r *ProjectReconciler) memoryStackHealth(ctx context.Context, p *tataradevv
 	var cluster cnpgv1.Cluster
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.PGCluster}, &cluster); e != nil {
 		if !apierrors.IsNotFound(e) {
-			return 0, 0, 0, 0, fmt.Errorf("get cnpg cluster: %w", e)
+			return memoryHealth{}, fmt.Errorf("get cnpg cluster: %w", e)
 		}
 	} else {
-		readyInstances = cluster.Status.ReadyInstances
+		h.pgReady = cluster.Status.ReadyInstances
+		h.pgPrimary = cluster.Status.CurrentPrimary
+		h.pgUnhealthy = pgUnhealthyInstances(cluster.Status.InstancesStatus)
+		h.pgDanglingPVC = cluster.Status.DanglingPVC
 	}
 
 	var sts appsv1.StatefulSet
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.Neo4j}, &sts); e != nil {
 		if !apierrors.IsNotFound(e) {
-			return 0, 0, 0, 0, fmt.Errorf("get neo4j statefulset: %w", e)
+			return memoryHealth{}, fmt.Errorf("get neo4j statefulset: %w", e)
 		}
 	} else {
-		neo4jReady = sts.Status.ReadyReplicas
+		h.neo4jReady = sts.Status.ReadyReplicas
 	}
 
 	var lightrag appsv1.Deployment
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.Lightrag}, &lightrag); e != nil {
 		if !apierrors.IsNotFound(e) {
-			return 0, 0, 0, 0, fmt.Errorf("get lightrag deployment: %w", e)
+			return memoryHealth{}, fmt.Errorf("get lightrag deployment: %w", e)
 		}
 	} else if deploymentRolloutConverged(&lightrag) {
-		lightragAvail = lightrag.Status.AvailableReplicas
+		h.lightragAvail = lightrag.Status.AvailableReplicas
 	}
 
 	var mem appsv1.Deployment
 	if e := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: names.Memory}, &mem); e != nil {
 		if !apierrors.IsNotFound(e) {
-			return 0, 0, 0, 0, fmt.Errorf("get memory deployment: %w", e)
+			return memoryHealth{}, fmt.Errorf("get memory deployment: %w", e)
 		}
 	} else if deploymentRolloutConverged(&mem) {
-		memoryAvail = mem.Status.AvailableReplicas
+		h.memoryAvail = mem.Status.AvailableReplicas
 	}
 
-	return readyInstances, neo4jReady, lightragAvail, memoryAvail, nil
+	return h, nil
 }
 
 // deploymentRolloutConverged reports whether d's rollout has fully landed: the
@@ -422,7 +505,7 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		return 0, r.failMemory(p, "ApplyError", err)
 	}
 
-	readyInstances, neo4jReady, lightragAvail, memoryAvail, err := r.memoryStackHealth(ctx, p)
+	h, err := r.memoryStackHealth(ctx, p)
 	if err != nil {
 		// A non-NotFound read is a transient API/cache blip, not a real failure
 		// (NotFound is already handled as not-yet-ready inside memoryStackHealth).
@@ -443,7 +526,20 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		return memoryRequeue, nil
 	}
 
-	phase := memoryPhase(readyInstances, memory.PgInstances(p), neo4jReady, lightragAvail, memoryAvail)
+	phase := memoryPhase(h.pgReady, h.pgWant, h.neo4jReady, h.lightragAvail, h.memoryAvail)
+
+	// Record which component is holding the stack and the CNPG instance/primary
+	// detail, so a Provisioning or degraded-but-quorate stack is diagnosable from
+	// the Project alone (issues #425, #442).
+	p.Status.Memory.NotReady = h.notReadyComponents()
+	p.Status.Memory.PgReadyInstances = h.pgReady
+	p.Status.Memory.PgWantInstances = h.pgWant
+	p.Status.Memory.PgPrimary = h.pgPrimary
+
+	// Capture the current provisioning episode's start before the block below
+	// clears it on reaching Ready; the provision-duration histogram measures
+	// from here, not from the Project's creation.
+	provisioningSince := p.Status.Memory.ProvisioningSince
 
 	// Maintain ReadySince/ProvisioningSince for the stabilization debounce
 	// (memoryStablyReady) and the Provisioning->Degraded timeout (issue #355).
@@ -476,16 +572,32 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 	}
 	p.Status.Memory.Phase = phase
 
+	// waiting names the components still below their gate, appended to every
+	// not-Ready condition message so the reason is legible without a second
+	// kubectl call (issue #425).
+	waiting := ""
+	if len(p.Status.Memory.NotReady) > 0 {
+		waiting = " (waiting on: " + strings.Join(p.Status.Memory.NotReady, ", ") + ")"
+	}
 	condStatus := metav1.ConditionFalse
 	reason := "Provisioning"
-	msg := "memory stack provisioning"
+	msg := "memory stack provisioning" + waiting
 	switch phase {
 	case "Ready":
 		condStatus = metav1.ConditionTrue
 		reason = "Ready"
 		msg = "memory stack ready at " + p.Status.Memory.Endpoint
 		if prevPhase != "Ready" {
-			r.Metrics.ObserveMemoryProvisionDuration(time.Since(p.CreationTimestamp.Time).Seconds())
+			// Measure the provisioning episode, not the Project's lifetime. Using
+			// CreationTimestamp made every Provisioning->Ready RE-transition record
+			// how old the Project was, which on a long-lived project swamped the
+			// histogram. ProvisioningSince is nil only on a first provision that
+			// never passed through Provisioning, where creation IS the episode start.
+			start := p.CreationTimestamp.Time
+			if provisioningSince != nil {
+				start = provisioningSince.Time
+			}
+			r.Metrics.ObserveMemoryProvisionDuration(now.Sub(start).Seconds())
 		}
 		// Fold a sustained retrieval-probe failure into the condition. Replica
 		// readiness alone cannot see a memory pod that is Available but serving a
@@ -496,10 +608,31 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		// The replica gate stays the precondition (a still-Provisioning stack is
 		// never probed) and phase stays "Ready", so the probe keeps running and the
 		// condition clears itself once the surface recovers.
-		if r.memoryUnhealthyCycles[p.Name] >= memoryRetrievalUnhealthyThreshold {
+		//
+		// A degraded-but-quorate postgres demotes the condition the same way
+		// (issue #442: a standby sat permanently diverged on an orphaned timeline
+		// for 8h42m and nothing detected it, because the quorum gate was still
+		// satisfied). RetrievalUnreachable is checked first and wins: it means the
+		// stack is not serving at all, the stronger statement, and keeping it
+		// first leaves the pre-existing #355 behaviour byte-for-byte unchanged.
+		switch {
+		case r.memoryUnhealthyCycles[p.Name] >= memoryRetrievalUnhealthyThreshold:
 			condStatus = metav1.ConditionFalse
 			reason = "RetrievalUnreachable"
 			msg = "memory replicas available but retrieval surface unreachable at " + p.Status.Memory.Endpoint
+		default:
+			if degraded := pgDegradedReason(h); degraded != "" {
+				condStatus = metav1.ConditionFalse
+				reason = "PostgresDegraded"
+				msg = "memory serving on a quorum but postgres is degraded: " + degraded
+				l.Info("memory postgres degraded while still quorate",
+					"action", "memory_pg_degraded",
+					"resource_id", p.Name,
+					"pg_ready_instances", h.pgReady,
+					"pg_want_instances", h.pgWant,
+					"pg_primary", h.pgPrimary,
+					"detail", degraded)
+			}
 		}
 	case "Degraded":
 		// Issue #355: a stuck backend must surface as a failing condition after a
@@ -510,8 +643,8 @@ func (r *ProjectReconciler) reconcileMemory(ctx context.Context, p *tataradevv1a
 		// backend actually becomes healthy.
 		elapsed := now.Sub(p.Status.Memory.ProvisioningSince.Time).Round(time.Second)
 		reason = "ProvisioningTimeout"
-		msg = fmt.Sprintf("memory stack still provisioning after %s (exceeds %s timeout)",
-			elapsed, r.MemoryConfig.ProvisioningTimeout)
+		msg = fmt.Sprintf("memory stack still provisioning after %s (exceeds %s timeout)%s",
+			elapsed, r.MemoryConfig.ProvisioningTimeout, waiting)
 	}
 	meta.SetStatusCondition(&p.Status.Conditions, metav1.Condition{
 		Type:               "MemoryReady",

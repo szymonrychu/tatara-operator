@@ -59,6 +59,28 @@ type MemoryStatus struct {
 	// stack sat Provisioning for 7h+ with no bounded failure signal).
 	// +optional
 	ProvisioningSince *metav1.Time `json:"provisioningSince,omitempty"`
+	// NotReady names the stack components currently below their readiness gate
+	// ("postgres", "neo4j", "lightrag", "memory-api"), in a stable order. Empty
+	// when the stack is Ready. Issue #425: a stack could sit Provisioning for
+	// hours with no record of WHICH of the four backends was holding it, which
+	// made the incident undiagnosable from the Project alone.
+	// +optional
+	NotReady []string `json:"notReady,omitempty"`
+	// PgReadyInstances / PgWantInstances are the observed and declared CNPG
+	// instance counts. They are recorded even while the stack reads Ready, so a
+	// degraded-but-quorate cluster (2 of 3 instances, issue #442) is visible
+	// without querying CNPG directly.
+	// +optional
+	PgReadyInstances int `json:"pgReadyInstances,omitempty"`
+	// +optional
+	PgWantInstances int `json:"pgWantInstances,omitempty"`
+	// PgPrimary is the pod CNPG currently reports as the primary. An empty value
+	// on an otherwise-quorate cluster means no primary is elected - the cluster
+	// accepts no writes. Read from Cluster.Status.CurrentPrimary because it stays
+	// observable while an instance's container is dead, unlike CNPG's own
+	// instance-manager endpoint (see MEMORY.md 2026-07-26).
+	// +optional
+	PgPrimary string `json:"pgPrimary,omitempty"`
 }
 
 // GrafanaSpec configures the optional per-project Grafana incident-response
