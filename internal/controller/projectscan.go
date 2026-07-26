@@ -509,7 +509,11 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
 	l := log.FromContext(ctx)
 	start := time.Now()
-	maxProp := act.MaxOpenProposals
+	// TODO(O4): this call site still reads the pre-target ceiling directly and
+	// keeps the unreachable maxProp<1 fallback (plan conflict C7); it is rewired
+	// onto act.ResolveTarget() when the brainstorm cycle itself is rewired onto
+	// the target control law.
+	maxProp := act.MaxOpenProposals //nolint:staticcheck // transitional; replaced in O4
 	if maxProp < 1 {
 		maxProp = 10
 	}
