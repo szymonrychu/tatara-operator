@@ -1015,6 +1015,34 @@ func (c *GitHub) ClosePR(ctx context.Context, repoURL, token string, number int,
 	return c.Comment(ctx, token, fmt.Sprintf("%s/%s#%d", owner, repo, number), body)
 }
 
+// ghRefGoneBody is what GitHub's delete-ref endpoint says when the ref is not
+// there. It answers 422 rather than 404 for a missing ref, alone among the
+// endpoints this package calls.
+const ghRefGoneBody = "Reference does not exist"
+
+// DeleteBranch deletes a head branch by deleting its ref. It is the branch half
+// of the B.6 reaper's step 4 (issue #443); the reaper only ever calls it for a
+// branch its own terminal Task pushed.
+//
+// A missing ref is normalized to a 404 *HTTPError so it reads as permanently
+// gone (controller.isPermanentTargetGone) rather than as a retryable failure
+// that requeues the reap forever. That normalization is the adapter's job:
+// GitHub reports a missing ref on THIS endpoint as a 422, and the operator's
+// provider-neutral "target is gone" vocabulary is 404/410.
+func (c *GitHub) DeleteBranch(ctx context.Context, repoURL, token, branch string) error {
+	owner, repo, err := ghOwnerRepo(repoURL)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("/repos/%s/%s/git/refs/heads/%s", owner, repo, branch)
+	err = ghDo(ctx, c.base(), http.MethodDelete, path, token, nil, nil)
+	var he *HTTPError
+	if errors.As(err, &he) && he.Status == http.StatusUnprocessableEntity && strings.Contains(he.Body, ghRefGoneBody) {
+		return &HTTPError{Status: http.StatusNotFound, Body: he.Body, Path: path}
+	}
+	return err
+}
+
 // mergeStateRecomputeDelay is how long to wait before re-fetching a PR when
 // GitHub returns mergeable:null / mergeable_state:"unknown" (lazy recompute).
 // GitHub typically resolves mergeability within 2-5 seconds. It is a package

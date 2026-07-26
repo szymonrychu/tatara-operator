@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,6 +154,7 @@ func TestPublishIngestHealth(t *testing.T) {
 	mkRepoObj := func(name, phase string, failCount int, enabled bool, last *metav1.Time) *tataradevv1alpha1.Repository {
 		rp := &tataradevv1alpha1.Repository{}
 		rp.Name = name
+		rp.Spec.ProjectRef = "proj"
 		rp.Spec.IngestEnabled = boolPtrRC(enabled)
 		rp.Status.Phase = phase
 		rp.Status.IngestFailureCount = failCount
@@ -162,36 +164,36 @@ func TestPublishIngestHealth(t *testing.T) {
 
 	// Failed phase -> failing 1.
 	r.publishIngestHealth(mkRepoObj("r-failed", "Failed", 0, true, nil))
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-failed")); got != 1 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-failed")); got != 1 {
 		t.Errorf("failed phase: failing = %v, want 1", got)
 	}
 	// Mid-retry (Ingesting but unresolved consecutive failures) -> failing 1.
 	r.publishIngestHealth(mkRepoObj("r-retry", "Ingesting", 2, true, nil))
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-retry")); got != 1 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-retry")); got != 1 {
 		t.Errorf("retrying: failing = %v, want 1", got)
 	}
 	// Healthy (Ingested, no failures) -> failing 0 and timestamp published.
 	ts := metav1.Unix(1750000000, 0)
 	r.publishIngestHealth(mkRepoObj("r-ok", "Ingested", 0, true, &ts))
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-ok")); got != 0 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-ok")); got != 0 {
 		t.Errorf("healthy: failing = %v, want 0", got)
 	}
-	if got := testutil.ToFloat64(m.RepositoryLastIngestTimestampGauge("r-ok")); got != 1750000000 {
+	if got := testutil.ToFloat64(m.RepositoryLastIngestTimestampGauge("proj", "r-ok")); got != 1750000000 {
 		t.Errorf("healthy: last_ingest_ts = %v, want 1750000000", got)
 	}
 	// Recovery on the SAME repo: the gauge must clear, not stay latched - this is
 	// the whole point of the current-state signal vs the monotonic counter (#138).
 	r.publishIngestHealth(mkRepoObj("r-heal", "Failed", 3, true, nil))
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-heal")); got != 1 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-heal")); got != 1 {
 		t.Fatalf("pre-recovery: failing = %v, want 1", got)
 	}
 	r.publishIngestHealth(mkRepoObj("r-heal", "Ingested", 0, true, &ts))
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-heal")); got != 0 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-heal")); got != 0 {
 		t.Errorf("post-recovery: failing = %v, want 0 (must clear)", got)
 	}
 	// A disabled repo never reports failing even if its status looks failed.
 	r.publishIngestHealth(mkRepoObj("r-disabled", "Failed", 5, false, nil))
-	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("r-disabled")); got != 0 {
+	if got := testutil.ToFloat64(m.RepositoryIngestFailingGauge("proj", "r-disabled")); got != 0 {
 		t.Errorf("disabled: failing = %v, want 0", got)
 	}
 }
@@ -467,17 +469,17 @@ func TestRepoReconcile_IngestGatedGauge(t *testing.T) {
 	}
 
 	reconcile()
-	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("gaugerepo")); got != 1 {
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-gauge", "gaugerepo")); got != 1 {
 		t.Fatalf("ingest_gated while inside stabilization window = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("gaugerepo")); got != 0 {
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("rp-gauge", "gaugerepo")); got != 0 {
 		t.Fatalf("ingest_failing while gated = %v, want 0 (this is exactly why the gated gauge exists)", got)
 	}
 
 	// Backdate ReadySince past the stabilization window: the gate clears.
 	setProjectMemoryReady(t, "rp-gauge", "http://mem-rp-gauge.tatara.svc:8080")
 	reconcile()
-	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("gaugerepo")); got != 0 {
+	if got := testutil.ToFloat64(r.Metrics.RepositoryIngestGatedGauge("rp-gauge", "gaugerepo")); got != 0 {
 		t.Fatalf("ingest_gated after memory stably Ready = %v, want 0", got)
 	}
 }
@@ -636,4 +638,254 @@ func TestRepoReconcile_ScheduleNoDoubleFireWithinInterval(t *testing.T) {
 	if res.RequeueAfter <= 0 {
 		t.Errorf("expected a requeue to the next fire, got %v", res.RequeueAfter)
 	}
+}
+
+// seedRepoStatus applies mutate to the repo's status subresource.
+func seedRepoStatus(t *testing.T, name string, mutate func(*tataradevv1alpha1.Repository)) {
+	t.Helper()
+	r := getRepo(t, name)
+	mutate(r)
+	if err := k8sClient.Status().Update(context.Background(), r); err != nil {
+		t.Fatalf("seed status for %s: %v", name, err)
+	}
+}
+
+// TestRepoReconcile_RepairsStaleFailedPhase guards issue #457. A Repository was
+// observed live in (Phase="Failed", IngestFailureCount=0) for ~20.8h with ZERO
+// ingest failures in 7 days of logs. Nothing repaired it: Status.Phase is
+// written only on job completion, and the IngestIdle branch guarded on the
+// failure count alone. operator_repository_ingest_failing derives from
+// (Phase=="Failed" || count>0) so the gauge latched at 1 and the alert told a
+// 21h false story. Phase=="Failed" must now imply an unresolved failure.
+func TestRepoReconcile_RepairsStaleFailedPhase(t *testing.T) {
+	mkProject(t, "rp-heal", "rp-heal-scm")
+	mkSecret(t, "rp-heal-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "healrepo", "rp-heal")
+	setProjectMemoryReady(t, "rp-heal", "http://mem-rp-heal.tatara.svc:8080")
+
+	now := metav1.NewTime(time.Now())
+	seedRepoStatus(t, "healrepo", func(r *tataradevv1alpha1.Repository) {
+		r.Status.LastIngestedCommit = "shaHeal"
+		r.Status.LastIngestTime = &now
+		r.Status.Phase = "Failed"
+		r.Status.IngestFailureCount = 0
+	})
+
+	r := newRepoReconciler()
+	if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: testNS, Name: "healrepo"},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	got := getRepo(t, "healrepo")
+	if got.Status.Phase != "Ingested" {
+		t.Errorf("phase = %q, want Ingested (a recorded successful ingest and no unresolved failure)", got.Status.Phase)
+	}
+	if v := testutil.ToFloat64(r.Metrics.RepositoryIngestFailingGauge("rp-heal", "healrepo")); v != 0 {
+		t.Errorf("ingest_failing = %v, want 0: the latched gauge is what pinned the alert for 20.8h", v)
+	}
+	if jobs := listIngestJobs(t, "healrepo"); len(jobs) != 0 {
+		t.Errorf("repairing a stale phase must not launch an ingest, got %d jobs", len(jobs))
+	}
+}
+
+// TestRepoReconcile_RepairsStaleFailedPhaseNeverIngested covers the other half
+// of the repair (issue #457): a repo carrying Phase="Failed" with no recorded
+// successful ingest has nothing to be "Ingested" at, so the repair clears the
+// phase and the ordinary first-full-ingest path takes over in the same pass.
+func TestRepoReconcile_RepairsStaleFailedPhaseNeverIngested(t *testing.T) {
+	mkProject(t, "rp-heal2", "rp-heal2-scm")
+	mkSecret(t, "rp-heal2-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "healrepo2", "rp-heal2")
+	setProjectMemoryReady(t, "rp-heal2", "http://mem-rp-heal2.tatara.svc:8080")
+
+	seedRepoStatus(t, "healrepo2", func(r *tataradevv1alpha1.Repository) {
+		r.Status.Phase = "Failed"
+		r.Status.IngestFailureCount = 0
+	})
+
+	if _, err := reconcileRepo(t, "healrepo2"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	waitRepoJob(t, "healrepo2")
+	if jobs := listIngestJobs(t, "healrepo2"); len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want 1 (never-ingested repo must get its full ingest)", len(jobs))
+	}
+	if got := getRepo(t, "healrepo2").Status.Phase; got != "Ingesting" {
+		t.Errorf("phase = %q, want Ingesting", got)
+	}
+}
+
+// TestRepoReconcile_FailedPhaseTriggersReingest guards issue #457's root cause:
+// ingestDecision returned want=false once LastIngestedCommit was set and no
+// newer re-ingest annotation existed, so Phase=="Failed" was never itself a
+// reason to re-ingest and the state was self-perpetuating - the repo's recall
+// corpus silently went stale until an unrelated cron tick rescued it. The
+// annotation is not a reliable trigger either: the Repository CR is helm-managed
+// and an apply strips it.
+func TestRepoReconcile_FailedPhaseTriggersReingest(t *testing.T) {
+	mkProject(t, "rp-refail", "rp-refail-scm")
+	mkSecret(t, "rp-refail-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "refail", "rp-refail")
+	setProjectMemoryReady(t, "rp-refail", "http://mem-rp-refail.tatara.svc:8080")
+
+	lastIngest := metav1.NewTime(time.Now().Add(-2 * time.Hour))
+	lastFailure := metav1.NewTime(time.Now().Add(-1 * time.Hour))
+	seedRepoStatus(t, "refail", func(r *tataradevv1alpha1.Repository) {
+		r.Status.LastIngestedCommit = "shaRefail"
+		r.Status.LastIngestTime = &lastIngest
+		r.Status.Phase = "Failed"
+		r.Status.IngestFailureCount = 1
+		r.Status.LastIngestFailureTime = &lastFailure
+	})
+
+	if _, err := reconcileRepo(t, "refail"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	waitRepoJob(t, "refail")
+	jobs := listIngestJobs(t, "refail")
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want 1 (a Failed repo with an elapsed backoff must re-ingest)", len(jobs))
+	}
+	if script := jobs[0].Spec.Template.Spec.Containers[0].Args[0]; !contains(script, "--since shaRefail") {
+		t.Errorf("the retry must stay incremental below the full-ingest fallback threshold: %q", script)
+	}
+}
+
+// TestRepoReconcile_FailedPhaseRespectsBackoff is the other side of making
+// Phase=="Failed" a re-ingest trigger (issue #457): a genuinely broken repo must
+// still back off instead of hammering a Job per reconcile. The repair guard is
+// what makes this safe - Phase=="Failed" now implies IngestFailureCount>0, which
+// is exactly the condition the exponential back-off gate keys on.
+func TestRepoReconcile_FailedPhaseRespectsBackoff(t *testing.T) {
+	mkProject(t, "rp-bo", "rp-bo-scm")
+	mkSecret(t, "rp-bo-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "borepo", "rp-bo")
+	setProjectMemoryReady(t, "rp-bo", "http://mem-rp-bo.tatara.svc:8080")
+
+	lastIngest := metav1.NewTime(time.Now().Add(-6 * time.Hour))
+	justFailed := metav1.NewTime(time.Now())
+	seedRepoStatus(t, "borepo", func(r *tataradevv1alpha1.Repository) {
+		r.Status.LastIngestedCommit = "shaBo"
+		r.Status.LastIngestTime = &lastIngest
+		r.Status.Phase = "Failed"
+		r.Status.IngestFailureCount = 5
+		r.Status.LastIngestFailureTime = &justFailed
+	})
+
+	for i := 0; i < 3; i++ {
+		res, err := reconcileRepo(t, "borepo")
+		if err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+		if res.RequeueAfter <= 0 {
+			t.Fatalf("reconcile %d: RequeueAfter = %v, want the remaining back-off", i, res.RequeueAfter)
+		}
+		if res.RequeueAfter > maxIngestBackoff {
+			t.Fatalf("reconcile %d: RequeueAfter = %v, want <= %v", i, res.RequeueAfter, maxIngestBackoff)
+		}
+	}
+	if jobs := listIngestJobs(t, "borepo"); len(jobs) != 0 {
+		t.Fatalf("jobs = %d, want 0: a repeatedly failing repo must back off, not hot-loop", len(jobs))
+	}
+	cond := findCond(getRepo(t, "borepo").Status.Conditions, "IngestBackoff")
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "IngestFailing" {
+		t.Fatalf("expected IngestBackoff=True/IngestFailing while held, got %+v", cond)
+	}
+	if getRepo(t, "borepo").Status.Phase != "Failed" {
+		t.Error("a repo with unresolved failures must keep Phase=Failed; only the desynchronised count=0 case is repaired")
+	}
+}
+
+// TestRepoReconcile_ConcurrentReconcilesLaunchOneJob guards the duplicate-Job
+// race in issue #457: two ingest Jobs were created for one Repository 16ms and
+// 21ms apart, from the same pod under different reconcileIDs, with the
+// "ingest job still active" guard losing the read-then-create race. Only the
+// last Job was adopted into status; the orphan ran to completion and its
+// outcome was never reconciled. The deterministic Job name makes the second
+// Create return AlreadyExists, which is adopted rather than duplicated.
+func TestRepoReconcile_ConcurrentReconcilesLaunchOneJob(t *testing.T) {
+	mkProject(t, "rp-race", "rp-race-scm")
+	mkSecret(t, "rp-race-scm", map[string][]byte{"token": []byte("x"), "webhookSecret": []byte("y")})
+	mkRepo(t, "racerepo", "rp-race")
+	setProjectMemoryReady(t, "rp-race", "http://mem-rp-race.tatara.svc:8080")
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "racerepo"}}
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	start := make(chan struct{})
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			r := newRepoReconciler()
+			<-start
+			_, errs[i] = r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent reconcile %d: %v", i, err)
+		}
+	}
+
+	jobs := listIngestJobs(t, "racerepo")
+	if len(jobs) != 1 {
+		names := make([]string, 0, len(jobs))
+		for i := range jobs {
+			names = append(names, jobs[i].Name)
+		}
+		t.Fatalf("jobs = %d %v, want exactly 1", len(jobs), names)
+	}
+	if got := waitRepoJob(t, "racerepo"); got != jobs[0].Name {
+		t.Errorf("status.jobName = %q, want the one live job %q (an unadopted Job is never reconciled)", got, jobs[0].Name)
+	}
+}
+
+// TestRepoReconcile_ForgetsGaugesForDeletedRepo covers the stale-series half of
+// the project label (issue #457): the per-repo ingest gauges are now labelled by
+// project as well as repo, so a series that outlives its Repository would keep
+// naming a repo/project pair that no longer exists.
+func TestRepoReconcile_ForgetsGaugesForDeletedRepo(t *testing.T) {
+	mkProject(t, "rp-gone", "rp-gone-scm")
+	repo := mkRepo(t, "gonerepo", "rp-gone")
+	repo.Spec.IngestEnabled = boolPtrRC(false)
+	if err := k8sClient.Update(context.Background(), repo); err != nil {
+		t.Fatalf("disable ingest: %v", err)
+	}
+
+	reg := prometheus.NewRegistry()
+	r := newRepoReconciler()
+	r.Metrics = obs.NewOperatorMetrics(reg)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: "gonerepo"}}
+	if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := repoSeriesCount(t, reg); got != 1 {
+		t.Fatalf("ingest_failing series after reconcile = %d, want 1", got)
+	}
+
+	if err := k8sClient.Delete(context.Background(), getRepo(t, "gonerepo")); err != nil {
+		t.Fatalf("delete repo: %v", err)
+	}
+	if _, err := r.Reconcile(logf.IntoContext(context.Background(), logf.Log), req); err != nil {
+		t.Fatalf("reconcile after delete: %v", err)
+	}
+	if got := repoSeriesCount(t, reg); got != 0 {
+		t.Errorf("ingest_failing series after the Repository was deleted = %d, want 0", got)
+	}
+}
+
+// repoSeriesCount returns the number of live operator_repository_ingest_failing
+// series on reg.
+func repoSeriesCount(t *testing.T, reg *prometheus.Registry) int {
+	t.Helper()
+	n, err := testutil.GatherAndCount(reg, "operator_repository_ingest_failing")
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	return n
 }
