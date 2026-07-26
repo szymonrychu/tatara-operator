@@ -79,19 +79,20 @@ chart-lint:
 			exit 1; \
 		fi
 	@on=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'kind: PrometheusRule'); \
-		off=$$($(HELM_BIN) template charts/tatara-operator --set prometheusRule.enabled=false | grep -c 'kind: PrometheusRule'); \
+		off=$$($(HELM_BIN) template charts/tatara-operator --set prometheusRule.enabled=false | grep -c 'kind: PrometheusRule' || true); \
 		if [ "$$on" -ne 1 ] || [ "$$off" -ne 0 ]; then \
 			echo "chart-lint: PrometheusRule gating broken (enabled renders $$on want 1, disabled renders $$off want 0)"; \
 			exit 1; \
 		fi
-	@for m in operator_reconcile_total operator_task_terminal_total operator_turn_timeout_total operator_agent_boot_crash_total operator_agent_unreachable_termination_total operator_ingest_job_total operator_scm_writes_total operator_reap_delete_error_total operator_push_receive_total operator_memory_stacks operator_tasks_inflight operator_tasks_minted_per_sweep operator_sweep_mint_cap_hit_total tatara_lifecycle_giveup_total operator_admission_blocked_total operator_token_budget_used_ratio; do \
-		if ! $(HELM_BIN) template charts/tatara-operator | grep -q "$$m"; then \
+	@rendered="$$($(HELM_BIN) template charts/tatara-operator)"; \
+	for m in operator_reconcile_total operator_task_terminal_total operator_turn_timeout_total operator_agent_boot_crash_total operator_agent_unreachable_termination_total operator_ingest_job_total operator_scm_writes_total operator_reap_delete_error_total operator_push_receive_total operator_memory_stacks operator_tasks_inflight operator_tasks_minted_per_sweep operator_sweep_mint_cap_hit_total tatara_lifecycle_giveup_total operator_admission_blocked_total operator_token_budget_used_ratio; do \
+		if ! grep -q "$$m" <<<"$$rendered"; then \
 			echo "chart-lint: PrometheusRule references unknown/absent metric $$m"; \
 			exit 1; \
 		fi; \
 	done
 	@don=$$($(HELM_BIN) template charts/tatara-operator | grep -c 'grafana_dashboard: "1"'); \
-		doff=$$($(HELM_BIN) template charts/tatara-operator --set dashboard.enabled=false | grep -c 'grafana_dashboard: "1"'); \
+		doff=$$($(HELM_BIN) template charts/tatara-operator --set dashboard.enabled=false | grep -c 'grafana_dashboard: "1"' || true); \
 		if [ "$$don" -ne 1 ] || [ "$$doff" -ne 0 ]; then \
 			echo "chart-lint: dashboard ConfigMap gating broken (enabled renders $$don want 1, disabled renders $$doff want 0)"; \
 			exit 1; \
@@ -107,7 +108,7 @@ rbac:
 rbac-check:
 	HELM_BIN="$(HELM_BIN)" CONTROLLER_GEN="$(CONTROLLER_GEN)" RBAC_GEN_DIR="$(RBAC_GEN_DIR)" bash hack/check-rbac-drift.sh
 
-ci: generate manifests lint test rbac-check
+ci: generate manifests lint test rbac-check chart-lint
 
 clean:
 	rm -rf bin dist
