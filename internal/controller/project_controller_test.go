@@ -11,6 +11,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/memory"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -462,12 +463,117 @@ func TestUpdateQueueAgeGauge_OldestPerBucket(t *testing.T) {
 	olderAge := time.Since(older.CreationTimestamp.Time).Seconds()
 	newerAge := time.Since(newer.CreationTimestamp.Time).Seconds()
 
-	got := testutil.ToFloat64(r.Metrics.QueueAgeGauge(tataradevv1alpha1.QueueClassNormal, "1", tataradevv1alpha1.QueueStateQueued))
+	got := testutil.ToFloat64(r.Metrics.QueueAgeGauge("qag-proj", tataradevv1alpha1.QueueClassNormal, "1", tataradevv1alpha1.QueueStateQueued))
 	if got < olderAge-0.5 {
 		t.Fatalf("operator_queue_age_seconds = %v, want >= %v (at least as old as the OLDER event)", got, olderAge)
 	}
 	if got <= newerAge+0.4 {
 		t.Fatalf("operator_queue_age_seconds = %v looks like it picked the NEWER event (age %v); want the OLDER one to win", got, newerAge)
+	}
+}
+
+// TestUpdateMemoryStackCounts_PerProject guards issue #425:
+// operator_memory_stacks carries a project label, so a Provisioning or Failed
+// stack names the project it belongs to. Each project reports 1 for its current
+// phase and 0 for the others, and the per-pass Reset drops a deleted project's
+// series entirely.
+func TestUpdateMemoryStackCounts_PerProject(t *testing.T) {
+	ctx := context.Background()
+	r, reg := newProjectReconcilerWithReg()
+
+	for name, phase := range map[string]string{"msp-prov": "Provisioning", "msp-ready": "Ready"} {
+		mkSecret(t, name+"-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+		mkProject(t, name, name+"-scm")
+		p := getProject(t, name)
+		p.Status.Memory = &tataradevv1alpha1.MemoryStatus{Phase: phase}
+		if err := k8sClient.Status().Update(ctx, p); err != nil {
+			t.Fatalf("set %s memory phase: %v", name, err)
+		}
+	}
+
+	r.updateMemoryStackCounts(ctx)
+
+	if got := gatherMemoryStackProjectPhase(t, reg, "msp-prov", "Provisioning"); got != 1 {
+		t.Fatalf("msp-prov/Provisioning = %v, want 1", got)
+	}
+	if got := gatherMemoryStackProjectPhase(t, reg, "msp-prov", "Ready"); got != 0 {
+		t.Fatalf("msp-prov/Ready = %v, want 0", got)
+	}
+	if got := gatherMemoryStackProjectPhase(t, reg, "msp-ready", "Ready"); got != 1 {
+		t.Fatalf("msp-ready/Ready = %v, want 1", got)
+	}
+	if got := gatherMemoryStackProjectPhase(t, reg, "msp-ready", "Provisioning"); got != 0 {
+		t.Fatalf("msp-ready/Provisioning = %v, want 0", got)
+	}
+
+	// Deleting a project must drop its series on the next pass, not strand it at
+	// its last value - that is what the per-pass Reset buys.
+	victim := getProject(t, "msp-prov")
+	if err := k8sClient.Delete(ctx, victim); err != nil {
+		t.Fatalf("delete msp-prov: %v", err)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		var p tataradevv1alpha1.Project
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: testNS, Name: "msp-prov"}, &p)
+		if k8serrors.IsNotFound(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("project msp-prov not deleted within timeout")
+		}
+		time.Sleep(interval)
+	}
+	r.updateMemoryStackCounts(ctx)
+	if got := gatherMemoryStackProjectPhase(t, reg, "msp-prov", "Provisioning"); got != 0 {
+		t.Fatalf("msp-prov/Provisioning after delete = %v, want 0 (series gone)", got)
+	}
+	if got := gatherMemoryStackProjectPhase(t, reg, "msp-ready", "Ready"); got != 1 {
+		t.Fatalf("msp-ready/Ready after unrelated delete = %v, want 1 (unaffected)", got)
+	}
+}
+
+// TestUpdateQueueAgeGauge_PerProject guards issue #418: operator_queue_age_seconds
+// carries a project label, so an alert-class backlog in one project no longer
+// pages as if it belonged to another. Both projects hold a same-bucket
+// QueuedEvent; each must get its own series and neither may leak into the other.
+func TestUpdateQueueAgeGauge_PerProject(t *testing.T) {
+	ctx := context.Background()
+	r, _ := newProjectReconcilerWithReg()
+	mkSecret(t, "qagp-a-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+	mkProject(t, "qagp-a", "qagp-a-scm")
+	mkSecret(t, "qagp-b-scm", map[string][]byte{"token": []byte("t"), "webhookSecret": []byte("w")})
+	mkProject(t, "qagp-b", "qagp-b-scm")
+
+	priority := 0
+	for _, projectRef := range []string{"qagp-a", "qagp-b"} {
+		q := &tataradevv1alpha1.QueuedEvent{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "qagp-" + projectRef + "-", Namespace: testNS},
+			Spec: tataradevv1alpha1.QueuedEventSpec{
+				Seq: 1, Class: tataradevv1alpha1.QueueClassAlert, Kind: "incident",
+				ProjectRef: projectRef, Priority: &priority,
+				Payload: tataradevv1alpha1.QueuedEventPayload{Kind: "incident"},
+			},
+		}
+		if err := k8sClient.Create(ctx, q); err != nil {
+			t.Fatalf("create QueuedEvent for %s: %v", projectRef, err)
+		}
+	}
+
+	r.updateQueueAgeGauge(ctx)
+
+	for _, projectRef := range []string{"qagp-a", "qagp-b"} {
+		got := testutil.ToFloat64(r.Metrics.QueueAgeGauge(projectRef,
+			tataradevv1alpha1.QueueClassAlert, "0", tataradevv1alpha1.QueueStateQueued))
+		if got <= 0 {
+			t.Fatalf("operator_queue_age_seconds{project=%q,class=alert,priority=0} = %v, want > 0", projectRef, got)
+		}
+	}
+	// A project with no QueuedEvents at all must have no series of its own.
+	got := testutil.ToFloat64(r.Metrics.QueueAgeGauge("qagp-absent",
+		tataradevv1alpha1.QueueClassAlert, "0", tataradevv1alpha1.QueueStateQueued))
+	if got != 0 {
+		t.Fatalf("operator_queue_age_seconds{project=qagp-absent} = %v, want 0 (no events)", got)
 	}
 }
 

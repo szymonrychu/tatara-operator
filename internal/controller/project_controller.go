@@ -448,32 +448,34 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 	r.lastGaugeRecompute = time.Now()
 }
 
-// updateMemoryStackCounts lists all Projects and sets the operator_memory_stacks
-// gauge to the current cluster-wide count per phase. Projects without
-// status.memory are not counted.
+// memoryStackPhases is the full set of phases Project.Status.Memory reports.
+// updateMemoryStackCounts sets every one per project each pass so a phase a
+// project has left reads 0 rather than retaining its last value.
+var memoryStackPhases = []string{"Provisioning", "Ready", "Failed", "Degraded"}
+
+// updateMemoryStackCounts lists all Projects and sets operator_memory_stacks to
+// 1 for each project's current memory phase and 0 for the others (issue #425).
+// The per-pass Reset also drops the series of a project that has been deleted.
+// Projects without status.memory are not reported at all.
 func (r *ProjectReconciler) updateMemoryStackCounts(ctx context.Context) {
 	var list tataradevv1alpha1.ProjectList
 	if err := r.List(ctx, &list); err != nil {
 		return
 	}
-	var provisioning, ready, failed, degraded int
+	r.Metrics.ResetMemoryStacks()
 	for i := range list.Items {
-		mem := list.Items[i].Status.Memory
-		if mem == nil {
+		p := &list.Items[i]
+		if p.Status.Memory == nil {
 			continue
 		}
-		switch mem.Phase {
-		case "Provisioning":
-			provisioning++
-		case "Ready":
-			ready++
-		case "Failed":
-			failed++
-		case "Degraded":
-			degraded++
+		for _, phase := range memoryStackPhases {
+			v := 0.0
+			if p.Status.Memory.Phase == phase {
+				v = 1.0
+			}
+			r.Metrics.SetMemoryStackPhase(p.Name, phase, v)
 		}
 	}
-	r.Metrics.SetMemoryStackCounts(provisioning, ready, failed, degraded)
 }
 
 // lightragDocStatuses is the full set of ingestion statuses lightrag reports for
@@ -653,15 +655,16 @@ func (r *ProjectReconciler) updateTaskStageGauges(ctx context.Context) {
 }
 
 // queueAgeBucket keys the operator_queue_age_seconds aggregation (contract
-// K.1): the OLDEST QueuedEvent's age per (class,priority,state) bucket.
+// K.1): the OLDEST QueuedEvent's age per (project,class,priority,state) bucket.
 type queueAgeBucket struct {
-	class, priority, state string
+	project, class, priority, state string
 }
 
 // updateQueueAgeGauge recomputes operator_queue_age_seconds from authoritative
 // cluster state (contract K.1): the age of the OLDEST QueuedEvent in each
-// (class,priority,state) bucket. A Reset() before each pass ensures an emptied
-// bucket does not retain its last value.
+// (project,class,priority,state) bucket. A Reset() before each pass ensures an
+// emptied bucket does not retain its last value, and also drops the series of a
+// project that no longer has any QueuedEvents.
 func (r *ProjectReconciler) updateQueueAgeGauge(ctx context.Context) {
 	if r.Metrics == nil {
 		return
@@ -682,7 +685,7 @@ func (r *ProjectReconciler) updateQueueAgeGauge(ctx context.Context) {
 		if state == "" {
 			state = tataradevv1alpha1.QueueStateQueued
 		}
-		b := queueAgeBucket{class: q.Spec.Class, priority: priority, state: state}
+		b := queueAgeBucket{project: q.Spec.ProjectRef, class: q.Spec.Class, priority: priority, state: state}
 		created := q.CreationTimestamp.Time
 		if existing, ok := oldest[b]; !ok || created.Before(existing) {
 			oldest[b] = created
@@ -690,7 +693,7 @@ func (r *ProjectReconciler) updateQueueAgeGauge(ctx context.Context) {
 	}
 	now := time.Now()
 	for b, ts := range oldest {
-		r.Metrics.SetQueueAge(b.class, b.priority, b.state, now.Sub(ts).Seconds())
+		r.Metrics.SetQueueAge(b.project, b.class, b.priority, b.state, now.Sub(ts).Seconds())
 	}
 }
 
