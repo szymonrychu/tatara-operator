@@ -20,6 +20,23 @@ const (
 	LabelQueuedEvent = "tatara.dev/queued-event"
 	LabelDedupKey    = "tatara.dev/dedup-key"
 
+	// LabelMintedBy carries the UID of the QueuedEvent that MINTED this Task. It
+	// is the mint-idempotency link (issue #443): Task names are GenerateName-
+	// minted, so a Create can no longer collide and AlreadyExists is no longer
+	// an idempotency primitive. A crash between the Create and the Admitted
+	// status patch is absorbed by FINDING the Task through this label instead
+	// of minting a second one.
+	//
+	// Two properties are load-bearing, and neither is true of LabelQueuedEvent:
+	//   - it is never rewritten. The dispatcher moves LabelQueuedEvent onto the
+	//     current per-stage admission ticket (admitTicket) the moment the Task
+	//     takes its first stage step.
+	//   - it is the UID, not the name. QueuedEventName is a pure function of
+	//     (project, dedupKey), so every brainstorm/refine cycle re-creates the
+	//     SAME QueuedEvent name; matching by name would let a new cycle adopt
+	//     (and, if terminal, DELETE) the previous cycle's Task.
+	LabelMintedBy = "tatara.dev/minted-by"
+
 	// LabelAlertRuleKey stamps the incident rule-key (16-hex incidentDedupKey) on
 	// an Issue CR so admission (dedupExists) can suppress a same-rule refire while
 	// the open tracker Issue lives, even after its Task terminates. Same VALUE as
@@ -364,7 +381,18 @@ func IsAdmissionTicket(qe *tatarav1alpha1.QueuedEvent) bool {
 // payload.taskRef is NOT a mint (see IsAdmissionTicket) and is refused: minting
 // from it would create a SECOND Task alongside the one the ticket names.
 //
-// When payload.Name is empty, task.Name is set to payload.GenerateName+qe.Name.
+// When payload.Name is empty the Task is GENERATENAME-minted, from
+// payload.GenerateName+qe.Name+"-" (issue #443). It used to be NAMED
+// payload.GenerateName+qe.Name, which is a constant for a constant dedupKey
+// ("brainstorm-<project>", "refine-<project>"), so every cycle of a
+// project-scoped kind reused ONE Task name and therefore ONE agent branch
+// (agent.TaskBranch falls back to "tatara/task-<task-name>"): each cycle
+// collided with the previous cycle's abandoned branch.
+//
+// The Task carries LabelMintedBy (the minting QueuedEvent's UID) so the
+// dispatcher can still find the Task an event already minted - see
+// LabelMintedBy: without that lookup a GenerateName mint has no idempotency
+// primitive at all.
 func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alpha1.Project, scheme *runtime.Scheme) (*tatarav1alpha1.Task, error) {
 	p := qe.Spec.Payload
 	if p.TaskRef != "" {
@@ -390,7 +418,7 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 	if p.Name != "" {
 		om.Name = p.Name
 	} else {
-		om.Name = p.GenerateName + qe.Name
+		om.GenerateName = p.GenerateName + qe.Name + "-"
 	}
 	if bp := p.NewTask; bp != nil {
 		// The B.7 mint blueprint WINS over the flat legacy fields: a stage-driven
@@ -404,13 +432,24 @@ func BuildTaskFromQueuedEvent(qe *tatarav1alpha1.QueuedEvent, proj *tatarav1alph
 		if bp.Annotations != nil {
 			om.Annotations = bp.Annotations
 		}
-		om.Name = bp.Name
+		if bp.Name != "" {
+			// A blueprint that names the Task keeps that exact name; one that does
+			// not keeps the GenerateName mint set above (a bare `om.Name = bp.Name`
+			// would blank BOTH and leave the Create nameless).
+			om.Name = bp.Name
+			om.GenerateName = ""
+		}
 		spec.RepositoryRef = bp.RepositoryRef
 		spec.Goal = bp.Goal
 		spec.Kind = bp.Kind
 		spec.AlertRules = bp.AlertRules
 	}
 	labels[LabelQueuedEvent] = qe.Name
+	if qe.UID != "" {
+		// Empty only for a QueuedEvent that never went through an API server
+		// (unit tests); mintedTask treats an unset UID as "adopts nothing".
+		labels[LabelMintedBy] = string(qe.UID)
+	}
 	if qe.Spec.DedupKey != "" {
 		labels[LabelDedupKey] = dedupLabel(qe.Spec.DedupKey)
 	}

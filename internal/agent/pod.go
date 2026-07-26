@@ -381,6 +381,20 @@ func branchEnvValues(task *tatarav1alpha1.Task) (taskBranch, checkoutBranch stri
 	return TaskBranch(task), ""
 }
 
+// PushBranch is the branch a Task's pod actually PUSHES to (TASK_BRANCH), or ""
+// when it pushes nothing (a review Task checks its target out read-only). It is
+// branchEnvValues' first return, exported so the reaper can ask "does any LIVE
+// Task still push here?" before deleting a branch on the forge (issue #443).
+//
+// It is NOT TaskBranch: a takeover Task pushes to the ABANDONED MR's existing
+// head branch, which is the branch some OTHER (now terminal) Task derived from
+// its own name. Asking TaskBranch would miss exactly that case - the one where
+// deleting the branch destroys live work.
+func PushBranch(task *tatarav1alpha1.Task) string {
+	b, _ := branchEnvValues(task)
+	return b
+}
+
 // kindReview is the review Task kind (and the review agent kind - they share
 // the string).
 const kindReview = "review"

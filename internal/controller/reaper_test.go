@@ -1478,3 +1478,93 @@ func TestReapIgnoresUnstampedTasks(t *testing.T) {
 		t.Fatal("ReapTerminal collected a Task with no status.stage")
 	}
 }
+
+// TestReapRefusesBranchDeleteWhenALiveTaskPushesToIt is the safety gate on the
+// platform's only destructive forge call (issue #443). A takeover Task adopts an
+// abandoned MR and pushes to its EXISTING head branch - the branch the abandoned
+// (now terminal) Task derived from its own name. Reaping that Task must CLOSE
+// nothing it should not, and must NOT delete the branch out from under the live
+// takeover. reapWriter.DeleteBranch panics unless a test installs a func, so the
+// gate is asserted by the absence of the call, not by a flag.
+func TestReapRefusesBranchDeleteWhenALiveTaskPushesToIt(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("takeoverguard")
+	repo := reapRepo("takeoverguard", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	dying := reapTask("takeoverguard", "abandoned-task", "clarify",
+		tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
+	branch := agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "abandoned-task"}})
+	dying.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 4)}
+
+	// The live takeover: a DIFFERENT Task pushing to the SAME branch. Its own
+	// agent.TaskBranch is tatara/task-takeover-task, so a TaskBranch-based scan
+	// would answer "nobody pushes here" - which is exactly the miss this guards.
+	takeover := reapTask("takeoverguard", "takeover-task", "takeover",
+		tatarav1alpha1.StageImplementing, "", time.Now())
+	takeover.Annotations = map[string]string{tatarav1alpha1.AnnTakeoverHeadBranch: branch}
+
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.MergeRequestName(repo.Name, 4), Namespace: testNS,
+			OwnerReferences: []metav1.OwnerReference{reapOwnerRef("abandoned-task", true)},
+		},
+		Spec: tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: 4, ProjectRef: "takeoverguard"},
+	}
+	mr.Status.Author = "tatara-bot"
+	mr.Status.HeadBranch = branch
+	mr.Status.State = "open"
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), dying, takeover, mr)
+	w := &reapWriter{}
+	w.closePR = func(string, int, string) error { return nil }
+	r := reapReconciler(c, w)
+
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	if len(w.deleted) != 0 {
+		t.Fatalf("DeleteBranch calls = %v, want none: %q is still being pushed to by takeover-task", w.deleted, branch)
+	}
+}
+
+// TestReapDeletesBranchWhenOnlyTerminalTasksMapToIt is the other side of the
+// gate: a corpse referencing the branch must not preserve it forever, or the
+// backlog this issue is about simply grows more slowly.
+func TestReapDeletesBranchWhenOnlyTerminalTasksMapToIt(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("takeoverdead")
+	repo := reapRepo("takeoverdead", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	dying := reapTask("takeoverdead", "abandoned-task", "clarify",
+		tatarav1alpha1.StageFailed, stage.ReasonTurnBudgetExhausted, time.Now().Add(-8*24*time.Hour))
+	branch := agent.TaskBranch(&tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "abandoned-task"}})
+	dying.Status.MRRefs = []string{tatarav1alpha1.MergeRequestName(repo.Name, 5)}
+
+	deadTakeover := reapTask("takeoverdead", "takeover-task", "takeover",
+		tatarav1alpha1.StageRejected, stage.ReasonMRClosedExternally, time.Now())
+	deadTakeover.Annotations = map[string]string{tatarav1alpha1.AnnTakeoverHeadBranch: branch}
+
+	mr := &tatarav1alpha1.MergeRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.MergeRequestName(repo.Name, 5), Namespace: testNS,
+			OwnerReferences: []metav1.OwnerReference{reapOwnerRef("abandoned-task", true)},
+		},
+		Spec: tatarav1alpha1.MergeRequestSpec{RepositoryRef: repo.Name, Number: 5, ProjectRef: "takeoverdead"},
+	}
+	mr.Status.Author = "tatara-bot"
+	mr.Status.HeadBranch = branch
+	mr.Status.State = "open"
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), dying, deadTakeover, mr)
+	w := &reapWriter{}
+	w.closePR = func(string, int, string) error { return nil }
+	w.deleteBrnch = func(string, string) error { return nil }
+	r := reapReconciler(c, w)
+
+	if err := r.ReapTerminal(ctx, proj); err != nil {
+		t.Fatalf("ReapTerminal: %v", err)
+	}
+	if len(w.deleted) != 1 || w.deleted[0] != branch {
+		t.Fatalf("DeleteBranch calls = %v, want exactly [%s]", w.deleted, branch)
+	}
+}
