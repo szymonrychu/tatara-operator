@@ -51,6 +51,18 @@ var (
 		Name: "operator_rest_takeover_error_total",
 		Help: "Internal errors in the OP9 mr-takeover endpoint, by stage.",
 	}, []string{"stage"})
+
+	// RestNotesRehydrateFailedTotal counts spilled note batches that
+	// task_context(notes=all) could not read back from tatara-memory. The read
+	// now serves the notes it HAS instead of 502-ing the whole response, so
+	// without this counter a permanently unreadable batch would be invisible:
+	// every agent would just quietly get a shorter history than it asked for.
+	// Labelled by project because each Project runs its own memory endpoint and
+	// one project's outage must not read as the fleet's.
+	RestNotesRehydrateFailedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "operator_restapi_notes_rehydrate_failed_total",
+		Help: "Spilled note batches task_context(notes=all) could not rehydrate from tatara-memory, by project.",
+	}, []string{"project"})
 )
 
 func init() {
@@ -60,6 +72,7 @@ func init() {
 		RestOwnershipRefusedTotal,
 		RestCIReadTotal,
 		RestTakeoverErrorTotal,
+		RestNotesRehydrateFailedTotal,
 	)
 	// Pre-seed the three real takeover-error stage label sets so a healthy
 	// operator exposes a zero baseline from startup (metric-wiring audit

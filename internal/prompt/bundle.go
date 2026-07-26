@@ -67,6 +67,10 @@ type Input struct {
 	// normal path; a notes=all caller that rehydrated the spilled notes sets it
 	// explicitly so the marker does not double-count them.
 	NotesTotal int
+	// NotesUnavailable is how many of those notes the caller could NOT read
+	// back (spilled batches tatara-memory refused). A notes=all read serves
+	// partial rather than failing, so the bundle must say so out loud.
+	NotesUnavailable int
 	// Assignment is the skill-driven assignment text. It is operator-authored
 	// and is NOT escaped: it sits outside the XML bundle. It MUST NEVER embed
 	// user-controlled text (e.g. Task.Spec.Goal, which is derived from an
@@ -143,8 +147,14 @@ type noteView struct {
 
 type notesView struct {
 	Total, Rendered, Elided int
-	Fetch                   string
-	Items                   []noteView
+	// Unavailable is the count of notes the caller KNOWS exist but could not
+	// read back (a spilled batch tatara-memory would not serve). It renders as
+	// its own attribute so a partial history can never be mistaken for a
+	// complete one: elided alone is ambiguous, since it also covers notes the
+	// byte plan simply did not fit.
+	Unavailable int
+	Fetch       string
+	Items       []noteView
 }
 
 type eventView struct {
@@ -235,7 +245,7 @@ const noteTmpl = `{{define "note"}}
     <note agent="{{x .Agent}}" at="{{x .At}}" kind="{{x .Kind}}" source="{{x .Source}}">{{x .Body}}</note>{{end}}`
 
 const notesTmpl = `{{define "notes"}}
-  <notes total="{{.Total}}" rendered="{{.Rendered}}" elided="{{.Elided}}"{{if .Fetch}} fetch="{{x .Fetch}}"{{end}}{{if .Items}}>
+  <notes total="{{.Total}}" rendered="{{.Rendered}}" elided="{{.Elided}}"{{if .Unavailable}} unavailable="{{.Unavailable}}"{{end}}{{if .Fetch}} fetch="{{x .Fetch}}"{{end}}{{if .Items}}>
 {{- range .Items}}{{template "note" .}}{{end}}
   </notes>{{else}}/>{{end}}{{end}}`
 
@@ -505,7 +515,10 @@ func buildView(in Input, issues []v1alpha1.Issue, mrs []v1alpha1.MergeRequest, t
 
 	if notesTotal > 0 {
 		kept := in.Notes[len(in.Notes)-p.notes:]
-		nv := &notesView{Total: notesTotal, Rendered: len(kept), Elided: notesTotal - len(kept)}
+		nv := &notesView{
+			Total: notesTotal, Rendered: len(kept), Elided: notesTotal - len(kept),
+			Unavailable: in.NotesUnavailable,
+		}
 		if nv.Elided > 0 {
 			nv.Fetch = fmt.Sprintf("task_context(task=%s, notes=all)", in.Task.Name)
 		}

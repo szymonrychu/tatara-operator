@@ -68,6 +68,16 @@ func (r *ProjectReconciler) driver() *StageDriver {
 	}
 }
 
+// spillerFor resolves the per-project spiller for the ProjectReconciler's own
+// direct objbudget.Fit* calls (the doc-batch stamp), nil-safe for unit tests
+// exactly like Minter.spillerFor below.
+func (r *ProjectReconciler) spillerFor(proj *tatarav1alpha1.Project) objbudget.Spiller {
+	if r.SpillerFor == nil || proj == nil {
+		return nil
+	}
+	return r.SpillerFor(proj)
+}
+
 // spillerFor resolves the per-project spiller EnsureTaskForMRComment mints
 // with. A nil SpillerFor yields a nil Spiller: safe for a genuinely fresh
 // mint (the synced MR snapshot carries no comments to evict yet), and matches

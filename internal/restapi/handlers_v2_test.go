@@ -3,6 +3,7 @@ package restapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -492,6 +493,98 @@ func TestTaskContext_NotesAll_RehydratesSpilledNotes(t *testing.T) {
 	require.NotContains(t, w.Body.String(), "SPILLED-ONE")
 }
 
+// TestTaskContext_NotesAll_ServesPartialOnRehydrateFailure: one unresolvable
+// spilled ref used to abort the WHOLE response with a 502, so a tatara-memory
+// outage made the entire note history unreadable - including the notes sitting
+// right there in the CR. A read loses nothing by serving what it has, PROVIDED
+// the partiality is unmistakable: the JSON carries notesTruncated plus the
+// unavailable-ref count, and the bundle's <notes> marker carries
+// unavailable="N" next to its total/rendered/elided.
+func TestTaskContext_NotesAll_ServesPartialOnRehydrateFailure(t *testing.T) {
+	okBatch, err := json.Marshal([]tatarav1alpha1.Note{
+		{At: metav1.NewTime(frozenNow.Add(-3 * time.Hour)), Agent: "implement", Kind: "note", Body: "SPILLED-OK"},
+	})
+	require.NoError(t, err)
+
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task.Status.Notes = []tatarav1alpha1.Note{
+		{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
+	}
+	task.Status.Stats.NotesSpilled = 4
+	task.Status.Stats.NotesSpilledRefs = []string{"track-1", "track-gone"}
+
+	// track-gone is absent from the fake, so Fetch fails for it and only for it.
+	e := buildV2(t, v2Opts{memory: &fakeMemory{byTrack: map[string]json.RawMessage{"track-1": okBatch}}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodGet, "/tasks/t1/context?notes=all", "")
+	require.Equal(t, http.StatusOK, w.Code, "a partial rehydrate must not 502 the whole read")
+
+	var resp struct {
+		Bundle               string `json:"bundle"`
+		NotesTruncated       bool   `json:"notesTruncated"`
+		NotesUnavailableRefs int    `json:"notesUnavailableRefs"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.True(t, resp.NotesTruncated)
+	require.Equal(t, 1, resp.NotesUnavailableRefs)
+	require.Contains(t, resp.Bundle, "SPILLED-OK", "the batch that DID resolve is still served")
+	require.Contains(t, resp.Bundle, "LIVE-NOTE", "the in-CR notes are served regardless")
+	// 4 spilled total, 1 came back: 3 notes are unreadable.
+	require.Contains(t, resp.Bundle, `unavailable="3"`,
+		"the bundle must say out loud that the history is incomplete")
+}
+
+// TestTaskContext_NotesAll_NoMemoryClientServesPartial: an unconfigured
+// NoteFetcher is the same class of failure as an unreachable one. It must not
+// 502 either; every spilled ref counts as unavailable.
+func TestTaskContext_NotesAll_NoMemoryClientServesPartial(t *testing.T) {
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task.Status.Notes = []tatarav1alpha1.Note{
+		{At: metav1.NewTime(frozenNow), Agent: "implement", Kind: "handoff", Body: "LIVE-NOTE"},
+	}
+	task.Status.Stats.NotesSpilled = 2
+	task.Status.Stats.NotesSpilledRefs = []string{"track-1", "track-2"}
+
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodGet, "/tasks/t1/context?notes=all", "")
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Bundle               string `json:"bundle"`
+		NotesTruncated       bool   `json:"notesTruncated"`
+		NotesUnavailableRefs int    `json:"notesUnavailableRefs"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.True(t, resp.NotesTruncated)
+	require.Equal(t, 2, resp.NotesUnavailableRefs)
+	require.Contains(t, resp.Bundle, "LIVE-NOTE")
+	require.Contains(t, resp.Bundle, `unavailable="2"`)
+}
+
+// TestTaskContext_NotesAll_CompleteHistoryIsNotFlaggedTruncated is the negative
+// half: notesTruncated must be ABSENT on a fully-resolved read, or the flag is
+// noise an agent learns to ignore.
+func TestTaskContext_NotesAll_CompleteHistoryIsNotFlaggedTruncated(t *testing.T) {
+	spilled, err := json.Marshal([]tatarav1alpha1.Note{
+		{At: metav1.NewTime(frozenNow.Add(-time.Hour)), Agent: "implement", Kind: "note", Body: "SPILLED-ONE"},
+	})
+	require.NoError(t, err)
+
+	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageImplementing, "implement")
+	task.Status.Stats.NotesSpilled = 1
+	task.Status.Stats.NotesSpilledRefs = []string{"track-1"}
+
+	e := buildV2(t, v2Opts{memory: &fakeMemory{byTrack: map[string]json.RawMessage{"track-1": spilled}}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	w := e.do(t, http.MethodGet, "/tasks/t1/context?notes=all", "")
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotContains(t, w.Body.String(), "notesTruncated")
+	require.NotContains(t, w.Body.String(), "unavailable=")
+}
+
 // --- 7. POST /tasks/{t}/notes ---------------------------------------------
 
 func TestPostNote_StampsAgentFromStatus(t *testing.T) {
@@ -580,6 +673,53 @@ func TestPostNote_At50TheOldestIsSpilledNot409(t *testing.T) {
 	require.Equal(t, 1, got.Status.Stats.NotesSpilled)
 	require.Equal(t, []string{"track-1"}, got.Status.Stats.NotesSpilledRefs)
 	require.Len(t, e.spiller.batches, 1)
+}
+
+// TestPostNote_AtCapWithBrokenSpillerIs503 pins the reporting, not the policy.
+// The write still FAILS when the oldest note cannot be spilled - that is the
+// deliberate A.7 blocking decision, and nothing here drops a note - but a 500
+// or a 502 reads as an operator bug and tells the caller to give up, while a
+// 503 plus Retry-After says "the dependency is down, come back", which is
+// exactly what a tatara-memory outage is.
+func TestPostNote_AtCapWithBrokenSpillerIs503(t *testing.T) {
+	capped := func() *tatarav1alpha1.Task {
+		task := taskV2("t1", "tatara", "implement", tatarav1alpha1.StageImplementing, "implement")
+		for i := 0; i < 50; i++ {
+			task.Status.Notes = append(task.Status.Notes, tatarav1alpha1.Note{
+				At:    metav1.NewTime(frozenNow.Add(time.Duration(i) * time.Minute)),
+				Agent: "implement", Kind: "note", Body: fmt.Sprintf("note-%02d", i),
+			})
+		}
+		return task
+	}
+
+	tests := []struct {
+		name string
+		opts v2Opts
+	}{
+		{name: "spill fails", opts: v2Opts{spillerErr: errors.New("tatara-memory unreachable")}},
+		{name: "no spiller configured", opts: v2Opts{
+			spillerFor: func(*tatarav1alpha1.Project) objbudget.Spiller { return nil },
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			task := capped()
+			e := buildV2(t, tc.opts, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/notes", `{"kind":"handoff","body":"THE HANDOFF"}`)
+			require.Equal(t, http.StatusServiceUnavailable, w.Code)
+			require.Equal(t, "10", w.Header().Get("Retry-After"))
+
+			// The block loses NOTHING: the 50 stored notes are untouched and the
+			// new one was not written either.
+			got := e.task(t, "t1")
+			require.Len(t, got.Status.Notes, 50)
+			require.Equal(t, "note-00", got.Status.Notes[0].Body)
+			require.Equal(t, 0, got.Status.Stats.NotesSpilled)
+		})
+	}
 }
 
 func TestPostNote_UnknownFieldIs400(t *testing.T) {

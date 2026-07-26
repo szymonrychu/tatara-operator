@@ -142,7 +142,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 // STARVES, never gets an agent slot, times out at 2h having run ZERO pods, and
 // stamps every member as documented. Result: on a busy project the docs are never
 // written, every night, silently.
-func (r *ProjectReconciler) ResolveDocBatch(ctx context.Context, batch *tatarav1alpha1.Task) error {
+func (r *ProjectReconciler) ResolveDocBatch(ctx context.Context, proj *tatarav1alpha1.Project, batch *tatarav1alpha1.Task) error {
 	if batch.Spec.Kind != DocBatchKind || len(batch.Spec.DocumentsTasks) == 0 {
 		return nil
 	}
@@ -168,7 +168,7 @@ func (r *ProjectReconciler) ResolveDocBatch(ctx context.Context, batch *tatarav1
 			"action", "doc_batch_abandoned", "resource_id", batch.Name,
 			"reason", obs.DocAbandonedTimeout, "pod_runs", batch.Status.Stats.PodRuns)
 	}
-	if err := r.StampDocumentedBy(ctx, batch); err != nil {
+	if err := r.StampDocumentedBy(ctx, proj, batch); err != nil {
 		return err
 	}
 	return r.annotateTask(ctx, batch, AnnDocBatchResolved, "true")
@@ -178,8 +178,14 @@ func (r *ProjectReconciler) ResolveDocBatch(ctx context.Context, batch *tatarav1
 // Task. It is what un-pins them from the reaper's delivered gate. An already-
 // stamped Task keeps its FIRST batch: the parent belongs to the batch that
 // actually covered it.
-func (r *ProjectReconciler) StampDocumentedBy(ctx context.Context, batch *tatarav1alpha1.Task) error {
+//
+// proj is threaded in solely to resolve the A.7 spiller. This used to pass a
+// literal nil, and a covered Task whose notes were over budget PANICKED on the
+// nil Spiller interface inside FitTask - recovered by controller-runtime into
+// an endless requeue that never named its cause.
+func (r *ProjectReconciler) StampDocumentedBy(ctx context.Context, proj *tatarav1alpha1.Project, batch *tatarav1alpha1.Task) error {
 	l := log.FromContext(ctx)
+	sp := r.spillerFor(proj)
 	for _, name := range batch.Spec.DocumentsTasks {
 		key := client.ObjectKey{Namespace: batch.Namespace, Name: name}
 		var parent tatarav1alpha1.Task
@@ -192,7 +198,7 @@ func (r *ProjectReconciler) StampDocumentedBy(ctx context.Context, batch *tatara
 		if parent.Status.DocumentedBy != "" {
 			continue
 		}
-		err := objbudget.FitTask(ctx, r.Client, nil, key, func(cur *tatarav1alpha1.Task) {
+		err := objbudget.FitTask(ctx, r.Client, sp, key, func(cur *tatarav1alpha1.Task) {
 			if cur.Status.DocumentedBy == "" {
 				cur.Status.DocumentedBy = batch.Name
 			}
@@ -212,7 +218,7 @@ func (r *ProjectReconciler) StampDocumentedBy(ctx context.Context, batch *tatara
 // waits at most docStageBudget past the batch that picks it up, and the batch is
 // force-terminated at exactly that budget. A documentation Task can never pin its
 // parent forever.
-func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, batch *tatarav1alpha1.Task, now time.Time) error {
+func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, proj *tatarav1alpha1.Project, batch *tatarav1alpha1.Task, now time.Time) error {
 	mrs, err := r.ownedMRs(ctx, batch)
 	if err != nil {
 		return err
@@ -220,7 +226,7 @@ func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, batch *tatarav1
 	// Through the CHOKE POINT: delivered(doc-timeout) is a terminal outcome and
 	// must fire operator_task_terminal_total like every other one.
 	stamp := metav1.NewTime(now)
-	if err := EnterStage(ctx, r.Client, nil, r.Metrics, batch, mrs,
+	if err := EnterStage(ctx, r.Client, r.spillerFor(proj), r.Metrics, batch, mrs,
 		tatarav1alpha1.StageDelivered, stage.ReasonDocTimeout, now, func(t *tatarav1alpha1.Task) {
 			t.Status.DeliveredAt = &stamp
 		}); err != nil {
@@ -229,7 +235,7 @@ func (r *ProjectReconciler) forceDocTimeout(ctx context.Context, batch *tatarav1
 	log.FromContext(ctx).Info("documentation batch exceeded docStageBudget; forced to delivered(doc-timeout)",
 		"action", "doc_batch_timeout", "resource_id", batch.Name,
 		"pod_runs", batch.Status.Stats.PodRuns, "covers", len(batch.Spec.DocumentsTasks))
-	return r.ResolveDocBatch(ctx, batch)
+	return r.ResolveDocBatch(ctx, proj, batch)
 }
 
 // needsDocumenting is THE predicate. It gates BOTH the nightly covered set AND

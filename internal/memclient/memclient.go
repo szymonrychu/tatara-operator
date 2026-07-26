@@ -228,15 +228,64 @@ func (c *Client) Fetch(ctx context.Context, trackID string) (json.RawMessage, er
 	return json.RawMessage(m.Text), nil
 }
 
+// retryBackoff is the delay before each retry attempt inside do: ~200ms
+// before the first retry, ~1s before the second, so at most 2 retries (3
+// attempts total) add ~1.2s worst case. A package-level var, not a const, so
+// a test can shrink it and keep the retry-path suite fast.
+var retryBackoff = []time.Duration{200 * time.Millisecond, time.Second}
+
 // do issues an HTTP request against the memory service, attaching the bearer
 // token and reading a bounded response body. It returns the raw response body
 // on 2xx, or a *RetryableError/*TerminalError otherwise.
+//
+// A retryable failure (5xx/429, or a transport-level error) is retried up to
+// len(retryBackoff) times; a terminal failure (any other 4xx) and a
+// token-mint or request-build failure are returned immediately, never
+// retried - retrying a permanent rejection or a client misconfiguration
+// cannot change the outcome. Each attempt rebuilds the request from body
+// (doOnce takes the []byte, not a shared reader), because an *http.Request's
+// body reader is single-use and cannot be replayed across attempts. Retrying
+// a POST /memories is safe even though it is not naturally idempotent HTTP:
+// the package doc comment above records that LightRAG answers a duplicate
+// insert with status "duplicated" and the same track_id, so a retried Spill
+// cannot create a second record.
+//
+// http.Client.Timeout (requestTimeout, 15s by default) bounds each attempt
+// independently, not the call as a whole: with no deadline on ctx, worst-case
+// wall time is 3 attempts * 15s plus up to ~1.2s of backoff between them.
 func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
 	tok, err := c.token(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("memclient: mint token for %s: %w", path, err)
 	}
 
+	for attempt := 0; ; attempt++ {
+		respBody, err := c.doOnce(ctx, method, path, body, tok)
+		if err == nil {
+			return respBody, nil
+		}
+		if !errors.Is(err, ErrRetryable) || attempt >= len(retryBackoff) {
+			return nil, err
+		}
+		slog.WarnContext(ctx, "memclient: retrying after transient error",
+			"attempt", attempt+1, "path", path, "status", retryableStatus(err), "error", err)
+
+		select {
+		case <-ctx.Done():
+			// ctx.Err() is more actionable than the transient HTTP error that
+			// triggered the wait: it tells the caller WHY the retry loop
+			// stopped (deadline exceeded / cancelled) instead of replaying a
+			// 503 that is no longer the reason the request failed.
+			return nil, fmt.Errorf("memclient: %s: %w", path, ctx.Err())
+		case <-time.After(retryBackoff[attempt]):
+		}
+	}
+}
+
+// doOnce performs a single HTTP attempt. body is passed as a []byte, not a
+// reader, so do can call this once per attempt and get a fresh, unconsumed
+// bytes.Reader every time.
+func (c *Client) doOnce(ctx context.Context, method, path string, body []byte, tok string) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -264,4 +313,14 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 		return nil, classify(resp.StatusCode, respBody, path)
 	}
 	return respBody, nil
+}
+
+// retryableStatus extracts the HTTP status from a retryable error for
+// logging, or 0 when the failure was transport-level (no response at all).
+func retryableStatus(err error) int {
+	var re *RetryableError
+	if errors.As(err, &re) {
+		return re.Status
+	}
+	return 0
 }
