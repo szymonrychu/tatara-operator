@@ -114,7 +114,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "memory re-ingest is failing for a repo"
-            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 15m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138)."
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) has been in a failing ingest state (status Phase=Failed or unresolved consecutive ingest failures) for 15m: its recall corpus is going stale. This keys on the live per-repo operator_repository_ingest_failing gauge derived from the Repository status, so it clears the moment a re-ingest succeeds. Unlike the old increase(operator_ingest_job_total[1h]) alert it does NOT keep firing for an hour after a transient incremental burst self-heals via the full-ingest fallback (issue #138)."
         - alert: TataraIngestGated
           expr: operator_repository_ingest_gated > 0
           for: 1h
@@ -122,7 +122,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "memory re-ingest is held by the memory-readiness gate"
-            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} has had its re-ingest held by the project memory-readiness gate for 1h. The gate is a SILENT hold - nothing fails and nothing retries - so operator_repository_ingest_failing reads 0 throughout and TataraIngestJobFailing cannot see it; a 37h fleet-wide freeze was previously caught only by TataraIngestStale's 26h backstop (issue #434). The gate normally clears within the 3m memory-Ready stabilization window, so an hour of it means the project's memory stack is not converging - check operator_memory_stacks for that project."
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) has had its re-ingest held by the project memory-readiness gate for 1h. The gate is a SILENT hold - nothing fails and nothing retries - so operator_repository_ingest_failing reads 0 throughout and TataraIngestJobFailing cannot see it; a 37h fleet-wide freeze was previously caught only by TataraIngestStale's 26h backstop (issue #434). The gate normally clears within the 3m memory-Ready stabilization window, so an hour of it means the project's memory stack is not converging - check operator_memory_stacks for that project."
         - alert: TataraIngestStale
           expr: (time() - operator_repository_last_ingest_timestamp_seconds) > {{ .Values.prometheusRule.ingestStaleAfterSeconds }}
           for: 30m
@@ -130,7 +130,7 @@ spec:
             severity: {{ .Values.prometheusRule.severityLabel | quote }}
           annotations:
             summary: "a repo has not been re-ingested recently"
-            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} last ingested {{ "{{" }} $value | humanizeDuration {{ "}}" }} ago, past the {{ .Values.prometheusRule.ingestStaleAfterSeconds }}s staleness budget: the recall corpus is going stale even though no ingest Job is actively failing (e.g. the re-ingest cron is not landing). Tune via prometheusRule.ingestStaleAfterSeconds."
+            description: "Repository {{ "{{" }} $labels.repo {{ "}}" }} (project {{ "{{" }} $labels.project {{ "}}" }}) last ingested {{ "{{" }} $value | humanizeDuration {{ "}}" }} ago, past the {{ .Values.prometheusRule.ingestStaleAfterSeconds }}s staleness budget: the recall corpus is going stale even though no ingest Job is actively failing (e.g. the re-ingest cron is not landing). Tune via prometheusRule.ingestStaleAfterSeconds."
         - alert: TataraSCMWriteErrors
           expr: increase(operator_scm_writes_total{kind="write",result="error"}[15m]) > 0
           labels:
