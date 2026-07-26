@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -346,11 +347,21 @@ func TestReconcileStage_MintIsIdempotentAgainstAStaleCache(t *testing.T) {
 	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
-		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+		WithStatusSubresource(&tatarav1alpha1.Task{}).
+		// projectRepos lists on this index. It was never reached before: the
+		// memory gate stopped the reconcile one step earlier.
+		WithIndex(&tatarav1alpha1.Repository{}, taskIndexRepositoryRef, func(obj client.Object) []string {
+			repo := obj.(*tatarav1alpha1.Repository)
+			if repo.Spec.ProjectRef == "" {
+				return nil
+			}
+			return []string{repo.Spec.ProjectRef}
+		}).Build()
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
 	require.NoError(t, err, "a mint the API server already has is a NO-OP, not an error")
@@ -376,7 +387,8 @@ func TestReconcileStage_MintStillMintsWhenTheApiServerAgrees(t *testing.T) {
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, fresh, time.Unix(1000, 0))
 	require.NoError(t, err)
@@ -417,11 +429,21 @@ func TestReconcileStage_TriagingIsIdempotentAgainstAStaleCache(t *testing.T) {
 	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
-		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+		WithStatusSubresource(&tatarav1alpha1.Task{}).
+		// projectRepos lists on this index. It was never reached before: the
+		// memory gate stopped the reconcile one step earlier.
+		WithIndex(&tatarav1alpha1.Repository{}, taskIndexRepositoryRef, func(obj client.Object) []string {
+			repo := obj.(*tatarav1alpha1.Repository)
+			if repo.Spec.ProjectRef == "" {
+				return nil
+			}
+			return []string{repo.Spec.ProjectRef}
+		}).Build()
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
 	require.NoError(t, err, "re-triaging a Task the API server already advanced is a NO-OP, not an error")
@@ -450,7 +472,8 @@ func TestReconcileStage_TriagingStillTriagesWhenTheApiServerAgrees(t *testing.T)
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, task, time.Unix(1000, 0))
 	require.NoError(t, err)
@@ -509,11 +532,21 @@ func TestReconcileStage_PodStageCapsAreIdempotentAgainstAStaleCache(t *testing.T
 	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
-		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+		WithStatusSubresource(&tatarav1alpha1.Task{}).
+		// projectRepos lists on this index. It was never reached before: the
+		// memory gate stopped the reconcile one step earlier.
+		WithIndex(&tatarav1alpha1.Repository{}, taskIndexRepositoryRef, func(obj client.Object) []string {
+			repo := obj.(*tatarav1alpha1.Repository)
+			if repo.Spec.ProjectRef == "" {
+				return nil
+			}
+			return []string{repo.Spec.ProjectRef}
+		}).Build()
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, stale, now)
 	require.NoError(t, err, "re-failing a Task the API server already failed is a NO-OP, not an error")
@@ -543,11 +576,21 @@ func TestReconcileStage_DriftIsCounted(t *testing.T) {
 	require.NoError(t, tatarav1alpha1.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proj, live).
-		WithStatusSubresource(&tatarav1alpha1.Task{}).Build()
+		WithStatusSubresource(&tatarav1alpha1.Task{}).
+		// projectRepos lists on this index. It was never reached before: the
+		// memory gate stopped the reconcile one step earlier.
+		WithIndex(&tatarav1alpha1.Repository{}, taskIndexRepositoryRef, func(obj client.Object) []string {
+			repo := obj.(*tatarav1alpha1.Repository)
+			if repo.Spec.ProjectRef == "" {
+				return nil
+			}
+			return []string{repo.Spec.ProjectRef}
+		}).Build()
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, stale, time.Unix(1000, 0))
 	require.NoError(t, err)
@@ -577,7 +620,8 @@ func TestReconcileStage_NoDriftIsNotCounted(t *testing.T) {
 
 	r := &TaskReconciler{
 		Client: c, APIReader: c, Scheme: scheme,
-		Metrics: obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		Metrics:   obs.NewOperatorMetrics(prometheus.NewRegistry()),
+		PodConfig: tsPodConfig(),
 	}
 	_, err := r.reconcileStage(context.Background(), proj, task, time.Unix(1000, 0))
 	require.NoError(t, err)

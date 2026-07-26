@@ -5,10 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 )
 
 // TestReadySince_TransitionEdges verifies that reconcileMemory stamps ReadySince on
@@ -79,110 +81,92 @@ func TestReadySince_TransitionEdges(t *testing.T) {
 	}
 }
 
-// TestMemoryStablyReady covers the stabilization helper.
-func TestMemoryStablyReady(t *testing.T) {
-	now := time.Now()
-	pastWindow := now.Add(-(memoryReadyStabilizationWindow + time.Minute))
-	withinWindow := now.Add(-(memoryReadyStabilizationWindow / 2))
-	rs := func(t time.Time) *metav1.Time { mt := metav1.NewTime(t); return &mt }
+// ---------------------------------------------------------------------------
+// MEMORY IS NOT A SPAWN GATE. The admission gate (task_controller.go) and the
+// pre-SubmitTurn gate (task_stage.go, issue #355) are GONE: they held every
+// Task indefinitely at a 15s poll with no timeout and no escape hatch, and the
+// documented outage that motivated them ran 7h+. An agent now SPAWNS with
+// memory down, is told so via TATARA_MEMORY_DEGRADED and the degraded prompt
+// appendix, and completes its assignment with reduced recall. The stably-ready
+// predicate survives - it gates INGEST (repository_controller.go), where a
+// partial corpus would actually be written - and it drives the degraded flag.
+// ---------------------------------------------------------------------------
 
-	cases := []struct {
-		name      string
-		memory    *tatarav1alpha1.MemoryStatus
-		wantReady bool
-	}{
-		{
-			name:      "nil memory status",
-			memory:    nil,
-			wantReady: false,
-		},
-		{
-			name:      "provisioning phase",
-			memory:    &tatarav1alpha1.MemoryStatus{Phase: "Provisioning"},
-			wantReady: false,
-		},
-		{
-			name:      "ready but no ReadySince",
-			memory:    &tatarav1alpha1.MemoryStatus{Phase: "Ready"},
-			wantReady: false,
-		},
-		{
-			name:      "ready but ReadySince within stabilization window",
-			memory:    &tatarav1alpha1.MemoryStatus{Phase: "Ready", ReadySince: rs(withinWindow)},
-			wantReady: false,
-		},
-		{
-			name:      "ready and ReadySince past stabilization window",
-			memory:    &tatarav1alpha1.MemoryStatus{Phase: "Ready", ReadySince: rs(pastWindow)},
-			wantReady: true,
-		},
-		{
-			name:      "ready and ReadySince exactly at window boundary",
-			memory:    &tatarav1alpha1.MemoryStatus{Phase: "Ready", ReadySince: rs(now.Add(-memoryReadyStabilizationWindow))},
-			wantReady: true,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			p := &tatarav1alpha1.Project{}
-			p.Status.Memory = tc.memory
-			got := memoryStablyReady(p, now)
-			if got != tc.wantReady {
-				t.Fatalf("memoryStablyReady = %v, want %v", got, tc.wantReady)
-			}
-		})
-	}
-}
-
-// TestTaskGate_SpawnOnly_InflightTurnNotGated verifies that a task with an
-// in-flight turn is not blocked by the memory gate even when memory is not yet
-// stably ready (ReadySince within window). The gate must be spawn-only.
-func TestTaskGate_SpawnOnly_InflightTurnNotGated(t *testing.T) {
-	mkTaskProject(t, "p-spawnonly", 3)
-	mkTaskRepository(t, "r-spawnonly", "p-spawnonly")
-	mkTask(t, "t-spawnonly", "p-spawnonly", "r-spawnonly")
-
-	// Set memory Ready but with ReadySince just now (within the stabilization window).
-	now := metav1.Now()
+func setProjectMemory(t *testing.T, name string, mem *tatarav1alpha1.MemoryStatus) {
+	t.Helper()
 	p := &tatarav1alpha1.Project{}
 	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "p-spawnonly"}, p); err != nil {
+		types.NamespacedName{Namespace: testNS, Name: name}, p); err != nil {
 		t.Fatalf("get project: %v", err)
 	}
-	p.Status.Memory = &tatarav1alpha1.MemoryStatus{
-		Phase:      "Ready",
-		Endpoint:   "http://mem-p-spawnonly.tatara.svc:8080",
-		ReadySince: &now, // within window -> not stably ready
-	}
+	p.Status.Memory = mem
 	if err := k8sClient.Status().Update(context.Background(), p); err != nil {
 		t.Fatalf("set memory: %v", err)
 	}
+}
 
-	// Give the task a live pod stage with a RUNNING pod (podStartedAt set) and an
-	// in-flight turn: an already-running agent surviving a memory blip. The gate
-	// is SPAWN-ONLY, keyed on podStartedAt == nil.
-	tk := &tatarav1alpha1.Task{}
-	if err := k8sClient.Get(context.Background(),
-		types.NamespacedName{Namespace: testNS, Name: "t-spawnonly"}, tk); err != nil {
-		t.Fatalf("get task: %v", err)
-	}
-	started := metav1.Now()
-	tk.Status.Stage = tatarav1alpha1.StageImplementing
-	tk.Status.PodStartedAt = &started
-	if err := k8sClient.Status().Update(context.Background(), tk); err != nil {
-		t.Fatalf("set task stage: %v", err)
-	}
-	annotate(t, "t-spawnonly", map[string]string{
-		annCurrentTurn: "turn-abc-123",
+// TestTaskSpawn_ProceedsWhenMemoryNotStablyReady is the reversal of issue #355's
+// gate: a Task with no pod yet must reach the pod-spawn path with memory NOT
+// stably ready, and must be MARKED degraded rather than held.
+func TestTaskSpawn_ProceedsWhenMemoryNotStablyReady(t *testing.T) {
+	mkTaskProject(t, "p-degraded", 3)
+	mkTaskRepository(t, "r-degraded", "p-degraded")
+	mkTaskWithKind(t, "t-degraded", "p-degraded", "r-degraded", "clarify")
+
+	// Ready, but ReadySince is NOW: inside the stabilization window, so the
+	// project is not stably ready. This is exactly what used to hold the spawn.
+	now := metav1.Now()
+	setProjectMemory(t, "p-degraded", &tatarav1alpha1.MemoryStatus{
+		Phase:      "Ready",
+		Endpoint:   "http://mem-p-degraded.tatara.svc:8080",
+		ReadySince: &now,
 	})
+	setTaskStage(t, "t-degraded", tatarav1alpha1.StageImplementing)
 
-	fs := newFakeSession()
-	r := newTaskReconciler(fs)
-	res, err := reconcileTask(t, r, "t-spawnonly")
+	r := newTaskReconciler(newFakeSession())
+	res, err := reconcileTask(t, r, "t-degraded")
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
-	if res.RequeueAfter == memGateRequeue {
-		t.Fatalf("in-flight turn must bypass memory gate (spawn-only); got memGateRequeue=%v", memGateRequeue)
+	if res.RequeueAfter != agentBootRequeue {
+		t.Fatalf("RequeueAfter = %v, want agentBootRequeue %v (the spawn must proceed, not poll a gate)",
+			res.RequeueAfter, agentBootRequeue)
+	}
+	if !podExists(t, agent.PodName(getTask(t, "t-degraded"))) {
+		t.Fatalf("no wrapper pod created: the memory gate is still holding the spawn")
+	}
+	if v := testutil.ToFloat64(r.Metrics.AgentPodDegradedCounter("p-degraded", "clarify", "memory")); v != 1 {
+		t.Fatalf("operator_agent_pod_degraded_total{project=p-degraded,kind=clarify,subsystem=memory} = %v, want 1", v)
+	}
+	cond := findCond(getTask(t, "t-degraded").Status.Conditions, tatarav1alpha1.ConditionMemoryDegraded)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("MemoryDegraded condition = %+v, want True", cond)
+	}
+	if cond.Reason != tatarav1alpha1.ReasonSpawnedWithoutRecall {
+		t.Fatalf("MemoryDegraded reason = %q, want %q", cond.Reason, tatarav1alpha1.ReasonSpawnedWithoutRecall)
+	}
+}
+
+// A stably-ready project spawns exactly the same pod and must NOT be flagged.
+func TestTaskSpawn_NotDegradedWhenMemoryStablyReady(t *testing.T) {
+	mkTaskProject(t, "p-healthy", 3)
+	mkTaskRepository(t, "r-healthy", "p-healthy")
+	mkTaskWithKind(t, "t-healthy", "p-healthy", "r-healthy", "clarify")
+
+	setProjectMemory(t, "p-healthy", stableMemStatus("http://mem-p-healthy.tatara.svc:8080"))
+	setTaskStage(t, "t-healthy", tatarav1alpha1.StageImplementing)
+
+	r := newTaskReconciler(newFakeSession())
+	if _, err := reconcileTask(t, r, "t-healthy"); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !podExists(t, agent.PodName(getTask(t, "t-healthy"))) {
+		t.Fatalf("no wrapper pod created for a healthy project")
+	}
+	if v := testutil.ToFloat64(r.Metrics.AgentPodDegradedCounter("p-healthy", "clarify", "memory")); v != 0 {
+		t.Fatalf("operator_agent_pod_degraded_total = %v, want 0 for a stably-ready project", v)
+	}
+	if c := findCond(getTask(t, "t-healthy").Status.Conditions, tatarav1alpha1.ConditionMemoryDegraded); c != nil {
+		t.Fatalf("MemoryDegraded condition set on a healthy spawn: %+v", c)
 	}
 }

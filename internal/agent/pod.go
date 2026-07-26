@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -484,6 +485,12 @@ func BuildPod(project *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, 
 		// Per-project memory endpoint: the agent's tatara-cli memory MCP reads
 		// TATARA_MEMORY_URL to reach this Project's tatara-memory service.
 		{Name: "TATARA_MEMORY_URL", Value: memoryEndpoint},
+		// Whether the memory stack is unavailable for THIS pod's lifetime. The
+		// endpoint above is still handed over: the tools must fail against the
+		// real backend rather than be silently unconfigured. Memory is never a
+		// spawn gate, so an agent has to be TOLD, and the wrapper hands
+		// os.Environ() to the agent process wholesale.
+		{Name: "TATARA_MEMORY_DEGRADED", Value: strconv.FormatBool(!tatarav1alpha1.MemoryStablyReady(project, time.Now()))},
 		// Operator REST URL: the agent's tatara-cli task_* MCP tools reach the
 		// operator API at TATARA_OPERATOR_URL.
 		{Name: "TATARA_OPERATOR_URL", Value: cfg.OperatorURL},

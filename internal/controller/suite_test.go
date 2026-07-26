@@ -101,7 +101,7 @@ func TestMain(m *testing.M) {
 // far enough in the past that memoryStablyReady returns true immediately.
 // Use this in tests that need the memory gate to admit work without delay.
 func stableMemStatus(endpoint string) *tataradevv1alpha1.MemoryStatus {
-	readySince := metav1.NewTime(time.Now().Add(-(memoryReadyStabilizationWindow + time.Minute)))
+	readySince := metav1.NewTime(time.Now().Add(-(tataradevv1alpha1.MemoryReadyStabilizationWindow + time.Minute)))
 	return &tataradevv1alpha1.MemoryStatus{
 		Phase:      "Ready",
 		Endpoint:   endpoint,

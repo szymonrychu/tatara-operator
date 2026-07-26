@@ -16,6 +16,24 @@ const PlatformProblemGuidance = "\n\n## Platform problems\n" +
 	"propose, or comment on a tracker issue asking a human to fix the platform, and do NOT treat a " +
 	"blocked tool as a reason to file your normal output - report it and stop."
 
+// MemoryDegradedGuidance is appended to a turn-0 directive ONLY when the
+// project memory stack is not stably ready. Memory failure no longer holds a
+// Task, so the agent runs with no recall and must be told that this is
+// expected. Without it the last word the agent reads about a failing tool is
+// PlatformProblemGuidance's "report it and stop", which is exactly the stall
+// the platform must no longer take on a memory outage.
+const MemoryDegradedGuidance = "\n\n## Memory recall is unavailable this turn\n" +
+	"The recall subsystem is down for this project right now. Every memory and code-graph tool " +
+	"will fail. This is EXPECTED, it is already alerted on, and it OVERRIDES the 'report it and " +
+	"stop' rule above for those tools specifically: a failing memory tool is NOT a reason to stop.\n" +
+	"  - Work from the repository itself: Serena/LSP, git history, and plain file reads give you " +
+	"everything memory would have summarised, just more slowly.\n" +
+	"  - Call `report_internal_issue` ONCE for the failure, then move on. Do not retry the memory " +
+	"tools in a loop and do not report each failure separately.\n" +
+	"  - Say in your outcome body (or in your decline reason) that memory recall was unavailable, " +
+	"so a reviewer knows what you could not check.\n" +
+	"  - COMPLETE the assignment with reduced recall. Declining for this reason alone is wrong."
+
 // ToolingNoteGuidance is appended to proposer-agent prompts (brainstorm,
 // healthCheck, refine, incident). It instructs the agent to fold any mise
 // tooling it needed into the issue it files, so the implementer can add it to
