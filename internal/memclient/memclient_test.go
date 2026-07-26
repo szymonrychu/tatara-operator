@@ -1,22 +1,29 @@
-package memclient_test
+// Package memclient (internal test package, not memclient_test) so retry
+// tests can shrink the unexported retryBackoff var directly - it is the
+// package's own knob, not part of the public API, so an external test
+// package has no way to reach it.
+package memclient
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/szymonrychu/tatara-operator/internal/memclient"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 )
 
-// Compile-time check: *memclient.Client satisfies objbudget.Spiller
-// structurally (memclient must not import objbudget from its non-test code -
-// that would invert the dependency).
-var _ objbudget.Spiller = (*memclient.Client)(nil)
+// Compile-time check: *Client satisfies objbudget.Spiller structurally
+// (memclient's non-test code must not import objbudget - objbudget defines
+// the interface, memclient only implements it; a _test.go file importing it
+// does not invert that dependency, since test files are excluded from the
+// production build).
+var _ objbudget.Spiller = (*Client)(nil)
 
 // serverMemory mirrors tatara-memory's memory.Memory
 // (code/tatara-memory/internal/memory/types.go) EXACTLY, so decoding a request
@@ -47,6 +54,17 @@ func staticToken(tok string) func(context.Context) (string, error) {
 	return func(context.Context) (string, error) { return tok, nil }
 }
 
+// shrinkRetryBackoff replaces the package's retry backoff with near-zero
+// delays for the duration of the test and restores the original on cleanup,
+// so a test that drives the retry loop in (*Client).do does not spend real
+// wall time sleeping (200ms + 1s per exhausted attempt otherwise).
+func shrinkRetryBackoff(t *testing.T) {
+	t.Helper()
+	orig := retryBackoff
+	retryBackoff = []time.Duration{time.Millisecond, time.Millisecond}
+	t.Cleanup(func() { retryBackoff = orig })
+}
+
 func TestSpill_Success(t *testing.T) {
 	var gotAuth, gotPath, gotMethod string
 	var gotMem serverMemory
@@ -65,7 +83,7 @@ func TestSpill_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("secret-tok"), nil)
+	c := New(srv.URL, staticToken("secret-tok"), nil)
 	trackID, err := c.Spill(context.Background(), "Issue", "issue-42", []string{"a", "b"})
 	if err != nil {
 		t.Fatalf("Spill: unexpected error: %v", err)
@@ -82,14 +100,14 @@ func TestSpill_Success(t *testing.T) {
 	if gotPath != "/memories" {
 		t.Fatalf("path = %q, want /memories", gotPath)
 	}
-	if gotMem.Metadata[memclient.MetadataKindKey] != "Issue" {
-		t.Fatalf("metadata[%s] = %q, want Issue", memclient.MetadataKindKey, gotMem.Metadata[memclient.MetadataKindKey])
+	if gotMem.Metadata[MetadataKindKey] != "Issue" {
+		t.Fatalf("metadata[%s] = %q, want Issue", MetadataKindKey, gotMem.Metadata[MetadataKindKey])
 	}
-	if gotMem.Metadata[memclient.MetadataNameKey] != "issue-42" {
-		t.Fatalf("metadata[%s] = %q, want issue-42", memclient.MetadataNameKey, gotMem.Metadata[memclient.MetadataNameKey])
+	if gotMem.Metadata[MetadataNameKey] != "issue-42" {
+		t.Fatalf("metadata[%s] = %q, want issue-42", MetadataNameKey, gotMem.Metadata[MetadataNameKey])
 	}
-	if gotMem.Metadata[memclient.MetadataSpillKey] != "1" {
-		t.Fatalf("metadata[%s] = %q, want 1", memclient.MetadataSpillKey, gotMem.Metadata[memclient.MetadataSpillKey])
+	if gotMem.Metadata[MetadataSpillKey] != "1" {
+		t.Fatalf("metadata[%s] = %q, want 1", MetadataSpillKey, gotMem.Metadata[MetadataSpillKey])
 	}
 	var back []string
 	if err := json.Unmarshal([]byte(gotMem.Text), &back); err != nil {
@@ -116,28 +134,29 @@ func TestSpill_BodyIsStrictlyAMemory(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	if _, err := c.Spill(context.Background(), "Task", "task-7", map[string]any{"notes": []string{"n1"}}); err != nil {
 		t.Fatalf("Spill: strict memory.Memory decode rejected the body: %v", err)
 	}
 }
 
 func TestSpill_ServerError_IsRetryable(t *testing.T) {
+	shrinkRetryBackoff(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("lightrag unavailable"))
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	_, err := c.Spill(context.Background(), "Issue", "issue-42", "payload")
 	if err == nil {
 		t.Fatal("Spill: want error on 500, got nil")
 	}
-	if !errors.Is(err, memclient.ErrRetryable) {
+	if !errors.Is(err, ErrRetryable) {
 		t.Fatalf("Spill: 500 error = %v, want errors.Is(err, ErrRetryable)", err)
 	}
-	if errors.Is(err, memclient.ErrTerminal) {
+	if errors.Is(err, ErrTerminal) {
 		t.Fatalf("Spill: 500 error must NOT be terminal: %v", err)
 	}
 }
@@ -149,15 +168,15 @@ func TestSpill_ClientError_IsTerminal(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	_, err := c.Spill(context.Background(), "Issue", "issue-42", "payload")
 	if err == nil {
 		t.Fatal("Spill: want error on 400, got nil")
 	}
-	if !errors.Is(err, memclient.ErrTerminal) {
+	if !errors.Is(err, ErrTerminal) {
 		t.Fatalf("Spill: 400 error = %v, want errors.Is(err, ErrTerminal)", err)
 	}
-	if errors.Is(err, memclient.ErrRetryable) {
+	if errors.Is(err, ErrRetryable) {
 		t.Fatalf("Spill: 400 error must NOT be retryable: %v", err)
 	}
 }
@@ -173,7 +192,7 @@ func TestSpill_MissingTrackID_IsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	trackID, err := c.Spill(context.Background(), "Issue", "issue-42", "payload")
 	if err == nil {
 		t.Fatalf("Spill: want error when response carries no id, got trackID=%q", trackID)
@@ -194,13 +213,13 @@ func TestFetch_RoundTrip(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(serverMemory{
 			ID:        "trk-123",
 			Text:      string(payload),
-			Metadata:  map[string]string{memclient.MetadataKindKey: "Task"},
+			Metadata:  map[string]string{MetadataKindKey: "Task"},
 			CreatedAt: time.Now().UTC(),
 		})
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("secret-tok"), nil)
+	c := New(srv.URL, staticToken("secret-tok"), nil)
 	got, err := c.Fetch(context.Background(), "trk-123")
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
@@ -253,7 +272,7 @@ func TestSpillFetch_RoundTrip(t *testing.T) {
 	}
 	want := []note{{Kind: "handoff", Body: "first"}, {Kind: "finding", Body: "second"}}
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	trackID, err := c.Spill(context.Background(), "Task", "task-7", want)
 	if err != nil {
 		t.Fatalf("Spill: %v", err)
@@ -281,7 +300,7 @@ func TestFetch_EmptyText_IsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	got, err := c.Fetch(context.Background(), "trk-123")
 	if err == nil {
 		t.Fatalf("Fetch: want error on empty text, got payload=%q", got)
@@ -295,25 +314,26 @@ func TestFetch_NotFound_IsTerminal(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	_, err := c.Fetch(context.Background(), "does-not-exist")
 	if err == nil {
 		t.Fatal("Fetch: want error on 404, got nil")
 	}
-	if !errors.Is(err, memclient.ErrTerminal) {
+	if !errors.Is(err, ErrTerminal) {
 		t.Fatalf("Fetch: 404 error = %v, want errors.Is(err, ErrTerminal)", err)
 	}
 }
 
 func TestFetch_ServiceUnavailable_IsRetryable(t *testing.T) {
+	shrinkRetryBackoff(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	_, err := c.Fetch(context.Background(), "trk-123")
-	if !errors.Is(err, memclient.ErrRetryable) {
+	if !errors.Is(err, ErrRetryable) {
 		t.Fatalf("Fetch: 503 error = %v, want errors.Is(err, ErrRetryable)", err)
 	}
 }
@@ -322,29 +342,234 @@ func TestFetch_ServiceUnavailable_IsRetryable(t *testing.T) {
 // (server unreachable, timeout) - distinct from an HTTP status response -
 // which must also be retryable, never terminal and never a silent success.
 func TestSpill_TransportFailure_IsRetryable(t *testing.T) {
+	shrinkRetryBackoff(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
 	srv.Close() // closed before use: connection refused
 
-	c := memclient.New(srv.URL, staticToken("tok"), nil)
+	c := New(srv.URL, staticToken("tok"), nil)
 	_, err := c.Spill(context.Background(), "Issue", "issue-42", "payload")
 	if err == nil {
 		t.Fatal("Spill: want error on unreachable server, got nil")
 	}
-	if !errors.Is(err, memclient.ErrRetryable) {
+	if !errors.Is(err, ErrRetryable) {
 		t.Fatalf("Spill: transport error = %v, want errors.Is(err, ErrRetryable)", err)
 	}
-	if errors.Is(err, memclient.ErrTerminal) {
+	if errors.Is(err, ErrTerminal) {
 		t.Fatalf("Spill: transport error must NOT be terminal: %v", err)
 	}
 }
 
 func TestSpill_TokenSourceError_IsReturned(t *testing.T) {
 	wantErr := errors.New("token mint failed")
-	c := memclient.New("http://unused.invalid", func(context.Context) (string, error) {
+	c := New("http://unused.invalid", func(context.Context) (string, error) {
 		return "", wantErr
 	}, nil)
 	_, err := c.Spill(context.Background(), "Issue", "issue-42", "payload")
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Spill: err = %v, want wrapping %v", err, wantErr)
+	}
+}
+
+// --- retry loop coverage (A.7 / do's bounded in-client retries) ---
+
+// TestSpill_RetrySucceedsOnSecondAttempt is required coverage 1: a 503 that
+// succeeds on the 2nd attempt returns the track_id, and the handler saw
+// exactly 2 requests (1 failure + 1 success, no third attempt wasted).
+func TestSpill_RetrySucceedsOnSecondAttempt(t *testing.T) {
+	shrinkRetryBackoff(t)
+	var mu sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("lightrag unavailable"))
+			return
+		}
+		var m serverMemory
+		if !decodeStrictOrReject(w, r, &m) {
+			return
+		}
+		m.ID = "trk-retry-ok"
+		m.CreatedAt = time.Now().UTC()
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(m)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	trackID, err := c.Spill(context.Background(), "Issue", "issue-1", "payload")
+	if err != nil {
+		t.Fatalf("Spill: unexpected error after retry: %v", err)
+	}
+	if trackID != "trk-retry-ok" {
+		t.Fatalf("Spill: trackID = %q, want trk-retry-ok", trackID)
+	}
+	mu.Lock()
+	got := count
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("handler saw %d requests, want exactly 2", got)
+	}
+}
+
+// TestDo_RetryClassification is required coverage 2 (persistent 503
+// exhausts all 3 attempts and returns ErrRetryable) and coverage 3+4 (a 400
+// is terminal and stops after exactly 1 request; a 429 is classified
+// retryable just like a 503, and is retried).
+func TestDo_RetryClassification(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		wantRequests  int
+		wantRetryable bool
+		wantTerminal  bool
+	}{
+		{
+			name:          "persistent 503 exhausts all 3 attempts and stays retryable",
+			status:        http.StatusServiceUnavailable,
+			wantRequests:  3,
+			wantRetryable: true,
+		},
+		{
+			name:         "400 is terminal and is never retried",
+			status:       http.StatusBadRequest,
+			wantRequests: 1,
+			wantTerminal: true,
+		},
+		{
+			name:          "429 classifies retryable and is retried like a 503",
+			status:        http.StatusTooManyRequests,
+			wantRequests:  3,
+			wantRetryable: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shrinkRetryBackoff(t)
+			var mu sync.Mutex
+			count := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				mu.Lock()
+				count++
+				mu.Unlock()
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte("err"))
+			}))
+			defer srv.Close()
+
+			c := New(srv.URL, staticToken("tok"), nil)
+			_, err := c.Spill(context.Background(), "Issue", "issue-1", "payload")
+			if err == nil {
+				t.Fatalf("Spill: want error for status %d, got nil", tt.status)
+			}
+			if tt.wantRetryable && !errors.Is(err, ErrRetryable) {
+				t.Fatalf("err = %v, want errors.Is(err, ErrRetryable)", err)
+			}
+			if tt.wantTerminal && !errors.Is(err, ErrTerminal) {
+				t.Fatalf("err = %v, want errors.Is(err, ErrTerminal)", err)
+			}
+			if tt.wantTerminal && errors.Is(err, ErrRetryable) {
+				t.Fatalf("err = %v, must NOT also be retryable", err)
+			}
+			mu.Lock()
+			got := count
+			mu.Unlock()
+			if got != tt.wantRequests {
+				t.Fatalf("handler saw %d requests, want exactly %d", got, tt.wantRequests)
+			}
+		})
+	}
+}
+
+// TestFetch_RetrySucceedsOnSecondAttempt is required coverage 5: the retry
+// loop lives in do, shared by Spill and Fetch, so Fetch must retry too.
+func TestFetch_RetrySucceedsOnSecondAttempt(t *testing.T) {
+	shrinkRetryBackoff(t)
+	var mu sync.Mutex
+	count := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		count++
+		n := count
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(serverMemory{
+			ID:        "trk-123",
+			Text:      `{"ok":true}`,
+			CreatedAt: time.Now().UTC(),
+		})
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	got, err := c.Fetch(context.Background(), "trk-123")
+	if err != nil {
+		t.Fatalf("Fetch: unexpected error after retry: %v", err)
+	}
+	if string(got) != `{"ok":true}` {
+		t.Fatalf("Fetch: payload = %s, want {\"ok\":true}", got)
+	}
+	mu.Lock()
+	reqs := count
+	mu.Unlock()
+	if reqs != 2 {
+		t.Fatalf("handler saw %d requests, want exactly 2", reqs)
+	}
+}
+
+// TestSpill_RetryReplaysBodyIntact is required coverage 6: a consumed
+// io.Reader cannot be replayed, so do must rebuild the request body fresh on
+// each attempt. Asserts the handler read the same non-empty JSON body twice.
+func TestSpill_RetryReplaysBodyIntact(t *testing.T) {
+	shrinkRetryBackoff(t)
+	var mu sync.Mutex
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		n := len(bodies)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		var m serverMemory
+		if err := json.Unmarshal(raw, &m); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		m.ID = "trk-replay-ok"
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(m)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, staticToken("tok"), nil)
+	if _, err := c.Spill(context.Background(), "Issue", "issue-1", []string{"a", "b", "c"}); err != nil {
+		t.Fatalf("Spill: unexpected error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("handler saw %d requests, want exactly 2", len(bodies))
+	}
+	if bodies[0] == "" || bodies[1] == "" {
+		t.Fatalf("request body must not be empty: attempt1=%q attempt2=%q", bodies[0], bodies[1])
+	}
+	if bodies[0] != bodies[1] {
+		t.Fatalf("retry body differs from first attempt:\nattempt1=%s\nattempt2=%s", bodies[0], bodies[1])
 	}
 }

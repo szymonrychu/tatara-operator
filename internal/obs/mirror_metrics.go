@@ -22,6 +22,24 @@ var MirrorCommentTruncatedTotal = prometheus.NewCounterVec(prometheus.CounterOpt
 	Help: "Comment bodies truncated at the 8192-byte ingest limit, by kind (contract A.1).",
 }, []string{"kind"})
 
+// MirrorWriteDroppedTotal counts best-effort mirror/webhook writes dropped on
+// error at a specific call site. These are the objbudget.Fit* writes that a
+// webhook or REST handler makes on the CONTINUE-ON-ERROR path: the caller
+// still returns 200 to the forge on purpose (a webhook must never fail, and a
+// REST accept must not unwind an already-committed stage transition), so the
+// write loss was previously visible only as a log line - or, at two sites, not
+// even that. The most common root cause is a tatara-memory outage: when the
+// objbudget byte-budget guard cannot spill, every write through objbudget.Fit*
+// fails by design (that blocking policy is deliberate, see MEMORY.md), so a
+// memory outage shows up here as a burst across many (project, kind, site)
+// series rather than as any single alert. site identifies the call site so a
+// rising rate can be traced back to which drop (and which downstream
+// consequence - a suppressed event, a stale cursor, a lost comment) it is.
+var MirrorWriteDroppedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	Name: "operator_mirror_write_dropped_total",
+	Help: "Best-effort mirror/webhook writes dropped on error, by project, kind and call site.",
+}, []string{"project", "kind", "site"})
+
 func init() {
-	ctrlmetrics.Registry.MustRegister(MirrorSyncTotal, MirrorCommentTruncatedTotal)
+	ctrlmetrics.Registry.MustRegister(MirrorSyncTotal, MirrorCommentTruncatedTotal, MirrorWriteDroppedTotal)
 }

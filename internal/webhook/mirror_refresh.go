@@ -11,6 +11,7 @@ import (
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 )
@@ -93,11 +94,21 @@ func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, p
 				i.Status.Body = ev.Body
 				i.Status.Title = ev.Title
 			}); ferr != nil {
-			s.log.ErrorContext(ctx, "issues: mirror body/title refresh failed", "error", ferr,
-				"project", proj.Name, "issue_ref", ev.IssueRef)
+			// changed never flips true (the closure that sets it never ran), so the
+			// !changed check below returns early and the owning Task never gets its
+			// issue_edited TaskEvent - this drop silently suppresses the derived
+			// unpark-worthy event, not just the mirror body/title.
+			obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_body_title").Inc()
+			s.log.WarnContext(ctx, "issues: mirror body/title refresh failed; issue_edited event also suppressed (changed stays false)",
+				"error", ferr, "project", proj.Name, "issue_ref", ev.IssueRef)
 		}
 	} else {
-		s.log.ErrorContext(ctx, "issues: no Spiller configured; mirror body/title refresh skipped", "issue_ref", ev.IssueRef)
+		// Same consequence as the FitIssue error above: no Spiller means the mirror
+		// is never touched, changed stays false, and the issue_edited TaskEvent is
+		// silently suppressed along with the body/title refresh.
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_body_title").Inc()
+		s.log.WarnContext(ctx, "issues: no Spiller configured; mirror body/title refresh skipped, issue_edited event also suppressed",
+			"project", proj.Name, "issue_ref", ev.IssueRef)
 	}
 
 	if !changed {
@@ -254,6 +265,7 @@ func (s *Server) stampIssueState(ctx context.Context, proj *tatarav1.Project, re
 	if err := objbudget.FitIssue(ctx, s.cfg.Client, sp, key, func(i *tatarav1.Issue) {
 		i.Status.State = state
 	}); err != nil {
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_state").Inc()
 		s.log.ErrorContext(ctx, "issues: mirror state refresh failed", "error", err, "issue", key.Name, "state", state)
 		return false
 	}
@@ -296,7 +308,13 @@ func (s *Server) fitMR(ctx context.Context, proj *tatarav1.Project, repo *tatara
 		return false
 	}
 	if err := objbudget.FitMergeRequest(ctx, s.cfg.Client, sp, key, mut); err != nil {
-		s.log.ErrorContext(ctx, "mr: mirror refresh failed", "error", err, "mr", key.Name)
+		// stampMRHead routes through here to advance Status.LastBotHeadSHA on a
+		// bot push; a dropped write leaves LastBotHeadSHA stale, which
+		// ReconcileOwnership (OP8) later reads as head drift and triggers a
+		// SPURIOUS ownership stand-down.
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "MergeRequest", "mr_refresh").Inc()
+		s.log.WarnContext(ctx, "mr: mirror refresh failed; a stampMRHead caller may leave LastBotHeadSHA stale and trigger a spurious ownership stand-down",
+			"error", err, "mr", key.Name, "project", proj.Name)
 		return false
 	}
 	return true

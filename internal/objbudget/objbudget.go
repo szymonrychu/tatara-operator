@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -45,6 +46,21 @@ import (
 // left to evict (an oversized spec.goal, a wall of conditions): the eviction
 // loop ran the evictable list to empty and the object still does not fit.
 var ErrObjectTooLarge = errors.New("object exceeds byte budget with nothing left to evict")
+
+// ErrSpillerUnconfigured means eviction was needed but no Spiller was passed.
+// It is a WIRING bug, not a runtime condition, and it is reported as a clean
+// error rather than tolerated: the write still fails, exactly as it did when
+// this path dereferenced a nil interface and panicked. See SpillBlocked.
+var ErrSpillerUnconfigured = errors.New("no tatara-memory spiller configured")
+
+// The reasons SpillBlocked distinguishes. They are the label values of
+// operator_objbudget_spill_blocked_total, so an alert can tell an outage
+// (spill_error, self-healing once tatara-memory is back) from a wiring bug
+// (unconfigured, which needs a deploy).
+const (
+	SpillBlockedReasonError        = "spill_error"
+	SpillBlockedReasonUnconfigured = "unconfigured"
+)
 
 // Spiller sends one eviction batch to tatara-memory and returns the durable
 // track_id the caller records. A concrete implementation lives over
@@ -65,6 +81,9 @@ type Metrics interface {
 	IncObjectTooLarge(kind, name string)
 	// IncCommentSpill records one eviction batch spilled to tatara-memory.
 	IncCommentSpill(kind string)
+	// IncSpillBlocked records a write REFUSED because its eviction batch could
+	// not be spilled, by kind and by one of the SpillBlockedReason* values.
+	IncSpillBlocked(kind, reason string)
 }
 
 type noopMetrics struct{}
@@ -72,6 +91,7 @@ type noopMetrics struct{}
 func (noopMetrics) ObserveObjectSize(string, int)    {}
 func (noopMetrics) IncObjectTooLarge(string, string) {}
 func (noopMetrics) IncCommentSpill(string)           {}
+func (noopMetrics) IncSpillBlocked(string, string)   {}
 
 var metricsRecorder Metrics = noopMetrics{}
 
@@ -101,6 +121,28 @@ func getWaitingOutCreateLag(ctx context.Context, c client.Client, key types.Name
 	return retry.OnError(createLagBackoff, apierrors.IsNotFound, func() error {
 		return c.Get(ctx, key, obj)
 	})
+}
+
+// SpillBlocked records that a guarded write was REFUSED because its eviction
+// batch could not be spilled to tatara-memory. Blocking is the deliberate
+// policy - see the package doc's SPILL FIRST, DROP ONLY ON SPILL SUCCESS
+// ordering - so this does not change any behaviour; it only makes the block
+// visible. Before it the block was completely silent: no metric, no
+// distinguishable log, so an object wedged by a memory outage was
+// indistinguishable from a healthy one and there was nothing to alert on.
+//
+// Exported because internal/restapi's note-cap path spills directly (outside
+// Fit*) and must land on the SAME counter; a second counter for the same
+// condition would split every alert query in two.
+//
+// items is a COUNT. Comment and note bodies are never logged here: they are
+// arbitrary forge/agent text and a spill-blocked object is exactly the case
+// where they are largest.
+func SpillBlocked(ctx context.Context, kind, name, reason string, items int) {
+	metricsRecorder.IncSpillBlocked(kind, reason)
+	slog.WarnContext(ctx, "objbudget: cannot spill to tatara-memory; refusing the write rather than dropping evicted items",
+		"action", "objbudget_spill_blocked", "kind", kind, "resource_id", name,
+		"reason", reason, "items", items)
 }
 
 // sizeOf returns the marshalled JSON size of obj in bytes.
@@ -191,8 +233,13 @@ func FitIssue(ctx context.Context, c client.Client, sp Spiller, key types.Namesp
 	var trackID string
 	evictedN := len(evicted)
 	if evictedN > 0 {
+		if sp == nil {
+			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonUnconfigured, evictedN)
+			return fmt.Errorf("objbudget: spill %d comments for issue %s: %w", evictedN, key.Name, ErrSpillerUnconfigured)
+		}
 		trackID, err = sp.Spill(ctx, kind, key.Name, evicted)
 		if err != nil {
+			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonError, evictedN)
 			return fmt.Errorf("objbudget: spill %d comments for issue %s: %w", evictedN, key.Name, err)
 		}
 		metricsRecorder.IncCommentSpill(kind)
@@ -258,8 +305,13 @@ func FitMergeRequest(ctx context.Context, c client.Client, sp Spiller, key types
 	var trackID string
 	evictedN := len(evicted)
 	if evictedN > 0 {
+		if sp == nil {
+			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonUnconfigured, evictedN)
+			return fmt.Errorf("objbudget: spill %d comments for mergerequest %s: %w", evictedN, key.Name, ErrSpillerUnconfigured)
+		}
 		trackID, err = sp.Spill(ctx, kind, key.Name, evicted)
 		if err != nil {
+			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonError, evictedN)
 			return fmt.Errorf("objbudget: spill %d comments for mergerequest %s: %w", evictedN, key.Name, err)
 		}
 		metricsRecorder.IncCommentSpill(kind)
@@ -328,8 +380,13 @@ func FitTask(ctx context.Context, c client.Client, sp Spiller, key types.Namespa
 	var trackID string
 	evictedN := len(evicted)
 	if evictedN > 0 {
+		if sp == nil {
+			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonUnconfigured, evictedN)
+			return fmt.Errorf("objbudget: spill %d notes for task %s: %w", evictedN, key.Name, ErrSpillerUnconfigured)
+		}
 		trackID, err = sp.Spill(ctx, kind, key.Name, evicted)
 		if err != nil {
+			SpillBlocked(ctx, kind, key.Name, SpillBlockedReasonError, evictedN)
 			return fmt.Errorf("objbudget: spill %d notes for task %s: %w", evictedN, key.Name, err)
 		}
 		metricsRecorder.IncCommentSpill(kind)

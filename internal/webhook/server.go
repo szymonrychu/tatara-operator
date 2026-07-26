@@ -1046,7 +1046,11 @@ func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Projec
 		}
 	})
 	if err != nil {
-		s.log.ErrorContext(ctx, "incident refire comment enqueue failed",
+		// The caller feeds this 0 return straight into escalationDue's byRefire
+		// check, so a dropped write here SUPPRESSES INCIDENT ESCALATION - the
+		// byRefire trigger can never fire for this refire.
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "incident_refire").Inc()
+		s.log.ErrorContext(ctx, "incident refire comment enqueue failed; refire count reset to 0 suppresses byRefire escalation",
 			"action", "incident_refire_comment", "issue", iss.Name, "error", err)
 		return 0
 	}
@@ -1115,6 +1119,7 @@ func (s *Server) maybeEscalateIncident(ctx context.Context, proj *tatarav1.Proje
 		stamped = true
 	})
 	if err != nil {
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "incident_escalate").Inc()
 		s.log.ErrorContext(ctx, "incident escalation stamp failed",
 			"action", "incident_escalated", "issue", iss.Name, "error", err)
 		return

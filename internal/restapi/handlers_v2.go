@@ -157,6 +157,13 @@ func openMRs(mrs []tatarav1alpha1.MergeRequest) []tatarav1alpha1.MergeRequest {
 type contextResp struct {
 	Task   string `json:"task"`
 	Bundle string `json:"bundle"`
+	// NotesTruncated is set on a notes=all read that could not rehydrate every
+	// spilled batch. The read serves what it HAS - a memory outage must not
+	// make the whole note history unreadable - so the caller needs an explicit
+	// signal that it is holding a partial journal.
+	NotesTruncated bool `json:"notesTruncated,omitempty"`
+	// NotesUnavailableRefs is how many spilled batches could not be read back.
+	NotesUnavailableRefs int `json:"notesUnavailableRefs,omitempty"`
 }
 
 func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
@@ -210,56 +217,81 @@ func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
 
 	notes := task.Status.Notes
 	notesTotal := 0
+	unavailableNotes, unavailableRefs := 0, 0
 	if r.URL.Query().Get("notes") == "all" {
-		rehydrated, err := s.rehydrateNotes(ctx, proj, task)
-		if err != nil {
-			s.log.ErrorContext(ctx, "restapi: rehydrating spilled notes failed",
-				append(reqLogFields(r), "task", task.Name, "error", err)...)
-			writeError(w, http.StatusBadGateway, "spilled notes are unavailable")
-			return
-		}
+		rehydrated, failedRefs := s.rehydrateNotes(ctx, proj, task)
 		notes = append(rehydrated, notes...)
-		notesTotal = len(notes)
+		unavailableRefs = failedRefs
+		// A ref that would not resolve costs an UNKNOWN number of notes, but
+		// status.stats.notesSpilled counts every note ever spilled, so the
+		// shortfall against what actually came back is the honest figure. It
+		// keeps the bundle's <notes> total (and therefore elided) truthful
+		// instead of silently redefining the history as "what we could read".
+		if failedRefs > 0 {
+			unavailableNotes = max(task.Status.Stats.NotesSpilled-len(rehydrated), 0)
+		}
+		notesTotal = len(notes) + unavailableNotes
 	}
 
 	bundle, err := prompt.Render(prompt.Input{
 		Task: task, Issues: issues, MergeRequests: mrs,
 		Events: task.Status.PendingEvents, Notes: notes, NotesTotal: notesTotal,
-		MaxBundleBytes: proj.Spec.MaxBundleBytes, Logger: s.log,
+		NotesUnavailable: unavailableNotes,
+		MaxBundleBytes:   proj.Spec.MaxBundleBytes, Logger: s.log,
 	})
 	if err != nil {
 		writeClientErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, contextResp{Task: task.Name, Bundle: bundle})
+	writeJSON(w, http.StatusOK, contextResp{
+		Task: task.Name, Bundle: bundle,
+		NotesTruncated: unavailableRefs > 0, NotesUnavailableRefs: unavailableRefs,
+	})
 }
 
 // rehydrateNotes pulls every spilled note batch back out of tatara-memory, in
 // spill order (stats.notesSpilledRefs ACCUMULATES, oldest batch first), so the
 // notes=all bundle renders the FULL history. This is the read path the
 // <notes ... fetch=...> marker names.
-func (s *Server) rehydrateNotes(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) ([]tatarav1alpha1.Note, error) {
+//
+// It is BEST-EFFORT and returns the count of refs it could not resolve rather
+// than an error. This is a READ: one unreadable batch used to abort the whole
+// response with a 502, so a tatara-memory outage made the entire note history
+// unreadable, including the notes sitting right there in the CR. Serving what
+// is available loses nothing and is strictly better, PROVIDED the caller is
+// told - which is what the returned count, contextResp.notesTruncated and the
+// bundle's unavailable="N" attribute are for.
+func (s *Server) rehydrateNotes(ctx context.Context, proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) ([]tatarav1alpha1.Note, int) {
 	refs := task.Status.Stats.NotesSpilledRefs
 	if len(refs) == 0 {
-		return nil, nil
+		return nil, 0
 	}
 	memory := s.memoryForOrNil(proj)
 	if memory == nil {
-		return nil, errors.New("restapi: no tatara-memory client configured")
+		s.log.WarnContext(ctx, "restapi: no tatara-memory client configured; serving notes=all without any spilled batch",
+			"action", "notes_rehydrate_failed", "project", proj.Name, "task", task.Name,
+			"reason", "unconfigured", "unavailable_refs", len(refs))
+		obs.RestNotesRehydrateFailedTotal.WithLabelValues(proj.Name).Add(float64(len(refs)))
+		return nil, len(refs)
 	}
 	var out []tatarav1alpha1.Note
+	failed := 0
 	for _, ref := range refs {
 		raw, err := memory.Fetch(ctx, ref)
-		if err != nil {
-			return nil, fmt.Errorf("fetch spilled notes %q: %w", ref, err)
+		if err == nil {
+			var batch []tatarav1alpha1.Note
+			if err = json.Unmarshal(raw, &batch); err == nil {
+				out = append(out, batch...)
+				continue
+			}
 		}
-		var batch []tatarav1alpha1.Note
-		if err := json.Unmarshal(raw, &batch); err != nil {
-			return nil, fmt.Errorf("decode spilled notes %q: %w", ref, err)
-		}
-		out = append(out, batch...)
+		failed++
+		obs.RestNotesRehydrateFailedTotal.WithLabelValues(proj.Name).Inc()
+		s.log.WarnContext(ctx, "restapi: spilled note batch could not be rehydrated; serving the notes=all history partial",
+			"action", "notes_rehydrate_failed", "project", proj.Name, "task", task.Name,
+			"track_id", ref, "error", err)
 	}
-	return out, nil
+	return out, failed
 }
 
 // --- 7. POST /tasks/{t}/notes ---------------------------------------------
@@ -331,17 +363,25 @@ func (s *Server) postNote(w http.ResponseWriter, r *http.Request) {
 	spillN := len(task.Status.Notes) + 1 - maxNotes
 	trackID := ""
 	if spillN > 0 {
+		// The write BLOCKS when it cannot spill - that is the deliberate A.7
+		// policy (SPILL FIRST, DROP ONLY ON SPILL SUCCESS), and a memory outage
+		// is a repairable fault, so no note is dropped meanwhile. What changed
+		// is only how the block is REPORTED: 500/502 reads as an operator bug
+		// and invites the agent to give up, while 503 + Retry-After says
+		// "temporarily unavailable, come back" - which is exactly true.
 		if spiller == nil {
-			writeError(w, http.StatusInternalServerError, "internal error")
+			objbudget.SpillBlocked(ctx, "Task", task.Name, objbudget.SpillBlockedReasonUnconfigured, spillN)
 			s.log.ErrorContext(ctx, "restapi: note cap reached with no spiller configured",
-				append(reqLogFields(r), "task", task.Name)...)
+				append(reqLogFields(r), "task", task.Name, "notes_to_spill", spillN)...)
+			writeRetryAfter(w, "note spill is unavailable; retry")
 			return
 		}
 		trackID, err = spiller.Spill(ctx, "Task", task.Name, task.Status.Notes[:spillN])
 		if err != nil {
+			objbudget.SpillBlocked(ctx, "Task", task.Name, objbudget.SpillBlockedReasonError, spillN)
 			s.log.ErrorContext(ctx, "restapi: spilling oldest notes failed",
-				append(reqLogFields(r), "task", task.Name, "error", err)...)
-			writeError(w, http.StatusBadGateway, "note spill failed")
+				append(reqLogFields(r), "task", task.Name, "notes_to_spill", spillN, "error", err)...)
+			writeRetryAfter(w, "note spill is unavailable; retry")
 			return
 		}
 	}

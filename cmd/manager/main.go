@@ -19,6 +19,7 @@ import (
 
 	apiv1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/config"
+	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/pushmetrics"
 	"github.com/szymonrychu/tatara-operator/internal/version"
@@ -111,6 +112,12 @@ func run(ctx context.Context) error {
 		return err
 	}
 	operatorMetrics := obs.NewOperatorMetrics(ctrlmetrics.Registry)
+	// The A.7 byte-budget guard's recorder. objbudget defaults to a no-op, and
+	// nothing installed a real one, so operator_object_size_bytes,
+	// operator_object_too_large_total and operator_comment_spill_total were
+	// registered by nobody and exported by nothing - every guarded write was
+	// unmeasured. Install it here, before any reconciler can run.
+	objbudget.SetMetrics(obs.NewObjBudgetMetrics(ctrlmetrics.Registry))
 	// Push-receiver for short-lived wrapper pods: aggregates their pushed
 	// series and re-exposes them on the operator's own /metrics registry.
 	pushReceiver := pushmetrics.New(cfg.PushMetricsTTL, cfg.PushMetricsAllowedPrefixes)

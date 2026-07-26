@@ -14,6 +14,7 @@ import (
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
@@ -70,10 +71,21 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 			IsBot:      isBot,
 		}
 		if err := controller.AppendCommentToMirror(ctx, s.cfg.Client, sp, obj, cmt); err != nil {
-			s.log.ErrorContext(ctx, "pendingEvents: mirror comment append failed", "error", err, "kind", kind)
+			// The function continues past this and still enqueues the TaskEvent
+			// below, so a HUMAN comment is lost from the mirror while the unpark
+			// event still fires - the agent gets unparked by a comment its bundle
+			// does not contain.
+			obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, kind, "comment_append").Inc()
+			s.log.WarnContext(ctx, "pendingEvents: mirror comment append failed; comment lost from mirror but the unpark event still fires",
+				"error", err, "kind", kind, "project", proj.Name)
 		}
 	} else {
-		s.log.ErrorContext(ctx, "pendingEvents: no Spiller configured; mirror comment append skipped", "kind", kind)
+		// Same consequence as the AppendCommentToMirror error above: no Spiller
+		// means the comment never lands on the mirror, but the TaskEvent below is
+		// still enqueued and can still unpark the Task.
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, kind, "comment_append").Inc()
+		s.log.WarnContext(ctx, "pendingEvents: no Spiller configured; mirror comment append skipped, comment lost from mirror but the unpark event still fires",
+			"kind", kind, "project", proj.Name)
 	}
 
 	// E.3 enqueue filter: a BOT-authored event is NEVER enqueued. Without it the

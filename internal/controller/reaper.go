@@ -434,7 +434,7 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 	// delivered(doc-timeout) case too is a harmless no-op.
 	if t.Spec.Kind == DocBatchKind && len(t.Spec.DocumentsTasks) > 0 &&
 		(t.Status.Stage == tatarav1alpha1.StageDelivered || t.Status.Stage == tatarav1alpha1.StageParked) {
-		if err := r.ResolveDocBatch(ctx, t); err != nil {
+		if err := r.ResolveDocBatch(ctx, proj, t); err != nil {
 			return err
 		}
 	}
@@ -469,7 +469,7 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 
 	case tatarav1alpha1.StageDocumenting:
 		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.DocStageBudget)) {
-			return r.forceDocTimeout(ctx, t, now)
+			return r.forceDocTimeout(ctx, proj, t, now)
 		}
 		return nil
 

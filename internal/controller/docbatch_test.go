@@ -140,7 +140,7 @@ func TestDocBatchStampsDocumentedByOnDelivered(t *testing.T) {
 	c := newMirrorClient(t, proj, src, docs, reapSecret(), t1, m1, batch)
 	r := reapReconciler(c, &reapWriter{})
 
-	if err := r.ResolveDocBatch(ctx, batch); err != nil {
+	if err := r.ResolveDocBatch(ctx, proj, batch); err != nil {
 		t.Fatalf("ResolveDocBatch: %v", err)
 	}
 	got, _ := mustGetTask(t, c, "task-a")

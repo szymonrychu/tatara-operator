@@ -58,6 +58,29 @@ func (f *fakeSpiller) Spill(_ context.Context, _, _ string, _ any) (string, erro
 	return "track-" + strconv.Itoa(f.calls), nil
 }
 
+// recordingMetrics captures IncSpillBlocked calls as "kind/reason" strings so
+// a test can assert the block is OBSERVABLE, not just that it happened.
+type recordingMetrics struct {
+	noopMetrics
+	blocked []string
+}
+
+func (r *recordingMetrics) IncSpillBlocked(kind, reason string) {
+	r.blocked = append(r.blocked, kind+"/"+reason)
+}
+
+// withRecordingMetrics installs a recorder for the duration of one test and
+// restores the no-op default afterwards. metricsRecorder is process-wide, so
+// the restore is mandatory - a leaked recorder would make a later test's
+// assertions depend on run order.
+func withRecordingMetrics(t *testing.T) *recordingMetrics {
+	t.Helper()
+	rec := &recordingMetrics{}
+	SetMetrics(rec)
+	t.Cleanup(func() { SetMetrics(nil) })
+	return rec
+}
+
 func bigComment(id string, at time.Time, n int) tatarav1alpha1.Comment {
 	return tatarav1alpha1.Comment{
 		ExternalID: id,
@@ -130,6 +153,7 @@ func TestFitIssue_SpillOnceDespiteConflictRetries(t *testing.T) {
 // the evicted comments, which is the forbidden ordering.
 func TestFitIssue_SpillFailureDropsNothing(t *testing.T) {
 	ctx := context.Background()
+	rec := withRecordingMetrics(t)
 	issue := overBudgetIssue("iss-repo-2", 120)
 	s := newTestScheme(t)
 	c := newFakeClient(t, s, issue)
@@ -163,6 +187,120 @@ func TestFitIssue_SpillFailureDropsNothing(t *testing.T) {
 	if string(beforeJSON) != string(afterJSON) {
 		t.Fatalf("Issue changed despite spill failure:\nbefore: %s\nafter:  %s", beforeJSON, afterJSON)
 	}
+
+	// The block is deliberate policy, but it must not be SILENT: without a
+	// counter a wedged object looks exactly like a healthy one and there is
+	// nothing to alert on while the memory outage lasts.
+	want := []string{"Issue/" + SpillBlockedReasonError}
+	if len(rec.blocked) != 1 || rec.blocked[0] != want[0] {
+		t.Fatalf("IncSpillBlocked calls = %v, want %v", rec.blocked, want)
+	}
+}
+
+// TestFit_NilSpillerBlocksInsteadOfPanicking covers the unconfigured-spiller
+// path. Before this, Fit* called Spill on a nil interface and PANICKED: inside
+// a reconciler controller-runtime recovers it and requeues, so the real cause
+// (a missing spiller) was buried under a stack trace and a hot requeue loop.
+// The write must still FAIL - dropping the evicted items is never an option -
+// but as a clean, countable, alertable error.
+func TestFit_NilSpillerBlocksInsteadOfPanicking(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	notes := make([]tatarav1alpha1.Note, 0, 120)
+	for i := 0; i < 120; i++ {
+		notes = append(notes, tatarav1alpha1.Note{
+			At: metav1.NewTime(base.Add(time.Duration(i) * time.Minute)), Agent: "implement",
+			Kind: "note", Body: strings.Repeat("x", 8000),
+		})
+	}
+
+	tests := []struct {
+		name string
+		obj  client.Object
+		kind string
+		fit  func(context.Context, client.Client, types.NamespacedName) error
+	}{
+		{
+			name: "issue",
+			obj:  overBudgetIssue("iss-nil-sp", 120),
+			kind: "Issue",
+			fit: func(ctx context.Context, c client.Client, k types.NamespacedName) error {
+				return FitIssue(ctx, c, nil, k, func(*tatarav1alpha1.Issue) {})
+			},
+		},
+		{
+			name: "mergerequest",
+			obj: &tatarav1alpha1.MergeRequest{
+				ObjectMeta: metav1.ObjectMeta{Name: "mr-nil-sp", Namespace: "tatara"},
+				Spec:       tatarav1alpha1.MergeRequestSpec{RepositoryRef: "repo", Number: 1},
+				Status:     tatarav1alpha1.MergeRequestStatus{Comments: overBudgetIssue("x", 120).Status.Comments},
+			},
+			kind: "MergeRequest",
+			fit: func(ctx context.Context, c client.Client, k types.NamespacedName) error {
+				return FitMergeRequest(ctx, c, nil, k, func(*tatarav1alpha1.MergeRequest) {})
+			},
+		},
+		{
+			name: "task",
+			obj: &tatarav1alpha1.Task{
+				ObjectMeta: metav1.ObjectMeta{Name: "proj-implement-2026-07-26-nilsp", Namespace: "tatara"},
+				Spec:       tatarav1alpha1.TaskSpec{ProjectRef: "proj", Goal: "g"},
+				Status:     tatarav1alpha1.TaskStatus{Notes: notes},
+			},
+			kind: "Task",
+			fit: func(ctx context.Context, c client.Client, k types.NamespacedName) error {
+				return FitTask(ctx, c, nil, k, func(*tatarav1alpha1.Task) {})
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rec := withRecordingMetrics(t)
+			s := newTestScheme(t)
+			c := newFakeClient(t, s, tc.obj)
+			key := types.NamespacedName{Name: tc.obj.GetName(), Namespace: "tatara"}
+
+			before := &unstructuredJSON{}
+			if err := before.capture(ctx, c, key, tc.obj.DeepCopyObject().(client.Object)); err != nil {
+				t.Fatalf("capture before: %v", err)
+			}
+
+			err := tc.fit(ctx, c, key)
+			if !errors.Is(err, ErrSpillerUnconfigured) {
+				t.Fatalf("fit err = %v, want ErrSpillerUnconfigured", err)
+			}
+
+			after := &unstructuredJSON{}
+			if err := after.capture(ctx, c, key, tc.obj.DeepCopyObject().(client.Object)); err != nil {
+				t.Fatalf("capture after: %v", err)
+			}
+			if before.json != after.json {
+				t.Fatalf("object changed despite a blocked spill:\nbefore: %s\nafter:  %s", before.json, after.json)
+			}
+
+			want := tc.kind + "/" + SpillBlockedReasonUnconfigured
+			if len(rec.blocked) != 1 || rec.blocked[0] != want {
+				t.Fatalf("IncSpillBlocked calls = %v, want [%s]", rec.blocked, want)
+			}
+		})
+	}
+}
+
+// unstructuredJSON re-reads an object and marshals it, so a test can assert
+// byte-for-byte that a blocked write left nothing behind.
+type unstructuredJSON struct{ json string }
+
+func (u *unstructuredJSON) capture(ctx context.Context, c client.Client, key types.NamespacedName, into client.Object) error {
+	if err := c.Get(ctx, key, into); err != nil {
+		return err
+	}
+	b, err := json.Marshal(into)
+	if err != nil {
+		return err
+	}
+	u.json = string(b)
+	return nil
 }
 
 // TestFitIssue_SpilledCommentsRefsAccumulate proves the v3 M19 bug is fixed:

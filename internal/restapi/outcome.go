@@ -884,6 +884,7 @@ func (o *outcomeCtx) implement(p implementPayload) {
 			if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(o.proj), key, func(m *tatarav1alpha1.MergeRequest) {
 				m.Status.LastBotHeadSHA = live
 			}); err != nil {
+				obs.MirrorWriteDroppedTotal.WithLabelValues(o.proj.Name, "MergeRequest", "record_bot_head").Inc()
 				s.log.WarnContext(ctx, "restapi: record_bot_head skipped: mirror write failed",
 					"action", "record_bot_head_skip", "reason", "fit_conflict", "task", o.task.Name, "mr", mr.Name, "error", err)
 				continue
@@ -1763,6 +1764,7 @@ func (o *outcomeCtx) incidentComment(p incidentPayload) {
 			t := metav1.NewTime(now)
 			i.Status.LastInvestigationCommentAt = &t
 		}); err != nil {
+			obs.MirrorWriteDroppedTotal.WithLabelValues(o.proj.Name, "Issue", "incident_cooldown_reset").Inc()
 			s.log.ErrorContext(ctx, "restapi: resetting incident comment cooldown after posted comment failed",
 				append(reqLogFields(o.r), "action", "comment_issue", "issue", key.Name, "error", err)...)
 		}

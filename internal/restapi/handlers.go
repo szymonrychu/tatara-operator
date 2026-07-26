@@ -37,6 +37,20 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// retryAfterSeconds is the hint on a 503 caused by a tatara-memory outage.
+// Long enough that an agent retrying in a tight loop cannot amplify the outage,
+// short enough that a blip costs one turn's pause and not the turn.
+const retryAfterSeconds = "10"
+
+// writeRetryAfter answers 503 Service Unavailable with a Retry-After header.
+// It is for a write the operator REFUSES on purpose while a dependency is down
+// - not an operator bug (500) and not a bad gateway response (502), both of
+// which read to a caller as "this will not work, give up".
+func writeRetryAfter(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", retryAfterSeconds)
+	writeError(w, http.StatusServiceUnavailable, msg)
+}
+
 // writeClientErr maps k8s apiserver errors onto the right HTTP status:
 // NotFound -> 404, Invalid (a CRD/validation rejection, e.g. #398's line=0
 // failing a CRD Minimum marker) -> 422 with the validation detail surfaced
