@@ -19,11 +19,14 @@ import (
 func setupMiddlewareTest(t *testing.T) (*auth.Verifier, *testjwks.Server, *obs.OperatorMetrics) {
 	t.Helper()
 	srv := testjwks.NewServer(t)
-	v, err := auth.NewVerifier(context.Background(), auth.Config{
+	v, err := auth.NewVerifier(auth.Config{
 		Issuer:   srv.Issuer(),
 		Audience: "tatara-operator",
 	})
 	require.NoError(t, err)
+	// These cases exercise middleware behaviour against a REACHABLE issuer, so
+	// discover eagerly here; the unreachable-issuer path has its own test.
+	require.NoError(t, v.WarmUp(context.Background()))
 	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
 	return v, srv, m
 }
@@ -144,6 +147,63 @@ func TestMiddleware_RecordsAuthMetrics(t *testing.T) {
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("invalid_scheme")))
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("invalid_token")))
 	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("accepted")))
+}
+
+// TestMiddleware_UnreachableIssuerIs503 pins the caller-visible half of issue
+// #456: while the IdP is unreachable the middleware must answer 503, so a
+// caller can tell "IdP down, retry" from "your token is bad, get a new one".
+// A genuinely invalid token must still be a 401 during the same outage window.
+func TestMiddleware_UnreachableIssuerIs503(t *testing.T) {
+	srv := testjwks.NewServer(t)
+	v, err := auth.NewVerifier(auth.Config{Issuer: srv.Issuer(), Audience: "tatara-operator"})
+	require.NoError(t, err)
+	m := obs.NewOperatorMetrics(prometheus.NewRegistry())
+
+	validTok := srv.SignTypedToken(t, testjwks.Claims{
+		Issuer:   srv.Issuer(),
+		Audience: []string{"tatara-operator"},
+		Subject:  "agent-1",
+	})
+	wrongAudTok := srv.SignTypedToken(t, testjwks.Claims{
+		Issuer:   srv.Issuer(),
+		Audience: []string{"other-app"},
+		Subject:  "agent-1",
+	})
+
+	handlerRan := false
+	handler := auth.Middleware(v, m)(okHandler(t, &handlerRan))
+	fire := func(tok string) *httptest.ResponseRecorder {
+		handlerRan = false
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr
+	}
+
+	srv.SetDown(true)
+	rr := fire(validTok)
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	assert.False(t, handlerRan)
+	assert.NotEmpty(t, rr.Header().Get("Retry-After"))
+	assert.Empty(t, rr.Header().Get("WWW-Authenticate"), "503 must not claim the token was rejected")
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("discovery_unavailable")))
+	assert.Equal(t, float64(0), testutil.ToFloat64(m.AuthCounter("invalid_token")))
+
+	// The outage does not stop retrying: once the issuer is back, the same
+	// verifier serves requests again without a restart.
+	srv.SetDown(false)
+	rr = fire(validTok)
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, handlerRan)
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("accepted")))
+
+	// A genuinely bad token is still a 401, never a 503.
+	rr = fire(wrongAudTok)
+	assert.Equal(t, http.StatusUnauthorized, rr.Code)
+	assert.False(t, handlerRan)
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("invalid_token")))
+	assert.Equal(t, float64(1), testutil.ToFloat64(m.AuthCounter("discovery_unavailable")))
 }
 
 // TestMiddleware_CtxCancelledPropagatesBeforeVerify confirms that a cancelled
