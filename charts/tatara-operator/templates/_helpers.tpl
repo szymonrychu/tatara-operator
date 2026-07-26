@@ -93,6 +93,14 @@ GRAFANA_MCP_IMAGE: {{ .Values.grafanaMcpImage | quote }}
 {{/* Per-Project memory-stack ServiceMonitor + PrometheusRule (issue #200). additionalLabels is a JSON object (rule 6), empty default keeps the chart cluster-agnostic (rule 14). */}}
 MEMORY_MONITORING_ENABLED: {{ .Values.memoryMonitoring.enabled | quote }}
 MEMORY_MONITOR_LABELS: {{ .Values.memoryMonitoring.additionalLabels | toJson | quote }}
+{{/* Per-Project cnpg WAL archiving + scheduled base backups (issue #432). Seven scalars (rule 6), all empty/off by default so the chart stays cluster-agnostic (rule 14). */}}
+MEMORY_BACKUP_ENABLED: {{ .Values.memoryBackup.enabled | quote }}
+MEMORY_BACKUP_ENDPOINT_URL: {{ .Values.memoryBackup.endpointUrl | quote }}
+MEMORY_BACKUP_BUCKET: {{ .Values.memoryBackup.bucket | quote }}
+MEMORY_BACKUP_PATH_PREFIX: {{ .Values.memoryBackup.pathPrefix | quote }}
+MEMORY_BACKUP_CREDENTIALS_SECRET_NAME: {{ .Values.memoryBackup.credentialsSecretName | quote }}
+MEMORY_BACKUP_RETENTION_POLICY: {{ .Values.memoryBackup.retentionPolicy | quote }}
+MEMORY_BACKUP_SCHEDULE_CRON: {{ .Values.memoryBackup.scheduleCron | quote }}
 LEADER_ELECTION: {{ .Values.leaderElection | quote }}
 IDLE_POD_REAP_MINUTES: {{ .Values.idlePodReapMinutes | quote }}
 MEMORY_PROVISIONING_TIMEOUT_MINUTES: {{ .Values.memoryProvisioningTimeoutMinutes | quote }}

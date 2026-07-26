@@ -54,13 +54,27 @@ type Config struct {
 	// resolve empty to "kubernetes.io/hostname", and the deploying helmfile can
 	// override it with a rack/zone label. Mirrors the AGENT_SCHEDULING precedent:
 	// a global operator env var, NOT a per-Project CRD field.
-	MemoryTopologyKey        string
-	OpenAISecretName         string
-	SemanticModel            string
-	IngesterImage            string
-	ExternalWebhookBase      string
-	OperatorOIDCClientID     string
-	OperatorOIDCClientSecret string
+	MemoryTopologyKey string
+	// Per-Project cnpg WAL archiving + scheduled base backups to an S3-compatible
+	// object store (issue #432). All seven default to empty/off so a cluster with
+	// no object store renders exactly the cnpg Cluster it renders today and the
+	// chart stays cluster-agnostic (rule 14). MemoryBackupEnabled alone is not
+	// enough: the bucket and the credentials Secret are both required, and a
+	// partial config fails closed (see memory.PGBackupStatus). The bucket itself
+	// is owned by tatara-helmfile, never created here.
+	MemoryBackupEnabled               bool
+	MemoryBackupEndpointURL           string
+	MemoryBackupBucket                string
+	MemoryBackupPathPrefix            string
+	MemoryBackupCredentialsSecretName string
+	MemoryBackupRetentionPolicy       string
+	MemoryBackupScheduleCron          string
+	OpenAISecretName                  string
+	SemanticModel                     string
+	IngesterImage                     string
+	ExternalWebhookBase               string
+	OperatorOIDCClientID              string
+	OperatorOIDCClientSecret          string
 	// OperatorOIDCSecretName is the name of the Kubernetes Secret that holds
 	// OPERATOR_OIDC_CLIENT_SECRET. Ingest Jobs source the OIDC client secret
 	// via SecretKeyRef from this Secret rather than embedding the plaintext
@@ -435,6 +449,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	memoryBackupEnabled, err := getBoolDefault("MEMORY_BACKUP_ENABLED", false)
+	if err != nil {
+		return Config{}, err
+	}
 	pushMetricsTTL, err := getDurationDefault("PUSH_METRICS_TTL", 5*time.Minute)
 	if err != nil {
 		return Config{}, err
@@ -525,53 +543,62 @@ func Load() (Config, error) {
 		incidentCorrelationLabels = DefaultIncidentCorrelationLabels
 	}
 	cfg := Config{
-		HTTPAddr:                   getDefault("HTTP_ADDR", ":8080"),
-		MetricsAddr:                getDefault("METRICS_ADDR", ":9090"),
-		HealthAddr:                 getDefault("HEALTH_ADDR", ":8081"),
-		InternalAddr:               getDefault("INTERNAL_ADDR", ":8082"),
-		CallbackURL:                os.Getenv("CALLBACK_URL"),
-		OIDCIssuer:                 os.Getenv("OIDC_ISSUER"),
-		OIDCAudience:               os.Getenv("OIDC_AUDIENCE"),
-		OperatorURL:                getDefault("OPERATOR_URL", "http://tatara-operator.tatara.svc:8080"),
-		MemoryImage:                os.Getenv("MEMORY_IMAGE"),
-		LightragImage:              os.Getenv("LIGHTRAG_IMAGE"),
-		GrafanaMCPImage:            os.Getenv("GRAFANA_MCP_IMAGE"),
-		Neo4jImage:                 os.Getenv("NEO4J_IMAGE"),
-		OpenAISecretName:           os.Getenv("OPENAI_SECRET_NAME"),
-		SemanticModel:              getDefault("SEMANTIC_MODEL", "gpt-4o-mini"),
-		IngesterImage:              os.Getenv("INGESTER_IMAGE"),
-		ExternalWebhookBase:        os.Getenv("EXTERNAL_WEBHOOK_BASE"),
-		OperatorOIDCClientID:       os.Getenv("OPERATOR_OIDC_CLIENT_ID"),
-		OperatorOIDCClientSecret:   os.Getenv("OPERATOR_OIDC_CLIENT_SECRET"),
-		OperatorOIDCSecretName:     os.Getenv("OPERATOR_OIDC_SECRET_NAME"),
-		AnthropicSecretName:        os.Getenv("ANTHROPIC_SECRET_NAME"),
-		CLIOIDCSecretName:          os.Getenv("CLI_OIDC_SECRET_NAME"),
-		ImagePullSecret:            os.Getenv("IMAGE_PULL_SECRET"),
-		AgentCPURequest:            os.Getenv("AGENT_CPU_REQUEST"),
-		AgentCPULimit:              os.Getenv("AGENT_CPU_LIMIT"),
-		AgentMemoryRequest:         os.Getenv("AGENT_MEMORY_REQUEST"),
-		AgentMemoryLimit:           os.Getenv("AGENT_MEMORY_LIMIT"),
-		AgentRunAsNonRoot:          agentRunAsNonRoot,
-		AgentRunAsUser:             agentRunAsUser,
-		AgentFSGroup:               agentFSGroup,
-		AgentScheduling:            os.Getenv("AGENT_SCHEDULING"),
-		Namespace:                  getDefault("NAMESPACE", "tatara"),
-		LogLevel:                   getDefault("LOG_LEVEL", "info"),
-		IngressHost:                os.Getenv("INGRESS_HOST"),
-		IngressClassName:           os.Getenv("INGRESS_CLASS_NAME"),
-		IngressRewriteTarget:       os.Getenv("INGRESS_REWRITE_TARGET"),
-		MemoryPathPrefix:           getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
-		LeaderElection:             leaderElection,
-		MemoryMonitoringEnabled:    memoryMonitoringEnabled,
-		MemoryMonitorLabels:        memoryMonitorLabels,
-		MemoryTopologyKey:          os.Getenv("MEMORY_TOPOLOGY_KEY"),
-		PushMetricsTTL:             pushMetricsTTL,
-		PushMetricsAllowedPrefixes: getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
-		IdlePodReapAfter:           idlePodReapAfter,
-		MemoryProvisioningTimeout:  memoryProvisioningTimeout,
-		CallbackHMACSecret:         os.Getenv("CALLBACK_HMAC_SECRET"),
-		CallbackHMACSecretName:     os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
-		SerenaURL:                  os.Getenv("TATARA_SERENA_URL"),
+		HTTPAddr:                 getDefault("HTTP_ADDR", ":8080"),
+		MetricsAddr:              getDefault("METRICS_ADDR", ":9090"),
+		HealthAddr:               getDefault("HEALTH_ADDR", ":8081"),
+		InternalAddr:             getDefault("INTERNAL_ADDR", ":8082"),
+		CallbackURL:              os.Getenv("CALLBACK_URL"),
+		OIDCIssuer:               os.Getenv("OIDC_ISSUER"),
+		OIDCAudience:             os.Getenv("OIDC_AUDIENCE"),
+		OperatorURL:              getDefault("OPERATOR_URL", "http://tatara-operator.tatara.svc:8080"),
+		MemoryImage:              os.Getenv("MEMORY_IMAGE"),
+		LightragImage:            os.Getenv("LIGHTRAG_IMAGE"),
+		GrafanaMCPImage:          os.Getenv("GRAFANA_MCP_IMAGE"),
+		Neo4jImage:               os.Getenv("NEO4J_IMAGE"),
+		OpenAISecretName:         os.Getenv("OPENAI_SECRET_NAME"),
+		SemanticModel:            getDefault("SEMANTIC_MODEL", "gpt-4o-mini"),
+		IngesterImage:            os.Getenv("INGESTER_IMAGE"),
+		ExternalWebhookBase:      os.Getenv("EXTERNAL_WEBHOOK_BASE"),
+		OperatorOIDCClientID:     os.Getenv("OPERATOR_OIDC_CLIENT_ID"),
+		OperatorOIDCClientSecret: os.Getenv("OPERATOR_OIDC_CLIENT_SECRET"),
+		OperatorOIDCSecretName:   os.Getenv("OPERATOR_OIDC_SECRET_NAME"),
+		AnthropicSecretName:      os.Getenv("ANTHROPIC_SECRET_NAME"),
+		CLIOIDCSecretName:        os.Getenv("CLI_OIDC_SECRET_NAME"),
+		ImagePullSecret:          os.Getenv("IMAGE_PULL_SECRET"),
+		AgentCPURequest:          os.Getenv("AGENT_CPU_REQUEST"),
+		AgentCPULimit:            os.Getenv("AGENT_CPU_LIMIT"),
+		AgentMemoryRequest:       os.Getenv("AGENT_MEMORY_REQUEST"),
+		AgentMemoryLimit:         os.Getenv("AGENT_MEMORY_LIMIT"),
+		AgentRunAsNonRoot:        agentRunAsNonRoot,
+		AgentRunAsUser:           agentRunAsUser,
+		AgentFSGroup:             agentFSGroup,
+		AgentScheduling:          os.Getenv("AGENT_SCHEDULING"),
+		Namespace:                getDefault("NAMESPACE", "tatara"),
+		LogLevel:                 getDefault("LOG_LEVEL", "info"),
+		IngressHost:              os.Getenv("INGRESS_HOST"),
+		IngressClassName:         os.Getenv("INGRESS_CLASS_NAME"),
+		IngressRewriteTarget:     os.Getenv("INGRESS_REWRITE_TARGET"),
+		MemoryPathPrefix:         getDefault("MEMORY_PATH_PREFIX", "/api/v1/memory"),
+		LeaderElection:           leaderElection,
+		MemoryMonitoringEnabled:  memoryMonitoringEnabled,
+		MemoryMonitorLabels:      memoryMonitorLabels,
+		MemoryTopologyKey:        os.Getenv("MEMORY_TOPOLOGY_KEY"),
+		// Passed through raw; the memory builders own the defaults for path
+		// prefix, retention and schedule so there is exactly one place they live.
+		MemoryBackupEnabled:               memoryBackupEnabled,
+		MemoryBackupEndpointURL:           os.Getenv("MEMORY_BACKUP_ENDPOINT_URL"),
+		MemoryBackupBucket:                os.Getenv("MEMORY_BACKUP_BUCKET"),
+		MemoryBackupPathPrefix:            os.Getenv("MEMORY_BACKUP_PATH_PREFIX"),
+		MemoryBackupCredentialsSecretName: os.Getenv("MEMORY_BACKUP_CREDENTIALS_SECRET_NAME"),
+		MemoryBackupRetentionPolicy:       os.Getenv("MEMORY_BACKUP_RETENTION_POLICY"),
+		MemoryBackupScheduleCron:          os.Getenv("MEMORY_BACKUP_SCHEDULE_CRON"),
+		PushMetricsTTL:                    pushMetricsTTL,
+		PushMetricsAllowedPrefixes:        getCSVList("PUSH_METRICS_ALLOWED_PREFIXES"),
+		IdlePodReapAfter:                  idlePodReapAfter,
+		MemoryProvisioningTimeout:         memoryProvisioningTimeout,
+		CallbackHMACSecret:                os.Getenv("CALLBACK_HMAC_SECRET"),
+		CallbackHMACSecretName:            os.Getenv("CALLBACK_HMAC_SECRET_NAME"),
+		SerenaURL:                         os.Getenv("TATARA_SERENA_URL"),
 
 		TokenBudgetEnabled:          tokenBudgetEnabled,
 		TokenBudgetMode:             getDefault("TOKEN_BUDGET_MODE", string(budget.ModeCustomWindow)),
