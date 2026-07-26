@@ -184,11 +184,17 @@ func (r *RepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			r.Metrics.ReconcileResult("Repository", "error")
 			return ctrl.Result{}, fmt.Errorf("set MemoryNotReady condition: %w", err)
 		}
+		// Issue #434: the gate is a SILENT hold - nothing fails, nothing retries, and
+		// the reconcile records "success" - so operator_repository_ingest_failing
+		// reads 0 for a gated repo indefinitely. This gauge is the only live signal
+		// that the gate is what is holding ingest.
+		r.Metrics.SetRepositoryIngestGated(repo.Name, true)
 		l.Info("ingest gated: project memory not stably ready",
 			"action", "ingest_gate", "resource_id", repo.Name, "project", project.Name)
 		r.Metrics.ReconcileResult("Repository", "success")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
+	r.Metrics.SetRepositoryIngestGated(repo.Name, false)
 
 	// Memory is Ready: clear the provisioning condition if it lingers from an
 	// earlier not-ready reconcile. Persist immediately when it flips, so it clears

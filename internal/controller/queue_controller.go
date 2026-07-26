@@ -370,6 +370,18 @@ func (r *DispatcherReconciler) admit(ctx context.Context, proj *tatarav1alpha1.P
 		}
 		for _, q := range queued {
 			if inflight >= cap {
+				// Issue #440: the pool is full with work still Queued. Every sibling
+				// refusal path (project_paused, token_budget, kind_ceiling) emits;
+				// this one used to break silently, so a saturated pool was
+				// indistinguishable from an empty one. Reached only from inside the
+				// loop, so queued is non-empty and this fires at most once per pool
+				// per pass. Admission behaviour is unchanged.
+				if r.Metrics != nil {
+					r.Metrics.AdmissionBlocked(proj.Name, class, "", "pool_full")
+				}
+				log.FromContext(ctx).Info("queue: admission held, pool at capacity",
+					"action", "admission_blocked", "project", proj.Name, "class", class,
+					"reason", "pool_full", "cap", cap, "inflight", inflight, "queued", len(queued))
 				break
 			}
 			if reserve > 0 && effectivePriority(q) != 2 && inflight >= cap-reserve {
