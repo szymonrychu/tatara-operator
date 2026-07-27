@@ -530,7 +530,11 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
 		return false
 	}
-	pending := pendingProposalCount(issues)
+	// The bot login is the authorship anchor the forgeable body-marker fallback
+	// in proposalPending requires. Resolved ONCE per pass, from the Project we
+	// already hold: no extra read, no SCM call.
+	botLogin := botLoginOf(proj)
+	pending := pendingProposalCount(issues, botLogin)
 	// operator_open_proposals is labelled by the owner/name SLUG, which is what
 	// the tatara-observability dashboard joins on - NOT by the Repository CR name
 	// pendingProposalCountByRepo keys on (DNS-1123, so it can never contain "/").
@@ -539,7 +543,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	// Every enrolled repo is written every pass, zeros included: the map only
 	// carries nonzero counts, so a repo whose proposals were all approved would
 	// otherwise drop out and latch its last nonzero value forever.
-	byRepoRef := pendingProposalCountByRepo(issues)
+	byRepoRef := pendingProposalCountByRepo(issues, botLogin)
 	for i := range repos {
 		if slug := repoSlug(&repos[i]); slug != "" {
 			r.Metrics.SetOpenProposals(slug, float64(byRepoRef[repos[i].Name]))

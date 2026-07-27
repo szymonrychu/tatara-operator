@@ -7,15 +7,23 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// testBotLogin is the fixture project's Scm.BotLogin: the author every genuine
+// tatara proposal carries, and the authorship anchor the body-marker fallback
+// requires.
+const testBotLogin = "tatara-bot"
+
 // iss builds an Issue CR fixture: provenance kind, forge state, platform status,
-// owning repo, and mirrored forge labels.
+// owning repo, and mirrored forge labels. The author is the bot, which is what a
+// genuine operator-filed proposal always looks like.
 func iss(kind, state, status, repo string, labels ...string) tatarav1alpha1.Issue {
 	return tatarav1alpha1.Issue{
 		ObjectMeta: metav1.ObjectMeta{Name: "iss-" + repo + "-1", Namespace: "tatara"},
 		Spec: tatarav1alpha1.IssueSpec{
 			RepositoryRef: repo, Number: 1, ProjectRef: "demo", ProposalKind: kind,
 		},
-		Status: tatarav1alpha1.IssueStatus{State: state, Status: status, Labels: labels},
+		Status: tatarav1alpha1.IssueStatus{
+			State: state, Status: status, Labels: labels, Author: testBotLogin,
+		},
 	}
 }
 
@@ -24,6 +32,14 @@ func iss(kind, state, status, repo string, labels ...string) tatarav1alpha1.Issu
 func issBody(kind, state, status, repo, body string) tatarav1alpha1.Issue {
 	out := iss(kind, state, status, repo)
 	out.Status.Body = body
+	return out
+}
+
+// issAuthored is issBody with an explicit author: a human-filed issue whose body
+// carries a PLANTED marker is the forgery this fallback must refuse.
+func issAuthored(kind, state, status, repo, body, author string) tatarav1alpha1.Issue {
+	out := issBody(kind, state, status, repo, body)
+	out.Status.Author = author
 	return out
 }
 
@@ -65,14 +81,39 @@ func TestProposalPending(t *testing.T) {
 			issBody("incident", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm)), false},
 		{"a stamped brainstorm survives a body whose marker was edited away",
 			issBody("brainstorm", "open", "new", "r1", "the marker is gone"), true},
+
+		// The AUTHORSHIP anchor on the fallback. The body is forge-editable, so
+		// anyone with write access to any issue on a tracked repo could paste the
+		// marker into it and inflate the backlog, suppressing legitimate refills.
+		// The author is not editable, and a genuine proposal is always bot-filed.
+		{"a marker planted in a human-authored issue does not count",
+			issAuthored("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm), "mallory"), false},
+		{"an empty author is never the bot",
+			issAuthored("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm), ""), false},
+		{"a stamped kind still counts regardless of author, because Spec is unforgeable",
+			issAuthored("brainstorm", "open", "new", "r1", "", "mallory"), true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			in := tc.in
-			if got := proposalPending(&in); got != tc.want {
+			if got := proposalPending(&in, testBotLogin); got != tc.want {
 				t.Fatalf("proposalPending = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// An unconfigured bot login must never turn every issue into a proposal. BotLogin
+// is a required, non-empty CRD field, so "" only happens on a malformed Project -
+// and there the fallback must fail CLOSED, not open.
+func TestProposalPendingWithNoBotLoginRefusesTheFallback(t *testing.T) {
+	marked := issBody("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm))
+	if proposalPending(&marked, "") {
+		t.Fatal("an unstamped marker must not count when the project has no bot login")
+	}
+	stamped := iss("brainstorm", "open", "new", "r1")
+	if !proposalPending(&stamped, "") {
+		t.Fatal("a Spec-stamped proposal needs no authorship corroboration")
 	}
 }
 
@@ -129,7 +170,7 @@ func TestPendingProposalCount(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := pendingProposalCount(tc.in); got != tc.want {
+			if got := pendingProposalCount(tc.in, testBotLogin); got != tc.want {
 				t.Fatalf("pendingProposalCount = %d, want %d", got, tc.want)
 			}
 		})
@@ -157,16 +198,19 @@ func TestPendingProposalCountCountsUnstampedBodyMarkerProposals(t *testing.T) {
 		issBody("", "open", "approved", "r5", body),
 		issBody("", "closed", "new", "r6", body),
 		issBody("", "open", "new", "r7", "a plain body with no marker"),
+		// The planted marker: a human-authored issue on a tracked repo whose body
+		// someone pasted the marker into. It must never buy a backlog slot.
+		issAuthored("", "open", "new", "r8", body, "mallory"),
 	}
 	for i := range issues {
 		if issues[i].Spec.ProposalKind != "" {
 			t.Fatalf("fixture %d must carry NO Spec.ProposalKind", i)
 		}
 	}
-	if got := pendingProposalCount(issues); got != 3 {
+	if got := pendingProposalCount(issues, testBotLogin); got != 3 {
 		t.Fatalf("pendingProposalCount = %d, want 3", got)
 	}
-	byRepo := pendingProposalCountByRepo(issues)
+	byRepo := pendingProposalCountByRepo(issues, testBotLogin)
 	want := map[string]int{"r1": 1, "r2": 1, "r3": 1}
 	if len(byRepo) != len(want) {
 		t.Fatalf("pendingProposalCountByRepo = %v, want %v", byRepo, want)
@@ -185,7 +229,7 @@ func TestPendingProposalCountByRepo(t *testing.T) {
 		iss("brainstorm", "open", "new", "r2", sysA),
 		iss("brainstorm", "open", "new", "r1"),
 		iss("brainstorm", "open", "approved", "r1"),
-	})
+	}, testBotLogin)
 	// Per-repo is deliberately UNCOLLAPSED: a systemic group spans repos, so
 	// collapsing it would have to attribute the one slot to an arbitrary repo.
 	want := map[string]int{"r1": 2, "r2": 1}

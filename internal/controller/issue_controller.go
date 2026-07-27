@@ -120,9 +120,9 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// Runs after the mirror sync so the backfill reads a FRESH body, and before
-	// the closed branch, which can delete the CR and return.
-	if err := r.stampProposalKind(ctx, &iss); err != nil {
+	// Runs after the mirror sync so the backfill reads a FRESH body and a fresh
+	// author, and before the closed branch, which can delete the CR and return.
+	if err := r.stampProposalKind(ctx, &iss, botLoginOf(&proj)); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -165,14 +165,27 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 // before the body marker existed stay unmarked and simply never count - a
 // bounded, shrinking set that self-corrects as the backlog turns over. No
 // migration job, no startup sweep, no manual step.
-func (r *IssueReconciler) stampProposalKind(ctx context.Context, iss *tatarav1alpha1.Issue) error {
+//
+// It reads the marker ONLY on a bot-authored issue. The body is forge-editable,
+// so an ungated backfill would let anyone with write access to any issue on a
+// tracked repo paste the marker in and have the operator stamp it PERMANENTLY as
+// a proposal, inflating the backlog and suppressing legitimate refills. Bot
+// authorship is the anchor a body editor cannot forge; see effectiveProposalKind
+// (proposalcount.go), which applies the identical gate to the read path so an
+// unstamped forgery cannot be counted in the passes before this runs.
+func (r *IssueReconciler) stampProposalKind(ctx context.Context, iss *tatarav1alpha1.Issue, botLogin string) error {
 	if iss.Spec.ProposalKind != "" {
+		return nil
+	}
+	if !issueAuthoredByBot(iss, botLogin) {
 		return nil
 	}
 	kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)
 	if kind == "" {
 		return nil
 	}
+	// Both errors are wrapped. RetryOnConflict still sees a conflict through the
+	// wrapper: apierrors.IsConflict resolves the APIStatus with errors.As.
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &tatarav1alpha1.Issue{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(iss), fresh); err != nil {
@@ -180,11 +193,12 @@ func (r *IssueReconciler) stampProposalKind(ctx context.Context, iss *tatarav1al
 		}
 		if fresh.Spec.ProposalKind != "" {
 			iss.Spec.ProposalKind = fresh.Spec.ProposalKind
+			iss.ResourceVersion = fresh.ResourceVersion
 			return nil
 		}
 		fresh.Spec.ProposalKind = kind
 		if err := r.Update(ctx, fresh); err != nil {
-			return err
+			return fmt.Errorf("issue: backfill provenance on %s: %w", iss.Name, err)
 		}
 		iss.Spec.ProposalKind = kind
 		iss.ResourceVersion = fresh.ResourceVersion

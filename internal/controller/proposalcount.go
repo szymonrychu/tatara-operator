@@ -16,15 +16,24 @@ import (
 // repos does not consume three slots of the target.
 const systemicLabelPrefix = "tatara/systemic-"
 
+// issueAuthoredByBot is the STRUCTURAL bot check, the same shape the approval
+// grammar and the pendingEvents enqueue filter rely on (mirror.go
+// mirrorCommentFrom): an EMPTY author, or an unconfigured bot login, is NEVER the
+// bot. Both halves must be non-empty, so it fails CLOSED.
+func issueAuthoredByBot(iss *tatarav1alpha1.Issue, botLogin string) bool {
+	return botLogin != "" && iss.Status.Author != "" && iss.Status.Author == botLogin
+}
+
 // effectiveProposalKind is the provenance of iss: the Spec stamp when set,
-// otherwise the in-body marker.
+// otherwise the in-body marker on a BOT-AUTHORED issue.
 //
 // The precedence is EXACT and load-bearing. Spec.ProposalKind is the
 // integrity-bearing field - the mirror only ever writes Status, so nothing
-// SCM-side can reach it - and it therefore WINS whenever it is set. The body
-// marker lives in the forge-editable body and is consulted ONLY on an unstamped
-// Issue, where there is no stamped value to override; a forge-side body edit can
-// never flip or clear a value the operator already wrote.
+// SCM-side can reach it - and it therefore WINS whenever it is set, with no
+// authorship corroboration needed. The body marker lives in the forge-editable
+// body and is consulted ONLY on an unstamped Issue, where there is no stamped
+// value to override; a forge-side body edit can never flip or clear a value the
+// operator already wrote.
 //
 // The fallback is the ROLLOUT property, not a convenience. Every proposal open
 // when this build ships was minted before the Spec field existed: it carries the
@@ -34,9 +43,22 @@ const systemicLabelPrefix = "tatara/systemic-"
 // already full. The reconciler backfill (issue_controller.go stampProposalKind)
 // converts those to stamped Issues as they reconcile, so this branch is
 // self-liquidating rather than a permanent second source of truth.
-func effectiveProposalKind(iss *tatarav1alpha1.Issue) string {
+//
+// The AUTHORSHIP gate on that fallback is a security control, not a filter.
+// Anyone with forge write access to ANY issue on a tracked repo can paste
+// "<!-- tatara-proposed-by:brainstorm -->" into a body they control. Ungated,
+// that alone would buy a permanent backlog slot and suppress legitimate refills
+// (a refill-cadence DoS; it can never reach auto-approve, which fails closed on
+// the absent ProposalBodyHash anchor). An attacker who can edit a body cannot
+// change its author, and a genuine proposal is ALWAYS filed under the bot
+// account, so requiring bot authorship closes the vector while leaving the
+// migration path for real pre-existing proposals fully intact.
+func effectiveProposalKind(iss *tatarav1alpha1.Issue, botLogin string) string {
 	if iss.Spec.ProposalKind != "" {
 		return iss.Spec.ProposalKind
+	}
+	if !issueAuthoredByBot(iss, botLogin) {
+		return ""
 	}
 	return tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)
 }
@@ -53,8 +75,13 @@ func effectiveProposalKind(iss *tatarav1alpha1.Issue) string {
 // decision, so it frees its slot immediately even though its forge issue stays
 // open through implementation. That is what makes "maintainer approves -> next
 // brainstorm launches" literally true.
-func proposalPending(iss *tatarav1alpha1.Issue) bool {
-	if effectiveProposalKind(iss) != tatarav1alpha1.ProposalKindBrainstorm {
+//
+// botLogin is Project.spec.scm.botLogin, threaded in by the caller so the
+// forgeable body-marker fallback has an unforgeable authorship anchor. It is
+// deliberately a plain string and not the Project: this predicate makes no API
+// call and no SCM call.
+func proposalPending(iss *tatarav1alpha1.Issue, botLogin string) bool {
+	if effectiveProposalKind(iss, botLogin) != tatarav1alpha1.ProposalKindBrainstorm {
 		return false
 	}
 	if iss.Status.State != "open" {
@@ -93,11 +120,11 @@ func systemicGroup(iss *tatarav1alpha1.Issue) string {
 
 // pendingProposalCount is the project-wide backlog level the control law
 // compares against the target. Systemic groups collapse to one slot each.
-func pendingProposalCount(issues []tatarav1alpha1.Issue) int {
+func pendingProposalCount(issues []tatarav1alpha1.Issue, botLogin string) int {
 	groups := map[string]bool{}
 	standalone := 0
 	for i := range issues {
-		if !proposalPending(&issues[i]) {
+		if !proposalPending(&issues[i], botLogin) {
 			continue
 		}
 		if g := systemicGroup(&issues[i]); g != "" {
@@ -114,10 +141,10 @@ func pendingProposalCount(issues []tatarav1alpha1.Issue) int {
 // a group spans repos, so collapsing it would attribute its one slot to an
 // arbitrary repo. The project-wide gauge (operator_brainstorm_pending_proposals)
 // carries the collapsed number.
-func pendingProposalCountByRepo(issues []tatarav1alpha1.Issue) map[string]int {
+func pendingProposalCountByRepo(issues []tatarav1alpha1.Issue, botLogin string) map[string]int {
 	out := map[string]int{}
 	for i := range issues {
-		if proposalPending(&issues[i]) {
+		if proposalPending(&issues[i], botLogin) {
 			out[issues[i].Spec.RepositoryRef]++
 		}
 	}

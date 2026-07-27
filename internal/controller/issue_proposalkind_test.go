@@ -27,13 +27,20 @@ func TestStampProposalKind(t *testing.T) {
 		name     string
 		specKind string
 		body     string
+		author   string
 		wantKind string
 	}{
-		{"empty kind with a brainstorm marker is backfilled", "", brainstormBody, "brainstorm"},
-		{"empty kind with an incident marker is backfilled", "", incidentBody, "incident"},
-		{"no marker is left alone", "", "a plain body", ""},
-		{"an already-stamped kind is never recomputed", "brainstorm", incidentBody, "brainstorm"},
-		{"a body edit that strips the marker cannot clear a stamped kind", "brainstorm", "edited away", "brainstorm"},
+		{"empty kind with a brainstorm marker is backfilled", "", brainstormBody, testBotLogin, "brainstorm"},
+		{"empty kind with an incident marker is backfilled", "", incidentBody, testBotLogin, "incident"},
+		{"no marker is left alone", "", "a plain body", testBotLogin, ""},
+		{"an already-stamped kind is never recomputed", "brainstorm", incidentBody, testBotLogin, "brainstorm"},
+		{"a body edit that strips the marker cannot clear a stamped kind", "brainstorm", "edited away", testBotLogin, "brainstorm"},
+
+		// The authorship anchor. Without it, anyone with forge write access to any
+		// issue on a tracked repo could paste the marker into it and have the
+		// operator PERMANENTLY (write-once) stamp it as a proposal.
+		{"a marker planted in a human-authored issue is never stamped", "", brainstormBody, "mallory", ""},
+		{"an empty author is never the bot", "", brainstormBody, "", ""},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -53,10 +60,11 @@ func TestStampProposalKind(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = k8sClient.Delete(context.Background(), iss) })
 			iss.Status.Body = tc.body
+			iss.Status.Author = tc.author
 			if err := r.Status().Update(ctx, iss); err != nil {
 				t.Fatalf("seed status: %v", err)
 			}
-			if err := r.stampProposalKind(ctx, iss); err != nil {
+			if err := r.stampProposalKind(ctx, iss, testBotLogin); err != nil {
 				t.Fatalf("stampProposalKind: %v", err)
 			}
 			var got tatarav1alpha1.Issue
