@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -119,6 +120,12 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
+	// Runs after the mirror sync so the backfill reads a FRESH body, and before
+	// the closed branch, which can delete the CR and return.
+	if err := r.stampProposalKind(ctx, &iss); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// WS3-I3: a human closed the driving issue mid-flight. Leader-only stop edge.
 	// Runs after the mirror sync so a cadence-detected close acts the same
 	// reconcile as a webhook-stamped one. When it acts, the Task is stopped (and
@@ -146,6 +153,45 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	return ctrl.Result{RequeueAfter: cadence}, nil
+}
+
+// stampProposalKind is the ONE-TIME migration backfill for Spec.ProposalKind.
+// Issues minted before the field existed carry an empty kind and would count as
+// 0 pending on rollout, so the operator would refill to N on top of the existing
+// backlog.
+//
+// It is WRITE-ONCE and Spec-only: a non-empty kind is never recomputed, so a
+// forge-side body edit after the fact cannot flip or clear it. Proposals minted
+// before the body marker existed stay unmarked and simply never count - a
+// bounded, shrinking set that self-corrects as the backlog turns over. No
+// migration job, no startup sweep, no manual step.
+func (r *IssueReconciler) stampProposalKind(ctx context.Context, iss *tatarav1alpha1.Issue) error {
+	if iss.Spec.ProposalKind != "" {
+		return nil
+	}
+	kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)
+	if kind == "" {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Issue{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(iss), fresh); err != nil {
+			return fmt.Errorf("issue: get %s for provenance backfill: %w", iss.Name, err)
+		}
+		if fresh.Spec.ProposalKind != "" {
+			iss.Spec.ProposalKind = fresh.Spec.ProposalKind
+			return nil
+		}
+		fresh.Spec.ProposalKind = kind
+		if err := r.Update(ctx, fresh); err != nil {
+			return err
+		}
+		iss.Spec.ProposalKind = kind
+		iss.ResourceVersion = fresh.ResourceVersion
+		log.FromContext(ctx).Info("issue: backfilled proposal provenance",
+			"action", "issue_proposal_kind_backfill", "resource_id", iss.Name, "proposal_kind", kind)
+		return nil
+	})
 }
 
 // projectLabels writes the ONE-WAY projection of Issue.status.status onto the

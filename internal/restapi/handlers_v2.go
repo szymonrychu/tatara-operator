@@ -1106,11 +1106,13 @@ func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
 		RepositoryRef: repo.Name, Number: number, URL: url, ProjectRef: proj.Name,
 	}
 	// A tatara-proposed body (brainstorm/incident marker) gets its auto-approve
-	// integrity anchor written HERE, once, into Spec - the one place the mirror
-	// never overwrites. This is the tamper record; the in-body marker is only
-	// provenance.
-	if tatarav1alpha1.ProposalKindFromBody(body) != "" {
+	// integrity anchor AND its durable provenance written HERE, once, into Spec -
+	// the one place the mirror never overwrites. The hash is the tamper record;
+	// ProposalKind is the provenance the backlog controller counts on. The in-body
+	// marker remains provenance-only.
+	if kind := tatarav1alpha1.ProposalKindFromBody(body); kind != "" {
 		spec.ProposalBodyHash = tatarav1alpha1.ComputeProposalContentHash(body)
+		spec.ProposalKind = kind
 	}
 	iss := &tatarav1alpha1.Issue{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns, Labels: crLabels},

@@ -16,6 +16,31 @@ import (
 // repos does not consume three slots of the target.
 const systemicLabelPrefix = "tatara/systemic-"
 
+// effectiveProposalKind is the provenance of iss: the Spec stamp when set,
+// otherwise the in-body marker.
+//
+// The precedence is EXACT and load-bearing. Spec.ProposalKind is the
+// integrity-bearing field - the mirror only ever writes Status, so nothing
+// SCM-side can reach it - and it therefore WINS whenever it is set. The body
+// marker lives in the forge-editable body and is consulted ONLY on an unstamped
+// Issue, where there is no stamped value to override; a forge-side body edit can
+// never flip or clear a value the operator already wrote.
+//
+// The fallback is the ROLLOUT property, not a convenience. Every proposal open
+// when this build ships was minted before the Spec field existed: it carries the
+// tatara-proposed-by marker in its mirrored body and nothing in Spec. Reading
+// only Spec would make pendingProposalCount zero for every project on the first
+// deploy, so the deficit would be the full target on top of a backlog that is
+// already full. The reconciler backfill (issue_controller.go stampProposalKind)
+// converts those to stamped Issues as they reconcile, so this branch is
+// self-liquidating rather than a permanent second source of truth.
+func effectiveProposalKind(iss *tatarav1alpha1.Issue) string {
+	if iss.Spec.ProposalKind != "" {
+		return iss.Spec.ProposalKind
+	}
+	return tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)
+}
+
 // proposalPending reports whether iss is a brainstorm proposal still AWAITING a
 // maintainer decision. This is the counting predicate for the backlog target.
 //
@@ -29,7 +54,7 @@ const systemicLabelPrefix = "tatara/systemic-"
 // open through implementation. That is what makes "maintainer approves -> next
 // brainstorm launches" literally true.
 func proposalPending(iss *tatarav1alpha1.Issue) bool {
-	if iss.Spec.ProposalKind != tatarav1alpha1.ProposalKindBrainstorm {
+	if effectiveProposalKind(iss) != tatarav1alpha1.ProposalKindBrainstorm {
 		return false
 	}
 	if iss.Status.State != "open" {

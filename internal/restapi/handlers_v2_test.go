@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -958,6 +959,27 @@ func TestIssueWrite_Create_IsSynchronousAndReturnsTheNumber(t *testing.T) {
 	require.Equal(t, "t1", iss.OwnerReferences[0].Name)
 	require.True(t, *iss.OwnerReferences[0].Controller)
 	require.Contains(t, e.task(t, "t1").Status.IssueRefs, iss.Name)
+	require.Empty(t, iss.Spec.ProposalKind,
+		"a plain agent-filed issue is not a tatara proposal and must carry no provenance")
+}
+
+// mintIssueCR stamps Spec.ProposalKind from the body marker, once, next to the
+// integrity anchor. Without it nothing in production ever writes the field and
+// pendingProposalCount reads structurally zero for every project.
+func TestIssueWrite_Create_StampsProposalKindFromTheBodyMarker(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+
+	body := tatarav1alpha1.StampProposalMarker("B", tatarav1alpha1.ProposalKindBrainstorm)
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+		`{"task":"t1","action":"create","repo":"tatara-operator","title":"T","body":`+
+			strconv.Quote(body)+`}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm, iss.Spec.ProposalKind)
+	require.Equal(t, tatarav1alpha1.ComputeProposalContentHash(body), iss.Spec.ProposalBodyHash,
+		"provenance and the integrity anchor are written by the same branch")
 }
 
 // The controller-ownership gate on EVERY action that names a number (fix 7).

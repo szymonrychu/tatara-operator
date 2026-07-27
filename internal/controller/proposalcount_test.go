@@ -19,6 +19,20 @@ func iss(kind, state, status, repo string, labels ...string) tatarav1alpha1.Issu
 	}
 }
 
+// issBody is iss plus a mirrored body, for the unstamped issues whose provenance
+// can only come from the in-body marker.
+func issBody(kind, state, status, repo, body string) tatarav1alpha1.Issue {
+	out := iss(kind, state, status, repo)
+	out.Status.Body = body
+	return out
+}
+
+// markedBody renders a mirrored body carrying the in-body provenance marker for
+// kind - exactly what outcome.go stamps on every proposal it files.
+func markedBody(kind string) string {
+	return tatarav1alpha1.StampProposalMarker("do the thing", kind)
+}
+
 func TestProposalPending(t *testing.T) {
 	tests := []struct {
 		name string
@@ -32,7 +46,25 @@ func TestProposalPending(t *testing.T) {
 		{"done does not count", iss("brainstorm", "open", "done", "r1"), false},
 		{"closed does not count", iss("brainstorm", "closed", "new", "r1"), false},
 		{"incident provenance is not a brainstorm proposal", iss("incident", "open", "new", "r1"), false},
-		{"unstamped provenance does not count", iss("", "open", "new", "r1"), false},
+		{"unstamped with no body marker does not count", iss("", "open", "new", "r1"), false},
+
+		// The body-marker fallback. Every proposal already open when this build
+		// ships carries the in-body marker and NOT the Spec field, so without the
+		// fallback the backlog reads zero on the first deploy and the controller
+		// refills to the full target on top of it.
+		{"unstamped with a brainstorm body marker counts",
+			issBody("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm)), true},
+		{"unstamped with an incident body marker does not count",
+			issBody("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindIncident)), false},
+		{"the body marker never revives a decided proposal",
+			issBody("", "open", "approved", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm)), false},
+
+		// Precedence: Spec is the integrity-bearing field (the mirror never writes
+		// Spec), so a forge-side body edit must not be able to override it either way.
+		{"a stamped kind wins over a contradicting body marker",
+			issBody("incident", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm)), false},
+		{"a stamped brainstorm survives a body whose marker was edited away",
+			issBody("brainstorm", "open", "new", "r1", "the marker is gone"), true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -101,6 +133,48 @@ func TestPendingProposalCount(t *testing.T) {
 				t.Fatalf("pendingProposalCount = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestPendingProposalCountCountsUnstampedBodyMarkerProposals is the rollout
+// safety property, and the reason the body-marker fallback exists at all.
+//
+// On the first deploy of this build, EVERY open proposal in every project was
+// minted before Spec.ProposalKind existed: it carries the in-body
+// tatara-proposed-by:brainstorm marker and nothing in Spec. If the count read
+// those as zero, the deficit would be the full target on the very first cron
+// tick and the controller would file N more proposals on top of a backlog that
+// was already full - the 2026-06-13 flooding-incident class. The count must be
+// NONZERO here with no Spec.ProposalKind set anywhere.
+func TestPendingProposalCountCountsUnstampedBodyMarkerProposals(t *testing.T) {
+	body := markedBody(tatarav1alpha1.ProposalKindBrainstorm)
+	issues := []tatarav1alpha1.Issue{
+		issBody("", "open", "new", "r1", body),
+		issBody("", "open", "", "r2", body),
+		issBody("", "open", "new", "r3", body),
+		// Not proposals, or already decided: these must not inflate the count.
+		issBody("", "open", "new", "r4", markedBody(tatarav1alpha1.ProposalKindIncident)),
+		issBody("", "open", "approved", "r5", body),
+		issBody("", "closed", "new", "r6", body),
+		issBody("", "open", "new", "r7", "a plain body with no marker"),
+	}
+	for i := range issues {
+		if issues[i].Spec.ProposalKind != "" {
+			t.Fatalf("fixture %d must carry NO Spec.ProposalKind", i)
+		}
+	}
+	if got := pendingProposalCount(issues); got != 3 {
+		t.Fatalf("pendingProposalCount = %d, want 3", got)
+	}
+	byRepo := pendingProposalCountByRepo(issues)
+	want := map[string]int{"r1": 1, "r2": 1, "r3": 1}
+	if len(byRepo) != len(want) {
+		t.Fatalf("pendingProposalCountByRepo = %v, want %v", byRepo, want)
+	}
+	for k, v := range want {
+		if byRepo[k] != v {
+			t.Fatalf("pendingProposalCountByRepo[%q] = %d, want %d", k, byRepo[k], v)
+		}
 	}
 }
 
