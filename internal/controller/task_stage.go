@@ -953,8 +953,47 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 
 	marker := turn0Marker(task)
 	if task.Annotations[annStageTurn0] == marker {
+		// THE CONVERSATION FOLLOW-UP TURN, and the ONLY stage that gets one.
+		//
+		// Every other pod stage takes exactly one turn per pod: turn-0 renders the
+		// whole bundle, the agent works, it submits an outcome, the stage moves and
+		// the pod dies. conversing is different by construction - it is where a Task
+		// waits with a live agent for the human's NEXT comment - so the pod must be
+		// able to take that comment as a further turn or the warmth buys nothing.
+		//
+		// Three guards, all load-bearing:
+		//   - stage == conversing, so the turn model of implementing/reviewing is
+		//     untouched;
+		//   - pendingEvents non-empty, so this fires on a real delta and not on
+		//     every 30s requeue (and the drain below is what makes it terminate);
+		//   - no turn in flight, because POST /v1/messages 409s during a turn and a
+		//     racing second submit is exactly the 2026-06 redelivery defect that
+		//     double-injected text into a live session.
+		if task.Status.Stage == tatarav1alpha1.StageConversing &&
+			len(task.Status.PendingEvents) > 0 && !taskHasInflightTurn(task) {
+			return r.submitStageTurn(ctx, proj, task, agentKind, "conversation", now)
+		}
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil // turn-0 already submitted for THIS pod
 	}
+
+	return r.submitStageTurn(ctx, proj, task, agentKind, "turn0", now)
+}
+
+// submitStageTurn renders the bundle and submits ONE turn to this Task's live
+// pod, then stamps the turn annotations and spends the pendingEvents delta that
+// was rendered into it. phase is "turn0" for a pod's first turn and
+// "conversation" for a conversing pod's follow-up; it names the submit site in
+// the failure path and in the log line, and is not otherwise behavioural.
+//
+// The annStageTurn0 marker is stamped for BOTH phases. For turn0 that is its
+// original meaning (this pod has been given the bundle). For a conversation turn
+// it is already set and re-stamping it is a no-op write that keeps the two paths
+// identical rather than branching.
+func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, agentKind, phase string, now time.Time) (ctrl.Result, error) {
+
+	l := log.FromContext(ctx)
+	marker := turn0Marker(task)
 
 	text, err := r.renderBundle(ctx, proj, task, agentKind)
 	if err != nil {
@@ -964,12 +1003,13 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	turnID, serr := r.Session.SubmitTurn(ctx, agent.BaseURL(task, task.Namespace), text, r.callbackURL())
 	elapsed := time.Since(t0).Seconds()
 	if serr != nil {
-		return r.handleTurnSubmitFailure(ctx, proj, task, serr, elapsed, "turn0")
+		return r.handleTurnSubmitFailure(ctx, proj, task, serr, elapsed, phase)
 	}
 	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", "ok", elapsed)
 	l.Info("turn submitted",
 		"action", "agent_turn_submit", "resource_id", task.Name, "turn_id", turnID,
-		"stage", task.Status.Stage, "agent_kind", agentKind, "bytes", len(text),
+		"stage", task.Status.Stage, "agent_kind", agentKind, "phase", phase,
+		"events", len(task.Status.PendingEvents), "bytes", len(text),
 		"duration_ms", int64(elapsed*1000))
 
 	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
@@ -983,10 +1023,11 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		delete(fresh.Annotations, annTurnLastActivity)
 		return true
 	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("stamp turn-0 marker: %w", err)
+		return ctrl.Result{}, fmt.Errorf("stamp turn marker (%s): %w", phase, err)
 	}
 	// E.3: the pending events were rendered into THIS bundle. They are the delta,
-	// and the delta is spent.
+	// and the delta is spent. Draining is also what terminates the conversation
+	// follow-up branch: with the delta spent, the next reconcile finds no events.
 	if len(task.Status.PendingEvents) > 0 {
 		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
 			if len(fresh.Status.PendingEvents) == 0 {
