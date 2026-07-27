@@ -123,8 +123,8 @@ func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 }
 
 // TestBrainstormGoal_ProjectSpanning: the goal must NOT contain a single
-// hard-coded repo slug; it must reference all repos and instruct the agent
-// to pick the best repo via propose_issue's repo arg.
+// hard-coded repo slug; it must reference all repos and instruct the agent to
+// pick the best repo via each proposal's repo field on submit_outcome.
 func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 	slugs := []string{"o/alpha", "o/beta", "o/gamma"}
 	g := brainstormGoalProject(slugs, "", "", 3)
@@ -139,9 +139,12 @@ func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 	if !strings.Contains(g, "tatara-code-quality-proposal") {
 		t.Fatalf("goal does not reference tatara-code-quality-proposal skill: %s", g)
 	}
-	// Must instruct agent to pass repo arg to propose_issue.
-	if !strings.Contains(g, "propose_issue") {
-		t.Fatalf("goal does not mention propose_issue: %s", g)
+	// Must instruct the agent to set each proposal's repo on submit_outcome.
+	if !strings.Contains(g, "action=propose") {
+		t.Fatalf("goal does not mention submit_outcome(action=propose): %s", g)
+	}
+	if !strings.Contains(g, "proposal's `repo`") {
+		t.Fatalf("goal does not tell the agent to set each proposal's repo: %s", g)
 	}
 	// Must NOT be scoped to a single repo (old single-slug format).
 	// The old format was "for repo <slug>" - new one covers the whole project.

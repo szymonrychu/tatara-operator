@@ -14,7 +14,7 @@ import (
 // the guard that neither comes back.
 func TestBrainstormGoalProject_NoSystemicRouting(t *testing.T) {
 	goal := brainstormGoalProject([]string{"o/a", "o/b"}, "ISSUES:\no/a#1 [bug] x\nOPEN MRs:\no/a#2 [ci:failure] y\nMAIN HEALTH:\no/a main CI: failure", "", 3)
-	for _, want := range []string{"MAIN HEALTH:", "OPEN MRs:", "skip_research"} {
+	for _, want := range []string{"MAIN HEALTH:", "OPEN MRs:", "action=skip"} {
 		if !strings.Contains(goal, want) {
 			t.Fatalf("goal missing %q", want)
 		}
