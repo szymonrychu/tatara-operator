@@ -418,7 +418,11 @@ type TaskEvent struct {
 // cache race costs a DELAY rather than a permanent stall.
 //
 // It is evidence of a PAST pass, not a licence: the backstop still re-checks
-// every owned Issue's live approval state before re-entering implementing.
+// every owned Issue's live approval state before re-entering implementing, AND
+// scopes the verdict to the CURRENT park - a verdict stamped before the Task's
+// current StageEnteredAt is treated as stale and refused, so an approval
+// consumed by an earlier park can never satisfy a later, unrelated one
+// (grammarPassedFor, internal/controller/unpark.go).
 type ApprovalVerdict struct {
 	// At is when the grammar passed.
 	At metav1.Time `json:"at"`
@@ -427,10 +431,21 @@ type ApprovalVerdict struct {
 	IssueRef string `json:"issueRef,omitempty"`
 	// CommentExternalID is the forge comment id the grammar matched, i.e. the
 	// Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
-	// makes this verdict traceable back to a real human action.
+	// makes this verdict traceable back to a real human action. Empty for the
+	// AutoApproveTataraProposals carve-out below, which cites no comment.
 	// +kubebuilder:validation:MaxLength=128
 	CommentExternalID string `json:"commentExternalId,omitempty"`
-	// Author is the verified maintainer login whose comment passed. Never the bot.
+	// Author is the verified maintainer login whose comment passed - never the
+	// bot login. EXCEPTION: under Project.spec.AutoApproveTataraProposals, a
+	// bot-authored, integrity-anchor-verified proposal with ZERO maintainer
+	// comments auto-approves (autoApproveApplies/autoApprovalEvidence,
+	// internal/controller/approval_grammar.go) and is recorded here with
+	// Author=AutoApproveLogin ("<tatara:auto>") - a deliberate, narrowly-gated
+	// carve-out, not a maintainer approval. Required non-empty: it is the one
+	// field every verdict this codebase ever writes always carries, so a
+	// consumer refusing an empty Author cannot be fooled by a schema-legal but
+	// otherwise-empty verdict.
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=128
 	Author string `json:"author,omitempty"`
 	// Phrase is the matched approvalPhrases entry.

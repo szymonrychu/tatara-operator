@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -162,20 +163,34 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 func TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines(t *testing.T) {
 	// The reconcile loop DOES drive identity-unverified now (Task 4): it reads
 	// Task.status.approvalVerdict rather than re-running the grammar. This Task
-	// carries no verdict, so grammarPassed is false and stage.Unpark declines
-	// with grammar-not-passed - the Task must stay exactly where it is.
+	// carries no verdict, but its one owned Issue IS live-approved: without the
+	// Issue seeded and approved, this test could not tell "correctly declined
+	// because grammarPassed is false" apart from "declined for the unrelated
+	// reason no Issues are owned" (DeclineNoOpenIssues) - it would pass either
+	// way and catch nothing. With the Issue approved, a wrongly-true
+	// grammarPassed WOULD re-enter the Task, so this asserts the SPECIFIC
+	// decline (grammar-not-passed), not just "stayed parked".
 	task := wfParkedTask("t-ident", "clarify", stage.ReasonIdentityUnverified)
+	task.Status.IssueRefs = []string{"iss-ident"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
 	}}
-	c := newMirrorClient(t, task)
-	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+	iss := &tatarav1alpha1.Issue{ObjectMeta: metav1.ObjectMeta{Name: "iss-ident", Namespace: mdNS}}
+	iss.Status.State = "open"
+	iss.Status.Status = "approved"
+	c := newMirrorClient(t, task, iss)
+	metrics := wfMetrics()
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: metrics}
 	if err := r.driveUnparks(context.Background(), wfProject(), time.Now()); err != nil {
 		t.Fatalf("driveUnparks: %v", err)
 	}
 	got := mdGetTask(t, c, task.Name)
 	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonIdentityUnverified {
-		t.Fatalf("driveUnparks touched identity-unverified: now %s(%s)", got.Status.Stage, got.Status.StageReason)
+		t.Fatalf("driveUnparks re-entered identity-unverified with NO grammar verdict on record: now %s(%s)",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 1 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 1", got)
 	}
 }
 

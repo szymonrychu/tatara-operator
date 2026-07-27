@@ -55,14 +55,21 @@ func TestDriveUnparks_RetriesIdentityUnverifiedFromThePersistedVerdict(t *testin
 	task.Spec.Kind = "clarify"
 	task.Status.Stage = tatarav1alpha1.StageParked
 	task.Status.StageReason = stage.ReasonIdentityUnverified
-	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	// StageEnteredAt and the verdict's At are given a REALISTIC gap (minutes, not
+	// microseconds): metav1.Time round-trips through the (fake or real) apiserver
+	// at whole-second precision, so two same-test time.Now() calls a few
+	// microseconds apart - which is what production never produces, since a human
+	// must physically comment between the park and the re-verify - would collapse
+	// to the SAME second and defeat grammarPassedFor's strict After() check.
+	parkedAt := time.Now().Add(-10 * time.Minute)
+	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
 	task.Status.IssueRefs = []string{"iss-helmfile-26"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Repo: "helmfile", Number: 26,
 		Author: "szymonrychu", Body: "go ahead",
 	}}
 	task.Status.ApprovalVerdict = &tatarav1alpha1.ApprovalVerdict{
-		At:                metav1.Now(),
+		At:                metav1.Time{Time: parkedAt.Add(5 * time.Minute)},
 		IssueRef:          "iss-helmfile-26",
 		CommentExternalID: "3606943691",
 		Author:            "szymonrychu",
@@ -156,18 +163,21 @@ func TestDriveUnparks_IdentityUnverifiedWithVerdictButNotAllApprovedStaysParked(
 	task.Spec.Kind = "clarify"
 	task.Status.Stage = tatarav1alpha1.StageParked
 	task.Status.StageReason = stage.ReasonIdentityUnverified
-	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now()}
+	// See the sibling test above for why the gap is minutes, not microseconds:
+	// metav1.Time round-trips at whole-second precision.
+	parkedAt := time.Now().Add(-10 * time.Minute)
+	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
 	task.Status.IssueRefs = []string{"iss-helmfile-27"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Repo: "helmfile", Number: 27,
 		Author: "szymonrychu", Body: "go ahead",
 	}}
-	// A verdict IS on record - the grammar passed at some point - but the live
-	// owned Issue is still open and NOT approved: the other half of the F.6
-	// rule the backstop must re-derive from live state, not assume from the
-	// verdict.
+	// A verdict IS on record, and it postdates this park - the grammar passed
+	// for THIS park - but the live owned Issue is still open and NOT approved:
+	// the other half of the F.6 rule the backstop must re-derive from live
+	// state, not assume from the verdict.
 	task.Status.ApprovalVerdict = &tatarav1alpha1.ApprovalVerdict{
-		At:                metav1.Now(),
+		At:                metav1.Time{Time: parkedAt.Add(5 * time.Minute)},
 		IssueRef:          "iss-helmfile-27",
 		CommentExternalID: "3606943700",
 		Author:            "szymonrychu",
@@ -196,5 +206,190 @@ func TestDriveUnparks_IdentityUnverifiedWithVerdictButNotAllApprovedStaysParked(
 	}
 	if got := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineNotAllApproved))); got != 1 {
 		t.Fatalf("operator_unpark_declined_total{identity-unverified,not-all-approved} = %v, want 1", got)
+	}
+}
+
+// THE SECURITY REVIEW FINDING (2026-07-27): ApprovalVerdict is never cleared by
+// stage.Enter (it resets Stage, StageReason, AgentKind, PodStartedAt,
+// StageWorkStartedAt, Stats.PodRecreations - stage.go's Enter - but not
+// ApprovalVerdict), and reverifyParked only writes a NEW one on a pass, leaving
+// a failing re-verify's OLD verdict in place. So a verdict stamped for an
+// EARLIER, already-consumed park can still be sitting on the Task when it
+// re-parks identity-unverified for an UNRELATED later reason.
+//
+// The verified attack chain: Issue A is approved (sticky - verifyOneIssue,
+// approval_grammar.go, deliberately never revokes an approval already given)
+// and the Task implements. It later acquires an unapproved Issue B and re-parks
+// identity-unverified. Issue B closes on the forge with no approval - openIssues
+// drops it, so allApproved([A]) is vacuously satisfied by the OLD approval.
+// ANY later non-bot comment (even "thanks", not an approval phrase) satisfies
+// hasNonBotEvent. Without scoping, the months-old verdict from Issue A would
+// authorize entry with NO fresh C.6 pass for THIS park. The fix: a verdict only
+// counts if it was stamped strictly AFTER the CURRENT park began
+// (StageEnteredAt), since stage.Enter re-stamps that on every transition.
+func TestDriveUnparks_VerdictPredatingCurrentParkStaysParked(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxOpenTasks = 6
+
+	parkedAt := time.Now().Add(-time.Hour)
+	task := &tatarav1alpha1.Task{}
+	task.Namespace = "tatara"
+	task.Name = "infrastructure-clarify-2026-07-27-staleverdict"
+	task.Spec.ProjectRef = "infrastructure"
+	task.Spec.Kind = "clarify"
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonIdentityUnverified
+	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
+	task.Status.IssueRefs = []string{"iss-helmfile-28"}
+	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Repo: "helmfile", Number: 28,
+		Author: "szymonrychu", Body: "thanks",
+	}}
+	// Stamped for a DIFFERENT, EARLIER park: two hours before the CURRENT one
+	// (parkedAt) began.
+	task.Status.ApprovalVerdict = &tatarav1alpha1.ApprovalVerdict{
+		At:                metav1.Time{Time: parkedAt.Add(-2 * time.Hour)},
+		IssueRef:          "iss-helmfile-old",
+		CommentExternalID: "1111111111",
+		Author:            "szymonrychu",
+		Phrase:            "go ahead",
+	}
+
+	// The currently owned Issue happens to ALSO read approved live (sticky from
+	// the old approval): if grammarPassed were derived from the stale verdict's
+	// mere presence, this Task would wrongly re-enter.
+	iss := &tatarav1alpha1.Issue{}
+	iss.Namespace = "tatara"
+	iss.Name = "iss-helmfile-28"
+	iss.Status.State = "open"
+	iss.Status.Status = "approved"
+
+	r := newUnparkTestReconciler(t, proj, task, iss)
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+
+	fresh := &tatarav1alpha1.Task{}
+	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if fresh.Status.Stage != tatarav1alpha1.StageParked {
+		t.Fatalf("stage = %s, want parked: a verdict predating the CURRENT park re-entered the Task", fresh.Status.Stage)
+	}
+	if got := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 1 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 1", got)
+	}
+}
+
+// MINOR 6: the CRD leaves author/commentExternalId optional (schema-evolution
+// headroom), so a hand-written {"at": "..."} verdict with every other field
+// empty is schema-valid on the wire, and its At can trivially postdate
+// StageEnteredAt. It must still never authorize entry: an empty Author is not
+// evidence of ANY approval, maintainer or auto. The zero-value verdict must be
+// unreachable-by-construction at the read site, not merely discouraged by CRD
+// validation (which a fake client - or a hand-edited CR bypassing admission -
+// does not enforce).
+func TestDriveUnparks_ZeroValueVerdictNeverAuthorizes(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxOpenTasks = 6
+
+	parkedAt := time.Now().Add(-time.Hour)
+	task := &tatarav1alpha1.Task{}
+	task.Namespace = "tatara"
+	task.Name = "t-zero-verdict"
+	task.Spec.ProjectRef = "infrastructure"
+	task.Spec.Kind = "clarify"
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonIdentityUnverified
+	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
+	task.Status.IssueRefs = []string{"iss-helmfile-30"}
+	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "go ahead",
+	}}
+	// Only At is set (and it postdates the current park, so the TIMING check
+	// alone would let this through): no Author, no IssueRef, no CommentExternalID.
+	task.Status.ApprovalVerdict = &tatarav1alpha1.ApprovalVerdict{
+		At: metav1.Time{Time: parkedAt.Add(time.Minute)},
+	}
+
+	iss := &tatarav1alpha1.Issue{}
+	iss.Namespace = "tatara"
+	iss.Name = "iss-helmfile-30"
+	iss.Status.State = "open"
+	iss.Status.Status = "approved"
+
+	r := newUnparkTestReconciler(t, proj, task, iss)
+
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+
+	fresh := &tatarav1alpha1.Task{}
+	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if fresh.Status.Stage != tatarav1alpha1.StageParked {
+		t.Fatalf("stage = %s, want parked: a verdict with no Author re-entered the Task", fresh.Status.Stage)
+	}
+}
+
+// IMPORTANT 3: reapParked's whole invariant is "a parked Task that can still
+// come back is never reaped" (reaper.go), checked by unparkFires BEFORE the
+// age-based collection. unparkFires used to build UnparkInput with no
+// GrammarPassed field at all (an unset bool defaults to false), so an
+// identity-unverified Task carrying a genuine, in-scope, freshly-scoped verdict
+// read as non-re-entryable to the reaper even though driveUnparks would re-enter
+// it on its very next pass - the reaper could collect a Task the driver was
+// about to save out from under it. The fix makes both call the SAME
+// grammarPassedFor helper on the same Task, so they cannot disagree by
+// construction.
+func TestUnparkFires_AgreesWithDriveUnparksOnIdentityUnverifiedVerdict(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxOpenTasks = 6
+
+	parkedAt := time.Now().Add(-time.Hour)
+	task := &tatarav1alpha1.Task{}
+	task.Namespace = "tatara"
+	task.Name = "infrastructure-clarify-2026-07-27-reaperagree"
+	task.Spec.ProjectRef = "infrastructure"
+	task.Spec.Kind = "clarify"
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonIdentityUnverified
+	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
+	task.Status.IssueRefs = []string{"iss-helmfile-29"}
+	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Repo: "helmfile", Number: 29,
+		Author: "szymonrychu", Body: "go ahead",
+	}}
+	task.Status.ApprovalVerdict = &tatarav1alpha1.ApprovalVerdict{
+		At:                metav1.Time{Time: parkedAt.Add(time.Minute)}, // AFTER this park began
+		IssueRef:          "iss-helmfile-29",
+		CommentExternalID: "2222222222",
+		Author:            "szymonrychu",
+		Phrase:            "go ahead",
+	}
+
+	iss := &tatarav1alpha1.Issue{}
+	iss.Namespace = "tatara"
+	iss.Name = "iss-helmfile-29"
+	iss.Status.State = "open"
+	iss.Status.Status = "approved"
+
+	r := newUnparkTestReconciler(t, proj, task, iss)
+
+	fires, err := r.unparkFires(context.Background(), proj, task, time.Now())
+	if err != nil {
+		t.Fatalf("unparkFires: %v", err)
+	}
+	if !fires {
+		t.Fatalf("unparkFires = false: the reaper disagrees with driveUnparks, which would re-enter this Task; " +
+			"a Task the driver is about to save must never read as collectible")
 	}
 }

@@ -1192,6 +1192,14 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // unparkFires reports whether an F.6 re-entry rule matches t RIGHT NOW. A parked
 // Task that can still come back is never reaped. stage.Unpark MUTATES its Task, so
 // it is asked on a DeepCopy: this is a probe, not a transition.
+//
+// GrammarPassed is resolved by grammarPassedFor (unpark.go), the SAME helper
+// driveUnparks' ApplyUnpark uses, on the SAME probe copy - so this probe cannot
+// disagree with the driver about whether a given identity-unverified verdict
+// counts (2026-07-27 security review finding 3: before this, the probe built
+// UnparkInput with no GrammarPassed field at all, which defaults to false, so a
+// Task the driver was about to re-enter on its very next pass could read here
+// as non-re-entryable and be reaped out from under it).
 func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
@@ -1211,14 +1219,16 @@ func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
+	probe := t.DeepCopy()
 	_, ok := stage.Unpark(stage.UnparkInput{
-		Task:         t.DeepCopy(),
-		Issues:       issues,
-		MRs:          mrs,
-		ActiveTasks:  active,
-		MaxOpenTasks: maxOpen,
-		BotLogin:     botLoginOf(proj),
-		Now:          now,
+		Task:          probe,
+		Issues:        issues,
+		MRs:           mrs,
+		ActiveTasks:   active,
+		MaxOpenTasks:  maxOpen,
+		BotLogin:      botLoginOf(proj),
+		GrammarPassed: grammarPassedFor(probe, false),
+		Now:           now,
 	})
 	return ok, nil
 }

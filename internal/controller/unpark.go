@@ -39,9 +39,26 @@ import (
 // Task.status.approvalVerdict the moment the grammar passes, whether or not the
 // un-park in that same request succeeds. This driver never re-runs the grammar -
 // it cannot - it reads that record and re-derives the rest (are all open owned
-// Issues approved?) from LIVE cluster state, which it can. A Task with no verdict
-// declines with grammar-not-passed and stays exactly where it is: there is no
-// path here that re-enters implementing without a recorded maintainer approval.
+// Issues approved?) from LIVE cluster state, which it can.
+//
+// The verdict is SCOPED TO THE CURRENT PARK (2026-07-27 security review
+// finding): stage.Enter never clears ApprovalVerdict, so a Task approved once,
+// moved on, and later re-parked identity-unverified for an UNRELATED reason (a
+// newly acquired, unapproved owned Issue; a later clarify round) still carries
+// the OLD verdict. grammarPassedFor (below) only honours a verdict stamped
+// AFTER the CURRENT park's StageEnteredAt - a verdict already consumed by an
+// earlier park can never satisfy a later one - and refuses a verdict with no
+// Author, so a schema-legal-but-empty {"at": "..."} verdict cannot authorize
+// anything either.
+//
+// A Task with no verdict, or only a stale one, declines with grammar-not-passed
+// and stays exactly where it is. ONE CARVE-OUT: under
+// Project.spec.AutoApproveTataraProposals, a bot-authored, anchor-verified
+// proposal with ZERO maintainer comments auto-approves (autoApproveApplies /
+// autoApprovalEvidence, approval_grammar.go) and verdictFrom records that as a
+// verdict with Author=AutoApproveLogin and no CommentExternalID - by design, not
+// a gap this driver introduces. Outside that flag, there is no path here that
+// re-enters implementing without a recorded maintainer approval.
 
 // UnparkDecline classifies WHY ApplyUnpark refused to re-enter (target==""),
 // so callers can tell an anomalous drift bail from a normal steady-state
@@ -97,6 +114,53 @@ func DeclineFor(code string) UnparkDecline {
 	default:
 		return DeclineRule
 	}
+}
+
+// grammarPassedFor scopes t's C.6 verdict to t's CURRENT park, for the ONE
+// stageReason (identity-unverified) that reads it. It is the SINGLE definition
+// of that scoping rule, called from both ApplyUnpark (on the freshly-read Task,
+// inside the retry loop) and reaper.go's unparkFires (on its probe DeepCopy),
+// so the periodic driver and the reap-eligibility probe cannot disagree about
+// whether a given verdict counts (2026-07-27 security review finding 3).
+//
+// Two refusals, both fail-closed:
+//
+//  1. v.At must be AFTER t.Status.StageEnteredAt. stage.Enter never clears
+//     ApprovalVerdict but DOES re-stamp StageEnteredAt on every transition,
+//     including into parked(identity-unverified) - so "the verdict postdates
+//     the current park" is exactly "this verdict was produced FOR this park,
+//     not carried over from an earlier one already consumed". Without this, an
+//     Issue approved once (sticky - verifyOneIssue never revokes it) could
+//     satisfy a LATER, unrelated park caused by a different, since-closed
+//     owned Issue (finding 1).
+//  2. v.Author must be non-empty. Task.Status.ApprovalVerdict's CRD schema
+//     leaves author/commentExternalId optional (evolution headroom), so a
+//     hand-written or corrupted {"at": "..."} verdict is schema-valid; Author is
+//     the one field every verdict this codebase writes always carries (a real
+//     maintainer login, or AutoApproveLogin for the guarded proposal
+//     carve-out - see verdictFrom), so requiring it makes the zero-value
+//     struct unreachable by construction here regardless of what a given CR's
+//     admission did or did not enforce (finding/minor 6).
+//
+// fallback is returned for every OTHER stageReason, where GrammarPassed is
+// ignored entirely (see stage.UnparkInput's doc comment).
+//
+// metav1.Time round-trips through the apiserver at WHOLE-SECOND precision (its
+// MarshalJSON drops sub-second digits), so two timestamps written within the
+// same second are indistinguishable by the time either is read back. That
+// never happens for a genuine identity-unverified verdict: a human must
+// physically comment on the forge AFTER the park, which is always seconds to
+// days later, never the same second. Refusing on equality (strict After, not
+// After-or-equal) is deliberately the conservative side of that non-issue.
+func grammarPassedFor(t *tatarav1alpha1.Task, fallback bool) bool {
+	if t.Status.StageReason != stage.ReasonIdentityUnverified {
+		return fallback
+	}
+	v := t.Status.ApprovalVerdict
+	if v == nil || v.Author == "" || t.Status.StageEnteredAt == nil {
+		return false
+	}
+	return v.At.After(t.Status.StageEnteredAt.Time)
 }
 
 // ApplyUnpark runs stage.Unpark for one parked Task and persists the re-entry
@@ -163,6 +227,10 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			decline = DeclineGuard
 			return nil
 		}
+		// grammarPassedFor reads the verdict off fresh - the UNCACHED read this
+		// closure just did - not off the caller's (possibly cached, possibly
+		// stale) task argument. See grammarPassedFor's own doc for why the
+		// verdict must additionally be scoped to fresh's CURRENT park.
 		to, code := stage.UnparkDetailed(stage.UnparkInput{
 			Task:            fresh,
 			Issues:          issues,
@@ -170,7 +238,7 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			ActiveTasks:     activeTasks,
 			MaxOpenTasks:    maxOpen,
 			BotLogin:        botLogin,
-			GrammarPassed:   grammarPassed,
+			GrammarPassed:   grammarPassedFor(fresh, grammarPassed),
 			MaxTurnsPerTask: maxTurns,
 			Now:             now,
 		})
@@ -258,12 +326,13 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		if t.Spec.ProjectRef != proj.Name || t.Status.Stage != tatarav1alpha1.StageParked {
 			continue
 		}
-		// The verdict is the ONE input this pass cannot reconstruct. Absent, it is
-		// false and stage.Unpark declines with grammar-not-passed; present, it is
-		// the webhook's own recorded C.6 pass and the owned-Issue half is re-derived
-		// from live state below.
-		grammarPassed := t.Status.StageReason == stage.ReasonIdentityUnverified && t.Status.ApprovalVerdict != nil
-		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, grammarPassed, now)
+		// The verdict is the ONE input this pass cannot reconstruct, and ApplyUnpark
+		// resolves it itself (grammarPassedFor, on its own UNCACHED read) rather than
+		// this loop computing it off t - t comes from the List above (r.Client,
+		// cached) and can lag exactly the write this whole feature exists to survive.
+		// false here is the fallback ApplyUnpark uses for every OTHER stageReason,
+		// where GrammarPassed is ignored entirely.
+		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
 				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.StageReason)
@@ -291,10 +360,17 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 				// single most important line in this file for diagnosing a repeat of
 				// the 2026-07-27 stall: if it fires often, the webhook fast path is
 				// losing its cache race routinely and the fast path is what to fix.
-				log.FromContext(ctx).Info("unpark: identity-unverified retried from the persisted grammar verdict",
-					"action", "unpark_verdict_backstop", "resource_id", t.Name, "stage", target,
-					"verdict_comment", t.Status.ApprovalVerdict.CommentExternalID,
-					"verdict_issue", t.Status.ApprovalVerdict.IssueRef)
+				//
+				// t (this loop's cached List item) is diagnostic best-effort here, not
+				// the security decision (that already happened, inside ApplyUnpark,
+				// against an uncached read) - so t.Status.ApprovalVerdict may be nil or
+				// stale even though the re-entry above genuinely succeeded; guard it
+				// rather than deref a verdict the cache never observed.
+				fields := []any{"action", "unpark_verdict_backstop", "resource_id", t.Name, "stage", target}
+				if v := t.Status.ApprovalVerdict; v != nil {
+					fields = append(fields, "verdict_comment", v.CommentExternalID, "verdict_issue", v.IssueRef)
+				}
+				log.FromContext(ctx).Info("unpark: identity-unverified retried from the persisted grammar verdict", fields...)
 			}
 			active++ // the re-entered Task is now active; keep the cap honest this pass.
 		}

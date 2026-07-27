@@ -223,15 +223,26 @@ spec:
                     format: date-time
                     type: string
                   author:
-                    description: Author is the verified maintainer login whose comment
-                      passed. Never the bot.
+                    description: |-
+                      Author is the verified maintainer login whose comment passed - never the
+                      bot login. EXCEPTION: under Project.spec.AutoApproveTataraProposals, a
+                      bot-authored, integrity-anchor-verified proposal with ZERO maintainer
+                      comments auto-approves (autoApproveApplies/autoApprovalEvidence,
+                      internal/controller/approval_grammar.go) and is recorded here with
+                      Author=AutoApproveLogin ("<tatara:auto>") - a deliberate, narrowly-gated
+                      carve-out, not a maintainer approval. Required non-empty: it is the one
+                      field every verdict this codebase ever writes always carries, so a
+                      consumer refusing an empty Author cannot be fooled by a schema-legal but
+                      otherwise-empty verdict.
                     maxLength: 128
+                    minLength: 1
                     type: string
                   commentExternalId:
                     description: |-
                       CommentExternalID is the forge comment id the grammar matched, i.e. the
                       Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
-                      makes this verdict traceable back to a real human action.
+                      makes this verdict traceable back to a real human action. Empty for the
+                      AutoApproveTataraProposals carve-out below, which cites no comment.
                     maxLength: 128
                     type: string
                   issueRef:
