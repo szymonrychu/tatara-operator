@@ -33,6 +33,18 @@ const (
 	// exists, leaving the still-OPEN CR the ownerless orphan the fresh
 	// MintForItem re-adopts.
 	SeverOrphan
+	// SeverRetainCR clears the TASK side only and leaves the Issue CR completely
+	// alone - ownerRefs, controller flag and mirror labels all stay (O9). It is
+	// the discarded-BRAINSTORM-PROPOSAL mode: that mirror is the only record that
+	// the idea was killed and WHY (the maintainer's comments), so deleting it
+	// makes the <proposal_history> block's declined rows unreachable and a killed
+	// idea invisible to the next brainstorm session.
+	//
+	// Keeping the ownerRef is deliberate and is what BOUNDS the retention: the CR
+	// cascades with its now rejected owner Task's reap instead of leaking a
+	// zero-owner CR nothing ever collects. SeverOrphan would drop that ref and
+	// retain declined proposals forever.
+	SeverRetainCR
 )
 
 // SeverIssueFromTask detaches issueName from task WITHOUT the split state the
@@ -93,6 +105,11 @@ func SeverIssueFromTask(ctx context.Context, c client.Client, task *tatarav1alph
 	// STEP 2 (CR side).
 	issKey := types.NamespacedName{Namespace: task.Namespace, Name: issueName}
 	switch mode {
+	case SeverRetainCR:
+		l.Info("severed an issue mirror from its task and retained the CR",
+			"action", "sever_issue_retain", "resource_id", issueName, "task", task.Name)
+		return nil
+
 	case SeverDeleteCR:
 		var iss tatarav1alpha1.Issue
 		if err := c.Get(ctx, issKey, &iss); err != nil {

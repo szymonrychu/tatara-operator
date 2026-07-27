@@ -129,6 +129,15 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 
+	// O9: a maintainer REOPENED a proposal the operator had retained as declined.
+	// It runs before the closed branch (the two states are exclusive) and after
+	// the mirror sync, so the reopen is acted on the same reconcile it is seen.
+	if iss.Status.State == "open" && iss.Status.Status == "rejected" {
+		if err := reopenRetainedProposal(ctx, r.Client, &iss); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// WS3-I3: a human closed the driving issue mid-flight. Leader-only stop edge.
 	// Runs after the mirror sync so a cadence-detected close acts the same
 	// reconcile as a webhook-stamped one. When it acts, the Task is stopped (and
@@ -292,9 +301,11 @@ func (r *IssueReconciler) projectLabels(ctx context.Context, proj *tatarav1alpha
 
 // handleIssueClosed routes a closed, owned Issue CR through the WS3-I3 stop edge
 // (a live, non-deploying source stage) or, as the review re-sever hardening,
-// finishes a crash-interrupted SeverDeleteCR on a rejected(issue-closed) owner.
+// finishes a crash-interrupted sever on a rejected(issue-closed) owner.
 // handled=true means the caller must stop this reconcile (the Task was stopped
-// and/or the mirror CR was deleted).
+// and/or the mirror CR was deleted). A RETAINED brainstorm-proposal mirror is
+// explicitly NOT handled: it survives, so the rest of the reconcile still owes
+// it a label projection and a cadence requeue.
 func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1alpha1.Issue) (bool, error) {
 	ownerName, owned := own.ControllerOwner(iss)
 	if !owned {
@@ -316,11 +327,18 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 	// Re-sever hardening: a rejected(issue-closed) owner Task with the closed CR
 	// still present means a crash interrupted the DeleteCR between clearing
 	// IssueRefs and deleting the mirror. Finish it (restores prompt reopen).
+	//
+	// O9 makes that same state the STEADY state of every retained brainstorm
+	// proposal, so it MUST route through recordProposalDecline: an unguarded
+	// re-sever would delete the mirror C3 exists to keep, on the very next
+	// reconcile. A retained mirror also reports handled=FALSE, so the reconcile
+	// continues and the rejected verdict still projects onto the declined label.
 	if task.Status.Stage == tatarav1alpha1.StageRejected && task.Status.StageReason == stage.ReasonIssueClosed {
-		if err := SeverIssueFromTask(ctx, r.Client, &task, iss.Name, SeverDeleteCR); err != nil {
+		retained, err := recordProposalDecline(ctx, r.Client, &task, iss.Name)
+		if err != nil {
 			return false, err
 		}
-		return true, nil
+		return !retained, nil
 	}
 	return false, nil
 }
