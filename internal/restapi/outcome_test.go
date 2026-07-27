@@ -791,6 +791,8 @@ func TestOutcome_Brainstorm_StampsProposalMarker(t *testing.T) {
 		"Issue CR Spec must anchor the filing-time body hash")
 	require.True(t, tatarav1alpha1.ProposalBodyMatchesAnchor(
 		issues.Items[0].Status.Body, issues.Items[0].Spec.ProposalBodyHash))
+	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm, issues.Items[0].Spec.ProposalKind,
+		"Issue CR Spec must carry the DURABLE provenance the backlog counts on")
 }
 
 func TestOutcome_Brainstorm_ProposalsAreCappedAt5(t *testing.T) {
@@ -849,6 +851,8 @@ func TestOutcome_Incident_StampsProposalMarker(t *testing.T) {
 	require.Equal(t, tatarav1alpha1.ComputeProposalContentHash(iss.Status.Body),
 		iss.Spec.ProposalBodyHash,
 		"Issue CR Spec must anchor the filing-time body hash")
+	require.Equal(t, tatarav1alpha1.ProposalKindIncident, iss.Spec.ProposalKind,
+		"an incident tracker issue is stamped incident, so it never counts as a brainstorm proposal")
 }
 
 // After file_issue on an incident Task whose spec.dedupKey is set, the minted

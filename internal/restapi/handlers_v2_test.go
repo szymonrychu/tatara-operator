@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +313,15 @@ func (e *v2Env) mr(t *testing.T, name string) *tatarav1alpha1.MergeRequest {
 func (e *v2Env) issue(t *testing.T, name string) *tatarav1alpha1.Issue {
 	t.Helper()
 	var out tatarav1alpha1.Issue
+	require.NoError(t, e.c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &out))
+	return &out
+}
+
+// project re-reads a Project CR by name, for tests that assert on a status
+// field a handler wrote (e.g. Status.BrainstormConsecutiveSkips).
+func (e *v2Env) project(t *testing.T, name string) *tatarav1alpha1.Project {
+	t.Helper()
+	var out tatarav1alpha1.Project
 	require.NoError(t, e.c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &out))
 	return &out
 }
@@ -958,6 +968,36 @@ func TestIssueWrite_Create_IsSynchronousAndReturnsTheNumber(t *testing.T) {
 	require.Equal(t, "t1", iss.OwnerReferences[0].Name)
 	require.True(t, *iss.OwnerReferences[0].Controller)
 	require.Contains(t, e.task(t, "t1").Status.IssueRefs, iss.Name)
+	require.Empty(t, iss.Spec.ProposalKind,
+		"a plain agent-filed issue is not a tatara proposal and must carry no provenance")
+}
+
+// The generic issue_write action=create endpoint is callable by ANY authenticated
+// agent pod with an agent-supplied body, and mintIssueCR files it under the bot
+// account. So body content must never be able to claim proposal provenance: an
+// agent processing forge content (a prompt-injection surface) that later files an
+// unrelated issue containing the literal marker string would otherwise mint a
+// PERMANENT backlog slot, and - via the auto-approve carve-out's anchor - an
+// auto-approvable one. Provenance comes from the CALLER, and this caller declares
+// none.
+func TestIssueWrite_Create_NeverClaimsProposalProvenanceFromTheBody(t *testing.T) {
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
+
+	body := tatarav1alpha1.StampProposalMarker("B", tatarav1alpha1.ProposalKindBrainstorm)
+	w := e.do(t, http.MethodPost, "/projects/tatara/scm/issue-write",
+		`{"task":"t1","action":"create","repo":"tatara-operator","title":"T","body":`+
+			strconv.Quote(body)+`}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
+	require.Empty(t, iss.Spec.ProposalKind,
+		"an agent-supplied body must never stamp durable proposal provenance")
+	require.Empty(t, iss.Spec.ProposalBodyHash,
+		"and must never mint the auto-approve integrity anchor either")
+	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm,
+		tatarav1alpha1.ProposalKindFromBody(iss.Status.Body),
+		"the body is stored verbatim; it is the SPEC that refuses the claim")
 }
 
 // The controller-ownership gate on EVERY action that names a number (fix 7).

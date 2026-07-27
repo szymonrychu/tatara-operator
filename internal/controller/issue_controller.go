@@ -14,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -119,6 +120,26 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
+	// Placed before the closed branch, which can delete the CR and return early.
+	// The cadence sync above does NOT feed this: syncIssueThread refreshes only
+	// Status.Comments/LastSyncedAt/conditions. Status.Body and Status.Author are
+	// written by SyncIssue on the webhook and scan intake paths, so the backfill
+	// reads whatever those last wrote.
+	if err := r.stampProposalKind(ctx, &iss, botLoginOf(&proj)); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// O9: a maintainer REOPENED a proposal the operator had retained as declined.
+	// It runs before the closed branch (the two states are exclusive) and after
+	// the mirror sync, so the reopen is acted on the same reconcile it is seen.
+	// The state it gates on is written by handleIssueOpened's stampIssueState;
+	// sweepIssues carries the backstop for a lost or gated-out delivery.
+	if iss.Status.State == "open" && iss.Status.Status == "rejected" {
+		if err := reopenRetainedProposal(ctx, r.Client, &iss, botLoginOf(&proj)); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
 	// WS3-I3: a human closed the driving issue mid-flight. Leader-only stop edge.
 	// Runs after the mirror sync so a cadence-detected close acts the same
 	// reconcile as a webhook-stamped one. When it acts, the Task is stopped (and
@@ -146,6 +167,57 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	return ctrl.Result{RequeueAfter: cadence}, nil
+}
+
+// stampProposalKind is the ONE-TIME migration backfill for Spec.ProposalKind.
+// Issues minted before the field existed carry an empty kind and would count as
+// 0 pending on rollout, so the operator would refill to N on top of the existing
+// backlog.
+//
+// It is WRITE-ONCE and Spec-only: a non-empty kind is never recomputed, so a
+// forge-side body edit after the fact cannot flip or clear it. Proposals minted
+// before the body marker existed stay unmarked and simply never count - a
+// bounded, shrinking set that self-corrects as the backlog turns over. No
+// migration job, no startup sweep, no manual step.
+//
+// It reads the marker ONLY on an issue that is bot-authored AND already carries a
+// ProposalBodyHash. Both gates are the read path's, verbatim - see
+// effectiveProposalKind (proposalcount.go) for why each exists. They must be
+// identical on both paths: the read gate stops a forgery being COUNTED in the
+// passes before this runs, and this one stops it being stamped PERMANENTLY.
+func (r *IssueReconciler) stampProposalKind(ctx context.Context, iss *tatarav1alpha1.Issue, botLogin string) error {
+	if iss.Spec.ProposalKind != "" {
+		return nil
+	}
+	if !issueAuthoredByBot(iss, botLogin) || iss.Spec.ProposalBodyHash == "" {
+		return nil
+	}
+	kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)
+	if kind == "" {
+		return nil
+	}
+	// Both errors are wrapped. RetryOnConflict still sees a conflict through the
+	// wrapper: apierrors.IsConflict resolves the APIStatus with errors.As.
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &tatarav1alpha1.Issue{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(iss), fresh); err != nil {
+			return fmt.Errorf("issue: get %s for provenance backfill: %w", iss.Name, err)
+		}
+		if fresh.Spec.ProposalKind != "" {
+			iss.Spec.ProposalKind = fresh.Spec.ProposalKind
+			iss.ResourceVersion = fresh.ResourceVersion
+			return nil
+		}
+		fresh.Spec.ProposalKind = kind
+		if err := r.Update(ctx, fresh); err != nil {
+			return fmt.Errorf("issue: backfill provenance on %s: %w", iss.Name, err)
+		}
+		iss.Spec.ProposalKind = kind
+		iss.ResourceVersion = fresh.ResourceVersion
+		log.FromContext(ctx).Info("issue: backfilled proposal provenance",
+			"action", "issue_proposal_kind_backfill", "resource_id", iss.Name, "proposal_kind", kind)
+		return nil
+	})
 }
 
 // projectLabels writes the ONE-WAY projection of Issue.status.status onto the
@@ -231,9 +303,11 @@ func (r *IssueReconciler) projectLabels(ctx context.Context, proj *tatarav1alpha
 
 // handleIssueClosed routes a closed, owned Issue CR through the WS3-I3 stop edge
 // (a live, non-deploying source stage) or, as the review re-sever hardening,
-// finishes a crash-interrupted SeverDeleteCR on a rejected(issue-closed) owner.
+// finishes a crash-interrupted sever on a rejected(issue-closed) owner.
 // handled=true means the caller must stop this reconcile (the Task was stopped
-// and/or the mirror CR was deleted).
+// and/or the mirror CR was deleted). A RETAINED brainstorm-proposal mirror is
+// explicitly NOT handled: it survives, so the rest of the reconcile still owes
+// it a label projection and a cadence requeue.
 func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1alpha1.Issue) (bool, error) {
 	ownerName, owned := own.ControllerOwner(iss)
 	if !owned {
@@ -255,13 +329,42 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 	// Re-sever hardening: a rejected(issue-closed) owner Task with the closed CR
 	// still present means a crash interrupted the DeleteCR between clearing
 	// IssueRefs and deleting the mirror. Finish it (restores prompt reopen).
+	//
+	// O9 makes that same state the STEADY state of every retained brainstorm
+	// proposal, so it MUST route through recordProposalDecline: an unguarded
+	// re-sever would delete the mirror C3 exists to keep, on the very next
+	// reconcile. A retained mirror also reports handled=FALSE, so the reconcile
+	// continues and the rejected verdict still projects onto the declined label.
 	if task.Status.Stage == tatarav1alpha1.StageRejected && task.Status.StageReason == stage.ReasonIssueClosed {
-		if err := SeverIssueFromTask(ctx, r.Client, &task, iss.Name, SeverDeleteCR); err != nil {
+		retained, err := recordProposalDecline(ctx, r.Client, &task, iss.Name, r.now())
+		if err != nil {
 			return false, err
 		}
-		return true, nil
+		return !retained, nil
 	}
-	return false, nil
+
+	// A PARKED owner, which is the shape that dominates real declines: a maintainer
+	// closes the proposal without commenting first, so nothing ever unparked it
+	// into clarifying. The stop edge correctly does nothing here, and before the
+	// 2026-07-27 ruling so did everything else, which meant that decline was never
+	// recorded and the reaper cascaded its mirror on the next pass.
+	//
+	// THE STAGE GATE IS EXPLICIT AND IT IS LOAD-BEARING. Everything that is not a
+	// live source stage and not mid-sever reaches this line, and that includes the
+	// SUCCESS path: CloseIssuesOnDelivery closes the driving issue itself and
+	// stamps state=closed/status=done while the Task is at deploying, then
+	// delivered. Ungated, a proposal that SHIPPED would be severed from its
+	// delivered Task, have its "done" overwritten to "rejected", be logged as a
+	// decline and relabelled tatara-declined on the forge. The verdict guard alone
+	// cannot save it, because the sever runs first.
+	//
+	// Recording is NOT stopping: the Task's stage, stage reason and pod are
+	// untouched, and a non-proposal issue is left entirely alone. handled stays
+	// FALSE either way, so the reconcile still projects labels and requeues.
+	if task.Status.Stage != tatarav1alpha1.StageParked {
+		return false, nil
+	}
+	return false, recordParkedProposalDecline(ctx, r.Client, &task, iss, r.now())
 }
 
 // SetupWithManager registers the Issue reconciler.

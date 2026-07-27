@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,19 +132,32 @@ func hasLabel(labels []string, want string) bool {
 	return false
 }
 
+// brainstormDedupKey is the natural key a project's brainstorm QueuedEvent is
+// enqueued under. One definition, two readers: createBrainstormTask (the
+// enqueue) and brainstorm()'s pre-fan-out queued check, which is only a valid
+// short-circuit while both agree on the key.
+func brainstormDedupKey(proj *tatarav1alpha1.Project) string {
+	return "brainstorm-" + proj.Name
+}
+
 // createBrainstormTask enqueues a project-scoped brainstorm QueuedEvent.
-// Returns created=true when a new event was enqueued.
-func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (bool, error) {
+// Returns created=true when a new event was enqueued. quota is the resolved
+// per-session proposal allowance; it rides as AnnBrainstormQuota, which
+// internal/restapi/outcome.go truncates submit_outcome against.
+func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string, quota int) (bool, error) {
 	provider := ""
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
-	dedupKey := "brainstorm-" + proj.Name
+	dedupKey := brainstormDedupKey(proj)
 	payload := tatarav1alpha1.QueuedEventPayload{
-		Kind:         "brainstorm",
-		Goal:         goal,
-		Labels:       map[string]string{labelActivity: "brainstorm"},
-		Annotations:  map[string]string{tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ",")},
+		Kind:   "brainstorm",
+		Goal:   goal,
+		Labels: map[string]string{labelActivity: "brainstorm"},
+		Annotations: map[string]string{
+			tatarav1alpha1.AnnBrainstormSources: strings.Join(sources, ","),
+			tatarav1alpha1.AnnBrainstormQuota:   strconv.Itoa(quota),
+		},
 		GenerateName: "brainstorm-",
 		Provider:     provider,
 		PodRepo:      "",
@@ -502,72 +516,191 @@ func (r *ProjectReconciler) stampScan(ctx context.Context, proj *tatarav1alpha1.
 	return nil
 }
 
-// brainstorm runs one brainstorm cycle at PROJECT scope: at most one brainstorm
-// QueuedEvent per cycle for the whole project. BrainstormActivity.MaxPerCycle is
-// deprecated and ignored; the hard cap of one per cycle is enforced here.
-// Concurrency is bounded solely by the dispatcher's QueueCapacity.
-func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project, reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task, act tatarav1alpha1.BrainstormActivity) {
+// brainstorm runs one brainstorm refill decision at PROJECT scope. trigger is
+// TriggerCron (the schedule backstop, which also resets the skip breaker) or
+// TriggerEvent (a maintainer verdict landed on a proposal Issue). It returns
+// whether a brainstorm QueuedEvent was created.
+//
+// The backlog level is read from Issue CRs in etcd, never from the forge: see
+// proposalPending. Concurrency is unchanged at one brainstorm Task per project -
+// only the TRIGGER and the QUOTA changed. BrainstormActivity.MaxPerCycle stays
+// deprecated and ignored.
+func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1.Project,
+	reader scm.SCMReader, repos []tatarav1alpha1.Repository, existing []tatarav1alpha1.Task,
+	act tatarav1alpha1.BrainstormActivity, trigger string) bool {
+
 	l := log.FromContext(ctx)
 	start := time.Now()
-	maxProp := act.MaxOpenProposals
-	if maxProp < 1 {
-		maxProp = 10
+
+	issues, err := r.projectProposalIssues(ctx, proj)
+	if err != nil {
+		l.Error(err, "brainstorm: list proposal issues",
+			"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+		return false
+	}
+	// The bot login is the authorship anchor the forgeable body-marker fallback
+	// in proposalPending requires. Resolved ONCE per pass, from the Project we
+	// already hold: no extra read, no SCM call.
+	botLogin := botLoginOf(proj)
+	pending := pendingProposalCount(issues, botLogin)
+	// operator_open_proposals is labelled by the owner/name SLUG, which is what
+	// the tatara-observability dashboard joins on - NOT by the Repository CR name
+	// pendingProposalCountByRepo keys on (DNS-1123, so it can never contain "/").
+	// Translating here keeps the series identity stable across this change.
+	//
+	// Every enrolled repo is written every pass, zeros included: the map only
+	// carries nonzero counts, so a repo whose proposals were all approved would
+	// otherwise drop out and latch its last nonzero value forever.
+	byRepoRef := pendingProposalCountByRepo(issues, botLogin)
+	for i := range repos {
+		if slug := repoSlug(&repos[i]); slug != "" {
+			r.Metrics.SetOpenProposals(slug, float64(byRepoRef[repos[i].Name]))
+		}
 	}
 
-	// Project-scoped in-flight guard: any non-terminal brainstorm Task blocks.
+	// The in-flight guard doubles as the read-your-writes ledger: a reconcile
+	// storm between "Task created" and "issues filed" sees inflight == 1 and
+	// cannot double-spawn.
+	inflight := 0
 	if brainstormInFlightProject(existing) {
-		l.Info("brainstorm: in-flight project brainstorm task; skipping cycle",
-			"action", "scan_brainstorm", "resource_id", proj.Name)
-		return
+		inflight = 1
 	}
 
-	brainstormingLabel, _, _, _ := lifecycleLabels(proj.Spec.Scm)
+	target := act.ResolveTarget()
+	deficit := brainstormDeficit(target, pending, inflight)
+	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
+		proj.Status.BrainstormConsecutiveSkips, trigger)
 
-	// Deterministic primary repo: sort by name, first valid slug wins.
+	// SHORT-CIRCUIT BEFORE THE SCM FAN-OUT. Everything past the !refill branch
+	// below reads the forge per repo: ListOpenIssues, then gatherRepoCIState
+	// (ListOpenPRs + up to 20 GetCommitCIStatus + GetDefaultBranchHeadSHA +
+	// GetCommitCIStatus). Concurrency is pinned at ONE brainstorm session per
+	// project by design, so while one is live that whole fan-out is guaranteed to
+	// be thrown away by the dedup key at the very END, inside createBrainstormTask.
+	//
+	// This early return is LOAD-BEARING FOR COST, not for correctness, and it must
+	// stay an early return. Before the target-backlog change brainstorm() opened
+	// with a hard early return on brainstormInFlightProject; the target law demoted
+	// it to an arithmetic term (inflight = 1 in the deficit), which still leaves
+	// deficit > 0 for any target above pending+1. Combined with the event trigger
+	// running this decision on EVERY Project reconcile (30s floor), that re-ran the
+	// fan-out every 30s for the whole duration of every session - tens of wasted
+	// forge calls per repo-set per 30s against a shared hourly token budget.
+	// Deferring costs nothing: the deficit is recomputed the moment the session
+	// terminates. This is not a decision to stay short, it is a decision not to
+	// decide while busy.
+	if refill && inflight > 0 {
+		refill, reason = false, "in-flight"
+	}
+	// The queued-but-not-admitted window. brainstormInFlightProject only sees a
+	// minted TASK; between EnqueueEvent and admission there is only a QueuedEvent,
+	// so inflight reads 0 there and the fan-out would run every pass for as long
+	// as the event sits queued. Keyed on exactly the natural key
+	// createBrainstormTask enqueues under. Fails CLOSED on a read error: skipping
+	// one pass is strictly cheaper than a fan-out the enqueue would dedup away.
+	if refill {
+		queued, qerr := queue.QueuedEventStillQueued(ctx, r.Client, proj.Namespace, proj.Name, brainstormDedupKey(proj))
+		switch {
+		case qerr != nil:
+			l.Error(fmt.Errorf("brainstorm: check queued event for %s: %w", proj.Name, qerr),
+				"brainstorm: queued-event check failed",
+				"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+			refill, reason = false, "queued-check-failed"
+		case queued:
+			refill, reason = false, "already-queued"
+		}
+	}
+
+	if !refill {
+		// O6 review Important 2: the EVENT trigger runs this decision on every
+		// reconcile of a brainstorm-enabled project (tens-of-seconds cadence),
+		// not just on a due cron tick like the pre-O6 code - so a healthy
+		// at-target project logging this "no refill" line at INFO would emit it
+		// continuously, the exact anti-pattern O4's review already deleted from
+		// projectProposalIssues. The CRON path still fires at most once per
+		// schedule period, so it keeps the INFO level; the EVENT path drops to
+		// V(1) (debug).
+		logSkip := l.Info
+		if trigger == TriggerEvent {
+			logSkip = l.V(1).Info
+		}
+		// BrainstormBreakerTrip is deliberately NOT incremented here: this branch
+		// re-evaluates on every event-triggered reconcile of a brainstorm-enabled
+		// project (tens-of-seconds cadence, see the V(1) drop above), so while the
+		// breaker stays tripped this "reason" is identical across many consecutive
+		// passes. A counter driven from it would climb continuously for as long as
+		// the breaker stays tripped, which is "is tripped", not "trips" - useless
+		// for alerting. The actual trip event - BrainstormConsecutiveSkips crossing
+		// its threshold - only ever happens where that field is incremented
+		// (bumpBrainstormSkips, internal/restapi/outcome.go), which is the one
+		// place this reconcile-repeated evaluation cannot be mistaken for a fresh
+		// trip; that is where BrainstormBreakerTrip is actually counted.
+		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
+		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
+		logSkip("brainstorm: no refill this pass",
+			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
+			"target", target, "pending", pending, "inflight", inflight,
+			"deficit", deficit, "trigger", trigger, "reason", reason,
+			"consecutive_skips", proj.Status.BrainstormConsecutiveSkips)
+		return false
+	}
+
+	// Deterministic repo order: sort by name, first valid slug wins.
 	sortedRepos := make([]tatarav1alpha1.Repository, len(repos))
 	copy(sortedRepos, repos)
-	sort.Slice(sortedRepos, func(i, j int) bool {
-		return sortedRepos[i].Name < sortedRepos[j].Name
-	})
+	sort.Slice(sortedRepos, func(i, j int) bool { return sortedRepos[i].Name < sortedRepos[j].Name })
 
-	// no-valid-repos is checked before at-cap here (2026-06-13 flooding-incident
-	// ordering).
-	r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos, existing,
-		brainstormingLabel, maxProp, "brainstorm", "scan_brainstorm", start, act.Sources,
-		false, brainstormGoalProject, r.createBrainstormTask)
+	created := r.runProjectScopedProposalCycle(ctx, proj, reader, sortedRepos,
+		"brainstorm", "scan_brainstorm", act.Sources, quota)
+	if !created {
+		// Decided to refill, nothing enqueued: no valid repos, an enqueue error,
+		// or the dedup key already holds a queued event. All three are logged in
+		// place; this line is what ties them back to the decision that led here.
+		// The gauges still get the fresh values on this exit too - every decision
+		// sets them, not just the two that return via a different branch, so a
+		// stretch of enqueue failures cannot leave a stale target/pending reading.
+		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
+		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
+		l.Info("brainstorm: refill decided but no event enqueued",
+			"action", "scan_brainstorm_not_enqueued", "resource_id", proj.Name,
+			"target", target, "pending", pending, "inflight", inflight,
+			"deficit", deficit, "quota", quota, "trigger", trigger)
+		return false
+	}
+	r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
+	r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
+	r.Metrics.BrainstormRefill(proj.Name, trigger)
+	l.Info("brainstorm: refill dispatched",
+		"action", "scan_brainstorm", "resource_id", proj.Name,
+		"target", target, "pending", pending, "inflight", inflight,
+		"deficit", deficit, "quota", quota, "trigger", trigger,
+		"duration_ms", time.Since(start).Milliseconds())
+	return true
 }
 
-// runProjectScopedProposalCycle runs the shared 90%-identical middle of
-// brainstorm() and healthCheck(): resolve per-repo slugs, accumulate the
-// proposal backlog (SCM issue count),
-// gather CI state, build the rich repo-state context, build the activity goal
-// text, and create the scan task - emitting the same log fields and metric
-// calls both callers previously duplicated.
+// runProjectScopedProposalCycle resolves per-repo slugs, gathers CI/MR state,
+// builds the rich repo-state context, builds the goal, and enqueues the
+// brainstorm event. It no longer counts a backlog: the caller owns the control
+// law (brainstormRefillDecision) and passes the resolved quota. The former
+// shared-with-healthCheck shape (goalBuilder/taskCreator function params plus a
+// checkCapFirst order flag) is gone with healthCheck and the cap - one caller
+// does not justify two function-valued parameters and an order flag.
 //
-// The two post-loop early-return guards (no-valid-repos / at-cap) are checked
-// in checkCapFirst order: brainstorm checks no-valid-repos first, healthCheck
-// checks at-cap first. This order is preserved verbatim per caller (do not let
-// this helper pick a single order - it touches the 2026-06-13 flooding-
-// incident path).
+// The at-cap guard whose ordering against no-valid-repos was caller-specific
+// (2026-06-13 flooding incident) no longer exists here: the caller decides
+// whether to refill at all BEFORE any repo work, and no-valid-repos is now the
+// only post-loop guard, so there is no ordering left to get wrong.
 func (r *ProjectReconciler) runProjectScopedProposalCycle(
 	ctx context.Context,
 	proj *tatarav1alpha1.Project,
 	reader scm.SCMReader,
 	sortedRepos []tatarav1alpha1.Repository,
-	existing []tatarav1alpha1.Task,
-	brainstormingLabel string,
-	maxProp int,
 	activityLabel, scanAction string,
-	start time.Time,
 	sources []string,
-	checkCapFirst bool,
-	goalBuilder func(slugs []string, repoStateCtx, guidance string) string,
-	taskCreator func(ctx context.Context, proj *tatarav1alpha1.Project, goal string, sources []string) (bool, error),
-) {
+	quota int,
+) bool {
 	l := log.FromContext(ctx)
 	issuesBySlug := make(map[string][]scm.IssueRef)
-	scmTotal := 0
-	scmAtCap := false
 	var slugs []string
 	for i := range sortedRepos {
 		rp := &sortedRepos[i]
@@ -576,63 +709,21 @@ func (r *ProjectReconciler) runProjectScopedProposalCycle(
 			continue
 		}
 		slugs = append(slugs, slug)
-		if scmAtCap {
-			// SCM backlog already at cap; skip the issue list for remaining repos
-			// (best-effort: their per-repo gauge keeps last cycle's value). Still
-			// collect slugs for the goal text.
-			continue
-		}
 		owner, name, err := scm.OwnerRepo(rp.Spec.URL)
 		if err != nil {
 			continue
 		}
 		iss, err := reader.ListOpenIssues(ctx, owner, name)
 		if err != nil {
-			l.Info(activityLabel+": backlog count failed (non-fatal)", "resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
+			l.Info(activityLabel+": open-issue read failed (non-fatal)",
+				"resource_id", proj.Name, "repo", rp.Name, "err", err.Error())
 			continue
 		}
 		issuesBySlug[slug] = iss
-		backlog := proposalBacklogCount(iss, brainstormingLabel)
-		r.Metrics.SetOpenProposals(slug, float64(backlog))
-		scmTotal += backlog
-		if scmTotal >= maxProp {
-			scmAtCap = true
-		}
 	}
-	total := scmTotal
-	atCap := total >= maxProp
-	noValidRepos := len(slugs) == 0
-
-	noValidReposGuard := func() bool {
-		if !noValidRepos {
-			return false
-		}
-		l.Info(activityLabel+": no valid repos", "resource_id", proj.Name)
-		return true
-	}
-	atCapGuard := func() bool {
-		if !atCap {
-			return false
-		}
-		l.Info(activityLabel+": project backlog at cap; skipping cycle",
-			"action", scanAction, "resource_id", proj.Name, "total", total, "cap", maxProp)
-		return true
-	}
-
-	if checkCapFirst {
-		if atCapGuard() {
-			return
-		}
-		if noValidReposGuard() {
-			return
-		}
-	} else {
-		if noValidReposGuard() {
-			return
-		}
-		if atCapGuard() {
-			return
-		}
+	if len(slugs) == 0 {
+		l.Info(activityLabel+": no valid repos", "action", scanAction, "resource_id", proj.Name)
+		return false
 	}
 
 	// Build PR / main-CI data (bounded + non-fatal) for the rich repo-state context.
@@ -641,14 +732,13 @@ func (r *ProjectReconciler) runProjectScopedProposalCycle(
 	// Build rich context from already-fetched data + bounded MR/main reads.
 	issuesCtx := r.buildRepoStateContext(ctx, proj, reader, issuesBySlug, prsBySlug, prCIBySlug, mainCIBySlug, sortedRepos)
 
-	goal := goalBuilder(slugs, issuesCtx, scmGuidance(proj))
-	_, err := taskCreator(ctx, proj, goal, sources)
+	goal := brainstormGoalProject(slugs, issuesCtx, scmGuidance(proj), quota)
+	created, err := r.createBrainstormTask(ctx, proj, goal, sources, quota)
 	if err != nil {
 		l.Error(err, "scan: enqueue "+activityLabel+" event", "resource_id", proj.Name)
-		return
+		return false
 	}
-	l.Info(activityLabel+" complete", "action", scanAction, "resource_id", proj.Name,
-		"picked", 1, "duration_ms", time.Since(start).Milliseconds())
+	return created
 }
 
 // appendGuidance appends a PROJECT CHARTER block when guidance is non-empty.
@@ -670,20 +760,25 @@ func scmGuidance(proj *tatarav1alpha1.Project) string {
 // brainstormGoalProject returns the turn-0 goal for a project-level brainstorm
 // task. repoStateCtx is the rich three-block string built by buildRepoStateContext
 // (ISSUES / OPEN MRs / MAIN HEALTH). When empty a fallback note is substituted.
-func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string) string {
+// quota is the resolved per-session proposal allowance; the PROPOSAL QUOTA line
+// is the agent-visible half of AnnBrainstormQuota and is a cross-repo interface
+// contract: the brainstorm skills quote the phrase "PROPOSAL QUOTA" to find it.
+func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string, quota int) string {
 	repoList := strings.Join(slugs, ", ")
 	stateBlock := "No live repo state available."
 	if repoStateCtx != "" {
 		stateBlock = repoStateCtx
 	}
-	goal := "Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
+	goal := fmt.Sprintf("PROPOSAL QUOTA: file AT MOST %d proposal(s) in this session. "+
+		"The operator truncates anything beyond %d.\n\n", quota, quota) +
+		"Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
 		"order; it owns the whole turn and emits the single terminal action itself (`propose_issue`, or " +
 		"`skip_research` when nothing clears the bar or the idea duplicates an open issue), grounded per " +
 		"the `tatara-code-quality-proposal` skill.\n\n" +
 		"HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
 		"still describes live, unfinished work, call `get_handoff` and propose continuing it (a `propose_issue` framed " +
 		"as resuming that work) before generating fresh ideas. Skip stale/superseded/delivered handoffs. Continuation " +
-		"proposals count against the same MaxOpenProposals cap as fresh ideas.\n\n" +
+		"proposals count against the same quota as fresh ideas.\n\n" +
 		"MANDATE: propose the highest-leverage code-quality, simplification, or robustness improvement across ALL " +
 		"repositories: " + repoList + ". Ground every claim in REAL code.\n\n" +
 		"READ REAL CODE (two signals, use both): (1) every listed repo is shallow-cloned read-only into " +
@@ -695,21 +790,18 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string)
 		"EARLY EXIT (do this FIRST, cheaply): scan the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears " +
 		"the bar for a genuinely novel, high-leverage proposal this cycle, call `skip_research(reason)` and STOP. " +
 		"Silence over noise.\n\n" +
-		"SYSTEMIC MANDATE: prefer a single systemic improvement (a pattern spanning >=2 repositories, a platform-wide " +
-		"gap, or recurring debt) over a one-repo tweak. Decompose: dispatch one parallel subagent per repository, then " +
-		"synthesize one systemic conclusion.\n\n" +
 		"NEW-IDEAS-ONLY CONTRACT - follow exactly ONE path:\n" +
 		"1. If the best idea DUPLICATES an existing open issue above: do NOT propose. Finish with a one-line note " +
 		"naming the duplicate. Do NOT comment on it.\n" +
-		"2. If genuinely novel AND standalone: call `propose_issue`. Set `repo` to the owning repository. Required " +
+		"2. If genuinely novel: call `propose_issue`. Set `repo` to the owning repository. Required " +
 		"body shape: (a) a one-paragraph problem statement citing the concrete file/symbol you read; (b) a " +
 		"DECOMPOSITION into sub-problems; (c) for EACH sub-problem, 2-3 concrete OPTIONS with one-line tradeoffs and " +
 		"your recommended pick; (d) the maintainer's decision framed as choosing one option per sub-problem. No flat " +
 		"list of open questions.\n\n" +
-		"ACTION RULE: a one-repo improvement emits exactly ONE propose_issue. A genuinely systemic improvement MAY " +
-		"emit one propose_issue per affected repository (bounded: at most 6), all sharing a single `systemicId` you " +
-		"generate. State which path and scope you chose before executing. You are a read-only proposer: never " +
-		"implement, never push, never open a PR."
+		"ACTION RULE: emit exactly ONE `submit_outcome`, carrying between 1 and your quota of proposals. Each " +
+		"proposal becomes its own issue and its own clarify Task; there is no umbrella and no systemic group. " +
+		"State which scope you chose before executing. You are a read-only proposer: never implement, never push, " +
+		"never open a PR."
 	return appendGuidance(goal+promptguidance.PlatformProblemGuidance+promptguidance.ToolingNoteGuidance, guidance)
 }
 
@@ -944,37 +1036,6 @@ func documentationInFlightProject(existing []tatarav1alpha1.Task) bool {
 		}
 	}
 	return false
-}
-
-// proposalBacklogCount counts open, undecided ideas in a pre-fetched issue
-// slice: non-PR issues bearing the brainstorming label.
-// Issues sharing a tatara/systemic-<id> label count as a single entry so that
-// a multi-repo systemic improvement does not inflate the backlog cap.
-func proposalBacklogCount(issues []scm.IssueRef, brainstormingLabel string) int {
-	const systemicPrefix = "tatara/systemic-"
-	groups := map[string]bool{}
-	standalone := 0
-	for _, iss := range issues {
-		if iss.IsPR {
-			continue
-		}
-		if !hasLabel(iss.Labels, brainstormingLabel) {
-			continue
-		}
-		sid := ""
-		for _, l := range iss.Labels {
-			if strings.HasPrefix(l, systemicPrefix) {
-				sid = l
-				break
-			}
-		}
-		if sid != "" {
-			groups[sid] = true
-		} else {
-			standalone++
-		}
-	}
-	return standalone + len(groups)
 }
 
 // createRefineTask enqueues a project-scoped refine QueuedEvent.
@@ -1217,9 +1278,14 @@ func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, re
 }
 
 // runScans runs each due activity and returns the soonest next-fire as a
-// requeue duration. Cron parsing/SCM/create failures are logged and skipped per
-// activity so one bad activity never blocks the others or crashes the reconciler.
-func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.Project) (time.Duration, error) {
+// requeue duration, plus the repos/existing-tasks/reader it fetched along the
+// way (nil on any early-return path that never reached the fetch). Cron
+// parsing/SCM/create failures are logged and skipped per activity so one bad
+// activity never blocks the others or crashes the reconciler. A caller that
+// needs the SAME scan-scoped data this pass - the O6 event-driven refill pass
+// in Reconcile - reuses these return values instead of re-listing/
+// re-resolving them a second time this reconcile (O6 review Minor 3).
+func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.Project) (time.Duration, []tatarav1alpha1.Repository, []tatarav1alpha1.Task, scm.SCMReader, error) {
 	l := log.FromContext(ctx)
 	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil || r.ReaderFor == nil {
 		// spec.scm and spec.scm.cron are +optional pointers: a Project that had
@@ -1237,7 +1303,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		// proj.Spec.Scm.Cron and cannot run before this guard without its own
 		// nil-guard rewrite, review finding).
 		obs.SweepNextExpectedTimestamp.DeletePartialMatch(prometheus.Labels{"project": proj.Name})
-		return 0, nil
+		return 0, nil, nil, nil, nil
 	}
 	// repos is populated below (after the reader/list-repos calls) but must be
 	// in scope for the defer now: publishNextExpected's issueScan/sweep branch
@@ -1304,17 +1370,17 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	reader, rerr := r.scanReader(ctx, proj)
 	if rerr != nil {
 		l.Error(rerr, "scan: resolve reader", "action", "scan_reader_error", "resource_id", proj.Name)
-		return maxScheduleRequeue, nil
+		return maxScheduleRequeue, nil, nil, nil, nil
 	}
 	var err error
 	repos, err = r.projectReposForScan(ctx, proj)
 	if err != nil {
-		return 0, err
+		return 0, nil, nil, nil, err
 	}
 	reposLoaded = true
 	existing, err := r.existingScanTasks(ctx, proj)
 	if err != nil {
-		return 0, err
+		return 0, nil, nil, nil, err
 	}
 
 	// THE B.4 SWEEP. Since the Task 20 cutover it is the ONLY intake: issueScan,
@@ -1354,6 +1420,23 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// barrier defers ONLY brainstorm - mrScan/issueScan/healthCheck run on
 	// their own schedules regardless. Both Succeeded and Failed refine release
 	// the gate so a broken refine never wedges brainstorm.
+	//
+	// O6 REVIEW, Important 1: this refine barrier runs UNCONDITIONALLY of the
+	// eventual refill decision - it fires (and, when needed, mints a refine
+	// Task) the moment the brainstorm schedule is due, BEFORE brainstorm() is
+	// even called below, so it never learns nor cares whether the backlog
+	// still has a deficit. That independence is load-bearing now that O6's
+	// event-driven refill path exists: the event path deliberately BYPASSES
+	// this barrier entirely (re-running refine per maintainer verdict was
+	// rejected as too expensive - approved design, not an oversight), which
+	// means the CRON tick above is refine's ONLY trigger. If this barrier were
+	// ever made conditional on brainstorm's own deficit (e.g. skipped
+	// whenever the event path has already kept the project at target),
+	// refine would silently stop running for any healthy, well-served
+	// project - see TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget,
+	// which pins exactly this: a refine Task still gets created on a due cron
+	// tick even with TargetOpenProposals=0, where brainstorm() can never
+	// decide to refill.
 	if cronSpec.Brainstorm.Enabled {
 		if base, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
 			if due {
@@ -1408,7 +1491,16 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 					}
 				}
 				if proceed {
-					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm)
+					r.brainstorm(ctx, proj, reader, repos, existing, cronSpec.Brainstorm, TriggerCron)
+					// The cron tick is the ONLY thing that re-enables the event-driven
+					// refill path after the skip breaker trips. Reset unconditionally,
+					// refill or not: a dry spell must cost one session per cron period,
+					// never wedge brainstorm permanently.
+					if rerr := r.resetBrainstormSkips(ctx, proj); rerr != nil {
+						l.Error(rerr, "scan: reset brainstorm skip breaker",
+							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
+						obs.SweepErrorsTotal.WithLabelValues(proj.Name, "brainstorm", "skip_reset_failed").Inc()
+					}
 					if serr := r.stampScan(ctx, proj, "brainstorm"); serr != nil {
 						l.Error(serr, "scan: persist brainstorm stamp failed",
 							"action", "scan_stamp_error", "resource_id", proj.Name, "activity", "brainstorm")
@@ -1466,5 +1558,5 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		}
 	}
 
-	return soonest, nil
+	return soonest, repos, existing, reader, nil
 }

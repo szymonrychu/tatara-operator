@@ -141,7 +141,7 @@ func TestRunScans_DocumentationDueCreatesDocTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestRunScans_DocumentationNoChangesNoTask(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	if _, err := r.runScans(context.Background(), proj); err != nil {
+	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 

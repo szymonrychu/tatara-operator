@@ -14,6 +14,24 @@ const (
 	DeliveredRetention = 48 * time.Hour
 	// RejectedRetention ages out a rejected Task.
 	RejectedRetention = 24 * time.Hour
+	// DeclinedProposalRetention is the ONE exception to RejectedRetention: a
+	// rejected(issue-closed) Task that still owns a RETAINED brainstorm-proposal
+	// mirror is held this long instead of 24h. Nothing else uses it, and no other
+	// Task shape is affected.
+	//
+	// The exception exists because the Task's reap is what deletes the mirror: the
+	// decline sever keeps the ownerRef on purpose, so the CR cascades with the
+	// Task. That mirror is the ONLY record that a proposal was discarded and WHY
+	// (the maintainer's comments), and it is what the brainstorm turn-0 bundle's
+	// <proposal_history> block renders declined rows from.
+	//
+	// WHAT BREAKS IF THIS IS LOWERED: at RejectedRetention a decline has a
+	// ONE-DAY half-life. The next brainstorm session no longer sees the killed
+	// idea, re-proposes it, and the maintainer declines it again - the immortal-PR
+	// loop the history block exists to close. Raising it is safe for correctness
+	// and costs Issue CRs plus one mirror thread re-read per MirrorCadenceActive
+	// per retained mirror, so it is also the CR-growth bound.
+	DeclinedProposalRetention = 14 * 24 * time.Hour
 	// FailedRetention ages out a failed Task.
 	FailedRetention = 7 * 24 * time.Hour
 	// DocStageBudget bounds a documenting batch: it never pins a parent past

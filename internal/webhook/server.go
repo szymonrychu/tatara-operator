@@ -627,6 +627,20 @@ func (s *Server) handleIssueOpened(ctx context.Context, w http.ResponseWriter, p
 		return
 	}
 
+	// Mirror the OPEN state before the mint. handleIssueClosed is the only writer
+	// of Status.State on the webhook path, so without this the mirror of a
+	// REOPENED issue stays "closed" forever: MintForItem writes state only when it
+	// CREATES the CR, and it does not create one for an issue that already has a
+	// controller owner. That is fatal for a retained declined proposal (O9), whose
+	// mirror is deliberately kept and owned - the leader's reopen undo gates on
+	// state=open and would never fire. Unconditional upsert, and a no-op when
+	// there is no CR (a genuinely new issue, which the mint then creates).
+	if s.stampIssueState(ctx, &proj, repo, ev.Number, "open") {
+		s.log.InfoContext(ctx, "issues: mirrored open state",
+			"action", "issue_opened_mirror", "project", proj.Name,
+			"repository", repo.Name, "number", ev.Number, "issue_action", ev.Action)
+	}
+
 	marked, err := controller.MarkWebhookOriginated(ctx, s.cfg.Client, &proj, repo, ev.Number, ev.URL, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "issues: mark webhook-originated failed", "error", err,

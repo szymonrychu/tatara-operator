@@ -80,6 +80,24 @@ Open, out of scope, deliberately not done:
 
 - [x] S3 conversation persistence (issue #114): cross-pod conversation resume via S3 (Task.Status.ConversationObjectKey/SessionID + BuildPod CONVERSATION_* env + turn-complete recording), 25% resume-vs-compaction hybrid (HandoverThresholdPercent default 50->25, mutually exclusive with full replay), brainstorm conversation forked per issue (copy-object), review/test agent for ALL MRs incl. user-authored (reviewText + PR-head read-only checkout), and reaper S3 GC when a batch fully closes (internal/objstore + operator_conversation_gc_total). Off until s3Bucket set. Branch tatara/fix-114-...; awaiting deploy (helmfile wiring + pin bump).
 - [x] Project-level brainstorm (one Task per project per cycle, not per-repo): summed backlog, project-scoped in-flight guard, deterministic primary repo, updated goal prompt listing all repos. CRD MaxOpenProposals default 3->5 (project-wide). PR feat/project-level-brainstorm; awaiting deploy.
+- [x] Brainstorm target-backlog (O1-O11): replaces the project-level cap above with a maintained
+  `targetOpenProposals` backlog the controller refills on a maintainer verdict, not a cron cap -
+  `deficit = max(0, target - pending - inflight)`, pending counted from Issue CRs
+  (`Spec.ProposalKind`), never a live SCM label; new `ProjectReconciler.Watches(&Issue{})` event
+  trigger + 15m cron backstop with a consecutive-skip circuit breaker; a refill Task carries a
+  quota annotation `submit_outcome` truncates to (clamped `[1,5]`); brainstorm pod turn-0 bundle
+  gains a `<proposal_history>` block rendered from the Issue CR mirror; a declined proposal's
+  mirror is retained (not deleted) under a dedicated 14-day `DeclinedProposalRetention`, distinct
+  from `RejectedRetention` (24h) and `ParkRetention` (7d); 5 new brainstorm metrics. Branch
+  `brainstorm-target-backlog`, plan+task briefs/reports/progress in
+  `.superpowers/sdd/2026-07-26-brainstorm-target-backlog-plan/` (parent tatara-new repo; no
+  separate design doc - the plan document there, `global-constraints.md`, carries the full
+  architecture and the approved-spec-vs-code conflict table). Decisions, corrections and residuals
+  are in the dated 2026-07-26/2026-07-27 `MEMORY.md` entries above. Companion repo changes:
+  tatara-agent-skills (guardrails + council-brainstorm skills), tatara-helmfile
+  (`targetOpenProposals` on the enrolled Projects), tatara-documentation (workflow/reference/tuning
+  pages). semver:minor; awaiting deploy (merge order: this repo released and applied before the
+  tatara-helmfile values change).
 - [x] Systemic-group implementation dedup (lead-per-repo): one brainstorm of N connected issues (shared systemicId) spawns one agent per (systemicId, repo), resolving same-repo siblings in one combined PR + marking non-leads with an idempotent comment. SystemicGroup on Task/payload, electSystemicLeads, issueScan collapse gate, 2 metrics. PR #124; awaiting deploy (tatara-helmfile dual pin). Plan docs/superpowers/plans/2026-06-23-systemic-impl-dedup.md.
 - [x] MR-ownership (branch feat/mr-ownership, OP1-OP13): MergeRequest gains status.ownership (tatara|external) + lastBotHeadSHA; merge gated on per-MR ownership instead of Kind=="review"; ReconcileOwnership backfill/drift-flip driven by both the leader reconciler and the sweep; gated /scm/mr-takeover endpoint is the only external->tatara path; new `takeover` Task kind minting into approved via AnnTakeoverHeadBranch; idempotent DrainOwnershipAnnouncement; general comment->task invariant closed for MRs via EnsureTaskForMRComment. See dated 2026-07-19 `MEMORY.md` entries. semver:minor; awaiting deploy.
 
@@ -199,11 +217,6 @@ Pre-cutover items below all targeted mrScan, which the 2026-07-13 task-centric r
 (B.4 sweep is the sole intake now). See MEMORY.md 2026-07-17 (Task 9) for the dead-field removal
 and the ScanMarks finding.
 
-- [ ] **`deploy-samples/tatara-project.yaml` sets `cron.issueScan.maxPerCycle`, which is not a
-  `CronActivity` field at all** (it has `schedule` + `maxPerRepo` only; `maxPerCycle` exists only on
-  `BrainstormActivity`, where it is deprecated and ignored). Pre-existing rot, pruned silently, so it
-  misleads readers rather than breaking. `tatara-project-values.yaml` already uses `maxPerRepo`
-  correctly. Reconcile the two samples against the real schema.
 - [ ] **NEW, replaces the items below:** `ProjectStatus.ScanMarks`/`ScanMark` have ZERO readers or
   writers anywhere in the codebase (only the type declarations and generated deepcopy reference
   them) - the whole per-item high-water-mark mechanism this section was built around appears to

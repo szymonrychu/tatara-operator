@@ -29,8 +29,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -295,10 +297,44 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.ensureLabelColors(ctx, &project)
 
-	scanRequeue, scanErr := r.runScans(ctx, &project)
+	scanRequeue, scanRepos, scanExisting, scanRdr, scanErr := r.runScans(ctx, &project)
 	if scanErr != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, scanErr
+	}
+
+	// EVENT-DRIVEN REFILL (design section 4, task O6). runScans owns the CRON
+	// path, gated on the schedule being due; this is the LEVEL-TRIGGERED pass
+	// that reacts to the Watches(&Issue{}) edge above - a maintainer verdict
+	// landing on a proposal Issue. It is a no-op unless the backlog is
+	// actually short: the control law reads the same Issue CRs either way, so
+	// running it even on a reconcile where the cron path JUST refilled costs
+	// nothing extra - brainstormRefillDecision's deficit clamp and the
+	// brainstorm QueuedEvent's dedup key both make a double-refill impossible.
+	//
+	// Reuses scanRepos/scanExisting/scanRdr, the SAME repos/existing-tasks/
+	// reader runScans already fetched this pass, instead of re-listing or
+	// re-resolving them a second time (O6 review Minor 3). A pass where
+	// runScans could not resolve the reader (bad scmSecretRef, ReaderFor
+	// unwired, etc) leaves scanRdr nil here too; runScans has already
+	// logged that failure at ERROR (scan_reader_error), so this simply skips
+	// rather than re-attempting and re-logging the identical failure (O6
+	// review Minor 4).
+	//
+	// The skip breaker gates ONLY this path (brainstormRefillDecision checks
+	// trigger == TriggerEvent); the cron tick above ignores it and is the
+	// thing that resets it, so a genuinely dry idea space still costs at most
+	// one session per cron period even if every event wake gets suppressed.
+	if cron := brainstormCronSpec(&project); cron != nil && cron.Enabled {
+		if scanRdr != nil {
+			r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron, TriggerEvent)
+		}
+		// The periodic resync is the BACKSTOP poll interval for a lost watch
+		// event, not the workqueue's error rate limiter (reconcile.Result
+		// godoc) - folded into scanRequeue so a brainstorm-enabled project
+		// always re-checks the backlog level at least this often even if no
+		// Issue write ever lands.
+		scanRequeue = soonestRequeue(scanRequeue, brainstormResyncInterval)
 	}
 	requeueAfter = soonestRequeue(requeueAfter, scanRequeue)
 
@@ -740,6 +776,14 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&networkingv1.Ingress{}).
+		// The EVENT-DRIVEN REFILL trigger (design section 4, task O6). Issue is
+		// not owned by Project (it is owned by the Task working it), so this is a
+		// plain Watches edge, not Owns. proposalVerdictPredicate is what keeps a
+		// project with a large Issue backlog from turning every mirror resync
+		// into a Project reconcile.
+		Watches(&tataradevv1alpha1.Issue{},
+			handler.EnqueueRequestsFromMapFunc(issueToProject),
+			builder.WithPredicates(proposalVerdictPredicate())).
 		// MaxConcurrentReconciles: 1 is explicit here; scan dedup/cap logic
 		// assumes serialised reconciles per kind.
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).

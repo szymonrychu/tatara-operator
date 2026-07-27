@@ -31,6 +31,17 @@ type IssueSpec struct {
 	// older build (fail-closed: no anchor => no auto-approve).
 	// +optional
 	ProposalBodyHash string `json:"proposalBodyHash,omitempty"`
+	// ProposalKind is the DURABLE provenance of a tatara-proposed issue
+	// ("brainstorm" | "incident"), stamped ONCE by the operator at mintIssueCR
+	// time (and backfilled once by the Issue reconciler for issues minted before
+	// this field existed). It lives in Spec, which the SCM mirror never writes,
+	// so a forge-side body edit cannot change it. It supersedes body-marker
+	// parsing as the authority for "is this a brainstorm proposal"; the body
+	// marker (proposal_marker.go) remains, unchanged, as the auto-approve
+	// integrity path.
+	// +optional
+	// +kubebuilder:validation:Enum=brainstorm;incident
+	ProposalKind string `json:"proposalKind,omitempty"`
 }
 
 // Comment is one comment mirrored from the forge onto an Issue or

@@ -110,9 +110,14 @@ func agentJob(agentKind string) string {
 	switch agentKind {
 	case stage.AgentBrainstorm:
 		return "## Your job\n\n" +
-			"Look for work worth doing in this project that nobody has proposed yet. The <task_index> " +
-			"above lists what has already been proposed - do not repeat it.\n\n" +
-			"End with `submit_outcome(kind=brainstorm, action=propose)` for each idea worth filing, or " +
+			"Look for work worth doing in this project that nobody has proposed yet. The " +
+			"<proposal_history> block above carries the project's recent brainstorm proposals with " +
+			"their outcome (open, approved, declined) and the maintainer comments that explain each " +
+			"verdict. A DECLINED proposal is a killed idea: do not re-propose it, and do not propose " +
+			"a restatement of it. Pull the full project Task index on demand with " +
+			"`task_context(index=true)`.\n\n" +
+			"Your session quota is stated in the <goal> element. End with " +
+			"`submit_outcome(kind=brainstorm, action=propose)` carrying at most that many ideas, or " +
 			"`submit_outcome(kind=brainstorm, action=skip)` when there is nothing novel. `skip` is a " +
 			"correct and common answer; a made-up proposal is not." +
 			promptguidance.ToolingNoteGuidance
@@ -139,9 +144,10 @@ func agentJob(agentKind string) string {
 
 	case stage.AgentRefine:
 		return "## Your job\n\n" +
-			"Groom the backlog in the <task_index> above: fold duplicates into one Task, close what is " +
-			"obsolete, and link what is related. Then `submit_outcome(kind=refine, ...)` with the folds, " +
-			"closes and links you decided on.\n\n" +
+			"Groom the project's backlog: fold duplicates into one Task, close what is obsolete, and " +
+			"link what is related. Pull the backlog with `task_context(index=true)` - it is not in " +
+			"the bundle above. Then `submit_outcome(kind=refine, ...)` with the folds, closes and " +
+			"links you decided on.\n\n" +
 			"The operator applies them and VERIFIES the fold adopted; a fold you cannot justify from the " +
 			"issue text is a fold that will be refused."
 

@@ -434,16 +434,34 @@ type BrainstormActivity struct {
 	// +kubebuilder:default=1
 	// +optional
 	MaxPerCycle int `json:"maxPerCycle,omitempty"`
-	// MaxOpenProposals caps the total open, unapproved agent proposals across
-	// ALL repos in the project; at or above this the brainstorm cycle is
-	// skipped. Default 5.
+	// TargetOpenProposals is the TARGET number of brainstorm proposals kept open
+	// and awaiting a maintainer decision across ALL repos in the project. The
+	// controller refills toward it: it never closes a proposal to reconcile
+	// downward. Unset falls back to MaxOpenProposals (deprecated alias) and then
+	// to DefaultTargetOpenProposals. An explicit 0 disables refill entirely.
+	// +optional
+	TargetOpenProposals *int `json:"targetOpenProposals,omitempty"`
+	// Deprecated: MaxOpenProposals was the pre-target CEILING. It is retained as
+	// a working alias, honoured ONLY when TargetOpenProposals is unset, so an
+	// unmigrated Project keeps working. Set TargetOpenProposals instead.
 	// +kubebuilder:default=5
 	// +optional
 	MaxOpenProposals int `json:"maxOpenProposals,omitempty"`
+	// HistoryWindow is how many recent brainstorm proposals are rendered into the
+	// brainstorm pod's turn-0 bundle as the <proposal_history> block. Unset uses
+	// DefaultHistoryWindow. An explicit 0 omits the block.
+	// +optional
+	HistoryWindow *int `json:"historyWindow,omitempty"`
+	// MaxConsecutiveSkips is the circuit-breaker threshold. After this many
+	// consecutive brainstorm sessions ending in action=skip, the EVENT-driven
+	// refill path is suppressed until a cron tick resets the counter. Unset uses
+	// DefaultMaxConsecutiveSkips. An explicit 0 means the breaker never trips.
+	// +optional
+	MaxConsecutiveSkips *int `json:"maxConsecutiveSkips,omitempty"`
 	// StaleProposalDays configures the staleness reaper that auto-closes
 	// bot-authored proposals with no human engagement (no human comment, no live
 	// work) for at least that many days, clearing dead proposals out of the
-	// MaxOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
+	// TargetOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
 	// sets an explicit window; the UNSET default (0) enables the reaper with a
 	// generous-but-finite default window (defaultStaleProposalDays) so un-approved
 	// proposals do not accumulate unboundedly; a NEGATIVE value is the explicit
@@ -453,6 +471,51 @@ type BrainstormActivity struct {
 	// +kubebuilder:validation:items:Enum=docs;memory;internet
 	// +optional
 	Sources []string `json:"sources,omitempty"`
+}
+
+// Brainstorm backlog defaults. They live here, not at the kubebuilder-default
+// layer, because all three fields are POINTERS: a kubebuilder default would make
+// "unset" indistinguishable from an explicit value, and an explicit 0 is
+// meaningful for every one of them.
+const (
+	DefaultTargetOpenProposals = 3
+	DefaultHistoryWindow       = 20
+	DefaultMaxConsecutiveSkips = 3
+	// MaxProposalsPerOutcome mirrors the submit_outcome schema ceiling enforced
+	// in internal/restapi/outcome.go. The quota is clamped to it so a large
+	// targetOpenProposals cannot instruct an obedient agent to emit a payload
+	// the operator will refuse with a 400.
+	MaxProposalsPerOutcome = 5
+)
+
+// ResolveTarget resolves the backlog target: the explicit field, else the
+// deprecated MaxOpenProposals alias, else the default. Never negative. It is
+// named Resolve* because a Go method cannot share a name with a field.
+func (a BrainstormActivity) ResolveTarget() int {
+	if a.TargetOpenProposals != nil {
+		return max(*a.TargetOpenProposals, 0)
+	}
+	if a.MaxOpenProposals > 0 {
+		return a.MaxOpenProposals
+	}
+	return DefaultTargetOpenProposals
+}
+
+// ResolveHistoryWindow resolves how many prior proposals ride in the turn-0
+// bundle as the <proposal_history> block. 0 omits the block.
+func (a BrainstormActivity) ResolveHistoryWindow() int {
+	if a.HistoryWindow != nil {
+		return max(*a.HistoryWindow, 0)
+	}
+	return DefaultHistoryWindow
+}
+
+// ResolveMaxConsecutiveSkips resolves the breaker threshold. 0 disables it.
+func (a BrainstormActivity) ResolveMaxConsecutiveSkips() int {
+	if a.MaxConsecutiveSkips != nil {
+		return max(*a.MaxConsecutiveSkips, 0)
+	}
+	return DefaultMaxConsecutiveSkips
 }
 
 // RefineActivity configures the cron-cycle refiner pre-step.
@@ -942,6 +1005,14 @@ type ProjectStatus struct {
 	// project. Computed on reconcile.
 	// +optional
 	OpenIncidentsCount int `json:"openIncidentsCount,omitempty"`
+	// BrainstormConsecutiveSkips counts brainstorm sessions that ended in
+	// action=skip back to back. action=propose resets it to 0; a cron tick
+	// resets it to 0. At BrainstormActivity.ResolveMaxConsecutiveSkips() the
+	// EVENT-driven refill path is suppressed - the liveness brake that stops
+	// skip -> deficit unchanged -> reconcile -> spawn -> skip burning pods on a
+	// proven-dry idea space.
+	// +optional
+	BrainstormConsecutiveSkips int `json:"brainstormConsecutiveSkips,omitempty"`
 }
 
 // ScanMark records the last GitHub activity timestamp the issue/PR scan has

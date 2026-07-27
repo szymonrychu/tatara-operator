@@ -111,7 +111,7 @@ func TestRefineBarrier_DueBrainstormTickCreatesRefineAndHolds(t *testing.T) {
 
 	ctx := context.Background()
 
-	requeue, err := r.runScans(ctx, proj)
+	requeue, _, _, _, err := r.runScans(ctx, proj)
 	if err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestRefineBarrier_DueBrainstormTickCreatesRefineAndHolds(t *testing.T) {
 
 	// Second reconcile with refine still non-terminal: still no brainstorm, no
 	// second refine QE (in-flight dedup).
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
 	}
 	if len(listBrainstormQEs(t, "refine-barrier")) != 0 {
@@ -152,12 +152,12 @@ func TestRefineBarrier_TerminalRefineReleasesBrainstorm(t *testing.T) {
 
 	ctx := context.Background()
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 1: %v", err)
 	}
 	markRefineTerminal(t, "refine-release", tatarav1alpha1.StageDelivered)
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
 	}
 
@@ -183,12 +183,12 @@ func TestRefineBarrier_FailedRefineStillReleases(t *testing.T) {
 
 	ctx := context.Background()
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 1: %v", err)
 	}
 	markRefineTerminal(t, "refine-failed", tatarav1alpha1.StageFailed)
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
 	}
 
@@ -214,14 +214,14 @@ func TestRefine_OnePerProjectPerCycle(t *testing.T) {
 
 	ctx := context.Background()
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans 1: %v", err)
 	}
 	if len(listRefineQEs(t, "refine-dedup")) != 1 {
 		t.Fatalf("want exactly 1 refine QE after first run")
 	}
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans 2: %v", err)
 	}
 	if len(listRefineQEs(t, "refine-dedup")) != 1 {
@@ -244,7 +244,7 @@ func TestRefine_LastRefineRecentSkipsNewRefine(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	if _, err := r.runScans(context.Background(), proj); err != nil {
+	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 	refineQEs := listRefineQEs(t, "refine-recent")
@@ -317,7 +317,7 @@ func TestRefineBarrier_HeldEmitsMetricPerTick(t *testing.T) {
 
 	before := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-held-metric", "brainstorm", "refine_barrier_held"))
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 1: %v", err)
 	}
 	afterFirst := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-held-metric", "brainstorm", "refine_barrier_held"))
@@ -325,7 +325,7 @@ func TestRefineBarrier_HeldEmitsMetricPerTick(t *testing.T) {
 		t.Fatalf("refine_barrier_held after tick 1 = %v, want %v", afterFirst, before+1)
 	}
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans round 2: %v", err)
 	}
 	afterSecond := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-held-metric", "brainstorm", "refine_barrier_held"))
@@ -354,7 +354,7 @@ func TestRefineBarrier_MaxHoldReleasesBrainstorm(t *testing.T) {
 
 	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-maxhold", "brainstorm", "refine_barrier_timeout"))
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 
@@ -390,7 +390,7 @@ func TestRefineBarrier_JustUnderMaxHoldDoesNotRelease(t *testing.T) {
 
 	beforeTimeout := testutil.ToFloat64(obs.SweepErrorsTotal.WithLabelValues("refine-justunder", "brainstorm", "refine_barrier_timeout"))
 
-	if _, err := r.runScans(ctx, proj); err != nil {
+	if _, _, _, _, err := r.runScans(ctx, proj); err != nil {
 		t.Fatalf("runScans: %v", err)
 	}
 
@@ -399,5 +399,51 @@ func TestRefineBarrier_JustUnderMaxHoldDoesNotRelease(t *testing.T) {
 	}
 	if len(listBrainstormQEs(t, "refine-justunder")) != 0 {
 		t.Fatalf("want brainstorm still held just under the max hold")
+	}
+}
+
+// TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget pins an O6 code
+// review finding (Important 1): the refine grooming pass must fire on the
+// brainstorm CRON tick's own due cadence, completely independent of whether
+// brainstorm itself will decide there is a deficit to refill. O6 added an
+// EVENT-driven refill path that deliberately bypasses this barrier by design
+// (re-running refine per maintainer verdict was rejected as too expensive),
+// which makes the cron tick refine's ONLY remaining trigger - so if the
+// barrier were ever made conditional on the refill decision, a healthy
+// project the event path keeps permanently at target would silently stop
+// grooming forever. TargetOpenProposals=0 forces brainstormDeficit to 0
+// unconditionally (an explicit 0 "disables refill entirely" per
+// BrainstormActivity's own doc comment), so brainstorm() can NEVER decide to
+// refill here - and the refine Task must still get created regardless.
+func TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget(t *testing.T) {
+	proj := seedRefineProject(t, "refine-attarget")
+	zero := 0
+	proj.Spec.Scm.Cron.Brainstorm.TargetOpenProposals = &zero
+	if err := k8sClient.Update(context.Background(), proj); err != nil {
+		t.Fatalf("disable refill via target=0: %v", err)
+	}
+	reader := &fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 1, Title: "open issue"}}}
+	r := newScanReconciler(reader)
+	reg := prometheus.NewRegistry()
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
+		t.Fatalf("runScans: %v", err)
+	}
+
+	if len(listRefineQEs(t, "refine-attarget")) == 0 {
+		t.Fatalf("want refine to run on the cron's own due cadence even though brainstorm has no deficit to refill")
+	}
+	// The barrier just minted this cycle's refine Task, so brainstorm is DEFERRED
+	// behind it on this very pass - brainstorm() is not reached at all. A bare
+	// "no brainstorm QueuedEvent" assertion cannot tell that apart from
+	// "brainstorm ran and decided target=0 means no refill", so assert the thing
+	// that does discriminate: brainstorm() sets the target gauge on EVERY decision
+	// exit it takes, so the series being absent proves it never ran this pass.
+	if n := len(listBrainstormQEs(t, "refine-attarget")); n != 0 {
+		t.Fatalf("want brainstorm deferred behind the refine barrier, got %d brainstorm QueuedEvents", n)
+	}
+	if got, ok := brainstormTargetSeries(t, reg, "refine-attarget"); ok {
+		t.Fatalf("operator_brainstorm_target_proposals{project=refine-attarget} = %v; the refine barrier must defer brainstorm() entirely on the pass that mints the refine Task", got)
 	}
 }

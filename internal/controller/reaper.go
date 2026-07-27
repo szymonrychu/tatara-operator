@@ -300,6 +300,19 @@ const (
 	// human's PR is worth five MORE review pods - every seven days, forever. That
 	// is the V7-9 cost amplifier with a week-long period.
 	AnnHumanReviewRounds = "tatara.dev/human-review-rounds"
+	// AnnProposalDeclinedAt is stamped on the TASK (RFC3339) when a brainstorm
+	// proposal it owns is DECLINED and its mirror retained. It anchors
+	// DeclinedProposalRetention on the DECLINE rather than on stageEnteredAt.
+	//
+	// It is not a nicety. For a rejected(issue-closed) owner the two coincide, so
+	// stageEnteredAt would do - but a decline is also recorded against a PARKED
+	// owner, and a parked(backlog-sweep) Task is never aged out at all: it can sit
+	// for months before a maintainer gets to its proposal. Anchored on
+	// stageEnteredAt the window would be long expired at the moment of the
+	// decline, so the exception would never fire for exactly the shape it was
+	// widened to cover. Absent (a decline recorded by an older build), the anchor
+	// falls back to stageEnteredAt.
+	AnnProposalDeclinedAt = "tatara.dev/proposal-declined-at"
 )
 
 // BranchDeleter is an OPTIONAL SCMWriter capability, in the same spirit as
@@ -457,7 +470,7 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 			return err
 		}
 		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.RejectedRetention)) {
-			return r.deleteReapedTask(ctx, proj, t, live)
+			return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
 		}
 		return nil
 
@@ -476,6 +489,77 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 	return nil
 }
 
+// holdsDeclinedProposal reports whether t still holds a RETAINED
+// brainstorm-proposal mirror inside the longer DeclinedProposalRetention window.
+// It is the ONLY reader of that constant, and it changes NO other reaper
+// behaviour: a Task holding no such mirror, and one past the longer window,
+// reaps exactly as before.
+//
+// IT DOES NOT GATE ON THE STAGE REASON, and that is the 2026-07-27 ruling's
+// whole point rather than an oversight. A decline is now recorded against a
+// PARKED owner too - the dominant shape, since closing an issue without
+// commenting first never unparks anything - and such a Task never becomes
+// rejected(issue-closed). Keying the exception on that reason, as the first
+// version did, would have left the dominant shape reaping on its old schedule
+// with the exception never firing at all.
+//
+// It gates on the RETAINED SHAPE instead (severedButStillOwned): the mirror is
+// found by OWNER REFERENCE, because the decline sever clears the Task's ref list
+// on purpose while deliberately keeping the CR's ownerRef - so ownedIssues
+// returns nothing here - and the ref list is then re-read as the proof that this
+// IS a severed retention rather than an ordinary owned issue that happens to be
+// closed. A Task still working its issues is never held.
+//
+// COST: one namespace-wide Issue List per call, and every caller reaches it only
+// at a site that would OTHERWISE DELETE the Task - past RejectedRetention, or a
+// backlog-sweep park whose every owned Issue is already closed, or an aged park
+// that has cleared its re-entry check. So it is once per Task per reap pass in
+// the window where that Task is dying anyway, not per parked Task per pass.
+func (r *ProjectReconciler) holdsDeclinedProposal(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, now time.Time) (bool, error) {
+
+	if now.After(declinedAt(t).Add(tatarav1alpha1.DeclinedProposalRetention)) {
+		return false, nil
+	}
+	var list tatarav1alpha1.IssueList
+	if err := r.List(ctx, &list, client.InNamespace(t.Namespace)); err != nil {
+		return false, fmt.Errorf("reap: list issues for %s: %w", t.Name, err)
+	}
+	botLogin := botLoginOf(proj)
+	for i := range list.Items {
+		iss := &list.Items[i]
+		if iss.Spec.ProjectRef != proj.Name {
+			continue
+		}
+		// The retention exists to keep a DECLINE queryable, so the mirror has to be
+		// one this Task owns, closed, and already severed. An open issue, one this
+		// Task does not own, or one it still lists is live work and gets no extra
+		// window. severedButStillOwned carries the ownership half itself.
+		if iss.Status.State != "closed" || !severedButStillOwned(t, iss) {
+			continue
+		}
+		if effectiveProposalKind(iss, botLogin) != tatarav1alpha1.ProposalKindBrainstorm {
+			continue
+		}
+		log.FromContext(ctx).V(1).Info("reap: holding a task for its retained declined-proposal mirror",
+			"action", "reap_hold_declined_proposal", "resource_id", t.Name, "issue", iss.Name)
+		return true, nil
+	}
+	return false, nil
+}
+
+// declinedAt is the anchor for DeclinedProposalRetention: the AnnProposalDeclinedAt
+// stamp when present, falling back to the generic stage clock. See that constant
+// for why the fallback is not good enough on its own.
+func declinedAt(t *tatarav1alpha1.Task) time.Time {
+	if v := t.Annotations[AnnProposalDeclinedAt]; v != "" {
+		if ts, err := time.Parse(time.RFC3339, v); err == nil {
+			return ts
+		}
+	}
+	return stageEnteredAt(t)
+}
+
 // reapParked splits the ONE park stage into its TWO populations.
 //
 //	parked(backlog-sweep)  NEVER on age. It is the durable mirror ANCHOR - it
@@ -487,6 +571,19 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
 
+	// The SAME decline-retention exception the rejected branch carries. A parked
+	// owner is where most declines actually land (a maintainer who just closes the
+	// issue never unparks anything), and the backlog-sweep branch below has NO age
+	// gate at all - it collects as soon as every owned Issue is closed - so without
+	// it the dominant decline's mirror survives one reap pass, minutes.
+	//
+	// IT DEFERS THE DELETE AND NOTHING ELSE. Asked once at the top it would also
+	// skip releaseTerminal, so a held Task's OTHER open issues would go up to
+	// DeclinedProposalRetention with no terminal comment, no tatara-parked label
+	// and no ownerRef release - starving unrelated artifacts to keep one mirror.
+	// Asked at each delete site instead, the terminal sequence still runs on
+	// schedule and only the collection waits. It is also why the List stays off
+	// the hot path: neither site is reached until the Task is otherwise due.
 	if t.Status.StageReason == stage.ReasonBacklogSweep {
 		issues, err := r.ownedIssues(ctx, t)
 		if err != nil {
@@ -497,7 +594,7 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 				return nil // still anchoring open work
 			}
 		}
-		return r.deleteReapedTask(ctx, proj, t, live)
+		return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
 	}
 
 	if !now.After(stageEnteredAt(t).Add(tatarav1alpha1.ParkRetention)) {
@@ -513,6 +610,23 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 	}
 	if err := r.releaseTerminal(ctx, proj, t, live); err != nil {
 		return err
+	}
+	return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
+}
+
+// deleteUnlessHoldingADecline is deleteReapedTask behind the decline-retention
+// exception. Every collection site that can be holding a retained proposal
+// mirror goes through it, so the hold is expressed once instead of being
+// re-derived per branch.
+func (r *ProjectReconciler) deleteUnlessHoldingADecline(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
+
+	hold, err := r.holdsDeclinedProposal(ctx, proj, t, now)
+	if err != nil {
+		return err
+	}
+	if hold {
+		return nil
 	}
 	return r.deleteReapedTask(ctx, proj, t, live)
 }

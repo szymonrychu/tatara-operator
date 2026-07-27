@@ -9,7 +9,7 @@ import (
 // instructs the agent to use the code-quality skill backed by real on-disk code and
 // the code-graph MCP tools, not just the deep-research/ADR path.
 func TestBrainstormGoalNamesCodeQualitySkillAndGrounding(t *testing.T) {
-	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "", 3)
 
 	// Must name the code-quality proposal skill.
 	if !strings.Contains(g, "tatara-code-quality-proposal") {
@@ -33,7 +33,7 @@ func TestBrainstormGoalNamesCodeQualitySkillAndGrounding(t *testing.T) {
 // confirms the dangling skip_brainstorm prompt token has been removed.
 // This test FAILS on the unmodified codebase.
 func TestBrainstormGoalNoDanglingSkipBrainstorm(t *testing.T) {
-	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "", 3)
 	if strings.Contains(g, "skip_brainstorm") {
 		t.Fatal("brainstorm goal must NOT contain dangling skip_brainstorm token; use skip_research instead")
 	}

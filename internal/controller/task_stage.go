@@ -1080,15 +1080,20 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 	if err != nil {
 		return "", err
 	}
+	history, err := ProposalHistoryFor(ctx, r.Client, proj, agentKind)
+	if err != nil {
+		return "", err
+	}
 	out, err := prompt.Render(prompt.Input{
-		Task:           task,
-		Issues:         issues,
-		MergeRequests:  mrs,
-		Events:         task.Status.PendingEvents,
-		Notes:          task.Status.Notes,
-		Assignment:     assignmentFor(agentKind, task, proj),
-		MaxBundleBytes: proj.Spec.MaxBundleBytes,
-		Metrics:        r.BundleMetrics,
+		Task:            task,
+		Issues:          issues,
+		MergeRequests:   mrs,
+		Events:          task.Status.PendingEvents,
+		Notes:           task.Status.Notes,
+		ProposalHistory: history,
+		Assignment:      assignmentFor(agentKind, task, proj),
+		MaxBundleBytes:  proj.Spec.MaxBundleBytes,
+		Metrics:         r.BundleMetrics,
 	})
 	if err != nil {
 		return "", fmt.Errorf("render bundle for %s: %w", task.Name, err)

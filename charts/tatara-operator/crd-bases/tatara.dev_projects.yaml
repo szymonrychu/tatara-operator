@@ -5790,12 +5790,25 @@ spec:
                         properties:
                           enabled:
                             type: boolean
+                          historyWindow:
+                            description: |-
+                              HistoryWindow is how many recent brainstorm proposals are rendered into the
+                              brainstorm pod's turn-0 bundle as the <proposal_history> block. Unset uses
+                              DefaultHistoryWindow. An explicit 0 omits the block.
+                            type: integer
+                          maxConsecutiveSkips:
+                            description: |-
+                              MaxConsecutiveSkips is the circuit-breaker threshold. After this many
+                              consecutive brainstorm sessions ending in action=skip, the EVENT-driven
+                              refill path is suppressed until a cron tick resets the counter. Unset uses
+                              DefaultMaxConsecutiveSkips. An explicit 0 means the breaker never trips.
+                            type: integer
                           maxOpenProposals:
                             default: 5
                             description: |-
-                              MaxOpenProposals caps the total open, unapproved agent proposals across
-                              ALL repos in the project; at or above this the brainstorm cycle is
-                              skipped. Default 5.
+                              Deprecated: MaxOpenProposals was the pre-target CEILING. It is retained as
+                              a working alias, honoured ONLY when TargetOpenProposals is unset, so an
+                              unmigrated Project keeps working. Set TargetOpenProposals instead.
                             type: integer
                           maxPerCycle:
                             default: 1
@@ -5820,11 +5833,19 @@ spec:
                               StaleProposalDays configures the staleness reaper that auto-closes
                               bot-authored proposals with no human engagement (no human comment, no live
                               work) for at least that many days, clearing dead proposals out of the
-                              MaxOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
+                              TargetOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
                               sets an explicit window; the UNSET default (0) enables the reaper with a
                               generous-but-finite default window (defaultStaleProposalDays) so un-approved
                               proposals do not accumulate unboundedly; a NEGATIVE value is the explicit
                               opt-out that disables the reaper entirely.
+                            type: integer
+                          targetOpenProposals:
+                            description: |-
+                              TargetOpenProposals is the TARGET number of brainstorm proposals kept open
+                              and awaiting a maintainer decision across ALL repos in the project. The
+                              controller refills toward it: it never closes a proposal to reconcile
+                              downward. Unset falls back to MaxOpenProposals (deprecated alias) and then
+                              to DefaultTargetOpenProposals. An explicit 0 disables refill entirely.
                             type: integer
                         type: object
                       documentation:
@@ -6061,6 +6082,15 @@ spec:
           status:
             description: ProjectStatus defines the observed state of a Project.
             properties:
+              brainstormConsecutiveSkips:
+                description: |-
+                  BrainstormConsecutiveSkips counts brainstorm sessions that ended in
+                  action=skip back to back. action=propose resets it to 0; a cron tick
+                  resets it to 0. At BrainstormActivity.ResolveMaxConsecutiveSkips() the
+                  EVENT-driven refill path is suppressed - the liveness brake that stops
+                  skip -> deficit unchanged -> reconcile -> spawn -> skip burning pods on a
+                  proven-dry idea space.
+                type: integer
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

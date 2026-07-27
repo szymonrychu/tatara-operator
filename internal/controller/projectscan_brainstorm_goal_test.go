@@ -6,7 +6,7 @@ import (
 )
 
 func TestBrainstormGoalDropsCommentPathAddsEarlyExit(t *testing.T) {
-	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "", 3)
 	if strings.Contains(g, "comment_on_issue") {
 		t.Fatal("brainstorm goal must NOT instruct comment_on_issue (path-2 dropped)")
 	}
@@ -25,7 +25,7 @@ func TestBrainstormGoalDropsCommentPathAddsEarlyExit(t *testing.T) {
 }
 
 func TestBrainstormGoalPrioritizesHandoffsFirst(t *testing.T) {
-	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "", 3)
 
 	for _, want := range []string{"list_handoffs", "get_handoff"} {
 		if !strings.Contains(g, want) {
@@ -33,7 +33,7 @@ func TestBrainstormGoalPrioritizesHandoffsFirst(t *testing.T) {
 		}
 	}
 	low := strings.ToLower(g)
-	for _, want := range []string{"handoff", "maxopenproposals", "continu"} {
+	for _, want := range []string{"handoff", "quota", "continu"} {
 		if !strings.Contains(low, want) {
 			t.Fatalf("brainstorm goal missing handoff-prioritize guidance %q", want)
 		}
@@ -45,7 +45,7 @@ func TestBrainstormGoalPrioritizesHandoffsFirst(t *testing.T) {
 }
 
 func TestBrainstormGoalMandatesCouncilSkill(t *testing.T) {
-	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "")
+	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "", 3)
 	for _, want := range []string{
 		"tatara-council-brainstorm",
 		"tatara-code-quality-proposal",

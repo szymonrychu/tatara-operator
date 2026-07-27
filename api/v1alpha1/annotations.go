@@ -38,6 +38,14 @@ const (
 // sites cannot drift.
 const AnnBrainstormSources = "tatara.dev/brainstorm-sources"
 
+// AnnBrainstormQuota is the annotation key carrying the per-session proposal
+// quota (the computed deficit, clamped to [1, MaxProposalsPerOutcome]) stamped
+// on brainstorm Tasks by projectscan and read by internal/restapi/outcome.go,
+// which TRUNCATES submit_outcome(action=propose) to it. Operator-side truncation
+// is the authority: an agent that ignores the quota cannot overshoot the target.
+// The agent-visible copy of the same number is a literal line in Task.Spec.Goal.
+const AnnBrainstormQuota = "tatara.dev/brainstorm-quota"
+
 // Label keys shared between the sweep and the cron scans.
 const (
 	// LabelSourceKind is the activity kind ("mrScan", "issueScan", etc.).
