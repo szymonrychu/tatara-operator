@@ -7,10 +7,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/own"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -222,57 +226,128 @@ func TestIssueReconcileReSeverStillFinishesAnOrdinaryCrashedDelete(t *testing.T)
 	require.True(t, issueGone(t, c, iss.Name), "re-sever must still finish the interrupted DeleteCR")
 }
 
-// TestReopenedRetainedProposalIsOrphanedAndCountsAgain closes the hole retention
-// itself opens. A retained mirror keeps a dead Task as its controller owner and
-// carries status=rejected, so a maintainer who REOPENS the proposal would
-// otherwise get an issue that: is not an orphan, so the sweep never re-mints a
-// Task for it; can never be approved (approvalInScope refuses a rejected
-// thread); and does not count as pending, so the controller refills over it. The
-// pre-O9 delete-and-re-create had none of those problems, so retention must undo
-// itself on reopen.
-func TestReopenedRetainedProposalIsOrphanedAndCountsAgain(t *testing.T) {
-	ctx := context.Background()
-	c, task, iss := seedClosedProposal(t, tatarav1alpha1.ProposalKindBrainstorm, true)
-	_, err := ApplyIssueClosedStop(ctx, c, task, iss.Name, time.Now())
-	require.NoError(t, err)
+// seedRetainedDecline drives a real decline to completion and returns the client
+// plus the retained mirror's name. It never hand-writes the retained state.
+func seedRetainedDecline(t *testing.T) (client.Client, *tatarav1alpha1.Project, *tatarav1alpha1.Repository, string) {
+	t.Helper()
+	proj, repo := sweepProject("reopen-proj"), sweepRepo("reopen-proj")
+	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+	task.Spec.Kind = "clarify"
+	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
+	iss.Spec.ProjectRef = proj.Name
+	task.Status.IssueRefs = []string{iss.Name}
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
 
-	// The maintainer reopens it; the mirror sync writes state back to open.
-	live := getIssueCR(t, c, iss.Name)
-	live.Status.State = "open"
-	require.NoError(t, c.Status().Update(ctx, live))
-
-	r := newIssueReconciler(c, &mirrorWriter{}, nil)
-	reconcileIssue(t, r, iss.Name)
-
-	gotIss, ok := getProposalIssue(t, c, iss.Name)
-	require.True(t, ok, "a reopened proposal keeps its mirror; only the verdict is undone")
-	require.Equal(t, "new", gotIss.Status.Status, "the decline is undone, so the thread is approvable again")
-	require.True(t, proposalPending(gotIss, "tatara-bot"), "a reopened proposal counts against the target again")
-	_, owned := own.ControllerOwner(gotIss)
-	require.False(t, owned,
-		"the dead rejected Task must not keep owning a live issue: the mirror is orphaned so the sweep re-mints it")
+	if _, err := ApplyIssueClosedStop(context.Background(), c, task, iss.Name, time.Now()); err != nil {
+		t.Fatalf("ApplyIssueClosedStop: %v", err)
+	}
+	return c, proj, repo, iss.Name
 }
 
-// TestReopenedOrdinaryIssueIsUntouched: the reopen undo is brainstorm-scoped
-// too. Nothing writes rejected on an ordinary issue, but the guard must not fire
-// on one that carries the status for any other reason.
-func TestReopenedOrdinaryIssueIsUntouched(t *testing.T) {
-	ctx := context.Background()
-	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+// TestSweepUndoesRetentionOnAReopenedProposal drives the undo through the REAL
+// caller, not by hand-writing Status.State.
+//
+// That distinction is the whole point of this test. The first version of O9
+// gated the undo on state=open and proved only that the FUNCTION worked - while
+// no production path could ever set a retained mirror's state back to open, so
+// the undo was dead code and reopen was newly broken rather than fixed. The
+// sweep is the backstop half of the fix: it lists OPEN forge issues, and a
+// retained mirror is controller-owned, so IsOrphanIssue skips it forever unless
+// the undo runs FIRST.
+func TestSweepUndoesRetentionOnAReopenedProposal(t *testing.T) {
+	c, proj, repo, issName := seedRetainedDecline(t)
+
+	before := getIssueCR(t, c, issName)
+	require.Equal(t, "rejected", before.Status.Status, "precondition: a real decline was retained")
+	require.Equal(t, "closed", before.Status.State)
+	_, ownedBefore := own.ControllerOwner(before)
+	require.True(t, ownedBefore, "precondition: the retained mirror is owned, so it is NOT an orphan")
+
+	// The maintainer reopens it on the forge. The sweep sees an OPEN issue.
+	rd := &sweepReader{
+		issues: []scm.IssueRef{{
+			Repo: "szymonrychu/tatara-operator", Number: 1,
+			Author: "tatara-bot", Title: "an idea", State: "open",
+		}},
+		content: map[int]scm.IssueContent{1: {Title: "an idea", Body: before.Status.Body}},
+	}
+	runSweep(t, c, proj, repo, rd)
+
+	got, ok := getProposalIssue(t, c, issName)
+	require.True(t, ok, "a reopened proposal keeps its mirror; only the verdict is undone")
+	require.Equal(t, "new", got.Status.Status, "the decline is undone, so the thread is approvable again")
+	require.Equal(t, "open", got.Status.State)
+	require.True(t, proposalPending(got, "tatara-bot"), "a reopened proposal counts against the target again")
+
+	// And it is workable again: the same pass adopts it, because the undo dropped
+	// the ownerRef before IsOrphanIssue read it.
+	owner, owned := own.ControllerOwner(got)
+	require.True(t, owned, "the sweep must re-mint a Task for the revived proposal")
+	require.NotEqual(t, "t-1", owner, "the dead rejected Task must not still own a live issue")
+}
+
+// TestSweepLeavesAnOrdinaryRejectedIssueAlone: the undo is brainstorm-scoped.
+func TestSweepLeavesAnOrdinaryRejectedIssueAlone(t *testing.T) {
+	proj, repo := sweepProject("ord-proj"), sweepRepo("ord-proj")
 	task := taskAtStage(tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman)
 	iss := proposalMirror(task, "", false)
+	iss.Spec.ProjectRef = proj.Name
+	iss.Status.State, iss.Status.Status = "open", "rejected"
 	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
-	live := getIssueCR(t, c, iss.Name)
-	live.Status.State, live.Status.Status = "open", "rejected"
-	require.NoError(t, c.Status().Update(ctx, live))
 
-	r := newIssueReconciler(c, &mirrorWriter{}, nil)
-	reconcileIssue(t, r, iss.Name)
+	rd := &sweepReader{
+		issues: []scm.IssueRef{{
+			Repo: "szymonrychu/tatara-operator", Number: 1,
+			Author: "alice", Title: "an idea", State: "open",
+		}},
+		content: map[int]scm.IssueContent{1: {Title: "an idea", Body: iss.Status.Body}},
+	}
+	runSweep(t, c, proj, repo, rd)
 
-	gotIss, ok := getProposalIssue(t, c, iss.Name)
-	require.True(t, ok)
-	require.Equal(t, "rejected", gotIss.Status.Status)
-	owner, owned := own.ControllerOwner(gotIss)
+	got := getIssueCR(t, c, iss.Name)
+	require.Equal(t, "rejected", got.Status.Status)
+	owner, owned := own.ControllerOwner(got)
 	require.True(t, owned)
 	require.Equal(t, task.Name, owner)
+}
+
+// TestReopenUndoOrphansBeforeClearingTheVerdict is an ORDERING PROBE, the same
+// idiom TestReapClosesOwnBotMRAfterHandover uses.
+//
+// The order is crash safety. Orphan first, clear second: the interruptible state
+// is rejected+ownerless, which the sweep backstop keys on (status=rejected
+// alone) and recovers. Clear first and the interruptible state is new+owned by a
+// dead Task - no gate re-enters it, no sweep adopts it, and the reaper cascades
+// the mirror away.
+func TestReopenUndoOrphansBeforeClearingTheVerdict(t *testing.T) {
+	c, proj, _, issName := seedRetainedDecline(t)
+
+	var ownersAtStatusWrite int
+	probe := interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if iss, isIssue := obj.(*tatarav1alpha1.Issue); isIssue && iss.Status.Status == "new" {
+				var live tatarav1alpha1.Issue
+				if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), &live); err != nil {
+					return err
+				}
+				ownersAtStatusWrite = len(live.GetOwnerReferences())
+			}
+			return cl.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
+	probed := fake.NewClientBuilder().
+		WithScheme(c.Scheme()).
+		WithObjects(getIssueCR(t, c, issName), getTaskCR(t, c, "t-1"), proj).
+		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.Task{}).
+		WithInterceptorFuncs(probe).
+		Build()
+
+	iss := &tatarav1alpha1.Issue{}
+	require.NoError(t, probed.Get(context.Background(),
+		types.NamespacedName{Namespace: testNS, Name: issName}, iss))
+	require.NoError(t, reopenRetainedProposal(context.Background(), probed, iss, "tatara-bot"))
+
+	require.Equal(t, 0, ownersAtStatusWrite,
+		"the verdict was cleared while the dead Task still owned the mirror: a crash there wedges it forever")
 }

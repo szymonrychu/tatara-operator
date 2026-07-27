@@ -213,28 +213,76 @@ func recordProposalDecline(ctx context.Context, c client.Client,
 // reopen has to put the mirror back in the same shape: verdict cleared, mirror
 // orphaned for the sweep to re-adopt.
 //
+// THE STEP ORDER IS CRASH SAFETY, not style. Orphaning FIRST and clearing the
+// verdict SECOND means the only interruptible intermediate state is
+// rejected + ownerless, which BOTH re-entry paths still recognise (the reconciler
+// gate is state=open + status=rejected; the sweep backstop keys on
+// status=rejected alone). Clearing first would leave open + new + owned-by-a-dead
+// Task, which no gate can re-enter, no sweep can adopt, and the reaper then
+// cascades - the exact wedge this function exists to prevent.
+//
+// It writes Status.State itself so BOTH callers converge on one op: the webhook
+// path has already stamped open, and the sweep backstop has not (it knows the
+// forge lists the issue as open, which is the same truth from the other side).
+//
+// botLogin is threaded in by the caller, which always already holds the Project.
+//
 // KNOWN COSMETIC RESIDUAL: the forge keeps the declined label the decline
 // projected onto it, because the label projection only writes for
 // approved/rejected/done. It is projection-only and nothing reads it for control
 // flow (C.6, fix 16), so it is left alone rather than adding a second label
 // write path.
-func reopenRetainedProposal(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issue) error {
-	proposal, err := isBrainstormProposal(ctx, c, iss)
-	if err != nil || !proposal {
-		return err
+//
+// KNOWN BEHAVIOURAL DELTA, stated because it is now reachable: the retained
+// mirror keeps its Spec.ProposalBodyHash, so a proposal CLOSED WITH NO
+// maintainer comment and then reopened still satisfies autoApproveApplies'
+// anchor factor. Pre-O9 the reopen re-minted an anchorless CR, which failed that
+// factor closed. Under autoApproveTataraProposals a triage-role reopen can
+// therefore resurrect a proposal a maintainer vetoed by closing it silently. The
+// anchor is unforgeable and the reopen is still an attributable forge action by
+// an allowed reporter, so this is defensible - but it is a real widening of the
+// auto-approve surface and must not be discovered later.
+func reopenRetainedProposal(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issue, botLogin string) error {
+	if effectiveProposalKind(iss, botLogin) != tatarav1alpha1.ProposalKindBrainstorm {
+		return nil
 	}
+	if iss.Status.Status != "rejected" {
+		return nil // nothing retained to undo
+	}
+
+	// STEP 1: hand the mirror back to the sweep, but ONLY away from the Task that
+	// the decline itself left owning it. Any other owner is live work and keeps it.
+	if ownerName, owned := own.ControllerOwner(iss); owned {
+		var owner tatarav1alpha1.Task
+		err := c.Get(ctx, types.NamespacedName{Namespace: iss.Namespace, Name: ownerName}, &owner)
+		switch {
+		case apierrors.IsNotFound(err):
+			// The owner is already gone; the mirror is cascading and there is nothing
+			// to sever from.
+		case err != nil:
+			return fmt.Errorf("proposal-reopened: get owning task %s: %w", ownerName, err)
+		case owner.Status.Stage == tatarav1alpha1.StageRejected &&
+			owner.Status.StageReason == stage.ReasonIssueClosed:
+			if err := SeverIssueFromTask(ctx, c, &owner, iss.Name, SeverOrphan); err != nil {
+				return err
+			}
+		}
+	}
+
+	// STEP 2: clear the verdict and mirror the reopen.
 	key := client.ObjectKeyFromObject(iss)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var fresh tatarav1alpha1.Issue
 		if err := c.Get(ctx, key, &fresh); err != nil {
 			return err
 		}
-		if fresh.Status.Status != "rejected" {
+		if fresh.Status.Status != "rejected" && fresh.Status.State == "open" {
 			return nil
 		}
 		// "new" is exactly what mintIssueCR seeds a freshly filed proposal with, so
 		// the reopened thread is indistinguishable from an untriaged one.
 		fresh.Status.Status = "new"
+		fresh.Status.State = "open"
 		return c.Status().Update(ctx, &fresh)
 	}); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -242,28 +290,9 @@ func reopenRetainedProposal(ctx context.Context, c client.Client, iss *tatarav1a
 		}
 		return fmt.Errorf("proposal-reopened: clear the decline on %s: %w", iss.Name, err)
 	}
-	iss.Status.Status = "new"
+	iss.Status.Status, iss.Status.State = "new", "open"
 
-	// Hand the mirror back to the sweep, but ONLY away from the Task that the
-	// decline itself left owning it. Any other owner is live work and keeps it.
-	ownerName, owned := own.ControllerOwner(iss)
-	if !owned {
-		return nil
-	}
-	var owner tatarav1alpha1.Task
-	if err := c.Get(ctx, types.NamespacedName{Namespace: iss.Namespace, Name: ownerName}, &owner); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("proposal-reopened: get owning task %s: %w", ownerName, err)
-	}
-	if owner.Status.Stage != tatarav1alpha1.StageRejected || owner.Status.StageReason != stage.ReasonIssueClosed {
-		return nil
-	}
-	if err := SeverIssueFromTask(ctx, c, &owner, iss.Name, SeverOrphan); err != nil {
-		return err
-	}
 	log.FromContext(ctx).Info("a declined brainstorm proposal was reopened: undid the retention",
-		"action", "proposal_reopened", "resource_id", iss.Name, "task", owner.Name)
+		"action", "proposal_reopened", "resource_id", iss.Name, "proposal_kind", tatarav1alpha1.ProposalKindBrainstorm)
 	return nil
 }

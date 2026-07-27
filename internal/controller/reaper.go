@@ -457,6 +457,16 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 			return err
 		}
 		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.RejectedRetention)) {
+			// The ONE exception to RejectedRetention (O9). Checked only here, on the
+			// pass that would otherwise delete, so the extra List costs nothing until
+			// a rejected Task is actually due.
+			hold, err := r.holdsDeclinedProposal(ctx, proj, t, now)
+			if err != nil {
+				return err
+			}
+			if hold {
+				return nil
+			}
 			return r.deleteReapedTask(ctx, proj, t, live)
 		}
 		return nil
@@ -474,6 +484,57 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 		return r.reapDelivered(ctx, proj, t, live, now, ds)
 	}
 	return nil
+}
+
+// holdsDeclinedProposal reports whether t is a rejected(issue-closed) Task still
+// holding a RETAINED brainstorm-proposal mirror inside the longer
+// DeclinedProposalRetention window. It is the ONLY reader of that constant and
+// it changes NO other reaper behaviour: every other Task shape, and this one
+// past the longer window, reaps exactly as before.
+//
+// The mirror is found by OWNER REFERENCE, not by Status.IssueRefs: the decline
+// sever clears the Task's ref list on purpose (so the reaper never walks a stale
+// ref) while deliberately keeping the CR's ownerRef, which is what makes the
+// Task's reap the thing that finally collects the mirror. ownedIssues would
+// therefore return nothing here and the hold would never fire.
+func (r *ProjectReconciler) holdsDeclinedProposal(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, now time.Time) (bool, error) {
+
+	if t.Status.StageReason != stage.ReasonIssueClosed {
+		return false, nil
+	}
+	if now.After(stageEnteredAt(t).Add(tatarav1alpha1.DeclinedProposalRetention)) {
+		return false, nil
+	}
+	var list tatarav1alpha1.IssueList
+	if err := r.List(ctx, &list, client.InNamespace(t.Namespace)); err != nil {
+		return false, fmt.Errorf("reap: list issues for %s: %w", t.Name, err)
+	}
+	botLogin := botLoginOf(proj)
+	for i := range list.Items {
+		iss := &list.Items[i]
+		if iss.Spec.ProjectRef != proj.Name || !ownedByTask(iss, t.Name) {
+			continue
+		}
+		if effectiveProposalKind(iss, botLogin) != tatarav1alpha1.ProposalKindBrainstorm {
+			continue
+		}
+		log.FromContext(ctx).V(1).Info("reap: holding a rejected task for its retained proposal mirror",
+			"action", "reap_hold_declined_proposal", "resource_id", t.Name, "issue", iss.Name)
+		return true, nil
+	}
+	return false, nil
+}
+
+// ownedByTask reports whether obj carries an ownerRef naming a Task called name,
+// controller flag or not.
+func ownedByTask(obj client.Object, name string) bool {
+	for _, ref := range obj.GetOwnerReferences() {
+		if ref.Kind == "Task" && ref.APIVersion == tatarav1alpha1.GroupVersion.String() && ref.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // reapParked splits the ONE park stage into its TWO populations.

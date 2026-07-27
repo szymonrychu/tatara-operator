@@ -673,6 +673,27 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 			fail("get_issue_cr", gerr, "repo", repo.Name, "number", ref.Number)
 			continue
 		}
+		// O9 BACKSTOP, and it runs BEFORE the orphan check on purpose. ref is an
+		// OPEN forge issue; a retained declined proposal's mirror still says closed
+		// and rejected, and it is controller-owned, so IsOrphanIssue is false and
+		// the loop would skip it forever. A lost or reporter-gated "reopened"
+		// delivery would then wedge it: never counted, never minted, and finally
+		// cascaded by its owner's reap. This is also the crash-recovery entry for a
+		// half-finished undo (ownerless but still rejected), which is why it keys on
+		// the verdict alone and not on ownership.
+		if cr != nil && cr.Status.Status == "rejected" && ext.State == "open" {
+			if rerr := reopenRetainedProposal(ctx, r.Client, cr, botLoginOf(proj)); rerr != nil {
+				fail("reopen_retained_proposal", rerr, "repo", repo.Name, "number", ref.Number)
+				continue
+			}
+			// Re-read: the undo dropped the ownerRef in etcd, and IsOrphanIssue below
+			// reads ownership off this copy. Without it the mint waits a full sweep
+			// period for a reopen the operator has already acted on.
+			if cr, gerr = r.issueCR(ctx, proj, repo, ref.Number); gerr != nil {
+				fail("get_issue_cr", gerr, "repo", repo.Name, "number", ref.Number)
+				continue
+			}
+		}
 		if !IsOrphanIssue(proj, repo, ext, cr) {
 			continue
 		}

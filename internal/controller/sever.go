@@ -53,8 +53,10 @@ const (
 // (spurious terminal comment + label re-stamp) and orphaned CRs leak. I3 and I4
 // both use this ONE op instead of two bespoke partial severances.
 //
-// LEADER-ONLY. It is called by ApplyIssueClosedStop (SeverDeleteCR) and the I4
-// no-re-entry resume driver (SeverOrphan); both run leader-side.
+// LEADER-ONLY. It is called by recordProposalDecline (SeverDeleteCR for an
+// ordinary issue, SeverRetainCR for a brainstorm proposal), the I4 no-re-entry
+// resume driver (SeverOrphan) and reopenRetainedProposal (SeverOrphan); all run
+// leader-side.
 //
 // ORDER: the Task side is cleared FIRST, so the worst crash-state after step 1
 // is "CR still owner-reffed but not listed by the Task": the CR keeps a valid
@@ -79,7 +81,9 @@ func SeverIssueFromTask(ctx context.Context, c client.Client, task *tatarav1alph
 	// to step 2 so the issue's OWN ownerRef is dropped and it does not cascade with
 	// the deleted Task.
 	taskKey := client.ObjectKeyFromObject(task)
+	detached := false
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		detached = false
 		fresh := &tatarav1alpha1.Task{}
 		if err := c.Get(ctx, taskKey, fresh); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -93,6 +97,7 @@ func SeverIssueFromTask(ctx context.Context, c client.Client, task *tatarav1alph
 			*task = *fresh
 			return nil // already detached; idempotent
 		}
+		detached = true
 		if err := c.Status().Update(ctx, fresh); err != nil {
 			return err
 		}
@@ -106,8 +111,14 @@ func SeverIssueFromTask(ctx context.Context, c client.Client, task *tatarav1alph
 	issKey := types.NamespacedName{Namespace: task.Namespace, Name: issueName}
 	switch mode {
 	case SeverRetainCR:
-		l.Info("severed an issue mirror from its task and retained the CR",
-			"action", "sever_issue_retain", "resource_id", issueName, "task", task.Name)
+		// Guarded on detached, unlike the two modes below: they END in a delete or an
+		// ownerRef drop, so their re-entry is a NotFound/no-op that logs once, while a
+		// retained CR outlives its sever and its owner re-enters this op on EVERY
+		// reconcile of the surviving mirror. Ungated it would log at INFO forever.
+		if detached {
+			l.Info("severed an issue mirror from its task and retained the CR",
+				"action", "sever_issue_retain", "resource_id", issueName, "task", task.Name)
+		}
 		return nil
 
 	case SeverDeleteCR:

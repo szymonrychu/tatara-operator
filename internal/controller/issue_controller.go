@@ -132,8 +132,10 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// O9: a maintainer REOPENED a proposal the operator had retained as declined.
 	// It runs before the closed branch (the two states are exclusive) and after
 	// the mirror sync, so the reopen is acted on the same reconcile it is seen.
+	// The state it gates on is written by handleIssueOpened's stampIssueState;
+	// sweepIssues carries the backstop for a lost or gated-out delivery.
 	if iss.Status.State == "open" && iss.Status.Status == "rejected" {
-		if err := reopenRetainedProposal(ctx, r.Client, &iss); err != nil {
+		if err := reopenRetainedProposal(ctx, r.Client, &iss, botLoginOf(&proj)); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
