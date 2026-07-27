@@ -351,3 +351,129 @@ func TestReopenUndoOrphansBeforeClearingTheVerdict(t *testing.T) {
 	require.Equal(t, 0, ownersAtStatusWrite,
 		"the verdict was cleared while the dead Task still owned the mirror: a crash there wedges it forever")
 }
+
+// seedParkedProposalClose wires a PARKED clarify Task owning a CLOSED proposal
+// mirror - the shape a maintainer produces by just closing the issue, with no
+// comment to unpark anything first. reason picks which park.
+func seedParkedProposalClose(t *testing.T, reason, kind string, stamped bool) (client.Client, *tatarav1alpha1.Task, *tatarav1alpha1.Issue) {
+	t.Helper()
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StageParked, reason)
+	task.Spec.Kind = "clarify"
+	iss := proposalMirror(task, kind, stamped)
+	task.Status.IssueRefs = []string{iss.Name}
+	return newMirrorClient(t, proj, repo, task, iss, scmSecret()), task, iss
+}
+
+// TestParkedProposalCloseIsRecordedWithoutStoppingTheTask is the 2026-07-27
+// ruling: the stop edge and the decline record are SEPARATE concerns.
+//
+// This is the shape that dominates real declines - closing an issue is one click
+// and needs no comment, so nothing ever unparks the owner into clarifying,
+// AllowsIssueClosedStop is false, and before this every such decline went
+// unrecorded and its mirror was cascaded by the very next reap pass. Recording
+// it must NOT stop the Task: stage, stage reason and pod are untouched.
+func TestParkedProposalCloseIsRecordedWithoutStoppingTheTask(t *testing.T) {
+	for _, reason := range []string{stage.ReasonBacklogSweep, stage.ReasonAwaitingHuman} {
+		t.Run(reason, func(t *testing.T) {
+			c, task, iss := seedParkedProposalClose(t, reason, tatarav1alpha1.ProposalKindBrainstorm, true)
+
+			r := newIssueReconciler(c, &mirrorWriter{}, nil)
+			reconcileIssue(t, r, iss.Name)
+
+			gotTask := getTaskCR(t, c, task.Name)
+			require.Equal(t, tatarav1alpha1.StageParked, gotTask.Status.Stage,
+				"recording a decline must never move the owner's stage")
+			require.Equal(t, reason, gotTask.Status.StageReason)
+			require.NotContains(t, gotTask.Status.IssueRefs, iss.Name,
+				"the sever still runs: that is what puts the mirror in the retained shape")
+			require.NotEmpty(t, gotTask.Annotations[AnnProposalDeclinedAt],
+				"the retention window is anchored on the decline, not on the park")
+
+			gotIss, ok := getProposalIssue(t, c, iss.Name)
+			require.True(t, ok, "the mirror is retained, not cascaded")
+			require.Equal(t, "rejected", gotIss.Status.Status)
+			require.Equal(t, "declined", proposalDisplayStatus(gotIss))
+			owner, owned := own.ControllerOwner(gotIss)
+			require.True(t, owned)
+			require.Equal(t, task.Name, owner, "the retained mirror keeps its ownerRef")
+		})
+	}
+}
+
+// TestParkedNonProposalCloseIsLeftCompletelyAlone is the blast-radius guard on
+// the widened gate. This branch is now reached for EVERY closed issue whose
+// owner is not stoppable, so it must write nothing at all for an ordinary issue
+// - not a sever, and above all not the delete recordProposalDecline would do.
+func TestParkedNonProposalCloseIsLeftCompletelyAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		kind    string
+		stamped bool
+	}{
+		{"a human-filed issue", "", false},
+		{"an incident tracker issue", tatarav1alpha1.ProposalKindIncident, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, task, iss := seedParkedProposalClose(t, stage.ReasonAwaitingHuman, tc.kind, tc.stamped)
+
+			r := newIssueReconciler(c, &mirrorWriter{}, nil)
+			reconcileIssue(t, r, iss.Name)
+
+			gotIss, ok := getProposalIssue(t, c, iss.Name)
+			require.True(t, ok, "an ordinary parked issue's mirror must not be deleted by the decline path")
+			require.Equal(t, "new", gotIss.Status.Status, "no verdict is invented for a non-proposal")
+
+			gotTask := getTaskCR(t, c, task.Name)
+			require.Contains(t, gotTask.Status.IssueRefs, iss.Name,
+				"no sever either: the Task's relationship to an ordinary issue is untouched")
+			require.Empty(t, gotTask.Annotations[AnnProposalDeclinedAt])
+		})
+	}
+}
+
+// TestReopenAfterAParkedDeclineRecoversTheSameWay: the reopen undo keys on the
+// RETAINED SHAPE, not on rejected(issue-closed), so a decline recorded against a
+// parked owner reopens exactly like one recorded against a stopped Task.
+func TestReopenAfterAParkedDeclineRecoversTheSameWay(t *testing.T) {
+	ctx := context.Background()
+	c, task, iss := seedParkedProposalClose(t, stage.ReasonBacklogSweep, tatarav1alpha1.ProposalKindBrainstorm, true)
+	r := newIssueReconciler(c, &mirrorWriter{}, nil)
+	reconcileIssue(t, r, iss.Name)
+	require.Equal(t, "rejected", getIssueCR(t, c, iss.Name).Status.Status, "precondition: the decline was recorded")
+
+	live := getIssueCR(t, c, iss.Name)
+	require.NoError(t, reopenRetainedProposal(ctx, c, live, "tatara-bot"))
+
+	got := getIssueCR(t, c, iss.Name)
+	require.Equal(t, "new", got.Status.Status)
+	require.Equal(t, "open", got.Status.State)
+	require.True(t, proposalPending(got, "tatara-bot"))
+	_, owned := own.ControllerOwner(got)
+	require.False(t, owned,
+		"a parked owner that already severed the mirror must release it too, or the reopen wedges one shape over")
+
+	require.Equal(t, tatarav1alpha1.StageParked, getTaskCR(t, c, task.Name).Status.Stage,
+		"the reopen undo does not move the owner's stage either")
+}
+
+// TestReopenNeverOrphansAMirrorTheOwnerIsStillWorking: the retained-shape key
+// must not fire on a live owner that still LISTS the issue.
+func TestReopenNeverOrphansAMirrorTheOwnerIsStillWorking(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
+	iss.Status.State, iss.Status.Status = "open", "rejected"
+	task.Status.IssueRefs = []string{iss.Name}
+	c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+
+	live := getIssueCR(t, c, iss.Name)
+	require.NoError(t, reopenRetainedProposal(ctx, c, live, "tatara-bot"))
+
+	got := getIssueCR(t, c, iss.Name)
+	require.Equal(t, "new", got.Status.Status, "the verdict is still cleared")
+	owner, owned := own.ControllerOwner(got)
+	require.True(t, owned, "but a Task that still lists the issue keeps owning it")
+	require.Equal(t, task.Name, owner)
+}

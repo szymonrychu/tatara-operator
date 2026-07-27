@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -68,7 +69,7 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 	// ownerRef drop would leave the closed CR un-owned AND un-cascadable. For a
 	// BRAINSTORM PROPOSAL the mirror is retained instead: see
 	// recordProposalDecline.
-	if _, err := recordProposalDecline(ctx, c, task, issueName); err != nil {
+	if _, err := recordProposalDecline(ctx, c, task, issueName, now); err != nil {
 		return true, err
 	}
 
@@ -83,6 +84,23 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 		"action", "issue_closed_stop", "resource_id", task.Name,
 		"from_stage", prevStage, "issue", issueName)
 	return true, nil
+}
+
+// severedButStillOwned is the RETAINED SHAPE predicate: t no longer LISTS
+// issueName in Status.IssueRefs, while still carrying an ownerRef on the mirror
+// (which every caller establishes from the CR side first).
+//
+// That combination is produced by exactly one thing, SeverRetainCR, because the
+// other two sever modes leave no ownerRef behind - one deletes the CR, the other
+// drops the ref. It is therefore the durable, STAGE-INDEPENDENT signature of
+// "this Task's only remaining relationship to this mirror is that its reap will
+// collect it".
+//
+// Keying on the shape rather than on rejected(issue-closed) is what lets a
+// decline recorded against a PARKED owner get the same retention window and the
+// same reopen recovery as one recorded against a stopped Task.
+func severedButStillOwned(t *tatarav1alpha1.Task, issueName string) bool {
+	return !slices.Contains(t.Status.IssueRefs, issueName)
 }
 
 // proposalBotLogin resolves the owning Project's bot login for iss - the
@@ -148,7 +166,7 @@ func isBrainstormProposal(ctx context.Context, c client.Client, iss *tatarav1alp
 // success. An APPROVED proposal a maintainer later closes is NEVER rewritten to
 // rejected - the approval is a verified, single-use evidence record.
 func recordProposalDecline(ctx context.Context, c client.Client,
-	task *tatarav1alpha1.Task, issueName string) (retained bool, err error) {
+	task *tatarav1alpha1.Task, issueName string, now time.Time) (retained bool, err error) {
 
 	key := types.NamespacedName{Namespace: task.Namespace, Name: issueName}
 	var iss tatarav1alpha1.Issue
@@ -165,11 +183,56 @@ func recordProposalDecline(ctx context.Context, c client.Client,
 	if !proposal {
 		return false, SeverIssueFromTask(ctx, c, task, issueName, SeverDeleteCR)
 	}
+	return true, retainProposalDecline(ctx, c, task, &iss, now)
+}
 
+// recordParkedProposalDecline is the same decline record for an owner Task the
+// WS3-I3 stop edge does not act on - a parked one, overwhelmingly (human ruling
+// 2026-07-27).
+//
+// It exists because the stop edge and the decline record are SEPARATE CONCERNS,
+// and conflating them left the dominant decline shape uncovered: a maintainer
+// closing a proposal without commenting first leaves the owner parked,
+// AllowsIssueClosedStop is false, nothing was recorded, and the reaper cascaded
+// the mirror on its next pass - a declined row that survived minutes.
+//
+// IT NEVER TOUCHES THE TASK'S STAGE. No stage.Enter, no wrapper teardown, no
+// terminal sequence: a parked Task stays exactly as parked as it was. The only
+// Task write is the sever's Status.IssueRefs clear, which is what hands the
+// mirror to the retention window instead of to the next reap.
+//
+// A NON-PROPOSAL issue is left completely alone here - no sever, no delete, no
+// write of any kind - which is the difference from recordProposalDecline. This
+// path is reached for every closed issue whose owner is not stoppable, so
+// deleting an ordinary parked issue's mirror from it would be a platform-wide
+// behaviour change dressed up as a brainstorm fix.
+func recordParkedProposalDecline(ctx context.Context, c client.Client,
+	task *tatarav1alpha1.Task, iss *tatarav1alpha1.Issue, now time.Time) error {
+
+	proposal, err := isBrainstormProposal(ctx, c, iss)
+	if err != nil || !proposal {
+		return err
+	}
+	return retainProposalDecline(ctx, c, task, iss, now)
+}
+
+// retainProposalDecline is the retain-and-stamp half, shared by both callers.
+// PRECONDITION: iss is a closed BRAINSTORM proposal (the callers own that gate,
+// because they disagree about what to do when it fails).
+//
+// It is idempotent: an already-decided mirror is a no-op and a missing CR is
+// success. An APPROVED proposal a maintainer later closes is NEVER rewritten to
+// rejected - the approval is a verified, single-use evidence record.
+func retainProposalDecline(ctx context.Context, c client.Client,
+	task *tatarav1alpha1.Task, iss *tatarav1alpha1.Issue, now time.Time) error {
+
+	key := client.ObjectKeyFromObject(iss)
 	// Task side FIRST, the same ORDER guarantee SeverIssueFromTask documents:
 	// drop the ref so the reaper never walks a stale one, then stamp the verdict.
-	if err := SeverIssueFromTask(ctx, c, task, issueName, SeverRetainCR); err != nil {
-		return true, err
+	// Clearing the ref is ALSO what puts the mirror into the retained shape the
+	// reaper's retention exception recognises (holdsDeclinedProposal).
+	if err := SeverIssueFromTask(ctx, c, task, iss.Name, SeverRetainCR); err != nil {
+		return err
 	}
 	stamped := false
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -189,16 +252,50 @@ func recordProposalDecline(ctx context.Context, c client.Client,
 		return nil
 	}); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return nil
 		}
-		return true, fmt.Errorf("issue-closed: record the decline on %s: %w", issueName, err)
+		return fmt.Errorf("issue-closed: record the decline on %s: %w", iss.Name, err)
 	}
-	if stamped {
-		log.FromContext(ctx).Info("retained a discarded brainstorm proposal's mirror",
-			"action", "proposal_declined", "resource_id", issueName, "task", task.Name,
-			"proposal_kind", tatarav1alpha1.ProposalKindBrainstorm, "comments", len(iss.Status.Comments))
+	if !stamped {
+		return nil
 	}
-	return true, nil
+	// Anchor the retention window on the DECLINE. Stamped only on the pass that
+	// actually recorded the verdict, so a re-entry cannot slide the window
+	// forward, and best-effort AFTER the verdict landed: a lost stamp costs the
+	// longer window (the reap falls back to the stage clock), never the record.
+	if err := stampDeclinedAt(ctx, c, task, now); err != nil {
+		log.FromContext(ctx).Error(err, "issue-closed: stamping the decline clock failed; the retention window falls back to the stage clock",
+			"action", "proposal_declined", "resource_id", iss.Name, "task", task.Name)
+	}
+	log.FromContext(ctx).Info("retained a discarded brainstorm proposal's mirror",
+		"action", "proposal_declined", "resource_id", iss.Name, "task", task.Name,
+		"owner_stage", task.Status.Stage, "owner_stage_reason", task.Status.StageReason,
+		"proposal_kind", tatarav1alpha1.ProposalKindBrainstorm, "comments", len(iss.Status.Comments))
+	return nil
+}
+
+// stampDeclinedAt records the decline time on the owner Task, write-once per
+// decline. It is the free function twin of (*ProjectReconciler).annotateTask -
+// this path holds a bare client.Client, not the reconciler.
+func stampDeclinedAt(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, now time.Time) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur tatarav1alpha1.Task
+		if err := c.Get(ctx, client.ObjectKeyFromObject(task), &cur); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if cur.Annotations == nil {
+			cur.Annotations = map[string]string{}
+		}
+		cur.Annotations[AnnProposalDeclinedAt] = now.UTC().Format(time.RFC3339)
+		if err := c.Update(ctx, &cur); err != nil {
+			return err
+		}
+		task.SetAnnotations(cur.Annotations)
+		return nil
+	})
 }
 
 // reopenRetainedProposal undoes the retention when a maintainer REOPENS a
@@ -252,6 +349,11 @@ func reopenRetainedProposal(ctx context.Context, c client.Client, iss *tatarav1a
 
 	// STEP 1: hand the mirror back to the sweep, but ONLY away from the Task that
 	// the decline itself left owning it. Any other owner is live work and keeps it.
+	//
+	// The test is the RETAINED SHAPE, not the owner's stage: a decline is now
+	// recorded against a parked owner as well as a rejected one, and keying this on
+	// rejected(issue-closed) would leave every parked-owner decline unreopenable -
+	// the same wedge, one shape over.
 	if ownerName, owned := own.ControllerOwner(iss); owned {
 		var owner tatarav1alpha1.Task
 		err := c.Get(ctx, types.NamespacedName{Namespace: iss.Namespace, Name: ownerName}, &owner)
@@ -261,8 +363,7 @@ func reopenRetainedProposal(ctx context.Context, c client.Client, iss *tatarav1a
 			// to sever from.
 		case err != nil:
 			return fmt.Errorf("proposal-reopened: get owning task %s: %w", ownerName, err)
-		case owner.Status.Stage == tatarav1alpha1.StageRejected &&
-			owner.Status.StageReason == stage.ReasonIssueClosed:
+		case severedButStillOwned(&owner, iss.Name):
 			if err := SeverIssueFromTask(ctx, c, &owner, iss.Name, SeverOrphan); err != nil {
 				return err
 			}

@@ -300,6 +300,19 @@ const (
 	// human's PR is worth five MORE review pods - every seven days, forever. That
 	// is the V7-9 cost amplifier with a week-long period.
 	AnnHumanReviewRounds = "tatara.dev/human-review-rounds"
+	// AnnProposalDeclinedAt is stamped on the TASK (RFC3339) when a brainstorm
+	// proposal it owns is DECLINED and its mirror retained. It anchors
+	// DeclinedProposalRetention on the DECLINE rather than on stageEnteredAt.
+	//
+	// It is not a nicety. For a rejected(issue-closed) owner the two coincide, so
+	// stageEnteredAt would do - but a decline is also recorded against a PARKED
+	// owner, and a parked(backlog-sweep) Task is never aged out at all: it can sit
+	// for months before a maintainer gets to its proposal. Anchored on
+	// stageEnteredAt the window would be long expired at the moment of the
+	// decline, so the exception would never fire for exactly the shape it was
+	// widened to cover. Absent (a decline recorded by an older build), the anchor
+	// falls back to stageEnteredAt.
+	AnnProposalDeclinedAt = "tatara.dev/proposal-declined-at"
 )
 
 // BranchDeleter is an OPTIONAL SCMWriter capability, in the same spirit as
@@ -486,24 +499,30 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 	return nil
 }
 
-// holdsDeclinedProposal reports whether t is a rejected(issue-closed) Task still
-// holding a RETAINED brainstorm-proposal mirror inside the longer
-// DeclinedProposalRetention window. It is the ONLY reader of that constant and
-// it changes NO other reaper behaviour: every other Task shape, and this one
-// past the longer window, reaps exactly as before.
+// holdsDeclinedProposal reports whether t still holds a RETAINED
+// brainstorm-proposal mirror inside the longer DeclinedProposalRetention window.
+// It is the ONLY reader of that constant, and it changes NO other reaper
+// behaviour: a Task holding no such mirror, and one past the longer window,
+// reaps exactly as before.
 //
-// The mirror is found by OWNER REFERENCE, not by Status.IssueRefs: the decline
-// sever clears the Task's ref list on purpose (so the reaper never walks a stale
-// ref) while deliberately keeping the CR's ownerRef, which is what makes the
-// Task's reap the thing that finally collects the mirror. ownedIssues would
-// therefore return nothing here and the hold would never fire.
+// IT DOES NOT GATE ON THE STAGE REASON, and that is the 2026-07-27 ruling's
+// whole point rather than an oversight. A decline is now recorded against a
+// PARKED owner too - the dominant shape, since closing an issue without
+// commenting first never unparks anything - and such a Task never becomes
+// rejected(issue-closed). Keying the exception on that reason, as the first
+// version did, would have left the dominant shape reaping on its old schedule
+// with the exception never firing at all.
+//
+// It gates on the RETAINED SHAPE instead (severedButStillOwned): the mirror is
+// found by OWNER REFERENCE, because the decline sever clears the Task's ref list
+// on purpose while deliberately keeping the CR's ownerRef - so ownedIssues
+// returns nothing here - and the ref list is then re-read as the proof that this
+// IS a severed retention rather than an ordinary owned issue that happens to be
+// closed. A Task still working its issues is never held.
 func (r *ProjectReconciler) holdsDeclinedProposal(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
-	if t.Status.StageReason != stage.ReasonIssueClosed {
-		return false, nil
-	}
-	if now.After(stageEnteredAt(t).Add(tatarav1alpha1.DeclinedProposalRetention)) {
+	if now.After(declinedAt(t).Add(tatarav1alpha1.DeclinedProposalRetention)) {
 		return false, nil
 	}
 	var list tatarav1alpha1.IssueList
@@ -516,14 +535,32 @@ func (r *ProjectReconciler) holdsDeclinedProposal(ctx context.Context, proj *tat
 		if iss.Spec.ProjectRef != proj.Name || !ownedByTask(iss, t.Name) {
 			continue
 		}
+		// The retention exists to keep a DECLINE queryable, so the mirror has to be
+		// a closed, severed one. An owned open issue, or one the Task still lists,
+		// is live work and gets no extra window.
+		if iss.Status.State != "closed" || !severedButStillOwned(t, iss.Name) {
+			continue
+		}
 		if effectiveProposalKind(iss, botLogin) != tatarav1alpha1.ProposalKindBrainstorm {
 			continue
 		}
-		log.FromContext(ctx).V(1).Info("reap: holding a rejected task for its retained proposal mirror",
+		log.FromContext(ctx).V(1).Info("reap: holding a task for its retained declined-proposal mirror",
 			"action", "reap_hold_declined_proposal", "resource_id", t.Name, "issue", iss.Name)
 		return true, nil
 	}
 	return false, nil
+}
+
+// declinedAt is the anchor for DeclinedProposalRetention: the AnnProposalDeclinedAt
+// stamp when present, falling back to the generic stage clock. See that constant
+// for why the fallback is not good enough on its own.
+func declinedAt(t *tatarav1alpha1.Task) time.Time {
+	if v := t.Annotations[AnnProposalDeclinedAt]; v != "" {
+		if ts, err := time.Parse(time.RFC3339, v); err == nil {
+			return ts
+		}
+	}
+	return stageEnteredAt(t)
 }
 
 // ownedByTask reports whether obj carries an ownerRef naming a Task called name,
@@ -547,6 +584,19 @@ func ownedByTask(obj client.Object, name string) bool {
 //	                       fires AND the bot park comment has LANDED.
 func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
+
+	// The SAME decline-retention exception the rejected branch carries. A parked
+	// owner is where most declines actually land (a maintainer who just closes the
+	// issue never unparks anything), and the backlog-sweep branch below has NO age
+	// gate at all - it collects as soon as every owned Issue is closed - so without
+	// this the dominant decline's mirror survives one reap pass, minutes.
+	hold, err := r.holdsDeclinedProposal(ctx, proj, t, now)
+	if err != nil {
+		return err
+	}
+	if hold {
+		return nil
+	}
 
 	if t.Status.StageReason == stage.ReasonBacklogSweep {
 		issues, err := r.ownedIssues(ctx, t)

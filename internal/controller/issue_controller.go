@@ -336,13 +336,24 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 	// reconcile. A retained mirror also reports handled=FALSE, so the reconcile
 	// continues and the rejected verdict still projects onto the declined label.
 	if task.Status.Stage == tatarav1alpha1.StageRejected && task.Status.StageReason == stage.ReasonIssueClosed {
-		retained, err := recordProposalDecline(ctx, r.Client, &task, iss.Name)
+		retained, err := recordProposalDecline(ctx, r.Client, &task, iss.Name, r.now())
 		if err != nil {
 			return false, err
 		}
 		return !retained, nil
 	}
-	return false, nil
+
+	// The owner is not stoppable and not mid-sever - a PARKED Task, in the shape
+	// that dominates real declines: a maintainer closes the proposal without
+	// commenting first, so nothing ever unparked it into clarifying. The stop edge
+	// correctly does nothing here, and before the 2026-07-27 ruling so did
+	// everything else, which meant that decline was never recorded and the reaper
+	// cascaded its mirror on the next pass.
+	//
+	// Recording it is NOT stopping it: the Task's stage, stage reason and pod are
+	// untouched, and a non-proposal issue is left entirely alone. handled stays
+	// FALSE either way, so the reconcile still projects labels and requeues.
+	return false, recordParkedProposalDecline(ctx, r.Client, &task, iss, r.now())
 }
 
 // SetupWithManager registers the Issue reconciler.

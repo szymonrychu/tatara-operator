@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -149,20 +150,27 @@ func TestDeclinedProposalRetentionBoundary(t *testing.T) {
 	}
 }
 
-// TestDeclinedProposalHoldIsScopedToThatOneTaskShape: the exception must not
-// become a general 14-day rejected retention. Every other rejected Task, and a
-// rejected(issue-closed) Task that owns no retained proposal, keeps the generic
-// 24h.
-func TestDeclinedProposalHoldIsScopedToThatOneTaskShape(t *testing.T) {
+// TestDeclinedProposalHoldIsScopedToTheRetainedShape: the exception must not
+// become a general 14-day rejected retention.
+//
+// The key is the RETAINED SHAPE - a closed, brainstorm-provenance mirror this
+// Task still owns but no longer LISTS - and not the stage reason, which a
+// parked-owner decline never carries. These four neighbours each miss the shape
+// by one clause and keep the generic 24h.
+func TestDeclinedProposalHoldIsScopedToTheRetainedShape(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		reason    string
-		withIssue bool
-		issKind   string
+		name        string
+		withIssue   bool
+		kind        string
+		state       string
+		stillListed bool
 	}{
-		{"issue-closed but owns no mirror at all", stage.ReasonIssueClosed, false, ""},
-		{"issue-closed owning a NON-proposal mirror", stage.ReasonIssueClosed, true, ""},
-		{"a rejected Task with any other reason", stage.ReasonNoOutcome, true, tatarav1alpha1.ProposalKindBrainstorm},
+		{name: "owns no mirror at all"},
+		{name: "owns a NON-proposal mirror", withIssue: true, state: "closed"},
+		{name: "owns a brainstorm mirror it is STILL WORKING", withIssue: true,
+			kind: tatarav1alpha1.ProposalKindBrainstorm, state: "closed", stillListed: true},
+		{name: "owns an OPEN brainstorm mirror", withIssue: true,
+			kind: tatarav1alpha1.ProposalKindBrainstorm, state: "open"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -170,24 +178,119 @@ func TestDeclinedProposalHoldIsScopedToThatOneTaskShape(t *testing.T) {
 			repo := reapRepo("scopeprop", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
 
 			task := reapTask("scopeprop", "clarify-task", "clarify",
-				tatarav1alpha1.StageRejected, tc.reason,
+				tatarav1alpha1.StageRejected, stage.ReasonIssueClosed,
 				time.Now().Add(-tatarav1alpha1.RejectedRetention-time.Hour))
 			objs := []client.Object{proj, repo, reapSecret(), task}
 			if tc.withIssue {
-				iss := reapProposalIssue("scopeprop", repo.Name, task.Name, "closed", "rejected", 13)
-				if tc.issKind == "" {
+				iss := reapProposalIssue("scopeprop", repo.Name, task.Name, tc.state, "rejected", 13)
+				if tc.kind == "" {
 					iss.Spec.ProposalKind, iss.Spec.ProposalBodyHash = "", ""
 					iss.Status.Body = "an ordinary issue"
+				}
+				if tc.stillListed {
+					task.Status.IssueRefs = []string{iss.Name}
 				}
 				objs = append(objs, iss)
 			}
 			c := newMirrorClient(t, objs...)
-			r := reapReconciler(c, &reapWriter{})
+			w := &reapWriter{
+				comment:  func(string, string) error { return nil },
+				addLabel: func(string, string) error { return nil },
+			}
+			r := reapReconciler(c, w)
 			require.NoError(t, r.ReapTerminal(ctx, proj))
 
 			_, alive := mustGetTask(t, c, task.Name)
 			require.False(t, alive,
-				"only a rejected(issue-closed) Task holding a brainstorm mirror gets the longer window")
+				"only a Task holding a mirror in the RETAINED shape gets the longer window")
 		})
 	}
+}
+
+// TestParkedDeclineMirrorSurvivesToTheSameBoundary is the measurement the round-1
+// report asked for, turned into a regression test.
+//
+// Measured before the fix: a proposal closed while its owner was
+// parked(backlog-sweep) had its mirror cascaded by the NEXT ReapTerminal pass -
+// one minute after the close - because that branch has no age gate at all (it
+// collects as soon as every owned Issue is closed) and the decline was never
+// recorded, so nothing held it. The declined row survived minutes.
+//
+// The boundary cases are the point: a value like -8d would pass at 24h, at 14d
+// and at no retention whatsoever for the first case, so it would pin nothing.
+func TestParkedDeclineMirrorSurvivesToTheSameBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		sinceClose   time.Duration
+		wantMirror   bool
+		wantTaskGone bool
+	}{
+		{"one minute after the close", time.Minute, true, false},
+		{"one hour short of the decline window", tatarav1alpha1.DeclinedProposalRetention - time.Hour, true, false},
+		{"one hour past the decline window", tatarav1alpha1.DeclinedProposalRetention + time.Hour, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj := reapProject("parkdecl")
+			repo := reapRepo("parkdecl", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+			// The Task has been parked(backlog-sweep) for MONTHS - that park never ages
+			// out - and the decline happened sinceClose ago. The window has to be
+			// anchored on the decline, or it expired long before the maintainer acted.
+			task := reapTask("parkdecl", "clarify-task", "clarify",
+				tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now().Add(-90*24*time.Hour))
+			task.Annotations = map[string]string{
+				AnnProposalDeclinedAt: time.Now().Add(-tc.sinceClose).UTC().Format(time.RFC3339),
+			}
+			// The retained shape: closed, rejected, still owned, NOT in IssueRefs.
+			iss := reapProposalIssue("parkdecl", repo.Name, task.Name, "closed", "rejected", 31)
+
+			c := newMirrorClient(t, proj, repo, reapSecret(), task, iss)
+			r := reapReconciler(c, &reapWriter{})
+			require.NoError(t, r.ReapTerminal(ctx, proj))
+
+			_, alive := mustGetTask(t, c, task.Name)
+			require.Equal(t, tc.wantTaskGone, !alive,
+				"task reaped=%v at %v after the close, want %v", !alive, tc.sinceClose, tc.wantTaskGone)
+
+			var got tatarav1alpha1.Issue
+			err := c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: iss.Name}, &got)
+			if tc.wantMirror {
+				require.NoError(t, err, "the declined mirror must outlive the reap pass")
+				owner, owned := own.ControllerOwner(&got)
+				require.True(t, owned)
+				require.Equal(t, task.Name, owner, "it is still bounded by its owner's reap")
+			} else {
+				// The fake client runs no GC, so the cascade is asserted at its cause:
+				// the Task is gone and the mirror's only owner went with it.
+				require.NoError(t, err)
+				require.True(t, ownedByTask(&got, task.Name),
+					"the ownerRef is kept, so the deleted Task cascades the mirror")
+			}
+		})
+	}
+}
+
+// TestParkedTaskStillWorkingItsIssueIsNotHeld: the hold keys on the RETAINED
+// shape, so a parked Task that still LISTS its closed issue - an ordinary park,
+// no decline recorded - reaps on its normal schedule.
+func TestParkedTaskStillWorkingItsIssueIsNotHeld(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("notheld")
+	repo := reapRepo("notheld", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	task := reapTask("notheld", "clarify-task", "clarify",
+		tatarav1alpha1.StageParked, stage.ReasonBacklogSweep, time.Now().Add(-time.Hour))
+	task.Annotations = map[string]string{AnnProposalDeclinedAt: time.Now().Format(time.RFC3339)}
+	iss := reapProposalIssue("notheld", repo.Name, task.Name, "closed", "rejected", 32)
+	// STILL LISTED: this is not a severed retention.
+	task.Status.IssueRefs = []string{iss.Name}
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, iss)
+	r := reapReconciler(c, &reapWriter{})
+	require.NoError(t, r.ReapTerminal(ctx, proj))
+
+	_, alive := mustGetTask(t, c, task.Name)
+	require.False(t, alive,
+		"a backlog-sweep park whose owned issues are all closed reaps as before when no retention is in play")
 }
