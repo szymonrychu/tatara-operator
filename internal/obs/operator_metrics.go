@@ -36,49 +36,54 @@ type OperatorMetrics struct {
 	*queueMetrics
 	*taskMetrics
 	*accountUsageMetrics
-	reconcileTotal               *prometheus.CounterVec
-	ingestJobDuration            prometheus.Histogram
-	turnDuration                 prometheus.Histogram
-	webhookEvents                *prometheus.CounterVec
-	tasksInflight                prometheus.Gauge
-	memoryProvisionDuration      prometheus.Histogram
-	memoryStacks                 *prometheus.GaugeVec
-	autoApproveTotal             *prometheus.CounterVec
-	tasksInflightKind            *prometheus.GaugeVec
-	agentBootRaceRequeue         prometheus.Counter
-	agentSessionBusyRequeue      prometheus.Counter
-	openProposals                *prometheus.GaugeVec
-	turnTimeoutTotal             *prometheus.CounterVec
-	ingestJobTotal               *prometheus.CounterVec
-	agentUnreachableTermTotal    prometheus.Counter
-	agentBootCrashTotal          *prometheus.CounterVec
-	orphanReapedTotal            *prometheus.CounterVec
-	reapDeleteErrorTotal         *prometheus.CounterVec
-	conversationGCTotal          *prometheus.CounterVec
-	turnSubmitTotal              *prometheus.CounterVec
-	turnSubmitDuration           *prometheus.HistogramVec
-	agentHTTPTotal               *prometheus.CounterVec
-	agentHTTPDuration            *prometheus.HistogramVec
-	authTotal                    *prometheus.CounterVec
-	webhookDuration              *prometheus.HistogramVec
-	restapiRequestsTotal         *prometheus.CounterVec
-	restapiRequestDuration       *prometheus.HistogramVec
-	memoryHealthReadErrors       prometheus.Counter
-	memoryStorageShrinkGuard     *prometheus.CounterVec
-	lightragDocuments            *prometheus.GaugeVec
-	lightragQueryErrors          prometheus.Counter
-	memoryRetrievalProbe         *prometheus.CounterVec
-	toolSurfaceProbe             *prometheus.CounterVec
-	toolSurfaceProbeDuration     *prometheus.HistogramVec
-	tokenBudgetUsedRatio         *prometheus.GaugeVec
-	admissionBlockedTotal        *prometheus.CounterVec
-	agentPodDegradedTotal        *prometheus.CounterVec
-	mrBindingBackstopTotal       *prometheus.CounterVec
-	repositoryIngestFailing      *prometheus.GaugeVec
-	repositoryIngestGated        *prometheus.GaugeVec
-	repositoryLastIngestTime     *prometheus.GaugeVec
-	repositoryPhaseRepairedTotal *prometheus.CounterVec
-	ingestJobDedupTotal          *prometheus.CounterVec
+	reconcileTotal                *prometheus.CounterVec
+	ingestJobDuration             prometheus.Histogram
+	turnDuration                  prometheus.Histogram
+	webhookEvents                 *prometheus.CounterVec
+	tasksInflight                 prometheus.Gauge
+	memoryProvisionDuration       prometheus.Histogram
+	memoryStacks                  *prometheus.GaugeVec
+	autoApproveTotal              *prometheus.CounterVec
+	tasksInflightKind             *prometheus.GaugeVec
+	agentBootRaceRequeue          prometheus.Counter
+	agentSessionBusyRequeue       prometheus.Counter
+	openProposals                 *prometheus.GaugeVec
+	brainstormTarget              *prometheus.GaugeVec
+	brainstormPending             *prometheus.GaugeVec
+	brainstormRefillTotal         *prometheus.CounterVec
+	brainstormBreakerTripTotal    *prometheus.CounterVec
+	brainstormQuotaTruncatedTotal *prometheus.CounterVec
+	turnTimeoutTotal              *prometheus.CounterVec
+	ingestJobTotal                *prometheus.CounterVec
+	agentUnreachableTermTotal     prometheus.Counter
+	agentBootCrashTotal           *prometheus.CounterVec
+	orphanReapedTotal             *prometheus.CounterVec
+	reapDeleteErrorTotal          *prometheus.CounterVec
+	conversationGCTotal           *prometheus.CounterVec
+	turnSubmitTotal               *prometheus.CounterVec
+	turnSubmitDuration            *prometheus.HistogramVec
+	agentHTTPTotal                *prometheus.CounterVec
+	agentHTTPDuration             *prometheus.HistogramVec
+	authTotal                     *prometheus.CounterVec
+	webhookDuration               *prometheus.HistogramVec
+	restapiRequestsTotal          *prometheus.CounterVec
+	restapiRequestDuration        *prometheus.HistogramVec
+	memoryHealthReadErrors        prometheus.Counter
+	memoryStorageShrinkGuard      *prometheus.CounterVec
+	lightragDocuments             *prometheus.GaugeVec
+	lightragQueryErrors           prometheus.Counter
+	memoryRetrievalProbe          *prometheus.CounterVec
+	toolSurfaceProbe              *prometheus.CounterVec
+	toolSurfaceProbeDuration      *prometheus.HistogramVec
+	tokenBudgetUsedRatio          *prometheus.GaugeVec
+	admissionBlockedTotal         *prometheus.CounterVec
+	agentPodDegradedTotal         *prometheus.CounterVec
+	mrBindingBackstopTotal        *prometheus.CounterVec
+	repositoryIngestFailing       *prometheus.GaugeVec
+	repositoryIngestGated         *prometheus.GaugeVec
+	repositoryLastIngestTime      *prometheus.GaugeVec
+	repositoryPhaseRepairedTotal  *prometheus.CounterVec
+	ingestJobDedupTotal           *prometheus.CounterVec
 	// repoProjectMu guards repoProject, the last project label published for
 	// each repo. A Repository's projectRef is mutable, so without it a repo
 	// moved between projects would keep reporting under both.
@@ -178,8 +183,28 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// had a brainstorm decision yet, not a bug.
 		openProposals: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_open_proposals",
-			Help: "Open, unapproved agent-proposed issues per repo.",
+			Help: "Open, unapproved agent-proposed issues per repo, counted from Issue CRs. Uncollapsed: a systemic group spans repos and counts once per repo here, once in total in operator_brainstorm_pending_proposals.",
 		}, []string{"repo"}),
+		brainstormTarget: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_brainstorm_target_proposals",
+			Help: "Configured brainstorm backlog TARGET per project (spec.scm.cron.brainstorm.targetOpenProposals, resolved). Pair with operator_brainstorm_pending_proposals: a backlog that never reaches the target is the signal that refill is wedged.",
+		}, []string{"project"}),
+		brainstormPending: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_brainstorm_pending_proposals",
+			Help: "Brainstorm proposals open and awaiting a maintainer decision per project, counted from Issue CRs with systemic groups collapsed to one slot. NOT the same as operator_open_proposals{repo}, which is the uncollapsed per-repo split.",
+		}, []string{"project"}),
+		brainstormRefillTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_brainstorm_refill_total",
+			Help: "Brainstorm refills dispatched, by trigger (event = a maintainer verdict landed on a proposal Issue; cron = the schedule backstop).",
+		}, []string{"project", "trigger"}),
+		brainstormBreakerTripTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_brainstorm_breaker_trip_total",
+			Help: "Times the consecutive-skip circuit breaker suppressed an event-driven refill. A rising value means the idea space is proven dry; the cron tick resets it.",
+		}, []string{"project"}),
+		brainstormQuotaTruncatedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_brainstorm_quota_truncated_total",
+			Help: "Proposals DROPPED by operator-side quota truncation. Nonzero means agents are overshooting the stated quota; operator-side truncation is the authority, so the target still holds.",
+		}, []string{"project"}),
 		turnTimeoutTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_turn_timeout_total",
 			Help: "Agent turns terminated for stalling (no activity past the inactivity deadline), by detection source.",
@@ -472,6 +497,11 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.agentBootRaceRequeue,
 		m.agentSessionBusyRequeue,
 		m.openProposals,
+		m.brainstormTarget,
+		m.brainstormPending,
+		m.brainstormRefillTotal,
+		m.brainstormBreakerTripTotal,
+		m.brainstormQuotaTruncatedTotal,
 		m.turnTimeoutTotal,
 		m.ingestJobTotal,
 		m.repositoryIngestFailing,
@@ -895,6 +925,57 @@ func (m *OperatorMetrics) SetTasksInflight(n float64) {
 // SetOpenProposals sets operator_open_proposals for a repo slug.
 func (m *OperatorMetrics) SetOpenProposals(repo string, n float64) {
 	m.openProposals.WithLabelValues(repo).Set(n)
+}
+
+// SetBrainstormTarget sets operator_brainstorm_target_proposals for a project.
+func (m *OperatorMetrics) SetBrainstormTarget(project string, n float64) {
+	if m == nil {
+		return
+	}
+	m.brainstormTarget.WithLabelValues(project).Set(n)
+}
+
+// SetBrainstormPending sets operator_brainstorm_pending_proposals for a project.
+func (m *OperatorMetrics) SetBrainstormPending(project string, n float64) {
+	if m == nil {
+		return
+	}
+	m.brainstormPending.WithLabelValues(project).Set(n)
+}
+
+// BrainstormRefill counts one dispatched refill by trigger (event|cron).
+func (m *OperatorMetrics) BrainstormRefill(project, trigger string) {
+	if m == nil {
+		return
+	}
+	m.brainstormRefillTotal.WithLabelValues(project, trigger).Inc()
+}
+
+// BrainstormBreakerTrip counts one skip-breaker TRIP: the consecutive-skip
+// counter crossing its configured threshold. Call this only at the crossing,
+// never on every pass the breaker stays tripped - the latter is "is tripped",
+// not "trips", and is useless for alerting (a monotonic counter that never
+// stops climbing while healthy-but-dry looks identical to one climbing
+// because something is actually wrong).
+func (m *OperatorMetrics) BrainstormBreakerTrip(project string) {
+	if m == nil {
+		return
+	}
+	m.brainstormBreakerTripTotal.WithLabelValues(project).Inc()
+}
+
+// BrainstormBreakerTripCounter returns the counter for project for test
+// assertions.
+func (m *OperatorMetrics) BrainstormBreakerTripCounter(project string) prometheus.Counter {
+	return m.brainstormBreakerTripTotal.WithLabelValues(project)
+}
+
+// BrainstormQuotaTruncated counts proposals dropped by quota truncation.
+func (m *OperatorMetrics) BrainstormQuotaTruncated(project string, dropped int) {
+	if m == nil || dropped <= 0 {
+		return
+	}
+	m.brainstormQuotaTruncatedTotal.WithLabelValues(project).Add(float64(dropped))
 }
 
 // OrphanReaped increments operator_orphan_reaped_total for the given reason

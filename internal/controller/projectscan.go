@@ -576,6 +576,19 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		if trigger == TriggerEvent {
 			logSkip = l.V(1).Info
 		}
+		// BrainstormBreakerTrip is deliberately NOT incremented here: this branch
+		// re-evaluates on every event-triggered reconcile of a brainstorm-enabled
+		// project (tens-of-seconds cadence, see the V(1) drop above), so while the
+		// breaker stays tripped this "reason" is identical across many consecutive
+		// passes. A counter driven from it would climb continuously for as long as
+		// the breaker stays tripped, which is "is tripped", not "trips" - useless
+		// for alerting. The actual trip event - BrainstormConsecutiveSkips crossing
+		// its threshold - only ever happens where that field is incremented
+		// (bumpBrainstormSkips, internal/restapi/outcome.go), which is the one
+		// place this reconcile-repeated evaluation cannot be mistaken for a fresh
+		// trip; that is where BrainstormBreakerTrip is actually counted.
+		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
+		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
 		logSkip("brainstorm: no refill this pass",
 			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
@@ -601,6 +614,9 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 			"deficit", deficit, "quota", quota, "trigger", trigger)
 		return false
 	}
+	r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
+	r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
+	r.Metrics.BrainstormRefill(proj.Name, trigger)
 	l.Info("brainstorm: refill dispatched",
 		"action", "scan_brainstorm", "resource_id", proj.Name,
 		"target", target, "pending", pending, "inflight", inflight,

@@ -1386,15 +1386,38 @@ func brainstormQuota(task *tatarav1alpha1.Task) int {
 	return min(max(n, 1), tatarav1alpha1.MaxProposalsPerOutcome)
 }
 
+// brainstormMaxConsecutiveSkips resolves the breaker threshold from a Project,
+// nil-safe against both spec.scm and spec.scm.cron being unset (mirrors
+// brainstormCronSpec in internal/controller/project_issue_watch.go, which this
+// package cannot call directly since it is unexported across the package
+// boundary).
+func brainstormMaxConsecutiveSkips(proj *tatarav1alpha1.Project) int {
+	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil {
+		return 0
+	}
+	return proj.Spec.Scm.Cron.Brainstorm.ResolveMaxConsecutiveSkips()
+}
+
 // bumpBrainstormSkips adds one to Project.status.brainstormConsecutiveSkips, or
 // resets it to 0 when reset is true. action=skip increments; action=propose
 // resets. The counter is what suppresses the event-driven refill on a
 // proven-dry idea space; the cron tick also clears it (resetBrainstormSkips in
 // internal/controller), which is the liveness guarantee for a project that
 // never gets another maintainer verdict to trigger a propose-side reset.
+//
+// This is the ONLY place BrainstormConsecutiveSkips is ever incremented, which
+// makes it the only place a genuine breaker TRIP (the counter crossing its
+// threshold) can be told apart from "the breaker is still tripped" - the
+// reconcile loop in internal/controller re-evaluates the already-tripped state
+// on every event-triggered pass and would over-count a naive per-pass counter.
+// BrainstormBreakerTrip therefore fires here, exactly once per crossing, after
+// a successful commit (not inside the retry closure before Update, which would
+// double-count a conflict-retried attempt).
 func (s *Server) bumpBrainstormSkips(ctx context.Context, projName string, reset bool) error {
 	key := types.NamespacedName{Namespace: s.ns, Name: projName}
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	tripped := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		tripped = false
 		var proj tatarav1alpha1.Project
 		if err := s.c.Get(ctx, key, &proj); err != nil {
 			return fmt.Errorf("bump brainstorm skips: get project %s: %w", projName, err)
@@ -1406,12 +1429,23 @@ func (s *Server) bumpBrainstormSkips(ctx context.Context, projName string, reset
 			proj.Status.BrainstormConsecutiveSkips = 0
 		} else {
 			proj.Status.BrainstormConsecutiveSkips++
+			if maxSkips := brainstormMaxConsecutiveSkips(&proj); maxSkips > 0 &&
+				proj.Status.BrainstormConsecutiveSkips == maxSkips {
+				tripped = true
+			}
 		}
 		if err := s.c.Status().Update(ctx, &proj); err != nil {
 			return fmt.Errorf("bump brainstorm skips: update project %s: %w", projName, err)
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if tripped {
+		s.metrics.BrainstormBreakerTrip(projName)
+	}
+	return nil
 }
 
 func (o *outcomeCtx) brainstorm(p brainstormPayload) {
@@ -1474,9 +1508,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	// the log. The [1,5] schema ceiling above still applies first - this only
 	// ever narrows further, never overrides that hard rejection.
 	if quota := brainstormQuota(o.task); len(p.Proposals) > quota {
+		dropped := len(p.Proposals) - quota
 		s.log.InfoContext(ctx, "restapi: truncating brainstorm proposals to the session quota",
 			append(reqLogFields(o.r), "action", "brainstorm_quota_truncated", "task", o.task.Name,
 				"submitted", len(p.Proposals), "quota", quota)...)
+		s.metrics.BrainstormQuotaTruncated(o.proj.Name, dropped)
 		p.Proposals = p.Proposals[:quota]
 	}
 
