@@ -843,8 +843,8 @@ func TestReentryEdgeDoesNotTTLStopTheFreshPod(t *testing.T) {
 // ===========================================================================
 
 func TestEveryStageHasABudget(t *testing.T) {
-	if len(stage.AllStages()) != 15 {
-		t.Errorf("AllStages() has %d members, want the 15 of F.1", len(stage.AllStages()))
+	if len(stage.AllStages()) != 16 {
+		t.Errorf("AllStages() has %d members, want the 16 of F.1", len(stage.AllStages()))
 	}
 	for _, s := range stage.AllStages() {
 		if _, ok := stage.Budget(s); !ok {
@@ -889,6 +889,7 @@ func TestBudgetTableIsVerbatimF4(t *testing.T) {
 		v1alpha1.StageApproved:      {24 * time.Hour, v1alpha1.StageParked, stage.ReasonAdmissionStarved},
 		v1alpha1.StageImplementing:  {6 * time.Hour, v1alpha1.StageParked, stage.ReasonStageDeadline},
 		v1alpha1.StageReviewing:     {4 * time.Hour, v1alpha1.StageParked, stage.ReasonStageDeadline},
+		v1alpha1.StageConversing:    {60 * time.Minute, v1alpha1.StageParked, stage.ReasonAwaitingHuman},
 		v1alpha1.StageMerging:       {4 * time.Hour, v1alpha1.StageParked, stage.ReasonMergeTimeout},
 		v1alpha1.StageDeploying:     {2 * time.Hour, v1alpha1.StageParked, stage.ReasonDeployTimeout},
 		v1alpha1.StageDocumenting:   {2 * time.Hour, v1alpha1.StageDelivered, stage.ReasonDocTimeout},
@@ -951,6 +952,13 @@ func TestTransitionTable(t *testing.T) {
 		{v1alpha1.StageReviewing, v1alpha1.StageMerging},
 		{v1alpha1.StageReviewing, v1alpha1.StageParked},
 		{v1alpha1.StageReviewing, v1alpha1.StageDelivered}, // kind=review, every owned MR merged externally
+		{v1alpha1.StageClarifying, v1alpha1.StageConversing},
+		{v1alpha1.StageReviewing, v1alpha1.StageConversing},
+		{v1alpha1.StageParked, v1alpha1.StageConversing},
+		{v1alpha1.StageConversing, v1alpha1.StageApproved},
+		{v1alpha1.StageConversing, v1alpha1.StageReviewing},
+		{v1alpha1.StageConversing, v1alpha1.StageParked},
+		{v1alpha1.StageConversing, v1alpha1.StageRejected},
 		{v1alpha1.StageMerging, v1alpha1.StageReviewing},
 		{v1alpha1.StageMerging, v1alpha1.StageDeploying},
 		{v1alpha1.StageMerging, v1alpha1.StageFailed},
@@ -1089,6 +1097,7 @@ func TestAgentKindFor(t *testing.T) {
 		v1alpha1.StageApproved:      "",
 		v1alpha1.StageImplementing:  "implement",
 		v1alpha1.StageReviewing:     "review",
+		v1alpha1.StageConversing:    "clarify",
 		v1alpha1.StageMerging:       "",
 		v1alpha1.StageDeploying:     "",
 		v1alpha1.StageDocumenting:   "documentation",

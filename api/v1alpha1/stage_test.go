@@ -13,7 +13,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/api/v1alpha1"
 )
 
-// TestStageConstants verifies each of the 15 stage constants exists and its
+// TestStageConstants verifies each of the 16 stage constants exists and its
 // value is the exact contract string (F.1).
 func TestStageConstants(t *testing.T) {
 	cases := map[string]struct {
@@ -28,6 +28,7 @@ func TestStageConstants(t *testing.T) {
 		"StageApproved":      {v1alpha1.StageApproved, "approved"},
 		"StageImplementing":  {v1alpha1.StageImplementing, "implementing"},
 		"StageReviewing":     {v1alpha1.StageReviewing, "reviewing"},
+		"StageConversing":    {v1alpha1.StageConversing, "conversing"},
 		"StageMerging":       {v1alpha1.StageMerging, "merging"},
 		"StageDeploying":     {v1alpha1.StageDeploying, "deploying"},
 		"StageDelivered":     {v1alpha1.StageDelivered, "delivered"},
@@ -58,6 +59,7 @@ func TestStageTerminal(t *testing.T) {
 		v1alpha1.StageApproved:      false,
 		v1alpha1.StageImplementing:  false,
 		v1alpha1.StageReviewing:     false,
+		v1alpha1.StageConversing:    false,
 		v1alpha1.StageMerging:       false,
 		v1alpha1.StageDeploying:     false,
 		v1alpha1.StageDelivered:     false,
@@ -66,8 +68,8 @@ func TestStageTerminal(t *testing.T) {
 		v1alpha1.StageFailed:        true,
 		v1alpha1.StageParked:        true,
 	}
-	if len(want) != 15 {
-		t.Fatalf("test table has %d stages, want 15", len(want))
+	if len(want) != 16 {
+		t.Fatalf("test table has %d stages, want 16", len(want))
 	}
 	for stage, wantTerminal := range want {
 		t.Run(stage, func(t *testing.T) {
@@ -81,7 +83,7 @@ func TestStageTerminal(t *testing.T) {
 
 // TestStagePodless covers F.2's "pod: none" rows: triaging, approved, merging,
 // deploying, delivered, rejected, failed, parked run no agent pod. The other
-// seven stages spawn one.
+// eight stages spawn one.
 func TestStagePodless(t *testing.T) {
 	want := map[string]bool{
 		v1alpha1.StageTriaging:      true,
@@ -98,10 +100,11 @@ func TestStagePodless(t *testing.T) {
 		v1alpha1.StageRefining:      false,
 		v1alpha1.StageImplementing:  false,
 		v1alpha1.StageReviewing:     false,
+		v1alpha1.StageConversing:    false,
 		v1alpha1.StageDocumenting:   false,
 	}
-	if len(want) != 15 {
-		t.Fatalf("test table has %d stages, want 15", len(want))
+	if len(want) != 16 {
+		t.Fatalf("test table has %d stages, want 16", len(want))
 	}
 	for stage, wantPodless := range want {
 		t.Run(stage, func(t *testing.T) {

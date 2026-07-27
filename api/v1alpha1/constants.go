@@ -10,6 +10,14 @@ const (
 	// ParkRetention is how long a park (except backlog-sweep) ages out before
 	// the reaper collects it (B.6).
 	ParkRetention = 7 * 24 * time.Hour
+	// ConversationIdleDefault is the conversing stage's IDLE budget when a
+	// Project sets no scm.conversationIdleMinutes. It is measured from
+	// status.conversationLastEventAt, which every queued event re-stamps, so it
+	// is a genuine idle timer and NOT the flat agentPodTTLSeconds cap measured
+	// from pod start. Per decision D6 there is no absolute lifetime ceiling while
+	// a conversation stays active: the pod rotates at its own TTL and the
+	// conversation continues in the replacement.
+	ConversationIdleDefault = 60 * time.Minute
 	// DeliveredRetention ages out a delivered Task (B.6/F.4, fix F1).
 	DeliveredRetention = 48 * time.Hour
 	// RejectedRetention ages out a rejected Task.

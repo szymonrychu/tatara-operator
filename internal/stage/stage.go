@@ -134,7 +134,7 @@ var Reasons = []string{
 // issueClosedTrigger is the F.3 prose for a WS3-I3 rejected(issue-closed) edge.
 const issueClosedTrigger = "a human closed the driving issue mid-flight (WS3-I3): the operator stops the work and the terminal reaper closes the bot PR"
 
-// issueClosedEdge is the rejected(issue-closed) edge added to the nine LIVE,
+// issueClosedEdge is the rejected(issue-closed) edge added to the ten LIVE,
 // non-deploying source stages (WS3-I3). deploying is EXCLUDED on purpose: a
 // merged, deploying change is finished work and a late issue close must not
 // rewind it (the same boundary the review path enforces). documenting is a
@@ -145,7 +145,7 @@ func issueClosedEdge() Edge {
 
 // issueClosedStopStages is the closed set of LIVE stages from which a
 // human-closed driving issue stops the Task at rejected(issue-closed) (WS3-I3).
-// It is the SAME nine stages that carry the edge; ApplyIssueClosedStop reads it
+// It is the SAME ten stages that carry the edge; ApplyIssueClosedStop reads it
 // so the webhook->leader gate and the F.3 table cannot drift apart.
 var issueClosedStopStages = map[string]bool{
 	v1alpha1.StageTriaging:      true,
@@ -156,6 +156,7 @@ var issueClosedStopStages = map[string]bool{
 	v1alpha1.StageApproved:      true,
 	v1alpha1.StageImplementing:  true,
 	v1alpha1.StageReviewing:     true,
+	v1alpha1.StageConversing:    true,
 	v1alpha1.StageMerging:       true,
 }
 
@@ -204,7 +205,7 @@ type Edge struct {
 	Trigger string
 }
 
-// AllStages returns the 15 members of the F.1 enum. Iteration order is the
+// AllStages returns the 16 members of the F.1 enum. Iteration order is the
 // contract's.
 func AllStages() []string {
 	return []string{
@@ -216,6 +217,7 @@ func AllStages() []string {
 		v1alpha1.StageApproved,
 		v1alpha1.StageImplementing,
 		v1alpha1.StageReviewing,
+		v1alpha1.StageConversing,
 		v1alpha1.StageMerging,
 		v1alpha1.StageDeploying,
 		v1alpha1.StageDelivered,
@@ -229,6 +231,13 @@ func AllStages() []string {
 // agentKinds is the F.2 table: which agent kind each stage spawns. A stage
 // mapping to "" is POD-LESS. This table and v1alpha1.StagePodless are asserted
 // to agree, mechanically, in the tests.
+//
+// conversing maps to AgentClarify deliberately and it is NOT a placeholder: the
+// clarify agent is the platform's conversational agent and its outcome
+// vocabulary (implement / discuss / close) IS the "where does this conversation
+// go next" decision. An eighth agent kind would need matching tool and skill
+// profiles in tatara-cli, tatara-agent-skills and the wrapper's installer, none
+// of which this change touches.
 var agentKinds = map[string]string{
 	v1alpha1.StageTriaging:      "",
 	v1alpha1.StageBrainstorming: AgentBrainstorm,
@@ -238,6 +247,7 @@ var agentKinds = map[string]string{
 	v1alpha1.StageApproved:      "",
 	v1alpha1.StageImplementing:  AgentImplement,
 	v1alpha1.StageReviewing:     AgentReview,
+	v1alpha1.StageConversing:    AgentClarify,
 	v1alpha1.StageMerging:       "",
 	v1alpha1.StageDeploying:     "",
 	v1alpha1.StageDelivered:     "",
@@ -296,6 +306,7 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "decision=discuss, or the 24h clarify budget elapses"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
+		Edge{To: v1alpha1.StageConversing, Trigger: "a qualifying comment arrived on an owned thread: the Task moves to a live conversation. The clarify pod of the stage being left is torn down by EnterStage as for any pod stage; the conversing pod's turn-0 bundle carries the whole thread, the notes journal and <events>, and every SUBSEQUENT comment reaches that live pod warm"},
 		issueClosedEdge(),
 	),
 
@@ -345,6 +356,22 @@ var Transitions = map[string][]Edge{
 		Edge{To: v1alpha1.StageDelivered, Reason: ReasonMRMergedExternally, Trigger: "kind=review Task, every owned MR merged externally before/while reviewing - no open MR to post an outcome against, so the operator finalizes the honest finished work"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonMRClosedExternally, Trigger: "kind=review Task, every owned MR terminal with at least one closed-unmerged: the review target was abandoned, recorded rejected not delivered"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonMRTakenOver, Trigger: "kind=review Task whose review target a maintainer TOOK OVER: the MR's controller ownership moved to a takeover Task (own.HandOverController demoted this parent to a plain owner), leaving it controller-owning zero MRs with no outcome to post; it is retired and the takeover Task now owns delivery. NOT delivered: the takeover Task itself reaches delivered for the MR, so the superseded parent must not double-count the one shipped MR as two deliveries. reviewing -> rejected is ungated in LegalFor, unlike reviewing -> delivered which requires AllMRsMerged(ownedMRs) and this parent owns none"},
+		Edge{To: v1alpha1.StageConversing, Trigger: "a qualifying comment arrived on the owned MR thread: the Task moves to a live conversation. Bounded by humanReviewRounds, exactly like the awaiting-human re-entry, because each lap can spawn a pod"},
+	),
+
+	// conversing is POD-BEARING and NON-TERMINAL. It is where a Task waits with a
+	// LIVE agent on the other end of a thread, instead of parked with none. Its
+	// clock is the IDLE timer on status.conversationLastEventAt, and its
+	// budget-elapsed exit (onElapse) is parked(awaiting-human) after a handoff
+	// turn - a conversation that goes quiet becomes an ordinary park, and an
+	// ordinary park is re-entered by the ordinary F.6 rules.
+	v1alpha1.StageConversing: podStageEdges(
+		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND the C.6 grammar passes for EVERY owned Issue, exactly as from clarifying"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS, exactly as from clarifying"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "the conversation went idle past conversationIdleMinutes (after a handoff turn), the per-project conversing ceiling evicted the longest-idle conversation (after a handoff turn), or decision=discuss"},
+		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
+		Edge{To: v1alpha1.StageReviewing, Trigger: "the conversation was entered FROM reviewing and the agent hands the thread back for a fresh review round. LegalFor's kind guard is untouched: implementing and merging remain unreachable for a kind=review Task"},
+		issueClosedEdge(),
 	),
 
 	// merging is POD-LESS: clock 3 ONLY, from stageEnteredAt, against ITS OWN 4h
@@ -399,6 +426,7 @@ var Transitions = map[string][]Edge{
 		{To: v1alpha1.StageFailed, Reason: ReasonDeployBlocked, Trigger: "F.6 deploy-timeout at maxDeployReentries"},
 		{To: v1alpha1.StageApproved, Reason: ReasonOwnershipLost, Trigger: "a maintainer re-took ownership via a takeover comment; the parked takeover Task re-enters the lifecycle at approved to resume pushing"},
 		{To: v1alpha1.StageMerging, Reason: ReasonOwnershipLost, Trigger: "an approved review landed on a stood-down (external-push) MR; the parked takeover Task re-enters at merging so the operator merges the approved human head"},
+		{To: v1alpha1.StageConversing, Trigger: "F.6 awaiting-human / identity-unverified: a qualifying comment arrived and the conversing ceiling has room. This is the un-park that makes a comment visibly start an agent instead of only queueing an event"},
 	},
 
 	// rejected and failed are TERMINAL. They have no exits: they age out and the
@@ -626,6 +654,7 @@ var budgets = map[string]time.Duration{
 	v1alpha1.StageApproved:      24 * time.Hour,
 	v1alpha1.StageImplementing:  6 * time.Hour,
 	v1alpha1.StageReviewing:     4 * time.Hour,
+	v1alpha1.StageConversing:    v1alpha1.ConversationIdleDefault,
 	v1alpha1.StageMerging:       4 * time.Hour,
 	v1alpha1.StageDeploying:     2 * time.Hour,
 	v1alpha1.StageDocumenting:   v1alpha1.DocStageBudget,
@@ -646,6 +675,7 @@ var onElapse = map[string]Edge{
 	v1alpha1.StageApproved:      {To: v1alpha1.StageParked, Reason: ReasonAdmissionStarved},
 	v1alpha1.StageImplementing:  {To: v1alpha1.StageParked, Reason: ReasonStageDeadline},
 	v1alpha1.StageReviewing:     {To: v1alpha1.StageParked, Reason: ReasonStageDeadline},
+	v1alpha1.StageConversing:    {To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman},
 	v1alpha1.StageMerging:       {To: v1alpha1.StageParked, Reason: ReasonMergeTimeout},
 	v1alpha1.StageDeploying:     {To: v1alpha1.StageParked, Reason: ReasonDeployTimeout},
 	v1alpha1.StageDocumenting:   {To: v1alpha1.StageDelivered, Reason: ReasonDocTimeout},

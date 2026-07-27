@@ -177,7 +177,14 @@ type TaskSpec struct {
 	InitialStageReason string `json:"initialStageReason,omitempty"`
 }
 
-// Stage* are the 15 members of the task-centric stage machine (contract F.1).
+// Stage* are the 16 members of the task-centric stage machine (contract F.1).
+// conversing is the 16th: a POD-BEARING, NON-TERMINAL stage a Task enters when a
+// comment needs a live agent on the other end. Because it is pod-bearing and
+// non-terminal it needs NO exception in the reaper (which gates on TaskDone), in
+// the concurrency accountant (queueTaskHoldsSlot = !TaskDone && !StagePodless) or
+// in the F.3 table. That is the whole reason it is a stage rather than a warm pod
+// kept alive through parked: the three carve-outs that would have needed each map
+// to a past production incident.
 const (
 	StageTriaging      = "triaging"
 	StageBrainstorming = "brainstorming"
@@ -187,6 +194,7 @@ const (
 	StageApproved      = "approved"
 	StageImplementing  = "implementing"
 	StageReviewing     = "reviewing"
+	StageConversing    = "conversing"
 	StageMerging       = "merging"
 	StageDeploying     = "deploying"
 	StageDelivered     = "delivered"
@@ -462,7 +470,7 @@ type TaskStatus struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// +kubebuilder:validation:Enum=triaging;brainstorming;clarifying;investigating;refining;approved;implementing;reviewing;merging;deploying;delivered;documenting;rejected;failed;parked
+	// +kubebuilder:validation:Enum=triaging;brainstorming;clarifying;investigating;refining;approved;implementing;reviewing;conversing;merging;deploying;delivered;documenting;rejected;failed;parked
 	// +optional
 	Stage string `json:"stage,omitempty"`
 	// StageEnteredAt is stamped on EVERY stage transition. It is the clock for the

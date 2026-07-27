@@ -529,6 +529,7 @@ spec:
                 - approved
                 - implementing
                 - reviewing
+                - conversing
                 - merging
                 - deploying
                 - delivered
