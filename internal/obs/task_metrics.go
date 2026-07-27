@@ -15,6 +15,9 @@ type taskMetrics struct {
 	taskParkedTotal         *prometheus.CounterVec
 	orphanAdoptedTotal      *prometheus.CounterVec
 	unparkDeclinedTotal     *prometheus.CounterVec
+	conversingPods          *prometheus.GaugeVec
+	conversingEntryDeclined *prometheus.CounterVec
+	conversingClosedTotal   *prometheus.CounterVec
 }
 
 // newTaskMetrics registers the task collectors on reg and returns the bundle.
@@ -70,6 +73,18 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 				"guard (the live Task had already drifted from what the caller believed was parked - rare, " +
 				"anomalous) or rule (stage.Unpark's re-entry rule was not satisfied yet - normal steady state).",
 		}, []string{"stageReason", "kind"}),
+		conversingPods: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_conversing_pods",
+			Help: "Tasks currently in the conversing stage, by project. It is the live reading of the per-project ceiling (Project.spec.maxConversingPods, default 5).",
+		}, []string{"project"}),
+		conversingEntryDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_conversing_entry_declined_total",
+			Help: "Comments that did NOT open a conversation, by project and reason. There is no acknowledgement layer, so this counter is the only thing that makes a refused conversation visible to an operator.",
+		}, []string{"project", "reason"}),
+		conversingClosedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_conversing_closed_total",
+			Help: "Conversations ended, by project and cause (idle | evicted). A rising evicted rate means the ceiling is the binding constraint, not the idle window.",
+		}, []string{"project", "cause"}),
 	}
 	reg.MustRegister(
 		m.taskTokensTotal,
@@ -82,6 +97,9 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.taskParkedTotal,
 		m.orphanAdoptedTotal,
 		m.unparkDeclinedTotal,
+		m.conversingPods,
+		m.conversingEntryDeclined,
+		m.conversingClosedTotal,
 	)
 	return m
 }
@@ -274,4 +292,43 @@ func (m *OperatorMetrics) UnparkDeclined(stageReason, kind string) {
 // (stageReason,kind) for test assertions.
 func (m *OperatorMetrics) UnparkDeclinedCounter(stageReason, kind string) prometheus.Counter {
 	return m.unparkDeclinedTotal.WithLabelValues(stageReason, kind)
+}
+
+// SetConversingPods sets operator_conversing_pods for one project.
+func (m *OperatorMetrics) SetConversingPods(project string, n float64) {
+	if m == nil || m.conversingPods == nil {
+		return
+	}
+	m.conversingPods.WithLabelValues(project).Set(n)
+}
+
+// ConversingPodsGauge returns the operator_conversing_pods gauge for a project.
+func (m *OperatorMetrics) ConversingPodsGauge(project string) prometheus.Gauge {
+	return m.conversingPods.WithLabelValues(project)
+}
+
+// ConversingEntryDeclined counts a comment that did not open a conversation.
+func (m *OperatorMetrics) ConversingEntryDeclined(project, reason string) {
+	if m == nil || m.conversingEntryDeclined == nil {
+		return
+	}
+	m.conversingEntryDeclined.WithLabelValues(project, reason).Inc()
+}
+
+// ConversingEntryDeclinedCounter returns the operator_conversing_entry_declined_total counter.
+func (m *OperatorMetrics) ConversingEntryDeclinedCounter(project, reason string) prometheus.Counter {
+	return m.conversingEntryDeclined.WithLabelValues(project, reason)
+}
+
+// ConversingClosed counts a conversation that ended, by cause.
+func (m *OperatorMetrics) ConversingClosed(project, cause string) {
+	if m == nil || m.conversingClosedTotal == nil {
+		return
+	}
+	m.conversingClosedTotal.WithLabelValues(project, cause).Inc()
+}
+
+// ConversingClosedCounter returns the operator_conversing_closed_total counter.
+func (m *OperatorMetrics) ConversingClosedCounter(project, cause string) prometheus.Counter {
+	return m.conversingClosedTotal.WithLabelValues(project, cause)
 }

@@ -231,6 +231,21 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		return ctrl.Result{RequeueAfter: agentBootRequeue}, false, nil
 	}
 
+	// The conversing budget-elapsed edge is NOT a plain transition: the agent is
+	// owed one handoff turn before its pod dies, or the notes journal - which IS
+	// the continuation state - is left empty for whatever pod comes next.
+	if task.Status.Stage == tatarav1alpha1.StageConversing {
+		mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
+		if mrErr != nil {
+			return ctrl.Result{}, true, mrErr
+		}
+		l.Info("conversation idle budget elapsed",
+			"action", "stage_deadline", "resource_id", task.Name, "stage", task.Status.Stage,
+			"clock", clock, "budget", budget.String(), "elapsed", elapsed.String(),
+			"to", edge.To, "stage_reason", edge.Reason)
+		return ctrl.Result{}, true, r.conversingHandoffAndPark(ctx, proj, task, mrs, "idle", now)
+	}
+
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
 	if mrErr != nil {
 		return ctrl.Result{}, true, mrErr
