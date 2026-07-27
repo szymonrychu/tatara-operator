@@ -89,7 +89,11 @@ var _ NoteAppender = (*FitNoteAppender)(nil)
 // and the operator TTL-stops it before its first turn. stage.Enter nils both pod
 // timestamps on every transition; the pod-CREATE stamp re-arms this one.
 func TTLDeadline(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (time.Time, bool) {
-	ttl := project.Spec.AgentPodTTLSeconds
+	// PodTTLSeconds, never project.Spec.AgentPodTTLSeconds directly: the pod's
+	// AGENT_POD_TTL_SECONDS env is stamped from the same resolver, and if these
+	// two ever diverge the wrapper 410s turns the operator still believes are
+	// admissible (or the operator stops a pod the wrapper is happily serving).
+	ttl := PodTTLSeconds(project, task)
 	if ttl <= 0 || task.Status.PodStartedAt == nil {
 		return time.Time{}, false
 	}

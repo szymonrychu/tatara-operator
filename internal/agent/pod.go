@@ -426,6 +426,31 @@ func agentRepoEnv(task *tatarav1alpha1.Task) string {
 	return ""
 }
 
+// PodTTLSeconds is G.7's pod-lifetime budget for THIS task's current stage, in
+// seconds. It is the SINGLE source of truth for the value: AgentEnv stamps it as
+// AGENT_POD_TTL_SECONDS (which is what the wrapper computes its own 410-Gone
+// deadline from) and TTLDeadline computes t0 from it, so the operator and the
+// pod can never disagree about when turns stop being admitted.
+//
+// The conversing stage gets the CONVERSATION idle window rather than the flat
+// project TTL. That is the resolution of the one real conflict in this design:
+// the wrapper refuses turns past podStart + this value and the wrapper is not
+// being changed, so a conversing pod cannot outlive a flat cap. It does not need
+// to. The two clocks answer different questions - this one says when ONE POD
+// rotates, Task.status.conversationLastEventAt says when the CONVERSATION ends -
+// and ttlStop leaves the STAGE unchanged, taking the handoff turn and re-arming
+// the Task so a replacement pod resumes from the handoff note. An
+// actively-replied-to conversation therefore keeps going indefinitely (decision
+// D6) while every individual pod stays bounded. Matching the pod TTL to the idle
+// window also means an idle conversation's pod dies at the same instant the idle
+// clock parks the Task, so there is no wasted rotation.
+func PodTTLSeconds(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) int {
+	if task != nil && task.Status.Stage == tatarav1alpha1.StageConversing {
+		return int(tatarav1alpha1.ConversationIdle(project) / time.Second)
+	}
+	return project.Spec.AgentPodTTLSeconds
+}
+
 // AgentEnv is the contract G.9 agent-pod env block: task identity, the agent
 // kind (which the cli's MCP server and the wrapper's skill installer BOTH key
 // their profiles on), the work branch, the pod TTL, and the wire contract
@@ -445,7 +470,7 @@ func AgentEnv(project *tatarav1alpha1.Project, task *tatarav1alpha1.Task) []core
 		{Name: "TATARA_SKILL_PROFILE", Value: profileForKind(kind)},
 		{Name: "TATARA_REPO", Value: agentRepoEnv(task)},
 		{Name: "TASK_BRANCH", Value: taskBranch},
-		{Name: "AGENT_POD_TTL_SECONDS", Value: strconv.Itoa(project.Spec.AgentPodTTLSeconds)},
+		{Name: "AGENT_POD_TTL_SECONDS", Value: strconv.Itoa(PodTTLSeconds(project, task))},
 		{Name: "TATARA_CONTRACT_VERSION", Value: strconv.Itoa(ContractVersion)},
 	}
 }
