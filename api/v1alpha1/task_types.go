@@ -406,6 +406,38 @@ type TaskEvent struct {
 	Body string `json:"body"`
 }
 
+// ApprovalVerdict is the DURABLE record that the C.6 approval grammar PASSED
+// for this Task, against one specific comment.
+//
+// It exists because the periodic un-park backstop (driveUnparks) can re-derive
+// everything else about an identity-unverified park from live cluster state -
+// which owned Issues are open, which are approved - but it can NEVER re-run the
+// grammar: the grammar needs a freshly SYNCED forge thread and a webhook payload
+// the backstop did not see. The verdict is that one missing input, made durable
+// at the moment the fast path establishes it, so a fast path that then loses a
+// cache race costs a DELAY rather than a permanent stall.
+//
+// It is evidence of a PAST pass, not a licence: the backstop still re-checks
+// every owned Issue's live approval state before re-entering implementing.
+type ApprovalVerdict struct {
+	// At is when the grammar passed.
+	At metav1.Time `json:"at"`
+	// IssueRef is the Issue CR name whose thread carried the approving comment.
+	// +kubebuilder:validation:MaxLength=253
+	IssueRef string `json:"issueRef,omitempty"`
+	// CommentExternalID is the forge comment id the grammar matched, i.e. the
+	// Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
+	// makes this verdict traceable back to a real human action.
+	// +kubebuilder:validation:MaxLength=128
+	CommentExternalID string `json:"commentExternalId,omitempty"`
+	// Author is the verified maintainer login whose comment passed. Never the bot.
+	// +kubebuilder:validation:MaxLength=128
+	Author string `json:"author,omitempty"`
+	// Phrase is the matched approvalPhrases entry.
+	// +kubebuilder:validation:MaxLength=128
+	Phrase string `json:"phrase,omitempty"`
+}
+
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
 	// +optional
@@ -496,6 +528,12 @@ type TaskStatus struct {
 	// from a pre-implement stage cannot auto-escalate straight into implementing.
 	// +optional
 	ParkedFromStage string `json:"parkedFromStage,omitempty"`
+	// ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
+	// written by the webhook fast path the moment the grammar passes, and read by
+	// the periodic driveUnparks backstop, which cannot re-run the grammar itself.
+	// Nil means no approving comment has ever been verified for this Task.
+	// +optional
+	ApprovalVerdict *ApprovalVerdict `json:"approvalVerdict,omitempty"`
 	// MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
 	// Persisted so a restarted operator resumes and never re-merges.
 	// +optional

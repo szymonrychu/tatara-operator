@@ -211,6 +211,41 @@ spec:
                 - documentation
                 - implement
                 type: string
+              approvalVerdict:
+                description: |-
+                  ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
+                  written by the webhook fast path the moment the grammar passes, and read by
+                  the periodic driveUnparks backstop, which cannot re-run the grammar itself.
+                  Nil means no approving comment has ever been verified for this Task.
+                properties:
+                  at:
+                    description: At is when the grammar passed.
+                    format: date-time
+                    type: string
+                  author:
+                    description: Author is the verified maintainer login whose comment
+                      passed. Never the bot.
+                    maxLength: 128
+                    type: string
+                  commentExternalId:
+                    description: |-
+                      CommentExternalID is the forge comment id the grammar matched, i.e. the
+                      Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
+                      makes this verdict traceable back to a real human action.
+                    maxLength: 128
+                    type: string
+                  issueRef:
+                    description: IssueRef is the Issue CR name whose thread carried
+                      the approving comment.
+                    maxLength: 253
+                    type: string
+                  phrase:
+                    description: Phrase is the matched approvalPhrases entry.
+                    maxLength: 128
+                    type: string
+                required:
+                - at
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
