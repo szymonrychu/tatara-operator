@@ -159,9 +159,11 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 	}
 }
 
-func TestDriveUnparks_SkipsIdentityUnverified(t *testing.T) {
-	// identity-unverified is webhook+grammar-driven; the reconcile loop must not
-	// touch it (driving it with GrammarPassed=false would strand it).
+func TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines(t *testing.T) {
+	// The reconcile loop DOES drive identity-unverified now (Task 4): it reads
+	// Task.status.approvalVerdict rather than re-running the grammar. This Task
+	// carries no verdict, so grammarPassed is false and stage.Unpark declines
+	// with grammar-not-passed - the Task must stay exactly where it is.
 	task := wfParkedTask("t-ident", "clarify", stage.ReasonIdentityUnverified)
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",

@@ -26,10 +26,22 @@ import (
 // reviewed+approved delivery whose CI stayed red past its budget parked at
 // merge-timeout and was stranded forever.
 //
-// This driver applies stage.Unpark. identity-unverified is EXCLUDED: it re-enters
-// only against a freshly SYNCED forge thread evaluated by the C.6 grammar
-// (ReVerifyParked), which is the webhook's job; driving it here with
-// GrammarPassed=false would never pass.
+// This driver applies stage.Unpark. identity-unverified USED TO BE EXCLUDED, on
+// the reasoning that it re-enters only against a freshly SYNCED forge thread
+// evaluated by the C.6 grammar (ReVerifyParked, the webhook's job) and that
+// driving it here with GrammarPassed=false would never pass. That reasoning was
+// correct and the exclusion was still a defect: it made the webhook's ONE
+// evaluation the only one that would ever happen, so a fast path that lost a
+// cache race stalled the Task permanently with the approval label already
+// visible on the forge (2026-07-27, gitlab helmfile#26).
+//
+// It is included now because the verdict is DURABLE. The webhook stamps
+// Task.status.approvalVerdict the moment the grammar passes, whether or not the
+// un-park in that same request succeeds. This driver never re-runs the grammar -
+// it cannot - it reads that record and re-derives the rest (are all open owned
+// Issues approved?) from LIVE cluster state, which it can. A Task with no verdict
+// declines with grammar-not-passed and stays exactly where it is: there is no
+// path here that re-enters implementing without a recorded maintainer approval.
 
 // UnparkDecline classifies WHY ApplyUnpark refused to re-enter (target==""),
 // so callers can tell an anomalous drift bail from a normal steady-state
@@ -218,9 +230,11 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 }
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
-// reason has an F.6 re-entry rule, EXCEPT identity-unverified (webhook-driven,
-// grammar-gated). activeTasks is computed ONCE and then advanced as each Task
-// re-enters an active stage, so a bulk re-entry never exceeds maxOpenTasks (H8).
+// reason has an F.6 re-entry rule, INCLUDING identity-unverified: the grammar
+// verdict it needs comes from the durable Task.status.approvalVerdict (see the
+// file header), never re-evaluated here. activeTasks is computed ONCE and then
+// advanced as each Task re-enters an active stage, so a bulk re-entry never
+// exceeds maxOpenTasks (H8).
 func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alpha1.Project, now time.Time) error {
 	var tl tatarav1alpha1.TaskList
 	if err := r.List(ctx, &tl, client.InNamespace(proj.Namespace)); err != nil {
@@ -244,10 +258,12 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		if t.Spec.ProjectRef != proj.Name || t.Status.Stage != tatarav1alpha1.StageParked {
 			continue
 		}
-		if t.Status.StageReason == stage.ReasonIdentityUnverified {
-			continue
-		}
-		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, now)
+		// The verdict is the ONE input this pass cannot reconstruct. Absent, it is
+		// false and stage.Unpark declines with grammar-not-passed; present, it is
+		// the webhook's own recorded C.6 pass and the owned-Issue half is re-derived
+		// from live state below.
+		grammarPassed := t.Status.StageReason == stage.ReasonIdentityUnverified && t.Status.ApprovalVerdict != nil
+		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, grammarPassed, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
 				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.StageReason)
@@ -270,6 +286,16 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 			r.Metrics.UnparkDeclined(t.Status.StageReason, string(decline))
 		}
 		if target != "" {
+			if t.Status.StageReason == stage.ReasonIdentityUnverified {
+				// This is the backstop catching what the fast path dropped. It is the
+				// single most important line in this file for diagnosing a repeat of
+				// the 2026-07-27 stall: if it fires often, the webhook fast path is
+				// losing its cache race routinely and the fast path is what to fix.
+				log.FromContext(ctx).Info("unpark: identity-unverified retried from the persisted grammar verdict",
+					"action", "unpark_verdict_backstop", "resource_id", t.Name, "stage", target,
+					"verdict_comment", t.Status.ApprovalVerdict.CommentExternalID,
+					"verdict_issue", t.Status.ApprovalVerdict.IssueRef)
+			}
 			active++ // the re-entered Task is now active; keep the cap honest this pass.
 		}
 	}
