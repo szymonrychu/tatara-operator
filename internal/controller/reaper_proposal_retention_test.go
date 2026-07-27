@@ -294,3 +294,52 @@ func TestParkedTaskStillWorkingItsIssueIsNotHeld(t *testing.T) {
 	require.False(t, alive,
 		"a backlog-sweep park whose owned issues are all closed reaps as before when no retention is in play")
 }
+
+// TestHeldTaskStillReleasesItsOtherArtifacts: the hold defers the DELETE, not the
+// terminal sequence.
+//
+// Asked once at the top of reapParked it also skipped releaseTerminal, so a held
+// Task's OTHER open issues went up to DeclinedProposalRetention with no terminal
+// comment, no tatara-parked label and no ownerRef release - starving unrelated
+// artifacts to keep one mirror queryable. The Task here is past ParkRetention and
+// holds a retained decline, so it must be kept alive AND still release the
+// unrelated open issue it owns.
+func TestHeldTaskStillReleasesItsOtherArtifacts(t *testing.T) {
+	ctx := context.Background()
+	proj := reapProject("heldrel")
+	repo := reapRepo("heldrel", "tatara-operator", "https://github.com/szymonrychu/tatara-operator.git")
+
+	task := reapTask("heldrel", "clarify-task", "clarify",
+		tatarav1alpha1.StageParked, stage.ReasonAwaitingHuman, time.Now().Add(-8*24*time.Hour))
+	task.Annotations = map[string]string{AnnProposalDeclinedAt: time.Now().Format(time.RFC3339)}
+
+	// The retained decline (severed: not in IssueRefs).
+	declined := reapProposalIssue("heldrel", repo.Name, task.Name, "closed", "rejected", 41)
+	// An UNRELATED open issue the Task is still working.
+	other := reapProposalIssue("heldrel", repo.Name, task.Name, "open", "new", 42)
+	other.Spec.ProposalKind, other.Spec.ProposalBodyHash = "", ""
+	other.Status.Body, other.Status.Author = "an ordinary issue", "alice"
+	task.Status.IssueRefs = []string{other.Name}
+
+	c := newMirrorClient(t, proj, repo, reapSecret(), task, declined, other)
+	w := &reapWriter{
+		comment:  func(string, string) error { return nil },
+		addLabel: func(string, string) error { return nil },
+	}
+	r := reapReconciler(c, w)
+	require.NoError(t, r.ReapTerminal(ctx, proj))
+
+	_, alive := mustGetTask(t, c, task.Name)
+	require.True(t, alive, "the hold must keep the Task alive for its retained decline")
+
+	require.Len(t, w.comments, 1, "the unrelated OPEN issue still gets its terminal comment: %v", w.comments)
+	require.Contains(t, w.comments[0], "#42")
+	require.Len(t, w.labels, 1, "and its tatara-parked label: %v", w.labels)
+	require.Contains(t, w.labels[0], "#42")
+
+	// The unrelated issue is released (fix H13 orphan), while the declined mirror
+	// keeps the ownerRef that bounds it.
+	require.Empty(t, mustGetIssue(t, c, other.Name).OwnerReferences,
+		"the unrelated open issue must be re-mintable now, not in 14 days")
+	require.True(t, ownedByTask(mustGetIssue(t, c, declined.Name), task.Name))
+}

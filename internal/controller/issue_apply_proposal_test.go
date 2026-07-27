@@ -2,10 +2,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,6 +28,9 @@ import (
 // which is what mintIssueCR does for every proposal it files. stamped=false
 // leaves Spec empty so the legacy pre-O5 read path (effectiveProposalKind's
 // bot-authorship + anchor gated body-marker fallback) is the thing under test.
+// errTestStampFailed is the injected failure for the decline-clock retry test.
+var errTestStampFailed = errors.New("injected: annotation update failed")
+
 func proposalMirror(task *tatarav1alpha1.Task, kind string, stamped bool) *tatarav1alpha1.Issue {
 	body := "an idea worth having"
 	if kind != "" {
@@ -476,4 +481,135 @@ func TestReopenNeverOrphansAMirrorTheOwnerIsStillWorking(t *testing.T) {
 	owner, owned := own.ControllerOwner(got)
 	require.True(t, owned, "but a Task that still lists the issue keeps owning it")
 	require.Equal(t, task.Name, owner)
+}
+
+// TestDeliveredProposalCloseIsNeverRecordedAsADecline is the regression test for
+// the SUCCESS path, which round 2 broke.
+//
+// CloseIssuesOnDelivery closes the driving issue ITSELF and stamps
+// state=closed/status=done while the owner is at deploying, then delivered.
+// Neither stage is stoppable (deploying is excluded on purpose) and neither is
+// rejected(issue-closed), so both fall through to the parked-decline branch. With
+// no stage gate that branch severed shipped work from its Task, rewrote "done"
+// to "rejected", logged a decline for a proposal that shipped, and relabelled the
+// forge issue tatara-declined. The verdict guard alone cannot prevent it: the
+// sever runs first.
+func TestDeliveredProposalCloseIsNeverRecordedAsADecline(t *testing.T) {
+	for _, stg := range []string{
+		tatarav1alpha1.StageDeploying,
+		tatarav1alpha1.StageDelivered,
+		tatarav1alpha1.StageDocumenting,
+	} {
+		t.Run(stg, func(t *testing.T) {
+			proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+			task := taskAtStage(stg, "")
+			task.Spec.Kind = "clarify"
+			iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
+			// Exactly what CloseIssuesOnDelivery leaves behind.
+			iss.Status.State, iss.Status.Status = "closed", "done"
+			task.Status.IssueRefs = []string{iss.Name}
+			c := newMirrorClient(t, proj, repo, task, iss, scmSecret())
+
+			w := &mirrorWriter{}
+			r := newIssueReconciler(c, w, nil)
+			reconcileIssue(t, r, iss.Name)
+
+			gotIss, ok := getProposalIssue(t, c, iss.Name)
+			require.True(t, ok)
+			require.Equal(t, "done", gotIss.Status.Status,
+				"a proposal that SHIPPED must never be rewritten as discarded")
+
+			gotTask := getTaskCR(t, c, task.Name)
+			require.Contains(t, gotTask.Status.IssueRefs, iss.Name,
+				"shipped work must not be severed from its Task")
+			require.Empty(t, gotTask.Annotations[AnnProposalDeclinedAt],
+				"no decline clock is started for a delivery")
+			require.NotContains(t, w.added, "tatara-declined",
+				"and the forge must not be relabelled declined on a delivered issue")
+		})
+	}
+}
+
+// TestDeclineVerdictNeverOverwritesDone is the defence-in-depth half of the same
+// fix, at the guard rather than at the gate.
+func TestDeclineVerdictNeverOverwritesDone(t *testing.T) {
+	ctx := context.Background()
+	c, task, iss := seedParkedProposalClose(t, stage.ReasonAwaitingHuman, tatarav1alpha1.ProposalKindBrainstorm, true)
+	live := getIssueCR(t, c, iss.Name)
+	live.Status.Status = "done"
+	require.NoError(t, c.Status().Update(ctx, live))
+
+	require.NoError(t, recordParkedProposalDecline(ctx, c, task, getIssueCR(t, c, iss.Name), time.Now()))
+
+	require.Equal(t, "done", getIssueCR(t, c, iss.Name).Status.Status)
+}
+
+// TestDeclineClockIsRetriedAfterAFailedStamp is the second Critical: the clock
+// was written only on the pass that stamped the verdict, and re-entry
+// short-circuits on an already-rejected mirror, so a failed annotation Update was
+// never retried. The fallback anchor is then the PARK time, typically already
+// expired, so the mirror is cascaded on the very next reap pass - the exact
+// symptom the window exists to kill, via the one path that looked harmless.
+func TestDeclineClockIsRetriedAfterAFailedStamp(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StageParked, stage.ReasonBacklogSweep)
+	task.Spec.Kind = "clarify"
+	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
+	task.Status.IssueRefs = []string{iss.Name}
+
+	// FAULT INJECTION: the annotation Update fails on the first attempt only.
+	failStamp := true
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo, task, iss, scmSecret()).
+		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.Task{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+				opts ...client.UpdateOption) error {
+				if tk, isTask := obj.(*tatarav1alpha1.Task); isTask &&
+					tk.Annotations[AnnProposalDeclinedAt] != "" && failStamp {
+					return apierrors.NewInternalError(errTestStampFailed)
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	// Pass 1: the verdict lands, the clock does not.
+	err := recordParkedProposalDecline(ctx, c, task, iss, time.Now())
+	require.Error(t, err, "a lost decline clock must surface, not be swallowed")
+
+	var afterFail tatarav1alpha1.Task
+	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(task), &afterFail))
+	require.Empty(t, afterFail.Annotations[AnnProposalDeclinedAt])
+	require.Equal(t, "rejected", getIssueCR(t, c, iss.Name).Status.Status,
+		"precondition for the bug: the verdict IS recorded, so re-entry short-circuits on it")
+
+	// Pass 2: the fault clears. The clock must still be written, even though the
+	// verdict write is now a no-op.
+	failStamp = false
+	require.NoError(t, recordParkedProposalDecline(ctx, c, &afterFail, getIssueCR(t, c, iss.Name), time.Now()))
+
+	var afterRetry tatarav1alpha1.Task
+	require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(task), &afterRetry))
+	require.NotEmpty(t, afterRetry.Annotations[AnnProposalDeclinedAt],
+		"the clock is keyed on the annotation being ABSENT, so it is retried until it lands")
+}
+
+// TestDeclineClockNeverSlidesForward: still write-once. A later pass must not
+// re-stamp and extend a window that is already running.
+func TestDeclineClockNeverSlidesForward(t *testing.T) {
+	ctx := context.Background()
+	c, task, iss := seedParkedProposalClose(t, stage.ReasonBacklogSweep, tatarav1alpha1.ProposalKindBrainstorm, true)
+
+	first := time.Now().Add(-10 * 24 * time.Hour)
+	require.NoError(t, recordParkedProposalDecline(ctx, c, task, iss, first))
+	stamped := getTaskCR(t, c, task.Name).Annotations[AnnProposalDeclinedAt]
+	require.NotEmpty(t, stamped)
+
+	require.NoError(t, recordParkedProposalDecline(ctx, c, getTaskCR(t, c, task.Name),
+		getIssueCR(t, c, iss.Name), time.Now()))
+	require.Equal(t, stamped, getTaskCR(t, c, task.Name).Annotations[AnnProposalDeclinedAt],
+		"a re-entry must not slide the retention window forward")
 }

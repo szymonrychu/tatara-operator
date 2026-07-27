@@ -90,11 +90,21 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 // issueName in Status.IssueRefs, while still carrying an ownerRef on the mirror
 // (which every caller establishes from the CR side first).
 //
-// That combination is produced by exactly one thing, SeverRetainCR, because the
-// other two sever modes leave no ownerRef behind - one deletes the CR, the other
-// drops the ref. It is therefore the durable, STAGE-INDEPENDENT signature of
-// "this Task's only remaining relationship to this mirror is that its reap will
-// collect it".
+// SeverRetainCR is the only thing that produces that combination DURABLY: the
+// other two sever modes leave no ownerRef behind, one by deleting the CR and one
+// by dropping the ref. It is not, however, the only thing that can produce it at
+// all - every own-then-list mint (mintIssueCRs, MintForItem, mintIssueCR,
+// linkArtifact) writes the ownerRef before appending the ref, so a crash between
+// the two leaves the same shape.
+//
+// A VERDICT CLAUSE IS WHAT CARRIES THE DISTINCTION, and both callers have one:
+// the reaper pairs this with state=="closed", the reopen undo with
+// status=="rejected". Neither can be true of a mint in flight - a mint is by
+// definition creating an OPEN issue, and it seeds status "new" - and every one of
+// those crash windows self-heals on the next reconcile anyway. Paired, this is
+// the durable, STAGE-INDEPENDENT signature of "this Task's only remaining
+// relationship to this mirror is that its reap will collect it". Do not use it
+// unpaired.
 //
 // Keying on the shape rather than on rejected(issue-closed) is what lets a
 // decline recorded against a PARKED owner get the same retention window and the
@@ -241,7 +251,15 @@ func retainProposalDecline(ctx context.Context, c client.Client,
 		if err := c.Get(ctx, key, &fresh); err != nil {
 			return err
 		}
-		if fresh.Status.Status == "rejected" || fresh.Status.Status == "approved" {
+		// "done" is in this guard for the same reason "approved" is: it is a
+		// verdict the platform already reached and a decline must never overwrite
+		// one. It is the DELIVERY stamp (CloseIssuesOnDelivery), so without it a
+		// shipped proposal would be rewritten as discarded. Defence in depth only -
+		// the caller's stage gate is what actually keeps this path away from
+		// delivered work, because the sever above has already run by the time we
+		// get here.
+		switch fresh.Status.Status {
+		case "rejected", "approved", "done":
 			return nil
 		}
 		fresh.Status.Status = "rejected"
@@ -256,16 +274,24 @@ func retainProposalDecline(ctx context.Context, c client.Client,
 		}
 		return fmt.Errorf("issue-closed: record the decline on %s: %w", iss.Name, err)
 	}
+	// Anchor the retention window on the DECLINE.
+	//
+	// THE TRIGGER IS "THE ANNOTATION IS ABSENT", NOT "we just stamped the verdict",
+	// and the difference is the whole retention. Keyed on the verdict write, a
+	// failed Update was never retried: re-entry finds status=rejected,
+	// short-circuits above, and the stamp never happens - while the FALLBACK for a
+	// parked owner is the park time, which is typically already expired, so the
+	// mirror is cascaded on the very next reap pass. That is the exact symptom
+	// this whole window exists to kill, reached by the one path that looked
+	// harmless. Absence keeps it write-once (it cannot slide forward) while making
+	// it retried on every reconcile until it lands.
+	if task.Annotations[AnnProposalDeclinedAt] == "" {
+		if err := stampDeclinedAt(ctx, c, task, now); err != nil {
+			return fmt.Errorf("issue-closed: stamp the decline clock on %s: %w", task.Name, err)
+		}
+	}
 	if !stamped {
 		return nil
-	}
-	// Anchor the retention window on the DECLINE. Stamped only on the pass that
-	// actually recorded the verdict, so a re-entry cannot slide the window
-	// forward, and best-effort AFTER the verdict landed: a lost stamp costs the
-	// longer window (the reap falls back to the stage clock), never the record.
-	if err := stampDeclinedAt(ctx, c, task, now); err != nil {
-		log.FromContext(ctx).Error(err, "issue-closed: stamping the decline clock failed; the retention window falls back to the stage clock",
-			"action", "proposal_declined", "resource_id", iss.Name, "task", task.Name)
 	}
 	log.FromContext(ctx).Info("retained a discarded brainstorm proposal's mirror",
 		"action", "proposal_declined", "resource_id", iss.Name, "task", task.Name,
@@ -274,9 +300,17 @@ func retainProposalDecline(ctx context.Context, c client.Client,
 	return nil
 }
 
-// stampDeclinedAt records the decline time on the owner Task, write-once per
-// decline. It is the free function twin of (*ProjectReconciler).annotateTask -
-// this path holds a bare client.Client, not the reconciler.
+// stampDeclinedAt records the decline time on the owner Task. It is the free
+// function twin of (*ProjectReconciler).annotateTask - this path holds a bare
+// client.Client, not the reconciler.
+//
+// Callers gate it on the annotation being ABSENT, which makes it write-once per
+// TASK rather than per decline. KNOWN, BOUNDED CONSEQUENCE: a Task that declines
+// a SECOND proposal keeps the first decline's clock, so the second mirror gets
+// the remainder of that window instead of a fresh one. It cannot slide a window
+// FORWARD, which is the direction that would matter, and in practice a proposal
+// gets its own clarify Task (mintClarifyTask, one per proposal), so a Task with
+// two retained mirrors is not a shape the propose path produces.
 func stampDeclinedAt(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, now time.Time) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cur tatarav1alpha1.Task

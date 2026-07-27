@@ -343,16 +343,27 @@ func (r *IssueReconciler) handleIssueClosed(ctx context.Context, iss *tatarav1al
 		return !retained, nil
 	}
 
-	// The owner is not stoppable and not mid-sever - a PARKED Task, in the shape
-	// that dominates real declines: a maintainer closes the proposal without
-	// commenting first, so nothing ever unparked it into clarifying. The stop edge
-	// correctly does nothing here, and before the 2026-07-27 ruling so did
-	// everything else, which meant that decline was never recorded and the reaper
-	// cascaded its mirror on the next pass.
+	// A PARKED owner, which is the shape that dominates real declines: a maintainer
+	// closes the proposal without commenting first, so nothing ever unparked it
+	// into clarifying. The stop edge correctly does nothing here, and before the
+	// 2026-07-27 ruling so did everything else, which meant that decline was never
+	// recorded and the reaper cascaded its mirror on the next pass.
 	//
-	// Recording it is NOT stopping it: the Task's stage, stage reason and pod are
+	// THE STAGE GATE IS EXPLICIT AND IT IS LOAD-BEARING. Everything that is not a
+	// live source stage and not mid-sever reaches this line, and that includes the
+	// SUCCESS path: CloseIssuesOnDelivery closes the driving issue itself and
+	// stamps state=closed/status=done while the Task is at deploying, then
+	// delivered. Ungated, a proposal that SHIPPED would be severed from its
+	// delivered Task, have its "done" overwritten to "rejected", be logged as a
+	// decline and relabelled tatara-declined on the forge. The verdict guard alone
+	// cannot save it, because the sever runs first.
+	//
+	// Recording is NOT stopping: the Task's stage, stage reason and pod are
 	// untouched, and a non-proposal issue is left entirely alone. handled stays
 	// FALSE either way, so the reconcile still projects labels and requeues.
+	if task.Status.Stage != tatarav1alpha1.StageParked {
+		return false, nil
+	}
 	return false, recordParkedProposalDecline(ctx, r.Client, &task, iss, r.now())
 }
 

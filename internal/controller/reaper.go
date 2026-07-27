@@ -470,17 +470,7 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 			return err
 		}
 		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.RejectedRetention)) {
-			// The ONE exception to RejectedRetention (O9). Checked only here, on the
-			// pass that would otherwise delete, so the extra List costs nothing until
-			// a rejected Task is actually due.
-			hold, err := r.holdsDeclinedProposal(ctx, proj, t, now)
-			if err != nil {
-				return err
-			}
-			if hold {
-				return nil
-			}
-			return r.deleteReapedTask(ctx, proj, t, live)
+			return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
 		}
 		return nil
 
@@ -519,6 +509,12 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 // returns nothing here - and the ref list is then re-read as the proof that this
 // IS a severed retention rather than an ordinary owned issue that happens to be
 // closed. A Task still working its issues is never held.
+//
+// COST: one namespace-wide Issue List per call, and every caller reaches it only
+// at a site that would OTHERWISE DELETE the Task - past RejectedRetention, or a
+// backlog-sweep park whose every owned Issue is already closed, or an aged park
+// that has cleared its re-entry check. So it is once per Task per reap pass in
+// the window where that Task is dying anyway, not per parked Task per pass.
 func (r *ProjectReconciler) holdsDeclinedProposal(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time) (bool, error) {
 
@@ -589,15 +585,15 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 	// owner is where most declines actually land (a maintainer who just closes the
 	// issue never unparks anything), and the backlog-sweep branch below has NO age
 	// gate at all - it collects as soon as every owned Issue is closed - so without
-	// this the dominant decline's mirror survives one reap pass, minutes.
-	hold, err := r.holdsDeclinedProposal(ctx, proj, t, now)
-	if err != nil {
-		return err
-	}
-	if hold {
-		return nil
-	}
-
+	// it the dominant decline's mirror survives one reap pass, minutes.
+	//
+	// IT DEFERS THE DELETE AND NOTHING ELSE. Asked once at the top it would also
+	// skip releaseTerminal, so a held Task's OTHER open issues would go up to
+	// DeclinedProposalRetention with no terminal comment, no tatara-parked label
+	// and no ownerRef release - starving unrelated artifacts to keep one mirror.
+	// Asked at each delete site instead, the terminal sequence still runs on
+	// schedule and only the collection waits. It is also why the List stays off
+	// the hot path: neither site is reached until the Task is otherwise due.
 	if t.Status.StageReason == stage.ReasonBacklogSweep {
 		issues, err := r.ownedIssues(ctx, t)
 		if err != nil {
@@ -608,7 +604,7 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 				return nil // still anchoring open work
 			}
 		}
-		return r.deleteReapedTask(ctx, proj, t, live)
+		return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
 	}
 
 	if !now.After(stageEnteredAt(t).Add(tatarav1alpha1.ParkRetention)) {
@@ -624,6 +620,23 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 	}
 	if err := r.releaseTerminal(ctx, proj, t, live); err != nil {
 		return err
+	}
+	return r.deleteUnlessHoldingADecline(ctx, proj, t, live, now)
+}
+
+// deleteUnlessHoldingADecline is deleteReapedTask behind the decline-retention
+// exception. Every collection site that can be holding a retained proposal
+// mirror goes through it, so the hold is expressed once instead of being
+// re-derived per branch.
+func (r *ProjectReconciler) deleteUnlessHoldingADecline(ctx context.Context, proj *tatarav1alpha1.Project,
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
+
+	hold, err := r.holdsDeclinedProposal(ctx, proj, t, now)
+	if err != nil {
+		return err
+	}
+	if hold {
+		return nil
 	}
 	return r.deleteReapedTask(ctx, proj, t, live)
 }
