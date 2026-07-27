@@ -110,9 +110,14 @@ func agentJob(agentKind string) string {
 	switch agentKind {
 	case stage.AgentBrainstorm:
 		return "## Your job\n\n" +
-			"Look for work worth doing in this project that nobody has proposed yet. The <task_index> " +
-			"above lists what has already been proposed - do not repeat it.\n\n" +
-			"End with `submit_outcome(kind=brainstorm, action=propose)` for each idea worth filing, or " +
+			"Look for work worth doing in this project that nobody has proposed yet. The " +
+			"<proposal_history> block above carries the project's recent brainstorm proposals with " +
+			"their outcome (open, approved, declined) and the maintainer comments that explain each " +
+			"verdict. A DECLINED proposal is a killed idea: do not re-propose it, and do not propose " +
+			"a restatement of it. Pull the full project Task index on demand with " +
+			"`task_context(index=true)`.\n\n" +
+			"Your session quota is stated in the <goal> element. End with " +
+			"`submit_outcome(kind=brainstorm, action=propose)` carrying at most that many ideas, or " +
 			"`submit_outcome(kind=brainstorm, action=skip)` when there is nothing novel. `skip` is a " +
 			"correct and common answer; a made-up proposal is not." +
 			promptguidance.ToolingNoteGuidance
