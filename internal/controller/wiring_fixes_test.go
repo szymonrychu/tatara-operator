@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -160,16 +159,28 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 	}
 }
 
-func TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines(t *testing.T) {
+// TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing
+// was TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines before Task 9's
+// conversing widening; renamed because it no longer declines - see below.
+func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing(t *testing.T) {
 	// The reconcile loop DOES drive identity-unverified now (Task 4): it reads
 	// Task.status.approvalVerdict rather than re-running the grammar. This Task
 	// carries no verdict, but its one owned Issue IS live-approved: without the
-	// Issue seeded and approved, this test could not tell "correctly declined
-	// because grammarPassed is false" apart from "declined for the unrelated
-	// reason no Issues are owned" (DeclineNoOpenIssues) - it would pass either
-	// way and catch nothing. With the Issue approved, a wrongly-true
-	// grammarPassed WOULD re-enter the Task, so this asserts the SPECIFIC
-	// decline (grammar-not-passed), not just "stayed parked".
+	// Issue seeded and approved, this test could not tell "correctly never
+	// reaches implementing because grammarPassed is false" apart from "never
+	// reaches implementing for the unrelated reason no Issues are owned" - it
+	// would pass either way and catch nothing. With the Issue approved, a
+	// wrongly-true grammarPassed WOULD re-enter the Task straight into
+	// implementing; this asserts that specifically never happens.
+	//
+	// Task 9: a GrammarPassed=false comment on identity-unverified now opens a
+	// conversation (conversing) instead of only declining - so this Task DOES
+	// move, but the conversing branch never consults Issue approval state at
+	// all (it fires before that check), and conversing maps to the clarify
+	// agent kind, which cannot reach implementing directly (LegalFor's kind
+	// guard, the F.3 table). The property this test proves - a live-approved
+	// Issue with no fresh grammar pass must never authorize implementing - is
+	// unchanged.
 	task := wfParkedTask("t-ident", "clarify", stage.ReasonIdentityUnverified)
 	task.Status.IssueRefs = []string{"iss-ident"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
@@ -185,12 +196,9 @@ func TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines(t *testing.T) {
 		t.Fatalf("driveUnparks: %v", err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonIdentityUnverified {
-		t.Fatalf("driveUnparks re-entered identity-unverified with NO grammar verdict on record: now %s(%s)",
+	if got.Status.Stage != tatarav1alpha1.StageConversing {
+		t.Fatalf("stage = %s(%s), want conversing: a live-approved Issue with NO fresh grammar verdict must never reach implementing",
 			got.Status.Stage, got.Status.StageReason)
-	}
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 1 {
-		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 1", got)
 	}
 }
 

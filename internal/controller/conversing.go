@@ -6,7 +6,6 @@ import (
 	"sort"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -237,11 +236,19 @@ var conversingEntryStages = map[string]bool{
 	tatarav1alpha1.StageReviewing:  true,
 }
 
-// EnterConversing applies the live-stage entry edge into conversing and stamps
-// the idle clock's base. It returns (false, nil) - not an error - when the Task
-// is in a stage that may not enter conversing, or when the reviewing round cap is
-// already spent: both are ordinary steady-state outcomes, and the caller falls
-// back to queueing the event and nothing else.
+// EnterConversing applies the live-stage entry edge into conversing. It
+// returns (false, nil) - not an error - when the Task is in a stage that may
+// not enter conversing, or when the reviewing round cap is already spent:
+// both are ordinary steady-state outcomes, and the caller falls back to
+// queueing the event and nothing else.
+//
+// The idle clock's base (status.conversationLastEventAt) is armed by
+// stage.Enter itself, unconditionally on every entry into conversing - see
+// its doc comment - not here: a second call site stamping the same field
+// would only be redundant-until-someone-forgets-it, and stage.Enter is the
+// ONE choke point every entry route (this one, and stage.UnparkDetailed's
+// pure enter() closure for the parked(awaiting-human)/
+// parked(identity-unverified) edges) already goes through.
 //
 // The previous stage's pod IS torn down, by EnterStage's ordinary choke-point
 // teardown. There is no carve-out and there must not be one: the pod name is
@@ -269,16 +276,14 @@ func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller,
 		return false, nil
 	}
 
-	stamp := metav1.NewTime(now)
 	err := EnterStage(ctx, c, sp, m, task, mrs, tatarav1alpha1.StageConversing, "", now,
 		func(t *tatarav1alpha1.Task) {
-			// ABSOLUTE ASSIGNMENTS only: FitTask re-runs this closure to size the
+			// ABSOLUTE ASSIGNMENT only: FitTask re-runs this closure to size the
 			// write and again on every conflict retry, so an increment here would
 			// multiply. The rounds value is computed once, outside.
 			if fromReviewing {
 				t.Status.HumanReviewRounds = task.Status.HumanReviewRounds + 1
 			}
-			t.Status.ConversationLastEventAt = &stamp
 		})
 	if err != nil {
 		return false, err

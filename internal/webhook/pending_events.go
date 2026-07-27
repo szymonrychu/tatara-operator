@@ -331,6 +331,16 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
 	}
+	// Task 9's conversing branch of the identity-unverified F.6 rule (a comment
+	// that fails the grammar opens a conversation instead of a dead end) needs
+	// the SAME ceiling answer ApplyUnpark now computes for the other two
+	// production callers - reused via controller.ConversingHasRoom, never
+	// reimplemented, off the uncached reader like every other read on this path.
+	conversingRoom, err := controller.ConversingHasRoom(ctx, s.reader(), proj)
+	if err != nil {
+		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed", "error", err, "task", task.Name)
+		return
+	}
 	key := client.ObjectKeyFromObject(task)
 	var declined controller.UnparkDecline
 	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -355,11 +365,12 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 			return err
 		}
 		target, code := stage.UnparkDetailed(stage.UnparkInput{
-			Task:          fresh,
-			Issues:        issues,
-			BotLogin:      botLogin,
-			GrammarPassed: passed,
-			Now:           time.Now(),
+			Task:              fresh,
+			Issues:            issues,
+			BotLogin:          botLogin,
+			GrammarPassed:     passed,
+			ConversingHasRoom: conversingRoom,
+			Now:               time.Now(),
 		})
 		if target == "" {
 			declined = controller.DeclineFor(code)

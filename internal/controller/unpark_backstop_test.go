@@ -99,9 +99,15 @@ func TestDriveUnparks_RetriesIdentityUnverifiedFromThePersistedVerdict(t *testin
 }
 
 // No verdict means the grammar has NEVER passed for this Task, and the backstop
-// cannot manufacture one. It must decline with grammar-not-passed and leave the
-// Task exactly where it was: driving a grammar-less re-entry into implementing
-// is the fully autonomous hallucinated-approval-to-prod path.
+// cannot manufacture one: it must never drive a grammar-less re-entry into
+// implementing - that is the fully autonomous hallucinated-approval-to-prod
+// path, and this is what stays impossible. But a human DID comment ("go
+// ahead" here has no verdict behind it - the grammar could not read it as
+// approval), and Task 9 reads that as a conversation, not a dead end: the
+// Task lands in conversing, which maps to the clarify agent kind and cannot
+// reach implementing directly (LegalFor's kind guard and the F.3 table are
+// unchanged) - re-approval still has to go through the SAME C.6 grammar from
+// there, exactly as from clarifying.
 func TestDriveUnparks_IdentityUnverifiedWithNoVerdictStaysParked(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
@@ -137,8 +143,8 @@ func TestDriveUnparks_IdentityUnverifiedWithNoVerdictStaysParked(t *testing.T) {
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if fresh.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("stage = %s, want parked: the backstop re-entered with NO grammar verdict", fresh.Status.Stage)
+	if fresh.Status.Stage != tatarav1alpha1.StageConversing {
+		t.Fatalf("stage = %s, want conversing: a comment with no grammar verdict behind it opens a conversation, never implementing", fresh.Status.Stage)
 	}
 }
 
@@ -227,6 +233,13 @@ func TestDriveUnparks_IdentityUnverifiedWithVerdictButNotAllApprovedStaysParked(
 // authorize entry with NO fresh C.6 pass for THIS park. The fix: a verdict only
 // counts if it was stamped strictly AFTER the CURRENT park began
 // (StageEnteredAt), since stage.Enter re-stamps that on every transition.
+//
+// Task 9 widens the F.6 rule so a GrammarPassed=false comment opens a
+// conversation instead of only declining - but that branch never looks at any
+// verdict, stale or otherwise, only at hasNonBotEvent and the conversing
+// ceiling, so the security property this test proves (a predating verdict
+// must never authorize entry to IMPLEMENTING) is untouched: conversing maps
+// to the clarify agent kind and cannot reach implementing directly.
 func TestDriveUnparks_VerdictPredatingCurrentParkStaysParked(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
@@ -276,11 +289,12 @@ func TestDriveUnparks_VerdictPredatingCurrentParkStaysParked(t *testing.T) {
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if fresh.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("stage = %s, want parked: a verdict predating the CURRENT park re-entered the Task", fresh.Status.Stage)
+	if fresh.Status.Stage != tatarav1alpha1.StageConversing {
+		t.Fatalf("stage = %s, want conversing: the comment opens a conversation, but NEVER via the predating verdict's stale approval", fresh.Status.Stage)
 	}
-	if got := testutil.ToFloat64(r.Metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 1 {
-		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 1", got)
+	if fresh.Status.ApprovalVerdict.CommentExternalID != "1111111111" {
+		t.Fatalf("verdict = %+v, want the STALE verdict left untouched - conversing entry must not manufacture a fresh one",
+			fresh.Status.ApprovalVerdict)
 	}
 }
 
@@ -292,6 +306,11 @@ func TestDriveUnparks_VerdictPredatingCurrentParkStaysParked(t *testing.T) {
 // unreachable-by-construction at the read site, not merely discouraged by CRD
 // validation (which a fake client - or a hand-edited CR bypassing admission -
 // does not enforce).
+//
+// As in the sibling tests above, Task 9's conversing branch does not consult
+// the verdict at all - so the zero-value verdict now opens a conversation
+// (same as no verdict would) rather than staying parked, but it still never
+// authorizes IMPLEMENTING, which is the property this test exists to prove.
 func TestDriveUnparks_ZeroValueVerdictNeverAuthorizes(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
@@ -333,8 +352,8 @@ func TestDriveUnparks_ZeroValueVerdictNeverAuthorizes(t *testing.T) {
 	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
 		t.Fatalf("get task: %v", err)
 	}
-	if fresh.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("stage = %s, want parked: a verdict with no Author re-entered the Task", fresh.Status.Stage)
+	if fresh.Status.Stage != tatarav1alpha1.StageConversing {
+		t.Fatalf("stage = %s, want conversing: the comment opens a conversation, but the no-Author verdict must never grant implementing", fresh.Status.Stage)
 	}
 }
 

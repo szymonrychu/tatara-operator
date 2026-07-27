@@ -602,6 +602,19 @@ func (e *MissingReasonError) Error() string {
 //
 // mrs are the MergeRequests this Task OWNS; they feed the C.5.3 pendingReview
 // gate. Pass nil when the Task owns none.
+//
+// ENTRY INTO CONVERSING ALSO ARMS THE IDLE CLOCK
+// (status.conversationLastEventAt = now), here rather than at each of
+// conversing's several entry call sites (controller.EnterConversing for the
+// live clarifying/reviewing edge, stage.UnparkDetailed's pure enter() closure
+// for the parked(awaiting-human)/parked(identity-unverified) edges). Enter is
+// the ONE choke point every one of them already goes through, so this is the
+// one place a future entry route cannot forget it - AppendTaskEvent stamps
+// the SAME field on every queued event and usually runs moments earlier in
+// the same request, but a caller must never depend on that ordering: an
+// unarmed clock means ArmedClock returns ClockNone and the conversation holds
+// its concurrency slot forever, since there is deliberately no absolute
+// lifetime ceiling (decision D6).
 func Enter(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, to, reason string, now time.Time) error {
 	from := t.Status.Stage
 	if from == "" {
@@ -628,6 +641,9 @@ func Enter(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, to, reason string, now
 	t.Status.PodStartedAt = nil
 	t.Status.StageWorkStartedAt = nil
 	t.Status.Stats.PodRecreations = 0
+	if to == v1alpha1.StageConversing {
+		t.Status.ConversationLastEventAt = &stamp
+	}
 	return nil
 }
 

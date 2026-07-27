@@ -211,6 +211,19 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 		getter = c
 	}
 
+	// Task 9's two conversational F.6 rules (awaiting-human, identity-unverified)
+	// need the SAME ceiling answer Task 11 already computes for the live-stage
+	// entry path (EnterConversing) - reused here, not reimplemented, so the
+	// webhook fast path and the periodic backstop can never disagree about how
+	// full a project's conversing lane is. Computed once per ApplyUnpark call
+	// (like issues/mrs above), off the same uncached-when-available getter: a
+	// stale ceiling read only ever costs an extra conversation slot for one pass,
+	// never a security decision, so this does not need the retry loop's freshness.
+	conversingRoom, err := ConversingHasRoom(ctx, getter, proj)
+	if err != nil {
+		return "", DeclineNone, fmt.Errorf("unpark: conversing capacity check on %s: %w", task.Name, err)
+	}
+
 	var target string
 	var decline UnparkDecline
 	key := client.ObjectKeyFromObject(task)
@@ -232,15 +245,16 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 		// stale) task argument. See grammarPassedFor's own doc for why the
 		// verdict must additionally be scoped to fresh's CURRENT park.
 		to, code := stage.UnparkDetailed(stage.UnparkInput{
-			Task:            fresh,
-			Issues:          issues,
-			MRs:             mrs,
-			ActiveTasks:     activeTasks,
-			MaxOpenTasks:    maxOpen,
-			BotLogin:        botLogin,
-			GrammarPassed:   grammarPassedFor(fresh, grammarPassed),
-			MaxTurnsPerTask: maxTurns,
-			Now:             now,
+			Task:              fresh,
+			Issues:            issues,
+			MRs:               mrs,
+			ActiveTasks:       activeTasks,
+			MaxOpenTasks:      maxOpen,
+			BotLogin:          botLogin,
+			GrammarPassed:     grammarPassedFor(fresh, grammarPassed),
+			MaxTurnsPerTask:   maxTurns,
+			ConversingHasRoom: conversingRoom,
+			Now:               now,
 		})
 		if to == "" {
 			target = ""
