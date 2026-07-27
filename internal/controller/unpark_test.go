@@ -93,8 +93,8 @@ func TestApplyUnpark_BotOnlyEventStillDeclines(t *testing.T) {
 	if target != "" {
 		t.Fatalf("a bot-only pendingEvent must never un-park; got target=%q", target)
 	}
-	if decline != DeclineRule {
-		t.Fatalf("decline = %q, want DeclineRule for a bot-only-event non-error refusal", decline)
+	if decline != DeclineNoHumanEvent {
+		t.Fatalf("decline = %q, want DeclineNoHumanEvent for a bot-only-event non-error refusal", decline)
 	}
 }
 

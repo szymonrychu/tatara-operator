@@ -277,7 +277,7 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 		s.log.ErrorContext(ctx, "pendingEvents: build scm reader failed", "error", err, "task", task.Name)
 		return
 	}
-	passed, err := controller.ReVerifyParked(ctx, s.cfg.Client, sp, reader, proj, task, ev, s.cfg.Metrics)
+	passed, evidence, err := controller.ReVerifyParkedDetailed(ctx, s.cfg.Client, sp, reader, proj, task, ev, s.cfg.Metrics)
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: reverify parked failed", "error", err, "task", task.Name)
 		return
@@ -288,27 +288,43 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 		botLogin = proj.Spec.Scm.BotLogin
 	}
 	key := client.ObjectKeyFromObject(task)
+	var declined controller.UnparkDecline
 	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		declined = controller.DeclineNone
 		fresh := &tatarav1.Task{}
 		if err := s.cfg.Client.Get(ctx, key, fresh); err != nil {
 			return err
 		}
 		if fresh.Status.Stage != tatarav1.StageParked || fresh.Status.StageReason != stage.ReasonIdentityUnverified {
+			declined = controller.DeclineGuard
 			return nil // raced past this un-park by another writer already
+		}
+		// THE VERDICT IS PERSISTED WHETHER OR NOT THE UN-PARK SUCCEEDS. That is the
+		// whole point: when the un-park loses a cache race, driveUnparks re-derives
+		// the owned-Issue half from live state and re-enters using this record,
+		// because it can never re-run the grammar itself.
+		if passed {
+			fresh.Status.ApprovalVerdict = verdictFrom(evidence, time.Now())
 		}
 		issues, err := s.loadOwnedIssues(ctx, fresh)
 		if err != nil {
 			return err
 		}
-		target, ok := stage.Unpark(stage.UnparkInput{
+		target, code := stage.UnparkDetailed(stage.UnparkInput{
 			Task:          fresh,
 			Issues:        issues,
 			BotLogin:      botLogin,
 			GrammarPassed: passed,
 			Now:           time.Now(),
 		})
-		if !ok {
-			return nil
+		if target == "" {
+			declined = controller.DeclineFor(code)
+			// The verdict write still has to land, so this is an Update, not a
+			// return: without it the backstop has nothing to retry with.
+			if !passed {
+				return nil
+			}
+			return s.cfg.Client.Status().Update(ctx, fresh)
 		}
 		if err := s.cfg.Client.Status().Update(ctx, fresh); err != nil {
 			return err
@@ -319,6 +335,47 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 	})
 	if updateErr != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: unpark task failed", "error", updateErr, "task", task.Name)
+		return
+	}
+	if declined != controller.DeclineNone {
+		// NOT an error, and NOT silent. This call site fires in DIRECT reaction to a
+		// maintainer comment on the single narrowest, highest-stakes re-entry rule
+		// in the F.6 table. The bare `if !ok { return nil }` this replaces is what
+		// made the 2026-07-27 stall undiagnosable: the approval label was visible on
+		// the forge and no log line anywhere said why the Task had not moved.
+		s.log.InfoContext(ctx, "pendingEvents: identity-unverified reverify declined",
+			"action", "pending_event_unpark_declined", "task", task.Name,
+			"stage_reason", stage.ReasonIdentityUnverified, "decline_kind", string(declined),
+			"grammar_passed", passed)
+		s.cfg.Metrics.UnparkDeclined(stage.ReasonIdentityUnverified, string(declined))
+	}
+}
+
+// verdictFrom collapses the per-Issue approval evidence into the Task's single
+// durable ApprovalVerdict. When several owned Issues approved, the NEWEST
+// evidence wins: the verdict answers "has a maintainer approved this Task", and
+// the newest approving comment is the one whose recency the backstop cares about.
+// Auto-approval evidence carries no CommentID and that is recorded faithfully.
+func verdictFrom(evidence map[string]*tatarav1.ApprovalEvidence, now time.Time) *tatarav1.ApprovalVerdict {
+	var bestName string
+	var best *tatarav1.ApprovalEvidence
+	for name, e := range evidence {
+		if e == nil {
+			continue
+		}
+		if best == nil || e.CreatedAt.After(best.CreatedAt.Time) {
+			best, bestName = e, name
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	return &tatarav1.ApprovalVerdict{
+		At:                metav1.NewTime(now),
+		IssueRef:          bestName,
+		CommentExternalID: best.CommentID,
+		Author:            best.Login,
+		Phrase:            best.Phrase,
 	}
 }
 
@@ -330,7 +387,15 @@ func (s *Server) loadOwnedIssues(ctx context.Context, task *tatarav1.Task) ([]ta
 	issues := make([]tatarav1.Issue, 0, len(task.Status.IssueRefs))
 	for _, name := range task.Status.IssueRefs {
 		var iss tatarav1.Issue
-		if err := s.cfg.Client.Get(ctx, objKey(s.cfg.Namespace, name), &iss); err != nil {
+		// UNCACHED (s.reader()), not s.cfg.Client. reverifyParked calls this
+		// microseconds after VerifyApprovalDetailed's objbudget.FitIssue wrote
+		// Status.Status="approved" to this very Issue CR, and a cached Get is not
+		// guaranteed to observe a write made through the same client - the informer
+		// converges only once the watch stream delivers it. A stale snapshot made
+		// allApproved false and the un-park declined silently, permanently, for a
+		// Task a maintainer had just approved (2026-07-27, gitlab helmfile#26). This
+		// is the escape hatch, not the fix: the fix is the driveUnparks backstop.
+		if err := s.reader().Get(ctx, objKey(s.cfg.Namespace, name), &iss); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}

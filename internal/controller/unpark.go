@@ -46,11 +46,46 @@ const (
 	// re-parked under a different reason). Rare and anomalous: the caller's
 	// view of the world had already drifted from the apiserver.
 	DeclineGuard UnparkDecline = "guard"
-	// DeclineRule means stage.Unpark's re-entry rule was evaluated against the
-	// live Task and was simply not satisfied yet. Normal steady state - most
-	// parked Tasks decline on most passes.
+	// DeclineRule is the FALLBACK for a stage-level decline code this package
+	// does not recognise. It is a bug-catcher: every code stage.UnparkDetailed
+	// can return has its own constant below, and a "rule" label appearing in
+	// operator_unpark_declined_total means the two vocabularies have drifted.
 	DeclineRule UnparkDecline = "rule"
+
+	// The rest MIRROR stage's decline vocabulary 1:1, so the metric's `kind`
+	// label carries WHICH condition refused rather than a shrug. They are
+	// declared here, not aliased, because internal/controller owns the metric
+	// and must not leak a stage-package identifier into a label value by
+	// accident.
+	DeclineNoHumanEvent     UnparkDecline = stage.DeclineNoHumanEvent
+	DeclineOverCap          UnparkDecline = stage.DeclineOverCap
+	DeclineGrammarNotPassed UnparkDecline = stage.DeclineGrammarNotPassed
+	DeclineNoOpenIssues     UnparkDecline = stage.DeclineNoOpenIssues
+	DeclineNotAllApproved   UnparkDecline = stage.DeclineNotAllApproved
+	DeclineMergedMR         UnparkDecline = stage.DeclineMergedMR
+	DeclineRoundsExhausted  UnparkDecline = stage.DeclineRoundsExhausted
+	DeclineTurnsExhausted   UnparkDecline = stage.DeclineTurnsExhausted
+	DeclineWrongParkedFrom  UnparkDecline = stage.DeclineWrongParkedFrom
+	DeclineIllegalEdge      UnparkDecline = stage.DeclineIllegalEdge
+	DeclineNoReentry        UnparkDecline = stage.DeclineNoReentry
 )
+
+// DeclineFor maps a stage-package decline code onto this package's typed
+// vocabulary. An unknown code falls back to DeclineRule, which is a bug-catcher
+// rather than a normal outcome.
+func DeclineFor(code string) UnparkDecline {
+	switch code {
+	case stage.DeclineNone:
+		return DeclineNone
+	case stage.DeclineNoHumanEvent, stage.DeclineOverCap, stage.DeclineGrammarNotPassed,
+		stage.DeclineNoOpenIssues, stage.DeclineNotAllApproved, stage.DeclineMergedMR,
+		stage.DeclineRoundsExhausted, stage.DeclineTurnsExhausted, stage.DeclineWrongParkedFrom,
+		stage.DeclineIllegalEdge, stage.DeclineNoReentry:
+		return UnparkDecline(code)
+	default:
+		return DeclineRule
+	}
+}
 
 // ApplyUnpark runs stage.Unpark for one parked Task and persists the re-entry
 // under optimistic concurrency. It is the SINGLE application of stage.Unpark,
@@ -116,7 +151,7 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			decline = DeclineGuard
 			return nil
 		}
-		to, ok := stage.Unpark(stage.UnparkInput{
+		to, code := stage.UnparkDetailed(stage.UnparkInput{
 			Task:            fresh,
 			Issues:          issues,
 			MRs:             mrs,
@@ -127,9 +162,9 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			MaxTurnsPerTask: maxTurns,
 			Now:             now,
 		})
-		if !ok {
+		if to == "" {
 			target = ""
-			decline = DeclineRule
+			decline = DeclineFor(code)
 			return nil
 		}
 		if err := c.Status().Update(ctx, fresh); err != nil {

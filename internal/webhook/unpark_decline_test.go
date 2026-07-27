@@ -15,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
@@ -60,10 +61,11 @@ func TestDriveCommentUnpark_GuardDecline_LogsKindAndCounts(t *testing.T) {
 	}
 }
 
-// A RULE decline (stage.Unpark's re-entry rule not satisfied - a bot-only
-// pendingEvent never un-parks) must be logged with decline_kind=rule and
-// counted, matching the existing TestDriveCommentUnpark_DeclineLogsInfo
-// behavior plus the new label/metric.
+// A normal steady-state decline (stage.UnparkDetailed's re-entry rule not
+// satisfied - a bot-only pendingEvent never un-parks, so DeclineNoHumanEvent)
+// must be logged with its specific decline_kind and counted, matching the
+// existing TestDriveCommentUnpark_DeclineLogsInfo behavior plus the new
+// label/metric.
 func TestDriveCommentUnpark_RuleDecline_LogsKindAndCounts(t *testing.T) {
 	proj := peProject("tatara-bot")
 	task := upTask("t-rule-webhook", "review", stage.ReasonAwaitingHuman)
@@ -84,12 +86,12 @@ func TestDriveCommentUnpark_RuleDecline_LogsKindAndCounts(t *testing.T) {
 		}
 	}
 	if found == nil {
-		t.Fatalf("no INFO log for the rule-declined un-park; log lines: %s", logBuf.String())
+		t.Fatalf("no INFO log for the declined un-park; log lines: %s", logBuf.String())
 	}
-	if found["decline_kind"] != "rule" {
-		t.Fatalf("decline_kind = %v, want rule: %+v", found["decline_kind"], found)
+	if found["decline_kind"] != string(controller.DeclineNoHumanEvent) {
+		t.Fatalf("decline_kind = %v, want %s: %+v", found["decline_kind"], controller.DeclineNoHumanEvent, found)
 	}
-	if got := testutil.ToFloat64(s.cfg.Metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, "rule")); got != 1 {
-		t.Fatalf("operator_unpark_declined_total{awaiting-human,rule} = %v, want 1", got)
+	if got := testutil.ToFloat64(s.cfg.Metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, string(controller.DeclineNoHumanEvent))); got != 1 {
+		t.Fatalf("operator_unpark_declined_total{awaiting-human,no-human-event} = %v, want 1", got)
 	}
 }

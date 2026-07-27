@@ -34,7 +34,7 @@ func TestDriveUnparksPaced_SkipsWithinFloor_FoldsResidualIntoRequeue(t *testing.
 	if requeue1 != 30*time.Second {
 		t.Fatalf("first pass requeue = %v, want the full 30s floor", requeue1)
 	}
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, "rule")); got != 1 {
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, string(DeclineNoHumanEvent))); got != 1 {
 		t.Fatalf("first pass must run driveUnparks and count one decline, got %v", got)
 	}
 
@@ -52,7 +52,7 @@ func TestDriveUnparksPaced_SkipsWithinFloor_FoldsResidualIntoRequeue(t *testing.
 	if requeue2 != 25*time.Second {
 		t.Fatalf("paced pass residual requeue = %v, want 25s (30s floor - 5s elapsed)", requeue2)
 	}
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, "rule")); got != 1 {
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, string(DeclineNoHumanEvent))); got != 1 {
 		t.Fatalf("a paced-out pass must not re-count a decline, got %v", got)
 	}
 
@@ -65,7 +65,7 @@ func TestDriveUnparksPaced_SkipsWithinFloor_FoldsResidualIntoRequeue(t *testing.
 	if requeue3 != 30*time.Second {
 		t.Fatalf("post-floor pass requeue = %v, want the full 30s floor again", requeue3)
 	}
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, "rule")); got != 2 {
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, string(DeclineNoHumanEvent))); got != 2 {
 		t.Fatalf("post-floor pass must run driveUnparks again and count a second decline, got %v", got)
 	}
 }
@@ -100,7 +100,7 @@ func TestDriveUnparksPaced_PerProjectFloor_DoesNotCrossThrottle(t *testing.T) {
 	if requeueB != 30*time.Second {
 		t.Fatalf("project B's first pass requeue = %v, want the full 30s floor (must not inherit project A's clock)", requeueB)
 	}
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, "rule")); got != 2 {
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, string(DeclineNoHumanEvent))); got != 2 {
 		t.Fatalf("both projects' first passes must each count one decline, got %v", got)
 	}
 }
