@@ -995,6 +995,17 @@ func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alph
 	l := log.FromContext(ctx)
 	marker := turn0Marker(task)
 
+	// Snapshot the events THIS turn is actually going to carry, before render and
+	// before the network round trip below. AppendTaskEvent's caller (the webhook
+	// handler) is NOT leader-elected and runs on every replica - unlike this
+	// reconcile, which the per-object-key workqueue plus leader election already
+	// serialises to at most one in flight per Task - so a new comment can land in
+	// status.pendingEvents while SubmitTurn is still outstanding. The drain below
+	// must remove exactly this snapshot, not whatever pendingEvents holds by the
+	// time it runs, or that late comment is erased having never been rendered
+	// into any turn (see drainRenderedEvents, task_events.go).
+	rendered := append([]tatarav1alpha1.TaskEvent(nil), task.Status.PendingEvents...)
+
 	text, err := r.renderBundle(ctx, proj, task, agentKind)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -1009,7 +1020,7 @@ func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alph
 	l.Info("turn submitted",
 		"action", "agent_turn_submit", "resource_id", task.Name, "turn_id", turnID,
 		"stage", task.Status.Stage, "agent_kind", agentKind, "phase", phase,
-		"events", len(task.Status.PendingEvents), "bytes", len(text),
+		"events", len(rendered), "bytes", len(text),
 		"duration_ms", int64(elapsed*1000))
 
 	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
@@ -1025,15 +1036,20 @@ func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alph
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("stamp turn marker (%s): %w", phase, err)
 	}
-	// E.3: the pending events were rendered into THIS bundle. They are the delta,
-	// and the delta is spent. Draining is also what terminates the conversation
-	// follow-up branch: with the delta spent, the next reconcile finds no events.
-	if len(task.Status.PendingEvents) > 0 {
+	// E.3: the pending events RENDERED (the `rendered` snapshot above) are the
+	// delta, and the delta is spent - remove exactly those, by value, from
+	// whatever pendingEvents holds NOW. Anything appended since the snapshot (a
+	// webhook write racing this turn) was never rendered and must survive to be
+	// carried by a later turn. Draining is also what terminates the conversation
+	// follow-up branch: with the rendered delta spent, the next reconcile finds
+	// no NEW events (unless one raced in, in which case it correctly still does).
+	if len(rendered) > 0 {
 		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-			if len(fresh.Status.PendingEvents) == 0 {
-				return false
+			drained := drainRenderedEvents(fresh.Status.PendingEvents, rendered)
+			if len(drained) == len(fresh.Status.PendingEvents) {
+				return false // nothing of the rendered snapshot was still there to remove
 			}
-			fresh.Status.PendingEvents = nil
+			fresh.Status.PendingEvents = drained
 			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("drain pending events: %w", err)

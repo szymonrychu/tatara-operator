@@ -134,6 +134,90 @@ func TestConversingRenderCountsBundleElision(t *testing.T) {
 	}
 }
 
+// REVIEW FINDING: the webhook handler (internal/webhook/server.go,
+// HandlerRunnable.NeedLeaderElection() == false) runs on every replica,
+// independent of leader election and of this reconcile loop, and calls
+// AppendTaskEvent directly. reconcile-vs-reconcile cannot race - the
+// controller-runtime workqueue serialises reconciles per object key, and
+// leader election means only one replica reconciles at all - but SubmitTurn
+// is a real network round trip to the wrapper pod, and a comment can land
+// in status.pendingEvents via the webhook while that round trip is still
+// outstanding. A drain that unconditionally nils pendingEvents at that point
+// erases the late comment: it was never rendered into any turn, and nothing
+// ever resends it - the exact failure this feature exists to fix, on its own
+// hot path.
+//
+// This reproduces the window directly: the fake Session's SubmitTurn calls
+// AppendTaskEvent mid-call (via sess.onSubmit), simulating the webhook
+// write landing between render and drain. The late event must survive THIS
+// reconcile's drain, and must be delivered as a genuine follow-up turn on
+// the next one.
+func TestConversingFollowUpDrainSurvivesAConcurrentAppend(t *testing.T) {
+	proj, task, r, sess := newConversingTurnFixture(t)
+	task.Annotations = map[string]string{
+		annStageTurn0:   turn0Marker(task),
+		annCurrentTurn:  "turn-0",
+		annTurnComplete: time.Now().UTC().Format(time.RFC3339),
+	}
+	task.Status.PendingEvents = []v1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "one more thing",
+	}}
+
+	late := v1alpha1.TaskEvent{
+		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu",
+		Body: "LATE ARRIVAL: landed while the turn was in flight",
+	}
+	sess.onSubmit = func() {
+		// The webhook handler's own path: Get, append, Status().Update - a
+		// SEPARATE object from the reconciler's "task", exactly like a real
+		// concurrent replica would use.
+		live := &v1alpha1.Task{}
+		if err := r.Get(context.Background(), objectKeyOf(task), live); err != nil {
+			t.Fatalf("get task mid-submit: %v", err)
+		}
+		if err := AppendTaskEvent(context.Background(), r.Client, live, late); err != nil {
+			t.Fatalf("append task event mid-submit: %v", err)
+		}
+	}
+
+	if _, err := r.reconcilePodStage(context.Background(), proj, task, "clarify", time.Now()); err != nil {
+		t.Fatalf("reconcilePodStage: %v", err)
+	}
+	if sess.submitted != 1 {
+		t.Fatalf("SubmitTurn called %d times, want 1", sess.submitted)
+	}
+
+	fresh := &v1alpha1.Task{}
+	if err := r.Get(context.Background(), objectKeyOf(task), fresh); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if len(fresh.Status.PendingEvents) != 1 || fresh.Status.PendingEvents[0].Body != late.Body {
+		t.Fatalf("PendingEvents = %+v, want exactly the late arrival to have survived the drain", fresh.Status.PendingEvents)
+	}
+
+	// The next reconcile, once the wrapper's callback marks the turn complete,
+	// must deliver the surviving event as a genuine follow-up turn - "survives
+	// the drain" is worthless if it is never actually delivered. onSubmit is a
+	// ONE-SHOT simulation of the concurrent webhook write; left armed it would
+	// fire again on this second SubmitTurn and inject a second late arrival,
+	// muddying what this assertion is actually proving.
+	sess.onSubmit = nil
+	task.Annotations[annTurnComplete] = time.Now().UTC().Format(time.RFC3339)
+	if _, err := r.reconcilePodStage(context.Background(), proj, task, "clarify", time.Now()); err != nil {
+		t.Fatalf("reconcilePodStage (follow-up): %v", err)
+	}
+	if sess.submitted != 2 {
+		t.Fatalf("SubmitTurn called %d times after the follow-up reconcile, want 2: the late arrival was never delivered", sess.submitted)
+	}
+	final := &v1alpha1.Task{}
+	if err := r.Get(context.Background(), objectKeyOf(task), final); err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if len(final.Status.PendingEvents) != 0 {
+		t.Errorf("PendingEvents = %d, want 0 after the late arrival's own turn", len(final.Status.PendingEvents))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -145,11 +229,23 @@ var _ agent.Session = (*countingSession)(nil)
 // (fakesession_test.go) but reduced to what this file needs: a bare submit
 // counter. SubmitTurn returns a fresh "turn-N" id and never errors; nothing
 // here exercises ErrBusy (task_controller_test.go covers that path).
+//
+// onSubmit, when set, fires INSIDE SubmitTurn, before it returns: this is
+// how TestConversingFollowUpDrainSurvivesAConcurrentAppend simulates the
+// webhook-vs-drain race - SubmitTurn is the real network round trip to the
+// wrapper pod, and the webhook handler that calls AppendTaskEvent runs on
+// every replica independent of leader election, so a comment can land in
+// status.pendingEvents at exactly this point: after render, before the
+// drain that follows SubmitTurn's return.
 type countingSession struct {
 	submitted int
+	onSubmit  func()
 }
 
 func (s *countingSession) SubmitTurn(_ context.Context, _, _, _ string) (string, error) {
+	if s.onSubmit != nil {
+		s.onSubmit()
+	}
 	s.submitted++
 	return "turn-" + strconv.Itoa(s.submitted), nil
 }
@@ -187,13 +283,19 @@ var conversingTurnRegistries = map[*TaskReconciler]*prometheus.Registry{}
 // once, at Build. A test that mutates its `task` pointer afterward - the
 // pattern every test in this file uses, and the pattern that matches a real
 // reconcile (handed an already-fetched, live object) - is invisible to that
-// snapshot: Get would keep returning the pre-mutation copy forever. Update is a
-// deliberate no-op against the underlying store for the same reason: nothing in
-// reconcilePodStage's flow re-Lists Task, so there is nothing for it to keep in
-// sync, and patchTaskAnnotations/patchTaskStatus's own `*task = *fresh` already
-// writes back through this exact pointer (task, live and the parameter named
-// "task" three call frames down are all literally the same struct), which is
-// what keeps a REAL reconcile's caller-held object current too.
+// snapshot: Get would keep returning the pre-mutation copy forever.
+//
+// Update/Status().Update write the incoming object's content INTO task via
+// DeepCopyInto, rather than relying on a caller's own copy-back (an earlier
+// version of this wrapper relied on patchTaskAnnotations/patchTaskStatus's own
+// `*task = *fresh` for that, which only holds when the caller's "task"
+// parameter happens to alias THIS exact pointer - true for reconcilePodStage's
+// own call chain, but NOT for a second, independent caller reading/writing
+// through a freshly Get'd copy of its own, which is exactly what
+// AppendTaskEvent does in TestConversingFollowUpDrainSurvivesAConcurrentAppend
+// to simulate the webhook handler's concurrent write. Writing unconditionally
+// here makes both callers correct without depending on which one happens to
+// hold the aliased pointer.
 type liveTaskClient struct {
 	client.Client
 	task *v1alpha1.Task
@@ -208,22 +310,25 @@ func (c *liveTaskClient) Get(ctx context.Context, key client.ObjectKey, obj clie
 }
 
 func (c *liveTaskClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
-	if _, ok := obj.(*v1alpha1.Task); ok {
+	if t, ok := obj.(*v1alpha1.Task); ok {
+		t.DeepCopyInto(c.task)
 		return nil
 	}
 	return c.Client.Update(ctx, obj, opts...)
 }
 
 func (c *liveTaskClient) Status() client.SubResourceWriter {
-	return &liveTaskStatusWriter{SubResourceWriter: c.Client.Status()}
+	return &liveTaskStatusWriter{SubResourceWriter: c.Client.Status(), task: c.task}
 }
 
 type liveTaskStatusWriter struct {
 	client.SubResourceWriter
+	task *v1alpha1.Task
 }
 
 func (w *liveTaskStatusWriter) Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-	if _, ok := obj.(*v1alpha1.Task); ok {
+	if t, ok := obj.(*v1alpha1.Task); ok {
+		t.DeepCopyInto(w.task)
 		return nil
 	}
 	return w.SubResourceWriter.Update(ctx, obj, opts...)

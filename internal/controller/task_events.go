@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
@@ -68,6 +69,55 @@ func appendEventCapped(events []tatarav1alpha1.TaskEvent, ev tatarav1alpha1.Task
 	out = append(out, ev)
 	if max > 0 && len(out) > max {
 		out = out[len(out)-max:]
+	}
+	return out
+}
+
+// drainRenderedEvents removes exactly the entries of rendered from current -
+// by VALUE, one occurrence each, wherever they sit in current - leaving
+// everything else (in particular anything appended after render) untouched.
+//
+// This is the fix for the webhook-vs-drain race: AppendTaskEvent's caller,
+// the webhook handler, runs on every replica regardless of leader election
+// (webhook.HandlerRunnable.NeedLeaderElection() is false - the reconcile
+// loop's per-object-key workqueue + leader election is what makes
+// reconcile-vs-reconcile impossible, but that guarantee does not reach the
+// webhook). A turn's SubmitTurn is a real network round trip; a comment can
+// land in status.pendingEvents while it is in flight. Unconditionally nil-ing
+// pendingEvents in the drain would silently erase that comment - it was never
+// rendered into any turn, and nothing would ever resend it. current has no
+// unique event id, so identity is the full value tuple (at/kind/repo/number/
+// author/body), which is what a real webhook-originated event is unique on in
+// practice.
+//
+// current is also NOT assumed to hold rendered as a strict prefix: the
+// maxPendingEvents cap (drop-oldest) can in principle evict an already-
+// rendered entry before this runs. A rendered entry no longer present is
+// simply not found and not removed - harmless, since there is nothing left to
+// remove.
+func drainRenderedEvents(current, rendered []tatarav1alpha1.TaskEvent) []tatarav1alpha1.TaskEvent {
+	if len(rendered) == 0 || len(current) == 0 {
+		return current
+	}
+	toRemove := make([]tatarav1alpha1.TaskEvent, len(rendered))
+	copy(toRemove, rendered)
+
+	out := make([]tatarav1alpha1.TaskEvent, 0, len(current))
+	for _, ev := range current {
+		matched := false
+		for i, r := range toRemove {
+			if reflect.DeepEqual(ev, r) {
+				toRemove = append(toRemove[:i], toRemove[i+1:]...)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, ev)
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
