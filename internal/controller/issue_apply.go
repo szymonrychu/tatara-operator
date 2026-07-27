@@ -63,22 +63,32 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 		return false, nil
 	}
 
+	// Tear the wrapper pod down inline, leader-safe (same idiom as the review
+	// appliers). The in-flight turn is abandoned; no half-finished branch is pushed.
+	//
+	// IT GOES FIRST, AHEAD OF EVERY OTHER FALLIBLE STEP, and that ordering is the
+	// only thing that makes it reliable. This function is UNREACHABLE on re-entry:
+	// the stage is now rejected, so AllowsIssueClosedStop is false and
+	// handleIssueClosed routes to the re-sever branch, which tears down nothing and
+	// no longer knows prevStage. Anything fallible placed above this line therefore
+	// leaks a LIVE interactive agent pod against a stopped Task until the Task is
+	// reaped - up to DeclinedProposalRetention now that the decline hold exists.
+	// Keep it first; do not add fallible work above it.
+	if stage.AgentKindFor(prevStage) != "" {
+		if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
+			return true, fmt.Errorf("issue-closed: delete wrapper pod for %s: %w", task.Name, err)
+		}
+	}
+
 	// Sever the closed issue from its Task. For an ORDINARY issue the mirror is a
 	// rebuildable projection: delete it (the reopen mint re-creates it via
 	// SyncIssue off the live open event), which is also the leak fix - a bare
 	// ownerRef drop would leave the closed CR un-owned AND un-cascadable. For a
 	// BRAINSTORM PROPOSAL the mirror is retained instead: see
-	// recordProposalDecline.
+	// recordProposalDecline. Both are recoverable on re-entry via the re-sever
+	// branch, which is why they sit below the teardown rather than above it.
 	if _, err := recordProposalDecline(ctx, c, task, issueName, now); err != nil {
 		return true, err
-	}
-
-	// Tear the wrapper pod down inline, leader-safe (same idiom as the review
-	// appliers). The in-flight turn is abandoned; no half-finished branch is pushed.
-	if stage.AgentKindFor(prevStage) != "" {
-		if err := agent.DeleteWrapper(ctx, c, task.Namespace, task); err != nil {
-			return true, fmt.Errorf("issue-closed: delete wrapper pod for %s: %w", task.Name, err)
-		}
 	}
 	log.FromContext(ctx).Info("issue closed mid-flight: stopped the task",
 		"action", "issue_closed_stop", "resource_id", task.Name,
@@ -86,31 +96,38 @@ func ApplyIssueClosedStop(ctx context.Context, c client.Client, task *tatarav1al
 	return true, nil
 }
 
-// severedButStillOwned is the RETAINED SHAPE predicate: t no longer LISTS
-// issueName in Status.IssueRefs, while still carrying an ownerRef on the mirror
-// (which every caller establishes from the CR side first).
+// severedButStillOwned is the RETAINED SHAPE predicate: t is iss's CONTROLLER
+// OWNER and yet no longer LISTS it in Status.IssueRefs.
 //
-// SeverRetainCR is the only thing that produces that combination DURABLY: the
+// BOTH conjuncts are evaluated HERE. An earlier version took the issue NAME and
+// tested only the ref list, leaving the ownership half to whatever the caller
+// happened to do first - which both callers did do, but a name that asserts a
+// conjunct the body never evaluates is a trap for the third one. Taking the
+// *Issue costs nothing: every caller already holds it.
+//
+// SeverRetainCR is the only thing that produces this combination DURABLY: the
 // other two sever modes leave no ownerRef behind, one by deleting the CR and one
 // by dropping the ref. It is not, however, the only thing that can produce it at
 // all - every own-then-list mint (mintIssueCRs, MintForItem, mintIssueCR,
 // linkArtifact) writes the ownerRef before appending the ref, so a crash between
 // the two leaves the same shape.
 //
-// A VERDICT CLAUSE IS WHAT CARRIES THE DISTINCTION, and both callers have one:
-// the reaper pairs this with state=="closed", the reopen undo with
-// status=="rejected". Neither can be true of a mint in flight - a mint is by
-// definition creating an OPEN issue, and it seeds status "new" - and every one of
-// those crash windows self-heals on the next reconcile anyway. Paired, this is
-// the durable, STAGE-INDEPENDENT signature of "this Task's only remaining
-// relationship to this mirror is that its reap will collect it". Do not use it
-// unpaired.
+// THE VERDICT CLAUSE IS THE CALLER'S, and deliberately so: the reaper pairs this
+// with state=="closed", the reopen undo with status=="rejected", and those are
+// genuinely different questions that cannot collapse into one predicate. Either
+// one excludes a mint in flight - a mint is by definition creating an OPEN issue,
+// and it seeds status "new" - and every one of those crash windows self-heals on
+// the next reconcile anyway. Paired with a verdict, this is the durable,
+// STAGE-INDEPENDENT signature of "this Task's only remaining relationship to this
+// mirror is that its reap will collect it". DO NOT USE IT WITHOUT A VERDICT
+// CLAUSE.
 //
 // Keying on the shape rather than on rejected(issue-closed) is what lets a
 // decline recorded against a PARKED owner get the same retention window and the
 // same reopen recovery as one recorded against a stopped Task.
-func severedButStillOwned(t *tatarav1alpha1.Task, issueName string) bool {
-	return !slices.Contains(t.Status.IssueRefs, issueName)
+func severedButStillOwned(t *tatarav1alpha1.Task, iss *tatarav1alpha1.Issue) bool {
+	owner, owned := own.ControllerOwner(iss)
+	return owned && owner == t.Name && !slices.Contains(t.Status.IssueRefs, iss.Name)
 }
 
 // proposalBotLogin resolves the owning Project's bot login for iss - the
@@ -274,21 +291,18 @@ func retainProposalDecline(ctx context.Context, c client.Client,
 		}
 		return fmt.Errorf("issue-closed: record the decline on %s: %w", iss.Name, err)
 	}
-	// Anchor the retention window on the DECLINE.
+	// Anchor the retention window on the DECLINE. UNCONDITIONAL on purpose:
+	// stampDeclinedAt is write-once against the live Task, so this is a no-op once
+	// anchored and a RETRY until it lands.
 	//
-	// THE TRIGGER IS "THE ANNOTATION IS ABSENT", NOT "we just stamped the verdict",
-	// and the difference is the whole retention. Keyed on the verdict write, a
-	// failed Update was never retried: re-entry finds status=rejected,
-	// short-circuits above, and the stamp never happens - while the FALLBACK for a
-	// parked owner is the park time, which is typically already expired, so the
-	// mirror is cascaded on the very next reap pass. That is the exact symptom
-	// this whole window exists to kill, reached by the one path that looked
-	// harmless. Absence keeps it write-once (it cannot slide forward) while making
-	// it retried on every reconcile until it lands.
-	if task.Annotations[AnnProposalDeclinedAt] == "" {
-		if err := stampDeclinedAt(ctx, c, task, now); err != nil {
-			return fmt.Errorf("issue-closed: stamp the decline clock on %s: %w", task.Name, err)
-		}
+	// It must NOT be gated on "we just stamped the verdict". Keyed that way a
+	// failed Update was never retried - re-entry finds status=rejected and
+	// short-circuits above - while the FALLBACK anchor for a parked owner is the
+	// park time, which is typically already expired, so the mirror is cascaded on
+	// the very next reap pass. That is the exact symptom this whole window exists
+	// to kill, reached by the one path that looked harmless.
+	if err := stampDeclinedAt(ctx, c, task, now); err != nil {
+		return fmt.Errorf("issue-closed: stamp the decline clock on %s: %w", task.Name, err)
 	}
 	if !stamped {
 		return nil
@@ -300,17 +314,23 @@ func retainProposalDecline(ctx context.Context, c client.Client,
 	return nil
 }
 
-// stampDeclinedAt records the decline time on the owner Task. It is the free
-// function twin of (*ProjectReconciler).annotateTask - this path holds a bare
-// client.Client, not the reconciler.
+// stampDeclinedAt records the decline time on the owner Task, WRITE-ONCE. It is
+// the free function twin of (*ProjectReconciler).annotateTask - this path holds a
+// bare client.Client, not the reconciler.
 //
-// Callers gate it on the annotation being ABSENT, which makes it write-once per
-// TASK rather than per decline. KNOWN, BOUNDED CONSEQUENCE: a Task that declines
-// a SECOND proposal keeps the first decline's clock, so the second mirror gets
-// the remainder of that window instead of a fresh one. It cannot slide a window
-// FORWARD, which is the direction that would matter, and in practice a proposal
-// gets its own clarify Task (mintClarifyTask, one per proposal), so a Task with
-// two retained mirrors is not a shape the propose path produces.
+// The write-once test is made against cur, the AUTHORITATIVE live copy fetched
+// inside the retry loop, not against the caller's possibly-stale in-memory Task.
+// That is what makes "cannot slide the window forward" a property of this
+// function rather than of caller discipline: a caller that has never read the
+// annotation, or read it before another writer landed one, still cannot overwrite
+// it. Callers therefore call unconditionally; an already-stamped Task is a no-op.
+//
+// KNOWN, BOUNDED CONSEQUENCE of write-once being per TASK: a Task that declines a
+// SECOND proposal keeps the first decline's clock, so the second mirror gets the
+// remainder of that window instead of a fresh one. It cannot EXTEND a window,
+// which is the direction that would matter, and in practice a proposal gets its
+// own clarify Task (mintClarifyTask, one per proposal), so a Task with two
+// retained mirrors is not a shape the propose path produces.
 func stampDeclinedAt(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, now time.Time) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var cur tatarav1alpha1.Task
@@ -319,6 +339,10 @@ func stampDeclinedAt(ctx context.Context, c client.Client, task *tatarav1alpha1.
 				return nil
 			}
 			return err
+		}
+		if cur.Annotations[AnnProposalDeclinedAt] != "" {
+			task.SetAnnotations(cur.Annotations) // already anchored; refresh the caller's copy
+			return nil
 		}
 		if cur.Annotations == nil {
 			cur.Annotations = map[string]string{}
@@ -397,7 +421,7 @@ func reopenRetainedProposal(ctx context.Context, c client.Client, iss *tatarav1a
 			// to sever from.
 		case err != nil:
 			return fmt.Errorf("proposal-reopened: get owning task %s: %w", ownerName, err)
-		case severedButStillOwned(&owner, iss.Name):
+		case severedButStillOwned(&owner, iss):
 			if err := SeverIssueFromTask(ctx, c, &owner, iss.Name, SeverOrphan); err != nil {
 				return err
 			}

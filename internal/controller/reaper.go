@@ -528,13 +528,14 @@ func (r *ProjectReconciler) holdsDeclinedProposal(ctx context.Context, proj *tat
 	botLogin := botLoginOf(proj)
 	for i := range list.Items {
 		iss := &list.Items[i]
-		if iss.Spec.ProjectRef != proj.Name || !ownedByTask(iss, t.Name) {
+		if iss.Spec.ProjectRef != proj.Name {
 			continue
 		}
 		// The retention exists to keep a DECLINE queryable, so the mirror has to be
-		// a closed, severed one. An owned open issue, or one the Task still lists,
-		// is live work and gets no extra window.
-		if iss.Status.State != "closed" || !severedButStillOwned(t, iss.Name) {
+		// one this Task owns, closed, and already severed. An open issue, one this
+		// Task does not own, or one it still lists is live work and gets no extra
+		// window. severedButStillOwned carries the ownership half itself.
+		if iss.Status.State != "closed" || !severedButStillOwned(t, iss) {
 			continue
 		}
 		if effectiveProposalKind(iss, botLogin) != tatarav1alpha1.ProposalKindBrainstorm {
@@ -557,17 +558,6 @@ func declinedAt(t *tatarav1alpha1.Task) time.Time {
 		}
 	}
 	return stageEnteredAt(t)
-}
-
-// ownedByTask reports whether obj carries an ownerRef naming a Task called name,
-// controller flag or not.
-func ownedByTask(obj client.Object, name string) bool {
-	for _, ref := range obj.GetOwnerReferences() {
-		if ref.Kind == "Task" && ref.APIVersion == tatarav1alpha1.GroupVersion.String() && ref.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 // reapParked splits the ONE park stage into its TWO populations.

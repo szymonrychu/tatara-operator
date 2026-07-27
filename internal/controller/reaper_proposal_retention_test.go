@@ -264,7 +264,8 @@ func TestParkedDeclineMirrorSurvivesToTheSameBoundary(t *testing.T) {
 				// The fake client runs no GC, so the cascade is asserted at its cause:
 				// the Task is gone and the mirror's only owner went with it.
 				require.NoError(t, err)
-				require.True(t, ownedByTask(&got, task.Name),
+				gotOwner, gotOwned := own.ControllerOwner(&got)
+				require.True(t, gotOwned && gotOwner == task.Name,
 					"the ownerRef is kept, so the deleted Task cascades the mirror")
 			}
 		})
@@ -341,5 +342,7 @@ func TestHeldTaskStillReleasesItsOtherArtifacts(t *testing.T) {
 	// keeps the ownerRef that bounds it.
 	require.Empty(t, mustGetIssue(t, c, other.Name).OwnerReferences,
 		"the unrelated open issue must be re-mintable now, not in 14 days")
-	require.True(t, ownedByTask(mustGetIssue(t, c, declined.Name), task.Name))
+	heldOwner, heldOwned := own.ControllerOwner(mustGetIssue(t, c, declined.Name))
+	require.True(t, heldOwned && heldOwner == task.Name,
+		"the declined mirror keeps the ownerRef that bounds it")
 }

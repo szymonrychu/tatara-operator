@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -15,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/agent"
 	"github.com/szymonrychu/tatara-operator/internal/own"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
@@ -28,6 +30,17 @@ import (
 // which is what mintIssueCR does for every proposal it files. stamped=false
 // leaves Spec empty so the legacy pre-O5 read path (effectiveProposalKind's
 // bot-authorship + anchor gated body-marker fallback) is the thing under test.
+// wrapperPodFor is the live agent pod ApplyIssueClosedStop must tear down.
+func wrapperPodFor(task *tatarav1alpha1.Task) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: agent.PodName(task), Namespace: testNS},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers:    []corev1.Container{{Name: "wrapper", Image: "wrapper:1"}},
+		},
+	}
+}
+
 // errTestStampFailed is the injected failure for the decline-clock retry test.
 var errTestStampFailed = errors.New("injected: annotation update failed")
 
@@ -612,4 +625,101 @@ func TestDeclineClockNeverSlidesForward(t *testing.T) {
 		getIssueCR(t, c, iss.Name), time.Now()))
 	require.Equal(t, stamped, getTaskCR(t, c, task.Name).Annotations[AnnProposalDeclinedAt],
 		"a re-entry must not slide the retention window forward")
+}
+
+// TestIssueClosedStopTearsDownTheWrapperBeforeAnyFallibleStep is the round-4
+// Important, and the bug it pins was introduced by round 3 making the decline
+// clock a hard error.
+//
+// ApplyIssueClosedStop is UNREACHABLE on re-entry: the stage is now rejected, so
+// AllowsIssueClosedStop is false and handleIssueClosed routes to the re-sever
+// branch, which tears down nothing and no longer knows prevStage. So any fallible
+// step ordered BEFORE the teardown leaks a live interactive agent pod against a
+// stopped Task until the Task is reaped - up to DeclinedProposalRetention now
+// that the decline hold exists. The teardown must therefore go first.
+func TestIssueClosedStopTearsDownTheWrapperBeforeAnyFallibleStep(t *testing.T) {
+	ctx := context.Background()
+	proj, repo := mirrorProject("tatara-bot"), mirrorRepo()
+	task := taskAtStage(tatarav1alpha1.StageClarifying, "")
+	task.Spec.Kind = "clarify"
+	iss := proposalMirror(task, tatarav1alpha1.ProposalKindBrainstorm, true)
+	task.Status.IssueRefs = []string{iss.Name}
+
+	// FAULT INJECTION: every Task annotation write fails, so the decline clock -
+	// the LAST fallible step - errors out. The pod must already be gone by then.
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo, task, iss, scmSecret(), wrapperPodFor(task)).
+		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.Task{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, cl client.WithWatch, obj client.Object,
+				opts ...client.UpdateOption) error {
+				if tk, isTask := obj.(*tatarav1alpha1.Task); isTask &&
+					tk.Annotations[AnnProposalDeclinedAt] != "" {
+					return apierrors.NewInternalError(errTestStampFailed)
+				}
+				return cl.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	_, err := ApplyIssueClosedStop(ctx, c, task, iss.Name, time.Now())
+	require.Error(t, err, "the failing step must still surface")
+
+	var pod corev1.Pod
+	perr := c.Get(ctx, types.NamespacedName{Namespace: testNS, Name: agent.PodName(task)}, &pod)
+	require.True(t, apierrors.IsNotFound(perr),
+		"the wrapper pod must be torn down BEFORE any fallible step: this function never runs again, "+
+			"so a pod left alive here outlives the stopped Task until it is reaped")
+}
+
+// TestSeveredButStillOwnedEvaluatesOwnershipItself: the name asserts a
+// conjunction and the body must evaluate all of it. A Task that does not own the
+// mirror is not in the retained shape however its ref list reads.
+func TestSeveredButStillOwnedEvaluatesOwnershipItself(t *testing.T) {
+	owner := taskAtStage(tatarav1alpha1.StageParked, stage.ReasonBacklogSweep)
+	stranger := &tatarav1alpha1.Task{ObjectMeta: metav1.ObjectMeta{Name: "other-task", Namespace: testNS}}
+	iss := proposalMirror(owner, tatarav1alpha1.ProposalKindBrainstorm, true)
+
+	for _, tc := range []struct {
+		name string
+		task *tatarav1alpha1.Task
+		refs []string
+		want bool
+	}{
+		{"controller owner, no longer listed", owner, nil, true},
+		{"controller owner, still listed", owner, []string{iss.Name}, false},
+		{"not the owner, and does not list it", stranger, nil, false},
+		{"not the owner, but lists it", stranger, []string{iss.Name}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := tc.task.DeepCopy()
+			probe.Status.IssueRefs = tc.refs
+			require.Equal(t, tc.want, severedButStillOwned(probe, iss))
+		})
+	}
+}
+
+// TestDeclineClockWriteOnceIsStructural: a caller holding a STALE Task (one that
+// has not observed the existing annotation) still cannot overwrite the anchor,
+// because the check is made against the live copy inside the retry loop.
+func TestDeclineClockWriteOnceIsStructural(t *testing.T) {
+	ctx := context.Background()
+	c, task, iss := seedParkedProposalClose(t, stage.ReasonBacklogSweep, tatarav1alpha1.ProposalKindBrainstorm, true)
+
+	first := time.Now().Add(-10 * 24 * time.Hour)
+	require.NoError(t, stampDeclinedAt(ctx, c, task, first))
+	anchored := getTaskCR(t, c, task.Name).Annotations[AnnProposalDeclinedAt]
+	require.NotEmpty(t, anchored)
+
+	// A stale caller: same object, annotation stripped from ITS copy only.
+	stale := getTaskCR(t, c, task.Name).DeepCopy()
+	stale.Annotations = nil
+	require.NoError(t, stampDeclinedAt(ctx, c, stale, time.Now()))
+
+	require.Equal(t, anchored, getTaskCR(t, c, task.Name).Annotations[AnnProposalDeclinedAt],
+		"write-once must hold against the live Task, not against whatever the caller last read")
+	require.Equal(t, anchored, stale.Annotations[AnnProposalDeclinedAt],
+		"and the caller's copy is refreshed to the authoritative value")
+	_ = iss
 }
