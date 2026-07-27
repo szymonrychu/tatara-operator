@@ -1679,7 +1679,7 @@ func TestReasonsIsTheClosedF5Set(t *testing.T) {
 		// the phase-2 drain never advanced the Task within HandoffDeadline.
 		"handoff-stalled",
 		// issue-closed: WS3-I3 rejected(issue-closed), the human-closed-the-driving
-		// -issue stop edge from the nine live stages.
+		// -issue stop edge from the ten live stages.
 		"issue-closed",
 		// tracked-elsewhere: investigating->rejected on submit_outcome(comment_issue),
 		// the incident agent appended evidence to an existing tracker rather than
@@ -2240,14 +2240,15 @@ func TestReenterOnReviewChangesRequested_NoOutcomeGuards(t *testing.T) {
 // WS3-I3: the rejected(issue-closed) stop edge.
 // ---------------------------------------------------------------------------
 
-// TestIssueClosedStopEdge asserts the nine LIVE source stages can enter
+// TestIssueClosedStopEdge asserts the ten LIVE source stages can enter
 // rejected(issue-closed) and that deploying/documenting/terminals cannot - the
 // F.3 table half of the WS3-I3 stop edge.
 func TestIssueClosedStopEdge(t *testing.T) {
 	live := []string{
 		v1alpha1.StageTriaging, v1alpha1.StageBrainstorming, v1alpha1.StageClarifying,
 		v1alpha1.StageInvestigating, v1alpha1.StageRefining, v1alpha1.StageApproved,
-		v1alpha1.StageImplementing, v1alpha1.StageReviewing, v1alpha1.StageMerging,
+		v1alpha1.StageImplementing, v1alpha1.StageReviewing, v1alpha1.StageConversing,
+		v1alpha1.StageMerging,
 	}
 	for _, from := range live {
 		if !stage.Legal(from, v1alpha1.StageRejected) {

@@ -495,7 +495,7 @@ func TestEveryIllegalTransitionIsRefusedAndCounted(t *testing.T) {
 				// Self-transitions are a silent no-op (issue #403), covered by
 				// TestSelfTransitionIsANoOpNotCounted, not an illegal-and-counted
 				// edge: they never appear in the F.3 table (stage.Legal(x,x) is
-				// always false), so without this skip every one of the 15 stages
+				// always false), so without this skip every one of the 16 stages
 				// would be double-counted as "illegal" here too.
 				continue
 			}
