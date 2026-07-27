@@ -297,7 +297,7 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.ensureLabelColors(ctx, &project)
 
-	scanRequeue, scanErr := r.runScans(ctx, &project)
+	scanRequeue, scanRepos, scanExisting, scanRdr, scanErr := r.runScans(ctx, &project)
 	if scanErr != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, scanErr
@@ -309,31 +309,25 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// landing on a proposal Issue. It is a no-op unless the backlog is
 	// actually short: the control law reads the same Issue CRs either way, so
 	// running it even on a reconcile where the cron path JUST refilled costs
-	// one List and nothing else - brainstormRefillDecision's deficit clamp and
-	// the brainstorm QueuedEvent's dedup key both make a double-refill
-	// impossible.
+	// nothing extra - brainstormRefillDecision's deficit clamp and the
+	// brainstorm QueuedEvent's dedup key both make a double-refill impossible.
+	//
+	// Reuses scanRepos/scanExisting/scanRdr, the SAME repos/existing-tasks/
+	// reader runScans already fetched this pass, instead of re-listing or
+	// re-resolving them a second time (O6 review Minor 3). A pass where
+	// runScans could not resolve the reader (bad scmSecretRef, ReaderFor
+	// unwired, etc) leaves scanRdr nil here too; runScans has already
+	// logged that failure at ERROR (scan_reader_error), so this simply skips
+	// rather than re-attempting and re-logging the identical failure (O6
+	// review Minor 4).
 	//
 	// The skip breaker gates ONLY this path (brainstormRefillDecision checks
 	// trigger == TriggerEvent); the cron tick above ignores it and is the
 	// thing that resets it, so a genuinely dry idea space still costs at most
 	// one session per cron period even if every event wake gets suppressed.
 	if cron := brainstormCronSpec(&project); cron != nil && cron.Enabled {
-		repos, rerr := r.projectReposForScan(ctx, &project)
-		if rerr != nil {
-			r.Metrics.ReconcileResult("Project", "error")
-			return ctrl.Result{}, fmt.Errorf("event refill: list repos: %w", rerr)
-		}
-		existing, eerr := r.existingScanTasks(ctx, &project)
-		if eerr != nil {
-			r.Metrics.ReconcileResult("Project", "error")
-			return ctrl.Result{}, fmt.Errorf("event refill: list existing tasks: %w", eerr)
-		}
-		if reader, readerErr := r.scanReader(ctx, &project); readerErr == nil {
-			r.brainstorm(ctx, &project, reader, repos, existing, *cron, TriggerEvent)
-		} else {
-			l.Info("event refill: scm reader unavailable (retry next reconcile)",
-				"action", "scan_brainstorm_event_reader_unavailable", "resource_id", project.Name,
-				"err", readerErr.Error())
+		if scanRdr != nil {
+			r.brainstorm(ctx, &project, scanRdr, scanRepos, scanExisting, *cron, TriggerEvent)
 		}
 		// The periodic resync is the BACKSTOP poll interval for a lost watch
 		// event, not the workqueue's error rate limiter (reconcile.Result

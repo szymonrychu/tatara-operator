@@ -264,7 +264,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans: %v", err)
 		}
 
@@ -310,7 +310,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans: %v", err)
 		}
 
@@ -331,7 +331,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans: %v", err)
 		}
 		if nextExpectedSeriesExists(t, "nx-doc-off", "documentation") {
@@ -348,7 +348,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans: %v", err)
 		}
 		if nextExpectedSeriesExists(t, "nx-doc-norepo", "documentation") {
@@ -365,7 +365,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans: %v", err)
 		}
 		for _, activity := range []string{"issueScan", SweepActivity} {
@@ -385,7 +385,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (enabled pass): %v", err)
 		}
 		if !nextExpectedSeriesExists(t, "nx-transition", "brainstorm") {
@@ -396,7 +396,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 		// and reconcile again with the SAME in-memory object runScans already
 		// operates on directly (it never re-fetches Spec for this check).
 		proj.Spec.Scm.Cron.Brainstorm.Enabled = false
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (disabled pass): %v", err)
 		}
 		if nextExpectedSeriesExists(t, "nx-transition", "brainstorm") {
@@ -419,7 +419,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (healthy pass): %v", err)
 		}
 		before := testutil.ToFloat64(obs.SweepNextExpectedTimestamp.WithLabelValues("nx-reader-fail", "issueScan"))
@@ -432,7 +432,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 		// requeue with a NIL error (no reconcile-error metric, just a log line)
 		// before repos is ever listed - the concrete scenario the review named.
 		proj.Spec.ScmSecretRef = "does-not-exist"
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (broken reader pass): %v", err)
 		}
 
@@ -455,7 +455,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 
 		r := newScanReconciler(&fakeReader{})
 		r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (healthy pass): %v", err)
 		}
 		if !nextExpectedSeriesExists(t, "nx-zero-repos", "issueScan") {
@@ -469,7 +469,7 @@ func TestPublishNextExpected_ThroughRunScans(t *testing.T) {
 		if err := k8sClient.Delete(context.Background(), repo); err != nil {
 			t.Fatalf("delete fixture repo: %v", err)
 		}
-		if _, err := r.runScans(context.Background(), proj); err != nil {
+		if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 			t.Fatalf("runScans (zero-repo pass): %v", err)
 		}
 
@@ -502,7 +502,7 @@ func TestRunScans_CronClearedRetractsNextExpected(t *testing.T) {
 
 	r := newScanReconciler(&fakeReader{})
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
-	if _, err := r.runScans(context.Background(), proj); err != nil {
+	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans (healthy pass): %v", err)
 	}
 	for _, activity := range []string{"issueScan", SweepActivity, "brainstorm"} {
@@ -513,7 +513,7 @@ func TestRunScans_CronClearedRetractsNextExpected(t *testing.T) {
 
 	// Clear spec.scm.cron exactly as a human editing the Project spec would.
 	proj.Spec.Scm.Cron = nil
-	if _, err := r.runScans(context.Background(), proj); err != nil {
+	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans (cron cleared pass): %v", err)
 	}
 	for _, activity := range []string{"issueScan", SweepActivity, "brainstorm"} {

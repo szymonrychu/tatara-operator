@@ -30,10 +30,12 @@ const brainstormResyncInterval = 15 * time.Minute
 // provenance gate only (Spec.ProposalKind), never its forgeable body-marker
 // fallback (which requires bot-authorship corroboration this callsite cannot
 // perform). That is deliberately narrower than the counting predicate: a
-// legacy, still-unstamped proposal's verdict is still caught by the
-// brainstormResyncInterval cron backstop, and O5's reconciler backfill stamps
-// the issue on its own next pass, so the gap is rollout-bounded, not
-// permanent.
+// legacy, still-unstamped proposal's verdict is still picked up within
+// brainstormResyncInterval (15m) by the periodic resync Reconcile folds into
+// every brainstorm-enabled Project's requeue, and O5's reconciler backfill
+// stamps the issue on its own next pass - so the gap is bounded to that 15m
+// window at most, not "until the next cron tick" (which could be up to a
+// full schedule period away) and not permanent.
 func proposalPendingChanged(oldIss, newIss *tatarav1alpha1.Issue) bool {
 	if oldIss.Spec.ProposalKind != tatarav1alpha1.ProposalKindBrainstorm &&
 		newIss.Spec.ProposalKind != tatarav1alpha1.ProposalKindBrainstorm {
@@ -76,8 +78,14 @@ func proposalVerdictPredicate() predicate.Predicate {
 			return ok1 && ok2 && proposalPendingChanged(oldIss, newIss)
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
+			// O6 review Minor 6: gate on proposalPending, matching CreateFunc,
+			// instead of the bare ProposalKind check this used to be - a
+			// delete of an issue that was stamped brainstorm but already
+			// DECIDED (approved/rejected/done, or simply closed) frees no
+			// slot, so admitting it would wake the Project for a guaranteed
+			// no-op deficit computation.
 			iss, ok := e.Object.(*tatarav1alpha1.Issue)
-			return ok && iss.Spec.ProposalKind == tatarav1alpha1.ProposalKindBrainstorm
+			return ok && proposalPending(iss, "")
 		},
 		GenericFunc: func(event.GenericEvent) bool { return false },
 	}

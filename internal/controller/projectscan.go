@@ -564,7 +564,19 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		proj.Status.BrainstormConsecutiveSkips, trigger)
 
 	if !refill {
-		l.Info("brainstorm: no refill this pass",
+		// O6 review Important 2: the EVENT trigger runs this decision on every
+		// reconcile of a brainstorm-enabled project (tens-of-seconds cadence),
+		// not just on a due cron tick like the pre-O6 code - so a healthy
+		// at-target project logging this "no refill" line at INFO would emit it
+		// continuously, the exact anti-pattern O4's review already deleted from
+		// projectProposalIssues. The CRON path still fires at most once per
+		// schedule period, so it keeps the INFO level; the EVENT path drops to
+		// V(1) (debug).
+		logSkip := l.Info
+		if trigger == TriggerEvent {
+			logSkip = l.V(1).Info
+		}
+		logSkip("brainstorm: no refill this pass",
 			"action", "scan_brainstorm_skipped", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,
 			"deficit", deficit, "trigger", trigger, "reason", reason,
@@ -1197,9 +1209,14 @@ func (r *ProjectReconciler) publishNextExpected(proj *tatarav1alpha1.Project, re
 }
 
 // runScans runs each due activity and returns the soonest next-fire as a
-// requeue duration. Cron parsing/SCM/create failures are logged and skipped per
-// activity so one bad activity never blocks the others or crashes the reconciler.
-func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.Project) (time.Duration, error) {
+// requeue duration, plus the repos/existing-tasks/reader it fetched along the
+// way (nil on any early-return path that never reached the fetch). Cron
+// parsing/SCM/create failures are logged and skipped per activity so one bad
+// activity never blocks the others or crashes the reconciler. A caller that
+// needs the SAME scan-scoped data this pass - the O6 event-driven refill pass
+// in Reconcile - reuses these return values instead of re-listing/
+// re-resolving them a second time this reconcile (O6 review Minor 3).
+func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.Project) (time.Duration, []tatarav1alpha1.Repository, []tatarav1alpha1.Task, scm.SCMReader, error) {
 	l := log.FromContext(ctx)
 	if proj.Spec.Scm == nil || proj.Spec.Scm.Cron == nil || r.ReaderFor == nil {
 		// spec.scm and spec.scm.cron are +optional pointers: a Project that had
@@ -1217,7 +1234,7 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		// proj.Spec.Scm.Cron and cannot run before this guard without its own
 		// nil-guard rewrite, review finding).
 		obs.SweepNextExpectedTimestamp.DeletePartialMatch(prometheus.Labels{"project": proj.Name})
-		return 0, nil
+		return 0, nil, nil, nil, nil
 	}
 	// repos is populated below (after the reader/list-repos calls) but must be
 	// in scope for the defer now: publishNextExpected's issueScan/sweep branch
@@ -1284,17 +1301,17 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	reader, rerr := r.scanReader(ctx, proj)
 	if rerr != nil {
 		l.Error(rerr, "scan: resolve reader", "action", "scan_reader_error", "resource_id", proj.Name)
-		return maxScheduleRequeue, nil
+		return maxScheduleRequeue, nil, nil, nil, nil
 	}
 	var err error
 	repos, err = r.projectReposForScan(ctx, proj)
 	if err != nil {
-		return 0, err
+		return 0, nil, nil, nil, err
 	}
 	reposLoaded = true
 	existing, err := r.existingScanTasks(ctx, proj)
 	if err != nil {
-		return 0, err
+		return 0, nil, nil, nil, err
 	}
 
 	// THE B.4 SWEEP. Since the Task 20 cutover it is the ONLY intake: issueScan,
@@ -1334,6 +1351,23 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 	// barrier defers ONLY brainstorm - mrScan/issueScan/healthCheck run on
 	// their own schedules regardless. Both Succeeded and Failed refine release
 	// the gate so a broken refine never wedges brainstorm.
+	//
+	// O6 REVIEW, Important 1: this refine barrier runs UNCONDITIONALLY of the
+	// eventual refill decision - it fires (and, when needed, mints a refine
+	// Task) the moment the brainstorm schedule is due, BEFORE brainstorm() is
+	// even called below, so it never learns nor cares whether the backlog
+	// still has a deficit. That independence is load-bearing now that O6's
+	// event-driven refill path exists: the event path deliberately BYPASSES
+	// this barrier entirely (re-running refine per maintainer verdict was
+	// rejected as too expensive - approved design, not an oversight), which
+	// means the CRON tick above is refine's ONLY trigger. If this barrier were
+	// ever made conditional on brainstorm's own deficit (e.g. skipped
+	// whenever the event path has already kept the project at target),
+	// refine would silently stop running for any healthy, well-served
+	// project - see TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget,
+	// which pins exactly this: a refine Task still gets created on a due cron
+	// tick even with TargetOpenProposals=0, where brainstorm() can never
+	// decide to refill.
 	if cronSpec.Brainstorm.Enabled {
 		if base, due, next, ok := r.activityDue(proj, "brainstorm"); ok {
 			if due {
@@ -1455,5 +1489,5 @@ func (r *ProjectReconciler) runScans(ctx context.Context, proj *tatarav1alpha1.P
 		}
 	}
 
-	return soonest, nil
+	return soonest, repos, existing, reader, nil
 }
