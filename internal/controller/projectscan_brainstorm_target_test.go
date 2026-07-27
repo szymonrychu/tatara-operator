@@ -181,6 +181,95 @@ func TestBrainstormInFlightSessionCountsTowardTheTarget(t *testing.T) {
 	}
 }
 
+// forgeReadCalls is the total SCM fan-out cost of one brainstorm() pass:
+// ListOpenIssues per repo plus gatherRepoCIState's ListOpenPRs per repo, all of
+// which runProjectScopedProposalCycle pays BEFORE createBrainstormTask's dedup
+// key gets a chance to throw the result away.
+func forgeReadCalls(rd *perRepoFakeReader) int { return rd.issueCalls + rd.prCalls }
+
+// TestBrainstormInFlightSkipsTheForgeFanOut pins a COST property, not a
+// correctness one, and it is the property the target-law refactor silently
+// dropped. Pre-target-backlog, brainstorm() opened with a hard early return on
+// the in-flight guard; the target law demoted that to an arithmetic term
+// (inflight = 1 inside the deficit), which still leaves deficit > 0 for any
+// target above pending+1 - here 3 - 0 - 1 = 2. The event trigger then made this
+// decision run on every Project reconcile (30s floor), so the whole per-repo
+// fan-out re-ran every 30s for the entire duration of every session and every
+// one of its results was discarded by the dedup key at the very END.
+//
+// Asserting "no second QueuedEvent" would prove nothing: the dedup key already
+// guaranteed that before and after. The assertion has to be on the READER.
+func TestBrainstormInFlightSkipsTheForgeFanOut(t *testing.T) {
+	tests := []struct {
+		name        string
+		slug        string
+		inflight    bool
+		wantCreated bool
+		wantReads   bool
+	}{
+		{"a live session suppresses the cycle before any forge read", "bs-fanout-live", true, false, false},
+		{"an idle project still pays for the fan-out and refills", "bs-fanout-idle", false, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			proj, repos := seedBrainstormProject(t, tc.slug, []string{"o/" + tc.slug}, ptrInt(3))
+			rd := emptyReader("o/" + tc.slug)
+			r := newScanReconciler(rd)
+			var existing []tatarav1alpha1.Task
+			if tc.inflight {
+				existing = []tatarav1alpha1.Task{liveBrainstormTask(proj)}
+			}
+
+			created := r.brainstorm(ctx, proj, rd, repos, existing,
+				proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+
+			if created != tc.wantCreated {
+				t.Fatalf("brainstorm created = %v, want %v", created, tc.wantCreated)
+			}
+			if got := forgeReadCalls(rd); (got > 0) != tc.wantReads {
+				t.Fatalf("forge read calls = %d, want %s", got,
+					map[bool]string{true: "at least one", false: "exactly zero"}[tc.wantReads])
+			}
+		})
+	}
+}
+
+// TestBrainstormQueuedEventSkipsTheForgeFanOut covers the other half of the
+// short-circuit: the queued-but-not-admitted window. brainstormInFlightProject
+// only sees a minted TASK, so between EnqueueEvent and admission inflight reads
+// 0 and the fan-out would run on every pass for as long as the event sits
+// queued. The second pass here must cost exactly nothing.
+func TestBrainstormQueuedEventSkipsTheForgeFanOut(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-fanout-queued", []string{"o/q1"}, ptrInt(3))
+	rd := emptyReader("o/q1")
+	r := newScanReconciler(rd)
+
+	if created := r.brainstorm(ctx, proj, rd, repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); !created {
+		t.Fatal("the first pass must enqueue a brainstorm event")
+	}
+	first := forgeReadCalls(rd)
+	if first == 0 {
+		t.Fatal("the first pass must actually reach the forge, otherwise the second-pass assertion proves nothing")
+	}
+
+	// No Task exists yet - only the Queued QueuedEvent - so the in-flight guard
+	// above is still 0 here and the queued check is the only thing holding the
+	// line.
+	if created := r.brainstorm(ctx, proj, rd, repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); created {
+		t.Fatal("a still-queued brainstorm event must suppress a second refill")
+	}
+	if got := forgeReadCalls(rd); got != first {
+		t.Fatalf("the second pass made %d extra forge reads while the event was still queued; want 0", got-first)
+	}
+	if n := len(listBrainstormQEs(t, proj.Name)); n != 1 {
+		t.Fatalf("want exactly 1 brainstorm QueuedEvent, got %d", n)
+	}
+}
+
 func TestBrainstormBreakerSuppressesTheEventPathOnly(t *testing.T) {
 	ctx := context.Background()
 	proj, repos := seedBrainstormProject(t, "bs-tgt-breaker", []string{"o/r1"}, ptrInt(3))

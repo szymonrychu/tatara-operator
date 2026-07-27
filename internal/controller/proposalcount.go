@@ -112,8 +112,24 @@ func proposalPending(iss *tatarav1alpha1.Issue, botLogin string) bool {
 // block renders. Issue.Status.Status alone cannot distinguish "discarded" from
 // "never triaged", so a closed-and-not-approved issue reads as declined: a
 // maintainer who just closes the issue has discarded the proposal.
+//
+// "done" MUST be folded into approved and MUST be tested before the closed
+// check. CloseIssuesOnDelivery (merge.go) stamps a SHIPPED proposal
+// State="closed" Status="done", which would otherwise fall through to the
+// closed arm and render every successfully delivered proposal as "declined" for
+// the whole of DeliveredRetention - at the TOP of the newest-first window, where
+// the pod prompt tells the agent a declined proposal is a killed idea. The agent
+// would read "we built and shipped this" as "the maintainer killed this" and
+// infer the exact opposite maintainer preference from the block whose entire
+// purpose is carrying verdict rationale. The rest of the branch already knows
+// done is not a decline (retainProposalDecline, proposalPending); only this
+// mapping missed it.
+//
+// The three-status contract (open|approved|declined) is FROZEN: the shipped
+// tatara-agent-skills text on the other side consumes exactly these three, so a
+// fourth status for "delivered" is not available here.
 func proposalDisplayStatus(iss *tatarav1alpha1.Issue) string {
-	if iss.Status.Status == "approved" {
+	if iss.Status.Status == "approved" || iss.Status.Status == "done" {
 		return "approved"
 	}
 	if iss.Status.Status == "rejected" || iss.Status.State == "closed" {

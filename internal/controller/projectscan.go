@@ -132,6 +132,14 @@ func hasLabel(labels []string, want string) bool {
 	return false
 }
 
+// brainstormDedupKey is the natural key a project's brainstorm QueuedEvent is
+// enqueued under. One definition, two readers: createBrainstormTask (the
+// enqueue) and brainstorm()'s pre-fan-out queued check, which is only a valid
+// short-circuit while both agree on the key.
+func brainstormDedupKey(proj *tatarav1alpha1.Project) string {
+	return "brainstorm-" + proj.Name
+}
+
 // createBrainstormTask enqueues a project-scoped brainstorm QueuedEvent.
 // Returns created=true when a new event was enqueued. quota is the resolved
 // per-session proposal allowance; it rides as AnnBrainstormQuota, which
@@ -141,7 +149,7 @@ func (r *ProjectReconciler) createBrainstormTask(ctx context.Context, proj *tata
 	if proj.Spec.Scm != nil {
 		provider = proj.Spec.Scm.Provider
 	}
-	dedupKey := "brainstorm-" + proj.Name
+	dedupKey := brainstormDedupKey(proj)
 	payload := tatarav1alpha1.QueuedEventPayload{
 		Kind:   "brainstorm",
 		Goal:   goal,
@@ -562,6 +570,46 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	deficit := brainstormDeficit(target, pending, inflight)
 	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
 		proj.Status.BrainstormConsecutiveSkips, trigger)
+
+	// SHORT-CIRCUIT BEFORE THE SCM FAN-OUT. Everything past the !refill branch
+	// below reads the forge per repo: ListOpenIssues, then gatherRepoCIState
+	// (ListOpenPRs + up to 20 GetCommitCIStatus + GetDefaultBranchHeadSHA +
+	// GetCommitCIStatus). Concurrency is pinned at ONE brainstorm session per
+	// project by design, so while one is live that whole fan-out is guaranteed to
+	// be thrown away by the dedup key at the very END, inside createBrainstormTask.
+	//
+	// This early return is LOAD-BEARING FOR COST, not for correctness, and it must
+	// stay an early return. Before the target-backlog change brainstorm() opened
+	// with a hard early return on brainstormInFlightProject; the target law demoted
+	// it to an arithmetic term (inflight = 1 in the deficit), which still leaves
+	// deficit > 0 for any target above pending+1. Combined with the event trigger
+	// running this decision on EVERY Project reconcile (30s floor), that re-ran the
+	// fan-out every 30s for the whole duration of every session - tens of wasted
+	// forge calls per repo-set per 30s against a shared hourly token budget.
+	// Deferring costs nothing: the deficit is recomputed the moment the session
+	// terminates. This is not a decision to stay short, it is a decision not to
+	// decide while busy.
+	if refill && inflight > 0 {
+		refill, reason = false, "in-flight"
+	}
+	// The queued-but-not-admitted window. brainstormInFlightProject only sees a
+	// minted TASK; between EnqueueEvent and admission there is only a QueuedEvent,
+	// so inflight reads 0 there and the fan-out would run every pass for as long
+	// as the event sits queued. Keyed on exactly the natural key
+	// createBrainstormTask enqueues under. Fails CLOSED on a read error: skipping
+	// one pass is strictly cheaper than a fan-out the enqueue would dedup away.
+	if refill {
+		queued, qerr := queue.QueuedEventStillQueued(ctx, r.Client, proj.Namespace, proj.Name, brainstormDedupKey(proj))
+		switch {
+		case qerr != nil:
+			l.Error(fmt.Errorf("brainstorm: check queued event for %s: %w", proj.Name, qerr),
+				"brainstorm: queued-event check failed",
+				"action", "scan_brainstorm_error", "resource_id", proj.Name, "trigger", trigger)
+			refill, reason = false, "queued-check-failed"
+		case queued:
+			refill, reason = false, "already-queued"
+		}
+	}
 
 	if !refill {
 		// O6 review Important 2: the EVENT trigger runs this decision on every

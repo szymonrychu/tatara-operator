@@ -149,7 +149,17 @@ func TestProposalDisplayStatus(t *testing.T) {
 		{"explicit rejection is declined", iss("brainstorm", "open", "rejected", "r1"), "declined"},
 		{"a maintainer who just closes it has discarded it", iss("brainstorm", "closed", "new", "r1"), "declined"},
 		{"still awaiting a decision", iss("brainstorm", "open", "new", "r1"), "open"},
-		{"done is not a proposal verdict; it reads as open", iss("brainstorm", "open", "done", "r1"), "open"},
+		// A SHIPPED proposal. CloseIssuesOnDelivery (merge.go) stamps exactly this
+		// pair on delivery, and without the done arm it falls into the closed check
+		// and renders as "declined" - at the top of the newest-first history window,
+		// where the pod prompt tells the agent a declined proposal is a killed idea.
+		// The agent would then read every successful delivery as a maintainer
+		// rejection for the whole of DeliveredRetention.
+		{"a delivered proposal is not a decline", iss("brainstorm", "closed", "done", "r1"), "approved"},
+		// done must beat the closed check, so it cannot be state-dependent: an
+		// Issue mid-delivery whose state has not been mirrored back yet reads the
+		// same way. done is never "awaiting a decision" (proposalPending agrees).
+		{"done outranks state", iss("brainstorm", "open", "done", "r1"), "approved"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

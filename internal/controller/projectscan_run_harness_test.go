@@ -22,9 +22,14 @@ type fakeReader struct {
 	// commentCalls counts ListIssueComments invocations, for tests asserting the
 	// per-cycle comment cache dedupes repeated gate reads of the same issue.
 	commentCalls int
+	// prCalls counts ListOpenPRs invocations. gatherRepoCIState is the second half
+	// of the brainstorm SCM fan-out, so this is how a test proves the cycle was
+	// short-circuited BEFORE the fan-out rather than after it.
+	prCalls int
 }
 
 func (f *fakeReader) ListOpenPRs(context.Context, string, string) ([]scm.PRRef, error) {
+	f.prCalls++
 	return f.prs, f.prErr
 }
 func (f *fakeReader) ListOpenIssues(context.Context, string, string) ([]scm.IssueRef, error) {
@@ -150,9 +155,14 @@ type perRepoFakeReader struct {
 	issuesByRepo map[string][]scm.IssueRef
 	// errRepos is the set of "owner/repo" slugs that return an error.
 	errRepos map[string]bool
+	// issueCalls counts ListOpenIssues invocations. It is the FIRST call of the
+	// brainstorm SCM fan-out, so a test that asserts zero here has proved the
+	// cycle never reached the forge at all.
+	issueCalls int
 }
 
 func (f *perRepoFakeReader) ListOpenIssues(_ context.Context, owner, repo string) ([]scm.IssueRef, error) {
+	f.issueCalls++
 	slug := owner + "/" + repo
 	if f.errRepos[slug] {
 		return nil, fmt.Errorf("fake error for %s", slug)

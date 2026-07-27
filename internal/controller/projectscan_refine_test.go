@@ -424,7 +424,8 @@ func TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget(t *testing.T) {
 	}
 	reader := &fakeReader{issues: []scm.IssueRef{{Repo: "o/r", Number: 1, Title: "open issue"}}}
 	r := newScanReconciler(reader)
-	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
+	reg := prometheus.NewRegistry()
+	r.Metrics = obs.NewOperatorMetrics(reg)
 
 	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
 		t.Fatalf("runScans: %v", err)
@@ -433,7 +434,16 @@ func TestRefineBarrierRunsEvenWhenBrainstormBacklogIsAtTarget(t *testing.T) {
 	if len(listRefineQEs(t, "refine-attarget")) == 0 {
 		t.Fatalf("want refine to run on the cron's own due cadence even though brainstorm has no deficit to refill")
 	}
-	if len(listBrainstormQEs(t, "refine-attarget")) != 0 {
-		t.Fatalf("want brainstorm to correctly decide no refill (target=0), not to be blocked just because refine ran")
+	// The barrier just minted this cycle's refine Task, so brainstorm is DEFERRED
+	// behind it on this very pass - brainstorm() is not reached at all. A bare
+	// "no brainstorm QueuedEvent" assertion cannot tell that apart from
+	// "brainstorm ran and decided target=0 means no refill", so assert the thing
+	// that does discriminate: brainstorm() sets the target gauge on EVERY decision
+	// exit it takes, so the series being absent proves it never ran this pass.
+	if n := len(listBrainstormQEs(t, "refine-attarget")); n != 0 {
+		t.Fatalf("want brainstorm deferred behind the refine barrier, got %d brainstorm QueuedEvents", n)
+	}
+	if got, ok := brainstormTargetSeries(t, reg, "refine-attarget"); ok {
+		t.Fatalf("operator_brainstorm_target_proposals{project=refine-attarget} = %v; the refine barrier must defer brainstorm() entirely on the pass that mints the refine Task", got)
 	}
 }

@@ -5833,7 +5833,7 @@ spec:
                               StaleProposalDays configures the staleness reaper that auto-closes
                               bot-authored proposals with no human engagement (no human comment, no live
                               work) for at least that many days, clearing dead proposals out of the
-                              MaxOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
+                              TargetOpenProposals backlog. Semantics (liveness finding #8): a POSITIVE value
                               sets an explicit window; the UNSET default (0) enables the reaper with a
                               generous-but-finite default window (defaultStaleProposalDays) so un-approved
                               proposals do not accumulate unboundedly; a NEGATIVE value is the explicit
