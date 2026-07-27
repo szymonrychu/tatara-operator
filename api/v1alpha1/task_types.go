@@ -569,6 +569,18 @@ type TaskStatus struct {
 	// rotate a pod forever. Nothing in the pod lifecycle touches this field.
 	// +optional
 	ConversationLastEventAt *metav1.Time `json:"conversationLastEventAt,omitempty"`
+	// BotRounds counts CONSECUTIVE agent-authored comment rounds on this Task with
+	// no intervening human comment. It is reset to zero by any human comment.
+	//
+	// It is COUNTED AND EXPOSED, and deliberately NEVER ACTED ON (decision D7):
+	// there is no ping-pong cap, and the stage machine is trusted to terminate an
+	// agent-to-agent exchange because every agent run ends in an outcome that
+	// moves the Task. The counter exists because the 2026-06 production incident
+	// was exactly this shape - a reactivation loop that posted 40+ duplicate bot
+	// comments - and nothing was counting, so a human found it by reading the
+	// thread. operator_bot_rounds is its fleet-wide view.
+	// +optional
+	BotRounds int `json:"botRounds,omitempty"`
 	// MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
 	// Persisted so a restarted operator resumes and never re-merges.
 	// +optional

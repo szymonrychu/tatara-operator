@@ -105,6 +105,27 @@ spec:
                     Comment is one comment mirrored from the forge onto an Issue or
                     MergeRequest.
                   properties:
+                    agentKind:
+                      description: |-
+                        AgentKind is the RESOLVED authorship of an OPERATOR-AUTHORED comment: the
+                        agent kind whose work produced it, stamped by the operator at the moment it
+                        posted the comment and keyed by the forge's own ExternalID. Empty on every
+                        comment the operator did not write.
+
+                        It is the platform's answer to "which agent said this", and it is
+                        deliberately NOT a login comparison: the bot login is one string shared by
+                        every agent kind, and login matching is a documented weak trust boundary.
+                        This field is the operator's own write ledger, so a bot comment with NO
+                        entry resolves to "" and triggers nothing - the rule FAILS CLOSED.
+                      enum:
+                      - brainstorm
+                      - incident
+                      - clarify
+                      - refine
+                      - review
+                      - documentation
+                      - implement
+                      type: string
                     author:
                       type: string
                     body:

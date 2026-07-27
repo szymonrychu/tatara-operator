@@ -36,3 +36,19 @@ func TestConversingMetrics_NilSafe(t *testing.T) {
 	m.ConversingEntryDeclined("p", "over-ceiling")
 	m.ConversingClosed("p", "idle")
 }
+
+func TestBotRoundsMetric(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := obs.NewOperatorMetrics(reg)
+
+	m.SetBotRounds("infrastructure", 3)
+
+	if got := testutil.ToFloat64(m.BotRoundsGauge("infrastructure")); got != 3 {
+		t.Errorf("operator_bot_rounds{infrastructure} = %v, want 3", got)
+	}
+}
+
+func TestBotRoundsMetric_NilSafe(t *testing.T) {
+	var m *obs.OperatorMetrics
+	m.SetBotRounds("p", 1)
+}

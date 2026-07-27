@@ -18,6 +18,7 @@ type taskMetrics struct {
 	conversingPods          *prometheus.GaugeVec
 	conversingEntryDeclined *prometheus.CounterVec
 	conversingClosedTotal   *prometheus.CounterVec
+	botRounds               *prometheus.GaugeVec
 }
 
 // newTaskMetrics registers the task collectors on reg and returns the bundle.
@@ -85,6 +86,10 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 			Name: "operator_conversing_closed_total",
 			Help: "Conversations ended, by project and cause (idle | evicted). A rising evicted rate means the ceiling is the binding constraint, not the idle window.",
 		}, []string{"project", "cause"}),
+		botRounds: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_bot_rounds",
+			Help: "Highest consecutive agent-authored comment rounds with no intervening human comment, by project. There is deliberately no ping-pong cap (decision D7); this gauge is the ONLY way a cycling agent pair becomes observable before a human finds it by reading duplicate comments.",
+		}, []string{"project"}),
 	}
 	reg.MustRegister(
 		m.taskTokensTotal,
@@ -100,6 +105,7 @@ func newTaskMetrics(reg prometheus.Registerer) *taskMetrics {
 		m.conversingPods,
 		m.conversingEntryDeclined,
 		m.conversingClosedTotal,
+		m.botRounds,
 	)
 	return m
 }
@@ -331,4 +337,17 @@ func (m *OperatorMetrics) ConversingClosed(project, cause string) {
 // ConversingClosedCounter returns the operator_conversing_closed_total counter.
 func (m *OperatorMetrics) ConversingClosedCounter(project, cause string) prometheus.Counter {
 	return m.conversingClosedTotal.WithLabelValues(project, cause)
+}
+
+// SetBotRounds sets operator_bot_rounds for one project.
+func (m *OperatorMetrics) SetBotRounds(project string, n float64) {
+	if m == nil || m.botRounds == nil {
+		return
+	}
+	m.botRounds.WithLabelValues(project).Set(n)
+}
+
+// BotRoundsGauge returns the operator_bot_rounds gauge for a project.
+func (m *OperatorMetrics) BotRoundsGauge(project string) prometheus.Gauge {
+	return m.botRounds.WithLabelValues(project)
 }

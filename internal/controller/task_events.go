@@ -52,6 +52,11 @@ func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.
 		// conversing: nothing reads the field outside that stage.
 		now := metav1.Now()
 		fresh.Status.ConversationLastEventAt = &now
+		// A HUMAN spoke. The consecutive-agent-round streak is over. AppendTaskEvent
+		// is only ever reached with a bot-authored event through the narrow D4
+		// cross-kind path, which bumps the counter itself AFTER this call, so
+		// resetting here is correct for both callers.
+		fresh.Status.BotRounds = 0
 		return c.Status().Update(ctx, fresh)
 	})
 	if err != nil {
@@ -59,6 +64,46 @@ func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.
 	}
 	*task = *fresh
 	return nil
+}
+
+// AppendAgentTaskEvent is the D4 cross-kind path's counterpart to
+// AppendTaskEvent, for the one caller (deliverAgentComment) that queues a
+// BOT-authored event. It appends the same capped TaskEvent and stamps the same
+// idle-clock reset, but INCREMENTS Task.status.botRounds instead of resetting
+// it, in the SAME Get-mutate-Update transaction, and returns the new count.
+//
+// It deliberately does NOT compose as AppendTaskEvent(...) followed by a
+// separate bump: AppendTaskEvent's human-comment reset (added just below) runs
+// on every call regardless of caller, because AppendTaskEvent has no signal to
+// tell a bot-authored append from a human one. Composing the two calls in
+// either order would either zero-then-rebump BotRounds to exactly 1 on EVERY
+// consecutive round (Append first) or bump-then-immediately-zero it (Bump
+// first) - both cap the counter at a fixed value and defeat the entire point of
+// a CONSECUTIVE round counter: the 2026-06 incident was 40+ rounds, not 1.
+// A single atomic transaction that increments instead of resetting is the only
+// way this path counts correctly. NOTHING reads the returned count to make a
+// decision (decision D7) - it is observability only.
+func AppendAgentTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent) (int, error) {
+	key := client.ObjectKeyFromObject(task)
+	fresh := &tatarav1alpha1.Task{}
+	rounds := 0
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh = &tatarav1alpha1.Task{}
+		if err := c.Get(ctx, key, fresh); err != nil {
+			return err
+		}
+		fresh.Status.PendingEvents = appendEventCapped(fresh.Status.PendingEvents, ev, maxPendingEvents)
+		now := metav1.Now()
+		fresh.Status.ConversationLastEventAt = &now
+		fresh.Status.BotRounds++
+		rounds = fresh.Status.BotRounds
+		return c.Status().Update(ctx, fresh)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("task_events: append agent task event on %s: %w", task.Name, err)
+	}
+	*task = *fresh
+	return rounds, nil
 }
 
 // appendEventCapped appends ev to events, keeping at most max entries by

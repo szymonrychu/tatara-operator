@@ -61,6 +61,19 @@ type Comment struct {
 	// STRUCTURAL bot exclusion relied on by the approval grammar (C.6) and by
 	// the pendingEvents enqueue filter (E.3).
 	IsBot bool `json:"isBot,omitempty"`
+	// AgentKind is the RESOLVED authorship of an OPERATOR-AUTHORED comment: the
+	// agent kind whose work produced it, stamped by the operator at the moment it
+	// posted the comment and keyed by the forge's own ExternalID. Empty on every
+	// comment the operator did not write.
+	//
+	// It is the platform's answer to "which agent said this", and it is
+	// deliberately NOT a login comparison: the bot login is one string shared by
+	// every agent kind, and login matching is a documented weak trust boundary.
+	// This field is the operator's own write ledger, so a bot comment with NO
+	// entry resolves to "" and triggers nothing - the rule FAILS CLOSED.
+	// +kubebuilder:validation:Enum=brainstorm;incident;clarify;refine;review;documentation;implement
+	// +optional
+	AgentKind string `json:"agentKind,omitempty"`
 	// Truncated is true when the ingest cut Body at 8192 bytes. The bundle
 	// renders truncated="true" on the <comment> element so the agent knows the
 	// text is partial and can pull the full body from the forge if it matters.

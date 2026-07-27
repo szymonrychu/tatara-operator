@@ -130,6 +130,95 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 	s.driveConversingEntry(ctx, &proj, task)
 }
 
+// deliverAgentComment is the D4 cross-kind path: an agent-authored comment on an
+// owned thread, delivered to a DIFFERENT agent kind than the one that wrote it.
+//
+// Everything about it is deliberately narrower than deliverPendingEvent:
+//   - the authoring kind comes from the operator's own comment ledger, never from
+//     the actor login, and an unresolved author is refused;
+//   - the reacting kind comes from the Task's stage, so a settled, delivered or
+//     merging Task starts nothing (decision D2);
+//   - same-kind is refused BY CONSTRUCTION, so an agent can never wake itself -
+//     though the round still gets COUNTED (below), because the D7 counter tracks
+//     every agent-authored round on a live conversation, not only the ones that
+//     happen to open a fresh one;
+//   - the C.6 approval grammar is never run and no un-park rule is evaluated: a
+//     bot comment cannot approve anything, ever.
+//
+// The consecutive-round counter (AppendAgentTaskEvent) is maintained here and is
+// NEVER acted on (decision D7): there is no ping-pong cap.
+func (s *Server) deliverAgentComment(ctx context.Context, proj tatarav1.Project, repo *tatarav1.Repository, ev scm.WebhookEvent) {
+	if repo == nil || !ev.IsComment {
+		return
+	}
+	obj, kind := s.resolveMirrorTarget(ctx, repo, ev)
+	if obj == nil {
+		return
+	}
+	task := s.resolveOwningTask(ctx, &proj, repo, obj, ev)
+	if task == nil {
+		return
+	}
+
+	authorKind := controller.ResolveCommentAgentKind(obj, strconv.Itoa(ev.CommentID))
+	reactingKind := controller.ReactingAgentKind(task)
+	if authorKind == "" || reactingKind == "" {
+		// FAIL CLOSED on either side: an unresolved author is a comment whose
+		// provenance the operator cannot vouch for (no ledger entry, predates the
+		// ledger, or was never operator-authored at all), and an unresolved
+		// reacting kind is a Task that is not in a live conversational state
+		// (settled, delivered, merging, or parked for a non-conversational reason).
+		// Neither case counts as a round: there is nothing here the operator can
+		// attribute to an agent landing on a live conversation.
+		s.log.InfoContext(ctx, "pendingEvents: agent comment unresolved; refusing",
+			"action", "agent_comment_declined", "task", task.Name, "project", proj.Name,
+			"author_kind", authorKind, "reacting_kind", reactingKind)
+		s.cfg.Metrics.ConversingEntryDeclined(proj.Name, "unresolved")
+		return
+	}
+
+	taskEv := tatarav1.TaskEvent{
+		At: metav1.Now(), Kind: kind, Repo: repo.Name, Number: ev.Number,
+		Author: ev.ActorLogin, Body: ev.CommentBody,
+	}
+	rounds, err := controller.AppendAgentTaskEvent(ctx, s.cfg.Client, task, taskEv)
+	if err != nil {
+		s.log.ErrorContext(ctx, "pendingEvents: append agent task event failed", "error", err, "task", task.Name)
+		return
+	}
+	s.cfg.Metrics.SetBotRounds(proj.Name, float64(rounds))
+
+	if !controller.CrossKindTriggers(authorKind, reactingKind) {
+		// Same-kind: refused BY CONSTRUCTION. The round is already counted above;
+		// nothing further happens - no conversing entry, no re-drive.
+		s.log.InfoContext(ctx, "pendingEvents: agent comment landed same-kind; round counted, no trigger",
+			"action", "agent_comment_same_kind", "task", task.Name, "project", proj.Name,
+			"author_kind", authorKind, "reacting_kind", reactingKind, "bot_rounds", rounds)
+		s.cfg.Metrics.ConversingEntryDeclined(proj.Name, "same-kind")
+		return
+	}
+
+	s.log.InfoContext(ctx, "pendingEvents: queued a cross-kind agent event",
+		"action", "agent_comment_queued", "task", task.Name, "project", proj.Name,
+		"author_kind", authorKind, "reacting_kind", reactingKind, "bot_rounds", rounds)
+
+	// driveConversingEntry is the ONLY re-entry attempted here, deliberately.
+	// stage.Unpark's F.6 rules (driveCommentUnpark's target, for parked(awaiting-
+	// human)) and reverifyParked's C.6 grammar (parked(identity-unverified)) are
+	// NEVER called from this path: both structurally require hasNonBotEvent - a
+	// GENUINE human-authored pendingEvent - and a bot-authored event can never
+	// satisfy that (by construction, not by an extra check here), so calling them
+	// would only ever decline. reverifyParked in particular must never even be
+	// attempted: it feeds the comment TEXT into the C.6 approval grammar, and a
+	// bot-authored comment must never be fed into that grammar - "a bot comment
+	// cannot approve anything, ever". A parked Task's queued event rides along,
+	// counted above, and waits for a genuine human comment or the daily sweep.
+	// driveConversingEntry itself is a harmless no-op on a non-live-stage Task
+	// (ConversingEntryEligible), so this call is exactly as narrow for a parked
+	// Task as it is active for one in clarifying/reviewing.
+	s.driveConversingEntry(ctx, &proj, task)
+}
+
 // driveConversingEntry moves a live clarifying/reviewing Task into conversing on
 // a qualifying comment, so the comment reaches an agent instead of only sitting
 // in pendingEvents. Best-effort, like every other side effect in this file: a

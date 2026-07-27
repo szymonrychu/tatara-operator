@@ -198,6 +198,11 @@ func (d *StageDriver) DrainPendingReview(ctx context.Context, mr *tatarav1alpha1
 			Line:        c.Line,
 			InReplyTo:   c.InReplyTo,
 			ReviewRound: pr.Round,
+			// THE AUTHORSHIP LEDGER. This is the operator posting a REVIEW comment,
+			// so the agent kind that produced it is review. Without this stamp a
+			// later cross-kind trigger cannot tell which agent spoke and fails
+			// closed, which is safe but silent.
+			AgentKind: stage.AgentReview,
 		}
 		if err := AppendCommentToMirror(ctx, d.Client, d.spiller(proj), mr, cmt); err != nil {
 			return err
@@ -613,6 +618,11 @@ func (d *StageDriver) postThreadComment(ctx context.Context, proj *tatarav1alpha
 		}
 		cmt := mirrorCommentFrom(proj, c)
 		cmt.InReplyTo = pc.InReplyTo
+		// Same ledger, other write site. The drained pending comment was authored
+		// by the agent whose Task owns the mirror; read that kind from the owning
+		// Task rather than assuming, so an issue-side clarify comment is not
+		// mislabelled as review.
+		cmt.AgentKind = pendingCommentAgentKind(ctx, d.Client, obj)
 		if err := AppendCommentToMirror(ctx, d.Client, d.spiller(proj), obj, cmt); err != nil {
 			return err
 		}
@@ -762,6 +772,22 @@ func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alph
 // file-level finding (#398); scm.ReviewFinding.Line stays a plain int here,
 // so nil lowers to 0 as a placeholder - WP4 teaches the forge posting path to
 // treat 0 as "no line, do not anchor inline" instead of a real diff line.
+// pendingCommentAgentKind resolves the agent kind that authored a drained pending
+// comment: the CURRENT agent kind of the Task that controller-owns the mirror.
+// An unowned mirror, a missing Task or a pod-less stage all yield "", which the
+// cross-kind trigger reads as "unresolved" and refuses to act on.
+func pendingCommentAgentKind(ctx context.Context, c client.Client, obj client.Object) string {
+	ownerName, ok := own.ControllerOwner(obj)
+	if !ok {
+		return ""
+	}
+	var task tatarav1alpha1.Task
+	if err := c.Get(ctx, client.ObjectKey{Namespace: obj.GetNamespace(), Name: ownerName}, &task); err != nil {
+		return ""
+	}
+	return task.Status.AgentKind
+}
+
 func scmFindings(in []tatarav1alpha1.ReviewFinding) []scm.ReviewFinding {
 	out := make([]scm.ReviewFinding, 0, len(in))
 	for _, f := range in {
