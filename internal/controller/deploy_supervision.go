@@ -27,6 +27,7 @@ var deployPinFiles = []string{
 	"values/tatara-operator/default.yaml",
 	"values/project-tatara/common.yaml",
 	"values/project-infrastructure/common.yaml",
+	"values/project-mtg/common.yaml",
 }
 
 // mergePRSquash is the SINGLE writer.Merge call site in the controller. Every
@@ -55,6 +56,7 @@ var releaseArtifact = map[string]string{
 	"tatara-operator":        "tatara-operator",
 	"project-tatara":         "tatara-operator",
 	"project-infrastructure": "tatara-operator",
+	"project-mtg":            "tatara-operator",
 }
 
 // helmfileReleaseRe matches a `- name: <release>` line in helmfile.yaml.gotmpl so
