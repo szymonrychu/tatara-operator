@@ -89,14 +89,33 @@ func TestConversingEdges(t *testing.T) {
 	}
 }
 
-// A kind=review Task conversing must not reach implementing or merging by any
-// path, exactly as from every other stage.
+// A kind=review Task conversing must not reach implementing, merging, or
+// approved by any path, exactly as from every other stage.
+//
+// The implementing/merging assertions below are VACUOUS on their own:
+// Legal(conversing, implementing) and Legal(conversing, merging) are already
+// false (neither pair is in the F.3 table AT ALL), so LegalFor would return
+// false for ANY kind, guard or no guard - deleting GUARD 1's kind check
+// entirely would not fail them. Legal(conversing, approved) IS in the table
+// (a clarify agent's decision=implement moves ANY kind there), so that
+// assertion is the one that actually exercises GUARD 1: without it, a
+// kind=review Task that reached conversing via reviewing -> conversing and
+// then submitted decision=implement would land in approved and sit there -
+// unable to reach implementing (still blocked) and unable to un-park on its
+// own - until the 24h admission-starved budget elapsed (2026-07-28 security
+// review IMPORTANT 3).
 func TestConversingReviewKindStillBarredFromImplementing(t *testing.T) {
 	task := &v1alpha1.Task{}
 	task.Spec.Kind = "review"
 	task.Status.Stage = v1alpha1.StageConversing
 	if stage.LegalFor(task, nil, v1alpha1.StageConversing, v1alpha1.StageImplementing) {
 		t.Fatal("a kind=review Task reached implementing from conversing")
+	}
+	if stage.LegalFor(task, nil, v1alpha1.StageConversing, v1alpha1.StageMerging) {
+		t.Fatal("a kind=review Task reached merging from conversing")
+	}
+	if stage.LegalFor(task, nil, v1alpha1.StageConversing, v1alpha1.StageApproved) {
+		t.Fatal("a kind=review Task reached approved from conversing - it would wedge there, unable to advance or un-park, until admission-starved (24h)")
 	}
 }
 

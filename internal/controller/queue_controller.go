@@ -675,6 +675,15 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 			fresh.Status.PodStartedAt = task.Status.PodStartedAt
 			fresh.Status.StageWorkStartedAt = task.Status.StageWorkStartedAt
 			fresh.Status.Stats.PodRecreations = task.Status.Stats.PodRecreations
+			// ConversationLastEventAt: target here is always implementing today (the
+			// bug-catcher above notes approved -> implementing is the only edge that
+			// reaches this branch), so stage.Enter never actually stamped it on this
+			// path - but copying it anyway keeps this field-by-field mirror honest
+			// against stage.Enter's real output rather than against today's ONE
+			// caller, so a future admission edge that DID target conversing could
+			// never silently lose the idle clock's arming to this omission
+			// (2026-07-28 security review Minor).
+			fresh.Status.ConversationLastEventAt = task.Status.ConversationLastEventAt
 			return true
 		}
 		if fresh.Status.AgentKind == agentKind {

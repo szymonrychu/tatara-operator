@@ -135,6 +135,15 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 // in pendingEvents. Best-effort, like every other side effect in this file: a
 // failure is logged and never surfaced to the SCM as a non-2xx.
 func (s *Server) driveConversingEntry(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
+	// The cheap check FIRST: most comments land on a Task that could never
+	// qualify (delivered, merging, implementing, parked-for-a-non-conversational
+	// reason, ...), and this is a free map lookup versus ConversingHasRoom's
+	// namespace List - which used to run unconditionally, on EVERY webhook
+	// comment, before this stage even mattered (2026-07-28 security review
+	// IMPORTANT 5).
+	if !controller.ConversingEntryEligible(task.Status.Stage) {
+		return
+	}
 	room, err := controller.ConversingHasRoom(ctx, s.reader(), proj)
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed", "error", err, "task", task.Name)
@@ -253,7 +262,21 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
-	target, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, false, time.Now())
+	// backlog-sweep never consults ConversingHasRoom (stage.go's ReasonBacklogSweep
+	// branch), so the capacity List only runs for the one reason that needs it
+	// here - awaiting-human - and a transient failure degrades to "no room"
+	// (the safe fallback) rather than aborting this comment-driven unpark
+	// entirely (2026-07-28 security review IMPORTANT 4).
+	conversingRoom := false
+	if task.Status.StageReason == stage.ReasonAwaitingHuman {
+		room, roomErr := controller.ConversingHasRoom(ctx, s.reader(), proj)
+		if roomErr != nil {
+			s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed; treating as no room", "error", roomErr, "task", task.Name)
+		} else {
+			conversingRoom = room
+		}
+	}
+	target, decline, err := controller.ApplyUnpark(ctx, s.cfg.Client, s.cfg.APIReader, proj, task, active, maxOpen, false, conversingRoom, time.Now())
 	if err != nil {
 		s.log.ErrorContext(ctx, "pendingEvents: comment-driven unpark failed", "error", err, "task", task.Name)
 		return
@@ -333,13 +356,18 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 	}
 	// Task 9's conversing branch of the identity-unverified F.6 rule (a comment
 	// that fails the grammar opens a conversation instead of a dead end) needs
-	// the SAME ceiling answer ApplyUnpark now computes for the other two
-	// production callers - reused via controller.ConversingHasRoom, never
-	// reimplemented, off the uncached reader like every other read on this path.
+	// the SAME ceiling answer ApplyUnpark's other two callers compute - reused
+	// via controller.ConversingHasRoom, never reimplemented, off the uncached
+	// reader like every other read on this path. A failure here degrades to "no
+	// room" (the safe fallback) rather than returning early: this reverify's
+	// whole point is that the ApprovalVerdict write below must land WHETHER OR
+	// NOT the un-park succeeds, and bailing out here before that write would
+	// throw away a genuine grammar pass over a transient capacity-check error
+	// (2026-07-28 security review IMPORTANT 4).
 	conversingRoom, err := controller.ConversingHasRoom(ctx, s.reader(), proj)
 	if err != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed", "error", err, "task", task.Name)
-		return
+		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed; treating as no room", "error", err, "task", task.Name)
+		conversingRoom = false
 	}
 	key := client.ObjectKeyFromObject(task)
 	var declined controller.UnparkDecline

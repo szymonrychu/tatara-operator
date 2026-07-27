@@ -366,11 +366,11 @@ var Transitions = map[string][]Edge{
 	// turn - a conversation that goes quiet becomes an ordinary park, and an
 	// ordinary park is re-entered by the ordinary F.6 rules.
 	v1alpha1.StageConversing: podStageEdges(
-		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND the C.6 grammar passes for EVERY owned Issue, exactly as from clarifying"},
+		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND verifyApprovalScope's LIVE C.6 grammar passes for EVERY owned Issue, exactly as from clarifying. Refused by LegalFor's GUARD 1 for a kind=review Task (a review Task owns zero Issues, so the grammar can never pass for it anyway; the guard makes that refusal structural rather than merely likely)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS, exactly as from clarifying"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "the conversation went idle past conversationIdleMinutes (after a handoff turn), the per-project conversing ceiling evicted the longest-idle conversation (after a handoff turn), or decision=discuss"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
-		Edge{To: v1alpha1.StageReviewing, Trigger: "the conversation was entered FROM reviewing and the agent hands the thread back for a fresh review round. LegalFor's kind guard is untouched: implementing and merging remain unreachable for a kind=review Task"},
+		Edge{To: v1alpha1.StageReviewing, Trigger: "the conversation was entered FROM reviewing and the agent hands the thread back for a fresh review round. LegalFor's kind guard is untouched: implementing, merging AND approved remain unreachable for a kind=review Task, by any path"},
 		issueClosedEdge(),
 	),
 
@@ -470,13 +470,23 @@ func Legal(from, to string) bool { return legalPairs[[2]string{from, to}] }
 
 // LegalFor is Legal plus the two guards that need the Task and its owned MRs.
 //
-// GUARD 1 (fixes V7-1, V6-3, C3-2). A kind=review Task may NEVER enter
-// implementing or merging. Not from reviewing on request_changes (the review
-// agent's NORMAL verdict on a bad human PR - the PRIMARY path v6 missed), not
-// from reviewing on approve, not from parked by any un-park rule, not from
-// anywhere. There is no author check to get wrong because the sweep ignores
-// bot-authored non-adoptable PRs, so EVERY review Task is non-bot-authored by
-// construction. Merging or fixing a human's PR is a HUMAN action.
+// GUARD 1 (fixes V7-1, V6-3, C3-2; widened 2026-07-28 security review IMPORTANT
+// 3). A kind=review Task may NEVER enter implementing, merging, or approved.
+// Not from reviewing on request_changes (the review agent's NORMAL verdict on a
+// bad human PR - the PRIMARY path v6 missed), not from reviewing on approve,
+// not from parked by any un-park rule, not from conversing (Task 9: a
+// kind=review Task reaches conversing via reviewing -> conversing, and its
+// clarify agent can submit decision=implement same as any other conversing
+// Task), not from anywhere. approved is included because it is the admission
+// GATE to implementing, not a destination in its own right for a Task that can
+// never be admitted: without this a kind=review Task stuck submitting
+// decision=implement would reach approved and sit there - unable to advance
+// (implementing is still blocked) and unable to un-park on its own - until the
+// 24h admission-starved budget elapses, a wedge rather than a crash but still a
+// wasted Task no comment can recover. There is no author check to get wrong
+// because the sweep ignores bot-authored non-adoptable PRs, so EVERY review
+// Task is non-bot-authored by construction. Merging or fixing a human's PR is a
+// HUMAN action.
 //
 // GUARD 2 (contract C.5.3). reviewing -> implementing and reviewing -> merging
 // BOTH require that every owned MergeRequest has status.pendingReview == nil. A
@@ -489,7 +499,7 @@ func LegalFor(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, from, to string) bo
 		return false
 	}
 	if t != nil && t.Spec.Kind == kindReview &&
-		(to == v1alpha1.StageImplementing || to == v1alpha1.StageMerging) {
+		(to == v1alpha1.StageImplementing || to == v1alpha1.StageMerging || to == v1alpha1.StageApproved) {
 		return false
 	}
 	if from == v1alpha1.StageReviewing &&
@@ -609,12 +619,17 @@ func (e *MissingReasonError) Error() string {
 // live clarifying/reviewing edge, stage.UnparkDetailed's pure enter() closure
 // for the parked(awaiting-human)/parked(identity-unverified) edges). Enter is
 // the ONE choke point every one of them already goes through, so this is the
-// one place a future entry route cannot forget it - AppendTaskEvent stamps
-// the SAME field on every queued event and usually runs moments earlier in
-// the same request, but a caller must never depend on that ordering: an
-// unarmed clock means ArmedClock returns ClockNone and the conversation holds
-// its concurrency slot forever, since there is deliberately no absolute
-// lifetime ceiling (decision D6).
+// one place a CALLER THAT USES Enter's OWN OUTPUT cannot forget it -
+// AppendTaskEvent stamps the SAME field on every queued event and usually
+// runs moments earlier in the same request, but a caller must never depend on
+// that ordering: an unarmed clock means ArmedClock returns ClockNone and the
+// conversation holds its concurrency slot forever, since there is
+// deliberately no absolute lifetime ceiling (decision D6). It is NOT a
+// guarantee against a caller that hand-copies Enter's RESULT field-by-field
+// instead of using the mutated Task directly (queue_controller.go's admission
+// write does exactly this, for a different edge, and must copy this field
+// too - it does, but that is a second place, not this one, and the next such
+// mirror must remember it independently).
 func Enter(t *v1alpha1.Task, mrs []v1alpha1.MergeRequest, to, reason string, now time.Time) error {
 	from := t.Status.Stage
 	if from == "" {
@@ -1189,11 +1204,37 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 		if !in.GrammarPassed {
 			// The human SAID something the C.6 grammar could not read as approval.
 			// That is precisely a conversation: an agent should read it and reply,
-			// rather than the Task sitting parked while the human waits. The Task
-			// does NOT reach implementing this way - conversing -> approved still
-			// requires the grammar to pass on every owned Issue, exactly as from
-			// clarifying - so this widens responsiveness, never the approval gate.
-			if in.ConversingHasRoom && hasNonBotEvent(t, in.BotLogin) {
+			// rather than the Task sitting parked while the human waits. This edge
+			// does NOT itself grant implementing or approved - the real gate is
+			// restapi's verifyApprovalScope (internal/restapi/outcome.go), which
+			// runs the LIVE C.6 grammar over every owned Issue on every
+			// submit_outcome(decision=implement) and never reads
+			// status.approvalVerdict. Widens responsiveness; the approval gate
+			// itself is untouched.
+			if in.ConversingHasRoom {
+				if t.Spec.Kind == kindReview {
+					// A kind=review Task owns ZERO Issues (H9's empty-set rule
+					// below), so verifyApprovalScope can NEVER pass for it -
+					// every decision=implement from a review-kind conversation
+					// bounces straight back to parked(identity-unverified). Without
+					// the SAME three guards ReasonAwaitingHuman's review branch
+					// carries above, a stuck kind=review Task would re-enter
+					// conversing on every subsequent human comment and spawn ONE
+					// POD PER COMMENT forever, capped only by maxTurnsPerTask
+					// (300) - the exact failure that branch's own comment names.
+					if anyMerged(in.MRs) {
+						return "", DeclineMergedMR
+					}
+					if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
+						return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another pod.
+					}
+					t.Status.HumanReviewRounds++
+					target, decline := enter(v1alpha1.StageConversing, "")
+					if decline != DeclineNone {
+						t.Status.HumanReviewRounds--
+					}
+					return target, decline
+				}
 				return enter(v1alpha1.StageConversing, "")
 			}
 			return "", DeclineGrammarNotPassed

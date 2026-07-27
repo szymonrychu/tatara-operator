@@ -58,7 +58,7 @@ func TestApplyUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 	liveClient := newMirrorClient(t, proj, live)
 	cached := &staleGetClient{Client: liveClient, stale: stale.DeepCopy()}
 
-	target, decline, err := ApplyUnpark(context.Background(), cached, liveClient, proj, stale, 0, 6, false, time.Now())
+	target, decline, err := ApplyUnpark(context.Background(), cached, liveClient, proj, stale, 0, 6, false, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestApplyUnpark_BotOnlyEventStillDeclines(t *testing.T) {
 	}}
 	c := newMirrorClient(t, proj, task)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, false, time.Now())
+	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, false, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestApplyUnpark_StageReasonGuardStillShortCircuitsOnLiveRead(t *testing.T) 
 
 	c := newMirrorClient(t, proj, live, mr)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, caller, 0, 6, false, time.Now())
+	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, caller, 0, 6, false, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}

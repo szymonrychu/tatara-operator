@@ -282,11 +282,11 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_GoAhead_UnparksInOneCommen
 // TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation: a
 // non-approving maintainer comment re-runs the grammar and it fails - but the
 // human DID say something, and Task 9 reads that as a live conversation
-// rather than a dead end: the Task moves to conversing (which maps to the
-// clarify agent kind and cannot reach implementing directly - it is NOT the
-// "go ahead" path proven by the sibling test above) with its idle clock
-// armed, instead of sitting parked for up to 7 days waiting on the exact
-// magic phrase.
+// rather than a dead end: the Task moves to conversing (it is NOT the "go
+// ahead" path proven by the sibling test above - reaching implementing from
+// here still requires a genuine decision=implement that passes restapi's
+// LIVE verifyApprovalScope grammar check) with its idle clock armed, instead
+// of sitting parked for up to 7 days waiting on the exact magic phrase.
 func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t *testing.T) {
 	task := peTask("t-parked-no", tatarav1.StageParked, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)

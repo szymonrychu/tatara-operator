@@ -104,11 +104,16 @@ func TestDriveUnparks_RetriesIdentityUnverifiedFromThePersistedVerdict(t *testin
 // path, and this is what stays impossible. But a human DID comment ("go
 // ahead" here has no verdict behind it - the grammar could not read it as
 // approval), and Task 9 reads that as a conversation, not a dead end: the
-// Task lands in conversing, which maps to the clarify agent kind and cannot
-// reach implementing directly (LegalFor's kind guard and the F.3 table are
-// unchanged) - re-approval still has to go through the SAME C.6 grammar from
-// there, exactly as from clarifying.
-func TestDriveUnparks_IdentityUnverifiedWithNoVerdictStaysParked(t *testing.T) {
+// Task lands in conversing. The REAL guarantee against an unverified
+// implement is restapi's verifyApprovalScope (internal/restapi/outcome.go),
+// which runs the LIVE C.6 grammar over every owned Issue on every
+// submit_outcome(decision=implement) and never reads status.approvalVerdict
+// - NOT LegalFor's kind guard, which keys on Task.Spec.Kind == "review" and
+// has nothing to say about a kind=clarify Task like this one. A clarify agent
+// standing in conversing CAN still move this Task toward implementing, via a
+// GENUINE decision=implement that passes the live grammar - see
+// TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted (internal/restapi).
+func TestDriveUnparks_IdentityUnverifiedWithNoVerdictOpensConversationNeverImplementing(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
 	proj.Name = "infrastructure"
@@ -238,9 +243,13 @@ func TestDriveUnparks_IdentityUnverifiedWithVerdictButNotAllApprovedStaysParked(
 // conversation instead of only declining - but that branch never looks at any
 // verdict, stale or otherwise, only at hasNonBotEvent and the conversing
 // ceiling, so the security property this test proves (a predating verdict
-// must never authorize entry to IMPLEMENTING) is untouched: conversing maps
-// to the clarify agent kind and cannot reach implementing directly.
-func TestDriveUnparks_VerdictPredatingCurrentParkStaysParked(t *testing.T) {
+// must never authorize entry to IMPLEMENTING) is untouched: the guarantee is
+// restapi's verifyApprovalScope re-running the LIVE C.6 grammar on every
+// decision=implement from conversing, never status.approvalVerdict - see
+// TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted
+// (internal/restapi/outcome_test.go), which proves this exact predating-verdict
+// shape is refused there too.
+func TestDriveUnparks_VerdictPredatingCurrentParkOpensConversationNeverImplementing(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"
 	proj.Name = "infrastructure"
@@ -403,12 +412,69 @@ func TestUnparkFires_AgreesWithDriveUnparksOnIdentityUnverifiedVerdict(t *testin
 
 	r := newUnparkTestReconciler(t, proj, task, iss)
 
-	fires, err := r.unparkFires(context.Background(), proj, task, time.Now())
+	fires, err := r.unparkFires(context.Background(), proj, task, time.Now(), false)
 	if err != nil {
 		t.Fatalf("unparkFires: %v", err)
 	}
 	if !fires {
 		t.Fatalf("unparkFires = false: the reaper disagrees with driveUnparks, which would re-enter this Task; " +
 			"a Task the driver is about to save must never read as collectible")
+	}
+}
+
+// 2026-07-28 security review CRITICAL 1: unparkFires is a FOURTH UnparkInput
+// builder (after ApplyUnpark, reverifyParked, and stage.UnparkDetailed's own
+// callers), and it used to leave ConversingHasRoom at its zero value (false)
+// unconditionally. The window: parked(identity-unverified), a non-bot event,
+// NO valid verdict (grammarPassed=false), and the conversing ceiling has
+// room. driveUnparks' ApplyUnpark, called with room=true, sends the Task to
+// conversing and saves it; unparkFires, called with room=false (the bug),
+// returns DeclineGrammarNotPassed and fires=false - so reapParked, once past
+// ParkRetention, would delete a Task the driver was about to save out from
+// under it. driveUnparksPaced and ReapTerminalPaced are paced
+// INDEPENDENTLY, so a pass where the driver is throttled and the reaper is
+// not is a real production window.
+//
+// This proves the probe and the driver reach the SAME verdict given the SAME
+// room=true answer: unparkFires(room=true) must return fires=true on exactly
+// the input where ApplyUnpark's own stage.UnparkDetailed call would enter
+// conversing (proven by TestUnpark_IdentityUnverifiedWithoutGrammarConversesWhenThereIsRoom
+// directly against the pure function).
+func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxOpenTasks = 6
+
+	task := &tatarav1alpha1.Task{}
+	task.Namespace = "tatara"
+	task.Name = "t-crit1-conversing-window"
+	task.Spec.ProjectRef = "infrastructure"
+	task.Spec.Kind = "clarify"
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonIdentityUnverified
+	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
+	// No ApprovalVerdict at all: GrammarPassed resolves false via grammarPassedFor.
+	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "not the magic phrase",
+	}}
+
+	r := newUnparkTestReconciler(t, proj, task)
+
+	firesNoRoom, err := r.unparkFires(context.Background(), proj, task, time.Now(), false)
+	if err != nil {
+		t.Fatalf("unparkFires(room=false): %v", err)
+	}
+	if firesNoRoom {
+		t.Fatal("unparkFires(room=false) = true: a full ceiling must fall back to the SAME non-firing decline as before Task 9, not invent a new re-entry")
+	}
+
+	firesRoom, err := r.unparkFires(context.Background(), proj, task, time.Now(), true)
+	if err != nil {
+		t.Fatalf("unparkFires(room=true): %v", err)
+	}
+	if !firesRoom {
+		t.Fatal("unparkFires(room=true) = false: the reaper disagrees with what ApplyUnpark would do with room - " +
+			"exactly the CRITICAL 1 window, where the reaper would delete a Task the driver was about to save into conversing")
 	}
 }

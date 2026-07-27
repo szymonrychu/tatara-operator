@@ -94,3 +94,59 @@ func TestUnpark_IdentityUnverifiedWithoutGrammarConversesWhenThereIsRoom(t *test
 		t.Fatalf("target = %q, want conversing", target)
 	}
 }
+
+// 2026-07-28 security review IMPORTANT 2: a kind=review Task owns ZERO
+// Issues, so verifyApprovalScope (internal/restapi/outcome.go) can NEVER pass
+// for it - every decision=implement from a review-kind conversation bounces
+// straight back here. Without the SAME three guards the sibling
+// ReasonAwaitingHuman review branch carries (merged-MR, round cap, round
+// increment), a stuck kind=review Task would re-enter conversing on every
+// subsequent human comment and spawn one pod per comment forever, capped
+// only by maxTurnsPerTask (300).
+func TestUnpark_IdentityUnverifiedReviewKindGuardedLikeAwaitingHuman(t *testing.T) {
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+
+	t.Run("review kind, no merged MR, under the round cap: conversing, round incremented", func(t *testing.T) {
+		task := parkedTask("review", stage.ReasonIdentityUnverified)
+		humanEvent(task)
+		task.Status.HumanReviewRounds = 2
+		target, decline := stage.UnparkDetailed(stage.UnparkInput{
+			Task: task, MRs: []v1alpha1.MergeRequest{openMR()},
+			GrammarPassed: false, ConversingHasRoom: true, Now: now,
+		})
+		if target != v1alpha1.StageConversing {
+			t.Fatalf("target = %q (decline %q), want conversing", target, decline)
+		}
+		if task.Status.HumanReviewRounds != 3 {
+			t.Fatalf("HumanReviewRounds = %d, want 3 (2 + 1)", task.Status.HumanReviewRounds)
+		}
+	})
+
+	t.Run("review kind, an owned MR already merged: refused, never re-enters", func(t *testing.T) {
+		task := parkedTask("review", stage.ReasonIdentityUnverified)
+		humanEvent(task)
+		target, decline := stage.UnparkDetailed(stage.UnparkInput{
+			Task: task, MRs: []v1alpha1.MergeRequest{mergedMR()},
+			GrammarPassed: false, ConversingHasRoom: true, Now: now,
+		})
+		if target != "" || decline != stage.DeclineMergedMR {
+			t.Fatalf("target=%q decline=%q, want (\"\", %q)", target, decline, stage.DeclineMergedMR)
+		}
+	})
+
+	t.Run("review kind, at the round cap: refused, no runaway pod spawn", func(t *testing.T) {
+		task := parkedTask("review", stage.ReasonIdentityUnverified)
+		humanEvent(task)
+		task.Status.HumanReviewRounds = v1alpha1.MaxHumanReviewRounds
+		target, decline := stage.UnparkDetailed(stage.UnparkInput{
+			Task: task, MRs: []v1alpha1.MergeRequest{openMR()},
+			GrammarPassed: false, ConversingHasRoom: true, Now: now,
+		})
+		if target != "" || decline != stage.DeclineRoundsExhausted {
+			t.Fatalf("target=%q decline=%q, want (\"\", %q)", target, decline, stage.DeclineRoundsExhausted)
+		}
+		if task.Status.HumanReviewRounds != v1alpha1.MaxHumanReviewRounds {
+			t.Fatalf("HumanReviewRounds = %d, want unchanged at %d", task.Status.HumanReviewRounds, v1alpha1.MaxHumanReviewRounds)
+		}
+	})
+}

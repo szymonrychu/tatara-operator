@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -176,11 +177,13 @@ func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImpl
 	// Task 9: a GrammarPassed=false comment on identity-unverified now opens a
 	// conversation (conversing) instead of only declining - so this Task DOES
 	// move, but the conversing branch never consults Issue approval state at
-	// all (it fires before that check), and conversing maps to the clarify
-	// agent kind, which cannot reach implementing directly (LegalFor's kind
-	// guard, the F.3 table). The property this test proves - a live-approved
-	// Issue with no fresh grammar pass must never authorize implementing - is
-	// unchanged.
+	// all (it fires before that check). The property this test proves - a
+	// live-approved Issue with no fresh grammar pass must never authorize
+	// implementing - is enforced downstream, at restapi's verifyApprovalScope,
+	// which reruns the LIVE C.6 grammar on every decision=implement from
+	// conversing and never reads status.approvalVerdict; it is NOT LegalFor's
+	// kind guard, which keys on Task.Spec.Kind == "review" and this Task is
+	// kind=clarify.
 	task := wfParkedTask("t-ident", "clarify", stage.ReasonIdentityUnverified)
 	task.Status.IssueRefs = []string{"iss-ident"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
@@ -199,6 +202,16 @@ func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImpl
 	if got.Status.Stage != tatarav1alpha1.StageConversing {
 		t.Fatalf("stage = %s(%s), want conversing: a live-approved Issue with NO fresh grammar verdict must never reach implementing",
 			got.Status.Stage, got.Status.StageReason)
+	}
+	// The original (pre-Task-9) version of this test asserted
+	// UnparkDeclinedCounter(identity-unverified, grammar-not-passed) == 1 - "the
+	// SPECIFIC decline, not just stayed parked". That assertion is gone, not
+	// merely dropped: this pass no longer declines at all (target != ""), so
+	// driveUnparks never calls Metrics.UnparkDeclined for it. Asserted here as
+	// 0, explicitly, so a future regression that made this decline again would
+	// fail LOUDLY on the counter, not silently pass by accident.
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 0 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 0: this pass entered conversing, it did not decline", got)
 	}
 }
 

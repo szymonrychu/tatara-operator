@@ -183,8 +183,18 @@ func grammarPassedFor(t *tatarav1alpha1.Task, fallback bool) bool {
 // normal (non-error) outcome, for a Task a human had just told to proceed
 // (issue: comment-driven unpark lost the cache-lag race 2/2 in prod). Nil
 // reader (unit tests that do not wire one) falls back to c.
+//
+// conversingHasRoom is the CALLER's precomputed answer to Task 9's F.6
+// capacity question (needsConversingRoom names which stageReasons ever consult
+// it). It is a PARAMETER, not computed in here, on purpose: driveUnparks calls
+// ApplyUnpark once per parked Task in a loop (tatara-operator#368 is the whole
+// reason that loop is paced at all), and ConversingHasRoom's countConversing is
+// an unindexed namespace List - computing it per-Task here would multiply that
+// List by the parked backlog on every pass, exactly the hot-path regression
+// #368 exists to prevent. Callers hoist it ONCE per pass instead (2026-07-28
+// security review IMPORTANT 4).
 func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, activeTasks, maxOpen int, grammarPassed bool, now time.Time) (string, UnparkDecline, error) {
+	task *tatarav1alpha1.Task, activeTasks, maxOpen int, grammarPassed, conversingHasRoom bool, now time.Time) (string, UnparkDecline, error) {
 
 	// c (cached) is safe here, unlike the retry-loop Task Get below: by the time
 	// driveCommentUnpark reaches this call the owning Issue CR is guaranteed to
@@ -209,19 +219,6 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 	getter := reader
 	if getter == nil {
 		getter = c
-	}
-
-	// Task 9's two conversational F.6 rules (awaiting-human, identity-unverified)
-	// need the SAME ceiling answer Task 11 already computes for the live-stage
-	// entry path (EnterConversing) - reused here, not reimplemented, so the
-	// webhook fast path and the periodic backstop can never disagree about how
-	// full a project's conversing lane is. Computed once per ApplyUnpark call
-	// (like issues/mrs above), off the same uncached-when-available getter: a
-	// stale ceiling read only ever costs an extra conversation slot for one pass,
-	// never a security decision, so this does not need the retry loop's freshness.
-	conversingRoom, err := ConversingHasRoom(ctx, getter, proj)
-	if err != nil {
-		return "", DeclineNone, fmt.Errorf("unpark: conversing capacity check on %s: %w", task.Name, err)
 	}
 
 	var target string
@@ -253,7 +250,7 @@ func ApplyUnpark(ctx context.Context, c client.Client, reader client.Reader, pro
 			BotLogin:          botLogin,
 			GrammarPassed:     grammarPassedFor(fresh, grammarPassed),
 			MaxTurnsPerTask:   maxTurns,
-			ConversingHasRoom: conversingRoom,
+			ConversingHasRoom: conversingHasRoom,
 			Now:               now,
 		})
 		if to == "" {
@@ -311,6 +308,17 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	return interval, nil
 }
 
+// needsConversingRoom reports whether stageReason is one of the two F.6 rules
+// that ever consult UnparkInput.ConversingHasRoom (stage.go's ReasonAwaitingHuman
+// and ReasonIdentityUnverified branches). Every other parked reason (merge-
+// timeout, deploy-timeout, no-outcome, handoff-stalled, backlog-sweep, ...)
+// never reads the field, so a caller sweeping a mixed batch can skip the
+// capacity List entirely when nothing in it would use the answer (2026-07-28
+// security review IMPORTANT 4).
+func needsConversingRoom(stageReason string) bool {
+	return stageReason == stage.ReasonAwaitingHuman || stageReason == stage.ReasonIdentityUnverified
+}
+
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
 // reason has an F.6 re-entry rule, INCLUDING identity-unverified: the grammar
 // verdict it needs comes from the durable Task.status.approvalVerdict (see the
@@ -331,6 +339,28 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		maxOpen = 6
 	}
 
+	// HOISTED, once per pass, not once per Task (tatara-operator#368: this loop
+	// is paced BECAUSE an unindexed per-Task List across the full parked backlog
+	// hammered the apiserver before). Skipped entirely when nothing in this
+	// batch would ever consult it. A transient List error degrades to "no room"
+	// (always the SAFE fallback - see UnparkInput.ConversingHasRoom's own doc)
+	// rather than failing the whole pass closed for every OTHER park reason,
+	// which never asked the question in the first place.
+	conversingRoom := false
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
+			room, roomErr := ConversingHasRoom(ctx, r.Client, proj)
+			if roomErr != nil {
+				log.FromContext(ctx).Error(roomErr, "unpark: conversing capacity check failed; treating this pass as no room",
+					"action", "unpark_conversing_room_error", "project", proj.Name)
+			} else {
+				conversingRoom = room
+			}
+			break
+		}
+	}
+
 	var firstErr error
 	for i := range tl.Items {
 		if ctx.Err() != nil {
@@ -346,7 +376,7 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		// cached) and can lag exactly the write this whole feature exists to survive.
 		// false here is the fallback ApplyUnpark uses for every OTHER stageReason,
 		// where GrammarPassed is ignored entirely.
-		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, now)
+		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, conversingRoom, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
 				"action", "unpark_error", "resource_id", t.Name, "reason", t.Status.StageReason)

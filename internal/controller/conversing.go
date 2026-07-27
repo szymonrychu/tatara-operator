@@ -236,6 +236,17 @@ var conversingEntryStages = map[string]bool{
 	tatarav1alpha1.StageReviewing:  true,
 }
 
+// ConversingEntryEligible reports whether stg is one of the live stages
+// EnterConversing may move into conversing - the SAME closed set
+// conversingEntryStages holds, exported so a caller outside this package (the
+// webhook's driveConversingEntry) can do this free map lookup BEFORE paying
+// for ConversingHasRoom's namespace List, instead of after. Every webhook
+// comment on every Task otherwise cost one List regardless of whether the
+// Task's stage could ever qualify (2026-07-28 security review IMPORTANT 5).
+func ConversingEntryEligible(stg string) bool {
+	return conversingEntryStages[stg]
+}
+
 // EnterConversing applies the live-stage entry edge into conversing. It
 // returns (false, nil) - not an error - when the Task is in a stage that may
 // not enter conversing, or when the reviewing round cap is already spent:
@@ -268,6 +279,13 @@ func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	if !conversingEntryStages[task.Status.Stage] {
 		return false, nil
 	}
+	// Captured BEFORE EnterStage mutates task.Status.Stage to conversing: the
+	// success log below needs the stage this Task actually entered FROM.
+	// task.Status.ParkedFromStage is the wrong field for this - it is only ever
+	// stamped on entry into PARKED, so on this live-stage edge it is either
+	// stale (left over from an earlier park) or empty, not "clarifying" or
+	// "reviewing" (2026-07-28 security review Minor).
+	fromStage := task.Status.Stage
 	fromReviewing := task.Status.Stage == tatarav1alpha1.StageReviewing
 	if fromReviewing && task.Status.HumanReviewRounds >= tatarav1alpha1.MaxHumanReviewRounds {
 		log.FromContext(ctx).Info("conversing entry refused: the human review round cap is spent",
@@ -290,6 +308,6 @@ func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	}
 	log.FromContext(ctx).Info("conversation opened",
 		"action", "conversing_entered", "resource_id", task.Name,
-		"from", task.Status.ParkedFromStage, "human_review_rounds", task.Status.HumanReviewRounds)
+		"from", fromStage, "human_review_rounds", task.Status.HumanReviewRounds)
 	return true, nil
 }
