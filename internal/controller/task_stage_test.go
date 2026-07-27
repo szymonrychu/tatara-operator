@@ -827,6 +827,12 @@ func TestEveryStageHasAReachableExit(t *testing.T) {
 			task.Status.PodStartedAt = &pod
 			task.Status.StageWorkStartedAt = &work
 		}
+		if stg == tatarav1alpha1.StageConversing {
+			// conversing's clock is the IDLE clock, based on
+			// conversationLastEventAt rather than stageWorkStartedAt (Task 6).
+			lastEvent := metav1.NewTime(now.Add(-budget - time.Hour))
+			task.Status.ConversationLastEventAt = &lastEvent
+		}
 		clock, _, _, got := stage.ArmedClock(task, false)
 		if clock == stage.ClockNone {
 			t.Fatalf("stage %q arms NO CLOCK: it has no exit deadline at all", stg)

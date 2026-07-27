@@ -744,6 +744,25 @@ func ArmedClock(t *v1alpha1.Task, paused bool) (clock string, since time.Time, b
 		return ClockNone, time.Time{}, 0, Edge{}
 	}
 
+	// THE IDLE CLOCK (conversing). A named case, not an inference. conversing is a
+	// POD stage, so the generic selector below would arm clock 1 or clock 2 or
+	// measure clock 3 from stageWorkStartedAt - all three of which describe pod
+	// age, and none of which describes how long the human has been silent. The
+	// budget here is the table default; reconcileClocks substitutes the project's
+	// scm.conversationIdleMinutes, which is the only per-project knob in the F.4
+	// clock model and is why the substitution lives at the caller rather than in
+	// this pure package.
+	if stg == v1alpha1.StageConversing {
+		if t.Status.ConversationLastEventAt == nil {
+			return ClockNone, time.Time{}, 0, Edge{}
+		}
+		elapse, ok := OnElapse(stg)
+		if !ok {
+			return ClockNone, time.Time{}, 0, Edge{}
+		}
+		return ClockWork, t.Status.ConversationLastEventAt.Time, budget, elapse
+	}
+
 	elapse, ok := OnElapse(stg)
 	if !ok {
 		return ClockNone, time.Time{}, 0, Edge{}

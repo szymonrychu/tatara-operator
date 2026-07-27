@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -43,6 +44,13 @@ func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.
 			return err
 		}
 		fresh.Status.PendingEvents = appendEventCapped(fresh.Status.PendingEvents, ev, maxPendingEvents)
+		// THE IDLE CLOCK RESET. Every queued event is, by definition, the
+		// conversation not being idle. It is stamped here rather than at the
+		// webhook because this is the ONE funnel every TaskEvent passes through, so
+		// no future event source can forget it. Harmless on a Task that is not
+		// conversing: nothing reads the field outside that stage.
+		now := metav1.Now()
+		fresh.Status.ConversationLastEventAt = &now
 		return c.Status().Update(ctx, fresh)
 	})
 	if err != nil {

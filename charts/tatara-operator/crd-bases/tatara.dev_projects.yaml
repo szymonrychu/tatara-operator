@@ -5780,6 +5780,24 @@ spec:
                     type: string
                   conversationIdleMinutes:
                     default: 60
+                    description: |-
+                      ConversationIdleMinutes is the conversing stage's IDLE budget: how long a
+                      conversation may go without a new event before the operator takes a handoff
+                      turn and parks it at awaiting-human. It is measured from
+                      Task.status.conversationLastEventAt, which every queued event re-stamps, so
+                      it is a genuine idle timer and NOT agentPodTTLSeconds, which is a flat cap
+                      from pod start with no reset.
+
+                      The two clocks answer different questions and do not conflict: this one says
+                      when the CONVERSATION ends, agentPodTTLSeconds says when ONE POD rotates. A
+                      conversing pod that hits its TTL takes the G.7 handoff turn and is replaced
+                      in the SAME stage, so an actively-replied-to conversation keeps going
+                      indefinitely (decision D6).
+
+                      This field survived the task-centric redesign as dead config, referenced
+                      only by its own round-trip test. It is live again as of the conversing
+                      stage. Zero means ConversationIdleDefault (60 minutes).
+                    minimum: 0
                     type: integer
                   cron:
                     description: ScmCron groups the cron-driven scan activities.

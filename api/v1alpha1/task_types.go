@@ -557,6 +557,18 @@ type TaskStatus struct {
 	// Nil means no approving comment has ever been verified for this Task.
 	// +optional
 	ApprovalVerdict *ApprovalVerdict `json:"approvalVerdict,omitempty"`
+	// ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
+	// is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
+	// every non-bot event queued while conversing, so the clock measures silence
+	// rather than pod age.
+	//
+	// It is a field of its OWN and deliberately NOT stageWorkStartedAt. The TTL
+	// stop nils stageWorkStartedAt and PodWatchReconciler re-stamps it when the
+	// REPLACEMENT pod becomes ready, so an idle clock based on it would reset on
+	// every pod rotation and an idle conversation would never park - it would
+	// rotate a pod forever. Nothing in the pod lifecycle touches this field.
+	// +optional
+	ConversationLastEventAt *metav1.Time `json:"conversationLastEventAt,omitempty"`
 	// MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
 	// Persisted so a restarted operator resumes and never re-merges.
 	// +optional

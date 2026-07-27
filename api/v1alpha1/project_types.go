@@ -635,7 +635,24 @@ type ScmSpec struct {
 	// +kubebuilder:default=60
 	// +optional
 	BabysitDeadlineMinutes int `json:"babysitDeadlineMinutes,omitempty"`
+	// ConversationIdleMinutes is the conversing stage's IDLE budget: how long a
+	// conversation may go without a new event before the operator takes a handoff
+	// turn and parks it at awaiting-human. It is measured from
+	// Task.status.conversationLastEventAt, which every queued event re-stamps, so
+	// it is a genuine idle timer and NOT agentPodTTLSeconds, which is a flat cap
+	// from pod start with no reset.
+	//
+	// The two clocks answer different questions and do not conflict: this one says
+	// when the CONVERSATION ends, agentPodTTLSeconds says when ONE POD rotates. A
+	// conversing pod that hits its TTL takes the G.7 handoff turn and is replaced
+	// in the SAME stage, so an actively-replied-to conversation keeps going
+	// indefinitely (decision D6).
+	//
+	// This field survived the task-centric redesign as dead config, referenced
+	// only by its own round-trip test. It is live again as of the conversing
+	// stage. Zero means ConversationIdleDefault (60 minutes).
 	// +kubebuilder:default=60
+	// +kubebuilder:validation:Minimum=0
 	// +optional
 	ConversationIdleMinutes int `json:"conversationIdleMinutes,omitempty"`
 	// ApprovalPhrases is the closed, per-project wordlist an approving
@@ -669,6 +686,16 @@ func EffectiveApprovalPhrases(p *Project) []string {
 		return p.Spec.Scm.ApprovalPhrases
 	}
 	return DefaultApprovalPhrases()
+}
+
+// ConversationIdle is the conversing stage's idle budget for p: the project's
+// scm.conversationIdleMinutes, or ConversationIdleDefault when it is unset or
+// non-positive. It is the ONE place the minutes-to-Duration conversion happens.
+func ConversationIdle(p *Project) time.Duration {
+	if p != nil && p.Spec.Scm != nil && p.Spec.Scm.ConversationIdleMinutes > 0 {
+		return time.Duration(p.Spec.Scm.ConversationIdleMinutes) * time.Minute
+	}
+	return ConversationIdleDefault
 }
 
 // ProjectSpec defines the desired state of a Project.

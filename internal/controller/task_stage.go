@@ -197,6 +197,14 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 
 	paused := projectPaused(proj)
 	clock, since, budget, edge := stage.ArmedClock(task, paused)
+	// The ONE per-project clock budget in the F.4 model. internal/stage is pure and
+	// holds no Project, so the table carries ConversationIdleDefault and the
+	// substitution happens here, at the single call site that has the Project in
+	// hand. Keeping the table row means TestEveryStageHasABudget still covers
+	// conversing and a future stage still cannot be added without a deadline.
+	if task.Status.Stage == tatarav1alpha1.StageConversing && clock == stage.ClockWork {
+		budget = tatarav1alpha1.ConversationIdle(proj)
+	}
 	if clock == stage.ClockNone {
 		// parked(backlog-sweep), or a stage with no budget row. Nothing ages out.
 		return ctrl.Result{}, false, nil
