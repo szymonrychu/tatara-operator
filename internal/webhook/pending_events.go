@@ -123,6 +123,50 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 		(task.Status.StageReason == stage.ReasonAwaitingHuman || task.Status.StageReason == stage.ReasonBacklogSweep) {
 		s.driveCommentUnpark(ctx, &proj, task)
 	}
+	// A LIVE conversational stage. The event is already queued above, but a
+	// clarifying/reviewing Task whose pod has finished its turn is deaf to it
+	// until something moves: conversing is what gives the comment a live agent on
+	// the other end and an idle clock that resets per event.
+	s.driveConversingEntry(ctx, &proj, task)
+}
+
+// driveConversingEntry moves a live clarifying/reviewing Task into conversing on
+// a qualifying comment, so the comment reaches an agent instead of only sitting
+// in pendingEvents. Best-effort, like every other side effect in this file: a
+// failure is logged and never surfaced to the SCM as a non-2xx.
+func (s *Server) driveConversingEntry(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
+	room, err := controller.ConversingHasRoom(ctx, s.reader(), proj)
+	if err != nil {
+		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed", "error", err, "task", task.Name)
+		return
+	}
+	if !room {
+		// The ceiling is real and the event is NOT lost: it stays in pendingEvents
+		// and rides into the Task's next turn whenever one happens. The metric is
+		// what makes the ceiling visible to the operator (there is no
+		// acknowledgement layer, per decision D5).
+		s.log.InfoContext(ctx, "pendingEvents: conversing ceiling reached; the event stays queued",
+			"action", "conversing_entry_declined", "task", task.Name,
+			"project", proj.Name, "decline", "over-ceiling")
+		s.cfg.Metrics.ConversingEntryDeclined(proj.Name, "over-ceiling")
+		return
+	}
+	sp := s.cfg.SpillerFor(proj)
+	mrs, err := controller.LoadTaskMRsFor(ctx, s.reader(), task)
+	if err != nil {
+		s.log.ErrorContext(ctx, "pendingEvents: load owned MRs failed", "error", err, "task", task.Name)
+		return
+	}
+	entered, err := controller.EnterConversing(ctx, s.cfg.Client, sp, s.cfg.Metrics, proj, task, mrs, time.Now())
+	if err != nil {
+		s.log.ErrorContext(ctx, "pendingEvents: conversing entry failed", "error", err, "task", task.Name)
+		return
+	}
+	if !entered {
+		return
+	}
+	s.log.InfoContext(ctx, "pendingEvents: opened a conversation on a human comment",
+		"action", "pending_event_conversing", "task", task.Name, "project", proj.Name)
 }
 
 // resolveOwningTask maps a mirror CR onto the Task the pending event belongs

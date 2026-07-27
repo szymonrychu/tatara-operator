@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -221,4 +222,69 @@ func (r *ProjectReconciler) enforceConversingCeiling(ctx context.Context, proj *
 		}
 	}
 	return firstErr
+}
+
+// conversingEntryStages is the CLOSED set of live stages a qualifying comment
+// may move into conversing. It is a table, not a switch with a default, for the
+// same reason every other table in the stage machine is: a stage that is not
+// named here cannot acquire this behaviour by accident.
+//
+// implementing is deliberately ABSENT. An implement pod is mid-change; taking it
+// down to hold a conversation would lose in-flight work, and a comment arriving
+// then already rides into its next turn through the ordinary pendingEvents path.
+var conversingEntryStages = map[string]bool{
+	tatarav1alpha1.StageClarifying: true,
+	tatarav1alpha1.StageReviewing:  true,
+}
+
+// EnterConversing applies the live-stage entry edge into conversing and stamps
+// the idle clock's base. It returns (false, nil) - not an error - when the Task
+// is in a stage that may not enter conversing, or when the reviewing round cap is
+// already spent: both are ordinary steady-state outcomes, and the caller falls
+// back to queueing the event and nothing else.
+//
+// The previous stage's pod IS torn down, by EnterStage's ordinary choke-point
+// teardown. There is no carve-out and there must not be one: the pod name is
+// per-TASK, so a surviving pod would be silently reused by conversing while still
+// running the previous stage's kind, model and skills. The conversing pod's
+// turn-0 bundle carries the whole mirror thread, the notes journal and <events>,
+// so nothing is lost - the FIRST comment pays one cold spawn and every subsequent
+// comment in that conversation reaches the live pod warm.
+//
+// Entry from reviewing increments humanReviewRounds and is capped by it, exactly
+// like the awaiting-human re-entry and for the same reason: each lap can spawn a
+// pod, and a chatty MR thread must not spawn one per comment.
+func EnterConversing(ctx context.Context, c client.Client, sp objbudget.Spiller, m *obs.OperatorMetrics,
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, mrs []tatarav1alpha1.MergeRequest,
+	now time.Time) (bool, error) {
+
+	if !conversingEntryStages[task.Status.Stage] {
+		return false, nil
+	}
+	fromReviewing := task.Status.Stage == tatarav1alpha1.StageReviewing
+	if fromReviewing && task.Status.HumanReviewRounds >= tatarav1alpha1.MaxHumanReviewRounds {
+		log.FromContext(ctx).Info("conversing entry refused: the human review round cap is spent",
+			"action", "conversing_entry_declined", "resource_id", task.Name,
+			"stage", task.Status.Stage, "decline", "rounds-exhausted")
+		return false, nil
+	}
+
+	stamp := metav1.NewTime(now)
+	err := EnterStage(ctx, c, sp, m, task, mrs, tatarav1alpha1.StageConversing, "", now,
+		func(t *tatarav1alpha1.Task) {
+			// ABSOLUTE ASSIGNMENTS only: FitTask re-runs this closure to size the
+			// write and again on every conflict retry, so an increment here would
+			// multiply. The rounds value is computed once, outside.
+			if fromReviewing {
+				t.Status.HumanReviewRounds = task.Status.HumanReviewRounds + 1
+			}
+			t.Status.ConversationLastEventAt = &stamp
+		})
+	if err != nil {
+		return false, err
+	}
+	log.FromContext(ctx).Info("conversation opened",
+		"action", "conversing_entered", "resource_id", task.Name,
+		"from", task.Status.ParkedFromStage, "human_review_rounds", task.Status.HumanReviewRounds)
+	return true, nil
 }

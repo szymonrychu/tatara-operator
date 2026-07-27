@@ -1009,7 +1009,14 @@ type UnparkInput struct {
 	BotLogin        string
 	GrammarPassed   bool
 	MaxTurnsPerTask int
-	Now             time.Time
+	// ConversingHasRoom is the CALLER's answer to "is this project under its
+	// conversing ceiling right now". internal/stage is pure and cannot count live
+	// Tasks, so the caller computes it once per pass. False is always SAFE: every
+	// rule that would have entered conversing falls back to exactly the target it
+	// had before this stage existed, so a full ceiling degrades responsiveness and
+	// never drops the event.
+	ConversingHasRoom bool
+	Now               time.Time
 }
 
 // The CLOSED decline vocabulary. UnparkDetailed returns exactly one of these,
@@ -1145,7 +1152,11 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 			return "", DeclineNoOpenIssues
 		}
 		if allApproved(open) {
+			// A maintainer approved. That is a decision, not a conversation.
 			return enter(v1alpha1.StageImplementing, "")
+		}
+		if in.ConversingHasRoom {
+			return enter(v1alpha1.StageConversing, "")
 		}
 		return enter(v1alpha1.StageClarifying, "")
 
@@ -1160,6 +1171,15 @@ func UnparkDetailed(in UnparkInput) (target string, decline string) {
 			return "", DeclineNoHumanEvent
 		}
 		if !in.GrammarPassed {
+			// The human SAID something the C.6 grammar could not read as approval.
+			// That is precisely a conversation: an agent should read it and reply,
+			// rather than the Task sitting parked while the human waits. The Task
+			// does NOT reach implementing this way - conversing -> approved still
+			// requires the grammar to pass on every owned Issue, exactly as from
+			// clarifying - so this widens responsiveness, never the approval gate.
+			if in.ConversingHasRoom && hasNonBotEvent(t, in.BotLogin) {
+				return enter(v1alpha1.StageConversing, "")
+			}
 			return "", DeclineGrammarNotPassed
 		}
 		open := openIssues(in.Issues)

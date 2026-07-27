@@ -399,10 +399,20 @@ func loadTaskIssues(ctx context.Context, c client.Client, t *tatarav1alpha1.Task
 }
 
 func loadTaskMRs(ctx context.Context, c client.Client, t *tatarav1alpha1.Task) ([]tatarav1alpha1.MergeRequest, error) {
+	return LoadTaskMRsFor(ctx, c, t)
+}
+
+// LoadTaskMRsFor resolves status.mrRefs to their CRs. It is the exported,
+// client.Reader-taking twin of loadTaskMRs, so a caller with only a Reader (the
+// webhook's driveConversingEntry, which prefers the uncached APIReader for the
+// same cache-lag reason every other webhook read does) can load a Task's owned
+// MergeRequests without a ProjectReconciler. A ref whose CR is gone is skipped -
+// the mirror is not authoritative.
+func LoadTaskMRsFor(ctx context.Context, r client.Reader, t *tatarav1alpha1.Task) ([]tatarav1alpha1.MergeRequest, error) {
 	out := make([]tatarav1alpha1.MergeRequest, 0, len(t.Status.MRRefs))
 	for _, name := range t.Status.MRRefs {
 		var mr tatarav1alpha1.MergeRequest
-		err := c.Get(ctx, types.NamespacedName{Namespace: t.Namespace, Name: name}, &mr)
+		err := r.Get(ctx, types.NamespacedName{Namespace: t.Namespace, Name: name}, &mr)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
