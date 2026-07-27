@@ -140,15 +140,17 @@ jobs:
           parent_repo: szymonrychu/tatara-helmfile
           new_value: ${{ needs.tag.outputs.version }}
           pr_label: semver:patch
-          # All 4 pins rewritten atomically in ONE deploy-train commit. The 3
-          # chart-version pins (the tatara-operator release plus both
-          # tatara-project releases project-tatara/project-infrastructure) take
-          # the bare X.Y.Z; the image tag takes vX.Y.Z. Match by release NAME,
-          # never a global replace, or tatara-chat's pin is clobbered.
+          # All 5 pins rewritten atomically in ONE deploy-train commit. The 4
+          # chart-version pins (the tatara-operator release plus all three
+          # tatara-project releases project-tatara/project-infrastructure/
+          # project-mtg) take the bare X.Y.Z; the image tag takes vX.Y.Z.
+          # Match by release NAME, never a global replace, or tatara-chat's
+          # pin is clobbered.
           pins: |
             [
               {"file":"helmfile.yaml.gotmpl","pattern":"(- name: tatara-operator\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
               {"file":"helmfile.yaml.gotmpl","pattern":"(- name: project-tatara\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
               {"file":"helmfile.yaml.gotmpl","pattern":"(- name: project-infrastructure\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
+              {"file":"helmfile.yaml.gotmpl","pattern":"(- name: project-mtg\\n(?:.*\\n)*?\\s*version: )\\S+","value_template":"\\1{{chart_version_bare}}"},
               {"file":"values/tatara-operator/common.yaml","pattern":"^(\\s*tag: )\".*\"$","value_template":"\\1\"{{image_version}}\""}
             ]
