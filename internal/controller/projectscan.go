@@ -270,6 +270,16 @@ func latestCommitSHA(commits []scm.CommitRef) string {
 	return latest.SHA
 }
 
+// documentationGoal returns the turn-0 goal for a scheduled documentation-sync
+// Task. Extracted from createDocumentationTask so the goal-builder tool-name
+// conformance test can reach it without a k8s client; the per-kind job text the
+// agent also reads comes from agentJob(stage.AgentDocumentation).
+func documentationGoal(sourceURL, headSHA string) string {
+	return fmt.Sprintf("Scheduled documentation sync: %s advanced to %s since the last doc "+
+		"update. Review the diff and update the documentation repo if it is doc-relevant; "+
+		"no-op otherwise.", sourceURL, headSHA)
+}
+
 // createDocumentationTask enqueues a documentation QueuedEvent repo-scoped to the
 // docs repo (documentation is the one repo-scoped agent kind). The source repo +
 // its diff window ride as annotations, matching the retired push path's shape so
@@ -283,10 +293,8 @@ func (r *ProjectReconciler) createDocumentationTask(ctx context.Context, proj *t
 	}
 	dedupKey := fmt.Sprintf("doc-%s-%s", sourceRepo.Name, headSHA)
 	payload := tatarav1alpha1.QueuedEventPayload{
-		Kind: "documentation",
-		Goal: fmt.Sprintf("Scheduled documentation sync: %s advanced to %s since the last doc "+
-			"update. Review the diff and update the documentation repo if it is doc-relevant; "+
-			"no-op otherwise.", sourceRepo.Spec.URL, headSHA),
+		Kind:          "documentation",
+		Goal:          documentationGoal(sourceRepo.Spec.URL, headSHA),
 		RepositoryRef: docsRepo.Name,
 		GenerateName:  "documentation-",
 		Provider:      provider,
