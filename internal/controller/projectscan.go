@@ -531,8 +531,19 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		return false
 	}
 	pending := pendingProposalCount(issues)
-	for slug, n := range pendingProposalCountByRepo(issues) {
-		r.Metrics.SetOpenProposals(slug, float64(n))
+	// operator_open_proposals is labelled by the owner/name SLUG, which is what
+	// the tatara-observability dashboard joins on - NOT by the Repository CR name
+	// pendingProposalCountByRepo keys on (DNS-1123, so it can never contain "/").
+	// Translating here keeps the series identity stable across this change.
+	//
+	// Every enrolled repo is written every pass, zeros included: the map only
+	// carries nonzero counts, so a repo whose proposals were all approved would
+	// otherwise drop out and latch its last nonzero value forever.
+	byRepoRef := pendingProposalCountByRepo(issues)
+	for i := range repos {
+		if slug := repoSlug(&repos[i]); slug != "" {
+			r.Metrics.SetOpenProposals(slug, float64(byRepoRef[repos[i].Name]))
+		}
 	}
 
 	// The in-flight guard doubles as the read-your-writes ledger: a reconcile
@@ -577,7 +588,7 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	l.Info("brainstorm: refill dispatched",
 		"action", "scan_brainstorm", "resource_id", proj.Name,
 		"target", target, "pending", pending, "inflight", inflight,
-		"deficit", deficit, "quota", quota, "trigger", trigger, "reason", reason,
+		"deficit", deficit, "quota", quota, "trigger", trigger,
 		"duration_ms", time.Since(start).Milliseconds())
 	return true
 }
@@ -694,13 +705,10 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"EARLY EXIT (do this FIRST, cheaply): scan the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears " +
 		"the bar for a genuinely novel, high-leverage proposal this cycle, call `skip_research(reason)` and STOP. " +
 		"Silence over noise.\n\n" +
-		"SYSTEMIC MANDATE: prefer a single systemic improvement (a pattern spanning >=2 repositories, a platform-wide " +
-		"gap, or recurring debt) over a one-repo tweak. Decompose: dispatch one parallel subagent per repository, then " +
-		"synthesize one systemic conclusion.\n\n" +
 		"NEW-IDEAS-ONLY CONTRACT - follow exactly ONE path:\n" +
 		"1. If the best idea DUPLICATES an existing open issue above: do NOT propose. Finish with a one-line note " +
 		"naming the duplicate. Do NOT comment on it.\n" +
-		"2. If genuinely novel AND standalone: call `propose_issue`. Set `repo` to the owning repository. Required " +
+		"2. If genuinely novel: call `propose_issue`. Set `repo` to the owning repository. Required " +
 		"body shape: (a) a one-paragraph problem statement citing the concrete file/symbol you read; (b) a " +
 		"DECOMPOSITION into sub-problems; (c) for EACH sub-problem, 2-3 concrete OPTIONS with one-line tradeoffs and " +
 		"your recommended pick; (d) the maintainer's decision framed as choosing one option per sub-problem. No flat " +

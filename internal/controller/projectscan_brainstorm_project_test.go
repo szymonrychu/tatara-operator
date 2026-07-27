@@ -23,7 +23,7 @@ import (
 // TestBrainstorm_ProjectLevel_MultiRepo_OneTask: 2 repos, 0 proposals across
 // the project -> exactly ONE brainstorm Task created, not two.
 func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-one", []string{"o/alpha", "o/beta"}, intPtr(5))
+	proj, repos := seedBrainstormProject(t, "bs-proj-one", []string{"o/alpha", "o/beta"}, ptrInt(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/alpha": {},
@@ -44,7 +44,7 @@ func TestBrainstorm_ProjectLevel_MultiRepo_OneTask(t *testing.T) {
 // TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks: a non-terminal
 // brainstorm Task for ANY repo in the project blocks a new one.
 func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-inflight", []string{"o/x", "o/y"}, intPtr(1))
+	proj, repos := seedBrainstormProject(t, "bs-proj-inflight", []string{"o/x", "o/y"}, ptrInt(1))
 
 	// Pre-create an in-flight brainstorm Task for repo x (not y).
 	pre := &tatarav1alpha1.Task{}
@@ -92,7 +92,7 @@ func TestBrainstorm_ProjectLevel_InFlight_AnyRepo_Blocks(t *testing.T) {
 // name for determinism across cycles.
 func TestBrainstorm_ProjectLevel_DeterministicPrimaryRepo(t *testing.T) {
 	// Seed repos with names that have a non-trivial sort order.
-	proj, repos := seedBrainstormProject(t, "bs-proj-det", []string{"o/zzz", "o/aaa", "o/mmm"}, intPtr(5))
+	proj, repos := seedBrainstormProject(t, "bs-proj-det", []string{"o/zzz", "o/aaa", "o/mmm"}, ptrInt(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/zzz": {},
@@ -153,7 +153,7 @@ func TestBrainstormGoal_ProjectSpanning(t *testing.T) {
 // TestBrainstorm_ProjectLevel_EmptyRepositoryRef: brainstorm creates a Task with
 // an empty RepositoryRef (project-scoped, no single-repo pin).
 func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-emptyref", []string{"o/alpha", "o/beta"}, intPtr(5))
+	proj, repos := seedBrainstormProject(t, "bs-proj-emptyref", []string{"o/alpha", "o/beta"}, ptrInt(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
 			"o/alpha": {},
@@ -177,7 +177,7 @@ func TestBrainstorm_ProjectLevel_EmptyRepositoryRef(t *testing.T) {
 // TestBrainstorm_ProjectLevel_ProjectScopedPodName: brainstorm QE is project-scoped.
 // PodRepo is empty because pod-name is stamped at admit time, not at enqueue time.
 func TestBrainstorm_ProjectLevel_ProjectScopedPodName(t *testing.T) {
-	proj, repos := seedBrainstormProject(t, "bs-proj-podname", []string{"o/alpha", "o/beta"}, intPtr(5))
+	proj, repos := seedBrainstormProject(t, "bs-proj-podname", []string{"o/alpha", "o/beta"}, ptrInt(5))
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{"o/alpha": {}, "o/beta": {}},
 	}

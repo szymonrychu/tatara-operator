@@ -5,19 +5,24 @@ import (
 	"testing"
 )
 
-func TestBrainstormGoalProject_SystemicMandate(t *testing.T) {
+// The goal used to carry a SYSTEMIC MANDATE ("prefer a pattern spanning >=2
+// repositories... dispatch one parallel subagent per repository") whose only
+// execution path was the ACTION RULE's `systemicId` fan-out. Nothing writes a
+// tatara/systemic-* label and proposalPayload has no systemicId field, so that
+// fan-out was removed and the mandate went with it: a mandate with no way to
+// act on it just made the goal contradict itself two paragraphs later. This is
+// the guard that neither comes back.
+func TestBrainstormGoalProject_NoSystemicRouting(t *testing.T) {
 	goal := brainstormGoalProject([]string{"o/a", "o/b"}, "ISSUES:\no/a#1 [bug] x\nOPEN MRs:\no/a#2 [ci:failure] y\nMAIN HEALTH:\no/a main CI: failure", "", 3)
-	for _, want := range []string{
-		"systemic", "subagent", "MAIN HEALTH:", "OPEN MRs:", "skip_research",
-	} {
+	for _, want := range []string{"MAIN HEALTH:", "OPEN MRs:", "skip_research"} {
 		if !strings.Contains(goal, want) {
 			t.Fatalf("goal missing %q", want)
 		}
 	}
-	// C4: nothing writes a tatara/systemic-* label and proposalPayload has no
-	// systemicId field, so the goal must not ask the agent to generate one.
-	if strings.Contains(goal, "systemicId") {
-		t.Fatalf("goal still names systemicId, which submit_outcome no longer accepts")
+	for _, unwanted := range []string{"SYSTEMIC MANDATE", "systemicId", "subagent"} {
+		if strings.Contains(goal, unwanted) {
+			t.Fatalf("goal still carries retired systemic routing: %q", unwanted)
+		}
 	}
 	if strings.Contains(goal, "Exactly one action per run") {
 		t.Fatalf("stale single-action clause still present")

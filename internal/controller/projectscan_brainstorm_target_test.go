@@ -11,7 +11,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/obs"
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -69,8 +71,6 @@ func liveBrainstormTask(proj *tatarav1alpha1.Project) tatarav1alpha1.Task {
 	return tk
 }
 
-func intPtr(v int) *int { return &v }
-
 func TestBrainstormGoalCarriesTheQuotaLine(t *testing.T) {
 	goal := brainstormGoalProject([]string{"o/r1"}, "STATE", "", 2)
 	want := "PROPOSAL QUOTA: file AT MOST 2 proposal(s) in this session."
@@ -89,7 +89,7 @@ func TestBrainstormGoalCarriesTheQuotaLine(t *testing.T) {
 // truncates against, and the goal line the agent reads.
 func TestBrainstormStampsTheQuotaAnnotation(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-ann", []string{"o/r1"}, intPtr(3))
+	proj, repos := seedBrainstormProject(t, "bs-tgt-ann", []string{"o/r1"}, ptrInt(3))
 	r := newScanReconciler(emptyReader("o/r1"))
 
 	created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
@@ -112,7 +112,7 @@ func TestBrainstormStampsTheQuotaAnnotation(t *testing.T) {
 
 func TestBrainstormRefillsOnlyTheDeficit(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-deficit", []string{"o/r1"}, intPtr(3))
+	proj, repos := seedBrainstormProject(t, "bs-tgt-deficit", []string{"o/r1"}, ptrInt(3))
 	r := newScanReconciler(emptyReader("o/r1"))
 	// Two pending proposal Issue CRs -> deficit 1.
 	seedProposalIssue(t, r, proj, "bs-tgt-deficit-r1", 1, "brainstorm", "open", "new")
@@ -133,7 +133,7 @@ func TestBrainstormRefillsOnlyTheDeficit(t *testing.T) {
 
 func TestBrainstormApprovedProposalFreesItsSlot(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-approved", []string{"o/r1"}, intPtr(1))
+	proj, repos := seedBrainstormProject(t, "bs-tgt-approved", []string{"o/r1"}, ptrInt(1))
 	r := newScanReconciler(emptyReader("o/r1"))
 	// One approved proposal, forge issue still OPEN. It must NOT count.
 	seedProposalIssue(t, r, proj, "bs-tgt-approved-r1", 1, "brainstorm", "open", "approved")
@@ -146,7 +146,7 @@ func TestBrainstormApprovedProposalFreesItsSlot(t *testing.T) {
 
 func TestBrainstormOverTargetCreatesNothingAndClosesNothing(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-over", []string{"o/r1"}, intPtr(1))
+	proj, repos := seedBrainstormProject(t, "bs-tgt-over", []string{"o/r1"}, ptrInt(1))
 	r := newScanReconciler(emptyReader("o/r1"))
 	for _, num := range []int{1, 2, 3} {
 		seedProposalIssue(t, r, proj, "bs-tgt-over-r1", num, "brainstorm", "open", "new")
@@ -171,7 +171,7 @@ func TestBrainstormOverTargetCreatesNothingAndClosesNothing(t *testing.T) {
 
 func TestBrainstormInFlightSessionCountsTowardTheTarget(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-inflight", []string{"o/r1"}, intPtr(1))
+	proj, repos := seedBrainstormProject(t, "bs-tgt-inflight", []string{"o/r1"}, ptrInt(1))
 	r := newScanReconciler(emptyReader("o/r1"))
 	existing := []tatarav1alpha1.Task{liveBrainstormTask(proj)}
 
@@ -183,7 +183,7 @@ func TestBrainstormInFlightSessionCountsTowardTheTarget(t *testing.T) {
 
 func TestBrainstormBreakerSuppressesTheEventPathOnly(t *testing.T) {
 	ctx := context.Background()
-	proj, repos := seedBrainstormProject(t, "bs-tgt-breaker", []string{"o/r1"}, intPtr(3))
+	proj, repos := seedBrainstormProject(t, "bs-tgt-breaker", []string{"o/r1"}, ptrInt(3))
 	proj.Status.BrainstormConsecutiveSkips = 3
 	r := newScanReconciler(emptyReader("o/r1"))
 
@@ -194,6 +194,80 @@ func TestBrainstormBreakerSuppressesTheEventPathOnly(t *testing.T) {
 	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
 		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); !created {
 		t.Fatal("the cron backstop must refill regardless of the breaker")
+	}
+}
+
+// openProposalsSeries reads operator_open_proposals{repo}. It reports PRESENCE
+// separately from value: gaugeValue (task_controller_test.go) folds "absent"
+// into 0, which is exactly the distinction this gauge's regression is about.
+func openProposalsSeries(t *testing.T, reg *prometheus.Registry, repo string) (float64, bool) {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "operator_open_proposals" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if labelsMatch(m.GetLabel(), map[string]string{"repo": repo}) {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// The {repo} label is the owner/name SLUG (what the tatara-observability
+// dashboard joins on), never the DNS-1123 Repository CR name that the Issue CRs
+// carry, and every enrolled repo is written every pass so an emptied repo falls
+// to 0 instead of latching its last nonzero value.
+func TestBrainstormOpenProposalsGaugeIsSluggedAndReachesZero(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-gauge", []string{"o/g1", "o/g2"}, ptrInt(5))
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(emptyReader("o/g1", "o/g2"))
+	r.Metrics = obs.NewOperatorMetrics(reg)
+	// Two pending on g1, none at all on g2.
+	seedProposalIssue(t, r, proj, repos[0].Name, 1, "brainstorm", "open", "new")
+	iss2 := seedProposalIssue(t, r, proj, repos[0].Name, 2, "brainstorm", "open", "new")
+
+	r.brainstorm(ctx, proj, emptyReader("o/g1", "o/g2"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+
+	if _, ok := openProposalsSeries(t, reg, repos[0].Name); ok {
+		t.Fatalf("gauge is labelled with the Repository CR name %q; it must be the owner/name slug", repos[0].Name)
+	}
+	if got, ok := openProposalsSeries(t, reg, "o/g1"); !ok || got != 2 {
+		t.Fatalf("operator_open_proposals{repo=o/g1} = %v (present=%v), want 2", got, ok)
+	}
+	// g2 has no proposals at all: the series must EXIST at 0, not be absent.
+	if got, ok := openProposalsSeries(t, reg, "o/g2"); !ok || got != 0 {
+		t.Fatalf("operator_open_proposals{repo=o/g2} = %v (present=%v), want an explicit 0", got, ok)
+	}
+
+	// Approving one proposal must move the gauge DOWN, and emptying g1 entirely
+	// must take it to 0 rather than latching at its last nonzero value.
+	iss2.Status.Status = "approved"
+	if err := r.Status().Update(ctx, iss2); err != nil {
+		t.Fatalf("approve issue: %v", err)
+	}
+	r.brainstorm(ctx, proj, emptyReader("o/g1", "o/g2"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	if got, ok := openProposalsSeries(t, reg, "o/g1"); !ok || got != 1 {
+		t.Fatalf("after one approval operator_open_proposals{repo=o/g1} = %v (present=%v), want 1", got, ok)
+	}
+
+	iss1 := getIssueCR(t, r.Client, tatarav1alpha1.IssueName(repos[0].Name, 1))
+	iss1.Status.Status = "approved"
+	if err := r.Status().Update(ctx, iss1); err != nil {
+		t.Fatalf("approve issue: %v", err)
+	}
+	r.brainstorm(ctx, proj, emptyReader("o/g1", "o/g2"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm, TriggerCron)
+	if got, ok := openProposalsSeries(t, reg, "o/g1"); !ok || got != 0 {
+		t.Fatalf("an emptied repo latched at %v (present=%v); want an explicit 0", got, ok)
 	}
 }
 
@@ -210,7 +284,7 @@ func TestResetBrainstormSkips(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			proj, _ := seedBrainstormProject(t, "bs-tgt-reset-"+strconv.Itoa(tc.start), []string{"o/r1"}, intPtr(3))
+			proj, _ := seedBrainstormProject(t, "bs-tgt-reset-"+strconv.Itoa(tc.start), []string{"o/r1"}, ptrInt(3))
 			r := newScanReconciler(emptyReader("o/r1"))
 			if tc.start > 0 {
 				proj.Status.BrainstormConsecutiveSkips = tc.start

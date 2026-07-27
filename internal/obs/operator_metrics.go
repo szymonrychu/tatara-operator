@@ -164,7 +164,11 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		// Set inside brainstorm() (projectscan.go) from
 		// pendingProposalCountByRepo, the UNCOLLAPSED per-repo pending count
 		// over Issue CRs: the project-wide count collapses systemic groups,
-		// which span repos, so splitting THAT per repo is undefined. It is
+		// which span repos, so splitting THAT per repo is undefined. That map
+		// is keyed by Repository CR name and re-keyed to the owner/name slug at
+		// the call site, because the label has always been the slug. Every
+		// enrolled repo is written every pass, zeros included, so a repo whose
+		// proposals were all approved falls to 0 instead of latching. It is
 		// written on every brainstorm refill decision (cron tick or Issue
 		// event), not on the 60s maybeRecomputeGauges pass most other
 		// per-project gauges use. Confirmed correctly wired (real nonzero
