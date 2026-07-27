@@ -1080,7 +1080,7 @@ func (r *TaskReconciler) renderBundle(ctx context.Context, proj *tatarav1alpha1.
 	if err != nil {
 		return "", err
 	}
-	history, err := r.proposalHistory(ctx, proj, task, agentKind)
+	history, err := ProposalHistoryFor(ctx, r.Client, proj, agentKind)
 	if err != nil {
 		return "", err
 	}

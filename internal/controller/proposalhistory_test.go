@@ -80,8 +80,7 @@ func TestProposalHistoryReadsIssueCRsNewestFirstWithinTheWindow(t *testing.T) {
 	seedHistoryIssue(t, c, "tatara", "demo", "incident", 9, 0, "open", "new")
 	seedHistoryIssue(t, c, "tatara", "demo", "", 8, 0, "open", "new")
 
-	r := &TaskReconciler{Client: c}
-	got, err := r.proposalHistory(ctx, historyProject(3), brainstormTaskFixture(), stage.AgentBrainstorm)
+	got, err := ProposalHistoryFor(ctx, c, historyProject(3), stage.AgentBrainstorm)
 	if err != nil {
 		t.Fatalf("proposalHistory: %v", err)
 	}
@@ -112,8 +111,7 @@ func TestProposalHistoryDerivesDeclinedFromAPlainClose(t *testing.T) {
 	c := newMirrorClient(t)
 	seedHistoryIssue(t, c, "tatara", "demo", "brainstorm", 1, 1, "closed", "new")
 
-	r := &TaskReconciler{Client: c}
-	got, err := r.proposalHistory(ctx, historyProject(20), brainstormTaskFixture(), stage.AgentBrainstorm)
+	got, err := ProposalHistoryFor(ctx, c, historyProject(20), stage.AgentBrainstorm)
 	if err != nil {
 		t.Fatalf("proposalHistory: %v", err)
 	}
@@ -137,8 +135,7 @@ func TestProposalHistoryCarriesTheCommentThread(t *testing.T) {
 			CreatedAt: metav1.NewTime(time.Now().Add(-time.Hour))},
 	)
 
-	r := &TaskReconciler{Client: c}
-	got, err := r.proposalHistory(ctx, historyProject(20), brainstormTaskFixture(), stage.AgentBrainstorm)
+	got, err := ProposalHistoryFor(ctx, c, historyProject(20), stage.AgentBrainstorm)
 	if err != nil {
 		t.Fatalf("proposalHistory: %v", err)
 	}
@@ -173,8 +170,7 @@ func TestProposalHistoryNilCases(t *testing.T) {
 			c := newMirrorClient(t)
 			seedHistoryIssue(t, c, "tatara", "demo", "brainstorm", 1, 1, "open", "new")
 
-			r := &TaskReconciler{Client: c}
-			got, err := r.proposalHistory(ctx, tc.proj, brainstormTaskFixture(), tc.agentKind)
+			got, err := ProposalHistoryFor(ctx, c, tc.proj, tc.agentKind)
 			if err != nil {
 				t.Fatalf("proposalHistory: %v", err)
 			}
@@ -194,8 +190,7 @@ func TestProposalHistoryIgnoresOtherProjects(t *testing.T) {
 	seedHistoryIssue(t, c, "tatara", "demo", "brainstorm", 1, 1, "open", "new")
 	seedHistoryIssue(t, c, "tatara", "other", "brainstorm", 2, 1, "open", "new")
 
-	r := &TaskReconciler{Client: c}
-	got, err := r.proposalHistory(ctx, historyProject(20), brainstormTaskFixture(), stage.AgentBrainstorm)
+	got, err := ProposalHistoryFor(ctx, c, historyProject(20), stage.AgentBrainstorm)
 	if err != nil {
 		t.Fatalf("proposalHistory: %v", err)
 	}
@@ -278,8 +273,7 @@ func TestProposalHistoryReadsLegacyUnstampedProposals(t *testing.T) {
 		t.Fatalf("status update: %v", err)
 	}
 
-	r := &TaskReconciler{Client: c}
-	got, err := r.proposalHistory(ctx, historyProject(20), brainstormTaskFixture(), stage.AgentBrainstorm)
+	got, err := ProposalHistoryFor(ctx, c, historyProject(20), stage.AgentBrainstorm)
 	if err != nil {
 		t.Fatalf("proposalHistory: %v", err)
 	}

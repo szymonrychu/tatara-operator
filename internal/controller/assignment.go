@@ -144,9 +144,10 @@ func agentJob(agentKind string) string {
 
 	case stage.AgentRefine:
 		return "## Your job\n\n" +
-			"Groom the backlog in the <task_index> above: fold duplicates into one Task, close what is " +
-			"obsolete, and link what is related. Then `submit_outcome(kind=refine, ...)` with the folds, " +
-			"closes and links you decided on.\n\n" +
+			"Groom the project's backlog: fold duplicates into one Task, close what is obsolete, and " +
+			"link what is related. Pull the backlog with `task_context(index=true)` - it is not in " +
+			"the bundle above. Then `submit_outcome(kind=refine, ...)` with the folds, closes and " +
+			"links you decided on.\n\n" +
 			"The operator applies them and VERIFIES the fold adopted; a fold you cannot justify from the " +
 			"issue text is a fold that will be refused."
 

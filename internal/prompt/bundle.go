@@ -388,7 +388,7 @@ func Render(in Input) (string, error) {
 		}
 		logger(in).Warn("bundle skeleton over budget: proposal history and notes elided, bodies truncated",
 			"task", in.Task.Name,
-			"agentKind", agentKind(in.Task),
+			"agentKind", AgentKind(in.Task),
 			"maxBundleBytes", budget,
 			"bytes", len(out),
 			"historyRendered", p.history,
@@ -504,7 +504,7 @@ func buildView(in Input, issues []v1alpha1.Issue, mrs []v1alpha1.MergeRequest, t
 			Name:    in.Task.Name,
 			Kind:    in.Task.Spec.Kind,
 			Stage:   in.Task.Status.Stage,
-			Agent:   agentKind(in.Task),
+			Agent:   AgentKind(in.Task),
 			Project: in.Task.Spec.ProjectRef,
 		},
 		Goal:       strings.TrimSpace(in.Task.Spec.Goal),
@@ -791,7 +791,7 @@ func report(in Input, out string, threads []thread, notesTotal int, p plan) {
 	if in.Metrics == nil {
 		return
 	}
-	kind := agentKind(in.Task)
+	kind := AgentKind(in.Task)
 	in.Metrics.ObserveBundleBytes(kind, len(out))
 	elided := notesTotal - p.notes + len(in.ProposalHistory) - p.history
 	for i := range threads {
@@ -810,7 +810,13 @@ func notesTotal(in Input) int {
 	return max(total, len(in.Notes))
 }
 
-func agentKind(t *v1alpha1.Task) string {
+// AgentKind is the agent kind a bundle renders as its agent="..." attribute:
+// the Task's assigned kind, falling back to its own kind before the first stage
+// entry has stamped one. It is exported because every caller that decides WHICH
+// optional sections to feed Render (today: the <proposal_history> block, which
+// is brainstorm-only) has to gate on the exact same string the bundle shows, or
+// the assignment text and the bundle can disagree about what is present.
+func AgentKind(t *v1alpha1.Task) string {
 	if t.Status.AgentKind != "" {
 		return t.Status.AgentKind
 	}

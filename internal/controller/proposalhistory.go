@@ -13,10 +13,10 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
-// proposalHistory builds the <proposal_history> block for a brainstorm turn-0
-// bundle: the most recent ResolveHistoryWindow() brainstorm-provenance Issue CRs
-// in the project, newest first, each with its display status and its full
-// comment thread. Non-brainstorm agent kinds get nil.
+// ProposalHistoryFor is the <proposal_history> block for a brainstorm bundle:
+// the most recent ResolveHistoryWindow() brainstorm-provenance Issue CRs in the
+// project, newest first, each with its display status and its full comment
+// thread. Non-brainstorm agent kinds get nil.
 //
 // It is the ONLY place a brainstorm agent can see a DECLINED proposal. A
 // discarded proposal's forge issue is closed, so the agent's own dedup scan over
@@ -24,11 +24,24 @@ import (
 // already killed. The comments come with it because they carry WHY, which a bare
 // status flag loses.
 //
+// It is EXPORTED, and that is the point: there are TWO prompt.Render call sites
+// (the operator's own turn-0 dispatch and internal/restapi's task_context
+// handler), and tatara-brainstorm-guardrails actively tells the brainstorm agent
+// it may re-read its own bundle with task_context(task=<name>) mid-turn. A block
+// that silently vanished on that re-read - while the bundle's standing trailer
+// still named <proposal_history> as present - would reopen the exact
+// re-propose-a-declined-idea failure this block exists to close. Any future
+// third Render call site must call this too.
+//
 // Everything is read from the Issue CR mirror in etcd, so the block costs no
 // extra SCM API calls, and the byte budget is enforced downstream by
 // prompt.Render (which evicts bot comments, then whole entries oldest-first).
-func (r *TaskReconciler) proposalHistory(ctx context.Context, proj *tatarav1alpha1.Project,
-	task *tatarav1alpha1.Task, agentKind string) ([]prompt.ProposalHistoryEntry, error) {
+//
+// agentKind must be the string the bundle itself renders as agent="...", i.e.
+// prompt.AgentKind(task), or the assignment text and the bundle can disagree
+// about whether the block is there.
+func ProposalHistoryFor(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
+	agentKind string) ([]prompt.ProposalHistoryEntry, error) {
 
 	// Scm.Cron is a POINTER, so both hops need a guard: a brainstorm-disabled
 	// project with no cron block at all would otherwise panic here.
@@ -39,9 +52,12 @@ func (r *TaskReconciler) proposalHistory(ctx context.Context, proj *tatarav1alph
 	if window <= 0 {
 		return nil, nil
 	}
+	// proj.Namespace, matching projectProposalIssues: the Project is the
+	// authority for where its Issue CRs live, not whichever Task happens to be
+	// asking.
 	var list tatarav1alpha1.IssueList
-	if err := r.List(ctx, &list, client.InNamespace(task.Namespace)); err != nil {
-		return nil, fmt.Errorf("proposal history for %s: list issues: %w", task.Name, err)
+	if err := c.List(ctx, &list, client.InNamespace(proj.Namespace)); err != nil {
+		return nil, fmt.Errorf("proposal history for %s: list issues: %w", proj.Name, err)
 	}
 	botLogin := botLoginOf(proj)
 	proposals := make([]*tatarav1alpha1.Issue, 0, len(list.Items))

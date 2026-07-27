@@ -233,11 +233,23 @@ func (s *Server) taskContext(w http.ResponseWriter, r *http.Request) {
 		notesTotal = len(notes) + unavailableNotes
 	}
 
+	// The SAME <proposal_history> block the operator feeds turn-0. A brainstorm
+	// agent is told (tatara-brainstorm-guardrails) it may re-read its own bundle
+	// with task_context(task=<name>) mid-turn; serving that re-read without the
+	// block would make the project's declined proposals silently vanish while the
+	// bundle's standing trailer still names the element - the exact
+	// re-propose-a-killed-idea failure the block exists to close.
+	history, err := controller.ProposalHistoryFor(ctx, s.c, proj, prompt.AgentKind(task))
+	if err != nil {
+		writeClientErr(w, err)
+		return
+	}
+
 	bundle, err := prompt.Render(prompt.Input{
 		Task: task, Issues: issues, MergeRequests: mrs,
 		Events: task.Status.PendingEvents, Notes: notes, NotesTotal: notesTotal,
-		NotesUnavailable: unavailableNotes,
-		MaxBundleBytes:   proj.Spec.MaxBundleBytes, Logger: s.log,
+		NotesUnavailable: unavailableNotes, ProposalHistory: history,
+		MaxBundleBytes: proj.Spec.MaxBundleBytes, Logger: s.log,
 	})
 	if err != nil {
 		writeClientErr(w, err)
