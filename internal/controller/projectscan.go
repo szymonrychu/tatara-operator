@@ -780,9 +780,10 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 	goal := fmt.Sprintf("PROPOSAL QUOTA: file AT MOST %d proposal(s) in this session. "+
 		"The operator truncates anything beyond %d.\n\n", quota, quota) +
 		"Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
-		"order; it owns the whole turn and emits the single terminal action itself (`propose_issue`, or " +
-		"`skip_research` when nothing clears the bar or the idea duplicates an open issue), grounded per " +
-		"the `tatara-code-quality-proposal` skill.\n\n" +
+		"order; it owns the whole turn and emits the single terminal action itself (ONE " +
+		"`submit_outcome`, carrying either your proposals or a skip reason when nothing clears the " +
+		"bar or the idea duplicates an open issue), grounded per the `tatara-code-quality-proposal` " +
+		"skill.\n\n" +
 		"HANDOFF CONTINUATION (do this FIRST): call `list_handoffs` for this project. For each open handoff that " +
 		"still describes live, unfinished work, call `get_handoff` and propose continuing it (a `propose_issue` framed " +
 		"as resuming that work) before generating fresh ideas. Skip stale/superseded/delivered handoffs. Continuation " +
@@ -791,17 +792,18 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"repositories: " + repoList + ". Ground every claim in REAL code.\n\n" +
 		"READ REAL CODE (two signals, use both): (1) every listed repo is shallow-cloned read-only into " +
 		"`workspace/<owner>/<repo>` - open the actual source, configs, and tests; (2) the code-graph MCP tools " +
-		"(`code_search`, `code_explain`, `code_related`, `code_important`, `code_cross_repo`, `code_bridges`, " +
-		"`code_communities`) index every enrolled repo - use them for the whole-project map, then open the on-disk " +
-		"files they point at to confirm before proposing. See the `tatara-code-quality-proposal` skill.\n\n" +
+		"(`code_search`, `code_context`, `code_graph`, `code_explain`) index every enrolled repo - use " +
+		"them for the whole-project map, then open the on-disk files they point at to confirm before " +
+		"proposing. See the `tatara-code-quality-proposal` skill.\n\n" +
 		stateBlock + "\n\n" +
 		"EARLY EXIT (do this FIRST, cheaply): scan the ISSUES / OPEN MRs / MAIN HEALTH state above. If nothing clears " +
-		"the bar for a genuinely novel, high-leverage proposal this cycle, call `skip_research(reason)` and STOP. " +
-		"Silence over noise.\n\n" +
+		"the bar for a genuinely novel, high-leverage proposal this cycle, emit " +
+		"`submit_outcome(action=skip, reason=...)` and STOP. Silence over noise.\n\n" +
 		"NEW-IDEAS-ONLY CONTRACT - follow exactly ONE path:\n" +
 		"1. If the best idea DUPLICATES an existing open issue above: do NOT propose. Finish with a one-line note " +
 		"naming the duplicate. Do NOT comment on it.\n" +
-		"2. If genuinely novel: call `propose_issue`. Set `repo` to the owning repository. Required " +
+		"2. If genuinely novel: emit `submit_outcome(action=propose, proposals=[...])`. Set each " +
+		"proposal's `repo` to the owning repository. Required " +
 		"body shape: (a) a one-paragraph problem statement citing the concrete file/symbol you read; (b) a " +
 		"DECOMPOSITION into sub-problems; (c) for EACH sub-problem, 2-3 concrete OPTIONS with one-line tradeoffs and " +
 		"your recommended pick; (d) the maintainer's decision framed as choosing one option per sub-problem. No flat " +

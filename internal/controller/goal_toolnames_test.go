@@ -23,7 +23,8 @@ func TestGoalBuildersNameOnlyRealTools(t *testing.T) {
 	const stateFixture = "ISSUES:\no/a#1 [bug] x\nOPEN MRs:\nnone\nMAIN HEALTH:\no/a main CI: success"
 
 	goals := map[string]string{
-		"documentationGoal": documentationGoal("https://github.com/o/a", "deadbeef"),
+		"documentationGoal":     documentationGoal("https://github.com/o/a", "deadbeef"),
+		"brainstormGoalProject": brainstormGoalProject([]string{"o/a", "o/b"}, stateFixture, "", 3),
 	}
 	for _, kind := range []string{
 		stage.AgentBrainstorm,
@@ -41,7 +42,6 @@ func TestGoalBuildersNameOnlyRealTools(t *testing.T) {
 		proj.Name = "proj-x"
 		goals["assignmentFor("+kind+")"] = assignmentFor(kind, task, proj)
 	}
-	_ = stateFixture
 
 	for name, goal := range goals {
 		t.Run(name, func(t *testing.T) {

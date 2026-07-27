@@ -10,11 +10,11 @@ func TestBrainstormGoalDropsCommentPathAddsEarlyExit(t *testing.T) {
 	if strings.Contains(g, "comment_on_issue") {
 		t.Fatal("brainstorm goal must NOT instruct comment_on_issue (path-2 dropped)")
 	}
-	if !strings.Contains(g, "skip_research") {
-		t.Fatal("brainstorm goal must instruct skip_research early-exit")
+	if !strings.Contains(g, "action=skip") {
+		t.Fatal("brainstorm goal must instruct the submit_outcome(action=skip) early-exit")
 	}
-	if !strings.Contains(g, "propose_issue") {
-		t.Fatal("brainstorm goal must keep propose_issue path")
+	if !strings.Contains(g, "action=propose") {
+		t.Fatal("brainstorm goal must keep the submit_outcome(action=propose) path")
 	}
 	// Proposal must decompose into sub-problems and offer options per piece.
 	for _, want := range []string{"sub-problem", "OPTIONS", "recommended"} {

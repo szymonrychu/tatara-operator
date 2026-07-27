@@ -17,15 +17,25 @@ func TestBrainstormGoalNamesCodeQualitySkillAndGrounding(t *testing.T) {
 	}
 
 	// Must ground proposals in real code: on-disk clones and code-graph tools.
-	for _, want := range []string{"workspace/", "code_search", "simplification", "robustness"} {
+	// code_context and code_graph are the post-fold names; code_related,
+	// code_important, code_cross_repo, code_bridges and code_communities were
+	// folded into their rel=/op= arguments and no longer exist as tools.
+	for _, want := range []string{
+		"workspace/", "code_search", "code_context", "code_graph", "code_explain",
+		"simplification", "robustness",
+	} {
 		if !strings.Contains(g, want) {
 			t.Fatalf("brainstorm goal missing code-quality grounding keyword %q", want)
 		}
 	}
 
-	// Must name the skip_research tool (not skip_brainstorm).
-	if !strings.Contains(g, "skip_research") {
-		t.Fatal("brainstorm goal must name skip_research for the early-exit tool")
+	// The early exit is submit_outcome(action=skip); skip_research never existed
+	// as a tool and is in tatara-cli's TestReapedToolsAreGone.
+	if !strings.Contains(g, "action=skip") {
+		t.Fatal("brainstorm goal must name submit_outcome(action=skip) for the early exit")
+	}
+	if strings.Contains(g, "skip_research") {
+		t.Fatal("brainstorm goal must NOT name the reaped skip_research tool")
 	}
 }
 
