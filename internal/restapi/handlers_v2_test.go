@@ -317,6 +317,15 @@ func (e *v2Env) issue(t *testing.T, name string) *tatarav1alpha1.Issue {
 	return &out
 }
 
+// project re-reads a Project CR by name, for tests that assert on a status
+// field a handler wrote (e.g. Status.BrainstormConsecutiveSkips).
+func (e *v2Env) project(t *testing.T, name string) *tatarav1alpha1.Project {
+	t.Helper()
+	var out tatarav1alpha1.Project
+	require.NoError(t, e.c.Get(context.Background(), client.ObjectKey{Namespace: ns, Name: name}, &out))
+	return &out
+}
+
 func projectV2(name string) *tatarav1alpha1.Project {
 	return &tatarav1alpha1.Project{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1368,6 +1369,51 @@ func closeIntentBody(reason string) string {
 
 // --- brainstorm -----------------------------------------------------------
 
+// brainstormQuota reads the per-session proposal quota the ProjectReconciler
+// stamped on the Task. It FAILS OPEN to the schema ceiling: an unannotated or
+// unparseable Task predates the quota (or was hand-created), and refusing its
+// outcome would lose a whole session's work. The floor is 1, because a session
+// that produced a real proposal must be able to file at least one.
+func brainstormQuota(task *tatarav1alpha1.Task) int {
+	raw, ok := task.Annotations[tatarav1alpha1.AnnBrainstormQuota]
+	if !ok {
+		return tatarav1alpha1.MaxProposalsPerOutcome
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return tatarav1alpha1.MaxProposalsPerOutcome
+	}
+	return min(max(n, 1), tatarav1alpha1.MaxProposalsPerOutcome)
+}
+
+// bumpBrainstormSkips adds one to Project.status.brainstormConsecutiveSkips, or
+// resets it to 0 when reset is true. action=skip increments; action=propose
+// resets. The counter is what suppresses the event-driven refill on a
+// proven-dry idea space; the cron tick also clears it (resetBrainstormSkips in
+// internal/controller), which is the liveness guarantee for a project that
+// never gets another maintainer verdict to trigger a propose-side reset.
+func (s *Server) bumpBrainstormSkips(ctx context.Context, projName string, reset bool) error {
+	key := types.NamespacedName{Namespace: s.ns, Name: projName}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var proj tatarav1alpha1.Project
+		if err := s.c.Get(ctx, key, &proj); err != nil {
+			return fmt.Errorf("bump brainstorm skips: get project %s: %w", projName, err)
+		}
+		if reset {
+			if proj.Status.BrainstormConsecutiveSkips == 0 {
+				return nil
+			}
+			proj.Status.BrainstormConsecutiveSkips = 0
+		} else {
+			proj.Status.BrainstormConsecutiveSkips++
+		}
+		if err := s.c.Status().Update(ctx, &proj); err != nil {
+			return fmt.Errorf("bump brainstorm skips: update project %s: %w", projName, err)
+		}
+		return nil
+	})
+}
+
 func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	ctx := o.r.Context()
 	s := o.s
@@ -1411,8 +1457,27 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		}) {
 			return
 		}
+		// Best-effort: losing a whole agent session over a status-counter write
+		// is the wrong trade, so a failure here is logged, never surfaced to the
+		// agent as a failed outcome.
+		if err := s.bumpBrainstormSkips(ctx, o.proj.Name, false); err != nil {
+			s.log.ErrorContext(ctx, "restapi: bumping the brainstorm skip breaker failed",
+				append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
+		}
 		o.ok("skip")
 		return
+	}
+
+	// OPERATOR-SIDE TRUNCATION IS THE AUTHORITY. The skill states the quota to
+	// the agent, but an agent that ignores it cannot overshoot the target:
+	// extra proposals are dropped here, silently to the agent and loudly in
+	// the log. The [1,5] schema ceiling above still applies first - this only
+	// ever narrows further, never overrides that hard rejection.
+	if quota := brainstormQuota(o.task); len(p.Proposals) > quota {
+		s.log.InfoContext(ctx, "restapi: truncating brainstorm proposals to the session quota",
+			append(reqLogFields(o.r), "action", "brainstorm_quota_truncated", "task", o.task.Name,
+				"submitted", len(p.Proposals), "quota", quota)...)
+		p.Proposals = p.Proposals[:quota]
 	}
 
 	// Each proposal becomes its OWN new clarify Task, owning its OWN Issue
@@ -1422,6 +1487,11 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 	if !ok {
 		return
 	}
+	// Resolved once: the label is INFORMATIONAL ONLY (nothing reads it for
+	// control flow - counting is Spec.ProposalKind on the CR, approval has been
+	// comment-only since C.6), but every filed proposal still carries it so a
+	// maintainer scanning the forge sees it triaged the same way it always has.
+	brainstormingLabel, _, _, _ := controller.LifecycleLabels(o.proj.Spec.Scm)
 	spawned := make([]string, 0, len(p.Proposals))
 	for _, pr := range p.Proposals {
 		repo, err := s.repoCR(ctx, o.proj.Name, pr.Repo)
@@ -1434,7 +1504,9 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// marker factor, and putting it on the SCM issue (not just the CR) keeps it
 		// alive across a mirror refresh. Harmless when the flag is off.
 		body := tatarav1alpha1.StampProposalMarker(pr.Body, tatarav1alpha1.ProposalKindBrainstorm)
-		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{Title: pr.Title, Body: body})
+		created, err := writer.CreateIssue(ctx, repo.Spec.URL, token, scm.IssueReq{
+			Title: pr.Title, Body: body, Labels: []string{brainstormingLabel},
+		})
 		controller.RecordSCM(s.metrics, providerOf(o.proj), "create_issue", err)
 		if err != nil {
 			s.log.ErrorContext(ctx, "restapi: filing a brainstorm proposal failed",
@@ -1468,6 +1540,12 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		return nil
 	}) {
 		return
+	}
+	// A productive session resets the breaker (best-effort, same trade as the
+	// skip-side bump: never fail an already-committed outcome over this).
+	if err := s.bumpBrainstormSkips(ctx, o.proj.Name, true); err != nil {
+		s.log.ErrorContext(ctx, "restapi: resetting the brainstorm skip breaker failed",
+			append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
 	}
 	o.ok("propose", "spawned", strings.Join(spawned, ","))
 }
