@@ -67,11 +67,11 @@ spec:
     cron:
       issueScan:
         schedule: "0 * * * *"
-        maxPerCycle: 1
+        maxPerRepo: 1
       brainstorm:
         enabled: true
         schedule: "0 6 * * *"
-        maxPerCycle: 1
+        targetOpenProposals: 3
         sources: [docs, memory, internet]
 ---
 apiVersion: tatara.dev/v1alpha1

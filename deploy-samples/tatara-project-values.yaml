@@ -75,7 +75,8 @@ project:
         brainstorm:
           enabled: true
           schedule: "0 * * * *"
-          maxOpenProposals: 8
+          targetOpenProposals: 3
+          historyWindow: 20
           sources: [docs, memory, internet]
 
 repositories:
