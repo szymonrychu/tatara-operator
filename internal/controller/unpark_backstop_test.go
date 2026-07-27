@@ -478,3 +478,46 @@ func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
 			"exactly the CRITICAL 1 window, where the reaper would delete a Task the driver was about to save into conversing")
 	}
 }
+
+// 2026-07-28 security review NEW-1: unparkFires never set
+// UnparkInput.MaxTurnsPerTask, so for a parked(no-outcome) Task,
+// ReasonNoOutcome's Stats.Turns >= in.MaxTurnsPerTask read Turns >= 0, which
+// is true for ANY real turn count. The probe always declined turns-exhausted
+// regardless of how far under its actual cap the Task was, so reapParked -
+// once past ParkRetention - deleted every parked(no-outcome) Task whether or
+// not driveUnparks' ApplyUnpark (which threads taskMaxTurns correctly) would
+// have re-entered it. Identical failure class to CRITICAL 1, on
+// MaxTurnsPerTask instead of ConversingHasRoom.
+//
+// This Task is parked(no-outcome) from implementing, with Turns(10) far below
+// the default cap (300, since neither the Task nor the Project overrides it) -
+// exactly the shape ApplyUnpark would re-enter into implementing. The probe
+// must agree.
+func TestUnparkFires_AgreesWithApplyUnparkOnMaxTurnsPerTask(t *testing.T) {
+	proj := &tatarav1alpha1.Project{}
+	proj.Namespace = "tatara"
+	proj.Name = "infrastructure"
+	proj.Spec.MaxOpenTasks = 6
+
+	task := &tatarav1alpha1.Task{}
+	task.Namespace = "tatara"
+	task.Name = "t-new1-no-outcome-under-cap"
+	task.Spec.ProjectRef = "infrastructure"
+	task.Spec.Kind = "clarify"
+	task.Status.Stage = tatarav1alpha1.StageParked
+	task.Status.StageReason = stage.ReasonNoOutcome
+	task.Status.ParkedFromStage = tatarav1alpha1.StageImplementing
+	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
+	task.Status.Stats.Turns = 10 // far below the default cap of 300
+
+	r := newUnparkTestReconciler(t, proj, task)
+
+	fires, err := r.unparkFires(context.Background(), proj, task, time.Now(), false)
+	if err != nil {
+		t.Fatalf("unparkFires: %v", err)
+	}
+	if !fires {
+		t.Fatal("unparkFires = false: a parked(no-outcome) Task at 10/300 turns must agree with ApplyUnpark that it re-enters - " +
+			"MaxTurnsPerTask was left at its zero value, so Turns >= 0 always declined turns-exhausted regardless of the real count")
+	}
+}

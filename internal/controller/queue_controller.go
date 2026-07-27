@@ -683,6 +683,16 @@ func (r *DispatcherReconciler) admitTicket(ctx context.Context, q *tatarav1alpha
 			// caller, so a future admission edge that DID target conversing could
 			// never silently lose the idle clock's arming to this omission
 			// (2026-07-28 security review Minor).
+			//
+			// This DOES overwrite fresh's live value with the outer, earlier-captured
+			// task's - a concurrent AppendTaskEvent landing on fresh between the Get
+			// above and this write would be clobbered (2026-07-28 security review
+			// follow-up). Judged inert, not fixed: this branch only ever fires on
+			// approved -> implementing, which never reads ConversationLastEventAt
+			// (ArmedClock's conversing-only branch is the sole reader), and any LATER
+			// conversing entry re-stamps this field unconditionally (stage.Enter, this
+			// package's EnterConversing) regardless of what it held going in - so a
+			// clobbered stale value here is never observed by anything.
 			fresh.Status.ConversationLastEventAt = task.Status.ConversationLastEventAt
 			return true
 		}

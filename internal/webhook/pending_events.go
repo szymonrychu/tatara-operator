@@ -392,9 +392,30 @@ func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, tas
 		if err != nil {
 			return err
 		}
+		// MRs feed anyMerged() in the ReasonIdentityUnverified conversing branch's
+		// kind=review guard (Task 9 IMPORTANT 2): without this, a kind=review Task
+		// parked(identity-unverified) whose owned MR is already merged would still
+		// open a conversing pod on the next stray comment - anyMerged(nil) is
+		// always false, so the guard was structurally inert on this ONE path,
+		// even though driveUnparks' ApplyUnpark (which does load MRs) enforced it
+		// correctly (2026-07-28 security review NEW-2). Not a security bypass:
+		// GUARD 1 still blocks review-kind from implementing/merging/approved -
+		// the impact was bounded pod waste on an already-merged PR.
+		mrs, err := controller.LoadTaskMRsFor(ctx, s.reader(), fresh)
+		if err != nil {
+			return err
+		}
+		// ActiveTasks/MaxOpenTasks are deliberately left unset: they are read ONLY
+		// by ReasonBacklogSweep (stage.go), and this function only ever drives
+		// ReasonIdentityUnverified - the guard above (fresh.Status.StageReason !=
+		// stage.ReasonIdentityUnverified) already refused any other reason before
+		// this point is reached. See unparkFires' field-by-field audit
+		// (internal/controller/reaper.go) for the equivalent reasoning against
+		// every UnparkInput field and all three production builders.
 		target, code := stage.UnparkDetailed(stage.UnparkInput{
 			Task:              fresh,
 			Issues:            issues,
+			MRs:               mrs,
 			BotLogin:          botLogin,
 			GrammarPassed:     passed,
 			ConversingHasRoom: conversingRoom,

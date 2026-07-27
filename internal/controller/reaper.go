@@ -1236,9 +1236,52 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // exactly the class of bug finding 3 already fixed once for GrammarPassed.
 // driveUnparksPaced and ReapTerminalPaced are paced INDEPENDENTLY, so a pass
 // where the driver is throttled and the reaper is not is a real production
-// window, not a theoretical one. The caller (ReapTerminal) hoists this the same
-// way driveUnparks does, off the SAME ConversingHasRoom helper - never
-// reimplemented - so the probe and the driver can never disagree.
+// window, not a theoretical one. The caller (ReapTerminal) hoists ConversingHasRoom
+// the same way driveUnparks does, off the SAME ConversingHasRoom helper - never
+// reimplemented.
+//
+// MaxTurnsPerTask is threaded from the SAME taskMaxTurns(proj, t) ApplyUnpark
+// uses (2026-07-28 security review NEW-1: this field was left at its zero value
+// here, so for a parked(no-outcome) Task, ReasonNoOutcome's
+// Stats.Turns >= in.MaxTurnsPerTask read as true for ANY Turns >= 0 - the probe
+// always declined turns-exhausted and fires=false regardless of the Task's real
+// turn count, so reapParked deleted every parked(no-outcome) Task once
+// ParkRetention elapsed, whether or not driveUnparks would have re-entered it.
+// Identical failure class to the ConversingHasRoom fix above, on a different
+// field and reason).
+//
+// FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1), every UnparkInput
+// field against this package's three production UnparkInput builders
+// (ApplyUnpark, reverifyParked - internal/webhook/pending_events.go, and this
+// function), so the next reader does not have to re-derive which fields each
+// reason actually consults:
+//   - Task, Now: set by all three. Always required.
+//   - Issues: set by all three. Read by ReasonAwaitingHuman (non-review) and
+//     ReasonIdentityUnverified (grammar-passed branch).
+//   - MRs: set by all three (reverifyParked as of the NEW-2 fix below). Read by
+//     ReasonAwaitingHuman (review kind), ReasonIdentityUnverified (review kind,
+//     Task 9), ReasonNoOutcome, ReasonHandoffStalled - all via anyMerged.
+//   - BotLogin: set by all three. Read by hasNonBotEvent in every comment-driven
+//     reason (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
+//   - GrammarPassed: set by all three (reverifyParked/ApplyUnpark compute it via
+//     grammarPassedFor; this probe the same). Read ONLY by ReasonIdentityUnverified.
+//   - ConversingHasRoom: set by all three as of the CRITICAL 1 fix above. Read by
+//     ReasonAwaitingHuman and ReasonIdentityUnverified.
+//   - MaxTurnsPerTask: set by ApplyUnpark and this function (as of NEW-1). NOT set
+//     by reverifyParked - harmless, because reverifyParked only ever drives
+//     ReasonIdentityUnverified, and MaxTurnsPerTask is read ONLY by ReasonNoOutcome,
+//     which reverifyParked never handles (task.Status.StageReason is checked
+//     before it is ever called).
+//   - ActiveTasks, MaxOpenTasks: set by ApplyUnpark and this function. NOT set by
+//     reverifyParked - same reasoning: both are read ONLY by ReasonBacklogSweep,
+//     which reverifyParked never handles either.
+//
+// With MaxTurnsPerTask now threaded, this probe and driveUnparks' ApplyUnpark
+// read the IDENTICAL set of UnparkInput fields for every reason either of them
+// actually handles, off the same helpers (grammarPassedFor, ConversingHasRoom,
+// taskMaxTurns) - so the two cannot silently diverge again without a new field
+// being added to UnparkInput and only one builder threading it, which this audit
+// exists to make an easy diff to catch.
 func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha1.Project,
 	t *tatarav1alpha1.Task, now time.Time, conversingRoom bool) (bool, error) {
 
@@ -1266,6 +1309,7 @@ func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha
 		ActiveTasks:       active,
 		MaxOpenTasks:      maxOpen,
 		BotLogin:          botLoginOf(proj),
+		MaxTurnsPerTask:   taskMaxTurns(proj, t),
 		GrammarPassed:     grammarPassedFor(probe, false),
 		ConversingHasRoom: conversingRoom,
 		Now:               now,

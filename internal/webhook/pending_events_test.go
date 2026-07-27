@@ -135,6 +135,15 @@ func peTask(name, stageName, stageReason string, issueRefs ...string) *tatarav1.
 	}
 }
 
+// peTaskKind is peTask with an explicit Spec.Kind, for the tests (2026-07-28
+// security review NEW-2) that need a kind=review Task - peTask itself
+// hardcodes "clarify" and every other caller relies on that.
+func peTaskKind(name, kind, stageName, stageReason string) *tatarav1.Task {
+	task := peTask(name, stageName, stageReason)
+	task.Spec.Kind = kind
+	return task
+}
+
 func getPETask(t *testing.T, c client.Client, name string) *tatarav1.Task {
 	t.Helper()
 	var task tatarav1.Task
@@ -316,6 +325,43 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t
 	}
 	if len(gotTask.Status.PendingEvents) != 1 {
 		t.Fatalf("pendingEvents = %d, want 1 RETAINED (the comment rides into the conversing pod's turn-0 bundle, not dropped here)", len(gotTask.Status.PendingEvents))
+	}
+}
+
+// TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConversation
+// is 2026-07-28 security review NEW-2: reverifyParked - the webhook-triggered,
+// comment-driven fast path identity-unverified re-entry actually goes through -
+// never loaded MRs, so the merged-MR guard added for Task 9's IMPORTANT 2
+// (anyMerged(in.MRs)) was structurally inert here: anyMerged(nil) is always
+// false. A kind=review Task parked(identity-unverified) whose owned MR is
+// already merged must NOT open a conversing pod on a stray comment - not a
+// security bypass (GUARD 1 still blocks review-kind from implementing/
+// merging/approved from conversing), but exactly the "one pod per human
+// comment" waste the guard exists to prevent.
+func TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConversation(t *testing.T) {
+	task := peTaskKind("t-parked-review-merged", "review", tatarav1.StageParked, stage.ReasonIdentityUnverified)
+	mergedAt := metav1.Now()
+	mr := peMR(88, task, tatarav1.MergeRequestStatus{State: "merged", MergedAt: &mergedAt})
+	task.Status.MRRefs = []string{mr.Name}
+	proj := peProject("tatara-bot", "maintainer")
+	sec := peSecret("pe-proj-scm", "pat")
+	c := peClient(t, proj, peRepo(), task, mr, sec)
+
+	rd := &fakeApprovalReader{comments: []scm.IssueComment{
+		{ExternalID: "c10", Author: "maintainer", Body: "any update?", CreatedAt: time.Now().UTC()},
+	}}
+	s := peServer(c, &stubSpiller{}, func(string, string) (scm.SCMReader, error) { return rd, nil })
+
+	ev := scm.WebhookEvent{
+		IsComment: true, IsPR: true, Number: 88,
+		ActorLogin: "maintainer", CommentID: 101, CommentBody: "any update?",
+	}
+	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
+
+	gotTask := getPETask(t, c, task.Name)
+	if gotTask.Status.Stage != tatarav1.StageParked {
+		t.Fatalf("stage = (%q,%q), want still parked - a kind=review Task with a merged owned MR must never open a conversing pod",
+			gotTask.Status.Stage, gotTask.Status.StageReason)
 	}
 }
 
