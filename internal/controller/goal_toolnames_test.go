@@ -24,6 +24,7 @@ func TestGoalBuildersNameOnlyRealTools(t *testing.T) {
 
 	goals := map[string]string{
 		"documentationGoal":     documentationGoal("https://github.com/o/a", "deadbeef"),
+		"docBatchGoal":          docBatchGoal([]string{"task-a", "task-b"}),
 		"brainstormGoalProject": brainstormGoalProject([]string{"o/a", "o/b"}, stateFixture, "", 3),
 	}
 	for _, kind := range []string{

@@ -273,7 +273,11 @@ func latestCommitSHA(commits []scm.CommitRef) string {
 // documentationGoal returns the turn-0 goal for a scheduled documentation-sync
 // Task. Extracted from createDocumentationTask so the goal-builder tool-name
 // conformance test can reach it without a k8s client; the per-kind job text the
-// agent also reads comes from agentJob(stage.AgentDocumentation).
+// agent also reads comes from agentJob(stage.AgentDocumentation). Its only
+// caller, documentationScan, currently has no production callers (see the
+// comment above the MintDocBatch call in the cron sweep recording that
+// MintDocBatch replaced it); the live documentation goal builder is
+// docBatchGoal in docbatch.go.
 func documentationGoal(sourceURL, headSHA string) string {
 	return fmt.Sprintf("Scheduled documentation sync: %s advanced to %s since the last doc "+
 		"update. Review the diff and update the documentation repo if it is doc-relevant; "+

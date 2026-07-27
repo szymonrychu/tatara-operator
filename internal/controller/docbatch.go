@@ -37,6 +37,17 @@ import (
 // DocBatchKind is the Task kind the nightly batch mints.
 const DocBatchKind = "documentation"
 
+// docBatchGoal returns the turn-0 goal for the nightly documentation batch.
+// Extracted from MintDocBatch so the goal-builder tool-name conformance test
+// can reach it without a k8s client.
+func docBatchGoal(covered []string) string {
+	return fmt.Sprintf(
+		"Nightly documentation batch. %d task(s) were delivered and merged since the "+
+			"last batch:\n\n%s\n\nUpdate the documentation repo for whichever of them are "+
+			"doc-relevant, in ONE pull request. No-op on the ones that are not.",
+		len(covered), "- "+strings.Join(covered, "\n- "))
+}
+
 // MintDocBatch is the nightly cron, once per project per night. It mints ONE
 // documentation Task covering every delivered Task that still needs documenting,
 // or NOTHING when there is nothing to document.
@@ -102,11 +113,7 @@ func (r *ProjectReconciler) MintDocBatch(ctx context.Context, proj *tatarav1alph
 			// Create -> documenting is derived by the reconciler create-edge from
 			// Spec.InitialStage (fix C5): no racing post-create stage write.
 			InitialStage: tatarav1alpha1.StageDocumenting,
-			Goal: fmt.Sprintf(
-				"Nightly documentation batch. %d task(s) were delivered and merged since the "+
-					"last batch:\n\n%s\n\nUpdate the documentation repo for whichever of them are "+
-					"doc-relevant, in ONE pull request. No-op on the ones that are not.",
-				len(covered), "- "+strings.Join(covered, "\n- ")),
+			Goal:         docBatchGoal(covered),
 		},
 	}
 	if err := controllerutil.SetControllerReference(proj, batch, r.Scheme); err != nil {

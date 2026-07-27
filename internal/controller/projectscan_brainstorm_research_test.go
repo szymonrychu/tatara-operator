@@ -45,6 +45,6 @@ func TestBrainstormGoalNamesCodeQualitySkillAndGrounding(t *testing.T) {
 func TestBrainstormGoalNoDanglingSkipBrainstorm(t *testing.T) {
 	g := brainstormGoalProject([]string{"o/a", "o/b"}, "STATE", "", 3)
 	if strings.Contains(g, "skip_brainstorm") {
-		t.Fatal("brainstorm goal must NOT contain dangling skip_brainstorm token; use skip_research instead")
+		t.Fatal("brainstorm goal must NOT contain dangling skip_brainstorm token; use submit_outcome(action=skip) instead")
 	}
 }
