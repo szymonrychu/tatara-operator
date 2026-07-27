@@ -963,10 +963,15 @@ func TestIssueWrite_Create_IsSynchronousAndReturnsTheNumber(t *testing.T) {
 		"a plain agent-filed issue is not a tatara proposal and must carry no provenance")
 }
 
-// mintIssueCR stamps Spec.ProposalKind from the body marker, once, next to the
-// integrity anchor. Without it nothing in production ever writes the field and
-// pendingProposalCount reads structurally zero for every project.
-func TestIssueWrite_Create_StampsProposalKindFromTheBodyMarker(t *testing.T) {
+// The generic issue_write action=create endpoint is callable by ANY authenticated
+// agent pod with an agent-supplied body, and mintIssueCR files it under the bot
+// account. So body content must never be able to claim proposal provenance: an
+// agent processing forge content (a prompt-injection surface) that later files an
+// unrelated issue containing the literal marker string would otherwise mint a
+// PERMANENT backlog slot, and - via the auto-approve carve-out's anchor - an
+// auto-approvable one. Provenance comes from the CALLER, and this caller declares
+// none.
+func TestIssueWrite_Create_NeverClaimsProposalProvenanceFromTheBody(t *testing.T) {
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
 		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"))
 
@@ -977,9 +982,13 @@ func TestIssueWrite_Create_StampsProposalKindFromTheBodyMarker(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 
 	iss := e.issue(t, tatarav1alpha1.IssueName("tatara-operator", 101))
-	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm, iss.Spec.ProposalKind)
-	require.Equal(t, tatarav1alpha1.ComputeProposalContentHash(body), iss.Spec.ProposalBodyHash,
-		"provenance and the integrity anchor are written by the same branch")
+	require.Empty(t, iss.Spec.ProposalKind,
+		"an agent-supplied body must never stamp durable proposal provenance")
+	require.Empty(t, iss.Spec.ProposalBodyHash,
+		"and must never mint the auto-approve integrity anchor either")
+	require.Equal(t, tatarav1alpha1.ProposalKindBrainstorm,
+		tatarav1alpha1.ProposalKindFromBody(iss.Status.Body),
+		"the body is stored verbatim; it is the SPEC that refuses the claim")
 }
 
 // The controller-ownership gate on EVERY action that names a number (fix 7).

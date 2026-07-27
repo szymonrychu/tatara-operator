@@ -1452,7 +1452,8 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 			writeClientErr(o.w, err)
 			return
 		}
-		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, body, nil); err != nil {
+		if err := s.mintIssueCR(ctx, o.proj, repo, child, number, created.URL, pr.Title, body,
+			tatarav1alpha1.ProposalKindBrainstorm, nil); err != nil {
 			writeClientErr(o.w, err)
 			return
 		}
@@ -1631,7 +1632,8 @@ func (o *outcomeCtx) incident(p incidentPayload) {
 	if len(crLabels) == 0 {
 		crLabels = nil
 	}
-	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, body, crLabels); err != nil {
+	if err := s.mintIssueCR(ctx, o.proj, repo, o.task, number, created.URL, p.Issue.Title, body,
+		tatarav1alpha1.ProposalKindIncident, crLabels); err != nil {
 		writeClientErr(o.w, err)
 		return
 	}

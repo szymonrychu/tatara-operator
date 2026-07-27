@@ -1082,7 +1082,8 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 		writeError(w, http.StatusBadGateway, "scm returned no issue number")
 		return
 	}
-	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, req.Title, req.Body, nil); err != nil {
+	// No proposal kind: an agent-supplied body never claims tatara provenance.
+	if err := s.mintIssueCR(ctx, proj, repo, task, number, created.URL, req.Title, req.Body, "", nil); err != nil {
 		writeClientErr(w, err)
 		return
 	}
@@ -1098,21 +1099,34 @@ func (s *Server) issueCreate(w http.ResponseWriter, r *http.Request, proj *tatar
 // status from what we just posted, and appends the ref to the Task. crLabels
 // is stamped on the Issue CR's metadata.labels (e.g. queue.LabelAlertRuleKey
 // for an incident tracker, O4); nil for every non-incident caller.
+//
+// proposalKind is the CALLER's declaration that this issue is a tatara proposal
+// (ProposalKindBrainstorm / ProposalKindIncident), or "" for an ordinary issue.
+// It is deliberately NOT sniffed out of body. Every caller here files under the
+// bot account, and the generic issue_write action=create path carries a body the
+// AGENT wrote - a prompt-injection surface. Deriving provenance from that body
+// would let an agent that merely echoes the marker string mint a permanent
+// backlog slot with an auto-approve anchor to match. The two operator-owned
+// proposal paths know their own kind and say so; the generic path says nothing.
 func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, task *tatarav1alpha1.Task, number int, url, title, body string,
-	crLabels map[string]string) error {
+	proposalKind string, crLabels map[string]string) error {
 	name := tatarav1alpha1.IssueName(repo.Name, number)
 	spec := tatarav1alpha1.IssueSpec{
 		RepositoryRef: repo.Name, Number: number, URL: url, ProjectRef: proj.Name,
 	}
-	// A tatara-proposed body (brainstorm/incident marker) gets its auto-approve
-	// integrity anchor AND its durable provenance written HERE, once, into Spec -
-	// the one place the mirror never overwrites. The hash is the tamper record;
-	// ProposalKind is the provenance the backlog controller counts on. The in-body
-	// marker remains provenance-only.
-	if kind := tatarav1alpha1.ProposalKindFromBody(body); kind != "" {
+	// A declared proposal gets its auto-approve integrity anchor AND its durable
+	// provenance written HERE, once, into Spec - the one place the mirror never
+	// overwrites. The hash is the tamper record; ProposalKind is the provenance the
+	// backlog controller counts on. They are written TOGETHER, so anchor-presence
+	// is exactly "the operator declared this a proposal" - which is what lets the
+	// migration fallback in the controller (effectiveProposalKind) tell a genuine
+	// pre-Spec-field proposal from a body that merely contains the marker string.
+	// The in-body marker stays provenance-only, and remains the auto-approve path's
+	// own marker factor.
+	if proposalKind != "" {
 		spec.ProposalBodyHash = tatarav1alpha1.ComputeProposalContentHash(body)
-		spec.ProposalKind = kind
+		spec.ProposalKind = proposalKind
 	}
 	iss := &tatarav1alpha1.Issue{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.ns, Labels: crLabels},

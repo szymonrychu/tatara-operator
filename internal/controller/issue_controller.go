@@ -120,8 +120,11 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// Runs after the mirror sync so the backfill reads a FRESH body and a fresh
-	// author, and before the closed branch, which can delete the CR and return.
+	// Placed before the closed branch, which can delete the CR and return early.
+	// The cadence sync above does NOT feed this: syncIssueThread refreshes only
+	// Status.Comments/LastSyncedAt/conditions. Status.Body and Status.Author are
+	// written by SyncIssue on the webhook and scan intake paths, so the backfill
+	// reads whatever those last wrote.
 	if err := r.stampProposalKind(ctx, &iss, botLoginOf(&proj)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -166,18 +169,16 @@ func (r *IssueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 // bounded, shrinking set that self-corrects as the backlog turns over. No
 // migration job, no startup sweep, no manual step.
 //
-// It reads the marker ONLY on a bot-authored issue. The body is forge-editable,
-// so an ungated backfill would let anyone with write access to any issue on a
-// tracked repo paste the marker in and have the operator stamp it PERMANENTLY as
-// a proposal, inflating the backlog and suppressing legitimate refills. Bot
-// authorship is the anchor a body editor cannot forge; see effectiveProposalKind
-// (proposalcount.go), which applies the identical gate to the read path so an
-// unstamped forgery cannot be counted in the passes before this runs.
+// It reads the marker ONLY on an issue that is bot-authored AND already carries a
+// ProposalBodyHash. Both gates are the read path's, verbatim - see
+// effectiveProposalKind (proposalcount.go) for why each exists. They must be
+// identical on both paths: the read gate stops a forgery being COUNTED in the
+// passes before this runs, and this one stops it being stamped PERMANENTLY.
 func (r *IssueReconciler) stampProposalKind(ctx context.Context, iss *tatarav1alpha1.Issue, botLogin string) error {
 	if iss.Spec.ProposalKind != "" {
 		return nil
 	}
-	if !issueAuthoredByBot(iss, botLogin) {
+	if !issueAuthoredByBot(iss, botLogin) || iss.Spec.ProposalBodyHash == "" {
 		return nil
 	}
 	kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)

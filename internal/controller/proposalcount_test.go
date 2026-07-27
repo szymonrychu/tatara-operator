@@ -28,10 +28,25 @@ func iss(kind, state, status, repo string, labels ...string) tatarav1alpha1.Issu
 }
 
 // issBody is iss plus a mirrored body, for the unstamped issues whose provenance
-// can only come from the in-body marker.
+// can only come from the in-body marker. A marked body also gets the Spec anchor,
+// because the operator has written the two together since f83e8f3 - that is what a
+// genuine pre-Spec-field proposal actually looks like on disk.
 func issBody(kind, state, status, repo, body string) tatarav1alpha1.Issue {
 	out := iss(kind, state, status, repo)
 	out.Status.Body = body
+	if tatarav1alpha1.ProposalKindFromBody(body) != "" {
+		out.Spec.ProposalBodyHash = tatarav1alpha1.ComputeProposalContentHash(body)
+	}
+	return out
+}
+
+// issNoAnchor is a marked body with NO Spec anchor: an issue the operator filed
+// on behalf of an AGENT (issue_write action=create) whose body happens to contain
+// the marker string. It is bot-authored, so the authorship gate passes; only the
+// missing anchor separates it from a genuine proposal.
+func issNoAnchor(kind, state, status, repo, body string) tatarav1alpha1.Issue {
+	out := issBody(kind, state, status, repo, body)
+	out.Spec.ProposalBodyHash = ""
 	return out
 }
 
@@ -92,6 +107,13 @@ func TestProposalPending(t *testing.T) {
 			issAuthored("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm), ""), false},
 		{"a stamped kind still counts regardless of author, because Spec is unforgeable",
 			issAuthored("brainstorm", "open", "new", "r1", "", "mallory"), true},
+
+		// The MINT anchor. mintIssueCR files agent-authored issues under the bot
+		// account too, so authorship alone cannot tell an agent's issue that happens
+		// to contain the marker string from a genuine proposal. The Spec anchor can:
+		// the operator writes it only when IT declared the issue a proposal.
+		{"a bot-filed issue whose body carries the marker but has no Spec anchor does not count",
+			issNoAnchor("", "open", "new", "r1", markedBody(tatarav1alpha1.ProposalKindBrainstorm)), false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -201,6 +223,10 @@ func TestPendingProposalCountCountsUnstampedBodyMarkerProposals(t *testing.T) {
 		// The planted marker: a human-authored issue on a tracked repo whose body
 		// someone pasted the marker into. It must never buy a backlog slot.
 		issAuthored("", "open", "new", "r8", body, "mallory"),
+		// The agent-filed issue: bot-authored (mintIssueCR files everything under
+		// the bot) with the marker string in its body but no operator-declared
+		// provenance. Also never a backlog slot.
+		issNoAnchor("", "open", "new", "r9", body),
 	}
 	for i := range issues {
 		if issues[i].Spec.ProposalKind != "" {

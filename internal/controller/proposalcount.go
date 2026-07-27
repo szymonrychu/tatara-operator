@@ -44,20 +44,34 @@ func issueAuthoredByBot(iss *tatarav1alpha1.Issue, botLogin string) bool {
 // converts those to stamped Issues as they reconcile, so this branch is
 // self-liquidating rather than a permanent second source of truth.
 //
-// The AUTHORSHIP gate on that fallback is a security control, not a filter.
-// Anyone with forge write access to ANY issue on a tracked repo can paste
-// "<!-- tatara-proposed-by:brainstorm -->" into a body they control. Ungated,
-// that alone would buy a permanent backlog slot and suppress legitimate refills
-// (a refill-cadence DoS; it can never reach auto-approve, which fails closed on
-// the absent ProposalBodyHash anchor). An attacker who can edit a body cannot
-// change its author, and a genuine proposal is ALWAYS filed under the bot
-// account, so requiring bot authorship closes the vector while leaving the
-// migration path for real pre-existing proposals fully intact.
+// The fallback carries TWO corroborating gates, both Spec-side or forge-immutable,
+// because the marker itself is neither.
+//
+//  1. BOT AUTHORSHIP. Anyone with forge write access to ANY issue on a tracked
+//     repo can paste "<!-- tatara-proposed-by:brainstorm -->" into a body they
+//     control. Ungated, that alone would buy a permanent backlog slot and
+//     suppress legitimate refills (a refill-cadence DoS). An attacker who can
+//     edit a body cannot change its author, and a genuine proposal is ALWAYS
+//     filed under the bot account.
+//
+//  2. A NON-EMPTY ProposalBodyHash. Bot authorship alone is not enough, because
+//     mintIssueCR files AGENT-authored issues (issue_write action=create) under
+//     the bot account too, and that body is agent-written - a prompt-injection
+//     surface. The anchor is written by mintIssueCR only when the CALLER declared
+//     a proposal kind, so its presence means "the operator declared this a
+//     proposal", which is the exact thing being asserted. This costs the
+//     migration path NOTHING: the anchor and the marker were introduced in the
+//     same commit (f83e8f3), so every proposal that carries a marker carries an
+//     anchor too. Presence only - never a MATCH, which would hand a body editor a
+//     way to deflate the count.
+//
+// A stamped Spec.ProposalKind needs neither gate: Spec is unreachable from the
+// forge and is only ever written by the operator.
 func effectiveProposalKind(iss *tatarav1alpha1.Issue, botLogin string) string {
 	if iss.Spec.ProposalKind != "" {
 		return iss.Spec.ProposalKind
 	}
-	if !issueAuthoredByBot(iss, botLogin) {
+	if !issueAuthoredByBot(iss, botLogin) || iss.Spec.ProposalBodyHash == "" {
 		return ""
 	}
 	return tatarav1alpha1.ProposalKindFromBody(iss.Status.Body)

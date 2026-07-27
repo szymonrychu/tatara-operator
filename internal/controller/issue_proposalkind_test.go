@@ -23,24 +23,36 @@ func TestStampProposalKind(t *testing.T) {
 	brainstormBody := tatarav1alpha1.StampProposalMarker("body", tatarav1alpha1.ProposalKindBrainstorm)
 	incidentBody := tatarav1alpha1.StampProposalMarker("body", tatarav1alpha1.ProposalKindIncident)
 
+	// anchorFor is what mintIssueCR writes alongside a declared proposal kind.
+	anchorFor := func(body string) string {
+		return tatarav1alpha1.ComputeProposalContentHash(body)
+	}
+
 	tests := []struct {
 		name     string
 		specKind string
 		body     string
 		author   string
+		anchor   string
 		wantKind string
 	}{
-		{"empty kind with a brainstorm marker is backfilled", "", brainstormBody, testBotLogin, "brainstorm"},
-		{"empty kind with an incident marker is backfilled", "", incidentBody, testBotLogin, "incident"},
-		{"no marker is left alone", "", "a plain body", testBotLogin, ""},
-		{"an already-stamped kind is never recomputed", "brainstorm", incidentBody, testBotLogin, "brainstorm"},
-		{"a body edit that strips the marker cannot clear a stamped kind", "brainstorm", "edited away", testBotLogin, "brainstorm"},
+		{"empty kind with a brainstorm marker is backfilled", "", brainstormBody, testBotLogin, anchorFor(brainstormBody), "brainstorm"},
+		{"empty kind with an incident marker is backfilled", "", incidentBody, testBotLogin, anchorFor(incidentBody), "incident"},
+		{"no marker is left alone", "", "a plain body", testBotLogin, "", ""},
+		{"an already-stamped kind is never recomputed", "brainstorm", incidentBody, testBotLogin, anchorFor(incidentBody), "brainstorm"},
+		{"a body edit that strips the marker cannot clear a stamped kind", "brainstorm", "edited away", testBotLogin, anchorFor("x"), "brainstorm"},
 
 		// The authorship anchor. Without it, anyone with forge write access to any
 		// issue on a tracked repo could paste the marker into it and have the
 		// operator PERMANENTLY (write-once) stamp it as a proposal.
-		{"a marker planted in a human-authored issue is never stamped", "", brainstormBody, "mallory", ""},
-		{"an empty author is never the bot", "", brainstormBody, "", ""},
+		{"a marker planted in a human-authored issue is never stamped", "", brainstormBody, "mallory", anchorFor(brainstormBody), ""},
+		{"an empty author is never the bot", "", brainstormBody, "", anchorFor(brainstormBody), ""},
+
+		// The MINT anchor. An agent-filed issue (issue_write action=create) is minted
+		// under the bot account too, so only the absent Spec anchor distinguishes a
+		// body that merely CONTAINS the marker from one the operator DECLARED a
+		// proposal. Never stamp the former, or the claim becomes permanent.
+		{"a bot-filed issue with the marker but no Spec anchor is never stamped", "", brainstormBody, testBotLogin, "", ""},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -51,8 +63,9 @@ func TestStampProposalKind(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 				Spec: tatarav1alpha1.IssueSpec{
 					RepositoryRef: "pk", Number: i + 1, ProjectRef: "demo",
-					URL:          "https://github.com/o/pk/issues/1",
-					ProposalKind: tc.specKind,
+					URL:              "https://github.com/o/pk/issues/1",
+					ProposalKind:     tc.specKind,
+					ProposalBodyHash: tc.anchor,
 				},
 			}
 			if err := r.Create(ctx, iss); err != nil {
