@@ -101,6 +101,15 @@ type ProjectReconciler struct {
 	// Seq provides durable per-project sequence numbers for QueuedEvents created
 	// by cron scans. Wired in wire.go; tests create via &queue.SeqSource{Client, Namespace}.
 	Seq *queue.SeqSource
+	// Tasks is the *TaskReconciler enforceConversingCeiling reaches
+	// conversingHandoffAndPark through - the eviction path takes the SAME
+	// handoff-turn-then-park sequence idle expiry does (Task 10), rather than a
+	// second copy of it. Wired in wire.go to the SAME *TaskReconciler the
+	// manager registers, not a second instance: two independent TaskReconcilers
+	// would mean two independently-configured Session/SpillerFor/PodConfig
+	// stacks for what must behave as one stopper. Nil (a test that never drives
+	// the ceiling) is never dereferenced.
+	Tasks *TaskReconciler
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
 	// (updateMemoryStackCounts + updateIssueStateCounts) run. Defaults to
@@ -351,6 +360,20 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("drive unparks: %w", unparkErr)
 	}
 	requeueAfter = soonestRequeue(requeueAfter, unparkRequeue)
+
+	// The conversing ceiling's level-triggered backstop. The webhook's
+	// ConversingHasRoom check is the fast path that usually keeps a project's
+	// live conversing count in range; this converges whatever raced it, and it
+	// is also what keeps operator_conversing_pods honest for a project whose
+	// comments have stopped arriving (a pure webhook-side gauge would freeze at
+	// its last reading forever). Blocking, matching driveUnparksPaced/
+	// resumeNoReentryParksPaced/ReapTerminalPaced above: an eviction failure
+	// (a write conflict, a forge outage mid-handoff) must requeue rather than
+	// be silently swallowed, the same as every other paced backstop in this loop.
+	if err := r.enforceConversingCeiling(ctx, &project, time.Now()); err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, fmt.Errorf("enforce conversing ceiling: %w", err)
+	}
 
 	// WS3-I4: a human reply to a Task parked with a NO-RE-ENTRY reason triggers a
 	// fresh gated re-mint (sever(Orphan) + MintForItem), never a smuggled re-entry.

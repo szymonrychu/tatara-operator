@@ -372,6 +372,37 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		return memclient.New(endpoint, memoryTokens.Token, nil)
 	}
 
+	// Built here, ahead of ProjectReconciler, so ProjectReconciler.Tasks below
+	// can point at the SAME *TaskReconciler instance the manager registers
+	// (SetupWithManager still runs at its usual place further down) rather than
+	// a second, independently-configured one. enforceConversingCeiling reaches
+	// conversingHandoffAndPark through this handle - the eviction path must
+	// share the live TaskReconciler's Session/SpillerFor/PodConfig stack, not a
+	// stand-in.
+	wrapperTokens := auth.NewTokenSource(auth.TokenSourceConfig{
+		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
+		ClientID:     cfg.OperatorOIDCClientID,
+		ClientSecret: cfg.OperatorOIDCClientSecret,
+		Audience:     "tatara-claude-code-wrapper",
+	})
+	taskReconciler := &controller.TaskReconciler{
+		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
+		Scheme:        mgr.GetScheme(),
+		Metrics:       metrics,
+		SpillerFor:    spillerFor,
+		Seq:           seq,
+		BundleMetrics: obs.NewBundleMetrics(ctrlmetrics.Registry),
+		Session:       agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
+		PodConfig:     podConfigFromConfig(cfg),
+		SCMFor: func(provider string) (scm.SCMWriter, error) {
+			return scm.ByProvider(provider)
+		},
+		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
+			return scm.ReaderByProvider(provider, token)
+		},
+	}
+
 	if err := (&controller.ProjectReconciler{
 		Client:              mgr.GetClient(),
 		APIReader:           mgr.GetAPIReader(),
@@ -394,6 +425,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		},
 		SpillerFor: spillerFor,
 		Seq:        seq,
+		Tasks:      taskReconciler,
 	}).SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup ProjectReconciler: %w", err)
 	}
@@ -499,29 +531,7 @@ func addReconcilers(mgr ctrl.Manager, cfg config.Config, metrics *obs.OperatorMe
 		return nil, fmt.Errorf("setup RepositoryReconciler: %w", err)
 	}
 
-	wrapperTokens := auth.NewTokenSource(auth.TokenSourceConfig{
-		TokenURL:     cfg.OIDCIssuer + "/protocol/openid-connect/token",
-		ClientID:     cfg.OperatorOIDCClientID,
-		ClientSecret: cfg.OperatorOIDCClientSecret,
-		Audience:     "tatara-claude-code-wrapper",
-	})
-	if err := (&controller.TaskReconciler{
-		Client:        mgr.GetClient(),
-		APIReader:     mgr.GetAPIReader(),
-		Scheme:        mgr.GetScheme(),
-		Metrics:       metrics,
-		SpillerFor:    spillerFor,
-		Seq:           seq,
-		BundleMetrics: obs.NewBundleMetrics(ctrlmetrics.Registry),
-		Session:       agent.NewHTTPSessionWithMetrics(wrapperTokens.Token, metrics),
-		PodConfig:     podConfigFromConfig(cfg),
-		SCMFor: func(provider string) (scm.SCMWriter, error) {
-			return scm.ByProvider(provider)
-		},
-		ReaderFor: func(provider, token string) (scm.SCMReader, error) {
-			return scm.ReaderByProvider(provider, token)
-		},
-	}).SetupWithManager(mgr); err != nil {
+	if err := taskReconciler.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setup TaskReconciler: %w", err)
 	}
 

@@ -698,6 +698,15 @@ func ConversationIdle(p *Project) time.Duration {
 	return ConversationIdleDefault
 }
 
+// MaxConversingPods is the per-project conversing ceiling for p, defaulting to
+// DefaultMaxConversingPods.
+func MaxConversingPods(p *Project) int {
+	if p != nil && p.Spec.MaxConversingPods > 0 {
+		return p.Spec.MaxConversingPods
+	}
+	return DefaultMaxConversingPods
+}
+
 // ProjectSpec defines the desired state of a Project.
 type ProjectSpec struct {
 	ScmSecretRef string `json:"scmSecretRef"`
@@ -722,6 +731,15 @@ type ProjectSpec struct {
 	// +kubebuilder:validation:Minimum=300
 	// +optional
 	AgentPodTTLSeconds int `json:"agentPodTTLSeconds,omitempty"`
+	// MaxConversingPods caps how many Tasks in this project may sit in the
+	// conversing stage at once. On reaching it, a new conversation EVICTS the
+	// longest-idle one: that Task takes a handoff turn and parks at
+	// awaiting-human, and it still works - it cold-spawns on its next comment.
+	// Zero means DefaultMaxConversingPods (5).
+	// +kubebuilder:default=5
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	MaxConversingPods int `json:"maxConversingPods,omitempty"`
 	// MaxNewTasksPerSweep caps how many Tasks ONE sweep pass may mint (fix B1).
 	// +kubebuilder:default=5
 	// +kubebuilder:validation:Minimum=1
