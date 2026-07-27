@@ -608,6 +608,11 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 		// Decided to refill, nothing enqueued: no valid repos, an enqueue error,
 		// or the dedup key already holds a queued event. All three are logged in
 		// place; this line is what ties them back to the decision that led here.
+		// The gauges still get the fresh values on this exit too - every decision
+		// sets them, not just the two that return via a different branch, so a
+		// stretch of enqueue failures cannot leave a stale target/pending reading.
+		r.Metrics.SetBrainstormTarget(proj.Name, float64(target))
+		r.Metrics.SetBrainstormPending(proj.Name, float64(pending))
 		l.Info("brainstorm: refill decided but no event enqueued",
 			"action", "scan_brainstorm_not_enqueued", "resource_id", proj.Name,
 			"target", target, "pending", pending, "inflight", inflight,

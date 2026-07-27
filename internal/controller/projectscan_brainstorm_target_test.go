@@ -197,21 +197,68 @@ func TestBrainstormBreakerSuppressesTheEventPathOnly(t *testing.T) {
 	}
 }
 
+// A refill DECISION with no repo to act on ("no valid repos", the third exit
+// of brainstorm()) must still set the target/pending gauges from this pass's
+// fresh values. O10 review Minor 1: this exit used to skip the setters the
+// other two exits call, so a stretch of enqueue failures left a stale
+// reading instead of the current one.
+func TestBrainstormNotEnqueuedStillSetsGauges(t *testing.T) {
+	ctx := context.Background()
+	proj, _ := seedBrainstormProject(t, "bs-tgt-notenq", nil, ptrInt(3))
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(emptyReader())
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if created := r.brainstorm(ctx, proj, emptyReader(), nil, nil,
+		proj.Spec.Scm.Cron.Brainstorm, TriggerCron); created {
+		t.Fatal("no repos with a valid slug: nothing can be enqueued")
+	}
+	if got, ok := brainstormTargetSeries(t, reg, proj.Name); !ok || got != 3 {
+		t.Fatalf("operator_brainstorm_target_proposals{project=%s} = %v (present=%v), want 3",
+			proj.Name, got, ok)
+	}
+	if got, ok := brainstormPendingSeries(t, reg, proj.Name); !ok || got != 0 {
+		t.Fatalf("operator_brainstorm_pending_proposals{project=%s} = %v (present=%v), want an explicit 0",
+			proj.Name, got, ok)
+	}
+}
+
 // openProposalsSeries reads operator_open_proposals{repo}. It reports PRESENCE
 // separately from value: gaugeValue (task_controller_test.go) folds "absent"
 // into 0, which is exactly the distinction this gauge's regression is about.
 func openProposalsSeries(t *testing.T, reg *prometheus.Registry, repo string) (float64, bool) {
+	t.Helper()
+	return projectGaugeSeries(t, reg, "operator_open_proposals", "repo", repo)
+}
+
+// brainstormTargetSeries reads operator_brainstorm_target_proposals{project}.
+func brainstormTargetSeries(t *testing.T, reg *prometheus.Registry, project string) (float64, bool) {
+	t.Helper()
+	return projectGaugeSeries(t, reg, "operator_brainstorm_target_proposals", "project", project)
+}
+
+// brainstormPendingSeries reads operator_brainstorm_pending_proposals{project}.
+func brainstormPendingSeries(t *testing.T, reg *prometheus.Registry, project string) (float64, bool) {
+	t.Helper()
+	return projectGaugeSeries(t, reg, "operator_brainstorm_pending_proposals", "project", project)
+}
+
+// projectGaugeSeries reads a single-label gauge vec's value for one label
+// value, reporting PRESENCE separately from value: gaugeValue
+// (task_controller_test.go) folds "absent" into 0, which is exactly the
+// distinction the "reaches zero, never latches" regressions above are about.
+func projectGaugeSeries(t *testing.T, reg *prometheus.Registry, metric, label, value string) (float64, bool) {
 	t.Helper()
 	mfs, err := reg.Gather()
 	if err != nil {
 		t.Fatalf("gather metrics: %v", err)
 	}
 	for _, mf := range mfs {
-		if mf.GetName() != "operator_open_proposals" {
+		if mf.GetName() != metric {
 			continue
 		}
 		for _, m := range mf.GetMetric() {
-			if labelsMatch(m.GetLabel(), map[string]string{"repo": repo}) {
+			if labelsMatch(m.GetLabel(), map[string]string{label: value}) {
 				return m.GetGauge().GetValue(), true
 			}
 		}
