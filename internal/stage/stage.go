@@ -963,6 +963,43 @@ type UnparkInput struct {
 	Now             time.Time
 }
 
+// The CLOSED decline vocabulary. UnparkDetailed returns exactly one of these,
+// and the caller puts it on operator_unpark_declined_total's `kind` label, so
+// the set must stay small and stable. A decline that cannot name its condition
+// is the defect this vocabulary exists to make impossible: the 2026-07-27
+// identity-unverified stall declined silently and no log or counter anywhere
+// could say which of GrammarPassed, len(open) and allApproved refused.
+const (
+	// DeclineNone means Unpark re-entered (target != "").
+	DeclineNone = ""
+	// DeclineNoHumanEvent: the rule needs a non-bot pendingEvent and there is none.
+	DeclineNoHumanEvent = "no-human-event"
+	// DeclineOverCap: backlog-sweep promotion would exceed maxOpenTasks. The
+	// promotion DEFERS; the event is retained.
+	DeclineOverCap = "over-cap"
+	// DeclineGrammarNotPassed: identity-unverified, and the C.6 grammar did not
+	// pass on this evaluation.
+	DeclineGrammarNotPassed = "grammar-not-passed"
+	// DeclineNoOpenIssues: the empty owned-Issue set is not a licence (fix V6-3).
+	DeclineNoOpenIssues = "no-open-issues"
+	// DeclineNotAllApproved: at least one open owned Issue is not approved. This
+	// is the shape a stale cached read produces after a fresh approval write.
+	DeclineNotAllApproved = "not-all-approved"
+	// DeclineMergedMR: re-entry would spawn a pod against an already-merged MR.
+	DeclineMergedMR = "merged-mr"
+	// DeclineRoundsExhausted: humanReviewRounds is at MaxHumanReviewRounds.
+	DeclineRoundsExhausted = "rounds-exhausted"
+	// DeclineTurnsExhausted: stats.turns is at maxTurnsPerTask.
+	DeclineTurnsExhausted = "turns-exhausted"
+	// DeclineWrongParkedFrom: a no-outcome park from a pre-implement stage must
+	// not auto-escalate into implementing (#406).
+	DeclineWrongParkedFrom = "wrong-parked-from"
+	// DeclineIllegalEdge: the F.3 table or a LegalFor guard refused the edge.
+	DeclineIllegalEdge = "illegal-edge"
+	// DeclineNoReentry: this park reason has no F.6 re-entry rule at all.
+	DeclineNoReentry = "no-reentry"
+)
+
 // Unpark is the F.6 re-entry function, and this is its entire body. A parked
 // Task does not "resume": it either matches ONE of these narrow rules or it ages
 // out at parkRetention and is reaped.
@@ -976,19 +1013,29 @@ type UnparkInput struct {
 // The target is RE-DERIVED FROM STATE, NEVER from status.parkedFromStage (which
 // is observability only).
 func Unpark(in UnparkInput) (target string, ok bool) {
+	target, _ = UnparkDetailed(in)
+	return target, target != ""
+}
+
+// UnparkDetailed is Unpark with the refusal named. decline is DeclineNone
+// exactly when target != "". See the decline vocabulary above for why this
+// exists: a guard that declines without recording a reason is how a
+// high-stakes re-entry rule stalls a Task for a day with zero errors and zero
+// logs.
+func UnparkDetailed(in UnparkInput) (target string, decline string) {
 	t := in.Task
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
 	}
-	enter := func(to, reason string) (string, bool) {
+	enter := func(to, reason string) (string, string) {
 		if err := Enter(t, in.MRs, to, reason, now); err != nil {
 			// A guard refused it. LegalFor is what stops a kind=review Task
 			// reaching implementing from the no-outcome rule, which F.6 itself
 			// writes with no kind guard. It stays parked and ages out.
-			return "", false
+			return "", DeclineIllegalEdge
 		}
-		return to, true
+		return to, DeclineNone
 	}
 
 	switch t.Status.StageReason {
@@ -999,20 +1046,20 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// when its Issues close. A refine fold does NOT promote it - the fold
 		// DELETES it (B.3).
 		if !hasNonBotEvent(t, in.BotLogin) {
-			return "", false
+			return "", DeclineNoHumanEvent
 		}
 		if in.ActiveTasks >= in.MaxOpenTasks {
 			// OVER CAP: the promotion DEFERS. The Task stays parked and the
 			// pendingEvent is RETAINED, never dropped. It promotes as soon as a
 			// slot frees.
-			return "", false
+			return "", DeclineOverCap
 		}
 		return enter(v1alpha1.StageTriaging, "")
 
 	case ReasonAwaitingHuman:
 		// The ONLY comment-driven re-entry.
 		if !hasNonBotEvent(t, in.BotLogin) {
-			return "", false
+			return "", DeclineNoHumanEvent
 		}
 		if t.Spec.Kind == kindReview {
 			// A review-kind Task may NEVER enter implementing or merging. There
@@ -1026,17 +1073,17 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 				// A pod spawned into reviewing on an already-merged MR has no
 				// legal outcome (issue #393). Refuse re-entry; the Task ages
 				// out at parkRetention and is reaped.
-				return "", false
+				return "", DeclineMergedMR
 			}
 			if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
-				return "", false // STAY PARKED. Do not spawn another review pod.
+				return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another review pod.
 			}
 			t.Status.HumanReviewRounds++
-			target, ok := enter(v1alpha1.StageReviewing, "")
-			if !ok {
+			target, decline := enter(v1alpha1.StageReviewing, "")
+			if decline != DeclineNone {
 				t.Status.HumanReviewRounds--
 			}
-			return target, ok
+			return target, decline
 		}
 		// THE EMPTY SET IS NOT A LICENCE (fix V6-3). A review Task owns ZERO
 		// Issues and all([]) == true, so v5's "if EVERY owned Issue is approved
@@ -1046,7 +1093,7 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// execution.
 		open := openIssues(in.Issues)
 		if len(open) == 0 {
-			return "", false
+			return "", DeclineNoOpenIssues
 		}
 		if allApproved(open) {
 			return enter(v1alpha1.StageImplementing, "")
@@ -1061,16 +1108,19 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// against a freshly SYNCED thread (see UnparkInput). On a FAIL it stays
 		// parked and the bot does NOT comment again.
 		if !hasNonBotEvent(t, in.BotLogin) {
-			return "", false
+			return "", DeclineNoHumanEvent
 		}
 		if !in.GrammarPassed {
-			return "", false
+			return "", DeclineGrammarNotPassed
 		}
 		open := openIssues(in.Issues)
-		if len(open) == 0 || !allApproved(open) {
+		if len(open) == 0 {
 			// H9: implementing needs EVERY owned Issue approved, and the empty
 			// set is not a licence here either.
-			return "", false
+			return "", DeclineNoOpenIssues
+		}
+		if !allApproved(open) {
+			return "", DeclineNotAllApproved
 		}
 		return enter(v1alpha1.StageImplementing, "")
 
@@ -1082,11 +1132,11 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// Idempotent: mergeCursor resumes and EVERY MR is re-validated against
 		// state=merged before any Merge call. NEVER implementing - that would
 		// recreate deleted branches and re-propose already-merged code.
-		target, ok := enter(v1alpha1.StageMerging, "")
-		if !ok {
+		target, decline := enter(v1alpha1.StageMerging, "")
+		if decline != DeclineNone {
 			t.Status.MergeReentries--
 		}
-		return target, ok
+		return target, decline
 
 	case ReasonDeployTimeout:
 		if t.Status.DeployReentries >= v1alpha1.MaxDeployReentries {
@@ -1094,11 +1144,11 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		}
 		t.Status.DeployReentries++
 		// Idempotent: per-MR deployedAt re-check. NEVER implementing.
-		target, ok := enter(v1alpha1.StageDeploying, "")
-		if !ok {
+		target, decline := enter(v1alpha1.StageDeploying, "")
+		if decline != DeclineNone {
 			t.Status.DeployReentries--
 		}
-		return target, ok
+		return target, decline
 
 	case ReasonNoOutcome:
 		// #406: only a park reached FROM implementing or reviewing may re-drive.
@@ -1109,14 +1159,14 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// Task must NOT be auto-escalated straight into implementing.
 		if t.Status.ParkedFromStage != v1alpha1.StageImplementing &&
 			t.Status.ParkedFromStage != v1alpha1.StageReviewing {
-			return "", false
+			return "", DeclineWrongParkedFrom
 		}
 		if anyMerged(in.MRs) {
 			// A re-implement would duplicate an already-merged change.
-			return "", false
+			return "", DeclineMergedMR
 		}
 		if t.Status.Stats.Turns >= in.MaxTurnsPerTask {
-			return "", false
+			return "", DeclineTurnsExhausted
 		}
 		return enter(v1alpha1.StageImplementing, "")
 
@@ -1132,23 +1182,23 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// each re-entry may spawn a review pod, and a comment storm must not
 		// spawn one per comment.
 		if !hasNonBotEvent(t, in.BotLogin) {
-			return "", false
+			return "", DeclineNoHumanEvent
 		}
 		if anyMerged(in.MRs) {
 			// A pod spawned into reviewing on an already-merged MR has no
 			// legal outcome (issue #393). Refuse re-entry; the Task ages out
 			// at parkRetention and is reaped.
-			return "", false
+			return "", DeclineMergedMR
 		}
 		if t.Status.HumanReviewRounds >= v1alpha1.MaxHumanReviewRounds {
-			return "", false // STAY PARKED. Do not spawn another review pod.
+			return "", DeclineRoundsExhausted // STAY PARKED. Do not spawn another review pod.
 		}
 		t.Status.HumanReviewRounds++
-		target, ok := enter(v1alpha1.StageReviewing, "")
-		if !ok {
+		target, decline := enter(v1alpha1.StageReviewing, "")
+		if decline != DeclineNone {
 			t.Status.HumanReviewRounds--
 		}
-		return target, ok
+		return target, decline
 
 	default:
 		// review-loop-exhausted, implement-declined, declined, false-positive,
@@ -1164,7 +1214,7 @@ func Unpark(in UnparkInput) (target string, ok bool) {
 		// still-open issue as a parked(backlog-sweep) Task, which OWNS it and
 		// costs nothing. If a human then comments, THAT Task promotes - as a NEW
 		// Task, not a zombie one.
-		return "", false
+		return "", DeclineNoReentry
 	}
 }
 
