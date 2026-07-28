@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -792,6 +793,27 @@ func (r *TaskReconciler) controllerBuilder(mgr ctrl.Manager) *builder.Builder {
 		// the hourly mirror sweep. Reconcile is idempotent (EnterStage refuses a
 		// redundant X->X) and tolerates the update-event double-enqueue.
 		Owns(&tatarav1alpha1.MergeRequest{}).
+		// THE ADMISSION WAKE. The dispatcher writes the TASK first (admitTicket's
+		// label patch, then its status patch) and flips the ticket's
+		// Status.State to Admitted LAST. That Task write wakes this reconciler
+		// while ensureTicket still reads Queued, so it returns
+		// RequeueAfter: admissionRequeue - and without this edge the Admitted flip
+		// that follows wakes nobody, costing a guaranteed 5m before the pod spawns.
+		//
+		// A ticket is NOT owned by its Task (its controller ownerRef points at the
+		// Project, internal/queue/enqueue.go), so this is a plain Watches edge and
+		// Owns is unavailable; builder.MatchEveryOwner widens which owner refs
+		// count but does not relax the ownership requirement. The predicate is what
+		// keeps a project with a deep queue from turning every ticket write into a
+		// Task reconcile: see ticketAdmittedPredicate for why all four of its funcs
+		// are set and why GenerationChangedPredicate is forbidden here.
+		//
+		// admissionRequeue STAYS. This edge makes the wake immediate; the slow poll
+		// remains the backstop for a leadership changeover (ROADMAP.md) and for the
+		// lossy-map-func case controller-runtime#1996 describes.
+		Watches(&tatarav1alpha1.QueuedEvent{},
+			handler.EnqueueRequestsFromMapFunc(r.ticketToTask),
+			builder.WithPredicates(ticketAdmittedPredicate())).
 		// MaxConcurrentReconciles: 1 serialises Task reconciles to avoid races in
 		// read-then-write sequences (pod creation, status updates, seq accounting
 		// in the admission queue). The admission queue is the sole concurrency gate.
