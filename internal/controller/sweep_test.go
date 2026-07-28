@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -208,18 +209,60 @@ func TestOrphanIssuePredicate(t *testing.T) {
 	}
 }
 
-// TestMintStage pins the TWO mint stages.
+// TestMintStage pins the TWO mint stages and the ONE load-bearing ordering
+// fact: tatara-parked beats every other clause. It does NOT pin an order among
+// the remaining clauses (trusted-human-author, webhookOriginated,
+// humanHasLastWord) - they all return the identical (StageTriaging, ""), so
+// their relative order has zero observable effect and no case here depends on
+// it.
 //
 // The tatara-parked LABEL READ is safe where fix 16's forbidden one is not: it
 // decides COST (do we spend a pod on this issue now?), never AUTHORITY (may this
 // issue be implemented?). Forging the label buys an attacker a Task that stays
 // PARKED - it fails SAFE. Forging an approval label would buy them prod. Do not
 // generalise one rule into the other.
+//
+// THE TRUSTED-AUTHOR CLAUSE's only pinned relationship to anything else is
+// AFTER tatara-parked: an explicit human park still wins over the author's
+// standing. It does not depend on webhookOriginated or humanHasLastWord at
+// all - a maintainer's issue starts an agent even when the delivery was lost
+// outright and no marker was ever stamped, regardless of where in the
+// function this clause happens to sit relative to those two. That is what
+// makes the sweep a genuine backstop rather than one that parks the work it
+// was meant to rescue.
+//
+// The clause is NARROWED to a trusted HUMAN, not IsTrustedAuthor verbatim.
+// IsTrustedAuthor documents the project's own bot login as a trusted insider
+// (api/v1alpha1/logins.go:61), and taken literally the clause would mint every
+// bot-authored orphan issue ACTIVE too - including an abandoned brainstorm
+// proposal issue whose Task was reaped and whose Issue CR lost its controller
+// owner in the process. ClassifyPR clause 2 (internal/controller/sweep.go,
+// lines 513-516; ClassifyPR itself starts at line 507) exists because the
+// identical property bit on the PR side: prInReactionScope returns true
+// immediately for IsTrustedAuthor, and the bot is documented as trusted there
+// too. That precedent is why this clause excludes the bot explicitly rather
+// than repeating the mistake on the issue side.
 func TestMintStage(t *testing.T) {
-	proj := sweepProject("mint-proj")
+	base := sweepProject("mint-proj")
+	repo := sweepRepo("mint-proj")
+
+	trusted := sweepProject("mint-proj")
+	trusted.Spec.Scm.MaintainerLogins = []string{"alice"}
+
+	reporterOnly := sweepProject("mint-proj")
+	reporterOnly.Spec.Scm.ReporterLogins = []string{"carol"}
+
+	// A per-Repository override REPLACES the project list for that repo (a
+	// non-nil pointer, including an explicit empty slice). Nothing about this
+	// clause is project-global.
+	noneHere := sweepRepo("mint-proj")
+	noneHere.Spec.MaintainerLogins = &[]string{}
+
 	t0 := time.Now().Add(-time.Hour)
 
 	tests := map[string]struct {
+		proj       *tatarav1alpha1.Project
+		repo       *tatarav1alpha1.Repository
 		iss        scm.Issue
 		webhook    bool
 		wantStage  string
@@ -245,7 +288,7 @@ func TestMintStage(t *testing.T) {
 			wantStage:  tatarav1alpha1.StageParked,
 			wantReason: stage.ReasonBacklogSweep,
 		},
-		"an untouched backlog issue: PARKED": {
+		"an untouched backlog issue from an UNLISTED author: PARKED": {
 			iss:        scm.Issue{Number: 1, State: "open", Author: "alice"},
 			wantStage:  tatarav1alpha1.StageParked,
 			wantReason: stage.ReasonBacklogSweep,
@@ -276,10 +319,73 @@ func TestMintStage(t *testing.T) {
 			}},
 			wantStage: tatarav1alpha1.StageParked, wantReason: stage.ReasonBacklogSweep,
 		},
+
+		// --- the trusted-author clause ---
+		"a MAINTAINER's brand-new issue mints ACTIVE with no marker and no comments": {
+			proj:      trusted,
+			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
+			wantStage: tatarav1alpha1.StageTriaging,
+		},
+		"a listed REPORTER's brand-new issue mints ACTIVE": {
+			proj:      reporterOnly,
+			iss:       scm.Issue{Number: 1, State: "open", Author: "carol"},
+			wantStage: tatarav1alpha1.StageTriaging,
+		},
+		"PRECEDENCE: tatara-parked BEATS a trusted author": {
+			proj:       trusted,
+			iss:        scm.Issue{Number: 1, State: "open", Author: "alice", Labels: []string{TataraParkedLabel}},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"PRECEDENCE: a trusted author needs NO webhook marker": {
+			proj:      trusted,
+			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
+			webhook:   false,
+			wantStage: tatarav1alpha1.StageTriaging,
+		},
+		"an author outside the lists is NOT trusted: PARKED": {
+			proj:       trusted,
+			iss:        scm.Issue{Number: 1, State: "open", Author: "mallory"},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"an empty author is never trusted: PARKED": {
+			proj:       trusted,
+			iss:        scm.Issue{Number: 1, State: "open", Author: ""},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"a per-repo override that clears the maintainer list un-trusts the author": {
+			proj:       trusted,
+			repo:       noneHere,
+			iss:        scm.Issue{Number: 1, State: "open", Author: "alice"},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		// COORDINATOR-NARROWED, DELIBERATELY PINNED (see the doc comment above). The
+		// brief's clause was IsTrustedAuthor verbatim, which mints a bot-authored
+		// orphan issue ACTIVE - an abandoned brainstorm proposal issue whose Task was
+		// reaped, say, and whose Issue CR lost its controller owner along with it.
+		// The narrowed clause excludes the project's own bot login, so this case
+		// falls through to the webhook/last-word/backlog clauses exactly as it did
+		// before this change: no webhook, no comments -> PARKED.
+		"a BOT-authored orphan issue is NOT a trusted human and does not mint ACTIVE": {
+			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot"},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			gotStage, gotReason := MintStage(proj, tc.iss, tc.webhook)
+			proj := tc.proj
+			if proj == nil {
+				proj = base
+			}
+			r := tc.repo
+			if r == nil {
+				r = repo
+			}
+			gotStage, gotReason := MintStage(proj, r, tc.iss, tc.webhook)
 			if gotStage != tc.wantStage || gotReason != tc.wantReason {
 				t.Fatalf("MintStage = (%q, %q), want (%q, %q)", gotStage, gotReason, tc.wantStage, tc.wantReason)
 			}
@@ -1431,6 +1537,47 @@ func TestSweepCutoverBacklogStillParksWithZeroPods(t *testing.T) {
 	}
 }
 
+// TestSweepCutoverBacklogFromATrustedMaintainerMintsActiveInstead is the
+// SIBLING the test above must not be read alone: it certifies the property the
+// trusted-human-author clause deliberately VOIDS. TestSweepCutoverBacklogStill-
+// ParksWithZeroPods only reads as "a backlog costs zero pod-hours" because
+// sweepProject sets no maintainer or reporter logins; give the same 40-issue
+// shape a maintainer allowlist that names the author and every one of those 40
+// issues mints ACTIVE instead, because IsTrustedAuthor stops needing a webhook
+// marker or a comment thread to trust "alice". The measured real-world cost of
+// this (MintStage's doc comment, and MEMORY.md) is 6 orphan issues cluster-wide
+// on 2026-07-28, ONE clarify pod per issue, ONCE - not 40 pods on every pass.
+func TestSweepCutoverBacklogFromATrustedMaintainerMintsActiveInstead(t *testing.T) {
+	const backlog = 40
+	proj := sweepProject("cutover-trusted-proj")
+	proj.Spec.MaxNewTasksPerSweep = backlog // one pass, whole backlog
+	proj.Spec.MaxOpenTasks = backlog        // every mint here is ACTIVE, unlike the parked sibling: it competes for the same budget
+	proj.Spec.Scm.MaintainerLogins = []string{"alice"}
+	repo := sweepRepo("cutover-trusted-proj")
+	c := newMirrorClient(t, proj, repo, mdSecret())
+
+	rd := &sweepReader{content: map[int]scm.IssueContent{}}
+	for n := 1; n <= backlog; n++ {
+		rd.issues = append(rd.issues, scm.IssueRef{
+			Repo: "szymonrychu/tatara-operator", Number: n, Author: "alice", State: "open",
+		})
+		rd.content[n] = scm.IssueContent{Title: "old bug", Body: "from before the cutover"}
+	}
+
+	runSweep(t, c, proj, repo, rd)
+
+	tasks := sweepTasks(t, c, proj.Name)
+	if len(tasks) != backlog {
+		t.Fatalf("tasks = %d, want %d", len(tasks), backlog)
+	}
+	for i := range tasks {
+		if tasks[i].Spec.InitialStage != tatarav1alpha1.StageTriaging || tasks[i].Spec.InitialStageReason != "" {
+			t.Fatalf("task %s initialStage = %q/%q, want triaging/\"\": a trusted maintainer's backlog issue mints ACTIVE",
+				tasks[i].Name, tasks[i].Spec.InitialStage, tasks[i].Spec.InitialStageReason)
+		}
+	}
+}
+
 // TestWebhookMarkerIsConsumedExactlyOnce: the marker is spent by the mint that
 // reads it. If it survived, the reap/re-mint cycle would re-activate the issue
 // forever - the M25 loop by another door.
@@ -1765,5 +1912,172 @@ func TestSweepHeartbeatIsPerProject(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(projB.Name, activity)); got <= stale {
 		t.Fatalf("project hb-multi-b heartbeat = %v, want a fresh stamp above %v", got, stale)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// THE READ-AFTER-WRITE RACE (mtg-decks#9, 2026-07-28).
+//
+// MarkWebhookOriginated used to Create the mirror CR and then immediately
+// re-Get it through the CACHED client under retry.RetryOnConflict, which
+// retries ONLY IsConflict. An informer cache that had not yet observed the
+// Create answered NotFound, the retry returned it verbatim, the webhook
+// handler 500'd, and MintForItem never ran - so a brand-new human issue
+// started nothing at all. It is a RACE: issue #7 won it on 2026-07-24, issue
+// #9 lost it by 437ms. laggingIssueGets reproduces the losing side
+// deterministically.
+// ---------------------------------------------------------------------------
+
+// laggingIssueGets returns an interceptor that answers NotFound to every Get of
+// an Issue while live (the default), mimicking an informer cache that has not
+// observed a Create yet, plus a caughtUp func the caller uses to switch the
+// cache back on before it verifies what was actually stored. Unlike a fixed
+// budget, this never runs out from under a test's OWN verification read: a
+// budget large enough to survive an implementation regression back to a
+// second internal read is, by the same arithmetic, large enough to also
+// intercept the test's post-call verification Get, since both draw from the
+// SAME counter. A caller that never calls caughtUp gets every Issue Get
+// lagging for the whole test, n irrelevant (kept for the one caller - the
+// already-exists test below - that wants a SPECIFIC number of real reads to
+// lag and then stop on its own, matching its own internal call count).
+func laggingIssueGets(n int) (interceptor.Funcs, func()) {
+	remaining, live := n, true
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, isIssue := obj.(*tatarav1alpha1.Issue); isIssue && live && remaining > 0 {
+				remaining--
+				return apierrors.NewNotFound(
+					tatarav1alpha1.GroupVersion.WithResource("issues").GroupResource(), key.Name)
+			}
+			return cli.Get(ctx, key, obj, opts...)
+		},
+	}, func() { live = false }
+}
+
+// TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead: the COMMON path. No
+// mirror CR exists, every cached Issue read lags, and the mark still succeeds -
+// because the marker is stamped on the object being CREATED, so there is no
+// second read to race. The lag stays live for the WHOLE call (a fixed budget
+// here would silently stop protecting the assertion the moment an
+// implementation regression added back a second internal read, because that
+// extra read would consume the budget meant for this test's own verification
+// Get instead) - caughtUp() only switches it off afterward, once the call has
+// returned.
+func TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead(t *testing.T) {
+	proj := sweepProject("race-new-proj")
+	repo := sweepRepo("race-new-proj")
+	lag, caughtUp := laggingIssueGets(8)
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo).
+		WithInterceptorFuncs(lag).
+		Build()
+
+	marked, err := MarkWebhookOriginated(context.Background(), c, nil, proj, repo, 9,
+		"https://github.com/szymonrychu/mtg-decks/issues/9", time.Now())
+	if err != nil {
+		t.Fatalf("MarkWebhookOriginated = %v, want nil: a brand-new issue must not depend on a cached re-read", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true: the create-time stamp IS the mark")
+	}
+
+	// The cache has now "caught up": switch the lag off before reading back what
+	// was actually stored, so this verification read is not itself intercepted.
+	caughtUp()
+	var iss tatarav1alpha1.Issue
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testNS, Name: tatarav1alpha1.IssueName(repo.Name, 9)}, &iss); err != nil {
+		t.Fatalf("get issue CR: %v", err)
+	}
+	if iss.Annotations[AnnWebhookOriginated] == "" {
+		t.Fatal("the created Issue CR carries no webhook-originated marker")
+	}
+}
+
+// TestMarkWebhookOriginatedRetriesNotFoundFromTheCache: the OTHER half. The CR
+// already exists (a concurrent writer won the Create), so the Get/Update branch
+// still runs - and it must RETRY a NotFound from the lagging cache instead of
+// returning it, which is what 500'd the delivery.
+func TestMarkWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
+	proj := sweepProject("race-exists-proj")
+	repo := sweepRepo("race-exists-proj")
+	existing := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.IssueName(repo.Name, 9), Namespace: testNS,
+		},
+		Spec: tatarav1alpha1.IssueSpec{
+			RepositoryRef: repo.Name, Number: 9, ProjectRef: proj.Name,
+			URL: "https://github.com/szymonrychu/mtg-decks/issues/9",
+		},
+	}
+	// TWO lagging Gets: the first is ensureIssueCR's existence probe (which then
+	// Creates and loses on AlreadyExists), the second is the Get/Update branch's
+	// own read. The third Get sees the object and the Update stamps it - this
+	// test's own budget naturally runs out from its own internal call count, so
+	// it does not need caughtUp (discarded here).
+	lag, _ := laggingIssueGets(2)
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo, existing).
+		WithInterceptorFuncs(lag).
+		Build()
+
+	marked, err := MarkWebhookOriginated(context.Background(), c, nil, proj, repo, 9,
+		"https://github.com/szymonrychu/mtg-decks/issues/9", time.Now())
+	if err != nil {
+		t.Fatalf("MarkWebhookOriginated = %v, want nil: a NotFound from a lagging cache must be RETRIED, not returned", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true: the existing CR must end up carrying the marker")
+	}
+
+	var iss tatarav1alpha1.Issue
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testNS, Name: tatarav1alpha1.IssueName(repo.Name, 9)}, &iss); err != nil {
+		t.Fatalf("get issue CR: %v", err)
+	}
+	if iss.Annotations[AnnWebhookOriginated] == "" {
+		t.Fatal("the existing Issue CR was never marked")
+	}
+}
+
+// TestClearWebhookOriginatedRetriesNotFoundFromTheCache is FINDING 2's
+// regression test (2026-07-28 review round 1): ClearWebhookOriginated used to
+// treat a cached NotFound as "no marker to clear" and return nil - correct for
+// a genuinely absent CR, wrong for a CR this same webhook request may have
+// just CREATED (mint's own Task.status.issueRefs write races the same
+// informer watch MarkWebhookOriginated used to lose against). Silently no-op'ing
+// that left the marker stamped forever: nothing else in the platform ever
+// clears it, so the issue re-activates on every later reap cycle. It must now
+// RETRY a NotFound instead, exactly like MarkWebhookOriginated.
+func TestClearWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
+	existing := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.IssueName("clear-repo", 9), Namespace: testNS,
+			Annotations: map[string]string{AnnWebhookOriginated: "2026-07-28T06:08:07Z"},
+		},
+		Spec: tatarav1alpha1.IssueSpec{RepositoryRef: "clear-repo", Number: 9, ProjectRef: "clear-proj"},
+	}
+	// ONE lagging Get: ClearWebhookOriginated's own read. The second sees the
+	// object and the Update spends the marker.
+	lag, _ := laggingIssueGets(1)
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(existing).
+		WithInterceptorFuncs(lag).
+		Build()
+
+	if err := ClearWebhookOriginated(context.Background(), c, nil, testNS, existing.Name); err != nil {
+		t.Fatalf("ClearWebhookOriginated = %v, want nil: a NotFound from a lagging cache must be RETRIED, not swallowed as a no-op", err)
+	}
+
+	var iss tatarav1alpha1.Issue
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: existing.Name}, &iss); err != nil {
+		t.Fatalf("get issue CR: %v", err)
+	}
+	if _, ok := iss.Annotations[AnnWebhookOriginated]; ok {
+		t.Fatal("the marker is still set: ClearWebhookOriginated must have spent it despite the lagging cache")
 	}
 }

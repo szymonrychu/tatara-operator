@@ -17,6 +17,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -60,14 +61,19 @@ const (
 	TataraParkedLabel = "tatara-parked"
 
 	// AnnWebhookOriginated is the DURABLE LIVENESS MARKER a live, HMAC-verified
-	// issues.opened/issues.reopened delivery leaves on the mirror Issue CR, and it
-	// is the ONLY thing that tells a freshly-opened human issue apart from a
-	// three-year-old untouched backlog issue: both are open, human-authored and
-	// ZERO-COMMENT, so humanHasLastWord is false for BOTH.
+	// issues.opened/issues.reopened delivery leaves on the mirror Issue CR, and,
+	// FOR AN AUTHOR OUTSIDE THE MAINTAINER/REPORTER ALLOWLISTS, it is the ONLY
+	// thing that tells a freshly-opened human issue apart from a three-year-old
+	// untouched backlog issue: both are open, human-authored and ZERO-COMMENT, so
+	// humanHasLastWord is false for BOTH. MintStage's trusted-human-author clause
+	// (below, sweep.go) mints ACTIVE for a maintainer/reporter's issue regardless
+	// of this marker, so this paragraph applies only to the untrusted-author case.
 	//
-	// WITHOUT IT THE PLATFORM'S FRONT DOOR IS SHUT. A human opens an issue, the
-	// sweep mints parked(backlog-sweep), no pod runs, and nothing happens until the
-	// human comments a SECOND time on their own issue.
+	// WITHOUT IT, FOR THAT UNTRUSTED-AUTHOR CASE, THE PLATFORM'S FRONT DOOR IS
+	// SHUT: a human opens an issue, the sweep mints parked(backlog-sweep), no pod
+	// runs, and nothing happens until the human comments a SECOND time on their
+	// own issue. A maintainer's or reporter's issue is unaffected either way - see
+	// MintStage's trusted-human-author clause.
 	//
 	// It CANNOT be replaced by reading "zero comments" as "a human has the last
 	// word": that mints the ENTIRE cutover backlog ACTIVE, which is the 150-issue,
@@ -146,7 +152,11 @@ func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository
 // The parked branch is what makes the ownership invariant affordable across a
 // 150-issue backlog: without it the post-cutover sweep mints 150 ACTIVE Tasks
 // that queue against 3 agent slots and spend 17-100 pod-hours re-triaging an
-// already-triaged backlog.
+// already-triaged backlog. The trusted-human-author clause below VOIDS that
+// affordability guarantee for the slice of the backlog authored by a listed
+// maintainer or reporter - see that clause's own paragraph for the measured
+// cost, which is small and bounded, not the same order of magnitude as an
+// unqualified 150-issue re-triage.
 //
 // THE TATARA-PARKED CLAUSE READS TASK HISTORY, NOT A COMMENT (fix M25). Keying
 // "active vs parked" on "does the bot have the last word" rested on a BEST-EFFORT
@@ -181,9 +191,52 @@ func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository
 // webhook saw, until a human REMOVES it or the operator does on promotion), and
 // the marker only decides ACTIVE-vs-backlog for an issue NOBODY has parked. The
 // belt to that brace is that the marker is CONSUMED by the mint that reads it.
-func MintStage(proj *tatarav1alpha1.Project, iss scm.Issue, webhookOriginated bool) (string, string) {
+//
+// THE TRUSTED-HUMAN-AUTHOR CLAUSE. The only ordering fact that is pinned and
+// load-bearing is AFTER tatara-parked: an explicit human park still wins over
+// the author's standing (TestMintStage/PRECEDENCE:_tatara-parked_BEATS_a_trusted_author).
+// It is NOT pinned "before the marker" or before humanHasLastWord, and do not
+// claim it is: this clause, webhookOriginated and humanHasLastWord all return
+// the identical (StageTriaging, ""), so their relative order among themselves
+// has ZERO observable effect on any test or any real mint - moving this
+// clause to the last position, after both, leaves every MintStage case green.
+// It is written first only because it is cheapest to evaluate and it is the
+// one that removes the webhook-delivery dependency entirely, not because
+// anything downstream of tatara-parked depends on seeing it before the others.
+//
+// It states the intended rule directly - a new issue from a maintainer or
+// reporter starts a clarify agent - and it is deliberately NARROWER than
+// IsTrustedAuthor: it excludes the project's own bot login. IsTrustedAuthor
+// documents the bot as a trusted insider (logins.go), and used verbatim here
+// it would mint every bot-authored orphan issue ACTIVE too - including an
+// abandoned brainstorm proposal issue whose Task was reaped and whose Issue CR
+// lost its controller owner along with it. ClassifyPR clause 2 exists because
+// the identical property bit on the PR side: prInReactionScope returns true
+// immediately for IsTrustedAuthor, so a bot-authored PR sailed through the
+// label gate too. This clause closes the issue-side twin of that hole up
+// front instead of discovering it in production. It is also what makes the
+// sweep a genuine BACKSTOP: a totally lost webhook delivery still results in
+// an ACTIVE Task on the next scan instead of a silently parked one.
+//
+// THE MEASURED COST, because "affordable" above is a claim that needs a
+// number and not a guess. On 2026-07-28, 6 orphan open Issue CRs were
+// sweep-eligible cluster-wide (tatara 4, infrastructure 1, mtg 1) - the entire
+// immediate population this clause exposes to an unconditional mint. 153
+// Tasks were parked, 27 of them stage-reason backlog-sweep; every one of those
+// 27 retains a controller owner (fix H13 does not release ownership on a
+// backlog park), so IsOrphanIssue is false for it and it does NOT re-mint
+// until the reaper eventually releases it - the cost is spread over time, not
+// paid at once on this change landing. A trusted human's backlog issue costs
+// exactly ONE clarify pod, ONCE: once that pod's Task parks again, the
+// reaper's tatara-parked stamp (the OUTERMOST gate, above) makes the park
+// PERMANENT, so the same issue is never re-minted a second time. Per-pass
+// exposure is further bounded by maxNewTasksPerSweep and maxOpenTasks.
+func MintStage(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, webhookOriginated bool) (string, string) {
 	if hasLabel(iss.Labels, TataraParkedLabel) {
 		return tatarav1alpha1.StageParked, stage.ReasonBacklogSweep
+	}
+	if iss.Author != botLoginOf(proj) && tatarav1alpha1.IsTrustedAuthor(proj, repo, iss.Author) {
+		return tatarav1alpha1.StageTriaging, ""
 	}
 	if webhookOriginated {
 		return tatarav1alpha1.StageTriaging, ""
@@ -223,18 +276,45 @@ func WebhookOriginated(cr *tatarav1alpha1.Issue) bool {
 //
 // The caller must have already applied the bot-actor and reporter-allowlist
 // gates: a BOT-authored issue event must never leave a marker.
-func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
+//
+// THE MARKER IS STAMPED AT CREATE TIME on the common path (a brand-new issue),
+// so that path performs NO second read and cannot race the informer cache. The
+// Get/Update branch below still serves the already-exists case, and it retries
+// NotFound as well as Conflict: the CR exists but this client's cache may not
+// have observed it yet, and returning that NotFound is what 500'd the delivery
+// for mtg-decks#9 and lost the mint outright (GitHub does not retry a 500).
+//
+// reader, when set, is the manager's UNCACHED reader (webhook.Config.APIReader /
+// ProjectReconciler.APIReader), threaded into both the create-time existence
+// probe and the Get/Update branch's own Get. Nil falls back to c. This is the
+// belt's OTHER half: webhookMarkerBackoff below bounds how long a genuinely
+// cached read is retried, but a caller that hands in the uncached reader never
+// depends on that backoff at all, because every Get it makes reads the API
+// server directly rather than waiting on an informer watch event.
+func MarkWebhookOriginated(ctx context.Context, c client.Client, reader client.Reader, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, url string, now time.Time) (bool, error) {
 
-	if err := ensureIssueCR(ctx, c, proj, repo, number, url); err != nil {
+	if reader == nil {
+		reader = c
+	}
+	created, err := ensureIssueCRWithAnnotations(ctx, c, reader, proj, repo, number, url,
+		map[string]string{AnnWebhookOriginated: now.UTC().Format(time.RFC3339)})
+	if err != nil {
 		return false, err
+	}
+	if created {
+		// A CR this call just created has no controller owner and no prior
+		// marker, so both guards in the branch below are vacuous for it.
+		return true, nil
 	}
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
 	marked := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.OnError(webhookMarkerBackoff, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsNotFound(err)
+	}, func() error {
 		marked = false
 		var iss tatarav1alpha1.Issue
-		if err := c.Get(ctx, key, &iss); err != nil {
+		if err := reader.Get(ctx, key, &iss); err != nil {
 			return err
 		}
 		if _, owned := own.ControllerOwner(&iss); owned {
@@ -256,6 +336,18 @@ func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1a
 	return marked, nil
 }
 
+// webhookMarkerBackoff bounds how long the belt-and-braces branches of
+// MarkWebhookOriginated/ClearWebhookOriginated retry a Conflict or a NotFound
+// against the CACHED client (their reader parameter is nil, e.g. an older
+// caller or a unit test with no APIReader wired). retry.DefaultRetry
+// (Steps:5, Duration:10ms, Factor:1.0 - ~50ms total) is sized for a write
+// conflict between two live clients, not an informer that has not yet
+// observed a Create; the live incident this whole fix answers (mtg-decks#9)
+// lost the race by 437ms, nearly 9x that budget. Matches objbudget's own
+// createLagBackoff (same problem, same shape), ~3.1s of total sleep across 5
+// attempts, then a NotFound is real and surfaces.
+var webhookMarkerBackoff = wait.Backoff{Steps: 5, Duration: 100 * time.Millisecond, Factor: 2}
+
 // clearWebhookOriginated spends the marker. It runs on the mint that READ it,
 // whatever stage that mint chose: a marker that outlived its mint would
 // re-activate the issue on the next reap/re-mint cycle, forever.
@@ -266,24 +358,36 @@ func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1a
 func (r *ProjectReconciler) clearWebhookOriginated(ctx context.Context, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int) error {
 
-	return ClearWebhookOriginated(ctx, r.Client, proj.Namespace, tatarav1alpha1.IssueName(repo.Name, number))
+	return ClearWebhookOriginated(ctx, r.Client, r.APIReader, proj.Namespace, tatarav1alpha1.IssueName(repo.Name, number))
 }
 
 // ClearWebhookOriginated deletes the AnnWebhookOriginated marker from the mirror
-// Issue CR (namespace, issueName), idempotently: a missing CR or missing marker
-// is a no-op. It is the "consumed exactly once" half of the liveness contract -
-// the mint that READ the marker clears it, so the marker cannot outlive its mint
-// and re-activate the issue on a later reap/re-mint cycle. Both the sweep
-// backstop and the webhook PRIMARY mint (fix F7-1) call it: before F7-1 only the
-// sweep cleared it, so a webhook mint left the marker behind forever.
-func ClearWebhookOriginated(ctx context.Context, c client.Client, namespace, issueName string) error {
+// Issue CR (namespace, issueName). It is the "consumed exactly once" half of
+// the liveness contract - the mint that READ the marker clears it, so the
+// marker cannot outlive its mint and re-activate the issue on a later
+// reap/re-mint cycle. Both the sweep backstop and the webhook PRIMARY mint
+// (fix F7-1) call it: before F7-1 only the sweep cleared it, so a webhook mint
+// left the marker behind forever.
+//
+// reader is MarkWebhookOriginated's uncached reader, nil-safe the same way.
+// It RETRIES a NotFound exactly like Mark does now, rather than swallowing it
+// as a no-op: a cached Get here can lose the SAME read-after-write race Mark
+// used to lose, on an Issue CR this same request may have just created, and
+// silently no-op'ing that left the marker never cleared (mtg-decks#9's
+// sibling defect - the mint still succeeded, but the marker leaked forever
+// because this Get never got a second chance). A CR that is genuinely gone
+// surfaces as an error after the backoff exhausts, exactly like Mark; every
+// caller already logs that error as non-fatal.
+func ClearWebhookOriginated(ctx context.Context, c client.Client, reader client.Reader, namespace, issueName string) error {
+	if reader == nil {
+		reader = c
+	}
 	key := types.NamespacedName{Namespace: namespace, Name: issueName}
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err := retry.OnError(webhookMarkerBackoff, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsNotFound(err)
+	}, func() error {
 		var iss tatarav1alpha1.Issue
-		if err := c.Get(ctx, key, &iss); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
-			}
+		if err := reader.Get(ctx, key, &iss); err != nil {
 			return err
 		}
 		if _, ok := iss.Annotations[AnnWebhookOriginated]; !ok {
@@ -721,7 +825,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		// HMAC-verified webhook said so: it mints ACTIVE even though its thread is
 		// empty. Nothing else can tell it from a cold backlog issue.
 		live := WebhookOriginated(cr)
-		stg, reason := MintStage(proj, ext, live)
+		stg, reason := MintStage(proj, repo, ext, live)
 		if !budget.allow(ctx, stg) {
 			continue
 		}

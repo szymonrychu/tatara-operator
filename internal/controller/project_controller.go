@@ -826,7 +826,16 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.APIReader == nil {
 		r.APIReader = mgr.GetAPIReader()
 	}
-	return ctrl.NewControllerManagedBy(mgr).
+	return projectControllerBuilder(mgr).Complete(r)
+}
+
+// projectControllerBuilder assembles the Project controller's ENTIRE watch set.
+// It is a separate function so the envtest (project_brainstorm_chain_test.go's
+// sibling coverage) registers the SAME builder production registers, instead of
+// a hand-copied duplicate that would go on passing after someone deleted the
+// real edge - deleting any Owns/Watches here now turns that test RED.
+func projectControllerBuilder(mgr ctrl.Manager) *builder.Builder {
+	bld := ctrl.NewControllerManagedBy(mgr).
 		For(&tataradevv1alpha1.Project{}).
 		Owns(&corev1.Secret{}).
 		Owns(&cnpgv1.Cluster{}).
@@ -843,9 +852,16 @@ func (r *ProjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// into a Project reconcile.
 		Watches(&tataradevv1alpha1.Issue{},
 			handler.EnqueueRequestsFromMapFunc(issueToProject),
-			builder.WithPredicates(proposalVerdictPredicate())).
-		// MaxConcurrentReconciles: 1 is explicit here; scan dedup/cap logic
-		// assumes serialised reconciles per kind.
-		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
-		Complete(r)
+			builder.WithPredicates(proposalVerdictPredicate()))
+	// THE BRAINSTORM CHAIN. A cycle that SKIPS writes no Issue, so the edge above
+	// never fires for it. See brainstormChainEdge for the real rationale (an
+	// immediate wake plus bypassing the workqueue's rate limiter under error
+	// backoff, NOT a 15m wait avoided - Project already self-requeues every 30s
+	// via defaultUnparkDriveInterval) and for why the skip breaker, not this
+	// edge, governs the five-consecutive-skips regime. In particular, do NOT add
+	// GenerationChangedPredicate to it.
+	bld = brainstormChainEdge(bld)
+	// MaxConcurrentReconciles: 1 is explicit here; scan dedup/cap logic assumes
+	// serialised reconciles per kind.
+	return bld.WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1})
 }
