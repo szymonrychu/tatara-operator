@@ -1819,7 +1819,7 @@ func TestOutcome_Refine_FoldAdoptsVerifiesThenDeletes(t *testing.T) {
 	require.Equal(t, tatarav1alpha1.StageDelivered, got.Status.Stage)
 
 	// C4: adoption transfers the CONTROLLER ref, but every downstream consumer
-	// (the C.6 approval grammar, the reaper's owned-set, the agent bundle)
+	// (the C.6 approval citation check, the reaper's owned-set, the agent bundle)
 	// reads the umbrella's Status.IssueRefs/MRRefs SLICES, not ownerRefs. A
 	// fold that doesn't append there leaves adopted work unguarded and absent
 	// from the bundle.

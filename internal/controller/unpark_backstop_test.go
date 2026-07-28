@@ -44,7 +44,7 @@ func objectKeyOf(o client.Object) client.ObjectKey {
 // it to stage.Unpark as UnparkInput.GrammarPassed. Step B deleted the reader,
 // step C the UnparkInput field, step D the API type - so the ONLY grant path
 // into implementing is now restapi's verifyApprovalScope
-// (internal/restapi/outcome.go), which runs the LIVE grammar against a live
+// (internal/restapi/outcome.go), which runs the LIVE citation check against a live
 // pod's submit_outcome. A Task in exactly the shape the old fast path re-entered
 // on - an approved owned Issue and a human comment pending - must land on
 // conversing.
@@ -265,7 +265,7 @@ func TestUnparkFires_AgreesWithApplyUnparkOnConversingHasRoom(t *testing.T) {
 	task.Status.StageEnteredAt = &metav1.Time{Time: time.Now().Add(-time.Hour)}
 	// There is no verdict field on UnparkInput any more, so room is the only variable.
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
-		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "not the magic phrase",
+		At: metav1.Now(), Kind: "issue_comment", Author: "szymonrychu", Body: "any human comment at all",
 	}}
 
 	r := newUnparkTestReconciler(t, proj, task)

@@ -131,7 +131,7 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 	// kind, not ev.Kind: scm.WebhookEvent.Kind is the coarse delivery kind
 	// ("issue"/"mr"/"push"). kind is the mirror kind resolveMirrorTarget already
 	// derived, and it is the SAME value stamped on taskEv.Kind, which is what
-	// the grammar's own issue_comment check reads.
+	// the C.6 citation check's own issue_comment check reads.
 	if kind == "issue_comment" && ev.Number > 0 && controller.TaskOwnsIssue(task, repo.Name, ev.Number) {
 		s.syncOwnedIssueThread(ctx, &proj, task, repo.Name, ev.Number)
 	}
@@ -161,7 +161,7 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 //     though the round still gets COUNTED (below), because the D7 counter tracks
 //     every agent-authored round on a live conversation, not only the ones that
 //     happen to open a fresh one;
-//   - the C.6 approval grammar is never run and no un-park rule is evaluated: a
+//   - the C.6 approval citation check is never run and no un-park rule is evaluated: a
 //     bot comment cannot approve anything, ever.
 //
 // The consecutive-round counter (AppendAgentTaskEvent) is maintained here and is

@@ -158,7 +158,7 @@ func TestMirrorTruncatesCommentBodies(t *testing.T) {
 }
 
 // TestMirrorComputesIsBotFromBotLogin asserts the STRUCTURAL bot exclusion the
-// approval grammar (C.6) and the pendingEvents enqueue filter (E.3) rely on:
+// C.6 approval citation check and the pendingEvents enqueue filter (E.3) rely on:
 // IsBot comes from Project.spec.scm.botLogin, never from a heuristic.
 func TestMirrorComputesIsBotFromBotLogin(t *testing.T) {
 	proj := mirrorProject("tatara-bot")
@@ -227,7 +227,7 @@ func TestSyncIssueUpsertsMirror(t *testing.T) {
 		t.Fatalf("lastSyncedAt must be stamped by a sync")
 	}
 	// status.status is NOT written by the mirror sync: it is the platform's
-	// decision state, owned by the approval grammar (C.6).
+	// decision state, owned by the C.6 approval citation check.
 	if iss.Status.Status != "" {
 		t.Fatalf("sync wrote status.status = %q; the mirror never decides platform state", iss.Status.Status)
 	}

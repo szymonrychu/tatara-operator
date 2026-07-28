@@ -327,7 +327,7 @@ var Transitions = map[string][]Edge{
 	// that is why the paused-project carve-out covers it too.
 	v1alpha1.StageApproved: {
 		{To: v1alpha1.StageImplementing, Trigger: "a QueuedEvent for the implement pod is ADMITTED"},
-		{To: v1alpha1.StageClarifying, Trigger: "the Task ACQUIRES a new Issue after approval. Approval is not sticky (fix H9)"},
+		{To: v1alpha1.StageClarifying, Trigger: "the Task ACQUIRES a new Issue after approval (fix H9). LEGAL BUT UNDRIVEN: applyApprovalStage was the only production caller and it died with the agent-judged approval gate, so nothing re-gates an approved Task today. If it is re-implemented the home is queue_controller.go, not restapi"},
 		{To: v1alpha1.StageParked, Reason: ReasonAdmissionStarved, Trigger: "the 24h admission budget elapses (skipped when the project is PAUSED)"},
 		{To: v1alpha1.StageParked, Reason: ReasonOwnershipLost, Trigger: "an external commit landed on the MR while approved: a takeover Task mints straight into approved already controller-owning the MR (MintOrUnparkTakeoverTask), so it can be flipped before ever reaching implementing"},
 		{To: v1alpha1.StageFailed, Reason: ReasonOperatorError, Trigger: "unrecoverable operator error"},
@@ -1011,7 +1011,7 @@ func HeadMoved(t *v1alpha1.Task, maxHeadMoveReentries int) (Edge, bool) {
 // UnparkInput is everything F.6 reads.
 //
 // internal/stage is PURE, and as of the agent-judged approval gate it does NO
-// approval reasoning at all. The caller performs NO grammar evaluation before
+// approval reasoning at all. The caller performs NO approval evaluation before
 // calling Unpark and passes NO verdict in: this package never sees an approval,
 // and no field here can carry one.
 //

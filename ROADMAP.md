@@ -21,9 +21,12 @@ Planned work not yet started. One line per item; link to plans for detail.
   approvalVerdict` and `stage.UnparkInput.GrammarPassed` are deleted, so no stored verdict can
   release code execution: `parked(identity-unverified)` un-parks to CONVERSING only, and the single
   grant path into `approved` is `restapi.verifyApprovalScope`'s LIVE per-request check over every
-  live owned Issue. Step F collapsed the two approval code paths into that one. Decisions, the
-  accepted residual risk (indirect prompt injection -> selective quoting) and the rejected
-  mitigations are in MEMORY.md (2026-07-28 / 2026-07-29 entries).
+  live owned Issue. Step F collapsed the two approval code paths into that one. The wire contract
+  moved with it: `TATARA_CONTRACT_VERSION` is 3 in tatara-operator, tatara-cli and
+  tatara-claude-code-wrapper, all three in one shot, because `submit_outcome(decision=implement)`
+  gained `approvalCitations`. Decisions, the accepted residual risk (indirect prompt injection to
+  selective quoting) and the rejected mitigations are in MEMORY.md (2026-07-28 / 2026-07-29
+  entries).
 
 Open, out of scope, deliberately not done:
 

@@ -53,7 +53,8 @@ import (
 // for that reason - stage.go's ReasonIdentityUnverified arm has no implementing
 // branch left to reach. The ONE surviving grant path into implementing is
 // restapi's verifyApprovalScope (internal/restapi/outcome.go), which runs the
-// LIVE grammar over every owned Issue on every submit_outcome(decision=implement):
+// LIVE citation check over every owned Issue on every
+// submit_outcome(decision=implement):
 // judged by an agent standing in conversing with a live pod, against live state,
 // never against a record.
 //
@@ -291,7 +292,7 @@ func NeedsConversingRoom(stageReason string) bool {
 
 // driveUnparks applies stage.Unpark to every parked Task in proj whose park
 // reason has an F.6 re-entry rule, INCLUDING identity-unverified - for which
-// CONVERSING is the only reachable target, because no grammar verdict is ever
+// CONVERSING is the only reachable target, because no approval verdict is ever
 // fed to stage.Unpark any more (see the file header). activeTasks is computed
 // ONCE and then advanced as each Task re-enters an active stage, so a bulk
 // re-entry never exceeds maxOpenTasks (H8).

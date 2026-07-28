@@ -159,9 +159,10 @@ func truncateCommentBody(body string) (string, bool) {
 // mirrorCommentFrom maps one forge comment onto the CR mirror's Comment,
 // truncating the body and computing IsBot from Project.spec.scm.botLogin.
 //
-// IsBot is the STRUCTURAL bot exclusion the approval grammar (C.6 clause 3a) and
-// the pendingEvents enqueue filter (E.3) rely on. An EMPTY author is never the
-// bot: a deleted account must not pass an equality gate.
+// IsBot is the STRUCTURAL bot exclusion the C.6 approval citation check (clause
+// (a) of verifyOneIssue) and the pendingEvents enqueue filter (E.3) rely on. An
+// EMPTY author is never the bot: a deleted account must not pass an equality
+// gate.
 func mirrorCommentFrom(proj *tatarav1alpha1.Project, c scm.IssueComment) tatarav1alpha1.Comment {
 	body, truncated := truncateCommentBody(c.Body)
 	botLogin := ""
@@ -366,7 +367,7 @@ func ensureMergeRequestCR(ctx context.Context, c client.Client, proj *tatarav1al
 // rate-limited read path (C.8).
 //
 // It never writes status.status: that is the platform's decision state, owned by
-// the C.6 approval grammar and the operator's own lifecycle writes. The mirror
+// the C.6 approval citation check and the operator's own lifecycle writes. The mirror
 // carries SCM TRUTH (state/labels/comments) and nothing else.
 func SyncIssue(ctx context.Context, c client.Client, sp objbudget.Spiller, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, ext scm.Issue) error {
 	if err := ensureIssueCR(ctx, c, proj, repo, ext.Number, ext.URL); err != nil {

@@ -2316,7 +2316,7 @@ func (s *Server) foldMembers(ctx context.Context, proj *tatarav1alpha1.Project, 
 				return err
 			}
 			// The umbrella's Status.IssueRefs is what every downstream
-			// consumer reads (the C.6 approval grammar, the reaper's
+			// consumer reads (the C.6 approval citation check, the reaper's
 			// owned-set, the agent bundle) - NOT ownerRefs. Adoption without
 			// this leaves adopted work unguarded and absent from the bundle.
 			if err := s.appendTaskRefFor(ctx, proj, umbrella.Name, &iss); err != nil {

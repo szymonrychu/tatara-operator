@@ -742,7 +742,7 @@ func (s *Server) handleIssueComment(ctx context.Context, w http.ResponseWriter, 
 		// work, but ONLY for a DIFFERENT agent kind than the one that wrote it, and
 		// only when that authorship is resolved from the operator's own ledger. It
 		// never falls through to the human intake below: no mint, no unpark, no
-		// approval grammar - just a queued event and, when the rule passes, a
+		// approval citation check - just a queued event and, when the rule passes, a
 		// conversation. botRepo is resolved locally (the human path below computes
 		// its own commentRepo further down, which does not exist yet at this point
 		// in the function) - matchRepo is a cheap cached-client Get, not a forge call.
