@@ -182,9 +182,30 @@ func IsOrphanIssue(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository
 // webhook saw, until a human REMOVES it or the operator does on promotion), and
 // the marker only decides ACTIVE-vs-backlog for an issue NOBODY has parked. The
 // belt to that brace is that the marker is CONSUMED by the mint that reads it.
-func MintStage(proj *tatarav1alpha1.Project, iss scm.Issue, webhookOriginated bool) (string, string) {
+//
+// THE TRUSTED-HUMAN-AUTHOR CLAUSE is the third position and it is not
+// negotiable: AFTER tatara-parked (an explicit human park still wins over the
+// author's standing) and BEFORE the marker (so it does not depend on webhook
+// delivery at all). It states the intended rule directly - a new issue from a
+// maintainer or reporter starts a clarify agent - and it is deliberately
+// NARROWER than IsTrustedAuthor: it excludes the project's own bot login.
+// IsTrustedAuthor documents the bot as a trusted insider (logins.go), and used
+// verbatim here it would mint every bot-authored orphan issue ACTIVE too -
+// including an abandoned brainstorm proposal issue whose Task was reaped and
+// whose Issue CR lost its controller owner along with it. ClassifyPR clause 2
+// (below) exists because the identical property bit on the PR side:
+// prInReactionScope returns true immediately for IsTrustedAuthor, so a
+// bot-authored PR sailed through the label gate too. This clause closes the
+// issue-side twin of that hole up front instead of discovering it in
+// production. It is also what makes the sweep a genuine BACKSTOP: a totally
+// lost webhook delivery still results in an ACTIVE Task on the next scan
+// instead of a silently parked one.
+func MintStage(proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, iss scm.Issue, webhookOriginated bool) (string, string) {
 	if hasLabel(iss.Labels, TataraParkedLabel) {
 		return tatarav1alpha1.StageParked, stage.ReasonBacklogSweep
+	}
+	if iss.Author != botLoginOf(proj) && tatarav1alpha1.IsTrustedAuthor(proj, repo, iss.Author) {
+		return tatarav1alpha1.StageTriaging, ""
 	}
 	if webhookOriginated {
 		return tatarav1alpha1.StageTriaging, ""
@@ -773,7 +794,7 @@ func (r *ProjectReconciler) sweepIssues(ctx context.Context, proj *tatarav1alpha
 		// HMAC-verified webhook said so: it mints ACTIVE even though its thread is
 		// empty. Nothing else can tell it from a cold backlog issue.
 		live := WebhookOriginated(cr)
-		stg, reason := MintStage(proj, ext, live)
+		stg, reason := MintStage(proj, repo, ext, live)
 		if !budget.allow(ctx, stg) {
 			continue
 		}

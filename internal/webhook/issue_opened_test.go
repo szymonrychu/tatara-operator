@@ -277,9 +277,10 @@ func TestIssueOpened_LaggingCacheStillMintsTriaging(t *testing.T) {
 
 // newServerWithReader mirrors newServer but wires reader as Config.APIReader -
 // production's manager.GetAPIReader(), an UNCACHED client distinct from the
-// cached Client. Used only by TestIssueOpened_UncachedReaderClosesTheRace,
-// which needs the two genuinely separate (real vs. cache-lagging) reads that a
-// single client cannot model.
+// cached Client. Used only by
+// TestIssueOpened_BoundedCacheLagMintsOnceAndConsumesTheMarker, which needs
+// the two genuinely separate (real vs. cache-lagging) reads that a single
+// client cannot model.
 func newServerWithReader(c client.Client, reader client.Reader) http.Handler {
 	return webhook.NewServer(webhook.Config{
 		Client:    c,
@@ -290,39 +291,44 @@ func newServerWithReader(c client.Client, reader client.Reader) http.Handler {
 	}).Handler()
 }
 
-// TestIssueOpened_UncachedReaderClosesTheRace IS FINDING 3'S REGRESSION TEST
-// (2026-07-28 review round 1, following mtg-decks#9). The test above
-// (TestIssueOpened_LaggingCacheStillMintsTriaging) proves MarkWebhookOriginated
-// itself survives a lagging cache. It does NOT prove the whole request does: a
-// review pass found that under sustained lag, a request could still 500
-// DOWNSTREAM of a successful mark and mint - in mirror.SyncIssue's own
-// objbudget.FitIssue read, called from MintIssueTask right after the Task is
-// created - and because that happens AFTER the Task already exists, the
-// marker is left stamped forever: neither the webhook (the error return skips
-// its own ClearWebhookOriginated call) nor a later sweep pass (whose own
-// createTaskRaceSafe now finds a live twin and takes the repair branch, which
-// never touches the marker) ever clears it, so the issue re-activates on
-// every later reap cycle.
+// TestIssueOpened_BoundedCacheLagMintsOnceAndConsumesTheMarker guards the
+// end-to-end mint under a lagging cache (2026-07-28 review round 1, following
+// mtg-decks#9). The test above (TestIssueOpened_LaggingCacheStillMintsTriaging)
+// proves MarkWebhookOriginated itself survives a lagging cache. It does NOT
+// prove the whole request does: a review pass found that under sustained lag,
+// a request could still 500 DOWNSTREAM of a successful mark and mint - in
+// mirror.SyncIssue's own objbudget.FitIssue read, called from MintIssueTask
+// right after the Task is created - and because that happens AFTER the Task
+// already exists, the marker is left stamped forever: neither the webhook
+// (the error return skips its own ClearWebhookOriginated call) nor a later
+// sweep pass (whose own createTaskRaceSafe now finds a live twin and takes
+// the repair branch, which never touches the marker) ever clears it, so the
+// issue re-activates on every later reap cycle. This test proves that
+// downstream path stays clean: exactly one Task, marker consumed.
+//
+// IT DOES NOT DISCRIMINATE MarkWebhookOriginated's OWN CHOICE OF READER,
+// despite the name it used to carry. Server.reader() prefers APIReader
+// (finding 1/3), so Mark's own footprint on the cached client is at most one
+// Get - but reverting that choice back to the cached client still leaves this
+// test GREEN, because objbudget.FitIssue's own pre-existing createLagBackoff
+// (~3.1s across 5 attempts, unrelated to this fix and shared by ~15 call
+// sites across the whole codebase) comfortably absorbs the same lag budget on
+// the create path regardless of which reader Mark used. Kept as end-to-end
+// bounded-lag coverage, not as a regression guard for finding 3's specific
+// reader choice.
 //
 // cachedClient and liveReader below share ONE k8s.io/client-go/testing.ObjectTracker
 // - only cachedClient carries the lag interceptor - modeling manager.GetClient()
 // (informer-backed, can lag a write it just made) against manager.GetAPIReader()
 // (direct to the API server, never lags) exactly as production wires
-// webhook.Config.APIReader. MarkWebhookOriginated now reads through
-// Server.reader(), which prefers APIReader, so ITS OWN read never depends on
-// the lagging client catching up - and because that keeps Mark's own footprint
-// on the cached client down to at most one Get on the create path (finding 1),
-// objbudget.FitIssue's own pre-existing createLagBackoff (~3.1s across 5
-// attempts, unrelated to this fix and out of its scope: it is shared by
-// ~15 call sites across the whole codebase) comfortably absorbs the rest for
-// a realistic, bounded lag. (issueCR - MintForItem's own orphan-classification
+// webhook.Config.APIReader. (issueCR - MintForItem's own orphan-classification
 // read - was ALSO tried on the uncached reader during this review round; it
 // broke TestResumeNoReentryPark_DirectMintCacheLagStillActive, whose own doc
 // comment documents that only the specific re-entrant read that needs
 // freshness goes through APIReader, not the general classification read, so
 // intake.go's issueCR deliberately stays on the cached Client - see its own
 // doc comment for the full reasoning.)
-func TestIssueOpened_UncachedReaderClosesTheRace(t *testing.T) {
+func TestIssueOpened_BoundedCacheLagMintsOnceAndConsumesTheMarker(t *testing.T) {
 	const secretVal = "whsec-lag2"
 	scheme := newScheme(t)
 	tracker := clientgotesting.NewObjectTracker(scheme, serializer.NewCodecFactory(scheme).UniversalDecoder())

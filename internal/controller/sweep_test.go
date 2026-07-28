@@ -209,18 +209,52 @@ func TestOrphanIssuePredicate(t *testing.T) {
 	}
 }
 
-// TestMintStage pins the TWO mint stages.
+// TestMintStage pins the TWO mint stages and, above all, THE ORDER OF THE
+// CLAUSES.
 //
 // The tatara-parked LABEL READ is safe where fix 16's forbidden one is not: it
 // decides COST (do we spend a pod on this issue now?), never AUTHORITY (may this
 // issue be implemented?). Forging the label buys an attacker a Task that stays
 // PARKED - it fails SAFE. Forging an approval label would buy them prod. Do not
 // generalise one rule into the other.
+//
+// THE TRUSTED-AUTHOR CLAUSE sits between the two: AFTER tatara-parked, so an
+// explicit human park still wins over the author's standing; BEFORE the webhook
+// marker, so a maintainer's issue starts an agent even when the delivery was
+// lost outright and no marker was ever stamped. That is what makes the sweep a
+// genuine backstop rather than one that parks the work it was meant to rescue.
+//
+// The clause is NARROWED to a trusted HUMAN, not IsTrustedAuthor verbatim.
+// IsTrustedAuthor documents the project's own bot login as a trusted insider
+// (api/v1alpha1/logins.go:61), and taken literally the clause would mint every
+// bot-authored orphan issue ACTIVE too - including an abandoned brainstorm
+// proposal issue whose Task was reaped and whose Issue CR lost its controller
+// owner in the process. ClassifyPR clause 2 (sweep.go, ~line 413) exists
+// because the identical property bit on the PR side: prInReactionScope returns
+// true immediately for IsTrustedAuthor, and the bot is documented as trusted
+// there too. That precedent is why this clause excludes the bot explicitly
+// rather than repeating the mistake on the issue side.
 func TestMintStage(t *testing.T) {
-	proj := sweepProject("mint-proj")
+	base := sweepProject("mint-proj")
+	repo := sweepRepo("mint-proj")
+
+	trusted := sweepProject("mint-proj")
+	trusted.Spec.Scm.MaintainerLogins = []string{"alice"}
+
+	reporterOnly := sweepProject("mint-proj")
+	reporterOnly.Spec.Scm.ReporterLogins = []string{"carol"}
+
+	// A per-Repository override REPLACES the project list for that repo (a
+	// non-nil pointer, including an explicit empty slice). Nothing about this
+	// clause is project-global.
+	noneHere := sweepRepo("mint-proj")
+	noneHere.Spec.MaintainerLogins = &[]string{}
+
 	t0 := time.Now().Add(-time.Hour)
 
 	tests := map[string]struct {
+		proj       *tatarav1alpha1.Project
+		repo       *tatarav1alpha1.Repository
 		iss        scm.Issue
 		webhook    bool
 		wantStage  string
@@ -246,7 +280,7 @@ func TestMintStage(t *testing.T) {
 			wantStage:  tatarav1alpha1.StageParked,
 			wantReason: stage.ReasonBacklogSweep,
 		},
-		"an untouched backlog issue: PARKED": {
+		"an untouched backlog issue from an UNLISTED author: PARKED": {
 			iss:        scm.Issue{Number: 1, State: "open", Author: "alice"},
 			wantStage:  tatarav1alpha1.StageParked,
 			wantReason: stage.ReasonBacklogSweep,
@@ -277,10 +311,73 @@ func TestMintStage(t *testing.T) {
 			}},
 			wantStage: tatarav1alpha1.StageParked, wantReason: stage.ReasonBacklogSweep,
 		},
+
+		// --- the trusted-author clause ---
+		"a MAINTAINER's brand-new issue mints ACTIVE with no marker and no comments": {
+			proj:      trusted,
+			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
+			wantStage: tatarav1alpha1.StageTriaging,
+		},
+		"a listed REPORTER's brand-new issue mints ACTIVE": {
+			proj:      reporterOnly,
+			iss:       scm.Issue{Number: 1, State: "open", Author: "carol"},
+			wantStage: tatarav1alpha1.StageTriaging,
+		},
+		"PRECEDENCE: tatara-parked BEATS a trusted author": {
+			proj:       trusted,
+			iss:        scm.Issue{Number: 1, State: "open", Author: "alice", Labels: []string{TataraParkedLabel}},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"PRECEDENCE: a trusted author needs NO webhook marker": {
+			proj:      trusted,
+			iss:       scm.Issue{Number: 1, State: "open", Author: "alice"},
+			webhook:   false,
+			wantStage: tatarav1alpha1.StageTriaging,
+		},
+		"an author outside the lists is NOT trusted: PARKED": {
+			proj:       trusted,
+			iss:        scm.Issue{Number: 1, State: "open", Author: "mallory"},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"an empty author is never trusted: PARKED": {
+			proj:       trusted,
+			iss:        scm.Issue{Number: 1, State: "open", Author: ""},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		"a per-repo override that clears the maintainer list un-trusts the author": {
+			proj:       trusted,
+			repo:       noneHere,
+			iss:        scm.Issue{Number: 1, State: "open", Author: "alice"},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
+		// COORDINATOR-NARROWED, DELIBERATELY PINNED (see the doc comment above). The
+		// brief's clause was IsTrustedAuthor verbatim, which mints a bot-authored
+		// orphan issue ACTIVE - an abandoned brainstorm proposal issue whose Task was
+		// reaped, say, and whose Issue CR lost its controller owner along with it.
+		// The narrowed clause excludes the project's own bot login, so this case
+		// falls through to the webhook/last-word/backlog clauses exactly as it did
+		// before this change: no webhook, no comments -> PARKED.
+		"a BOT-authored orphan issue is NOT a trusted human and does not mint ACTIVE": {
+			iss:        scm.Issue{Number: 1, State: "open", Author: "tatara-bot"},
+			wantStage:  tatarav1alpha1.StageParked,
+			wantReason: stage.ReasonBacklogSweep,
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			gotStage, gotReason := MintStage(proj, tc.iss, tc.webhook)
+			proj := tc.proj
+			if proj == nil {
+				proj = base
+			}
+			r := tc.repo
+			if r == nil {
+				r = repo
+			}
+			gotStage, gotReason := MintStage(proj, r, tc.iss, tc.webhook)
 			if gotStage != tc.wantStage || gotReason != tc.wantReason {
 				t.Fatalf("MintStage = (%q, %q), want (%q, %q)", gotStage, gotReason, tc.wantStage, tc.wantReason)
 			}

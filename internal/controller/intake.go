@@ -139,7 +139,7 @@ func (m *Minter) MintForItem(ctx context.Context, proj *tatarav1alpha1.Project,
 	if !IsOrphanIssue(proj, repo, item.Issue, cr) {
 		return nil, false, nil
 	}
-	stg, reason := MintStage(proj, item.Issue, webhookOriginated)
+	stg, reason := MintStage(proj, repo, item.Issue, webhookOriginated)
 	return m.MintIssueTask(ctx, proj, repo, item.Issue, stg, reason, sp)
 }
 
