@@ -82,12 +82,14 @@ func TestDriveUnparks_GuardDecline_LogsAndCounts(t *testing.T) {
 	}
 }
 
-// Finding 3 (rule side) + finding 2 (metric): a RULE decline in driveUnparks
-// (stage.Unpark's re-entry rule simply not satisfied - normal steady state,
-// e.g. no non-bot comment yet) must NOT be logged - driveUnparks sweeps every
-// parked Task every pass and this is the expected outcome for most of
-// them - but it must still count against operator_unpark_declined_total,
-// distinguished by kind="rule", so the metric stays complete.
+// Finding 3 (rule side) + finding 2 (metric): a normal steady-state decline in
+// driveUnparks (stage.UnparkDetailed's re-entry rule simply not satisfied -
+// e.g. no non-bot comment yet, DeclineNoHumanEvent) must NOT be logged -
+// driveUnparks sweeps every parked Task every pass and this is the expected
+// outcome for most of them - but it must still count against
+// operator_unpark_declined_total, distinguished by its specific kind, so the
+// metric stays complete and queryable per condition (not collapsed into a
+// single "rule" bucket).
 func TestDriveUnparks_RuleDecline_CountsButDoesNotLog(t *testing.T) {
 	task := wfParkedTask("t-rule-du", "review", stage.ReasonAwaitingHuman)
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
@@ -102,19 +104,19 @@ func TestDriveUnparks_RuleDecline_CountsButDoesNotLog(t *testing.T) {
 	}
 
 	if containsLine(*lines, "unpark: declined (drift guard)") {
-		t.Fatalf("a RULE decline must never log the drift-guard line; lines: %v", *lines)
+		t.Fatalf("a non-guard decline must never log the drift-guard line; lines: %v", *lines)
 	}
 	for _, l := range *lines {
 		if l != "" {
-			t.Fatalf("driveUnparks must stay silent on a RULE decline (log spam on every steady-state sweep); got line %q", l)
+			t.Fatalf("driveUnparks must stay silent on a non-guard decline (log spam on every steady-state sweep); got line %q", l)
 		}
 	}
-	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, "rule")); got != 1 {
-		t.Fatalf("operator_unpark_declined_total{awaiting-human,rule} = %v, want 1", got)
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonAwaitingHuman, string(DeclineNoHumanEvent))); got != 1 {
+		t.Fatalf("operator_unpark_declined_total{awaiting-human,no-human-event} = %v, want 1", got)
 	}
 	got := mdGetTask(t, c, task.Name)
 	if got.Status.Stage != tatarav1alpha1.StageParked {
-		t.Fatalf("rule decline must not mutate the live Task; stage=%s", got.Status.Stage)
+		t.Fatalf("non-guard decline must not mutate the live Task; stage=%s", got.Status.Stage)
 	}
 }
 

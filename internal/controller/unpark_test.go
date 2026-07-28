@@ -58,7 +58,7 @@ func TestApplyUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 	liveClient := newMirrorClient(t, proj, live)
 	cached := &staleGetClient{Client: liveClient, stale: stale.DeepCopy()}
 
-	target, decline, err := ApplyUnpark(context.Background(), cached, liveClient, proj, stale, 0, 6, false, time.Now())
+	target, decline, err := ApplyUnpark(context.Background(), cached, liveClient, proj, stale, 0, 6, false, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
@@ -86,15 +86,15 @@ func TestApplyUnpark_BotOnlyEventStillDeclines(t *testing.T) {
 	}}
 	c := newMirrorClient(t, proj, task)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, false, time.Now())
+	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, task, 0, 6, false, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}
 	if target != "" {
 		t.Fatalf("a bot-only pendingEvent must never un-park; got target=%q", target)
 	}
-	if decline != DeclineRule {
-		t.Fatalf("decline = %q, want DeclineRule for a bot-only-event non-error refusal", decline)
+	if decline != DeclineNoHumanEvent {
+		t.Fatalf("decline = %q, want DeclineNoHumanEvent for a bot-only-event non-error refusal", decline)
 	}
 }
 
@@ -123,7 +123,7 @@ func TestApplyUnpark_StageReasonGuardStillShortCircuitsOnLiveRead(t *testing.T) 
 
 	c := newMirrorClient(t, proj, live, mr)
 
-	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, caller, 0, 6, false, time.Now())
+	target, decline, err := ApplyUnpark(context.Background(), c, c, proj, caller, 0, 6, false, false, time.Now())
 	if err != nil {
 		t.Fatalf("ApplyUnpark: %v", err)
 	}

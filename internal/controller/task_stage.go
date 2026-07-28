@@ -197,6 +197,14 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 
 	paused := projectPaused(proj)
 	clock, since, budget, edge := stage.ArmedClock(task, paused)
+	// The ONE per-project clock budget in the F.4 model. internal/stage is pure and
+	// holds no Project, so the table carries ConversationIdleDefault and the
+	// substitution happens here, at the single call site that has the Project in
+	// hand. Keeping the table row means TestEveryStageHasABudget still covers
+	// conversing and a future stage still cannot be added without a deadline.
+	if task.Status.Stage == tatarav1alpha1.StageConversing && clock == stage.ClockWork {
+		budget = tatarav1alpha1.ConversationIdle(proj)
+	}
 	if clock == stage.ClockNone {
 		// parked(backlog-sweep), or a stage with no budget row. Nothing ages out.
 		return ctrl.Result{}, false, nil
@@ -221,6 +229,21 @@ func (r *TaskReconciler) reconcileClocks(ctx context.Context, proj *tatarav1alph
 		// The one case podwatch CANNOT see is a pod that was DELETED while never
 		// Ready (its predicate drops delete events), and reconcilePodStage owns that.
 		return ctrl.Result{RequeueAfter: agentBootRequeue}, false, nil
+	}
+
+	// The conversing budget-elapsed edge is NOT a plain transition: the agent is
+	// owed one handoff turn before its pod dies, or the notes journal - which IS
+	// the continuation state - is left empty for whatever pod comes next.
+	if task.Status.Stage == tatarav1alpha1.StageConversing {
+		mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
+		if mrErr != nil {
+			return ctrl.Result{}, true, mrErr
+		}
+		l.Info("conversation idle budget elapsed",
+			"action", "stage_deadline", "resource_id", task.Name, "stage", task.Status.Stage,
+			"clock", clock, "budget", budget.String(), "elapsed", elapsed.String(),
+			"to", edge.To, "stage_reason", edge.Reason)
+		return ctrl.Result{}, true, r.conversingHandoffAndPark(ctx, proj, task, mrs, "idle", now)
 	}
 
 	mrs, mrErr := ownedMergeRequests(ctx, r.Client, task)
@@ -945,8 +968,58 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 
 	marker := turn0Marker(task)
 	if task.Annotations[annStageTurn0] == marker {
+		// THE CONVERSATION FOLLOW-UP TURN, and the ONLY stage that gets one.
+		//
+		// Every other pod stage takes exactly one turn per pod: turn-0 renders the
+		// whole bundle, the agent works, it submits an outcome, the stage moves and
+		// the pod dies. conversing is different by construction - it is where a Task
+		// waits with a live agent for the human's NEXT comment - so the pod must be
+		// able to take that comment as a further turn or the warmth buys nothing.
+		//
+		// Three guards, all load-bearing:
+		//   - stage == conversing, so the turn model of implementing/reviewing is
+		//     untouched;
+		//   - pendingEvents non-empty, so this fires on a real delta and not on
+		//     every 30s requeue (and the drain below is what makes it terminate);
+		//   - no turn in flight, because POST /v1/messages 409s during a turn and a
+		//     racing second submit is exactly the 2026-06 redelivery defect that
+		//     double-injected text into a live session.
+		if task.Status.Stage == tatarav1alpha1.StageConversing &&
+			len(task.Status.PendingEvents) > 0 && !taskHasInflightTurn(task) {
+			return r.submitStageTurn(ctx, proj, task, agentKind, "conversation", now)
+		}
 		return ctrl.Result{RequeueAfter: stageRequeue}, nil // turn-0 already submitted for THIS pod
 	}
+
+	return r.submitStageTurn(ctx, proj, task, agentKind, "turn0", now)
+}
+
+// submitStageTurn renders the bundle and submits ONE turn to this Task's live
+// pod, then stamps the turn annotations and spends the pendingEvents delta that
+// was rendered into it. phase is "turn0" for a pod's first turn and
+// "conversation" for a conversing pod's follow-up; it names the submit site in
+// the failure path and in the log line, and is not otherwise behavioural.
+//
+// The annStageTurn0 marker is stamped for BOTH phases. For turn0 that is its
+// original meaning (this pod has been given the bundle). For a conversation turn
+// it is already set and re-stamping it is a no-op write that keeps the two paths
+// identical rather than branching.
+func (r *TaskReconciler) submitStageTurn(ctx context.Context, proj *tatarav1alpha1.Project,
+	task *tatarav1alpha1.Task, agentKind, phase string, now time.Time) (ctrl.Result, error) {
+
+	l := log.FromContext(ctx)
+	marker := turn0Marker(task)
+
+	// Snapshot the events THIS turn is actually going to carry, before render and
+	// before the network round trip below. AppendTaskEvent's caller (the webhook
+	// handler) is NOT leader-elected and runs on every replica - unlike this
+	// reconcile, which the per-object-key workqueue plus leader election already
+	// serialises to at most one in flight per Task - so a new comment can land in
+	// status.pendingEvents while SubmitTurn is still outstanding. The drain below
+	// must remove exactly this snapshot, not whatever pendingEvents holds by the
+	// time it runs, or that late comment is erased having never been rendered
+	// into any turn (see drainRenderedEvents, task_events.go).
+	rendered := append([]tatarav1alpha1.TaskEvent(nil), task.Status.PendingEvents...)
 
 	text, err := r.renderBundle(ctx, proj, task, agentKind)
 	if err != nil {
@@ -956,12 +1029,13 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 	turnID, serr := r.Session.SubmitTurn(ctx, agent.BaseURL(task, task.Namespace), text, r.callbackURL())
 	elapsed := time.Since(t0).Seconds()
 	if serr != nil {
-		return r.handleTurnSubmitFailure(ctx, proj, task, serr, elapsed, "turn0")
+		return r.handleTurnSubmitFailure(ctx, proj, task, serr, elapsed, phase)
 	}
 	r.Metrics.TurnSubmit(task.Spec.Kind, "ok", "ok", elapsed)
 	l.Info("turn submitted",
 		"action", "agent_turn_submit", "resource_id", task.Name, "turn_id", turnID,
-		"stage", task.Status.Stage, "agent_kind", agentKind, "bytes", len(text),
+		"stage", task.Status.Stage, "agent_kind", agentKind, "phase", phase,
+		"events", len(rendered), "bytes", len(text),
 		"duration_ms", int64(elapsed*1000))
 
 	if err := r.patchTaskAnnotations(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
@@ -975,16 +1049,22 @@ func (r *TaskReconciler) reconcilePodStage(ctx context.Context, proj *tatarav1al
 		delete(fresh.Annotations, annTurnLastActivity)
 		return true
 	}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("stamp turn-0 marker: %w", err)
+		return ctrl.Result{}, fmt.Errorf("stamp turn marker (%s): %w", phase, err)
 	}
-	// E.3: the pending events were rendered into THIS bundle. They are the delta,
-	// and the delta is spent.
-	if len(task.Status.PendingEvents) > 0 {
+	// E.3: the pending events RENDERED (the `rendered` snapshot above) are the
+	// delta, and the delta is spent - remove exactly those, by value, from
+	// whatever pendingEvents holds NOW. Anything appended since the snapshot (a
+	// webhook write racing this turn) was never rendered and must survive to be
+	// carried by a later turn. Draining is also what terminates the conversation
+	// follow-up branch: with the rendered delta spent, the next reconcile finds
+	// no NEW events (unless one raced in, in which case it correctly still does).
+	if len(rendered) > 0 {
 		if err := r.patchTaskStatus(ctx, task, func(fresh *tatarav1alpha1.Task) bool {
-			if len(fresh.Status.PendingEvents) == 0 {
-				return false
+			drained := drainRenderedEvents(fresh.Status.PendingEvents, rendered)
+			if len(drained) == len(fresh.Status.PendingEvents) {
+				return false // nothing of the rendered snapshot was still there to remove
 			}
-			fresh.Status.PendingEvents = nil
+			fresh.Status.PendingEvents = drained
 			return true
 		}); err != nil {
 			return ctrl.Result{}, fmt.Errorf("drain pending events: %w", err)

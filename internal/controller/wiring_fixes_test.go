@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -159,21 +160,106 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 	}
 }
 
-func TestDriveUnparks_SkipsIdentityUnverified(t *testing.T) {
-	// identity-unverified is webhook+grammar-driven; the reconcile loop must not
-	// touch it (driving it with GrammarPassed=false would strand it).
+// TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing
+// was TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines before Task 9's
+// conversing widening; renamed because it no longer declines - see below.
+func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing(t *testing.T) {
+	// The reconcile loop DOES drive identity-unverified now (Task 4): it reads
+	// Task.status.approvalVerdict rather than re-running the grammar. This Task
+	// carries no verdict, but its one owned Issue IS live-approved: without the
+	// Issue seeded and approved, this test could not tell "correctly never
+	// reaches implementing because grammarPassed is false" apart from "never
+	// reaches implementing for the unrelated reason no Issues are owned" - it
+	// would pass either way and catch nothing. With the Issue approved, a
+	// wrongly-true grammarPassed WOULD re-enter the Task straight into
+	// implementing; this asserts that specifically never happens.
+	//
+	// Task 9: a GrammarPassed=false comment on identity-unverified now opens a
+	// conversation (conversing) instead of only declining - so this Task DOES
+	// move, but the conversing branch never consults Issue approval state at
+	// all (it fires before that check). The property this test proves - a
+	// live-approved Issue with no fresh grammar pass must never authorize
+	// implementing - is enforced downstream, at restapi's verifyApprovalScope,
+	// which reruns the LIVE C.6 grammar on every decision=implement from
+	// conversing and never reads status.approvalVerdict; it is NOT LegalFor's
+	// kind guard, which keys on Task.Spec.Kind == "review" and this Task is
+	// kind=clarify.
 	task := wfParkedTask("t-ident", "clarify", stage.ReasonIdentityUnverified)
+	task.Status.IssueRefs = []string{"iss-ident"}
 	task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
 		At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
 	}}
-	c := newMirrorClient(t, task)
-	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+	iss := &tatarav1alpha1.Issue{ObjectMeta: metav1.ObjectMeta{Name: "iss-ident", Namespace: mdNS}}
+	iss.Status.State = "open"
+	iss.Status.Status = "approved"
+	c := newMirrorClient(t, task, iss)
+	metrics := wfMetrics()
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: metrics}
 	if err := r.driveUnparks(context.Background(), wfProject(), time.Now()); err != nil {
 		t.Fatalf("driveUnparks: %v", err)
 	}
 	got := mdGetTask(t, c, task.Name)
-	if got.Status.Stage != tatarav1alpha1.StageParked || got.Status.StageReason != stage.ReasonIdentityUnverified {
-		t.Fatalf("driveUnparks touched identity-unverified: now %s(%s)", got.Status.Stage, got.Status.StageReason)
+	if got.Status.Stage != tatarav1alpha1.StageConversing {
+		t.Fatalf("stage = %s(%s), want conversing: a live-approved Issue with NO fresh grammar verdict must never reach implementing",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	// The original (pre-Task-9) version of this test asserted
+	// UnparkDeclinedCounter(identity-unverified, grammar-not-passed) == 1 - "the
+	// SPECIFIC decline, not just stayed parked". That assertion is gone, not
+	// merely dropped: this pass no longer declines at all (target != ""), so
+	// driveUnparks never calls Metrics.UnparkDeclined for it. Asserted here as
+	// 0, explicitly, so a future regression that made this decline again would
+	// fail LOUDLY on the counter, not silently pass by accident.
+	if got := testutil.ToFloat64(metrics.UnparkDeclinedCounter(stage.ReasonIdentityUnverified, string(DeclineGrammarNotPassed))); got != 0 {
+		t.Fatalf("operator_unpark_declined_total{identity-unverified,grammar-not-passed} = %v, want 0: this pass entered conversing, it did not decline", got)
+	}
+}
+
+// TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry is the CRITICAL 2
+// discrimination proof (2026-07-28 final review, first half): driveUnparks
+// used to hoist a single "has room" boolean ONCE per pass and reuse it,
+// unconditionally, for every parked Task in the batch - nothing decremented
+// it as Tasks actually entered conversing. A bulk maintainer comment pass
+// (UnparkInput.ActiveTasks' own doc names exactly this scenario) could
+// therefore push admissions well past the per-project conversing ceiling.
+// Four parked(awaiting-human) Tasks against a ceiling of 2 must never put
+// more than 2 into conversing in a single pass.
+func TestDriveUnparks_ConversingRoomBudgetCapsBulkReEntry(t *testing.T) {
+	proj := wfProject()
+	proj.Spec.MaxConversingPods = 2
+
+	names := []string{"a", "b", "c", "d"}
+	var objs []client.Object
+	for _, n := range names {
+		task := wfParkedTask("t-bulk-"+n, "clarify", stage.ReasonAwaitingHuman)
+		task.Status.PendingEvents = []tatarav1alpha1.TaskEvent{{
+			At: metav1.Now(), Kind: "issue_comment", Author: "human", Body: "go ahead",
+		}}
+		iss := &tatarav1alpha1.Issue{ObjectMeta: metav1.ObjectMeta{Name: "iss-bulk-" + n, Namespace: mdNS}}
+		iss.Status.State = "open"
+		iss.Status.Status = "new" // NOT approved: allApproved must stay false so this Task's
+		// re-entry consults ConversingHasRoom rather than jumping straight to implementing.
+		task.Status.IssueRefs = []string{iss.Name}
+		objs = append(objs, task, iss)
+	}
+	c := newMirrorClient(t, objs...)
+	r := &ProjectReconciler{Client: c, Scheme: c.Scheme(), Metrics: wfMetrics()}
+	if err := r.driveUnparks(context.Background(), proj, time.Now()); err != nil {
+		t.Fatalf("driveUnparks: %v", err)
+	}
+
+	conversing := 0
+	for _, n := range names {
+		got := mdGetTask(t, c, "t-bulk-"+n)
+		if got.Status.Stage == tatarav1alpha1.StageConversing {
+			conversing++
+		}
+	}
+	if conversing > proj.Spec.MaxConversingPods {
+		t.Fatalf("driveUnparks put %d Tasks into conversing in one pass against a ceiling of %d - the room budget was reused instead of spent", conversing, proj.Spec.MaxConversingPods)
+	}
+	if conversing == 0 {
+		t.Fatalf("driveUnparks put 0 Tasks into conversing - the room budget computation itself is broken, not just the cap")
 	}
 }
 

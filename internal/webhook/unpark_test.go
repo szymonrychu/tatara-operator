@@ -110,6 +110,39 @@ func TestDriveCommentUnpark_UsesLiveReadNotCachedGet(t *testing.T) {
 	}
 }
 
+// TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation is Task 9's
+// promised edge, proven LIVE through the actual production entry point
+// (driveCommentUnpark, called from deliverPendingEvent on every qualifying
+// webhook delivery) rather than stage.UnparkDetailed directly: a maintainer
+// comment on a parked(awaiting-human) Task whose one owned Issue is still
+// unapproved must reach a LIVE agent, not merely re-enter clarifying to post
+// one reply and die. This is the single most-cited symptom this whole
+// feature exists to fix.
+func TestDriveCommentUnpark_ParkedAwaitingHuman_OpensConversation(t *testing.T) {
+	proj := peProject("tatara-bot", "maintainer")
+	task := upTask("t-awaiting-conv", "clarify", stage.ReasonAwaitingHuman)
+	iss := peIssue(7, task) // State=open, Status="new" (unapproved)
+	task.Status.IssueRefs = []string{iss.Name}
+	task.Status.PendingEvents = []tatarav1.TaskEvent{{
+		At: metav1.Now(), Kind: "issue_comment", Author: "maintainer", Body: "any update?",
+	}}
+
+	c := peClient(t, proj, task, iss)
+	var logBuf bytes.Buffer
+	s := upServer(t, c, c, &logBuf)
+
+	s.driveCommentUnpark(context.Background(), proj, task)
+
+	got := getPETask(t, c, task.Name)
+	if got.Status.Stage != tatarav1.StageConversing {
+		t.Fatalf("driveCommentUnpark on an unapproved parked(awaiting-human) Task landed at %s(%s), want conversing",
+			got.Status.Stage, got.Status.StageReason)
+	}
+	if got.Status.ConversationLastEventAt == nil {
+		t.Fatal("ConversationLastEventAt is nil: the idle clock was never armed, so this conversation would never time out")
+	}
+}
+
 // The decline path (target=="", err==nil) must log at INFO with the task
 // name and stageReason - a silent decline here is what hid the cache-lag
 // race for a full day with zero errors.

@@ -391,6 +391,56 @@ func TestApprovalPhrases_EmptyNeverMeansAny(t *testing.T) {
 	}
 }
 
+// TestConversationIdle asserts every input that must fall back to
+// ConversationIdleDefault: a nil Project, a Project with a nil Scm block, and
+// a Project whose Scm is set but ConversationIdleMinutes is left at its
+// zero-value - alongside the one case that overrides it.
+func TestConversationIdle(t *testing.T) {
+	tests := []struct {
+		name string
+		proj *v1alpha1.Project
+		want time.Duration
+	}{
+		{
+			name: "nil Project falls back to the default",
+			proj: nil,
+			want: v1alpha1.ConversationIdleDefault,
+		},
+		{
+			name: "nil Scm block falls back to the default",
+			proj: &v1alpha1.Project{},
+			want: v1alpha1.ConversationIdleDefault,
+		},
+		{
+			name: "zero-value ConversationIdleMinutes falls back to the default",
+			proj: &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ConversationIdleMinutes: 0}}},
+			want: v1alpha1.ConversationIdleDefault,
+		},
+		{
+			name: "a configured positive value overrides the default",
+			proj: &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ConversationIdleMinutes: 5}}},
+			want: 5 * time.Minute,
+		},
+		{
+			// 2026-07-28 final review IMPORTANT 3: this value drives
+			// agent.PodTTLSeconds directly for the conversing stage - unfloored,
+			// 1 minute gives a 60s pod TTL against a 5-minute PodReadyTimeout,
+			// which TTL-stops the pod before it can ever become Ready, and
+			// ttlStop charges no podRecreations budget against that loop.
+			name: "a value below ConversationIdleFloor is clamped up to the floor",
+			proj: &v1alpha1.Project{Spec: v1alpha1.ProjectSpec{Scm: &v1alpha1.ScmSpec{ConversationIdleMinutes: 1}}},
+			want: v1alpha1.ConversationIdleFloor,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := v1alpha1.ConversationIdle(tt.proj); got != tt.want {
+				t.Fatalf("ConversationIdle() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestModelFor asserts AgentSpec.ModelFor/EffortFor key on the AGENT kind
 // passed by the caller, not the Task origin kind - the fix for the live cost
 // regression where values/project-*/common.yaml keys modelByKind on the

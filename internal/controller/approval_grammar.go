@@ -534,29 +534,39 @@ func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spill
 func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
 	metrics *obs.OperatorMetrics) (bool, error) {
+	passed, _, err := ReVerifyParkedDetailed(ctx, c, sp, reader, proj, task, ev, metrics)
+	return passed, err
+}
+
+// ReVerifyParkedDetailed is ReVerifyParked plus the EVIDENCE the pass was built
+// from, keyed by Issue CR name. The caller persists it as the Task's durable
+// ApprovalVerdict: the grammar verdict is the one input the periodic un-park
+// backstop can never reconstruct, because it needs a freshly synced forge thread
+// and a webhook payload the backstop did not see.
+func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
+	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
+	metrics *obs.OperatorMetrics) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, error) {
+
 	botLogin := ""
 	if proj.Spec.Scm != nil {
 		botLogin = proj.Spec.Scm.BotLogin
 	}
 	if ev.Author == "" || (botLogin != "" && ev.Author == botLogin) {
-		return false, nil
+		return false, nil, nil
 	}
 	if ev.Kind == "issue_comment" && ev.Repo != "" && ev.Number > 0 {
 		key := IssueKey(ev.Repo, ev.Number)
 		if approvalOwnsIssue(task, ev.Repo, ev.Number) {
 			if err := SyncIssueOnDemand(ctx, c, sp, reader, proj, key); err != nil {
-				return false, fmt.Errorf("approval: on-demand sync of %s: %w", key, err)
+				return false, nil, fmt.Errorf("approval: on-demand sync of %s: %w", key, err)
 			}
 		}
 	}
-	// VerifyApprovalDetailed (not VerifyApproval) so an auto-approval landing here
-	// - a multi-issue Task whose triggering comment approved one issue while
-	// another owned bot proposal auto-approves - still increments the counter.
 	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, metrics)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return ApprovalPassed(evidence), nil
+	return ApprovalPassed(evidence), evidence, nil
 }
 
 // approvalOwnsIssue reports whether the Task owns the Issue the event landed on.

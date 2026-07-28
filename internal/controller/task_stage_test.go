@@ -495,7 +495,7 @@ func TestEveryIllegalTransitionIsRefusedAndCounted(t *testing.T) {
 				// Self-transitions are a silent no-op (issue #403), covered by
 				// TestSelfTransitionIsANoOpNotCounted, not an illegal-and-counted
 				// edge: they never appear in the F.3 table (stage.Legal(x,x) is
-				// always false), so without this skip every one of the 15 stages
+				// always false), so without this skip every one of the 16 stages
 				// would be double-counted as "illegal" here too.
 				continue
 			}
@@ -826,6 +826,12 @@ func TestEveryStageHasAReachableExit(t *testing.T) {
 			work := metav1.NewTime(now.Add(-budget - time.Hour))
 			task.Status.PodStartedAt = &pod
 			task.Status.StageWorkStartedAt = &work
+		}
+		if stg == tatarav1alpha1.StageConversing {
+			// conversing's clock is the IDLE clock, based on
+			// conversationLastEventAt rather than stageWorkStartedAt (Task 6).
+			lastEvent := metav1.NewTime(now.Add(-budget - time.Hour))
+			task.Status.ConversationLastEventAt = &lastEvent
 		}
 		clock, _, _, got := stage.ArmedClock(task, false)
 		if clock == stage.ClockNone {

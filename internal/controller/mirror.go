@@ -258,6 +258,17 @@ func mergeOneComment(cur, in tatarav1alpha1.Comment) tatarav1alpha1.Comment {
 	if out.ReviewRound == 0 {
 		out.ReviewRound = cur.ReviewRound
 	}
+	if out.AgentKind == "" {
+		// Task 12's authorship ledger. incoming is always a fresh read straight off
+		// the forge (mirrorCommentFrom never sets it - only the two operator-write
+		// sites in reviewpost.go do), so without this an hourly cadence resync of
+		// an already-ledgered review comment would silently WIPE its AgentKind back
+		// to "" the moment the general sync next touched that ExternalID - the
+		// cross-kind trigger would then fail closed on a comment it once could
+		// resolve. Preserving it here is what makes the ledger durable across a
+		// resync rather than a one-shot artifact of the post that wrote it.
+		out.AgentKind = cur.AgentKind
+	}
 	return out
 }
 

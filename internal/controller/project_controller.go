@@ -101,6 +101,15 @@ type ProjectReconciler struct {
 	// Seq provides durable per-project sequence numbers for QueuedEvents created
 	// by cron scans. Wired in wire.go; tests create via &queue.SeqSource{Client, Namespace}.
 	Seq *queue.SeqSource
+	// Tasks is the *TaskReconciler enforceConversingCeiling reaches
+	// conversingHandoffAndPark through - the eviction path takes the SAME
+	// handoff-turn-then-park sequence idle expiry does (Task 10), rather than a
+	// second copy of it. Wired in wire.go to the SAME *TaskReconciler the
+	// manager registers, not a second instance: two independent TaskReconcilers
+	// would mean two independently-configured Session/SpillerFor/PodConfig
+	// stacks for what must behave as one stopper. Nil (a test that never drives
+	// the ceiling) is never dereferenced.
+	Tasks *TaskReconciler
 
 	// GaugeRecomputeInterval controls how often the cluster-wide gauge scans
 	// (updateMemoryStackCounts + updateIssueStateCounts) run. Defaults to
@@ -352,6 +361,26 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	requeueAfter = soonestRequeue(requeueAfter, unparkRequeue)
 
+	// The conversing ceiling's level-triggered backstop. The webhook's
+	// ConversingHasRoom check is the fast path that usually keeps a project's
+	// live conversing count in range; this converges whatever raced it, and it
+	// is also what keeps operator_conversing_pods honest for a project whose
+	// comments have stopped arriving (a pure webhook-side gauge would freeze at
+	// its last reading forever). Blocking, matching driveUnparksPaced/
+	// resumeNoReentryParksPaced/ReapTerminalPaced above: an eviction failure
+	// (a write conflict, a forge outage mid-handoff) must requeue rather than
+	// be silently swallowed, the same as every other paced backstop in this loop.
+	// enforceConversingCeiling caps how much overflow it evicts in ONE call
+	// (maxConversingEvictionsPerPass, conversing.go) so a large overflow cannot
+	// wedge this single MaxConcurrentReconciles=1 loop for hours; the returned
+	// duration asks for a quick re-drive when work remains.
+	ceilingRequeue, err := r.enforceConversingCeiling(ctx, &project, time.Now())
+	if err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, fmt.Errorf("enforce conversing ceiling: %w", err)
+	}
+	requeueAfter = soonestRequeue(requeueAfter, ceilingRequeue)
+
 	// WS3-I4: a human reply to a Task parked with a NO-RE-ENTRY reason triggers a
 	// fresh gated re-mint (sever(Orphan) + MintForItem), never a smuggled re-entry.
 	// Leader-only; the reaper is the backstop. Runs after driveUnparks so a
@@ -481,7 +510,38 @@ func (r *ProjectReconciler) maybeRecomputeGauges(ctx context.Context) {
 	r.updateLightragDocCounts(ctx)
 	r.updateMemoryRetrievalProbe(ctx)
 	r.updateToolSurfaceProbe(ctx)
+	r.updateBotRoundsGauge(ctx)
 	r.lastGaugeRecompute = time.Now()
+}
+
+// updateBotRoundsGauge recomputes operator_bot_rounds from authoritative
+// cluster state: the MAXIMUM live Task.status.botRounds per project, matching
+// the metric's own help text ("Highest consecutive agent-authored comment
+// rounds ... by project"). A Reset() before each pass ensures a project whose
+// highest-round Task since resolved (a human commented and reset it, the
+// conversation parked, the Task went terminal) reads its current true value
+// instead of retaining whatever bot-authored event happened to write the
+// gauge last (2026-07-28 final review IMPORTANT 5) - the webhook fast path no
+// longer writes this gauge directly for exactly that reason.
+func (r *ProjectReconciler) updateBotRoundsGauge(ctx context.Context) {
+	if r.Metrics == nil {
+		return
+	}
+	var list tataradevv1alpha1.TaskList
+	if err := r.List(ctx, &list); err != nil {
+		return
+	}
+	r.Metrics.ResetBotRounds()
+	maxByProject := make(map[string]int)
+	for i := range list.Items {
+		t := &list.Items[i]
+		if t.Status.BotRounds > maxByProject[t.Spec.ProjectRef] {
+			maxByProject[t.Spec.ProjectRef] = t.Status.BotRounds
+		}
+	}
+	for project, n := range maxByProject {
+		r.Metrics.SetBotRounds(project, float64(n))
+	}
 }
 
 // memoryStackPhases is the full set of phases Project.Status.Memory reports.

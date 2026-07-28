@@ -363,6 +363,29 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 		}
 	}
 
+	// HOISTED, once per pass, not once per Task - the SAME reasoning as
+	// driveUnparks' identical hoist (unpark.go, 2026-07-28 security review
+	// IMPORTANT 4): ConversingHasRoom's countConversing is an unindexed
+	// namespace List, and reapOne -> reapParked -> unparkFires runs in a loop
+	// over every Task in the project on every ReapTerminal pass. Skipped
+	// entirely when nothing in this batch would ever consult it, and a
+	// transient error degrades to "no room" (the safe fallback) rather than
+	// failing the whole reap pass for every OTHER stage and reason.
+	conversingRoom := false
+	for i := range tl.Items {
+		t := &tl.Items[i]
+		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
+			room, roomErr := ConversingHasRoom(ctx, r.Client, proj)
+			if roomErr != nil {
+				l.Error(roomErr, "reap: conversing capacity check failed; treating this pass as no room",
+					"action", "reap_conversing_room_error", "project", proj.Name)
+			} else {
+				conversingRoom = room
+			}
+			break
+		}
+	}
+
 	var firstErr error
 	for i := range tl.Items {
 		if ctx.Err() != nil {
@@ -378,7 +401,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 				"action", "reap_blocked", "resource_id", t.Name, "reason", obs.GCBlockedFoldInFlight)
 			continue
 		}
-		if err := r.reapOne(ctx, proj, t, live, now, ds); err != nil {
+		if err := r.reapOne(ctx, proj, t, live, now, ds, conversingRoom); err != nil {
 			l.Error(err, "reap: terminal task", "action", "reap_error",
 				"resource_id", t.Name, "stage", t.Status.Stage, "stage_reason", t.Status.StageReason)
 			if firstErr == nil {
@@ -432,7 +455,7 @@ func (r *ProjectReconciler) ReapTerminalPaced(ctx context.Context, proj *tatarav
 
 // reapOne is the B.6 table, row by row.
 func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState) error {
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, ds *docReapState, conversingRoom bool) error {
 
 	// A documentation batch reaching delivered or parked THROUGH THE NORMAL
 	// review/merge/deploy path (reason "") never goes through forceDocTimeout, so
@@ -475,7 +498,7 @@ func (r *ProjectReconciler) reapOne(ctx context.Context, proj *tatarav1alpha1.Pr
 		return nil
 
 	case tatarav1alpha1.StageParked:
-		return r.reapParked(ctx, proj, t, live, now)
+		return r.reapParked(ctx, proj, t, live, now, conversingRoom)
 
 	case tatarav1alpha1.StageDocumenting:
 		if now.After(stageEnteredAt(t).Add(tatarav1alpha1.DocStageBudget)) {
@@ -569,7 +592,7 @@ func declinedAt(t *tatarav1alpha1.Task) time.Time {
 //	parked(anything else)  ages out at parkRetention, IF no F.6 re-entry rule
 //	                       fires AND the bot park comment has LANDED.
 func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, live map[string]bool, now time.Time) error {
+	t *tatarav1alpha1.Task, live map[string]bool, now time.Time, conversingRoom bool) error {
 
 	// The SAME decline-retention exception the rejected branch carries. A parked
 	// owner is where most declines actually land (a maintainer who just closes the
@@ -600,7 +623,7 @@ func (r *ProjectReconciler) reapParked(ctx context.Context, proj *tatarav1alpha1
 	if !now.After(stageEnteredAt(t).Add(tatarav1alpha1.ParkRetention)) {
 		return nil
 	}
-	fires, err := r.unparkFires(ctx, proj, t, now)
+	fires, err := r.unparkFires(ctx, proj, t, now, conversingRoom)
 	if err != nil {
 		return err
 	}
@@ -1192,8 +1215,75 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // unparkFires reports whether an F.6 re-entry rule matches t RIGHT NOW. A parked
 // Task that can still come back is never reaped. stage.Unpark MUTATES its Task, so
 // it is asked on a DeepCopy: this is a probe, not a transition.
+//
+// GrammarPassed is resolved by grammarPassedFor (unpark.go), the SAME helper
+// driveUnparks' ApplyUnpark uses, on the SAME probe copy - so this probe cannot
+// disagree with the driver about whether a given identity-unverified verdict
+// counts (2026-07-27 security review finding 3: before this, the probe built
+// UnparkInput with no GrammarPassed field at all, which defaults to false, so a
+// Task the driver was about to re-enter on its very next pass could read here
+// as non-re-entryable and be reaped out from under it).
+//
+// conversingRoom is the SAME reasoning applied to Task 9's ConversingHasRoom
+// field (2026-07-28 security review CRITICAL 1): unparkFires is a FOURTH
+// UnparkInput builder (after ApplyUnpark, reverifyParked, and stage.UnparkDetailed
+// itself), and it used to leave ConversingHasRoom at its zero value (false).
+// The window this reopened: parked(identity-unverified), a non-bot event, no
+// valid verdict, and the ceiling has room. driveUnparks' ApplyUnpark (room=true)
+// would send the Task to conversing and save it; this probe (room=false, before
+// the fix) would return DeclineGrammarNotPassed, fires=false, and reapParked -
+// once past ParkRetention - would delete a Task the driver was about to save,
+// exactly the class of bug finding 3 already fixed once for GrammarPassed.
+// driveUnparksPaced and ReapTerminalPaced are paced INDEPENDENTLY, so a pass
+// where the driver is throttled and the reaper is not is a real production
+// window, not a theoretical one. The caller (ReapTerminal) hoists ConversingHasRoom
+// the same way driveUnparks does, off the SAME ConversingHasRoom helper - never
+// reimplemented.
+//
+// MaxTurnsPerTask is threaded from the SAME taskMaxTurns(proj, t) ApplyUnpark
+// uses (2026-07-28 security review NEW-1: this field was left at its zero value
+// here, so for a parked(no-outcome) Task, ReasonNoOutcome's
+// Stats.Turns >= in.MaxTurnsPerTask read as true for ANY Turns >= 0 - the probe
+// always declined turns-exhausted and fires=false regardless of the Task's real
+// turn count, so reapParked deleted every parked(no-outcome) Task once
+// ParkRetention elapsed, whether or not driveUnparks would have re-entered it.
+// Identical failure class to the ConversingHasRoom fix above, on a different
+// field and reason).
+//
+// FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1), every UnparkInput
+// field against this package's three production UnparkInput builders
+// (ApplyUnpark, reverifyParked - internal/webhook/pending_events.go, and this
+// function), so the next reader does not have to re-derive which fields each
+// reason actually consults:
+//   - Task, Now: set by all three. Always required.
+//   - Issues: set by all three. Read by ReasonAwaitingHuman (non-review) and
+//     ReasonIdentityUnverified (grammar-passed branch).
+//   - MRs: set by all three (reverifyParked as of the NEW-2 fix below). Read by
+//     ReasonAwaitingHuman (review kind), ReasonIdentityUnverified (review kind,
+//     Task 9), ReasonNoOutcome, ReasonHandoffStalled - all via anyMerged.
+//   - BotLogin: set by all three. Read by hasNonBotEvent in every comment-driven
+//     reason (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
+//   - GrammarPassed: set by all three (reverifyParked/ApplyUnpark compute it via
+//     grammarPassedFor; this probe the same). Read ONLY by ReasonIdentityUnverified.
+//   - ConversingHasRoom: set by all three as of the CRITICAL 1 fix above. Read by
+//     ReasonAwaitingHuman and ReasonIdentityUnverified.
+//   - MaxTurnsPerTask: set by ApplyUnpark and this function (as of NEW-1). NOT set
+//     by reverifyParked - harmless, because reverifyParked only ever drives
+//     ReasonIdentityUnverified, and MaxTurnsPerTask is read ONLY by ReasonNoOutcome,
+//     which reverifyParked never handles (task.Status.StageReason is checked
+//     before it is ever called).
+//   - ActiveTasks, MaxOpenTasks: set by ApplyUnpark and this function. NOT set by
+//     reverifyParked - same reasoning: both are read ONLY by ReasonBacklogSweep,
+//     which reverifyParked never handles either.
+//
+// With MaxTurnsPerTask now threaded, this probe and driveUnparks' ApplyUnpark
+// read the IDENTICAL set of UnparkInput fields for every reason either of them
+// actually handles, off the same helpers (grammarPassedFor, ConversingHasRoom,
+// taskMaxTurns) - so the two cannot silently diverge again without a new field
+// being added to UnparkInput and only one builder threading it, which this audit
+// exists to make an easy diff to catch.
 func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha1.Project,
-	t *tatarav1alpha1.Task, now time.Time) (bool, error) {
+	t *tatarav1alpha1.Task, now time.Time, conversingRoom bool) (bool, error) {
 
 	issues, err := r.ownedIssues(ctx, t)
 	if err != nil {
@@ -1211,14 +1301,18 @@ func (r *ProjectReconciler) unparkFires(ctx context.Context, proj *tatarav1alpha
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
+	probe := t.DeepCopy()
 	_, ok := stage.Unpark(stage.UnparkInput{
-		Task:         t.DeepCopy(),
-		Issues:       issues,
-		MRs:          mrs,
-		ActiveTasks:  active,
-		MaxOpenTasks: maxOpen,
-		BotLogin:     botLoginOf(proj),
-		Now:          now,
+		Task:              probe,
+		Issues:            issues,
+		MRs:               mrs,
+		ActiveTasks:       active,
+		MaxOpenTasks:      maxOpen,
+		BotLogin:          botLoginOf(proj),
+		MaxTurnsPerTask:   taskMaxTurns(proj, t),
+		GrammarPassed:     grammarPassedFor(probe, false),
+		ConversingHasRoom: conversingRoom,
+		Now:               now,
 	})
 	return ok, nil
 }

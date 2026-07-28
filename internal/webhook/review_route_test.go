@@ -158,7 +158,13 @@ func TestReview_Approved_EntersMerging(t *testing.T) {
 }
 
 // changes_requested on an adopted human PR (owning Task Kind=review) does NOT
-// drive implementing.
+// drive implementing. ApplyReviewChangesRequested refuses the kind=review edge
+// and folds to the pending-event path (deliverPendingEvent), which now (Task 9)
+// also opens a live conversation on a qualifying reviewing-stage event: the
+// human's feedback reaches a clarify agent instead of only queueing silently.
+// conversing is NOT implementing/merging - the F.3 kind guard still refuses
+// those for kind=review, by any path - so this is a widening of
+// responsiveness, never of the approval gate.
 func TestReview_ChangesRequested_ReviewKind_NotDriven(t *testing.T) {
 	const secretVal = "whsec-rv4"
 	proj := reviewProject("rv4", "rv4-scm", "tatara-bot", []string{"maint"})
@@ -171,7 +177,9 @@ func TestReview_ChangesRequested_ReviewKind_NotDriven(t *testing.T) {
 	postReview(t, h, "rv4", secretVal, reviewBody("submitted", "changes_requested", 903, "maint", 45))
 
 	got := getTask(t, c, task.Name)
-	require.Equal(t, tatarav1.StageReviewing, got.Status.Stage, "a kind=review Task is only reviewed, never driven to implementing")
+	require.Equal(t, tatarav1.StageConversing, got.Status.Stage,
+		"a kind=review Task is never driven to implementing, but a qualifying review now opens a conversation")
+	require.Equal(t, 1, got.Status.HumanReviewRounds, "entry from reviewing bumps the round counter, exactly like the awaiting-human re-entry")
 }
 
 // The SAME (review.id, state) delivered twice fires the transition once. A

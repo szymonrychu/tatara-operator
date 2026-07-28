@@ -635,6 +635,58 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 	require.NotNil(t, e2.issue(t, i1.Name).Status.Approval)
 }
 
+// 2026-07-28 security review IMPORTANT 7: the entire safety claim behind
+// Task 9's identity-unverified -> conversing widening is that conversing ->
+// approved is gated by THIS handler's verifyApprovalScope, which runs the
+// LIVE C.6 grammar and NEVER reads Task.status.approvalVerdict - so a Task
+// arriving at conversing with an absent, zero-value, or predating-the-park
+// verdict (all shapes the F.6 identity-unverified backstop treats as "not
+// authorized" - see unpark_backstop_test.go) must be refused here exactly
+// the same as a Task with no verdict at all. Note for accuracy: a clarify
+// agent standing at conversing CAN move a Task toward code execution, via
+// decision=implement -> approved -> admission to implementing - "cannot
+// reach implementing directly" only ever described the ONE edge, never the
+// two-hop path through a GENUINE grammar pass.
+func TestOutcome_Conversing_ApprovalVerdictIsNeverConsulted(t *testing.T) {
+	cases := []struct {
+		name    string
+		verdict *tatarav1alpha1.ApprovalVerdict
+	}{
+		{name: "absent verdict", verdict: nil},
+		{name: "zero-value verdict (no Author, no CommentExternalID)", verdict: &tatarav1alpha1.ApprovalVerdict{
+			At: metav1.NewTime(frozenNow.Add(-30 * time.Minute)),
+		}},
+		{name: "verdict predating the current park/stage-entry", verdict: &tatarav1alpha1.ApprovalVerdict{
+			At:       metav1.NewTime(frozenNow.Add(-2 * time.Hour)), // StageEnteredAt is frozenNow-1h
+			IssueRef: "iss-old", CommentExternalID: "999", Author: "szymonrychu", Phrase: "go ahead",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			i1 := issueV2("tatara-operator", 291, "t1")
+			task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageConversing, "clarify")
+			task.Status.ApprovalVerdict = tc.verdict
+
+			// fakeApproval grants NOTHING: the live C.6 grammar fails on this
+			// request regardless of what status.approvalVerdict claims.
+			e := buildV2(t, v2Opts{
+				writer:   panicForge{},
+				approval: &fakeApproval{grant: map[string]bool{}},
+			}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task, i1)
+
+			w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+				`{"kind":"clarify","payload":{"decision":"implement","reason":"trust the stored verdict"}}`)
+			require.Equal(t, http.StatusOK, w.Code)
+
+			got := e.task(t, "t1")
+			require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
+				"conversing -> approved must be refused: the stored verdict is never consulted")
+			require.Equal(t, "identity-unverified", got.Status.StageReason)
+			require.Empty(t, e.issue(t, i1.Name).Status.Approval, "nothing is stamped when the live scope gate fails")
+		})
+	}
+}
+
 // An auto-approval through the clarify submit path (the primary auto-approve
 // site: a bot proposal reaching implement) increments operator_auto_approve_total
 // by proposal kind, so the last-gate-removed release is queryable without

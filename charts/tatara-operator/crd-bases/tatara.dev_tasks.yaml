@@ -211,6 +211,65 @@ spec:
                 - documentation
                 - implement
                 type: string
+              approvalVerdict:
+                description: |-
+                  ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
+                  written by the webhook fast path the moment the grammar passes, and read by
+                  the periodic driveUnparks backstop, which cannot re-run the grammar itself.
+                  Nil means no approving comment has ever been verified for this Task.
+                properties:
+                  at:
+                    description: At is when the grammar passed.
+                    format: date-time
+                    type: string
+                  author:
+                    description: |-
+                      Author is the verified maintainer login whose comment passed - never the
+                      bot login. EXCEPTION: under Project.spec.AutoApproveTataraProposals, a
+                      bot-authored, integrity-anchor-verified proposal with ZERO maintainer
+                      comments auto-approves (autoApproveApplies/autoApprovalEvidence,
+                      internal/controller/approval_grammar.go) and is recorded here with
+                      Author=AutoApproveLogin ("<tatara:auto>") - a deliberate, narrowly-gated
+                      carve-out, not a maintainer approval. Required non-empty: it is the one
+                      field every verdict this codebase ever writes always carries, so a
+                      consumer refusing an empty Author cannot be fooled by a schema-legal but
+                      otherwise-empty verdict.
+                    maxLength: 128
+                    minLength: 1
+                    type: string
+                  commentExternalId:
+                    description: |-
+                      CommentExternalID is the forge comment id the grammar matched, i.e. the
+                      Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
+                      makes this verdict traceable back to a real human action. Empty for the
+                      AutoApproveTataraProposals carve-out below, which cites no comment.
+                    maxLength: 128
+                    type: string
+                  issueRef:
+                    description: IssueRef is the Issue CR name whose thread carried
+                      the approving comment.
+                    maxLength: 253
+                    type: string
+                  phrase:
+                    description: Phrase is the matched approvalPhrases entry.
+                    maxLength: 128
+                    type: string
+                required:
+                - at
+                type: object
+              botRounds:
+                description: |-
+                  BotRounds counts CONSECUTIVE agent-authored comment rounds on this Task with
+                  no intervening human comment. It is reset to zero by any human comment.
+
+                  It is COUNTED AND EXPOSED, and deliberately NEVER ACTED ON (decision D7):
+                  there is no ping-pong cap, and the stage machine is trusted to terminate an
+                  agent-to-agent exchange because every agent run ends in an outcome that
+                  moves the Task. The counter exists because the 2026-06 production incident
+                  was exactly this shape - a reactivation loop that posted 40+ duplicate bot
+                  comments - and nothing was counting, so a human found it by reading the
+                  thread. operator_bot_rounds is its fleet-wide view.
+                type: integer
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -270,6 +329,20 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              conversationLastEventAt:
+                description: |-
+                  ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
+                  is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
+                  every non-bot event queued while conversing, so the clock measures silence
+                  rather than pod age.
+
+                  It is a field of its OWN and deliberately NOT stageWorkStartedAt. The TTL
+                  stop nils stageWorkStartedAt and PodWatchReconciler re-stamps it when the
+                  REPLACEMENT pod becomes ready, so an idle clock based on it would reset on
+                  every pod rotation and an idle conversation would never park - it would
+                  rotate a pod forever. Nothing in the pod lifecycle touches this field.
+                format: date-time
+                type: string
               deliveredAt:
                 format: date-time
                 type: string
@@ -483,6 +556,7 @@ spec:
                 - approved
                 - implementing
                 - reviewing
+                - conversing
                 - merging
                 - deploying
                 - delivered

@@ -35,6 +35,7 @@ func init() {
 		tatarav1alpha1.StageImplementing, tatarav1alpha1.StageReviewing, tatarav1alpha1.StageMerging,
 		tatarav1alpha1.StageDeploying, tatarav1alpha1.StageDelivered, tatarav1alpha1.StageDocumenting,
 		tatarav1alpha1.StageRejected, tatarav1alpha1.StageFailed, tatarav1alpha1.StageParked,
+		tatarav1alpha1.StageConversing,
 	} {
 		StageDriftTotal.WithLabelValues(stg)
 	}

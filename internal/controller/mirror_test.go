@@ -655,3 +655,36 @@ func TestIndexesResolve(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeOneComment_PreservesAgentKind is Task 12's ledger-durability
+// regression: mirrorCommentFrom (every general forge resync - SyncMergeRequest,
+// syncMergeRequestThread, redeliverMRComments) never sets Comment.AgentKind, so
+// an incoming re-read of an ALREADY-LEDGERED comment must not blank it out.
+// Found while auditing every Comment{} builder for Task 12: without this,
+// AppendCommentToMirror's set-union upsert (mergeOneComment) would wipe the
+// operator's own authorship stamp on the very next hourly cadence sync of the
+// same MR thread - ResolveCommentAgentKind would then fail closed on a comment
+// it could resolve a moment earlier, silently degrading the whole feature over
+// time rather than failing loudly.
+func TestMergeOneComment_PreservesAgentKind(t *testing.T) {
+	cur := tatarav1alpha1.Comment{ExternalID: "1", Author: "tatara-bot", Body: "old", AgentKind: "review"}
+	// incoming simulates a fresh forge read (mirrorCommentFrom's shape): same
+	// ExternalID, a body that may have converged, but NO AgentKind - the general
+	// sync path never stamps it.
+	incoming := tatarav1alpha1.Comment{ExternalID: "1", Author: "tatara-bot", Body: "old"}
+
+	got := mergeOneComment(cur, incoming)
+	if got.AgentKind != "review" {
+		t.Fatalf("AgentKind = %q, want %q preserved from the existing ledger entry", got.AgentKind, "review")
+	}
+
+	// An incoming copy that DOES carry a (non-empty) AgentKind - e.g. a second
+	// operator write to the SAME ExternalID, which should not happen in
+	// practice but must not regress if it ever does - wins, exactly like every
+	// other preserved field's "incoming wins when non-empty" rule.
+	incoming2 := tatarav1alpha1.Comment{ExternalID: "1", Author: "tatara-bot", Body: "old", AgentKind: "implement"}
+	got2 := mergeOneComment(cur, incoming2)
+	if got2.AgentKind != "implement" {
+		t.Fatalf("AgentKind = %q, want %q (a non-empty incoming value wins)", got2.AgentKind, "implement")
+	}
+}

@@ -177,7 +177,14 @@ type TaskSpec struct {
 	InitialStageReason string `json:"initialStageReason,omitempty"`
 }
 
-// Stage* are the 15 members of the task-centric stage machine (contract F.1).
+// Stage* are the 16 members of the task-centric stage machine (contract F.1).
+// conversing is the 16th: a POD-BEARING, NON-TERMINAL stage a Task enters when a
+// comment needs a live agent on the other end. Because it is pod-bearing and
+// non-terminal it needs NO exception in the reaper (which gates on TaskDone), in
+// the concurrency accountant (queueTaskHoldsSlot = !TaskDone && !StagePodless) or
+// in the F.3 table. That is the whole reason it is a stage rather than a warm pod
+// kept alive through parked: the three carve-outs that would have needed each map
+// to a past production incident.
 const (
 	StageTriaging      = "triaging"
 	StageBrainstorming = "brainstorming"
@@ -187,6 +194,7 @@ const (
 	StageApproved      = "approved"
 	StageImplementing  = "implementing"
 	StageReviewing     = "reviewing"
+	StageConversing    = "conversing"
 	StageMerging       = "merging"
 	StageDeploying     = "deploying"
 	StageDelivered     = "delivered"
@@ -406,6 +414,53 @@ type TaskEvent struct {
 	Body string `json:"body"`
 }
 
+// ApprovalVerdict is the DURABLE record that the C.6 approval grammar PASSED
+// for this Task, against one specific comment.
+//
+// It exists because the periodic un-park backstop (driveUnparks) can re-derive
+// everything else about an identity-unverified park from live cluster state -
+// which owned Issues are open, which are approved - but it can NEVER re-run the
+// grammar: the grammar needs a freshly SYNCED forge thread and a webhook payload
+// the backstop did not see. The verdict is that one missing input, made durable
+// at the moment the fast path establishes it, so a fast path that then loses a
+// cache race costs a DELAY rather than a permanent stall.
+//
+// It is evidence of a PAST pass, not a licence: the backstop still re-checks
+// every owned Issue's live approval state before re-entering implementing, AND
+// scopes the verdict to the CURRENT park - a verdict stamped before the Task's
+// current StageEnteredAt is treated as stale and refused, so an approval
+// consumed by an earlier park can never satisfy a later, unrelated one
+// (grammarPassedFor, internal/controller/unpark.go).
+type ApprovalVerdict struct {
+	// At is when the grammar passed.
+	At metav1.Time `json:"at"`
+	// IssueRef is the Issue CR name whose thread carried the approving comment.
+	// +kubebuilder:validation:MaxLength=253
+	IssueRef string `json:"issueRef,omitempty"`
+	// CommentExternalID is the forge comment id the grammar matched, i.e. the
+	// Comment.ExternalID the C.6 single-use-evidence clause consumed. It is what
+	// makes this verdict traceable back to a real human action. Empty for the
+	// AutoApproveTataraProposals carve-out below, which cites no comment.
+	// +kubebuilder:validation:MaxLength=128
+	CommentExternalID string `json:"commentExternalId,omitempty"`
+	// Author is the verified maintainer login whose comment passed - never the
+	// bot login. EXCEPTION: under Project.spec.AutoApproveTataraProposals, a
+	// bot-authored, integrity-anchor-verified proposal with ZERO maintainer
+	// comments auto-approves (autoApproveApplies/autoApprovalEvidence,
+	// internal/controller/approval_grammar.go) and is recorded here with
+	// Author=AutoApproveLogin ("<tatara:auto>") - a deliberate, narrowly-gated
+	// carve-out, not a maintainer approval. Required non-empty: it is the one
+	// field every verdict this codebase ever writes always carries, so a
+	// consumer refusing an empty Author cannot be fooled by a schema-legal but
+	// otherwise-empty verdict.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	Author string `json:"author,omitempty"`
+	// Phrase is the matched approvalPhrases entry.
+	// +kubebuilder:validation:MaxLength=128
+	Phrase string `json:"phrase,omitempty"`
+}
+
 // TaskStatus defines the observed state of a Task.
 type TaskStatus struct {
 	// +optional
@@ -415,7 +470,7 @@ type TaskStatus struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// +kubebuilder:validation:Enum=triaging;brainstorming;clarifying;investigating;refining;approved;implementing;reviewing;merging;deploying;delivered;documenting;rejected;failed;parked
+	// +kubebuilder:validation:Enum=triaging;brainstorming;clarifying;investigating;refining;approved;implementing;reviewing;conversing;merging;deploying;delivered;documenting;rejected;failed;parked
 	// +optional
 	Stage string `json:"stage,omitempty"`
 	// StageEnteredAt is stamped on EVERY stage transition. It is the clock for the
@@ -496,6 +551,36 @@ type TaskStatus struct {
 	// from a pre-implement stage cannot auto-escalate straight into implementing.
 	// +optional
 	ParkedFromStage string `json:"parkedFromStage,omitempty"`
+	// ApprovalVerdict is the durable C.6 grammar pass (see ApprovalVerdict). It is
+	// written by the webhook fast path the moment the grammar passes, and read by
+	// the periodic driveUnparks backstop, which cannot re-run the grammar itself.
+	// Nil means no approving comment has ever been verified for this Task.
+	// +optional
+	ApprovalVerdict *ApprovalVerdict `json:"approvalVerdict,omitempty"`
+	// ConversationLastEventAt is the IDLE CLOCK BASE for the conversing stage. It
+	// is stamped on entry into conversing and RE-STAMPED by AppendTaskEvent on
+	// every non-bot event queued while conversing, so the clock measures silence
+	// rather than pod age.
+	//
+	// It is a field of its OWN and deliberately NOT stageWorkStartedAt. The TTL
+	// stop nils stageWorkStartedAt and PodWatchReconciler re-stamps it when the
+	// REPLACEMENT pod becomes ready, so an idle clock based on it would reset on
+	// every pod rotation and an idle conversation would never park - it would
+	// rotate a pod forever. Nothing in the pod lifecycle touches this field.
+	// +optional
+	ConversationLastEventAt *metav1.Time `json:"conversationLastEventAt,omitempty"`
+	// BotRounds counts CONSECUTIVE agent-authored comment rounds on this Task with
+	// no intervening human comment. It is reset to zero by any human comment.
+	//
+	// It is COUNTED AND EXPOSED, and deliberately NEVER ACTED ON (decision D7):
+	// there is no ping-pong cap, and the stage machine is trusted to terminate an
+	// agent-to-agent exchange because every agent run ends in an outcome that
+	// moves the Task. The counter exists because the 2026-06 production incident
+	// was exactly this shape - a reactivation loop that posted 40+ duplicate bot
+	// comments - and nothing was counting, so a human found it by reading the
+	// thread. operator_bot_rounds is its fleet-wide view.
+	// +optional
+	BotRounds int `json:"botRounds,omitempty"`
 	// MergeCursor is the index into Spec.MergeOrder the sequential merge reached.
 	// Persisted so a restarted operator resumes and never re-merges.
 	// +optional
