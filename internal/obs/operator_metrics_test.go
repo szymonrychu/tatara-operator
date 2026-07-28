@@ -1644,6 +1644,19 @@ func TestBrainstormMetrics(t *testing.T) {
 	require.Equal(t, 2.0, testutil.ToFloat64(m.brainstormQuotaTruncatedTotal.WithLabelValues("demo")))
 }
 
+// operator_brainstorm_paused is the only metric-level signal for a project
+// paused and never resuming (I1 fix round): a design spec that says "publish
+// paused as a distinct state" but only ever suppresses next_expected leaves
+// zero metric evidence a project is stuck. SetBrainstormPaused must move the
+// gauge both ways, not just latch to 1.
+func TestSetBrainstormPaused(t *testing.T) {
+	m := NewOperatorMetrics(prometheus.NewRegistry())
+	m.SetBrainstormPaused("demo", true)
+	require.Equal(t, 1.0, testutil.ToFloat64(m.brainstormPaused.WithLabelValues("demo")))
+	m.SetBrainstormPaused("demo", false)
+	require.Equal(t, 0.0, testutil.ToFloat64(m.brainstormPaused.WithLabelValues("demo")))
+}
+
 // A nil *OperatorMetrics must be safe: several unit-test reconcilers build one
 // without metrics, and a panic there is a test-only outage that hides real bugs.
 func TestBrainstormMetricsAreNilSafe(t *testing.T) {
@@ -1651,6 +1664,7 @@ func TestBrainstormMetricsAreNilSafe(t *testing.T) {
 	require.NotPanics(t, func() {
 		m.SetBrainstormTarget("demo", 3)
 		m.SetBrainstormPending("demo", 1)
+		m.SetBrainstormPaused("demo", true)
 		m.BrainstormRefill("demo")
 		m.BrainstormQuotaTruncated("demo", 1)
 	})

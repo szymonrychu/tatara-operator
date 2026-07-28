@@ -567,8 +567,9 @@ type ScmCron struct {
 	// Schedule disables it.
 	// +optional
 	Documentation CronActivity `json:"documentation,omitempty"`
-	// Refine configures the project-refiner pre-step. No schedule: refine fires
-	// off the existing scan cadence as a mandatory barrier before scans/brainstorm.
+	// Refine configures the periodic project refiner. It has its OWN cron
+	// (RefineActivity.Schedule) - it is not a pre-scan barrier and does not
+	// piggyback on any other activity's cadence. Empty Schedule disables it.
 	// +optional
 	Refine RefineActivity `json:"refine,omitempty"`
 }
@@ -1125,6 +1126,27 @@ type ProjectStatus struct {
 	// to read without opening the Task.
 	// +optional
 	BrainstormPauseReason string `json:"brainstormPauseReason,omitempty"`
+	// LastMovementAt records the last time ANY brainstorm-resume trigger fired
+	// for this project (push, merge, maintainer-comment, maintainer-close,
+	// manual), stamped UNCONDITIONALLY - regardless of whether brainstorm was
+	// paused at the time (I3 fix round).
+	//
+	// This is deliberately NOT the same signal as the AnnBrainstormResume
+	// annotation, which StampBrainstormResume only ever writes on a project
+	// that IS ALREADY paused (the reconcile's clearBrainstormPauseIfRequested
+	// is its single consumer, and annotating an unpaused project would be an
+	// unconditional write per webhook delivery for no scheduling effect). That
+	// left a gap: a merge/push/maintainer trigger landing WHILE a brainstorm
+	// session was in flight for a project that was NOT YET paused was silently
+	// discarded, so the session's own eventual exhausted verdict could pause a
+	// project that had already moved - the OPPOSITE of the design's intended
+	// fail direction ("over-resumes rather than under-resumes"). The exhausted
+	// outcome handler (internal/restapi/outcome.go) compares this field
+	// against the session's own Task start time and refuses the pause when
+	// movement is newer, so the annotation path stays paused-only while this
+	// field is always live for that comparison.
+	// +optional
+	LastMovementAt *metav1.Time `json:"lastMovementAt,omitempty"`
 }
 
 // ScanMark records the last GitHub activity timestamp the issue/PR scan has

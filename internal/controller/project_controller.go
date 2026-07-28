@@ -317,18 +317,26 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	r.ensureLabelColors(ctx, &project)
 
+	// Consume any standing resume signal BEFORE runScans. The manual-override
+	// annotation (tatara.dev/brainstorm-resume) is the escape hatch every
+	// prior-art system lacks, and it needs nothing runScans computes - it only
+	// reads/writes Status.BrainstormPausedAt and the annotation itself. Running
+	// it before runScans (rather than after, gated behind runScans' scanErr
+	// early return) means it is consumed even on a project whose runScans
+	// errors PERSISTENTLY (bad ScmSecretRef, a listing failure, anything):
+	// previously that project could never consume the annotation at all (I4
+	// fix round). This also keeps the original intent - a resume and the
+	// session it unblocks landing in the SAME reconcile - since the refill
+	// pass still runs after runScans, later in this function.
+	if err := r.clearBrainstormPauseIfRequested(ctx, &project); err != nil {
+		r.Metrics.ReconcileResult("Project", "error")
+		return ctrl.Result{}, err
+	}
+
 	scanRequeue, scanRepos, scanExisting, scanRdr, scanErr := r.runScans(ctx, &project)
 	if scanErr != nil {
 		r.Metrics.ReconcileResult("Project", "error")
 		return ctrl.Result{}, scanErr
-	}
-
-	// Consume any standing resume signal BEFORE the refill pass, so a resume and
-	// the session it unblocks land in the SAME reconcile instead of waiting for
-	// the next wake.
-	if err := r.clearBrainstormPauseIfRequested(ctx, &project); err != nil {
-		r.Metrics.ReconcileResult("Project", "error")
-		return ctrl.Result{}, err
 	}
 
 	// EVENT-DRIVEN REFILL (design section 4, task O6). runScans owns the CRON

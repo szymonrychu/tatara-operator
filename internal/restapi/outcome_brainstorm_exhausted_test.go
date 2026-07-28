@@ -67,6 +67,61 @@ func TestBrainstormExhaustedRequiresAReason(t *testing.T) {
 	require.Nil(t, e.project(t, "tatara").Status.BrainstormPausedAt)
 }
 
+// TestBrainstormExhaustedRefusesThePauseWhenTheProjectMovedDuringTheSession is
+// I3's fix round proof. The design spec's intended fail direction is
+// "over-resumes rather than under-resumes" (ResumeBrainstormOnPush's own
+// comment). Before the fix, StampBrainstormResume early-returned on an
+// UNPAUSED project, so a merge/push/maintainer trigger landing WHILE this
+// session was in flight was silently discarded, and the session's own
+// eventual exhausted verdict paused a project that had already moved - the
+// OPPOSITE of the intended direction, wedged until the next qualifying
+// event. taskV2 stamps StageEnteredAt to frozenNow-1h; a movement stamped
+// AFTER that (here, 30 minutes ago) must refuse the pause.
+func TestBrainstormExhaustedRefusesThePauseWhenTheProjectMovedDuringTheSession(t *testing.T) {
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	p := e.project(t, "tatara")
+	moved := metav1.NewTime(frozenNow.Add(-30 * time.Minute))
+	p.Status.LastMovementAt = &moved
+	require.NoError(t, e.c.Status().Update(context.Background(), p))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"brainstorm","payload":{"action":"exhausted","reason":"every open lane is blocked on a human decision"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	proj := e.project(t, "tatara")
+	require.Nil(t, proj.Status.BrainstormPausedAt,
+		"a movement newer than this session's own start must refuse the pause")
+	require.Empty(t, proj.Status.BrainstormPauseReason)
+	// The Task itself must still complete normally: refusing the pause is not
+	// refusing the outcome.
+	require.Equal(t, tatarav1alpha1.StageDelivered, e.task(t, "t1").Status.Stage)
+}
+
+// TestBrainstormExhaustedStillPausesWhenMovementPredatesTheSession proves the
+// refusal is scoped to genuinely CONCURRENT movement, not any movement ever
+// recorded: a stamp from before this session even started is stale evidence
+// the session already accounted for, and must not block a real exhausted
+// verdict forever.
+func TestBrainstormExhaustedStillPausesWhenMovementPredatesTheSession(t *testing.T) {
+	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
+	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)
+
+	p := e.project(t, "tatara")
+	moved := metav1.NewTime(frozenNow.Add(-2 * time.Hour)) // before StageEnteredAt (frozenNow-1h)
+	p.Status.LastMovementAt = &moved
+	require.NoError(t, e.c.Status().Update(context.Background(), p))
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"brainstorm","payload":{"action":"exhausted","reason":"every open lane is blocked on a human decision"}}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	proj := e.project(t, "tatara")
+	require.NotNil(t, proj.Status.BrainstormPausedAt,
+		"movement that predates this session's own start must not block its exhausted verdict")
+}
+
 func TestBrainstormRejectsAnUnknownAction(t *testing.T) {
 	task := taskV2("t1", "tatara", "brainstorm", tatarav1alpha1.StageBrainstorming, "brainstorm")
 	e := buildV2(t, v2Opts{}, projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"), task)

@@ -1392,18 +1392,47 @@ func brainstormQuota(task *tatarav1alpha1.Task) int {
 // Project reconcile's job (internal/controller, AnnBrainstormResume), never
 // this handler's - except for the propose path below, where the session just
 // PROVED the idea space is not exhausted.
-func (s *Server) stampBrainstormPause(ctx context.Context, projName, reason string) error {
-	return s.setBrainstormPause(ctx, projName, &reason)
+//
+// sessionStart is this brainstorm session's own Task entering StageBrainstorming
+// (o.task.Status.StageEnteredAt, the "clock for the POD-LESS stages" per its
+// own doc comment - the closest thing a Task has to "when this session
+// started"). It is compared against Project.Status.LastMovementAt inside
+// setBrainstormPause's retry loop (I3 fix round): see that function's comment
+// for why.
+func (s *Server) stampBrainstormPause(ctx context.Context, projName, reason string, sessionStart time.Time) error {
+	return s.setBrainstormPause(ctx, projName, &reason, sessionStart)
 }
 
 // clearBrainstormPause is stampBrainstormPause's inverse, used by the propose
 // path. Both funnel through setBrainstormPause so the conflict-retry and the
-// no-op short circuit exist once.
+// no-op short circuit exist once. sessionStart is irrelevant on the clear
+// path (nothing to refuse), so it passes the zero value.
 func (s *Server) clearBrainstormPause(ctx context.Context, projName string) error {
-	return s.setBrainstormPause(ctx, projName, nil)
+	return s.setBrainstormPause(ctx, projName, nil, time.Time{})
 }
 
-func (s *Server) setBrainstormPause(ctx context.Context, projName string, reason *string) error {
+// setBrainstormPause is the single funnel for both stampBrainstormPause and
+// clearBrainstormPause.
+//
+// THE FAIL DIRECTION (I3 fix round). The design spec's intended fail
+// direction is "over-resumes rather than under-resumes" (see
+// ResumeBrainstormOnPush's own comment, same precedent). StampBrainstormResume
+// (internal/controller/brainstorm_resume.go) used to early-return on an
+// UNPAUSED project, so a merge/push/maintainer trigger landing WHILE a
+// brainstorm session was in flight - before this exhausted verdict ever
+// landed - was silently discarded: the session's own eventual exhausted
+// verdict then paused a project that had ALREADY moved, and it stayed paused
+// until the next qualifying event - the OPPOSITE of the intended direction.
+// StampBrainstormResume now stamps Status.LastMovementAt UNCONDITIONALLY,
+// whether or not the project was paused, so that signal survives regardless.
+// Read fresh inside the retry loop (never from a caller-held snapshot, which
+// could itself be stale by the time this write lands): if it is newer than
+// sessionStart, the project moved out from under this verdict before it was
+// ever submitted, so the pause is refused entirely - not stamped and then
+// immediately resumed, which would cost a real session for nothing. The
+// caller's Task commit still proceeds; refusing the pause is not refusing the
+// outcome.
+func (s *Server) setBrainstormPause(ctx context.Context, projName string, reason *string, sessionStart time.Time) error {
 	key := types.NamespacedName{Namespace: s.ns, Name: projName}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var proj tatarav1alpha1.Project
@@ -1417,6 +1446,9 @@ func (s *Server) setBrainstormPause(ctx context.Context, projName string, reason
 			proj.Status.BrainstormPausedAt = nil
 			proj.Status.BrainstormPauseReason = ""
 		} else {
+			if proj.Status.LastMovementAt != nil && proj.Status.LastMovementAt.After(sessionStart) {
+				return nil
+			}
 			now := metav1.NewTime(s.now())
 			proj.Status.BrainstormPausedAt = &now
 			proj.Status.BrainstormPauseReason = *reason
@@ -1426,6 +1458,22 @@ func (s *Server) setBrainstormPause(ctx context.Context, projName string, reason
 		}
 		return nil
 	})
+}
+
+// brainstormSessionStart resolves the brainstorm Task's own session start,
+// for setBrainstormPause's movement comparison (I3 fix round). StageEnteredAt
+// is "the clock for the POD-LESS stages" (task_types.go's own doc comment) -
+// stamped on EVERY stage transition, including the entry into
+// StageBrainstorming that begins this session - so it is the closest thing a
+// Task has to "when this session started". Falls back to the Task's own
+// CreationTimestamp on the (should-never-happen) chance StageEnteredAt is
+// unset, rather than the zero time: the zero time would make EVERY movement
+// ever recorded read as "after sessionStart" and refuse the pause forever.
+func brainstormSessionStart(task *tatarav1alpha1.Task) time.Time {
+	if task.Status.StageEnteredAt != nil {
+		return task.Status.StageEnteredAt.Time
+	}
+	return task.CreationTimestamp.Time
 }
 
 func (o *outcomeCtx) brainstorm(p brainstormPayload) {
@@ -1474,7 +1522,7 @@ func (o *outcomeCtx) brainstorm(p brainstormPayload) {
 		// Task stays non-terminal so the agent's retry of this SAME idempotent
 		// outcome lands both halves together.
 		if p.Action == "exhausted" {
-			if err := s.stampBrainstormPause(ctx, o.proj.Name, p.Reason); err != nil {
+			if err := s.stampBrainstormPause(ctx, o.proj.Name, p.Reason, brainstormSessionStart(o.task)); err != nil {
 				s.log.ErrorContext(ctx, "restapi: stamping the brainstorm pause failed; agent must retry",
 					append(reqLogFields(o.r), "task", o.task.Name, "project", o.proj.Name, "error", err)...)
 				writeError(o.w, http.StatusInternalServerError, "internal error")

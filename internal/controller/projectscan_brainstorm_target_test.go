@@ -408,6 +408,57 @@ func brainstormPendingSeries(t *testing.T, reg *prometheus.Registry, project str
 	return projectGaugeSeries(t, reg, "operator_brainstorm_pending_proposals", "project", project)
 }
 
+// brainstormPausedSeries reads operator_brainstorm_paused{project}.
+func brainstormPausedSeries(t *testing.T, reg *prometheus.Registry, project string) (float64, bool) {
+	t.Helper()
+	return projectGaugeSeries(t, reg, "operator_brainstorm_paused", "project", project)
+}
+
+// TestBrainstormPausedProjectSetsPausedGauge is I1's fix round proof: the
+// design spec calls for metric-level observability of a project paused and
+// never resuming, and operator_brainstorm_paused did not exist at all before
+// this fix - the observability alert citing it was referencing a series that
+// was never published. A paused project's refill pass must publish it as 1.
+func TestBrainstormPausedProjectSetsPausedGauge(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-paused-gauge", []string{"o/r1"}, ptrInt(3))
+	now := metav1.Now()
+	proj.Status.BrainstormPausedAt = &now
+	proj.Status.BrainstormPauseReason = "every lane is blocked on a human"
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(emptyReader("o/r1"))
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("a paused project must not dispatch a refill")
+	}
+	if got, ok := brainstormPausedSeries(t, reg, proj.Name); !ok || got != 1 {
+		t.Fatalf("operator_brainstorm_paused{project=%s} = %v (present=%v), want 1", proj.Name, got, ok)
+	}
+}
+
+// TestBrainstormUnpausedProjectClearsPausedGauge proves the gauge is not a
+// one-way latch: an at-target (unpaused) project must read an EXPLICIT 0, not
+// absent - a dashboard cannot otherwise tell "never paused" from "paused, then
+// the pod restarted and the process-local series was lost".
+func TestBrainstormUnpausedProjectClearsPausedGauge(t *testing.T) {
+	ctx := context.Background()
+	proj, repos := seedBrainstormProject(t, "bs-tgt-unpaused-gauge", []string{"o/r1"}, ptrInt(0))
+	reg := prometheus.NewRegistry()
+	r := newScanReconciler(emptyReader("o/r1"))
+	r.Metrics = obs.NewOperatorMetrics(reg)
+
+	if created := r.brainstorm(ctx, proj, emptyReader("o/r1"), repos, nil,
+		proj.Spec.Scm.Cron.Brainstorm); created {
+		t.Fatal("target 0: nothing should be dispatched")
+	}
+	if got, ok := brainstormPausedSeries(t, reg, proj.Name); !ok || got != 0 {
+		t.Fatalf("operator_brainstorm_paused{project=%s} = %v (present=%v), want an explicit 0",
+			proj.Name, got, ok)
+	}
+}
+
 // projectGaugeSeries reads a single-label gauge vec's value for one label
 // value, reporting PRESENCE separately from value: gaugeValue
 // (task_controller_test.go) folds "absent" into 0, which is exactly the

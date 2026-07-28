@@ -2,11 +2,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/scm"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // THE NAMED REGRESSION GUARD. A documentation Task's merge is the operator
@@ -51,6 +57,11 @@ func TestBrainstormResumeKindExcludesDocumentationAndPinBumpTasks(t *testing.T) 
 	}
 }
 
+// TestStampBrainstormResumeIsANoOpWhenNotPaused documents the ANNOTATION half
+// only: an unpaused project must never receive the write-per-webhook
+// AnnBrainstormResume annotation, which has no reconcile consumer until the
+// project actually pauses. It says nothing about Status.LastMovementAt, which
+// IS stamped unconditionally - see the movement test below (I3 fix round).
 func TestStampBrainstormResumeIsANoOpWhenNotPaused(t *testing.T) {
 	ctx := context.Background()
 	proj := mkResumeProject(t, "resume-noop", false)
@@ -60,6 +71,30 @@ func TestStampBrainstormResumeIsANoOpWhenNotPaused(t *testing.T) {
 	fresh := getResumeProject(t, proj.Name)
 	if _, ok := fresh.Annotations[tatarav1alpha1.AnnBrainstormResume]; ok {
 		t.Fatal("an unpaused project must not be annotated: a resume nobody asked for is a write per webhook")
+	}
+}
+
+// TestStampBrainstormResumeRecordsMovementUnconditionally is I3's fix round
+// proof at the resume-stamp layer. Status.LastMovementAt must be stamped on
+// EVERY call, paused or not - unlike the annotation, which stays gated on
+// BrainstormPausedAt != nil - so a movement that lands while a session is in
+// flight for an UNPAUSED project is never silently discarded: the exhausted
+// outcome handler (internal/restapi) reads this field to refuse a stale pause.
+func TestStampBrainstormResumeRecordsMovementUnconditionally(t *testing.T) {
+	ctx := context.Background()
+	proj := mkResumeProject(t, "resume-movement-unpaused", false)
+	if getResumeProject(t, proj.Name).Status.LastMovementAt != nil {
+		t.Fatal("setup: LastMovementAt must start nil")
+	}
+	if err := StampBrainstormResume(ctx, k8sClient, testNS, proj.Name, ResumeTriggerPush); err != nil {
+		t.Fatalf("StampBrainstormResume: %v", err)
+	}
+	fresh := getResumeProject(t, proj.Name)
+	if fresh.Status.LastMovementAt == nil {
+		t.Fatal("movement must be stamped even on an UNPAUSED project - a live session must be able to observe it")
+	}
+	if _, ok := fresh.Annotations[tatarav1alpha1.AnnBrainstormResume]; ok {
+		t.Fatal("an unpaused project still must not get the resume annotation - only the movement stamp is unconditional")
 	}
 }
 
@@ -211,5 +246,70 @@ func mkMergedMR(t *testing.T, projName, mrName, sha string) {
 	mr.Status.MergedSHA = sha
 	if err := k8sClient.Status().Update(ctx, mr); err != nil {
 		t.Fatalf("stamp merged sha: %v", err)
+	}
+}
+
+// TestClearBrainstormPauseIfRequestedRunsEvenWhenRunScansErrors is I4's fix
+// round proof. clearBrainstormPauseIfRequested used to run AFTER runScans'
+// scanErr early return, so a project whose runScans errors persistently
+// (a bad ScmSecretRef, a listing failure, anything) could never consume the
+// tatara.dev/brainstorm-resume annotation - the manual override the design
+// spec calls the escape hatch every prior-art system lacks becomes
+// unreachable on exactly the project that needs it most. The fix moves the
+// consume-and-clear step ABOVE the scanErr return. This proves it: runScans
+// is forced to error via an injected Task-list failure (existingScanTasks),
+// and the annotation must still be consumed even though Reconcile itself
+// still propagates scanErr.
+func TestClearBrainstormPauseIfRequestedRunsEvenWhenRunScansErrors(t *testing.T) {
+	ctx := logf.IntoContext(context.Background(), logf.Log)
+	proj := mkResumeProject(t, "resume-scan-err", true)
+
+	mkSecret(t, "resume-scan-err-scm", map[string][]byte{"token": []byte("t")})
+	proj.Spec.ScmSecretRef = "resume-scan-err-scm"
+	proj.Spec.Scm.Cron = &tatarav1alpha1.ScmCron{}
+	if err := k8sClient.Update(ctx, proj); err != nil {
+		t.Fatalf("set scmSecretRef/cron: %v", err)
+	}
+
+	if err := StampBrainstormResume(ctx, k8sClient, testNS, proj.Name, ResumeTriggerManual); err != nil {
+		t.Fatalf("StampBrainstormResume: %v", err)
+	}
+	if _, ok := getResumeProject(t, proj.Name).Annotations[tatarav1alpha1.AnnBrainstormResume]; !ok {
+		t.Fatal("setup: resume annotation must be present before reconcile")
+	}
+
+	wc, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+	if err != nil {
+		t.Fatalf("new watch client: %v", err)
+	}
+	injErr := errors.New("injected: list tasks failed")
+	ic := interceptor.NewClient(wc, interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*tatarav1alpha1.TaskList); ok {
+				return injErr
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+
+	r := newProjectReconciler()
+	r.Client = ic
+	r.ReaderFor = func(string, string) (scm.SCMReader, error) {
+		return mdPlainReader{}, nil
+	}
+
+	_, rerr := r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: testNS, Name: proj.Name}})
+	if rerr == nil {
+		t.Fatal("setup: expected Reconcile to propagate the injected scanErr")
+	}
+
+	fresh := getResumeProject(t, proj.Name)
+	if fresh.Status.BrainstormPausedAt != nil || fresh.Status.BrainstormPauseReason != "" {
+		t.Fatalf("pause not cleared despite scanErr: %v %q",
+			fresh.Status.BrainstormPausedAt, fresh.Status.BrainstormPauseReason)
+	}
+	if _, ok := fresh.Annotations[tatarav1alpha1.AnnBrainstormResume]; ok {
+		t.Fatal("the manual override annotation must be consumed even when runScans errors " +
+			"persistently - otherwise it is unreachable on exactly the project that needs it")
 	}
 }

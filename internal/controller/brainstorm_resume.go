@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,21 +54,51 @@ func brainstormResumeKind(kind string) bool {
 }
 
 // StampBrainstormResume records trigger on projName's AnnBrainstormResume
-// annotation. The Project reconcile (clearBrainstormPauseIfRequested) is the
-// SINGLE consumer: it clears the pause and removes the annotation.
+// annotation, AND unconditionally stamps Status.LastMovementAt. The Project
+// reconcile (clearBrainstormPauseIfRequested) is the SINGLE consumer of the
+// annotation: it clears the pause and removes the annotation.
 //
-// It is a NO-OP on a project that is not paused. Every webhook delivery would
-// otherwise be an unconditional write to the Project object.
+// The annotation write is a NO-OP on a project that is not paused. Every
+// webhook delivery would otherwise be an unconditional write to the Project
+// object, for an annotation with no reconcile effect until the project
+// actually pauses.
+//
+// Status.LastMovementAt is different: it is stamped on EVERY call, paused or
+// not (I3 fix round). Before this, a merge/push/maintainer trigger landing
+// WHILE a brainstorm session was in flight for a project that was NOT YET
+// paused was silently discarded entirely - nothing recorded it anywhere - so
+// that session's own eventual exhausted verdict could pause a project that
+// had already moved, and it stayed paused until the NEXT qualifying event.
+// That is the OPPOSITE of the design's intended fail direction ("over-resumes
+// rather than under-resumes", see ResumeBrainstormOnPush's own comment).
+// internal/restapi's exhausted outcome handler (setBrainstormPause) now reads
+// this field, freshly, and refuses to pause when it is newer than the
+// session's own Task start - it is the durable signal that comparison needs,
+// and unlike the annotation it can never be a no-op: a session can be live on
+// an unpaused project at any time.
 //
 // It lives in internal/controller and is exported because internal/webhook
 // imports this package (one way - internal/controller must never import
-// internal/webhook), and all five triggers must write the same annotation
-// through the same code.
+// internal/webhook), and all five triggers must write the same fields through
+// the same code.
 func StampBrainstormResume(ctx context.Context, c client.Client, ns, projName, trigger string) error {
 	if projName == "" || trigger == "" {
 		return nil
 	}
 	key := types.NamespacedName{Namespace: ns, Name: projName}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var proj tatarav1alpha1.Project
+		if err := c.Get(ctx, key, &proj); err != nil {
+			return fmt.Errorf("brainstorm resume: get project %s: %w", projName, err)
+		}
+		now := metav1.Now()
+		proj.Status.LastMovementAt = &now
+		return c.Status().Update(ctx, &proj)
+	}); err != nil {
+		return fmt.Errorf("brainstorm resume: stamp movement on project %s: %w", projName, err)
+	}
+
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var proj tatarav1alpha1.Project
 		if err := c.Get(ctx, key, &proj); err != nil {

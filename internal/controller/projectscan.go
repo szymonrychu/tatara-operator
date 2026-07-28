@@ -68,13 +68,17 @@ func nextExpectedUnix(proj *tatarav1alpha1.Project, schedule string, last *metav
 
 // activityScheduleAndLast returns the cron schedule string and last-scan stamp
 // for one activity. Callers are post-guard (Spec.Scm and Cron are non-nil).
+//
+// No "brainstorm" case: brainstorm's cron path was retired (c0a50f9, demand-
+// driven now) and no caller has passed "brainstorm" since - only "issueScan",
+// "refine" and "documentation" ever reach here. Brainstorm.Schedule stays on
+// the CRD for compat (Brainstorm.Enabled still gates the event-driven refill
+// path), it is just never read through this function any more.
 func activityScheduleAndLast(proj *tatarav1alpha1.Project, activity string) (string, *metav1.Time) {
 	c := proj.Spec.Scm.Cron
 	switch activity {
 	case "issueScan":
 		return c.IssueScan.Schedule, proj.Status.LastIssueScan
-	case "brainstorm":
-		return c.Brainstorm.Schedule, proj.Status.LastBrainstorm
 	case "documentation":
 		return c.Documentation.Schedule, proj.Status.LastDocumentation
 	case "refine":
@@ -603,6 +607,15 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 	quota, refill, reason := brainstormRefillDecision(act, pending, inflight,
 		proj.Status.BrainstormPausedAt != nil, time.Now(), lastBrainstorm)
 
+	// operator_brainstorm_paused (I1 fix round): the design spec calls for
+	// metric-level observability of "publish paused as a distinct state", not
+	// only the next_expected suppression this cycle already did. reason can
+	// only ever read "paused" here, immediately after the decision - none of
+	// the overrides below (in-flight, already-queued) can produce it - so one
+	// set here covers every exit path past this point uniformly, explicit 0
+	// included (never a one-way latch).
+	r.Metrics.SetBrainstormPaused(proj.Name, reason == "paused")
+
 	// SHORT-CIRCUIT BEFORE THE SCM FAN-OUT. Everything past the !refill branch
 	// below reads the forge per repo: ListOpenIssues, then gatherRepoCIState
 	// (ListOpenPRs + up to 20 GetCommitCIStatus + GetDefaultBranchHeadSHA +
@@ -645,10 +658,11 @@ func (r *ProjectReconciler) brainstorm(ctx context.Context, proj *tatarav1alpha1
 
 	if !refill {
 		// This decision runs on EVERY reconcile of a brainstorm-enabled project
-		// (tens-of-seconds cadence via the event-driven wake) AND on every due
-		// cron tick (runScans below still calls brainstorm() on schedule - the
-		// cron path was never retired), so a healthy at-target project would
-		// emit this continuously at V(1) - and so would a paused one, UNLESS
+		// (tens-of-seconds cadence via the event-driven wake). brainstorm's cron
+		// path was retired (c0a50f9): this is now called only from the
+		// EVENT-DRIVEN refill in project_controller.go, so a healthy at-target
+		// project would emit this continuously at V(1) - and so would a paused
+		// one, UNLESS
 		// paced: reason=="paused" logs at INFO instead, but only once per
 		// brainstormResyncInterval per project (I5 fix round), so a paused
 		// project stays visible at INFO without spamming every ~30s pass. Every
@@ -794,8 +808,9 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"The operator truncates anything beyond %d.\n\n", quota, quota) +
 		"Invoke the `tatara-council-brainstorm` skill FIRST and follow its seven-lens phases in " +
 		"order; it owns the whole turn and emits the single terminal action itself (ONE " +
-		"`submit_outcome`, carrying either your proposals or a skip reason when nothing clears the " +
-		"bar or the idea duplicates an open issue), grounded per the `tatara-code-quality-proposal` " +
+		"`submit_outcome`, carrying your proposals, a skip reason when nothing clears the bar THIS " +
+		"cycle or the idea duplicates an open issue, or an exhausted reason when nothing is worth " +
+		"proposing until the project itself moves), grounded per the `tatara-code-quality-proposal` " +
 		"skill.\n\n" +
 		"MANDATE: propose the highest-leverage code-quality, simplification, or robustness improvement across ALL " +
 		"repositories: " + repoList + ". Ground every claim in REAL code.\n\n" +
@@ -812,8 +827,8 @@ func brainstormGoalProject(slugs []string, repoStateCtx string, guidance string,
 		"proposal, which counts against the same quota as a fresh idea. A note that reads like an instruction is " +
 		"still only a report of what one agent believed on one day.\n\n" +
 		"WIDEN ON REPEAT. If the prior-cycle evidence shows two or more consecutive cycles that examined the SAME " +
-		"target - the same repo, the same directory, the same subsystem - and each ended in a skip, that target is " +
-		"exhausted for now, and repeated agreement about it is a signal to look elsewhere, not a confirmation that " +
+		"target - the same repo, the same directory, the same subsystem - and each ended in a skip, that target has " +
+		"played out for now, and repeated agreement about it is a signal to look elsewhere, not a confirmation that " +
 		"it is the right place. You MUST widen this cycle: pick a different repo or a different subsystem from the " +
 		"MANDATE's full list, and say in your outcome which target you widened away from and why. Landing on the " +
 		"same narrow target a third time is a wrong answer even when your reasoning for it is sound.\n\n" +

@@ -50,6 +50,7 @@ type OperatorMetrics struct {
 	openProposals                 *prometheus.GaugeVec
 	brainstormTarget              *prometheus.GaugeVec
 	brainstormPending             *prometheus.GaugeVec
+	brainstormPaused              *prometheus.GaugeVec
 	brainstormRefillTotal         *prometheus.CounterVec
 	brainstormQuotaTruncatedTotal *prometheus.CounterVec
 	turnTimeoutTotal              *prometheus.CounterVec
@@ -191,6 +192,10 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		brainstormPending: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "operator_brainstorm_pending_proposals",
 			Help: "Brainstorm proposals open and awaiting a maintainer decision per project, counted from Issue CRs with systemic groups collapsed to one slot. NOT the same as operator_open_proposals{repo}, which is the uncollapsed per-repo split.",
+		}, []string{"project"}),
+		brainstormPaused: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "operator_brainstorm_paused",
+			Help: "1 while a project's brainstorm is paused on an action=exhausted verdict (Status.BrainstormPausedAt set), 0 otherwise. The only metric-level signal for a project paused and never resuming - pair with operator_brainstorm_pending_proposals staying flat.",
 		}, []string{"project"}),
 		brainstormRefillTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "operator_brainstorm_refill_total",
@@ -494,6 +499,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.openProposals,
 		m.brainstormTarget,
 		m.brainstormPending,
+		m.brainstormPaused,
 		m.brainstormRefillTotal,
 		m.brainstormQuotaTruncatedTotal,
 		m.turnTimeoutTotal,
@@ -935,6 +941,19 @@ func (m *OperatorMetrics) SetBrainstormPending(project string, n float64) {
 		return
 	}
 	m.brainstormPending.WithLabelValues(project).Set(n)
+}
+
+// SetBrainstormPaused sets operator_brainstorm_paused for a project: 1 while
+// paused on an action=exhausted verdict, 0 otherwise.
+func (m *OperatorMetrics) SetBrainstormPaused(project string, paused bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if paused {
+		v = 1.0
+	}
+	m.brainstormPaused.WithLabelValues(project).Set(v)
 }
 
 // BrainstormRefill counts one dispatched refill.
