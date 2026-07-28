@@ -389,7 +389,10 @@ func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alph
 // goes back to clarifying.
 //
 // It never enters a stage from parked: that edge belongs to stage.Unpark, which
-// takes this function's verdict as UnparkInput.GrammarPassed.
+// as of agent-judged-approval-gate step B takes NO verdict from this function or
+// any other - UnparkInput.GrammarPassed is set by nobody, so a parked
+// identity-unverified Task can only reach conversing. This function has no
+// production caller either (only tests); it is deleted in step 7.
 func VerifyApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task) (map[string]*tatarav1alpha1.ApprovalEvidence, error) {
 	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, nil)
@@ -485,8 +488,10 @@ func approvalRepo(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issu
 // clarifying -> approved on a pass; approved -> clarifying when the gate no
 // longer holds (approval is NOT sticky: an agent cannot widen its own mandate by
 // adopting work after the gate). Every other stage - notably parked - is left
-// alone: stage.Unpark owns the un-park edge and takes the verdict as
-// GrammarPassed.
+// alone: stage.Unpark owns the un-park edge, and as of
+// agent-judged-approval-gate step B it takes no verdict at all -
+// UnparkInput.GrammarPassed is set by no builder, so nothing this gate computes
+// can move a parked Task.
 func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spiller,
 	task *tatarav1alpha1.Task, passed bool) error {
 	var to string
@@ -528,9 +533,13 @@ func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spill
 // comment that triggered it, and silently fails - restoring the exact 7-day dead
 // end this redesign removes.
 //
-// It returns the grammar verdict, which the caller feeds to stage.Unpark as
-// UnparkInput.GrammarPassed. A BOT-authored event is refused before any forge
-// read: the operator's own park comment can never un-park the Task it parked.
+// It returns the grammar verdict, which the caller USED TO feed to stage.Unpark
+// as UnparkInput.GrammarPassed. As of agent-judged-approval-gate step A it has
+// NO CALLER AT ALL - the webhook limb that called it is gone, and step B removed
+// the reader of the field it fed - so the verdict it returns goes nowhere. Kept
+// only until step 7 deletes it; do not wire a new caller to it. A BOT-authored
+// event is refused before any forge read: the operator's own park comment can
+// never un-park the Task it parked.
 func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
 	metrics *obs.OperatorMetrics) (bool, error) {

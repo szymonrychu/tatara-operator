@@ -141,8 +141,9 @@ func DeclineFor(code string) UnparkDecline {
 // ApplyUnpark runs stage.Unpark for one parked Task and persists the re-entry
 // under optimistic concurrency. It is the SINGLE application of stage.Unpark,
 // shared by the project-reconcile driver (driveUnparks, the time-based reasons)
-// and the webhook comment-driven paths (awaiting-human, backlog-sweep), so every
-// F.6 re-entry flows through one place. activeTasks / maxOpen are supplied by the
+// and the webhook comment-driven paths (awaiting-human, backlog-sweep and, since
+// step A folded away its bespoke limb, identity-unverified), so every F.6
+// re-entry flows through one place. activeTasks / maxOpen are supplied by the
 // caller (computed once per pass) so a bulk promotion cannot exceed maxOpenTasks
 // on a stale count. target is "" when the park did not re-enter; decline then
 // says why (DeclineGuard vs DeclineRule) so the caller can log/count them

@@ -1276,10 +1276,13 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 //   - BotLogin: read by hasNonBotEvent in every comment-driven reason
 //     (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
 //   - ConversingHasRoom: set by both as of the CRITICAL 1 fix above. Read by
-//     ReasonAwaitingHuman and ReasonIdentityUnverified. For identity-unverified
-//     it is now the ONLY thing that decides re-entry after hasNonBotEvent, so
-//     the probe and the driver agreeing on it is more load-bearing than before,
-//     not less.
+//     ReasonAwaitingHuman and ReasonIdentityUnverified. For a NON-REVIEW-kind
+//     identity-unverified Task it is now the ONLY thing that decides re-entry
+//     after hasNonBotEvent, so the probe and the driver agreeing on it is more
+//     load-bearing than before, not less. A kind=review Task still passes the
+//     same two extra guards ReasonAwaitingHuman's review branch carries -
+//     anyMerged(in.MRs) and HumanReviewRounds >= MaxHumanReviewRounds - so for
+//     that kind the MRs bullet above stays live too.
 //   - MaxTurnsPerTask: set by both (as of NEW-1), off the SAME taskMaxTurns.
 //     Read ONLY by ReasonNoOutcome.
 //   - ActiveTasks, MaxOpenTasks: read ONLY by ReasonBacklogSweep.

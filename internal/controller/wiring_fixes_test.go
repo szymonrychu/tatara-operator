@@ -164,15 +164,16 @@ func TestDriveUnparks_BacklogSweepStaysParkedWithoutComment(t *testing.T) {
 // was TestDriveUnparks_IdentityUnverifiedWithoutVerdictDeclines before Task 9's
 // conversing widening; renamed because it no longer declines - see below.
 func TestDriveUnparks_IdentityUnverifiedWithoutVerdictOpensConversationNeverImplementing(t *testing.T) {
-	// The reconcile loop DOES drive identity-unverified now (Task 4): it reads
-	// Task.status.approvalVerdict rather than re-running the grammar. This Task
-	// carries no verdict, but its one owned Issue IS live-approved: without the
-	// Issue seeded and approved, this test could not tell "correctly never
-	// reaches implementing because grammarPassed is false" apart from "never
-	// reaches implementing for the unrelated reason no Issues are owned" - it
-	// would pass either way and catch nothing. With the Issue approved, a
-	// wrongly-true grammarPassed WOULD re-enter the Task straight into
-	// implementing; this asserts that specifically never happens.
+	// The reconcile loop DOES drive identity-unverified now. Its one owned Issue
+	// is deliberately seeded LIVE-APPROVED: without that, this test could not
+	// tell "correctly never reaches implementing because no grammar verdict
+	// feeds stage.Unpark" apart from "never reaches implementing for the
+	// unrelated reason no Issues are owned" - it would pass either way and catch
+	// nothing. With the Issue approved, anything that put a true into
+	// UnparkInput.GrammarPassed WOULD re-enter the Task straight into
+	// implementing; this asserts that specifically never happens. As of step B
+	// no builder sets that field at all, which is what makes it impossible
+	// rather than merely unlikely.
 	//
 	// Task 9: a GrammarPassed=false comment on identity-unverified now opens a
 	// conversation (conversing) instead of only declining - so this Task DOES
