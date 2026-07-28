@@ -5,6 +5,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"html"
 	"strings"
 	"time"
 
@@ -45,8 +46,11 @@ import (
 
 // Approval refusal reasons. They name what the OPERATOR could not establish -
 // never what the comment meant, which is the agent's job. They are the `reason`
-// label on operator_approval_refused_total and the text the operator's park
-// comment reports back to the human.
+// label on operator_approval_refused_total and the `reason` field of the
+// action=approval_refused INFO log. NOTHING renders them to the human: the
+// refusal parks the Task at identity-unverified and the operator posts no
+// comment saying why (ApprovalRefusedComment, which did, had no production
+// caller and was deleted with the wordlist).
 const (
 	// ApprovalRefusedNoMaintainer: there is no maintainer-authored, non-bot
 	// comment on the thread at all, and the auto-approve carve-out does not apply.
@@ -87,10 +91,17 @@ func ApprovalPassed(evidence map[string]*tatarav1alpha1.ApprovalEvidence) bool {
 	return true
 }
 
-// approvalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
+// ApprovalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
 // human closing one issue of a multi-issue Task must not make approval require a
-// phrase on a CLOSED thread, forever.
-func approvalInScope(iss *tatarav1alpha1.Issue) bool {
+// citation on a CLOSED thread, forever.
+//
+// EXPORTED because restapi's verifyApprovalScope must apply the IDENTICAL
+// filter, and did not. Without it, a Task whose only Issue a human had CLOSED
+// produced an all-nil evidence map that verifyApprovalScope still reported as
+// granted, and decision=implement reached approved with no citation, no
+// maintainer comment and no evidence at all. One definition of "a live Issue",
+// not two free to drift - the same reason TaskOwnsIssue is exported.
+func ApprovalInScope(iss *tatarav1alpha1.Issue) bool {
 	if iss.Status.State != "open" {
 		return false
 	}
@@ -107,6 +118,50 @@ func isMaintainerComment(c *tatarav1alpha1.Comment, proj *tatarav1alpha1.Project
 		return false
 	}
 	return tatarav1alpha1.IsMaintainer(proj, repo, c.Author)
+}
+
+// quoteOccursIn is clause (c), the anti-fabrication check, and it is
+// ENTITY-TOLERANT ON PURPOSE. It returns the form of the quote that actually
+// occurs in body, and whether one does.
+//
+// THE AGENT DOES NOT SEE THE RAW BODY. It copies its quote out of the turn-0
+// bundle, and prompt.EscapeText has already replaced & < > " ' with their XML
+// entities in every comment body rendered there (contract E.1). Matching the
+// quote against the RAW mirror body therefore refused a maintainer who wrote
+// "let's ship it" - the bundle says "let&apos;s ship it", the agent cites that
+// verbatim exactly as its prompt tells it to, and strings.Contains fails.
+// Apostrophes and ampersands are ordinary in approving comments, so that was a
+// routine refusal, not an edge case: the Task parked at identity-unverified and
+// the next turn plausibly cited the same escaped span and looped.
+//
+// BOTH forms are tried, in this order, and neither is a weakening: each is a
+// LITERAL containment test against the body the operator holds itself, so a
+// fabricated quote still fails both.
+//
+//  1. the quote AS SUBMITTED - a re-verification reading off the mirror rather
+//     than the bundle submits the raw text, and a maintainer who literally typed
+//     "&amp;" must match on that form (unescaping it would yield "&", which is
+//     NOT what the body contains);
+//  2. the quote UNESCAPED - the bundle form. html.UnescapeString is the stdlib
+//     inverse and is used rather than hand-rolling escapeXML's reverse, which
+//     would be a second definition free to drift from the first.
+//
+// It is fixed HERE, in the one place that compares, and never by instructing the
+// agent to submit an unescaped quote: an instruction repeated across the clarify
+// prompt and two agent skills will drift, a single comparison cannot.
+func quoteOccursIn(body, quoted string) (string, bool) {
+	quote := strings.TrimSpace(quoted)
+	if quote == "" {
+		return "", false
+	}
+	if strings.Contains(body, quote) {
+		return quote, true
+	}
+	if un := strings.TrimSpace(html.UnescapeString(quote)); un != "" && un != quote &&
+		strings.Contains(body, un) {
+		return un, true
+	}
+	return "", false
 }
 
 // verifyOneIssue is the per-Issue approval decision and the SINGLE definition
@@ -146,7 +201,7 @@ func isMaintainerComment(c *tatarav1alpha1.Comment, proj *tatarav1alpha1.Project
 // caused the un-park - would refuse itself forever. Clause (d) and the agent's
 // own reading of the thread already give everything recency-vs-park would have.
 //
-// The caller has already established the Issue is in scope (approvalInScope).
+// The caller has already established the Issue is in scope (ApprovalInScope).
 // An Issue that ALREADY CARRIES VALID EVIDENCE is approved: clause (2) asks
 // whether every live Issue CARRIES evidence, not whether it can be re-derived
 // right now. That idempotence keeps the autoApproveTataraProposals path
@@ -222,8 +277,8 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	// Clause (c). TrimSpace first: an empty or whitespace-only quote is a
 	// trivially-matching substring and must be refused explicitly, not accepted
 	// by strings.Contains's empty-needle rule.
-	quote := strings.TrimSpace(quoted)
-	if quote == "" || !strings.Contains(cited.Body, quote) {
+	quote, ok := quoteOccursIn(cited.Body, quoted)
+	if !ok {
 		return nil, ApprovalRefusedQuoteAbsent
 	}
 
@@ -236,7 +291,11 @@ func verifyOneIssue(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 		Login:     cited.Author,
 		CommentID: cited.ExternalID,
 		CreatedAt: cited.CreatedAt,
-		Phrase:    quote, // the agent's verbatim quote, re-verified by the operator
+		// The agent's quote, in the form that ACTUALLY OCCURS in the body the
+		// operator holds (quoteOccursIn returns the matched form, not the
+		// submitted one). A human reads this in `kubectl get issue -o yaml`, so
+		// it must not be the entity soup the agent copied out of its bundle.
+		Phrase: quote,
 	}, ""
 }
 
@@ -271,7 +330,7 @@ func autoApproveApplies(iss *tatarav1alpha1.Issue, proj *tatarav1alpha1.Project,
 	if !proj.Spec.AutoApproveTataraProposals {
 		return false
 	}
-	if !approvalInScope(iss) {
+	if !ApprovalInScope(iss) {
 		return false
 	}
 	if botLogin == "" || iss.Status.Author == "" || iss.Status.Author != botLogin {
@@ -315,7 +374,7 @@ type GrammarVerifier struct {
 func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alpha1.Project,
 	iss *tatarav1alpha1.Issue,
 	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
-	if !approvalInScope(iss) {
+	if !ApprovalInScope(iss) {
 		return iss.Status.Approval, true
 	}
 	botLogin := ""
@@ -333,8 +392,8 @@ func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alph
 	return ev, true
 }
 
-// VerifyApproval runs the C.6 grammar over EVERY LIVE owned Issue and writes the
-// verified evidence. It is called from TWO places: clarify
+// VerifyApproval runs the citation check over EVERY LIVE owned Issue and writes
+// the verified evidence. It is called from TWO places: clarify
 // submit_outcome(decision=implement), and the parked(identity-unverified) un-park
 // path on a non-bot pendingEvent (via ReVerifyParked).
 //
@@ -389,7 +448,7 @@ func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.S
 			}
 			return nil, nil, fmt.Errorf("approval: get issue %s: %w", name, err)
 		}
-		if !approvalInScope(&iss) {
+		if !ApprovalInScope(&iss) {
 			continue
 		}
 
@@ -502,8 +561,8 @@ func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spill
 // reader of the field it fed, and step C removed the field itself - so the
 // verdict it returns goes nowhere. Kept
 // only until step 7 deletes it; do not wire a new caller to it. A BOT-authored
-// event is refused before any forge read: the operator's own park comment can
-// never un-park the Task it parked.
+// event is refused before any forge read, so no comment the bot ever writes on
+// an owned thread can un-park the Task.
 func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
 	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
 	citations []tatarav1alpha1.ApprovalCitation, metrics *obs.OperatorMetrics) (bool, error) {

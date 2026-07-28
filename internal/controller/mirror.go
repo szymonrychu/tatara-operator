@@ -577,12 +577,12 @@ func syncMergeRequestThread(ctx context.Context, c client.Client, sp objbudget.S
 // cadence. It is run whenever a NON-BOT pendingEvent arrives on a parked Task
 // (fix M11), and it is NOT an optimisation.
 //
-// The C.6 grammar re-evaluation that releases parked(identity-unverified) (F.6)
-// needs the approving comment IN THE MIRROR, with its ExternalID: clause 3d
-// enforces single-use evidence against it, and TaskEvent carries no externalId.
-// The parked cadence is DAILY. Without this sync the grammar re-runs against a
-// thread that does not contain the comment that triggered it, and silently fails
-// - restoring the exact 7-day dead end the redesign removes.
+// The citation check that releases parked(identity-unverified) (F.6) needs the
+// approving comment IN THE MIRROR, with its ExternalID: the agent cites that id
+// and the single-use clause is enforced against it, and TaskEvent carries no
+// externalId. The parked cadence is DAILY. Without this sync the check re-runs
+// against a thread that does not contain the comment that triggered it, and
+// silently fails - restoring the exact 7-day dead end the redesign removes.
 //
 // issueKey is the A.3 index key ("<repositoryRef>#<number>"), so the lookup is
 // an indexed field lookup, never a hashed name.

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/szymonrychu/tatara-operator/internal/agent"
+	"github.com/szymonrychu/tatara-operator/internal/controller"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -163,6 +164,15 @@ func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Proje
 	iss *tatarav1alpha1.Issue,
 	citations []tatarav1alpha1.ApprovalCitation) (*tatarav1alpha1.ApprovalEvidence, bool) {
 	f.gotCitations = append(f.gotCitations, citations)
+	// MIRRORS THE PRODUCTION SEAM, and it is load-bearing that it does. The real
+	// verifier (controller.GrammarVerifier.VerifyApproval) returns the Issue's
+	// STORED approval with ok=TRUE for an out-of-scope Issue - it is not pending
+	// approval, so it must not block the scope check. That stored approval is
+	// routinely nil. A fake that refused instead would certify a gate production
+	// does not have.
+	if !controller.ApprovalInScope(iss) {
+		return iss.Status.Approval, true
+	}
 	if !f.grant[iss.Name] {
 		return nil, false
 	}

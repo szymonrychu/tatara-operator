@@ -1349,9 +1349,27 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	o.ok("implement", "issues", len(issues))
 }
 
-// verifyApprovalScope re-derives the approval over EVERY owned Issue, offering
-// each of them the SAME citation set the agent submitted. The empty set is NOT a
-// licence: a clarify Task with no Issue has nothing to approve and is refused.
+// verifyApprovalScope re-derives the approval over every LIVE owned Issue,
+// offering each of them the SAME citation set the agent submitted.
+//
+// THE EMPTY SET IS NOT A LICENCE, and it has two shapes here, not one. A clarify
+// Task with NO Issue has nothing to approve and is refused; so is a Task whose
+// every owned Issue is OUT OF SCOPE (closed / done / rejected). The second shape
+// was a live gate hole: ownedIssues returns every owned Issue whatever its
+// state, and the verifier answers (Issue.Status.Approval, true) for an
+// out-of-scope one - correct in isolation, since a closed thread is not pending
+// approval and must not block the others, but that stored approval is routinely
+// nil. Refusing only on len(issues)==0 therefore reported granted=true over an
+// all-nil map, and a Task whose ONLY Issue a HUMAN HAD CLOSED walked to approved
+// with no citation, no maintainer comment and no evidence. Closing the issue is
+// the strongest veto a human has; it must not be the thing that releases the
+// work.
+//
+// The out-of-scope Issues are FILTERED rather than required to produce evidence,
+// which is what keeps a human closing ONE issue of a multi-issue Task from
+// stranding the rest. controller.ApprovalInScope is the same predicate the
+// controller-side twin applies (VerifyApprovalDetailed + ApprovalPassed), called
+// rather than restated so the two gates cannot drift.
 //
 // A nil verifier FAILS CLOSED.
 func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,
@@ -1362,11 +1380,23 @@ func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.P
 	}
 	out := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(issues))
 	for i := range issues {
+		if !controller.ApprovalInScope(&issues[i]) {
+			continue
+		}
 		ev, ok := s.approval.VerifyApproval(ctx, proj, &issues[i], citations)
-		if !ok {
+		// A LIVE Issue that granted with NO evidence is a refusal, not a pass.
+		// The verifier is not supposed to answer that way for an in-scope Issue,
+		// which is exactly why it is caught here rather than trusted: the
+		// downstream writer's nil guard skips the Issue write and lets control
+		// fall through to stage.Enter(approved), so an approver-less grant
+		// advanced the Task while writing nothing that recorded it.
+		if !ok || ev == nil {
 			return false, nil
 		}
 		out[issues[i].Name] = ev
+	}
+	if len(out) == 0 {
+		return false, nil
 	}
 	return true, out
 }

@@ -121,10 +121,14 @@ func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
 // there is no label -> status path and no Status.ApprovedByMaintainer field - a
 // label is a one-way PROJECTION of Issue.Status.Status, never an input. TWO paths
 // move an Issue to Status=approved, and each writes Issue.Status.Approval
-// (ApprovalEvidence), never a label: (a) the C.6 comment grammar - the MOST
-// RECENT maintainer comment CONSISTS OF an approval phrase (verifyOneIssue,
-// approval_grammar.go), recorded with the maintainer login + the consumed
-// commentId; (b) auto-approve (autoApproveTataraProposals) - a bot-authored,
+// (ApprovalEvidence), never a label: (a) the AGENT-JUDGED CITATION GATE - the
+// clarify agent reads the thread, decides for itself that a maintainer comment
+// approves, and CITES it; the operator verifies only WHO wrote the cited comment
+// and that the quote really occurs in the body it holds, never intent, and never
+// recency (verifyOneIssue, approval_grammar.go). There is NO wordlist and no
+// most-recent-comment rule; both were deleted with the C.6 grammar. Recorded
+// with the maintainer login + the consumed commentId; (b) auto-approve
+// (autoApproveTataraProposals) - a bot-authored,
 // tatara-proposed issue (tatara-proposed-by marker) under the per-project flag,
 // where the brainstorm/incident investigation itself served as the review,
 // recorded with Auto=true and the "<tatara:auto>" sentinel. Path (b) fires ONLY

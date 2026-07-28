@@ -794,12 +794,18 @@ func TestOutcome_Clarify_BadShapeStays4xx(t *testing.T) {
 	}
 }
 
-// TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten: granted==true implies
-// every Issue produced evidence, but this writer used to assign it UNGUARDED.
-// status=approved with a nil approval is an approved Issue with NO approver - it
-// defeats the idempotence short-circuit, defeats the single-use replay guard,
-// and projects tatara-approved to the forge with nobody behind it. The
-// controller's own writer guards this; this one did not.
+// TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten: a LIVE Issue that the
+// verifier grants with NO evidence must not approve anything, at either of the
+// two places it could. status=approved with a nil approval is an approved Issue
+// with NO approver - it defeats the idempotence short-circuit, defeats the
+// single-use replay guard, and projects tatara-approved to the forge with nobody
+// behind it.
+//
+// Both halves are asserted deliberately. The writer's own nil guard (Task 5)
+// stops the ISSUE write; verifyApprovalScope's ok-but-nil refusal stops the TASK
+// advancing, which the writer guard alone did not - it skipped the write and let
+// control fall through to stage.Enter(approved). Asserting only the Issue write
+// is what let that half-fix look complete.
 func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	e := buildV2(t, v2Opts{writer: panicForge{},
@@ -816,6 +822,74 @@ func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 	require.Nil(t, got.Status.Approval)
 	require.NotEqual(t, "approved", got.Status.Status,
 		"an approver-less approval must never be written")
+	// Skipping the Issue write is only HALF the guard, and asserting only that
+	// half is what certified the hole below: control still fell through to
+	// stage.Enter(approved), so the Task advanced on an evidence map that
+	// approved nothing.
+	require.NotEqual(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage,
+		"the Task must not reach approved on an approver-less approval")
+}
+
+// TestOutcome_Clarify_ClosedIssueIsNotALicence is the gate hole this branch's
+// review found, and it is reachable by a HUMAN, not just a misbehaving agent.
+//
+// ownedIssues returns every owned Issue whatever its state. The verifier returns
+// (iss.Status.Approval, true) for an out-of-scope Issue - correct in isolation,
+// since a closed thread is not pending approval and must not block the others -
+// and that stored approval is routinely nil. verifyApprovalScope then refused
+// only on len(issues)==0, so a Task whose ONLY Issue a human had CLOSED produced
+// granted=true over an all-nil map: no citation, no maintainer comment, no
+// evidence, and decision=implement walked to approved and on to implementing.
+//
+// A human CLOSING the issue is the strongest veto they have. It must not be the
+// thing that releases the work. The controller-side twin has refused exactly
+// this since it was written (ApprovalPassed, "THE EMPTY SET IS NOT A LICENCE");
+// this path had no equivalent.
+func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
+	closed := issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
+		i.Status.State = "closed"
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{}, approval: &fakeApproval{}},
+		projectV2("tatara"), scmSecretV2(), repoV2("tatara-operator", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), closed)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"they closed it, so ship it",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	got := e.task(t, "t1")
+	require.Equal(t, tatarav1alpha1.StageParked, got.Status.Stage,
+		"a Task whose only Issue is CLOSED must not reach approved")
+	require.Equal(t, "identity-unverified", got.Status.StageReason)
+	require.Nil(t, e.issue(t, closed.Name).Status.Approval)
+}
+
+// TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne is the other half of the
+// scope filter, and the reason it is a FILTER and not a blanket "every owned
+// Issue must produce evidence". A human closing ONE issue of a multi-issue Task
+// must not strand the rest: the closed thread drops out of the scope loop
+// entirely rather than contributing a nil that refuses the whole Task.
+func TestOutcome_Clarify_ClosedIssueDoesNotBlockALiveOne(t *testing.T) {
+	live := issueV2("tatara-operator", 291, "t1")
+	closed := issueV2("tatara-cli", 12, "t1", func(i *tatarav1alpha1.Issue) {
+		i.Status.State = "closed"
+	})
+	e := buildV2(t, v2Opts{writer: panicForge{},
+		approval: &fakeApproval{grant: map[string]bool{live.Name: true}, needCitation: true}},
+		projectV2("tatara"), scmSecretV2(),
+		repoV2("tatara-operator", "tatara"), repoV2("tatara-cli", "tatara"),
+		taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageClarifying, "clarify"), live, closed)
+
+	w := e.do(t, http.MethodPost, "/tasks/t1/outcome",
+		`{"kind":"clarify","payload":{"decision":"implement","reason":"maintainer-1 said go ahead",`+
+			`"approvalCitations":[{"id":"c-2","quote":"go ahead"}]}}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	require.Equal(t, tatarav1alpha1.StageApproved, e.task(t, "t1").Status.Stage)
+	require.Equal(t, "approved", e.issue(t, live.Name).Status.Status)
+	require.NotEqual(t, "approved", e.issue(t, closed.Name).Status.Status,
+		"the out-of-scope Issue is skipped, never written")
 }
 
 // A nil verifier FAILS CLOSED.

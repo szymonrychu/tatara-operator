@@ -302,8 +302,8 @@ var Transitions = map[string][]Edge{
 	),
 
 	v1alpha1.StageClarifying: podStageEdges(
-		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND the C.6 grammar passes for EVERY owned Issue"},
-		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS"},
+		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND the agent's CITATION verifies for EVERY LIVE owned Issue"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the citation does NOT verify (uncited, not a maintainer's, quote absent, or evidence replayed)"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "decision=discuss, or the 24h clarify budget elapses"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
 		Edge{To: v1alpha1.StageConversing, Trigger: "a qualifying comment arrived on an owned thread: the Task moves to a live conversation. The clarify pod of the stage being left is torn down by EnterStage as for any pod stage; the conversing pod's turn-0 bundle carries the whole thread, the notes journal and <events>, and every SUBSEQUENT comment reaches that live pod warm"},
@@ -366,8 +366,8 @@ var Transitions = map[string][]Edge{
 	// turn - a conversation that goes quiet becomes an ordinary park, and an
 	// ordinary park is re-entered by the ordinary F.6 rules.
 	v1alpha1.StageConversing: podStageEdges(
-		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND verifyApprovalScope's LIVE C.6 grammar passes for EVERY owned Issue, exactly as from clarifying. Refused by LegalFor's GUARD 1 for a kind=review Task (a review Task owns zero Issues, so the grammar can never pass for it anyway; the guard makes that refusal structural rather than merely likely)"},
-		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the C.6 grammar FAILS, exactly as from clarifying"},
+		Edge{To: v1alpha1.StageApproved, Trigger: "submit_outcome(decision=implement) AND verifyApprovalScope's LIVE citation check passes for EVERY LIVE owned Issue, exactly as from clarifying. Refused by LegalFor's GUARD 1 for a kind=review Task (a review Task owns zero Issues, so the citation check can never pass for it anyway; the guard makes that refusal structural rather than merely likely)"},
+		Edge{To: v1alpha1.StageParked, Reason: ReasonIdentityUnverified, Trigger: "decision=implement but the citation does NOT verify, exactly as from clarifying"},
 		Edge{To: v1alpha1.StageParked, Reason: ReasonAwaitingHuman, Trigger: "the conversation went idle past conversationIdleMinutes (after a handoff turn), the per-project conversing ceiling evicted the longest-idle conversation (after a handoff turn), or decision=discuss"},
 		Edge{To: v1alpha1.StageRejected, Reason: ReasonDeclined, Trigger: "decision=close (the operator closes the issue)"},
 		Edge{To: v1alpha1.StageReviewing, Trigger: "the conversation was entered FROM reviewing and the agent hands the thread back for a fresh review round. LegalFor's kind guard is untouched: implementing, merging AND approved remain unreachable for a kind=review Task, by any path"},

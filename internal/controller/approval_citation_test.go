@@ -3,12 +3,14 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
+	"github.com/szymonrychu/tatara-operator/internal/prompt"
 )
 
 // cit is a one-element citation slice: the common shape.
@@ -312,5 +314,119 @@ func TestVerifyOneIssue_MultipleCitations(t *testing.T) {
 	}
 	if ev.CommentID != "c-2" {
 		t.Fatalf("evidence commentId = %q, want c-2 (the only maintainer-authored citation)", ev.CommentID)
+	}
+}
+
+// TestVerifyOneIssue_CitationSurvivesBundleEntityEscaping pins a REAL defect,
+// not a hypothetical one. The agent copies its quote out of the turn-0 bundle,
+// and prompt.EscapeText has ALREADY replaced & < > " ' with their XML entities
+// in every comment body rendered there (contract E.1, internal/prompt/escape.go).
+// The operator then matched that quote against the RAW mirror body, so:
+//
+//	maintainer types:  let's ship it, go ahead
+//	bundle shows:      let&apos;s ship it, go ahead
+//	agent cites:       let&apos;s ship it     (verbatim, exactly as instructed)
+//	operator:          strings.Contains(raw, escaped) == false -> REFUSED
+//
+// The Task parked at identity-unverified with nothing telling the human why, and
+// the next turn plausibly cited the same escaped span and looped. Apostrophes
+// and ampersands are ordinary in approving comments ("that's fine", "go ahead &
+// ship"), so this was not an edge case.
+//
+// It is fixed on the OPERATOR side deliberately, never by instructing the agent:
+// one place cannot drift, an instruction repeated across the clarify prompt and
+// two agent skills will.
+//
+// The escaped forms below are produced by the REAL bundle escaper rather than
+// hand-written entities, so this test cannot drift from escape.go.
+func TestVerifyOneIssue_CitationSurvivesBundleEntityEscaping(t *testing.T) {
+	t0 := time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC)
+	proj := citProject("bot-1", "maintainer-1")
+	repo := citRepo()
+
+	tests := []struct {
+		name       string
+		body       string // what the maintainer actually typed (the mirror body)
+		quote      string // what the agent submits
+		wantReason string // "" means PASS
+	}{
+		{
+			name:  "apostrophe, cited in the bundle-escaped form",
+			body:  "let's ship it, go ahead",
+			quote: prompt.EscapeText("let's ship it"),
+		},
+		{
+			name:  "ampersand, cited in the bundle-escaped form",
+			body:  "go ahead & ship it",
+			quote: prompt.EscapeText("go ahead & ship it"),
+		},
+		{
+			name:  "angle brackets, cited in the bundle-escaped form",
+			body:  "yes, ship <v2> now",
+			quote: prompt.EscapeText("ship <v2> now"),
+		},
+		{
+			name:  "double quotes, cited in the bundle-escaped form",
+			body:  `approved, but keep it to the "clarify" package`,
+			quote: prompt.EscapeText(`approved, but keep it to the "clarify" package`),
+		},
+		{
+			// The maintainer TYPED the five characters "&amp;". The bundle
+			// double-escapes it to "&amp;amp;" (escapeXML's & rule runs first),
+			// so one unescape of the agent's quote lands back on the literal
+			// text the operator holds.
+			name:  "a literally-typed entity is double-escaped in the bundle and still matches",
+			body:  "go ahead, the flag is &amp; not |",
+			quote: prompt.EscapeText("the flag is &amp; not |"),
+		},
+		{
+			// The same maintainer text, cited RAW instead of from the bundle -
+			// what a re-verification off the mirror would submit. Unescaping
+			// that would turn "&amp;" into "&" and lose the match, so the raw
+			// form has to be tried too.
+			name:  "a literally-typed entity cited RAW still matches",
+			body:  "go ahead, the flag is &amp; not |",
+			quote: "the flag is &amp; not |",
+		},
+		{
+			name:  "an unescaped quote is unaffected",
+			body:  "go ahead, I approve!",
+			quote: "go ahead, I approve!",
+		},
+		{
+			// The widening must not become a licence: entity-tolerance only
+			// adds a second literal needle, it never stops requiring one.
+			name:       "a fabricated quote is still refused",
+			body:       "let's not do this yet",
+			quote:      prompt.EscapeText("let's ship it"),
+			wantReason: ApprovalRefusedQuoteAbsent,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			iss := citIssue(cmt("c-1", "maintainer-1", tc.body, false, t0))
+			ev, reason := verifyOneIssue(iss, proj, repo, "bot-1", cit("c-1", tc.quote))
+			if reason != tc.wantReason {
+				t.Fatalf("reason = %q, want %q (body %q, quote %q)",
+					reason, tc.wantReason, tc.body, tc.quote)
+			}
+			if tc.wantReason != "" {
+				if ev != nil {
+					t.Fatal("a refusal returned non-nil evidence")
+				}
+				return
+			}
+			if ev == nil {
+				t.Fatal("a pass returned nil evidence")
+			}
+			// The stored Phrase is what a human reads in `kubectl get issue -o
+			// yaml`. It must be the form that ACTUALLY OCCURS in the body the
+			// operator holds, not the entity soup the agent copied out of its
+			// bundle.
+			if !strings.Contains(tc.body, ev.Phrase) {
+				t.Fatalf("evidence.Phrase = %q does not occur in the mirror body %q", ev.Phrase, tc.body)
+			}
+		})
 	}
 }

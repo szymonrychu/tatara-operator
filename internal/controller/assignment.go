@@ -144,6 +144,9 @@ func agentJob(agentKind string) string {
 			"that issue, that its author is a verified non-bot maintainer, that your quote occurs in " +
 			"the body it holds, and that the comment was not already spent as evidence. Any of those " +
 			"failing parks the Task at identity-unverified.\n\n" +
+			"NEVER CITE A COMMENT THAT DECLINES. A go-ahead carrying a scope note (\"yes, but keep it " +
+			"to one package\") is an approval; a conditional one (\"not until the tests pass\") is not, " +
+			"however agreeable its wording. You are the only reader of intent in this loop.\n\n" +
 			"IT DOES NOT CHECK RECENCY, SO THE WITHDRAWAL VETO IS YOURS. Read every maintainer comment " +
 			"newer than the one you want to cite. A benign follow-up (\"ping me when the PR is up\") " +
 			"leaves the go-ahead standing; one that takes it back (\"actually hold off\") means " +
