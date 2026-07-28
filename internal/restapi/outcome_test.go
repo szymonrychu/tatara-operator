@@ -599,7 +599,7 @@ func TestOutcome_Review_RecordsReviewOutcomeMetric(t *testing.T) {
 // --- clarify ---------------------------------------------------------------
 
 // Approval is in NO schema. The agent reports decision=implement with a reason;
-// the operator INDEPENDENTLY verifies the C.6 grammar over EVERY owned Issue.
+// the operator INDEPENDENTLY runs the C.6 citation check over EVERY owned Issue.
 func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	i2 := issueV2("tatara-operator", 292, "t1")
@@ -638,7 +638,7 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 // 2026-07-28 security review IMPORTANT 7: the entire safety claim behind
 // Task 9's identity-unverified -> conversing widening is that conversing ->
 // approved is gated by THIS handler's verifyApprovalScope, which runs the
-// LIVE C.6 grammar per request. This test is what certifies that widening:
+// LIVE C.6 citation check per request. This test is what certifies that widening:
 // a Task standing at conversing gets NO credit for anything that happened
 // before it arrived there, so when the live grammar refuses, the Task goes
 // straight back to parked(identity-unverified) with no approval stamped.
@@ -654,11 +654,11 @@ func TestOutcome_Clarify_ImplementRequiresApprovalOnEveryOwnedIssue(t *testing.T
 // toward code execution, via decision=implement -> approved -> admission to
 // implementing - "cannot reach implementing directly" only ever described
 // the ONE edge, never the two-hop path through a GENUINE grammar pass.
-func TestOutcome_Conversing_ImplementRefusedWhenLiveGrammarFails(t *testing.T) {
+func TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails(t *testing.T) {
 	i1 := issueV2("tatara-operator", 291, "t1")
 	task := taskV2("t1", "tatara", "clarify", tatarav1alpha1.StageConversing, "clarify")
 
-	// fakeApproval grants NOTHING: the live C.6 grammar fails on this request.
+	// fakeApproval grants NOTHING: the live C.6 citation check fails on this request.
 	e := buildV2(t, v2Opts{
 		writer:   panicForge{},
 		approval: &fakeApproval{grant: map[string]bool{}},
@@ -842,9 +842,9 @@ func TestOutcome_Clarify_GrantedWithNilEvidenceIsNotWritten(t *testing.T) {
 // evidence, and decision=implement walked to approved and on to implementing.
 //
 // A human CLOSING the issue is the strongest veto they have. It must not be the
-// thing that releases the work. The controller-side twin has refused exactly
-// this since it was written (ApprovalPassed, "THE EMPTY SET IS NOT A LICENCE");
-// this path had no equivalent.
+// thing that releases the work. THE EMPTY SET IS NOT A LICENCE: all([]) == true
+// must never gate code execution, and after the Task-level twin was deleted this
+// loop is the only place that principle is enforced at all.
 func TestOutcome_Clarify_ClosedIssueIsNotALicence(t *testing.T) {
 	closed := issueV2("tatara-operator", 291, "t1", func(i *tatarav1alpha1.Issue) {
 		i.Status.State = "closed"

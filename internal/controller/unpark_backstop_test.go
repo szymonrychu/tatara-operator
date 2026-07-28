@@ -106,7 +106,7 @@ func TestApplyUnpark_IdentityUnverifiedNeverReachesImplementing(t *testing.T) {
 // a kind=clarify Task like this one. A clarify agent standing in conversing CAN
 // still move this Task toward implementing, via a GENUINE decision=implement
 // that passes that live check - see
-// TestOutcome_Conversing_ImplementRefusedWhenLiveGrammarFails (internal/restapi).
+// TestOutcome_Conversing_ImplementRefusedWhenLiveCitationCheckFails (internal/restapi).
 func TestDriveUnparks_IdentityUnverifiedOpensConversationNeverImplementing(t *testing.T) {
 	proj := &tatarav1alpha1.Project{}
 	proj.Namespace = "tatara"

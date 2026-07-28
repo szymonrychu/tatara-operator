@@ -30,7 +30,7 @@ import (
 // This driver applies stage.Unpark for EVERY park reason that has an F.6
 // re-entry rule, identity-unverified included. That reason USED TO BE EXCLUDED,
 // on the reasoning that it re-enters only against a freshly SYNCED forge thread
-// evaluated by the C.6 grammar (the webhook's job). The exclusion was a defect:
+// evaluated by the C.6 citation check (the webhook's job). The exclusion was a defect:
 // it made the webhook's ONE evaluation the only one that would ever happen, so a
 // fast path that lost a cache race stalled the Task permanently with the
 // approval label already visible on the forge (2026-07-27, gitlab helmfile#26).
@@ -57,24 +57,21 @@ import (
 // judged by an agent standing in conversing with a live pod, against live state,
 // never against a record.
 //
-// ONE CARVE-OUT, AND IT IS CURRENTLY UNREACHABLE. Under
+// ONE CARVE-OUT, AND IT NEVER FIRES FROM HERE. Under
 // Project.spec.AutoApproveTataraProposals, a bot-authored, anchor-verified
 // proposal with ZERO maintainer comments auto-approves (autoApproveApplies /
 // autoApprovalEvidence, approval_grammar.go) - a deliberate, narrowly gated
-// exception, not a gap this driver introduces. Between step A and step F of the
-// agent-judged-approval-gate sequence it cannot fire at all, and the consequence
-// is worse than "no auto-approval": such a proposal has NO re-entry whatsoever.
-// autoApproveApplies sits inside verifyOneIssue, and verifyOneIssue's one
-// surviving PRODUCTION caller is GrammarVerifier.VerifyApproval
-// (approval_grammar.go), reached from restapi's submit_outcome scope check
-// (internal/restapi/outcome.go) - which needs a live pod, which a parked Task
-// does not have. VerifyApprovalDetailed also reaches verifyOneIssue but has no
-// production caller at all: its only callers are the package-level
-// VerifyApproval and ReVerifyParkedDetailed, both test-only since step A. Every
-// OTHER way out of parked(identity-unverified) requires hasNonBotEvent, i.e. a
-// human comment, and the carve-out's defining condition is ZERO maintainer
-// comments. So an auto-approvable proposal parked here strands until
-// ParkRetention reaps it. Step F closes this.
+// exception, not a gap this driver introduces. autoApproveApplies sits inside
+// verifyOneIssue, and after step F verifyOneIssue has exactly ONE production
+// caller left: GrammarVerifier.VerifyApproval, reached from restapi's
+// submit_outcome scope check (internal/restapi/outcome.go). That needs a live
+// pod, which a parked Task does not have, so the carve-out is granted where such
+// a proposal actually lives - clarifying (or conversing) with a pod attached -
+// and never as a side effect of un-parking. Nothing strands: a bot proposal with
+// no maintainer comment is not the shape that parks at identity-unverified in
+// the first place (the scope check GRANTS it), and one that is parked here for
+// some other reason re-enters through conversing on a non-bot pendingEvent like
+// every other park reason, then submits its outcome against a live pod.
 //
 // Outside that flag, there is no path from parked(identity-unverified) into
 // implementing here at all. The OTHER reasons keep their own rules unchanged -

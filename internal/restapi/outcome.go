@@ -1356,7 +1356,11 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 	}) {
 		return
 	}
-	o.ok("implement", "issues", len(issues))
+	// len(evidence), not len(issues): the map holds exactly the IN-SCOPE Issues
+	// that produced evidence, which is what this outcome actually approved. Owned
+	// but out-of-scope Issues are filtered out of both the scope check and the
+	// write loop above, so reporting every owned Issue overstated the grant.
+	o.ok("implement", "issues", len(evidence))
 }
 
 // verifyApprovalScope re-derives the approval over every LIVE owned Issue,
@@ -1377,9 +1381,12 @@ func (o *outcomeCtx) clarify(p clarifyPayload) {
 //
 // The out-of-scope Issues are FILTERED rather than required to produce evidence,
 // which is what keeps a human closing ONE issue of a multi-issue Task from
-// stranding the rest. controller.ApprovalInScope is the same predicate the
-// controller-side twin applies (VerifyApprovalDetailed + ApprovalPassed), called
-// rather than restated so the two gates cannot drift.
+// stranding the rest. controller.ApprovalInScope is called rather than restated
+// so the scope filter here, the one in the write loop below, and the one inside
+// the verifier's own carve-out cannot drift. There is no controller-side twin of
+// this loop any more: the Task-level VerifyApprovalDetailed/ApprovalPassed pair
+// lost its last production caller and was deleted, leaving this the single place
+// an approval can be granted.
 //
 // A nil verifier FAILS CLOSED.
 func (s *Server) verifyApprovalScope(ctx context.Context, proj *tatarav1alpha1.Project,

@@ -75,7 +75,7 @@ func TestAgentCommentTriggersOnlyAcrossKinds(t *testing.T) {
 		{name: "reviewing with no ledger entry: FAILS CLOSED, no trigger, no round, no queue",
 			taskStage: tatarav1.StageReviewing, ledgerKind: "",
 			wantConverse: false, wantRoundBump: false, wantSameKindDecline: false, wantPendingEvents: 0},
-		{name: "parked identity-unverified cross-kind: round counted, event queued, but NEVER unparked - the only re-entry path runs the C.6 grammar, which a bot comment must never feed",
+		{name: "parked identity-unverified cross-kind: round counted, event queued, but NEVER unparked - the only re-entry path runs the C.6 citation check, which a bot comment must never feed",
 			taskStage: tatarav1.StageParked, taskReason: stage.ReasonIdentityUnverified, ledgerKind: stage.AgentReview,
 			wantConverse: false, wantRoundBump: true, wantSameKindDecline: false, wantPendingEvents: 1},
 		// A Task that STARTS the delivery already conversing is deliberately NOT a

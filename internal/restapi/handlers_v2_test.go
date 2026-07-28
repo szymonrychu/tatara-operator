@@ -173,6 +173,14 @@ func (f *fakeApproval) VerifyApproval(_ context.Context, _ *tatarav1alpha1.Proje
 	if !controller.ApprovalInScope(iss) {
 		return iss.Status.Approval, true
 	}
+	// ALSO MIRRORS THE SEAM: verifyOneIssue's clause-2 idempotence returns an
+	// already-approved Issue's STORED evidence before any citation clause runs,
+	// so an Issue that already carries evidence needs no citation. Without this
+	// arm needCitation was STRICTER than production for exactly that Issue, and a
+	// test built on it would certify a refusal the real verifier never makes.
+	if iss.Status.Status == "approved" && iss.Status.Approval != nil {
+		return iss.Status.Approval, true
+	}
 	if !f.grant[iss.Name] {
 		return nil, false
 	}

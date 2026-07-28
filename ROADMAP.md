@@ -12,6 +12,19 @@ Planned work not yet started. One line per item; link to plans for detail.
   `helm.sh/resource-policy: keep` means `helm upgrade` leaves the CRD behind. Decisions, traps and
   errata are in `MEMORY.md` (2026-07-13 entries).
 
+- [x] **THE AGENT-JUDGED APPROVAL GATE (contract C.6). Steps A-F complete 2026-07-29.** The approval
+  wordlist is gone: the AGENT judges what a maintainer comment MEANS and CITES it (`{id, quote}`),
+  and the OPERATOR re-derives only the structural facts against its own mirror - the cited comment
+  exists on this Issue, its author is maintainer-authored and structurally non-bot, the verbatim
+  quote occurs in the body the operator holds, and the evidence is single-use. No recency clause and
+  no `stageEnteredAt` clause (both deadlock ordinary threads; see MEMORY.md). `Task.status.
+  approvalVerdict` and `stage.UnparkInput.GrammarPassed` are deleted, so no stored verdict can
+  release code execution: `parked(identity-unverified)` un-parks to CONVERSING only, and the single
+  grant path into `approved` is `restapi.verifyApprovalScope`'s LIVE per-request check over every
+  live owned Issue. Step F collapsed the two approval code paths into that one. Decisions, the
+  accepted residual risk (indirect prompt injection -> selective quoting) and the rejected
+  mitigations are in MEMORY.md (2026-07-28 / 2026-07-29 entries).
+
 Open, out of scope, deliberately not done:
 
 - [ ] **Remove the superseded `documentationScan`** (+ `createDocumentationTask`, `documentationInFlightProject`, `oldestCommitSHA`/`latestCommitSHA`, `documentation_guard_test.go`). The 2026-07-13 wiring pass swapped the documentation cron to `MintDocBatch` (F2 nightly batch); `documentationScan` (per-changed-repo diff model) is now dead in production but still test-referenced (lint-safe). Delete once its QueuedEvent doc-kind path is confirmed unused.

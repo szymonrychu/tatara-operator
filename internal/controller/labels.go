@@ -126,7 +126,7 @@ func managedLabelColors(s *tatarav1alpha1.ScmSpec) map[string]string {
 // approves, and CITES it; the operator verifies only WHO wrote the cited comment
 // and that the quote really occurs in the body it holds, never intent, and never
 // recency (verifyOneIssue, approval_grammar.go). There is NO wordlist and no
-// most-recent-comment rule; both were deleted with the C.6 grammar. Recorded
+// most-recent-comment rule; both were deleted with the approval wordlist. Recorded
 // with the maintainer login + the consumed commentId; (b) auto-approve
 // (autoApproveTataraProposals) - a bot-authored, tatara-proposed issue
 // (tatara-proposed-by marker) under the per-project flag,

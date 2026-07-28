@@ -154,9 +154,17 @@ type PendingComment struct {
 }
 
 // ApprovalEvidence is the single-use, auditable record of the ONE maintainer
-// comment the operator verified before setting Status=approved (fix 15). It is
-// consumed once: a later approval must cite a DIFFERENT comment (a replayed
-// evidence id is refused).
+// comment the operator verified before setting Status=approved (fix 15). A
+// later approval must cite a DIFFERENT comment: re-citing the id recorded here
+// is refused (ApprovalRefusedEvidenceReplayed).
+//
+// THE GUARD IS AGAINST THIS FIELD, NOT AGAINST HISTORY. This is ONE slot,
+// overwritten by each new approval, so nothing remembers the ids consumed before
+// the current one: after TWO approve-then-leave-approved cycles the FIRST
+// comment is citable again, because the second overwrote it. Nothing reaches
+// that sequence today. Storing a list of consumed ids would close it and is the
+// fix if a path to it ever appears; the doc is worded to the code rather than
+// the other way round so the gap is visible instead of denied.
 type ApprovalEvidence struct {
 	Login     string      `json:"login"`     // verified maintainer, never the bot
 	CommentID string      `json:"commentId"` // the cited Comment.ExternalID

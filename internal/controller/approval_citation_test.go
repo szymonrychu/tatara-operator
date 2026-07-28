@@ -190,6 +190,36 @@ func TestVerifyOneIssue_CitationFailClosedMatrix(t *testing.T) {
 			wantReason:  ApprovalRefusedCitationNotMaintainer,
 		},
 		{
+			// THE SECOND BOT DISJUNCT, ON ITS OWN. Every other bot row sets
+			// IsBot:true and short-circuits isMaintainerComment at the FIRST
+			// disjunct, so `Author == botLogin` had no test of its own - a live
+			// arm of a security check with nothing pinning it. Here the mirror
+			// did NOT flag the comment (IsBot false: mirrorComments computes it
+			// from the project's botLogin, so a botLogin added or corrected
+			// AFTER the comment was mirrored leaves stale rows unflagged), and
+			// the bot is in maintainerLogins. The login comparison is what has
+			// to refuse it.
+			name: "cited comment is the bot's, UNFLAGGED by the mirror, and the bot is in maintainerLogins",
+			iss: citIssue(
+				cmt("c-1", "bot-1", "go ahead", false, t0),
+				cmt("c-2", "maintainer-1", "let me look", false, t0.Add(time.Minute)),
+			),
+			citations:   cit("c-1", "go ahead"),
+			maintainers: []string{"maintainer-1", "bot-1"},
+			wantReason:  ApprovalRefusedCitationNotMaintainer,
+		},
+		{
+			// The same unflagged bot comment as the ONLY comment on the thread:
+			// no maintainer has spoken at all, so the refusal is clause (a)'s.
+			// This is what stops the operator's own park comment from being read
+			// as the maintainer whose presence makes consent a live question.
+			name:        "an UNFLAGGED bot comment is not a maintainer comment for clause (a) either",
+			iss:         citIssue(cmt("c-1", "bot-1", "go ahead", false, t0)),
+			citations:   cit("c-1", "go ahead"),
+			maintainers: []string{"maintainer-1", "bot-1"},
+			wantReason:  ApprovalRefusedNoMaintainer,
+		},
+		{
 			name:       "cited comment id does not exist on the issue at all",
 			iss:        citIssue(cmt("c-2", "maintainer-1", "go ahead", false, t0)),
 			citations:  cit("c-999", "go ahead"),

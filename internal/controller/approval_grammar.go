@@ -4,22 +4,16 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"html"
 	"strings"
-	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
-	"github.com/szymonrychu/tatara-operator/internal/objbudget"
 	"github.com/szymonrychu/tatara-operator/internal/obs"
-	"github.com/szymonrychu/tatara-operator/internal/scm"
-	"github.com/szymonrychu/tatara-operator/internal/stage"
 )
 
 // THE APPROVAL GATE (contract C.6). PRESENCE IS NOT CONSENT; A CITATION IS.
@@ -43,6 +37,16 @@ import (
 // and the SCOPE is EVERY LIVE owned Issue (state=open, status not in
 // done/rejected), never just one: one citation on one issue must not approve a
 // Task spanning every repo in mergeOrder.
+//
+// THERE IS EXACTLY ONE ENTRY POINT: GrammarVerifier.VerifyApproval, a per-Issue
+// READER. The scope loop, the evidence write and the clarifying -> approved edge
+// all belong to restapi's verifyApprovalScope + submit_outcome writer
+// (internal/restapi/outcome.go), which is the only place the agent's claim
+// exists. This package used to carry a second, Task-level twin
+// (VerifyApproval/VerifyApprovalDetailed/applyApprovalStage) that looped, wrote
+// and moved the stage itself; it lost its last production caller with the
+// re-verify-on-unpark path and was deleted rather than left as a second gate
+// free to drift from the one that runs.
 
 // Approval refusal reasons. They name what the OPERATOR could not establish -
 // never what the comment meant, which is the agent's job. They are the `reason`
@@ -73,23 +77,6 @@ const (
 	// evidence once. A later approval must cite a DIFFERENT comment.
 	ApprovalRefusedEvidenceReplayed = "evidence-replayed"
 )
-
-// ApprovalPassed reports whether EVERY live owned Issue carries evidence.
-//
-// THE EMPTY SET IS NOT A LICENCE: an evidence map with no entries - a Task
-// owning ZERO live Issues - is a REFUSAL, never a pass. all([]) == true must
-// never gate code execution.
-func ApprovalPassed(evidence map[string]*tatarav1alpha1.ApprovalEvidence) bool {
-	if len(evidence) == 0 {
-		return false
-	}
-	for _, e := range evidence {
-		if e == nil {
-			return false
-		}
-	}
-	return true
-}
 
 // ApprovalInScope is C.6 clause (2), narrowed to LIVE issues (fix L3-14): a
 // human closing one issue of a multi-issue Task must not make approval require a
@@ -370,7 +357,7 @@ type GrammarVerifier struct {
 // VerifyApproval implements the restapi.ApprovalVerifier seam for ONE owned
 // Issue. An out-of-scope (closed / done / rejected) Issue is not pending
 // approval and never blocks the scope check: it passes with whatever evidence it
-// already carries, mirroring VerifyApprovalDetailed's skip.
+// already carries.
 //
 // THAT ARM IS PERMISSIVE, NOT FAIL-CLOSED, and the safety is NOT here: the
 // evidence it returns is routinely nil. It is the CALLER that must not treat
@@ -400,107 +387,6 @@ func (g *GrammarVerifier) VerifyApproval(ctx context.Context, proj *tatarav1alph
 	return ev, true
 }
 
-// VerifyApproval runs the citation check over EVERY LIVE owned Issue and writes
-// the verified evidence. It is called from TWO places: clarify
-// submit_outcome(decision=implement), and the parked(identity-unverified) un-park
-// path on a non-bot pendingEvent (via ReVerifyParked).
-//
-// On a pass, per issue: status.approval = {login, commentId, createdAt, phrase}
-// and status.status = approved. Once EVERY live issue is approved, a Task sitting
-// in clarifying enters approved. Approval is NOT sticky: a Task in approved that
-// no longer satisfies clause (2) - because it ACQUIRED an Issue after the gate -
-// goes back to clarifying.
-//
-// It never enters a stage from parked: that edge belongs to stage.Unpark, which
-// as of agent-judged-approval-gate step C takes NO verdict from this function or
-// any other - stage.UnparkInput has no verdict field at all any more, so a
-// parked identity-unverified Task can only reach conversing. This function has
-// no production caller either (only tests); it is deleted in step 7.
-func VerifyApproval(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
-	citations []tatarav1alpha1.ApprovalCitation) (map[string]*tatarav1alpha1.ApprovalEvidence, error) {
-	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, citations, nil)
-	return evidence, err
-}
-
-// VerifyApprovalDetailed is VerifyApproval plus the per-issue refusal reason -
-// one of the ApprovalRefused* constants above. The evidence map has an entry for
-// every LIVE owned Issue; a nil value is a refusal.
-//
-// citations are the agent's approval citations for THIS verification, applied to
-// every live owned Issue - the same set restapi's verifyApprovalScope offers each
-// Issue in the scope loop.
-//
-// metrics may be nil; when set, an auto-approval TRANSITION (the last human gate
-// removed) increments operator_auto_approve_total{kind} so the path is queryable
-// without log-scraping (hard rule 13), and every refusal increments
-// operator_approval_refused_total{reason}.
-func VerifyApprovalDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task,
-	citations []tatarav1alpha1.ApprovalCitation, metrics *obs.OperatorMetrics) (
-	map[string]*tatarav1alpha1.ApprovalEvidence, map[string]string, error) {
-	l := log.FromContext(ctx)
-	evidence := make(map[string]*tatarav1alpha1.ApprovalEvidence, len(task.Status.IssueRefs))
-	refusals := make(map[string]string, len(task.Status.IssueRefs))
-
-	botLogin := ""
-	if proj.Spec.Scm != nil {
-		botLogin = proj.Spec.Scm.BotLogin
-	}
-
-	for _, name := range task.Status.IssueRefs {
-		var iss tatarav1alpha1.Issue
-		if err := c.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: name}, &iss); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return nil, nil, fmt.Errorf("approval: get issue %s: %w", name, err)
-		}
-		if !ApprovalInScope(&iss) {
-			continue
-		}
-
-		repo := approvalRepo(ctx, c, &iss)
-		ev, reason := verifyOneIssue(&iss, proj, repo, botLogin, citations)
-		if reason != "" {
-			evidence[name] = nil
-			refusals[name] = reason
-			l.Info("approval refused",
-				"action", "approval_refused", "task", task.Name, "issue", name, "reason", reason)
-			metrics.ApprovalRefused(reason)
-			continue
-		}
-
-		// A NEWLY DERIVED evidence is persisted; an already-approved Issue
-		// short-circuits inside verifyOneIssue with its stored evidence and needs
-		// no re-write (clause 2 idempotency, autoApprove and single-use liveness).
-		if ev != nil && (iss.Status.Status != "approved" || iss.Status.Approval == nil) {
-			key := types.NamespacedName{Namespace: iss.Namespace, Name: iss.Name}
-			if err := objbudget.FitIssue(ctx, c, sp, key, func(cur *tatarav1alpha1.Issue) {
-				cur.Status.Approval = ev.DeepCopy()
-				cur.Status.Status = "approved"
-			}); err != nil {
-				return nil, nil, fmt.Errorf("approval: record evidence on %s: %w", name, err)
-			}
-			l.Info("approval verified",
-				"action", "approval_verified", "task", task.Name, "issue", name,
-				"maintainer_login", ev.Login, "cited_comment_id", ev.CommentID,
-				"auto", ev.Auto)
-			if ev.Auto && metrics != nil {
-				if kind := tatarav1alpha1.ProposalKindFromBody(iss.Status.Body); kind != "" {
-					metrics.AutoApproveTotal(kind)
-				}
-			}
-		}
-		evidence[name] = ev
-	}
-
-	if err := applyApprovalStage(ctx, c, sp, task, ApprovalPassed(evidence)); err != nil {
-		return nil, nil, err
-	}
-	return evidence, refusals, nil
-}
-
 // approvalRepo resolves the Issue's Repository for the per-repository
 // maintainerLogins override. A missing Repository resolves to the project list.
 func approvalRepo(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issue) *tatarav1alpha1.Repository {
@@ -512,103 +398,6 @@ func approvalRepo(ctx context.Context, c client.Client, iss *tatarav1alpha1.Issu
 		return nil
 	}
 	return &repo
-}
-
-// applyApprovalStage moves the Task across the ONE edge the gate owns.
-// clarifying -> approved on a pass; approved -> clarifying when the gate no
-// longer holds (approval is NOT sticky: an agent cannot widen its own mandate by
-// adopting work after the gate). Every other stage - notably parked - is left
-// alone: stage.Unpark owns the un-park edge, and as of
-// agent-judged-approval-gate step C it takes no verdict at all -
-// stage.UnparkInput has no verdict field left to carry one, so nothing this gate
-// computes can move a parked Task.
-func applyApprovalStage(ctx context.Context, c client.Client, sp objbudget.Spiller,
-	task *tatarav1alpha1.Task, passed bool) error {
-	var to string
-	switch {
-	case passed && task.Status.Stage == tatarav1alpha1.StageClarifying:
-		to = tatarav1alpha1.StageApproved
-	case !passed && task.Status.Stage == tatarav1alpha1.StageApproved:
-		to = tatarav1alpha1.StageClarifying
-	default:
-		return nil
-	}
-
-	now := time.Now()
-	var enterErr error
-	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
-	if err := objbudget.FitTask(ctx, c, sp, key, func(cur *tatarav1alpha1.Task) {
-		enterErr = stage.Enter(cur, nil, to, "", now)
-	}); err != nil {
-		return fmt.Errorf("approval: enter %s on %s: %w", to, task.Name, err)
-	}
-	if enterErr != nil {
-		return fmt.Errorf("approval: enter %s on %s: %w", to, task.Name, enterErr)
-	}
-	if err := c.Get(ctx, key, task); err != nil {
-		return fmt.Errorf("approval: refresh task %s: %w", task.Name, err)
-	}
-	log.FromContext(ctx).Info("approval gate moved the task",
-		"action", "approval_stage", "task", task.Name, "stage", to, "passed", passed)
-	return nil
-}
-
-// ReVerifyParked is the C3-3 un-park path, and its ordering is MANDATORY: it
-// SYNCS THAT ISSUE'S THREAD FROM THE FORGE FIRST (one forge read, on a human
-// comment, on a parked Task - cheap), and only THEN runs the grammar.
-//
-// The mirror cadence for a parked Task is DAILY, clause (d) enforces single-use
-// evidence against Comment.ExternalID, and a TaskEvent carries no externalId. So
-// without the sync the grammar re-runs against a thread that does NOT contain the
-// comment that triggered it, and silently fails - restoring the exact 7-day dead
-// end this redesign removes.
-//
-// It returns the grammar verdict, which the caller USED TO feed to stage.Unpark
-// as UnparkInput.GrammarPassed. As of agent-judged-approval-gate step A it has
-// NO CALLER AT ALL - the webhook limb that called it is gone, step B removed the
-// reader of the field it fed, and step C removed the field itself - so the
-// verdict it returns goes nowhere. Kept
-// only until step 7 deletes it; do not wire a new caller to it. A BOT-authored
-// event is refused before any forge read, so no comment the bot ever writes on
-// an owned thread can un-park the Task.
-func ReVerifyParked(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
-	citations []tatarav1alpha1.ApprovalCitation, metrics *obs.OperatorMetrics) (bool, error) {
-	passed, _, err := ReVerifyParkedDetailed(ctx, c, sp, reader, proj, task, ev, citations, metrics)
-	return passed, err
-}
-
-// ReVerifyParkedDetailed is ReVerifyParked plus the EVIDENCE the pass was built
-// from, keyed by Issue CR name. The caller USED TO persist that evidence as a
-// durable Task.status.approvalVerdict, on the reasoning that the grammar verdict
-// was the one input the periodic un-park backstop could never reconstruct. That
-// field was deleted in agent-judged-approval-gate step D and the evidence now
-// goes nowhere: this function is test-only, like ReVerifyParked above it.
-func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.Spiller, reader scm.SCMReader,
-	proj *tatarav1alpha1.Project, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent,
-	citations []tatarav1alpha1.ApprovalCitation,
-	metrics *obs.OperatorMetrics) (bool, map[string]*tatarav1alpha1.ApprovalEvidence, error) {
-
-	botLogin := ""
-	if proj.Spec.Scm != nil {
-		botLogin = proj.Spec.Scm.BotLogin
-	}
-	if ev.Author == "" || (botLogin != "" && ev.Author == botLogin) {
-		return false, nil, nil
-	}
-	if ev.Kind == "issue_comment" && ev.Repo != "" && ev.Number > 0 {
-		key := IssueKey(ev.Repo, ev.Number)
-		if TaskOwnsIssue(task, ev.Repo, ev.Number) {
-			if err := SyncIssueOnDemand(ctx, c, sp, reader, proj, key); err != nil {
-				return false, nil, fmt.Errorf("approval: on-demand sync of %s: %w", key, err)
-			}
-		}
-	}
-	evidence, _, err := VerifyApprovalDetailed(ctx, c, sp, proj, task, citations, metrics)
-	if err != nil {
-		return false, nil, err
-	}
-	return ApprovalPassed(evidence), evidence, nil
 }
 
 // TaskOwnsIssue reports whether the Task owns the Issue the event landed on.
