@@ -15,6 +15,7 @@ import (
 	"github.com/szymonrychu/tatara-operator/internal/scm"
 	"github.com/szymonrychu/tatara-operator/internal/stage"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -1765,5 +1766,118 @@ func TestSweepHeartbeatIsPerProject(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(obs.SweepLastSuccessTimestamp.WithLabelValues(projB.Name, activity)); got <= stale {
 		t.Fatalf("project hb-multi-b heartbeat = %v, want a fresh stamp above %v", got, stale)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// THE READ-AFTER-WRITE RACE (mtg-decks#9, 2026-07-28).
+//
+// MarkWebhookOriginated used to Create the mirror CR and then immediately
+// re-Get it through the CACHED client under retry.RetryOnConflict, which
+// retries ONLY IsConflict. An informer cache that had not yet observed the
+// Create answered NotFound, the retry returned it verbatim, the webhook
+// handler 500'd, and MintForItem never ran - so a brand-new human issue
+// started nothing at all. It is a RACE: issue #7 won it on 2026-07-24, issue
+// #9 lost it by 437ms. laggingIssueGets reproduces the losing side
+// deterministically.
+// ---------------------------------------------------------------------------
+
+// laggingIssueGets returns an interceptor that answers NotFound to the first n
+// Gets of an Issue, mimicking an informer cache that has not observed a Create
+// yet. Gets of every other kind, and Issue Gets after the nth, pass through.
+func laggingIssueGets(n int) interceptor.Funcs {
+	remaining := n
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey,
+			obj client.Object, opts ...client.GetOption) error {
+			if _, isIssue := obj.(*tatarav1alpha1.Issue); isIssue && remaining > 0 {
+				remaining--
+				return apierrors.NewNotFound(
+					tatarav1alpha1.GroupVersion.WithResource("issues").GroupResource(), key.Name)
+			}
+			return cli.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+// TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead: the COMMON path. No
+// mirror CR exists, every cached Issue read lags, and the mark still succeeds -
+// because the marker is stamped on the object being CREATED, so there is no
+// second read to race.
+func TestMarkWebhookOriginatedBrandNewIssueNeedsNoSecondRead(t *testing.T) {
+	proj := sweepProject("race-new-proj")
+	repo := sweepRepo("race-new-proj")
+	// Budget of 1: the create path performs exactly ONE real Issue Get (the
+	// existence probe), and that is the read that must lag. A larger budget
+	// would also intercept this test's own verification read below, since the
+	// fix's whole point is that the create path never issues a second one.
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo).
+		WithInterceptorFuncs(laggingIssueGets(1)).
+		Build()
+
+	marked, err := MarkWebhookOriginated(context.Background(), c, proj, repo, 9,
+		"https://github.com/szymonrychu/mtg-decks/issues/9", time.Now())
+	if err != nil {
+		t.Fatalf("MarkWebhookOriginated = %v, want nil: a brand-new issue must not depend on a cached re-read", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true: the create-time stamp IS the mark")
+	}
+
+	// Read straight off the tracker: the interceptor budget is spent by now, and
+	// the annotation must actually be on the stored object, not just reported.
+	var iss tatarav1alpha1.Issue
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testNS, Name: tatarav1alpha1.IssueName(repo.Name, 9)}, &iss); err != nil {
+		t.Fatalf("get issue CR: %v", err)
+	}
+	if iss.Annotations[AnnWebhookOriginated] == "" {
+		t.Fatal("the created Issue CR carries no webhook-originated marker")
+	}
+}
+
+// TestMarkWebhookOriginatedRetriesNotFoundFromTheCache: the OTHER half. The CR
+// already exists (a concurrent writer won the Create), so the Get/Update branch
+// still runs - and it must RETRY a NotFound from the lagging cache instead of
+// returning it, which is what 500'd the delivery.
+func TestMarkWebhookOriginatedRetriesNotFoundFromTheCache(t *testing.T) {
+	proj := sweepProject("race-exists-proj")
+	repo := sweepRepo("race-exists-proj")
+	existing := &tatarav1alpha1.Issue{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: tatarav1alpha1.IssueName(repo.Name, 9), Namespace: testNS,
+		},
+		Spec: tatarav1alpha1.IssueSpec{
+			RepositoryRef: repo.Name, Number: 9, ProjectRef: proj.Name,
+			URL: "https://github.com/szymonrychu/mtg-decks/issues/9",
+		},
+	}
+	// TWO lagging Gets: the first is ensureIssueCR's existence probe (which then
+	// Creates and loses on AlreadyExists), the second is the Get/Update branch's
+	// own read. The third Get sees the object and the Update stamps it.
+	c := fake.NewClientBuilder().
+		WithScheme(mirrorScheme(t)).
+		WithObjects(proj, repo, existing).
+		WithInterceptorFuncs(laggingIssueGets(2)).
+		Build()
+
+	marked, err := MarkWebhookOriginated(context.Background(), c, proj, repo, 9,
+		"https://github.com/szymonrychu/mtg-decks/issues/9", time.Now())
+	if err != nil {
+		t.Fatalf("MarkWebhookOriginated = %v, want nil: a NotFound from a lagging cache must be RETRIED, not returned", err)
+	}
+	if !marked {
+		t.Fatal("marked = false, want true: the existing CR must end up carrying the marker")
+	}
+
+	var iss tatarav1alpha1.Issue
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testNS, Name: tatarav1alpha1.IssueName(repo.Name, 9)}, &iss); err != nil {
+		t.Fatalf("get issue CR: %v", err)
+	}
+	if iss.Annotations[AnnWebhookOriginated] == "" {
+		t.Fatal("the existing Issue CR was never marked")
 	}
 }

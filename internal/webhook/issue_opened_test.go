@@ -29,8 +29,12 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	tatarav1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/controller"
@@ -221,3 +225,46 @@ func TestIssueClosed_NeverMarks(t *testing.T) {
 }
 
 func ptrBool(b bool) *bool { return &b }
+
+// TestIssueOpened_LaggingCacheStillMintsTriaging IS THE REGRESSION TEST FOR
+// mtg-decks#9. The handler runs against a client whose Issue reads lag (an
+// informer cache that has not observed a Create yet). Before the fix,
+// MarkWebhookOriginated returned that NotFound, handleIssueOpened 500'd at
+// server.go:648, and MintForItem at :660 never ran - a maintainer opened an
+// issue and the platform did nothing, with no retry from GitHub. It must now
+// answer 202 and mint an ACTIVE clarify Task.
+func TestIssueOpened_LaggingCacheStillMintsTriaging(t *testing.T) {
+	const secretVal = "whsec-lag1"
+	remaining := 2
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(
+			projectWithReporters("lagproj", "lagproj-scm", "tatara", "tatara-bot", nil),
+			secret("lagproj-scm", secretVal),
+			repository("repo-lag", "lagproj", "https://github.com/o/r.git", "main"),
+		).
+		WithStatusSubresource(&tatarav1.Project{}, &tatarav1.Repository{}, &tatarav1.Task{},
+			&tatarav1.QueuedEvent{}, &tatarav1.Issue{}, &tatarav1.MergeRequest{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey,
+				obj client.Object, opts ...client.GetOption) error {
+				if _, isIssue := obj.(*tatarav1.Issue); isIssue && remaining > 0 {
+					remaining--
+					return apierrors.NewNotFound(
+						tatarav1.GroupVersion.WithResource("issues").GroupResource(), key.Name)
+				}
+				return cli.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	h, _ := newServer(t, c)
+
+	// postIssueOpened asserts 202 itself. Before the fix this is a 500.
+	postIssueOpened(t, h, "lagproj", secretVal, issueOpenedBy("opened", "alice", 9))
+
+	var tl tatarav1.TaskList
+	require.NoError(t, c.List(context.Background(), &tl))
+	require.Len(t, tl.Items, 1, "a brand-new maintainer issue must mint exactly one Task")
+	require.Equal(t, tatarav1.StageTriaging, tl.Items[0].Spec.InitialStage,
+		"the mint must be ACTIVE: a human just opened this issue")
+}

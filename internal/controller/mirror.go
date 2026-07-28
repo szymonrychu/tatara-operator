@@ -277,17 +277,36 @@ func mergeOneComment(cur, in tatarav1alpha1.Comment) tatarav1alpha1.Comment {
 // M3-10), which appends the minting Task as the controller owner - and a zero-
 // owner Issue is exactly the survivor that path adopts.
 func ensureIssueCR(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project, repo *tatarav1alpha1.Repository, number int, url string) error {
+	_, err := ensureIssueCRWithAnnotations(ctx, c, proj, repo, number, url, nil)
+	return err
+}
+
+// ensureIssueCRWithAnnotations is ensureIssueCR plus two things its callers
+// could not get any other way:
+//
+//   - ann is stamped on the object it CREATES, so a caller that needs an
+//     annotation on a brand-new mirror never has to re-read the object it just
+//     wrote. That read-after-write against the CACHED client is what lost
+//     mtg-decks#9: the informer had not observed the Create, the Get answered
+//     NotFound, and the webhook 500'd.
+//   - created reports whether THIS call created the CR. false means it already
+//     existed - either the probe below found it, or a concurrent writer won the
+//     Create - and a caller that needs ann applied to an EXISTING object must
+//     fall back to its own read-modify-write.
+func ensureIssueCRWithAnnotations(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
+	repo *tatarav1alpha1.Repository, number int, url string, ann map[string]string) (bool, error) {
+
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
 	var cur tatarav1alpha1.Issue
 	err := c.Get(ctx, key, &cur)
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("mirror: get issue %s: %w", key.Name, err)
+		return false, fmt.Errorf("mirror: get issue %s: %w", key.Name, err)
 	}
 	iss := &tatarav1alpha1.Issue{
-		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace, Annotations: ann},
 		Spec: tatarav1alpha1.IssueSpec{
 			RepositoryRef: repo.Name,
 			Number:        number,
@@ -295,10 +314,13 @@ func ensureIssueCR(ctx context.Context, c client.Client, proj *tatarav1alpha1.Pr
 			ProjectRef:    proj.Name,
 		},
 	}
-	if err := c.Create(ctx, iss); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("mirror: create issue %s: %w", key.Name, err)
+	if err := c.Create(ctx, iss); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return false, fmt.Errorf("mirror: create issue %s: %w", key.Name, err)
+		}
+		return false, nil
 	}
-	return nil
+	return true, nil
 }
 
 // ensureMergeRequestCR is the MergeRequest counterpart of ensureIssueCR.

@@ -223,15 +223,31 @@ func WebhookOriginated(cr *tatarav1alpha1.Issue) bool {
 //
 // The caller must have already applied the bot-actor and reporter-allowlist
 // gates: a BOT-authored issue event must never leave a marker.
+//
+// THE MARKER IS STAMPED AT CREATE TIME on the common path (a brand-new issue),
+// so that path performs NO second read and cannot race the informer cache. The
+// Get/Update branch below still serves the already-exists case, and it retries
+// NotFound as well as Conflict: the CR exists but this client's cache may not
+// have observed it yet, and returning that NotFound is what 500'd the delivery
+// for mtg-decks#9 and lost the mint outright (GitHub does not retry a 500).
 func MarkWebhookOriginated(ctx context.Context, c client.Client, proj *tatarav1alpha1.Project,
 	repo *tatarav1alpha1.Repository, number int, url string, now time.Time) (bool, error) {
 
-	if err := ensureIssueCR(ctx, c, proj, repo, number, url); err != nil {
+	created, err := ensureIssueCRWithAnnotations(ctx, c, proj, repo, number, url,
+		map[string]string{AnnWebhookOriginated: now.UTC().Format(time.RFC3339)})
+	if err != nil {
 		return false, err
+	}
+	if created {
+		// A CR this call just created has no controller owner and no prior
+		// marker, so both guards in the branch below are vacuous for it.
+		return true, nil
 	}
 	key := types.NamespacedName{Namespace: proj.Namespace, Name: tatarav1alpha1.IssueName(repo.Name, number)}
 	marked := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	err = retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return apierrors.IsConflict(err) || apierrors.IsNotFound(err)
+	}, func() error {
 		marked = false
 		var iss tatarav1alpha1.Issue
 		if err := c.Get(ctx, key, &iss); err != nil {
