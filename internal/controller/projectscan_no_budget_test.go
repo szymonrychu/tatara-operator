@@ -20,19 +20,23 @@ import (
 )
 
 // TestBrainstormEnqueuesDespiteQueuedAutonomousCount asserts that when the
-// queued-autonomous count already exceeds the old MaxOpenTasks cap, a due
+// queued-autonomous count already exceeds the old MaxOpenTasks cap,
 // brainstorm still enqueues (the budget gate no longer blocks creation).
 //
-// Setup: maxOpenTasks=1 (old cap), brainstorm enabled + due, proposal backlog
-// under maxOpenProposals. Two Queued autonomous QueuedEvents pre-seeded
-// (count=2 > old cap 1). After runScans, a brainstorm QE with
-// dedupKey "brainstorm-<proj>" must exist.
+// Setup: maxOpenTasks=1 (old cap), proposal backlog under maxOpenProposals.
+// Two Queued autonomous QueuedEvents pre-seeded (count=2 > old cap 1). After
+// r.brainstorm(), a brainstorm QE with dedupKey "brainstorm-<proj>" must
+// exist.
+//
+// Brainstorm has no cron of its own any more (Task 3: refine re-homing), so
+// this calls r.brainstorm() directly instead of driving it through
+// r.runScans() - runScans no longer touches brainstorm at all, matching every
+// other direct-call brainstorm test in projectscan_brainstorm_target_test.go.
 func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 	const projName = "no-budget-proj"
 	cron := &tatarav1alpha1.ScmCron{
 		Brainstorm: tatarav1alpha1.BrainstormActivity{
 			Enabled:          true,
-			Schedule:         "* * * * *", // always due
 			MaxOpenProposals: 5,
 		},
 	}
@@ -62,23 +66,15 @@ func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 		}
 	}
 
-	// Backdate LastBrainstorm so the * * * * * schedule fires immediately.
-	// The project was just created, so CreationTimestamp is recent; the cron's
-	// next-fire would be in the next minute, making due=false. Stamp with a
-	// 30-minute-ago time so next-fire is in the past AND well outside C2's
-	// DefaultBrainstormMinSessionIntervalMinutes cooldown floor (this test
-	// targets the budget gate, not the cooldown gate).
+	// Backdate LastBrainstorm well outside C2's
+	// DefaultBrainstormMinSessionIntervalMinutes cooldown floor - this test
+	// targets the budget gate, not the cooldown gate.
 	past := metav1.NewTime(time.Now().Add(-30 * time.Minute))
 	proj.Status.LastBrainstorm = &past
-	// Stamp LastRefine to now (after the brainstorm due-base) so the refine
-	// pre-scan barrier (merged onto the brainstorm tick) is already satisfied
-	// this cycle; this test targets the budget gate, not the refine barrier.
-	now := metav1.Now()
-	proj.Status.LastRefine = &now
 	if err := k8sClient.Status().Update(context.Background(), proj); err != nil {
 		t.Fatalf("status update LastBrainstorm: %v", err)
 	}
-	// Re-fetch to get consistent ResourceVersion before passing to runScans.
+	// Re-fetch to get consistent ResourceVersion before passing to brainstorm.
 	fresh := &tatarav1alpha1.Project{}
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: projName}, fresh); err != nil {
 		t.Fatalf("get proj: %v", err)
@@ -86,7 +82,7 @@ func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 	proj = fresh
 
 	// Add a repo so brainstorm has at least one valid slug.
-	_ = mkScanRepo(t, projName, projName+"-br-repo", "https://github.com/o/nb.git")
+	repo := mkScanRepo(t, projName, projName+"-br-repo", "https://github.com/o/nb.git")
 
 	reader := &perRepoFakeReader{
 		issuesByRepo: map[string][]scm.IssueRef{
@@ -96,9 +92,7 @@ func TestBrainstormEnqueuesDespiteQueuedAutonomousCount(t *testing.T) {
 	r := newScanReconciler(reader)
 	r.Metrics = obs.NewOperatorMetrics(prometheus.NewRegistry())
 
-	if _, _, _, _, err := r.runScans(context.Background(), proj); err != nil {
-		t.Fatalf("runScans: %v", err)
-	}
+	r.brainstorm(context.Background(), proj, reader, []tatarav1alpha1.Repository{repo}, nil, cron.Brainstorm)
 
 	qes := listBrainstormQEs(t, projName)
 	if len(qes) == 0 {

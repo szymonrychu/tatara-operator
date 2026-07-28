@@ -53,7 +53,10 @@ func assertLabelNames(t *testing.T, got, want []string) {
 // the Project reconcile path (issue #441). It must be idempotent: Reconcile
 // calls it on every pass.
 func TestSeedSweepErrorsForProject(t *testing.T) {
-	const wantPerProject = 13 + 3*6 // sweep x 13 (nightlySweep dropped: dead, no live producer), brainstorm/documentation/issueScan x 6
+	// sweep x 13 (nightlySweep dropped: dead, no live producer), brainstorm x 1
+	// (demand-driven now, only stamp_failed can fire), documentation/issueScan
+	// x 2 each (invalid_cron, stamp_failed), refine x 3 (its own cron, Task 3).
+	const wantPerProject = 13 + 1 + 2*2 + 3
 
 	before := testutil.CollectAndCount(SweepErrorsTotal)
 	SeedSweepErrorsForProject("seed-test-proj")

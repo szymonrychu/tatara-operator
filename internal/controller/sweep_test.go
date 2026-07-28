@@ -1856,16 +1856,19 @@ func TestSweepErrorsSeededForProject(t *testing.T) {
 	const project = "seeded-scan-proj"
 	obs.SeedSweepErrorsForProject(project)
 
-	activities := []string{"brainstorm", "documentation", "issueScan"}
-	reasons := []string{
-		"refine_barrier_held",
-		"refine_check_failed",
-		"refine_inflight_check_failed",
-		"invalid_cron",
-		"stamp_failed",
-		"refine_barrier_timeout",
+	// Task 3 (refine re-homing): brainstorm has no cron of its own any more
+	// (demand-driven, event path only, so only stamp_failed can fire on it);
+	// documentation/issueScan share the plain cron reason set; refine is now
+	// its own activity with its own inflight-dedup reason. The barrier-era
+	// refine_barrier_held/refine_barrier_timeout/refine_check_failed reasons
+	// have no producer left anywhere and are gone from the seeded set too.
+	perActivityReasons := map[string][]string{
+		"brainstorm":    {"stamp_failed"},
+		"documentation": {"invalid_cron", "stamp_failed"},
+		"issueScan":     {"invalid_cron", "stamp_failed"},
+		"refine":        {"invalid_cron", "stamp_failed", "refine_inflight_check_failed"},
 	}
-	for _, activity := range activities {
+	for activity, reasons := range perActivityReasons {
 		for _, reason := range reasons {
 			if !sweepErrorsTotalSeries(t, project, activity, reason) {
 				t.Errorf("SweepErrorsTotal{project=%s,activity=%s,reason=%s} has no series; want it seeded per project",
@@ -1877,7 +1880,7 @@ func TestSweepErrorsSeededForProject(t *testing.T) {
 		t.Errorf("SweepErrorsTotal{project=%s,activity=%s,reason=list_tasks} has no series; want the sweep reason set seeded too",
 			project, SweepActivity)
 	}
-	if sweepErrorsTotalSeries(t, "never-seeded-proj", "brainstorm", "invalid_cron") {
+	if sweepErrorsTotalSeries(t, "never-seeded-proj", "brainstorm", "stamp_failed") {
 		t.Errorf("SweepErrorsTotal has a series for a project that was never seeded; seeding must be per-project")
 	}
 }

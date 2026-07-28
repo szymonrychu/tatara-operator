@@ -5948,6 +5948,11 @@ spec:
                               ClosedLookbackDays bounds how far back closed issues are loaded for
                               already-implemented detection. Default 30 when zero.
                             type: integer
+                          schedule:
+                            description: Schedule is a 5-field cron (robfig ParseStandard).
+                              Empty disables refine.
+                            pattern: ^$|^(\S+\s+){4}\S+$
+                            type: string
                         type: object
                     type: object
                   declinedLabel:

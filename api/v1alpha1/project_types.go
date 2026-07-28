@@ -539,8 +539,15 @@ func (a BrainstormActivity) ResolveMinSessionInterval() time.Duration {
 	}
 }
 
-// RefineActivity configures the cron-cycle refiner pre-step.
+// RefineActivity configures the periodic project refiner. It is NOT a
+// brainstorm pre-step any more: brainstorm is demand-driven and has no cron to
+// hang a barrier off, so refine carries its own schedule. Grooming the backlog
+// is genuinely periodic work; refilling it is not.
 type RefineActivity struct {
+	// Schedule is a 5-field cron (robfig ParseStandard). Empty disables refine.
+	// +kubebuilder:validation:Pattern=`^$|^(\S+\s+){4}\S+$`
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
 	// ClosedLookbackDays bounds how far back closed issues are loaded for
 	// already-implemented detection. Default 30 when zero.
 	// +optional

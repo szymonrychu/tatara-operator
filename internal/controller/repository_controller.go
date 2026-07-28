@@ -34,20 +34,6 @@ const ReingestAnnotation = tataradevv1alpha1.ReingestRequestedAnnotation
 // re-evaluate the schedule reasonably soon.
 const maxScheduleRequeue = 6 * time.Hour
 
-// requeueRefineBarrier is the requeue used when scans are deferred waiting for
-// a refine Task to reach a terminal state.
-const requeueRefineBarrier = 30 * time.Second
-
-// requeueRefineBarrierMaxHold is the release valve for the refine pre-scan
-// barrier (issue #401): if a refine Task never reaches a terminal state, the
-// barrier would otherwise hold brainstorm (and the LastBrainstorm heartbeat
-// stamp behind it) forever. Once a barrier has held longer than this, runScans
-// proceeds to brainstorm anyway so the cron and its liveness heartbeat recover
-// even with a permanently stuck refine Task; the stuck Task itself is left for
-// the reaper/on-call, surfaced via the refine_barrier_timeout SweepErrorsTotal
-// reason and a WARN-style log at the release point.
-const requeueRefineBarrierMaxHold = 2 * time.Hour
-
 // ingestBackoff constants for exponential back-off between failed Job re-creations.
 const (
 	baseIngestBackoff = 30 * time.Second
