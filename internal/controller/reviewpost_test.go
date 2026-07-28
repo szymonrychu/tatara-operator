@@ -765,3 +765,40 @@ func TestReviewAdvanceEdge_TerminalMRBeatsStalePendingReview(t *testing.T) {
 	require.Equal(t, tatarav1alpha1.StageDelivered, edge.To)
 	require.Equal(t, stage.ReasonMRMergedExternally, edge.Reason)
 }
+
+// TestAppendOperatorNote_ClampsOversizedBody is the #495 defect class on its
+// second-most-reachable field. Note.Body is CRD-capped at 4096 bytes and three
+// of its four writers clamp (restapi's two note paths, the TTL synthetic note);
+// appendOperatorNote did not. Its one caller feeds it reviewBeltNote, which
+// concatenates up to 30 findings whose OWN bodies are permitted 8192 bytes
+// each, so the belt note that carries a request_changes review into the next
+// implement pod could not be written at all - and that note is the only thing
+// standing between a lost mirror race and a Task that burns maxReviewRounds
+// with no idea what to fix.
+func TestAppendOperatorNote_ClampsOversizedBody(t *testing.T) {
+	ctx := context.Background()
+	d, proj, _ := newOwnershipDriver(t, ctx)
+	mkTaskWithKind(t, "note-clamp-task", proj.Name, "", "review")
+	task := getTask(t, "note-clamp-task")
+
+	body := strings.Repeat("finding detail ", 2000) // ~30 KB, a plausible 30-finding belt note
+	if err := d.appendOperatorNote(ctx, proj, task, body); err != nil {
+		t.Fatalf("appendOperatorNote must clamp, not 422: %v", err)
+	}
+	notes := getTask(t, "note-clamp-task").Status.Notes
+	if len(notes) != 1 {
+		t.Fatalf("notes = %d, want 1", len(notes))
+	}
+	if len(notes[0].Body) > tatarav1alpha1.NoteBodyMaxBytes {
+		t.Fatalf("stored note body = %d bytes, want <= %d", len(notes[0].Body), tatarav1alpha1.NoteBodyMaxBytes)
+	}
+
+	// The idempotency guard compares the STORED body, so a second call with the
+	// same oversized input must still be recognised as already written.
+	if err := d.appendOperatorNote(ctx, proj, task, body); err != nil {
+		t.Fatal(err)
+	}
+	if again := getTask(t, "note-clamp-task").Status.Notes; len(again) != 1 {
+		t.Fatalf("re-appending the same oversized note wrote it twice: %d notes", len(again))
+	}
+}

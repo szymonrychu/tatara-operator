@@ -1085,7 +1085,8 @@ func (s *Server) enqueueRefireComment(ctx context.Context, proj *tatarav1.Projec
 		reqID := fmt.Sprintf("refire-%s-%d", iss.Name, i.Status.RefireCount)
 		if len(i.Status.PendingComments) < 20 {
 			i.Status.PendingComments = append(i.Status.PendingComments, tatarav1.PendingComment{
-				RequestID: reqID, Action: "comment", Body: body,
+				RequestID: reqID, Action: "comment",
+				Body: tatarav1.TruncateUTF8(body, tatarav1.PendingCommentBodyMaxBytes),
 			})
 			t := metav1.NewTime(now)
 			i.Status.LastRefireCommentAt = &t

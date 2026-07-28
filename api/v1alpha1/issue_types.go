@@ -54,6 +54,7 @@ type Comment struct {
 	// Body is TRUNCATED AT INGEST to 8192 bytes (fix E3). GitHub allows 65,536-
 	// char bodies: 25 max-size comments = 1.6 MB = over the etcd ceiling. A 64 KB
 	// comment is not prompt-useful anyway.
+	// Go-side twin: CommentBodyMaxBytes (limits.go).
 	// +kubebuilder:validation:MaxLength=8192
 	Body      string      `json:"body"`
 	CreatedAt metav1.Time `json:"createdAt"`
@@ -111,6 +112,7 @@ type Comment struct {
 type PendingReview struct {
 	// There is NO Event field (fix M9): the event is ALWAYS "COMMENT" (C.5.1b),
 	// so it is a constant in the implementation, not data on the wire.
+	// Go-side twin: PendingReviewBodyMaxBytes (limits.go).
 	// +kubebuilder:validation:MaxLength=16384
 	Body string `json:"body"`
 	// +optional
@@ -134,6 +136,7 @@ type ReviewFinding struct {
 	// Line is nil for a file-level finding (no single line to anchor to);
 	// non-nil values are 1-based diff line numbers.
 	Line *int `json:"line,omitempty"`
+	// Go-side twin: ReviewFindingBodyMaxBytes (limits.go).
 	// +kubebuilder:validation:MaxLength=8192
 	Body string `json:"body"`
 	// +kubebuilder:validation:Enum=critical;high;medium;low
@@ -147,6 +150,7 @@ type PendingComment struct {
 	RequestID string `json:"requestId"`
 	// +kubebuilder:validation:Enum=comment;reply
 	Action string `json:"action"`
+	// Go-side twin: PendingCommentBodyMaxBytes (limits.go).
 	// +kubebuilder:validation:MaxLength=16384
 	Body string `json:"body"`
 	// +optional
@@ -173,6 +177,9 @@ type IssueStatus struct {
 	Title string `json:"title,omitempty"`
 	// +optional
 	Author string `json:"author,omitempty"`
+	// Go-side twin: IssueBodyMaxBytes (limits.go). The forge's own cap is in
+	// CHARACTERS, this one is in BYTES, so a body the forge accepted can still
+	// be too long here - every writer clamps (issue #495).
 	// +optional
 	// +kubebuilder:validation:MaxLength=65536
 	Body string `json:"body,omitempty"`

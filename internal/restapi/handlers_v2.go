@@ -31,8 +31,11 @@ import (
 
 // The contract-C limits that are not CRD constants.
 const (
-	// noteBodyMaxBytes is C.2.6's note-body cap, applied on a rune boundary.
-	noteBodyMaxBytes = 4096
+	// noteBodyMaxBytes is C.2.6's note-body cap, applied on a rune boundary. It
+	// IS a CRD constant now: three copies of the number drifted apart from the
+	// marker they all mirror, and the copy that was never written at all cost
+	// #495.
+	noteBodyMaxBytes = tatarav1alpha1.NoteBodyMaxBytes
 	// maxNotes is the Go-side note cap (C.2.6). At the cap the OLDEST note is
 	// spilled to tatara-memory and dropped. There is NO 409-on-cap: an agent
 	// must ALWAYS be able to write its handoff.
@@ -1153,7 +1156,8 @@ func (s *Server) mintIssueCR(ctx context.Context, proj *tatarav1alpha1.Project,
 	}
 	now := metav1.NewTime(s.now())
 	iss.Status = tatarav1alpha1.IssueStatus{
-		Title: title, Body: body, Author: botLogin(proj), State: "open", Status: "new",
+		Title: title, Body: truncateValidUTF8(body, tatarav1alpha1.IssueBodyMaxBytes),
+		Author: botLogin(proj), State: "open", Status: "new",
 		CreatedAt: &now, UpdatedAt: &now, LastSyncedAt: &now,
 	}
 	if err := s.c.Status().Update(ctx, iss); err != nil {
@@ -1255,6 +1259,7 @@ func (s *Server) issueDeferred(w http.ResponseWriter, r *http.Request, proj *tat
 	if action == "edit" {
 		pc.Body = editIntentBody(req.Title, req.Body)
 	}
+	pc.Body = truncateValidUTF8(pc.Body, tatarav1alpha1.PendingCommentBodyMaxBytes)
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
 	if err := objbudget.FitIssue(ctx, s.c, s.spillerForOrNil(proj), key, func(i *tatarav1alpha1.Issue) {
 		for _, e := range i.Status.PendingComments {
@@ -1542,7 +1547,8 @@ func (s *Server) mintMRCR(ctx context.Context, proj *tatarav1alpha1.Project,
 	}
 	now := metav1.NewTime(s.now())
 	mr.Status = tatarav1alpha1.MergeRequestStatus{
-		Title: title, Body: body, Author: botLogin(proj), State: "open", Status: "new",
+		Title: title, Body: truncateValidUTF8(body, tatarav1alpha1.MergeRequestBodyMaxBytes),
+		Author: botLogin(proj), State: "open", Status: "new",
 		HeadBranch: head, CreatedAt: &now, UpdatedAt: &now, LastSyncedAt: &now,
 	}
 	if err := s.c.Status().Update(ctx, mr); err != nil {
@@ -1571,7 +1577,8 @@ func (s *Server) mrDeferred(w http.ResponseWriter, r *http.Request, proj *tatara
 
 	requestID := newRequestID(task.Name, req.Action, name, req.Body, req.InReplyTo)
 	pc := tatarav1alpha1.PendingComment{
-		RequestID: requestID, Action: req.Action, Body: req.Body, InReplyTo: req.InReplyTo,
+		RequestID: requestID, Action: req.Action, InReplyTo: req.InReplyTo,
+		Body: truncateValidUTF8(req.Body, tatarav1alpha1.PendingCommentBodyMaxBytes),
 	}
 	key := types.NamespacedName{Namespace: s.ns, Name: name}
 	if err := objbudget.FitMergeRequest(ctx, s.c, s.spillerForOrNil(proj), key, func(m *tatarav1alpha1.MergeRequest) {

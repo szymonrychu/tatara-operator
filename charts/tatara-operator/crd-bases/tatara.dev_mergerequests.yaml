@@ -87,6 +87,9 @@ spec:
               author:
                 type: string
               body:
+                description: |-
+                  Go-side twin: MergeRequestBodyMaxBytes (limits.go). Byte-capped, while the
+                  forge caps in characters - every writer clamps (issue #495).
                 maxLength: 65536
                 type: string
               ciStatus:
@@ -133,6 +136,7 @@ spec:
                         Body is TRUNCATED AT INGEST to 8192 bytes (fix E3). GitHub allows 65,536-
                         char bodies: 25 max-size comments = 1.6 MB = over the etcd ceiling. A 64 KB
                         comment is not prompt-useful anyway.
+                        Go-side twin: CommentBodyMaxBytes (limits.go).
                       maxLength: 8192
                       type: string
                     createdAt:
@@ -329,6 +333,7 @@ spec:
                       - reply
                       type: string
                     body:
+                      description: 'Go-side twin: PendingCommentBodyMaxBytes (limits.go).'
                       maxLength: 16384
                       type: string
                     inReplyTo:
@@ -353,6 +358,7 @@ spec:
                     description: |-
                       There is NO Event field (fix M9): the event is ALWAYS "COMMENT" (C.5.1b),
                       so it is a constant in the implementation, not data on the wire.
+                      Go-side twin: PendingReviewBodyMaxBytes (limits.go).
                     maxLength: 16384
                     type: string
                   findings:
@@ -363,6 +369,7 @@ spec:
                         evict (it is spec-adjacent intent, not an evictable comment) - fix M8.
                       properties:
                         body:
+                          description: 'Go-side twin: ReviewFindingBodyMaxBytes (limits.go).'
                           maxLength: 8192
                           type: string
                         line:

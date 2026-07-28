@@ -6,7 +6,6 @@ import (
 	"maps"
 	"sort"
 	"time"
-	"unicode/utf8"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
 	"github.com/szymonrychu/tatara-operator/internal/objbudget"
@@ -40,7 +39,7 @@ const (
 	// boundary. GitHub allows 65,536-char bodies, so 25 max-size comments is
 	// 1.6 MB - over the etcd ceiling on its own - and a 64 KB comment is not
 	// prompt-useful anyway.
-	commentBodyLimit = 8192
+	commentBodyLimit = tatarav1alpha1.CommentBodyMaxBytes
 
 	// MirrorCadenceActive is the sync interval for the Issues/MRs of an ACTIVE
 	// (pod-eligible) Task.
@@ -146,14 +145,7 @@ func MirrorCadence(t *tatarav1alpha1.Task) time.Duration {
 // string cuts mid-rune, and an invalid-UTF-8 string is rejected by the API
 // server's JSON encoder, so the rune boundary is not cosmetic.
 func truncateCommentBody(body string) (string, bool) {
-	if len(body) <= commentBodyLimit {
-		return body, false
-	}
-	cut := body[:commentBodyLimit]
-	for len(cut) > 0 && !utf8.ValidString(cut) {
-		cut = cut[:len(cut)-1]
-	}
-	return cut, true
+	return tatarav1alpha1.TruncateUTF8(body, commentBodyLimit), len(body) > commentBodyLimit
 }
 
 // mirrorCommentFrom maps one forge comment onto the CR mirror's Comment,
@@ -380,7 +372,7 @@ func SyncIssue(ctx context.Context, c client.Client, sp objbudget.Spiller, proj 
 	err := objbudget.FitIssue(ctx, c, sp, key, func(iss *tatarav1alpha1.Issue) {
 		iss.Status.Title = ext.Title
 		iss.Status.Author = ext.Author
-		iss.Status.Body = ext.Body
+		iss.Status.Body = tatarav1alpha1.TruncateUTF8(ext.Body, tatarav1alpha1.IssueBodyMaxBytes)
 		iss.Status.State = ext.State
 		iss.Status.Labels = ext.Labels
 		if !ext.CreatedAt.IsZero() {
@@ -422,7 +414,7 @@ func SyncMergeRequest(ctx context.Context, c client.Client, sp objbudget.Spiller
 	err := objbudget.FitMergeRequest(ctx, c, sp, key, func(mr *tatarav1alpha1.MergeRequest) {
 		mr.Status.Title = ext.Title
 		mr.Status.Author = ext.Author
-		mr.Status.Body = ext.Body
+		mr.Status.Body = tatarav1alpha1.TruncateUTF8(ext.Body, tatarav1alpha1.MergeRequestBodyMaxBytes)
 		mr.Status.State = ext.State
 		mr.Status.HeadBranch = ext.HeadBranch
 		mr.Status.HeadSHA = ext.HeadSHA

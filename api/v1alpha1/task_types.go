@@ -107,6 +107,7 @@ type TaskSpec struct {
 	// it can never shrink the goal. It therefore needs a hard cap of its own
 	// (fix L31) or it eats the budget the guard is defending.
 	// The same cap applies to QueuedTaskBlueprint.Goal (B.7).
+	// Go-side twin: GoalMaxBytes (limits.go).
 	// +kubebuilder:validation:MaxLength=16384
 	Goal string `json:"goal"`
 	// Source is the originating SCM work item. It is the seed identity triaging
@@ -365,6 +366,7 @@ type Note struct {
 	Agent string `json:"agent"`
 	// +kubebuilder:validation:Enum=note;plan;handoff
 	Kind string `json:"kind"`
+	// Go-side twin: NoteBodyMaxBytes (limits.go). Change both together.
 	// +kubebuilder:validation:MaxLength=4096
 	Body string `json:"body"`
 }
@@ -410,6 +412,9 @@ type TaskEvent struct {
 	Repo   string `json:"repo"`   // Repository CR name
 	Number int    `json:"number"` // 0 for kind=alert
 	Author string `json:"author"`
+	// Go-side twin: TaskEventBodyMaxBytes (limits.go). Forge comments routinely
+	// run past it - this platform's own agents write multi-KB ones - so every
+	// writer MUST clamp. AppendTaskEvent does it for all of them (issue #495).
 	// +kubebuilder:validation:MaxLength=4096
 	Body string `json:"body"`
 }

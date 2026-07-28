@@ -25,6 +25,13 @@ const maxPendingEvents = 20
 // retry.RetryOnConflict and would hot-loop webhook redelivery, so the cap
 // here must stay strictly below it.
 //
+// It clamps ev.Body to TaskEvent.Body's MaxLength for the same reason and in
+// the same place: the COUNT was capped here and the LENGTH was not, so a forge
+// comment over 4 KB 422-ed the whole status update and the comment never
+// reached the Task (issue #495). The clamp lives at this funnel rather than at
+// the four TaskEvent construction sites because this is the one function every
+// TaskEvent passes through - a fifth call site cannot reintroduce the 422.
+//
 // The E.3 enqueue filter (drop a bot-authored event) is the CALLER's
 // responsibility, applied BEFORE this function is ever invoked - a
 // bot-authored ev must never reach it.
@@ -37,6 +44,7 @@ const maxPendingEvents = 20
 // same capped mr_comment TaskEvent the webhook fast path does, and the two
 // paths must never duplicate this logic - one function, two callers.
 func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent) error {
+	ev = clampTaskEventBody(ev)
 	key := client.ObjectKeyFromObject(task)
 	fresh := &tatarav1alpha1.Task{}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -70,7 +78,9 @@ func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.
 // AppendTaskEvent, for the one caller (deliverAgentComment) that queues a
 // BOT-authored event. It INCREMENTS Task.status.botRounds instead of
 // resetting it, in the SAME Get-mutate-Update transaction, and returns the new
-// count.
+// count. It clamps ev.Body exactly as AppendTaskEvent does (issue #495): an
+// agent comment is no likelier to fit 4096 bytes than a human's, and a 422 here
+// takes the botRounds increment down with the append.
 //
 // enqueue controls whether ev is actually appended to Status.PendingEvents.
 // It must be false for a SAME-KIND agent comment: the only consumer of
@@ -106,6 +116,7 @@ func AppendTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.
 // way this path counts correctly. NOTHING reads the returned count to make a
 // decision (decision D7) - it is observability only.
 func AppendAgentTaskEvent(ctx context.Context, c client.Client, task *tatarav1alpha1.Task, ev tatarav1alpha1.TaskEvent, enqueue bool) (int, error) {
+	ev = clampTaskEventBody(ev)
 	key := client.ObjectKeyFromObject(task)
 	fresh := &tatarav1alpha1.Task{}
 	rounds := 0
@@ -126,6 +137,35 @@ func AppendAgentTaskEvent(ctx context.Context, c client.Client, task *tatarav1al
 	}
 	*task = *fresh
 	return rounds, nil
+}
+
+// taskEventTruncatedMarker ends a clamped body. It is not decoration: without
+// it an agent reading the event cannot tell a human's short reply from the
+// first 4 KB of a long one, and would answer a question whose second half it
+// never saw. The full text is NOT lost - AppendCommentToMirror has already put
+// it (up to the mirror's own 8192 cap) on the MergeRequest/Issue mirror the
+// event names, which is where the marker points.
+const taskEventTruncatedMarker = "\n...(truncated by tatara; full comment on the mirrored thread"
+
+// clampTaskEventBody fits ev.Body inside TaskEvent.Body's CRD MaxLength,
+// cutting on a RUNE boundary and marking the cut. A body that already fits is
+// returned byte-identical: drainRenderedEvents matches a rendered event by its
+// whole value tuple, body included, so an unconditional rewrite would break the
+// webhook-vs-drain race guard.
+//
+// A byte-slice of a UTF-8 string cuts mid-rune and the API server's JSON
+// encoder rejects invalid UTF-8, so the rune boundary is load-bearing, exactly
+// as in mirror.go's truncateCommentBody.
+func clampTaskEventBody(ev tatarav1alpha1.TaskEvent) tatarav1alpha1.TaskEvent {
+	if len(ev.Body) <= tatarav1alpha1.TaskEventBodyMaxBytes {
+		return ev
+	}
+	marker := taskEventTruncatedMarker + ")"
+	if ev.Repo != "" && ev.Number > 0 {
+		marker = fmt.Sprintf("%s %s#%d)", taskEventTruncatedMarker, ev.Repo, ev.Number)
+	}
+	ev.Body = tatarav1alpha1.TruncateUTF8(ev.Body, tatarav1alpha1.TaskEventBodyMaxBytes-len(marker)) + marker
+	return ev
 }
 
 // appendEventCapped appends ev to events, keeping at most max entries by

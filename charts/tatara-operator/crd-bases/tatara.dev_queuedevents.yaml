@@ -101,6 +101,14 @@ spec:
                       Task name that makes admission idempotent.
                     type: string
                   goal:
+                    description: |-
+                      Goal is copied VERBATIM onto the rebuilt Task's Spec.Goal, which is capped
+                      at GoalMaxBytes - so it needed the same cap and did not have it. Without
+                      it an over-long goal was accepted here and only rejected at admission, one
+                      layer away from the producer that could still have done something about it
+                      (issue #495's class: a bounded field fed from an unbounded one).
+                      Go-side twin: GoalMaxBytes (limits.go).
+                    maxLength: 16384
                     type: string
                   groupKey:
                     description: |-
@@ -131,6 +139,7 @@ spec:
                         description: |-
                           Goal carries the SAME MaxLength=16384 cap as Task.spec.goal
                           (task_types.go) - it is NON-EVICTABLE at the far end.
+                          Go-side twin: GoalMaxBytes (limits.go).
                         maxLength: 16384
                         type: string
                       issueKeys:

@@ -135,6 +135,10 @@ spec:
               author:
                 type: string
               body:
+                description: |-
+                  Go-side twin: IssueBodyMaxBytes (limits.go). The forge's own cap is in
+                  CHARACTERS, this one is in BYTES, so a body the forge accepted can still
+                  be too long here - every writer clamps (issue #495).
                 maxLength: 65536
                 type: string
               commentCount:
@@ -176,6 +180,7 @@ spec:
                         Body is TRUNCATED AT INGEST to 8192 bytes (fix E3). GitHub allows 65,536-
                         char bodies: 25 max-size comments = 1.6 MB = over the etcd ceiling. A 64 KB
                         comment is not prompt-useful anyway.
+                        Go-side twin: CommentBodyMaxBytes (limits.go).
                       maxLength: 8192
                       type: string
                     createdAt:
@@ -368,6 +373,7 @@ spec:
                       - reply
                       type: string
                     body:
+                      description: 'Go-side twin: PendingCommentBodyMaxBytes (limits.go).'
                       maxLength: 16384
                       type: string
                     inReplyTo:

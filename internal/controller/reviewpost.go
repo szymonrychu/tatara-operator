@@ -749,8 +749,15 @@ func (d *StageDriver) owningTask(ctx context.Context, obj client.Object) (*tatar
 
 // appendOperatorNote appends ONE operator note, idempotently: a re-run of phase
 // 2 must not write the belt twice.
+//
+// The body is clamped to Note.Body's CRD MaxLength first (issue #495's class).
+// Its caller feeds it reviewBeltNote, which concatenates up to 30 findings whose
+// own bodies are each permitted 8192 bytes, so an unclamped belt note routinely
+// could not be written at all - and the clamp must happen BEFORE the
+// already-written check, since that compares the STORED body.
 func (d *StageDriver) appendOperatorNote(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, body string) error {
+	body = tatarav1alpha1.TruncateUTF8(body, tatarav1alpha1.NoteBodyMaxBytes)
 	now := metav1.NewTime(d.now())
 	key := client.ObjectKeyFromObject(task)
 	if err := objbudget.FitTask(ctx, d.Client, d.spiller(proj), key, func(t *tatarav1alpha1.Task) {

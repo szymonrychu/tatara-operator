@@ -1,6 +1,9 @@
 package obs
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -53,10 +56,11 @@ func assertLabelNames(t *testing.T, got, want []string) {
 // the Project reconcile path (issue #441). It must be idempotent: Reconcile
 // calls it on every pass.
 func TestSeedSweepErrorsForProject(t *testing.T) {
-	// sweep x 13 (nightlySweep dropped: dead, no live producer), brainstorm x 1
+	// sweep x 17 (nightlySweep dropped: dead, no live producer; +4 for the
+	// fail() sites the list had drifted from, issue #495), brainstorm x 1
 	// (demand-driven now, only stamp_failed can fire), documentation/issueScan
 	// x 2 each (invalid_cron, stamp_failed), refine x 3 (its own cron, Task 3).
-	const wantPerProject = 13 + 1 + 2*2 + 3
+	const wantPerProject = 17 + 1 + 2*2 + 3
 
 	before := testutil.CollectAndCount(SweepErrorsTotal)
 	SeedSweepErrorsForProject("seed-test-proj")
@@ -73,5 +77,47 @@ func TestSeedSweepErrorsForProject(t *testing.T) {
 	SeedSweepErrorsForProject("seed-test-proj-2")
 	if two := testutil.CollectAndCount(SweepErrorsTotal); two-after != wantPerProject {
 		t.Fatalf("seeding a SECOND project added %d series, want %d (per-project, not shared)", two-after, wantPerProject)
+	}
+}
+
+// TestSweepSeedReasonsCoverEveryFailSite is the #495 instrumentation half.
+// sweepSeedReasons carries a "keep in sync with sweep.go's fail(reason, ...)
+// call sites" comment and had silently drifted from four of them, including
+// reconcile_ownership. An unseeded reason has NO series until its first error,
+// and a counter series born AT its first error has no earlier sample to
+// increase from - so increase(operator_sweep_errors_total{reason=...}[1h]) is
+// blind to exactly the first failure after every pod roll. That is why the
+// alert for this class had to be written against Loki ERROR lines instead of
+// the counter that exists for it. A comment cannot enforce that; this test can.
+func TestSweepSeedReasonsCoverEveryFailSite(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "controller", "sweep.go"))
+	if err != nil {
+		t.Fatalf("read sweep.go: %v", err)
+	}
+	seeded := map[string]bool{}
+	for _, r := range sweepSeedReasons {
+		seeded[r] = true
+	}
+	used := map[string]bool{}
+	for _, m := range regexp.MustCompile(`fail\("([a-z_]+)"`).FindAllStringSubmatch(string(src), -1) {
+		used[m[1]] = true
+	}
+	if len(used) == 0 {
+		t.Fatal("found no fail(\"...\") call sites in sweep.go - the scan is broken, not the seed list")
+	}
+	for reason := range used {
+		if !seeded[reason] {
+			t.Errorf("sweep.go fails with reason %q but sweepSeedReasons does not seed it: "+
+				"increase() cannot see its first increment", reason)
+		}
+	}
+	for reason := range seeded {
+		if reason == "list_tasks" {
+			continue // seeded deliberately; incremented outside fail()
+		}
+		if !used[reason] {
+			t.Errorf("sweepSeedReasons seeds %q but no fail(%q, ...) call site remains in sweep.go: "+
+				"a permanently dead zero series", reason, reason)
+		}
 	}
 }
