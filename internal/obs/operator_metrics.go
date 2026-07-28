@@ -69,6 +69,7 @@ type OperatorMetrics struct {
 	restapiRequestsTotal          *prometheus.CounterVec
 	restapiRequestDuration        *prometheus.HistogramVec
 	memoryHealthReadErrors        prometheus.Counter
+	memoryApplyTransientErrors    *prometheus.CounterVec
 	memoryStorageShrinkGuard      *prometheus.CounterVec
 	lightragDocuments             *prometheus.GaugeVec
 	lightragQueryErrors           prometheus.Counter
@@ -328,6 +329,17 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 			Name: "operator_memory_health_read_errors_total",
 			Help: "Total transient errors reading memory-stack health (not real stack failures).",
 		}),
+		// Issue #439: counts memory-stack applies that failed on a RETRYABLE
+		// dependency (an admission webhook that could not be reached, an
+		// apiserver 429/503/timeout) and were therefore soft-requeued instead of
+		// flipping the stack to Failed. This is the only live signal for that
+		// window, because the soft path deliberately logs at INFO and returns no
+		// reconcile error - a rate that keeps climbing without an accompanying
+		// ApplyError is a dependency that never came back.
+		memoryApplyTransientErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_memory_apply_transient_errors_total",
+			Help: "Total memory-stack applies soft-requeued on a retryable dependency failure (unreachable admission webhook, apiserver 429/503/timeout), by project.",
+		}, []string{"project"}),
 		// Counts every reconcile where the rendered cnpg storage was clamped up to
 		// the provisioned volume to avoid a cnpg shrink rejection (issue #248). A
 		// nonzero value means a Project spec is asking for less storage than is live.
@@ -523,6 +535,7 @@ func NewOperatorMetrics(reg prometheus.Registerer) *OperatorMetrics {
 		m.restapiRequestsTotal,
 		m.restapiRequestDuration,
 		m.memoryHealthReadErrors,
+		m.memoryApplyTransientErrors,
 		m.memoryStorageShrinkGuard,
 		m.lightragDocuments,
 		m.lightragQueryErrors,
@@ -1050,6 +1063,20 @@ func (m *OperatorMetrics) RESTRequestsCounter(endpoint, result string) prometheu
 // Called when memoryStackHealth returns a transient non-NotFound error. Finding 13.
 func (m *OperatorMetrics) MemoryHealthReadError() {
 	m.memoryHealthReadErrors.Inc()
+}
+
+// MemoryApplyTransientError increments operator_memory_apply_transient_errors_total
+// for a project. Called when applyMemoryStack failed on a retryable dependency
+// (unreachable admission webhook, apiserver 429/503/timeout) and the reconcile
+// soft-requeued instead of recording phase=Failed (issue #439).
+func (m *OperatorMetrics) MemoryApplyTransientError(project string) {
+	m.memoryApplyTransientErrors.WithLabelValues(project).Inc()
+}
+
+// MemoryApplyTransientErrorCounter returns the counter for a project for test
+// assertions.
+func (m *OperatorMetrics) MemoryApplyTransientErrorCounter(project string) prometheus.Counter {
+	return m.memoryApplyTransientErrors.WithLabelValues(project)
 }
 
 // MemoryStorageShrinkGuarded increments operator_memory_storage_shrink_guarded_total
