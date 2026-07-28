@@ -691,3 +691,37 @@ func TestBuildTaskFromQueuedEvent_NewTaskBlueprint(t *testing.T) {
 		t.Fatalf("labels: %v", task.Labels)
 	}
 }
+
+func TestTaskRefIndexer(t *testing.T) {
+	cases := []struct {
+		name string
+		qe   *tatarav1alpha1.QueuedEvent
+		want []string
+	}{
+		{
+			name: "a ticket indexes under its taskRef",
+			qe: &tatarav1alpha1.QueuedEvent{Spec: tatarav1alpha1.QueuedEventSpec{
+				Payload: tatarav1alpha1.QueuedEventPayload{TaskRef: "task-abc"},
+			}},
+			want: []string{"task-abc"},
+		},
+		{
+			name: "a mint indexes nothing",
+			qe:   &tatarav1alpha1.QueuedEvent{},
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := TaskRefIndexer(tc.qe)
+			if len(got) != len(tc.want) {
+				t.Fatalf("TaskRefIndexer = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("TaskRefIndexer = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

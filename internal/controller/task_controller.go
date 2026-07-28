@@ -13,8 +13,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tatarav1alpha1 "github.com/szymonrychu/tatara-operator/api/v1alpha1"
@@ -726,8 +728,12 @@ func (r *TaskReconciler) registerFieldIndexes(idx client.FieldIndexer) error {
 		}); err != nil {
 		return fmt.Errorf("index Repository.spec.projectRef: %w", err)
 	}
-	// Contract A.3: the mirror's four indexes (the fifth, queuedEventDedupKey,
-	// belongs to DispatcherReconciler, which owns the QueuedEvent controller).
+	// Contract A.3: the mirror's four indexes. An index is registered by its
+	// CONSUMER, not by whoever owns the GVK: queuedEventDedupKey lives on
+	// DispatcherReconciler because the dispatcher and the webhook read it, and
+	// QueuedEvent.spec.payload.taskRef lives HERE because ensureTicket is its
+	// only reader. Both are QueuedEvent indexes with different field names, so
+	// registering them from two reconcilers against one manager is fine.
 	// Dedup is an indexed lookup on issueKey/mrKey, NEVER a hashed Task name and
 	// NEVER a label selector - label VALUES reject ':' and '#'.
 	//
@@ -745,6 +751,9 @@ func (r *TaskReconciler) registerFieldIndexes(idx client.FieldIndexer) error {
 	}
 	if err := idx.IndexField(context.Background(), &tatarav1alpha1.Task{}, TaskDocumentsTasksIndex, TaskDocumentsTasksIndexer); err != nil {
 		return fmt.Errorf("index Task.documentsTasks: %w", err)
+	}
+	if err := idx.IndexField(context.Background(), &tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer); err != nil {
+		return fmt.Errorf("index QueuedEvent.spec.payload.taskRef: %w", err)
 	}
 	return nil
 }
@@ -771,6 +780,16 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := podClocks.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup pod-clock watch: %w", err)
 	}
+	return r.controllerBuilder(mgr).Complete(r)
+}
+
+// controllerBuilder assembles the Task controller's ENTIRE watch set. It is a
+// separate function for the same reason projectControllerBuilder is
+// (project_controller.go): task_ticket_wake_test.go's envtest registers the SAME
+// builder production registers, instead of a hand-copied duplicate that would go
+// on passing after someone deleted the real edge. Deleting any For/Owns/Watches
+// here now turns that test RED.
+func (r *TaskReconciler) controllerBuilder(mgr ctrl.Manager) *builder.Builder {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&tatarav1alpha1.Task{}).
 		Owns(&corev1.Pod{}).
@@ -781,11 +800,31 @@ func (r *TaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// the hourly mirror sweep. Reconcile is idempotent (EnterStage refuses a
 		// redundant X->X) and tolerates the update-event double-enqueue.
 		Owns(&tatarav1alpha1.MergeRequest{}).
+		// THE ADMISSION WAKE. The dispatcher writes the TASK first (admitTicket's
+		// label patch, then its status patch) and flips the ticket's
+		// Status.State to Admitted LAST. That Task write wakes this reconciler
+		// while ensureTicket still reads Queued, so it returns
+		// RequeueAfter: admissionRequeue - and without this edge the Admitted flip
+		// that follows wakes nobody, costing a guaranteed 5m before the pod spawns.
+		//
+		// A ticket is NOT owned by its Task (its controller ownerRef points at the
+		// Project, internal/queue/enqueue.go), so this is a plain Watches edge and
+		// Owns is unavailable; builder.MatchEveryOwner widens which owner refs
+		// count but does not relax the ownership requirement. The predicate is what
+		// keeps a project with a deep queue from turning every ticket write into a
+		// Task reconcile: see ticketAdmittedPredicate for why all four of its funcs
+		// are set and why GenerationChangedPredicate is forbidden here.
+		//
+		// admissionRequeue STAYS. This edge makes the wake immediate; the slow poll
+		// remains the backstop for a leadership changeover (ROADMAP.md) and for the
+		// lossy-map-func case controller-runtime#1996 describes.
+		Watches(&tatarav1alpha1.QueuedEvent{},
+			handler.EnqueueRequestsFromMapFunc(r.ticketToTask),
+			builder.WithPredicates(ticketAdmittedPredicate())).
 		// MaxConcurrentReconciles: 1 serialises Task reconciles to avoid races in
 		// read-then-write sequences (pod creation, status updates, seq accounting
 		// in the admission queue). The admission queue is the sole concurrency gate.
-		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1}).
-		Complete(r)
+		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 1})
 }
 
 // deleteWrapper best-effort deletes the wrapper Pod and Service for a task.

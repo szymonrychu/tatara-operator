@@ -1328,6 +1328,7 @@ func ticketMirrorClient(t *testing.T, objs ...client.Object) client.Client {
 		WithObjects(objs...).
 		WithStatusSubresource(&tatarav1alpha1.Issue{}, &tatarav1alpha1.MergeRequest{},
 			&tatarav1alpha1.Task{}, &tatarav1alpha1.QueuedEvent{}).
+		WithIndex(&tatarav1alpha1.QueuedEvent{}, queue.TaskRefIndex, queue.TaskRefIndexer).
 		Build()
 }
 

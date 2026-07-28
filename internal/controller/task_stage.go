@@ -1406,9 +1406,24 @@ func (r *TaskReconciler) ensureStagePod(ctx context.Context, proj *tatarav1alpha
 func (r *TaskReconciler) ensureTicket(ctx context.Context, proj *tatarav1alpha1.Project,
 	task *tatarav1alpha1.Task, agentKind string) (bool, error) {
 
+	// Indexed, not a namespace-wide scan: this runs on EVERY reconcile of every
+	// pod-stage Task, and the unindexed form was O(all queued events). Falls
+	// back to a full-namespace scan only for a direct (uncached) client with no
+	// registered field index (isFieldSelectorUnsupported, same as projectRepos
+	// above and sweep.go) - a raw envtest client cannot register a field index
+	// at all. A CACHED client (production, via registerFieldIndexes; every
+	// fake-client test, via WithIndex) that is missing the index fails loudly
+	// instead, and mirror_test.go's TestIndexesRegistered is the guard that the
+	// production registration cannot be dropped.
 	var qel tatarav1alpha1.QueuedEventList
-	if err := r.List(ctx, &qel, client.InNamespace(task.Namespace)); err != nil {
-		return false, fmt.Errorf("list queuedevents: %w", err)
+	err := r.List(ctx, &qel, client.InNamespace(task.Namespace),
+		client.MatchingFields{queue.TaskRefIndex: task.Name})
+	if err != nil && isFieldSelectorUnsupported(err) {
+		qel = tatarav1alpha1.QueuedEventList{}
+		err = r.List(ctx, &qel, client.InNamespace(task.Namespace))
+	}
+	if err != nil {
+		return false, fmt.Errorf("list admission tickets for task %s: %w", task.Name, err)
 	}
 	for i := range qel.Items {
 		q := &qel.Items[i]

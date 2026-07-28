@@ -10,6 +10,7 @@ type queueMetrics struct {
 	queueInflight              *prometheus.GaugeVec
 	queueAge                   *prometheus.GaugeVec
 	dispatcherBackstopEnqueued *prometheus.CounterVec
+	admissionWakeTotal         *prometheus.CounterVec
 }
 
 // newQueueMetrics registers the queue collectors on reg and returns the bundle.
@@ -44,6 +45,17 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 			Name: "operator_dispatcher_backstop_enqueued_total",
 			Help: "QueuedEvents re-enqueued by the leader-only admission backstop sweep, by project.",
 		}, []string{"project"}),
+		// The EVENT-DRIVEN WAKE on a ticket reaching Admitted (task_ticket_watch.go).
+		// Before this edge existed, the dispatcher's Task write woke TaskReconciler
+		// while the ticket still read Queued, and the later Admitted flip woke
+		// nobody: every admission cost a full admissionRequeue (5m) before the pod
+		// spawned. A non-zero rate here is the proof the watch is live; a rate that
+		// drops to zero while operator_queue_admitted_total keeps climbing means the
+		// wake is lost again and admission is back on the 5m backstop.
+		admissionWakeTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "operator_admission_wake_total",
+			Help: "Task reconcile enqueues from an admission ticket reaching Admitted, by pool class and agent kind.",
+		}, []string{"class", "agent_kind"}),
 	}
 	reg.MustRegister(
 		m.queueAdmittedTotal,
@@ -51,6 +63,7 @@ func newQueueMetrics(reg prometheus.Registerer) *queueMetrics {
 		m.queueInflight,
 		m.queueAge,
 		m.dispatcherBackstopEnqueued,
+		m.admissionWakeTotal,
 	)
 	return m
 }
@@ -71,6 +84,19 @@ func (m *queueMetrics) DispatcherBackstopEnqueued(project string) {
 // assertions.
 func (m *queueMetrics) DispatcherBackstopEnqueuedCounter(project string) prometheus.Counter {
 	return m.dispatcherBackstopEnqueued.WithLabelValues(project)
+}
+
+// AdmissionWake increments operator_admission_wake_total: an admission ticket
+// reached Admitted and woke its Task's reconcile, by pool class
+// ("normal"|"alert") and the ticket's payload agent kind.
+func (m *queueMetrics) AdmissionWake(class, agentKind string) {
+	m.admissionWakeTotal.WithLabelValues(class, agentKind).Inc()
+}
+
+// AdmissionWakeCounter returns the counter for (class, agentKind), for test
+// assertions.
+func (m *queueMetrics) AdmissionWakeCounter(class, agentKind string) prometheus.Counter {
+	return m.admissionWakeTotal.WithLabelValues(class, agentKind)
 }
 
 // SetQueueDepth sets operator_queue_depth for a project and pool class to n (Queued-state count).
