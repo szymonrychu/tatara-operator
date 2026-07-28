@@ -1,7 +1,8 @@
 package webhook
 
 // Task 18 (contract E.3 / Section I "pendingEvents") coverage for
-// deliverPendingEvent and its wiring into reverifyParked (fix C3-3 / M11).
+// deliverPendingEvent and its wiring into the shared comment unpark plus the
+// D2 on-demand issue mirror sync (fix M11).
 // These are white-box tests (package webhook) because they call the
 // unexported deliverPendingEvent directly, bypassing handleIssueComment's own
 // (redundant) bot/reporter gates - the point is to prove pending_events.go's
@@ -66,7 +67,7 @@ func peScheme(t *testing.T) *runtime.Scheme {
 }
 
 // peClient builds a fake client carrying the field index SyncIssueOnDemand
-// needs (controller.IssueKeyIndex) - without it the C3-3 re-verify path 500s
+// needs (controller.IssueKeyIndex) - without it the on-demand issue sync 500s
 // on List, not because the property under test is wrong.
 func peClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
@@ -254,48 +255,99 @@ func TestDeliverPendingEvent_NoOwningTask_MirrorsOnlyNoEnqueue(t *testing.T) {
 	}
 }
 
-// TestDeliverPendingEvent_ParkedIdentityUnverified_GoAhead_UnparksInOneComment
-// is fix C3-3 + M11's webhook wiring: a maintainer "go ahead" on a parked
-// Task, with the LOCAL mirror stale (no comments at all), completes in ONE
-// webhook delivery - reverifyParked runs the C3-3 on-demand sync (proven by
-// rd.calls==1) and the grammar pass un-parks straight to implementing,
-// without waiting for any cron sweep.
-func TestDeliverPendingEvent_ParkedIdentityUnverified_GoAhead_UnparksInOneComment(t *testing.T) {
-	task := peTask("t-parked-ok", tatarav1.StageParked, stage.ReasonIdentityUnverified)
-	iss := peIssue(7, task) // stale mirror: zero comments locally
+// TestDeliverPendingEvent_IdentityUnverifiedUsesCommentUnpark is the Step A
+// behaviour: a non-bot comment on a parked(identity-unverified) Task no longer
+// runs a bespoke re-verify limb; it joins awaiting-human and backlog-sweep on
+// the ONE shared driveCommentUnpark, which MUST compute conversing room for it
+// (a gate on == ReasonAwaitingHuman would make the conversing edge structurally
+// inert on the webhook fast path).
+//
+// The body is the exact literal the C.6 wordlist still accepts, on purpose:
+// that is what the deleted limb turned into an un-park straight to
+// implementing. The shared path reads the DURABLE verdict instead
+// (grammarPassedFor), this Task has none, and a human who said something with
+// no verdict behind it is a conversation, not a decision.
+func TestDeliverPendingEvent_IdentityUnverifiedUsesCommentUnpark(t *testing.T) {
+	task := peTask("t-parked-shared", tatarav1.StageParked, stage.ReasonIdentityUnverified)
+	iss := peIssue(7, task)
 	task.Status.IssueRefs = []string{iss.Name}
 	proj := peProject("tatara-bot", "maintainer")
 	sec := peSecret("pe-proj-scm", "pat")
 	c := peClient(t, proj, peRepo(), task, iss, sec)
 
 	rd := &fakeApprovalReader{comments: []scm.IssueComment{
-		{ExternalID: "c9", Author: "maintainer", Body: "go ahead", CreatedAt: time.Now().UTC()},
+		{ExternalID: "c-900", Author: "maintainer", Body: "go ahead", CreatedAt: time.Now().UTC()},
 	}}
 	s := peServer(c, &stubSpiller{}, func(string, string) (scm.SCMReader, error) { return rd, nil })
 
 	ev := scm.WebhookEvent{
 		IsComment: true, IssueRef: "o/r#7", Number: 7,
-		ActorLogin: "maintainer", CommentID: 99, CommentBody: "go ahead",
+		ActorLogin: "maintainer", CommentID: 900, CommentBody: "go ahead",
+	}
+	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
+
+	gotTask := getPETask(t, c, task.Name)
+	if gotTask.Status.Stage != tatarav1.StageConversing {
+		t.Fatalf("stage = (%q,%q), want conversing - the comment must reach an agent through the ONE shared unpark, and that unpark must have computed conversing room for identity-unverified",
+			gotTask.Status.Stage, gotTask.Status.StageReason)
+	}
+}
+
+// TestDeliverPendingEvent_CommentSyncsIssueMirror is D2. The operator verifies
+// the agent's citation against Issue.Status.Comments, and the agent reads the
+// external_id it cites out of the turn-0 bundle, which is rendered from the
+// SAME field. Nothing else on the webhook comment path writes that field
+// (mirror_refresh.go only touches Body/Title, and the parked cadence is daily),
+// so without this sync the forge thread the agent must cite from is in neither,
+// and every clarify refuses forever.
+//
+// The Task here is LIVE (clarifying), not parked: that is the whole delta. The
+// deleted limb bought this forge read for parked(identity-unverified) ONLY, so
+// the one stage that actually renders turn-0 bundles never got it.
+func TestDeliverPendingEvent_CommentSyncsIssueMirror(t *testing.T) {
+	task := peTask("t-live-sync", tatarav1.StageClarifying, "")
+	iss := peIssue(7, task) // mirror carries ZERO comments
+	task.Status.IssueRefs = []string{iss.Name}
+	proj := peProject("tatara-bot", "maintainer")
+	sec := peSecret("pe-proj-scm", "pat")
+	c := peClient(t, proj, peRepo(), task, iss, sec)
+
+	// c-900 is an EARLIER maintainer comment the stale mirror never saw. It is
+	// distinguishable from the webhook's own append (external id "901"), so its
+	// presence proves the on-demand sync ran, not the append.
+	rd := &fakeApprovalReader{comments: []scm.IssueComment{
+		{ExternalID: "c-900", Author: "maintainer", Body: "use the starred option",
+			CreatedAt: time.Now().UTC().Add(-time.Hour)},
+	}}
+	s := peServer(c, &stubSpiller{}, func(string, string) (scm.SCMReader, error) { return rd, nil })
+
+	ev := scm.WebhookEvent{
+		IsComment: true, IssueRef: "o/r#7", Number: 7,
+		ActorLogin: "maintainer", CommentID: 901, CommentBody: "go ahead, I approve!",
 	}
 	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
 
 	if rd.calls != 1 {
-		t.Fatalf("forge reads = %d, want EXACTLY 1 (the C3-3 on-demand sync must run)", rd.calls)
+		t.Fatalf("forge reads = %d, want EXACTLY 1 (the on-demand issue sync must run on a LIVE Task's comment too)", rd.calls)
 	}
-	gotTask := getPETask(t, c, task.Name)
-	if gotTask.Status.Stage != tatarav1.StageImplementing {
-		t.Fatalf("stage = %q, want implementing - a maintainer 'go ahead' must un-park in ONE webhook delivery, not a 7-day cron wait", gotTask.Status.Stage)
+	gotIssue := getPEIssue(t, c, iss.Name)
+	var found bool
+	for _, cm := range gotIssue.Status.Comments {
+		if cm.ExternalID == "c-900" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mirror comments = %#v, want the forge thread synced on demand (c-900 present)", gotIssue.Status.Comments)
 	}
 }
 
 // TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation: a
-// non-approving maintainer comment re-runs the grammar and it fails - but the
-// human DID say something, and Task 9 reads that as a live conversation
-// rather than a dead end: the Task moves to conversing (it is NOT the "go
-// ahead" path proven by the sibling test above - reaching implementing from
-// here still requires a genuine decision=implement that passes restapi's
-// LIVE verifyApprovalScope grammar check) with its idle clock armed, instead
-// of sitting parked for up to 7 days waiting on the exact magic phrase.
+// maintainer comment with no durable verdict behind it is a live conversation
+// rather than a dead end. The Task moves to conversing with its idle clock
+// armed, instead of sitting parked for up to 7 days. Reaching implementing from
+// there still requires a genuine decision=implement that passes restapi's LIVE
+// approval check - the conversing edge grants nothing on its own.
 func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t *testing.T) {
 	task := peTask("t-parked-no", tatarav1.StageParked, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)
@@ -329,15 +381,15 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_NotYet_OpensConversation(t
 }
 
 // TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConversation
-// is 2026-07-28 security review NEW-2: reverifyParked - the webhook-triggered,
-// comment-driven fast path identity-unverified re-entry actually goes through -
-// never loaded MRs, so the merged-MR guard added for Task 9's IMPORTANT 2
-// (anyMerged(in.MRs)) was structurally inert here: anyMerged(nil) is always
-// false. A kind=review Task parked(identity-unverified) whose owned MR is
-// already merged must NOT open a conversing pod on a stray comment - not a
-// security bypass (GUARD 1 still blocks review-kind from implementing/
-// merging/approved from conversing), but exactly the "one pod per human
-// comment" waste the guard exists to prevent.
+// is 2026-07-28 security review NEW-2, now guaranteed structurally: the
+// merged-MR guard (anyMerged(in.MRs)) can only fire if the caller actually
+// LOADS the owned MRs, and the bespoke identity-unverified limb that did not is
+// gone - every comment-driven re-entry is ApplyUnpark, which always loads them.
+// A kind=review Task parked(identity-unverified) whose owned MR is already
+// merged must NOT open a conversing pod on a stray comment - not a security
+// bypass (GUARD 1 still blocks review-kind from implementing/merging/approved
+// from conversing), but exactly the "one pod per human comment" waste the guard
+// exists to prevent.
 func TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConversation(t *testing.T) {
 	task := peTaskKind("t-parked-review-merged", "review", tatarav1.StageParked, stage.ReasonIdentityUnverified)
 	mergedAt := metav1.Now()
@@ -365,11 +417,11 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_ReviewKindMergedMR_NoConve
 	}
 }
 
-// TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverReverifies:
+// TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverSyncsOrUnparks:
 // a bot comment on a parked(identity-unverified) Task is dropped by the E.3
-// filter before the owning Task is even looked up, so reverifyParked (and its
-// forge read) is never reached at all.
-func TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverReverifies(t *testing.T) {
+// filter before the owning Task is even looked up, so neither the on-demand
+// issue sync (and its forge read) nor the comment unpark is reached at all.
+func TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverSyncsOrUnparks(t *testing.T) {
 	task := peTask("t-parked-bot", tatarav1.StageParked, stage.ReasonIdentityUnverified)
 	iss := peIssue(7, task)
 	task.Status.IssueRefs = []string{iss.Name}
@@ -387,7 +439,7 @@ func TestDeliverPendingEvent_ParkedIdentityUnverified_BotComment_NeverReverifies
 	s.deliverPendingEvent(context.Background(), *proj, peRepo(), ev)
 
 	if rd.calls != 0 {
-		t.Fatalf("forge reads = %d, want 0 - a bot event must never even cost a re-verify attempt", rd.calls)
+		t.Fatalf("forge reads = %d, want 0 - a bot event must never even cost an on-demand forge read", rd.calls)
 	}
 	gotTask := getPETask(t, c, task.Name)
 	if gotTask.Status.Stage != tatarav1.StageParked || len(gotTask.Status.PendingEvents) != 0 {

@@ -59,7 +59,7 @@ func TestDriveUnparks_RetriesIdentityUnverifiedFromThePersistedVerdict(t *testin
 	// microseconds): metav1.Time round-trips through the (fake or real) apiserver
 	// at whole-second precision, so two same-test time.Now() calls a few
 	// microseconds apart - which is what production never produces, since a human
-	// must physically comment between the park and the re-verify - would collapse
+	// must physically comment between the park and the approval - would collapse
 	// to the SAME second and defeat grammarPassedFor's strict After() check.
 	parkedAt := time.Now().Add(-10 * time.Minute)
 	task.Status.StageEnteredAt = &metav1.Time{Time: parkedAt}
@@ -223,8 +223,8 @@ func TestDriveUnparks_IdentityUnverifiedWithVerdictButNotAllApprovedStaysParked(
 // THE SECURITY REVIEW FINDING (2026-07-27): ApprovalVerdict is never cleared by
 // stage.Enter (it resets Stage, StageReason, AgentKind, PodStartedAt,
 // StageWorkStartedAt, Stats.PodRecreations - stage.go's Enter - but not
-// ApprovalVerdict), and reverifyParked only writes a NEW one on a pass, leaving
-// a failing re-verify's OLD verdict in place. So a verdict stamped for an
+// ApprovalVerdict), and a NEW one is only written on an approval, leaving a
+// refused approval's OLD verdict in place. So a verdict stamped for an
 // EARLIER, already-consumed park can still be sitting on the Task when it
 // re-parks identity-unverified for an UNRELATED later reason.
 //
@@ -422,9 +422,9 @@ func TestUnparkFires_AgreesWithDriveUnparksOnIdentityUnverifiedVerdict(t *testin
 	}
 }
 
-// 2026-07-28 security review CRITICAL 1: unparkFires is a FOURTH UnparkInput
-// builder (after ApplyUnpark, reverifyParked, and stage.UnparkDetailed's own
-// callers), and it used to leave ConversingHasRoom at its zero value (false)
+// 2026-07-28 security review CRITICAL 1: unparkFires is a THIRD UnparkInput
+// builder (after ApplyUnpark and stage.UnparkDetailed's own callers), and it
+// used to leave ConversingHasRoom at its zero value (false)
 // unconditionally. The window: parked(identity-unverified), a non-bot event,
 // NO valid verdict (grammarPassed=false), and the conversing ceiling has
 // room. driveUnparks' ApplyUnpark, called with room=true, sends the Task to

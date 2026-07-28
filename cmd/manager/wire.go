@@ -107,8 +107,8 @@ func addWebhookServer(ctx context.Context, mgr ctrl.Manager, cfg config.Config, 
 
 	// M2 webhook routes - unauthenticated, HMAC-verified inside the handler.
 	// SpillerFor resolves the A.7 spill client per Project (the E.3 pendingEvents
-	// mirror + the identity-unverified re-verify both write through objbudget); an
-	// unset SpillerFor left reverifyParked dead (fix W1).
+	// mirror + the on-demand issue thread sync both write through objbudget); an
+	// unset SpillerFor left both of those dead (fix W1).
 	webhook.NewServer(webhook.Config{
 		Client:                          mgr.GetClient(),
 		APIReader:                       mgr.GetAPIReader(),

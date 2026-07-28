@@ -26,15 +26,19 @@ import (
 // best-effort - any failure here is logged, never surfaced to the SCM as a
 // non-2xx.
 //
-// Three things happen, in order:
+// Four things happen, in order:
 //  1. the comment is mirrored onto the owning Issue/MergeRequest CR
 //     immediately (does not wait for the sweep's cadence sync);
 //  2. a non-bot event is queued onto the owning Task's pendingEvents,
 //     capped and drop-oldest;
-//  3. if that Task is parked(identity-unverified), the approval grammar is
-//     re-run right now - syncing that issue's thread from the forge FIRST
-//     (fix M11) - so a maintainer's "go ahead" un-parks in one comment
-//     instead of waiting on the daily mirror cadence.
+//  3. if the comment landed on an Issue this Task owns, that Issue's whole
+//     thread is re-synced from the forge right now (fix M11, decision D2), so
+//     the mirror both sides of the approval gate read is current instead of up
+//     to a day stale;
+//  4. a parked Task with an F.6 comment-driven re-entry rule (awaiting-human,
+//     backlog-sweep, identity-unverified) is driven through the ONE shared
+//     ApplyUnpark, so a maintainer's reply moves it in one comment instead of
+//     waiting on the project reconcile cadence.
 func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project, repo *tatarav1.Repository, ev scm.WebhookEvent) {
 	if repo == nil {
 		return
@@ -116,11 +120,26 @@ func (s *Server) deliverPendingEvent(ctx context.Context, proj tatarav1.Project,
 	s.log.InfoContext(ctx, "pendingEvents: queued task event",
 		"action", "pending_event_queued", "task", task.Name, "kind", kind, "repo", repo.Name, "number", ev.Number)
 
-	if task.Status.Stage == tatarav1.StageParked && task.Status.StageReason == stage.ReasonIdentityUnverified {
-		s.reverifyParked(ctx, &proj, task, taskEv)
+	// D2: the comment mirror is the ONLY place both the turn-0 bundle's
+	// external_id and the operator's own citation check read from, and NOTHING
+	// else on this path writes it (mirror_refresh.go touches Body/Title only,
+	// and the parked mirror cadence is daily). One forge read here - exactly the
+	// read the deleted identity-unverified limb already paid for, now bought for
+	// ANY live or parked Task rather than only parked(identity-unverified) - is
+	// what makes the cited comment visible to BOTH sides of the gate.
+	//
+	// kind, not ev.Kind: scm.WebhookEvent.Kind is the coarse delivery kind
+	// ("issue"/"mr"/"push"). kind is the mirror kind resolveMirrorTarget already
+	// derived, and it is the SAME value stamped on taskEv.Kind, which is what
+	// the grammar's own issue_comment check reads.
+	if kind == "issue_comment" && ev.Number > 0 && controller.TaskOwnsIssue(task, repo.Name, ev.Number) {
+		s.syncOwnedIssueThread(ctx, &proj, task, repo.Name, ev.Number)
 	}
+
 	if task.Status.Stage == tatarav1.StageParked &&
-		(task.Status.StageReason == stage.ReasonAwaitingHuman || task.Status.StageReason == stage.ReasonBacklogSweep) {
+		(task.Status.StageReason == stage.ReasonAwaitingHuman ||
+			task.Status.StageReason == stage.ReasonBacklogSweep ||
+			task.Status.StageReason == stage.ReasonIdentityUnverified) {
 		s.driveCommentUnpark(ctx, &proj, task)
 	}
 	// A LIVE conversational stage. The event is already queued above, but a
@@ -214,16 +233,16 @@ func (s *Server) deliverAgentComment(ctx context.Context, proj tatarav1.Project,
 		"author_kind", authorKind, "reacting_kind", reactingKind, "bot_rounds", rounds)
 
 	// driveConversingEntry is the ONLY re-entry attempted here, deliberately.
-	// stage.Unpark's F.6 rules (driveCommentUnpark's target, for parked(awaiting-
-	// human)) and reverifyParked's C.6 grammar (parked(identity-unverified)) are
-	// NEVER called from this path: both structurally require hasNonBotEvent - a
+	// stage.Unpark's F.6 comment-driven rules (driveCommentUnpark's target:
+	// awaiting-human, backlog-sweep, identity-unverified) are NEVER called from
+	// this path: every one of them structurally requires hasNonBotEvent - a
 	// GENUINE human-authored pendingEvent - and a bot-authored event can never
 	// satisfy that (by construction, not by an extra check here), so calling them
-	// would only ever decline. reverifyParked in particular must never even be
-	// attempted: it feeds the comment TEXT into the C.6 approval grammar, and a
-	// bot-authored comment must never be fed into that grammar - "a bot comment
-	// cannot approve anything, ever". A parked Task's queued event rides along,
-	// counted above, and waits for a genuine human comment or the daily sweep.
+	// would only ever decline. The on-demand issue sync is skipped here for the
+	// same reason: nothing on this path can approve anything, so there is no
+	// citation to make visible and no forge read worth buying. A parked Task's
+	// queued event rides along, counted above, and waits for a genuine human
+	// comment or the daily sweep.
 	// driveConversingEntry itself is a harmless no-op on a non-live-stage Task
 	// (ConversingEntryEligible), so this call is exactly as narrow for a parked
 	// Task as it is active for one in clarifying/reviewing.
@@ -345,13 +364,19 @@ func (s *Server) resolveOwningTask(ctx context.Context, proj *tatarav1.Project,
 	return task
 }
 
-// driveCommentUnpark is the F.6 comment-driven re-entry for parked(awaiting-human)
-// and parked(backlog-sweep): a non-bot pendingEvent (already enqueued above) may
-// promote them PROMPTLY, instead of waiting on the project reconcile cadence.
-// Unlike identity-unverified it needs no grammar and no forge sync - stage.Unpark
-// reads the enqueued pendingEvents directly - so it shares the operator's single
-// ApplyUnpark, which re-checks the maxOpenTasks cap at re-entry (H8: a promotion
-// is not a mint). The project-reconcile driveUnparks loop backstops this.
+// driveCommentUnpark is THE F.6 comment-driven re-entry, for all three reasons
+// that have one: parked(awaiting-human), parked(backlog-sweep) and
+// parked(identity-unverified). A non-bot pendingEvent (already enqueued above)
+// may promote them PROMPTLY, instead of waiting on the project reconcile cadence.
+//
+// identity-unverified used to have a bespoke limb of its own here, on the
+// reasoning that it needed a re-run grammar the shared path could not compute.
+// It did not: ApplyUnpark resolves the same answer off the DURABLE
+// Task.status.approvalVerdict (grammarPassedFor), and it is strictly better on
+// the axis that limb existed for - its in-loop Get uses the uncached APIReader,
+// which is exactly the read that lost the 2026-07-27 cache race. One path, one
+// maxOpenTasks re-check at re-entry (H8: a promotion is not a mint), one set of
+// decline metrics. The project-reconcile driveUnparks loop backstops this.
 func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task) {
 	active, err := controller.CountActiveTasks(ctx, s.cfg.Client, proj)
 	if err != nil {
@@ -362,13 +387,15 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 	if maxOpen <= 0 {
 		maxOpen = 6
 	}
-	// backlog-sweep never consults ConversingHasRoom (stage.go's ReasonBacklogSweep
-	// branch), so the capacity List only runs for the one reason that needs it
-	// here - awaiting-human - and a transient failure degrades to "no room"
+	// backlog-sweep never consults ConversingHasRoom, but awaiting-human AND
+	// identity-unverified both do (controller.NeedsConversingRoom is the single
+	// definition, shared with driveUnparks). Gating on awaiting-human alone
+	// would leave the identity-unverified conversing edge STRUCTURALLY INERT on
+	// this webhook fast path. A transient List failure degrades to "no room"
 	// (the safe fallback) rather than aborting this comment-driven unpark
 	// entirely (2026-07-28 security review IMPORTANT 4).
 	conversingRoom := false
-	if task.Status.StageReason == stage.ReasonAwaitingHuman {
+	if controller.NeedsConversingRoom(task.Status.StageReason) {
 		room, roomErr := controller.ConversingHasRoom(ctx, s.reader(), proj)
 		if roomErr != nil {
 			s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed; treating as no room", "error", roomErr, "task", task.Name)
@@ -402,6 +429,46 @@ func (s *Server) driveCommentUnpark(ctx context.Context, proj *tatarav1.Project,
 		"action", "pending_event_unpark", "task", task.Name, "stage", target, "reason_from", task.Status.StageReason)
 }
 
+// syncOwnedIssueThread is D2's one forge read: it re-syncs the owned Issue's
+// thread from the forge onto the mirror, NOW, on the comment that triggered it.
+//
+// It is not an optimisation. Issue.Status.Comments is the single field BOTH
+// halves of the approval gate read: the agent reads the comment's external_id
+// out of the turn-0 bundle rendered from it, and the operator re-verifies the
+// agent's citation against it. The webhook's own AppendCommentToMirror covers
+// only THIS comment; the rest of the thread converges on a DAILY cadence. A
+// Task whose mirror is a day stale therefore has an agent citing ids that are
+// not there yet.
+//
+// Every failure here is best-effort and LOUD: the unpark below still queues and
+// drives the event and the daily cadence still converges, but a silent miss
+// means the agent cannot cite and the gate refuses.
+func (s *Server) syncOwnedIssueThread(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task, repoRef string, number int) {
+	key := controller.IssueKey(repoRef, number)
+	fail := func(msg string, err error) {
+		obs.MirrorWriteDroppedTotal.WithLabelValues(proj.Name, "Issue", "issue_sync").Inc()
+		s.log.ErrorContext(ctx, "pendingEvents: "+msg+"; the cited comment may not be visible to the gate",
+			"action", "pending_event_issue_sync_failed", "error", err,
+			"task", task.Name, "project", proj.Name, "issue", key)
+	}
+	sp := s.cfg.SpillerFor(proj)
+	if sp == nil {
+		fail("no Spiller configured; on-demand issue sync skipped", nil)
+		return
+	}
+	reader, err := s.scmReader(ctx, proj)
+	if err != nil {
+		fail("build scm reader failed", err)
+		return
+	}
+	if err := controller.SyncIssueOnDemand(ctx, s.cfg.Client, sp, reader, proj, key); err != nil {
+		fail("on-demand issue sync failed", err)
+		return
+	}
+	s.log.InfoContext(ctx, "pendingEvents: synced the owned issue thread on demand",
+		"action", "pending_event_issue_synced", "task", task.Name, "project", proj.Name, "issue", key)
+}
+
 // resolveMirrorTarget maps a webhook event onto its mirror CR (Issue or
 // MergeRequest), by the deterministic name - never a field-indexed List - so
 // no field index needs registering for this lookup. A miss (no CR minted yet)
@@ -425,189 +492,6 @@ func (s *Server) resolveMirrorTarget(ctx context.Context, repo *tatarav1.Reposit
 		return nil, ""
 	}
 	return iss, "issue_comment"
-}
-
-// reverifyParked is the F.6/C3-3 un-park path for stageReason=identity-
-// unverified, wired to Task 10's ReVerifyParked (which syncs the issue thread
-// from the forge FIRST, then re-runs the C.6 grammar) and Task 9's
-// stage.Unpark. On a grammar pass with every owned Issue approved, the Task
-// enters implementing; on a fail, or if some owned Issue is still
-// unapproved, it stays parked and pendingEvents is retained (never dropped).
-func (s *Server) reverifyParked(ctx context.Context, proj *tatarav1.Project, task *tatarav1.Task, ev tatarav1.TaskEvent) {
-	sp := s.cfg.SpillerFor(proj)
-	if sp == nil {
-		s.log.ErrorContext(ctx, "pendingEvents: no Spiller configured; skipping identity-unverified reverify", "task", task.Name)
-		return
-	}
-	reader, err := s.scmReader(ctx, proj)
-	if err != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: build scm reader failed", "error", err, "task", task.Name)
-		return
-	}
-	passed, evidence, err := controller.ReVerifyParkedDetailed(ctx, s.cfg.Client, sp, reader, proj, task, ev, s.cfg.Metrics)
-	if err != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: reverify parked failed", "error", err, "task", task.Name)
-		return
-	}
-
-	botLogin := ""
-	if proj.Spec.Scm != nil {
-		botLogin = proj.Spec.Scm.BotLogin
-	}
-	// Task 9's conversing branch of the identity-unverified F.6 rule (a comment
-	// that fails the grammar opens a conversation instead of a dead end) needs
-	// the SAME ceiling answer ApplyUnpark's other two callers compute - reused
-	// via controller.ConversingHasRoom, never reimplemented, off the uncached
-	// reader like every other read on this path. A failure here degrades to "no
-	// room" (the safe fallback) rather than returning early: this reverify's
-	// whole point is that the ApprovalVerdict write below must land WHETHER OR
-	// NOT the un-park succeeds, and bailing out here before that write would
-	// throw away a genuine grammar pass over a transient capacity-check error
-	// (2026-07-28 security review IMPORTANT 4).
-	conversingRoom, err := controller.ConversingHasRoom(ctx, s.reader(), proj)
-	if err != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: conversing capacity check failed; treating as no room", "error", err, "task", task.Name)
-		conversingRoom = false
-	}
-	key := client.ObjectKeyFromObject(task)
-	var declined controller.UnparkDecline
-	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		declined = controller.DeclineNone
-		fresh := &tatarav1.Task{}
-		if err := s.cfg.Client.Get(ctx, key, fresh); err != nil {
-			return err
-		}
-		if fresh.Status.Stage != tatarav1.StageParked || fresh.Status.StageReason != stage.ReasonIdentityUnverified {
-			declined = controller.DeclineGuard
-			return nil // raced past this un-park by another writer already
-		}
-		// THE VERDICT IS PERSISTED WHETHER OR NOT THE UN-PARK SUCCEEDS. That is the
-		// whole point: when the un-park loses a cache race, driveUnparks re-derives
-		// the owned-Issue half from live state and re-enters using this record,
-		// because it can never re-run the grammar itself.
-		if passed {
-			fresh.Status.ApprovalVerdict = verdictFrom(evidence, time.Now())
-		}
-		issues, err := s.loadOwnedIssues(ctx, fresh)
-		if err != nil {
-			return err
-		}
-		// MRs feed anyMerged() in the ReasonIdentityUnverified conversing branch's
-		// kind=review guard (Task 9 IMPORTANT 2): without this, a kind=review Task
-		// parked(identity-unverified) whose owned MR is already merged would still
-		// open a conversing pod on the next stray comment - anyMerged(nil) is
-		// always false, so the guard was structurally inert on this ONE path,
-		// even though driveUnparks' ApplyUnpark (which does load MRs) enforced it
-		// correctly (2026-07-28 security review NEW-2). Not a security bypass:
-		// GUARD 1 still blocks review-kind from implementing/merging/approved -
-		// the impact was bounded pod waste on an already-merged PR.
-		mrs, err := controller.LoadTaskMRsFor(ctx, s.reader(), fresh)
-		if err != nil {
-			return err
-		}
-		// ActiveTasks/MaxOpenTasks are deliberately left unset: they are read ONLY
-		// by ReasonBacklogSweep (stage.go), and this function only ever drives
-		// ReasonIdentityUnverified - the guard above (fresh.Status.StageReason !=
-		// stage.ReasonIdentityUnverified) already refused any other reason before
-		// this point is reached. See unparkFires' field-by-field audit
-		// (internal/controller/reaper.go) for the equivalent reasoning against
-		// every UnparkInput field and all three production builders.
-		target, code := stage.UnparkDetailed(stage.UnparkInput{
-			Task:              fresh,
-			Issues:            issues,
-			MRs:               mrs,
-			BotLogin:          botLogin,
-			GrammarPassed:     passed,
-			ConversingHasRoom: conversingRoom,
-			Now:               time.Now(),
-		})
-		if target == "" {
-			declined = controller.DeclineFor(code)
-			// The verdict write still has to land, so this is an Update, not a
-			// return: without it the backstop has nothing to retry with.
-			if !passed {
-				return nil
-			}
-			return s.cfg.Client.Status().Update(ctx, fresh)
-		}
-		if err := s.cfg.Client.Status().Update(ctx, fresh); err != nil {
-			return err
-		}
-		s.log.InfoContext(ctx, "pendingEvents: unparked task",
-			"action", "pending_event_unpark", "task", fresh.Name, "stage", target, "grammar_passed", passed)
-		return nil
-	})
-	if updateErr != nil {
-		s.log.ErrorContext(ctx, "pendingEvents: unpark task failed", "error", updateErr, "task", task.Name)
-		return
-	}
-	if declined != controller.DeclineNone {
-		// NOT an error, and NOT silent. This call site fires in DIRECT reaction to a
-		// maintainer comment on the single narrowest, highest-stakes re-entry rule
-		// in the F.6 table. The bare `if !ok { return nil }` this replaces is what
-		// made the 2026-07-27 stall undiagnosable: the approval label was visible on
-		// the forge and no log line anywhere said why the Task had not moved.
-		s.log.InfoContext(ctx, "pendingEvents: identity-unverified reverify declined",
-			"action", "pending_event_unpark_declined", "task", task.Name,
-			"stage_reason", stage.ReasonIdentityUnverified, "decline_kind", string(declined),
-			"grammar_passed", passed)
-		s.cfg.Metrics.UnparkDeclined(stage.ReasonIdentityUnverified, string(declined))
-	}
-}
-
-// verdictFrom collapses the per-Issue approval evidence into the Task's single
-// durable ApprovalVerdict. When several owned Issues approved, the NEWEST
-// evidence wins: the verdict answers "has a maintainer approved this Task", and
-// the newest approving comment is the one whose recency the backstop cares about.
-// Auto-approval evidence carries no CommentID and that is recorded faithfully.
-func verdictFrom(evidence map[string]*tatarav1.ApprovalEvidence, now time.Time) *tatarav1.ApprovalVerdict {
-	var bestName string
-	var best *tatarav1.ApprovalEvidence
-	for name, e := range evidence {
-		if e == nil {
-			continue
-		}
-		if best == nil || e.CreatedAt.After(best.CreatedAt.Time) {
-			best, bestName = e, name
-		}
-	}
-	if best == nil {
-		return nil
-	}
-	return &tatarav1.ApprovalVerdict{
-		At:                metav1.NewTime(now),
-		IssueRef:          bestName,
-		CommentExternalID: best.CommentID,
-		Author:            best.Login,
-		Phrase:            best.Phrase,
-	}
-}
-
-// loadOwnedIssues resolves task's owned Issue CRs for the F.6 empty-set and
-// allApproved checks. A ref that no longer resolves (deleted/renamed) is
-// skipped, not an error - stage.Unpark's own scope check then runs against
-// whatever survives.
-func (s *Server) loadOwnedIssues(ctx context.Context, task *tatarav1.Task) ([]tatarav1.Issue, error) {
-	issues := make([]tatarav1.Issue, 0, len(task.Status.IssueRefs))
-	for _, name := range task.Status.IssueRefs {
-		var iss tatarav1.Issue
-		// UNCACHED (s.reader()), not s.cfg.Client. reverifyParked calls this
-		// microseconds after VerifyApprovalDetailed's objbudget.FitIssue wrote
-		// Status.Status="approved" to this very Issue CR, and a cached Get is not
-		// guaranteed to observe a write made through the same client - the informer
-		// converges only once the watch stream delivers it. A stale snapshot made
-		// allApproved false and the un-park declined silently, permanently, for a
-		// Task a maintainer had just approved (2026-07-27, gitlab helmfile#26). This
-		// is the escape hatch, not the fix: the fix is the driveUnparks backstop.
-		if err := s.reader().Get(ctx, objKey(s.cfg.Namespace, name), &iss); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return nil, fmt.Errorf("pendingEvents: get issue %s: %w", name, err)
-		}
-		issues = append(issues, iss)
-	}
-	return issues, nil
 }
 
 // scmReader builds a token-bound scm.SCMReader for proj, on demand: the

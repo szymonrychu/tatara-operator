@@ -386,9 +386,12 @@ func (r *ProjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	requeueAfter = soonestRequeue(requeueAfter, scanRequeue)
 
 	// THE F.6 RE-ENTRY DRIVER (fix W3). Applies stage.Unpark to every parked Task
-	// whose reason has a re-entry rule (time-based merge/deploy/no-outcome plus the
-	// comment-driven awaiting-human/backlog-sweep backstop); identity-unverified is
-	// webhook+grammar-driven and skipped. Paced independently of Reconcile()'s other
+	// whose reason has a re-entry rule - time-based merge/deploy/no-outcome plus
+	// the comment-driven awaiting-human/backlog-sweep/identity-unverified backstop.
+	// identity-unverified is INCLUDED: its grammar verdict is durable
+	// (Task.status.approvalVerdict), so this loop re-derives the rest from live
+	// state rather than needing the webhook's one shot to have won its cache race.
+	// Paced independently of Reconcile()'s other
 	// drivers (tatara-operator#368: an unrelated 10s-or-faster forced cadence was
 	// hammering this path across the full parked backlog every single pass). A
 	// persist failure requeues.

@@ -556,7 +556,7 @@ func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.S
 	}
 	if ev.Kind == "issue_comment" && ev.Repo != "" && ev.Number > 0 {
 		key := IssueKey(ev.Repo, ev.Number)
-		if approvalOwnsIssue(task, ev.Repo, ev.Number) {
+		if TaskOwnsIssue(task, ev.Repo, ev.Number) {
 			if err := SyncIssueOnDemand(ctx, c, sp, reader, proj, key); err != nil {
 				return false, nil, fmt.Errorf("approval: on-demand sync of %s: %w", key, err)
 			}
@@ -569,9 +569,12 @@ func ReVerifyParkedDetailed(ctx context.Context, c client.Client, sp objbudget.S
 	return ApprovalPassed(evidence), evidence, nil
 }
 
-// approvalOwnsIssue reports whether the Task owns the Issue the event landed on.
-// An event on a thread this Task does not own buys no forge read.
-func approvalOwnsIssue(task *tatarav1alpha1.Task, repoRef string, number int) bool {
+// TaskOwnsIssue reports whether the Task owns the Issue the event landed on.
+// An event on a thread this Task does not own buys no forge read. Exported
+// because the webhook comment path scopes its own on-demand mirror sync with
+// exactly this predicate (internal/webhook/pending_events.go) - one definition
+// of "this Task's thread", not two that can drift.
+func TaskOwnsIssue(task *tatarav1alpha1.Task, repoRef string, number int) bool {
 	want := tatarav1alpha1.IssueName(repoRef, number)
 	for _, name := range task.Status.IssueRefs {
 		if name == want {

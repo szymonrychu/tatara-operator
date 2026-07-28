@@ -374,7 +374,7 @@ func (r *ProjectReconciler) ReapTerminal(ctx context.Context, proj *tatarav1alph
 	conversingRoom := false
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
+		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && NeedsConversingRoom(t.Status.StageReason) {
 			room, roomErr := ConversingHasRoom(ctx, r.Client, proj)
 			if roomErr != nil {
 				l.Error(roomErr, "reap: conversing capacity check failed; treating this pass as no room",
@@ -1225,9 +1225,9 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // as non-re-entryable and be reaped out from under it).
 //
 // conversingRoom is the SAME reasoning applied to Task 9's ConversingHasRoom
-// field (2026-07-28 security review CRITICAL 1): unparkFires is a FOURTH
-// UnparkInput builder (after ApplyUnpark, reverifyParked, and stage.UnparkDetailed
-// itself), and it used to leave ConversingHasRoom at its zero value (false).
+// field (2026-07-28 security review CRITICAL 1): unparkFires is a THIRD
+// UnparkInput builder (after ApplyUnpark and stage.UnparkDetailed itself), and
+// it used to leave ConversingHasRoom at its zero value (false).
 // The window this reopened: parked(identity-unverified), a non-bot event, no
 // valid verdict, and the ceiling has room. driveUnparks' ApplyUnpark (room=true)
 // would send the Task to conversing and save it; this probe (room=false, before
@@ -1251,30 +1251,27 @@ func (r *ProjectReconciler) deleteReapedTask(ctx context.Context, proj *tatarav1
 // field and reason).
 //
 // FIELD-BY-FIELD AUDIT (2026-07-28 security review NEW-1), every UnparkInput
-// field against this package's three production UnparkInput builders
-// (ApplyUnpark, reverifyParked - internal/webhook/pending_events.go, and this
-// function), so the next reader does not have to re-derive which fields each
-// reason actually consults:
-//   - Task, Now: set by all three. Always required.
-//   - Issues: set by all three. Read by ReasonAwaitingHuman (non-review) and
+// field against this package's two production UnparkInput builders (ApplyUnpark
+// and this function), so the next reader does not have to re-derive which fields
+// each reason actually consults. There used to be a third - a bespoke webhook
+// limb that drove ReasonIdentityUnverified on its own and left four of these
+// fields unset - and every "NOT set by" caveat this audit carried was about it.
+// It is gone: identity-unverified now goes through ApplyUnpark like every other
+// comment-driven reason, so both remaining builders set the whole struct.
+//   - Task, Now: set by both. Always required.
+//   - Issues: set by both. Read by ReasonAwaitingHuman (non-review) and
 //     ReasonIdentityUnverified (grammar-passed branch).
-//   - MRs: set by all three (reverifyParked as of the NEW-2 fix below). Read by
-//     ReasonAwaitingHuman (review kind), ReasonIdentityUnverified (review kind,
-//     Task 9), ReasonNoOutcome, ReasonHandoffStalled - all via anyMerged.
-//   - BotLogin: set by all three. Read by hasNonBotEvent in every comment-driven
+//   - MRs: set by both. Read by ReasonAwaitingHuman (review kind),
+//     ReasonIdentityUnverified (review kind, Task 9), ReasonNoOutcome,
+//     ReasonHandoffStalled - all via anyMerged.
+//   - BotLogin: set by both. Read by hasNonBotEvent in every comment-driven
 //     reason (backlog-sweep, awaiting-human, identity-unverified, handoff-stalled).
-//   - GrammarPassed: set by all three (reverifyParked/ApplyUnpark compute it via
-//     grammarPassedFor; this probe the same). Read ONLY by ReasonIdentityUnverified.
-//   - ConversingHasRoom: set by all three as of the CRITICAL 1 fix above. Read by
+//   - GrammarPassed: set by both, via grammarPassedFor off the durable verdict.
+//     Read ONLY by ReasonIdentityUnverified.
+//   - ConversingHasRoom: set by both as of the CRITICAL 1 fix above. Read by
 //     ReasonAwaitingHuman and ReasonIdentityUnverified.
-//   - MaxTurnsPerTask: set by ApplyUnpark and this function (as of NEW-1). NOT set
-//     by reverifyParked - harmless, because reverifyParked only ever drives
-//     ReasonIdentityUnverified, and MaxTurnsPerTask is read ONLY by ReasonNoOutcome,
-//     which reverifyParked never handles (task.Status.StageReason is checked
-//     before it is ever called).
-//   - ActiveTasks, MaxOpenTasks: set by ApplyUnpark and this function. NOT set by
-//     reverifyParked - same reasoning: both are read ONLY by ReasonBacklogSweep,
-//     which reverifyParked never handles either.
+//   - MaxTurnsPerTask: set by both (as of NEW-1). Read ONLY by ReasonNoOutcome.
+//   - ActiveTasks, MaxOpenTasks: set by both. Read ONLY by ReasonBacklogSweep.
 //
 // With MaxTurnsPerTask now threaded, this probe and driveUnparks' ApplyUnpark
 // read the IDENTICAL set of UnparkInput fields for every reason either of them

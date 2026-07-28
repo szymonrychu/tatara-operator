@@ -63,8 +63,8 @@ func (s *Server) handleIssueClosed(ctx context.Context, w http.ResponseWriter, p
 // the mirror), and (b) if the body or title actually CHANGED, appends an
 // issue_edited pending event on the owning Task. It does NOT drive the unpark:
 // the leader-only driveUnparks/Task reconcile consumes the fresh pending event
-// (awaiting-human / backlog-sweep re-engage; identity-unverified needs an
-// approval phrase, not an edit, so it stays parked - correct).
+// (awaiting-human / backlog-sweep re-engage; identity-unverified needs a
+// recorded approval, not an edit, so it stays parked - correct).
 func (s *Server) handleIssueEdited(ctx context.Context, w http.ResponseWriter, provider string, proj tatarav1.Project, ev scm.WebhookEvent) {
 	if isBotActor(&proj, ev.ActorLogin) {
 		s.accept(w, provider, ev.Kind, ev.Action, "ignored")

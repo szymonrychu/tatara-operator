@@ -18,8 +18,9 @@ import (
 // THE F.6 RE-ENTRY DRIVER (fix W3).
 //
 // stage.Unpark carries a full re-entry body for SIX park reasons, but before
-// this file its ONLY production caller was the webhook's reverifyParked, gated to
-// identity-unverified. unparkFires (reaper.go) merely CHECKS whether a park would
+// this file its ONLY production caller was a bespoke webhook limb, gated to
+// identity-unverified (since deleted - every comment-driven re-entry is
+// ApplyUnpark now). unparkFires (reaper.go) merely CHECKS whether a park would
 // re-enter, on a DeepCopy, so the reaper does not collect a re-entryable Task - it
 // never APPLIED the transition. So awaiting-human, merge-timeout, deploy-timeout,
 // no-outcome and backlog-sweep all had a re-entry body and NO driver: a
@@ -55,8 +56,8 @@ import (
 // and stays exactly where it is. ONE CARVE-OUT: under
 // Project.spec.AutoApproveTataraProposals, a bot-authored, anchor-verified
 // proposal with ZERO maintainer comments auto-approves (autoApproveApplies /
-// autoApprovalEvidence, approval_grammar.go) and verdictFrom records that as a
-// verdict with Author=AutoApproveLogin and no CommentExternalID - by design, not
+// autoApprovalEvidence, approval_grammar.go) and the approval gate records that
+// as a verdict with Author=AutoApproveLogin and no CommentExternalID - not
 // a gap this driver introduces. Outside that flag, there is no path here that
 // re-enters implementing without a recorded maintainer approval.
 
@@ -138,7 +139,7 @@ func DeclineFor(code string) UnparkDecline {
 //     hand-written or corrupted {"at": "..."} verdict is schema-valid; Author is
 //     the one field every verdict this codebase writes always carries (a real
 //     maintainer login, or AutoApproveLogin for the guarded proposal
-//     carve-out - see verdictFrom), so requiring it makes the zero-value
+//     carve-out), so requiring it makes the zero-value
 //     struct unreachable by construction here regardless of what a given CR's
 //     admission did or did not enforce (finding/minor 6).
 //
@@ -185,7 +186,7 @@ func grammarPassedFor(t *tatarav1alpha1.Task, fallback bool) bool {
 // reader (unit tests that do not wire one) falls back to c.
 //
 // conversingHasRoom is the CALLER's precomputed answer to Task 9's F.6
-// capacity question (needsConversingRoom names which stageReasons ever consult
+// capacity question (NeedsConversingRoom names which stageReasons ever consult
 // it). It is a PARAMETER, not computed in here, on purpose: driveUnparks calls
 // ApplyUnpark once per parked Task in a loop (tatara-operator#368 is the whole
 // reason that loop is paced at all), and ConversingHasRoom's countConversing is
@@ -308,14 +309,14 @@ func (r *ProjectReconciler) driveUnparksPaced(ctx context.Context, proj *tatarav
 	return interval, nil
 }
 
-// needsConversingRoom reports whether stageReason is one of the two F.6 rules
+// NeedsConversingRoom reports whether stageReason is one of the two F.6 rules
 // that ever consult UnparkInput.ConversingHasRoom (stage.go's ReasonAwaitingHuman
 // and ReasonIdentityUnverified branches). Every other parked reason (merge-
 // timeout, deploy-timeout, no-outcome, handoff-stalled, backlog-sweep, ...)
 // never reads the field, so a caller sweeping a mixed batch can skip the
 // capacity List entirely when nothing in it would use the answer (2026-07-28
 // security review IMPORTANT 4).
-func needsConversingRoom(stageReason string) bool {
+func NeedsConversingRoom(stageReason string) bool {
 	return stageReason == stage.ReasonAwaitingHuman || stageReason == stage.ReasonIdentityUnverified
 }
 
@@ -359,7 +360,7 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 	conversingRoomBudget := 0
 	for i := range tl.Items {
 		t := &tl.Items[i]
-		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && needsConversingRoom(t.Status.StageReason) {
+		if t.Spec.ProjectRef == proj.Name && t.Status.Stage == tatarav1alpha1.StageParked && NeedsConversingRoom(t.Status.StageReason) {
 			live, listErr := countConversing(ctx, r.Client, proj)
 			if listErr != nil {
 				log.FromContext(ctx).Error(listErr, "unpark: conversing capacity check failed; treating this pass as no room",
@@ -386,7 +387,7 @@ func (r *ProjectReconciler) driveUnparks(ctx context.Context, proj *tatarav1alph
 		// cached) and can lag exactly the write this whole feature exists to survive.
 		// false here is the fallback ApplyUnpark uses for every OTHER stageReason,
 		// where GrammarPassed is ignored entirely.
-		conversingRoom := needsConversingRoom(t.Status.StageReason) && conversingRoomBudget > 0
+		conversingRoom := NeedsConversingRoom(t.Status.StageReason) && conversingRoomBudget > 0
 		target, decline, err := ApplyUnpark(ctx, r.Client, r.APIReader, proj, t, active, maxOpen, false, conversingRoom, now)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "unpark: apply failed",
